@@ -16,14 +16,19 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (  # noqa: E402
+    CacheFieldLayout,
+    CacheGroupLayout,
+    CacheMemoryPlan,
+    CachePlaneLayout,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
+    PagedCacheGroupSpec,
+)
 from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
-    CACHE_PD_PROTOCOL_VERSION,
-    CachePDGroup,
     CachePDGroupPages,
-    CachePDLayout,
     CachePDPageManifest,
-    CachePDSlabRegistration,
-    CachePDTransferSegment,
+    CacheTransferContract,
 )
 from tokenspeed.runtime.pd.mooncake.entities import (  # noqa: E402
     TransferInfo,
@@ -31,19 +36,42 @@ from tokenspeed.runtime.pd.mooncake.entities import (  # noqa: E402
 )
 
 
-def _layout(*, capacity: int = 16) -> CachePDLayout:
-    return CachePDLayout(
-        version=CACHE_PD_PROTOCOL_VERSION,
-        layout_fingerprint="a" * 64,
-        block_size=2,
-        num_pages_with_null=capacity,
-        physical_buffer_ids=("history_slab", "state_slab"),
-        physical_page_bytes=16,
-        groups=(
-            CachePDGroup("history", "history", "full_suffix", (0,)),
-            CachePDGroup("state", "state", "latest_snapshot", (1,)),
+def _group_spec(
+    group_id: str,
+    family: str,
+    policy: str,
+    *,
+    packing: int = 1,
+) -> PagedCacheGroupSpec:
+    return PagedCacheGroupSpec(
+        group_id=group_id,
+        retention="full_history",
+        rows_per_page=2,
+        entry_stride_tokens=1,
+        sliding_window_tokens=None,
+        family=family,
+        cache_blocks_per_lcm_block=packing,
+        transfer_policy=policy,
+    )
+
+
+def _layout(*, capacity: int = 16) -> CacheTransferContract:
+    specs = (
+        _group_spec("history", "history", "full_suffix"),
+        _group_spec("state", "state", "latest_snapshot"),
+    )
+    plan = CacheMemoryPlan(
+        logical_block_tokens=2,
+        lcm_block_bytes=32,
+        num_lcm_blocks=capacity - 1,
+        groups=tuple(CacheGroupLayout(spec.group_id, 1, capacity) for spec in specs),
+        planes=(CachePlaneLayout("cache", 32, 0),),
+        fields=(
+            CacheFieldLayout("history", "history", "cache", (16,), 1, 0, 32),
+            CacheFieldLayout("state", "state", "cache", (16,), 1, 16, 32),
         ),
     )
+    return CacheTransferContract(plan, specs, ("uint8", "uint8"))
 
 
 def _op(*, state_page: int = 6):
@@ -72,7 +100,7 @@ def _destination_manifest() -> CachePDPageManifest:
     )
 
 
-def _destination_transfer_info(layout: CachePDLayout) -> TransferInfo:
+def _destination_transfer_info(layout: CacheTransferContract) -> TransferInfo:
     manifest = _destination_manifest()
     frames = [
         b"9",
@@ -87,7 +115,7 @@ def _destination_transfer_info(layout: CachePDLayout) -> TransferInfo:
         b"1",
         b"[]",
         manifest.to_wire_bytes(),
-        layout.peer.to_wire_bytes(),
+        layout.to_wire_bytes(),
     ]
     return TransferInfo.from_zmq(frames)
 
@@ -166,28 +194,81 @@ def test_cache_decode_destination_seeds_remote_prompt_cache_length(
     assert resets == [([7, 11], [1535, 3073])]
 
 
-def test_cache_factory_exposes_raw_slabs_as_mooncake_layers() -> None:
+def test_cache_factory_exposes_one_typed_arena() -> None:
+    from tokenspeed.runtime.cache.transfer.layout import (
+        CacheField,
+        CacheGroupLayout,
+        CacheTransferLayout,
+    )
     from tokenspeed.runtime.pd.factory import get_kv_args
 
+    class _Dtype:
+        def __str__(self):
+            return "torch.uint8"
+
+    class _Buffer:
+        dtype = _Dtype()
+        nbytes = _layout().plan.arena_bytes
+
+        @staticmethod
+        def is_contiguous():
+            return True
+
+        @staticmethod
+        def storage_offset():
+            return 0
+
+        @staticmethod
+        def data_ptr():
+            return 0x1000
+
+        @staticmethod
+        def untyped_storage():
+            return SimpleNamespace(data_ptr=lambda: 0x1000)
+
     layout = _layout()
-    extent = layout.num_pages_with_null * layout.physical_page_bytes
-    registrations = (
-        CachePDSlabRegistration(0, "history_slab", 0x1000, extent),
-        CachePDSlabRegistration(1, "state_slab", 0x2000, extent),
+    transfer_layout = CacheTransferLayout(
+        num_lcm_blocks=layout.plan.num_lcm_blocks,
+        groups=tuple(
+            CacheGroupLayout(
+                group_id=group.group_id,
+                cache_blocks_per_lcm_block=group.cache_blocks_per_lcm_block,
+                fields=(
+                    CacheField(
+                        field_id=field.field_id,
+                        device_buffer_index=0,
+                        device_block_zero_offset_bytes=field.field_offset_bytes,
+                        block_stride_bytes=field.page_stride_bytes,
+                        payload_bytes=field.payload_bytes,
+                        dtype=dtype,
+                    ),
+                ),
+            )
+            for group, field, dtype in zip(
+                layout.plan.groups,
+                layout.plan.fields,
+                layout.field_dtypes,
+                strict=True,
+            )
+        ),
+        buffers=(_Buffer(),),
+        consumers=(tuple(field.field_id for field in layout.plan.fields),),
     )
     pool = SimpleNamespace(
         supports_disaggregation=True,
-        get_pd_cache_contract=lambda: (layout, registrations),
+        plan=layout.plan,
+        paged_cache_group_specs=layout.group_specs,
+        cache_transfer_layout=lambda *, scope: transfer_layout,
     )
 
     kv_args = get_kv_args(0, 0, "mlx5_0", pool, None)
 
-    assert kv_args.target_layer_num == 2
-    assert kv_args.kv_layer_ids == [0, 1]
-    assert kv_args.offsets == [(0,), (1,)]
-    assert kv_args.kv_item_lens == [16, 16]
-    assert kv_args.kv_unit_lens == [16, 16]
-    assert kv_args.cache_layout is layout
+    assert kv_args.target_layer_num == 1
+    assert kv_args.kv_layer_ids == [0]
+    assert kv_args.offsets == [(0,)]
+    assert kv_args.kv_item_lens == [32]
+    assert kv_args.kv_unit_lens == [32]
+    assert kv_args.cache_layout == layout
 
 
 def test_decode_publishes_manifest_through_legacy_receiver() -> None:
@@ -294,113 +375,40 @@ def test_shared_manager_validates_manifest_before_dma() -> None:
         manager._validate_cache_transfer(chunk, destination)
 
 
-def test_shared_manager_transfers_only_group_bound_slabs() -> None:
-    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
-
-    layout = _layout()
-    source_manifest = CachePDPageManifest(
-        groups=(
-            CachePDGroupPages("history", (2, 3)),
-            CachePDGroupPages("state", (6,)),
-        ),
-        prefix_len=2,
-        prompt_len=5,
-    )
-    destination_manifest = _destination_manifest()
-    calls = []
-    manager = object.__new__(MooncakeKVManagerPrefill)
-    manager.kv_args = SimpleNamespace(
-        cache_layout=layout,
-        kv_data_ptrs=[0x1000, 0x2000],
-        kv_item_lens=[16, 16],
-    )
-    manager.engine = SimpleNamespace(
-        batch_transfer_sync=lambda session, src, dst, lengths: (
-            calls.append((session, src, dst, lengths)) or 0
-        )
-    )
-
-    assert (
-        manager.send_kvcache(
-            "session",
-            np.asarray([2, 3, 6], dtype=np.int64),
-            [0x3000, 0x4000],
-            np.asarray([10, 11, 12], dtype=np.int64),
-            None,
-            src_page_manifest=source_manifest,
-            dst_page_manifest=destination_manifest,
-            dst_num_pages_with_null=layout.num_pages_with_null,
-        )
-        == 0
-    )
-    assert calls == [
-        (
-            "session",
-            [0x1020, 0x2060],
-            [0x30A0, 0x40C0],
-            [32, 16],
-        )
-    ]
-
-
 def _segmented_layout(
     *,
     capacity: int,
     history_k_offset: int,
     history_v_offset: int,
     state_offset: int,
-) -> CachePDLayout:
-    return CachePDLayout(
-        version=CACHE_PD_PROTOCOL_VERSION,
-        layout_fingerprint="b" * 64,
-        block_size=2,
-        num_pages_with_null=capacity,
-        physical_buffer_ids=("lcm_arena",),
-        physical_page_bytes=1024,
+) -> CacheTransferContract:
+    specs = (
+        _group_spec("history", "history", "full_suffix", packing=2),
+        _group_spec("state", "state", "latest_snapshot"),
+    )
+    plan = CacheMemoryPlan(
+        logical_block_tokens=2,
+        lcm_block_bytes=1024,
+        num_lcm_blocks=capacity - 1,
         groups=(
-            CachePDGroup(
-                "history",
-                "history",
-                "full_suffix",
-                (0,),
-                cache_blocks_per_lcm_block=2,
-                transfer_segments=(
-                    CachePDTransferSegment(
-                        physical_slot=0,
-                        field_id="layer.0.k",
-                        dtype="bfloat16",
-                        page_zero_offset=history_k_offset,
-                        page_stride_bytes=256,
-                        payload_bytes=256,
-                    ),
-                    CachePDTransferSegment(
-                        physical_slot=0,
-                        field_id="layer.0.v",
-                        dtype="bfloat16",
-                        page_zero_offset=history_v_offset,
-                        page_stride_bytes=256,
-                        payload_bytes=256,
-                    ),
-                ),
-            ),
-            CachePDGroup(
-                "state",
-                "state",
-                "latest_snapshot",
-                (0,),
-                cache_blocks_per_lcm_block=1,
-                transfer_segments=(
-                    CachePDTransferSegment(
-                        physical_slot=0,
-                        field_id="layer.1.ssm",
-                        dtype="float32",
-                        page_zero_offset=state_offset,
-                        page_stride_bytes=512,
-                        payload_bytes=384,
-                    ),
-                ),
-            ),
+            CacheGroupLayout("history", 2, 1 + (capacity - 1) * 2),
+            CacheGroupLayout("state", 1, capacity),
         ),
+        planes=(
+            CachePlaneLayout("history_k", 256, history_k_offset),
+            CachePlaneLayout("history_v", 256, history_v_offset),
+            CachePlaneLayout("state", 512, state_offset),
+        ),
+        fields=(
+            CacheFieldLayout("history", "layer.0.k", "history_k", (128,), 2, 0, 256),
+            CacheFieldLayout("history", "layer.0.v", "history_v", (128,), 2, 0, 256),
+            CacheFieldLayout("state", "layer.1.ssm", "state", (96,), 4, 0, 512),
+        ),
+    )
+    return CacheTransferContract(
+        plan,
+        specs,
+        ("bfloat16", "bfloat16", "float32"),
     )
 
 
@@ -451,8 +459,7 @@ def test_shared_manager_resolves_lcm_group_segments() -> None:
             None,
             src_page_manifest=source_manifest,
             dst_page_manifest=destination_manifest,
-            dst_num_pages_with_null=layout.num_pages_with_null,
-            dst_page_zero_offsets=layout.peer.page_zero_offset_map(),
+            dst_cache_layout=layout,
         )
         == 0
     )
@@ -475,122 +482,6 @@ def test_shared_manager_resolves_lcm_group_segments() -> None:
             ],
             [256, 256, 256, 256, 384],
         )
-    ]
-
-
-def test_cache_transfer_blocks_filters_by_layer_range() -> None:
-    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
-
-    layout = _segmented_layout(
-        capacity=5,
-        history_k_offset=768,
-        history_v_offset=2816,
-        state_offset=512,
-    )
-    source_manifest = CachePDPageManifest(
-        groups=(
-            CachePDGroupPages("history", (1, 2)),
-            CachePDGroupPages("state", (4,)),
-        ),
-        prefix_len=0,
-        prompt_len=4,
-    )
-    destination_manifest = CachePDPageManifest(
-        groups=(
-            CachePDGroupPages("history", (5, 6)),
-            CachePDGroupPages("state", (3,)),
-        ),
-        prefix_len=0,
-        prompt_len=4,
-    )
-    manager = object.__new__(MooncakeKVManagerPrefill)
-    manager.kv_args = SimpleNamespace(
-        cache_layout=layout,
-        kv_data_ptrs=[0x10000],
-        kv_item_lens=[1024],
-    )
-
-    def blocks_for(layer_range):
-        return manager._cache_transfer_blocks(
-            dst_ptrs=[0x20000],
-            src_indices=np.asarray([1, 2, 4], dtype=np.int64),
-            dst_indices=np.asarray([5, 6, 3], dtype=np.int64),
-            src_manifest=source_manifest,
-            dst_manifest=destination_manifest,
-            dst_num_pages_with_null=layout.num_pages_with_null,
-            dst_page_zero_offsets=layout.peer.page_zero_offset_map(),
-            layer_range=layer_range,
-        )
-
-    # layer.0 lives in the history group (k + v segments); layer.1 is the state
-    # group's ssm segment. Filtering by [0,1) drops the state slab entirely.
-    layer0 = blocks_for((0, 1))
-    assert [length for _, _, length in layer0] == [256, 256, 256, 256]
-    layer1 = blocks_for((1, 2))
-    assert [length for _, _, length in layer1] == [384]
-    # Union of the windows equals the unfiltered whole-request transfer.
-    assert blocks_for(None) == layer0 + layer1
-
-
-def test_cache_layerwise_streams_windows_gated_on_step() -> None:
-    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
-
-    layout = _segmented_layout(
-        capacity=5,
-        history_k_offset=768,
-        history_v_offset=2816,
-        state_offset=512,
-    )
-    source_manifest = CachePDPageManifest(
-        groups=(
-            CachePDGroupPages("history", (1, 2)),
-            CachePDGroupPages("state", (4,)),
-        ),
-        prefix_len=0,
-        prompt_len=4,
-    )
-    destination_manifest = CachePDPageManifest(
-        groups=(
-            CachePDGroupPages("history", (5, 6)),
-            CachePDGroupPages("state", (3,)),
-        ),
-        prefix_len=0,
-        prompt_len=4,
-    )
-    waited_steps = []
-    sent = []
-    manager = object.__new__(MooncakeKVManagerPrefill)
-    manager.kv_args = SimpleNamespace(
-        cache_layout=layout,
-        kv_data_ptrs=[0x10000],
-        kv_item_lens=[1024],
-    )
-    manager.layer_num = 2
-    manager.layerwise_debug = False
-    manager._wait_until_cache_step = lambda step: waited_steps.append(step)
-    manager._transfer_data = lambda session, blocks: (
-        sent.append((session, [length for _, _, length in blocks])) or 0
-    )
-
-    ret = manager._cache_send_kvcache_layerwise(
-        "session",
-        np.asarray([1, 2, 4], dtype=np.int64),
-        [0x20000],
-        np.asarray([5, 6, 3], dtype=np.int64),
-        begin_cache_step=100,
-        interval=1,
-        src_page_manifest=source_manifest,
-        dst_page_manifest=destination_manifest,
-        dst_num_pages_with_null=layout.num_pages_with_null,
-        dst_page_zero_offsets=layout.peer.page_zero_offset_map(),
-    )
-
-    assert ret == 0
-    # One window per layer, each blocking on that layer's cache step first.
-    assert waited_steps == [100, 101]
-    assert sent == [
-        ("session", [256, 256, 256, 256]),
-        ("session", [384]),
     ]
 
 
@@ -647,8 +538,7 @@ def test_shared_manager_uses_destination_page_zero_offsets() -> None:
             None,
             src_page_manifest=source_manifest,
             dst_page_manifest=destination_manifest,
-            dst_num_pages_with_null=destination_layout.num_pages_with_null,
-            dst_page_zero_offsets=destination_layout.peer.page_zero_offset_map(),
+            dst_cache_layout=destination_layout,
         )
         == 0
     )
@@ -679,16 +569,17 @@ def test_cache_uses_equal_tp_identity_route() -> None:
         kv_args=SimpleNamespace(
             engine_rank=3,
             cache_layout=layout,
-            kv_item_lens=[16, 16],
-            kv_unit_lens=[16, 16],
+            kv_item_lens=[32],
+            kv_unit_lens=[32],
         ),
     )
     prefill = PrefillParallelInfo(
         tp_size=8,
         dp_size=1,
-        kv_item_lens=(16, 16),
-        kv_unit_lens=(16, 16),
-        cache_layout=layout.peer,
+        enable_mla_l1_5_cache=False,
+        kv_item_lens=(32,),
+        kv_unit_lens=(32,),
+        cache_layout=layout,
     )
 
     route = _calc(manager, prefill)
@@ -701,20 +592,6 @@ def test_cache_uses_equal_tp_identity_route() -> None:
     prefill.tp_size = 4
     with pytest.raises(NotImplementedError, match="equal Prefill and Decode TP"):
         _calc(manager, prefill)
-
-
-def test_cache_contract_requires_one_complete_pool_abi() -> None:
-    from tokenspeed.runtime.pd.factory import _get_cache_contract
-
-    with pytest.raises(RuntimeError, match="get_pd_cache_contract"):
-        _get_cache_contract(SimpleNamespace(supports_disaggregation=True))
-
-    contract = (object(), ())
-    pool = SimpleNamespace(
-        supports_disaggregation=True,
-        get_pd_cache_contract=lambda: contract,
-    )
-    assert _get_cache_contract(pool) is contract
 
 
 def test_pool_without_disaggregation_does_not_require_cache_contract() -> None:

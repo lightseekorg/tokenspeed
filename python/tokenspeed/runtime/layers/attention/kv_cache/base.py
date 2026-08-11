@@ -63,17 +63,11 @@ class CachePool:
         token_capacity: int | None = None,
         backing_pool: CachePool | None = None,
         field_layer_offset: int = 0,
-        pd_disaggregation_enabled: bool = False,
     ):
         self.dtype = dtype
         self.rank = rank
         self.size = size
         self.page_size = page_size
-        # PD disaggregation transfers the whole LCM arena over the cache-group
-        # contract (get_pd_cache_contract): one physical parent page per
-        # Mooncake unit, so a strided multi-field arena moves correctly. Every
-        # contract-planned pool supports it uniformly.
-        self._pd_disaggregation_enabled = bool(pd_disaggregation_enabled)
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
             #  Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
@@ -104,9 +98,8 @@ class CachePool:
         # A heterogeneous draft view (for example, an MHA Eagle3 head over an
         # MLA target) binds its own field family but must not allocate another
         # arena. Construction is deliberately target-first: the draft aliases
-        # the target's already-registered buffer and field registry. Sharing
-        # the registry is also required by pd_contract(), which validates that
-        # every field in the merged plan has acquired a runtime dtype.
+        # the target's already-registered buffer and field registry. The
+        # registry also supplies the runtime dtypes for the PD contract.
         self._backing_pool = backing_pool
         if backing_pool is None:
             self.buffer: torch.Tensor | None = None
@@ -223,42 +216,9 @@ class CachePool:
 
     @property
     def supports_disaggregation(self) -> bool:
-        """True when this pool can move its KV over the PD cache-group contract.
-
-        Enabled by --disaggregation-mode; every contract-planned pool exposes
-        the same raw-slab transfer ABI (get_pd_cache_contract), so PD is a
-        uniform capability rather than a per-family special case.
-        """
-        return self._pd_disaggregation_enabled
-
-    def get_pd_cache_contract(self):
-        """Describe the LCM arena for PD transfer (layout + slab registrations)."""
-        if not self.supports_disaggregation:
-            raise RuntimeError(
-                "paged cache PD requires --disaggregation-mode on this pool"
-            )
-        return self.pd_contract(self.paged_cache_group_specs)
-
-    def pd_contract(self, group_specs):
-        buffer = self._ensure_buffer()
-        from tokenspeed.runtime.pd.cache_protocol import build_lcm_pd_cache_contract
-
-        missing = [
-            field.field_id
-            for field in self.plan.fields
-            if field.field_id not in self._fields
-        ]
-        if missing:
-            raise RuntimeError(f"cache fields have no runtime dtype: {missing}")
-        field_dtypes = {
-            field_id: str(view.dtype).removeprefix("torch.")
-            for field_id, view in self._fields.items()
-        }
-        return build_lcm_pd_cache_contract(
-            plan=self.plan,
-            buffer=buffer,
-            group_specs=group_specs,
-            field_dtypes=field_dtypes,
+        """Whether this pool exposes complete inputs for cache transfer."""
+        return bool(self.paged_cache_group_specs) and all(
+            spec.transfer_policy is not None for spec in self.paged_cache_group_specs
         )
 
     def _ensure_buffer(self) -> torch.Tensor:
@@ -277,21 +237,7 @@ class CachePool:
         return self.buffer
 
     def _field_block_byte_offset(self, field_id: str, block_id: int) -> int:
-        field = self.plan.field(field_id)
-        group = self.plan.group(field.group_id)
-        if block_id < 0 or block_id >= group.page_count:
-            raise IndexError(
-                f"block_id {block_id} outside [0, {group.page_count}) for "
-                f"group {group.group_id!r}"
-            )
-        plane = self.plan.plane(field.plane_id)
-        return (
-            plane.arena_offset_bytes
-            + plane.bytes_per_lcm_block
-            - field.page_stride_bytes
-            + block_id * field.page_stride_bytes
-            + field.field_offset_bytes
-        )
+        return self.plan.field_page_byte_offset(field_id, block_id)
 
     def _block_byte_segments(
         self, group_id: str, block_ids: list[int]
@@ -316,26 +262,42 @@ class CachePool:
         """Optional hook for model-specific paged-cache diagnostics."""
 
     def cache_transfer_layout(self):
-        """Return the byte contract used by Host cache transfers."""
+        """Return the transfer layout consumed by this compute view."""
         from tokenspeed.runtime.cache.transfer.layout import (
-            layout_from_lcm_plan,
             select_layer_fields,
         )
 
         try:
-            layer_num = self.layer_num
-        except AttributeError as exc:
-            raise RuntimeError(
-                f"{type(self).__name__} must expose layer_num for Host L2"
-            ) from exc
-        try:
             field_ids, consumers = select_layer_fields(
                 self.plan.fields,
                 first_layer=self._field_layer_offset,
-                num_layers=layer_num,
+                num_layers=self.layer_num,
             )
-        except ValueError as exc:
+        except (AttributeError, IndexError, ValueError) as exc:
             raise RuntimeError(str(exc)) from exc
+        return self._build_cache_transfer_layout(field_ids, consumers)
+
+    def cache_contract_binding(self) -> tuple[torch.Tensor, dict[str, str]]:
+        """Return the arena and field dtypes bound to the cache contract."""
+        if not self.supports_disaggregation:
+            raise RuntimeError(
+                "cache pool has no transfer policy in its runtime contract"
+            )
+        field_ids = {field.field_id for field in self.plan.fields}
+        missing = sorted(field_ids - set(self._fields))
+        if missing:
+            raise RuntimeError(f"cache fields have no runtime dtype: {missing}")
+        return self._ensure_buffer(), {
+            field_id: str(self._fields[field_id].dtype).removeprefix("torch.")
+            for field_id in field_ids
+        }
+
+    def _build_cache_transfer_layout(self, field_ids, consumers):
+        from tokenspeed.runtime.cache.transfer.layout import layout_from_lcm_plan
+
+        missing = sorted(set(field_ids) - set(self._fields))
+        if missing:
+            raise RuntimeError(f"cache fields have no runtime dtype: {missing}")
         local_group_ids = {
             field.group_id for field in self.plan.fields if field.field_id in field_ids
         }

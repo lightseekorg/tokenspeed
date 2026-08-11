@@ -31,7 +31,7 @@ import zmq
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
     CachePDPageManifest,
-    CachePDPeerLayout,
+    CacheTransferContract,
     validate_cache_manifest,
     validate_cache_peer_layout,
 )
@@ -68,7 +68,7 @@ def _get_prefill_parallel_info_from_server(
             prefill_parallel_info = response.json()
             cache_layout_wire = prefill_parallel_info.get("cache_layout")
             cache_layout = (
-                CachePDPeerLayout.from_wire_bytes(cache_layout_wire.encode("ascii"))
+                CacheTransferContract.from_wire_bytes(cache_layout_wire.encode("ascii"))
                 if cache_layout_wire is not None
                 else None
             )
@@ -381,10 +381,7 @@ def _calc(kv_mgr, prefill_parallel_info: PrefillParallelInfo) -> ReceiverRoutePl
                 "Paged cache decode connected to a non-Paged cache prefill"
             )
         validate_cache_peer_layout(local_cache_layout, prefill_cache_layout)
-        expected_item_lens = tuple(
-            local_cache_layout.physical_page_bytes
-            for _ in range(local_cache_layout.physical_slot_count)
-        )
+        expected_item_lens = (local_cache_layout.plan.lcm_block_bytes,)
         if (
             tuple(kv_mgr.kv_args.kv_item_lens) != expected_item_lens
             or tuple(kv_mgr.kv_args.kv_unit_lens) != expected_item_lens
@@ -655,7 +652,6 @@ class MooncakeKVReceiver:
             validate_cache_manifest(
                 page_manifest,
                 layout=cache_layout,
-                num_pages_with_null=cache_layout.num_pages_with_null,
                 peer="destination",
             )
         for bootstrap_info in self.bootstrap_infos:
@@ -703,7 +699,7 @@ class MooncakeKVReceiver:
                     message_parts.extend(
                         (
                             page_manifest.to_wire_bytes(),
-                            cache_layout.peer.to_wire_bytes(),
+                            cache_layout.to_wire_bytes(),
                         )
                     )
                 sock.send_multipart(message_parts)

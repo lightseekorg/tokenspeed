@@ -99,6 +99,29 @@ class CacheMemoryPlan:
                 return plane
         raise KeyError(plane_id)
 
+    def field_page_byte_offset(self, field_id: str, page_id: int) -> int:
+        """Return one field page's byte offset in the shared cache arena."""
+        field = self.field(field_id)
+        group = self.group(field.group_id)
+        if (
+            isinstance(page_id, bool)
+            or not isinstance(page_id, int)
+            or page_id < 0
+            or page_id >= group.page_count
+        ):
+            raise IndexError(
+                f"page_id {page_id} outside [0, {group.page_count}) for "
+                f"group {group.group_id!r}"
+            )
+        plane = self.plane(field.plane_id)
+        return (
+            plane.arena_offset_bytes
+            + plane.bytes_per_lcm_block
+            - field.page_stride_bytes
+            + page_id * field.page_stride_bytes
+            + field.field_offset_bytes
+        )
+
     def capacity_report(
         self,
         *,

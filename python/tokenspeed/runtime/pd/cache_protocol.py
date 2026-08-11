@@ -18,497 +18,186 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Model-neutral Paged cache prefill/decode metadata contract.
+"""Paged cache transfer contract and per-request PD protocol.
 
-Paged cache groups share a page-ID namespace and bind to aliased raw slabs.
-Prefill and decode allocate their pages independently, so each side publishes a
-typed layout and a per-request page manifest. The existing Mooncake backend
-then transfers each group's selected pages across its bound raw slabs.
+The cache recipe owns semantic group specs and the memory planner owns physical
+geometry. PD transports those objects directly instead of maintaining a second
+flattened layout schema. The same module also owns request page manifests and
+peer validation, keeping the lockstep PD wire surface in one place.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from typing import Any, Literal
 
-CACHE_PD_PROTOCOL_VERSION = 2
-MAX_CACHE_LAYOUT_WIRE_BYTES = 256 << 10
-MAX_CACHE_MANIFEST_WIRE_BYTES = 2 << 20
-MAX_CACHE_GROUPS = 64
-MAX_CACHE_PHYSICAL_SLOTS = 256
-MAX_CACHE_MANIFEST_PAGES = 1 << 15
-
-_UINT64_LIMIT = 1 << 64
-_FAMILIES = frozenset(("history", "state"))
-_TRANSFER_POLICIES = frozenset(("full_suffix", "latest_snapshot"))
-_PEER_LAYOUT_KEYS = frozenset(
-    ("version", "layout_fingerprint", "num_pages_with_null", "page_zero_offsets")
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheFieldLayout,
+    CacheGroupLayout,
+    CacheMemoryPlan,
+    CachePlaneLayout,
 )
-_PEER_OFFSET_KEYS = frozenset(("group_id", "field_id", "page_zero_offset"))
-_MANIFEST_KEYS = frozenset(("version", "prefix_len", "prompt_len", "groups"))
-_MANIFEST_GROUP_KEYS = frozenset(("group_id", "page_ids"))
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
+    Retention,
+    TransferPolicy,
+)
 
-Family = Literal["history", "state"]
-TransferPolicy = Literal["full_suffix", "latest_snapshot"]
-
-
-class CachePDProtocolError(ValueError):
-    """A peer, descriptor, or scheduler violated the Paged cache PD contract."""
+MAX_CACHE_CONTRACT_WIRE_BYTES = 256 << 10
+MAX_CACHE_MANIFEST_WIRE_BYTES = 2 << 20
 
 
-def _integer(name: str, value: object, minimum: int = 0) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise CachePDProtocolError(
-            f"{name} must be an integer >= {minimum}, got {value!r}"
-        )
-    return value
+class CacheContractError(ValueError):
+    """A cache pool, peer, or scheduler violated the runtime cache contract."""
 
 
-def _string(name: str, value: object) -> str:
-    if not isinstance(value, str) or not value:
-        raise CachePDProtocolError(
-            f"{name} must be a non-empty bounded string without control characters"
-        )
-    try:
-        encoded = value.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise CachePDProtocolError(f"{name} is not valid Unicode") from exc
-    if len(encoded) > 256 or any(
-        ord(character) < 32 or ord(character) == 127 for character in value
-    ):
-        raise CachePDProtocolError(
-            f"{name} must be a non-empty bounded string without control characters"
-        )
-    return value
-
-
-def _choice(name: str, value: object, choices: frozenset[str]) -> str:
-    if not isinstance(value, str) or value not in choices:
-        raise CachePDProtocolError(
-            f"{name} must be one of {sorted(choices)}, got {value!r}"
-        )
-    return value
-
-
-def _require(condition: bool, message: str) -> None:
-    if not condition:
-        raise CachePDProtocolError(message)
-
-
-def _sequence(
-    value: object, *, name: str, maximum: int, nonempty: bool = True
-) -> tuple[Any, ...]:
-    if not isinstance(value, (tuple, list)):
-        raise CachePDProtocolError(f"{name} must be a tuple or list")
-    minimum = 1 if nonempty else 0
-    if not minimum <= len(value) <= maximum:
-        raise CachePDProtocolError(f"{name} must contain {minimum}..{maximum} entries")
-    return tuple(value)
-
-
-def _integer_sequence(
-    value: object,
-    *,
-    name: str,
-    maximum: int,
-    minimum: int = 0,
-    ordered_unique: bool = False,
-) -> tuple[int, ...]:
-    result = tuple(
-        _integer(f"{name} entry", item, minimum)
-        for item in _sequence(value, name=name, maximum=maximum)
-    )
-    if ordered_unique:
-        _require(
-            result == tuple(sorted(set(result))),
-            f"{name} must be sorted and unique",
-        )
-    return result
-
-
-def _exact_keys(value: dict[str, Any], expected: frozenset[str], name: str) -> None:
-    actual = frozenset(value)
-    if actual != expected:
-        raise CachePDProtocolError(
-            f"{name} schema keys disagree: "
-            f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
-        )
-
-
-def _encode(payload: dict[str, Any], *, name: str, maximum: int) -> bytes:
+def _dump_wire_json(value: object, *, name: str, maximum: int) -> bytes:
     try:
         result = json.dumps(
-            payload,
-            ensure_ascii=True,
-            allow_nan=False,
+            asdict(value),  # type: ignore[arg-type]
             separators=(",", ":"),
-            sort_keys=True,
         ).encode()
     except (TypeError, ValueError, OverflowError) as exc:
-        raise CachePDProtocolError(f"{name} cannot be encoded") from exc
+        raise CacheContractError(f"{name} cannot be encoded") from exc
     if len(result) > maximum:
-        raise CachePDProtocolError(f"{name} exceeds {maximum} wire bytes")
+        raise CacheContractError(f"{name} exceeds {maximum} wire bytes")
     return result
 
 
-def _decode(raw: bytes, *, name: str, maximum: int) -> dict[str, Any]:
-    if not isinstance(raw, bytes) or not raw or len(raw) > maximum:
-        raise CachePDProtocolError(f"{name} payload must be 1..{maximum} bytes")
-
-    def object_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in result:
-                raise CachePDProtocolError(
-                    f"{name} JSON contains duplicate key {key!r}"
-                )
-            result[key] = value
-        return result
-
-    def reject_constant(value: str) -> None:
-        raise CachePDProtocolError(f"{name} JSON contains non-finite number {value}")
-
+def _load_wire_json(raw: bytes, *, name: str, maximum: int) -> dict:
+    if not raw or len(raw) > maximum:
+        raise CacheContractError(f"{name} payload must be 1..{maximum} bytes")
     try:
-        value = json.loads(
-            raw.decode(),
-            object_pairs_hook=object_hook,
-            parse_constant=reject_constant,
-        )
-    except CachePDProtocolError:
-        raise
-    except (
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-        RecursionError,
-        ValueError,
-        OverflowError,
-    ) as exc:
-        raise CachePDProtocolError(f"invalid {name} JSON") from exc
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CacheContractError(f"invalid {name} JSON") from exc
     if not isinstance(value, dict):
-        raise CachePDProtocolError(f"{name} payload must be a JSON object")
-    return value
-
-
-def _canonical_round_trip(
-    raw: bytes, value: object, *, name: str, maximum: int
-) -> None:
-    if raw != _encode(asdict(value), name=name, maximum=maximum):  # type: ignore[arg-type]
-        raise CachePDProtocolError(f"{name} must use canonical JSON encoding")
-
-
-@dataclass(frozen=True, slots=True)
-class CachePDTransferSegment:
-    """One strided field copied for every selected page in a cache group."""
-
-    physical_slot: int
-    field_id: str
-    dtype: str
-    page_zero_offset: int
-    page_stride_bytes: int
-    payload_bytes: int
-
-    def __post_init__(self) -> None:
-        _integer("segment physical_slot", self.physical_slot)
-        _string("segment field_id", self.field_id)
-        _string("segment dtype", self.dtype)
-        _integer("segment page_zero_offset", self.page_zero_offset)
-        _integer("segment page_stride_bytes", self.page_stride_bytes, 1)
-        _integer("segment payload_bytes", self.payload_bytes, 1)
-        _require(
-            self.payload_bytes <= self.page_stride_bytes,
-            f"segment {self.field_id!r} payload exceeds its page stride",
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class CachePDGroup:
-    group_id: str
-    family: Family
-    transfer_policy: TransferPolicy
-    physical_slots: tuple[int, ...]
-    cache_blocks_per_lcm_block: int = 1
-    transfer_segments: tuple[CachePDTransferSegment, ...] = ()
-
-    def __post_init__(self) -> None:
-        _string("group_id", self.group_id)
-        _choice(f"group {self.group_id!r} family", self.family, _FAMILIES)
-        _choice(
-            f"group {self.group_id!r} transfer_policy",
-            self.transfer_policy,
-            _TRANSFER_POLICIES,
-        )
-        _integer_sequence(
-            self.physical_slots,
-            name=f"group {self.group_id!r} physical_slots",
-            maximum=MAX_CACHE_PHYSICAL_SLOTS,
-            ordered_unique=True,
-        )
-        _integer(
-            f"group {self.group_id!r} cache_blocks_per_lcm_block",
-            self.cache_blocks_per_lcm_block,
-            1,
-        )
-        segments = _sequence(
-            self.transfer_segments,
-            name=f"group {self.group_id!r} transfer_segments",
-            maximum=MAX_CACHE_PHYSICAL_SLOTS,
-            nonempty=False,
-        )
-        if not all(isinstance(segment, CachePDTransferSegment) for segment in segments):
-            raise CachePDProtocolError(
-                f"group {self.group_id!r} transfer_segments must contain "
-                "CachePDTransferSegment values"
-            )
-        field_ids = tuple(segment.field_id for segment in segments)
-        _require(
-            len(field_ids) == len(set(field_ids)),
-            f"group {self.group_id!r} repeats a transfer field",
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class CachePDSlabRegistration:
-    physical_slot: int
-    buffer_id: str
-    base_addr: int
-    length: int
-
-    def __post_init__(self) -> None:
-        _integer("slab physical_slot", self.physical_slot)
-        _string("slab buffer_id", self.buffer_id)
-        _integer("slab base_addr", self.base_addr, 1)
-        _integer("slab length", self.length, 1)
-        _require(self.base_addr < _UINT64_LIMIT, "slab base_addr exceeds uint64")
-        _require(
-            self.base_addr + self.length <= _UINT64_LIMIT,
-            "slab registered extent exceeds uint64",
-        )
-
-
-def _layout_fingerprint(value: object) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise CachePDProtocolError(
-            "layout_fingerprint must be a 64-character lowercase SHA-256 hex string"
-        )
+        raise CacheContractError(f"{name} payload must be a JSON object")
     return value
 
 
 @dataclass(frozen=True, slots=True)
-class CachePDPeerOffset:
-    """One peer-local field base offset inside the peer's arena."""
+class CacheTransferContract:
+    """Thin PD wire envelope around the cache-owned plan and group specs."""
 
-    group_id: str
-    field_id: str
-    page_zero_offset: int
+    plan: CacheMemoryPlan
+    group_specs: tuple[PagedCacheGroupSpec, ...]
+    # Dtypes align positionally with plan.fields; field IDs stay plan-owned.
+    field_dtypes: tuple[str, ...]
 
-    def __post_init__(self) -> None:
-        _string("peer offset group_id", self.group_id)
-        _string("peer offset field_id", self.field_id)
-        _integer("peer offset page_zero_offset", self.page_zero_offset)
-
-
-@dataclass(frozen=True, slots=True)
-class CachePDPeerLayout:
-    """Peer-local fields that are not committed by the semantic fingerprint.
-
-    Capacity and per-field ``page_zero_offset`` values may differ across PD
-    peers when arena plane packing scales with ``num_lcm_blocks``.
-    """
-
-    version: int
-    layout_fingerprint: str
-    num_pages_with_null: int
-    page_zero_offsets: tuple[CachePDPeerOffset, ...] = ()
-
-    def __post_init__(self) -> None:
-        if _integer("layout version", self.version, 1) != CACHE_PD_PROTOCOL_VERSION:
-            raise CachePDProtocolError(
-                f"unsupported Paged cache layout version {self.version}"
+    def fields_for_group(self, group_id: str) -> tuple[CacheFieldLayout, ...]:
+        return tuple(
+            sorted(
+                (field for field in self.plan.fields if field.group_id == group_id),
+                key=lambda field: field.field_id,
             )
-        _layout_fingerprint(self.layout_fingerprint)
-        _integer("num_pages_with_null", self.num_pages_with_null, 2)
-        offsets = _sequence(
-            self.page_zero_offsets,
-            name="page_zero_offsets",
-            maximum=MAX_CACHE_GROUPS * MAX_CACHE_PHYSICAL_SLOTS,
-            nonempty=False,
-        )
-        if not all(isinstance(offset, CachePDPeerOffset) for offset in offsets):
-            raise CachePDProtocolError(
-                "page_zero_offsets must contain CachePDPeerOffset values"
-            )
-        keys = tuple((offset.group_id, offset.field_id) for offset in offsets)
-        _require(
-            len(keys) == len(set(keys)),
-            "page_zero_offsets repeats a (group_id, field_id) pair",
         )
 
-    def page_zero_offset_map(self) -> dict[tuple[str, str], int]:
-        return {
-            (offset.group_id, offset.field_id): offset.page_zero_offset
-            for offset in self.page_zero_offsets
-        }
+    def field_dtype(self, field_id: str) -> str:
+        for field, dtype in zip(self.plan.fields, self.field_dtypes, strict=True):
+            if field.field_id == field_id:
+                return dtype
+        raise KeyError(field_id)
 
     def to_wire_bytes(self) -> bytes:
-        return _encode(
-            asdict(self),
-            name="Paged cache peer layout",
-            maximum=MAX_CACHE_LAYOUT_WIRE_BYTES,
+        return _dump_wire_json(
+            self,
+            name="cache transfer contract",
+            maximum=MAX_CACHE_CONTRACT_WIRE_BYTES,
         )
 
     @classmethod
-    def from_wire_bytes(cls, raw: bytes) -> "CachePDPeerLayout":
-        payload = _decode(
-            raw, name="Paged cache peer layout", maximum=MAX_CACHE_LAYOUT_WIRE_BYTES
-        )
-        _exact_keys(payload, _PEER_LAYOUT_KEYS, "Paged cache peer layout")
-        offsets = []
-        for position, entry in enumerate(
-            _sequence(
-                payload["page_zero_offsets"],
-                name="Paged cache peer layout page_zero_offsets",
-                maximum=MAX_CACHE_GROUPS * MAX_CACHE_PHYSICAL_SLOTS,
-                nonempty=False,
-            )
-        ):
-            if not isinstance(entry, dict):
-                raise CachePDProtocolError(
-                    f"Paged cache peer layout page_zero_offsets[{position}] "
-                    "must be an object"
-                )
-            _exact_keys(
-                entry,
-                _PEER_OFFSET_KEYS,
-                f"Paged cache peer layout page_zero_offsets[{position}]",
-            )
-            offsets.append(
-                CachePDPeerOffset(
-                    group_id=entry["group_id"],
-                    field_id=entry["field_id"],
-                    page_zero_offset=entry["page_zero_offset"],
-                )
-            )
-        layout = cls(
-            version=payload["version"],
-            layout_fingerprint=payload["layout_fingerprint"],
-            num_pages_with_null=payload["num_pages_with_null"],
-            page_zero_offsets=tuple(offsets),
-        )
-        _canonical_round_trip(
+    def from_wire_bytes(cls, raw: bytes) -> "CacheTransferContract":
+        payload = _load_wire_json(
             raw,
-            layout,
-            name="Paged cache peer layout",
-            maximum=MAX_CACHE_LAYOUT_WIRE_BYTES,
+            name="cache transfer contract",
+            maximum=MAX_CACHE_CONTRACT_WIRE_BYTES,
         )
-        return layout
-
-
-@dataclass(frozen=True, slots=True)
-class CachePDLayout:
-    """One local, typed Paged cache ABI plus its local capacity."""
-
-    version: int
-    layout_fingerprint: str
-    block_size: int
-    num_pages_with_null: int
-    physical_buffer_ids: tuple[str, ...]
-    physical_page_bytes: int
-    groups: tuple[CachePDGroup, ...]
-
-    def __post_init__(self) -> None:
-        if _integer("layout version", self.version, 1) != CACHE_PD_PROTOCOL_VERSION:
-            raise CachePDProtocolError(
-                f"unsupported Paged cache layout version {self.version}"
-            )
-        _layout_fingerprint(self.layout_fingerprint)
-        _integer("block_size", self.block_size, 1)
-        _integer("num_pages_with_null", self.num_pages_with_null, 2)
-        _integer("physical_page_bytes", self.physical_page_bytes, 1)
-        buffer_ids = _sequence(
-            self.physical_buffer_ids,
-            name="physical_buffer_ids",
-            maximum=MAX_CACHE_PHYSICAL_SLOTS,
-        )
-        for buffer_id in buffer_ids:
-            _string("physical buffer_id", buffer_id)
-        _require(
-            len(buffer_ids) == len(set(buffer_ids)),
-            "layout contains duplicate physical buffer IDs",
-        )
-        if self.num_pages_with_null * self.physical_page_bytes >= _UINT64_LIMIT:
-            raise CachePDProtocolError("raw slab extent exceeds uint64")
-        groups = _sequence(self.groups, name="layout groups", maximum=MAX_CACHE_GROUPS)
-        if not all(isinstance(group, CachePDGroup) for group in groups):
-            raise CachePDProtocolError("layout groups must contain CachePDGroup values")
-        group_ids = tuple(group.group_id for group in groups)
-        if len(group_ids) != len(set(group_ids)):
-            raise CachePDProtocolError("layout contains duplicate group IDs")
-        covered: set[int] = set()
-        for group in groups:
-            for slot in group.physical_slots:
-                if slot >= self.physical_slot_count:
-                    raise CachePDProtocolError(
-                        f"group {group.group_id!r} slot {slot} exceeds "
-                        f"physical_slot_count={self.physical_slot_count}"
+        try:
+            plan_payload = payload["plan"]
+            plan = CacheMemoryPlan(
+                logical_block_tokens=plan_payload["logical_block_tokens"],
+                lcm_block_bytes=plan_payload["lcm_block_bytes"],
+                num_lcm_blocks=plan_payload["num_lcm_blocks"],
+                groups=tuple(
+                    CacheGroupLayout(**group) for group in plan_payload["groups"]
+                ),
+                planes=tuple(
+                    CachePlaneLayout(**plane) for plane in plan_payload["planes"]
+                ),
+                fields=tuple(
+                    CacheFieldLayout(
+                        **{
+                            **field,
+                            "shape": tuple(field["shape"]),
+                        }
                     )
-                covered.add(slot)
-            for segment in group.transfer_segments:
-                if segment.physical_slot >= self.physical_slot_count:
-                    raise CachePDProtocolError(
-                        f"group {group.group_id!r} segment "
-                        f"{segment.field_id!r} slot {segment.physical_slot} "
-                        f"exceeds physical_slot_count={self.physical_slot_count}"
-                    )
-                registered_extent = self.num_pages_with_null * self.physical_page_bytes
-                group_page_count = (
-                    1
-                    + (self.num_pages_with_null - 1) * group.cache_blocks_per_lcm_block
-                )
-                segment_extent = (
-                    segment.page_zero_offset
-                    + (group_page_count - 1) * segment.page_stride_bytes
-                    + segment.payload_bytes
-                )
-                if segment_extent > registered_extent:
-                    raise CachePDProtocolError(
-                        f"group {group.group_id!r} segment "
-                        f"{segment.field_id!r} exceeds its registered buffer"
-                    )
-                covered.add(segment.physical_slot)
-        missing = set(range(self.physical_slot_count)) - covered
-        if missing:
-            raise CachePDProtocolError(
-                f"layout leaves physical slots unbound: {sorted(missing)}"
+                    for field in plan_payload["fields"]
+                ),
             )
-
-    @property
-    def physical_slot_count(self) -> int:
-        return len(self.physical_buffer_ids)
-
-    @property
-    def peer(self) -> CachePDPeerLayout:
-        offsets = tuple(
-            CachePDPeerOffset(
-                group_id=group.group_id,
-                field_id=segment.field_id,
-                page_zero_offset=segment.page_zero_offset,
+            return cls(
+                plan=plan,
+                group_specs=tuple(
+                    PagedCacheGroupSpec(**spec) for spec in payload["group_specs"]
+                ),
+                field_dtypes=tuple(payload["field_dtypes"]),
             )
-            for group in self.groups
-            for segment in group.transfer_segments
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CacheContractError("invalid cache transfer contract") from exc
+
+
+def build_cache_transfer_contract(
+    *,
+    plan: CacheMemoryPlan,
+    buffer: object,
+    group_specs: Sequence[PagedCacheGroupSpec],
+    field_dtypes: Mapping[str, str],
+) -> tuple[CacheTransferContract, int]:
+    """Bind one cache memory plan to its semantics, dtypes, and raw slab."""
+    specs = tuple(group_specs)
+    plan_group_ids = tuple(group.group_id for group in plan.groups)
+    spec_group_ids = tuple(spec.group_id for spec in specs)
+    if set(plan_group_ids) != set(spec_group_ids):
+        raise CacheContractError(
+            "cache plan and scheduler group IDs disagree: "
+            f"missing={sorted(set(plan_group_ids) - set(spec_group_ids))}, "
+            f"extra={sorted(set(spec_group_ids) - set(plan_group_ids))}"
         )
-        return CachePDPeerLayout(
-            version=self.version,
-            layout_fingerprint=self.layout_fingerprint,
-            num_pages_with_null=self.num_pages_with_null,
-            page_zero_offsets=offsets,
+    expected_field_ids = {field.field_id for field in plan.fields}
+    if set(field_dtypes) != expected_field_ids:
+        raise CacheContractError(
+            "cache field dtype map must contain exactly the planned fields"
         )
+    contract = CacheTransferContract(
+        plan=plan,
+        group_specs=specs,
+        field_dtypes=tuple(field_dtypes[field.field_id] for field in plan.fields),
+    )
+    if (
+        str(buffer.dtype) != "torch.uint8"
+        or not buffer.is_contiguous()
+        or buffer.storage_offset() != 0
+        or buffer.data_ptr() != buffer.untyped_storage().data_ptr()
+        or int(buffer.nbytes) != plan.arena_bytes
+    ):
+        raise CacheContractError(
+            "cache transfer buffer must be the contiguous uint8 arena owner"
+        )
+    return contract, buffer.data_ptr()
+
+
+def build_pool_cache_transfer_contract(
+    pool: object,
+) -> tuple[CacheTransferContract, int]:
+    """Build the PD wire envelope from the cache-owned arena binding."""
+    buffer, field_dtypes = pool.cache_contract_binding()
+    return build_cache_transfer_contract(
+        plan=pool.plan,
+        buffer=buffer,
+        group_specs=pool.paged_cache_group_specs,
+        field_dtypes=field_dtypes,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,190 +205,133 @@ class CachePDGroupPages:
     group_id: str
     page_ids: tuple[int, ...]
 
-    def __post_init__(self) -> None:
-        _string("manifest group_id", self.group_id)
-        pages = _integer_sequence(
-            self.page_ids,
-            name=f"manifest group {self.group_id!r} page_ids",
-            maximum=MAX_CACHE_MANIFEST_PAGES,
-            minimum=1,
-        )
-        _require(
-            len(pages) == len(set(pages)),
-            f"manifest group {self.group_id!r} repeats a page ID",
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class CachePDPageManifest:
     groups: tuple[CachePDGroupPages, ...]
     prefix_len: int
     prompt_len: int
-    version: int = CACHE_PD_PROTOCOL_VERSION
-
-    def __post_init__(self) -> None:
-        if _integer("manifest version", self.version, 1) != CACHE_PD_PROTOCOL_VERSION:
-            raise CachePDProtocolError(
-                f"unsupported Paged cache manifest version {self.version}"
-            )
-        _integer("manifest prefix_len", self.prefix_len)
-        _integer("manifest prompt_len", self.prompt_len, 1)
-        if self.prefix_len >= self.prompt_len:
-            raise CachePDProtocolError("manifest requires prefix_len < prompt_len")
-        groups = _sequence(
-            self.groups, name="manifest groups", maximum=MAX_CACHE_GROUPS
-        )
-        if not all(isinstance(group, CachePDGroupPages) for group in groups):
-            raise CachePDProtocolError(
-                "manifest groups must contain CachePDGroupPages values"
-            )
-        group_ids = tuple(group.group_id for group in groups)
-        if len(group_ids) != len(set(group_ids)):
-            raise CachePDProtocolError("manifest contains duplicate group IDs")
-        page_count = sum(len(group.page_ids) for group in groups)
-        if page_count > MAX_CACHE_MANIFEST_PAGES:
-            raise CachePDProtocolError("manifest contains too many pages")
 
     def to_wire_bytes(self) -> bytes:
-        return _encode(
-            asdict(self),
+        return _dump_wire_json(
+            self,
             name="Paged cache manifest",
             maximum=MAX_CACHE_MANIFEST_WIRE_BYTES,
         )
 
     @classmethod
     def from_wire_bytes(cls, raw: bytes) -> "CachePDPageManifest":
-        payload = _decode(
+        payload = _load_wire_json(
             raw, name="Paged cache manifest", maximum=MAX_CACHE_MANIFEST_WIRE_BYTES
         )
-        _exact_keys(payload, _MANIFEST_KEYS, "Paged cache manifest")
-        groups = []
-        total = 0
-        for position, group in enumerate(
-            _sequence(
-                payload["groups"],
-                name="Paged cache manifest groups",
-                maximum=MAX_CACHE_GROUPS,
-            )
-        ):
-            if not isinstance(group, dict):
-                raise CachePDProtocolError(
-                    f"Paged cache manifest group {position} must be an object"
-                )
-            _exact_keys(
-                group, _MANIFEST_GROUP_KEYS, f"Paged cache manifest group {position}"
-            )
-            pages = _sequence(
-                group["page_ids"],
-                name=f"Paged cache manifest group {position} page_ids",
-                maximum=MAX_CACHE_MANIFEST_PAGES,
-            )
-            total += len(pages)
-            if total > MAX_CACHE_MANIFEST_PAGES:
-                raise CachePDProtocolError("manifest contains too many pages")
-            groups.append(
-                CachePDGroupPages(
-                    group["group_id"],
-                    tuple(pages),
-                )
-            )
-        manifest = cls(
-            groups=tuple(groups),
+        return cls(
+            groups=tuple(
+                CachePDGroupPages(group["group_id"], tuple(group["page_ids"]))
+                for group in payload["groups"]
+            ),
             prefix_len=payload["prefix_len"],
             prompt_len=payload["prompt_len"],
-            version=payload["version"],
         )
-        _canonical_round_trip(
-            raw,
-            manifest,
-            name="Paged cache manifest",
-            maximum=MAX_CACHE_MANIFEST_WIRE_BYTES,
-        )
-        return manifest
 
 
 def _logical_slots(
-    policy: TransferPolicy, prefix_len: int, prompt_len: int, block_size: int
+    policy: TransferPolicy,
+    prefix_len: int,
+    prompt_len: int,
+    block_size: int,
+    retention: Retention,
+    sliding_window_tokens: int | None,
 ) -> tuple[int, ...]:
     if policy == "full_suffix":
         begin = prefix_len // block_size
+        if retention == "sliding_window":
+            # The next decode token can attend the preceding window - 1 raw
+            # tokens. Include every group page intersecting that retained tail.
+            retained_begin = max(0, prompt_len - sliding_window_tokens + 1)
+            begin = max(begin, retained_begin // block_size)
         end = (prompt_len + block_size - 1) // block_size
-        count = end - begin
-        if count > MAX_CACHE_MANIFEST_PAGES:
-            raise CachePDProtocolError("manifest logical suffix exceeds the page limit")
         return tuple(range(begin, end))
-    if policy == "latest_snapshot":
-        return ((prompt_len - 1) // block_size,)
-    raise CachePDProtocolError(f"unsupported transfer policy {policy!r}")
-
-
-def _group_page_count(group: CachePDGroup, num_pages_with_null: int) -> int:
-    """Resolve one group's child-page capacity from the registered parents."""
-    return 1 + (num_pages_with_null - 1) * group.cache_blocks_per_lcm_block
+    return ((prompt_len - 1) // block_size,)
 
 
 def validate_cache_peer_layout(
-    layout: CachePDLayout, peer_layout: CachePDPeerLayout
+    layout: CacheTransferContract, peer_layout: CacheTransferContract
 ) -> None:
-    if not isinstance(layout, CachePDLayout) or not isinstance(
-        peer_layout, CachePDPeerLayout
+    if layout.plan.logical_block_tokens != peer_layout.plan.logical_block_tokens:
+        raise CacheContractError(
+            "Paged cache P/D contract mismatch: scheduler_block_tokens"
+        )
+    local_group_ids = tuple(spec.group_id for spec in layout.group_specs)
+    peer_group_ids = tuple(spec.group_id for spec in peer_layout.group_specs)
+    if local_group_ids != peer_group_ids:
+        raise CacheContractError("Paged cache P/D contract mismatch: group order")
+    for local_spec, peer_spec in zip(
+        layout.group_specs, peer_layout.group_specs, strict=True
     ):
-        raise CachePDProtocolError(
-            "layout compatibility requires local and peer Paged cache layouts"
-        )
-    if layout.version != peer_layout.version:
-        raise CachePDProtocolError("Paged cache P/D layout ABI mismatch: version")
-    if layout.layout_fingerprint != peer_layout.layout_fingerprint:
-        raise CachePDProtocolError(
-            "Paged cache P/D layout ABI mismatch: layout_fingerprint"
-        )
-    local_keys = {
-        (group.group_id, segment.field_id)
-        for group in layout.groups
-        for segment in group.transfer_segments
-    }
-    peer_keys = {
-        (offset.group_id, offset.field_id) for offset in peer_layout.page_zero_offsets
-    }
-    if local_keys != peer_keys:
-        raise CachePDProtocolError(
-            "Paged cache P/D layout ABI mismatch: page_zero_offsets "
-            f"missing={sorted(local_keys - peer_keys)} "
-            f"extra={sorted(peer_keys - local_keys)}"
-        )
+        if (
+            local_spec.family != peer_spec.family
+            or local_spec.cache_block_tokens != peer_spec.cache_block_tokens
+            or local_spec.retention != peer_spec.retention
+            or local_spec.sliding_window_tokens != peer_spec.sliding_window_tokens
+            or local_spec.transfer_policy != peer_spec.transfer_policy
+        ):
+            raise CacheContractError(
+                f"Paged cache P/D contract mismatch: group {local_spec.group_id!r} "
+                "semantics"
+            )
+        local_fields = layout.fields_for_group(local_spec.group_id)
+        peer_fields = peer_layout.fields_for_group(peer_spec.group_id)
+        if tuple(field.field_id for field in local_fields) != tuple(
+            field.field_id for field in peer_fields
+        ):
+            raise CacheContractError(
+                f"Paged cache P/D contract mismatch: group "
+                f"{local_spec.group_id!r} transfer field order"
+            )
+        for local_field, peer_field in zip(local_fields, peer_fields, strict=True):
+            if (
+                layout.field_dtype(local_field.field_id)
+                != peer_layout.field_dtype(peer_field.field_id)
+                or local_field.shape != peer_field.shape
+                or local_field.element_size != peer_field.element_size
+            ):
+                raise CacheContractError(
+                    f"Paged cache P/D contract mismatch: field "
+                    f"{local_field.field_id!r} semantics"
+                )
 
 
 def validate_cache_manifest(
     manifest: CachePDPageManifest,
     *,
-    layout: CachePDLayout,
-    num_pages_with_null: int,
+    layout: CacheTransferContract,
     peer: str,
 ) -> None:
-    if not isinstance(manifest, CachePDPageManifest):
-        raise CachePDProtocolError(f"{peer} manifest has the wrong type")
-    capacity = _integer(f"{peer} num_pages_with_null", num_pages_with_null, 2)
-    expected = tuple(group.group_id for group in layout.groups)
+    if manifest.prefix_len >= manifest.prompt_len:
+        raise CacheContractError(f"{peer} manifest requires prefix_len < prompt_len")
+    expected = tuple(spec.group_id for spec in layout.group_specs)
     actual = tuple(group.group_id for group in manifest.groups)
     if actual != expected:
-        raise CachePDProtocolError(f"{peer} manifest group order disagrees with layout")
-    if manifest.prefix_len % layout.block_size:
-        raise CachePDProtocolError(f"{peer} manifest prefix_len is not page aligned")
-    for group, layout_group in zip(manifest.groups, layout.groups, strict=True):
+        raise CacheContractError(f"{peer} manifest group order disagrees with layout")
+    if manifest.prefix_len % layout.plan.logical_block_tokens:
+        raise CacheContractError(f"{peer} manifest prefix_len is not page aligned")
+    for group, spec in zip(manifest.groups, layout.group_specs, strict=True):
         required = _logical_slots(
-            layout_group.transfer_policy,
+            spec.transfer_policy,
             manifest.prefix_len,
             manifest.prompt_len,
-            layout.block_size,
+            spec.cache_block_tokens,
+            spec.retention,
+            spec.sliding_window_tokens,
         )
         if len(group.page_ids) != len(required):
-            raise CachePDProtocolError(
+            raise CacheContractError(
                 f"{peer} manifest group {group.group_id!r} page count disagrees "
                 "with its transfer policy"
             )
-        group_capacity = _group_page_count(layout_group, capacity)
-        if any(page >= group_capacity for page in group.page_ids):
-            raise CachePDProtocolError(
+        group_capacity = layout.plan.group(spec.group_id).page_count
+        if any(page <= 0 or page >= group_capacity for page in group.page_ids):
+            raise CacheContractError(
                 f"{peer} manifest group {group.group_id!r} has an out-of-bounds page"
             )
 
@@ -707,376 +339,97 @@ def validate_cache_manifest(
 def validate_cache_manifest_pair(
     src_manifest: CachePDPageManifest,
     dst_manifest: CachePDPageManifest,
-    layout: CachePDLayout,
-    *,
-    dst_num_pages_with_null: int,
+    src_layout: CacheTransferContract,
+    dst_layout: CacheTransferContract,
 ) -> None:
-    validate_cache_manifest(
-        src_manifest,
-        layout=layout,
-        num_pages_with_null=layout.num_pages_with_null,
-        peer="source",
-    )
-    validate_cache_manifest(
-        dst_manifest,
-        layout=layout,
-        num_pages_with_null=dst_num_pages_with_null,
-        peer="destination",
-    )
+    validate_cache_manifest(src_manifest, layout=src_layout, peer="source")
+    validate_cache_manifest(dst_manifest, layout=dst_layout, peer="destination")
     if (
         src_manifest.prefix_len != dst_manifest.prefix_len
         or src_manifest.prompt_len != dst_manifest.prompt_len
     ):
-        raise CachePDProtocolError(
-            "source/destination prefix_len or prompt_len disagree"
-        )
+        raise CacheContractError("source/destination prefix_len or prompt_len disagree")
 
 
 def cache_manifest_page_ids(
     manifest: CachePDPageManifest,
     *,
-    layout: CachePDLayout,
-    num_pages_with_null: int | None = None,
+    layout: CacheTransferContract,
     peer: str = "local",
 ) -> tuple[int, ...]:
     """Flatten a validated manifest into the legacy Mooncake page-vector order."""
-    capacity = (
-        layout.num_pages_with_null
-        if num_pages_with_null is None
-        else num_pages_with_null
-    )
-    validate_cache_manifest(
-        manifest,
-        layout=layout,
-        num_pages_with_null=capacity,
-        peer=peer,
-    )
+    validate_cache_manifest(manifest, layout=layout, peer=peer)
     return tuple(page_id for group in manifest.groups for page_id in group.page_ids)
 
 
 def build_cache_page_manifest(
     forward_op: object,
     *,
-    layout: CachePDLayout,
+    layout: CacheTransferContract,
     request_row: int,
     prefix_len: int,
     prompt_len: int,
 ) -> CachePDPageManifest:
     """Select each group's pages according to its explicit transfer policy."""
-    if not isinstance(layout, CachePDLayout):
-        raise CachePDProtocolError("layout must be a CachePDLayout")
-    request_row = _integer("request_row", request_row)
-    prefix_len = _integer("prefix_len", prefix_len)
-    prompt_len = _integer("prompt_len", prompt_len, 1)
     if prefix_len >= prompt_len:
-        raise CachePDProtocolError("Paged cache PD requires prefix_len < prompt_len")
-    if prefix_len % layout.block_size:
-        raise CachePDProtocolError("Paged cache PD prefix_len must be page aligned")
-    arrays_fn = getattr(forward_op, "block_tables_arrays", None)
-    if not callable(arrays_fn):
-        raise CachePDProtocolError("Paged cache PD requires block_tables_arrays()")
-    mapping = arrays_fn()
-    if not isinstance(mapping, Mapping):
-        raise CachePDProtocolError("block_tables_arrays() must return a mapping")
-    actual_ids = tuple(mapping)
-    for group_id in actual_ids:
-        _string("scheduler group_id", group_id)
-    _require(
-        len(actual_ids) == len(set(actual_ids)),
-        "scheduler returned duplicate group IDs",
-    )
-    expected_ids = tuple(group.group_id for group in layout.groups)
-    layout_groups_by_id = {group.group_id: group for group in layout.groups}
-    if set(actual_ids) != set(expected_ids):
-        raise CachePDProtocolError(
+        raise CacheContractError("Paged cache PD requires prefix_len < prompt_len")
+    if prefix_len % layout.plan.logical_block_tokens:
+        raise CacheContractError("Paged cache PD prefix_len must be page aligned")
+    mapping = forward_op.block_tables_arrays()  # type: ignore[attr-defined]
+    expected_ids = {group.group_id for group in layout.group_specs}
+    if set(mapping) != expected_ids:
+        raise CacheContractError(
             "scheduler group IDs disagree with the Paged cache layout: "
-            f"missing={sorted(set(expected_ids) - set(actual_ids))}, "
-            f"extra={sorted(set(actual_ids) - set(expected_ids))}"
+            f"missing={sorted(expected_ids - set(mapping))}, "
+            f"extra={sorted(set(mapping) - expected_ids)}"
         )
 
     groups: list[CachePDGroupPages] = []
-    inspected: list[tuple[str, Any, frozenset[int]]] = []
-    for layout_group in layout.groups:
-        table = mapping[layout_group.group_id]
-        if (
-            getattr(table, "ndim", None) != 2
-            or getattr(getattr(table, "dtype", None), "kind", None) != "i"
-            or getattr(getattr(table, "dtype", None), "itemsize", None) not in (4, 8)
-        ):
-            raise CachePDProtocolError(
-                f"table {layout_group.group_id!r} must be a 2-D int32/int64 array"
-            )
-        if request_row >= table.shape[0]:
-            raise CachePDProtocolError(
-                f"request_row exceeds table {layout_group.group_id!r}"
-            )
+    for spec in layout.group_specs:
+        table = mapping[spec.group_id]
         logical_slots = _logical_slots(
-            layout_group.transfer_policy,
+            spec.transfer_policy,
             prefix_len,
             prompt_len,
-            layout.block_size,
+            spec.cache_block_tokens,
+            spec.retention,
+            spec.sliding_window_tokens,
         )
-        if logical_slots[-1] >= table.shape[1]:
-            raise CachePDProtocolError(
-                f"table {layout_group.group_id!r} misses logical slot "
-                f"{logical_slots[-1]}"
+        if logical_slots and logical_slots[-1] >= table.shape[1]:
+            raise CacheContractError(
+                f"table {spec.group_id!r} misses logical slot " f"{logical_slots[-1]}"
             )
         page_ids = tuple(
             int(table[request_row, logical_slot]) for logical_slot in logical_slots
         )
         for logical_slot, page_id in zip(logical_slots, page_ids, strict=True):
-            group_capacity = _group_page_count(layout_group, layout.num_pages_with_null)
+            group_capacity = layout.plan.group(spec.group_id).page_count
             if page_id <= 0 or page_id >= group_capacity:
-                raise CachePDProtocolError(
-                    f"table {layout_group.group_id!r} logical slot {logical_slot} "
+                raise CacheContractError(
+                    f"table {spec.group_id!r} logical slot {logical_slot} "
                     f"has invalid page ID {page_id}"
                 )
         groups.append(
             CachePDGroupPages(
-                layout_group.group_id,
+                spec.group_id,
                 page_ids,
             )
         )
-        inspected.append((layout_group.group_id, table, frozenset(logical_slots)))
-    manifest = CachePDPageManifest(
+    return CachePDPageManifest(
         groups=tuple(groups), prefix_len=prefix_len, prompt_len=prompt_len
     )
 
-    selected = {
-        (group.group_id, page_id): logical_slot
-        for group, layout_group in zip(manifest.groups, layout.groups, strict=True)
-        for page_id, logical_slot in zip(
-            group.page_ids,
-            _logical_slots(
-                layout_group.transfer_policy,
-                manifest.prefix_len,
-                manifest.prompt_len,
-                layout.block_size,
-            ),
-            strict=True,
-        )
-    }
-    for group_id, table, selected_slots in inspected:
-        for logical_slot, raw_page in enumerate(table[request_row]):
-            page_id = int(raw_page)
-            layout_group = layout_groups_by_id[group_id]
-            group_capacity = _group_page_count(layout_group, layout.num_pages_with_null)
-            if (
-                logical_slot not in selected_slots
-                and 0 < page_id < group_capacity
-                and (group_id, page_id) in selected
-            ):
-                raise CachePDProtocolError(
-                    f"selected page {page_id} for {group_id!r} slot "
-                    f"{selected[(group_id, page_id)]} aliases live unselected slot "
-                    f"{logical_slot}"
-                )
-    return manifest
 
-
-def validate_cache_slab_registrations(
-    registrations: object,
-    *,
-    layout: CachePDLayout,
-    peer: str,
-    num_pages_with_null: int | None = None,
-) -> tuple[CachePDSlabRegistration, ...]:
-    _string("registration peer", peer)
-    values = _sequence(
-        registrations,
-        name=f"{peer} slab registrations",
-        maximum=MAX_CACHE_PHYSICAL_SLOTS,
-    )
-    if len(values) != layout.physical_slot_count:
-        raise CachePDProtocolError(
-            f"{peer} slab registration count disagrees with layout"
-        )
-    if not all(isinstance(value, CachePDSlabRegistration) for value in values):
-        raise CachePDProtocolError(
-            f"{peer} registrations must contain CachePDSlabRegistration values"
-        )
-    result = tuple(values)
-    if tuple(value.physical_slot for value in result) != tuple(
-        range(layout.physical_slot_count)
-    ):
-        raise CachePDProtocolError(
-            f"{peer} registrations must use exact physical-slot order"
-        )
-    if tuple(value.buffer_id for value in result) != layout.physical_buffer_ids:
-        raise CachePDProtocolError(
-            f"{peer} registration buffer IDs disagree with layout"
-        )
-    capacity = (
-        layout.num_pages_with_null
-        if num_pages_with_null is None
-        else _integer(f"{peer} num_pages_with_null", num_pages_with_null, 2)
-    )
-    extent = capacity * layout.physical_page_bytes
-    if extent >= _UINT64_LIMIT:
-        raise CachePDProtocolError(f"{peer} registered extent exceeds uint64")
-    if any(value.length != extent for value in result):
-        raise CachePDProtocolError(
-            f"{peer} registered extent disagrees with layout capacity"
-        )
-    by_address = sorted(result, key=lambda value: value.base_addr)
-    if any(
-        right.base_addr < left.base_addr + left.length
-        for left, right in zip(by_address, by_address[1:])
-    ):
-        raise CachePDProtocolError(f"{peer} registered slab extents overlap")
-    return result
-
-
-def build_lcm_pd_cache_contract(
-    *,
-    plan: object,
-    buffer: object,
-    group_specs: object,
-    field_dtypes: Mapping[str, str],
-) -> tuple[CachePDLayout, tuple[CachePDSlabRegistration, ...]]:
-    """Describe one LCM arena without copying or flattening its buffer."""
-    groups = tuple(getattr(plan, "groups", ()))
-    fields = tuple(getattr(plan, "fields", ()))
-    planes = tuple(getattr(plan, "planes", ()))
-    specs = tuple(group_specs)
-    plan_group_ids = tuple(group.group_id for group in groups)
-    spec_group_ids = tuple(spec.group_id for spec in specs)
-    if set(plan_group_ids) != set(spec_group_ids):
-        raise CachePDProtocolError(
-            "LCM plan and scheduler group IDs disagree: "
-            f"missing={sorted(set(plan_group_ids) - set(spec_group_ids))}, "
-            f"extra={sorted(set(spec_group_ids) - set(plan_group_ids))}"
-        )
-    if set(field_dtypes) != {field.field_id for field in fields}:
-        raise CachePDProtocolError(
-            "LCM field dtype map must contain exactly the planned fields"
-        )
-
-    plan_groups = {group.group_id: group for group in groups}
-    plan_planes = {plane.plane_id: plane for plane in planes}
-    transfer_groups = []
-    for spec in specs:
-        group = plan_groups[spec.group_id]
-        transfer_policy = getattr(spec, "transfer_policy", None)
-        if transfer_policy is None:
-            raise CachePDProtocolError(
-                f"LCM PD group {spec.group_id!r} requires a transfer policy"
-            )
-        group_fields = tuple(
-            field for field in fields if field.group_id == spec.group_id
-        )
-        if not group_fields:
-            raise CachePDProtocolError(
-                f"LCM PD group {spec.group_id!r} has no planned fields"
-            )
-        segments = []
-        for field in group_fields:
-            plane = plan_planes[field.plane_id]
-            segments.append(
-                CachePDTransferSegment(
-                    physical_slot=0,
-                    field_id=field.field_id,
-                    dtype=field_dtypes[field.field_id],
-                    page_zero_offset=(
-                        plane.arena_offset_bytes
-                        + plane.bytes_per_lcm_block
-                        - field.page_stride_bytes
-                        + field.field_offset_bytes
-                    ),
-                    page_stride_bytes=field.page_stride_bytes,
-                    payload_bytes=field.payload_bytes,
-                )
-            )
-        transfer_groups.append(
-            CachePDGroup(
-                group_id=spec.group_id,
-                family=spec.family,
-                transfer_policy=transfer_policy,
-                physical_slots=(0,),
-                cache_blocks_per_lcm_block=group.cache_blocks_per_lcm_block,
-                transfer_segments=tuple(segments),
-            )
-        )
-
-    fingerprint_payload = {
-        "schema_version": CACHE_PD_PROTOCOL_VERSION,
-        "logical_block_tokens": int(plan.logical_block_tokens),
-        "lcm_block_bytes": int(plan.lcm_block_bytes),
-        "groups": [
-            {
-                "order": order,
-                "group_id": spec.group_id,
-                "family": spec.family,
-                "transfer_policy": spec.transfer_policy,
-                "retention": spec.retention,
-                "sliding_window_tokens": spec.sliding_window_tokens,
-                "cache_blocks_per_lcm_block": plan_groups[
-                    spec.group_id
-                ].cache_blocks_per_lcm_block,
-            }
-            for order, spec in enumerate(specs)
-        ],
-        # Omit arena_offset_bytes: plane-major packing scales those offsets with
-        # num_lcm_blocks, which is peer-local capacity rather than shared ABI.
-        "planes": [
-            {
-                "plane_id": plane.plane_id,
-                "bytes_per_lcm_block": plane.bytes_per_lcm_block,
-            }
-            for plane in planes
-        ],
-        "fields": [
-            {
-                "group_id": field.group_id,
-                "field_id": field.field_id,
-                "plane_id": field.plane_id,
-                "shape": field.shape,
-                "dtype": field_dtypes[field.field_id],
-                "element_size": field.element_size,
-                "field_offset_bytes": field.field_offset_bytes,
-                "page_stride_bytes": field.page_stride_bytes,
-            }
-            for field in fields
-        ],
-    }
-    fingerprint = hashlib.sha256(
-        json.dumps(
-            fingerprint_payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        ).encode("ascii")
-    ).hexdigest()
-    layout = CachePDLayout(
-        version=CACHE_PD_PROTOCOL_VERSION,
-        layout_fingerprint=fingerprint,
-        block_size=int(plan.logical_block_tokens),
-        num_pages_with_null=int(plan.num_lcm_blocks) + 1,
-        physical_buffer_ids=("lcm_arena",),
-        physical_page_bytes=int(plan.lcm_block_bytes),
-        groups=tuple(transfer_groups),
-    )
-
-    if (
-        getattr(buffer, "dtype", None) is None
-        or str(buffer.dtype) != "torch.uint8"
-        or not buffer.is_contiguous()
-        or buffer.storage_offset() != 0
-        or buffer.data_ptr() != buffer.untyped_storage().data_ptr()
-        or int(buffer.nbytes) != int(plan.arena_bytes)
-    ):
-        raise CachePDProtocolError(
-            "LCM PD buffer must be the contiguous uint8 arena owner"
-        )
-    registrations = (
-        CachePDSlabRegistration(
-            physical_slot=0,
-            buffer_id="lcm_arena",
-            base_addr=buffer.data_ptr(),
-            length=buffer.nbytes,
-        ),
-    )
-    return layout, validate_cache_slab_registrations(
-        registrations, layout=layout, peer="local"
-    )
+__all__ = [
+    "CacheContractError",
+    "CachePDGroupPages",
+    "CachePDPageManifest",
+    "CacheTransferContract",
+    "build_cache_page_manifest",
+    "build_cache_transfer_contract",
+    "build_pool_cache_transfer_contract",
+    "cache_manifest_page_ids",
+    "validate_cache_manifest",
+    "validate_cache_manifest_pair",
+    "validate_cache_peer_layout",
+]

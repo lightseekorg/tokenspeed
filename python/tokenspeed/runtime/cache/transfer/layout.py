@@ -26,7 +26,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+        CacheMemoryPlan,
+    )
 
 
 def _positive(name: str, value: int) -> int:

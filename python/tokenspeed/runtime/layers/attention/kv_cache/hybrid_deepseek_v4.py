@@ -452,7 +452,6 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
             memory_plan=memory_plan,
             paged_cache_group_specs=paged_cache_group_specs,
             token_capacity=token_capacity,
-            pd_disaggregation_enabled=pd_disaggregation_enabled,
         )
         # Tag KV allocations as "kv_cache" (no CPU backup: discarded on sleep)
         # so release/resume_memory_occupation frees them. See memory_occupation.py.

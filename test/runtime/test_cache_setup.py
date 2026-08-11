@@ -346,6 +346,8 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
     target_config,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from tokenspeed.runtime.pd.cache_protocol import build_pool_cache_transfer_contract
+
     model_config = SimpleNamespace(num_attention_layers=2, hf_config=SimpleNamespace())
     draft_model_config = SimpleNamespace(
         num_attention_layers=1, hf_config=SimpleNamespace()
@@ -450,7 +452,6 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
     assert set(target_pool._fields) == {
         field.field_id for field in setup.spec.memory_plan.fields
     }
-
     target_layout = target_pool.cache_transfer_layout()
     draft_layout = draft_pool.cache_transfer_layout()
     target_transfer_fields = {
@@ -467,6 +468,10 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
         group_ids=tuple(spec.group_id for spec in target_pool.paged_cache_group_specs),
     )
     assert len(combined_layout.consumers) == 3
+    contract, base_addr = build_pool_cache_transfer_contract(target_pool)
+    assert contract.plan is target_pool.plan
+    assert base_addr == target_pool.buffer.data_ptr()
+    assert len(contract.field_dtypes) == len(target_pool._fields)
 
     target_last_layer = target_pool.get_key_buffer(1).clone()
 

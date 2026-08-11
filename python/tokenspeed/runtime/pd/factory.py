@@ -20,7 +20,7 @@
 
 """Factories for PD KV transfer helpers."""
 
-from tokenspeed.runtime.pd.cache_protocol import validate_cache_slab_registrations
+from tokenspeed.runtime.pd.cache_protocol import build_pool_cache_transfer_contract
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
@@ -42,14 +42,7 @@ def _get_contiguous_buf_unit_lens(pool, item_lens):
 def _get_cache_contract(pool):
     if getattr(pool, "supports_disaggregation", False) is not True:
         return None
-
-    contract_getter = getattr(pool, "get_pd_cache_contract", None)
-    if not callable(contract_getter):
-        raise RuntimeError(
-            "cache pool advertises cache-contract disaggregation but is missing the "
-            "required get_pd_cache_contract() ABI"
-        )
-    return contract_getter()
+    return build_pool_cache_transfer_contract(pool)
 
 
 def get_kv_args(
@@ -65,26 +58,18 @@ def get_kv_args(
         # live inside the same merged plan the contract describes, so slab
         # pages carry the draft KV with no extra registration
         # (draft_token_to_kv_pool is a layer-mapped view of the same pool).
-        layout, registrations = cache_contract
-        registrations = validate_cache_slab_registrations(
-            registrations,
-            layout=layout,
-            peer="local",
-        )
-        physical_slot_count = layout.physical_slot_count
-        item_lens = [layout.physical_page_bytes] * physical_slot_count
+        layout, base_addr = cache_contract
+        item_len = layout.plan.lcm_block_bytes
         return KVArgs(
             engine_rank=engine_rank,
-            kv_data_ptrs=[registration.base_addr for registration in registrations],
-            kv_data_lens=[registration.length for registration in registrations],
-            kv_item_lens=item_lens,
-            target_layer_num=physical_slot_count,
+            kv_data_ptrs=[base_addr],
+            kv_data_lens=[layout.plan.arena_bytes],
+            kv_item_lens=[item_len],
+            target_layer_num=1,
             draft_layer_num=0,
-            kv_layer_ids=list(range(physical_slot_count)),
-            # One logical Mooncake unit is one complete raw-slab page. This
-            # makes equal-TP cache-contract routes identity routes and prevents the
-            # generic heterogeneous-TP planner from splitting a raw page.
-            kv_unit_lens=item_lens,
+            kv_layer_ids=[0],
+            # One logical Mooncake unit is one complete raw-arena parent page.
+            kv_unit_lens=[item_len],
             state_data_ptrs=[],
             state_data_lens=[],
             state_item_lens=[],
@@ -92,7 +77,7 @@ def get_kv_args(
             state_type="none",
             state_layer_ids=[],
             mamba_offsets=[],
-            offsets=[(physical_slot,) for physical_slot in range(physical_slot_count)],
+            offsets=[(0,)],
             aux_data_ptrs=[],
             aux_data_lens=[],
             aux_item_lens=[],

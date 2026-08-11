@@ -26,7 +26,7 @@ from tokenspeed.runtime.pd.base.manager import DisaggManagerBase
 from tokenspeed.runtime.pd.base.mooncake_engine import (
     MooncakeTransferEngine,
 )
-from tokenspeed.runtime.pd.cache_protocol import CachePDPeerLayout
+from tokenspeed.runtime.pd.cache_protocol import CacheTransferContract
 from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
 from tokenspeed.runtime.pd.utils import DisaggregationMode
 from tokenspeed.runtime.utils.network import get_local_ip_by_remote
@@ -115,7 +115,7 @@ class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):
             if not isinstance(cache_layout_wire, str):
                 raise ValueError("Paged cache bootstrap layout must be a string")
             try:
-                cache_layout = CachePDPeerLayout.from_wire_bytes(
+                cache_layout = CacheTransferContract.from_wire_bytes(
                     cache_layout_wire.encode("ascii")
                 )
             except (UnicodeEncodeError, ValueError) as exc:

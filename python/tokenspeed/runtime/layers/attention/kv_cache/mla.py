@@ -82,7 +82,6 @@ class MLATokenToKVPool(CachePool):
             token_capacity=token_capacity,
             backing_pool=backing_pool,
             field_layer_offset=field_layer_offset,
-            pd_disaggregation_enabled=pd_disaggregation_enabled,
         )
         self.model_dtype = model_dtype
         self.quant_method = quant_method

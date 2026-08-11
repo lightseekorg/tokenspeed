@@ -78,7 +78,6 @@ class MHATokenToKVPool(CachePool):
             token_capacity=token_capacity,
             backing_pool=backing_pool,
             field_layer_offset=field_layer_offset,
-            pd_disaggregation_enabled=pd_disaggregation_enabled,
         )
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(

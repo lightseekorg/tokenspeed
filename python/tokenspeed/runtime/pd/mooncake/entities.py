@@ -25,9 +25,8 @@ import numpy as np
 import numpy.typing as npt
 
 from tokenspeed.runtime.pd.cache_protocol import (
-    CachePDLayout,
     CachePDPageManifest,
-    CachePDPeerLayout,
+    CacheTransferContract,
 )
 from tokenspeed.runtime.pd.transfer_plan import (
     TransferFragment,
@@ -60,7 +59,7 @@ class KVArgs:
     mamba_offsets: list[int] | None = None
     # Paged cache keeps the typed layout beside the normal Mooncake buffer
     # descriptor. The buffers themselves still use the shared transfer path.
-    cache_layout: CachePDLayout | None = None
+    cache_layout: CacheTransferContract | None = None
 
 
 class KVTransferError(Exception):
@@ -118,7 +117,7 @@ class TransferInfo:
     is_dummy: bool
     transfer_fragments: tuple[TransferFragment, ...] = ()
     page_manifest: CachePDPageManifest | None = None
-    peer_cache_layout: CachePDPeerLayout | None = None
+    peer_cache_layout: CacheTransferContract | None = None
 
     @classmethod
     def from_zmq(cls, msg: list[bytes]):
@@ -152,7 +151,7 @@ class TransferInfo:
                 )
             if manifest_frame:
                 page_manifest = CachePDPageManifest.from_wire_bytes(manifest_frame)
-                peer_cache_layout = CachePDPeerLayout.from_wire_bytes(layout_frame)
+                peer_cache_layout = CacheTransferContract.from_wire_bytes(layout_frame)
             is_dummy = False
         return cls(
             room=int(msg[0].decode("ascii")),

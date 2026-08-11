@@ -79,13 +79,13 @@ def _plan(fields):
     return layout.with_num_lcm_blocks(_NUM_LCM_BLOCKS)
 
 
-def _specs(plan):
+def _specs(plan, pd_enabled: bool):
     return build_paged_cache_group_specs(
         layer_types=("full_attention",) * _NUM_LAYERS,
         group_ids=("full_attention",) * _NUM_LAYERS,
         sliding_window_tokens=None,
         page_size=_P,
-        pd_disaggregation_enabled=True,
+        pd_disaggregation_enabled=pd_enabled,
     )
 
 
@@ -107,10 +107,9 @@ def _make_mla_pool(pd_enabled: bool):
         page_size=_P,
         rank=0,
         memory_plan=plan,
-        paged_cache_group_specs=_specs(plan),
+        paged_cache_group_specs=_specs(plan, pd_enabled),
         token_capacity=_NUM_LCM_BLOCKS * _P,
         layer_group_ids=("full_attention",) * _NUM_LAYERS,
-        pd_disaggregation_enabled=pd_enabled,
     )
 
 
@@ -133,50 +132,56 @@ def _make_dsa_pool(pd_enabled: bool):
         rank=0,
         index_head_dim=_MLACfg.index_head_dim,
         memory_plan=plan,
-        paged_cache_group_specs=_specs(plan),
+        paged_cache_group_specs=_specs(plan, pd_enabled),
         token_capacity=_NUM_LCM_BLOCKS * _P,
         layer_group_ids=("full_attention",) * _NUM_LAYERS,
-        pd_disaggregation_enabled=pd_enabled,
     )
 
 
 def test_mla_pool_advertises_pd_contract_when_enabled() -> None:
+    from tokenspeed.runtime.pd.cache_protocol import (
+        build_pool_cache_transfer_contract,
+    )
+
     pool = _make_mla_pool(pd_enabled=True)
     assert pool.supports_disaggregation is True
-    layout, registrations = pool.get_pd_cache_contract()
-    # One LCM arena -> one slab registration; one history group.
-    assert len(registrations) == 1
-    assert len(layout.groups) == 1
-    group = layout.groups[0]
-    # MLA: one transfer segment per layer (latent_kv), all in the history group.
-    assert len(group.transfer_segments) == _NUM_LAYERS
-    field_ids = {seg.field_id for seg in group.transfer_segments}
+    contract, base_addr = build_pool_cache_transfer_contract(pool)
+    assert base_addr == pool.buffer.data_ptr()
+    field_ids = {
+        field.field_id for field in contract.fields_for_group("full_attention")
+    }
     assert field_ids == {f"layer.{i}.latent_kv" for i in range(_NUM_LAYERS)}
 
 
 def test_dsa_pool_contract_covers_latent_and_index_k() -> None:
+    from tokenspeed.runtime.pd.cache_protocol import (
+        build_pool_cache_transfer_contract,
+    )
+
     pool = _make_dsa_pool(pd_enabled=True)
     assert pool.supports_disaggregation is True
-    layout, registrations = pool.get_pd_cache_contract()
-    assert len(registrations) == 1
-    assert len(layout.groups) == 1
-    group = layout.groups[0]
-    field_ids = {seg.field_id for seg in group.transfer_segments}
+    contract, base_addr = build_pool_cache_transfer_contract(pool)
+    assert base_addr == pool.buffer.data_ptr()
+    fields = contract.fields_for_group("full_attention")
+    field_ids = {field.field_id for field in fields}
     # DSA packs BOTH latent_kv and index_k for every layer into the one
     # history group; the legacy per-buffer path dropped/mis-strided these.
     expected = {f"layer.{i}.latent_kv" for i in range(_NUM_LAYERS)} | {
         f"layer.{i}.index_k" for i in range(_NUM_LAYERS)
     }
     assert field_ids == expected
-    # Every segment carries a real page stride and a full-suffix policy.
-    assert group.transfer_policy == "full_suffix"
-    assert all(seg.page_stride_bytes > 0 for seg in group.transfer_segments)
+    assert contract.group_specs[0].transfer_policy == "full_suffix"
+    assert all(field.page_stride_bytes > 0 for field in fields)
 
 
 def test_pd_contract_refused_when_disabled() -> None:
     import pytest
 
+    from tokenspeed.runtime.pd.cache_protocol import (
+        build_pool_cache_transfer_contract,
+    )
+
     pool = _make_mla_pool(pd_enabled=False)
     assert pool.supports_disaggregation is False
-    with pytest.raises(RuntimeError, match="disaggregation-mode"):
-        pool.get_pd_cache_contract()
+    with pytest.raises(RuntimeError, match="no transfer policy"):
+        build_pool_cache_transfer_contract(pool)
