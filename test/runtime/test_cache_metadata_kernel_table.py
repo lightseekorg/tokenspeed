@@ -81,17 +81,11 @@ def test_kernel_table_is_memoized_per_geometry() -> None:
     pool = _make_pool("cuda", usable_pages=6)
     metadata, op = _metadata(pool, [[3, 5]])
 
-    a = metadata.kernel_table(
-        page_size=_KERNEL_PAGE, max_pages=8, active_forward_op=op
-    )
-    b = metadata.kernel_table(
-        page_size=_KERNEL_PAGE, max_pages=8, active_forward_op=op
-    )
+    a = metadata.kernel_table(page_size=_KERNEL_PAGE, max_pages=8, active_forward_op=op)
+    b = metadata.kernel_table(page_size=_KERNEL_PAGE, max_pages=8, active_forward_op=op)
     assert a is b
     # A different width is a different view, not the cached one.
-    c = metadata.kernel_table(
-        page_size=_KERNEL_PAGE, max_pages=4, active_forward_op=op
-    )
+    c = metadata.kernel_table(page_size=_KERNEL_PAGE, max_pages=4, active_forward_op=op)
     assert c is not a
     assert c.shape[1] == 4
 

@@ -890,7 +890,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         if src_page_manifest is None or dst_page_manifest is None:
             raise ValueError("Paged cache layerwise transfer requires page manifests")
         if dst_num_pages_with_null is None:
-            raise ValueError("Paged cache layerwise transfer requires destination capacity")
+            raise ValueError(
+                "Paged cache layerwise transfer requires destination capacity"
+            )
 
         interval = max(int(interval), 1)
         log_layerwise = getattr(self, "layerwise_debug", False)

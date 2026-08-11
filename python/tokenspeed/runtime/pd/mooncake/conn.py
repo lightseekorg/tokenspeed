@@ -125,12 +125,8 @@ class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):
                 raise ValueError(
                     "Paged cache prefill ranks registered incompatible layouts"
                 )
-            if any(
-                data.get(field) for field in ("state_item_lens", "state_unit_lens")
-            ):
-                raise ValueError(
-                    "Paged cache bootstrap cannot advertise a state plane"
-                )
+            if any(data.get(field) for field in ("state_item_lens", "state_unit_lens")):
+                raise ValueError("Paged cache bootstrap cannot advertise a state plane")
             kv_item_lens = data.get("kv_item_lens", [])
             kv_unit_lens = data.get("kv_unit_lens", [])
             if not kv_item_lens or kv_unit_lens != kv_item_lens:
