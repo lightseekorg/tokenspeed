@@ -67,6 +67,7 @@ class MLATokenToKVPool(CachePool):
         paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = (),
         token_capacity: int | None = None,
         layer_group_ids: tuple[str, ...] = (),
+        pd_disaggregation_enabled: bool = False,
     ):
         super().__init__(
             size,
@@ -77,6 +78,7 @@ class MLATokenToKVPool(CachePool):
             memory_plan,
             paged_cache_group_specs=paged_cache_group_specs,
             token_capacity=token_capacity,
+            pd_disaggregation_enabled=pd_disaggregation_enabled,
         )
         self.model_dtype = model_dtype
         self.quant_method = quant_method

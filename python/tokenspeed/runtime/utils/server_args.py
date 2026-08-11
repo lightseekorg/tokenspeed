@@ -229,7 +229,6 @@ class ServerArgs:
     kvstore_mem_layout: str = "layer_first"
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
-    enable_mla_l1_5_cache: bool = False
 
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
@@ -396,6 +395,18 @@ class ServerArgs:
     def resolve_config_aliases(self):
         if self.use_trtllm_ragged_deepseek_prefill is not None:
             self.mla_disable_ragged = not self.use_trtllm_ragged_deepseek_prefill
+
+        # Classify explicit DSpark arguments before cache validation, matching
+        # the speculative-config path below. Model aliases that resolve to the
+        # target checkpoint must use the same fail-closed cache contract.
+        if self.speculative_config is None and self.speculative_algorithm == "DSPARK":
+            explicit_draft_model = self.speculative_draft_model_path
+            if (
+                self.draft_model_path_use_base
+                or explicit_draft_model is None
+                or maybe_model_redirect(explicit_draft_model) == self.model
+            ):
+                self.draft_model_path_use_base = True
 
         if self.speculative_config is not None:
             try:
@@ -695,24 +706,8 @@ class ServerArgs:
                 self.speculative_num_steps = expected_steps
             elif self.speculative_num_steps != expected_steps:
                 raise ValueError(
-                    "DFLASH requires speculative_num_steps to equal "
-                    "speculative_num_draft_tokens - 1. "
-                    f"Got {self.speculative_num_steps=} and "
-                    f"{self.speculative_num_draft_tokens=}."
-                )
-
-        if self.speculative_algorithm == "DSPARK" and self.draft_model_path_use_base:
-            if self.enable_prefix_caching:
-                raise ValueError(
-                    "DSPARK does not yet preserve its captured-context windows "
-                    "across prefix-cache hits; use --no-enable-prefix-caching."
-                )
-            expected_steps = max(int(self.speculative_num_draft_tokens) - 1, 0)
-            if self.speculative_num_steps == ServerArgs.speculative_num_steps:
-                self.speculative_num_steps = expected_steps
-            elif self.speculative_num_steps != expected_steps:
-                raise ValueError(
-                    "DSPARK requires speculative_num_steps to equal "
+                    f"{self.speculative_algorithm} requires "
+                    "speculative_num_steps to equal "
                     "speculative_num_draft_tokens - 1. "
                     f"Got {self.speculative_num_steps=} and "
                     f"{self.speculative_num_draft_tokens=}."
@@ -814,21 +809,33 @@ class ServerArgs:
                 )
 
     def validate_cache_options(self):
-        if self.enable_kvstore and not self.enable_prefix_caching:
-            if self.speculative_algorithm == "DSPARK" and (
-                self.draft_model_path_use_base
-                or self.speculative_draft_model_path is None
-                or self.speculative_draft_model_path == self.model
-            ):
-                raise ValueError(
-                    "DSPARK currently requires both --disable-kvstore and "
-                    "--no-enable-prefix-caching."
-                )
-            if self.disaggregation_mode != "decode":
-                raise ValueError(
-                    "KVStore and disabled prefix caching are mutually exclusive "
-                    "and cannot be used at the same time. Please use only one of them."
-                )
+        speculative_algorithm = getattr(self, "speculative_algorithm", None)
+        draft_model_path_use_base = getattr(self, "draft_model_path_use_base", False)
+        speculative_draft_model_path = getattr(
+            self, "speculative_draft_model_path", None
+        )
+        if (
+            self.enable_kvstore
+            and speculative_algorithm == "DSPARK"
+            and (
+                draft_model_path_use_base
+                or speculative_draft_model_path is None
+                or speculative_draft_model_path == self.model
+            )
+        ):
+            raise ValueError(
+                "DSPARK same-checkpoint decoding does not support KVStore; "
+                "use --disable-kvstore."
+            )
+        if (
+            self.enable_kvstore
+            and not self.enable_prefix_caching
+            and self.disaggregation_mode != "decode"
+        ):
+            raise ValueError(
+                "KVStore and disabled prefix caching are mutually exclusive "
+                "and cannot be used at the same time. Please use only one of them."
+            )
 
     def validate(self):
         if (
@@ -1170,11 +1177,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.kvstore_storage_backend_extra_config,
             help="A dictionary in JSON string format containing extra configuration for the storage backend.",
-        )
-        parser.add_argument(
-            "--enable-mla-l1-5-cache",
-            action="store_true",
-            help="Enable MLA L1.5 cache in disaggregation paths.",
         )
         # Mamba Cache
         parser.add_argument(

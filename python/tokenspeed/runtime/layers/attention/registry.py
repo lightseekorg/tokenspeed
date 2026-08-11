@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -454,7 +453,9 @@ def _create_hybrid_linear_attn_backend(
     return backend
 
 
-def _wrap_inkling_backend(inner, text_config, attn_config, *, num_layers, is_draft):
+def _wrap_inkling_backend(
+    inner, text_config, attn_config, *, num_layers, is_draft, conv_columns
+):
     """Wrap a dense backend with the engine-side Inkling sconv state pool.
 
     The wrapper only adds conv metadata; all attention delegates to ``inner``.
@@ -493,6 +494,7 @@ def _wrap_inkling_backend(inner, text_config, attn_config, *, num_layers, is_dra
     backend = InklingAttnBackend(
         inner,
         conv_pool,
+        conv_columns=conv_columns,
         spec_num_tokens=getattr(attn_config, "speculative_num_draft_tokens", 1),
         is_draft=is_draft,
     )
@@ -618,13 +620,11 @@ def _create_target_components(
         config,
         num_layers=text_config.num_hidden_layers,
         is_draft=False,
+        conv_columns=_inkling_conv_columns(pool, text_config),
     )
     probe_dir = os.environ.get("INKLING_POOL_PROBE_DIR")
     if probe_dir:
         _start_inkling_pool_probe(pool, conv_pool, rank, probe_dir)
-    conv_columns = _inkling_conv_columns(pool, text_config)
-    backend.conv_columns = conv_columns
-    backend.inner.engine_owned_group_ids = frozenset(conv_columns["group_block_tokens"])
     return backend, pool
 
 
@@ -696,6 +696,9 @@ def _create_draft_components(
 
     backend = _create_attn_backend(model_config.attention_arch, config)
     if is_inkling:
+        # Depth layers carry conv checkpoint fields as continuation tenants
+        # of the target's kvconv/hiddenconv groups; the draft gets the same
+        # paged bridges (publish/restore) the target wrapper gets.
         text_config = model_config.hf_config.get_text_config()
         backend, _ = _wrap_inkling_backend(
             backend,
@@ -703,6 +706,7 @@ def _create_draft_components(
             config,
             num_layers=num_layers,
             is_draft=True,
+            conv_columns=_inkling_conv_columns(draft_pool, text_config),
         )
     return backend, draft_pool
 
@@ -1000,11 +1004,7 @@ def create_attn_components(
         mark_cache_contract = getattr(side_backend, "mark_cache_contract", None)
         if mark_cache_contract is None:
             continue
-        params = inspect.signature(mark_cache_contract).parameters
-        if "logical_page_size" in params:
-            mark_cache_contract(logical_page_size=side_pool.plan.logical_block_tokens)
-        else:
-            mark_cache_contract()
+        mark_cache_contract()
 
     _prepare_verify_workspace(
         server_args=server_args,

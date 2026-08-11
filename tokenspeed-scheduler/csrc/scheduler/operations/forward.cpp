@@ -172,10 +172,20 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         return coordinator_.ProbePrefix(hashes);
     };
     const std::int32_t cache_block_tokens = coordinator_.CacheBlockTokens();
-    const std::int32_t cacheable_pages = std::max((request->PrefillSize() - 1) / cache_block_tokens, 0);
+    // The final prompt token is always recomputed to produce logits. Some
+    // consumers additionally require a larger prompt tail (for example, to
+    // rebuild request-persistent state that is not stored in the KV cache).
+    // Limit the probe itself so excluded hit pages are never claimed: admission
+    // will allocate private writable pages for the replayed suffix.
+    const std::int32_t replay_tokens = std::max(config_.prefix_replay_tokens, 1);
+    const std::int32_t max_cacheable_tokens = std::max(request->PrefillSize() - replay_tokens, 0);
+    const std::int32_t probe_pages = max_cacheable_tokens / cache_block_tokens;
+    const std::int32_t candidate_pages = std::max((request->PrefillSize() - 1) / cache_block_tokens, 0);
     std::vector<std::span<const std::int32_t>> paged_tokens = request->FullPagedTokens(false);
-    paged_tokens.resize(std::min(paged_tokens.size(), static_cast<std::size_t>(cacheable_pages)));
+    paged_tokens.resize(std::min(paged_tokens.size(), static_cast<std::size_t>(candidate_pages)));
     std::vector<std::string> hashes = ComputePagedHashes(paged_tokens, "");
+    const auto probe_hashes =
+        std::span<const std::string>(hashes).first(std::min(hashes.size(), static_cast<std::size_t>(probe_pages)));
 
     AdmissionMatch match;
     match.candidate_page_hashes = hashes;
@@ -185,7 +195,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         match.probe = probe({});
         return match;
     }
-    match.probe = probe(hashes);
+    match.probe = probe(probe_hashes);
     const std::int32_t hit_pages =
         std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens) / cache_block_tokens;
     match.page_hashes.assign(hashes.begin(), hashes.begin() + hit_pages);

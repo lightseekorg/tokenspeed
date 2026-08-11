@@ -48,6 +48,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import ceil_div
 
@@ -204,7 +205,13 @@ class CacheGroupsMixin:
         return self._group_page_size(getattr(layer, "group_id", ""))
 
     def _kernel_page_tables(self, page_tables):
-        """Convert scheduler page IDs to the page size consumed by the kernel."""
+        """Convert per-group page IDs to the page size consumed by the kernel.
+
+        The mixin owns the conversion end to end: the group's page size was
+        learned from the pool's specs (``_learn_cache_groups``), so no pool
+        round-trip is needed. Identity when every group already matches its
+        consumer page size (plain MHA).
+        """
         if not page_tables:
             return page_tables
         if all(
@@ -212,14 +219,12 @@ class CacheGroupsMixin:
             for gid in page_tables
         ):
             return page_tables
-        if self.cache_pool is None:
-            raise RuntimeError("cache-aware backend has no bound CachePool")
         return {
-            gid: self.cache_pool.expand_block_table(
-                gid,
+            gid: expand_page_table(
                 table,
-                kernel_block_tokens=self._consumer_page_size(gid),
-                max_kernel_blocks=self.max_num_pages,
+                logical_page_size=self._group_page_size(gid),
+                kernel_page_size=self._consumer_page_size(gid),
+                max_kernel_pages=self.max_num_pages,
             )
             for gid, table in page_tables.items()
         }
@@ -631,13 +636,11 @@ class CacheGroupsMixin:
                 rows = min(src.shape[0], bs)
                 ratio = self._group_page_ratios[i]
                 if ratio != 1:
-                    if self.cache_pool is None:
-                        raise RuntimeError("cache-aware backend has no bound CachePool")
-                    self.cache_pool.expand_block_table(
-                        gid,
+                    expand_page_table(
                         src[:rows, :source_cols],
-                        kernel_block_tokens=self._consumer_page_size(gid),
-                        max_kernel_blocks=buf.shape[1],
+                        logical_page_size=self._group_page_size(gid),
+                        kernel_page_size=self._consumer_page_size(gid),
+                        max_kernel_pages=buf.shape[1],
                         out=buf[:rows],
                     )
                     if rows < bs:

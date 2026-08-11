@@ -40,6 +40,7 @@ def _backend(*, spec_num_tokens: int = 1, is_draft: bool = False) -> MLAAttnBack
     backend._cache_contract_bound = True
     backend.max_context_len = 4096
     backend.max_num_pages = 8
+    backend.page_size = PAGE
     backend.decode_cuda_graph_metadata = {}
     return backend
 
@@ -58,9 +59,7 @@ def test_plain_decode_writes_one_location_per_request() -> None:
     table = _table()
     seq_lens = torch.tensor([70, 130], dtype=torch.int32)
 
-    locs = MLAAttnBackend._cache_decode_out_cache_loc(
-        table, seq_lens, batch_size=2, logical_page_size=PAGE
-    )
+    locs = _backend()._cache_decode_out_cache_loc(table, seq_lens, batch_size=2)
 
     assert locs.shape == (2,)
     # req0: pos 69 -> page col 1 (id 2), offset 5. req1: pos 129 -> col 2 (id 11), offset 1.
@@ -71,8 +70,8 @@ def test_verify_writes_the_whole_window_request_major() -> None:
     table = _table()
     seq_lens = torch.tensor([70, 130], dtype=torch.int32)
 
-    locs = MLAAttnBackend._cache_decode_out_cache_loc(
-        table, seq_lens, batch_size=2, logical_page_size=PAGE, q_len_per_req=4
+    locs = _backend()._cache_decode_out_cache_loc(
+        table, seq_lens, batch_size=2, q_len_per_req=4
     )
 
     assert locs.shape == (8,)
@@ -90,11 +89,9 @@ def test_verify_window_ends_at_the_last_token() -> None:
     table = _table()
     seq_lens = torch.tensor([70, 130], dtype=torch.int32)
 
-    single = MLAAttnBackend._cache_decode_out_cache_loc(
-        table, seq_lens, batch_size=2, logical_page_size=PAGE
-    )
-    window = MLAAttnBackend._cache_decode_out_cache_loc(
-        table, seq_lens, batch_size=2, logical_page_size=PAGE, q_len_per_req=4
+    single = _backend()._cache_decode_out_cache_loc(table, seq_lens, batch_size=2)
+    window = _backend()._cache_decode_out_cache_loc(
+        table, seq_lens, batch_size=2, q_len_per_req=4
     )
     assert window.view(2, 4)[:, -1].tolist() == single.tolist()
 
@@ -102,11 +99,10 @@ def test_verify_window_ends_at_the_last_token() -> None:
 def test_window_locations_are_distinct() -> None:
     """Folding the window into one slot is the failure this guards."""
     table = _table(rows=1)
-    locs = MLAAttnBackend._cache_decode_out_cache_loc(
+    locs = _backend()._cache_decode_out_cache_loc(
         table,
         torch.tensor([100], dtype=torch.int32),
         batch_size=1,
-        logical_page_size=PAGE,
         q_len_per_req=8,
     )
     assert len(set(locs.tolist())) == 8
@@ -116,11 +112,10 @@ def test_window_spanning_a_page_boundary_follows_the_table() -> None:
     """Positions either side of a page edge must resolve to different pages."""
     table = _table(rows=1)
     # seq 66 with a window of 4 covers 62,63 (page col 0) and 64,65 (col 1).
-    locs = MLAAttnBackend._cache_decode_out_cache_loc(
+    locs = _backend()._cache_decode_out_cache_loc(
         table,
         torch.tensor([66], dtype=torch.int32),
         batch_size=1,
-        logical_page_size=PAGE,
         q_len_per_req=4,
     )
     page0, page1 = int(table[0, 0]), int(table[0, 1])
@@ -134,11 +129,10 @@ def test_window_spanning_a_page_boundary_follows_the_table() -> None:
 
 def test_short_sequences_clamp_instead_of_going_negative() -> None:
     table = _table(rows=1)
-    locs = MLAAttnBackend._cache_decode_out_cache_loc(
+    locs = _backend()._cache_decode_out_cache_loc(
         table,
         torch.tensor([2], dtype=torch.int32),
         batch_size=1,
-        logical_page_size=PAGE,
         q_len_per_req=4,
     )
     assert all(loc >= 0 for loc in locs.tolist())
@@ -150,17 +144,16 @@ def test_out_buffer_is_filled_in_place() -> None:
     seq_lens = torch.tensor([70, 130], dtype=torch.int32)
     buf = torch.zeros(2 * 4, dtype=torch.int64)
 
-    returned = MLAAttnBackend._cache_decode_out_cache_loc(
+    returned = _backend()._cache_decode_out_cache_loc(
         table,
         seq_lens,
         batch_size=2,
-        logical_page_size=PAGE,
         out=buf,
         q_len_per_req=4,
     )
     assert returned.data_ptr() == buf.data_ptr()
-    expected = MLAAttnBackend._cache_decode_out_cache_loc(
-        table, seq_lens, batch_size=2, logical_page_size=PAGE, q_len_per_req=4
+    expected = _backend()._cache_decode_out_cache_loc(
+        table, seq_lens, batch_size=2, q_len_per_req=4
     )
     assert buf.tolist() == expected.tolist()
 
