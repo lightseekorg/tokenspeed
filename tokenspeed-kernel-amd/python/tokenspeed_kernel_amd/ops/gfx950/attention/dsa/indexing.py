@@ -98,36 +98,36 @@ def _dsa_decode_logits_fp8_kernel(
         layout=row_layout,
     )
 
-    for head in gl.static_range(0, num_heads):
-        head_weight = gl.load(weights + token * num_heads + head).to(gl.float32)
-        head_score = gl.full(
-            [BLOCK_N],
+    for dim_start in gl.static_range(0, head_dim, BLOCK_D):
+        dims = dim_start + dim_offsets
+        weighted_q = gl.full(
+            [BLOCK_D],
             value=0.0,
             dtype=gl.float32,
-            layout=row_layout,
+            layout=dim_layout,
         )
-        for dim_start in gl.static_range(0, head_dim, BLOCK_D):
-            dims = dim_start + dim_offsets
+        for head in gl.static_range(0, num_heads):
+            head_weight = gl.load(weights + token * num_heads + head).to(gl.float32)
             q_vals = gl.amd.cdna4.buffer_load(
                 ptr=q,
                 offsets=((token * num_heads + head) * head_dim + dims).to(gl.int32),
                 mask=dims < head_dim,
                 other=0.0,
             ).to(gl.float32)
-            k_vals = gl.amd.cdna4.buffer_load(
-                ptr=index_k_fp8,
-                offsets=(fp8_base[:, None] + dims[None, :]).to(gl.int32),
-                mask=valid[:, None] & (dims[None, :] < head_dim),
-                other=0.0,
-            ).to(gl.float32)
-            k_scale = gl.amd.cdna4.buffer_load(
-                ptr=index_k_scale,
-                offsets=(scale_base + dim_start // 128).to(gl.int32),
-                mask=valid,
-                other=0.0,
-            ).to(gl.float32)
-            head_score += gl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
-        scores += head_score * head_weight
+            weighted_q += q_vals * head_weight
+        k_vals = gl.amd.cdna4.buffer_load(
+            ptr=index_k_fp8,
+            offsets=(fp8_base[:, None] + dims[None, :]).to(gl.int32),
+            mask=valid[:, None] & (dims[None, :] < head_dim),
+            other=0.0,
+        ).to(gl.float32)
+        k_scale = gl.amd.cdna4.buffer_load(
+            ptr=index_k_scale,
+            offsets=(scale_base + dim_start // 128).to(gl.int32),
+            mask=valid,
+            other=0.0,
+        ).to(gl.float32)
+        scores += gl.sum(k_vals * k_scale[:, None] * weighted_q[None, :], axis=1)
 
     scores *= softmax_scale
     scores = gl.where(valid, scores, -float("inf"))
@@ -191,36 +191,36 @@ def _dsa_prefill_logits_fp8_kernel(
         layout=row_layout,
     )
 
-    for head in gl.static_range(0, num_heads):
-        head_weight = gl.load(weights + token * num_heads + head).to(gl.float32)
-        head_score = gl.full(
-            [BLOCK_N],
+    for dim_start in gl.static_range(0, head_dim, BLOCK_D):
+        dims = dim_start + dim_offsets
+        weighted_q = gl.full(
+            [BLOCK_D],
             value=0.0,
             dtype=gl.float32,
-            layout=row_layout,
+            layout=dim_layout,
         )
-        for dim_start in gl.static_range(0, head_dim, BLOCK_D):
-            dims = dim_start + dim_offsets
+        for head in gl.static_range(0, num_heads):
+            head_weight = gl.load(weights + token * num_heads + head).to(gl.float32)
             q_vals = gl.amd.cdna4.buffer_load(
                 ptr=q,
                 offsets=((token * num_heads + head) * head_dim + dims).to(gl.int32),
                 mask=dims < head_dim,
                 other=0.0,
             ).to(gl.float32)
-            k_vals = gl.amd.cdna4.buffer_load(
-                ptr=index_k_fp8,
-                offsets=(fp8_base[:, None] + dims[None, :]).to(gl.int32),
-                mask=valid[:, None] & (dims[None, :] < head_dim),
-                other=0.0,
-            ).to(gl.float32)
-            k_scale = gl.amd.cdna4.buffer_load(
-                ptr=index_k_scale,
-                offsets=(scale_base + dim_start // 128).to(gl.int32),
-                mask=valid,
-                other=0.0,
-            ).to(gl.float32)
-            head_score += gl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
-        scores += head_score * head_weight
+            weighted_q += q_vals * head_weight
+        k_vals = gl.amd.cdna4.buffer_load(
+            ptr=index_k_fp8,
+            offsets=(fp8_base[:, None] + dims[None, :]).to(gl.int32),
+            mask=valid[:, None] & (dims[None, :] < head_dim),
+            other=0.0,
+        ).to(gl.float32)
+        k_scale = gl.amd.cdna4.buffer_load(
+            ptr=index_k_scale,
+            offsets=(scale_base + dim_start // 128).to(gl.int32),
+            mask=valid,
+            other=0.0,
+        ).to(gl.float32)
+        scores += gl.sum(k_vals * k_scale[:, None] * weighted_q[None, :], axis=1)
 
     scores *= softmax_scale
     scores = gl.where(valid, scores, -float("inf"))
