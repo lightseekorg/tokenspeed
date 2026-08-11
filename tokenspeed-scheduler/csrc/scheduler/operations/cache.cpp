@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "cache/forward_cache_ops.h"
+#include "scheduler/operations/cache.h"
 
 #include <stdexcept>
 

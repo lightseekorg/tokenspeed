@@ -72,7 +72,6 @@ public:
     std::int32_t TokenSize() const { return token_container_.Size(); }
     std::int32_t LastToken() const { return token_container_.LastToken(); }
     std::int32_t PrefillSize() const { return token_container_.PrefillSize(); }
-
     PrefillInfo CurrentPrefillInfo() const;
 
     std::int32_t UnscheduledPrefillSize() const {
@@ -98,6 +97,13 @@ public:
 
     fsm::CacheProgress CacheProgress() const { return forwardState("CacheProgress").CacheProgressRef(); }
 
+    fsm::PrefillSource PrefillSource() const {
+        if (const auto* state = std::get_if<fsm::Prefilling>(&state_)) {
+            return state->Source();
+        }
+        throw std::logic_error("Request::PrefillSource: expected Prefilling; got " + StateName());
+    }
+
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {
         return std::visit(
             Overloaded{
@@ -119,6 +125,7 @@ public:
                               [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
                               [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
                               [](const fsm::Decoding&) -> std::string { return "Decoding"; },
+                              [](const fsm::Retracted&) -> std::string { return "Retracted"; },
                               [](const fsm::Finished&) -> std::string { return "Finished"; },
                           },
                           state_);

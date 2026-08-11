@@ -65,17 +65,16 @@ class GrammarManager:
         self.compile_timeout_secs = float(server_args.grammar_compile_timeout_secs)
         self.compile_max_retries = int(server_args.grammar_compile_max_retries)
 
-        # Backend is None when (a) the user disabled grammar via
-        # --grammar-backend none or (b) tokenizer init is skipped (no tokenizer
-        # → can't build a backend). Either way, requests with grammar fields
-        # get rejected at admission time in process_req_with_grammar.
-        if server_args.skip_tokenizer_init:
-            self.grammar_backend = None
-
-        else:
-            self.grammar_backend = create_grammar_backend(
-                server_args, tokenizer, vocab_size
-            )
+        # Backend is None only when the user disabled grammar via
+        # --grammar-backend none; requests with grammar fields then get
+        # rejected at admission time in process_req_with_grammar. Note
+        # skip_tokenizer_init does NOT disable grammar: it only moves prompt
+        # tokenization to the frontend (e.g. the SMG headless ZMQ drive), and
+        # RequestHandler loads the scheduler-side tokenizer unconditionally,
+        # so the vocab the backend needs is always available here.
+        self.grammar_backend = create_grammar_backend(
+            server_args, tokenizer, vocab_size
+        )
 
         # Grammar admission must be coherent across attention TP ranks: every rank
         # in the group sees the same recv_reqs (broadcast in RequestHandler.recv_reqs),

@@ -310,7 +310,7 @@ tokenspeed serve Qwen/Qwen3-30B-A3B \
 Qwen3.8 shares the hybrid linear-attention (GDN) / full-attention layer
 pattern with Qwen3.5.
 
-### Qwen3.8-Max
+### Qwen3.8-2.4T-A95B
 
 Qwen3.8-max needs 16 GPUs, so it runs on two 8-GPU nodes. Launch
 `tokenspeed serve` on every node with the same command, changing only
@@ -333,8 +333,8 @@ DeepEP legs and are unavailable without `--all2all-backend deepep`.
 
 ```bash
 # node 0 (serves the HTTP API)
-tokenspeed serve /path/to/qwen3.8-max-fp8 \
-  --served-model-name qwen3.8-max \
+tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
+  --served-model-name Qwen/Qwen3.8-2.4T-A95B \
   --nnodes 2 --node-rank 0 --nprocs-per-node 8 --world-size 16 \
   --dist-init-addr <node0-host>:25000 \
   --attn-tp-size 16 \
@@ -350,8 +350,8 @@ tokenspeed serve /path/to/qwen3.8-max-fp8 \
   --host 0.0.0.0 --port 8000
 
 # node 1 (same command, --node-rank 1)
-tokenspeed serve /path/to/qwen3.8-max-fp8 \
-  --served-model-name qwen3.8-max \
+tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
+  --served-model-name Qwen/Qwen3.8-2.4T-A95B \
   --nnodes 2 --node-rank 1 --nprocs-per-node 8 --world-size 16 \
   --dist-init-addr <node0-host>:25000 \
   --attn-tp-size 16 \
@@ -374,8 +374,8 @@ routing on DeepEP dispatch/combine instead of all-gather:
 
 ```bash
 # node 0 (serves the HTTP API)
-tokenspeed serve /path/to/qwen3.8-max-fp8 \
-  --served-model-name qwen3.8-max \
+tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
+  --served-model-name Qwen/Qwen3.8-2.4T-A95B \
   --nnodes 2 --node-rank 0 --nprocs-per-node 8 --world-size 16 \
   --dist-init-addr <node0-host>:25000 \
   --attn-tp-size 8 --data-parallel-size 2 --ep-size 16 \
@@ -393,8 +393,8 @@ tokenspeed serve /path/to/qwen3.8-max-fp8 \
   --host 0.0.0.0 --port 8000
 
 # node 1 (same command, --node-rank 1)
-tokenspeed serve /path/to/qwen3.8-max-fp8 \
-  --served-model-name qwen3.8-max \
+tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
+  --served-model-name Qwen/Qwen3.8-2.4T-A95B \
   --nnodes 2 --node-rank 1 --nprocs-per-node 8 --world-size 16 \
   --dist-init-addr <node0-host>:25000 \
   --attn-tp-size 8 --data-parallel-size 2 --ep-size 16 \
@@ -552,6 +552,54 @@ scheduler — the runtime disables overlap scheduling automatically when
 speculative decoding and paged-cache groups are both active — and prefix caching
 stays on by default. Add `--enable-metrics` to read `Decoded Tok/Iter` and the
 speculative accept rate from the run summary.
+
+### DSpark speculative decoding with Prefix Replay
+
+A V4-Flash checkpoint that includes complete DSpark draft weights can use
+same-checkpoint DSpark decoding. Prefix Replay keeps prefix caching enabled
+while recomputing the bounded prompt suffix needed to rebuild DSpark's
+request-persistent state:
+
+```bash
+tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
+  --served-model-name deepseek-v4-flash \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-backend flashinfer_trtllm \
+  --attention-use-fp4-indexer-cache \
+  --max-model-len 96000 \
+  --max-num-seqs 80 \
+  --max-total-tokens 2560000 \
+  --max-prefill-tokens 8192 \
+  --chunked-prefill-size 8192 \
+  --enable-mixed-batch \
+  --enable-prefix-caching \
+  --gpu-memory-utilization 0.90 \
+  --disable-kvstore \
+  --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
+  --speculative-eagle-topk 1 \
+  --max-cudagraph-capture-size 80 \
+  --prefill-graph-max-tokens 2048 \
+  --enable-metrics \
+  --enable-cache-report \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+The replay window comes from the checkpoint's DSpark configuration; there is
+no user-tuned replay-length flag. Startup fails closed when same-checkpoint
+DSpark weights are incomplete, the replay capability is missing, KVStore is
+enabled, or the draft checkpoint contains only MTP/NextN weights. External
+DSpark checkpoints that do not advertise this capability keep the generic
+scheduler behavior.
+
+For a two-node TP8 deployment, run one process per node with four local workers
+and the same command on both nodes. See [Multi-Node](../serving/parallelism.md#multi-node)
+for explicit topology flags and launcher-derived settings. Before applying
+production load, confirm that every rank reports a nonzero Prefix Replay window,
+then check completion, speculative acceptance, and cache-hit metrics with fixed
+prompts and package/model revisions.
 
 ## Tuning Order
 

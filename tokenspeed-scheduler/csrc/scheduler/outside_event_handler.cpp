@@ -20,7 +20,6 @@
 
 #include "scheduler/scheduler.h"
 
-#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -34,16 +33,6 @@
 #include "utils.h"
 
 namespace tokenspeed {
-
-namespace {
-
-void FreeAll(std::vector<CacheBlockRef>&& block_refs) {
-    for (auto it = block_refs.rbegin(); it != block_refs.rend(); ++it) {
-        it->reset();
-    }
-}
-
-}  // namespace
 
 void Scheduler::handleEvent(const pd::BootstrappedEvent& event) {
     Request* request = findRequest(event.request_id);
@@ -155,27 +144,11 @@ void Scheduler::handleEvent(const forward::Abort& event) {
 }
 
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
-    std::vector<StoreTicket> tickets = store_ops_.Retire(event.op_id);
-    for (StoreTicket& ticket : tickets) {
-        if (event.success) {
-            coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key);
-        }
-    }
-    for (auto it = tickets.rbegin(); it != tickets.rend(); ++it) {
-        it->device_block_ref.reset();
-        it->host_block_ref.reset();
-    }
+    tier_transfers_.CompleteWriteBack(event.op_id);
 }
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
-    auto it = load_ops_.find(event.op_id);
-    if (it == load_ops_.end()) {
-        return;
-    }
-    _assert(event.success, "host loadback failed: host bytes integrity");
-    FreeAll(std::move(it->second.host_pins));
-    FreeAll(std::move(it->second.device_blocks));
-    load_ops_.erase(it);
+    tier_transfers_.CompleteLoadBack(event.op_id);
 }
 
 }  // namespace tokenspeed

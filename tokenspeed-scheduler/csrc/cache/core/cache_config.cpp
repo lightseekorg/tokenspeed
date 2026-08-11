@@ -18,32 +18,31 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#pragma once
+#include "cache/core/cache_config.h"
 
-#include <map>
-#include <span>
-#include <string>
-#include <vector>
-
-#include "cache/cache_types.h"
-#include "cache/kv_cache_coordinator.h"
+#include <stdexcept>
 
 namespace tokenspeed {
 
-struct SchedulerConfig;
-
-// One KvCacheSpec per config paged_cache_group (group_id = index); all groups share config.block_size.
-std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
-
-std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
-                               std::int32_t page_size, std::int32_t promotion_boundary_tokens);
-
-void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables);
-
-// One row per config group_id. Each manager resolves the group's LCM placement
-// to the kernel-visible page id.
-std::map<std::string, std::vector<std::int32_t>> BuildBlockTables(const KvCacheCoordinator& coordinator,
-                                                                  const std::vector<BlockTable>& tables,
-                                                                  std::span<const std::string> group_ids);
+void PagedCacheGroupConfig::Validate() const {
+    if (group_id.empty()) {
+        throw std::invalid_argument("PagedCacheGroupConfig: group_id must be non-empty");
+    }
+    if (rows_per_page <= 0) {
+        throw std::invalid_argument("PagedCacheGroupConfig: rows_per_page must be > 0");
+    }
+    if (entry_stride_tokens <= 0) {
+        throw std::invalid_argument("PagedCacheGroupConfig: entry_stride_tokens must be > 0");
+    }
+    if (total_pages < 1) {
+        throw std::invalid_argument("PagedCacheGroupConfig: total_pages must include the null page");
+    }
+    if (cache_blocks_per_lcm_block <= 0) {
+        throw std::invalid_argument("PagedCacheGroupConfig: cache_blocks_per_lcm_block must be > 0");
+    }
+    if (retention == Retention::SlidingWindow && (!sliding_window_tokens || *sliding_window_tokens <= 0)) {
+        throw std::invalid_argument("PagedCacheGroupConfig: sliding_window_tokens must be > 0 for sliding groups");
+    }
+}
 
 }  // namespace tokenspeed

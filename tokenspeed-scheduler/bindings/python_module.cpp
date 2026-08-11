@@ -35,6 +35,7 @@
 #include "scheduler/request.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/types.h"
+#include "utils.h"
 
 /*
 Writable types:
@@ -157,12 +158,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
-        .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache);
+        .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
+        .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens);
 
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::RequestSpec::request_id)
-        .def_rw("tokens", &tokenspeed::RequestSpec::tokens);
+        .def_rw("tokens", &tokenspeed::RequestSpec::tokens)
+        .def_rw("max_new_tokens", &tokenspeed::RequestSpec::max_new_tokens);
 
     nb::module_ forward_event = m.def_submodule("ForwardEvent");
     nb::class_<tokenspeed::forward::ExtendResult>(forward_event, "ExtendResult")
@@ -191,13 +194,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     nb::class_<tokenspeed::cache::WriteBackDone>(cache, "WriteBackDoneEvent")
         .def(nb::init<>())
-        .def_rw("op_id", &tokenspeed::cache::WriteBackDone::op_id)
-        .def_rw("success", &tokenspeed::cache::WriteBackDone::success);
+        .def_rw("op_id", &tokenspeed::cache::WriteBackDone::op_id);
 
     nb::class_<tokenspeed::cache::LoadBackDone>(cache, "LoadBackDoneEvent")
         .def(nb::init<>())
-        .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id)
-        .def_rw("success", &tokenspeed::cache::LoadBackDone::success);
+        .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id);
 
     nb::class_<tokenspeed::pd::BootstrappedEvent>(pd, "BootstrappedEvent")
         .def(nb::init<std::string>(), nb::arg("request_id"))
@@ -237,6 +238,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](const tokenspeed::ForwardBatch& op) -> const std::vector<std::int32_t>& { return op.prefill_lengths; },
             nb::rv_policy::reference_internal)
         .def_ro("decode_input_ids", &tokenspeed::ForwardBatch::decode_input_ids)
+        .def("is_local_prefill", &tokenspeed::ForwardBatch::IsLocalPrefill)
         .def_prop_ro(
             "block_tables",
             [](const tokenspeed::ForwardBatch& op)
@@ -250,6 +252,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                  nb::dict out;
                  for (auto& [gid, buf] : op.block_tables_contig) {
                      const std::size_t rows = op.request_ids.size();
+                     tokenspeed::FatalCheck(rows == 0 || buf.size() % rows == 0,
+                                            "block-table buffer must contain complete rows");
                      const std::size_t columns = rows == 0 ? 0 : buf.size() / rows;
                      out[nb::str(gid.c_str())] =
                          nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(buf.data(), {rows, columns}, self);
@@ -261,11 +265,13 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     // ─── CacheOperation (attached to the Cache submodule) ──────────
     nb::class_<tokenspeed::LoadBackBatch>(cache, "LoadBackOp")
         .def_ro("op_ids", &tokenspeed::LoadBackBatch::op_ids)
+        .def_ro("group_ids", &tokenspeed::LoadBackBatch::group_ids)
         .def_ro("src_pages", &tokenspeed::LoadBackBatch::src_pages)
         .def_ro("dst_pages", &tokenspeed::LoadBackBatch::dst_pages);
 
     nb::class_<tokenspeed::WriteBackBatch>(cache, "WriteBackOp")
         .def_ro("op_ids", &tokenspeed::WriteBackBatch::op_ids)
+        .def_ro("group_ids", &tokenspeed::WriteBackBatch::group_ids)
         .def_ro("src_pages", &tokenspeed::WriteBackBatch::src_pages)
         .def_ro("dst_pages", &tokenspeed::WriteBackBatch::dst_pages);
 
@@ -302,16 +308,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              nb::arg("request_specs"))
         .def("next_execution_plan", [](tokenspeed::Scheduler& s) { return s.NextExecutionPlan(); })
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
-        .def(
-            "drain_kv_events",
-            [](tokenspeed::Scheduler& s) {
-                nb::list result;
-                for (auto& event : s.DrainKvEvents()) {
-                    std::visit([&result](auto& inner) { result.append(nb::cast(inner, nb::rv_policy::copy)); }, event);
-                }
-                return result;
-            },
-            nb::rv_policy::move)
+        .def("drain_kv_events",
+             [](tokenspeed::Scheduler& s) {
+                 nb::list result;
+                 for (auto& event : s.DrainKvEvents()) {
+                     std::visit([&result](auto& inner) { result.append(nb::cast(inner, nb::rv_policy::copy)); }, event);
+                 }
+                 return result;
+             })
         .def("waiting_size", &tokenspeed::Scheduler::WaitingSize)
         .def("decoding_size", &tokenspeed::Scheduler::DecodingSize)
         .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize)
@@ -320,6 +324,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("active_kv_pages", &tokenspeed::Scheduler::ActiveKvPages)
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
+        .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
+        .def("clear_cache", &tokenspeed::Scheduler::ClearCache)
         .def("paged_cache_group_total_pages", &tokenspeed::Scheduler::PagedCacheGroupTotalPages, nb::arg("group_id"))
         .def("paged_cache_group_available_pages", &tokenspeed::Scheduler::PagedCacheGroupAvailablePages,
              nb::arg("group_id"));

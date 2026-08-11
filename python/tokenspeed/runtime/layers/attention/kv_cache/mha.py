@@ -77,6 +77,7 @@ class MHATokenToKVPool(CachePool):
             paged_cache_group_specs=paged_cache_group_specs,
             token_capacity=token_capacity,
             backing_pool=backing_pool,
+            field_layer_offset=field_layer_offset,
         )
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -86,9 +87,6 @@ class MHATokenToKVPool(CachePool):
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
-        self._field_layer_offset = int(field_layer_offset)
-        if self._field_layer_offset < 0:
-            raise ValueError("field_layer_offset must be non-negative")
         # Fewer-head layers reinterpret the allocation width as more rows.
         self._layer_kv_head_counts = (
             tuple(int(h) for h in layer_kv_head_counts)
@@ -250,8 +248,8 @@ class MHATokenToKVPool(CachePool):
         # note: get_key_buffer is hooked with synchronization for layer-wise KV cache loading
         # it is supposed to be used only by attention backend not for information purpose
         # same applies to get_value_buffer and get_kv_buffer
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         return self._get_key_buffer(layer_id)
 
     def _get_value_buffer(self, layer_id: int):
@@ -264,8 +262,8 @@ class MHATokenToKVPool(CachePool):
         return self._layer_row_view(buf, layer_id)
 
     def get_value_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         return self._get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int):

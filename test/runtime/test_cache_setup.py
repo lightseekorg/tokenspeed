@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import tokenspeed.runtime.layers.attention.kv_cache.mha as mha_cache
+from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
@@ -445,10 +446,27 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
     assert draft_pool.buffer is target_pool.buffer
     assert draft_pool._fields is target_pool._fields
     assert draft_pool.runtime_contract is target_pool.runtime_contract
-    assert draft_pool.layer_transfer_counter is None
+    assert draft_pool.layerwise_load_tracker is None
     assert set(target_pool._fields) == {
         field.field_id for field in setup.spec.memory_plan.fields
     }
+
+    target_layout = target_pool.cache_transfer_layout()
+    draft_layout = draft_pool.cache_transfer_layout()
+    target_transfer_fields = {
+        field_id for consumer in target_layout.consumers for field_id in consumer
+    }
+    draft_transfer_fields = {
+        field_id for consumer in draft_layout.consumers for field_id in consumer
+    }
+    assert target_transfer_fields == set(target_pool._fields) - draft_field_ids
+    assert draft_transfer_fields == draft_field_ids
+    combined_layout = combine_cache_transfer_layouts(
+        target_layout,
+        draft_layout,
+        group_ids=tuple(spec.group_id for spec in target_pool.paged_cache_group_specs),
+    )
+    assert len(combined_layout.consumers) == 3
 
     target_last_layer = target_pool.get_key_buffer(1).clone()
 
@@ -689,3 +707,32 @@ def test_draft_view_maps_local_layer_ids_to_continuation_planes() -> None:
     # The hybrid default stays the inverse: global sparse ids -> compact slots.
     hybrid_pool = LayerMappedKVPool(_FakePool(), [3, 7, 11])
     assert hybrid_pool.get_key_buffer(7) == 1
+
+
+def test_draft_view_maps_inkling_conv_checkpoint_accessors() -> None:
+    """Same tripwire for the Inkling conv-checkpoint accessors: the
+    __getattr__ pass-through would resolve them against the target's
+    layers 0..n, silently restoring/publishing the wrong planes."""
+    from tokenspeed.runtime.layers.attention.kv_cache.base import LayerMappedKVPool
+
+    class _FakePool:
+        page_size = 4
+
+        def kvconv_checkpoint_buffers(self, layer_id: int):
+            return ("kv", layer_id)
+
+        def hiddenconv_checkpoint_buffer(self, layer_id: int, component: str):
+            return ("hidden", layer_id, component)
+
+    num_target_layers = 66
+    draft_pool = LayerMappedKVPool(
+        _FakePool(),
+        [num_target_layers + local for local in range(3)],
+        layer_map={local: num_target_layers + local for local in range(3)},
+    )
+    assert draft_pool.kvconv_checkpoint_buffers(0) == ("kv", 66)
+    assert draft_pool.hiddenconv_checkpoint_buffer(2, "mlpconv") == (
+        "hidden",
+        68,
+        "mlpconv",
+    )

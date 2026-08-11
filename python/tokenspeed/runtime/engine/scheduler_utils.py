@@ -187,10 +187,11 @@ def aligned_max_scheduled_tokens(
     return max_scheduled_tokens - max_scheduled_tokens % grain
 
 
-def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
+def make_spec(rid: str, tokens: list[int], max_new_tokens: int = 0) -> RequestSpec:
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
+    spec.max_new_tokens = max_new_tokens
     return spec
 
 
@@ -209,7 +210,13 @@ def make_config(
     disable_prefix_cache: bool = False,
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
     enable_mixed_prefill_decode: bool = False,
+    prefix_replay_tokens: int = 0,
 ) -> SchedulerConfig:
+    if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
+        raise ValueError(
+            "prefix_replay_tokens must fit a non-negative int32; "
+            f"got {prefix_replay_tokens}."
+        )
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
@@ -229,6 +236,7 @@ def make_config(
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
+    cfg.prefix_replay_tokens = prefix_replay_tokens
     cfg.disable_l2_cache = disable_l2_cache
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
@@ -303,6 +311,59 @@ def should_use_overlap_schedule(
     return True
 
 
+def resolve_dspark_prefix_replay_tokens(
+    *,
+    speculative_algorithm: str | None,
+    enable_prefix_caching: bool,
+    enable_kvstore: bool,
+    disaggregation_mode: str,
+    draft_model_path_use_base: bool,
+    draft_model_config: Any | None,
+) -> int:
+    """Resolve the prompt tail needed to rebuild DSpark runtime state.
+
+    DeepSeek V4 DSpark advertises the requirement through its draft
+    ``ModelConfig``. Same-checkpoint DSpark configurations without that
+    capability remain fail-closed. External generic DSpark configurations keep
+    their existing scheduler behavior until they advertise an equivalent
+    contract.
+    """
+
+    if not enable_prefix_caching or speculative_algorithm != "DSPARK":
+        return 0
+    if draft_model_config is None:
+        raise ValueError(
+            "DSPARK prefix caching requires a resolved draft model configuration."
+        )
+
+    replay_tokens = getattr(draft_model_config, "dspark_prefix_replay_tokens", None)
+    if replay_tokens is None:
+        if draft_model_path_use_base:
+            raise ValueError(
+                "DSPARK same-checkpoint prefix caching requires a draft model "
+                "that advertises captured-context replay support."
+            )
+        return 0
+
+    replay_tokens = int(replay_tokens)
+    if not 0 < replay_tokens <= (1 << 31) - 1:
+        raise ValueError(
+            "DSPARK captured-context replay requirement must fit a positive int32; "
+            f"got {replay_tokens}."
+        )
+    if enable_kvstore:
+        raise ValueError(
+            "DSPARK captured-context replay does not support KVStore; "
+            "use --disable-kvstore."
+        )
+    if disaggregation_mode != "null":
+        raise ValueError(
+            "DSPARK captured-context replay does not support disaggregated "
+            f"serving; got role {disaggregation_mode!r}."
+        )
+    return replay_tokens
+
+
 def make_extend_result_event(
     request_id: str, tokens: Sequence[int] = ()
 ) -> "ForwardEvent.ExtendResult":
@@ -350,8 +411,6 @@ def cache_event_to_payload(event) -> dict:
     return {
         "kind": kind,
         "op_id": int(event.op_id),
-        "success": bool(event.success),
-        "request_id": getattr(event, "request_id", ""),
     }
 
 
@@ -361,10 +420,6 @@ def cache_event_from_payload(payload: dict):
         raise ValueError(f"Unsupported cache event type: {kind}")
     event = _CACHE_EVENT_TYPES[kind]()
     event.op_id = int(payload["op_id"])
-    event.success = bool(payload["success"])
-    request_id = payload.get("request_id", "")
-    if request_id:
-        event.request_id = request_id
     return event
 
 
@@ -390,9 +445,7 @@ def pop_common_cache_event_payloads(
 
     ready_payloads = []
     for key in sorted(common_keys, key=lambda item: (item[1], item[0])):
-        payload = dict(rank_maps[0][key])
-        payload["success"] = all(rank_map[key]["success"] for rank_map in rank_maps)
-        ready_payloads.append(payload)
+        ready_payloads.append(dict(rank_maps[0][key]))
     return ready_payloads
 
 

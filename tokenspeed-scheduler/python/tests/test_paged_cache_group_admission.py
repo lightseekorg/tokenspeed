@@ -58,7 +58,10 @@ def _request_ids_in_plan(plan) -> set[str]:
 def _overlap_admission_scheduler(verify_width: int) -> Scheduler:
     committed_tokens = 3
     reservation_end = committed_tokens - 1 + verify_width
-    total_pages = reservation_end + 1
+    # One additional verify window stays protected while the scheduler runs
+    # one step ahead of the Device.
+    protected_pages = verify_width
+    total_pages = reservation_end + 1 + protected_pages
     cfg = _base_config(num_device_pages=total_pages)
     cfg.block_size = 1
     cfg.decode_input_tokens = verify_width
@@ -85,7 +88,9 @@ def _overlap_admission_scheduler(verify_width: int) -> Scheduler:
 def test_overlap_decode_admission_uses_runtime_verify_width(verify_width: int):
     scheduler = _overlap_admission_scheduler(verify_width)
     assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
-    assert scheduler.paged_cache_group_available_pages("overlap.history") == 0
+    assert (
+        scheduler.paged_cache_group_available_pages("overlap.history") == verify_width
+    )
 
 
 def test_overlap_schedule_depth_defaults_to_zero_and_rejects_deeper_pipeline():

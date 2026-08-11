@@ -1,114 +1,20 @@
-"""MemoryExecutor host-tier tests.
-transport.
-
-Covers the executor roundtrip against a real (tiny) device pool with
-WriteBackDone AND LoadBackDone acks, the ack payload shape riding the
-TP-synced commit path, the layer -> mirror-tensor fencing mapping, and the
-num_host_pages sizing arithmetic (pure CPU).
-"""
+"""Compact Host cache executor tests."""
 
 from __future__ import annotations
 
 import os
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-# CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, suite="runtime-1gpu")
-
-LAYER_TYPES = ("sliding_attention", "full_attention") * 2
-
-# GDN hybrid: layers 0/2 are state layers (slab pairs 0/1); the KV side
-# stays per-layer (linear_attention disables slab pairing) but state layers
-# carry no KV tensors under the flat predicate (M18a T4), and the LAST
-# layer is an attention layer -- exercising the finish-event pin.
-GDN_LAYER_TYPES = ("linear_attention", "full_attention") * 2
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
-class _StubPool:
-    """CPU-only device-pool stand-in for sizing arithmetic: 4 layers dedup
-    to 2 K + 2 V slabs (paired layers alias the same tensor)."""
-
-    def __init__(self, torch):
-        self.page_size = 4
-        self.size = 32
-        rows = self.size + self.page_size
-        k_slabs = [torch.zeros((rows, 1, 8), dtype=torch.bfloat16) for _ in range(2)]
-        v_slabs = [torch.zeros((rows, 1, 8), dtype=torch.bfloat16) for _ in range(2)]
-        self.k_buffer = [k_slabs[0], k_slabs[0], k_slabs[1], k_slabs[1]]
-        self.v_buffer = [v_slabs[0], v_slabs[0], v_slabs[1], v_slabs[1]]
-
-
-class HostPageSizingTest(unittest.TestCase):
-    """num_host_pages budget arithmetic; no CUDA, no scheduler ext."""
-
-    def setUp(self):
-        try:
-            import torch
-
-            from tokenspeed.runtime.cache.host_mirror import (
-                HostMirror,
-                bytes_per_host_page,
-            )
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch: {exc}")
-        self.torch = torch
-        self.HostMirror = HostMirror
-        self.bytes_per_host_page = bytes_per_host_page
-
-    def test_bytes_per_host_page_matches_mirror(self):
-        stub = _StubPool(self.torch)
-        # 4 distinct mirrors x page_size 4 x row 1*8 bf16 (16 B) = 256 B.
-        self.assertEqual(self.bytes_per_host_page(stub), 256)
-        mirror = self.HostMirror(stub, num_host_pages=2)
-        self.assertEqual(mirror.bytes_per_host_page(), 256)
-
-    def test_num_host_pages_formula(self):
-        from tokenspeed.runtime.cache.executor.memory_executor import (
-            num_host_pages,
-        )
-
-        # Ratio sizing mirrors the single-table token->page align-up:
-        # int(size * ratio) // page_size + 1.
-        self.assertEqual(
-            num_host_pages(
-                bytes_per_host_page=256,
-                device_pool_size=32,
-                page_size=4,
-                host_ratio=2.0,
-                host_size_gb=0,
-            ),
-            int(32 * 2.0) // 4 + 1,
-        )
-        # Explicit GB budget floors to whole mirror pages (never exceeds).
-        self.assertEqual(
-            num_host_pages(
-                bytes_per_host_page=256,
-                device_pool_size=32,
-                page_size=4,
-                host_ratio=2.0,
-                host_size_gb=1,
-            ),
-            int(1e9) // 256,
-        )
-        # A budget below one page is a configuration error.
-        with self.assertRaises(ValueError):
-            num_host_pages(
-                bytes_per_host_page=int(1e9),
-                device_pool_size=32,
-                page_size=4,
-                host_ratio=2.0,
-                host_size_gb=0.5,
-            )
-
-
-class LoadBackDonePayloadTest(unittest.TestCase):
-    """LoadBackDone rides the same TP-synced commit path as WriteBackDone;
-    needs the scheduler ext, not a GPU."""
-
+class CacheEventPayloadTest(unittest.TestCase):
     def setUp(self):
         try:
             from tokenspeed_scheduler import Cache
@@ -118,369 +24,350 @@ class LoadBackDonePayloadTest(unittest.TestCase):
                 cache_event_to_payload,
                 pop_common_cache_event_payloads,
             )
-        except (ImportError, ModuleNotFoundError, AttributeError) as exc:
-            self.skipTest(f"needs tokenspeed_scheduler ext: {exc}")
-        if not hasattr(Cache, "LoadBackDoneEvent"):
-            self.skipTest("scheduler ext predates the LoadBackDoneEvent binding")
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
         self.Cache = Cache
-        self.to_payload = cache_event_to_payload
         self.from_payload = cache_event_from_payload
+        self.to_payload = cache_event_to_payload
         self.pop_common = pop_common_cache_event_payloads
 
-    def _load_done(self, op_id: int):
-        evt = self.Cache.LoadBackDoneEvent()
-        evt.op_id = op_id
-        evt.success = True
-        return evt
+    def test_cache_completion_payload_round_trip_has_no_failure_channel(self):
+        for event_type in (
+            self.Cache.WriteBackDoneEvent,
+            self.Cache.LoadBackDoneEvent,
+        ):
+            with self.subTest(event_type=event_type.__name__):
+                event = event_type()
+                event.op_id = 7
 
-    def test_payload_shape_and_roundtrip(self):
-        payload = self.to_payload(self._load_done(3))
-        self.assertEqual(
-            payload,
-            {
-                "kind": "LoadBackDoneEvent",
-                "op_id": 3,
-                "success": True,
-                "request_id": "",
-            },
-        )
-        ready = self.pop_common([[payload]])  # world_size=1 gather
-        self.assertEqual(ready, [payload])
-        evt = self.from_payload(ready[0])
-        self.assertIsInstance(evt, self.Cache.LoadBackDoneEvent)
-        self.assertEqual(int(evt.op_id), 3)
-        self.assertTrue(evt.success)
+                payload = self.to_payload(event)
 
-    def test_pop_common_requires_all_ranks(self):
-        payload = self.to_payload(self._load_done(4))
-        self.assertEqual(self.pop_common([[payload], []]), [])
-        both = self.pop_common([[payload], [dict(payload)]])
-        self.assertEqual(both, [payload])
+                self.assertEqual(
+                    payload,
+                    {
+                        "kind": event_type.__name__,
+                        "op_id": 7,
+                    },
+                )
+                self.assertEqual(
+                    self.pop_common([[payload], [dict(payload)]]), [payload]
+                )
+                restored = self.from_payload(payload)
+                self.assertIsInstance(restored, event_type)
+                self.assertEqual(int(restored.op_id), 7)
 
 
-class MemoryExecutorTest(unittest.TestCase):
-    """Real (tiny) MHATokenToKVPool on GPU driving the flat executor."""
-
-    def setUp(self):
+class GroupAwareWireTest(unittest.TestCase):
+    def test_hybrid_state_access_waits_for_layer_load(self):
         try:
-            import torch
-            from cache_pool_test_utils import plan_fields
-            from tokenspeed_scheduler import Cache
-
-            from tokenspeed.runtime.cache.executor.memory_executor import (
-                MemoryExecutor,
+            from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
+                HybridKDATokenToKVPool,
             )
-            from tokenspeed.runtime.cache.transfer.types import CacheKind
             from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
                 HybridMHATokenToKVPool,
             )
-            from tokenspeed.runtime.layers.attention.kv_cache.mha import (
-                MHATokenToKVPool,
-            )
-            from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
-                qwen_gdn_cache_fields,
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        for pool_type in (HybridMHATokenToKVPool, HybridKDATokenToKVPool):
+            with self.subTest(pool_type=pool_type.__name__):
+                tracker = Mock()
+                pool = pool_type.__new__(pool_type)
+                pool.layerwise_load_tracker = tracker
+                pool._state_buffers_by_layer = {3: ("conv", "recurrent")}
+                if pool_type is HybridMHATokenToKVPool:
+                    pool._state_layer_ids = (3,)
+
+                self.assertEqual(pool.get_component(3, "conv_state"), "conv")
+                tracker.wait_for_layer.assert_called_once_with(3)
+
+    def test_pool_transfer_layout_matches_scheduler_group_order(self):
+        try:
+            from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        pool = CachePool.__new__(CachePool)
+        pool.layer_num = 2
+        pool.buffer = object()
+        pool._backing_pool = None
+        pool._field_layer_offset = 0
+        pool.paged_cache_group_specs = (
+            SimpleNamespace(group_id="state"),
+            SimpleNamespace(group_id="full"),
+        )
+        pool.plan = SimpleNamespace(
+            num_lcm_blocks=4,
+            planes=(
+                SimpleNamespace(
+                    plane_id="shared",
+                    bytes_per_lcm_block=4096,
+                    arena_offset_bytes=0,
+                ),
+            ),
+            groups=(
+                SimpleNamespace(
+                    group_id="full",
+                    cache_blocks_per_lcm_block=32,
+                ),
+                SimpleNamespace(
+                    group_id="state",
+                    cache_blocks_per_lcm_block=1,
+                ),
+            ),
+            fields=(
+                SimpleNamespace(
+                    group_id="full",
+                    field_id="layer.1.k",
+                    plane_id="shared",
+                    field_offset_bytes=0,
+                    page_stride_bytes=128,
+                    payload_bytes=128,
+                ),
+                SimpleNamespace(
+                    group_id="state",
+                    field_id="layer.0.state",
+                    plane_id="shared",
+                    field_offset_bytes=0,
+                    page_stride_bytes=4096,
+                    payload_bytes=4096,
+                ),
+            ),
+        )
+
+        layout = pool.cache_transfer_layout()
+
+        self.assertEqual(
+            tuple(group.group_id for group in layout.groups),
+            ("state", "full"),
+        )
+
+    def test_submit_plan_clears_layerwise_waits_without_load(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        tracker = Mock()
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._load_trackers = [(tracker, 1)]
+
+        executor.submit_plan(SimpleNamespace(cache=[]))
+
+        tracker.set_consumers.assert_called_once_with(-1)
+
+    def test_submit_preserves_group_identity(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        op_ids = []
+        transfers = []
+        L2CacheExecutor._append_transfers(
+            [7],
+            [[0, 1]],
+            [[5, 5]],
+            [[9, 9]],
+            collected_op_ids=op_ids,
+            transfers=transfers,
+            source_is_device=True,
+        )
+        self.assertEqual(op_ids, [7])
+        self.assertEqual(transfers, [(0, 5, 9), (1, 5, 9)])
+
+    def test_writeback_calls_transfer_with_compact_layout(self):
+        try:
+            import tokenspeed.runtime.cache.l2.executor as executor_module
+
+            L2CacheExecutor = executor_module.L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ready_write_op_ids = []
+        executor.layout = SimpleNamespace(buffers=("device",))
+        executor.host_storage = SimpleNamespace(host_buffer="host")
+        executor.write_stream = object()
+        executor.transfer_backend = "dma"
+        executor._write_acks = []
+        ranges = [(0, 64, 128, 32)]
+        executor._transfer_ranges = Mock(return_value=ranges)
+        start = Mock()
+        finish = Mock()
+
+        with (
+            patch.object(
+                executor_module.torch.cuda, "Event", side_effect=(start, finish)
+            ),
+            patch.object(executor_module, "transfer_cache_ranges") as transfer,
+        ):
+            executor._start_writing([7], [(0, 5, 9)])
+
+        transfer.assert_called_once_with(
+            "d2h",
+            executor.layout.buffers,
+            executor.host_storage.host_buffer,
+            ranges,
+            executor.write_stream,
+            backend="dma",
+        )
+        start.record.assert_called_once_with()
+        start.wait.assert_called_once_with(executor.write_stream)
+        finish.record.assert_called_once_with(executor.write_stream)
+
+    def test_loadback_logs_non_empty_batch(self):
+        try:
+            import tokenspeed.runtime.cache.l2.executor as executor_module
+
+            L2CacheExecutor = executor_module.L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ready_load_op_ids = []
+        executor._load_acks = []
+        executor.load_stream = object()
+        executor.transfer_backend = "dma"
+        executor.layout = SimpleNamespace(buffers=("device",), consumers=(("field",),))
+        executor.host_storage = SimpleNamespace(host_buffer="host")
+        executor._transfer_ranges = Mock(return_value=[(0, 64, 128, 32)])
+        load_events = SimpleNamespace(start_event=Mock(), layer_done_events=[None])
+        tracker = Mock()
+        tracker.begin_load.return_value = 0
+        tracker.event_sets = [load_events]
+        executor._load_trackers = [(tracker, 1)]
+        finish = Mock()
+
+        with (
+            patch.object(executor_module, "get_is_capture_mode", return_value=False),
+            patch.object(executor_module.device_module, "Event", return_value=finish),
+            patch.object(executor_module, "transfer_cache_ranges"),
+            patch.object(executor_module.logger, "info") as log_info,
+        ):
+            executor._start_loading([9], [(0, 2, 1), (0, 5, 4)])
+
+        log_info.assert_called_once_with(
+            "[L2] load started: operations=%d blocks=%d", 1, 2
+        )
+
+
+class CompactLayoutRoundTripTest(unittest.TestCase):
+    def setUp(self):
+        try:
+            import torch
+
+            import tokenspeed.runtime.cache.l2.executor as executor_module
+            from tokenspeed.runtime.cache.transfer.layout import (
+                CacheField,
+                CacheGroupLayout,
+                CacheTransferLayout,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel + scheduler ext: {exc}")
-        if not hasattr(Cache, "LoadBackDoneEvent"):
-            self.skipTest("scheduler ext predates the LoadBackDoneEvent binding")
+            self.skipTest(f"needs runtime dependencies: {exc}")
         if not torch.cuda.is_available():
             self.skipTest("needs a CUDA device")
         self.torch = torch
-        self.Cache = Cache
-        self.CacheKind = CacheKind
-        self.MemoryExecutor = MemoryExecutor
-        self.MHATokenToKVPool = MHATokenToKVPool
-        self.HybridMHATokenToKVPool = HybridMHATokenToKVPool
-        self.qwen_gdn_cache_fields = qwen_gdn_cache_fields
-        self.plan_fields = plan_fields
+        self.executor_module = executor_module
+        self.CacheField = CacheField
+        self.CacheGroupLayout = CacheGroupLayout
+        self.CacheTransferLayout = CacheTransferLayout
 
-    def _pool(self):
-        from cache_pool_test_utils import make_mha_memory_plan
-
-        kwargs = {
-            "size": 32,
-            "dtype": self.torch.bfloat16,
-            "head_num": 1,
-            "head_dim": 8,
-            "layer_num": 4,
-            "device": "cuda",
-            "enable_memory_saver": False,
-            "page_size": 4,
-            "rank": 0,
-            "layer_types": LAYER_TYPES,
-            "sliding_window_tokens": 128,
-        }
-        from cache_pool_test_utils import make_layer_group_ids
-
-        kwargs["memory_plan"] = make_mha_memory_plan(
-            size=kwargs["size"],
-            page_size=kwargs["page_size"],
-            layer_num=kwargs["layer_num"],
-            kv_heads=kwargs["head_num"],
-            head_dim=kwargs["head_dim"],
-            dtype=kwargs["dtype"],
-            layer_types=kwargs["layer_types"],
-            sliding_window_tokens=kwargs["sliding_window_tokens"],
-        )
-        kwargs["layer_group_ids"] = make_layer_group_ids(
-            layer_num=kwargs["layer_num"],
-            layer_types=kwargs["layer_types"],
-            sliding_window_tokens=kwargs["sliding_window_tokens"],
-        )
-        kwargs.pop("sliding_window_tokens", None)
-        return self.MHATokenToKVPool(**kwargs)
-
-    def _executor(self, pool):
-        return self.MemoryExecutor(device_pool=pool, host_ratio=2.0, host_size_gb=0)
-
-    def _fill_device_pages(self, mirror, device_pages):
-        p = mirror.page_size
-        for tensor_idx, (dev, _) in enumerate(mirror.tensor_pairs):
-            for d in device_pages:
-                dev[d * p : (d + 1) * p].fill_(tensor_idx * 16 + d + 1)
-        self.torch.cuda.synchronize()
-
-    def _snapshot(self, mirror, device_pages):
-        p = mirror.page_size
-        return [
-            {d: dev[d * p : (d + 1) * p].cpu().clone() for d in device_pages}
-            for dev, _ in mirror.tensor_pairs
-        ]
-
-    def _drain(self, executor, expect: int) -> list:
-        results = []
-        for _ in range(1000):
-            results.extend(executor.poll_results())
-            if len(results) >= expect:
-                return results
-            self.torch.cuda.synchronize()
-        self.fail(f"expected {expect} acks, drained {len(results)}")
-
-    def test_roundtrip_with_acks_and_fencing(self):
+    def test_real_transfer_restores_compact_multigroup_layout_byte_exactly(self):
         torch = self.torch
-        pool = self._pool()
-        executor = self._executor(pool)
-        mirror = executor.mirror
-        # Ratio sizing: int(32 * 2.0) // 4 + 1.
-        self.assertEqual(executor.num_host_pages, 17)
-        self.assertTrue(executor.emits_loadback_acks)
-        # The fencing counter is registered where the legacy pool would be.
-        self.assertIs(pool.layer_transfer_counter, executor._counter)
-
-        device_pages = [1, 2]
-        self._fill_device_pages(mirror, device_pages)
-        before = self._snapshot(mirror, device_pages)
-
-        # WriteBack: device pages [1, 2] -> host pages [5, 6].
-        executor.submit_writeback([7], [[1, 2]], [[5, 6]])
-        executor.flush()
-        results = self._drain(executor, 1)
-        self.assertEqual(len(results), 1)
-        self.assertIsInstance(results[0], self.Cache.WriteBackDoneEvent)
-        self.assertEqual(int(results[0].op_id), 7)
-        self.assertTrue(results[0].success)
-
-        for dev, _ in mirror.tensor_pairs:
-            p = mirror.page_size
-            for d in device_pages:
-                dev[d * p : (d + 1) * p].zero_()
-        torch.cuda.synchronize()
-
-        # LoadBack: host pages [5, 6] -> device pages [1, 2] (wire order:
-        # src=host, dst=device, as C++ LoadBackOp emits).
-        executor.submit_loadback([9], [[5, 6]], [[1, 2]])
-        executor.flush()
-
-        # Layerwise fencing: producer registered under the op, consumer waits
-        # gate per layer through the pool's registered counter.
-        producer_idx = executor.get_producer_index(self.CacheKind.KV, 9)
-        self.assertIsNotNone(producer_idx)
-        executor.set_consumer(self.CacheKind.KV, [producer_idx])
-        for layer_id in range(4):
-            pool.layer_transfer_counter.wait_until(layer_id)
-        torch.cuda.synchronize()
-
-        results = self._drain(executor, 1)
-        self.assertEqual(len(results), 1)
-        self.assertIsInstance(results[0], self.Cache.LoadBackDoneEvent)
-        self.assertEqual(int(results[0].op_id), 9)
-        self.assertTrue(results[0].success)
-
-        after = self._snapshot(mirror, device_pages)
-        for tensor_idx in range(len(mirror.tensor_pairs)):
-            for d in device_pages:
-                self.assertTrue(
-                    torch.equal(
-                        before[tensor_idx][d].view(torch.uint8),
-                        after[tensor_idx][d].view(torch.uint8),
-                    ),
-                    f"tensor {tensor_idx} device page {d} not byte-exact",
-                )
-
-        # Producer index is popped exactly once (event_loop consumes it in
-        # _setup_layerwise_loadback right after submit).
-        self.assertIsNone(executor.get_producer_index(self.CacheKind.KV, 9))
-
-    def _state_pool(self):
-        fields = self.qwen_gdn_cache_fields(
-            layer_types=GDN_LAYER_TYPES,
-            layer_group_ids=(
-                "linear_attention_0",
-                "full_attention",
-                "linear_attention_0",
-                "full_attention",
-            ),
-            logical_block_tokens=4,
-            kv_shape=(4, 1, 8),
-            kv_element_size=2,
-            conv_shape=(2, 4),
-            conv_element_size=2,
-            ssm_shape=(2, 8),
-            ssm_element_size=2,
-        )
-        plan = self.plan_fields(
-            fields,
-            logical_block_tokens=4,
+        first = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
+        second = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
+        layout = self.CacheTransferLayout(
             num_lcm_blocks=4,
-            alignment=2,
-            max_padding_fraction=1.0,
-        )
-        max_packing = max(group.cache_blocks_per_lcm_block for group in plan.groups)
-        kwargs = {
-            "size": plan.num_lcm_blocks * max_packing * plan.logical_block_tokens,
-            "dtype": self.torch.bfloat16,
-            "head_num": 1,
-            "head_dim": 8,
-            "layer_num": 4,
-            "device": "cuda",
-            "enable_memory_saver": False,
-            "page_size": 4,
-            "rank": 0,
-            "layer_types": GDN_LAYER_TYPES,
-            "sliding_window_tokens": None,
-            "memory_plan": plan,
-            "layer_group_ids": (
-                "linear_attention_0",
-                "full_attention",
-                "linear_attention_0",
-                "full_attention",
-            ),
-            "state_field_dtypes": {
-                f"layer.{layer_id}.{field}": self.torch.bfloat16
-                for layer_id in (0, 2)
-                for field in ("conv", "ssm")
-            },
-        }
-        kwargs.pop("sliding_window_tokens", None)
-        return self.HybridMHATokenToKVPool(**kwargs)
-
-    def _fill_spans(self, mirror, device_pages):
-        for tensor_idx, ((dev, _), span) in enumerate(
-            zip(mirror.tensor_pairs, mirror.row_spans)
-        ):
-            for d in device_pages:
-                dev[d * span : (d + 1) * span].fill_(tensor_idx * 16 + d + 1)
-        self.torch.cuda.synchronize()
-
-    def _snapshot_spans(self, mirror, device_pages):
-        return [
-            {d: dev[d * span : (d + 1) * span].cpu().clone() for d in device_pages}
-            for (dev, _), span in zip(mirror.tensor_pairs, mirror.row_spans)
-        ]
-
-    def test_state_layer_event_mapping(self):
-        pool = self._state_pool()
-        executor = self._executor(pool)
-        mirror = executor.mirror
-        # Grouped GDN KV (2 K + 2 V; state layers carry no KV, M18a T4) +
-        # conv0, ssm0, conv1, ssm1.
-        self.assertEqual(len(mirror.tensor_pairs), 8)
-        self._fill_spans(mirror, [3])
-        executor.submit_writeback([1], [[3]], [[0]])
-        executor.flush()
-        self._drain(executor, 1)
-
-        # Spy on the per-tensor events to pin the layer -> event mapping.
-        captured = {}
-        orig = mirror.load_pages_with_events
-
-        def spy(pairs, stream):
-            events = orig(pairs, stream)
-            captured["events"] = events
-            return events
-
-        mirror.load_pages_with_events = spy
-        executor.submit_loadback([2], [[0]], [[3]])
-        executor.flush()
-        events = captured["events"]
-        self.assertEqual(len(events), 8)
-        producer_idx = executor.get_producer_index(self.CacheKind.KV, 2)
-        producer_event = executor._counter.events[producer_idx]
-        # State layers 0/2 ack on their ssm event (conv precedes ssm on the
-        # serial stream, so it covers the pair); attention layer 1 keeps its
-        # V-tensor event (num_k=2, k-index 0 -> events[2]); the LAST layer
-        # pins events[-1] so finish_event (producer-slot reuse fence) covers
-        # the trailing state copies.
-        self.assertIs(producer_event.load_events[0], events[5])
-        self.assertIs(producer_event.load_events[1], events[2])
-        self.assertIs(producer_event.load_events[2], events[7])
-        self.assertIs(producer_event.load_events[3], events[-1])
-        self.torch.cuda.synchronize()
-        self.assertTrue(producer_event.finish_event.query())
-        self._drain(executor, 1)
-
-    def test_state_pool_roundtrip_with_fencing(self):
-        torch = self.torch
-        pool = self._state_pool()
-        executor = self._executor(pool)
-        mirror = executor.mirror
-
-        device_pages = [1, 2]
-        self._fill_spans(mirror, device_pages)
-        before = self._snapshot_spans(mirror, device_pages)
-
-        executor.submit_writeback([21], [[1, 2]], [[5, 6]])
-        executor.flush()
-        self._drain(executor, 1)
-
-        for (dev, _), span in zip(mirror.tensor_pairs, mirror.row_spans):
-            for d in device_pages:
-                dev[d * span : (d + 1) * span].zero_()
-        torch.cuda.synchronize()
-
-        executor.submit_loadback([23], [[5, 6]], [[1, 2]])
-        executor.flush()
-        producer_idx = executor.get_producer_index(self.CacheKind.KV, 23)
-        self.assertIsNotNone(producer_idx)
-        executor.set_consumer(self.CacheKind.KV, [producer_idx])
-        for layer_id in range(4):
-            pool.layer_transfer_counter.wait_until(layer_id)
-        torch.cuda.synchronize()
-        self._drain(executor, 1)
-
-        after = self._snapshot_spans(mirror, device_pages)
-        for tensor_idx in range(len(mirror.tensor_pairs)):
-            for d in device_pages:
-                self.assertTrue(
-                    torch.equal(
-                        before[tensor_idx][d].view(torch.uint8),
-                        after[tensor_idx][d].view(torch.uint8),
+            groups=(
+                self.CacheGroupLayout(
+                    group_id="full",
+                    cache_blocks_per_lcm_block=2,
+                    fields=(
+                        self.CacheField("layer.0.k", 0, 8, 8, 4),
+                        self.CacheField("layer.0.v", 1, 16, 12, 6),
                     ),
-                    f"tensor {tensor_idx} device page {d} not byte-exact",
-                )
+                ),
+                self.CacheGroupLayout(
+                    group_id="state",
+                    cache_blocks_per_lcm_block=1,
+                    fields=(self.CacheField("layer.1.state", 0, 64, 10, 5),),
+                ),
+            ),
+            buffers=(first, second),
+            consumers=(("layer.0.k", "layer.0.v"), ("layer.1.state",)),
+        )
 
-    def test_empty_op_acks_immediately(self):
-        pool = self._pool()
-        executor = self._executor(pool)
-        # C++ dedups transfers across ops of one batched operation, so an op
-        # can arrive with empty page lists; it still owes exactly one ack.
-        executor.submit_writeback([11], [[]], [[]])
-        executor.submit_loadback([12], [[]], [[]])
-        executor.flush()
-        results = self._drain(executor, 2)
-        kinds = {type(r).__name__: int(r.op_id) for r in results}
-        self.assertEqual(kinds, {"WriteBackDoneEvent": 11, "LoadBackDoneEvent": 12})
+        class SyntheticPool:
+            def cache_transfer_layout(self):
+                return layout
+
+            def register_layerwise_load_tracker(self, tracker):
+                self.load_tracker = tracker
+
+        pool = SyntheticPool()
+        pool.paged_cache_group_specs = tuple(
+            SimpleNamespace(group_id=group.group_id) for group in layout.groups
+        )
+        with patch.object(self.executor_module, "_HOST_MEM_HEADROOM_BYTES", 0):
+            executor = self.executor_module.L2CacheExecutor(
+                pool,
+                host_ratio=1.0,
+                host_size_gb=0,
+                io_backend="direct",
+            )
+
+        # Hand-derived Device ranges for blocks (full: 1, 4; state: 3).
+        first[16:20].fill_(0x11)
+        second[28:34].fill_(0x12)
+        first[40:44].fill_(0x41)
+        second[64:70].fill_(0x42)
+        first[94:99].fill_(0x73)
+        torch.cuda.synchronize()
+
+        executor._start_writing(  # pylint: disable=protected-access
+            [7],
+            [(0, 1, 1), (0, 4, 4), (1, 3, 3)],
+        )
+        executor.write_stream.synchronize()
+        write_results = executor.poll_results()
+        self.assertEqual([int(event.op_id) for event in write_results], [7])
+
+        # Destroy every Device byte so stale cache contents cannot make the
+        # H2D half of the round trip pass accidentally.
+        first.fill_(0xEE)
+        second.fill_(0xEE)
+        torch.cuda.synchronize()
+
+        load_index = executor._start_loading(  # pylint: disable=protected-access
+            [9],
+            [(0, 2, 1), (0, 5, 4), (1, 4, 3)],
+        )
+        self.assertIsNotNone(load_index)
+        pool.load_tracker.set_consumers(load_index)
+        pool.load_tracker.wait_for_layer(0)
+        pool.load_tracker.wait_for_layer(1)
+        torch.cuda.synchronize()
+        load_results = executor.poll_results()
+        self.assertEqual([int(event.op_id) for event in load_results], [9])
+
+        # Hand-derived destination ranges for blocks (full: 2, 5; state: 4).
+        self.assertTrue(
+            torch.equal(first[24:28].cpu(), torch.full((4,), 0x11, dtype=torch.uint8))
+        )
+        self.assertTrue(
+            torch.equal(second[40:46].cpu(), torch.full((6,), 0x12, dtype=torch.uint8))
+        )
+        self.assertTrue(
+            torch.equal(first[48:52].cpu(), torch.full((4,), 0x41, dtype=torch.uint8))
+        )
+        self.assertTrue(
+            torch.equal(second[76:82].cpu(), torch.full((6,), 0x42, dtype=torch.uint8))
+        )
+        self.assertTrue(
+            torch.equal(first[104:109].cpu(), torch.full((5,), 0x73, dtype=torch.uint8))
+        )
+        executor.shutdown()
 
 
 if __name__ == "__main__":

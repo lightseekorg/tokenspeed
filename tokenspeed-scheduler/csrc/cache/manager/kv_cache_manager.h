@@ -32,9 +32,9 @@
 #include <utility>
 #include <vector>
 
-#include "cache/block_pool.h"
-#include "cache/cache_block_ref.h"
-#include "cache/cache_types.h"
+#include "cache/core/block_pool.h"
+#include "cache/core/cache_block_ref.h"
+#include "cache/core/cache_types.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -45,14 +45,14 @@ class KvCacheManager {
 public:
     // Read-only admission snapshot from one cache-index lookup; owns no block.
     struct CachedBlockMetadata {
-        std::uint64_t last_access_epoch;
-        std::int32_t logical_block_index;
-        CacheBoundaryKind boundary_kind;
-        bool was_acquired;
+        std::uint64_t last_access_epoch{0};
+        std::int32_t logical_block_index{-1};
+        CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
+        bool was_acquired{false};
     };
 
     explicit KvCacheManager(std::int32_t cache_block_tokens, std::int32_t cache_blocks_per_lcm_block = 1,
-                            GroupId group_id = 0)
+                            std::uint32_t group_id = 0)
         : cache_block_tokens_{cache_block_tokens},
           cache_blocks_per_lcm_block_{cache_blocks_per_lcm_block},
           group_id_{group_id} {
@@ -66,7 +66,7 @@ public:
 
     std::int32_t CacheBlockTokens() const noexcept { return cache_block_tokens_; }
     std::int32_t CacheBlocksPerLcmBlock() const noexcept { return cache_blocks_per_lcm_block_; }
-    GroupId Id() const noexcept { return group_id_; }
+    std::uint32_t Id() const noexcept { return group_id_; }
 
     std::int32_t ResolveKernelPageId(CacheBlockLocation location) const {
         _assert(location.lcm_block_id > 0, "LCM block id must be > 0");
@@ -238,6 +238,8 @@ public:
         return true;
     }
 
+    // Registers block_ref under key. If key already has a canonical block,
+    // block_ref is replaced with a reference to that block.
     void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch,
                              std::int32_t logical_block_index = -1,
                              CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk,
@@ -299,6 +301,14 @@ public:
         const CacheEntries* cache_index = findCacheEntries(pool);
         return cache_index != nullptr && findEntry(*cache_index, key) != cache_index->entries.end();
     }
+    CacheBlockRef AcquireCachedBlock(const BlockPool& pool, const CacheKey& key) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return {};
+        }
+        ConstCacheEntryIterator entry_it = findEntry(*cache_index, key);
+        return entry_it == cache_index->entries.end() ? CacheBlockRef{} : entry_it->block_ref;
+    }
     bool ContainsCachedBlock(const BlockPool& pool, CacheBlockLocation location) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
         return cache_index != nullptr && findEntry(*cache_index, location) != cache_index->entries.end();
@@ -334,14 +344,22 @@ public:
     }
 
     std::vector<CacheBlockLocation> EvictableBlockLocations(const BlockPool& pool) const {
+        return EvictableBlockLocationsAfterReleasing(pool, {});
+    }
+
+    std::vector<CacheBlockLocation> EvictableBlockLocationsAfterReleasing(
+        const BlockPool& pool, std::span<const CacheBlockLocation> released_locations) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
         if (cache_index == nullptr) {
             return {};
         }
         std::vector<CacheBlockLocation> locations;
         for (const CacheEntry& cache_entry : cache_index->entries) {
-            if (cache_entry.block_ref.unique()) {
-                locations.push_back(cache_entry.block_ref->Location());
+            const CacheBlockLocation location = cache_entry.block_ref->Location();
+            const std::uint32_t released_owners =
+                static_cast<std::uint32_t>(std::ranges::count(released_locations, location));
+            if (cache_entry.block_ref.use_count() == 1 + released_owners) {
+                locations.push_back(location);
             }
         }
         return locations;
@@ -388,7 +406,9 @@ public:
         return 0;
     }
     virtual std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(const BlockTable& /*table*/,
-                                                                        std::int32_t /*num_computed_tokens*/) const {
+                                                                        std::int32_t /*num_computed_tokens*/,
+                                                                        std::span<const CacheBlockLocation>
+                                                                        /*released_locations*/) const {
         return {};
     }
 
@@ -421,7 +441,7 @@ protected:
 
     std::int32_t cache_block_tokens_;
     std::int32_t cache_blocks_per_lcm_block_;
-    GroupId group_id_;
+    std::uint32_t group_id_;
 
 private:
     struct CacheEntry {

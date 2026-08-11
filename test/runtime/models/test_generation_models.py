@@ -77,7 +77,7 @@ CI_MODELS = [
         "openai/gpt-oss-120b",
         tp_size=_AVAILABLE_GPUS,
         skip_long_prompt=True,
-        min_gpu_memory_gb=150,
+        min_gpu_memory_gb=80,
         extra_kwargs={
             "disable_prefill_graph": True,
             "max_total_tokens": 32768,

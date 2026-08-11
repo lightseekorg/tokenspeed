@@ -38,22 +38,107 @@ _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32
 _is_nvidia = current_platform().is_nvidia
 
 __all__ = [
+    "compute_group_decode_locs",
     "copy_state_rows",
     "fused_fp8_set_kv_buffer",
-    "compute_group_decode_locs",
-    "unpack_group_tables",
     "gather_page_table_with_padding",
     "index_k_block_split_scatter",
     "quantize_mxfp8_rows",
     "quantize_store_kv_mxfp8",
     "store_kv_cache",
     "store_sf_interleaved",
+    "transfer_cache_ranges",
     "transfer_kv_all_layer",
     "transfer_kv_all_layer_mla",
     "transfer_kv_per_layer",
     "transfer_kv_per_layer_mla",
-    "zero_byte_segments",
+    "unpack_group_tables",
+    "zero_byte_ranges",
 ]
+
+
+# -----------------------------------------------------------------------------
+# Compact Host Cache Transfer
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _transfer_cache_ranges_kernel(
+    buffer_addresses_ptr,
+    ranges_ptr,
+    NUM_DEVICE_BUFFERS: tl.constexpr,
+    DIRECTION: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    range_id = tl.program_id(0)
+    byte_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    range_offset = range_id * 4
+    device_buffer_index = tl.load(ranges_ptr + range_offset)
+    device_offset = tl.load(ranges_ptr + range_offset + 1)
+    host_offset = tl.load(ranges_ptr + range_offset + 2)
+    num_bytes = tl.load(ranges_ptr + range_offset + 3)
+
+    device_address = tl.load(buffer_addresses_ptr + device_buffer_index)
+    host_address = tl.load(buffer_addresses_ptr + NUM_DEVICE_BUFFERS)
+    device_ptr = tl.cast(device_address + device_offset, tl.pointer_type(tl.uint8))
+    host_ptr = tl.cast(host_address + host_offset, tl.pointer_type(tl.uint8))
+    mask = byte_offsets < num_bytes
+    if DIRECTION == 0:
+        values = tl.load(device_ptr + byte_offsets, mask=mask, cache_modifier=".cg")
+        tl.store(
+            host_ptr + byte_offsets,
+            values,
+            mask=mask,
+            cache_modifier=".cs",
+        )
+    else:
+        values = tl.load(host_ptr + byte_offsets, mask=mask, cache_modifier=".cg")
+        tl.store(device_ptr + byte_offsets, values, mask=mask)
+
+
+def transfer_cache_ranges(
+    device_buffers: list[torch.Tensor],
+    host_buffer: torch.Tensor,
+    ranges: list[tuple[int, int, int, int]],
+    direction: int,
+) -> None:
+    """Copy byte ranges between device buffers and mapped Host memory.
+
+    The Host tensor is passed indirectly through its GPU-visible UVA address;
+    Triton receives only CUDA tensors containing addresses and descriptors.
+    Argument shape, dtype, and bounds validation belongs to the public
+    transport wrapper.
+
+    Args:
+        device_buffers: Contiguous device cache tensors.
+        host_buffer: Contiguous pinned CPU uint8 buffer.
+        ranges: ``(device_buffer_index, device_offset, host_offset, num_bytes)``.
+        direction: ``0`` for device-to-Host and ``1`` for Host-to-device.
+
+    Returns:
+        None; the copy is enqueued on the current device stream.
+    """
+
+    if direction not in (0, 1):
+        raise ValueError("direction must be 0 (D2H) or 1 (H2D)")
+    if not ranges:
+        return
+    device = device_buffers[0].device
+    platform = current_platform()
+    addresses = [buffer.data_ptr() for buffer in device_buffers]
+    addresses.append(platform.device_visible_data_ptr(host_buffer))
+    address_table = torch.tensor(addresses, dtype=torch.uint64, device=device)
+    range_table = torch.tensor(ranges, dtype=torch.int64, device=device)
+    block_size = 4096
+    grid = (len(ranges), triton.cdiv(max(row[3] for row in ranges), block_size))
+    _transfer_cache_ranges_kernel[grid](
+        address_table,
+        range_table,
+        NUM_DEVICE_BUFFERS=len(device_buffers),
+        DIRECTION=direction,
+        BLOCK_SIZE=block_size,
+        num_warps=8,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -62,46 +147,46 @@ __all__ = [
 
 
 @triton.jit
-def _zero_byte_segments_kernel(
+def _zero_byte_ranges_kernel(
     backing_ptr,
-    segments_ptr,
+    ranges_ptr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    segment_id = tl.program_id(0)
+    range_id = tl.program_id(0)
     byte_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    segment_offset = tl.load(segments_ptr + segment_id * 2)
-    segment_size = tl.load(segments_ptr + segment_id * 2 + 1)
+    range_offset = tl.load(ranges_ptr + range_id * 2)
+    range_size = tl.load(ranges_ptr + range_id * 2 + 1)
     tl.store(
-        backing_ptr + segment_offset + byte_offsets,
+        backing_ptr + range_offset + byte_offsets,
         0,
-        mask=byte_offsets < segment_size,
+        mask=byte_offsets < range_size,
     )
 
 
-def zero_byte_segments(backing: torch.Tensor, segments: list[tuple[int, int]]) -> None:
+def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> None:
     """Zero selected byte ranges in one contiguous cache allocation.
 
     Args:
         backing: Contiguous uint8 cache allocation.
-        segments: ``(byte_offset, byte_count)`` ranges within ``backing``.
+        ranges: ``(byte_offset, byte_count)`` rows within ``backing``.
     """
-    if not segments:
+    if not ranges:
         return
     if backing.dtype != torch.uint8 or not backing.is_contiguous():
         raise ValueError("backing must be a contiguous uint8 tensor")
     if any(
         offset < 0 or size <= 0 or offset + size > backing.numel()
-        for offset, size in segments
+        for offset, size in ranges
     ):
-        raise ValueError("segments must be non-empty ranges within backing")
+        raise ValueError("ranges must be non-empty and lie within backing")
 
-    segment_table = torch.tensor(segments, dtype=torch.int64, device=backing.device)
+    range_table = torch.tensor(ranges, dtype=torch.int64, device=backing.device)
     block_size = 1024
-    max_size = max(size for _, size in segments)
-    grid = (len(segments), triton.cdiv(max_size, block_size))
-    _zero_byte_segments_kernel[grid](
+    max_size = max(size for _, size in ranges)
+    grid = (len(ranges), triton.cdiv(max_size, block_size))
+    _zero_byte_ranges_kernel[grid](
         backing,
-        segment_table,
+        range_table,
         BLOCK_SIZE=block_size,
         num_warps=4,
     )

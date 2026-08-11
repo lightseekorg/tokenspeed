@@ -49,11 +49,12 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/scheduler/outside_event_handler.cpp
     csrc/scheduler/scheduler.cpp
 
-    csrc/cache/cache_config.cpp
-    csrc/cache/kv_cache_admission.cpp
-    csrc/cache/kv_cache_coordinator.cpp
-    csrc/cache/cache_block_ref.cpp
-    csrc/cache/forward_cache_ops.cpp
+    csrc/cache/core/cache_config.cpp
+    csrc/cache/coordinator/kv_cache_admission.cpp
+    csrc/cache/coordinator/kv_cache_coordinator.cpp
+    csrc/cache/core/cache_block_ref.cpp
+    csrc/scheduler/operations/cache.cpp
+    csrc/cache/tier/transfer_manager.cpp
 )
 
 target_include_directories(tokenspeed_scheduler_core

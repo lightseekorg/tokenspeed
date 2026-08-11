@@ -28,8 +28,8 @@ namespace tokenspeed {
 class ReqPoolAllocator;
 
 struct ReqPoolIndex {
+    // The allocator must outlive every index it creates.
     ReqPoolIndex() = default;
-    ReqPoolIndex(std::int32_t slot, ReqPoolAllocator* allocator);
 
     // Forbid Copy construct
     ReqPoolIndex(const ReqPoolIndex&) = delete;
@@ -48,6 +48,9 @@ struct ReqPoolIndex {
     std::int32_t slot_{};
 
 private:
+    friend class ReqPoolAllocator;
+
+    ReqPoolIndex(std::int32_t slot, ReqPoolAllocator* allocator);
     ReqPoolAllocator* allocator_{nullptr};
 };
 
@@ -69,7 +72,7 @@ public:
     std::int32_t AvailableSlots() const;
 
 private:
-    void deAllocate(std::int32_t slot);
+    void deallocate(std::int32_t slot);
 
     friend struct ReqPoolIndex;
 

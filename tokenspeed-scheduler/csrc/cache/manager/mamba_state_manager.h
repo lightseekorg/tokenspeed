@@ -18,31 +18,22 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "cache/cache_config.h"
+#pragma once
 
-#include <stdexcept>
+#include <cstdint>
+
+#include "cache/manager/swa_manager.h"
 
 namespace tokenspeed {
 
-void PagedCacheGroupConfig::Validate() const {
-    if (group_id.empty()) {
-        throw std::invalid_argument("PagedCacheGroupConfig: group_id must be non-empty");
-    }
-    if (rows_per_page <= 0) {
-        throw std::invalid_argument("PagedCacheGroupConfig: rows_per_page must be > 0");
-    }
-    if (entry_stride_tokens <= 0) {
-        throw std::invalid_argument("PagedCacheGroupConfig: entry_stride_tokens must be > 0");
-    }
-    if (total_pages < 1) {
-        throw std::invalid_argument("PagedCacheGroupConfig: total_pages must include the null page");
-    }
-    if (cache_blocks_per_lcm_block <= 0) {
-        throw std::invalid_argument("PagedCacheGroupConfig: cache_blocks_per_lcm_block must be > 0");
-    }
-    if (retention == Retention::SlidingWindow && (!sliding_window_tokens || *sliding_window_tokens <= 0)) {
-        throw std::invalid_argument("PagedCacheGroupConfig: sliding_window_tokens must be > 0 for sliding groups");
-    }
-}
+// GDN/mamba semantics: hit the nearest P-boundary snapshot and retain only the
+// request's live state page. Completed pages remain cache-owned after the
+// request table releases them.
+class MambaStateManager : public SwaManager {
+public:
+    explicit MambaStateManager(std::int32_t cache_block_tokens, std::int32_t cache_blocks_per_lcm_block = 1,
+                               std::uint32_t group_id = 0)
+        : SwaManager(cache_block_tokens, cache_blocks_per_lcm_block, /*sliding_window=*/2, group_id) {}
+};
 
 }  // namespace tokenspeed

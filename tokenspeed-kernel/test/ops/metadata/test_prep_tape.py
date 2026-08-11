@@ -22,6 +22,7 @@ def test_tape_matches_eager_chain():
 
     tape = PrepTape(dev)
     tape.fill(idxbuf, n=Reg.BS, value=-1)
+    tape.barrier()
     tape.gather(idxbuf, table, gsrc, n=Reg.REAL_BS, oob_value=-7)
     tape.copy(qsl, cached, n=Reg.TOKENS)
     tape.copy2d(twod, srcrows, rows=Reg.BS, src_cols=16, pad_value=-1)
@@ -62,6 +63,28 @@ def test_finalized_tape_rejects_new_ops():
     tape.finalize()
     with pytest.raises(RuntimeError):
         tape.fill(buf, n=8, value=2)
+    with pytest.raises(RuntimeError):
+        tape.barrier()
+
+
+def test_dependent_source_write_precedes_gather_read():
+    """Exercise a cross-program RAW hazard, not only two writes to dst."""
+    dev = "cuda"
+    n = 1 << 18
+    src = torch.zeros(n, dtype=torch.int32, device=dev)
+    idx = torch.tensor([n - 1], dtype=torch.int32, device=dev)
+    dst = torch.zeros(1, dtype=torch.int32, device=dev)
+
+    tape = PrepTape(dev)
+    tape.fill(src, n=n, value=123)
+    tape.barrier()
+    tape.gather(dst, src, idx, n=1)
+    tape.finalize()
+    assert isinstance(tape._descs, tuple) and len(tape._descs) == 2
+
+    tape.run({})
+    torch.cuda.synchronize()
+    assert dst.item() == 123
 
 
 def test_state_pages_matches_reference():
@@ -72,8 +95,8 @@ def test_state_pages_matches_reference():
     seq_lens = torch.tensor(
         [1, 63, 64, 65, 128, 129, 200, 384], dtype=torch.int32, device=dev
     )
-    state_in = torch.zeros(BS, dtype=torch.int32, device=dev)
-    state_out = torch.zeros(BS, dtype=torch.int32, device=dev)
+    state_in = torch.zeros(BS + 4, dtype=torch.int32, device=dev)
+    state_out = torch.zeros(BS + 4, dtype=torch.int32, device=dev)
 
     tape = PrepTape(dev)
     tape.state_pages(
@@ -85,7 +108,10 @@ def test_state_pages_matches_reference():
         max_slots=SLOTS,
         page_size=P,
     )
+    tape.filltail(state_in, live=Reg.BS, total=BS + 4, value=-1)
+    tape.filltail(state_out, live=Reg.BS, total=BS + 4, value=-1)
     tape.finalize()
+    assert isinstance(tape._descs, torch.Tensor)
     tape.run({Reg.BS: BS, Reg.PTR0: rows, Reg.PTR1: seq_lens})
     torch.cuda.synchronize()
 
@@ -98,5 +124,7 @@ def test_state_pages_matches_reference():
     ref_in = rows.gather(1, in_slots.unsqueeze(1)).squeeze(1)
     ref_in = torch.where(before > 0, ref_in, torch.zeros_like(ref_in))
     ref_out = rows.gather(1, out_slots.unsqueeze(1)).squeeze(1)
-    assert torch.equal(state_in, ref_in.int())
-    assert torch.equal(state_out, ref_out.int())
+    assert torch.equal(state_in[:BS], ref_in.int())
+    assert torch.equal(state_out[:BS], ref_out.int())
+    assert (state_in[BS:] == -1).all()
+    assert (state_out[BS:] == -1).all()

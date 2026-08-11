@@ -29,7 +29,7 @@
 #include <utility>
 #include <vector>
 
-#include "cache/cache_block_ref.h"
+#include "cache/core/block_table.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -47,7 +47,7 @@ inline constexpr CacheNamespaceId kDefaultCacheNamespaceId = 0;
 
 struct CacheKey {
     CacheNamespaceId namespace_id{kDefaultCacheNamespaceId};
-    GroupId group_id{0};
+    std::uint32_t group_id{0};
     ContentHash content_hash{};
     // CacheBlock position within the scheduler's enclosing P-token hash page.
     std::int32_t cache_block_offset{0};
@@ -58,7 +58,7 @@ struct CacheKey {
 struct CacheKeyHash {
     std::size_t operator()(const CacheKey& key) const noexcept {
         std::size_t hash = std::hash<CacheNamespaceId>{}(key.namespace_id);
-        const std::size_t group_hash = std::hash<GroupId>{}(key.group_id);
+        const std::size_t group_hash = std::hash<std::uint32_t>{}(key.group_id);
         hash ^= group_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
         const std::size_t content_hash = std::hash<ContentHash>{}(key.content_hash);
         hash ^= content_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
@@ -68,37 +68,16 @@ struct CacheKeyHash {
 };
 
 struct KvCacheSpec {
-    AttnKind kind;
+    AttnKind kind{AttnKind::kFull};
     // Only kSlidingWindow uses this value. Mamba's one-checkpoint lookback is
     // an internal Manager policy rather than a model window.
-    std::int32_t sliding_window;
+    std::int32_t sliding_window{0};
     // Number of this group's CacheBlocks packed into one physical LCM block.
     // It affects placement only, not the scheduler-wide prefix boundary P.
-    std::int32_t cache_blocks_per_lcm_block;
+    std::int32_t cache_blocks_per_lcm_block{1};
     // Tokens represented by one CacheBlock in this group. Zero keeps the
     // legacy meaning: use the coordinator-wide logical granularity P.
     std::int32_t cache_block_tokens{0};
-};
-
-// Per-request logical-page -> physical-page mapping.
-class BlockTable {
-public:
-    std::span<const CacheBlockRef> Blocks() const noexcept { return blocks_; }
-    std::int32_t NumBlocks() const { return static_cast<std::int32_t>(blocks_.size()); }
-    std::int32_t AvailableTokens() const { return available_tokens_; }
-
-    CacheBlockRef EvictToNull(std::int32_t index) {
-        _assert(0 <= index && index < static_cast<std::int32_t>(blocks_.size()), "EvictToNull index out of range");
-        return std::exchange(blocks_[static_cast<std::size_t>(index)], {});
-    }
-
-private:
-    friend class KvCacheManager;
-
-    std::vector<CacheBlockRef> blocks_{};
-    // Unconsumed capacity at the logical tail. This may span multiple blocks
-    // when admission preallocates a later decode/MTP step.
-    std::int32_t available_tokens_{0};
 };
 
 // Per-group input for one admission. page_hashes is the request's cumulative
@@ -121,17 +100,6 @@ struct GroupDemand {
     std::int32_t materialized_suffix_start{-1};
 };
 
-// LCM ownership ids for scheduler accounting/debugging. Kernel-facing page
-// tables must instead go through KvCacheManager::BlockTablePageIds().
-inline std::vector<std::int32_t> BlockTableLcmBlockIds(const BlockTable& table) {
-    std::vector<std::int32_t> ids;
-    ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
-    for (const CacheBlockRef& block_ref : table.Blocks()) {
-        ids.push_back(block_ref ? block_ref->Location().lcm_block_id : 0);
-    }
-    return ids;
-}
-
 struct PrefixMatch {
     std::vector<CacheBlockRef> blocks{};
 
@@ -150,9 +118,9 @@ struct GroupPrefixProbe {
     std::vector<std::uint8_t> hits{};
 };
 
-// Pinned source/destination pages for one asynchronous cache transfer.
+// Pinned source/destination blocks for one asynchronous cache transfer.
 struct BlockTransfer {
-    GroupId group_id{0};
+    std::uint32_t group_id{0};
     CacheBlockRef source;
     CacheBlockRef destination;
 };

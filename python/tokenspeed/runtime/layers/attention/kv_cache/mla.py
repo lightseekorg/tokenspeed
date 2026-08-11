@@ -171,8 +171,8 @@ class MLATokenToKVPool(CachePool):
             return [[start_idx + layer_id] for layer_id in range(self.layer_num)]
 
     def get_key_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         buffer = self.kv_buffer[layer_id]
         if buffer is None:
             raise ValueError(f"layer {layer_id} is a KDA state layer")
@@ -184,8 +184,8 @@ class MLATokenToKVPool(CachePool):
             return buffer
 
     def get_value_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         buffer = self.kv_buffer[layer_id]
         if buffer is None:
             raise ValueError(f"layer {layer_id} is a KDA state layer")

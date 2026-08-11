@@ -158,7 +158,7 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
 
     assert actual.shape == (num_tokens, latent_size)
     assert actual.dtype == torch.bfloat16
-    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-2)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])
@@ -266,7 +266,75 @@ def test_gluon_grouped_a16w4_situ_matches_kimi_k3_shape_gfx950() -> None:
         situ_beta=4.0,
         situ_linear_beta=25.0,
     )
-    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-2)
+
+
+def test_grouped_atomic_combine_matches_partial_reduction_gfx950(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The FP32 atomic stage-2 epilogue must match the default partials path.
+
+    ``GROUPED_ATOMIC_COMBINE_MAX_TOKENS`` is 0 because atomics are slower on
+    every reachable batch, so this is the only coverage the atomic branch gets.
+    Keep it: the constant exists so the crossover can be re-measured, and that
+    is only safe while the branch is known to be correct.
+    """
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import situ_grouped
+
+    generator = torch.Generator(device="cuda").manual_seed(20260809)
+    num_tokens = 12
+    num_experts = 8
+    top_k = 4
+    latent_size = 3584
+    intermediate_size = 512
+    raw = make_mxfp4_moe_weights(num_experts, latent_size, intermediate_size, generator)
+    hidden_states = (
+        torch.randn(
+            (num_tokens, latent_size),
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        * 0.1
+    )
+    topk_weights, topk_ids = make_round_robin_topk(num_tokens, num_experts, top_k)
+
+    def run() -> torch.Tensor:
+        return situ_grouped.gluon_a16w4_situ_grouped_ep_gfx950(
+            hidden_states,
+            raw["w13_weight"],
+            raw["w13_scale"],
+            raw["w2_weight"],
+            raw["w2_scale"],
+            topk_weights,
+            topk_ids,
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+            expert_start=0,
+        )
+
+    monkeypatch.setattr(
+        situ_grouped, "GROUPED_ATOMIC_COMBINE_MAX_TOKENS", 0, raising=True
+    )
+    partials = run()
+    monkeypatch.setattr(
+        situ_grouped, "GROUPED_ATOMIC_COMBINE_MAX_TOKENS", num_tokens, raising=True
+    )
+    atomic = run()
+
+    expected = a16w4_mxfp4_moe_reference(
+        hidden_states,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_ids,
+        topk_weights,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+    torch.testing.assert_close(partials, expected, atol=2e-4, rtol=2e-2)
+    torch.testing.assert_close(atomic, expected, atol=2e-4, rtol=2e-2)
 
 
 def _make_local_ep_module(
@@ -385,7 +453,7 @@ def test_gluon_grouped_device_align_localizes_global_ep_routes_gfx950() -> None:
         situ_linear_beta=25.0,
     )
 
-    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(actual, expected, atol=3e-4, rtol=3e-2)
 
 
 @pytest.mark.parametrize("top_k", [1, 4])
@@ -461,7 +529,7 @@ def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
         situ_linear_beta=25.0,
     )
 
-    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(actual, expected, atol=3e-4, rtol=3e-2)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
@@ -526,4 +594,4 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
         captured = apply()
     graph.replay()
     torch.cuda.synchronize()
-    torch.testing.assert_close(captured, eager, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(captured, eager, atol=3e-4, rtol=3e-2)

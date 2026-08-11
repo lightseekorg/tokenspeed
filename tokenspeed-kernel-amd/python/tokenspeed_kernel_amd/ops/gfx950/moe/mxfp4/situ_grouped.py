@@ -44,6 +44,17 @@ MXFP4_GROUP_SIZE = 32
 _MXFP4_GROUP_SIZE_GL = gl.constexpr(32)
 GROUPED_BLOCK_M = 64
 GROUPED_FUSED_ALIGN_MAX_ROUTES = 128
+# Atomic combine's cost hardly depends on the batch size at all.  The list of
+# (token, expert) pairs is padded out to a full GROUPED_BLOCK_M-row block per
+# expert, so with 112 experts it is ~7168 rows even for a single token.
+# Every one of those rows issues its atomics, whether or not it holds real work
+# given padding is masked off by pointing the address out of bounds, which does
+# not skip the instruction.  A 16-token batch therefore issues 25.7M atomics to
+# perform 0.92M useful ones.
+#
+# The constant stays instead of deleting the atomic path outright, so the
+# comparison is easy to redo if the padding ever stops dominating.
+GROUPED_ATOMIC_COMBINE_MAX_TOKENS = 0
 
 
 @gluon.jit
@@ -808,11 +819,7 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
         num_warps=s1_warps,
     )
 
-    # Atomic combine wins in decode, where only a handful of local routes
-    # contend.  Prefill retains deterministic BF16 partials + one FP32 masked
-    # reduction; measurements show atomics lose once thousands of tokens hit
-    # the same output surface.
-    fuse_combine = num_tokens <= 16
+    fuse_combine = num_tokens <= GROUPED_ATOMIC_COMBINE_MAX_TOKENS
     if fuse_combine:
         stage2_out = torch.zeros(
             (num_tokens, hidden_dim),

@@ -24,8 +24,8 @@
 #include <string>
 #include <vector>
 
-#include "cache/block_pool.h"
-#include "cache/full_attn_manager.h"
+#include "cache/core/block_pool.h"
+#include "cache/manager/full_attn_manager.h"
 #include "scheduler/page_hasher.h"
 
 namespace tokenspeed::test {
@@ -34,7 +34,7 @@ namespace {
 using token_span = std::span<const std::int32_t>;
 
 // A real key from page_hasher.h, not a synthetic placeholder.
-CacheKey RealKey(const std::vector<std::int32_t>& tokens, GroupId group_id) {
+CacheKey RealKey(const std::vector<std::int32_t>& tokens, std::uint32_t group_id) {
     std::vector<token_span> pages = {token_span(tokens.data(), tokens.size())};
     std::vector<std::string> hashes = ComputePagedHashes(pages, "");
     return CacheKey{.group_id = group_id, .content_hash = std::move(hashes.front())};
@@ -537,13 +537,13 @@ TEST(FullAttnManagerLcmTest, CrossGroupRebindRequiresErasingEveryChildEntry) {
     first_group.Free(table);
 
     ASSERT_TRUE(first_group.EvictCachedBlock(pool, CacheBlockLocation{.lcm_block_id = 1, .slot_index = 0}));
-    ASSERT_EQ(pool.BoundGroup(1), std::optional<GroupId>{0});
+    ASSERT_EQ(pool.BoundGroup(1), std::optional<std::uint32_t>{0});
     ASSERT_TRUE(first_group.EvictCachedBlock(pool, CacheBlockLocation{.lcm_block_id = 1, .slot_index = 1}));
     ASSERT_EQ(pool.BoundGroup(1), std::nullopt);
 
     CacheBlockRef rebound = pool.AcquireBlock(/*group_id=*/1, /*cache_blocks_per_lcm_block=*/8);
     ASSERT_TRUE(rebound);
-    EXPECT_EQ(pool.BoundGroup(1), std::optional<GroupId>{1});
+    EXPECT_EQ(pool.BoundGroup(1), std::optional<std::uint32_t>{1});
 }
 
 TEST(FullAttnManagerLcmTest, DuplicateRegistrationUpdatesEpochWithoutReorderingEntries) {

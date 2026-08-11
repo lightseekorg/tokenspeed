@@ -25,10 +25,10 @@
 #include <string>
 #include <vector>
 
-#include "cache/block_pool.h"
-#include "cache/cache_types.h"
+#include "cache/core/block_pool.h"
+#include "cache/core/cache_types.h"
 #include "scheduler/page_hasher.h"
-#include "cache/swa_manager.h"
+#include "cache/manager/swa_manager.h"
 
 namespace tokenspeed::test {
 namespace {
@@ -44,7 +44,7 @@ std::vector<std::int32_t> BlockIds(const std::vector<CacheBlockRef>& refs) {
 
 using token_span = std::span<const std::int32_t>;
 
-CacheKey RealKey(const std::vector<std::int32_t>& tokens, GroupId group_id) {
+CacheKey RealKey(const std::vector<std::int32_t>& tokens, std::uint32_t group_id) {
     std::vector<token_span> pages = {token_span(tokens.data(), tokens.size())};
     std::vector<std::string> hashes = ComputePagedHashes(pages, "");
     return CacheKey{.group_id = group_id, .content_hash = std::move(hashes.front())};
@@ -460,6 +460,21 @@ TEST(SwaManagerTest, ReclaimExpiredFreedCachedPageStaysPrefixReusable) {
     EXPECT_FALSE(table.Blocks()[0]);
     CacheBlockRef hit = mgr.Match(pool, std::vector<CacheKey>{h0}, 0, 1).blocks.front();
     EXPECT_EQ(hit->Location().lcm_block_id, p0);
+}
+
+TEST(SwaManagerTest, WriteBackAckMakesSlidCachedPageReclaimable) {
+    BlockPool pool(2);
+    SwaManager mgr(/*cache_block_tokens=*/4, /*sliding_window=*/4);
+    BlockTable table;
+    ASSERT_TRUE(mgr.Acquire(pool, table, 4));
+    mgr.CacheFullBlocks(pool, table, std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0)});
+    CacheBlockRef writeback_pin = table.Blocks().front();
+    const CacheBlockLocation location = writeback_pin->Location();
+
+    EXPECT_TRUE(mgr.ReclaimableBlockLocationsAt(table, /*num_computed_tokens=*/7, {}).empty());
+    EXPECT_TRUE(mgr.EvictableBlockLocationsAfterReleasing(pool, std::vector{location}).empty());
+    EXPECT_EQ(mgr.ReclaimableBlockLocationsAt(table, /*num_computed_tokens=*/7, std::vector{location}),
+              std::vector{location});
 }
 
 TEST(SwaManagerTest, ReclaimExpiredLeavesAvailableCapacityUnchanged) {
