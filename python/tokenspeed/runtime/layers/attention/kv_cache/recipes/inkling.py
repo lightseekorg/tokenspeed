@@ -219,7 +219,8 @@ def _workspace_bytes(
     )
     conv_dim = inkling_conv_total_dim(text_config, attn_config.attn_tp_size)
     element_size = torch.bfloat16.itemsize
-    return num_layers * rows * ring_rows * conv_dim * element_size
+    pending_bytes = rows * torch.bool.itemsize
+    return num_layers * rows * ring_rows * conv_dim * element_size + pending_bytes
 
 
 def prepare_inkling_cache(

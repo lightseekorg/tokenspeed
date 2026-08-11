@@ -33,6 +33,7 @@ from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
     CachePDPageManifest,
     CacheTransferContract,
     CacheTransferSchema,
+    build_cache_fields_by_producer_step,
     build_cache_page_manifest,
     build_cache_transfer_contract,
     build_cache_transfer_schema,
@@ -679,6 +680,25 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
             assert partition.global_extent == 4
         else:
             assert partition is None
+
+
+def test_producer_schedule_groups_draft_fields_in_the_final_step() -> None:
+    spec = _group_spec("history", "history", "full_suffix")
+    layout = _contract(
+        (spec,),
+        tuple(
+            _field("history", f"layer.{layer_id}.kv", offset=layer_id)
+            for layer_id in range(4)
+        ),
+    )
+
+    schedule = build_cache_fields_by_producer_step(layout.plan, num_target_layers=2)
+
+    assert schedule.fields_by_step == (
+        ("layer.0.kv",),
+        ("layer.1.kv",),
+        ("layer.2.kv", "layer.3.kv"),
+    )
 
 
 if __name__ == "__main__":

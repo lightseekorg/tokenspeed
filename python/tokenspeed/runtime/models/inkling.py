@@ -404,7 +404,14 @@ def _sconv_apply(
         group_id=checkpoint_group,
         buffers=checkpoint_buffers,
     )
-    return inkling_ring_sconv(
+    if md.remote_restore_mask is not None:
+        backend.restore_shortconv_endpoint(
+            state,
+            checkpoint_buffers,
+            md,
+            checkpoint_group,
+        )
+    y = inkling_ring_sconv(
         x,
         weight,
         state,
@@ -420,6 +427,16 @@ def _sconv_apply(
         page_size=backend.conv_columns["block_tokens"],
         enable_pdl=pdl_enabled(),
     )
+    if md.num_extends > 0 and backend.conv_columns.get("pd_endpoint_snapshots", False):
+        # The fused kernel already publishes aligned boundaries. CachePD also
+        # needs the exact prompt endpoint, which may lie inside the last page.
+        backend.publish_shortconv_endpoint(
+            state,
+            checkpoint_buffers,
+            md,
+            checkpoint_group,
+        )
+    return y
 
 
 class InklingRelLogitsProj(nn.Module):
@@ -629,6 +646,9 @@ class InklingAttention(nn.Module):
             ctx,
             out_cache_loc,
             rel_logits=rel_logits.contiguous(),
+            # Inkling's readiness boundary is after both hidden-state sconv
+            # writes below, not immediately after attention KV publication.
+            record_kv_cache=False,
         )
         output, _ = self.wo_ud(attn_output)
         return output
@@ -1085,6 +1105,11 @@ class InklingDecoderLayer(nn.Module):
             mlp_out = self.mlp(mlp_input)
         if self.mlp_sconv is not None:
             mlp_out = self.mlp_sconv(mlp_out, ctx)
+        if ctx.attn_backend.enable_layerwise_cache_ready:
+            mlp_out = ctx.attn_backend.record_layer_cache_ready(
+                mlp_out,
+                ctx.forward_mode,
+            )
         return mlp_out, residual
 
 
@@ -1315,6 +1340,10 @@ class InklingVisionTower(nn.Module):
         super().__init__()
         assert config.vision_encoder_type == "hmlp", config.vision_encoder_type
         self.vision_encoder = InklingHMLPPatchEncoder(config)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.vision_encoder.parameters()).dtype
 
     def forward(self, vision_features: torch.Tensor) -> torch.Tensor:
         return self.vision_encoder(vision_features)

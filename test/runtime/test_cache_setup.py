@@ -356,13 +356,14 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
     draft_model_config = SimpleNamespace(
         num_attention_layers=1, hf_config=SimpleNamespace()
     )
-    draft_attn_config = _mha_config()
+    target_attn_config = replace(target_config(), pd_disaggregation_enabled=True)
+    draft_attn_config = replace(_mha_config(), pd_disaggregation_enabled=True)
 
     setup = prepare_cache_setup(
         family=family,
         server_args=SimpleNamespace(max_total_tokens=None),
         model_config=model_config,
-        attn_config=target_config(),
+        attn_config=target_attn_config,
         draft_model_config=draft_model_config,
         draft_attn_config=draft_attn_config,
         cache_budget_bytes=65_536,
@@ -395,7 +396,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
     )
     target_pool = create_cache_pool(
         target_spec,
-        target_config(),
+        target_attn_config,
         num_layers=2,
         rank=0,
         enable_memory_saver=False,
@@ -514,30 +515,10 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
         _resolve_heterogeneous_draft_family,
     )
 
-    assert (
-        _resolve_heterogeneous_draft_family(
-            "mla", "mha", pd_disaggregation_enabled=False
-        )
-        == "mha"
-    )
-    assert (
-        _resolve_heterogeneous_draft_family(
-            "kimi_k3", "mla", pd_disaggregation_enabled=False
-        )
-        == "mla"
-    )
+    assert _resolve_heterogeneous_draft_family("mla", "mha") == "mha"
+    assert _resolve_heterogeneous_draft_family("kimi_k3", "mla") == "mla"
     with pytest.raises(RuntimeError, match="require an MHA draft"):
-        _resolve_heterogeneous_draft_family(
-            "mha", "mla", pd_disaggregation_enabled=False
-        )
-    with pytest.raises(RuntimeError, match="PD disaggregation does not support"):
-        _resolve_heterogeneous_draft_family(
-            "kimi_k3", "mla", pd_disaggregation_enabled=True
-        )
-    with pytest.raises(RuntimeError, match="PD disaggregation does not support"):
-        _resolve_heterogeneous_draft_family(
-            "msa", "mha", pd_disaggregation_enabled=True
-        )
+        _resolve_heterogeneous_draft_family("mha", "mla")
     with pytest.raises(RuntimeError, match="support ordinary drafts only"):
         _create_draft_components(
             server_args=None,
@@ -550,6 +531,45 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
             is_hybrid_linear=True,
             is_kda=False,
             is_inkling=False,
+        )
+
+
+def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tokenspeed.runtime.layers.attention.registry as registry
+
+    monkeypatch.setattr(
+        registry,
+        "is_deepseek_v4",
+        lambda config: getattr(config, "is_deepseek_v4", False),
+    )
+    server_args = SimpleNamespace(
+        attention_backend=None,
+        drafter_attention_backend=None,
+        disaggregation_mode="prefill",
+    )
+    target = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=("LlamaForCausalLM",),
+            is_deepseek_v4=False,
+        )
+    )
+    draft = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=("DeepseekV4ForCausalLMNextN",),
+            is_deepseek_v4=True,
+        )
+    )
+
+    with pytest.raises(NotImplementedError, match="target-only"):
+        registry.create_attn_components(
+            server_args,
+            target,
+            gpu_id=0,
+            rank=0,
+            gpu_memory=0,
+            draft_model_config=draft,
         )
 
 

@@ -77,8 +77,6 @@ def _ordinary_cache_family(config: BaseAttnConfig | None) -> CacheModelFamily | 
 def _resolve_heterogeneous_draft_family(
     target_family: CacheModelFamily,
     draft_family: CacheModelFamily | None,
-    *,
-    pd_disaggregation_enabled: bool,
 ) -> CacheModelFamily | None:
     """Validate and return the supported heterogeneous draft family."""
     if draft_family is None:
@@ -88,22 +86,12 @@ def _resolve_heterogeneous_draft_family(
             raise RuntimeError(
                 "Kimi-K3 unified cache currently requires an ordinary MLA draft view"
             )
-        if pd_disaggregation_enabled:
-            raise RuntimeError(
-                "PD disaggregation does not support heterogeneous target/draft "
-                "cache families"
-            )
         return draft_family
     if target_family not in _ORDINARY_CACHE_FAMILIES or draft_family == target_family:
         return None
     if draft_family != "mha":
         raise RuntimeError(
             "heterogeneous ordinary cache views currently require an MHA draft"
-        )
-    if pd_disaggregation_enabled:
-        raise RuntimeError(
-            "PD disaggregation does not support heterogeneous target/draft "
-            "cache families"
         )
     return draft_family
 
@@ -463,7 +451,14 @@ def _create_hybrid_linear_attn_backend(
 
 
 def _wrap_inkling_backend(
-    inner, text_config, attn_config, *, num_layers, is_draft, conv_columns
+    inner,
+    text_config,
+    attn_config,
+    *,
+    num_layers,
+    is_draft,
+    conv_columns,
+    enable_layerwise_cache_ready=False,
 ):
     """Wrap a dense backend with the engine-side Inkling sconv state pool.
 
@@ -506,6 +501,7 @@ def _wrap_inkling_backend(
         conv_columns=conv_columns,
         spec_num_tokens=getattr(attn_config, "speculative_num_draft_tokens", 1),
         is_draft=is_draft,
+        enable_layerwise_cache_ready=enable_layerwise_cache_ready,
     )
     return backend, conv_pool
 
@@ -522,6 +518,15 @@ def _inkling_conv_columns(pool, text_config):
             "kvconv": block_tokens,
             "hiddenconv": block_tokens,
         },
+        "pd_endpoint_snapshots": all(
+            spec.transfer_policy == "latest_snapshot"
+            for spec in pool.paged_cache_group_specs
+            if spec.group_id in ("kvconv", "hiddenconv")
+        )
+        and any(
+            spec.group_id in ("kvconv", "hiddenconv")
+            for spec in pool.paged_cache_group_specs
+        ),
     }
     logger.info(
         "Inkling ShortConv boundary checkpoints: P=%d, groups=%s",
@@ -630,6 +635,10 @@ def _create_target_components(
         num_layers=text_config.num_hidden_layers,
         is_draft=False,
         conv_columns=_inkling_conv_columns(pool, text_config),
+        enable_layerwise_cache_ready=(
+            server_args.disaggregation_mode == "prefill"
+            and getattr(server_args, "disaggregation_layerwise_interval", 0) > 0
+        ),
     )
     probe_dir = os.environ.get("INKLING_POOL_PROBE_DIR")
     if probe_dir:
@@ -791,6 +800,9 @@ def create_attn_components(
         if draft_model_config is not None
         else []
     )
+    is_inkling_draft_model = any(
+        architecture in _INKLING_ARCHITECTURES for architecture in draft_architectures
+    )
     is_dspark_draft_model = any(
         architecture == "DeepseekV4ForCausalLMDSpark"
         for architecture in draft_architectures
@@ -805,10 +817,11 @@ def create_attn_components(
         server_args.attention_backend = "deepseek_v4"
     if is_deepseek_v4_draft_model:
         server_args.drafter_attention_backend = "deepseek_v4"
-    if (is_deepseek_v4_model or is_deepseek_v4_draft_model) and (
-        server_args.disaggregation_mode in ("prefill", "decode")
-    ):
-        raise NotImplementedError("DeepSeek V4 PD is not supported")
+        if server_args.disaggregation_mode in ("prefill", "decode"):
+            raise NotImplementedError(
+                "DeepSeek V4 PD supports target-only decoding; a DeepSeek V4 "
+                "draft cache is not transferable"
+            )
     if is_hybrid_linear:
         # GDN (Qwen3.5) / KDA (Kimi-K3) hybrid models always need
         # hybrid_linear_attn. Save the user's original choice for the
@@ -826,10 +839,18 @@ def create_attn_components(
     config = _create_attn_config(server_args, model_config)
     if is_deepseek_v4_model:
         config.sliding_window_tokens = int(model_config.hf_config.sliding_window)
-    if is_inkling and server_args.disaggregation_mode in ("prefill", "decode"):
-        raise NotImplementedError("Inkling PD is not supported")
-    if isinstance(config, MSAConfig) and config.pd_disaggregation_enabled:
-        raise NotImplementedError("MSA PD is not supported")
+    if (
+        (is_inkling or is_inkling_draft_model)
+        and server_args.disaggregation_mode in ("prefill", "decode")
+        and (
+            draft_model_config is not None
+            or getattr(server_args, "speculative_algorithm", None) is not None
+        )
+    ):
+        raise NotImplementedError(
+            "Inkling PD supports target-only decoding; speculative/draft "
+            "ShortConv checkpoint transfer is not implemented"
+        )
     target_text_config = getattr(
         model_config.hf_config, "text_config", model_config.hf_config
     )
@@ -908,11 +929,6 @@ def create_attn_components(
     heterogeneous_draft_family = _resolve_heterogeneous_draft_family(
         cache_family,
         draft_cache_family,
-        pd_disaggregation_enabled=config.pd_disaggregation_enabled
-        or (
-            draft_attn_config is not None
-            and draft_attn_config.pd_disaggregation_enabled
-        ),
     )
     cache_memory = profile_available_cache_memory_bytes(
         attn_config=config,

@@ -3893,11 +3893,12 @@ class DeepseekV4Attention(nn.Module):
         else:
             raise RuntimeError(f"Unsupported DeepSeek V4 forward mode: {forward_mode}")
         with nvtx_range(f"{profile_prefix}_output_proj"):
-            return self._project_attention_output(
+            output = self._project_attention_output(
                 attn_output,
                 positions,
                 cos_sin_cache,
             )
+        return ctx.attn_backend.record_layer_cache_ready(output, forward_mode)
 
 
 class DeepseekV4DecoderLayer(nn.Module):

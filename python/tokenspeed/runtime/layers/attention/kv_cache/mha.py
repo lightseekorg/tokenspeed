@@ -141,14 +141,6 @@ class MHATokenToKVPool(CachePool):
             ).view(-1, self.head_num, self.head_dim)
             for layer_id in range(self.layer_num)
         ]
-        aliased = len({buffer.data_ptr() for buffer in self.k_buffer}) < len(
-            self.k_buffer
-        ) or len({buffer.data_ptr() for buffer in self.v_buffer}) < len(self.v_buffer)
-        if aliased and self._pd_disaggregation_enabled:
-            raise RuntimeError(
-                "aliased/sliding MHA CachePD support is deferred to a "
-                "model-support follow-up. Set disaggregation_mode='null'."
-            )
         logger.info(
             "KV layout: one buffer with %d per-layer K/V views",
             self.layer_num,

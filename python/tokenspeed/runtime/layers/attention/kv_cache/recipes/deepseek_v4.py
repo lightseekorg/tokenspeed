@@ -20,6 +20,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     solve_cache_layout,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    apply_pd_transfer_policies,
+)
 
 _LOGICAL_BLOCK_TOKENS = 256
 _MAX_PADDING_FRACTION = 2.0
@@ -208,6 +211,18 @@ def prepare_deepseek_v4_cache(
     overlap_schedule_depth: int,
 ):
     """Build target and draft cache specs for DeepSeek V4."""
+    pd_enabled = bool(attn_config.pd_disaggregation_enabled)
+    if pd_enabled and (
+        getattr(server_args, "speculative_algorithm", None) is not None
+        or draft_model_config is not None
+        or draft_attn_config is not None
+        or decode_input_tokens != 1
+    ):
+        raise NotImplementedError(
+            "DeepSeek V4 PD supports target-only decoding; speculative/MTP "
+            "cache transfer is not implemented"
+        )
+
     # Deferred: setup.py imports this recipe at module load.
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
         CachePoolSpec,
@@ -281,6 +296,8 @@ def prepare_deepseek_v4_cache(
             decode_input_tokens=decode_input_tokens,
         )
     )
+    if pd_enabled:
+        specs = tuple(apply_pd_transfer_policies(specs))
     max_packing = max(packing.values())
     token_limit = configured_token_limit(server_args)
     upper_bound = (

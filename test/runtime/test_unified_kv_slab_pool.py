@@ -295,13 +295,39 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             )
         self.assertNotEqual(pool.k_buffer[0].data_ptr(), pool.k_buffer[6].data_ptr())
 
-    def test_guard_raises_on_pd_with_aliased_plan(self):
-        with self.assertRaisesRegex(
-            RuntimeError,
-            r"aliased/sliding MHA CachePD support is deferred"
-            r".*disaggregation_mode='null'",
-        ):
-            self._pool(pd_disaggregation_enabled=True)
+    def test_aliased_sliding_plan_publishes_one_typed_pd_arena(self):
+        from cache_pool_test_utils import make_layer_group_ids
+
+        from tokenspeed.runtime.pd.cache_protocol import (
+            build_pool_cache_transfer_contract,
+        )
+
+        group_ids = make_layer_group_ids(
+            layer_num=len(GPT_OSS_LAYER_TYPES),
+            layer_types=GPT_OSS_LAYER_TYPES,
+            sliding_window_tokens=128,
+        )
+        specs = _real_spec().build_paged_cache_group_specs(
+            layer_types=GPT_OSS_LAYER_TYPES,
+            group_ids=group_ids,
+            sliding_window_tokens=128,
+            page_size=16,
+            pd_disaggregation_enabled=True,
+        )
+        pool = self._pool(
+            layer_group_ids=group_ids,
+            paged_cache_group_specs=specs,
+        )
+
+        layout, base_addr = build_pool_cache_transfer_contract(pool)
+
+        self.assertTrue(pool.supports_disaggregation)
+        self.assertEqual(base_addr, pool.buffer.data_ptr())
+        self.assertEqual(layout.plan, pool.plan)
+        groups = {spec.retention: spec for spec in layout.group_specs}
+        self.assertEqual(set(groups), {"full_history", "sliding_window"})
+        self.assertIsNone(groups["full_history"].sliding_window_tokens)
+        self.assertEqual(groups["sliding_window"].sliding_window_tokens, 128)
 
     def test_constructor_without_specs_publishes_no_contract(self):
         # The recipe is the single source of group specs; a pool constructed

@@ -303,6 +303,20 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._cuda_graph_query_start_by_tokens_per_req: dict[int, torch.Tensor] = {}
         self._cuda_graph_token_to_req_by_tokens_per_req: dict[int, torch.Tensor] = {}
 
+    def record_layer_cache_ready(
+        self,
+        hidden_states: torch.Tensor,
+        forward_mode: ForwardMode,
+    ) -> torch.Tensor:
+        """Publish readiness after V4's model-local cache writers complete."""
+        if (
+            getattr(self, "step_counter", None) is not None
+            and not forward_mode.is_decode()
+            and not forward_mode.is_idle()
+        ):
+            self.step_counter.record_cache()
+        return hidden_states
+
     def _configure_cache_group_contract(
         self,
         paged_cache_group_specs=(),

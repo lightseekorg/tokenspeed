@@ -76,6 +76,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
     build_deepseek_v4_cache_fields,
+    prepare_deepseek_v4_cache,
     solve_deepseek_v4_memory_layout,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec import (
@@ -139,6 +140,7 @@ from tokenspeed.runtime.models.deepseek_v4_dspark_ops.attention import (
 )
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import _local_vocab_argmax
 from tokenspeed.runtime.models.deepseek_v4_mtp import DeepseekV4ForCausalLMNextN
+from tokenspeed.runtime.pd.cache_protocol import build_cache_fields_by_producer_step
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import (
     global_server_args_dict,
@@ -2351,7 +2353,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                         layout,
                         sliding_window=128,
                         logical_block_tokens=256,
-                    )
+                    ),
                 ).with_num_lcm_blocks(1),
                 paged_cache_group_specs=(),
                 token_capacity=256,
@@ -3314,7 +3316,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                         layout,
                         sliding_window=128,
                         logical_block_tokens=256,
-                    )
+                    ),
                 ).with_num_lcm_blocks(1),
                 paged_cache_group_specs=(),
                 token_capacity=256,
@@ -5792,3 +5794,49 @@ def test_v4_merged_solve_draft_is_a_continuation_layer():
     packing = dict(merged.group_packing)
     group = plan.group("v4.swa_kv")
     assert group.page_count == 1 + 2 * packing["v4.swa_kv"]
+
+
+def test_v4_pd_recipe_and_readiness_follow_cache_producers():
+    setup = prepare_deepseek_v4_cache(
+        server_args=SimpleNamespace(
+            speculative_algorithm=None,
+            attention_use_fp4_indexer_cache=False,
+            max_total_tokens=512,
+            chunked_prefill_size=256,
+        ),
+        model_config=SimpleNamespace(
+            num_attention_layers=3,
+            hf_config=SimpleNamespace(
+                compress_ratios=(1, 4, 128),
+                head_dim=512,
+                qk_rope_head_dim=64,
+                sliding_window=128,
+                index_head_dim=128,
+                attention_config={},
+            ),
+        ),
+        attn_config=SimpleNamespace(
+            pd_disaggregation_enabled=True,
+            page_size=256,
+            max_bs=2,
+            context_len=1024,
+        ),
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=1 << 30,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+    schedule = build_cache_fields_by_producer_step(
+        setup.spec.memory_plan, num_target_layers=3
+    )
+    assert schedule.step_count == 3
+    assert all(schedule.fields_by_step)
+
+    records = []
+    backend = object.__new__(DeepseekV4AttentionBackend)
+    backend.step_counter = SimpleNamespace(record_cache=lambda: records.append(True))
+    output = object()
+    for mode in (ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.IDLE):
+        assert backend.record_layer_cache_ready(output, mode) is output
+    assert records == [True]
