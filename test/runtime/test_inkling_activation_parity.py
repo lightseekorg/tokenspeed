@@ -128,6 +128,43 @@ def _reference_layer_states(model, text, input_ids):
     yield "final_norm", h
 
 
+class _ConvCheckpointPool:
+    """KV pool view adding the paged sconv checkpoint buffers the backend
+    now requires (paged conv is mandatory; there is no rolling fallback)."""
+
+    def __init__(self, kv_pool, *, layer_kv_widths, num_pages, rows, hidden, device):
+        self._kv_pool = kv_pool
+        # Per-layer widths: kvconv fields track each layer's own K/V conv
+        # width (hetero full/SWA head counts), exactly like the real recipe.
+        self._kvconv = [
+            tuple(
+                torch.zeros(num_pages, rows, width, dtype=torch.bfloat16, device=device)
+                for _ in range(2)
+            )
+            for width in layer_kv_widths
+        ]
+        self._hidden = {
+            component: torch.zeros(
+                len(layer_kv_widths),
+                num_pages,
+                rows,
+                hidden,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            for component in ("attnconv", "mlpconv")
+        }
+
+    def kvconv_checkpoint_buffers(self, layer_id):
+        return self._kvconv[layer_id]
+
+    def hiddenconv_checkpoint_buffer(self, layer_id, component):
+        return self._hidden[component][layer_id]
+
+    def __getattr__(self, name):
+        return getattr(self._kv_pool, name)
+
+
 class _Harness:
     """Real-backend single-request driver for the in-process model."""
 
@@ -194,7 +231,38 @@ class _Harness:
             dtype=torch.bfloat16,
             device=device,
         )
-        self.backend = InklingAttnBackend(inner, conv_pool)
+        conv_block_tokens = 128
+        num_conv_pages = 1024 // conv_block_tokens
+        conv_columns = {
+            "block_tokens": conv_block_tokens,
+            "conv_group_of_layer": ("kvconv",) * text.num_hidden_layers,
+            "hidden_group_of_layer": ("hiddenconv",) * text.num_hidden_layers,
+            "group_block_tokens": {
+                "kvconv": conv_block_tokens,
+                "hiddenconv": conv_block_tokens,
+            },
+        }
+        self.backend = InklingAttnBackend(inner, conv_pool, conv_columns=conv_columns)
+        from tokenspeed.runtime.configs.inkling_config import (
+            inkling_kv_heads_for_layer,
+        )
+
+        self.pool_view = _ConvCheckpointPool(
+            self.kv_pool,
+            layer_kv_widths=[
+                inkling_kv_heads_for_layer(text, i, True) * text.head_dim
+                for i in range(text.num_hidden_layers)
+            ],
+            num_pages=num_conv_pages + 1,
+            rows=text.sconv_kernel_size - 1,
+            hidden=text.hidden_size,
+            device=device,
+        )
+        # Dense conv page map: boundary j*128 -> page j+1 (page 0 = hole).
+        conv_table = torch.arange(
+            1, num_conv_pages + 1, dtype=torch.int32, device=device
+        ).unsqueeze(0)
+        self.conv_tables = {"kvconv": conv_table, "hiddenconv": conv_table}
         # Request slot REQ_SLOT owns pages [1, 2, ...] -> token locs 64+.
         max_pages = 1024 // PAGE_SIZE
         self.page_table = torch.zeros(8, max_pages, dtype=torch.int32, device=device)
@@ -205,7 +273,7 @@ class _Harness:
     def _ctx(self, mode):
         return SimpleNamespace(
             attn_backend=self.backend,
-            token_to_kv_pool=self.kv_pool,
+            token_to_kv_pool=self.pool_view,
             forward_mode=mode,
             bs=1,
         )
@@ -233,6 +301,7 @@ class _Harness:
             extend_seq_lens_cpu=torch.tensor([T]),
             extend_prefix_lens=torch.zeros(1, dtype=torch.int32, device=dev),
             extend_prefix_lens_cpu=torch.zeros(1, dtype=torch.int32),
+            block_tables=self.conv_tables,
         )
         self.seq_len = T
         out_cache_loc = self._token_locs(0, T)
@@ -254,6 +323,7 @@ class _Harness:
             seq_lens=seq_lens,
             page_table=self.page_table,
             forward_mode=ForwardMode.DECODE,
+            block_tables=self.conv_tables,
         )
         out_cache_loc = self._token_locs(self.seq_len - 1, 1)
         ids = torch.tensor([token_id], device=dev)

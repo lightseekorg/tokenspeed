@@ -772,6 +772,72 @@ class CacheMemoryPlanTest(unittest.TestCase):
         self.assertIn("layer.0.k_scale", fp8_by_id)
         self.assertIn("layer.0.v_scale", fp8_by_id)
 
+    def test_inkling_draft_conv_fields_join_target_checkpoint_groups(self):
+        """Draft depth layers carry kvconv/hiddenconv checkpoint fields as
+        continuation tenants of the TARGET's conv groups: same group ids
+        (no draft-specific namespace), planes shifted to the continuation
+        range, kvconv tails squatting in the draft kv planes."""
+        recipe_kwargs = dict(
+            logical_block_tokens=128,
+            head_dim=128,
+            kv_element_size=2,
+            hidden_size=256,
+            checkpoint_rows=3,
+            kvconv_element_size=2,
+            hiddenconv_element_size=2,
+        )
+        target = self.layouts_module.inkling_cache_fields(
+            layer_group_ids=("full", "swa"), layer_kv_heads=(2, 4), **recipe_kwargs
+        )
+        draft = self.layouts_module.inkling_cache_fields(
+            layer_group_ids=("swa", "full"), layer_kv_heads=(4, 2), **recipe_kwargs
+        )
+        (
+            merged,
+            _,
+            _,
+            _,
+            num_draft_layers,
+        ) = self.plan_module.merge_continuation_layers(
+            fields=target,
+            layer_types=("full", "swa"),
+            group_ids=("full", "swa"),
+            draft_fields=draft,
+            draft_layer_types=("swa", "full"),
+            draft_group_ids=("swa", "full"),
+        )
+        self.assertEqual(num_draft_layers, 2)
+        by_id = {field.field_id: field for field in merged}
+        # Continuation renumbering: draft layer 0 -> global layer 2, its
+        # occurrence-0 planes -> unit.2.*; conv groups are the target's own.
+        self.assertEqual(by_id["layer.2.kvconv_k"].group_id, "kvconv")
+        self.assertEqual(by_id["layer.2.kvconv_k"].plane_id, "unit.2.k")
+        self.assertEqual(by_id["layer.2.attnconv"].group_id, "hiddenconv")
+        self.assertEqual(by_id["layer.2.attnconv"].plane_id, "unit.2.hidden_k")
+        self.assertEqual(
+            {field.group_id for field in merged},
+            {"full", "swa", "kvconv", "hiddenconv"},
+        )
+        plan = self._plan_fields(
+            merged,
+            logical_block_tokens=128,
+            num_lcm_blocks=2,
+            max_padding_fraction=float("inf"),
+        )
+        # The draft kvconv tail lives in the same plane as the draft KV
+        # (squatter), while the 2-byte hidden tail spills to its own plane.
+        self.assertEqual(
+            plan.field("layer.2.kvconv_k").plane_id,
+            plan.field("layer.2.k").plane_id,
+        )
+        self.assertNotEqual(
+            plan.field("layer.2.attnconv").plane_id,
+            plan.field("layer.2.k").plane_id,
+        )
+        # One page-id space per conv group covers target AND draft tenants.
+        self.assertGreaterEqual(plan.group("kvconv").cache_blocks_per_lcm_block, 1)
+        self.assertGreaterEqual(plan.group("hiddenconv").cache_blocks_per_lcm_block, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

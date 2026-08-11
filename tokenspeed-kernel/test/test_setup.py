@@ -61,6 +61,7 @@ def test_cuda_install_requires_include_runtime_dependencies(monkeypatch) -> None
         "tokenspeed-proton",
         "tokenspeed-triton",
         "flashinfer-python",
+        "nvidia-cudnn-frontend",
         "nvidia-ml-py",
         "nvtx",
         "torch",
@@ -69,6 +70,7 @@ def test_cuda_install_requires_include_runtime_dependencies(monkeypatch) -> None
     assert {"tokenspeed-kernel-amd", "tokenspeed-iris"}.isdisjoint(requirements)
     assert "tokenspeed-triton-kernels" not in requirements
     assert requirements["nvidia-cutlass-dsl"].extras == {"cu13"}
+    assert str(requirements["nvidia-cudnn-frontend"].specifier) == "==1.26.0"
 
 
 def test_cuda_thirdparty_requirements_are_exactly_pinned() -> None:

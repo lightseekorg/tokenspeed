@@ -104,7 +104,11 @@ def _prep_tape_kernel(descs_ptr, regs_ptr, BLOCK: tl.constexpr):
 
 
 def run_tape(descs, regs) -> None:
-    """Execute a finalized tape: one launch, one program per descriptor."""
+    """Execute ordered stages, with one parallel program per descriptor."""
+    if isinstance(descs, tuple):
+        for stage in descs:
+            run_tape(stage, regs)
+        return
     n_ops = descs.shape[0]
     if n_ops == 0:
         return

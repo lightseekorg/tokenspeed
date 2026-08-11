@@ -234,10 +234,13 @@ class FusedQkvzbaTest(unittest.TestCase):
             mixed_qkvz, mixed_ba = _make_inputs(8192, nk, nv)  # prefill-sized
             args = (mixed_qkvz, mixed_ba, nk, nv, HEAD_QK, HEAD_V)
             t_new = triton.testing.do_bench(
-                lambda a=args: fused(*a), warmup=50, rep=200
+                lambda a=args: fused(*a), warmup=50, rep=200, return_mode="median"
             )
             t_old = triton.testing.do_bench(
-                lambda a=args: _legacy_launch(*a), warmup=50, rep=200
+                lambda a=args: _legacy_launch(*a),
+                warmup=50,
+                rep=200,
+                return_mode="median",
             )
             results[nv // nk] = (t_old, t_new)
 
@@ -268,8 +271,12 @@ class FusedQkvzbaTest(unittest.TestCase):
             return torch.cat((q, k, v), dim=-1), z, b, a
 
         args = (mixed_qkvz, mixed_ba, nk, nv, HEAD_QK, HEAD_V)
-        t_fused = triton.testing.do_bench(lambda: fused(*args), warmup=50, rep=200)
-        t_torch = triton.testing.do_bench(torch_fallback, warmup=50, rep=200)
+        t_fused = triton.testing.do_bench(
+            lambda: fused(*args), warmup=50, rep=200, return_mode="median"
+        )
+        t_torch = triton.testing.do_bench(
+            torch_fallback, warmup=50, rep=200, return_mode="median"
+        )
         self.assertLessEqual(
             t_fused,
             t_torch,

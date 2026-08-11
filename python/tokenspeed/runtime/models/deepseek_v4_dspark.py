@@ -57,6 +57,7 @@ from tokenspeed.runtime.utils import add_prefix
 logger = logging.getLogger(__name__)
 
 _DSPARK_WEIGHT_RE = re.compile(r"^mtp\.(\d+)\.(.+)$")
+DEFAULT_DSPARK_WINDOW_SIZE = 128
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 _ATTENTION_TENSORS = frozenset(
     {
@@ -371,7 +372,9 @@ class DeepseekV4DSparkModel(nn.Module):
             "rope_head_dim": int(config.qk_rope_head_dim),
             "n_groups": int(config.o_groups),
             "o_lora_rank": int(config.o_lora_rank),
-            "window_size": int(getattr(config, "dspark_window_size", 128)),
+            "window_size": int(
+                getattr(config, "dspark_window_size", DEFAULT_DSPARK_WINDOW_SIZE)
+            ),
             "eps": self.rms_norm_eps,
             "softmax_scale": head_dim**-0.5,
         }
