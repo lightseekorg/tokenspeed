@@ -51,6 +51,7 @@ from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -199,6 +200,14 @@ class K3DSparkDecoderLayer(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("self_attn", prefix),
         )
+        # The draft's MLA layers join the target's full_attention paged-cache
+        # group (K3 publishes 4 groups: full_attention + 3 KDA linear). The
+        # inherited attn_mqa/attn_mha are built without a group_id; tag them so
+        # validate_paged_cache_group_ids binds them to the full_attention table
+        # instead of failing on an empty group_id. Mirrors the target
+        # (kimi_k3.py MLA layer construction).
+        self.self_attn.attn_mqa.group_id = FULL_ATTENTION
+        self.self_attn.attn_mha.group_id = FULL_ATTENTION
         self.layer_id = layer_id
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=eps)
         self.mlp = DFlashMLP(
