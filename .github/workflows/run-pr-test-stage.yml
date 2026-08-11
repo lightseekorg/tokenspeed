@@ -106,6 +106,14 @@ jobs:
           name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.WORK_DIR }}/.ci-artifacts/result.json
 
+      - name: Upload task logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}-logs
+          path: ${{ env.WORK_DIR }}/.ci-artifacts/
+          if-no-files-found: ignore
+
       - name: Cleanup work directory
         if: always()
         run: |
