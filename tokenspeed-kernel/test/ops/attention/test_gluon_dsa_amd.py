@@ -423,6 +423,23 @@ def _normal_weights(
     return torch.softmax(logits, dim=-1).contiguous()
 
 
+def _split_bf16_weights(
+    tokens: int,
+    heads: int,
+    *,
+    device: str,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    backing = _randn_bf16(
+        (tokens, 128 + heads),
+        device=device,
+        generator=generator,
+    )
+    weights = backing[:, 128:]
+    assert not weights.is_contiguous()
+    return weights
+
+
 def _round_up_to_page(slots: int, page_size: int) -> int:
     return int(math.ceil(slots / page_size) * page_size)
 
@@ -673,6 +690,140 @@ def test_dsa_prefill_topk_fp8_glm52_cases(case: _TopKPrefillCase) -> None:
         row_ends,
         topk=case.topk,
         softmax_scale=softmax_scale,
+    )
+
+    _assert_topk_matches(workspace_indices, topk_lens, expected_indices, expected_lens)
+
+
+@pytest.mark.skipif(
+    not is_cdna4(), reason="BF16 split-weight support is specific to gfx950"
+)
+@pytest.mark.parametrize(
+    ("seq_len", "capture_graph"),
+    ((8192, False), (8192, True), (16384, False), (16384, True)),
+    ids=("fused-eager", "fused-graph", "precombined-eager", "precombined-graph"),
+)
+def test_dsa_decode_topk_fp8_accepts_glm52_bf16_split_weights(
+    seq_len: int,
+    capture_graph: bool,
+) -> None:
+    device = "cuda"
+    page_size = 64
+    head_dim = 128
+    index_heads = 32
+    topk = 2048
+    q_len_per_req = 2
+    gen = _generator(device, 107)
+    block_table, num_slots = _make_decode_block_table((seq_len,), page_size, device)
+    q = _randn_bf16(
+        (q_len_per_req, index_heads, head_dim),
+        device=device,
+        generator=gen,
+    )
+    weights = _split_bf16_weights(
+        q_len_per_req,
+        index_heads,
+        device=device,
+        generator=gen,
+    )
+    packed_index_k, index_k = _pack_index_k_cache(
+        _randn_bf16((num_slots, head_dim), device=device, generator=gen),
+        page_size,
+    )
+    seq_lens = torch.tensor((seq_len,), device=device, dtype=torch.int32)
+
+    topk_slots = torch.empty((q_len_per_req, topk), device=device, dtype=torch.int32)
+    topk_lens = torch.empty((q_len_per_req,), device=device, dtype=torch.int32)
+
+    def invoke() -> None:
+        gluon_dsa_decode_topk_fp8(
+            q,
+            weights,
+            seq_lens,
+            block_table,
+            page_size=page_size,
+            topk=topk,
+            softmax_scale=head_dim**-0.5 * index_heads**-0.5,
+            q_len_per_req=q_len_per_req,
+            index_k_cache=packed_index_k,
+            out=topk_slots,
+            lens_out=topk_lens,
+        )
+
+    invoke()
+    torch.cuda.synchronize()
+    if capture_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            invoke()
+        graph.replay()
+        torch.cuda.synchronize()
+    expected_slots, expected_lens = _reference_decode_topk(
+        q,
+        weights,
+        index_k,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=head_dim**-0.5 * index_heads**-0.5,
+        q_len_per_req=q_len_per_req,
+    )
+
+    _assert_topk_matches(topk_slots, topk_lens, expected_slots, expected_lens)
+
+
+@pytest.mark.skipif(
+    not is_cdna4(), reason="BF16 split-weight support is specific to gfx950"
+)
+def test_dsa_prefill_topk_fp8_accepts_glm52_bf16_split_weights() -> None:
+    device = "cuda"
+    page_size = 64
+    head_dim = 128
+    index_heads = 32
+    topk = 2048
+    gen = _generator(device, 206)
+    workspace, row_starts, row_ends, _ = _make_prefill_workspace(
+        (4094,), (2,), device=device
+    )
+    num_tokens = 2
+    num_slots = _round_up_to_page(int(workspace.numel()), page_size)
+    q = _randn_bf16(
+        (num_tokens, index_heads, head_dim),
+        device=device,
+        generator=gen,
+    )
+    weights = _split_bf16_weights(
+        num_tokens,
+        index_heads,
+        device=device,
+        generator=gen,
+    )
+    packed_index_k, index_k = _pack_index_k_cache(
+        _randn_bf16((num_slots, head_dim), device=device, generator=gen),
+        page_size,
+    )
+
+    workspace_indices, topk_lens = gluon_dsa_prefill_topk_fp8(
+        q,
+        weights,
+        workspace,
+        row_starts,
+        row_ends,
+        topk=topk,
+        softmax_scale=head_dim**-0.5 * index_heads**-0.5,
+        index_k_cache=packed_index_k,
+        page_size=page_size,
+    )
+    expected_indices, expected_lens = _reference_prefill_topk(
+        q,
+        weights,
+        index_k,
+        workspace,
+        row_starts,
+        row_ends,
+        topk=topk,
+        softmax_scale=head_dim**-0.5 * index_heads**-0.5,
     )
 
     _assert_topk_matches(workspace_indices, topk_lens, expected_indices, expected_lens)

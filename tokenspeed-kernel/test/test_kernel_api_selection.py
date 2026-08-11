@@ -1147,9 +1147,9 @@ def _attention_dsa_prefill_bf16_dense_rank128() -> object:
     )
 
 
-def _attention_dsa_decode_topk() -> object:
+def _attention_dsa_decode_topk(*, weights_dtype: torch.dtype = torch.float32) -> object:
     q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
-    weights = torch.empty((2, 2), dtype=torch.float32)
+    weights = torch.empty((2, 2), dtype=weights_dtype)
     index_k = torch.zeros((128, 132), dtype=torch.uint8)
     seq_lens = torch.tensor([64, 64], dtype=torch.int32)
     block_table = torch.zeros((2, 1), dtype=torch.int32)
@@ -1165,14 +1165,19 @@ def _attention_dsa_decode_topk() -> object:
     )
 
 
+def _attention_dsa_decode_topk_bf16_weights() -> object:
+    return _attention_dsa_decode_topk(weights_dtype=torch.bfloat16)
+
+
 def _attention_dsa_prefill_topk(
     *,
     page_size: int = 64,
     solution: str | None = None,
     override: str | None = None,
+    weights_dtype: torch.dtype = torch.float32,
 ) -> object:
     q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
-    weights = torch.empty((2, 2), dtype=torch.float32)
+    weights = torch.empty((2, 2), dtype=weights_dtype)
     index_k = torch.zeros((128, 132), dtype=torch.uint8)
     kv_workspace_slots = torch.arange(64, dtype=torch.int64)
     row_starts = torch.tensor([0, 8], dtype=torch.int32)
@@ -1190,6 +1195,10 @@ def _attention_dsa_prefill_topk(
         solution=solution,
         override=override,
     )
+
+
+def _attention_dsa_prefill_topk_bf16_weights() -> object:
+    return _attention_dsa_prefill_topk(weights_dtype=torch.bfloat16)
 
 
 def _attention_dsa_plan() -> object:
@@ -2107,9 +2116,14 @@ def _case(
     mode: str,
     expected: str,
     invoke: Callable[[], object],
+    *,
+    id_suffix: str | None = None,
 ) -> KernelApiSelectionCase:
+    case_id = f"{arch}/{family}.{mode}/{expected}"
+    if id_suffix is not None:
+        case_id = f"{case_id}/{id_suffix}"
     return KernelApiSelectionCase(
-        id=f"{arch}/{family}.{mode}/{expected}",
+        id=case_id,
         arch=arch,
         family=family,
         mode=mode,
@@ -2357,9 +2371,27 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
+        "dsa_decode_topk",
+        "gluon_dsa_decode_topk_fp8_gfx950",
+        _attention_dsa_decode_topk_bf16_weights,
+        id_suffix="bf16-weights",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
         "dsa_prefill_topk",
         "gluon_dsa_prefill_topk_fp8_gfx950",
         _attention_dsa_prefill_topk,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_prefill_topk",
+        "gluon_dsa_prefill_topk_fp8_gfx950",
+        _attention_dsa_prefill_topk_bf16_weights,
+        id_suffix="bf16-weights",
     ),
     _case(
         _is_cdna4,

@@ -62,6 +62,8 @@ _PERSISTENT_NUM_BUCKETS = gl.constexpr(1 << 11)
 _PERSISTENT_NUM_PASSES = gl.constexpr(3)
 _PERSISTENT_COUNTER_STRIDE = gl.constexpr(32)
 _PERSISTENT_WORKSPACE_CACHE_MAXSIZE = 16
+_GLM52_SCORING_HEADS = 32
+_GLM52_FUSED_DECODE_MAX_CANDIDATES = 16384
 
 _persistent_topk_workspace_cache: OrderedDict[
     tuple[int, int, int], tuple[torch.Tensor, ...]
@@ -1894,6 +1896,13 @@ def _dsa_topk_indices(
     )
 
 
+def _combine_scoring_query_heads(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    return (q.float() * weights.float().unsqueeze(-1)).sum(dim=1)
+
+
 def gluon_dsa_decode_topk_fp8_gfx950(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -1921,6 +1930,8 @@ def gluon_dsa_decode_topk_fp8_gfx950(
     if index_k_cache is None:
         raise RuntimeError("Gluon DSA paged top-k requires packed FP8 index_k_cache")
     row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, int(page_size))
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
     _check_score_input_contract(q, weights, index_k_cache)
     if seq_lens.dim() != 1:
         raise ValueError(
@@ -1957,6 +1968,18 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         )
         return empty_out, empty_lens
     max_seq_len = int(block_table.shape[1]) * int(page_size)
+    fold_weighted_heads = (
+        q.shape[1] == _GLM52_SCORING_HEADS
+        and q.shape[0] * max_seq_len <= _GLM52_FUSED_DECODE_MAX_CANDIDATES
+    )
+    if fold_weighted_heads:
+        score_q = q
+        score_num_heads = q.shape[1]
+    else:
+        # Fusing avoids a launch for small grids; larger grids would repeat the
+        # head reduction once per cache tile, so reduce it once before scoring.
+        score_q = _combine_scoring_query_heads(q, weights)[:, None, :]
+        score_num_heads = 1
     if out is None:
         out = torch.empty((q.shape[0], topk), dtype=torch.int32, device=q.device)
     if lens_out is None:
@@ -1965,8 +1988,9 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         (q.shape[0], max_seq_len), dtype=torch.float32, device=q.device
     )
     block_n = 32
-    _dsa_decode_logits_fp8_kernel[(q.shape[0], triton.cdiv(max_seq_len, block_n))](
-        q,
+    score_grid = (q.shape[0], triton.cdiv(max_seq_len, block_n))
+    _dsa_decode_logits_fp8_kernel[score_grid](
+        score_q,
         index_k_cache.view(torch.float8_e4m3fn),
         index_k_cache.view(torch.float32),
         weights,
@@ -1978,11 +2002,12 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         page_size=int(page_size),
         row_bytes=row_bytes,
         max_seq_len=max_seq_len,
-        num_heads=q.shape[1],
+        num_heads=score_num_heads,
         head_dim=q.shape[2],
         num_groups=q.shape[2] // 128,
         softmax_scale=float(softmax_scale),
         q_len_per_req=q_len_per_req,
+        FOLD_WEIGHTED_HEADS=fold_weighted_heads,
         BLOCK_N=block_n,
         BLOCK_D=128,
         num_warps=4,
@@ -2025,6 +2050,8 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
             "Gluon DSA top-k requires packed FP8 index_k_cache and page_size"
         )
     row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, int(page_size))
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
     _check_score_input_contract(q, weights, index_k_cache)
     if kv_workspace_slots.dim() != 1:
         raise ValueError(
@@ -2075,16 +2102,16 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
     block_n = 32
     for start in range(0, q.shape[0], max_query_rows):
         end = min(start + max_query_rows, q.shape[0])
+        combined_q = _combine_scoring_query_heads(q[start:end], weights[start:end])
         logits = torch.empty(
             (end - start, seq_len_sum), dtype=torch.float32, device=q.device
         )
         _dsa_prefill_logits_fp8_kernel[
             (end - start, triton.cdiv(seq_len_sum, block_n))
         ](
-            q[start:end],
+            combined_q[:, None, :],
             index_k_cache.view(torch.float8_e4m3fn),
             index_k_cache.view(torch.float32),
-            weights[start:end],
             kv_workspace_slots,
             row_starts[start:end],
             row_ends[start:end],
@@ -2093,7 +2120,7 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
             seq_len_sum=seq_len_sum,
             page_size=int(page_size),
             row_bytes=row_bytes,
-            num_heads=q.shape[1],
+            num_heads=1,
             head_dim=q.shape[2],
             num_groups=q.shape[2] // 128,
             softmax_scale=float(softmax_scale),
