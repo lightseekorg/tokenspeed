@@ -1,4 +1,22 @@
 # Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 """Registration shim for the AMD gfx950 Gluon AttnRes kernel."""
 
@@ -37,12 +55,18 @@ if _attn_res_rmsnorm_impl is not None:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "delta_compatible": frozenset({True}),
             "fused_output_norm": frozenset({True}),
-            "large_prefill": frozenset({True}),
+            "has_delta": frozenset({False, True}),
+            "hidden_dimension_contiguous": frozenset({True}),
+            "inputs_on_same_gpu": frozenset({True}),
+            "large_prefill": frozenset({False, True}),
             "hidden_size": frozenset({4096, 5120, 6144, 7168, 8192}),
+            "partial_block_storage": frozenset({False, True}),
             "separate_output_eps": frozenset({False, True}),
+            "writes_block": frozenset({False, True}),
         },
-        tags={"prefill", "fusion"},
+        tags={"decode", "prefill", "fusion"},
     )
     def gluon_attn_res_fwd_gfx950(
         *,
@@ -53,6 +77,9 @@ if _attn_res_rmsnorm_impl is not None:
         eps: float,
         out_norm_weight: torch.Tensor | None,
         out_norm_eps: float,
+        delta: torch.Tensor | None,
+        num_valid_blocks: int,
+        block_write_idx: int,
     ) -> torch.Tensor:
         """Adapt block-major runtime storage to the Gluon token-major kernel."""
         if out_norm_weight is None:
@@ -65,7 +92,9 @@ if _attn_res_rmsnorm_impl is not None:
             score_eps=eps,
             output_rms_weight=out_norm_weight,
             output_eps=out_norm_eps,
-            num_valid_blocks=block_residual.shape[0],
+            delta=delta,
+            num_valid_blocks=num_valid_blocks,
+            block_write_idx=block_write_idx,
         )
 
 else:

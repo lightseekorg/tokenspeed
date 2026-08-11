@@ -69,7 +69,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     sigmoid_mul,
 )
 from tokenspeed_kernel.ops.attention import mla_normalize_project_query
-from tokenspeed_kernel.ops.attn_res import attn_res_fwd
+from tokenspeed_kernel.ops.attn_res import attn_res_fwd, attn_res_fwd_available
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.gemm import (
     kimi3_latent_projection_add3,
@@ -537,6 +537,9 @@ def _apply_attn_res(
     norm: RMSNorm,
     num_valid_blocks: int,
     out_norm: RMSNorm | None = None,
+    *,
+    delta: torch.Tensor | None = None,
+    block_write_idx: int = -1,
 ) -> torch.Tensor:
     """AttnRes mixing: a learned softmax attention over block-residual snapshots.
 
@@ -553,16 +556,25 @@ def _apply_attn_res(
     ``out_norm`` is given, the following RMSNorm is fused into the kernel
     epilogue and the normed mix is returned.
     """
-    if num_valid_blocks <= 0:
+    if num_valid_blocks <= 0 and delta is None and block_write_idx < 0:
         return prefix_sum if out_norm is None else out_norm(prefix_sum)
+
+    # Calls that do not append a snapshot only need the valid rows. Preserve the
+    # tightly sliced contract used by backends without in-kernel snapshot writes.
+    kernel_blocks = (
+        block_residual if block_write_idx >= 0 else block_residual[:num_valid_blocks]
+    )
     return attn_res_fwd(
         prefix_sum,
-        block_residual[:num_valid_blocks],
+        kernel_blocks,
         proj.weight.reshape(-1),
         norm.weight,
         norm.variance_epsilon,
         out_norm_weight=None if out_norm is None else out_norm.weight,
         out_norm_eps=None if out_norm is None else out_norm.variance_epsilon,
+        delta=delta,
+        num_valid_blocks=num_valid_blocks,
+        block_write_idx=block_write_idx,
     )
 
 
@@ -1758,6 +1770,136 @@ class KimiLinearDecoderLayer(nn.Module):
             prefix_sum = None
         return h, prefix_sum
 
+    def _fused_attnres_graph_available(
+        self, hidden_states: torch.Tensor, block_residual: torch.Tensor
+    ) -> bool:
+        # B1 already fuses the post-attention mix into the all-reduce.
+        if hidden_states.shape[0] == 1:
+            return False
+
+        block_write_idx = self.block_write_idx if self.is_block_write_layer else -1
+        pre_attn = attn_res_fwd_available(
+            hidden_states,
+            block_residual,
+            self.self_attention_res_proj.weight.reshape(-1),
+            self.self_attention_res_norm.weight,
+            self.self_attention_res_norm.variance_epsilon,
+            out_norm_weight=self.input_layernorm.weight,
+            out_norm_eps=self.input_layernorm.variance_epsilon,
+            num_valid_blocks=self.prev_valid_blocks,
+            block_write_idx=block_write_idx,
+        )
+        if not pre_attn:
+            return False
+
+        mlp_valid_blocks = self.prev_valid_blocks + int(self.is_block_write_layer)
+        return attn_res_fwd_available(
+            hidden_states,
+            block_residual,
+            self.mlp_res_proj.weight.reshape(-1),
+            self.mlp_res_norm.weight,
+            self.mlp_res_norm.variance_epsilon,
+            out_norm_weight=self.post_attention_layernorm.weight,
+            out_norm_eps=self.post_attention_layernorm.variance_epsilon,
+            delta=None if self.is_block_write_layer else hidden_states,
+            num_valid_blocks=mlp_valid_blocks,
+        )
+
+    def _forward_fused_attnres_graph(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: "ForwardContext",
+        out_cache_loc: torch.Tensor,
+        block_residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one AttnRes launch on each side of the attention collective."""
+        prefix_sum = hidden_states
+        h = _apply_attn_res(
+            prefix_sum,
+            block_residual,
+            self.self_attention_res_proj,
+            self.self_attention_res_norm,
+            self.prev_valid_blocks,
+            out_norm=self.input_layernorm,
+            block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
+        )
+
+        attn_partial = self.self_attn(
+            positions=positions,
+            hidden_states=h,
+            ctx=ctx,
+            out_cache_loc=out_cache_loc,
+            comm_manager=self.comm_manager,
+            attnres_partial_args=None,
+        )
+        reduced = all_reduce(attn_partial, self.mapping.attn.tp_group)
+
+        if self.is_block_write_layer:
+            prefix_sum = reduced
+            delta = None
+        else:
+            delta = reduced
+        h = _apply_attn_res(
+            prefix_sum,
+            block_residual,
+            self.mlp_res_proj,
+            self.mlp_res_norm,
+            self.prev_valid_blocks + int(self.is_block_write_layer),
+            out_norm=self.post_attention_layernorm,
+            delta=delta,
+        )
+
+        if self.is_moe_layer:
+            num_global_tokens, max_num_tokens_per_gpu = (
+                self.comm_manager.get_num_tokens(ctx)
+            )
+            prefix_sum = self.block_sparse_moe(
+                h,
+                prefix_sum,
+                num_global_tokens=num_global_tokens,
+                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            )
+        else:
+            prefix_sum = prefix_sum + self.mlp(h)
+        self._prepare_next_fallback_attnres_partial(prefix_sum, block_residual)
+        return prefix_sum, block_residual
+
+    def _prepare_next_fallback_attnres_partial(
+        self,
+        hidden_states: torch.Tensor,
+        block_residual: torch.Tensor,
+    ) -> None:
+        """Bridge a fused layer to the existing split AttnRes fallback."""
+        num_tokens = hidden_states.shape[0]
+        if (
+            self._next_attn_mix is None
+            or not hidden_states.is_cuda
+            or not 0 < num_tokens <= ATTNRES_FAST_PATH_MAX_TOKENS
+        ):
+            return
+
+        next_layer, valid_blocks = self._next_attn_mix
+        if next_layer._fused_attnres_graph_available(hidden_states, block_residual):
+            return
+        attn_scratch = _sliced_scratch(hidden_states, 1, num_tokens)
+        if self._hoist_next_mlp:
+            attnres_partial_dual(
+                block_residual[:valid_blocks],
+                next_layer._mlp_wp,
+                next_layer._attn_wp,
+                next_layer.mlp_res_norm.variance_epsilon,
+                _sliced_scratch(hidden_states, next_layer._mlp_slot, num_tokens),
+                attn_scratch,
+            )
+        else:
+            attnres_partial(
+                block_residual[:valid_blocks],
+                next_layer._attn_wp,
+                next_layer.self_attention_res_norm.variance_epsilon,
+                attn_scratch,
+            )
+
     @torch.no_grad()
     def forward(
         self,
@@ -1767,6 +1909,15 @@ class KimiLinearDecoderLayer(nn.Module):
         out_cache_loc: torch.Tensor,
         block_residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._fused_attnres_graph_available(hidden_states, block_residual):
+            return self._forward_fused_attnres_graph(
+                positions,
+                hidden_states,
+                ctx,
+                out_cache_loc,
+                block_residual,
+            )
+
         h, prefix_sum = self._mix_into_attention(hidden_states, block_residual)
         # The mlp-side mixing's block partial hides under attention on the aux
         # stream (blocks are final for this layer once the snapshot above ran);
