@@ -26,7 +26,7 @@ import math
 import re
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import pairwise
 
 # Planner/runtime limits, not model layout inputs.
@@ -346,7 +346,11 @@ def merge_continuation_layers(
     )
 
 
-def continue_layer_fields(fields, *, first_layer_id: int) -> tuple[CacheFieldSpec, ...]:
+def continue_layer_fields(
+    fields,
+    *,
+    first_layer_id: int,
+) -> tuple[CacheFieldSpec, ...]:
     """Renumber per-layer fields as continuation layers of one big model.
 
     Draft layers join the target's ``solve_cache_layout`` as ordinary
@@ -366,14 +370,10 @@ def continue_layer_fields(fields, *, first_layer_id: int) -> tuple[CacheFieldSpe
         )
 
     return tuple(
-        CacheFieldSpec(
-            field.group_id,
-            _shift(field.field_id),
-            _shift(field.plane_id),
-            field.shape,
-            field.element_size,
-            exact_page_stride=field.exact_page_stride,
-            page_stride_alignment_bytes=field.page_stride_alignment_bytes,
+        replace(
+            field,
+            field_id=_shift(field.field_id),
+            plane_id=_shift(field.plane_id),
         )
         for field in fields
     )

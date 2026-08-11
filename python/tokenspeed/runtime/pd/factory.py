@@ -20,7 +20,11 @@
 
 """Factories for PD KV transfer helpers."""
 
-from tokenspeed.runtime.pd.cache_protocol import build_pool_cache_transfer_contract
+from tokenspeed.runtime.pd.cache_protocol import (
+    build_cache_fields_by_producer_step,
+    build_cache_transfer_schema,
+    build_pool_cache_transfer_contract,
+)
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
@@ -39,10 +43,23 @@ def _get_contiguous_buf_unit_lens(pool, item_lens):
     return unit_lens
 
 
-def _get_cache_contract(pool):
+def _get_cache_contract(pool, *, model_config, draft_model_config):
     if getattr(pool, "supports_disaggregation", False) is not True:
         return None
-    return build_pool_cache_transfer_contract(pool)
+    transfer_schema = build_cache_transfer_schema(
+        pool.plan,
+        model_config=model_config,
+        draft_model_config=draft_model_config,
+    )
+    producer_schedule = build_cache_fields_by_producer_step(
+        pool.plan,
+        num_target_layers=model_config.num_attention_layers,
+    )
+    layout, base_addr = build_pool_cache_transfer_contract(
+        pool,
+        transfer_schema=transfer_schema,
+    )
+    return layout, base_addr, producer_schedule
 
 
 def get_kv_args(
@@ -51,14 +68,21 @@ def get_kv_args(
     ib_device,
     token_to_kv_pool,
     draft_token_to_kv_pool,
+    *,
+    model_config,
+    draft_model_config=None,
 ):
-    cache_contract = _get_cache_contract(token_to_kv_pool)
+    cache_contract = _get_cache_contract(
+        token_to_kv_pool,
+        model_config=model_config,
+        draft_model_config=draft_model_config,
+    )
     if cache_contract is not None:
         # One big model, one arena: the draft's continuation-layer planes
         # live inside the same merged plan the contract describes, so slab
         # pages carry the draft KV with no extra registration
         # (draft_token_to_kv_pool is a layer-mapped view of the same pool).
-        layout, base_addr = cache_contract
+        layout, base_addr, producer_schedule = cache_contract
         item_len = layout.plan.lcm_block_bytes
         return KVArgs(
             engine_rank=engine_rank,
@@ -84,6 +108,7 @@ def get_kv_args(
             ib_device=ib_device,
             gpu_id=gpu_id,
             cache_layout=layout,
+            cache_producer_schedule=producer_schedule,
         )
 
     # One big model, one pool: the pool's buffers already cover the draft's

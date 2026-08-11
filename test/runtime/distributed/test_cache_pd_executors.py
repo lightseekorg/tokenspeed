@@ -67,8 +67,8 @@ def _layout(*, capacity: int = 16) -> CacheTransferContract:
         groups=tuple(CacheGroupLayout(spec.group_id, 1, capacity) for spec in specs),
         planes=(CachePlaneLayout("cache", 32, 0),),
         fields=(
-            CacheFieldLayout("history", "history", "cache", (16,), 1, 0, 32),
-            CacheFieldLayout("state", "state", "cache", (16,), 1, 16, 32),
+            CacheFieldLayout("history", "layer.0.latent", "cache", (16,), 1, 0, 32),
+            CacheFieldLayout("state", "layer.1.state", "cache", (16,), 1, 16, 32),
         ),
     )
     return CacheTransferContract(plan, specs, ("uint8", "uint8"))
@@ -116,6 +116,8 @@ def _destination_transfer_info(layout: CacheTransferContract) -> TransferInfo:
         b"[]",
         manifest.to_wire_bytes(),
         layout.to_wire_bytes(),
+        b"1",
+        b"0",
     ]
     return TransferInfo.from_zmq(frames)
 
@@ -259,9 +261,30 @@ def test_cache_factory_exposes_one_typed_arena() -> None:
         plan=layout.plan,
         paged_cache_group_specs=layout.group_specs,
         cache_transfer_layout=lambda *, scope: transfer_layout,
+        cache_contract_binding=lambda: (
+            _Buffer(),
+            {
+                field.field_id: dtype
+                for field, dtype in zip(
+                    layout.plan.fields, layout.field_dtypes, strict=True
+                )
+            },
+        ),
     )
 
-    kv_args = get_kv_args(0, 0, "mlx5_0", pool, None)
+    model_config = SimpleNamespace(
+        num_attention_layers=2,
+        num_key_value_heads=1,
+        hf_config=SimpleNamespace(),
+    )
+    kv_args = get_kv_args(
+        0,
+        0,
+        "mlx5_0",
+        pool,
+        None,
+        model_config=model_config,
+    )
 
     assert kv_args.target_layer_num == 1
     assert kv_args.kv_layer_ids == [0]
@@ -367,6 +390,9 @@ def test_shared_manager_validates_manifest_before_dma() -> None:
     )
     manager = object.__new__(MooncakeKVManagerPrefill)
     manager.kv_args = SimpleNamespace(cache_layout=layout)
+    manager.world_size = 1
+    manager.dp_size = 1
+    manager.attn_tp_rank = 0
 
     manager._validate_cache_transfer(chunk, destination)
 
@@ -442,6 +468,7 @@ def test_shared_manager_resolves_lcm_group_segments() -> None:
     manager.kv_args = SimpleNamespace(
         cache_layout=layout,
         kv_data_ptrs=[0x10000],
+        kv_data_lens=[layout.plan.arena_bytes],
         kv_item_lens=[1024],
     )
     manager.engine = SimpleNamespace(
@@ -521,6 +548,7 @@ def test_shared_manager_uses_destination_page_zero_offsets() -> None:
     manager.kv_args = SimpleNamespace(
         cache_layout=source_layout,
         kv_data_ptrs=[0x10000],
+        kv_data_lens=[source_layout.plan.arena_bytes],
         kv_item_lens=[1024],
     )
     manager.engine = SimpleNamespace(
@@ -590,8 +618,11 @@ def test_cache_uses_equal_tp_identity_route() -> None:
     assert route.default_required_dst_info_num == 1
 
     prefill.tp_size = 4
-    with pytest.raises(NotImplementedError, match="equal Prefill and Decode TP"):
-        _calc(manager, prefill)
+    route = _calc(manager, prefill)
+    assert route.target_tp_rank is None
+    assert route.target_tp_ranks == (1,)
+    assert route.required_prefill_response_num == 1
+    assert route.default_required_dst_info_num == 2
 
 
 def test_pool_without_disaggregation_does_not_require_cache_contract() -> None:

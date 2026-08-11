@@ -270,8 +270,14 @@ def test_merged_plan_views_filter_and_remap_fields_before_combining():
         "full",
         "draft_swa",
     )
+    assert combined.buffers == ("shared-buffer",)
     assert tuple(field.field_id for field in combined.groups[2].fields) == (
-        "draft:layer.2.k",
+        "layer.2.k",
+    )
+    assert combined.consumers == (
+        ("layer.0.k",),
+        ("layer.1.state",),
+        ("layer.2.k",),
     )
 
 

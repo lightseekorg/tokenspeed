@@ -248,7 +248,6 @@ def build_hybrid_cache_setup(
     merged_group_ids = tuple(group_ids)
     merged_specs = tuple(group_specs)
     merged_head_counts = layer_kv_head_counts
-
     merged_layout = solve_cache_layout(
         merged_fields,
         logical_block_tokens=logical_block_tokens,

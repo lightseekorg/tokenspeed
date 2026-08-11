@@ -560,6 +560,8 @@ class EventLoop:
                 server_args.disaggregation_ib_device,
                 token_to_kv_pool,
                 draft_token_to_kv_pool,
+                model_config=self.model_config,
+                draft_model_config=draft_model_config,
             )
             pd_manager_args = KVManagerArgs(
                 bootstrap_port=server_args.disaggregation_bootstrap_port,

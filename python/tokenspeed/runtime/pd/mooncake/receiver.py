@@ -33,12 +33,12 @@ from tokenspeed.runtime.pd.cache_protocol import (
     CachePDPageManifest,
     CacheTransferContract,
     validate_cache_manifest,
-    validate_cache_peer_layout,
 )
 from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
 from tokenspeed.runtime.pd.transfer_plan import (
     BufferKind,
     BufferLayout,
+    PagedCacheTransferPlanner,
     ParallelLayout,
     PDTransferPlanner,
     RankTransferPlan,
@@ -129,11 +129,17 @@ class ReceiverRoutePlan:
     default_required_dst_info_num: int
     transfer_plan: RankTransferPlan | None = None
     supports_remote_spec_candidates: bool = True
+    dummy_tp_ranks: tuple[int, ...] = ()
 
     def required_dst_info_num_for_tp_rank(self, tp_rank: int) -> int:
+        if tp_rank in self.dummy_tp_ranks:
+            return 1
         if self.transfer_plan is None:
             return self.default_required_dst_info_num
         return self.transfer_plan.required_dst_info_num_for_prefill_rank(tp_rank)
+
+    def is_dummy_tp_rank(self, tp_rank: int) -> bool:
+        return tp_rank in self.dummy_tp_ranks
 
     def fragments_for_tp_rank(self, tp_rank: int):
         if self.transfer_plan is None:
@@ -361,11 +367,18 @@ def _legacy_mla_route_plan(
     required_dst_info_num: int,
     required_prefill_response_num: int,
 ) -> ReceiverRoutePlan:
+    target_tp_ranks = tuple(target_tp_ranks)
+    dummy_tp_ranks = (
+        tuple(rank for rank in target_tp_ranks if rank != target_tp_rank)
+        if target_tp_rank is not None
+        else ()
+    )
     return ReceiverRoutePlan(
         target_tp_rank=target_tp_rank,
-        target_tp_ranks=tuple(target_tp_ranks),
+        target_tp_ranks=target_tp_ranks,
         required_prefill_response_num=required_prefill_response_num,
         default_required_dst_info_num=required_dst_info_num,
+        dummy_tp_ranks=dummy_tp_ranks,
     )
 
 
@@ -380,29 +393,51 @@ def _calc(kv_mgr, prefill_parallel_info: PrefillParallelInfo) -> ReceiverRoutePl
             raise RuntimeError(
                 "Paged cache decode connected to a non-Paged cache prefill"
             )
-        validate_cache_peer_layout(local_cache_layout, prefill_cache_layout)
-        expected_item_lens = (local_cache_layout.plan.lcm_block_bytes,)
+        expected_local_item_lens = (local_cache_layout.plan.lcm_block_bytes,)
+        expected_prefill_item_lens = (prefill_cache_layout.plan.lcm_block_bytes,)
+        prefill_item_lens = tuple(prefill_parallel_info.kv_item_lens)
+        prefill_unit_lens = tuple(prefill_parallel_info.kv_unit_lens)
         if (
-            tuple(kv_mgr.kv_args.kv_item_lens) != expected_item_lens
-            or tuple(kv_mgr.kv_args.kv_unit_lens) != expected_item_lens
-            or tuple(prefill_parallel_info.kv_item_lens) != expected_item_lens
-            or tuple(prefill_parallel_info.kv_unit_lens) != expected_item_lens
+            tuple(kv_mgr.kv_args.kv_item_lens) != expected_local_item_lens
+            or tuple(kv_mgr.kv_args.kv_unit_lens) != expected_local_item_lens
+            or prefill_item_lens != expected_prefill_item_lens
+            or prefill_unit_lens != expected_prefill_item_lens
             or prefill_parallel_info.state_item_lens
             or prefill_parallel_info.state_unit_lens
         ):
             raise RuntimeError(
                 "Paged cache P/D raw-slab Mooncake descriptors are incompatible"
             )
-        if prefill_tp_size_per_dp_rank != local_tp_size_per_dp_rank:
-            raise NotImplementedError(
-                "Paged cache PD currently requires equal Prefill and Decode TP sizes"
+        decode_tp_rank = kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
+        planner = PagedCacheTransferPlanner(
+            prefill_tp_size=prefill_tp_size_per_dp_rank,
+            decode_tp_size=local_tp_size_per_dp_rank,
+            prefill_layout=prefill_cache_layout,
+            decode_layout=local_cache_layout,
+        )
+        transfer_plan = planner.plan_for_decode_rank(decode_tp_rank)
+        data_tp_ranks = tuple(transfer_plan.target_prefill_ranks)
+        dummy_tp_ranks = ()
+        if decode_tp_rank == 0:
+            dummy_tp_ranks = tuple(
+                rank
+                for rank, decode_ranks in planner.decode_ranks_by_prefill_rank.items()
+                if not decode_ranks
             )
-        target_tp_rank = kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
-        return _legacy_mla_route_plan(
+        target_tp_ranks = tuple(sorted((*data_tp_ranks, *dummy_tp_ranks)))
+        target_tp_rank = (
+            data_tp_ranks[0] if transfer_plan.plan_kind == "identity" else None
+        )
+        return ReceiverRoutePlan(
             target_tp_rank=target_tp_rank,
-            target_tp_ranks=(target_tp_rank,),
-            required_dst_info_num=1,
-            required_prefill_response_num=1,
+            target_tp_ranks=target_tp_ranks,
+            required_prefill_response_num=transfer_plan.required_prefill_response_num,
+            default_required_dst_info_num=(
+                transfer_plan.required_dst_info_num_for_prefill_rank(data_tp_ranks[0])
+            ),
+            transfer_plan=transfer_plan,
+            supports_remote_spec_candidates=transfer_plan.plan_kind == "identity",
+            dummy_tp_ranks=dummy_tp_ranks,
         )
     if prefill_cache_layout is not None:
         raise RuntimeError("non-Paged cache decode connected to a Paged cache prefill")
@@ -489,6 +524,11 @@ class MooncakeKVReceiver:
         self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
             route_plan.required_prefill_response_num
         )
+        self.kv_mgr.expected_prefill_ranks_table[self.bootstrap_room] = frozenset(
+            rank
+            for rank in route_plan.target_tp_ranks
+            if not route_plan.is_dummy_tp_rank(rank)
+        )
         target_dp_group = self.bootstrap_room % prefill_parallel_info.dp_size
         target_tp_key = ",".join(str(rank) for rank in route_plan.target_tp_ranks)
         bootstrap_key = f"{self.bootstrap_addr}_{target_dp_group}_{target_tp_key}"
@@ -555,10 +595,10 @@ class MooncakeKVReceiver:
                 target_dp_group,
             )
             if bootstrap_info is not None:
-                #  only support MLA for now: select one prefill rank as real rank
-                bootstrap_info["is_dummy"] = not bool(
-                    _target_tp_rank == route_plan.target_tp_rank
-                    or route_plan.target_tp_rank is None
+                # Control-only rendezvous ranks participate in Prefill TP
+                # status collectives but do not receive cache data.
+                bootstrap_info["is_dummy"] = route_plan.is_dummy_tp_rank(
+                    _target_tp_rank
                 )
                 bootstrap_info["required_dst_info_num"] = (
                     route_plan.required_dst_info_num_for_tp_rank(_target_tp_rank)
@@ -696,10 +736,14 @@ class MooncakeKVReceiver:
                 if not is_dummy and (transfer_fragments or page_manifest is not None):
                     message_parts.extend(encode_transfer_fragments(transfer_fragments))
                 if not is_dummy and page_manifest is not None:
+                    decode_tp_size = self.kv_mgr.world_size // self.kv_mgr.dp_size
+                    decode_tp_rank = self.kv_mgr.kv_args.engine_rank % decode_tp_size
                     message_parts.extend(
                         (
                             page_manifest.to_wire_bytes(),
                             cache_layout.to_wire_bytes(),
+                            str(decode_tp_size).encode("ascii"),
+                            str(decode_tp_rank).encode("ascii"),
                         )
                     )
                 sock.send_multipart(message_parts)
@@ -744,6 +788,12 @@ class MooncakeKVReceiver:
 
         if self.bootstrap_room in self.kv_mgr.prefill_response_tracker:
             self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room)
+
+        if self.bootstrap_room in self.kv_mgr.expected_prefill_ranks_table:
+            self.kv_mgr.expected_prefill_ranks_table.pop(self.bootstrap_room)
+
+        self.kv_mgr._pending_bootstrap_token_table.pop(self.bootstrap_room, None)
+        self.kv_mgr._pending_spec_candidate_ids_table.pop(self.bootstrap_room, None)
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank

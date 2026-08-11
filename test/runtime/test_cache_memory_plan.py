@@ -353,6 +353,42 @@ class CacheMemoryPlanTest(unittest.TestCase):
         for model_name in ("qwen", "inkling", "kimi", "deepseek"):
             self.assertNotIn(model_name, planner_source)
 
+    def test_recipes_and_memory_plan_do_not_own_pd_metadata(self):
+        pd_fields = {
+            "producer_step_count",
+            "ready_step",
+            "tp_partition_axis",
+            "tp_partition_global_extent",
+            "tp_partition_global_parts",
+        }
+        for plan_type in (
+            self.plan_module.CacheFieldSpec,
+            self.plan_module.CacheFieldLayout,
+            self.plan_module.CacheMemoryPlan,
+        ):
+            self.assertTrue(pd_fields.isdisjoint(plan_type.__dataclass_fields__))
+
+        for path in _RECIPE_DIR.glob("*.py"):
+            module = ast.parse(path.read_text())
+            imports = {
+                node.module
+                for node in ast.walk(module)
+                if isinstance(node, ast.ImportFrom) and node.module is not None
+            } | {
+                alias.name
+                for node in ast.walk(module)
+                if isinstance(node, ast.Import)
+                for alias in node.names
+            }
+            self.assertFalse(
+                any(
+                    imported.startswith("tokenspeed.runtime.pd")
+                    or imported.startswith("tokenspeed.runtime.cache.transfer")
+                    for imported in imports
+                ),
+                path.name,
+            )
+
     def test_cache_pool_factory_is_separate_from_setup(self):
         setup_module = ast.parse((_RECIPE_DIR / "setup.py").read_text())
         factory_module = ast.parse((_KV_CACHE_DIR / "factory.py").read_text())

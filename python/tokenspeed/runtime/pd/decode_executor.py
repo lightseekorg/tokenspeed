@@ -29,10 +29,7 @@ from tokenspeed.runtime.execution.block_table import (
 )
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.pd.base.status import TransferPoll
-from tokenspeed.runtime.pd.cache_protocol import (
-    build_cache_page_manifest,
-    cache_manifest_page_ids,
-)
+from tokenspeed.runtime.pd.cache_protocol import build_cache_page_manifest
 from tokenspeed.runtime.pd.mooncake.decode import MooncakeKVManagerDecode
 from tokenspeed.runtime.pd.mooncake.receiver import MooncakeKVReceiver
 from tokenspeed.runtime.pd.utils import (
@@ -93,10 +90,8 @@ class DisaggDecodeExecutor:
                 prompt_len=int(op.prefill_lengths[index]),
             )
             page_ids = np.asarray(
-                cache_manifest_page_ids(
-                    manifest,
-                    layout=self.cache_layout,
-                    peer="destination",
+                tuple(
+                    page_id for group in manifest.groups for page_id in group.page_ids
                 ),
                 dtype=np.int64,
             )

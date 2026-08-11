@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
+from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldLayout,
@@ -43,6 +44,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     Retention,
     TransferPolicy,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.configs.model_config import ModelConfig
 
 MAX_CACHE_CONTRACT_WIRE_BYTES = 256 << 10
 MAX_CACHE_MANIFEST_WIRE_BYTES = 2 << 20
@@ -78,6 +82,220 @@ def _load_wire_json(raw: bytes, *, name: str, maximum: int) -> dict:
 
 
 @dataclass(frozen=True, slots=True)
+class CacheFieldPartition:
+    """Dense global-to-rank-local partitioning for one PD cache field."""
+
+    axis: int
+    global_extent: int
+    global_parts: tuple[int, ...] = ()
+
+    def validate(self, *, field_id: str, local_shape: tuple[int, ...]) -> None:
+        if (
+            isinstance(self.axis, bool)
+            or not isinstance(self.axis, int)
+            or not 0 <= self.axis < len(local_shape)
+            or isinstance(self.global_extent, bool)
+            or not isinstance(self.global_extent, int)
+            or self.global_extent < local_shape[self.axis]
+        ):
+            raise ValueError(f"cache field {field_id!r} has invalid partition geometry")
+        local_extent = local_shape[self.axis]
+        if self.global_extent % local_extent:
+            raise ValueError(
+                f"cache field {field_id!r} global partition extent is not "
+                "divisible by its local extent"
+            )
+        distinct_shards = self.global_extent // local_extent
+        if self.global_parts and (
+            len(self.global_parts) < 2
+            or len(self.global_parts) > 16
+            or any(
+                isinstance(part, bool)
+                or not isinstance(part, int)
+                or part <= 0
+                or part % distinct_shards
+                for part in self.global_parts
+            )
+            or sum(self.global_parts) != self.global_extent
+        ):
+            raise ValueError(
+                f"cache field {field_id!r} has invalid global partition parts"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class CacheFieldTransferSpec:
+    field_id: str
+    partition: CacheFieldPartition
+
+    def __post_init__(self) -> None:
+        if not self.field_id:
+            raise ValueError("cache transfer field_id must be non-empty")
+
+
+@dataclass(frozen=True, slots=True)
+class CacheTransferSchema:
+    """PD wire semantics omitted from the rank-local cache memory plan."""
+
+    fields: tuple[CacheFieldTransferSpec, ...] = ()
+
+    def __post_init__(self) -> None:
+        field_ids = tuple(field.field_id for field in self.fields)
+        if len(field_ids) != len(set(field_ids)):
+            raise ValueError("cache transfer schema contains a duplicate field")
+
+    def partition_for(self, field_id: str) -> CacheFieldPartition | None:
+        for field in self.fields:
+            if field.field_id == field_id:
+                return field.partition
+        return None
+
+    def validate(self, plan: CacheMemoryPlan) -> None:
+        planned_fields = {field.field_id: field for field in plan.fields}
+        unknown = {field.field_id for field in self.fields} - set(planned_fields)
+        if unknown:
+            raise ValueError(
+                f"cache transfer schema references unknown fields {sorted(unknown)}"
+            )
+        for transfer_field in self.fields:
+            field = planned_fields[transfer_field.field_id]
+            transfer_field.partition.validate(
+                field_id=field.field_id,
+                local_shape=field.shape,
+            )
+
+
+def _text_config(model_config: ModelConfig):
+    text_config = getattr(model_config, "hf_text_config", None)
+    if text_config is not None:
+        return text_config
+    return getattr(model_config.hf_config, "text_config", model_config.hf_config)
+
+
+def _field_layer_id(field_id: str) -> int:
+    parts = field_id.split(".", 2)
+    if len(parts) != 3 or parts[0] != "layer":
+        raise ValueError(f"PD cache field {field_id!r} is not layer-owned")
+    try:
+        layer_id = int(parts[1])
+    except ValueError as exc:
+        raise ValueError(
+            f"PD cache field {field_id!r} has an invalid layer id"
+        ) from exc
+    if layer_id < 0:
+        raise ValueError(f"PD cache field {field_id!r} has an invalid layer id")
+    return layer_id
+
+
+def _source_model(
+    layer_id: int,
+    *,
+    model_config: ModelConfig,
+    draft_model_config: ModelConfig | None,
+) -> tuple[ModelConfig, int]:
+    target_layers = model_config.num_attention_layers
+    if layer_id < target_layers:
+        return model_config, layer_id
+    if draft_model_config is None:
+        raise ValueError(
+            f"PD cache field layer {layer_id} exceeds the target model without a draft"
+        )
+    draft_layer_id = layer_id - target_layers
+    if draft_layer_id >= draft_model_config.num_attention_layers:
+        raise ValueError(f"PD cache field layer {layer_id} exceeds the merged model")
+    return draft_model_config, draft_layer_id
+
+
+def _partition_for_field(
+    field: CacheFieldLayout,
+    *,
+    model_config: ModelConfig,
+    draft_model_config: ModelConfig | None,
+    logical_block_tokens: int,
+    inkling_layers: frozenset[int],
+) -> CacheFieldPartition | None:
+    layer_id = _field_layer_id(field.field_id)
+    source_model, source_layer_id = _source_model(
+        layer_id,
+        model_config=model_config,
+        draft_model_config=draft_model_config,
+    )
+    suffix = field.field_id.split(".", 2)[2]
+
+    if layer_id in inkling_layers:
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
+            inkling_layer_kv_head_counts,
+        )
+
+        global_heads = inkling_layer_kv_head_counts(source_model)[source_layer_id]
+        if suffix in ("k", "v"):
+            return CacheFieldPartition(1, global_heads)
+        if suffix in ("k_scale", "v_scale"):
+            return CacheFieldPartition(0, global_heads)
+        if suffix.startswith("kvconv_"):
+            return CacheFieldPartition(1, global_heads * source_model.head_dim)
+        return None
+
+    if suffix in ("k", "v"):
+        return CacheFieldPartition(1, source_model.num_key_value_heads)
+    if suffix in ("k_scale", "v_scale"):
+        axis = 0 if logical_block_tokens == 128 else 1
+        return CacheFieldPartition(axis, source_model.num_key_value_heads)
+
+    text_config = _text_config(source_model)
+    if suffix in ("conv", "ssm") and hasattr(text_config, "linear_num_key_heads"):
+        key_width = text_config.linear_key_head_dim * text_config.linear_num_key_heads
+        value_width = (
+            text_config.linear_value_head_dim * text_config.linear_num_value_heads
+        )
+        if suffix == "conv":
+            return CacheFieldPartition(
+                0,
+                2 * key_width + value_width,
+                (key_width, key_width, value_width),
+            )
+        return CacheFieldPartition(0, text_config.linear_num_value_heads)
+
+    linear_config = getattr(text_config, "linear_attn_config", None)
+    if suffix in ("conv_state", "recurrent_state") and linear_config is not None:
+        num_heads = int(linear_config["num_heads"])
+        head_dim = int(linear_config["head_dim"])
+        if suffix == "conv_state":
+            width = num_heads * head_dim
+            return CacheFieldPartition(0, 3 * width, (width, width, width))
+        return CacheFieldPartition(0, num_heads)
+
+    return None
+
+
+def build_cache_transfer_schema(
+    plan: CacheMemoryPlan,
+    *,
+    model_config: ModelConfig,
+    draft_model_config: ModelConfig | None = None,
+) -> CacheTransferSchema:
+    """Compile model-specific PD distribution semantics beside a pure plan."""
+
+    inkling_layers = frozenset(
+        _field_layer_id(field.field_id)
+        for field in plan.fields
+        if field.field_id.split(".", 2)[-1].startswith("kvconv_")
+    )
+    fields = []
+    for field in plan.fields:
+        partition = _partition_for_field(
+            field,
+            model_config=model_config,
+            draft_model_config=draft_model_config,
+            logical_block_tokens=plan.logical_block_tokens,
+            inkling_layers=inkling_layers,
+        )
+        if partition is not None:
+            fields.append(CacheFieldTransferSpec(field.field_id, partition))
+    return CacheTransferSchema(tuple(fields))
+
+
+@dataclass(frozen=True, slots=True)
 class CacheTransferContract:
     """Thin PD wire envelope around the cache-owned plan and group specs."""
 
@@ -85,6 +303,10 @@ class CacheTransferContract:
     group_specs: tuple[PagedCacheGroupSpec, ...]
     # Dtypes align positionally with plan.fields; field IDs stay plan-owned.
     field_dtypes: tuple[str, ...]
+    transfer_schema: CacheTransferSchema = CacheTransferSchema()
+
+    def __post_init__(self) -> None:
+        self.transfer_schema.validate(self.plan)
 
     def fields_for_group(self, group_id: str) -> tuple[CacheFieldLayout, ...]:
         return tuple(
@@ -136,12 +358,26 @@ class CacheTransferContract:
                     for field in plan_payload["fields"]
                 ),
             )
+            schema_payload = payload["transfer_schema"]
             return cls(
                 plan=plan,
                 group_specs=tuple(
                     PagedCacheGroupSpec(**spec) for spec in payload["group_specs"]
                 ),
                 field_dtypes=tuple(payload["field_dtypes"]),
+                transfer_schema=CacheTransferSchema(
+                    tuple(
+                        CacheFieldTransferSpec(
+                            field_id=field["field_id"],
+                            partition=CacheFieldPartition(
+                                axis=field["partition"]["axis"],
+                                global_extent=field["partition"]["global_extent"],
+                                global_parts=tuple(field["partition"]["global_parts"]),
+                            ),
+                        )
+                        for field in schema_payload["fields"]
+                    )
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise CacheContractError("invalid cache transfer contract") from exc
@@ -153,6 +389,7 @@ def build_cache_transfer_contract(
     buffer: object,
     group_specs: Sequence[PagedCacheGroupSpec],
     field_dtypes: Mapping[str, str],
+    transfer_schema: CacheTransferSchema = CacheTransferSchema(),
 ) -> tuple[CacheTransferContract, int]:
     """Bind one cache memory plan to its semantics, dtypes, and raw slab."""
     specs = tuple(group_specs)
@@ -173,6 +410,7 @@ def build_cache_transfer_contract(
         plan=plan,
         group_specs=specs,
         field_dtypes=tuple(field_dtypes[field.field_id] for field in plan.fields),
+        transfer_schema=transfer_schema,
     )
     if (
         str(buffer.dtype) != "torch.uint8"
@@ -189,6 +427,8 @@ def build_cache_transfer_contract(
 
 def build_pool_cache_transfer_contract(
     pool: object,
+    *,
+    transfer_schema: CacheTransferSchema = CacheTransferSchema(),
 ) -> tuple[CacheTransferContract, int]:
     """Build the PD wire envelope from the cache-owned arena binding."""
     buffer, field_dtypes = pool.cache_contract_binding()
@@ -197,7 +437,82 @@ def build_pool_cache_transfer_contract(
         buffer=buffer,
         group_specs=pool.paged_cache_group_specs,
         field_dtypes=field_dtypes,
+        transfer_schema=transfer_schema,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class CacheProducerSchedule:
+    """Prefill-local field readiness metadata, intentionally absent from wire."""
+
+    fields_by_step: tuple[tuple[str, ...], ...]
+
+    def __post_init__(self) -> None:
+        if not self.fields_by_step:
+            raise ValueError("cache producer schedule must contain at least one step")
+        fields = []
+        for step_fields in self.fields_by_step:
+            if any(not field_id for field_id in step_fields):
+                raise ValueError("cache producer field IDs must be non-empty")
+            fields.extend(step_fields)
+        if len(fields) != len(set(fields)):
+            raise ValueError("a cache field cannot be produced by multiple steps")
+
+    @property
+    def step_count(self) -> int:
+        return len(self.fields_by_step)
+
+    def fields_in_range(self, begin_step: int, end_step: int) -> frozenset[str]:
+        if not 0 <= begin_step <= end_step <= self.step_count:
+            raise ValueError(
+                f"cache producer step range [{begin_step}, {end_step}) is outside "
+                f"[0, {self.step_count})"
+            )
+        return frozenset(
+            field_id
+            for step_fields in self.fields_by_step[begin_step:end_step]
+            for field_id in step_fields
+        )
+
+
+def build_cache_fields_by_producer_step(
+    plan: CacheMemoryPlan,
+    *,
+    num_target_layers: int,
+) -> CacheProducerSchedule:
+    """Group cache fields by the Prefill barrier that makes them transferable."""
+
+    fields_by_layer: dict[int, list[str]] = {}
+    for field in plan.fields:
+        layer_id = _field_layer_id(field.field_id)
+        fields_by_layer.setdefault(layer_id, []).append(field.field_id)
+
+    if not fields_by_layer:
+        raise ValueError("layerwise PD requires at least one cache field")
+    merged_layers = max(fields_by_layer) + 1
+    if (
+        isinstance(num_target_layers, bool)
+        or not isinstance(num_target_layers, int)
+        or not 0 < num_target_layers <= merged_layers
+    ):
+        raise ValueError("PD target layer count is outside the cache plan")
+
+    fields_by_step = [
+        tuple(fields_by_layer.get(layer_id, ()))
+        for layer_id in range(num_target_layers)
+    ]
+    if merged_layers > num_target_layers:
+        # A speculative drafter may execute its physical layers repeatedly;
+        # all draft cache fields become transferable at one final barrier.
+        fields_by_step.append(
+            tuple(
+                field_id
+                for layer_id in range(num_target_layers, merged_layers)
+                for field_id in fields_by_layer.get(layer_id, ())
+            )
+        )
+
+    return CacheProducerSchedule(tuple(fields_by_step))
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,11 +604,22 @@ def validate_cache_peer_layout(
                 f"{local_spec.group_id!r} transfer field order"
             )
         for local_field, peer_field in zip(local_fields, peer_fields, strict=True):
+            local_global_shape = list(local_field.shape)
+            peer_global_shape = list(peer_field.shape)
+            local_partition = layout.transfer_schema.partition_for(local_field.field_id)
+            peer_partition = peer_layout.transfer_schema.partition_for(
+                peer_field.field_id
+            )
+            if local_partition is not None:
+                local_global_shape[local_partition.axis] = local_partition.global_extent
+            if peer_partition is not None:
+                peer_global_shape[peer_partition.axis] = peer_partition.global_extent
             if (
                 layout.field_dtype(local_field.field_id)
                 != peer_layout.field_dtype(peer_field.field_id)
-                or local_field.shape != peer_field.shape
                 or local_field.element_size != peer_field.element_size
+                or local_partition != peer_partition
+                or tuple(local_global_shape) != tuple(peer_global_shape)
             ):
                 raise CacheContractError(
                     f"Paged cache P/D contract mismatch: field "
@@ -422,10 +748,16 @@ def build_cache_page_manifest(
 
 __all__ = [
     "CacheContractError",
+    "CacheFieldPartition",
+    "CacheFieldTransferSpec",
     "CachePDGroupPages",
     "CachePDPageManifest",
+    "CacheProducerSchedule",
     "CacheTransferContract",
+    "CacheTransferSchema",
+    "build_cache_fields_by_producer_step",
     "build_cache_page_manifest",
+    "build_cache_transfer_schema",
     "build_cache_transfer_contract",
     "build_pool_cache_transfer_contract",
     "cache_manifest_page_ids",

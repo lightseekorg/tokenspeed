@@ -58,7 +58,6 @@ def qwen_gdn_cache_fields(
         )
     if next(iter(kv_shape)) != logical_block_tokens:
         raise ValueError("kv_shape must start with logical_block_tokens")
-
     occurrences: dict[str, int] = {}
     fields = []
     for layer_id, (label, group_id) in enumerate(zip(layer_types, layer_group_ids)):

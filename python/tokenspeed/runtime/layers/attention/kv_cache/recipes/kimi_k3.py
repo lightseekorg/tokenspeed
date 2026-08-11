@@ -138,7 +138,6 @@ def kimi_k3_cache_fields(
         or recurrent_element_size <= 0
     ):
         raise ValueError("Kimi-K3 KDA state geometry must be positive")
-
     occurrences: dict[str, int] = {}
     fields = []
     for layer_id, group_id in enumerate(layer_group_ids):

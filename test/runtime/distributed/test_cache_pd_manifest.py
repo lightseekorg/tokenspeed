@@ -32,8 +32,10 @@ from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
     CachePDGroupPages,
     CachePDPageManifest,
     CacheTransferContract,
+    CacheTransferSchema,
     build_cache_page_manifest,
     build_cache_transfer_contract,
+    build_cache_transfer_schema,
     validate_cache_manifest,
     validate_cache_peer_layout,
 )
@@ -91,6 +93,7 @@ def _contract(
     page_bytes: int = 128,
     planes: tuple[CachePlaneLayout, ...] | None = None,
     dtypes: tuple[str, ...] | None = None,
+    transfer_schema: CacheTransferSchema = CacheTransferSchema(),
 ) -> CacheTransferContract:
     plan = CacheMemoryPlan(
         logical_block_tokens=block_size,
@@ -118,6 +121,7 @@ def _contract(
         plan=plan,
         group_specs=specs,
         field_dtypes=dtypes or tuple("uint8" for _ in fields),
+        transfer_schema=transfer_schema,
     )
 
 
@@ -463,6 +467,44 @@ _LCM_SPECS = (
 )
 
 
+def _recipe_contract(
+    fields,
+    specs,
+    dtypes,
+    *,
+    ptr=0x10000,
+    q=128,
+    transfer_schema=CacheTransferSchema(),
+    **solve,
+):
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+        solve_cache_layout,
+    )
+
+    plan = solve_cache_layout(
+        fields,
+        logical_block_tokens=q,
+        max_padding_fraction=1.0,
+        **solve,
+    ).with_num_lcm_blocks(3)
+    aligned_specs = tuple(
+        replace(
+            spec,
+            cache_blocks_per_lcm_block=(
+                plan.group(spec.group_id).cache_blocks_per_lcm_block
+            ),
+        )
+        for spec in specs
+    )
+    return build_cache_transfer_contract(
+        plan=plan,
+        buffer=_cache_buffer(plan.arena_bytes, data_ptr=ptr),
+        group_specs=aligned_specs,
+        field_dtypes=dtypes,
+        transfer_schema=transfer_schema,
+    )[0]
+
+
 def test_lcm_contract_registers_one_arena_and_preserves_group_geometry() -> None:
     plan = _two_plane_lcm_plan(3)
     layout, base_addr = build_cache_transfer_contract(
@@ -502,6 +544,141 @@ def test_peer_layout_allows_capacity_and_offsets_to_differ() -> None:
         "layer.0.v", 0
     ) != large.plan.field_page_byte_offset("layer.0.v", 0)
     validate_cache_peer_layout(small, large)
+
+
+@pytest.mark.parametrize("family", ("mha", "mla", "dsa"))
+def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
+    family: str,
+) -> None:
+    import torch
+
+    from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
+        _ordinary_fields,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        build_paged_cache_group_specs,
+    )
+
+    common = {
+        "device": "cpu",
+        "backend_name": "test",
+        "num_attention_heads": 8,
+        "num_kv_heads": 4,
+        "head_dim": 8,
+        "attn_tp_size": 2,
+        "dtype": torch.bfloat16,
+        "kv_cache_dtype": torch.bfloat16,
+        "page_size": 16,
+        "context_len": 256,
+        "max_bs": 4,
+        "max_graph_bs": 4,
+        "kv_cache_quant_method": "none",
+    }
+    classes = {"mha": MHAConfig, "mla": MLAConfig, "dsa": DSAConfig}
+    extras = {}
+    if family != "mha":
+        extras.update(
+            kv_lora_rank=6,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=2,
+            v_head_dim=4,
+            scaling=1.0,
+            kv_cache_dim=8,
+        )
+    if family == "dsa":
+        extras.update(index_topk=4, index_head_dim=128, index_n_heads=1)
+    config = classes[family](
+        **common,
+        **extras,
+        layer_types=(),
+        pd_disaggregation_enabled=True,
+    )
+
+    fields, group_ids = _ordinary_fields(config, 2)
+    packing = {group_id: 1 for group_id in group_ids}
+    specs = build_paged_cache_group_specs(
+        layer_types=(),
+        group_ids=group_ids,
+        sliding_window_tokens=None,
+        page_size=config.page_size,
+        cache_blocks_per_lcm_block=packing,
+        pd_disaggregation_enabled=True,
+    )
+    field_dtypes = {
+        field.field_id: (
+            "uint8"
+            if family == "dsa" and field.field_id.endswith(".index_k")
+            else "bfloat16"
+        )
+        for field in fields
+    }
+    layout = _recipe_contract(
+        fields,
+        specs,
+        field_dtypes,
+        q=config.page_size,
+        cache_blocks_per_lcm_block=packing,
+        alignment=1,
+    )
+    model_config = SimpleNamespace(
+        num_attention_layers=2,
+        num_key_value_heads=4,
+        hf_config=SimpleNamespace(),
+    )
+    layout = replace(
+        layout,
+        transfer_schema=build_cache_transfer_schema(
+            layout.plan,
+            model_config=model_config,
+        ),
+    )
+
+    assert layout.plan.logical_block_tokens == 16
+    assert len(layout.group_specs) == 1
+    group = layout.group_specs[0]
+    assert (
+        group.group_id,
+        group.family,
+        group.cache_blocks_per_lcm_block,
+    ) == (
+        "full_attention",
+        "history",
+        1,
+    )
+
+    fields_by_id = {
+        field.field_id: field for field in layout.fields_for_group(group.group_id)
+    }
+    suffixes = {
+        "mha": ("k", "v"),
+        "mla": ("latent_kv",),
+        "dsa": ("index_k", "latent_kv"),
+    }[family]
+    expected_field_ids = tuple(
+        f"layer.{layer_id}.{suffix}" for layer_id in range(2) for suffix in suffixes
+    )
+    assert tuple(sorted(fields_by_id)) == expected_field_ids
+    for field_id, field in fields_by_id.items():
+        is_index = field_id.endswith(".index_k")
+        expected_shape = (
+            (16, 132)
+            if family == "dsa" and is_index
+            else (16, 1, 8) if field_id.endswith(".latent_kv") else (16, 2, 8)
+        )
+        expected_element_size = 1 if family == "dsa" and is_index else 2
+        assert layout.field_dtype(field_id) == field_dtypes[field_id]
+        assert field.shape == expected_shape
+        assert field.element_size == expected_element_size
+        partition = layout.transfer_schema.partition_for(field_id)
+        if field_id.endswith((".k", ".v")):
+            assert partition is not None
+            assert partition.axis == 1
+            assert partition.global_extent == 4
+        else:
+            assert partition is None
 
 
 if __name__ == "__main__":

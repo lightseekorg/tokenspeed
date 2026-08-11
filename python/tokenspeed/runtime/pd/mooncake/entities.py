@@ -26,12 +26,30 @@ import numpy.typing as npt
 
 from tokenspeed.runtime.pd.cache_protocol import (
     CachePDPageManifest,
+    CacheProducerSchedule,
     CacheTransferContract,
 )
 from tokenspeed.runtime.pd.transfer_plan import (
-    TransferFragment,
+    MAX_PAGED_CACHE_TP_SIZE,
+    TransferPlanFragment,
     decode_transfer_fragments,
 )
+
+
+def _bounded_ascii_uint(frame: bytes, *, name: str, minimum: int, maximum: int) -> int:
+    max_digits = len(str(maximum))
+    if (
+        not isinstance(frame, bytes)
+        or not 1 <= len(frame) <= max_digits
+        or any(byte < ord("0") or byte > ord("9") for byte in frame)
+        or len(frame) > 1
+        and frame[0] == ord("0")
+    ):
+        raise ValueError(f"{name} must be canonical unsigned ASCII")
+    value = int(frame)
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} is out of range")
+    return value
 
 
 @dataclasses.dataclass
@@ -60,6 +78,7 @@ class KVArgs:
     # Paged cache keeps the typed layout beside the normal Mooncake buffer
     # descriptor. The buffers themselves still use the shared transfer path.
     cache_layout: CacheTransferContract | None = None
+    cache_producer_schedule: CacheProducerSchedule | None = None
 
 
 class KVTransferError(Exception):
@@ -115,9 +134,11 @@ class TransferInfo:
     decode_prefix_len: int
     dst_mamba_indices: npt.NDArray[np.int64] | None
     is_dummy: bool
-    transfer_fragments: tuple[TransferFragment, ...] = ()
+    transfer_fragments: tuple[TransferPlanFragment, ...] = ()
     page_manifest: CachePDPageManifest | None = None
     peer_cache_layout: CacheTransferContract | None = None
+    decode_tp_size: int | None = None
+    decode_tp_rank: int | None = None
 
     @classmethod
     def from_zmq(cls, msg: list[bytes]):
@@ -152,7 +173,29 @@ class TransferInfo:
             if manifest_frame:
                 page_manifest = CachePDPageManifest.from_wire_bytes(manifest_frame)
                 peer_cache_layout = CacheTransferContract.from_wire_bytes(layout_frame)
+                if len(msg) != 18:
+                    raise ValueError(
+                        "Paged cache pre-allocation requires Decode TP identity"
+                    )
+                decode_tp_size = _bounded_ascii_uint(
+                    msg[16],
+                    name="Paged cache decode_tp_size",
+                    minimum=1,
+                    maximum=MAX_PAGED_CACHE_TP_SIZE,
+                )
+                decode_tp_rank = _bounded_ascii_uint(
+                    msg[17],
+                    name="Paged cache decode_tp_rank",
+                    minimum=0,
+                    maximum=decode_tp_size - 1,
+                )
+            else:
+                decode_tp_size = None
+                decode_tp_rank = None
             is_dummy = False
+        if is_dummy:
+            decode_tp_size = None
+            decode_tp_rank = None
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -167,6 +210,8 @@ class TransferInfo:
             transfer_fragments=transfer_fragments,
             page_manifest=page_manifest,
             peer_cache_layout=peer_cache_layout,
+            decode_tp_size=decode_tp_size,
+            decode_tp_rank=decode_tp_rank,
         )
 
 
@@ -186,6 +231,8 @@ class KVArgsRegisterInfo:
     def from_zmq(cls, msg: list[bytes]):
         # Format: room, endpoint, port, session, kv_ptrs, aux_ptrs, state_ptrs, decode_prefix_len.
         # Older senders used msg[6] for decode_prefix_len and omitted state_ptrs.
+        if len(msg) not in (7, 8):
+            raise ValueError("KV args registration requires 7 or 8 frames")
         has_state_frame = len(msg) >= 8
         if has_state_frame:
             state_frame = msg[6]
@@ -195,6 +242,8 @@ class KVArgsRegisterInfo:
             decode_prefix_len = (
                 int(msg[6].decode("ascii")) if len(msg) >= 7 and msg[6] else 0
             )
+        if any(len(frame) % 8 for frame in (msg[4], msg[5], state_frame)):
+            raise ValueError("KV args pointer frames must contain packed uint64 values")
 
         return cls(
             room=str(msg[0].decode("ascii")),

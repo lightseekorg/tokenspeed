@@ -21,9 +21,15 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
+
+from tokenspeed.runtime.pd.cache_protocol import (
+    CacheTransferContract,
+    validate_cache_peer_layout,
+)
 
 
 class UnsupportedPDLayoutError(ValueError):
@@ -104,71 +110,186 @@ class TransferFragment:
     page_count: int | None = None
 
 
+@dataclass(frozen=True)
+class CacheTransferFragment:
+    """One field-relative row fragment copied for every selected cache page.
+
+    Arena bases, segment page-zero offsets, page bases, and page strides are
+    deliberately resolved from the validated source/destination cache layouts
+    at execution time. Keeping those peer-local addresses out of the route
+    plan prevents the wire fragment from becoming a second, independently
+    trusted cache ABI.
+    """
+
+    group_id: str
+    field_id: str
+    src_rank: int
+    dst_rank: int
+    src_byte_offset: int
+    dst_byte_offset: int
+    src_row_stride_bytes: int
+    dst_row_stride_bytes: int
+    bytes_per_row: int
+    rows_per_page: int
+
+
+TransferPlanFragment = TransferFragment | CacheTransferFragment
+
+
 TRANSFER_PLAN_PROTOCOL_VERSION = 1
+PAGED_TRANSFER_PLAN_PROTOCOL_VERSION = 2
+MAX_PAGED_CACHE_TP_SIZE = 1024
+_MAX_TRANSFER_PLAN_WIRE_BYTES = 2 << 20
+_MAX_TRANSFER_FRAGMENTS = 1 << 16
 
 
 def encode_transfer_fragments(
-    fragments: tuple[TransferFragment, ...],
+    fragments: tuple[TransferPlanFragment, ...],
 ) -> tuple[bytes, bytes]:
-    payload = [
-        {
-            "buffer_index": fragment.buffer_index,
-            "buffer_kind": fragment.buffer_kind.value,
-            "src_rank": fragment.src_rank,
-            "dst_rank": fragment.dst_rank,
-            "src_page_stride_bytes": fragment.src_page_stride_bytes,
-            "dst_page_stride_bytes": fragment.dst_page_stride_bytes,
-            "src_byte_offset": fragment.src_byte_offset,
-            "dst_byte_offset": fragment.dst_byte_offset,
-            "bytes_per_page": fragment.bytes_per_page,
-            "page_count": fragment.page_count,
-        }
-        for fragment in fragments
-    ]
-    return (
-        str(TRANSFER_PLAN_PROTOCOL_VERSION).encode("ascii"),
-        json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-    )
+    if len(fragments) > _MAX_TRANSFER_FRAGMENTS:
+        raise UnsupportedPDLayoutError("transfer plan contains too many fragments")
+    if all(isinstance(fragment, TransferFragment) for fragment in fragments):
+        payload = [
+            {
+                "buffer_index": fragment.buffer_index,
+                "buffer_kind": fragment.buffer_kind.value,
+                "src_rank": fragment.src_rank,
+                "dst_rank": fragment.dst_rank,
+                "src_page_stride_bytes": fragment.src_page_stride_bytes,
+                "dst_page_stride_bytes": fragment.dst_page_stride_bytes,
+                "src_byte_offset": fragment.src_byte_offset,
+                "dst_byte_offset": fragment.dst_byte_offset,
+                "bytes_per_page": fragment.bytes_per_page,
+                "page_count": fragment.page_count,
+            }
+            for fragment in fragments
+        ]
+        version = TRANSFER_PLAN_PROTOCOL_VERSION
+    elif all(isinstance(fragment, CacheTransferFragment) for fragment in fragments):
+        payload = [
+            {name: getattr(fragment, name) for name in fragment.__dataclass_fields__}
+            for fragment in fragments
+        ]
+        version = PAGED_TRANSFER_PLAN_PROTOCOL_VERSION
+    else:
+        raise UnsupportedPDLayoutError(
+            "legacy and Paged cache transfer fragments cannot be mixed"
+        )
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > _MAX_TRANSFER_PLAN_WIRE_BYTES:
+        raise UnsupportedPDLayoutError("transfer plan exceeds the wire-size limit")
+    return str(version).encode("ascii"), encoded
 
 
 def decode_transfer_fragments(
     version_frame: bytes | None,
     payload_frame: bytes | None,
-) -> tuple[TransferFragment, ...]:
+) -> tuple[TransferPlanFragment, ...]:
     if not version_frame and not payload_frame:
         return ()
     if not version_frame or not payload_frame:
         raise UnsupportedPDLayoutError("incomplete transfer plan frames")
+    if len(version_frame) > 16:
+        raise UnsupportedPDLayoutError("invalid transfer plan protocol version")
 
     try:
         version = int(version_frame.decode("ascii"))
-    except ValueError as exc:
+    except (UnicodeDecodeError, ValueError) as exc:
         raise UnsupportedPDLayoutError(
             "invalid transfer plan protocol version"
         ) from exc
-    if version != TRANSFER_PLAN_PROTOCOL_VERSION:
+    if version not in (
+        TRANSFER_PLAN_PROTOCOL_VERSION,
+        PAGED_TRANSFER_PLAN_PROTOCOL_VERSION,
+    ):
         raise UnsupportedPDLayoutError(
             f"unsupported transfer plan protocol version={version}"
         )
-
-    raw_fragments = json.loads(payload_frame.decode("utf-8"))
-    return tuple(
-        TransferFragment(
-            buffer_index=int(fragment["buffer_index"]),
-            buffer_kind=BufferKind(fragment["buffer_kind"]),
-            src_rank=int(fragment["src_rank"]),
-            dst_rank=int(fragment["dst_rank"]),
-            src_page_stride_bytes=int(fragment["src_page_stride_bytes"]),
-            dst_page_stride_bytes=int(fragment["dst_page_stride_bytes"]),
-            src_byte_offset=int(fragment["src_byte_offset"]),
-            dst_byte_offset=int(fragment["dst_byte_offset"]),
-            bytes_per_page=int(fragment["bytes_per_page"]),
-            page_count=(
-                None if fragment["page_count"] is None else int(fragment["page_count"])
-            ),
+    if version == PAGED_TRANSFER_PLAN_PROTOCOL_VERSION and version_frame != str(
+        PAGED_TRANSFER_PLAN_PROTOCOL_VERSION
+    ).encode("ascii"):
+        raise UnsupportedPDLayoutError(
+            "Paged cache transfer plan version must use canonical ASCII encoding"
         )
-        for fragment in raw_fragments
-    )
+    if len(payload_frame) > _MAX_TRANSFER_PLAN_WIRE_BYTES:
+        raise UnsupportedPDLayoutError("transfer plan exceeds the wire-size limit")
+    try:
+        raw_fragments = json.loads(payload_frame.decode("utf-8"))
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ) as exc:
+        raise UnsupportedPDLayoutError("invalid transfer plan JSON") from exc
+    if (
+        not isinstance(raw_fragments, list)
+        or len(raw_fragments) > _MAX_TRANSFER_FRAGMENTS
+    ):
+        raise UnsupportedPDLayoutError("transfer plan must be a bounded JSON list")
+    fragments = []
+    for fragment in raw_fragments:
+        if not isinstance(fragment, dict):
+            raise UnsupportedPDLayoutError("transfer fragment must be a JSON object")
+        if version == TRANSFER_PLAN_PROTOCOL_VERSION:
+            # Preserve the legacy v1 decoder's coercive schema during the
+            # staged migration. Strict exact-schema decoding applies only to
+            # the new Paged-cache v2 plan.
+            try:
+                fragments.append(
+                    TransferFragment(
+                        buffer_index=int(fragment["buffer_index"]),
+                        buffer_kind=BufferKind(fragment["buffer_kind"]),
+                        src_rank=int(fragment["src_rank"]),
+                        dst_rank=int(fragment["dst_rank"]),
+                        src_page_stride_bytes=int(fragment["src_page_stride_bytes"]),
+                        dst_page_stride_bytes=int(fragment["dst_page_stride_bytes"]),
+                        src_byte_offset=int(fragment["src_byte_offset"]),
+                        dst_byte_offset=int(fragment["dst_byte_offset"]),
+                        bytes_per_page=int(fragment["bytes_per_page"]),
+                        page_count=(
+                            None
+                            if fragment["page_count"] is None
+                            else int(fragment["page_count"])
+                        ),
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise UnsupportedPDLayoutError(
+                    "invalid legacy transfer fragment"
+                ) from exc
+        else:
+            expected_keys = set(CacheTransferFragment.__dataclass_fields__)
+            if set(fragment) != expected_keys:
+                raise UnsupportedPDLayoutError(
+                    "Paged cache transfer fragment has unexpected fields"
+                )
+            if (
+                not isinstance(fragment["group_id"], str)
+                or not isinstance(fragment["field_id"], str)
+                or any(
+                    isinstance(fragment[name], bool)
+                    or not isinstance(fragment[name], int)
+                    for name in expected_keys - {"group_id", "field_id"}
+                )
+            ):
+                raise UnsupportedPDLayoutError(
+                    "Paged cache transfer fragment has invalid field types"
+                )
+            fragments.append(
+                CacheTransferFragment(
+                    **fragment,
+                )
+            )
+    result = tuple(fragments)
+    if (
+        version == PAGED_TRANSFER_PLAN_PROTOCOL_VERSION
+        and encode_transfer_fragments(result)[1] != payload_frame
+    ):
+        raise UnsupportedPDLayoutError(
+            "Paged cache transfer plan must use canonical JSON encoding"
+        )
+    return result
 
 
 @dataclass(frozen=True)
@@ -177,7 +298,7 @@ class RankTransferPlan:
     target_dp_group: int
     target_prefill_ranks: tuple[int, ...]
     required_prefill_response_num: int
-    fragments_by_prefill_rank: dict[int, tuple[TransferFragment, ...]]
+    fragments_by_prefill_rank: dict[int, tuple[TransferPlanFragment, ...]]
     required_dst_info_num_by_prefill_rank: dict[int, int]
 
     def required_dst_info_num_for_prefill_rank(self, prefill_rank: int) -> int:
@@ -199,6 +320,12 @@ class _Interval:
         if start >= end:
             return None
         return _Interval(start, end)
+
+
+@dataclass(frozen=True)
+class _RankPartition:
+    interval: _Interval
+    local_offset: int
 
 
 class PDTransferPlanner:
@@ -465,3 +592,285 @@ class PDTransferPlanner:
         prefill_tp_size: int, decode_tp_size: int, decode_tp_rank: int
     ) -> int:
         return (decode_tp_rank * prefill_tp_size) // decode_tp_size
+
+
+class PagedCacheTransferPlanner:
+    """Plan model-neutral dense Paged-cache fields across unequal TP sizes."""
+
+    def __init__(
+        self,
+        *,
+        prefill_tp_size: int,
+        decode_tp_size: int,
+        prefill_layout: CacheTransferContract,
+        decode_layout: CacheTransferContract,
+    ):
+        if prefill_tp_size <= 0 or decode_tp_size <= 0:
+            raise UnsupportedPDLayoutError("Paged cache TP sizes must be positive")
+        if (
+            prefill_tp_size > MAX_PAGED_CACHE_TP_SIZE
+            or decode_tp_size > MAX_PAGED_CACHE_TP_SIZE
+        ):
+            raise UnsupportedPDLayoutError(
+                f"Paged cache TP sizes cannot exceed {MAX_PAGED_CACHE_TP_SIZE}"
+            )
+        self.prefill_tp_size = prefill_tp_size
+        self.decode_tp_size = decode_tp_size
+        validate_cache_peer_layout(prefill_layout, decode_layout)
+        self._partitions = {
+            field.field_id: prefill_layout.transfer_schema.partition_for(field.field_id)
+            for field in prefill_layout.plan.fields
+        }
+        self._segment_pairs = tuple(
+            (prefill_spec.group_id, prefill_segment, decode_segment)
+            for prefill_spec, decode_spec in zip(
+                prefill_layout.group_specs,
+                decode_layout.group_specs,
+                strict=True,
+            )
+            for prefill_segment, decode_segment in zip(
+                prefill_layout.fields_for_group(prefill_spec.group_id),
+                decode_layout.fields_for_group(decode_spec.group_id),
+                strict=True,
+            )
+        )
+        for _, prefill_segment, decode_segment in self._segment_pairs:
+            self._validate_tp_mapping(prefill_segment, decode_segment)
+        self._decode_ranks_by_prefill_rank = self._calc_source_decode_ranks()
+
+    @property
+    def decode_ranks_by_prefill_rank(self) -> dict[int, frozenset[int]]:
+        """Decode ranks served by each Prefill rank."""
+        return dict(self._decode_ranks_by_prefill_rank)
+
+    def plan_for_decode_rank(self, decode_tp_rank: int) -> RankTransferPlan:
+        if not 0 <= decode_tp_rank < self.decode_tp_size:
+            raise UnsupportedPDLayoutError(
+                f"decode_tp_rank={decode_tp_rank} is out of range"
+            )
+        if self.prefill_tp_size == self.decode_tp_size:
+            return RankTransferPlan(
+                plan_kind="identity",
+                target_dp_group=0,
+                target_prefill_ranks=(decode_tp_rank,),
+                required_prefill_response_num=1,
+                fragments_by_prefill_rank={decode_tp_rank: ()},
+                required_dst_info_num_by_prefill_rank={
+                    decode_tp_rank: len(
+                        self._decode_ranks_by_prefill_rank[decode_tp_rank]
+                    )
+                },
+            )
+
+        fragments_by_rank = self._fragments_for_decode_rank(decode_tp_rank)
+        target_ranks = tuple(fragments_by_rank)
+        if not target_ranks:
+            raise UnsupportedPDLayoutError(
+                f"Paged cache decode TP rank {decode_tp_rank} has no source fragments"
+            )
+        return RankTransferPlan(
+            plan_kind="fragmented",
+            target_dp_group=0,
+            target_prefill_ranks=target_ranks,
+            required_prefill_response_num=len(target_ranks),
+            fragments_by_prefill_rank=fragments_by_rank,
+            required_dst_info_num_by_prefill_rank={
+                rank: len(self._decode_ranks_by_prefill_rank[rank])
+                for rank in target_ranks
+            },
+        )
+
+    def _validate_tp_mapping(self, prefill_segment, decode_segment) -> None:
+        field = prefill_segment.field_id
+        if self.prefill_tp_size == self.decode_tp_size and (
+            prefill_segment.shape != decode_segment.shape
+            or prefill_segment.payload_bytes != decode_segment.payload_bytes
+        ):
+            raise UnsupportedPDLayoutError(
+                f"equal-TP Paged cache field {field!r} rank-local geometry differs"
+            )
+        partition = self._partitions[prefill_segment.field_id]
+        if partition is None:
+            return
+        self._rank_partitions(prefill_segment, partition, self.prefill_tp_size, 0)
+        self._rank_partitions(decode_segment, partition, self.decode_tp_size, 0)
+
+    def _fragments_for_decode_rank(
+        self, decode_tp_rank: int
+    ) -> dict[int, tuple[CacheTransferFragment, ...]]:
+        fragments: dict[int, list[CacheTransferFragment]] = {}
+        for group_id, prefill_segment, decode_segment in self._segment_pairs:
+            partition = self._partitions[prefill_segment.field_id]
+            if partition is None:
+                prefill_rank = self._replicated_source_tp_rank(
+                    self.prefill_tp_size,
+                    self.decode_tp_size,
+                    decode_tp_rank,
+                )
+                fragment = self._make_fragment(
+                    group_id=group_id,
+                    prefill_segment=prefill_segment,
+                    decode_segment=decode_segment,
+                    partition=None,
+                    prefill_rank=prefill_rank,
+                    decode_tp_rank=decode_tp_rank,
+                    intersection=None,
+                    prefill_interval=None,
+                    decode_interval=None,
+                )
+                fragments.setdefault(prefill_rank, []).append(fragment)
+                continue
+
+            decode_partitions = self._rank_partitions(
+                decode_segment, partition, self.decode_tp_size, decode_tp_rank
+            )
+            for prefill_rank in range(self.prefill_tp_size):
+                if not self._is_representative_rank(
+                    prefill_segment, partition, self.prefill_tp_size, prefill_rank
+                ):
+                    continue
+                prefill_partitions = self._rank_partitions(
+                    prefill_segment, partition, self.prefill_tp_size, prefill_rank
+                )
+                for prefill_partition, decode_partition in zip(
+                    prefill_partitions, decode_partitions, strict=True
+                ):
+                    intersection = prefill_partition.interval.intersect(
+                        decode_partition.interval
+                    )
+                    if intersection is None:
+                        continue
+                    fragment = self._make_fragment(
+                        group_id=group_id,
+                        prefill_segment=prefill_segment,
+                        decode_segment=decode_segment,
+                        partition=partition,
+                        prefill_rank=prefill_rank,
+                        decode_tp_rank=decode_tp_rank,
+                        intersection=intersection,
+                        prefill_interval=prefill_partition.interval,
+                        decode_interval=decode_partition.interval,
+                        prefill_local_offset=prefill_partition.local_offset,
+                        decode_local_offset=decode_partition.local_offset,
+                    )
+                    fragments.setdefault(prefill_rank, []).append(fragment)
+        return {
+            rank: tuple(rank_fragments)
+            for rank, rank_fragments in sorted(fragments.items())
+        }
+
+    @staticmethod
+    def _make_fragment(
+        *,
+        group_id,
+        prefill_segment,
+        decode_segment,
+        partition,
+        prefill_rank,
+        decode_tp_rank,
+        intersection,
+        prefill_interval,
+        decode_interval,
+        prefill_local_offset=0,
+        decode_local_offset=0,
+    ) -> CacheTransferFragment:
+        if partition is None:
+            rows_per_page = 1
+            src_row_stride = prefill_segment.payload_bytes
+            dst_row_stride = decode_segment.payload_bytes
+            bytes_per_row = prefill_segment.payload_bytes
+            src_byte_offset = 0
+            dst_byte_offset = 0
+        else:
+            axis = partition.axis
+            inner_bytes = (
+                math.prod(prefill_segment.shape[axis + 1 :])
+                * prefill_segment.element_size
+            )
+            rows_per_page = math.prod(prefill_segment.shape[:axis])
+            src_row_stride = prefill_segment.shape[axis] * inner_bytes
+            dst_row_stride = decode_segment.shape[axis] * inner_bytes
+            bytes_per_row = intersection.length * inner_bytes
+            src_byte_offset = (
+                prefill_local_offset + intersection.start - prefill_interval.start
+            ) * inner_bytes
+            dst_byte_offset = (
+                decode_local_offset + intersection.start - decode_interval.start
+            ) * inner_bytes
+
+        if (
+            rows_per_page > 1
+            and src_row_stride == bytes_per_row
+            and dst_row_stride == bytes_per_row
+        ):
+            bytes_per_row *= rows_per_page
+            src_row_stride = bytes_per_row
+            dst_row_stride = bytes_per_row
+            rows_per_page = 1
+
+        return CacheTransferFragment(
+            group_id=group_id,
+            field_id=prefill_segment.field_id,
+            src_rank=prefill_rank,
+            dst_rank=decode_tp_rank,
+            src_byte_offset=src_byte_offset,
+            dst_byte_offset=dst_byte_offset,
+            src_row_stride_bytes=src_row_stride,
+            dst_row_stride_bytes=dst_row_stride,
+            bytes_per_row=bytes_per_row,
+            rows_per_page=rows_per_page,
+        )
+
+    @staticmethod
+    def _rank_partitions(
+        segment, partition, tp_size: int, tp_rank: int
+    ) -> tuple[_RankPartition, ...]:
+        axis = partition.axis
+        local_extent = segment.shape[axis]
+        global_extent = partition.global_extent
+        distinct_shards = global_extent // local_extent
+        if distinct_shards > tp_size or tp_size % distinct_shards:
+            raise UnsupportedPDLayoutError(
+                f"Paged cache field {segment.field_id!r} cannot map global "
+                f"extent {global_extent} and local extent {local_extent} to TP={tp_size}"
+            )
+        replica_group_size = tp_size // distinct_shards
+        shard_rank = tp_rank // replica_group_size
+        global_parts = partition.global_parts or (global_extent,)
+        partitions = []
+        global_offset = 0
+        local_offset = 0
+        for global_part_extent in global_parts:
+            local_part_extent = global_part_extent // distinct_shards
+            start = global_offset + shard_rank * local_part_extent
+            partitions.append(
+                _RankPartition(
+                    interval=_Interval(start, start + local_part_extent),
+                    local_offset=local_offset,
+                )
+            )
+            global_offset += global_part_extent
+            local_offset += local_part_extent
+        return tuple(partitions)
+
+    @staticmethod
+    def _is_representative_rank(segment, partition, tp_size: int, tp_rank: int) -> bool:
+        local_extent = segment.shape[partition.axis]
+        distinct_shards = partition.global_extent // local_extent
+        replica_group_size = tp_size // distinct_shards
+        return tp_rank % replica_group_size == 0
+
+    @staticmethod
+    def _replicated_source_tp_rank(
+        prefill_tp_size: int, decode_tp_size: int, decode_tp_rank: int
+    ) -> int:
+        return (decode_tp_rank * prefill_tp_size) // decode_tp_size
+
+    def _calc_source_decode_ranks(self) -> dict[int, frozenset[int]]:
+        if self.prefill_tp_size == self.decode_tp_size:
+            return {rank: frozenset({rank}) for rank in range(self.prefill_tp_size)}
+        decode_ranks = {rank: set() for rank in range(self.prefill_tp_size)}
+        for decode_tp_rank in range(self.decode_tp_size):
+            for prefill_rank in self._fragments_for_decode_rank(decode_tp_rank):
+                decode_ranks[prefill_rank].add(decode_tp_rank)
+        return {rank: frozenset(ranks) for rank, ranks in decode_ranks.items()}

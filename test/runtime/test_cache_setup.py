@@ -185,12 +185,16 @@ def test_attention_configs_do_not_own_cache_setup() -> None:
 def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
     text_config = SimpleNamespace(
         mamba2_cache_params=(
-            (2, 2),
+            (3, 2),
             (1, 2, 2),
             torch.bfloat16,
             torch.float32,
             (0,),
-        )
+        ),
+        linear_key_head_dim=1,
+        linear_num_key_heads=1,
+        linear_value_head_dim=1,
+        linear_num_value_heads=1,
     )
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(text_config=text_config),
@@ -468,6 +472,10 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
         group_ids=tuple(spec.group_id for spec in target_pool.paged_cache_group_specs),
     )
     assert len(combined_layout.consumers) == 3
+    assert combined_layout.buffers == (target_pool.buffer,)
+    assert {
+        field.field_id for group in combined_layout.groups for field in group.fields
+    } == set(target_pool._fields)
     contract, base_addr = build_pool_cache_transfer_contract(target_pool)
     assert contract.plan is target_pool.plan
     assert base_addr == target_pool.buffer.data_ptr()

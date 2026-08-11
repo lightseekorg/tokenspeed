@@ -32,7 +32,8 @@ class PagedCacheGroupSpec:
     rows_per_page: int
     entry_stride_tokens: int
     sliding_window_tokens: int | None
-    # History groups form a chain; State groups only need the trailing window.
+    # History stores token history; State stores recurrent state. Retention
+    # determines whether either family is full-history or sliding.
     family: Family = "history"
     # Physical child CacheBlocks packed into one shared LCM parent.
     cache_blocks_per_lcm_block: int = 1
@@ -574,8 +575,9 @@ def apply_pd_transfer_policies(
 ) -> list[PagedCacheGroupSpec]:
     """Stamp PD-disaggregation transfer policies onto group specs.
 
-    State groups transfer only their trailing snapshot; history groups
-    transfer the full suffix.
+    Full-history state groups transfer only their trailing snapshot. Sliding
+    state is rolling token history and therefore transfers its complete
+    retained suffix, like an attention-history group.
     """
     from dataclasses import replace
 
@@ -583,7 +585,9 @@ def apply_pd_transfer_policies(
         replace(
             spec,
             transfer_policy=(
-                "latest_snapshot" if spec.family == "state" else "full_suffix"
+                "latest_snapshot"
+                if spec.family == "state" and spec.retention == "full_history"
+                else "full_suffix"
             ),
         )
         for spec in specs

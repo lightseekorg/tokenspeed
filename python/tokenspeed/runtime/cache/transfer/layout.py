@@ -305,6 +305,54 @@ def combine_cache_transfer_layouts(
             raise ValueError("scheduler and transfer cache groups do not match")
         ordered_group_ids = group_ids
 
+    shared_arena = (
+        len(target.buffers) == 1
+        and len(draft.buffers) == 1
+        and target.buffers[0] is draft.buffers[0]
+    )
+    if shared_arena:
+        target_fields = {
+            field.field_id for group in target.groups for field in group.fields
+        }
+        draft_fields = {
+            field.field_id for group in draft.groups for field in group.fields
+        }
+        overlap = target_fields & draft_fields
+        if overlap:
+            raise ValueError(
+                "shared target/draft arena views overlap fields " f"{sorted(overlap)}"
+            )
+        if any(
+            field.device_buffer_index != 0
+            for layout in (target, draft)
+            for group in layout.groups
+            for field in group.fields
+        ):
+            raise ValueError("shared arena fields must use device buffer zero")
+        groups = []
+        for group_id in ordered_group_ids:
+            target_group = target_groups.get(group_id)
+            draft_group = draft_groups.get(group_id)
+            fields = ()
+            if target_group is not None:
+                fields += target_group.fields
+            if draft_group is not None:
+                fields += draft_group.fields
+            geometry = target_group if target_group is not None else draft_group
+            groups.append(
+                CacheGroupLayout(
+                    group_id=group_id,
+                    cache_blocks_per_lcm_block=geometry.cache_blocks_per_lcm_block,
+                    fields=fields,
+                )
+            )
+        return CacheTransferLayout(
+            num_lcm_blocks=target.num_lcm_blocks,
+            groups=tuple(groups),
+            buffers=target.buffers,
+            consumers=target.consumers + draft.consumers,
+        )
+
     draft_buffer_base = len(target.buffers)
 
     def namespaced_field(

@@ -294,13 +294,30 @@ class DisaggPrefillExecutor:
             transfer_infos = self.kv_manager.transfer_infos.get(
                 sender.bootstrap_room, {}
             )
+            if not transfer_infos:
+                raise RuntimeError("Paged cache destination metadata is unavailable")
             destinations = [
                 info for info in transfer_infos.values() if not info.is_dummy
             ]
-            if len(destinations) != 1:
-                raise RuntimeError(
-                    "Paged cache PD requires exactly one identity-routed destination"
+            if not destinations:
+                # A rank with no data edge still participates in the Prefill
+                # TP status collective. Decode TP rank zero sends it one dummy
+                # rendezvous; enqueueing a final no-op lets the existing
+                # transfer worker mark this rank successful without DMA.
+                token = self._request_token.get(request_id)
+                if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+                    raise RuntimeError("Paged cache bootstrap token is unavailable")
+                pending.append(
+                    (
+                        request_id,
+                        sender,
+                        op.request_pool_indices[index],
+                        token,
+                        None,
+                        np.empty(0, dtype=np.int64),
+                    )
                 )
+                continue
             destination = destinations[0]
             if (
                 destination.page_manifest is None
@@ -314,12 +331,20 @@ class DisaggPrefillExecutor:
                 prefix_len=destination.page_manifest.prefix_len,
                 prompt_len=destination.page_manifest.prompt_len,
             )
-            validate_cache_manifest_pair(
-                manifest,
-                destination.page_manifest,
-                self.cache_layout,
-                destination.peer_cache_layout,
-            )
+            for destination in destinations:
+                if (
+                    destination.page_manifest is None
+                    or destination.peer_cache_layout is None
+                ):
+                    raise RuntimeError(
+                        "Paged cache destination metadata is unavailable"
+                    )
+                validate_cache_manifest_pair(
+                    manifest,
+                    destination.page_manifest,
+                    self.cache_layout,
+                    destination.peer_cache_layout,
+                )
             token = self._request_token.get(request_id)
             if isinstance(token, bool) or not isinstance(token, int) or token < 0:
                 raise RuntimeError("Paged cache bootstrap token is unavailable")

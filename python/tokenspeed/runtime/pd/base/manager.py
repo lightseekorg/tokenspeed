@@ -67,7 +67,9 @@ class DisaggManagerBase:
     def _connect(self, endpoint: str):
         socket = zmq.Context().socket(zmq.PUSH)
         socket.connect(endpoint)
-        return socket
+        # PyZMQ sockets are not thread-safe. Managers run multiple transfer
+        # workers, so serialize sends that reuse this cached endpoint socket.
+        return socket, threading.Lock()
 
     def check_status(self, bootstrap_room: int):
         """Status of ``bootstrap_room``; raises ``KeyError`` if never seen."""
