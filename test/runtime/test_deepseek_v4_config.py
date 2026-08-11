@@ -4970,6 +4970,13 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         with (
+            # deep_gemm is unavailable on AMD runners; the guard only checks
+            # for None and every consumer below is patched out.
+            patch.object(
+                deepseek_v4_model,
+                "deep_gemm",
+                deepseek_v4_model.deep_gemm or SimpleNamespace(),
+            ),
             patch.object(
                 deepseek_v4_model,
                 "deepseek_v4_prepare_indexer_q_mxfp4",
