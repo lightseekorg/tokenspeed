@@ -207,7 +207,7 @@ def test_decode_publishes_manifest_through_legacy_receiver() -> None:
     assert len(calls) == 1
     args, kwargs = calls[0]
     assert args[0].tolist() == [2, 3, 6]
-    assert args[1:5] == (7, 2, None, None)
+    assert args[1:] == (7, 2, None)
     assert kwargs["page_manifest"].groups[0].page_ids == (2, 3)
     assert executor._request_pool_indices == {"request-0": 7}
 
