@@ -870,16 +870,9 @@ class KimiLinearMoEGate(nn.Module):
 ATTNRES_FAST_PATH_MAX_TOKENS = 32
 
 
-def attnres_mlp_slot(layer_id: int) -> int:
-    """Slot holding ``layer_id``'s mlp-side partial; alternates so a layer's
-    all-reduce never reads the buffer its own aux branch is writing.
-
-    Args:
-        layer_id: Zero-based decoder layer index.
-
-    Returns:
-        The scratch slot index, 0 or 2.
-    """
+def _attnres_mlp_slot(layer_id: int) -> int:
+    """Slot (0 or 2) for this layer's mlp-side partial; alternates so a layer
+    never reads the buffer its own aux branch is writing for the next one."""
     return 2 * (layer_id % 2)
 
 
@@ -1529,7 +1522,7 @@ class KimiLinearDecoderLayer(nn.Module):
         self._next_attn_mix = None
         # Whether the next layer's mlp-side partial rides our sweep too.
         self._hoist_next_mlp = False
-        self._mlp_slot = attnres_mlp_slot(layer_id)
+        self._mlp_slot = _attnres_mlp_slot(layer_id)
         # Precomputed rms_w * res_w products (filled in post_load_weights).
         self._attn_wp = None
         self._mlp_wp = None
