@@ -1,13 +1,15 @@
-from contextlib import contextmanager
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
-from tokenspeed.runtime.distributed.comm_backend import nccl as nccl_module
+from tokenspeed.runtime.distributed.comm_backend import (
+    triton_allreduce as triton_allreduce_module,
+)
 from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
-from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+from tokenspeed.runtime.distributed.comm_backend.triton_allreduce import (
+    TritonAllReduceBackend,
+)
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
@@ -78,10 +80,14 @@ def test_force_deterministic_rsag_routes_all_reduce_collection_to_nccl(
     group = (0, 1)
 
     tensors = (first, second, third)
-    backend._nccl.all_reduce.return_value = tensors
     backend.all_reduce(tensors, group)
 
-    backend._nccl.all_reduce.assert_called_once_with(tensors, group, op=None)
+    assert backend._nccl.all_reduce.call_count == len(tensors)
+    for call, tensor in zip(backend._nccl.all_reduce.call_args_list, tensors):
+        assert call.args[0] is tensor
+        assert call.args[1] == group
+        assert call.kwargs == {"op": None}
+    backend._nccl.all_reduce_two.assert_not_called()
     backend._trtllm_ar.has_trtllm_ar.assert_not_called()
     backend._triton_ar.can_run.assert_not_called()
 
@@ -91,42 +97,37 @@ def test_all_reduce_rejects_empty_collection(backend):
         backend.all_reduce((), (0, 1))
 
 
-@pytest.mark.parametrize(
-    ("is_amd", "tensor_count", "expected_groups"),
-    [(True, 3, 1), (False, 2, 1), (False, 3, 0)],
-)
-def test_nccl_collection_grouping(monkeypatch, is_amd, tensor_count, expected_groups):
-    backend = NcclBackend()
+def test_triton_collection_fallback_reduces_each_tensor(monkeypatch):
+    fallback = Mock()
+    fallback.all_reduce.side_effect = lambda tensor, _group, op: tensor
+    backend = TritonAllReduceBackend(fallback)
+    monkeypatch.setattr(backend, "_get_or_create", lambda _group: object())
+    monkeypatch.setattr(
+        triton_allreduce_module,
+        "all_reduce_can_run",
+        lambda _state, _tensor, op: False,
+    )
+    tensors = tuple(torch.empty(1) for _ in range(3))
+
+    assert backend.all_reduce(tensors, (0, 1)) == tensors
+    assert fallback.all_reduce.call_count == len(tensors)
+    assert all(
+        call.args[0] is tensor
+        for call, tensor in zip(fallback.all_reduce.call_args_list, tensors)
+    )
+
+
+def test_force_deterministic_rsag_preserves_two_tensor_nccl_grouping(
+    backend, monkeypatch
+):
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", True)
+    tensors = (torch.empty(1, 4), torch.empty(1, 8))
     group = (0, 1)
-    group_calls = []
+    backend._nccl.all_reduce_two.return_value = tensors
 
-    @contextmanager
-    def coalescing_manager(*, group):
-        group_calls.append(group)
-        yield
-
-    monkeypatch.setattr(
-        nccl_module,
-        "current_platform",
-        lambda: SimpleNamespace(is_amd=is_amd),
-    )
-    monkeypatch.setattr(
-        backend,
-        "_get_or_create_resources",
-        lambda _group: {
-            "world_size": 2,
-            "pynccl_comm": None,
-            "device_group": "device-group",
-        },
-    )
-    monkeypatch.setattr(torch.distributed, "_coalescing_manager", coalescing_manager)
-    all_reduce = Mock()
-    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
-
-    tensors = tuple(torch.empty(1) for _ in range(tensor_count))
-    assert backend.all_reduce(tensors, group) == tensors
-    assert group_calls == ["device-group"] * expected_groups
-    assert all_reduce.call_count == tensor_count
+    assert backend.all_reduce(tensors, group) is tensors
+    backend._nccl.all_reduce_two.assert_called_once_with(*tensors, group, op=None)
+    backend._nccl.all_reduce.assert_not_called()
 
 
 def test_plan_all_reduce_uses_triton(backend, monkeypatch):

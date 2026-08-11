@@ -110,15 +110,17 @@ class AutoBackend(CommBackend):
             tensors = tensor
             if len(tensors) == 0:
                 raise ValueError("all-reduce requires at least one tensor")
-            if self._force_deterministic_rsag() or self._group_spans_nodes(group):
-                return self._nccl.all_reduce(tensors, group, op=op)
+            use_nccl = self._force_deterministic_rsag() or self._group_spans_nodes(
+                group
+            )
             # Collections past the one-shot window are headed for NCCL;
             # grouping avoids the copy required to concatenate them first.
-            if all(
+            use_nccl = use_nccl or all(
                 value.numel() * value.element_size() > MAX_ONESHOT_BYTES
                 for value in tensors
-            ):
-                return self._nccl.all_reduce(tensors, group, op=op)
+            )
+            if use_nccl and len(tensors) == 2:
+                return self._nccl.all_reduce_two(*tensors, group, op=op)
             return super().all_reduce(tensors, group, op=op)
 
         # AR backend dispatch -- first match wins. This is Tier 1 (which

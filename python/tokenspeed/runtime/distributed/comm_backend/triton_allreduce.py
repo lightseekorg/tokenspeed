@@ -90,7 +90,7 @@ class TritonAllReduceBackend(CommBackend):
         op=None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         if not isinstance(tensor, torch.Tensor):
-            return self._fallback.all_reduce(tensor, group, op=op)
+            return super().all_reduce(tensor, group, op=op)
 
         state = self._get_or_create(group)
         if all_reduce_can_run(state, tensor, op=op):

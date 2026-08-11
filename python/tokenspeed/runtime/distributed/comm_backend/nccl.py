@@ -27,7 +27,6 @@ via custom ops.
 
 import torch
 import torch.distributed
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 
@@ -82,52 +81,52 @@ class NcclBackend(CommBackend):
 
     # ---- Public CommBackend interface ----
 
-    def all_reduce(
-        self,
-        tensor: torch.Tensor | tuple[torch.Tensor, ...],
-        group: Group,
-        op=None,
-    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        """Reduce one tensor, or batch independent tensors as an NCCL group.
-
-        Grouping batches collective submission without copying the operands
-        into one contiguous buffer. Falls back to ordinary collectives when
-        the coalescing manager is unavailable.
-        """
-        if isinstance(tensor, torch.Tensor):
-            res = self._get_or_create_resources(group)
-            if res["world_size"] == 1:
-                return tensor
-            if op is None:
-                op = torch.distributed.ReduceOp.SUM
-            pynccl = res["pynccl_comm"]
-            if pynccl is not None and not pynccl.disabled:
-                pynccl.all_reduce(tensor, op=op)
-            else:
-                torch.distributed.all_reduce(tensor, op=op, group=res["device_group"])
-            return tensor
-
-        tensors = tensor
-        if len(tensors) == 0:
-            raise ValueError("all-reduce requires at least one tensor")
-        # RCCL supports arbitrary grouped collectives. Preserve NVIDIA's
-        # existing two-tensor grouping and reduce larger collections normally.
-        if not current_platform().is_amd and len(tensors) != 2:
-            return super().all_reduce(tensors, group, op=op)
+    def all_reduce(self, tensor: torch.Tensor, group: Group, op=None) -> torch.Tensor:
         res = self._get_or_create_resources(group)
         if res["world_size"] == 1:
-            return tensors
+            return tensor
+        if op is None:
+            op = torch.distributed.ReduceOp.SUM
+        pynccl = res["pynccl_comm"]
+        if pynccl is not None and not pynccl.disabled:
+            pynccl.all_reduce(tensor, op=op)
+        else:
+            torch.distributed.all_reduce(tensor, op=op, group=res["device_group"])
+        return tensor
+
+    def all_reduce_two(
+        self,
+        first: torch.Tensor,
+        second: torch.Tensor,
+        group: Group,
+        op=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce two tensors in one grouped NCCL launch.
+
+        NCCL group semantics aggregate the two collectives into a single
+        kernel launch, so callers get single-launch latency WITHOUT first
+        copying the operands into one contiguous buffer -- the copy-free
+        alternative to a cat + single all-reduce. Falls back to two ordinary
+        collectives when the coalescing manager is unavailable (pynccl-driven
+        groups, torch without ``_coalescing_manager``).
+        """
+        res = self._get_or_create_resources(group)
+        if res["world_size"] == 1:
+            return first, second
         if op is None:
             op = torch.distributed.ReduceOp.SUM
         pynccl = res["pynccl_comm"]
         coalescing = getattr(torch.distributed, "_coalescing_manager", None)
         if coalescing is None or (pynccl is not None and not pynccl.disabled):
-            return tuple(self.all_reduce(value, group, op=op) for value in tensors)
+            return (
+                self.all_reduce(first, group, op=op),
+                self.all_reduce(second, group, op=op),
+            )
         device_group = res["device_group"]
         with coalescing(group=device_group):
-            for value in tensors:
-                torch.distributed.all_reduce(value, op=op, group=device_group)
-        return tensors
+            torch.distributed.all_reduce(first, op=op, group=device_group)
+            torch.distributed.all_reduce(second, op=op, group=device_group)
+        return first, second
 
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0
