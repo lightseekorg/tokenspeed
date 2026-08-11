@@ -658,8 +658,9 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     """
     server_args.zmq_msgpack = True
     server_args.skip_tokenizer_init = True
-    # DP > 1 is rejected in event_loop._init_msgpack_transport, the choke point
-    # shared with the non-headless --zmq-msgpack launch path.
+    # DP > 1: each rank dials the frontend with its own engine identity
+    # (zmq_engine_index + dp_rank) in event_loop._init_msgpack_transport, the
+    # choke point shared with the non-headless --zmq-msgpack launch path.
 
     configure_logger(server_args)
     _set_envs_and_config(server_args)

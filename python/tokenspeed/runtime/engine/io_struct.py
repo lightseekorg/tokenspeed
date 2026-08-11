@@ -707,9 +707,16 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # non-ragged (always length == len(rids)).
     output_token_logprobs_val: list[list[float]]
     output_token_logprobs_idx: list[list[int]]
+    # Producing DP rank's engine index (the identity it dialed the frontend
+    # with). The output PULL socket carries no routing identity, so under
+    # DP the batch itself names its rank. Appended field: defaults to 0 so
+    # older peers on either side stay compatible.
+    engine_index: int = 0
 
     @classmethod
-    def from_full(cls, out: BatchTokenIDOut) -> "BatchTokenIDOutSlim":
+    def from_full(
+        cls, out: BatchTokenIDOut, engine_index: int = 0
+    ) -> "BatchTokenIDOutSlim":
         # Token source: ``out.output_ids`` — the not-yet-sent slice of each
         # request's generated ids. NOT ``out.decode_ids``: that is the
         # incremental-detokenization window, which starts at the prompt tail
@@ -723,6 +730,7 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
                 "the per-request generated token ids"
             )
         return cls(
+            engine_index=engine_index,
             rids=list(out.rids),
             output_ids=[list(ids) for ids in out.output_ids],
             finished_reasons=[_finish_type(fr) for fr in out.finished_reasons],
