@@ -110,10 +110,6 @@ class DisaggPrefillExecutor:
             self._layerwise_token_published.add(request_id)
 
     def register_layerwise_step_counter(self, step_counter, interval: int) -> None:
-        if self.uses_cache_contract:
-            raise NotImplementedError(
-                "Paged cache PD does not support layerwise cache transfer"
-            )
         self._layerwise_enabled = True
         self._layerwise_interval = max(int(interval), 1)
         self.kv_manager.register_layerwise_step_counter(
@@ -185,9 +181,12 @@ class DisaggPrefillExecutor:
         )
 
     def prepare_prefill(self, op) -> None:
-        if self.uses_cache_contract:
+        if not self._layerwise_enabled:
             return
-        if not self._layerwise_enabled or op.num_extends() == 0:
+        if self.uses_cache_contract:
+            self._cache_prepare_prefill(op)
+            return
+        if op.num_extends() == 0:
             return
         table = select_block_table(op)
         begin_cache_step = self.kv_manager.reserve_layerwise_cache_steps()
@@ -275,54 +274,93 @@ class DisaggPrefillExecutor:
                 mamba_indices=None,
             )
 
+    def _cache_request_manifest(self, op, index: int, sender):
+        """Build and validate the source page manifest + page-id vector for one
+        request against its single identity-routed destination. Returns
+        ``(manifest, page_ids)``; shared by the whole-request and layerwise
+        contract transfer paths."""
+        transfer_infos = self.kv_manager.transfer_infos.get(sender.bootstrap_room, {})
+        destinations = [info for info in transfer_infos.values() if not info.is_dummy]
+        if len(destinations) != 1:
+            raise RuntimeError(
+                "Paged cache PD requires exactly one identity-routed destination"
+            )
+        destination = destinations[0]
+        if destination.page_manifest is None or destination.peer_cache_layout is None:
+            raise RuntimeError("Paged cache destination metadata is unavailable")
+        manifest = build_cache_page_manifest(
+            op,
+            layout=self.cache_layout,
+            request_row=index,
+            prefix_len=destination.page_manifest.prefix_len,
+            prompt_len=destination.page_manifest.prompt_len,
+        )
+        validate_cache_manifest_pair(
+            manifest,
+            destination.page_manifest,
+            self.cache_layout,
+            dst_num_pages_with_null=destination.peer_cache_layout.num_pages_with_null,
+        )
+        page_ids = np.asarray(
+            cache_manifest_page_ids(
+                manifest,
+                layout=self.cache_layout,
+                peer="source",
+            ),
+            dtype=np.int64,
+        )
+        return manifest, page_ids
+
+    def _cache_prepare_prefill(self, op) -> None:
+        """Layerwise contract prefill: enqueue the whole-request raw-slab transfer
+        with a reserved per-layer cache-step window. Contract PD does not chunk the
+        prompt, so one transfer covers every page; the layer-by-layer overlap
+        happens inside the transfer worker, which blocks on the step counter per
+        layer window before shipping that window's segments. The last (only) chunk
+        waits for the bootstrap token, mirroring the whole-request path."""
+        if op.num_extends() == 0:
+            return
+        begin_cache_step = self.kv_manager.reserve_layerwise_cache_steps()
+        for index, request_id in enumerate(op.request_ids[: op.num_extends()]):
+            sender = self.senders.get(request_id)
+            if sender is None:
+                self._drop_request_state(request_id)
+                continue
+            manifest, page_ids = self._cache_request_manifest(op, index, sender)
+            sender.send_layerwise(
+                page_ids,
+                slice(0, len(page_ids)),
+                op.request_pool_indices[index],
+                True,
+                begin_cache_step=begin_cache_step,
+                layerwise_interval=self._layerwise_interval,
+                wait_for_bootstrap_token=True,
+                page_manifest=manifest,
+            )
+
     def _cache_decode(self, op) -> None:
+        if self._layerwise_enabled:
+            # Layerwise already streamed the KV during prepare_prefill; only the
+            # bootstrap token still needs publishing on the last chunk.
+            for request_id in op.request_ids:
+                sender = self.senders.get(request_id)
+                if sender is None or not sender.has_layerwise_transfer():
+                    continue
+                token = self._request_token.get(request_id)
+                if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+                    raise RuntimeError("Paged cache bootstrap token is unavailable")
+                self.kv_manager.set_prefill_metadata(sender.bootstrap_room, token, None)
+                self._request_token.pop(request_id, None)
+            return
         pending = []
         for index, request_id in enumerate(op.request_ids):
             sender = self.senders.get(request_id)
             if sender is None:
                 continue
-            transfer_infos = self.kv_manager.transfer_infos.get(
-                sender.bootstrap_room, {}
-            )
-            destinations = [
-                info for info in transfer_infos.values() if not info.is_dummy
-            ]
-            if len(destinations) != 1:
-                raise RuntimeError(
-                    "Paged cache PD requires exactly one identity-routed destination"
-                )
-            destination = destinations[0]
-            if (
-                destination.page_manifest is None
-                or destination.peer_cache_layout is None
-            ):
-                raise RuntimeError("Paged cache destination metadata is unavailable")
-            manifest = build_cache_page_manifest(
-                op,
-                layout=self.cache_layout,
-                request_row=index,
-                prefix_len=destination.page_manifest.prefix_len,
-                prompt_len=destination.page_manifest.prompt_len,
-            )
-            validate_cache_manifest_pair(
-                manifest,
-                destination.page_manifest,
-                self.cache_layout,
-                dst_num_pages_with_null=(
-                    destination.peer_cache_layout.num_pages_with_null
-                ),
-            )
+            manifest, page_ids = self._cache_request_manifest(op, index, sender)
             token = self._request_token.get(request_id)
             if isinstance(token, bool) or not isinstance(token, int) or token < 0:
                 raise RuntimeError("Paged cache bootstrap token is unavailable")
-            page_ids = np.asarray(
-                cache_manifest_page_ids(
-                    manifest,
-                    layout=self.cache_layout,
-                    peer="source",
-                ),
-                dtype=np.int64,
-            )
             pending.append(
                 (
                     request_id,

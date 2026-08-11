@@ -475,10 +475,3 @@ class StepCounter:
 
     def query_ready_aux_step(self) -> int:
         return ctypes.c_int64.from_address(self.h_ready_aux_step.data_ptr()).value
-
-
-@dataclasses.dataclass
-class PageTransferMetadata:
-    indices_are_local: bool
-    page_transfer_mask: npt.NDArray[np.bool_]
-    page_local_indices: npt.NDArray[np.int64] | None = None

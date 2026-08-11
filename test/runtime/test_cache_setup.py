@@ -423,10 +423,10 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
             paged_cache_group_specs=target_spec.paged_cache_group_specs,
             backing_pool=target_pool,
         )
-    with pytest.raises(ValueError, match="only supported by ordinary MHA pools"):
+    with pytest.raises(ValueError, match="only supported by ordinary MHA or MLA pools"):
         create_cache_pool(
             target_spec,
-            target_config(),
+            _msa_config(),
             num_layers=2,
             rank=0,
             enable_memory_saver=False,
@@ -507,9 +507,19 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
         )
         == "mha"
     )
+    assert (
+        _resolve_heterogeneous_draft_family(
+            "kimi_k3", "mla", pd_disaggregation_enabled=False
+        )
+        == "mla"
+    )
     with pytest.raises(RuntimeError, match="require an MHA draft"):
         _resolve_heterogeneous_draft_family(
             "mha", "mla", pd_disaggregation_enabled=False
+        )
+    with pytest.raises(RuntimeError, match="PD disaggregation does not support"):
+        _resolve_heterogeneous_draft_family(
+            "kimi_k3", "mla", pd_disaggregation_enabled=True
         )
     with pytest.raises(RuntimeError, match="PD disaggregation does not support"):
         _resolve_heterogeneous_draft_family(
