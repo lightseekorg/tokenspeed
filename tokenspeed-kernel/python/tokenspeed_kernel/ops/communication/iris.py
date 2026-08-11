@@ -83,6 +83,7 @@ IRIS_AR_RMSNORM_STATES: dict = {}
 _PRODUCER_DIRECT_GL_DTYPES = {
     torch.bfloat16: gl.bfloat16,
     torch.float16: gl.float16,
+    torch.float32: gl.float32,
 }
 
 
@@ -338,6 +339,7 @@ class IrisAllReduce(object):
         self.rank_in_group = rank_in_group
         self.max_numel = max_numel
         self.dtype = dtype
+        self._elements_per_word = 8 // dtype.itemsize
         self.device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
         self._config = config or _IrisConfig(
             block_size_m=1,
@@ -474,7 +476,7 @@ class IrisAllReduce(object):
             if tensor.data_ptr() != self._input_buf.data_ptr() + offset * element_size:
                 return False
             offset += tensor.numel()
-        return offset % 4 == 0 and offset <= self.max_numel
+        return offset % self._elements_per_word == 0 and offset <= self.max_numel
 
     def all_reduce_symmetric(
         self, tensors: tuple[torch.Tensor, ...]
@@ -501,6 +503,7 @@ class IrisAllReduce(object):
             NUM_TILES=num_tiles,
             NUM_WARPS=1,
             ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[self.dtype],
+            ELEMENTS_PER_WORD=self._elements_per_word,
             num_warps=1,
         )
         return outputs
@@ -660,6 +663,34 @@ def _pack_16bitx4(value_0, value_1, value_2, value_3, dtype: gl.constexpr):
 
 
 @gluon.jit
+def _unpack_word(packed, dtype: gl.constexpr, elements_per_word: gl.constexpr):
+    # Explicit branches keep Gluon from type-checking the inactive bitcast.
+    if elements_per_word == 4:
+        return _unpack_16bitx4(packed, dtype)
+    else:
+        value_0 = (packed & 0xFFFFFFFF).to(gl.uint32).to(dtype, bitcast=True)
+        value_1 = ((packed >> 32) & 0xFFFFFFFF).to(gl.uint32).to(dtype, bitcast=True)
+        return value_0, value_1, value_0, value_1
+
+
+@gluon.jit
+def _pack_word(
+    value_0,
+    value_1,
+    value_2,
+    value_3,
+    dtype: gl.constexpr,
+    elements_per_word: gl.constexpr,
+):
+    if elements_per_word == 4:
+        return _pack_16bitx4(value_0, value_1, value_2, value_3, dtype)
+    else:
+        bits_0 = value_0.to(dtype).to(gl.uint32, bitcast=True).to(gl.uint64)
+        bits_1 = value_1.to(dtype).to(gl.uint32, bitcast=True).to(gl.uint64)
+        return bits_0 | (bits_1 << 32)
+
+
+@gluon.jit
 def iris_reduce_symmetric_gluon_kernel(
     input_sym_ptr,
     output_ptr,
@@ -680,6 +711,7 @@ def iris_reduce_symmetric_gluon_kernel(
     NUM_TILES: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
+    ELEMENTS_PER_WORD: gl.constexpr,
 ):
     """Reduce producer outputs placed consecutively in symmetric memory."""
     block_id = gl.program_id(0)
@@ -716,11 +748,11 @@ def iris_reduce_symmetric_gluon_kernel(
 
     input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
     layout: gl.constexpr = gl.BlockedLayout([2], [64], [NUM_WARPS], [0])
-    lane = gl.arange(0, BLOCK_SIZE // 4, layout=layout)
-    total_packed: gl.constexpr = TOTAL_NUMEL // 4
+    lane = gl.arange(0, BLOCK_SIZE // ELEMENTS_PER_WORD, layout=layout)
+    total_packed: gl.constexpr = TOTAL_NUMEL // ELEMENTS_PER_WORD
     tile_id = block_id
     while tile_id < NUM_TILES:
-        packed_offset = tile_id * (BLOCK_SIZE // 4) + lane
+        packed_offset = tile_id * (BLOCK_SIZE // ELEMENTS_PER_WORD) + lane
         mask = packed_offset < total_packed
         local_packed = gl.amd.cdna4.buffer_load(
             tl.cast(input_sym_ptr, gl.pointer_type(gl.uint64)),
@@ -728,7 +760,9 @@ def iris_reduce_symmetric_gluon_kernel(
             mask=mask,
             other=0,
         )
-        acc_0, acc_1, acc_2, acc_3 = _unpack_16bitx4(local_packed, ELEMENT_DTYPE)
+        acc_0, acc_1, acc_2, acc_3 = _unpack_word(
+            local_packed, ELEMENT_DTYPE, ELEMENTS_PER_WORD
+        )
         for peer in gl.static_range(0, WORLD_SIZE):
             if peer != RANK:
                 peer_heap = _iris_heap_base(
@@ -752,15 +786,22 @@ def iris_reduce_symmetric_gluon_kernel(
                     other=0,
                     cache=".cg",
                 )
-                peer_0, peer_1, peer_2, peer_3 = _unpack_16bitx4(
-                    peer_packed, ELEMENT_DTYPE
+                peer_0, peer_1, peer_2, peer_3 = _unpack_word(
+                    peer_packed, ELEMENT_DTYPE, ELEMENTS_PER_WORD
                 )
                 acc_0 += peer_0
                 acc_1 += peer_1
                 acc_2 += peer_2
                 acc_3 += peer_3
 
-        packed_output = _pack_16bitx4(acc_0, acc_1, acc_2, acc_3, ELEMENT_DTYPE)
+        packed_output = _pack_word(
+            acc_0,
+            acc_1,
+            acc_2,
+            acc_3,
+            ELEMENT_DTYPE,
+            ELEMENTS_PER_WORD,
+        )
         gl.amd.cdna4.buffer_store(
             packed_output,
             tl.cast(output_ptr, gl.pointer_type(gl.uint64)),

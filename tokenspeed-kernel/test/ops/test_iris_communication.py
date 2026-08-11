@@ -68,7 +68,7 @@ def _spawn_and_collect(worker_fn, args, world_size: int) -> None:
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_producer_direct_admission_supported_world_sizes(
     monkeypatch,
     world_size,
@@ -81,7 +81,7 @@ def test_producer_direct_admission_supported_world_sizes(
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    state = SimpleNamespace(world_size=world_size, max_numel=32)
+    state = SimpleNamespace(world_size=world_size, max_bytes=64)
 
     assert triton_ops.symm_outputs_can_run(
         state,
@@ -91,12 +91,35 @@ def test_producer_direct_admission_supported_world_sizes(
 
 
 @pytest.mark.parametrize(
+    ("dtype", "shapes"),
+    [
+        (torch.bfloat16, ((32,),)),
+        (torch.float16, ((32,),)),
+        (torch.float32, ((16,),)),
+    ],
+)
+def test_producer_direct_admission_uses_byte_capacity(monkeypatch, dtype, shapes):
+    from tokenspeed_kernel.ops.communication import triton as triton_ops
+
+    monkeypatch.setattr(
+        triton_ops,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=True),
+    )
+    state = SimpleNamespace(world_size=8, max_bytes=64)
+
+    assert triton_ops.symm_outputs_can_run(state, shapes, dtype)
+
+
+@pytest.mark.parametrize(
     ("world_size", "shapes", "dtype", "op"),
     [
         (1, ((4,),), torch.bfloat16, dist.ReduceOp.SUM),
         (8, ((3,),), torch.bfloat16, dist.ReduceOp.SUM),
+        (8, ((3,),), torch.float32, dist.ReduceOp.SUM),
         (8, ((36,),), torch.bfloat16, dist.ReduceOp.SUM),
-        (8, ((4,),), torch.float32, dist.ReduceOp.SUM),
+        (8, ((18,),), torch.float32, dist.ReduceOp.SUM),
+        (8, ((4,),), torch.float64, dist.ReduceOp.SUM),
         (8, ((4,),), torch.bfloat16, dist.ReduceOp.PRODUCT),
     ],
 )
@@ -114,7 +137,7 @@ def test_producer_direct_admission_rejects_unsupported_requests(
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    state = SimpleNamespace(world_size=world_size, max_numel=32)
+    state = SimpleNamespace(world_size=world_size, max_bytes=64)
 
     assert not triton_ops.symm_outputs_can_run(state, shapes, dtype, op)
 
@@ -127,7 +150,7 @@ def test_producer_direct_admission_is_cdna4_only(monkeypatch):
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=False),
     )
-    state = SimpleNamespace(world_size=8, max_numel=32)
+    state = SimpleNamespace(world_size=8, max_bytes=64)
 
     assert not triton_ops.symm_outputs_can_run(
         state,
@@ -223,6 +246,20 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         )
         _check_all_reduce_symmetric_outputs(
             fp16_state,
+            rank,
+            world_size,
+            ((3, 5), (1, 1)),
+            device,
+        )
+
+        fp32_state = create_iris_state(
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            max_numel=max_numel,
+            dtype=torch.float32,
+        )
+        _check_all_reduce_symmetric_outputs(
+            fp32_state,
             rank,
             world_size,
             ((3, 5), (1, 1)),

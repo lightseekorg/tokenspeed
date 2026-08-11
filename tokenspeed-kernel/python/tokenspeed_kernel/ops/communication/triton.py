@@ -60,6 +60,7 @@ class TritonCommState:
     world_size: int
     device: torch.device
     max_numel: int = 0
+    max_bytes: int = 0
     max_token_num: int = 0
     hidden_dim: int = 0
     comm_buff: torch.Tensor | None = None
@@ -1879,6 +1880,7 @@ def create_state(
     hidden_size: int = 0,
     device: torch.device = None,
     max_numel: int = 0,
+    max_bytes: int = 0,
 ) -> TritonCommState:
     assert (
         type(group) == dist.ProcessGroup
@@ -1901,6 +1903,7 @@ def create_state(
             world_size=world_size,
             device=device,
             max_numel=max_numel,
+            max_bytes=max_bytes or max_numel * torch.bfloat16.itemsize,
             comm_buff=comm_buff,
             symm_mem_hdl=symm_mem_hdl,
         )
@@ -1948,7 +1951,7 @@ def all_reduce(state: TritonCommState, tensor: torch.Tensor, op=None) -> torch.T
     if platform.is_amd:
         from . import iris as _iris_mod
 
-        key = (id(state.group), state.max_numel, tensor.dtype)
+        key = (id(state.group), state.max_bytes, tensor.dtype)
         iris_state = _iris_mod.IRIS_AR_STATES.get(key)
         if iris_state is None:
             iris_state = _iris_mod.create_iris_state(
@@ -1984,15 +1987,19 @@ def symm_outputs_can_run(
     if op is None:
         op = torch.distributed.ReduceOp.SUM
     numels = tuple(math.prod(shape) for shape in shapes)
+    element_bytes = dtype.itemsize
+    elements_per_word = 8 // element_bytes
+    total_numel = sum(numels)
     return (
         current_platform().is_cdna4
         and state.world_size in (2, 4, 8)
-        and dtype in (torch.bfloat16, torch.float16)
+        and dtype in (torch.bfloat16, torch.float16, torch.float32)
         and op == torch.distributed.ReduceOp.SUM
-        and numels
+        and bool(numels)
         and all(numel > 0 for numel in numels)
-        and sum(numels) % 4 == 0
-        and sum(numels) <= state.max_numel
+        and 8 % element_bytes == 0
+        and total_numel % elements_per_word == 0
+        and total_numel * element_bytes <= state.max_bytes
     )
 
 
@@ -2006,13 +2013,14 @@ def acquire_symm_outputs(
         raise RuntimeError("unsupported symmetric all-reduce output request")
     from . import iris as _iris_mod
 
-    key = (id(state.group), state.max_numel, dtype)
+    max_numel = state.max_bytes // dtype.itemsize
+    key = (id(state.group), state.max_bytes, dtype)
     iris_state = _iris_mod.IRIS_AR_STATES.get(key)
     if iris_state is None:
         iris_state = _iris_mod.create_iris_state(
             group=state.group,
             rank_in_group=state.rank_in_group,
-            max_numel=state.max_numel,
+            max_numel=max_numel,
             dtype=dtype,
             device=state.device,
         )
@@ -2034,7 +2042,7 @@ def all_reduce_symm_can_run(
         return False
     from . import iris as _iris_mod
 
-    key = (id(state.group), state.max_numel, tensors[0].dtype)
+    key = (id(state.group), state.max_bytes, tensors[0].dtype)
     iris_state = _iris_mod.IRIS_AR_STATES.get(key)
     return iris_state is not None and iris_state.owns_outputs(tensors)
 
@@ -2046,7 +2054,7 @@ def all_reduce_symmetric(
     """Reduce consecutive Iris producer outputs in one launch."""
     from . import iris as _iris_mod
 
-    key = (id(state.group), state.max_numel, tensors[0].dtype)
+    key = (id(state.group), state.max_bytes, tensors[0].dtype)
     iris_state = _iris_mod.IRIS_AR_STATES[key]
     return _iris_mod.iris_all_reduce_symmetric(iris_state, tensors)
 
