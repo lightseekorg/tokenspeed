@@ -869,6 +869,13 @@ class KimiLinearMoEGate(nn.Module):
 # allocated to exactly this many rows. Raise together with --max-num-seqs.
 ATTNRES_FAST_PATH_MAX_TOKENS = 32
 
+
+def _attnres_mlp_slot(layer_id: int) -> int:
+    """Slot (0 or 2) for this layer's mlp-side partial; alternates so a layer
+    never reads the buffer its own aux branch is writing for the next one."""
+    return 2 * (layer_id % 2)
+
+
 _ATTNRES_SCRATCH: list | None = None
 
 
@@ -877,8 +884,8 @@ def _attnres_scratch(
 ):
     """Shared (m, s, acc) scratch for the split attn_res mixing (bs <= cap).
 
-    slot 0 = the layer's mlp-side mix; slot 1 = the next layer's attn-side mix
-    (their lifetimes overlap, so they get separate buffers).
+    slot 1 = the next layer's attn-side mix; slots 0/2 = the mlp-side mix,
+    ping-ponged on layer parity so the hoist needs no ordering edge.
     """
     global _ATTNRES_SCRATCH
     sc = _ATTNRES_SCRATCH
@@ -895,7 +902,7 @@ def _attnres_scratch(
                     cap, like.shape[-1], dtype=torch.float32, device=like.device
                 ),
             )
-            for _ in range(2)
+            for _ in range(3)
         ]
         _ATTNRES_SCRATCH = sc
     return sc[slot]
@@ -1513,11 +1520,16 @@ class KimiLinearDecoderLayer(nn.Module):
         # mix; set by the backbone after all layers exist. The partial launches
         # from this (MoE) layer's aux branch, hidden under the routed experts.
         self._next_attn_mix = None
+        # Whether the next layer's mlp-side partial rides our sweep too.
+        self._hoist_next_mlp = False
+        self._mlp_slot = _attnres_mlp_slot(layer_id)
         # Precomputed rms_w * res_w products (filled in post_load_weights).
         self._attn_wp = None
         self._mlp_wp = None
         # True when the PREVIOUS layer precomputes our attn-side block partial.
         self._attn_split = False
+        # True when the PREVIOUS layer precomputes our mlp-side block partial.
+        self._mlp_split = False
         # True when the NEXT layer folds our routed+shared residual accumulate
         # into its attn-side combine (we return the parts unsummed).
         self.comm_manager = CommManager(
@@ -1646,9 +1658,9 @@ class KimiLinearDecoderLayer(nn.Module):
             and h.is_cuda
             and mlp_valid_blocks > 0
         )
-        scratch = _sliced_scratch(h, 0, num_tokens) if split_mix else None
-        # The next layer's attn-side partial reads the same (now final) block
-        # set as our mlp-side partial, so both ride one sweep when armed.
+        scratch = _sliced_scratch(h, self._mlp_slot, num_tokens) if split_mix else None
+        # Block-write layers only: theirs cannot ride the previous sweep.
+        own_mlp = split_mix and not self._mlp_split
         next_mix = self._next_attn_mix if split_mix else None
         sc1 = _sliced_scratch(h, 1, num_tokens) if next_mix is not None else None
         # The mlp-side combine (blocks partial + post-AR prefix) rides the
@@ -1667,16 +1679,24 @@ class KimiLinearDecoderLayer(nn.Module):
         with self.attn_fork.scope(enable=get_is_capture_mode()) as fork:
             with fork.branch():
                 if next_mix is not None:
-                    nxt_layer, _ = next_mix
-                    attnres_partial_dual(
-                        block_residual[:mlp_valid_blocks],
-                        self._mlp_wp,
-                        nxt_layer._attn_wp,
-                        self.mlp_res_norm.variance_epsilon,
-                        scratch,
-                        sc1,
-                    )
-                elif split_mix:
+                    next_layer, _ = next_mix
+                    if self._hoist_next_mlp:
+                        attnres_partial_dual(
+                            block_residual[:mlp_valid_blocks],
+                            next_layer._mlp_wp,
+                            next_layer._attn_wp,
+                            self.mlp_res_norm.variance_epsilon,
+                            _sliced_scratch(h, next_layer._mlp_slot, num_tokens),
+                            sc1,
+                        )
+                    else:
+                        attnres_partial(
+                            block_residual[:mlp_valid_blocks],
+                            next_layer._attn_wp,
+                            self.mlp_res_norm.variance_epsilon,
+                            sc1,
+                        )
+                if own_mlp:
                     attnres_partial(
                         block_residual[:mlp_valid_blocks],
                         self._mlp_wp,
@@ -1690,6 +1710,9 @@ class KimiLinearDecoderLayer(nn.Module):
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
+            if own_mlp and fork._active:
+                # The AR below reads `scratch` the aux branch may still write.
+                fork.join_event.wait(torch.cuda.current_stream())
             prefix_sum, h_fused = self._reduce_attn_accumulate(
                 attn_out, prefix_sum, combine=ar_combine
             )
@@ -1791,9 +1814,13 @@ class KimiLinearModel(nn.Module):
                 assert (
                     cur.mlp_res_norm.variance_epsilon
                     == nxt.self_attention_res_norm.variance_epsilon
+                    == nxt.mlp_res_norm.variance_epsilon
                 ), "dual partial assumes one shared RMS epsilon"
                 cur._next_attn_mix = (nxt, nxt.prev_valid_blocks)
                 nxt._attn_split = True
+                # A block-write layer's own block does not exist a layer earlier.
+                cur._hoist_next_mlp = not nxt.is_block_write_layer
+                nxt._mlp_split = cur._hoist_next_mlp
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
