@@ -151,14 +151,13 @@ def test_kimi3_rmsnorm_linear_add_matches_composed_and_captures() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = tokenspeed_kernel.rmsnorm_linear_add(
+        actual = tokenspeed_kernel.kimi3_latent_projection_add3(
             latent,
-            norm_weight,
             projection_weight,
             prefix,
             shared,
+            norm_weight=norm_weight,
             eps=1e-6,
-            solution="gluon",
         )
     graph.replay()
     torch.cuda.synchronize()

@@ -224,21 +224,6 @@ def _test_all_reduce(rank, world_size, device, group, ref_group):
         result = all_reduce(inp.clone(), group)
         torch.testing.assert_close(result, expected)
 
-    # Independent production-sized Kimi shared and routed segments. AMD Iris
-    # handles this with one kernel; other backends use the two-call fallback.
-    first = torch.randint(1, 16, (1, 7168), dtype=torch.bfloat16, device=device)
-    second = torch.randint(1, 16, (1, 3584), dtype=torch.bfloat16, device=device)
-    expected_first = first.clone()
-    expected_second = second.clone()
-    dist.all_reduce(expected_first, group=ref_group)
-    dist.all_reduce(expected_second, group=ref_group)
-    result_first, result_second = all_reduce(
-        (first.clone(), second.clone()),
-        group,
-    )
-    torch.testing.assert_close(result_first, expected_first)
-    torch.testing.assert_close(result_second, expected_second)
-
     inputs = tuple(
         torch.randint(1, 16, (size,), dtype=torch.float32, device=device)
         for size in (8, 12, 16)

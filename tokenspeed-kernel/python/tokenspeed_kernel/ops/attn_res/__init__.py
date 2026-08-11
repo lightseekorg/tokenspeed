@@ -66,10 +66,7 @@ def attn_res_fwd(
     N = block_residual.shape[0] + 1
     max_tokens = (
         _MAX_GFX950_TOKENS
-        if T > _MAX_TOKENS
-        and H == 7168
-        and out_norm_weight is not None
-        and Platform.get().is_cdna4
+        if H == 7168 and out_norm_weight is not None and Platform.get().is_cdna4
         else _MAX_TOKENS
     )
     eligible = H in _SUPPORTED_H and 1 <= T <= max_tokens and 1 <= N <= _MAX_N

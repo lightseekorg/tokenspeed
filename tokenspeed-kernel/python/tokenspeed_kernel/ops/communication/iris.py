@@ -103,6 +103,7 @@ def _get_or_create_iris_context(heap_size: int):
 
 
 class IrisRSAG(object):
+
     def __init__(
         self,
         group: dist.ProcessGroup,
@@ -119,9 +120,9 @@ class IrisRSAG(object):
             "torch.distributed must be initialized before constructing "
             "IrisRSAG; call dist.init_process_group() first."
         )
-        assert (
-            _platform.is_amd
-        ), f"IrisRSAG currently targets AMD ROCm; got non-AMD platform: {_platform}"
+        assert _platform.is_amd, (
+            "IrisRSAG currently targets AMD ROCm; " f"got non-AMD platform: {_platform}"
+        )
         assert (
             group == dist.group.WORLD or group.size() == dist.get_world_size()
         ), "iris.ccl all_gather/reduce_scatter do not accept a sub-group."
@@ -398,9 +399,10 @@ class IrisAllReduce(object):
             f"backend={self.dtype}"
         )
         numel = tensor.numel()
-        assert (
-            numel <= self.max_numel
-        ), f"tensor numel ({numel}) exceeds iris buffer capacity ({self.max_numel})"
+        assert numel <= self.max_numel, (
+            f"tensor numel ({numel}) exceeds iris buffer capacity "
+            f"({self.max_numel})"
+        )
         if tensor.dim() >= 2:
             n_dim = tensor.shape[-1]
             m_dim = numel // n_dim
@@ -915,6 +917,7 @@ def iris_allreduce_residual_rmsnorm_kernel_persistent(
 
 
 class IrisAllReduceResidualRMSNorm(object):
+
     def __init__(
         self,
         group: dist.ProcessGroup,
@@ -994,9 +997,10 @@ class IrisAllReduceResidualRMSNorm(object):
             f"backend={self.hidden_dim}"
         )
         num_tokens = input_tensor.shape[0]
-        assert (
-            num_tokens <= self.max_token_num
-        ), f"num_tokens ({num_tokens}) exceeds max_token_num ({self.max_token_num})"
+        assert num_tokens <= self.max_token_num, (
+            f"num_tokens ({num_tokens}) exceeds max_token_num "
+            f"({self.max_token_num})"
+        )
         assert weight.shape == (
             self.hidden_dim,
         ), f"weight shape {weight.shape} != ({self.hidden_dim},)"

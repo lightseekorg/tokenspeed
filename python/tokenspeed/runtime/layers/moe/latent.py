@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.moe import (
     latent_moe_expert_shared,
     native_latent_moe_available,
 )
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_backend.base import AllReducePlan
@@ -157,8 +158,6 @@ def latent_moe_expert_shared_all_reduce(
     expert_start: int,
     w13_interleaved: bool,
     group: tuple[int, ...],
-    override: str | None = None,
-    solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Produce and reduce the routed latent and shared-expert output."""
     plan = plan_all_reduce(
@@ -186,8 +185,6 @@ def latent_moe_expert_shared_all_reduce(
         w13_interleaved=w13_interleaved,
         routed_out=routed_out,
         shared_out=shared_out,
-        override=override,
-        solution=solution,
     )
     shared_out, routed_out = plan.run()
     return routed_out, shared_out
@@ -325,6 +322,9 @@ class Kimi3LatentProjection(ReplicatedLinear):
         hidden_states: torch.Tensor,
         addend_a: torch.Tensor,
         addend_c: torch.Tensor,
+        *,
+        norm_weight: torch.Tensor | None = None,
+        eps: float | None = None,
     ) -> torch.Tensor:
         """Project routed latents and accumulate two full-width addends.
 
@@ -335,6 +335,8 @@ class Kimi3LatentProjection(ReplicatedLinear):
             self.weight,
             addend_a,
             addend_c,
+            norm_weight=norm_weight,
+            eps=eps,
         )
 
 
@@ -451,13 +453,12 @@ class LatentMoELayer(nn.Module):
                 prefix_sum,
                 shared_output,
             )
-        elif routed_latent.shape[0] == 1:
-            output = tokenspeed_kernel.rmsnorm_linear_add(
+        elif routed_latent.shape[0] == 1 and current_platform().is_cdna4:
+            output = self.routed_up_proj.forward_add3(
                 routed_latent,
-                self.routed_norm.weight,
-                self.routed_up_proj.weight,
                 prefix_sum,
                 shared_output,
+                norm_weight=self.routed_norm.weight,
                 eps=self.routed_norm.variance_epsilon,
             )
         else:

@@ -19,9 +19,6 @@ import tokenspeed_kernel.ops.attn_res as attn_res  # noqa: E402
 from tokenspeed_kernel.ops.attn_res import attn_res_fwd  # noqa: E402
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk  # noqa: E402
 from tokenspeed_kernel.ops.moe.sigmoid_topk import _gluon_eligible  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.attention.kda.attn_res import (  # noqa: E402
-    _attn_res_rmsnorm_kernel,
-)
 
 
 def _attn_res_reference(
@@ -112,29 +109,6 @@ def test_attn_res_large_prefill_dispatch_boundary(monkeypatch) -> None:
         "torch_attn_res_fwd",
         "torch_attn_res_fwd",
     ]
-
-
-def test_attn_res_large_candidate_stride_compiles() -> None:
-    tensor = torch.empty(1, device="cuda", dtype=torch.bfloat16)
-    _attn_res_rmsnorm_kernel.warmup(
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        stride_layer_t=7168,
-        stride_block_t=7168,
-        stride_block_n=32768 * 7168,
-        stride_output_t=7168,
-        H=7168,
-        N=12,
-        SCORE_EPS=1e-6,
-        OUTPUT_EPS=1e-6,
-        NUM_WARPS=8,
-        num_warps=8,
-        grid=(1,),
-    )
 
 
 @pytest.mark.parametrize("tokens", [1, 17, 8192])

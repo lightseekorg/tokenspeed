@@ -401,6 +401,8 @@ def kimi3_latent_projection_add3(
     prefix: torch.Tensor,
     shared_output: torch.Tensor,
     *,
+    norm_weight: torch.Tensor | None = None,
+    eps: float | None = None,
     solution: str = "auto",
 ) -> torch.Tensor:
     """Project K3 latent rows and add the residual and shared-expert output.
@@ -452,6 +454,44 @@ def kimi3_latent_projection_add3(
         and weight.is_contiguous()
         and (k, n) in _KIMI3_SHAPES
     )
+    if norm_weight is not None:
+        if (
+            norm_weight.shape != (k,)
+            or norm_weight.dtype != hidden_states.dtype
+            or norm_weight.device != hidden_states.device
+            or not norm_weight.is_contiguous()
+        ):
+            raise ValueError("Kimi K3 norm weight must match the latent input")
+        if eps is None or eps <= 0.0:
+            raise ValueError("Kimi K3 RMSNorm epsilon must be positive")
+        if (
+            solution == "auto"
+            and Platform.get().is_cdna4
+            and m == 1
+            and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
+            and specialized
+        ):
+            from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.rmsnorm_linear_add import (
+                gluon_rmsnorm_linear_add_gfx950,
+            )
+
+            return gluon_rmsnorm_linear_add_gfx950(
+                hidden_states,
+                norm_weight,
+                weight,
+                prefix,
+                shared_output,
+                eps=eps,
+            )
+        source = hidden_states.float()
+        hidden_states = (
+            source
+            * torch.rsqrt(source.square().mean(dim=-1, keepdim=True) + eps)
+            * norm_weight.float()
+        ).to(hidden_states.dtype)
+    elif eps is not None:
+        raise ValueError("Kimi K3 RMSNorm epsilon requires a norm weight")
+
     if solution == "auto":
         if m == 1 and specialized:
             solution = "rowcta_gemv"
