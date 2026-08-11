@@ -54,6 +54,7 @@ TokenSpeed-specific behavior explicitly.
 | `--tensor-parallel-size`, `--tp` | `--attn-tp-size` | The familiar alias maps to attention TP. TokenSpeed can split attention, dense, and MoE TP. |
 | `--expert-parallel-size` | `--expert-parallel-size`, `--ep-size` | TokenSpeed supports the familiar name and its existing short form. |
 | `--attention-backend` | `--attention-backend` | Name is aligned; available backend values are TokenSpeed-specific. |
+| `--max-loras` | `--max-loras` | Same meaning — the cap on distinct LoRA adapters per batch — but TokenSpeed treats `0` (the default) as "LoRA scheduling disabled" rather than as a batch that admits no adapters, and has no separate enable flag for the scheduler cap. |
 | `--moe-backend` | `--moe-backend` | Name is aligned; available backend values are TokenSpeed-specific. |
 
 ## Recipe Translation Notes

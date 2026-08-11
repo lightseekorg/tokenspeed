@@ -417,6 +417,7 @@ class EventLoop:
             disable_prefix_cache=not server_args.enable_prefix_caching,
             paged_cache_groups=paged_cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
+            max_loras=server_args.max_loras,
         )
         scheduler_cfg.enable_pd_cache = self._pd_cache_enabled
         logger.info(

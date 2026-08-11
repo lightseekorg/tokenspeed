@@ -109,7 +109,7 @@ void Scheduler::publishCompletedPages(Request& request) {
 
     const std::string previous_hash = progress.page_hashes.empty() ? std::string{} : progress.page_hashes.back();
     std::vector<std::string> new_hashes =
-        AdvancePagedHashes(stable_pages, first_new_page, previous_hash, num_stable_pages);
+        AdvancePagedHashes(stable_pages, first_new_page, previous_hash, num_stable_pages, request.CacheNamespaceKeys());
     progress.page_hashes.insert(progress.page_hashes.end(), std::make_move_iterator(new_hashes.begin()),
                                 std::make_move_iterator(new_hashes.end()));
 

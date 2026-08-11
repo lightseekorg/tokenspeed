@@ -133,17 +133,45 @@ inline std::vector<std::string> ComputePagedHashes(
     return hashes;
 }
 
+// Applies one set of keys to *every* page, rather than the per-page lists
+// ComputePagedHashes takes. This is what cache namespacing wants: the key
+// identifies the owner of the whole request (e.g. a LoRA adapter), not one page.
+//
+// Chaining alone would make a page-0 key sufficient -- every later page folds in
+// prior_hash -- but callers may start a chain mid-request (see
+// AdvancePagedHashes), and such a chain would then carry no key at all. Keying
+// every page makes isolation independent of where the chain starts.
+//
+// An empty key list is byte-identical to ComputePagedHashes with no extra keys,
+// so un-namespaced requests hash exactly as they did before this overload existed.
+inline std::vector<std::string> ComputeNamespacedPagedHashes(
+    std::span<const std::span<const std::int32_t>> paged_tokens, const std::string& prior,
+    std::span<const std::string> namespace_keys) {
+    std::vector<std::string> hashes;
+    hashes.reserve(paged_tokens.size());
+    std::string current_prior = prior;
+    for (std::span<const std::int32_t> page : paged_tokens) {
+        current_prior = HashPage(page, current_prior, namespace_keys);
+        hashes.push_back(current_prior);
+    }
+    return hashes;
+}
+
 // Continues an existing hash chain and returns only [first_page, past_end_page).
+//
+// namespace_keys must match the keys the chain was seeded with; passing them is
+// what keeps an extended page in the same namespace as the pages before it.
 inline std::vector<std::string> AdvancePagedHashes(std::span<const std::span<const std::int32_t>> paged_tokens,
                                                    std::int32_t first_page, const std::string& prior,
-                                                   std::int32_t past_end_page) {
+                                                   std::int32_t past_end_page,
+                                                   std::span<const std::string> namespace_keys = {}) {
     _assert(first_page >= 0, "first_page must be >= 0");
     _assert(past_end_page > first_page, "hash range must be non-empty");
     _assert(past_end_page <= static_cast<std::int32_t>(paged_tokens.size()),
             "hash range exceeds the available full pages");
-    return ComputePagedHashes(paged_tokens.subspan(static_cast<std::size_t>(first_page),
-                                                   static_cast<std::size_t>(past_end_page - first_page)),
-                              prior);
+    return ComputeNamespacedPagedHashes(paged_tokens.subspan(static_cast<std::size_t>(first_page),
+                                                             static_cast<std::size_t>(past_end_page - first_page)),
+                                        prior, namespace_keys);
 }
 
 }  // namespace tokenspeed

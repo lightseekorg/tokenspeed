@@ -44,6 +44,15 @@ public:
 
     const std::string& Id() const { return id_; }
 
+    // Resolved LoRA adapter id; 0 means base model.
+    std::int32_t LoraId() const { return lora_id_; }
+
+    // Keys that namespace this request's KV pages, for the page hasher. Holds
+    // the adapter id for a LoRA request and nothing for a base-model one, whose
+    // pages therefore hash exactly as they do in a build without LoRA support --
+    // base-model requests keep sharing one prefix-cache namespace.
+    std::span<const std::string> CacheNamespaceKeys() const { return lora_hash_keys_; }
+
     template <typename Event>
     void Apply(Event&& event) {
         state_ = std::visit(
@@ -136,6 +145,11 @@ private:
     const fsm::ForwardState& forwardState(const char* operation) const;
 
     std::string id_;
+    std::int32_t lora_id_{0};
+    // lora_id_ rendered once, held as a 0-or-1 element vector so
+    // CacheNamespaceKeys() can hand out a span without re-formatting the id on
+    // every hash call.
+    std::vector<std::string> lora_hash_keys_;
     TokenContainer token_container_;
     std::int32_t page_size_{};
     fsm::State state_;

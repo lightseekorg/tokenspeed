@@ -260,7 +260,7 @@ std::vector<CacheKey> Scheduler::registerKvEventPages(const Request& request, st
     for (std::size_t i = progress.block_hashes.size(); i < page_hashes.size(); ++i) {
         const std::optional<std::uint64_t> parent_hash =
             i == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes[i - 1]};
-        progress.block_hashes.push_back(HashKvBlock(token_pages[i], parent_hash));
+        progress.block_hashes.push_back(HashKvBlock(token_pages[i], parent_hash, request.CacheNamespaceKeys()));
     }
 
     std::vector<CacheKey> registered_keys;

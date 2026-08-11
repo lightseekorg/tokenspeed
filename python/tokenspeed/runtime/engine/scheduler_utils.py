@@ -187,11 +187,19 @@ def aligned_max_scheduled_tokens(
     return max_scheduled_tokens - max_scheduled_tokens % grain
 
 
-def make_spec(rid: str, tokens: list[int], max_new_tokens: int = 0) -> RequestSpec:
+def make_spec(
+    rid: str,
+    tokens: list[int],
+    max_new_tokens: int = 0,
+    lora_id: int = 0,
+) -> RequestSpec:
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
     spec.max_new_tokens = max_new_tokens
+    # 0 is the base model on both sides of the boundary; tolerate None from
+    # callers that have not resolved an adapter.
+    spec.lora_id = lora_id or 0
     return spec
 
 
@@ -210,11 +218,13 @@ def make_config(
     disable_prefix_cache: bool = False,
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
     enable_mixed_prefill_decode: bool = False,
+    max_loras: int = 0,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
+    cfg.max_loras = max_loras
     cfg.block_size = page_size
 
     cfg.num_host_pages = num_host_pages
