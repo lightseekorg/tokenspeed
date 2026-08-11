@@ -26,6 +26,7 @@ back to NCCL.
 """
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend.base import (
     AllReducePlan,
@@ -119,6 +120,11 @@ class AutoBackend(CommBackend):
                 value.numel() * value.element_size() > MAX_ONESHOT_BYTES
                 for value in tensors
             )
+            use_nccl = use_nccl or (
+                current_platform().is_amd
+                and sum(value.numel() * value.element_size() for value in tensors)
+                > self._triton_ar.producer_direct_max_bytes
+            )
             if use_nccl and len(tensors) == 2:
                 return self._nccl.all_reduce_two(*tensors, group, op=op)
             return super().all_reduce(tensors, group, op=op)
@@ -162,6 +168,13 @@ class AutoBackend(CommBackend):
             self._force_deterministic_rsag()
             or self._group_spans_nodes(group)
             or self._trtllm_ar.has_trtllm_ar(group)
+        ):
+            return super().plan_all_reduce(shapes, like, group, op=op)
+        if current_platform().is_amd and not self._triton_ar.can_plan_all_reduce(
+            shapes,
+            like,
+            group,
+            op=op,
         ):
             return super().plan_all_reduce(shapes, like, group, op=op)
         return self._triton_ar.plan_all_reduce(

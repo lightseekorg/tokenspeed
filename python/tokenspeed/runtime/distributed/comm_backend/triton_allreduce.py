@@ -20,14 +20,13 @@
 
 """Triton all-reduce backend for latency-sensitive small AMD tensors."""
 
-import math
-
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.triton import (
     all_reduce,
     all_reduce_can_run,
     all_reduce_staging,
+    all_reduce_staging_can_run,
     all_reduce_symmetric,
     create_state,
 )
@@ -42,15 +41,26 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 
+_DEFAULT_PRODUCER_DIRECT_MAX_BYTES = 1024 * 1024
+
 
 class TritonAllReduceBackend(CommBackend):
-    def __init__(self, fallback: CommBackend):
+    def __init__(
+        self,
+        fallback: CommBackend,
+        producer_direct_max_bytes: int = _DEFAULT_PRODUCER_DIRECT_MAX_BYTES,
+    ):
         self._fallback = fallback
         self._instances = {}
-        self._max_bytes = 512 * 1024
+        self._producer_direct_max_bytes = producer_direct_max_bytes
         self._max_numel = (
-            self._max_bytes // torch.empty((), dtype=torch.bfloat16).element_size()
+            producer_direct_max_bytes
+            // torch.empty((), dtype=torch.bfloat16).element_size()
         )
+
+    @property
+    def producer_direct_max_bytes(self) -> int:
+        return self._producer_direct_max_bytes
 
     def _get_or_create(self, group: Group):
         if group in self._instances:
@@ -66,7 +76,7 @@ class TritonAllReduceBackend(CommBackend):
         return state
 
     def can_run(self, tensor: torch.Tensor, group: Group, op=None) -> bool:
-        if len(group) <= 1:
+        if len(group) <= 1 or not current_platform().is_amd:
             return False
         if op is None:
             op = torch.distributed.ReduceOp.SUM
@@ -105,17 +115,7 @@ class TritonAllReduceBackend(CommBackend):
         op=None,
     ) -> AllReducePlan:
         """Acquire symmetric outputs and defer their Iris reduction."""
-        numels = tuple(math.prod(shape) for shape in shapes)
-        if not (
-            current_platform().is_cdna4
-            and like.is_cuda
-            and like.dtype == torch.bfloat16
-            and len(group) == 8
-            and numels
-            and all(numel > 0 and numel % 4 == 0 for numel in numels)
-            and sum(numels) <= self._max_numel
-            and (op is None or op == dist.ReduceOp.SUM)
-        ):
+        if not self.can_plan_all_reduce(shapes, like, group, op=op):
             return super().plan_all_reduce(shapes, like, group, op=op)
 
         state = self._get_or_create(group)
@@ -129,6 +129,19 @@ class TritonAllReduceBackend(CommBackend):
             return all_reduce_symmetric(state, outputs)
 
         return AllReducePlan(outputs, reduce)
+
+    def can_plan_all_reduce(
+        self,
+        shapes: tuple[tuple[int, ...], ...],
+        like: torch.Tensor,
+        group: Group,
+        op=None,
+    ) -> bool:
+        """Check producer-direct eligibility without initializing Iris."""
+        if not current_platform().is_cdna4 or not like.is_cuda:
+            return False
+        state = self._get_or_create(group)
+        return all_reduce_staging_can_run(state, shapes, like.dtype, op=op)
 
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0

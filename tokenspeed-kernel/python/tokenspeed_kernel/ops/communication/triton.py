@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any, List, Tuple
 
@@ -38,6 +39,7 @@ __all__ = [
     "all_gather_inner",
     "all_reduce_can_run",
     "all_reduce",
+    "all_reduce_staging_can_run",
     "all_reduce_staging",
     "all_reduce_symmetric",
     "allreduce_residual_rmsnorm",
@@ -1961,15 +1963,46 @@ def all_reduce(state: TritonCommState, tensor: torch.Tensor, op=None) -> torch.T
     raise AssertionError(f"Unsupported platform: {platform}")
 
 
+def all_reduce_staging_can_run(
+    state: TritonCommState,
+    shapes: tuple[tuple[int, ...], ...],
+    dtype: torch.dtype,
+    op=None,
+) -> bool:
+    """Check whether Iris can reduce producer-owned output buffers.
+
+    Args:
+        state: Communication group and symmetric-buffer capacity.
+        shapes: Ordered shapes the producer will write.
+        dtype: Element type shared by all outputs.
+        op: Reduction operation; only SUM is currently supported.
+
+    Returns:
+        Whether the request is supported by the CDNA4 producer-direct kernel.
+    """
+    if op is None:
+        op = torch.distributed.ReduceOp.SUM
+    numels = tuple(math.prod(shape) for shape in shapes)
+    return (
+        current_platform().is_cdna4
+        and state.world_size in (2, 4, 8)
+        and dtype in (torch.bfloat16, torch.float16)
+        and op == torch.distributed.ReduceOp.SUM
+        and numels
+        and all(numel > 0 for numel in numels)
+        and sum(numels) % 4 == 0
+        and sum(numels) <= state.max_numel
+    )
+
+
 def all_reduce_staging(
     state: TritonCommState,
     shapes: tuple[tuple[int, ...], ...],
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, ...]:
     """Acquire consecutive Iris views for producer-direct reduction."""
-    platform = current_platform()
-    if not platform.is_amd or dtype != torch.bfloat16 or state.world_size != 8:
-        raise RuntimeError("symmetric staging requires AMD TP8 BF16")
+    if not all_reduce_staging_can_run(state, shapes, dtype):
+        raise RuntimeError("unsupported symmetric all-reduce staging request")
     from . import iris as _iris_mod
 
     key = (id(state.group), state.max_numel, dtype)

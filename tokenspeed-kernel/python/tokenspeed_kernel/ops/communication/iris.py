@@ -80,6 +80,10 @@ __all__ = [
 
 IRIS_AR_STATES: dict = {}
 IRIS_AR_RMSNORM_STATES: dict = {}
+_PRODUCER_DIRECT_GL_DTYPES = {
+    torch.bfloat16: gl.bfloat16,
+    torch.float16: gl.float16,
+}
 
 
 def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:
@@ -353,6 +357,9 @@ class IrisAllReduce(object):
         free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
         self._ctx = _get_or_create_iris_context(heap_size)
         self.world_size = group.size()
+        group_ranks = dist.get_process_group_ranks(group)
+        assert len(group_ranks) == self.world_size
+        assert group_ranks[rank_in_group] == dist.get_rank()
         self._input_buf = self._ctx.zeros((max_numel,), dtype=dtype)
         self._producer_direct_output_buf = torch.empty(
             max_numel, dtype=dtype, device=self.device
@@ -369,8 +376,11 @@ class IrisAllReduce(object):
             (self._producer_direct_max_programs, self.world_size),
             dtype=torch.int32,
         )
+        heap_bases = self._ctx.get_heap_bases()
+        self._group_heap_bases = heap_bases[group_ranks].contiguous()
+        group_heap_bases = [int(address) for address in self._group_heap_bases.tolist()]
         self._heap_base_addresses = tuple(
-            int(address) for address in self._ctx.get_heap_bases().tolist()
+            group_heap_bases + [group_heap_bases[-1]] * (8 - self.world_size)
         )
         free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
@@ -380,7 +390,7 @@ class IrisAllReduce(object):
 
         self._rank_start = 0
         self._rank_stride = 1
-        self._iris_rank = dist.get_rank()
+        self._iris_rank = rank_in_group
         self._workspace = None
 
     def all_reduce(
@@ -414,7 +424,7 @@ class IrisAllReduce(object):
             in_view.view(-1),
             tensor.view(-1),
             self._ready_flags,
-            self._ctx.get_heap_bases(),
+            self._group_heap_bases,
             numel,
             RANK=self._iris_rank,
             WORLD_SIZE=self.world_size,
@@ -467,14 +477,12 @@ class IrisAllReduce(object):
             and tensor.device == self.device
             and tensor.is_contiguous()
             and tensor.numel() > 0
-            and tensor.numel() % 4 == 0
             for tensor in tensors
         )
         total_numel = sum(tensor.numel() for tensor in tensors)
-        assert total_numel <= self.max_numel
+        assert total_numel % 4 == 0 and total_numel <= self.max_numel
         num_tiles = triton.cdiv(total_numel, self._producer_direct_block_size)
         num_programs = min(num_tiles, self._producer_direct_max_programs)
-        num_rounds = triton.cdiv(num_tiles, num_programs)
         outputs = self._views(
             self._producer_direct_output_buf,
             tuple(tuple(tensor.shape) for tensor in tensors),
@@ -490,8 +498,8 @@ class IrisAllReduce(object):
             BLOCK_SIZE=self._producer_direct_block_size,
             NUM_PROGRAMS=num_programs,
             NUM_TILES=num_tiles,
-            NUM_ROUNDS=num_rounds,
             NUM_WARPS=1,
+            ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[self.dtype],
             num_warps=1,
         )
         return outputs
@@ -627,26 +635,26 @@ def _iris_wait_for_rank_epoch(
 
 
 @gluon.jit
-def _unpack_bf16x4(packed):
-    value_0 = ((packed & 0xFFFF).to(gl.uint32) << 16).to(gl.float32, bitcast=True)
-    value_1 = (((packed >> 16) & 0xFFFF).to(gl.uint32) << 16).to(
-        gl.float32, bitcast=True
+def _unpack_16bitx4(packed, dtype: gl.constexpr):
+    value_0 = (packed & 0xFFFF).to(gl.uint16).to(dtype, bitcast=True).to(gl.float32)
+    value_1 = (
+        ((packed >> 16) & 0xFFFF).to(gl.uint16).to(dtype, bitcast=True).to(gl.float32)
     )
-    value_2 = (((packed >> 32) & 0xFFFF).to(gl.uint32) << 16).to(
-        gl.float32, bitcast=True
+    value_2 = (
+        ((packed >> 32) & 0xFFFF).to(gl.uint16).to(dtype, bitcast=True).to(gl.float32)
     )
-    value_3 = (((packed >> 48) & 0xFFFF).to(gl.uint32) << 16).to(
-        gl.float32, bitcast=True
+    value_3 = (
+        ((packed >> 48) & 0xFFFF).to(gl.uint16).to(dtype, bitcast=True).to(gl.float32)
     )
     return value_0, value_1, value_2, value_3
 
 
 @gluon.jit
-def _pack_bf16x4(value_0, value_1, value_2, value_3):
-    bits_0 = value_0.to(gl.bfloat16).to(gl.uint16, bitcast=True).to(gl.uint64)
-    bits_1 = value_1.to(gl.bfloat16).to(gl.uint16, bitcast=True).to(gl.uint64)
-    bits_2 = value_2.to(gl.bfloat16).to(gl.uint16, bitcast=True).to(gl.uint64)
-    bits_3 = value_3.to(gl.bfloat16).to(gl.uint16, bitcast=True).to(gl.uint64)
+def _pack_16bitx4(value_0, value_1, value_2, value_3, dtype: gl.constexpr):
+    bits_0 = value_0.to(dtype).to(gl.uint16, bitcast=True).to(gl.uint64)
+    bits_1 = value_1.to(dtype).to(gl.uint16, bitcast=True).to(gl.uint64)
+    bits_2 = value_2.to(dtype).to(gl.uint16, bitcast=True).to(gl.uint64)
+    bits_3 = value_3.to(dtype).to(gl.uint16, bitcast=True).to(gl.uint64)
     return bits_0 | (bits_1 << 16) | (bits_2 << 32) | (bits_3 << 48)
 
 
@@ -669,8 +677,8 @@ def iris_reduce_symmetric_gluon_kernel(
     BLOCK_SIZE: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     NUM_TILES: gl.constexpr,
-    NUM_ROUNDS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    ELEMENT_DTYPE: gl.constexpr,
 ):
     """Reduce producer outputs placed consecutively in symmetric memory."""
     block_id = gl.program_id(0)
@@ -709,17 +717,17 @@ def iris_reduce_symmetric_gluon_kernel(
     layout: gl.constexpr = gl.BlockedLayout([2], [64], [NUM_WARPS], [0])
     lane = gl.arange(0, BLOCK_SIZE // 4, layout=layout)
     total_packed: gl.constexpr = TOTAL_NUMEL // 4
-    for tile_round in gl.static_range(0, NUM_ROUNDS):
-        tile_id = block_id + tile_round * NUM_PROGRAMS
+    tile_id = block_id
+    while tile_id < NUM_TILES:
         packed_offset = tile_id * (BLOCK_SIZE // 4) + lane
-        mask = (tile_id < NUM_TILES) & (packed_offset < total_packed)
+        mask = packed_offset < total_packed
         local_packed = gl.amd.cdna4.buffer_load(
             tl.cast(input_sym_ptr, gl.pointer_type(gl.uint64)),
             packed_offset.to(gl.int32),
             mask=mask,
             other=0,
         )
-        acc_0, acc_1, acc_2, acc_3 = _unpack_bf16x4(local_packed)
+        acc_0, acc_1, acc_2, acc_3 = _unpack_16bitx4(local_packed, ELEMENT_DTYPE)
         for peer in gl.static_range(0, WORLD_SIZE):
             if peer != RANK:
                 peer_heap = _iris_heap_base(
@@ -743,19 +751,22 @@ def iris_reduce_symmetric_gluon_kernel(
                     other=0,
                     cache=".cg",
                 )
-                peer_0, peer_1, peer_2, peer_3 = _unpack_bf16x4(peer_packed)
+                peer_0, peer_1, peer_2, peer_3 = _unpack_16bitx4(
+                    peer_packed, ELEMENT_DTYPE
+                )
                 acc_0 += peer_0
                 acc_1 += peer_1
                 acc_2 += peer_2
                 acc_3 += peer_3
 
-        packed_output = _pack_bf16x4(acc_0, acc_1, acc_2, acc_3)
+        packed_output = _pack_16bitx4(acc_0, acc_1, acc_2, acc_3, ELEMENT_DTYPE)
         gl.amd.cdna4.buffer_store(
             packed_output,
             tl.cast(output_ptr, gl.pointer_type(gl.uint64)),
             packed_offset.to(gl.int32),
             mask=mask,
         )
+        tile_id += NUM_PROGRAMS
 
 
 @triton.jit

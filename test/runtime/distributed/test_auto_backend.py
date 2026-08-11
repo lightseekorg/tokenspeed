@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -20,6 +21,8 @@ def backend(monkeypatch):
     monkeypatch.setattr(instance, "_rsag", Mock())
     monkeypatch.setattr(instance, "_trtllm_ar", Mock())
     monkeypatch.setattr(instance, "_triton_ar", Mock())
+    instance._triton_ar.producer_direct_max_bytes = 1024 * 1024
+    instance._triton_ar.can_plan_all_reduce.return_value = True
     return instance
 
 
@@ -117,6 +120,23 @@ def test_triton_collection_fallback_reduces_each_tensor(monkeypatch):
     )
 
 
+def test_triton_plan_does_not_initialize_iris_off_cdna4(monkeypatch):
+    fallback = Mock()
+    backend = TritonAllReduceBackend(fallback)
+    get_or_create = Mock(side_effect=AssertionError("must not initialize Iris"))
+    monkeypatch.setattr(backend, "_get_or_create", get_or_create)
+    monkeypatch.setattr(
+        triton_allreduce_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=False),
+    )
+
+    plan = backend.plan_all_reduce(((2, 4),), torch.empty(2, 4), (0, 1))
+
+    assert tuple(output.shape for output in plan.outputs) == ((2, 4),)
+    get_or_create.assert_not_called()
+
+
 def test_force_deterministic_rsag_preserves_two_tensor_nccl_grouping(
     backend, monkeypatch
 ):
@@ -128,6 +148,26 @@ def test_force_deterministic_rsag_preserves_two_tensor_nccl_grouping(
     assert backend.all_reduce(tensors, group) is tensors
     backend._nccl.all_reduce_two.assert_called_once_with(*tensors, group, op=None)
     backend._nccl.all_reduce.assert_not_called()
+
+
+def test_amd_collection_past_iris_capacity_uses_grouped_rccl(
+    backend,
+    monkeypatch,
+):
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
+    monkeypatch.setattr(
+        "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
+        lambda: SimpleNamespace(is_amd=True),
+    )
+    tensors = (
+        torch.empty(384 * 1024, dtype=torch.bfloat16),
+        torch.empty(256 * 1024, dtype=torch.bfloat16),
+    )
+    group = (0, 1)
+    backend._nccl.all_reduce_two.return_value = tensors
+
+    assert backend.all_reduce(tensors, group) is tensors
+    backend._nccl.all_reduce_two.assert_called_once_with(*tensors, group, op=None)
 
 
 def test_plan_all_reduce_uses_triton(backend, monkeypatch):
@@ -144,6 +184,45 @@ def test_plan_all_reduce_uses_triton(backend, monkeypatch):
     backend._triton_ar.plan_all_reduce.assert_called_once_with(
         shapes, like, (0, 1), op=None
     )
+    backend._triton_ar.can_plan_all_reduce.assert_called_once_with(
+        shapes, like, (0, 1), op=None
+    )
+
+
+def test_plan_all_reduce_amd_uses_base_when_iris_is_ineligible(
+    backend,
+    monkeypatch,
+):
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
+    monkeypatch.setitem(global_server_args_dict, "mapping", None)
+    backend._trtllm_ar.has_trtllm_ar.return_value = False
+    backend._triton_ar.can_plan_all_reduce.return_value = False
+    like = torch.empty(1, 3584, dtype=torch.bfloat16)
+    shapes = ((1, 7168), (1, 3584))
+
+    result = backend.plan_all_reduce(shapes, like, (0, 1))
+
+    assert tuple(output.shape for output in result.outputs) == shapes
+    backend._triton_ar.plan_all_reduce.assert_not_called()
+
+
+def test_plan_all_reduce_non_amd_keeps_existing_delegation(backend, monkeypatch):
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
+    monkeypatch.setitem(global_server_args_dict, "mapping", None)
+    monkeypatch.setattr(
+        "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
+        lambda: SimpleNamespace(is_amd=False),
+    )
+    backend._trtllm_ar.has_trtllm_ar.return_value = False
+    backend._triton_ar.plan_all_reduce.return_value = "plan"
+    like = torch.empty(1, 3584, dtype=torch.bfloat16)
+    shapes = ((1, 7168), (1, 3584))
+
+    assert backend.plan_all_reduce(shapes, like, (0, 1)) == "plan"
+    backend._triton_ar.plan_all_reduce.assert_called_once_with(
+        shapes, like, (0, 1), op=None
+    )
+    backend._triton_ar.can_plan_all_reduce.assert_not_called()
 
 
 def test_plan_all_reduce_preserves_trtllm(backend, monkeypatch):
