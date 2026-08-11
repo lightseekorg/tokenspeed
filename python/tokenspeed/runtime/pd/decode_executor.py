@@ -120,7 +120,6 @@ class DisaggDecodeExecutor:
                 aux_index,
                 prefix_len,
                 None,
-                None,
                 page_manifest=manifest,
             )
 
