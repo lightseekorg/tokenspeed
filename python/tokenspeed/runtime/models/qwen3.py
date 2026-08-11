@@ -63,11 +63,13 @@ class Qwen3MLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         quant_config: QuantizationConfig | None = None,
+        layer_id: int = 0,
         tp_rank: int | None = None,
         tp_size: int | None = None,
         tp_group: tuple[int, ...] | None = None,
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -94,11 +96,17 @@ class Qwen3MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, ctx: ForwardContext | None = None):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+        # LoRA delta on the fused gate/up output (added before SiluAndMul,
+        # matching PEFT semantics).
+        if ctx is not None and ctx.lora_manager is not None:
+            gate_up = ctx.lora_manager.apply_gate_up_lora(x, gate_up, self.layer_id)
+        intermediate = self.act_fn(gate_up)
+        out, _ = self.down_proj(intermediate)
+        if ctx is not None and ctx.lora_manager is not None:
+            out = ctx.lora_manager.apply_down_lora(intermediate, out, self.layer_id)
+        return out
 
 
 class Qwen3Attention(nn.Module):
@@ -120,6 +128,7 @@ class Qwen3Attention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.mapping = mapping
         self.hidden_size = hidden_size
         self.tp_rank = self.mapping.attn.tp_rank
@@ -210,6 +219,14 @@ class Qwen3Attention(nn.Module):
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+
+        # LoRA delta for Q/K/V projections (segment-grouped Triton path).
+        # The manager's batch_info holds persistent buffers, so this call
+        # is safe to record into a CUDA graph: replay updates batch_info
+        # in place before graph.replay().
+        if ctx.lora_manager is not None:
+            qkv = ctx.lora_manager.apply_qkv_lora(hidden_states, qkv, self.layer_id)
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
@@ -217,6 +234,11 @@ class Qwen3Attention(nn.Module):
         if len(attn_output.size()) == 3:
             attn_output = attn_output.reshape(attn_output.shape[0], -1)
         output, _ = self.o_proj(attn_output)
+
+        # LoRA delta for O projection
+        if ctx.lora_manager is not None:
+            output = ctx.lora_manager.apply_o_lora(attn_output, output, self.layer_id)
+
         return output
 
 
@@ -261,6 +283,7 @@ class Qwen3DecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
+            layer_id=layer_id,
             tp_rank=self.mapping.dense.tp_rank,
             tp_size=self.mapping.dense.tp_size,
             tp_group=self.mapping.dense.tp_group,
@@ -321,7 +344,7 @@ class Qwen3DecoderLayer(nn.Module):
                     residual,
                 )
             )
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, ctx)
         return hidden_states, residual
 
 

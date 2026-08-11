@@ -54,6 +54,8 @@ from tokenspeed.runtime.engine.io_struct import (
     IsSchedulerPausedReqOutput,
     IsSleepingReqInput,
     IsSleepingReqOutput,
+    LoadLoraReqInput,
+    LoadLoraReqOutput,
     PauseMode,
     PauseSchedulerReqInput,
     PauseSchedulerReqOutput,
@@ -68,6 +70,8 @@ from tokenspeed.runtime.engine.io_struct import (
     ResumeSchedulerReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
+    UnloadLoraReqInput,
+    UnloadLoraReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
@@ -108,7 +112,7 @@ class _Communicator(Generic[T]):
                 raise RuntimeError("Communicator result state was not reset.")
 
         if obj:
-            self._sender.send_pyobj(obj)
+            await self._sender.send_pyobj(obj)
 
         self._result_event = asyncio.Event()
         self._result_values = []
@@ -129,7 +133,7 @@ class _Communicator(Generic[T]):
             self._result_event = asyncio.Event()
 
             if obj:
-                self._sender.send_pyobj(obj)
+                await self._sender.send_pyobj(obj)
 
         await self._result_event.wait()
         result_values = copy.deepcopy(self._result_values)
@@ -207,6 +211,12 @@ class SchedulerControlClient:
             server_args.mapping.attn.dp_size,
             mode="watching",
         )
+        self.load_lora_communicator = _Communicator(
+            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
+        )
+        self.unload_lora_communicator = _Communicator(
+            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -281,8 +291,38 @@ class SchedulerControlClient:
                     GetLoadReqOutput,
                     self.get_load_communicator.handle_recv,
                 ),
+                (
+                    LoadLoraReqOutput,
+                    self.load_lora_communicator.handle_recv,
+                ),
+                (
+                    UnloadLoraReqOutput,
+                    self.unload_lora_communicator.handle_recv,
+                ),
             ]
         )
+
+    async def load_lora_adapter(
+        self: "AsyncLLM",
+        lora_name: str,
+        adapter_path: str,
+    ) -> tuple[bool, int, str]:
+        """Send a LoadLoraReqInput to the scheduler subprocess."""
+        self.auto_create_handle_loop()
+        result = (
+            await self.load_lora_communicator(
+                LoadLoraReqInput(lora_name=lora_name, adapter_path=adapter_path)
+            )
+        )[0]
+        return result.success, result.lora_id, result.message
+
+    async def unload_lora_adapter(self: "AsyncLLM", lora_name: str) -> tuple[bool, str]:
+        """Send an UnloadLoraReqInput to the scheduler subprocess."""
+        self.auto_create_handle_loop()
+        result = (
+            await self.unload_lora_communicator(UnloadLoraReqInput(lora_name=lora_name))
+        )[0]
+        return result.success, result.message
 
     async def flush_cache(self: AsyncLLM) -> FlushCacheReqOutput:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
