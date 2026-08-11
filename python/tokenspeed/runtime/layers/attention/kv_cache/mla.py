@@ -69,6 +69,7 @@ class MLATokenToKVPool(CachePool):
         layer_group_ids: tuple[str, ...] = (),
         field_layer_offset: int = 0,
         backing_pool: CachePool | None = None,
+        pd_disaggregation_enabled: bool = False,
     ):
         super().__init__(
             size,
@@ -80,6 +81,8 @@ class MLATokenToKVPool(CachePool):
             paged_cache_group_specs=paged_cache_group_specs,
             token_capacity=token_capacity,
             backing_pool=backing_pool,
+            field_layer_offset=field_layer_offset,
+            pd_disaggregation_enabled=pd_disaggregation_enabled,
         )
         self.model_dtype = model_dtype
         self.quant_method = quant_method
@@ -87,9 +90,6 @@ class MLATokenToKVPool(CachePool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.layer_num = layer_num
-        self._field_layer_offset = int(field_layer_offset)
-        if self._field_layer_offset < 0:
-            raise ValueError("field_layer_offset must be non-negative")
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
         # Physical group id per layer, from the cache recipe
         # (CachePoolSpec.layer_group_ids) — the single source the scheduler

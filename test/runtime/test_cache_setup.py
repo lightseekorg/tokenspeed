@@ -717,3 +717,32 @@ def test_draft_view_maps_local_layer_ids_to_continuation_planes() -> None:
     # The hybrid default stays the inverse: global sparse ids -> compact slots.
     hybrid_pool = LayerMappedKVPool(_FakePool(), [3, 7, 11])
     assert hybrid_pool.get_key_buffer(7) == 1
+
+
+def test_draft_view_maps_inkling_conv_checkpoint_accessors() -> None:
+    """Same tripwire for the Inkling conv-checkpoint accessors: the
+    __getattr__ pass-through would resolve them against the target's
+    layers 0..n, silently restoring/publishing the wrong planes."""
+    from tokenspeed.runtime.layers.attention.kv_cache.base import LayerMappedKVPool
+
+    class _FakePool:
+        page_size = 4
+
+        def kvconv_checkpoint_buffers(self, layer_id: int):
+            return ("kv", layer_id)
+
+        def hiddenconv_checkpoint_buffer(self, layer_id: int, component: str):
+            return ("hidden", layer_id, component)
+
+    num_target_layers = 66
+    draft_pool = LayerMappedKVPool(
+        _FakePool(),
+        [num_target_layers + local for local in range(3)],
+        layer_map={local: num_target_layers + local for local in range(3)},
+    )
+    assert draft_pool.kvconv_checkpoint_buffers(0) == ("kv", 66)
+    assert draft_pool.hiddenconv_checkpoint_buffer(2, "mlpconv") == (
+        "hidden",
+        68,
+        "mlpconv",
+    )

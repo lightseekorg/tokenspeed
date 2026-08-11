@@ -1075,7 +1075,55 @@ def test_jit_caches_are_redirected_off_the_work_dir():
         "TRITON_CACHE_DIR": "/tmp/ci-jit-cache-gb200-1gpu-0/triton",
         "CUTE_DSL_CACHE_DIR": "/tmp/ci-jit-cache-gb200-1gpu-0/cute_dsl",
         "TORCHINDUCTOR_CACHE_DIR": "/tmp/ci-jit-cache-gb200-1gpu-0/torchinductor",
+        "TORCH_EXTENSIONS_DIR": "/tmp/ci-jit-cache-gb200-1gpu-0/torch_extensions",
     }
+
+
+def test_stale_torch_extension_build_is_removed(tmp_path):
+    cache_root = tmp_path / "torch_extensions"
+    locked_build = cache_root / "ext_a"
+    complete_build = cache_root / "ext_b"
+    locked_build.mkdir(parents=True)
+    complete_build.mkdir()
+    (locked_build / "lock").touch()
+    (locked_build / "partial.so").touch()
+    (complete_build / "complete.so").touch()
+
+    pipeline.remove_stale_torch_extension_builds(
+        {"TORCH_EXTENSIONS_DIR": str(cache_root)}, dry_run=False
+    )
+
+    assert not locked_build.exists()
+    assert (complete_build / "complete.so").exists()
+
+
+def test_stale_torch_extension_build_survives_dry_run(tmp_path, capsys):
+    pipeline.remove_stale_torch_extension_builds({}, dry_run=False)
+    pipeline.remove_stale_torch_extension_builds(
+        {"TORCH_EXTENSIONS_DIR": str(tmp_path / "missing")}, dry_run=True
+    )
+    locked_build = tmp_path / "torch_extensions" / "ext_a"
+    locked_build.mkdir(parents=True)
+    (locked_build / "lock").touch()
+
+    pipeline.remove_stale_torch_extension_builds(
+        {"TORCH_EXTENSIONS_DIR": str(locked_build.parent)}, dry_run=True
+    )
+
+    assert locked_build.exists()
+    assert "[dry-run] remove stale torch extension build" in capsys.readouterr().out
+
+
+def test_stale_torch_extension_cleanup_fails_if_lock_survives(tmp_path, monkeypatch):
+    locked_build = tmp_path / "torch_extensions" / "ext_a"
+    locked_build.mkdir(parents=True)
+    (locked_build / "lock").touch()
+    monkeypatch.setattr(pipeline.shutil, "rmtree", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="failed to remove stale"):
+        pipeline.remove_stale_torch_extension_builds(
+            {"TORCH_EXTENSIONS_DIR": str(locked_build.parent)}, dry_run=False
+        )
 
 
 def test_jit_cache_env_keeps_explicit_overrides():

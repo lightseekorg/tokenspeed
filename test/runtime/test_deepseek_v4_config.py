@@ -1285,14 +1285,31 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(build(64).block_size, 256)
         self.assertEqual(build(128).block_size, 128)
 
-    def test_model_config_rejects_prefix_cache_for_external_v4_dspark(self):
+    def test_model_config_advertises_v4_dspark_prefix_replay_requirement(self):
         hf_config = SimpleNamespace(
             architectures=["DeepseekV4ForCausalLMDSpark"],
+            model_type="deepseek_v4",
+            head_dim=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            rope_scaling=None,
+            hidden_size=4096,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            num_hidden_layers=1,
+            vocab_size=32000,
+            quantization_config=None,
+            dspark_block_size=5,
+            dspark_window_size=96,
         )
         server_args = SimpleNamespace(
             mapping=None,
             speculative_algorithm="DSPARK",
             enable_prefix_caching=True,
+            speculative_num_draft_tokens=6,
+            block_size=256,
+            load_format="auto",
+            ext_yaml=None,
         )
         with (
             patch(
@@ -1301,27 +1318,31 @@ class TestDeepseekV4Config(unittest.TestCase):
             ),
             patch(
                 "tokenspeed.runtime.configs.model_config.get_generation_config",
-                return_value=None,
+                return_value=SimpleNamespace(eos_token_id=None),
             ),
             patch(
                 "tokenspeed.runtime.configs.model_config.get_hf_text_config",
                 return_value=hf_config,
             ),
             patch(
-                "tokenspeed.runtime.models.deepseek_v4_dspark.count_dspark_stages"
+                "tokenspeed.runtime.models.deepseek_v4_dspark.count_dspark_stages",
+                return_value=2,
             ) as count_stages,
+            patch(
+                "tokenspeed.runtime.configs.model_config.get_context_length",
+                return_value=4096,
+            ),
+            patch.object(ModelConfig, "_verify_quantization"),
         ):
-            with self.assertRaisesRegex(
-                ValueError,
-                "--no-enable-prefix-caching",
-            ):
-                ModelConfig(
-                    "external-draft",
-                    model_override_args="{}",
-                    is_draft_worker=True,
-                    server_args=server_args,
-                )
-        count_stages.assert_not_called()
+            model_config = ModelConfig(
+                "external-draft",
+                model_override_args="{}",
+                is_draft_worker=True,
+                server_args=server_args,
+            )
+        self.assertEqual(model_config.dspark_prefix_replay_tokens, 96)
+        self.assertEqual(model_config.num_attention_layers, 2)
+        count_stages.assert_called_once_with("external-draft", revision=None)
 
     def test_model_config_keeps_incompatible_user_quantization_error(self):
         model_config = object.__new__(ModelConfig)
@@ -1564,14 +1585,36 @@ class TestDeepseekV4Config(unittest.TestCase):
             "model.stages.0.main_proj.weight_scale_inv",
         )
         self.assertEqual(
-            model._map_checkpoint_name("mtp.1.ffn.experts.7.w1.scale"),
-            "model.stages.1.block.ffn.experts.7.w1.weight_scale",
-        )
-        self.assertEqual(
             model._map_checkpoint_name("mtp.2.markov_head.markov_w1.weight"),
             "model.markov_embedding.weight",
         )
         self.assertIsNone(model._map_checkpoint_name("mtp.3.norm.weight"))
+
+    def test_dspark_expert_scale_mapping_follows_moe_backend(self):
+        # Expert block scales land on `w{13,2}_weight_scale` params only under
+        # the mega-MoE backend; every other backend registers
+        # `..._weight_scale_inv` via create_fp8_block_scale_inverses.
+        model = object.__new__(DeepseekV4ForCausalLMDSpark)
+        model.model = SimpleNamespace(num_stages=3)
+
+        mega = SimpleNamespace(is_mega_moe=lambda: True)
+        non_mega = SimpleNamespace(is_mega_moe=lambda: False)
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4_dspark.get_moe_backend",
+            return_value=mega,
+        ):
+            self.assertEqual(
+                model._map_checkpoint_name("mtp.1.ffn.experts.7.w1.scale"),
+                "model.stages.1.block.ffn.experts.7.w1.weight_scale",
+            )
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4_dspark.get_moe_backend",
+            return_value=non_mega,
+        ):
+            self.assertEqual(
+                model._map_checkpoint_name("mtp.1.ffn.experts.7.w1.scale"),
+                "model.stages.1.block.ffn.experts.7.w1.weight_scale_inv",
+            )
 
     def test_dspark_attention_contract_uses_checkpoint_namespace(self):
         self.assertIn("attn.attn_sink", _ATTENTION_CHECKPOINT_TENSORS)
@@ -1983,8 +2026,23 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(server_args.speculative_num_steps, 5)
         self.assertEqual(server_args.speculative_num_draft_tokens, 6)
 
-    def test_dspark_rejects_prefix_cache_until_state_reuse_is_supported(self):
-        with self.assertRaisesRegex(ValueError, "--no-enable-prefix-caching"):
+    def test_dspark_allows_prefix_cache_when_kvstore_is_disabled(self):
+        server_args = ServerArgs(
+            model="unused",
+            disable_kvstore=True,
+            speculative_config=json.dumps(
+                {"method": "dspark", "num_speculative_tokens": 5}
+            ),
+        )
+
+        self.assertTrue(server_args.enable_prefix_caching)
+        self.assertTrue(server_args.draft_model_path_use_base)
+
+    def test_dspark_same_checkpoint_rejects_kvstore(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "does not support KVStore",
+        ):
             ServerArgs(
                 model="unused",
                 speculative_config=json.dumps(
@@ -1992,18 +2050,103 @@ class TestDeepseekV4Config(unittest.TestCase):
                 ),
             )
 
-    def test_dspark_requires_kvstore_and_prefix_cache_to_be_disabled_together(self):
-        with self.assertRaisesRegex(
-            ValueError,
-            "both --disable-kvstore and --no-enable-prefix-caching",
-        ):
+    def test_dspark_explicit_same_checkpoint_rejects_kvstore(self):
+        with self.assertRaisesRegex(ValueError, "does not support KVStore"):
             ServerArgs(
-                model="unused",
-                enable_prefix_caching=False,
+                model="same-checkpoint",
                 speculative_config=json.dumps(
-                    {"method": "dspark", "num_speculative_tokens": 5}
+                    {
+                        "method": "dspark",
+                        "model": "same-checkpoint",
+                        "num_speculative_tokens": 5,
+                    }
                 ),
             )
+
+    def test_dspark_explicit_redirected_same_checkpoint_rejects_kvstore(self):
+        with (
+            patch(
+                "tokenspeed.runtime.utils.server_args.maybe_model_redirect",
+                side_effect=lambda model: (
+                    "resolved-checkpoint" if model == "model-alias" else model
+                ),
+            ),
+            self.assertRaisesRegex(ValueError, "does not support KVStore"),
+        ):
+            ServerArgs(
+                model="model-alias",
+                speculative_algorithm="DSPARK",
+                speculative_draft_model_path="model-alias",
+                speculative_num_steps=5,
+            )
+
+    def test_dspark_explicit_external_checkpoint_preserves_cache_behavior(self):
+        server_args = ServerArgs(
+            model="target-checkpoint",
+            speculative_algorithm="DSPARK",
+            speculative_draft_model_path="external-draft",
+            speculative_num_steps=5,
+        )
+
+        self.assertTrue(server_args.enable_kvstore)
+        self.assertTrue(server_args.enable_prefix_caching)
+        self.assertFalse(server_args.draft_model_path_use_base)
+        self.assertEqual(server_args.speculative_draft_model_path, "external-draft")
+
+    def test_decode_kvstore_without_prefix_cache_preserves_generic_behavior(self):
+        server_args = ServerArgs(
+            model="target-checkpoint",
+            enable_prefix_caching=False,
+            disaggregation_mode="decode",
+        )
+
+        self.assertTrue(server_args.enable_kvstore)
+        self.assertFalse(server_args.enable_prefix_caching)
+
+    def test_dspark_same_checkpoint_decode_still_rejects_kvstore(self):
+        with self.assertRaisesRegex(ValueError, "does not support KVStore"):
+            ServerArgs(
+                model="same-checkpoint",
+                enable_prefix_caching=False,
+                disaggregation_mode="decode",
+                speculative_algorithm="DSPARK",
+                speculative_draft_model_path="same-checkpoint",
+                speculative_num_steps=5,
+            )
+
+    def test_dspark_external_decode_preserves_generic_cache_behavior(self):
+        server_args = ServerArgs(
+            model="target-checkpoint",
+            enable_prefix_caching=False,
+            disaggregation_mode="decode",
+            speculative_algorithm="DSPARK",
+            speculative_draft_model_path="external-draft",
+            speculative_num_steps=5,
+        )
+
+        self.assertTrue(server_args.enable_kvstore)
+        self.assertFalse(server_args.enable_prefix_caching)
+        self.assertFalse(server_args.draft_model_path_use_base)
+        self.assertEqual(server_args.speculative_draft_model_path, "external-draft")
+
+    def test_dspark_external_checkpoint_preserves_generic_cache_behavior(self):
+        server_args = ServerArgs(
+            model="target-checkpoint",
+            speculative_config=json.dumps(
+                {
+                    "method": "dspark",
+                    "model": "external-draft",
+                    "num_speculative_tokens": 6,
+                }
+            ),
+        )
+
+        self.assertTrue(server_args.enable_kvstore)
+        self.assertTrue(server_args.enable_prefix_caching)
+        self.assertFalse(server_args.draft_model_path_use_base)
+        self.assertEqual(server_args.speculative_draft_model_path, "external-draft")
+        self.assertEqual(server_args.speculative_num_steps, 5)
+        self.assertEqual(server_args.speculative_num_draft_tokens, 6)
 
     def test_deepseek_v4_attention_layout_matches_compressed_cache_contract(self):
         config = SimpleNamespace(
@@ -4948,6 +5091,13 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         with (
+            # deep_gemm is unavailable on AMD runners; the guard only checks
+            # for None and every consumer below is patched out.
+            patch.object(
+                deepseek_v4_model,
+                "deep_gemm",
+                deepseek_v4_model.deep_gemm or SimpleNamespace(),
+            ),
             patch.object(
                 deepseek_v4_model,
                 "deepseek_v4_prepare_indexer_q_mxfp4",

@@ -126,10 +126,10 @@ class DSABackend(AttentionBackend):
     def override_num_extends(self, num_extends: int):
         return self._dense_backend.override_num_extends(num_extends)
 
-    def mark_cache_contract(self, logical_page_size: int | None = None) -> None:
+    def mark_cache_contract(self) -> None:
         """Forward the contract mark to the dense sub-backend, which owns the
         group tables and the graph write-location buffer."""
-        self._dense_backend.mark_cache_contract(logical_page_size=logical_page_size)
+        self._dense_backend.mark_cache_contract()
 
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
         return self._dense_backend.select_out_cache_loc(

@@ -49,19 +49,6 @@ _LOGICAL_P = 128  # logical block size (ratio 2 kernel pages per logical page)
 _MAX_CTX = 256
 
 
-class _StubCachePool:
-    def expand_block_table(
-        self, _group_id, block_table, *, kernel_block_tokens, max_kernel_blocks, out
-    ):
-        return expand_page_table(
-            block_table,
-            logical_page_size=_LOGICAL_P,
-            kernel_page_size=kernel_block_tokens,
-            max_kernel_pages=max_kernel_blocks,
-            out=out,
-        )
-
-
 def _bare_mla_backend(
     *,
     cache_contract: bool,
@@ -79,7 +66,6 @@ def _bare_mla_backend(
     backend._block_table_aliased = False
     backend._cache_groups_bound = False
     backend._cache_contract_bound = False
-    backend.cache_pool = _StubCachePool()
     backend.decode_cuda_graph_metadata = {}
     backend.decode_cuda_graph_kv_indices = None
     backend.decode_cuda_graph_group_out_cache_loc = None
@@ -120,7 +106,7 @@ def test_mla_target_verify_width_applies_to_mixed_batches() -> None:
 def test_cutedsl_mla_draft_keeps_classic_page_table_contract() -> None:
     backend = _bare_mla_backend(cache_contract=False, is_draft=True)
 
-    backend.mark_cache_contract(logical_page_size=_LOGICAL_P)
+    backend.mark_cache_contract()
 
     assert backend._cache_contract_bound is False
 
@@ -150,8 +136,9 @@ def _bare_amd_mla_backend(
 
 
 class _StubFullAttnMeta:
-    """Minimal stand-in for CacheBatchMetadata's MLA surface: a padded
-    full-attention table and the logical block size, freshness-checked by op."""
+    """Minimal stand-in for CacheBatchMetadata's MLA surface: the logical
+    full-attention table served through ``kernel_table`` (kernel-page
+    expansion, memoized), freshness-checked by op."""
 
     full_attention_group_id = "full_attention"
 
@@ -159,11 +146,33 @@ class _StubFullAttnMeta:
         self._table = table
         self.block_size = block_size
         self._forward_op = forward_op
+        self._kernel_tables = {}
 
     def require_full_attention_table(self, *, active_forward_op):
         if active_forward_op is not self._forward_op:
             raise RuntimeError("stale forward op")
         return self._table
+
+    def kernel_table(
+        self, group_id=None, *, page_size, max_pages=None, active_forward_op
+    ):
+        if active_forward_op is not self._forward_op:
+            raise RuntimeError("stale forward op")
+        key = (group_id, page_size, max_pages)
+        cached = self._kernel_tables.get(key)
+        if cached is None:
+            cached = expand_page_table(
+                self._table,
+                logical_page_size=self.block_size,
+                kernel_page_size=page_size,
+                max_kernel_pages=max_pages,
+            )
+            self._kernel_tables[key] = cached
+        return cached
+
+    def validate_live_pages(self, seq_lens, *, active_forward_op):
+        if active_forward_op is not self._forward_op:
+            raise RuntimeError("stale forward op")
 
 
 def test_replay_refreshes_buffers_in_place_and_pads_page_zero() -> None:
