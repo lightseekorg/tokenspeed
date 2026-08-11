@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.gemm.kimi3 import KIMI3_HIDDEN_SIZE, KIMI3_QKVFAB_SIZE
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -137,8 +138,8 @@ if current_platform().is_amd:
             priority=Priority.SPECIALIZED,
             traits={
                 "tokens": frozenset({1}),
-                "input_size": frozenset({7168}),
-                "output_size": frozenset({3648, 6288}),
+                "input_size": frozenset({KIMI3_HIDDEN_SIZE}),
+                "output_size": frozenset({3648, KIMI3_QKVFAB_SIZE}),
                 "num_blocks": frozenset(range(1, 12)),
                 "inputs_contiguous": frozenset({True}),
             },

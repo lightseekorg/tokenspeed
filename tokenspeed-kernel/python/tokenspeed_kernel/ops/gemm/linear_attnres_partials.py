@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.gemm.kimi3 import KIMI3_HIDDEN_SIZE
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -301,7 +302,7 @@ def linear_attnres_partials(
     triton_partial_eligible = (
         blocks.is_cuda
         and blocks.dtype == torch.bfloat16
-        and blocks.shape[2] == 7168
+        and blocks.shape[2] == KIMI3_HIDDEN_SIZE
         and blocks.stride(2) == 1
         and score_weight_a.is_contiguous()
         and score_weight_b.is_contiguous()

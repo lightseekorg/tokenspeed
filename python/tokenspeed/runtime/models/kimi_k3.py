@@ -1769,6 +1769,8 @@ class KimiLinearDecoderLayer(nn.Module):
         attnres_partial_args = None
         if next_mix is not None and self._hoist_next_mlp and num_tokens == 1:
             next_layer, _ = next_mix
+            # This layer's attention projection writes both block partials
+            # hoisted for the next layer, which consumes their scratch slots.
             candidate_args = (
                 block_residual[:mlp_valid_blocks],
                 next_layer._mlp_wp,
@@ -1793,8 +1795,7 @@ class KimiLinearDecoderLayer(nn.Module):
             )
         )
         with self.attn_fork.scope(
-            enable=get_is_capture_mode()
-            and (attnres_partial_args is None or own_mlp)
+            enable=get_is_capture_mode() and (attnres_partial_args is None or own_mlp)
         ) as fork:
             with fork.branch():
                 if next_mix is not None:
@@ -1806,9 +1807,7 @@ class KimiLinearDecoderLayer(nn.Module):
                                 next_layer._mlp_wp,
                                 next_layer._attn_wp,
                                 self.mlp_res_norm.variance_epsilon,
-                                _sliced_scratch(
-                                    h, next_layer._mlp_slot, num_tokens
-                                ),
+                                _sliced_scratch(h, next_layer._mlp_slot, num_tokens),
                                 sc1,
                             )
                     else:
