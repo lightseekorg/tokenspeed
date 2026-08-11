@@ -186,7 +186,7 @@ def latent_moe_expert_shared_all_reduce(
         routed_out=routed_out,
         shared_out=shared_out,
     )
-    shared_out, routed_out = plan.run()
+    shared_out, routed_out = plan.execute_all_reduce()
     return routed_out, shared_out
 
 
@@ -616,7 +616,7 @@ class LatentMoELayer(nn.Module):
             shared_reduction_applied = True
 
         if reduction_plan is not None:
-            shared_output, routed_latent = reduction_plan.run()
+            shared_output, routed_latent = reduction_plan.execute_all_reduce()
             _check_shape(shared_output, output_shape, "joint_plan shared output")
             _check_shape(routed_latent, latent_shape, "joint_plan routed latent")
             shared_reduction_applied = True

@@ -155,6 +155,7 @@ class AutoBackend(CommBackend):
         group: Group,
         op=None,
     ) -> AllReducePlan:
+        """Select ordinary or producer-direct deferred reduction planning."""
         if (
             self._force_deterministic_rsag()
             or self._group_spans_nodes(group)

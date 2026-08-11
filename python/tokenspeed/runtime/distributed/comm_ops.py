@@ -205,7 +205,12 @@ def plan_all_reduce(
     backend: CommBackend | None = None,
     op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
 ) -> AllReducePlan:
-    """Allocate producer outputs and bind their collective."""
+    """Return writable producer outputs with a deferred all-reduce.
+
+    This function does not launch a collective. Fill ``plan.outputs`` first,
+    then call ``plan.execute_all_reduce()`` to run the backend-selected
+    reduction.
+    """
     if backend is None:
         backend = get_global_backend()
     return backend.plan_all_reduce(shapes, like, group, op=op)

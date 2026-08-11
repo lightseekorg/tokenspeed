@@ -225,10 +225,8 @@ def test_latent_expert_shared_owns_output_plan_and_reduction(
     routed_staging = torch.empty(2, 3)
     reduced_shared = torch.full_like(shared_staging, 7)
     reduced_routed = torch.full_like(routed_staging, 11)
-    plan = SimpleNamespace(
-        outputs=(shared_staging, routed_staging),
-        run=lambda: (reduced_shared, reduced_routed),
-    )
+    plan = mock.Mock(outputs=(shared_staging, routed_staging))
+    plan.execute_all_reduce.return_value = reduced_shared, reduced_routed
 
     def fake_plan(shapes, like, group):
         assert shapes == ((2, 5), (2, 3))
@@ -471,9 +469,10 @@ def test_latent_moe_plans_shared_and_routed_outputs() -> None:
 
     def joint_plan(shapes, like):
         outputs = tuple(like.new_empty(shape) for shape in shapes)
-        plan = SimpleNamespace(
-            outputs=outputs,
-            run=mock.Mock(side_effect=lambda: (outputs[0] + 5, outputs[1] * 2)),
+        plan = mock.Mock(outputs=outputs)
+        plan.execute_all_reduce.side_effect = lambda: (
+            outputs[0] + 5,
+            outputs[1] * 2,
         )
         plans.append(plan)
         return plan
@@ -492,7 +491,7 @@ def test_latent_moe_plans_shared_and_routed_outputs() -> None:
     expected = routed + hidden_states * 4 + 5
     torch.testing.assert_close(actual, expected)
     assert len(plans) == 1
-    plans[0].run.assert_called_once_with()
+    plans[0].execute_all_reduce.assert_called_once_with()
 
 
 def test_latent_moe_can_return_separate_residual_components() -> None:

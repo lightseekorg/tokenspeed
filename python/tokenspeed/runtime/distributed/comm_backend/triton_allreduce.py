@@ -104,6 +104,7 @@ class TritonAllReduceBackend(CommBackend):
         group: Group,
         op=None,
     ) -> AllReducePlan:
+        """Acquire symmetric outputs and defer their Iris reduction."""
         numels = tuple(math.prod(shape) for shape in shapes)
         if not (
             current_platform().is_cdna4
@@ -124,10 +125,10 @@ class TritonAllReduceBackend(CommBackend):
             like.dtype,
         )
 
-        def run() -> tuple[torch.Tensor, ...]:
+        def reduce() -> tuple[torch.Tensor, ...]:
             return all_reduce_symmetric(state, outputs)
 
-        return AllReducePlan(outputs, run)
+        return AllReducePlan(outputs, reduce)
 
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0
