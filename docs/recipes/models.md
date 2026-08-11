@@ -333,7 +333,7 @@ DeepEP legs and are unavailable without `--all2all-backend deepep`.
 
 ```bash
 # node 0 (serves the HTTP API)
-tokenspeed serve /path/to/qwen3.8-max-fp8 \
+tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --served-model-name qwen3.8-max \
   --nnodes 2 --node-rank 0 --nprocs-per-node 8 --world-size 16 \
   --dist-init-addr <node0-host>:25000 \
@@ -350,7 +350,7 @@ tokenspeed serve /path/to/qwen3.8-max-fp8 \
   --host 0.0.0.0 --port 8000
 
 # node 1 (same command, --node-rank 1)
-tokenspeed serve /path/to/qwen3.8-max-fp8 \
+tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --served-model-name qwen3.8-max \
   --nnodes 2 --node-rank 1 --nprocs-per-node 8 --world-size 16 \
   --dist-init-addr <node0-host>:25000 \
@@ -374,7 +374,7 @@ routing on DeepEP dispatch/combine instead of all-gather:
 
 ```bash
 # node 0 (serves the HTTP API)
-tokenspeed serve /path/to/qwen3.8-max-fp8 \
+tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --served-model-name qwen3.8-max \
   --nnodes 2 --node-rank 0 --nprocs-per-node 8 --world-size 16 \
   --dist-init-addr <node0-host>:25000 \
@@ -393,7 +393,7 @@ tokenspeed serve /path/to/qwen3.8-max-fp8 \
   --host 0.0.0.0 --port 8000
 
 # node 1 (same command, --node-rank 1)
-tokenspeed serve /path/to/qwen3.8-max-fp8 \
+tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --served-model-name qwen3.8-max \
   --nnodes 2 --node-rank 1 --nprocs-per-node 8 --world-size 16 \
   --dist-init-addr <node0-host>:25000 \
