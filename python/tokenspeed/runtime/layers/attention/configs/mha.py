@@ -40,8 +40,8 @@ class MHAConfig(BaseAttnConfig):
     layer_types: tuple[str, ...] = ()
     sliding_window_tokens: int | tuple[int | None, ...] | None = None
     max_scheduled_tokens: int = 0
-    # True iff server_args.disaggregation_mode != "null"; used to reject
-    # layouts whose aliased fields cannot use legacy per-layer transfers.
+    # True iff server_args.disaggregation_mode != "null"; cache recipes use
+    # it to stamp transfer policies onto the paged-cache group specs.
     pd_disaggregation_enabled: bool = False
     # Per-group scheduler page sizes, published by the registry for
     # group-aware backends (backends/cache_groups.py).

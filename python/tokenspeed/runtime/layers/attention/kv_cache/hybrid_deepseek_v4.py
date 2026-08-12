@@ -433,7 +433,6 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         memory_plan: CacheMemoryPlan,
         paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...],
         token_capacity: int,
-        pd_disaggregation_enabled: bool = False,
     ) -> None:
         if size <= 0:
             raise ValueError(f"DeepSeek V4 KV pool size must be positive, got {size}")

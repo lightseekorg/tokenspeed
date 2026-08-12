@@ -59,7 +59,6 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
         rank=0,
         layer_types=layer_types,
         layer_group_ids=group_ids,
-        pd_disaggregation_enabled=True,
         paged_cache_group_specs=build_paged_cache_group_specs(
             layer_types=layer_types,
             group_ids=group_ids,

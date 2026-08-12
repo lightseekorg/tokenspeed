@@ -47,8 +47,8 @@ class MSAConfig(BaseAttnConfig):
     layer_types: tuple[str, ...] = ()
     sliding_window_tokens: None = None
     max_scheduled_tokens: int = 0
-    # True iff server_args.disaggregation_mode != "null"; the pool's
-    # transfer-layout guard consumes it.
+    # True iff server_args.disaggregation_mode != "null"; cache recipes use
+    # it to stamp transfer policies onto the paged-cache group specs.
     pd_disaggregation_enabled: bool = False
 
     index_head_dim: int = 0

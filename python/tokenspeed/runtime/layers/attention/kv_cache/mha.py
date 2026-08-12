@@ -61,7 +61,6 @@ class MHATokenToKVPool(CachePool):
         token_capacity: int | None = None,
         layer_types: tuple[str, ...] = (),
         layer_group_ids: tuple[str, ...] = (),
-        pd_disaggregation_enabled: bool = False,
         layer_kv_head_counts: tuple[int, ...] | None = None,
         kv_alloc_head_count: int | None = None,
         field_layer_offset: int = 0,

@@ -43,7 +43,6 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         memory_plan: CacheMemoryPlan,
         layer_group_ids: tuple[str, ...],
         layer_types: tuple[str, ...],
-        pd_disaggregation_enabled: bool = False,
         state_field_dtypes: Mapping[str, torch.dtype] | None = None,
         **kwargs,
     ):
@@ -63,7 +62,6 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         super().__init__(
             memory_plan=memory_plan,
             layer_group_ids=group_ids,
-            pd_disaggregation_enabled=pd_disaggregation_enabled,
             **kwargs,
         )
 

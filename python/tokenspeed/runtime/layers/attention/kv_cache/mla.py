@@ -69,7 +69,6 @@ class MLATokenToKVPool(CachePool):
         layer_group_ids: tuple[str, ...] = (),
         field_layer_offset: int = 0,
         backing_pool: CachePool | None = None,
-        pd_disaggregation_enabled: bool = False,
     ):
         super().__init__(
             size,

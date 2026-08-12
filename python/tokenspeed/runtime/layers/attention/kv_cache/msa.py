@@ -34,7 +34,6 @@ class MSATokenToKVPool(MHATokenToKVPool):
         token_capacity: int | None = None,
         layer_types: tuple[str, ...] = (),
         layer_group_ids: tuple[str, ...] = (),
-        pd_disaggregation_enabled: bool = False,
     ) -> None:
         self.index_head_dim = index_head_dim
         self.index_dtype = index_dtype
@@ -52,7 +51,6 @@ class MSATokenToKVPool(MHATokenToKVPool):
             rank=rank,
             layer_types=layer_types,
             layer_group_ids=layer_group_ids,
-            pd_disaggregation_enabled=pd_disaggregation_enabled,
             memory_plan=memory_plan,
             paged_cache_group_specs=paged_cache_group_specs,
             token_capacity=token_capacity,
