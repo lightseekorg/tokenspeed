@@ -157,6 +157,52 @@ class TreeMaskGraphRoutingTest(_TorchCase):
         )
 
 
+class DraftTreeMaskMetadataIsolationTest(_TorchCase):
+    """Target verify masks must not become draft attention metadata."""
+
+    def test_mixed_batch_drops_target_spec_info_from_draft_metadata(self):
+        torch = self.torch
+        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+            CudaGraphWrapper,
+        )
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+        captured = {"target": [], "draft": []}
+
+        class FakeBackend:
+            uses_paged_cache_groups = False
+
+            def __init__(self, key):
+                self.key = key
+
+            def init_forward_metadata(self, *args, **kwargs):
+                captured[self.key].append((args, kwargs))
+
+        wrapper = object.__new__(CudaGraphWrapper)
+        wrapper.attn_backend = FakeBackend("target")
+        wrapper.draft_attn_backend = FakeBackend("draft")
+        wrapper.max_tokens_per_req = 4
+        wrapper.drafter = SimpleNamespace(
+            cache_view=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
+            draft_seq_lens_buf=torch.zeros(2, dtype=torch.int32),
+        )
+        wrapper.use_v4_mtp_paged_metadata = False
+
+        target_spec_info = SimpleNamespace(custom_mask=torch.ones(4, dtype=torch.int8))
+        wrapper._init_forward_metadata(
+            padded_bs=2,
+            num_extends=1,
+            req_pool_indices=torch.zeros(2, dtype=torch.int32),
+            seq_lens=torch.tensor([21, 22], dtype=torch.int32),
+            page_table=torch.zeros((1, 1), dtype=torch.int32),
+            forward_mode=ForwardMode.MIXED,
+            spec_info=target_spec_info,
+        )
+
+        self.assertIs(captured["target"][0][1]["spec_info"], target_spec_info)
+        self.assertNotIn("spec_info", captured["draft"][0][1])
+
+
 class DraftCacheGroupIdsTest(_TorchCase):
     """DFLASH owns an independent draft page table; EAGLE-style drafts use
     target cache-group tables at matching page ids."""

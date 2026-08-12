@@ -1005,12 +1005,12 @@ class CudaGraphWrapper:
                 draft_prefill_seq_lens = (
                     seq_lens if self.use_v4_mtp_paged_metadata else draft_seq_lens
                 )
-                # Drafter consumes its own groups' tables (see _draft_group_tables).
-                draft_extend_kwargs = (
-                    {**kwargs, "block_tables": draft_group_tables}
-                    if kwargs.get("block_tables") is not None
-                    else kwargs
-                )
+                # Drafter consumes its own groups' tables (see _draft_group_tables),
+                # but target verify metadata must never leak into draft attention.
+                draft_extend_kwargs = dict(kwargs)
+                draft_extend_kwargs.pop("spec_info", None)
+                if kwargs.get("block_tables") is not None:
+                    draft_extend_kwargs["block_tables"] = draft_group_tables
                 if self.use_v4_mtp_paged_metadata:
                     # cache_metadata describes the target pool and exposes all
                     # target cache groups. The V4 drafter has a narrower cache
