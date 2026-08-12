@@ -51,10 +51,14 @@ class MooncakeKVSender:
         # inner state
         self.init_time = time.time()
         self.conclude_state = None
-        self._layerwise_final_submitted = False
+        self._layerwise_chunk_submitted = False
+        self._layerwise_final_chunk_submitted = False
 
-    def has_layerwise_final(self) -> bool:
-        return self._layerwise_final_submitted
+    def layerwise_chunk_submitted(self) -> bool:
+        return self._layerwise_chunk_submitted
+
+    def layerwise_final_chunk_submitted(self) -> bool:
+        return self._layerwise_final_chunk_submitted
 
     def send(
         self,
@@ -92,7 +96,10 @@ class MooncakeKVSender:
         spec_candidate_ids: list[int] | None = None,
         cache_page_selection: CachePDLayerwisePageSelection | None = None,
     ):
-        self._layerwise_final_submitted = self._layerwise_final_submitted or is_last
+        self._layerwise_chunk_submitted = True
+        self._layerwise_final_chunk_submitted = (
+            self._layerwise_final_chunk_submitted or is_last
+        )
 
         logger.info(
             "[MooncakeKVSender.send_layerwise] bootstrap_room=%s "

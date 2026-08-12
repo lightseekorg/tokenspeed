@@ -161,13 +161,20 @@ class DisaggPrefillExecutor:
                     "Paged cache Prefill chunk extends past Decode's prompt manifest"
                 )
             is_last = chunk_end == prompt_len
+            # On the first submitted chunk, include pages that Prefill found in
+            # its local cache but Decode still needs. Once a chunk has been
+            # submitted, each later selection starts at its own chunk boundary
+            # so already transferred pages are not sent again.
+            selection_start = chunk_begin
+            if not sender.layerwise_chunk_submitted():
+                selection_start = min(selection_start, prefix_len)
             selection = build_cache_layerwise_page_selection(
                 op,
                 layout=self.cache_layout,
                 request_row=index,
                 prefix_len=prefix_len,
                 prompt_len=prompt_len,
-                chunk_start=chunk_begin,
+                chunk_start=selection_start,
                 chunk_end=chunk_end,
             )
             for destination in destinations:
@@ -213,20 +220,61 @@ class DisaggPrefillExecutor:
             # bootstrap token still needs publishing on the last chunk.
             for request_id in op.request_ids:
                 sender = self.senders.get(request_id)
-                if sender is None or not sender.has_layerwise_final():
+                if sender is None:
+                    continue
+                if not sender.layerwise_final_chunk_submitted():
+                    transfer_infos = self.kv_manager.transfer_infos.get(
+                        sender.bootstrap_room, {}
+                    )
+                    if transfer_infos and all(
+                        info.is_dummy for info in transfer_infos.values()
+                    ):
+                        # Idle representative ranks have no cache fields to
+                        # stream, but still participate in the Prefill TP status
+                        # collective. Submit their final no-op only after the
+                        # Prefill forward has completed.
+                        token = self._request_token.get(request_id)
+                        spec_candidate_ids = self._request_spec_candidate_ids.get(
+                            request_id
+                        )
+                        if (
+                            isinstance(token, bool)
+                            or not isinstance(token, int)
+                            or token < 0
+                        ):
+                            raise RuntimeError(
+                                "Paged cache bootstrap token is unavailable"
+                            )
+                        sender.send(
+                            True,
+                            bootstrap_token=token,
+                            spec_candidate_ids=spec_candidate_ids,
+                            page_manifest=None,
+                        )
+                        self._request_token.pop(request_id, None)
+                        self._request_spec_candidate_ids.pop(request_id, None)
+                        self._layerwise_token_published.discard(request_id)
                     continue
                 token = self._request_token.get(request_id)
+                spec_candidate_ids = self._request_spec_candidate_ids.get(request_id)
                 if isinstance(token, bool) or not isinstance(token, int) or token < 0:
                     raise RuntimeError("Paged cache bootstrap token is unavailable")
-                self.kv_manager.set_prefill_metadata(sender.bootstrap_room, token, None)
+                if request_id not in self._layerwise_token_published:
+                    self.kv_manager.set_prefill_metadata(
+                        sender.bootstrap_room,
+                        token,
+                        spec_candidate_ids,
+                    )
                 self._request_token.pop(request_id, None)
+                self._request_spec_candidate_ids.pop(request_id, None)
+                self._layerwise_token_published.discard(request_id)
             return
         pending = []
         for index, request_id in enumerate(op.request_ids):
             sender = self.senders.get(request_id)
             if sender is None:
                 continue
-            if sender.has_layerwise_final():
+            if sender.layerwise_final_chunk_submitted():
                 token = self._request_token.pop(request_id, None)
                 spec_candidate_ids = self._request_spec_candidate_ids.pop(
                     request_id, None

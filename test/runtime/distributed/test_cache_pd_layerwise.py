@@ -194,9 +194,14 @@ def test_prepare_cache_prefill_preflights_batch_and_reserves_once() -> None:
     class _Sender:
         def __init__(self, room: int):
             self.bootstrap_room = room
+            self.started = False
+
+        def layerwise_chunk_submitted(self):
+            return self.started
 
         def send_layerwise(self, *args, **kwargs):
             calls.append((self.bootstrap_room, args, kwargs))
+            self.started = True
 
     reserves = []
     manager = SimpleNamespace(
@@ -233,7 +238,7 @@ def test_prepare_cache_prefill_preflights_batch_and_reserves_once() -> None:
     assert reserves == [True]
     assert [call[2]["begin_cache_step"] for call in calls] == [77, 77]
     assert [call[2]["layerwise_interval"] for call in calls] == [2, 2]
-    assert all(call[2]["is_last"] for call in calls)
+    assert all(call[1] == (True,) for call in calls)
 
     # A later bad row rejects the whole batch before any step is reserved or
     # an earlier valid row is enqueued.
@@ -244,6 +249,65 @@ def test_prepare_cache_prefill_preflights_batch_and_reserves_once() -> None:
         executor._prepare_cache_prefill(operation)
     assert reserves == []
     assert calls == []
+
+
+def test_first_layerwise_chunk_includes_deeper_prefill_cache_hit() -> None:
+    from tokenspeed.runtime.pd.mooncake.sender import MooncakeKVSender
+    from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
+
+    layout = _grouped_layout()
+    destination = SimpleNamespace(
+        is_dummy=False,
+        page_manifest=make_manifest(
+            ("history", (20, 21, 22, 23)),
+            ("state-a", (24,)),
+            ("state-b", (25,)),
+            prefix=2,
+            prompt=9,
+        ),
+    )
+    calls = []
+
+    manager = SimpleNamespace(
+        begin_room=lambda _room: None,
+        add_transfer_request=lambda *args, **kwargs: calls.append((args, kwargs)),
+        transfer_infos={9: {"decode-0": destination}},
+        reserve_layerwise_cache_steps=lambda: 77,
+    )
+    sender = MooncakeKVSender(manager, "127.0.0.1:9000", 9)
+    tables = {
+        "history": np.asarray([[1, 2, 3, 4, 5]], dtype=np.int32),
+        "state-a": np.asarray([[6, 7, 8, 9, 10]], dtype=np.int32),
+        "state-b": np.asarray([[11, 12, 13, 14, 15]], dtype=np.int32),
+    }
+    executor = object.__new__(DisaggPrefillExecutor)
+    executor.cache_layout = layout
+    executor.senders = {"request-0": sender}
+    executor.kv_manager = manager
+    executor._layerwise_interval = 1
+
+    def operation(chunk_begin, chunk_length):
+        return SimpleNamespace(
+            request_ids=["request-0"],
+            extend_prefix_lens=[chunk_begin],
+            input_lengths=[chunk_length],
+            num_extends=lambda: 1,
+            block_tables_arrays=lambda: tables,
+        )
+
+    assert not sender.layerwise_chunk_submitted()
+    executor._prepare_cache_prefill(operation(4, 3))
+    assert sender.layerwise_chunk_submitted()
+    assert not sender.layerwise_final_chunk_submitted()
+    executor._prepare_cache_prefill(operation(7, 2))
+    assert sender.layerwise_final_chunk_submitted()
+
+    first_history = calls[0][1]["cache_page_selection"].groups[0]
+    assert first_history.source_page_ids == (2, 3)
+    assert first_history.destination_positions == (0, 1)
+    second_history = calls[1][1]["cache_page_selection"].groups[0]
+    assert second_history.source_page_ids == (4, 5)
+    assert second_history.destination_positions == (2, 3)
 
 
 def _ordinary_layerwise_group():
