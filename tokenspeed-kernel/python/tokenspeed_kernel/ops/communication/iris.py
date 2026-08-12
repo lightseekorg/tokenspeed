@@ -513,6 +513,36 @@ class IrisAllReduce(object):
 
 
 @triton.jit
+def _iris_wait_for_peers_triton(
+    flags,
+    block_id,
+    epoch,
+    heap_bases,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+):
+    """Acquire every peer's published epoch."""
+    local_heap = tl.load(heap_bases + RANK)
+    flags_heap_offset = tl.cast(flags, tl.uint64) - local_heap
+    for peer in tl.static_range(0, WORLD_SIZE):
+        if peer != RANK:
+            peer_heap = tl.load(heap_bases + peer)
+            peer_flag = tl.cast(
+                peer_heap + flags_heap_offset,
+                tl.pointer_type(tl.int32),
+            )
+            peer_flag += block_id * WORLD_SIZE + peer
+            seen = tl.full((), 0, dtype=tl.int32)
+            while seen < epoch:
+                seen = tl.atomic_add(
+                    peer_flag,
+                    0,
+                    sem="acquire",
+                    scope="sys",
+                )
+
+
+@triton.jit
 def iris_stage_one_shot_allreduce_kernel(
     input_ptr,
     input_sym_ptr,
@@ -537,18 +567,14 @@ def iris_stage_one_shot_allreduce_kernel(
     epoch = tl.load(local_ready).to(tl.int32) + 1
     tl.atomic_xchg(local_ready, epoch, sem="release", scope="sys")
 
-    for peer in tl.static_range(0, WORLD_SIZE):
-        if peer != RANK:
-            seen = tl.full((), 0, dtype=tl.int32)
-            while seen < epoch:
-                seen = iris.load(
-                    ready_flags + flag_offset + peer,
-                    RANK,
-                    peer,
-                    heap_bases,
-                    cache_modifier=".cv",
-                    volatile=True,
-                )
+    _iris_wait_for_peers_triton(
+        ready_flags,
+        block_id,
+        epoch,
+        heap_bases,
+        RANK,
+        WORLD_SIZE,
+    )
 
     acc = local.to(tl.float32)
     for peer in tl.static_range(0, WORLD_SIZE):
@@ -596,7 +622,7 @@ def _iris_heap_base(
 
 
 @gluon.jit
-def _iris_wait_for_rank_epoch(
+def _iris_wait_for_peers_gluon(
     ready_flags,
     block_id,
     epoch,
@@ -613,7 +639,7 @@ def _iris_wait_for_rank_epoch(
     WORLD_SIZE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    """Poll rank epochs with a layout matching the specialized launch."""
+    """Acquire every peer's published epoch."""
     ready_layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     peer_ids = gl.arange(0, WORLD_SIZE, layout=ready_layout)
     peer_heaps = gl.where(peer_ids == 0, heap_base_0, heap_base_7)
@@ -632,12 +658,12 @@ def _iris_wait_for_rank_epoch(
     peer_mask = peer_ids != RANK
     seen = gl.full([WORLD_SIZE], 0, gl.int32, layout=ready_layout)
     while gl.min(gl.where(peer_mask, seen, epoch), axis=0) < epoch:
-        seen = gl.load(
+        seen = gl.atomic_add(
             peer_flags,
+            0,
             mask=peer_mask,
-            other=epoch,
-            cache_modifier=".cv",
-            volatile=True,
+            sem="acquire",
+            scope="sys",
         )
 
 
@@ -731,7 +757,7 @@ def iris_reduce_symmetric_gluon_kernel(
     )
     epoch_ptr = ready_flags + block_id * WORLD_SIZE + RANK
     epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
-    _iris_wait_for_rank_epoch(
+    _iris_wait_for_peers_gluon(
         ready_flags,
         block_id,
         epoch,
@@ -816,7 +842,7 @@ def iris_reduce_symmetric_gluon_kernel(
     # Do not return while a peer program can still be reading this rank's
     # input. The next producer reuses the same symmetric buffer.
     completion_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
-    _iris_wait_for_rank_epoch(
+    _iris_wait_for_peers_gluon(
         ready_flags,
         block_id,
         completion_epoch,
