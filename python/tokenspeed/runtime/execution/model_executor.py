@@ -523,9 +523,6 @@ class ModelExecutor:
 
         self._autotune()
 
-        # Freeze before any capture: a graph records the address of whatever
-        # workspace view it captured, so the shared block must not move after
-        # this point.
         workspace_pool(self.device).freeze()
 
         if not self.forward_step.disable:
