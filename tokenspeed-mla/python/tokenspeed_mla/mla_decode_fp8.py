@@ -2813,22 +2813,23 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         correction_factor = self.acc_dtype(1)
         common_params.p_cor_pipeline.producer_acquire(p_cor_producer_state)
 
-        # Number of tiles from the global-K end that may contain masked
-        # positions. Causal and tree masks both touch the last S_q KV columns,
-        # which can span up to ceil((S_q-1)/tile_N)+1 tiles in boundary cases.
-        # Non-causal dense attention only needs the final K-bound tile.
-        tile_n = self.mma_qk_tiler[1]
-        if cutlass.const_expr(self.is_causal or self.tree_mask_mode):
-            mask_tile_count = (self.seq_len_q - 1 + tile_n - 1) // tile_n + 1
+        # A custom tree mask is a full [S_q x K] matrix, so every global-K tile
+        # may contain denied positions. Causal masking only touches the last
+        # S_q KV columns, while non-causal dense attention only needs the final
+        # K-bound tile.
+        if cutlass.const_expr(self.tree_mask_mode):
+            first_mask_tile_idx = cutlass.Int32(0)
         else:
-            mask_tile_count = 1
+            tile_n = self.mma_qk_tiler[1]
+            if cutlass.const_expr(self.is_causal):
+                mask_tile_count = (self.seq_len_q - 1 + tile_n - 1) // tile_n + 1
+            else:
+                mask_tile_count = 1
 
-        # first_mask_tile_idx is the global index of the first tile that may
-        # need masking. Runtime because it depends on K (per-batch in
-        # var-seq / split-KV).
-        first_mask_tile_idx = k_tile_total - mask_tile_count
+            # Runtime because it depends on K (per-batch in var-seq / split-KV).
+            first_mask_tile_idx = k_tile_total - mask_tile_count
 
-        # Phase 1: pure unmasked bulk tiles (all columns strictly < min k_bound).
+        # Phase 1: pure unmasked bulk tiles (not used for a full custom mask).
         while k_tile_count > 1 and k_index < first_mask_tile_idx:
             (
                 mma_s_consumer_state,
@@ -2853,8 +2854,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             k_index = k_index + 1
             k_tile_count = k_tile_count - 1
 
-        # Phase 2: intermediate tiles that overlap the causal/K-bound region
-        # but are not this work-split's final tile.
+        # Phase 2: intermediate tiles that require mask evaluation but are not
+        # this work-split's final tile.
         while k_tile_count > 1:
             (
                 mma_s_consumer_state,
