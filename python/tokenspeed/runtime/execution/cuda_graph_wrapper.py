@@ -338,7 +338,7 @@ class CudaGraphWrapper:
             capture_items = [
                 (variant, bs)
                 for variant in self._cuda_graph_capture_variants()
-                for bs in self.capture_bs
+                for bs in sorted(self.capture_bs, reverse=True)
             ]
             capture_range = tqdm.tqdm(capture_items) if rank == 0 else capture_items
             if rank == 0:
