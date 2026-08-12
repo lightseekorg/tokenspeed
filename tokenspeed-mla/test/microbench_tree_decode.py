@@ -23,7 +23,7 @@
 This is intentionally not a default pytest: it compiles and runs the Blackwell
 CuTe MLA kernel. It validates the optional custom_mask path against an
 independent absorbed-MLA PyTorch reference and includes non-tile-aligned K plus
-batched offsets.
+batched offsets and masks that deny early history columns.
 
 Example:
     python tokenspeed-mla/test/microbench_tree_decode.py --iters 50
@@ -129,19 +129,18 @@ def call_kernel(
     )
 
 
-def absorbed_ref(query, kv_cache, block_tables, seq_lens, ancestor):
+def absorbed_ref(query, kv_cache, block_tables, seq_lens, custom_mask, cmask_off):
     batch, q_len = query.shape[:2]
     scale = 1.0 / math.sqrt(D_QK)
     out = torch.zeros(batch, q_len, H, KV_LORA, device=DEV, dtype=torch.float32)
     qf = query.float()
     for b in range(batch):
         K = int(seq_lens[b])
-        hist = K - q_len
+        mask_offset = int(cmask_off[b])
+        request_mask = custom_mask[mask_offset : mask_offset + q_len * K].view(q_len, K)
         kv = kv_cache[block_tables[b]].reshape(-1, D_QK).float()[:K]
         for qi in range(q_len):
-            valid = torch.zeros(K, dtype=torch.bool, device=DEV)
-            valid[:hist] = True
-            valid[hist:K] = ancestor[b, qi].to(DEV)
+            valid = request_mask[qi].bool()
             scores = (qf[b, qi] @ kv.t()) * scale
             probs = torch.softmax(
                 scores.masked_fill(~valid.view(1, -1), float("-inf")), dim=-1
@@ -197,11 +196,56 @@ def run_case(batch: int, q_len: int, seq_k: int, args) -> bool:
             custom_mask=custom_mask,
             cmask_off=cmask_off,
         ).float()
-        expected = absorbed_ref(query, kv_cache, block_tables, seq_lens, ancestor_cpu)
+        expected = absorbed_ref(
+            query,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            custom_mask,
+            cmask_off,
+        )
         max_abs = (actual - expected).abs().max().item()
         ok = max_abs < args.tolerance
         print(
             f"[B={batch} q={q_len} K={seq_k}] {name} tree vs ref "
+            f"max_abs={max_abs:.3e} {'OK' if ok else 'FAIL'}"
+        )
+        passed = passed and ok
+
+    if seq_k > q_len:
+        history_mask, history_off = build_custom_mask(
+            chain_ancestor(batch, q_len), seq_lens
+        )
+        for b in range(batch):
+            K = int(seq_lens[b])
+            hist = K - q_len
+            offset = int(history_off[b])
+            request_mask = history_mask[offset : offset + q_len * K].view(q_len, K)
+            request_mask[:, :hist] = False
+
+        actual = call_kernel(
+            query,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            workspace,
+            seq_k,
+            causal=False,
+            custom_mask=history_mask,
+            cmask_off=history_off,
+        ).float()
+        expected = absorbed_ref(
+            query,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            history_mask,
+            history_off,
+        )
+        max_abs = (actual - expected).abs().max().item()
+        ok = max_abs < args.tolerance
+        print(
+            f"[B={batch} q={q_len} K={seq_k}] masked history vs ref "
             f"max_abs={max_abs:.3e} {'OK' if ok else 'FAIL'}"
         )
         passed = passed and ok
