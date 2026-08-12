@@ -1067,6 +1067,87 @@ def _attention_dsa_decode() -> object:
     )
 
 
+def _attention_dsa_decode_fp8_dense_rank128_q4(
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> object:
+    q = torch.empty((2, 4, 8, 192), dtype=dtype)
+    kv_cache = torch.empty((64, 192), dtype=dtype)
+    topk_slots = torch.empty((8, 2048), dtype=torch.int32)
+    topk_lens = torch.empty((8,), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_decode(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=64,
+        qk_nope_head_dim=128,
+        kv_lora_rank=128,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
+        q_len_per_req=4,
+    )
+
+
+def _attention_dsa_decode_fp8_e5m2_dense_rank128_q4() -> object:
+    return _attention_dsa_decode_fp8_dense_rank128_q4(torch.float8_e5m2)
+
+
+def _attention_dsa_decode_fp8_dense_rank512(
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> object:
+    q = torch.empty((2, 4, 8, 576), dtype=dtype)
+    kv_cache = torch.empty((64, 576), dtype=dtype)
+    topk_slots = torch.empty((8, 2048), dtype=torch.int32)
+    topk_lens = torch.empty((8,), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_decode(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=64,
+        qk_nope_head_dim=192,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
+        q_len_per_req=4,
+    )
+
+
+def _attention_dsa_decode_fp8_e5m2_dense_rank512() -> object:
+    return _attention_dsa_decode_fp8_dense_rank512(torch.float8_e5m2)
+
+
+def _attention_dsa_decode_fp8_sparse_rank512(
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> object:
+    q = torch.empty((2, 4, 8, 576), dtype=dtype)
+    sparse_kv_cache = torch.empty((64, 656), dtype=torch.uint8)
+    topk_slots = torch.empty((8, 2048), dtype=torch.int32)
+    topk_lens = torch.empty((8,), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_decode(
+        q=q,
+        kv_cache=None,
+        sparse_kv_cache=sparse_kv_cache,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=64,
+        qk_nope_head_dim=192,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
+        q_len_per_req=4,
+    )
+
+
+def _attention_dsa_decode_fp8_e5m2_sparse_rank512() -> object:
+    return _attention_dsa_decode_fp8_sparse_rank512(torch.float8_e5m2)
+
+
 def _attention_dsa_prefill() -> object:
     q = torch.empty((2, 8, 576), dtype=torch.bfloat16)
     sparse_kv_cache = torch.empty((64, 656), dtype=torch.uint8)
@@ -1087,9 +1168,11 @@ def _attention_dsa_prefill() -> object:
     )
 
 
-def _attention_dsa_prefill_fp8_dense() -> object:
-    q = torch.empty((2, 8, 576), dtype=torch.float8_e4m3fn)
-    kv_cache = torch.empty((64, 576), dtype=torch.float8_e4m3fn)
+def _attention_dsa_prefill_fp8_dense(
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> object:
+    q = torch.empty((2, 8, 576), dtype=dtype)
+    kv_cache = torch.empty((64, 576), dtype=dtype)
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return tokenspeed_kernel.dsa_prefill(
@@ -1105,6 +1188,10 @@ def _attention_dsa_prefill_fp8_dense() -> object:
         softmax_scale=1.0,
         page_size=64,
     )
+
+
+def _attention_dsa_prefill_fp8_e5m2_dense() -> object:
+    return _attention_dsa_prefill_fp8_dense(torch.float8_e5m2)
 
 
 def _attention_dsa_decode_fp8_dense_rank128() -> object:
@@ -1147,9 +1234,9 @@ def _attention_dsa_prefill_bf16_dense_rank128() -> object:
     )
 
 
-def _attention_dsa_decode_topk() -> object:
+def _attention_dsa_decode_topk(*, weights_dtype: torch.dtype = torch.float32) -> object:
     q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
-    weights = torch.empty((2, 2), dtype=torch.float32)
+    weights = torch.empty((2, 2), dtype=weights_dtype)
     index_k = torch.zeros((128, 132), dtype=torch.uint8)
     seq_lens = torch.tensor([64, 64], dtype=torch.int32)
     block_table = torch.zeros((2, 1), dtype=torch.int32)
@@ -1165,14 +1252,19 @@ def _attention_dsa_decode_topk() -> object:
     )
 
 
+def _attention_dsa_decode_topk_bf16_weights() -> object:
+    return _attention_dsa_decode_topk(weights_dtype=torch.bfloat16)
+
+
 def _attention_dsa_prefill_topk(
     *,
     page_size: int = 64,
     solution: str | None = None,
     override: str | None = None,
+    weights_dtype: torch.dtype = torch.float32,
 ) -> object:
     q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
-    weights = torch.empty((2, 2), dtype=torch.float32)
+    weights = torch.empty((2, 2), dtype=weights_dtype)
     index_k = torch.zeros((128, 132), dtype=torch.uint8)
     kv_workspace_slots = torch.arange(64, dtype=torch.int64)
     row_starts = torch.tensor([0, 8], dtype=torch.int32)
@@ -1190,6 +1282,10 @@ def _attention_dsa_prefill_topk(
         solution=solution,
         override=override,
     )
+
+
+def _attention_dsa_prefill_topk_bf16_weights() -> object:
+    return _attention_dsa_prefill_topk(weights_dtype=torch.bfloat16)
 
 
 def _attention_dsa_plan() -> object:
@@ -2107,9 +2203,14 @@ def _case(
     mode: str,
     expected: str,
     invoke: Callable[[], object],
+    *,
+    id_suffix: str | None = None,
 ) -> KernelApiSelectionCase:
+    case_id = f"{arch}/{family}.{mode}/{expected}"
+    if id_suffix is not None:
+        case_id = f"{case_id}/{id_suffix}"
     return KernelApiSelectionCase(
-        id=f"{arch}/{family}.{mode}/{expected}",
+        id=case_id,
         arch=arch,
         family=family,
         mode=mode,
@@ -2333,6 +2434,54 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
+        "dsa_decode_fp8_dense_rank128",
+        "gluon_dsa_decode_gfx950",
+        _attention_dsa_decode_fp8_dense_rank128_q4,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_decode_fp8_e5m2_dense_rank128",
+        "gluon_dsa_decode_gfx950",
+        _attention_dsa_decode_fp8_e5m2_dense_rank128_q4,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_decode_fp8_dense_rank512",
+        "gluon_dsa_decode_gfx950",
+        _attention_dsa_decode_fp8_dense_rank512,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_decode_fp8_e5m2_dense_rank512",
+        "gluon_dsa_decode_gfx950",
+        _attention_dsa_decode_fp8_e5m2_dense_rank512,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_decode_fp8_sparse_rank512",
+        "gluon_dsa_decode_gfx950",
+        _attention_dsa_decode_fp8_sparse_rank512,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_decode_fp8_e5m2_sparse_rank512",
+        "gluon_dsa_decode_gfx950",
+        _attention_dsa_decode_fp8_e5m2_sparse_rank512,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
         "dsa_prefill",
         "gluon_dsa_prefill_gfx950",
         _attention_dsa_prefill,
@@ -2341,9 +2490,17 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
-        "dsa_prefill",
-        "triton_dsa_prefill",
+        "dsa_prefill_fp8_dense_rank512",
+        "gluon_dsa_prefill_fp8_dense_gfx950",
         _attention_dsa_prefill_fp8_dense,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_prefill_fp8_e5m2_dense_rank512",
+        "gluon_dsa_prefill_fp8_dense_gfx950",
+        _attention_dsa_prefill_fp8_e5m2_dense,
     ),
     _case(
         _is_cdna4,
@@ -2357,9 +2514,27 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
+        "dsa_decode_topk",
+        "gluon_dsa_decode_topk_fp8_gfx950",
+        _attention_dsa_decode_topk_bf16_weights,
+        id_suffix="bf16-weights",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
         "dsa_prefill_topk",
         "gluon_dsa_prefill_topk_fp8_gfx950",
         _attention_dsa_prefill_topk,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_prefill_topk",
+        "gluon_dsa_prefill_topk_fp8_gfx950",
+        _attention_dsa_prefill_topk_bf16_weights,
+        id_suffix="bf16-weights",
     ),
     _case(
         _is_cdna4,

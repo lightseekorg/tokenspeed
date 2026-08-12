@@ -423,6 +423,23 @@ def _normal_weights(
     return torch.softmax(logits, dim=-1).contiguous()
 
 
+def _split_bf16_weights(
+    tokens: int,
+    heads: int,
+    *,
+    device: str,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    backing = _randn_bf16(
+        (tokens, 128 + heads),
+        device=device,
+        generator=generator,
+    )
+    weights = backing[:, 128:]
+    assert not weights.is_contiguous()
+    return weights
+
+
 def _round_up_to_page(slots: int, page_size: int) -> int:
     return int(math.ceil(slots / page_size) * page_size)
 
@@ -673,6 +690,140 @@ def test_dsa_prefill_topk_fp8_glm52_cases(case: _TopKPrefillCase) -> None:
         row_ends,
         topk=case.topk,
         softmax_scale=softmax_scale,
+    )
+
+    _assert_topk_matches(workspace_indices, topk_lens, expected_indices, expected_lens)
+
+
+@pytest.mark.skipif(
+    not is_cdna4(), reason="BF16 split-weight support is specific to gfx950"
+)
+@pytest.mark.parametrize(
+    ("seq_len", "capture_graph"),
+    ((8192, False), (8192, True), (16384, False), (16384, True)),
+    ids=("fused-eager", "fused-graph", "precombined-eager", "precombined-graph"),
+)
+def test_dsa_decode_topk_fp8_accepts_glm52_bf16_split_weights(
+    seq_len: int,
+    capture_graph: bool,
+) -> None:
+    device = "cuda"
+    page_size = 64
+    head_dim = 128
+    index_heads = 32
+    topk = 2048
+    q_len_per_req = 2
+    gen = _generator(device, 107)
+    block_table, num_slots = _make_decode_block_table((seq_len,), page_size, device)
+    q = _randn_bf16(
+        (q_len_per_req, index_heads, head_dim),
+        device=device,
+        generator=gen,
+    )
+    weights = _split_bf16_weights(
+        q_len_per_req,
+        index_heads,
+        device=device,
+        generator=gen,
+    )
+    packed_index_k, index_k = _pack_index_k_cache(
+        _randn_bf16((num_slots, head_dim), device=device, generator=gen),
+        page_size,
+    )
+    seq_lens = torch.tensor((seq_len,), device=device, dtype=torch.int32)
+
+    topk_slots = torch.empty((q_len_per_req, topk), device=device, dtype=torch.int32)
+    topk_lens = torch.empty((q_len_per_req,), device=device, dtype=torch.int32)
+
+    def invoke() -> None:
+        gluon_dsa_decode_topk_fp8(
+            q,
+            weights,
+            seq_lens,
+            block_table,
+            page_size=page_size,
+            topk=topk,
+            softmax_scale=head_dim**-0.5 * index_heads**-0.5,
+            q_len_per_req=q_len_per_req,
+            index_k_cache=packed_index_k,
+            out=topk_slots,
+            lens_out=topk_lens,
+        )
+
+    invoke()
+    torch.cuda.synchronize()
+    if capture_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            invoke()
+        graph.replay()
+        torch.cuda.synchronize()
+    expected_slots, expected_lens = _reference_decode_topk(
+        q,
+        weights,
+        index_k,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=head_dim**-0.5 * index_heads**-0.5,
+        q_len_per_req=q_len_per_req,
+    )
+
+    _assert_topk_matches(topk_slots, topk_lens, expected_slots, expected_lens)
+
+
+@pytest.mark.skipif(
+    not is_cdna4(), reason="BF16 split-weight support is specific to gfx950"
+)
+def test_dsa_prefill_topk_fp8_accepts_glm52_bf16_split_weights() -> None:
+    device = "cuda"
+    page_size = 64
+    head_dim = 128
+    index_heads = 32
+    topk = 2048
+    gen = _generator(device, 206)
+    workspace, row_starts, row_ends, _ = _make_prefill_workspace(
+        (4094,), (2,), device=device
+    )
+    num_tokens = 2
+    num_slots = _round_up_to_page(int(workspace.numel()), page_size)
+    q = _randn_bf16(
+        (num_tokens, index_heads, head_dim),
+        device=device,
+        generator=gen,
+    )
+    weights = _split_bf16_weights(
+        num_tokens,
+        index_heads,
+        device=device,
+        generator=gen,
+    )
+    packed_index_k, index_k = _pack_index_k_cache(
+        _randn_bf16((num_slots, head_dim), device=device, generator=gen),
+        page_size,
+    )
+
+    workspace_indices, topk_lens = gluon_dsa_prefill_topk_fp8(
+        q,
+        weights,
+        workspace,
+        row_starts,
+        row_ends,
+        topk=topk,
+        softmax_scale=head_dim**-0.5 * index_heads**-0.5,
+        index_k_cache=packed_index_k,
+        page_size=page_size,
+    )
+    expected_indices, expected_lens = _reference_prefill_topk(
+        q,
+        weights,
+        index_k,
+        workspace,
+        row_starts,
+        row_ends,
+        topk=topk,
+        softmax_scale=head_dim**-0.5 * index_heads**-0.5,
     )
 
     _assert_topk_matches(workspace_indices, topk_lens, expected_indices, expected_lens)
@@ -948,7 +1099,15 @@ def _assert_slots_visible(
     "q_dtype",
     [
         pytest.param(torch.bfloat16, id="q_bf16"),
-        pytest.param(torch.float8_e4m3fn, id="q_fp8"),
+        pytest.param(torch.float8_e4m3fn, id="q_e4m3"),
+        pytest.param(
+            torch.float8_e5m2,
+            id="q_e5m2",
+            marks=pytest.mark.skipif(
+                not is_cdna4(),
+                reason="E5M2 DSA support is specific to gfx950",
+            ),
+        ),
     ],
 )
 def test_dsa_with_sparse_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
@@ -1016,18 +1175,37 @@ def test_dsa_with_sparse_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
     "q_dtype",
     [
         pytest.param(torch.bfloat16, id="q_bf16"),
-        pytest.param(torch.float8_e4m3fn, id="q_fp8"),
+        pytest.param(torch.float8_e4m3fn, id="q_e4m3"),
+        pytest.param(
+            torch.float8_e5m2,
+            id="q_e5m2",
+            marks=pytest.mark.skipif(
+                not is_cdna4(),
+                reason="E5M2 DSA support is specific to gfx950",
+            ),
+        ),
     ],
 )
-def test_dsa_dense_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
+@pytest.mark.parametrize(
+    "kv_lora_rank",
+    [
+        pytest.param(128, id="rank_128"),
+        pytest.param(512, id="rank_512"),
+    ],
+)
+def test_dsa_dense_kvcache(
+    mode: str,
+    api,
+    q_dtype: torch.dtype,
+    kv_lora_rank: int,
+) -> None:
     device = "cuda"
     tokens = 3
     num_heads = 2
     num_slots = 16
     topk = 512
-    kv_lora_rank = 128
     qk_rope_head_dim = 64
-    qk_nope_head_dim = 128
+    qk_nope_head_dim = 192 if kv_lora_rank == 512 else 128
     softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
     q_bf16 = torch.randn(
         tokens,
@@ -1066,6 +1244,93 @@ def test_dsa_dense_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
         q,
         dequant_latent,
         dequant_rope,
+        topk_slots,
+        topk_lens,
+        softmax_scale,
+    )
+    assert out.shape == (tokens, num_heads, kv_lora_rank)
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.skipif(
+    not is_cdna4(),
+    reason="dense FP8 specialization is specific to the gfx950 implementation",
+)
+@pytest.mark.parametrize(
+    "api",
+    [
+        pytest.param(gluon_dsa_decode, id="decode"),
+        pytest.param(gluon_dsa_prefill, id="prefill"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("valid_lengths", "max_seqlen_k"),
+    [
+        pytest.param((0, 1, 33, 2048), 2112, id="static-full-width"),
+        pytest.param((0, 1, 31, 33), 33, id="dynamic-short-list"),
+    ],
+)
+@pytest.mark.parametrize(
+    "fp8_dtype",
+    [
+        pytest.param(torch.float8_e4m3fn, id="e4m3"),
+        pytest.param(torch.float8_e5m2, id="e5m2"),
+    ],
+)
+def test_dsa_dense_fp8_glm52_production_shape(
+    api,
+    valid_lengths: tuple[int, ...],
+    max_seqlen_k: int,
+    fp8_dtype: torch.dtype,
+) -> None:
+    device = "cuda"
+    tokens = 4
+    num_heads = 16
+    num_slots = 2112
+    topk = 2048
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 192
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
+    gen = _generator(device, 401)
+
+    q = _randn_bf16(
+        (tokens, num_heads, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+        generator=gen,
+    ).to(fp8_dtype)
+    kv_cache = _randn_bf16(
+        (num_slots, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+        generator=gen,
+    ).to(fp8_dtype)
+    topk_slots = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
+    topk_lens = torch.tensor(valid_lengths, device=device, dtype=torch.int32)
+    for token, count in enumerate(topk_lens.tolist()):
+        topk_slots[token, :count] = torch.randperm(
+            max_seqlen_k, device=device, generator=gen, dtype=torch.int32
+        )[:count]
+
+    out = api(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=max_seqlen_k,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        page_size=64,
+        q_len_per_req=4 if api is gluon_dsa_decode else 1,
+    )
+
+    ref = _dsa_reference(
+        q,
+        kv_cache[:, :kv_lora_rank],
+        kv_cache[:, kv_lora_rank:],
         topk_slots,
         topk_lens,
         softmax_scale,

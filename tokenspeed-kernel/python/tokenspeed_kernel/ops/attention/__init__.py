@@ -2900,9 +2900,10 @@ def dsa_prefill_topk(
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
-    Gluon requires q, weights, index_k_cache, kv_workspace_slots, row_starts,
-    and row_ends to be contiguous on q's device. kv_workspace_slots must be
-    int64; row_starts and row_ends must be int32.
+    Gluon compacts weights when needed. It requires q, index_k_cache,
+    kv_workspace_slots, row_starts, and row_ends to be contiguous on q's
+    device. kv_workspace_slots must be int64; row_starts and row_ends must be
+    int32.
 
     Returns:
         Tuple of workspace row ids and valid counts. Returned indices are
@@ -3014,8 +3015,9 @@ def dsa_decode_topk(
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
-    Gluon requires q, weights, index_k_cache, seq_lens, and block_table to be
-    contiguous on q's device. seq_lens and block_table must be int32.
+    Gluon compacts weights when needed. It requires q, index_k_cache, seq_lens,
+    and block_table to be contiguous on q's device. seq_lens and block_table
+    must be int32.
 
     Returns:
         Tuple of global KV slots and valid counts; invalid entries are -1.
