@@ -89,7 +89,7 @@ class AttentionConfig:
         assert HEAD_DIM == 128
         assert ROPE_DIM == 64
         assert BLOCK_M == 128
-        assert BLOCK_N == (128 if IS_FP8 else 64)
+        assert BLOCK_N == 64
         assert NUM_BUFFERS == 2
 
         warp_bases = [[1, 0], [2, 0]]
@@ -639,7 +639,7 @@ def get_config(
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
     block_m = 128
-    block_n = 128 if is_fp8 else 64
+    block_n = 64
     num_warps = 4
     batch_size = cu_seqlens_q.numel() - 1
     return LaunchConfig(
