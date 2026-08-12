@@ -39,8 +39,9 @@ from tokenspeed.runtime.execution.workspace import (  # noqa: E402
 
 
 def _pool() -> WorkspacePool:
-    # CPU keeps these runnable without a device; the pool is device-agnostic.
-    return WorkspacePool("cpu")
+    # CPU keeps these runnable without a device; a tiny initial block keeps
+    # the growth-path tests meaningful.
+    return WorkspacePool("cpu", initial_nbytes=1024)
 
 
 def test_allocate_returns_non_overlapping_views():
@@ -125,5 +126,14 @@ def test_pools_are_per_device_and_resettable():
 
 
 def test_pool_allocates_on_its_own_device():
-    (view,) = WorkspacePool("cpu").allocate(((16,), torch.uint8))
+    (view,) = _pool().allocate(((16,), torch.uint8))
     assert view.device.type == "cpu"
+
+
+def test_initial_size_comes_from_env():
+    from tokenspeed.runtime.utils.env import envs
+
+    with envs.TOKENSPEED_WORKSPACE_INITIAL_MB.override(1):
+        pool = WorkspacePool("cpu")
+    (view,) = pool.allocate(((1 << 20,), torch.uint8))  # fits, no growth
+    assert view.numel() == 1 << 20

@@ -99,7 +99,10 @@ class _ChunkedPrefillMetadata:
     max_chunk_len_per_loop: list
 
 
-# Shared across all flashinfer prefill wrappers used by FlashMLABackend.
+# Shared across all flashinfer prefill wrappers used by FlashMLABackend. NOT
+# eligible for the WorkspacePool: the wrappers keep plan() state in this
+# buffer across the plan/run boundary, and the pool's shared block hands the
+# same bytes to every consumer. Size via FLASHINFER_WORKSPACE_SIZE.
 _global_workspace_buffer = None
 
 

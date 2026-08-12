@@ -40,10 +40,8 @@ The contract, which every caller must hold to:
 * **The block must reach its peak before the first CUDA-graph capture.** A
   graph records the raw address of any view captured into it, so the executor
   freezes the pool right before capture and a frozen pool refuses to grow
-  (naming the caller that asked). Cache sizing grows the block to the known
-  peak before profiling free memory, which both satisfies this rule and makes
-  the bytes come out of the measured KV budget instead of the utilization
-  headroom -- see the attention registry.
+  (naming the caller that asked). Consumers therefore warm the block to their
+  peak when they are constructed -- see the trtllm backend.
 
 Sizing policy (constants, batch shapes, env overrides) belongs to callers; the
 pool only carves.
@@ -58,6 +56,7 @@ import os
 import torch
 
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.env import envs
 
 logger = get_colorful_logger(__name__)
 
@@ -84,9 +83,13 @@ def _caller() -> str:
 class WorkspacePool:
     """One device's shared scratch block; the contract is in the module docstring."""
 
-    def __init__(self, device: torch.device | str) -> None:
+    def __init__(
+        self, device: torch.device | str, initial_nbytes: int | None = None
+    ) -> None:
+        if initial_nbytes is None:
+            initial_nbytes = envs.TOKENSPEED_WORKSPACE_INITIAL_MB.get() * (1 << 20)
         self.device = torch.device(device)
-        self._block: torch.Tensor | None = None
+        self._block = torch.empty(initial_nbytes, dtype=torch.uint8, device=self.device)
         self._frozen = False
 
     def allocate(
@@ -103,26 +106,27 @@ class WorkspacePool:
         sizes = [_round_up(math.prod(shape) * dtype.itemsize) for shape, dtype in specs]
         total = sum(sizes)
         block = self._block
-        held = 0 if block is None else block.numel()
 
-        if held < total:
+        if block.numel() < total:
             if self._frozen:
                 raise RuntimeError(
                     f"workspace pool is frozen but {_caller()} needs "
                     f"{total / (1 << 20):.2f} MB (block holds "
-                    f"{held / (1 << 20):.2f} MB). Growing would move the block "
-                    "out from under any CUDA graph that captured a view of it; "
-                    "the block must reach its peak before the first capture."
+                    f"{block.numel() / (1 << 20):.2f} MB). Growing would move "
+                    "the block out from under any CUDA graph that captured a "
+                    "view of it; the block must reach its peak before the "
+                    "first capture."
                 )
             logger.info(
                 "workspace block: %.2f MB -> %.2f MB (%s)",
-                held / (1 << 20),
+                block.numel() / (1 << 20),
                 total / (1 << 20),
                 _caller(),
             )
-            # Drop the old block before allocating the larger one so the
-            # caching allocator can serve the new request from those bytes.
-            self._block = None
+            # Point _block at an empty tensor first so the old block is
+            # actually released, letting the caching allocator serve the new
+            # request from those bytes.
+            self._block = torch.empty(0, dtype=torch.uint8, device=self.device)
             del block
             self._block = torch.empty(total, dtype=torch.uint8, device=self.device)
             block = self._block
@@ -138,10 +142,7 @@ class WorkspacePool:
     def freeze(self) -> None:
         """Pin the block's address; growth now raises. Call before graph capture."""
         self._frozen = True
-        logger.info(
-            "workspace frozen: %.2f MB",
-            (0 if self._block is None else self._block.numel()) / (1 << 20),
-        )
+        logger.info("workspace frozen: %.2f MB", self._block.numel() / (1 << 20))
 
     def unfreeze(self) -> None:
         """Allow growth again, for reconfiguration that re-runs cache sizing."""

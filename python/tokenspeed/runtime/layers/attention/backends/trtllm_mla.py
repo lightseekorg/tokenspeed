@@ -52,6 +52,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
+from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
@@ -62,8 +63,11 @@ logger = logging.getLogger(__name__)
 # Block constraint from flashinfer: block_num % (128 / page_size) == 0
 TRTLLM_BLOCK_CONSTRAINT = 128
 
-# Shared workspace buffer for fused kernels (256 MB, zero-initialized).
-# Zero-init is required for the kernel's internal semaphore mechanism.
+# Shared workspace buffer for fused kernels, zero-initialized. NOT eligible
+# for the WorkspacePool: zero-init is required for the kernel's internal
+# semaphore mechanism, i.e. the content carries state between launches, and
+# the pool's shared block hands the same bytes to every consumer. Size in MB
+# via TOKENSPEED_WORKSPACE_TRTLLM_MLA_MB.
 _trtllm_workspace_buffer = None
 
 
@@ -72,7 +76,7 @@ def get_trtllm_workspace_buffer(device):
     global _trtllm_workspace_buffer
     if _trtllm_workspace_buffer is None:
         _trtllm_workspace_buffer = torch.zeros(
-            256 * 1024 * 1024,
+            envs.TOKENSPEED_WORKSPACE_TRTLLM_MLA_MB.get() * (1 << 20),
             dtype=torch.uint8,
             device=device,
         )
