@@ -1636,17 +1636,17 @@ def _gluon_mla_decode_gfx950(
             "gluon MLA decode requires kv_lora_rank=512, qk_rope_head_dim=64, "
             f"got {kv_lora_rank}/{qk_rope_head_dim}"
         )
-    is_fp8_q = q.dtype == torch.float8_e4m3fn
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    is_fp8_q = q.dtype in fp8_dtypes
     valid_bf16_q = q.dtype == torch.bfloat16 and kv_cache.dtype in (
         torch.bfloat16,
-        torch.float8_e4m3fn,
-        torch.float8_e5m2,
+        *fp8_dtypes,
     )
-    valid_fp8_q = is_fp8_q and kv_cache.dtype == torch.float8_e4m3fn
+    valid_fp8_q = is_fp8_q and kv_cache.dtype == q.dtype
     if not (valid_bf16_q or valid_fp8_q):
         raise NotImplementedError(
             "gluon MLA decode requires bf16 q with bf16/fp8 kv_cache or "
-            "float8_e4m3fn q with float8_e4m3fn kv_cache, got "
+            "matching fp8 q and kv_cache, got "
             f"{q.dtype}/{kv_cache.dtype}"
         )
     is_fp8_kv = kv_cache.dtype != torch.bfloat16
@@ -2129,10 +2129,9 @@ def gluon_mla_decode_projected_value_gfx950(
     logit_cap: float = 0.0,
 ) -> torch.Tensor:
     """Run native FP8 MLA with a projected-value epilogue."""
-    if q.dtype != torch.float8_e4m3fn or kv_cache.dtype != torch.float8_e4m3fn:
-        raise NotImplementedError(
-            "projected-value MLA requires float8_e4m3fn q and kv_cache"
-        )
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    if q.dtype not in fp8_dtypes or kv_cache.dtype != q.dtype:
+        raise NotImplementedError("projected-value MLA requires matching fp8 q and kv")
     if (qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim) != (128, 512, 64):
         raise NotImplementedError(
             "projected-value MLA requires qk_nope/kv_lora/qk_rope dimensions "

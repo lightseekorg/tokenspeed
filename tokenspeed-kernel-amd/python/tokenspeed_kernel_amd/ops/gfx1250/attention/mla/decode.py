@@ -18,6 +18,9 @@ from tokenspeed_kernel_amd.ops.gfx1250.attention.mla._common import (
     e5m2_info,
     make_kernel_repr,
 )
+from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.reduce_project_value import (
+    gluon_mla_reduce_project_value_gfx1250,
+)
 
 
 @gluon.aggregate
@@ -703,6 +706,8 @@ def gluon_mla_decode_gfx1250(
     logit_cap: float = 0.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
+    value_weight: torch.Tensor | None = None,
+    gate: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run absorbed MLA decode over a paged cache on GFX1250.
 
@@ -758,18 +763,20 @@ def gluon_mla_decode_gfx1250(
     if num_query_heads < 1:
         raise ValueError("num_query_heads must be positive")
 
-    expected_out_shape = (batch_size, 1, num_query_heads, kv_lora_rank)
     output_dtype = torch.bfloat16
-    if out is None:
-        out = torch.empty(expected_out_shape, dtype=output_dtype, device=q.device)
-    elif out.shape != expected_out_shape or out.dtype != output_dtype:
-        raise ValueError(
-            f"out must have shape {expected_out_shape} and dtype {output_dtype}, "
-            f"got {tuple(out.shape)} and {out.dtype}"
-        )
+    projected_value = value_weight is not None
+    if not projected_value:
+        expected_out_shape = (batch_size, 1, num_query_heads, kv_lora_rank)
+        if out is None:
+            out = torch.empty(expected_out_shape, dtype=output_dtype, device=q.device)
+        elif out.shape != expected_out_shape or out.dtype != output_dtype:
+            raise ValueError(
+                f"out must have shape {expected_out_shape} and dtype {output_dtype}, "
+                f"got {tuple(out.shape)} and {out.dtype}"
+            )
 
     q_flat = q[:, 0]
-    out_flat = out[:, 0]
+    out_flat = out[:, 0] if not projected_value else None
     num_kv_heads = 1
     block_m = 16
     block_q = max(1, block_m // num_query_heads)
@@ -853,36 +860,128 @@ def gluon_mla_decode_gfx1250(
         else None
     )
     lse_flat = lse[:, 0] if lse is not None else None
-    _mla_decode_fwd_reduce_kernel[(batch_size, num_query_heads)](
-        output_ptr=out_flat,
-        lse_ptr=lse_flat,
-        split_output_ptr=split_output,
-        split_max_ptr=split_max,
-        split_expsum_ptr=split_expsum,
-        seq_lens_ptr=cache_seqlens,
-        out_scale_ptr=None,
-        num_seqs=batch_size,
-        num_query_heads=num_query_heads,
-        output_stride_0=out_flat.stride(0),
-        output_stride_1=out_flat.stride(1),
-        lse_stride_0=lse_flat.stride(0) if lse_flat is not None else 0,
-        lse_stride_1=lse_flat.stride(1) if lse_flat is not None else 0,
-        block_tables_stride=page_table.stride(0),
-        num_tokens_per_seq=1,
-        total_num_tokens=batch_size,
-        TILE_SIZE=page_size,
-        KV_LORA_RANK=kv_lora_rank,
-        query_start_len_ptr=query_start_lens,
-        BLOCK_Q=block_q,
-        NUM_KV_SPLITS=num_kv_splits,
-        ALL_DECODE=True,
-        HAS_LSE=return_lse,
-        num_warps=4,
-        waves_per_eu=1,
-        num_stages=1,
-    )
+    if projected_value:
+        if return_lse or out is None:
+            raise ValueError("MLA projected-value decode requires out")
+        gluon_mla_reduce_project_value_gfx1250(
+            split_output,
+            split_max,
+            split_expsum,
+            cache_seqlens,
+            value_weight,
+            gate=gate,
+            page_size=page_size,
+            out=out,
+        )
+    else:
+        _mla_decode_fwd_reduce_kernel[(batch_size, num_query_heads)](
+            output_ptr=out_flat,
+            lse_ptr=lse_flat,
+            split_output_ptr=split_output,
+            split_max_ptr=split_max,
+            split_expsum_ptr=split_expsum,
+            seq_lens_ptr=cache_seqlens,
+            out_scale_ptr=None,
+            num_seqs=batch_size,
+            num_query_heads=num_query_heads,
+            output_stride_0=out_flat.stride(0),
+            output_stride_1=out_flat.stride(1),
+            lse_stride_0=lse_flat.stride(0) if lse_flat is not None else 0,
+            lse_stride_1=lse_flat.stride(1) if lse_flat is not None else 0,
+            block_tables_stride=page_table.stride(0),
+            num_tokens_per_seq=1,
+            total_num_tokens=batch_size,
+            TILE_SIZE=page_size,
+            KV_LORA_RANK=kv_lora_rank,
+            query_start_len_ptr=query_start_lens,
+            BLOCK_Q=block_q,
+            NUM_KV_SPLITS=num_kv_splits,
+            ALL_DECODE=True,
+            HAS_LSE=return_lse,
+            num_warps=4,
+            waves_per_eu=1,
+            num_stages=1,
+        )
 
     return (out, lse) if return_lse else out
 
 
-__all__ = ["gluon_mla_decode_gfx1250"]
+def gluon_mla_decode_projected_value_gfx1250(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    *,
+    value_weight: torch.Tensor,
+    gate: torch.Tensor | None = None,
+    out: torch.Tensor,
+    logit_cap: float = 0.0,
+) -> torch.Tensor:
+    """Decode MLA and fuse split reduction, BF16 projection, and sigmoid gating.
+
+    Args:
+        q: FP8 absorbed query shaped ``[1, 1, heads, 576]`` for 12 or 16 heads.
+        kv_cache: Contiguous matching-FP8 paged cache with page size 64.
+        page_table: Int32 page table for the single sequence.
+        cache_seqlens: Int32 visible cache length for the sequence.
+        max_seqlen_k: Maximum visible KV length used for split selection.
+        qk_nope_head_dim: Original non-RoPE head width, which must be 128.
+        kv_lora_rank: Latent rank, which must be 512.
+        qk_rope_head_dim: RoPE width, which must be 64.
+        softmax_scale: Scale applied to QK logits.
+        value_weight: Contiguous BF16 weights shaped ``[heads, 512, 128]``.
+        gate: Optional contiguous BF16 raw sigmoid gate shaped
+            ``[1, heads * 128]``.
+        out: Contiguous BF16 output shaped ``[1, heads * 128]``.
+        logit_cap: Unsupported logit cap; must be zero.
+
+    Returns:
+        ``out`` containing the projected and optionally gated values.
+    """
+
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    if q.dtype not in fp8_dtypes or kv_cache.dtype != q.dtype:
+        raise NotImplementedError("projected-value MLA requires matching fp8 q and kv")
+    if (qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim) != (128, 512, 64):
+        raise NotImplementedError(
+            "projected-value MLA requires qk_nope/kv_lora/qk_rope dimensions "
+            "(128, 512, 64)"
+        )
+    expected_weight = (q.shape[2], kv_lora_rank, out.shape[-1] // q.shape[2])
+    if tuple(value_weight.shape) != expected_weight:
+        raise ValueError(f"value_weight must have shape {expected_weight}")
+    if gate is not None and gate.shape != out.shape:
+        raise ValueError("gate and out must have matching shapes")
+    if (
+        out.dtype != torch.bfloat16
+        or not out.is_cuda
+        or not out.is_contiguous()
+        or out.device != q.device
+    ):
+        raise ValueError("projected-value MLA requires contiguous colocated bf16 out")
+    return gluon_mla_decode_gfx1250(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=max_seqlen_k,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        logit_cap=logit_cap,
+        out=out,
+        value_weight=value_weight,
+        gate=gate,
+    )
+
+
+__all__ = [
+    "gluon_mla_decode_gfx1250",
+    "gluon_mla_decode_projected_value_gfx1250",
+]

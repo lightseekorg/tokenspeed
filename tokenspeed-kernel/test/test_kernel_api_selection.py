@@ -879,6 +879,64 @@ def _attention_mla_decode_fp8q_unsupported_heads() -> object:
     )
 
 
+def _attention_mla_decode_projected_value_gfx1250(heads: int = 12) -> object:
+    q = torch.empty((1, 1, heads, 576), dtype=torch.float8_e4m3fn)
+    kv_cache = torch.empty((64, 64, 1, 576), dtype=torch.float8_e4m3fn)
+    page_table = torch.arange(64, dtype=torch.int32).view(1, 64)
+    cache_seqlens = torch.tensor([4096], dtype=torch.int32)
+    value_weight = torch.empty((heads, 512, 128), dtype=torch.bfloat16)
+    out = torch.empty((1, heads * 128), dtype=torch.bfloat16)
+    return tokenspeed_kernel.mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=4096,
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=192**-0.5,
+        value_weight=value_weight,
+        out=out,
+    )
+
+
+def _attention_mla_project_value_gfx1250(
+    *,
+    heads: int = 12,
+    use_gate: bool = False,
+) -> object:
+    attention = torch.empty((1, heads, 512), dtype=torch.bfloat16)
+    weight = torch.empty((heads, 512, 128), dtype=torch.bfloat16)
+    out = torch.empty((1, heads * 128), dtype=torch.bfloat16)
+    gate = torch.empty_like(out) if use_gate else None
+    return tokenspeed_kernel.mla_project_value(
+        attention,
+        weight,
+        gate=gate,
+        out=out,
+    )
+
+
+def _attention_mla_normalize_project_query_gfx1250(heads: int = 12) -> object:
+    query = torch.empty((1, 1536), dtype=torch.bfloat16)
+    kv = torch.empty((1, 512), dtype=torch.bfloat16)
+    query_norm_weight = torch.empty((1536,), dtype=torch.bfloat16)
+    kv_norm_weight = torch.empty((512,), dtype=torch.bfloat16)
+    projection_weight = torch.empty((heads * 192, 1536), dtype=torch.bfloat16)
+    return tokenspeed_kernel.mla_normalize_project_query(
+        query,
+        kv,
+        query_norm_weight,
+        kv_norm_weight,
+        projection_weight,
+        eps=1e-6,
+        prepare_absorbed_query=True,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+    )
+
+
 def _attention_rel_prefill() -> object:
     q = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     k = torch.empty((4, 8, 64), dtype=torch.bfloat16)
@@ -2367,6 +2425,57 @@ _CASES = [
         _attention_mla_decode_fp8q_unsupported_heads,
     ),
     _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "mla_decode_projected_value",
+        "gluon_mla_decode_projected_value_gfx1250",
+        _attention_mla_decode_projected_value_gfx1250,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "mla_decode_projected_value",
+        "gluon_mla_decode_projected_value_gfx1250",
+        lambda: _attention_mla_decode_projected_value_gfx1250(16),
+        id_suffix="h16",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "mla_project_value",
+        "gluon_mla_project_value_gfx1250",
+        _attention_mla_project_value_gfx1250,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "mla_project_value",
+        "gluon_mla_project_value_gfx1250",
+        lambda: _attention_mla_project_value_gfx1250(use_gate=True),
+        id_suffix="sigmoid-gate",
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "mla_normalize_project_query",
+        "gluon_mla_normalize_project_query_gfx1250",
+        _attention_mla_normalize_project_query_gfx1250,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "attention",
+        "mla_normalize_project_query",
+        "gluon_mla_normalize_project_query_gfx1250",
+        lambda: _attention_mla_normalize_project_query_gfx1250(16),
+        id_suffix="h16",
+    ),
+    _case(
         _is_cdna4,
         "cdna4",
         "attention",
@@ -2867,6 +2976,12 @@ def selected_kernel_spy(monkeypatch):
                 )
             if case.mode == "dsa_plan":
                 return torch.empty((1, 4), dtype=torch.int32)
+            if case.mode in {
+                "mla_decode_projected_value",
+                "mla_normalize_project_query",
+                "mla_project_value",
+            }:
+                return kwargs["out"]
             q = kwargs["q"]
             if case.mode == "gdn_chunk_prefill":
                 return GdnChunkPrefillResult(
@@ -3023,6 +3138,40 @@ _GLUON_MLA_FIXED_KERNELS = (
     "gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
     "gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
 )
+
+
+@pytest.mark.parametrize(
+    "trait,value,matches",
+    [
+        pytest.param("num_q_heads", 12, True, id="matched"),
+        pytest.param("num_q_heads", 16, True, id="h16"),
+        pytest.param("num_q_heads", 32, False, id="unsupported-heads"),
+        pytest.param("value_head_dim", 64, False, id="unsupported-value"),
+        pytest.param("page_size", 128, False, id="unsupported-page"),
+        pytest.param("support_logit_cap", True, False, id="unsupported-logit-cap"),
+    ],
+)
+def test_gluon_mla_projected_value_gfx1250_traits_are_narrow(
+    trait: str,
+    value: object,
+    matches: bool,
+) -> None:
+    spec = KernelRegistry.get().get_by_name("gluon_mla_decode_projected_value_gfx1250")
+    if spec is None:
+        pytest.skip("gfx1250 Gluon MLA registration is unavailable")
+    traits = {
+        "batch_size": 1,
+        "q_len": 1,
+        "num_q_heads": 12,
+        "page_size": 64,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "value_head_dim": 128,
+        "gate_kind": "sigmoid",
+        "support_logit_cap": False,
+    }
+    traits[trait] = value
+    assert spec_matches_traits(spec, traits) is matches
 
 
 def _require_gluon_mla_fixed_kernel(name: str):

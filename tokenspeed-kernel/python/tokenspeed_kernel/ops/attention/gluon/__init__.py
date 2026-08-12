@@ -133,11 +133,20 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
         gluon_mla_decode_gfx1250 as _mla_decode_gfx1250_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
+        gluon_mla_decode_projected_value_gfx1250 as _mla_decode_projected_value_gfx1250_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.extend import (
         gluon_mla_extend_gfx1250 as _mla_extend_gfx1250_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.normalize_project_query import (
+        gluon_mla_normalize_project_query_gfx1250 as _mla_normalize_project_query_gfx1250_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.prefill import (
         gluon_mla_prefill_gfx1250 as _mla_prefill_gfx1250_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.project_value import (
+        gluon_mla_project_value_gfx1250 as _mla_project_value_gfx1250_impl,
     )
 
     @register_kernel(
@@ -577,7 +586,13 @@ if current_platform().is_amd:
                     kv_cache=dense_tensor_format(torch.float8_e4m3fn),
                     value_weight=dense_tensor_format(torch.bfloat16),
                     out=dense_tensor_format(torch.bfloat16),
-                )
+                ),
+                format_signature(
+                    q=dense_tensor_format(torch.float8_e5m2),
+                    kv_cache=dense_tensor_format(torch.float8_e5m2),
+                    value_weight=dense_tensor_format(torch.bfloat16),
+                    out=dense_tensor_format(torch.bfloat16),
+                ),
             }
         ),
         priority=Priority.SPECIALIZED,
@@ -665,6 +680,47 @@ if current_platform().is_amd:
         },
     )(_mla_normalize_project_query_impl)
 
+    register_kernel(
+        "attention",
+        "mla_normalize_project_query",
+        name="gluon_mla_normalize_project_query_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    query=dense_tensor_format(torch.bfloat16),
+                    kv=dense_tensor_format(torch.bfloat16),
+                    projection_weight=dense_tensor_format(torch.bfloat16),
+                    out=dense_tensor_format(torch.bfloat16),
+                ),
+                format_signature(
+                    query=dense_tensor_format(torch.bfloat16),
+                    kv=dense_tensor_format(torch.bfloat16),
+                    projection_weight=dense_tensor_format(torch.bfloat16),
+                    out=dense_tensor_format(torch.bfloat16),
+                    tail_out=dense_tensor_format(torch.bfloat16),
+                ),
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "num_tokens": frozenset({1}),
+            "query_width": frozenset({1536}),
+            "kv_width": frozenset({512}),
+            "output_width": frozenset({2304, 3072}),
+            "output_prefix_width": frozenset({128, 2304, 3072}),
+            "output_tail_width": frozenset({0, 64}),
+            "split_output": frozenset({False, True}),
+            "inputs_contiguous": frozenset({True}),
+            "outputs_inner_contiguous": frozenset({True}),
+        },
+    )(_mla_normalize_project_query_gfx1250_impl)
+
     @register_kernel(
         "attention",
         "mla_decode_with_kvcache",
@@ -728,6 +784,76 @@ if current_platform().is_amd:
     )
     def gluon_mla_decode_gfx1250(*args, **kwargs):
         return _mla_decode_gfx1250_impl(*args, **kwargs)
+
+    register_kernel(
+        "attention",
+        "mla_decode_projected_value",
+        name="gluon_mla_decode_projected_value_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.float8_e4m3fn),
+                    kv_cache=dense_tensor_format(torch.float8_e4m3fn),
+                    value_weight=dense_tensor_format(torch.bfloat16),
+                    out=dense_tensor_format(torch.bfloat16),
+                ),
+                format_signature(
+                    q=dense_tensor_format(torch.float8_e5m2),
+                    kv_cache=dense_tensor_format(torch.float8_e5m2),
+                    value_weight=dense_tensor_format(torch.bfloat16),
+                    out=dense_tensor_format(torch.bfloat16),
+                ),
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "batch_size": frozenset({1}),
+            "q_len": frozenset({1}),
+            "num_q_heads": frozenset({12, 16}),
+            "page_size": frozenset({64}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "value_head_dim": frozenset({128}),
+            "gate_kind": frozenset({"none", "sigmoid"}),
+            "support_logit_cap": frozenset({False}),
+        },
+    )(_mla_decode_projected_value_gfx1250_impl)
+
+    register_kernel(
+        "attention",
+        "mla_project_value",
+        name="gluon_mla_project_value_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    attention=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                    out=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "batch_size": frozenset({1}),
+            "num_heads": frozenset({12, 16}),
+            "latent_dim": frozenset({512}),
+            "value_dim": frozenset({128}),
+            "gate_kind": frozenset({"none", "sigmoid"}),
+            "inputs_contiguous": frozenset({True}),
+        },
+    )(_mla_project_value_gfx1250_impl)
 
     @register_kernel(
         "attention",
