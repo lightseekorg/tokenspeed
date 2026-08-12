@@ -28,6 +28,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 #include <spdlog/sinks/ostream_sink.h>
@@ -40,6 +41,16 @@
 namespace tokenspeed::test {
 
 namespace {
+
+static_assert(std::is_same_v<decltype(std::declval<fsm::SchedulePrefillFirstChunkEvent&>()(
+                                 std::declval<fsm::Submitted&&>())),
+                             fsm::State>);
+static_assert(std::is_same_v<decltype(std::declval<fsm::SchedulePrefillFirstChunkEvent&>()(
+                                 std::declval<fsm::Retracted&&>())),
+                             fsm::State>);
+static_assert(std::is_same_v<decltype(std::declval<fsm::SchedulePrefillEvent&>()(
+                                 std::declval<fsm::Prefilling&&>())),
+                             fsm::State>);
 
 std::pair<bool, std::string> ClearL1CacheWithCapturedLog(Scheduler* scheduler) {
     std::ostringstream output;
@@ -806,7 +817,7 @@ namespace {
 
 void SendAbort(Scheduler& scheduler, const std::string& id) {
     ExecutionEvent event;
-    event.With(ForwardEvent{forward::Abort{.request_id = id}});
+    event.With(forward::Abort{.request_id = id});
     scheduler.Advance(std::move(event));
 }
 

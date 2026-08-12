@@ -25,7 +25,6 @@
 #include <string>
 #include <type_traits>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include "cache/coordinator/kv_cache_coordinator.h"
@@ -56,14 +55,15 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
           cache_progress_{std::move(cache_progress)},
           load_pairs_{std::move(load_pairs)} {}
 
-    std::variant<PrefillDone, Prefilling> operator()(Submitted&& state);
-    std::variant<PrefillDone, Prefilling> operator()(Retracted&& state);
+    // Multi-target transitions return the canonical state variant so callers
+    // can consume every event result through the same interface.
+    State operator()(Submitted&& state);
+    State operator()(Retracted&& state);
     std::vector<BlockTransfer> TakeLoadPairs() { return std::exchange(load_pairs_, {}); }
     PrefillSource Source() const { return source_; }
 
 private:
-    template <typename State>
-    std::variant<PrefillDone, Prefilling> scheduleFirstChunk(State&& state);
+    State scheduleFirstChunk(TokenContainer* token_container, std::int32_t page_size);
 
     std::int32_t tokens_this_round_{};
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
@@ -85,7 +85,7 @@ struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event},
           cache_progress_{std::move(cache_progress)} {}
 
-    std::variant<PrefillDone, Prefilling> operator()(Prefilling&& state);
+    State operator()(Prefilling&& state);
 
 private:
     std::int32_t tokens_this_round_{};
