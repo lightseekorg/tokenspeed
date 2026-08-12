@@ -39,7 +39,10 @@ from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextC
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+    get_is_capture_mode,
+    get_is_cuda_graph_phase,
+)
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.linear import (
@@ -351,8 +354,9 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             enable=(
                 self.shared_expert is not None
                 and hidden_states.shape[0] > 0
-                and get_is_capture_mode()
-            )
+                and get_is_cuda_graph_phase()
+            ),
+            overlap=get_is_capture_mode(),
         ) as fork:
             with fork.branch():
                 if self.shared_expert is not None:

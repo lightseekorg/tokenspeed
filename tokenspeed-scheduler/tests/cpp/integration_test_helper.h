@@ -109,27 +109,27 @@ protected:
 
     void SendWriteBackDone(std::uint32_t op_id) {
         ExecutionEvent event;
-        event.With(CacheEvent{cache::WriteBackDone{
+        event.With(cache::WriteBackDone{
             .op_id = op_id,
-        }});
+        });
         scheduler_->Advance(std::move(event));
     }
 
     void SendLoadBackDone(std::uint32_t op_id) {
         ExecutionEvent event;
-        event.With(CacheEvent{cache::LoadBackDone{
+        event.With(cache::LoadBackDone{
             .op_id = op_id,
-        }});
+        });
         scheduler_->Advance(std::move(event));
     }
 
     // Send ExtendResult (new decode tokens) to the scheduler.
     void SendForwardDone(const std::string& request_id, const std::vector<std::int32_t>& tokens) {
         ExecutionEvent event;
-        event.With(ForwardEvent{forward::ExtendResult{
+        event.With(forward::ExtendResult{
             .request_id = request_id,
             .tokens = tokens,
-        }});
+        });
         scheduler_->Advance(std::move(event));
     }
 
@@ -137,15 +137,15 @@ protected:
     // This triggers FinishEvent: Decoding → Draining (or Finished if no writeback needed).
     void SendFinish(const std::string& request_id) {
         ExecutionEvent event;
-        event.With(ForwardEvent{forward::Finish{
+        event.With(forward::Finish{
             .request_id = request_id,
-        }});
+        });
         scheduler_->Advance(std::move(event));
     }
 
     void SendAbortEvent(const std::string& request_id) {
         ExecutionEvent event;
-        event.With(ForwardEvent{forward::Abort{.request_id = request_id}});
+        event.With(forward::Abort{.request_id = request_id});
         scheduler_->Advance(std::move(event));
     }
 
