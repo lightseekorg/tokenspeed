@@ -22,6 +22,18 @@
 
 namespace tokenspeed::test {
 
+TEST(ExecutionEventTest, StoresConcreteEventsInInsertionOrder) {
+    ExecutionEvent event;
+    event.With(cache::WriteBackDone{.op_id = 7})
+        .With(forward::Abort{.request_id = "r0"})
+        .With(pd::BootstrappedEvent{"r1"});
+
+    ASSERT_EQ(event.Events().size(), 3u);
+    EXPECT_TRUE(std::holds_alternative<cache::WriteBackDone>(event.Events()[0]));
+    EXPECT_TRUE(std::holds_alternative<forward::Abort>(event.Events()[1]));
+    EXPECT_TRUE(std::holds_alternative<pd::BootstrappedEvent>(event.Events()[2]));
+}
+
 inline const ForwardBatch* FindForwardBatch(const std::vector<Operation>& operations) {
     for (const auto& operation : operations) {
         if (auto* batch = std::get_if<ForwardBatch>(&operation)) {
@@ -140,13 +152,13 @@ protected:
 
     void SendBootstrapped(const std::string& request_id) {
         ExecutionEvent event;
-        event.With(PDEvent{pd::BootstrappedEvent{request_id}});
+        event.With(pd::BootstrappedEvent{request_id});
         scheduler_->Advance(std::move(event));
     }
 
     void SendRemotePrefillDone(const std::string& request_id, std::int32_t bootstrap_token) {
         ExecutionEvent event;
-        event.With(PDEvent{pd::RemotePrefillDoneEvent{request_id, bootstrap_token}});
+        event.With(pd::RemotePrefillDoneEvent{request_id, bootstrap_token});
         scheduler_->Advance(std::move(event));
     }
 };
@@ -689,7 +701,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapsh
     EXPECT_EQ(decode->block_tables, destination->block_tables);
 
     ExecutionEvent succeeded;
-    succeeded.With(PDEvent{pd::SucceededEvent{"r0"}});
+    succeeded.With(pd::SucceededEvent{"r0"});
     scheduler_->Advance(succeeded);
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), 6);
 }
@@ -717,7 +729,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndLeavesStatePrefix
     PlanOnce();
 
     ExecutionEvent succeeded;
-    succeeded.With(PDEvent{pd::SucceededEvent{"r0"}});
+    succeeded.With(pd::SucceededEvent{"r0"});
     scheduler_->Advance(succeeded);
 
     Submit({MakeRequestSpec("r1", /*num_pages=*/4, /*start=*/1)});

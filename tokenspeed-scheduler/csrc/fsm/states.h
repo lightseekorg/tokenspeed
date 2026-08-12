@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <utility>
 #include <variant>
 
 #include "fsm/forward_states.h"
@@ -29,5 +30,14 @@
 namespace tokenspeed::fsm {
 
 using State = std::variant<Bootstrapping, Submitted, Prefilling, PrefillDone, Decoding, Retracted, Finished>;
+
+inline State ToState(State state) {
+    return state;
+}
+
+template <typename... StateTs>
+State ToState(std::variant<StateTs...>&& state) {
+    return std::visit([](auto&& inner) -> State { return State{std::move(inner)}; }, std::move(state));
+}
 
 }  // namespace tokenspeed::fsm
