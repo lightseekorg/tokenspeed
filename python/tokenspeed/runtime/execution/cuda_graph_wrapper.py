@@ -492,10 +492,6 @@ class CudaGraphWrapper:
             return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
         with _capture_execution_path():
-            # Warm up the exact execution topology that will be recorded. In
-            # particular, PyTorch 2.13 keys ROCm hipBLASLt handles by stream;
-            # both the graph stream and capture-only auxiliary streams must be
-            # touched before hipMalloc becomes illegal inside capture.
             for _ in range(4):
                 torch.cuda.synchronize()
                 dist.barrier()
