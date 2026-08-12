@@ -100,7 +100,10 @@ from tokenspeed.runtime.configs.inkling_config import (
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+    get_is_capture_mode,
+    get_is_cuda_graph_phase,
+)
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -581,10 +584,11 @@ class InklingAttention(nn.Module):
         qkvr, _ = self.qkvr(hidden_states)
         q, kv, r = qkvr.split([self.q_size, 2 * self.kv_size, self.r_size], dim=-1)
 
-        # Fork the R-slice-only rel projection onto the aux stream (capture
-        # only; joins before attention). INKLING_ATTN_RELFORK=0 = serial.
+        # Warm the R-slice projection serially on the capture topology, then
+        # overlap it during capture. INKLING_ATTN_RELFORK=0 stays serial.
         with self.stream_fork.scope(
-            enable=_ATTN_RELFORK and get_is_capture_mode()
+            enable=_ATTN_RELFORK and get_is_cuda_graph_phase(),
+            overlap=get_is_capture_mode(),
         ) as fork:
             with fork.branch():
                 rel_logits = self.rel_logits_proj(
@@ -932,8 +936,11 @@ class InklingSparseMoeBlock(nn.Module):
             num_global_tokens, max_tokens_per_gpu = self.comm_manager.get_num_tokens(
                 ctx
             )
-            # Shared experts depend only on x: fork before the gate (capture-only, allocator stream safety).
-            with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+            # Warm this branch serially on the aux stream, then overlap it with
+            # the gate during capture.
+            with self.stream_fork.scope(
+                enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
+            ) as fork:
                 with fork.branch():
                     shared_out = self.shared_experts(x, do_finalize=False)
                 weights, topk_ids, router_logits = self.gate(x)
@@ -975,7 +982,9 @@ class InklingSparseMoeBlock(nn.Module):
                     topk_ids=topk_ids,
                     router_logits=router_logits,
                 )
-                with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+                with self.stream_fork.scope(
+                    enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
+                ) as fork:
                     routed_out = self.experts(
                         hidden_states=x,
                         topk_output=topk_output,
