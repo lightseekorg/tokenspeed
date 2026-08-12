@@ -47,7 +47,7 @@ public:
     void Apply(Event&& event) {
         state_ = std::visit(
             [&event](auto&& state) -> fsm::State {
-                return std::forward<Event>(event)(std::move(state));
+                return fsm::ToState(std::forward<Event>(event)(std::move(state)));
             },
             std::move(state_));
     }

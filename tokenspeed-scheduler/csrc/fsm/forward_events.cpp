@@ -29,7 +29,8 @@
 
 namespace tokenspeed::fsm {
 
-State SchedulePrefillFirstChunkEvent::scheduleFirstChunk(TokenContainer* token_container, std::int32_t page_size) {
+std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::scheduleFirstChunk(
+    TokenContainer* token_container, std::int32_t page_size) {
     _assert(coordinator_ != nullptr, "SchedulePrefillFirstChunkEvent requires a cache coordinator");
     _assert(block_tables_.size() == static_cast<std::size_t>(coordinator_->NumGroups()),
             "SchedulePrefillFirstChunkEvent requires one admitted table per cache group");
@@ -56,15 +57,15 @@ State SchedulePrefillFirstChunkEvent::scheduleFirstChunk(TokenContainer* token_c
                       source_};
 }
 
-State SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
+std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
     return scheduleFirstChunk(state.TokenContainerPtr(), state.PageSize());
 }
 
-State SchedulePrefillFirstChunkEvent::operator()(Retracted&& state) {
+std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()(Retracted&& state) {
     return scheduleFirstChunk(state.TokenContainerPtr(), state.PageSize());
 }
 
-State SchedulePrefillEvent::operator()(Prefilling&& state) {
+std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefilling&& state) {
     TokenContainer* token_container = state.TokenContainerPtr();
     const std::int32_t page_size = state.PageSize();
     const PrefillSource source = state.Source();

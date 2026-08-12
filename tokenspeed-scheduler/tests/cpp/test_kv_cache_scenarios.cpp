@@ -44,13 +44,13 @@ namespace {
 
 static_assert(std::is_same_v<decltype(std::declval<fsm::SchedulePrefillFirstChunkEvent&>()(
                                  std::declval<fsm::Submitted&&>())),
-                             fsm::State>);
+                             std::variant<fsm::PrefillDone, fsm::Prefilling>>);
 static_assert(std::is_same_v<decltype(std::declval<fsm::SchedulePrefillFirstChunkEvent&>()(
                                  std::declval<fsm::Retracted&&>())),
-                             fsm::State>);
+                             std::variant<fsm::PrefillDone, fsm::Prefilling>>);
 static_assert(std::is_same_v<decltype(std::declval<fsm::SchedulePrefillEvent&>()(
                                  std::declval<fsm::Prefilling&&>())),
-                             fsm::State>);
+                             std::variant<fsm::PrefillDone, fsm::Prefilling>>);
 
 std::pair<bool, std::string> ClearL1CacheWithCapturedLog(Scheduler* scheduler) {
     std::ostringstream output;
