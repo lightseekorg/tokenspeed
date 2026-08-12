@@ -8,8 +8,12 @@ from tokenspeed.runtime.distributed.comm_backend import (
     triton_allreduce as triton_allreduce_module,
 )
 from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
 from tokenspeed.runtime.distributed.comm_backend.triton_allreduce import (
     TritonAllReduceBackend,
+)
+from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
+    TrtllmAllReduceBackend,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -121,6 +125,24 @@ def test_triton_collection_fallback_reduces_each_tensor(monkeypatch):
     )
 
 
+def test_triton_ordinary_all_reduce_keeps_512_kib_limit(monkeypatch):
+    backend = TritonAllReduceBackend(Mock(), producer_direct_max_bytes=1024 * 1024)
+    tensor = Mock(
+        is_cuda=True,
+        is_contiguous=Mock(return_value=True),
+        dtype=torch.bfloat16,
+    )
+    tensor.numel.return_value = 300 * 1024
+    monkeypatch.setattr(
+        triton_allreduce_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_amd=True),
+    )
+
+    assert not backend.can_run(tensor, (0, 1))
+    assert backend.producer_direct_max_bytes == 1024 * 1024
+
+
 def test_triton_output_acquisition_does_not_initialize_iris_off_cdna4(monkeypatch):
     fallback = Mock()
     backend = TritonAllReduceBackend(fallback)
@@ -138,7 +160,7 @@ def test_triton_output_acquisition_does_not_initialize_iris_off_cdna4(monkeypatc
     get_or_create.assert_not_called()
 
 
-def test_triton_output_acquisition_falls_back_when_iris_setup_fails(monkeypatch):
+def test_triton_output_acquisition_propagates_iris_setup_failure(monkeypatch):
     fallback = Mock()
     backend = TritonAllReduceBackend(fallback)
     monkeypatch.setattr(
@@ -152,14 +174,12 @@ def test_triton_output_acquisition_falls_back_when_iris_setup_fails(monkeypatch)
         Mock(side_effect=RuntimeError("Iris setup failed")),
     )
     like = Mock(is_cuda=True, dtype=torch.bfloat16)
-    like.new_empty.side_effect = torch.empty
 
-    outputs = backend.acquire_all_reduce_outputs(((2, 4),), like, (0, 1))
-
-    assert tuple(output.shape for output in outputs) == ((2, 4),)
+    with pytest.raises(RuntimeError, match="Iris setup failed"):
+        backend.acquire_all_reduce_outputs(((2, 4),), like, (0, 1))
 
 
-def test_triton_output_acquisition_falls_back_when_staging_fails(monkeypatch):
+def test_triton_output_acquisition_propagates_staging_failure(monkeypatch):
     fallback = Mock()
     backend = TritonAllReduceBackend(fallback)
     state = SimpleNamespace()
@@ -170,11 +190,34 @@ def test_triton_output_acquisition_falls_back_when_staging_fails(monkeypatch):
         "acquire_symm_outputs",
         Mock(side_effect=RuntimeError("Iris staging failed")),
     )
-    like = torch.empty(2, 4)
+    with pytest.raises(RuntimeError, match="Iris staging failed"):
+        backend.acquire_all_reduce_outputs(((2, 4),), torch.empty(2, 4), (0, 1))
 
-    outputs = backend.acquire_all_reduce_outputs(((2, 4),), like, (0, 1))
 
-    assert tuple(output.shape for output in outputs) == ((2, 4),)
+def test_nccl_collection_uses_single_tensor_path():
+    backend = NcclBackend()
+    backend._resources[(0,)] = {
+        "pynccl_comm": None,
+        "device_group": None,
+        "world_size": 1,
+    }
+    tensors = (torch.empty(1), torch.empty(2), torch.empty(3))
+
+    outputs = backend.all_reduce(tensors, (0,))
+
+    assert all(output is tensor for output, tensor in zip(outputs, tensors))
+
+
+def test_trtllm_collection_uses_fallback_single_tensor_path():
+    fallback = Mock()
+    fallback.all_reduce.side_effect = lambda tensor, _group, op: tensor
+    backend = TrtllmAllReduceBackend(fallback)
+    tensors = (torch.empty(1), torch.empty(2), torch.empty(3))
+
+    outputs = backend.all_reduce(tensors, (0, 1))
+
+    assert all(output is tensor for output, tensor in zip(outputs, tensors))
+    assert fallback.all_reduce.call_count == len(tensors)
 
 
 def test_force_deterministic_rsag_preserves_two_tensor_nccl_grouping(

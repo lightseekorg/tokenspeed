@@ -532,10 +532,26 @@ def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
     torch.testing.assert_close(actual, expected, atol=3e-4, rtol=3e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16, 32])
 def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
     num_tokens: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from tokenspeed_kernel.ops.moe.gluon import mxfp4 as mxfp4_module
+
+    grouped = mxfp4_module.gluon_a16w4_situ_grouped_ep_gfx950
+    grouped_calls = 0
+
+    def tracked_grouped(*args, **kwargs):
+        nonlocal grouped_calls
+        grouped_calls += 1
+        return grouped(*args, **kwargs)
+
+    monkeypatch.setattr(
+        mxfp4_module,
+        "gluon_a16w4_situ_grouped_ep_gfx950",
+        tracked_grouped,
+    )
     generator = torch.Generator(device="cuda").manual_seed(20260718)
     top_k = 4
     _, raw = _make_mxfp4_module(
@@ -579,6 +595,7 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     ).clone()
+    assert bool(grouped_calls) == (num_tokens > 16)
     output = torch.empty_like(hidden_states)
     module._situ_output_buffer = output
 

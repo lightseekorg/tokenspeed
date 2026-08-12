@@ -38,7 +38,10 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 
+# Preserve the measured ordinary-Iris window while allowing a larger
+# producer-direct backing allocation.
 _DEFAULT_PRODUCER_DIRECT_MAX_BYTES = 1024 * 1024
+_DEFAULT_ALL_REDUCE_MAX_BYTES = 512 * 1024
 
 
 class TritonAllReduceBackend(CommBackend):
@@ -51,7 +54,7 @@ class TritonAllReduceBackend(CommBackend):
         self._instances = {}
         self._producer_direct_max_bytes = producer_direct_max_bytes
         self._max_numel = (
-            producer_direct_max_bytes
+            min(producer_direct_max_bytes, _DEFAULT_ALL_REDUCE_MAX_BYTES)
             // torch.empty((), dtype=torch.bfloat16).element_size()
         )
 
@@ -118,11 +121,9 @@ class TritonAllReduceBackend(CommBackend):
         if not self.can_acquire_outputs(shapes, like, group, op=op):
             return super().acquire_all_reduce_outputs(shapes, like, group, op=op)
 
-        try:
-            state = self._get_or_create(group)
-            return acquire_symm_outputs(state, shapes, like.dtype)
-        except Exception:
-            return super().acquire_all_reduce_outputs(shapes, like, group, op=op)
+        # Do not let one rank silently select a different collective protocol.
+        state = self._get_or_create(group)
+        return acquire_symm_outputs(state, shapes, like.dtype)
 
     def can_acquire_outputs(
         self,
@@ -134,11 +135,8 @@ class TritonAllReduceBackend(CommBackend):
         """Check producer-direct eligibility without initializing Iris."""
         if not current_platform().is_cdna4 or not like.is_cuda:
             return False
-        try:
-            state = self._get_or_create(group)
-            return symm_outputs_can_run(state, shapes, like.dtype, op=op)
-        except Exception:
-            return False
+        state = self._get_or_create(group)
+        return symm_outputs_can_run(state, shapes, like.dtype, op=op)
 
     def can_reduce_outputs(
         self,
