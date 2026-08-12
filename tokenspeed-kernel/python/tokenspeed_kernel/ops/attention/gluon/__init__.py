@@ -1015,7 +1015,11 @@ if current_platform().is_amd:
                 format_signature(
                     q=dense_tensor_format(torch.bfloat16),
                     weights=dense_tensor_format(torch.float32),
-                )
+                ),
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    weights=dense_tensor_format(torch.bfloat16),
+                ),
             }
         ),
         priority=Priority.SPECIALIZED,
@@ -1046,7 +1050,11 @@ if current_platform().is_amd:
                 format_signature(
                     q=dense_tensor_format(torch.bfloat16),
                     weights=dense_tensor_format(torch.float32),
-                )
+                ),
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    weights=dense_tensor_format(torch.bfloat16),
+                ),
             }
         ),
         priority=Priority.SPECIALIZED,

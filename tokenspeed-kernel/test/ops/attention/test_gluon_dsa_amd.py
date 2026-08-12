@@ -695,12 +695,25 @@ def test_dsa_prefill_topk_fp8_glm52_cases(case: _TopKPrefillCase) -> None:
     _assert_topk_matches(workspace_indices, topk_lens, expected_indices, expected_lens)
 
 
-@pytest.mark.skipif(
-    not is_cdna4(), reason="BF16 split-weight support is specific to gfx950"
-)
+if is_cdna4():
+    _BF16_SPLIT_WEIGHT_DECODE_CASES = (
+        (8192, False),
+        (8192, True),
+        (16384, False),
+        (16384, True),
+    )
+else:
+    _BF16_SPLIT_WEIGHT_DECODE_CASES = (
+        (49152, False),
+        (49152, True),
+        (49153, False),
+        (49153, True),
+    )
+
+
 @pytest.mark.parametrize(
     ("seq_len", "capture_graph"),
-    ((8192, False), (8192, True), (16384, False), (16384, True)),
+    _BF16_SPLIT_WEIGHT_DECODE_CASES,
     ids=("fused-eager", "fused-graph", "precombined-eager", "precombined-graph"),
 )
 def test_dsa_decode_topk_fp8_accepts_glm52_bf16_split_weights(
@@ -773,9 +786,6 @@ def test_dsa_decode_topk_fp8_accepts_glm52_bf16_split_weights(
     _assert_topk_matches(topk_slots, topk_lens, expected_slots, expected_lens)
 
 
-@pytest.mark.skipif(
-    not is_cdna4(), reason="BF16 split-weight support is specific to gfx950"
-)
 def test_dsa_prefill_topk_fp8_accepts_glm52_bf16_split_weights() -> None:
     device = "cuda"
     page_size = 64

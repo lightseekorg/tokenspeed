@@ -60,6 +60,7 @@ def _dsa_decode_logits_fp8_kernel(
     num_groups: gl.constexpr,
     softmax_scale: gl.constexpr,
     q_len_per_req: gl.constexpr,
+    FOLD_WEIGHTED_HEADS: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_D: gl.constexpr,
 ):
@@ -93,13 +94,16 @@ def _dsa_decode_logits_fp8_kernel(
         + block_offset.to(gl.int64) * num_groups
     )
 
-    scores = gl.zeros([BLOCK_N], gl.float32, layout=row_layout)
-    for head in gl.static_range(0, num_heads):
-        q_vals = gl.load(
-            q + (token * num_heads + head) * head_dim + dims,
-            mask=dims < head_dim,
-            other=0.0,
-        ).to(gl.float32)
+    if FOLD_WEIGHTED_HEADS:
+        weighted_q = gl.zeros([BLOCK_D], gl.float32, layout=dim_layout)
+        for head in gl.static_range(0, num_heads):
+            q_vals = gl.load(
+                q + (token * num_heads + head) * head_dim + dims,
+                mask=dims < head_dim,
+                other=0.0,
+            ).to(gl.float32)
+            head_weight = gl.load(weights + token * num_heads + head).to(gl.float32)
+            weighted_q += q_vals * head_weight
         k_vals = gl.load(
             index_k_fp8 + fp8_base[:, None] + dims[None, :],
             mask=valid[:, None] & (dims[None, :] < head_dim),
@@ -111,9 +115,28 @@ def _dsa_decode_logits_fp8_kernel(
             mask=valid,
             other=0.0,
         ).to(gl.float32)
-        head_score = gl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
-        head_weight = gl.load(weights + token * num_heads + head).to(gl.float32)
-        scores += head_score * head_weight
+        scores = gl.sum(k_vals * k_scale[:, None] * weighted_q[None, :], axis=1)
+    else:
+        head_weight: gl.constexpr = 1.0
+        scores = gl.zeros([BLOCK_N], gl.float32, layout=row_layout)
+        for head in gl.static_range(0, num_heads):
+            q_vals = gl.load(
+                q + (token * num_heads + head) * head_dim + dims,
+                mask=dims < head_dim,
+                other=0.0,
+            ).to(gl.float32)
+            k_vals = gl.load(
+                index_k_fp8 + fp8_base[:, None] + dims[None, :],
+                mask=valid[:, None] & (dims[None, :] < head_dim),
+                other=0.0,
+            ).to(gl.float32)
+            k_scale = gl.load(
+                index_k_scale + scale_base,
+                mask=valid,
+                other=0.0,
+            ).to(gl.float32)
+            head_score = gl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
+            scores += head_score * head_weight
 
     scores *= softmax_scale
     scores = gl.where(valid, scores, -float("inf"))
@@ -129,7 +152,6 @@ def _dsa_prefill_logits_fp8_kernel(
     q,
     index_k_fp8,
     index_k_scale,
-    weights,
     kv_workspace_slots,
     row_starts,
     row_ends,
@@ -172,6 +194,7 @@ def _dsa_prefill_logits_fp8_kernel(
     )
 
     scores = gl.zeros([BLOCK_N], gl.float32, layout=row_layout)
+    head_weight: gl.constexpr = 1.0
     for head in gl.static_range(0, num_heads):
         q_vals = gl.load(
             q + (token * num_heads + head) * head_dim + dims,
@@ -189,7 +212,6 @@ def _dsa_prefill_logits_fp8_kernel(
             other=0.0,
         ).to(gl.float32)
         head_score = gl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
-        head_weight = gl.load(weights + token * num_heads + head).to(gl.float32)
         scores += head_score * head_weight
 
     scores *= softmax_scale
@@ -209,8 +231,10 @@ def _check_packed_fp8_inputs(
 ) -> int:
     if q.dtype != torch.bfloat16:
         raise TypeError(f"DSA Gluon top-k expects BF16 q, got {q.dtype}")
-    if weights.dtype != torch.float32:
-        raise TypeError(f"DSA Gluon top-k expects FP32 weights, got {weights.dtype}")
+    if weights.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(
+            f"DSA Gluon top-k expects BF16 or FP32 weights, got {weights.dtype}"
+        )
     if q.dim() != 3:
         raise ValueError(f"q must be [tokens, heads, dim], got {tuple(q.shape)}")
     if weights.shape != q.shape[:2]:
