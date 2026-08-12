@@ -154,6 +154,7 @@ class IdleReplayScrubTest(unittest.TestCase):
                 global_forward_mode=[int(ForwardMode.IDLE)],
                 all_decode_or_idle=True,
                 all_extend=False,
+                any_custom_tree_mask=False,
                 need_idle_forward=True,
             ),
         )

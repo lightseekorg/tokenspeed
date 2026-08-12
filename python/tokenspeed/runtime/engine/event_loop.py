@@ -296,8 +296,8 @@ class EventLoop:
             self.world_cpu_group = pg_manager.get_process_group(
                 "gloo", mapping.world_group
             )
-            self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
-            self._dp_global_info = torch.zeros(mapping.world_size, 3, dtype=torch.int32)
+            self._dp_local_info = torch.zeros(1, 4, dtype=torch.int32)
+            self._dp_global_info = torch.zeros(mapping.world_size, 4, dtype=torch.int32)
         if server_args.enable_kvstore:
             if server_args.kvstore_storage_backend is not None:
                 raise NotImplementedError(
@@ -998,6 +998,12 @@ class EventLoop:
         self._dp_local_info[0, 0] = num_tokens
         self._dp_local_info[0, 1] = batch_size
         self._dp_local_info[0, 2] = int(forward_mode)
+        spec_info = getattr(forward_op, "spec_info", None)
+        self._dp_local_info[0, 3] = int(
+            executes_model_forward
+            and spec_info is not None
+            and getattr(spec_info, "custom_mask", None) is not None
+        )
         dist.all_gather_into_tensor(
             self._dp_global_info,
             self._dp_local_info,
@@ -1006,6 +1012,8 @@ class EventLoop:
         global_num_tokens = self._dp_global_info[:, 0].tolist()
         global_batch_size = self._dp_global_info[:, 1].tolist()
         global_forward_mode = self._dp_global_info[:, 2].tolist()
+        global_custom_tree_mask = self._dp_global_info[:, 3].tolist()
+        any_custom_tree_mask = max(global_custom_tree_mask) > 0
         any_rank_has_work = max(global_num_tokens) > 0
         need_idle_forward = num_tokens == 0 and any_rank_has_work
         all_decode_or_idle = all(
@@ -1026,6 +1034,7 @@ class EventLoop:
             global_forward_mode=global_forward_mode,
             all_decode_or_idle=all_decode_or_idle,
             all_extend=all_extend,
+            any_custom_tree_mask=any_custom_tree_mask,
             need_idle_forward=need_idle_forward,
         )
 

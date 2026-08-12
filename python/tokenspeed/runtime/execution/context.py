@@ -58,6 +58,9 @@ class ForwardContext:
     global_bs: list[int] | None = None
     all_decode_or_idle: bool = False
     all_extend: bool = False
+    # Replicated by the event loop so every DP rank chooses the same
+    # graph/eager route when any rank carries per-request tree-mask metadata.
+    any_custom_tree_mask: bool = False
     # Models that need specific collective sizing (e.g. draft models whose
     # first-step forward narrows activations) report these via
     # ``report_collective_sizing``. Unset (None) means comm sizing falls

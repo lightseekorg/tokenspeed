@@ -1071,6 +1071,8 @@ class CudaGraphWrapper:
             return False
         if not ctx.forward_mode.is_decode():
             return False
+        if getattr(ctx, "any_custom_tree_mask", False):
+            return False
         if self.dp_size > 1:
             if not ctx.all_decode_or_idle:
                 return False

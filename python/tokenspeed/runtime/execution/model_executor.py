@@ -1074,6 +1074,7 @@ class ModelExecutor:
             global_num_tokens=dp_metadata.global_num_tokens,
             global_bs=dp_metadata.global_batch_size,
             all_decode_or_idle=dp_metadata.all_decode_or_idle,
+            any_custom_tree_mask=dp_metadata.any_custom_tree_mask,
         )
         sampling_info = SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
@@ -1431,6 +1432,7 @@ class ModelExecutor:
                     ctx.global_bs = dp_metadata.global_batch_size
                     ctx.all_decode_or_idle = dp_metadata.all_decode_or_idle
                     ctx.all_extend = dp_metadata.all_extend
+                    ctx.any_custom_tree_mask = dp_metadata.any_custom_tree_mask
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_start = time.perf_counter() if timing_enabled else 0.0
                     sampling_info = self._build_sampling_info(bs, sampling_params_list)

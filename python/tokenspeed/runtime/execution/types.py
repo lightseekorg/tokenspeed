@@ -48,6 +48,7 @@ class DpForwardMetadata:
     global_forward_mode: list[int]
     all_decode_or_idle: bool
     all_extend: bool
+    any_custom_tree_mask: bool
     need_idle_forward: bool
 
 
