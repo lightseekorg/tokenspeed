@@ -25,7 +25,6 @@
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -48,14 +47,7 @@ public:
     void Apply(Event&& event) {
         state_ = std::visit(
             [&event](auto&& state) -> fsm::State {
-                auto result = std::forward<Event>(event)(std::move(state));
-                using Result = std::remove_cvref_t<decltype(result)>;
-                if constexpr (std::is_convertible_v<Result, fsm::State>) {
-                    return fsm::State{std::move(result)};
-                } else {
-                    return std::visit([](auto&& inner) -> fsm::State { return fsm::State{std::move(inner)}; },
-                                      std::move(result));
-                }
+                return fsm::ToState(std::forward<Event>(event)(std::move(state)));
             },
             std::move(state_));
     }

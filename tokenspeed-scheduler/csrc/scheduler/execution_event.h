@@ -29,8 +29,7 @@ namespace tokenspeed {
 
 class ExecutionEvent {
 public:
-    template <typename EventType>
-    ExecutionEvent& With(EventType event) {
+    ExecutionEvent& With(Event event) {
         events_.emplace_back(std::move(event));
         return *this;
     }
