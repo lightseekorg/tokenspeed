@@ -46,9 +46,7 @@ public:
     template <typename Event>
     void Apply(Event&& event) {
         state_ = std::visit(
-            [&event](auto&& state) -> fsm::State {
-                return fsm::ToState(std::forward<Event>(event)(std::move(state)));
-            },
+            [&event](auto&& state) -> fsm::State { return fsm::ToState(std::forward<Event>(event)(std::move(state))); },
             std::move(state_));
     }
 

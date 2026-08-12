@@ -62,8 +62,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
     PrefillSource Source() const { return source_; }
 
 private:
-    std::variant<PrefillDone, Prefilling> scheduleFirstChunk(TokenContainer* token_container,
-                                                            std::int32_t page_size);
+    std::variant<PrefillDone, Prefilling> scheduleFirstChunk(TokenContainer* token_container, std::int32_t page_size);
 
     std::int32_t tokens_this_round_{};
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
