@@ -74,6 +74,26 @@ def get_is_cuda_graph_phase() -> bool:
     return _is_cuda_graph_phase
 
 
+@contextmanager
+def _capture_execution_path():
+    """Select graph-capture branches for warmup and graph recording.
+
+    Capture-only branches may use streams and library handles that eager
+    execution never touches. Running warmups under the same mode ensures all
+    of that per-stream state is initialized before recording starts.
+    """
+    global _is_capture_mode, _is_cuda_graph_phase
+    old_capture_mode = _is_capture_mode
+    old_cuda_graph_phase = _is_cuda_graph_phase
+    _is_capture_mode = True
+    _is_cuda_graph_phase = True
+    try:
+        yield
+    finally:
+        _is_capture_mode = old_capture_mode
+        _is_cuda_graph_phase = old_cuda_graph_phase
+
+
 def _should_update_mamba_state_after_mtp_verify(
     drafter, attn_backend, forward_mode: ForwardMode
 ) -> bool:
@@ -119,9 +139,6 @@ def get_batch_sizes_to_capture(config: ModelExecutorConfig):
     effective_max = min(config.max_cudagraph_capture_size, max_bs)
     capture_bs = [bs for bs in capture_bs if 0 < bs <= effective_max]
     return capture_bs
-
-
-global_graph_memory_pool = None
 
 
 class DeepEPCudaGraphRunnerAdapter:
@@ -298,6 +315,7 @@ class CudaGraphWrapper:
         )
         self.graphs: dict[tuple[str, int], torch.cuda.CUDAGraph] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
+        self._graph_memory_pool = None
 
         self._forward_func: Callable | None = forward_func
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -473,51 +491,50 @@ class CudaGraphWrapper:
                 )
             return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
-        global _is_cuda_graph_phase
-        _is_cuda_graph_phase = True
+        with _capture_execution_path():
+            # Warm up the exact execution topology that will be recorded. In
+            # particular, PyTorch 2.13 keys ROCm hipBLASLt handles by stream;
+            # both the graph stream and capture-only auxiliary streams must be
+            # touched before hipMalloc becomes illegal inside capture.
+            for _ in range(4):
+                torch.cuda.synchronize()
+                dist.barrier()
+                self._prepare_sampling_capture(bs=bs, variant=variant)
+                # Keep warmup seq_lens >= q_len_per_req so no query row gets an
+                # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
+                self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
+                self._init_capture_metadata(bs)
+                with torch.cuda.stream(self.stream):
+                    run_once()
 
-        # Warm up before capture.
-        for _ in range(4):
+            # Clear any per-pool state that warm-up dirtied at pool row 0,
+            # so the graph captures reads against a clean baseline.
+            if self.sampling_backend is not None:
+                self.sampling_backend.reset_capture_state()
+
             torch.cuda.synchronize()
             dist.barrier()
-            self._prepare_sampling_capture(bs=bs, variant=variant)
-            # Keep warmup seq_lens >= q_len_per_req so no query row gets an
-            # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
-            self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
+
+            # Warmups can switch a backend back to eager metadata objects. Restore
+            # the graph-backed metadata immediately before capture so replay-time
+            # metadata refreshes update the same tensors recorded by the graph.
             self._init_capture_metadata(bs)
-            run_once()
 
-        # Clear any per-pool state that warm-up dirtied at pool row 0,
-        # so the graph captures reads against a clean baseline.
-        if self.sampling_backend is not None:
-            self.sampling_backend.reset_capture_state()
+            # Fill sampler buffers OUTSIDE the capture so RNG ops aren't recorded.
+            self._prepare_sampling_capture(bs=bs, variant=variant)
+            # Warmup forwards can mutate aliased metadata buffers, so refresh
+            # them again immediately before graph capture records the final views.
+            self._init_capture_metadata(bs)
 
-        torch.cuda.synchronize()
-        dist.barrier()
+            self.deepep_adapter.capture()
 
-        # Warmups can switch a backend back to eager metadata objects. Restore
-        # the graph-backed metadata immediately before capture so replay-time
-        # metadata refreshes update the same tensors recorded by the graph.
-        self._init_capture_metadata(bs)
+            with torch.cuda.graph(
+                graph, pool=self._graph_memory_pool, stream=self.stream
+            ):
+                out = run_once()
 
-        # Fill sampler buffers OUTSIDE the capture so RNG ops aren't recorded.
-        self._prepare_sampling_capture(bs=bs, variant=variant)
-        # Warmup forwards can mutate aliased metadata buffers, so refresh
-        # them again immediately before graph capture records the final views.
-        self._init_capture_metadata(bs)
-
-        self.deepep_adapter.capture()
-
-        global _is_capture_mode
-        _is_capture_mode = True
-        global global_graph_memory_pool
-        with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=self.stream):
-            out = run_once()
-
-        torch.cuda.synchronize()
-        dist.barrier()
-        _is_capture_mode = False
-        _is_cuda_graph_phase = False
+            torch.cuda.synchronize()
+            dist.barrier()
 
         # Graph capture records the hostfunc launches without invoking
         # them, so the dummy run_once pushed stays queued — drain it, and
@@ -531,7 +548,7 @@ class CudaGraphWrapper:
                     break
             self.capturable_grammar.reset_state()
 
-        global_graph_memory_pool = graph.pool()
+        self._graph_memory_pool = graph.pool()
 
         return graph, out
 
