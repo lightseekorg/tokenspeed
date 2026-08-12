@@ -317,12 +317,6 @@ class CudaGraphWrapper:
         with freeze_gc(self.enable_cudagraph_gc):
             self.stream = torch.cuda.Stream()
             # Capture backend-declared sampler variants explicitly.
-            # Capture largest-first. The graph pool can only reuse a freed
-            # block when a later capture fits inside it, so ascending order
-            # forces a fresh allocation for every bucket and the pool ends up
-            # holding the SUM of all buckets; descending order lets the first
-            # (largest) capture set the high-water mark and every smaller
-            # bucket reuse it.
             capture_items = [
                 (variant, bs)
                 for variant in self._cuda_graph_capture_variants()
