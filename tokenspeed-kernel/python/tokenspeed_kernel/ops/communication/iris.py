@@ -483,6 +483,9 @@ class IrisAllReduce(object):
     ) -> tuple[torch.Tensor, ...]:
         """Reduce consecutive producer outputs from symmetric memory."""
         assert self.owns_outputs(tensors)
+        if not _platform.is_cdna4:
+            raise RuntimeError("producer-direct Iris all-reduce requires CDNA4")
+
         total_numel = sum(tensor.numel() for tensor in tensors)
         num_tiles = triton.cdiv(total_numel, self._producer_direct_block_size)
         num_programs = min(num_tiles, self._producer_direct_max_programs)
@@ -809,6 +812,27 @@ def iris_reduce_symmetric_gluon_kernel(
             mask=mask,
         )
         tile_id += NUM_PROGRAMS
+
+    # Do not return while a peer program can still be reading this rank's
+    # input. The next producer reuses the same symmetric buffer.
+    completion_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
+    _iris_wait_for_rank_epoch(
+        ready_flags,
+        block_id,
+        completion_epoch,
+        local_heap,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+        RANK,
+        WORLD_SIZE,
+        NUM_WARPS,
+    )
 
 
 @triton.jit

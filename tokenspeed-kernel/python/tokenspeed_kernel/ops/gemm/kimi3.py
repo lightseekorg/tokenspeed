@@ -412,6 +412,10 @@ def kimi3_latent_projection_add3(
         weight: Contiguous BF16 projection weight shaped ``[N, K]``.
         prefix: BF16 residual rows shaped ``[M, N]``.
         shared_output: BF16 shared-expert rows shaped ``[M, N]``.
+        norm_weight: Optional contiguous BF16 RMSNorm weight shaped ``[K]``.
+            When provided, RMSNorm is applied to ``hidden_states`` before the
+            projection.
+        eps: Positive RMSNorm epsilon required with ``norm_weight``.
         solution: ``"auto"`` selects the fused row-CTA GEMV for one-token
             execution, the fused MFMA epilogue for the tuned M=16 tile, and
             otherwise composes the registered projection and add kernels.

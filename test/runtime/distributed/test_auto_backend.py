@@ -138,6 +138,45 @@ def test_triton_output_acquisition_does_not_initialize_iris_off_cdna4(monkeypatc
     get_or_create.assert_not_called()
 
 
+def test_triton_output_acquisition_falls_back_when_iris_setup_fails(monkeypatch):
+    fallback = Mock()
+    backend = TritonAllReduceBackend(fallback)
+    monkeypatch.setattr(
+        triton_allreduce_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=True),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_get_or_create",
+        Mock(side_effect=RuntimeError("Iris setup failed")),
+    )
+    like = Mock(is_cuda=True, dtype=torch.bfloat16)
+    like.new_empty.side_effect = torch.empty
+
+    outputs = backend.acquire_all_reduce_outputs(((2, 4),), like, (0, 1))
+
+    assert tuple(output.shape for output in outputs) == ((2, 4),)
+
+
+def test_triton_output_acquisition_falls_back_when_staging_fails(monkeypatch):
+    fallback = Mock()
+    backend = TritonAllReduceBackend(fallback)
+    state = SimpleNamespace()
+    monkeypatch.setattr(backend, "can_acquire_outputs", lambda *args, **kwargs: True)
+    monkeypatch.setattr(backend, "_get_or_create", lambda _group: state)
+    monkeypatch.setattr(
+        triton_allreduce_module,
+        "acquire_symm_outputs",
+        Mock(side_effect=RuntimeError("Iris staging failed")),
+    )
+    like = torch.empty(2, 4)
+
+    outputs = backend.acquire_all_reduce_outputs(((2, 4),), like, (0, 1))
+
+    assert tuple(output.shape for output in outputs) == ((2, 4),)
+
+
 def test_force_deterministic_rsag_preserves_two_tensor_nccl_grouping(
     backend, monkeypatch
 ):

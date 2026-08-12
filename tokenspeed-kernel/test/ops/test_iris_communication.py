@@ -294,6 +294,9 @@ def _check_all_reduce_symmetric_outputs(
     shapes,
     device,
 ) -> None:
+    if not current_platform().is_cdna4:
+        return
+
     from tokenspeed_kernel.ops.communication.iris import (
         iris_acquire_outputs,
         iris_all_reduce_symmetric,
@@ -313,6 +316,22 @@ def _check_all_reduce_symmetric_outputs(
             atol=0,
             rtol=0,
         )
+
+    snapshots = []
+    for scale in range(1, 5):
+        for index, output in enumerate(outputs, start=1):
+            output.fill_(scale * index * (rank + 1))
+        results = iris_all_reduce_symmetric(state, outputs)
+        snapshots.append(tuple(result.clone() for result in results))
+    torch.cuda.synchronize()
+    for scale, results in enumerate(snapshots, start=1):
+        for index, (output, result) in enumerate(zip(outputs, results), start=1):
+            torch.testing.assert_close(
+                result,
+                torch.full_like(output, scale * index * expected_value),
+                atol=0,
+                rtol=0,
+            )
 
     dist.barrier()
     graph = torch.cuda.CUDAGraph()

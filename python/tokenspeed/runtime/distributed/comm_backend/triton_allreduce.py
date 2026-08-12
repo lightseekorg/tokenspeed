@@ -118,12 +118,11 @@ class TritonAllReduceBackend(CommBackend):
         if not self.can_acquire_outputs(shapes, like, group, op=op):
             return super().acquire_all_reduce_outputs(shapes, like, group, op=op)
 
-        state = self._get_or_create(group)
-        return acquire_symm_outputs(
-            state,
-            shapes,
-            like.dtype,
-        )
+        try:
+            state = self._get_or_create(group)
+            return acquire_symm_outputs(state, shapes, like.dtype)
+        except Exception:
+            return super().acquire_all_reduce_outputs(shapes, like, group, op=op)
 
     def can_acquire_outputs(
         self,
@@ -135,8 +134,11 @@ class TritonAllReduceBackend(CommBackend):
         """Check producer-direct eligibility without initializing Iris."""
         if not current_platform().is_cdna4 or not like.is_cuda:
             return False
-        state = self._get_or_create(group)
-        return symm_outputs_can_run(state, shapes, like.dtype, op=op)
+        try:
+            state = self._get_or_create(group)
+            return symm_outputs_can_run(state, shapes, like.dtype, op=op)
+        except Exception:
+            return False
 
     def can_reduce_outputs(
         self,

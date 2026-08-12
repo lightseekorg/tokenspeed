@@ -1797,7 +1797,7 @@ def allreduce_residual_rmsnorm(
 
         token_num, hidden_dim = input_tensor.shape
 
-        from . import iris as _iris_mod
+        import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
         if (
             input_tensor.is_cuda
@@ -1949,7 +1949,7 @@ def all_reduce(state: TritonCommState, tensor: torch.Tensor, op=None) -> torch.T
     assert all_reduce_can_run(state, tensor, op=op)
     platform = current_platform()
     if platform.is_amd:
-        from . import iris as _iris_mod
+        import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
         key = (id(state.group), state.max_bytes, tensor.dtype)
         iris_state = _iris_mod.IRIS_AR_STATES.get(key)
@@ -2011,7 +2011,7 @@ def acquire_symm_outputs(
     """Acquire consecutive Iris views for producer-direct reduction."""
     if not symm_outputs_can_run(state, shapes, dtype):
         raise RuntimeError("unsupported symmetric all-reduce output request")
-    from . import iris as _iris_mod
+    import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
     max_numel = state.max_bytes // dtype.itemsize
     key = (id(state.group), state.max_bytes, dtype)
@@ -2040,7 +2040,7 @@ def all_reduce_symm_can_run(
         return False
     if not tensors:
         return False
-    from . import iris as _iris_mod
+    import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
     key = (id(state.group), state.max_bytes, tensors[0].dtype)
     iris_state = _iris_mod.IRIS_AR_STATES.get(key)
@@ -2052,7 +2052,7 @@ def all_reduce_symmetric(
     tensors: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, ...]:
     """Reduce consecutive Iris producer outputs in one launch."""
-    from . import iris as _iris_mod
+    import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
     key = (id(state.group), state.max_bytes, tensors[0].dtype)
     iris_state = _iris_mod.IRIS_AR_STATES[key]
