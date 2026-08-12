@@ -248,32 +248,6 @@ def _mla_decode_fwd_kernel(
     offs_q_d_rope = gl.arange(
         0, QK_ROPE_HEAD_DIM, layout=gl.SliceLayout(0, cfg.Q_ROPE_LOAD_LAYOUT)
     )
-    KV_LORA_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, K_WIDTH],
-        threads_per_warp=[1, 32],
-        warps_per_cta=[num_warps, 1],
-        order=[1, 0],
-    )
-    rope_threads: gl.constexpr = QK_ROPE_HEAD_DIM // K_WIDTH
-    K_ROPE_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, K_WIDTH],
-        threads_per_warp=[WARP_SIZE // rope_threads, rope_threads],
-        warps_per_cta=[num_warps, 1],
-        order=[1, 0],
-    )
-    offs_kv_t_lora = gl.arange(
-        0, TILE_SIZE, layout=gl.SliceLayout(1, KV_LORA_LOAD_LAYOUT)
-    )
-    offs_kv_d_lora = gl.arange(
-        0, KV_LORA_RANK, layout=gl.SliceLayout(0, KV_LORA_LOAD_LAYOUT)
-    )
-    offs_k_t_rope = gl.arange(
-        0, TILE_SIZE, layout=gl.SliceLayout(1, K_ROPE_LOAD_LAYOUT)
-    )
-    offs_k_d_rope = gl.arange(
-        0, QK_ROPE_HEAD_DIM, layout=gl.SliceLayout(0, K_ROPE_LOAD_LAYOUT)
-    )
-
     query_pos_lora = (
         token_q_block_local_idx * BLOCK_Q + offs_q_m_lora // cfg.NUM_QUERIES_PER_KV
     )
@@ -385,29 +359,33 @@ def _mla_decode_fwd_kernel(
             physical_block_idx * stride_kv_buffer_0 + kv_head_idx * stride_kv_buffer_2
         )
 
-        kv_lora_offset = (
-            kv_offset
-            + offs_kv_t_lora[:, None] * stride_kv_buffer_1
-            + offs_kv_d_lora[None, :] * stride_kv_buffer_3
+        kv_lora_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=kv_buffer_ptr + kv_offset,
+            shape=(TILE_SIZE, KV_LORA_RANK),
+            strides=(stride_kv_buffer_1, stride_kv_buffer_3),
+            block_shape=(TILE_SIZE, KV_LORA_RANK),
+            layout=cfg.KV_LORA_SHARED_LAYOUT,
         )
-        # KV_lora : (BLOCK_M, KV_LORA_RANK)
-        KV_lora_load = gl.load(
-            kv_buffer_ptr + kv_lora_offset,
+        k_rope_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=kv_buffer_ptr + kv_offset + KV_LORA_RANK * stride_kv_buffer_3,
+            shape=(TILE_SIZE, QK_ROPE_HEAD_DIM),
+            strides=(stride_kv_buffer_1, stride_kv_buffer_3),
+            block_shape=(TILE_SIZE, QK_ROPE_HEAD_DIM),
+            layout=cfg.K_ROPE_SHARED_LAYOUT,
+        )
+        gl.amd.gfx1250.tdm.async_load(
+            kv_lora_desc,
+            [0, 0],
+            kv_lora_shared,
             cache_modifier=cfg.kv_cache_modifier,
         )
-        kv_lora_shared.store(KV_lora_load)
-
-        k_rope_offset = (
-            kv_offset
-            + offs_k_t_rope[:, None] * stride_kv_buffer_1
-            + (KV_LORA_RANK + offs_k_d_rope[None, :]) * stride_kv_buffer_3
-        )
-        # K_rope : (BLOCK_M, QK_ROPE_HEAD_DIM)
-        K_rope_load = gl.load(
-            kv_buffer_ptr + k_rope_offset,
+        gl.amd.gfx1250.tdm.async_load(
+            k_rope_desc,
+            [0, 0],
+            k_rope_shared,
             cache_modifier=cfg.kv_cache_modifier,
         )
-        k_rope_shared.store(K_rope_load)
+        gl.amd.gfx1250.tdm.async_wait(0)
 
         S = gl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=cfg.QK_WMMA_LAYOUT)
 
