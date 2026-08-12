@@ -98,7 +98,6 @@ from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearCo
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
-    all_reduce_residual_attnres,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
 )
@@ -1672,15 +1671,48 @@ class KimiLinearDecoderLayer(nn.Module):
         if combine is not None and prefix_sum is not None and num_tokens == 1:
             scratch, _, _, out_norm_w, eps = combine
             if out_norm_w is not None:
-                h, residual_out = all_reduce_residual_attnres(
+                from tokenspeed_kernel.ops.communication.triton import (
+                    allreduce_residual_attnres_combine,
+                    allreduce_residual_attnres_combine_supported,
+                )
+
+                group = _get_process_group(self.mapping.attn.tp_group)
+                fused_supported = not global_server_args_dict.get(
+                    "force_deterministic_rsag", False
+                ) and allreduce_residual_attnres_combine_supported(
                     attn_partial,
                     prefix_sum,
                     self._mlp_wp,
                     out_norm_w,
                     scratch,
-                    eps,
-                    group=self.mapping.attn.tp_group,
+                    rank=self.mapping.attn.tp_rank,
+                    group=group,
+                    local_world_size=self.mapping.nprocs_per_node,
                 )
+                if fused_supported:
+                    h, residual_out = allreduce_residual_attnres_combine(
+                        attn_partial,
+                        prefix_sum,
+                        self._mlp_wp,
+                        out_norm_w,
+                        scratch,
+                        rank=self.mapping.attn.tp_rank,
+                        group=group,
+                        local_world_size=self.mapping.nprocs_per_node,
+                        eps=eps,
+                    )
+                else:
+                    residual_out = prefix_sum + all_reduce(
+                        attn_partial, self.mapping.attn.tp_group
+                    )
+                    h = attnres_combine(
+                        residual_out,
+                        self._mlp_wp,
+                        out_norm_w,
+                        eps,
+                        scratch,
+                        torch.empty_like(residual_out),
+                    )
                 return residual_out, h
         reduced = all_reduce(attn_partial, self.mapping.attn.tp_group)
         return (reduced if prefix_sum is None else prefix_sum + reduced), None

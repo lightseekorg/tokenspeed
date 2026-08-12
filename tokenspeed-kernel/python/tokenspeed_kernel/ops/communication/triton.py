@@ -43,8 +43,8 @@ __all__ = [
     "acquire_symm_outputs",
     "all_reduce_symm_can_run",
     "all_reduce_symmetric",
-    "all_reduce_residual_attnres_can_run",
-    "all_reduce_residual_attnres",
+    "allreduce_residual_attnres_combine_supported",
+    "allreduce_residual_attnres_combine",
     "allreduce_residual_rmsnorm",
     "create_dp_sampling_state",
     "dp_sampling_gather",
@@ -2061,7 +2061,7 @@ def all_reduce_symmetric(
     return _iris_mod.iris_all_reduce_symmetric(iris_state, tensors)
 
 
-def all_reduce_residual_attnres_can_run(
+def _all_reduce_residual_attnres_can_run(
     state: TritonCommState,
     partial: torch.Tensor,
     residual: torch.Tensor,
@@ -2113,7 +2113,7 @@ def all_reduce_residual_attnres_can_run(
     )
 
 
-def all_reduce_residual_attnres(
+def _all_reduce_residual_attnres(
     state: TritonCommState,
     partial: torch.Tensor,
     residual: torch.Tensor,
@@ -2123,8 +2123,26 @@ def all_reduce_residual_attnres(
     eps: float,
     op=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reduce a Kimi-K3 attention partial and finish its AttnRes epilogue."""
-    assert all_reduce_residual_attnres_can_run(
+    """Reduce a Kimi-K3 attention partial and finish its AttnRes epilogue.
+
+    Args:
+        state: Initialized communication state for the tensor-parallel group.
+        partial: Contiguous local BF16 attention partial shaped ``[1, 7168]``.
+        residual: Contiguous BF16 residual stream shaped ``[1, 7168]``.
+        score_weight: Contiguous BF16 AttnRes score weight shaped ``[7168]``.
+        output_weight: Contiguous BF16 output RMSNorm weight shaped ``[7168]``.
+        scratch: Contiguous FP32 ``(max_logit, exp_sum, weighted_sum)`` tensors
+            for the historical AttnRes candidates, shaped ``[1]``, ``[1]``,
+            and ``[1, 7168]``.
+        eps: Positive epsilon used for AttnRes scoring and output RMSNorm.
+        op: Reduction operation; only ``SUM`` is supported.
+
+    Returns:
+        A pair containing the normalized AttnRes mixture and the BF16 sum of
+        ``residual`` with the all-reduced attention partial, both shaped
+        ``[1, 7168]``.
+    """
+    assert _all_reduce_residual_attnres_can_run(
         state,
         partial,
         residual,
@@ -2149,6 +2167,107 @@ def all_reduce_residual_attnres(
     return _iris_mod.iris_all_reduce_residual_attnres(
         iris_state,
         partial,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        eps,
+        op=op,
+    )
+
+
+def _attnres_comm_state(
+    input_tensor: torch.Tensor,
+    rank: int,
+    group: dist.ProcessGroup,
+) -> TritonCommState:
+    return TritonCommState(
+        group=group,
+        rank_in_group=rank,
+        world_size=group.size(),
+        device=input_tensor.device,
+        max_numel=input_tensor.numel(),
+    )
+
+
+def allreduce_residual_attnres_combine_supported(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    output_weight: torch.Tensor,
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    rank: int,
+    group: dist.ProcessGroup,
+    local_world_size: int,
+    op=None,
+) -> bool:
+    """Return whether the fused Kimi-K3 Iris collective supports this call.
+
+    The Iris all-reduce transport is node-local. ``local_world_size`` maps the
+    process group's global ranks to nodes so multi-node attention groups use
+    the model's ordinary collective fallback instead.
+    """
+    if local_world_size <= 0:
+        return False
+    group_ranks = dist.get_process_group_ranks(group)
+    if len({global_rank // local_world_size for global_rank in group_ranks}) != 1:
+        return False
+    return _all_reduce_residual_attnres_can_run(
+        _attnres_comm_state(input_tensor, rank, group),
+        input_tensor,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        op=op,
+    )
+
+
+def allreduce_residual_attnres_combine(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    output_weight: torch.Tensor,
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    rank: int,
+    group: dist.ProcessGroup,
+    local_world_size: int,
+    eps: float = 1e-6,
+    op=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the fused Kimi-K3 Iris all-reduce and AttnRes epilogue.
+
+    Args:
+        input_tensor: Per-rank BF16 attention partial shaped ``[1, 7168]``.
+        residual: Running BF16 residual stream shaped ``[1, 7168]``.
+        score_weight: Precomputed AttnRes score weight shaped ``[7168]``.
+        output_weight: Output RMSNorm weight shaped ``[7168]``.
+        scratch: FP32 ``(max_logit, exp_sum, weighted_sum)`` partials.
+        rank: Rank within ``group``.
+        group: Eight-rank node-local attention process group.
+        local_world_size: Number of processes on each node.
+        eps: Positive epsilon for AttnRes scoring and output RMSNorm.
+        op: Reduction operation. Only ``SUM`` is supported.
+
+    Returns:
+        The normalized AttnRes output and accumulated residual, in that order.
+    """
+    assert allreduce_residual_attnres_combine_supported(
+        input_tensor,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        rank=rank,
+        group=group,
+        local_world_size=local_world_size,
+        op=op,
+    )
+    return _all_reduce_residual_attnres(
+        _attnres_comm_state(input_tensor, rank, group),
+        input_tensor,
         residual,
         score_weight,
         output_weight,

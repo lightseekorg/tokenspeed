@@ -360,7 +360,10 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
     )
     from tokenspeed_kernel.ops.communication.iris import (
         iris_all_reduce,
-        iris_all_reduce_residual_attnres,
+    )
+    from tokenspeed_kernel.ops.communication.triton import (
+        allreduce_residual_attnres_combine,
+        allreduce_residual_attnres_combine_supported,
     )
 
     torch.manual_seed(101)
@@ -389,29 +392,43 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
         scratch,
         torch.empty_like(residual),
     )
+    assert allreduce_residual_attnres_combine_supported(
+        local,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        rank=rank,
+        group=state.group,
+        local_world_size=8,
+    )
     for _ in range(4):
-        actual_hidden, actual_residual = iris_all_reduce_residual_attnres(
-            state,
+        actual_hidden, actual_residual = allreduce_residual_attnres_combine(
             local,
             residual,
             score_weight,
             output_weight,
             scratch,
-            1e-6,
+            rank=rank,
+            group=state.group,
+            local_world_size=8,
+            eps=1e-6,
         )
         torch.testing.assert_close(actual_residual, expected_residual, atol=0, rtol=0)
         torch.testing.assert_close(actual_hidden, expected_hidden, atol=2e-2, rtol=2e-2)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        graph_hidden, graph_residual = iris_all_reduce_residual_attnres(
-            state,
+        graph_hidden, graph_residual = allreduce_residual_attnres_combine(
             local,
             residual,
             score_weight,
             output_weight,
             scratch,
-            1e-6,
+            rank=rank,
+            group=state.group,
+            local_world_size=8,
+            eps=1e-6,
         )
     graph.replay()
     torch.cuda.synchronize()
