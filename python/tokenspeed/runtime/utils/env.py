@@ -284,6 +284,9 @@ class Envs:
     TOKENSPEED_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
 
     # Runtime behavior
+    # trtllm-gen attention scratch, in MB. The kernel fills whatever it gets
+    # (multi-CTA KV splits), so this trades memory for decode parallelism.
+    TOKENSPEED_WORKSPACE_TRTLLM_MHA_MB = EnvInt(512)
     TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     TOKENSPEED_DETOKENIZER_MAX_STATES = EnvInt(1 << 16)
     TOKENSPEED_FORCE_FAKE_FULL_NVLINK = EnvBool(False)
