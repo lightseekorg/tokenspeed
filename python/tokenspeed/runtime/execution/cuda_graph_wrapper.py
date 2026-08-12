@@ -24,12 +24,13 @@ import bisect
 import gc
 import queue
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 import tqdm
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import (
@@ -476,16 +477,23 @@ class CudaGraphWrapper:
         global _is_cuda_graph_phase
         _is_cuda_graph_phase = True
 
-        # Warm up before capture.
-        for _ in range(4):
-            torch.cuda.synchronize()
-            dist.barrier()
-            self._prepare_sampling_capture(bs=bs, variant=variant)
-            # Keep warmup seq_lens >= q_len_per_req so no query row gets an
-            # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
-            self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
-            self._init_capture_metadata(bs)
-            run_once()
+        # ROCm hipBLASLt handles are cached per (device, stream). Warm the
+        # capture stream so lazy handle setup cannot occur during capture.
+        warmup_context = (  # noqa: E731
+            (lambda: torch.cuda.stream(self.stream))
+            if current_platform().is_amd
+            else nullcontext
+        )
+        with warmup_context():
+            for _ in range(4):
+                torch.cuda.synchronize()
+                dist.barrier()
+                self._prepare_sampling_capture(bs=bs, variant=variant)
+                # Keep warmup seq_lens >= q_len_per_req so no query row gets an
+                # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
+                self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
+                self._init_capture_metadata(bs)
+                run_once()
 
         # Clear any per-pool state that warm-up dirtied at pool row 0,
         # so the graph captures reads against a clean baseline.
