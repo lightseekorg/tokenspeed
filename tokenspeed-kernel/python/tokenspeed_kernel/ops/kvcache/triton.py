@@ -180,7 +180,14 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
     ):
         raise ValueError("ranges must be non-empty and lie within backing")
 
-    range_table = torch.tensor(ranges, dtype=torch.int64, device=backing.device)
+    # torch.tensor(list, device=cuda) is a SYNCHRONIZING pageable H2D: it
+    # drains every kernel already queued (tens of ms mid-decode). Stage in
+    # pinned memory instead; the caching host allocator event-guards reuse.
+    range_table = (
+        torch.tensor(ranges, dtype=torch.int64)
+        .pin_memory()
+        .to(backing.device, non_blocking=True)
+    )
     block_size = 1024
     max_size = max(size for _, size in ranges)
     grid = (len(ranges), triton.cdiv(max_size, block_size))
