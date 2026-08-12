@@ -53,6 +53,10 @@ NUM_EXPERTS = 4
 HIDDEN = 512
 INTERMEDIATE = 256
 TOPK = 2
+# Inputs dequantize exactly; leave only a small margin above BF16's worst-case
+# relative rounding error (2**-8) when comparing against the FP32 reference.
+_BF16_ATOL = 4e-3
+_BF16_RTOL = 4e-3
 # ``_E2M1_VALUES`` without the +-6 endpoint, which every group carries anyway.
 _E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0)
 
@@ -188,7 +192,9 @@ def test_direct_mfma_decode_stage1_matches_reference(
             silu = gate / (1.0 + torch.exp(-alpha * gate))
             expected[token * TOPK + slot] = silu * (linear + beta)
 
-    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        actual.float(), expected, atol=_BF16_ATOL, rtol=_BF16_RTOL
+    )
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2])
@@ -234,4 +240,6 @@ def test_direct_mfma_decode_stage2_matches_reference(
             gate = topk_weights[token, slot].to(torch.bfloat16)
             expected[token] += (partial * gate).float()
 
-    torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        actual.float(), expected, atol=_BF16_ATOL, rtol=_BF16_RTOL
+    )
