@@ -187,6 +187,33 @@ def test_cuda_graph_route_uses_global_batch_for_dp_idle_rank():
     ) == (True, 32)
 
 
+@pytest.mark.parametrize(
+    ("bs", "input_num_tokens"),
+    [(2, 2), (0, 0)],
+)
+def test_cuda_graph_route_uses_dp_wide_tree_mask_bypass(bs: int, input_num_tokens: int):
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=bs,
+        num_extends=0,
+        input_num_tokens=input_num_tokens,
+        forward_mode=ForwardMode.DECODE,
+        global_num_tokens=[2, 0],
+        all_decode_or_idle=True,
+        any_custom_tree_mask=True,
+    )
+
+    assert _graph_route(
+        bs,
+        ctx,
+        dp_size=2,
+        max_bs=32,
+        capture_bs=[16, 32],
+        max_tokens_per_req=1,
+    ) == (False, bs)
+
+
 def test_cuda_graph_route_respects_disable_padding_with_global_batch():
     ctx = ForwardContext(
         attn_backend=None,
