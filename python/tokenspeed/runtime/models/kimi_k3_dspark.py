@@ -408,6 +408,14 @@ class K3DSparkModel(nn.Module):
             )
         else:
             hidden_states = input_embeds
+        # A DP-idle rank has no draft rows. K3 DSPARK's draft is dense and all
+        # of its collectives are scoped to the local attention TP group, whose
+        # peers are idle together, so there is no cross-DP collective to join.
+        # In particular, FlashInfer's SiLU kernel cannot launch with M=0.
+        if hidden_states.shape[0] == 0:
+            return LogitsProcessorOutput(
+                next_token_logits=None, hidden_states=hidden_states
+            )
         # A zero residual rather than None: the drafter hands over an un-reduced
         # embedding, so the first layer must take the all-reduce path too.
         residual = torch.zeros_like(hidden_states)

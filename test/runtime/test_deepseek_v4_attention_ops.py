@@ -30,6 +30,13 @@ from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     indexer_mxfp4_paged_gather,
     persistent_topk,
 )
+from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    _deepseek_v4_decode_swa_indices_and_lens_kernel,
+    _deepseek_v4_dequantize_and_gather_k_kernel,
+    _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel,
+    _deepseek_v4_fused_sparse_compress_cache_kernel,
+    _deepseek_v4_gather_launch_config,
+)
 from tokenspeed_kernel.ops.transform import hadamard_transform
 
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
@@ -296,6 +303,55 @@ def _expected_overlap_normed(
 
 
 class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
+    def test_v4_table_kernels_do_not_specialize_runtime_geometry(self):
+        cases = (
+            (
+                _deepseek_v4_fused_sparse_compress_cache_kernel,
+                ("block_table_stride", "block_table_width"),
+            ),
+            (
+                _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel,
+                ("block_table_stride", "block_table_width"),
+            ),
+            (
+                _deepseek_v4_dequantize_and_gather_k_kernel,
+                ("block_table_stride", "max_blocks_per_seq"),
+            ),
+            (
+                _deepseek_v4_decode_swa_indices_and_lens_kernel,
+                ("block_table_stride", "max_blocks_per_seq"),
+            ),
+        )
+        for kernel, names in cases:
+            parameters = {parameter.name: parameter for parameter in kernel.params}
+            for name in names:
+                with self.subTest(kernel=kernel.__name__, name=name):
+                    parameter = parameters[name]
+                    self.assertFalse(parameter.is_constexpr)
+                    self.assertTrue(parameter.do_not_specialize)
+
+    def test_sparse_prefill_gather_launch_config(self):
+        cases = (
+            (1, 0, (128, 4)),
+            (1, 512, (128, 4)),
+            (1, 513, (512, 1)),
+            (1, 3072, (512, 1)),
+            (1, 3073, (1024, 1)),
+            (1, 6144, (1024, 1)),
+            (1, 6145, (2048, 1)),
+            (3, 6145, (1024, 1)),
+            (4, 12288, (1024, 1)),
+            (4, 12289, (2048, 1)),
+            (8, 2048, (512, 1)),
+            (8, 8192, (2048, 1)),
+        )
+        for num_reqs, max_rows, expected in cases:
+            with self.subTest(num_reqs=num_reqs, max_rows=max_rows):
+                self.assertEqual(
+                    _deepseek_v4_gather_launch_config(num_reqs, max_rows),
+                    expected,
+                )
+
     def test_swa_slot_mapping_guard_masks_out_of_range_slots(self):
         slots = torch.tensor([-3, -1, 0, 7, 8, 99], dtype=torch.int64)
 
@@ -1817,7 +1873,11 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
 
         seq_lens = torch.tensor([9, 8], device=device, dtype=torch.int32)
         gather_lens = torch.tensor([3, 2], device=device, dtype=torch.int32)
-        block_table = torch.tensor([[0, 1], [2, 0]], device=device, dtype=torch.int32)
+        block_table_storage = torch.tensor(
+            [[0, 1, -1], [2, 0, -1]], device=device, dtype=torch.int32
+        )
+        block_table = block_table_storage[:, :2]
+        self.assertEqual(block_table.stride(), (3, 1))
         block_table_base_offsets = torch.tensor(
             [1, 1], device=device, dtype=torch.int32
         )
@@ -1831,6 +1891,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             block_table_base_offsets=block_table_base_offsets,
             block_size=block_size,
             offset=1,
+            max_gather_len=3,
         )
         torch.cuda.synchronize()
 

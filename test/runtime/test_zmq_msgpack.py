@@ -250,6 +250,25 @@ def test_slim_out_from_full_roundtrip():
     assert rt.cached_tokens == [1]
     assert rt.output_token_logprobs_val == [[]]
     assert rt.output_token_logprobs_idx == [[]]
+    assert rt.engine_index == 0
+
+
+def test_slim_out_carries_the_producing_engine_index():
+    # The output PULL socket has no routing identity, so under DP the batch
+    # itself names its producing rank; 0 stays the single-engine default.
+    slim = BatchTokenIDOutSlim.from_full(_make_batch_out(), engine_index=3)
+    rt = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(_encode_payload(slim))
+    assert rt.engine_index == 3
+
+
+def test_slim_out_engine_index_defaults_for_older_senders():
+    # Appended field: a 9-element array from an older sender must still decode.
+    slim = BatchTokenIDOutSlim.from_full(_make_batch_out())
+    raw = msgspec.msgpack.decode(_encode_payload(slim))
+    rt = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(
+        msgspec.msgpack.encode(raw[:9])
+    )
+    assert rt.engine_index == 0
 
 
 def test_slim_out_sources_output_ids_not_the_detok_window():
@@ -286,21 +305,22 @@ def test_slim_out_carries_logprob_columns():
 
 
 def test_slim_out_is_tagged_positional_tuple():
-    """The wire form must be a 9-element tagged array (the frontend's codec
-    depends on the tag and column order)."""
+    """The wire form must be a 10-element tagged array (the frontend's codec
+    depends on the tag and column order; engine_index is the appended tail)."""
     out = _make_batch_out(
         output_token_logprobs_val=[[-0.5]], output_token_logprobs_idx=[[10]]
     )
-    slim = BatchTokenIDOutSlim.from_full(out)
+    slim = BatchTokenIDOutSlim.from_full(out, engine_index=1)
     raw = msgspec.msgpack.decode(_encode_payload(slim))
     assert isinstance(raw, list)
     assert raw[0] == "BatchTokenIDOutSlim"
-    assert len(raw) == 9
+    assert len(raw) == 10
     assert raw[1] == ["r1"]  # rids
     assert raw[2] == [[10, 11]]  # output_ids
     assert raw[3] == ["length"]  # finished_reasons
     assert raw[7] == [[pytest.approx(-0.5)]]
     assert raw[8] == [[10]]
+    assert raw[9] == 1  # engine_index (appended)
 
 
 def test_slim_out_finish_reason_none_maps_to_empty():
@@ -634,6 +654,92 @@ def test_connect_and_data_plane_roundtrip():
     finally:
         recv.close()
         send.close()
+        frontend.close()
+        ctx.term()
+        tmp.cleanup()
+
+
+def test_two_dp_ranks_connect_with_distinct_identities():
+    """DP ranks share one frontend socket set: each dials with its own
+    engine-index identity, inputs route to exactly one rank, and outputs name
+    their producing rank in the batch (the PULL side has no identity)."""
+    ctx = zmq.Context()
+    tmp = tempfile.TemporaryDirectory()
+    frontend = _FakeSmgFrontend(ctx, Path(tmp.name))
+
+    engines: dict[int, tuple] = {}
+    errors: dict[int, Exception] = {}
+
+    def _engine(index: int) -> None:
+        try:
+            engines[index] = zmq_msgpack.connect_msgpack_engine(
+                ctx,
+                frontend.handshake_addr,
+                engine_index=index,
+                ready_response=zmq_wire.WireEngineCoreReadyResponse(
+                    max_model_len=4096,
+                    dtype="bfloat16",
+                    vllm_version="tokenspeed-test",
+                    data_parallel_size=2,
+                    data_parallel_rank=index,
+                ),
+                vocab_size=32000,
+            )
+        except Exception as exc:
+            errors[index] = exc
+
+    threads = [threading.Thread(target=_engine, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+
+    # Phase-tracked handshake: HELLO and READY interleave arbitrarily across
+    # ranks on the one ROUTER, so drive it per-identity rather than in order.
+    init = zmq_wire.WireHandshakeInitMessage(
+        addresses=zmq_wire.WireHandshakeAddresses(
+            inputs=[frontend.input_addr], outputs=[frontend.output_addr]
+        )
+    )
+    inits_sent: set[bytes] = set()
+    ready: set[bytes] = set()
+    while len(ready) < 2:
+        engine_id, _payload = frontend.handshake.recv_multipart()
+        if engine_id not in inits_sent:
+            frontend.handshake.send_multipart([engine_id, zmq_wire.encode(init)])
+            inits_sent.add(engine_id)
+        else:
+            ready.add(engine_id)
+    registered: set[bytes] = set()
+    while len(registered) < 2:
+        reg_id, reg_payload = frontend.input.recv_multipart()
+        assert len(reg_payload) > 0
+        registered.add(reg_id)
+
+    for t in threads:
+        t.join(timeout=15)
+    assert not errors, errors
+    expected_ids = {struct.pack("<H", 0), struct.pack("<H", 1)}
+    assert inits_sent == expected_ids
+    assert registered == expected_ids
+
+    try:
+        # Inputs route by identity: only rank 1 sees a request addressed to it.
+        frames = MsgpackEncoder().encode(_make_request(rid="to-rank-1"))
+        frontend.input.send_multipart(
+            [struct.pack("<H", 1), zmq_wire.REQ_TYPE_ADD, *frames]
+        )
+        io = engines[1][0].recv_pyobj()
+        assert io.rid == "to-rank-1"
+        with pytest.raises(zmq.Again):
+            engines[0][0].recv_pyobj(zmq.NOBLOCK)
+
+        # Outputs name their rank: rank 1's batch arrives tagged engine_index=1.
+        engines[1][1].send_pyobj(_make_batch_out())
+        out = frontend.recv_output()
+        assert out.engine_index == 1
+    finally:
+        for recv, send in engines.values():
+            recv.close()
+            send.close()
         frontend.close()
         ctx.term()
         tmp.cleanup()

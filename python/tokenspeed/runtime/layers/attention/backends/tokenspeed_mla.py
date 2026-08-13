@@ -44,6 +44,7 @@ from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.trtllm_mla import (
     TRTLLM_BLOCK_CONSTRAINT,
@@ -65,34 +66,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# CuteDSL decode workspace. The kernel's own `get_workspace_size` formula is
-#   B * H * q_len * split_kv * (D + 1) * (acc_dtype.width // 8)   (bytes)
-# and `B * split_kv <= num_SMs`, so a closed-form upper bound (Float32 acc) is
-#   num_SMs * H * q_len * (D + 1) * 4
-# Buffer is per-device and does NOT need zero-init.
-_cutedsl_workspace_buffer: dict[torch.device, torch.Tensor] = {}
-
-# Initial q_len capacity for the per-device decode workspace. The buffer grows
-# on demand before each launch, so larger verify/draft batches are supported.
-_CUTEDSL_INITIAL_Q_LEN_CAPACITY = 8
-
-
-def get_cutedsl_workspace_buffer(
-    device: torch.device,
-    num_heads_per_tp: int,
-    kv_lora_rank: int,
-    q_len_capacity: int = _CUTEDSL_INITIAL_Q_LEN_CAPACITY,
-) -> torch.Tensor:
-    """Get or grow the per-device CuteDSL workspace buffer."""
-    num_sms = get_num_sm(device)
-    required = num_sms * num_heads_per_tp * q_len_capacity * (kv_lora_rank + 1) * 4
-
-    existing = _cutedsl_workspace_buffer.get(device)
-    if existing is None or existing.numel() < required:
-        _cutedsl_workspace_buffer[device] = torch.empty(
-            required, dtype=torch.int8, device=device
-        )
-    return _cutedsl_workspace_buffer[device]
+# Fallback q_len capacity for warming the decode workspace when the backend
+# runs without speculative decoding (q_len is then 1, but keep the historical
+# floor so draft experiments do not immediately hit the frozen-pool error).
+_CUTEDSL_WARMUP_Q_LEN_FLOOR = 8
 
 
 @dataclass
@@ -155,10 +132,17 @@ class CuteDSLMLABackend(AttentionBackend):
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
 
-        # Workspace buffers — sized from config's num_heads / kv_lora_rank.
-        num_heads_per_tp = config.num_attention_heads // config.attn_tp_size
-        self.cutedsl_workspace = get_cutedsl_workspace_buffer(
-            config.device, num_heads_per_tp, self.kv_lora_rank
+        # Decode scratch comes from the shared WorkspacePool: the kernel's own
+        # get_workspace_size formula is B*H*q_len*split_kv*(D+1)*acc_bytes with
+        # B*split_kv <= num_SMs, giving the closed-form bound used in
+        # _cutedsl_workspace. The content is partial decode accumulators,
+        # consumed within each op and never zero-initialized, so sharing the
+        # block is safe. Warm to the verify-path peak now: graph capture runs
+        # the decode forward with the pool frozen.
+        self._num_heads_per_tp = config.num_attention_heads // config.attn_tp_size
+        self._workspace_pool = workspace_pool(config.device)
+        self.cutedsl_workspace = self._cutedsl_workspace(
+            max(_CUTEDSL_WARMUP_Q_LEN_FLOOR, self.spec_num_tokens or 1)
         )
 
         # Pre-compile prefill kernel variants so JIT doesn't run during serving.
@@ -192,7 +176,7 @@ class CuteDSLMLABackend(AttentionBackend):
                 f"got {kv_cache_dtype!r}."
             )
 
-        self.num_local_heads = num_heads_per_tp
+        self.num_local_heads = self._num_heads_per_tp
 
         # Metadata
         self.forward_decode_metadata: CuteDSLMLADecodeMetadata | None = None
@@ -204,6 +188,18 @@ class CuteDSLMLABackend(AttentionBackend):
         # Allocated in init_cuda_graph_state only when _cache_contract_bound.
         self.decode_cuda_graph_group_out_cache_loc: torch.Tensor | None = None
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None
+
+    def _cutedsl_workspace(self, q_len_capacity: int) -> torch.Tensor:
+        """Per-use view of the shared block, sized by the closed-form bound."""
+        required = (
+            get_num_sm(self.device)
+            * self._num_heads_per_tp
+            * q_len_capacity
+            * (self.kv_lora_rank + 1)
+            * 4
+        )
+        (buf,) = self._workspace_pool.allocate(((required,), torch.int8))
+        return buf
 
     def mark_cache_contract(self) -> None:
         """Mark this MLA backend as a Kimi-K3 Paged cache contract sub-backend.
@@ -880,9 +876,7 @@ class CuteDSLMLABackend(AttentionBackend):
             )
             CuteDSLMLABackend._logged_decode = True
 
-        self.cutedsl_workspace = get_cutedsl_workspace_buffer(
-            query.device, layer.tp_q_head_num, self.kv_lora_rank, query.shape[1]
-        )
+        self.cutedsl_workspace = self._cutedsl_workspace(query.shape[1])
 
         raw_out = tokenspeed_mla_decode(
             query=query,
