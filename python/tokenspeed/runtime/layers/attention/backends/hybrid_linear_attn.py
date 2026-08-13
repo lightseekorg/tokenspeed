@@ -681,7 +681,7 @@ class MambaAttnBackend(AttentionBackend):
         ctx = getattr(self, "_verify_commit_ctx", None)
         if ctx is None:
             return
-        committed, tables, draft_token_num, read_pages_by_group = ctx
+        committed, tables, draft_token_num, read_pages_by_group = ctx[:4]
         bs = accepted_length.shape[0]
         k = accepted_length.to(torch.int64).clamp(min=1, max=draft_token_num)
         new_last = committed[:bs] + k - 1
@@ -812,6 +812,36 @@ class MambaAttnBackend(AttentionBackend):
             state_out_blocks[group_id] = state_out
         return state_in_blocks, state_out_blocks
 
+    def _resolve_pending_before_forward(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        num_extends: int,
+        kwargs: dict,
+    ) -> None:
+        """Resolve family-specific deferred work before a non-verify forward.
+
+        Linear backends with no cross-round deferred work resolve nothing. The
+        boundary is here because subclasses may need the batch identity and
+        extend prefix before shared metadata selects state pages.
+        """
+
+    def _arm_verify_round(
+        self,
+        real_bs: int,
+        padded_bs: int,
+        kwargs: dict,
+        state_in_blocks_by_group: dict[str, torch.Tensor] | None,
+        verify_committed: torch.Tensor | None,
+        req_pool_indices: torch.Tensor,
+    ) -> None:
+        """Arm family-specific work after verify state pages are resolved.
+
+        Scratch-based verify needs no per-round arming. The boundary is here
+        because replay-based families need both committed pages and the exact
+        padded batch that the shared metadata flow has established.
+        """
+
     def init_forward_metadata(
         self,
         bs: int,
@@ -920,6 +950,10 @@ class MambaAttnBackend(AttentionBackend):
 
         state_in_blocks_by_group = None
         state_out_blocks_by_group = None
+        if not is_target_verify:
+            self._resolve_pending_before_forward(
+                bs, req_pool_indices, num_extends, kwargs
+            )
         # Idle/bs==0 forwards carry no requests and never reach the mamba
         # forward (router returns early), so no tables are required.
         if bs > 0 and not forward_mode.is_idle():
@@ -939,11 +973,28 @@ class MambaAttnBackend(AttentionBackend):
                 state_out_blocks_by_group = state_in_blocks_by_group
                 self._ensure_verify_scratch(bs, draft_token_num)
                 mamba_output_indices = self._verify_scratch_grid(bs, draft_token_num)
+                verify_op = kwargs.get("forward_batch")
+                if verify_op is not None:
+                    verify_rpis = list(verify_op.request_pool_indices)[:bs]
+                    verify_req_ids = list(verify_op.request_ids)[:bs]
+                else:
+                    verify_rpis, verify_req_ids = [], []
                 self._verify_commit_ctx = (
                     verify_committed,
                     verify_tables,
                     draft_token_num,
                     state_in_blocks_by_group,
+                    verify_rpis,
+                    verify_req_ids,
+                    req_pool_indices,
+                )
+                self._arm_verify_round(
+                    bs,
+                    bs,
+                    kwargs,
+                    state_in_blocks_by_group,
+                    verify_committed,
+                    req_pool_indices,
                 )
             else:
                 (
@@ -1081,6 +1132,16 @@ class MambaAttnBackend(AttentionBackend):
 
         real_bs = bs - num_padding
         req_pool_indices = req_pool_indices[:bs]
+        num_extends = int(
+            kwargs.get(
+                "num_extends",
+                (
+                    bs
+                    if forward_mode is not None and forward_mode.is_extend_or_mixed()
+                    else 0
+                ),
+            )
+        )
 
         is_target_verify = (
             forward_mode is not None
@@ -1133,6 +1194,10 @@ class MambaAttnBackend(AttentionBackend):
 
         state_in_blocks_by_group = None
         state_out_blocks_by_group = None
+        if not is_target_verify:
+            self._resolve_pending_before_forward(
+                bs, req_pool_indices, num_extends, kwargs
+            )
         if self.state_paging_active and is_target_verify:
             # Target-verify replay: refresh the captured state_in buffers,
             # re-arm the post-round commit, and keep the recorded scratch grid.
@@ -1148,11 +1213,20 @@ class MambaAttnBackend(AttentionBackend):
                 ) = self._verify_state_blocks(
                     real_bs, seq_lens, draft_token_num, kwargs
                 )
+                verify_op = kwargs.get("forward_batch")
+                if verify_op is not None:
+                    verify_rpis = list(verify_op.request_pool_indices)[:real_bs]
+                    verify_req_ids = list(verify_op.request_ids)[:real_bs]
+                else:
+                    verify_rpis, verify_req_ids = [], []
                 self._verify_commit_ctx = (
                     verify_committed,
                     verify_tables,
                     draft_token_num,
                     pages_by_group,
+                    verify_rpis,
+                    verify_req_ids,
+                    req_pool_indices,
                 )
             else:
                 self._verify_commit_ctx = None
@@ -1178,6 +1252,14 @@ class MambaAttnBackend(AttentionBackend):
                 state_out.fill_(self.pad_slot_id)
                 state_in_blocks_by_group[group_id] = state_in
                 state_out_blocks_by_group[group_id] = state_out
+            self._arm_verify_round(
+                real_bs,
+                bs,
+                kwargs,
+                pages_by_group,
+                verify_committed if real_bs > 0 else None,
+                req_pool_indices,
+            )
         elif self.state_paging_active:
             # For multi-group state paging, dual indexing runs once per
             # state group over the real rows. Padded rows get pad_slot_id (-1),
@@ -1640,7 +1722,10 @@ class MambaAttnBackend(AttentionBackend):
             batch_size = seq_len // draft_token_num
             output_indices = self.forward_metadata.mamba_output_indices
             state_in_blocks, _, conv_comp, ssm_comp = self._layer_state(layer_id)
-            conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
+            layer_scratch = (self._verify_scratch or {}).get(layer_id)
+            conv_scratch, ssm_scratch = (
+                layer_scratch if layer_scratch is not None else (None, None)
+            )
             fused_out = self._verify(
                 mixed_qkv,
                 conv_weights,
@@ -1650,6 +1735,7 @@ class MambaAttnBackend(AttentionBackend):
                 ssm_scratch,
                 state_in_blocks,
                 output_indices,
+                layer_id=layer_id,
                 bias=bias,
                 f_a_out=f_a_out,
                 f_b_weight=f_b_weight,
@@ -1665,6 +1751,8 @@ class MambaAttnBackend(AttentionBackend):
             )
             if fused_out is not None:
                 return fused_out
+            if conv_scratch is None or ssm_scratch is None:
+                raise RuntimeError("verify scratch is unavailable after fused fallback")
             # Read the committed window and write per-position states into the
             # verify scratch. The accepted position is committed afterward.
             if layer_id == self._state_layer_ids()[0]:
@@ -1811,12 +1899,13 @@ class MambaAttnBackend(AttentionBackend):
         mixed_qkv: torch.Tensor,
         conv_weights: torch.Tensor,
         conv_comp: torch.Tensor,
-        conv_scratch: torch.Tensor,
+        conv_scratch: torch.Tensor | None,
         ssm_comp: torch.Tensor,
-        ssm_scratch: torch.Tensor,
+        ssm_scratch: torch.Tensor | None,
         state_in_blocks: torch.Tensor,
         output_indices: torch.Tensor,
         *,
+        layer_id: int,
         bias: torch.Tensor | None,
         f_a_out: torch.Tensor | None,
         f_b_weight: torch.Tensor | None,
@@ -1850,6 +1939,7 @@ class MambaAttnBackend(AttentionBackend):
             ssm_scratch: Per-position recurrent verify scratch.
             state_in_blocks: Per-request committed-state page ids.
             output_indices: ``[bs, T]`` verify scratch row grid.
+            layer_id: Layer whose family-specific verify implementation runs.
             bias: Conv bias; a fused path requires the bias-free conv.
             f_a_out: Low-rank gate activation (KDA); None on GDN.
             f_b_weight: Second gate projection consumed inside the fusion.

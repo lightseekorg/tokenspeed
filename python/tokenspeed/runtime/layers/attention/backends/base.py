@@ -216,6 +216,41 @@ class AttentionBackend(ABC):
     def register_step_counter(self, step_counter: StepCounter):
         self.step_counter = step_counter
 
+    # --- Pending state ----------------------------------------------------
+    # Extension point for any backend-owned work deferred past the forward
+    # that produced it -- lazy speculative-verify commits today; future state
+    # or kv-cache variants belong here too rather than growing new engine
+    # hooks. The engine calls these at the points a backend cannot observe on
+    # its own (the forward-issue boundary, the pause fence) and owns all
+    # stream fencing; implementations run on the caller's current stream.
+
+    def has_pending(self) -> bool:
+        """Whether backend-owned work is still deferred past its forward.
+
+        Must be a cheap host-side probe: it gates the engine's stream fence.
+        """
+        return False
+
+    def notify_forward_issued(self) -> None:
+        """The forward this round prepared has been issued to the device.
+
+        Called once per forward, whether or not the step that follows it
+        succeeds. Work a backend enqueued INSIDE that forward is done being
+        owed at this point; anything that reads a later result to decide is
+        racing the failures between here and there.
+        """
+
+    def flush_pending(self, resident_request_ids: set[str]) -> None:
+        """Resolve all pending work now, under the current weights.
+
+        The engine calls this before idling under a pause: a pause may
+        precede a weight update, and pending work must land under the
+        weights that produced it. ``resident_request_ids`` is every request
+        the engine still holds; there is no batch here, so a backend whose
+        work targets per-request memory has no other way to tell a live
+        owner from one whose pages are already reclaimed.
+        """
+
     @contextmanager
     def record_pd_cache_step(
         self,

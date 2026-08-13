@@ -935,6 +935,7 @@ def _rmsnorm_gated_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    stride_gate_row: tl.constexpr,
 ):
     token = tl.program_id(0)
     offs_h = tl.arange(0, BLOCK_H)
@@ -945,7 +946,8 @@ def _rmsnorm_gated_kernel(
     var = tl.sum(x * x, axis=1) / head_dim
     rsig = tl.math.rsqrt(var + eps)
     w = tl.load(weight_ptr + offs_d).to(tl.float32)
-    g = tl.load(gate_ptr + idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
+    gidx = token * stride_gate_row + offs_h[:, None] * head_dim + offs_d[None, :]
+    g = tl.load(gate_ptr + gidx, mask=mask_h[:, None], other=0.0).to(tl.float32)
     y = x * rsig[:, None] * w[None, :] * tl.sigmoid(g)
     tl.store(out_ptr + idx, y.to(out_ptr.dtype.element_ty), mask=mask_h[:, None])
 
@@ -970,7 +972,7 @@ def rmsnorm_gated_sigmoid(
     Returns:
         ``[num_tokens, num_heads*head_dim]`` tensor of ``x``'s dtype.
     """
-    assert x.is_contiguous() and gate.is_contiguous()
+    assert x.is_contiguous() and gate.stride(-1) == 1
     out = torch.empty_like(x)
     _rmsnorm_gated_kernel[(x.shape[0],)](
         x,
@@ -981,6 +983,7 @@ def rmsnorm_gated_sigmoid(
         num_heads=num_heads,
         head_dim=head_dim,
         BLOCK_H=triton.next_power_of_2(num_heads),
+        stride_gate_row=gate.stride(0),
         num_warps=4,
     )
     return out

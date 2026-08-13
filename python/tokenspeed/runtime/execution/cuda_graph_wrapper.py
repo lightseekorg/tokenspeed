@@ -1296,6 +1296,11 @@ class CudaGraphWrapper:
             )
 
             result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+            # Work the backend enqueued inside the forward is on the device now.
+            # Releasing it here rather than after the state update below is what
+            # keeps a round that never reaches that update from leaving the work
+            # owed -- and applied a second time by the next round.
+            self.attn_backend.notify_forward_issued()
 
         if use_graph and padded_bs != bs:
             ctx.bs = bs

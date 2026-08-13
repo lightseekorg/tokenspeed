@@ -194,6 +194,7 @@ class CacheContractMetadataTest(unittest.TestCase):
             dtype=torch.bfloat16,
             head_dim=128,
             is_draft=False,
+            max_bs=8,
             speculative_num_draft_tokens=1,
         )
         backend = MambaAttnBackend(config)
@@ -295,6 +296,7 @@ class VerifyMetadataTest(unittest.TestCase):
             dtype=torch.bfloat16,
             head_dim=2,
             is_draft=False,
+            max_bs=8,
             speculative_num_draft_tokens=4,
         )
         self.backend = MambaAttnBackend(config)
@@ -404,6 +406,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             dtype=torch.bfloat16,
             head_dim=self.D,
             is_draft=False,
+            max_bs=8,
             speculative_num_draft_tokens=spec_num_tokens,
             replay_ssm=replay_ssm,
         )

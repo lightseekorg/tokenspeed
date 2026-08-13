@@ -845,11 +845,10 @@ class KimiLinearKDA(nn.Module):
                 eps=eps,
             )
         f_a_end = 4 * proj_local + self.head_dim
-        mixed_qkv = output[:, : 3 * proj_local]
-        if not mixed_qkv.is_contiguous():
-            mixed_qkv = mixed_qkv.contiguous()
         return (
-            mixed_qkv,
+            # Strided row-slice: every fused KDA consumer takes a token
+            # stride; strict paths re-pack at their own branch heads.
+            output[:, : 3 * proj_local],
             output[:, 3 * proj_local : 4 * proj_local],
             output[:, 4 * proj_local : f_a_end],
             output[:, f_a_end : self.qkvgb_proj.used_rows],

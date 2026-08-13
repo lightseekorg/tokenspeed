@@ -138,6 +138,8 @@ __all__ = [
     "try_kda_fused_paged_decode",
     "try_kda_fused_paged_verify",
     "KdaFusedDecodeResult",
+    "try_kda_replay_commit",
+    "kda_replay_commit_supported",
     "KdaPrefillResult",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
@@ -1612,7 +1614,6 @@ def try_kda_fused_paged_verify(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
     conv_states: torch.Tensor,
-    conv_scratch: torch.Tensor,
     f_a_out: torch.Tensor,
     f_b_weight: torch.Tensor,
     beta_logits: torch.Tensor,
@@ -1620,22 +1621,50 @@ def try_kda_fused_paged_verify(
     dt_bias: torch.Tensor,
     *,
     state_pool: torch.Tensor,
-    state_scratch: torch.Tensor,
     read_indices: torch.Tensor,
-    write_indices: torch.Tensor,
     num_heads: int,
     head_dim: int,
     draft_token_num: int,
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
+    prev_qkv: torch.Tensor | None = None,
+    prev_f_a: torch.Tensor | None = None,
+    prev_beta: torch.Tensor | None = None,
+    prev_base: torch.Tensor | None = None,
+    prev_steps: torch.Tensor | None = None,
+    enable_pdl: bool = False,
+    commit_indices: torch.Tensor | None = None,
+    capture: tuple | None = None,
+    gate_scratch: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Try a registered pre-convolution KDA target-verify fusion.
 
-    Mirrors ``try_kda_fused_paged_decode`` for the speculative verify batch:
-    per-position conv windows and recurrent states land in the verify
-    scratches for partial-accept commit. Returns ``None`` only when no
-    implementation supports the current platform.
+    Mirrors ``try_kda_fused_paged_decode`` for the speculative verify batch.
+    Verification stores no state of its own; the ``prev_*`` args (all
+    together) additionally replay and commit the PREVIOUS round's accepted
+    prefix on the way in -- the lazy-commit fast path, with ``prev_base < 0``
+    marking requests that have no pending window. A request that leaves the
+    verify stream still needs a standalone ``try_kda_replay_commit`` flush.
+
+    How many launches this takes is an implementation detail: today it is a
+    gate precompute, the fused recurrence, and a conv-window commit that
+    also stages this round's payload. Callers see one call either way.
+
+    Args:
+        capture: ``(f_a_dst, beta_dst, base_row)`` destinations for this
+            round's payload. ``prev_qkv`` doubles as the qkv ring, so it is
+            not repeated here.
+        gate_scratch: caller-provided fp32 scratch for the fusion's hoisted
+            gate, ``[>= 2*N*T, num_heads*head_dim]``. Transient within this
+            call, so a shared per-op workspace fits; ``None`` falls back to
+            a kernel-module buffer meant for direct kernel callers (tests,
+            sweeps) -- it has no post-capture growth guard, so graph-capture
+            callers must pass their own scratch.
+
+    Returns:
+        The verify output, or ``None`` when no implementation supports the
+        current platform.
     """
     signature = _attention_format_signature(
         q=mixed_qkv,
@@ -1653,30 +1682,170 @@ def try_kda_fused_paged_verify(
         )
     except NoKernelFoundError:
         return None
-    return kernel(
+    out = kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
         conv_states=conv_states,
-        conv_scratch=conv_scratch,
         f_a_out=f_a_out,
         f_b_weight=f_b_weight,
         beta_logits=beta_logits,
         A_log=A_log,
         dt_bias=dt_bias,
         state_pool=state_pool,
-        state_scratch=state_scratch,
         read_indices=read_indices,
-        write_indices=write_indices,
         num_heads=num_heads,
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
+        prev_qkv=prev_qkv,
+        prev_f_a=prev_f_a,
+        prev_beta=prev_beta,
+        prev_base=prev_base,
+        prev_steps=prev_steps,
+        enable_pdl=enable_pdl,
+        commit_indices=commit_indices,
+        gate_scratch=gate_scratch,
     )
+    if out is not None and prev_qkv is not None:
+        # A replay round without capture destinations would silently skip the
+        # conv commit and lose this round's payload; say so instead.
+        assert capture is not None, "a replay verify round must supply capture"
+        from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+            kda_commit_conv_window,
+        )
+
+        # The conv half commits in its own launch: the recurrence splits V
+        # across programs that share this request's q/k conv slots, so an
+        # in-place roll there would race its own reads.
+        f_a_dst, beta_dst, capture_base = capture
+        kda_commit_conv_window(
+            prev_qkv,
+            conv_states,
+            conv_states,
+            read_indices,
+            commit_indices,
+            prev_steps,
+            conv_dim=mixed_qkv.shape[-1],
+            draft_token_num=draft_token_num,
+            row_base=prev_base,
+            enable_pdl=enable_pdl,
+            capture=(mixed_qkv, f_a_out, beta_logits, f_a_dst, beta_dst, capture_base),
+        )
+    return out
+
+
+def try_kda_replay_commit(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_out: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    state_out: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None = -5.0,
+    override: str | None = None,
+    solution: str | None = None,
+    gate_scratch: torch.Tensor | None = None,
+) -> bool:
+    """Try a registered KDA speculative replay-commit.
+
+    Replays the accepted prefix of a verified draft window from the committed
+    page, so the caller never has to keep a recurrent state per draft
+    position. Pass the SAME projections the verify pass consumed.
+    ``gate_scratch`` is transient fp32 scratch for the hoisted gate
+    (``[>= N*T, num_heads*head_dim]``); ``None`` falls back to a
+    kernel-module buffer.
+
+    Returns:
+        ``True`` when a kernel ran, ``False`` when none supports the current
+        platform (the caller must then fall back to a scratch-based commit).
+    """
+    signature = _attention_format_signature(
+        q=mixed_qkv,
+        k=mixed_qkv,
+        v=mixed_qkv,
+    )
+    try:
+        kernel = select_kernel(
+            "attention",
+            "kda_replay_commit",
+            signature,
+            traits={"flat_state": True},
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return False
+    kernel(
+        mixed_qkv=mixed_qkv,
+        conv_weights=conv_weights,
+        conv_states=conv_states,
+        conv_out=conv_out,
+        f_a_out=f_a_out,
+        f_b_weight=f_b_weight,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        state_out=state_out,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        accepted_length=accepted_length,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+        gate_scratch=gate_scratch,
+    )
+    return True
 
 
 # ===-----------------------------------------------------------------------===#
 # MHA Kernels
 # ===-----------------------------------------------------------------------===#
+
+
+def kda_replay_commit_supported(
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    solution: str | None = None,
+) -> bool:
+    """Whether this platform has a KDA speculative replay-commit kernel.
+
+    Lets a caller decide up front whether it can skip allocating a
+    per-draft-position state scratch, before any verify batch has run.
+
+    Args:
+        dtype: activation dtype the verify batch will use.
+        solution: restrict to one registered solution, as in ``select_kernel``.
+
+    Returns:
+        ``True`` when a kernel is registered for the current platform.
+    """
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    try:
+        select_kernel(
+            "attention",
+            "kda_replay_commit",
+            signature,
+            traits={"flat_state": True},
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return False
+    return True
 
 
 def mha_prefill(

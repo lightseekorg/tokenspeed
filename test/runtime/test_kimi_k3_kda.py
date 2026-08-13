@@ -79,6 +79,7 @@ def _backend_config(device: str, *, spec_tokens: int = 1) -> SimpleNamespace:
         dtype=torch.bfloat16,
         head_dim=128,
         is_draft=False,
+        max_bs=8,
         speculative_num_draft_tokens=spec_tokens,
     )
 

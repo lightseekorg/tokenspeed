@@ -1018,6 +1018,25 @@ class EventLoop:
             else:
                 raise ValueError(f"unsupported cache op kind: {type(op).__name__}")
 
+    def _flush_pending(self) -> None:
+        """Resolve pending state on the execution stream (pause fence).
+
+        The stream hop is the loop's job: an overlap-scheduled forward still
+        in flight must finish writing the backend's buffers first. A round
+        with no forward is deliberately NOT such a point: capacity
+        retraction schedules nothing precisely while the other decoders stay
+        resident, so an empty round says nothing about who is still here.
+        """
+        backend = self.model_executor.attn_backend
+        if not backend.has_pending():
+            return
+        resident = set(self.output_processor.rid_to_state)
+        stream = self.model_executor.execution_stream
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            backend.flush_pending(resident)
+        torch.cuda.current_stream().wait_stream(stream)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -1605,6 +1624,8 @@ class EventLoop:
             self._drain_ready_epd_embeddings()
             self._commit_cache_results()
             if self._pause.forward_blocked:
+                # A pause may precede a weight update: flush deferred state under the weights that produced it.
+                self._flush_pending()
                 self._paused_idle_step()
                 continue
             execution_plan = self.scheduler.next_execution_plan()
@@ -1753,8 +1774,8 @@ class EventLoop:
             self._process_new_requests()
             self._commit_cache_results()
             if self._pause.forward_blocked:
-                # Freeze: commit any in-flight (overlapped) step — a forward
-                # already on the GPU can't be un-launched — then idle.
+                # Freeze: commit the in-flight overlapped step, flush deferred state under its own weights, then idle.
+                self._flush_pending()
                 self._paused_idle_step(prev_forward_op, prev_results)
                 prev_results = None
                 prev_forward_op = None
