@@ -654,6 +654,7 @@ def _mla_nope_quantize_fp8_kernel(
     BLOCK_R: tl.constexpr,
     HAS_SCALE_Q_TENSOR: tl.constexpr,
     HAS_SCALE_KV_TENSOR: tl.constexpr,
+    BROADCAST_K: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     token = tl.program_id(0)
@@ -693,26 +694,38 @@ def _mla_nope_quantize_fp8_kernel(
         mask=mask_r,
     )
 
+    # BROADCAST_K: the key carries one head (absorbed MLA decode, where the KV
+    # latent is shared by every query head). Zero strides already make the loads
+    # read head 0 for all program ids; the stores must additionally collapse to
+    # head 0, because the output holds one latent per token and heads 1..N-1
+    # would otherwise write past it.
+    if BROADCAST_K:
+        store_k = head == 0
+    else:
+        store_k = True
+
     kn = tl.load(
         k_nope + token * kn_stride_t + head * kn_stride_h + offs_n,
         mask=mask_n,
         other=0.0,
     ).to(tl.float32)
-    tl.store(
-        k_nope_out + token * kno_stride_t + head * kno_stride_h + offs_n,
-        (kn * scale_kv).to(tl.float8e4nv),
-        mask=mask_n,
-    )
+    if store_k:
+        tl.store(
+            k_nope_out + token * kno_stride_t + head * kno_stride_h + offs_n,
+            (kn * scale_kv).to(tl.float8e4nv),
+            mask=mask_n,
+        )
     kr = tl.load(
         k_rope + token * kr_stride_t + head * kr_stride_h + offs_r,
         mask=mask_r,
         other=0.0,
     ).to(tl.float32)
-    tl.store(
-        k_rope_out + token * kro_stride_t + head * kro_stride_h + offs_r,
-        (kr * scale_kv).to(tl.float8e4nv),
-        mask=mask_r,
-    )
+    if store_k:
+        tl.store(
+            k_rope_out + token * kro_stride_t + head * kro_stride_h + offs_r,
+            (kr * scale_kv).to(tl.float8e4nv),
+            mask=mask_r,
+        )
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -736,13 +749,35 @@ def mla_nope_quantize_fp8_triton(
     a single head; it broadcasts across the output heads via a zero stride."""
     num_tokens, num_heads, nope_dim = q_nope.shape
     rope_dim = q_rope.shape[-1]
-    if k_nope.shape != q_nope.shape:
-        raise ValueError(f"k_nope {k_nope.shape} must match q_nope {q_nope.shape}")
+    kv_heads = k_nope.shape[1]
+    if (k_nope.shape[0], k_nope.shape[2]) != (num_tokens, nope_dim) or kv_heads not in (
+        1,
+        num_heads,
+    ):
+        raise ValueError(
+            f"k_nope {tuple(k_nope.shape)} must be [{num_tokens}, 1 or {num_heads}, "
+            f"{nope_dim}] to match q_nope {tuple(q_nope.shape)}"
+        )
     if k_rope.shape[1] not in (1, num_heads):
         raise ValueError(
             f"k_rope heads must be 1 or {num_heads}, got {k_rope.shape[1]}"
         )
-    if k_rope_out.shape[1] != num_heads:
+    # Absorbed MLA decode shares one KV latent across every query head, so the
+    # key arrives single-head while the query does not. Broadcast it on load and
+    # emit a single-head key, which is also what the KV cache stores.
+    broadcast_k = kv_heads == 1 and num_heads > 1
+    if broadcast_k and k_rope.shape[1] != 1:
+        raise ValueError(
+            f"k_nope is single-head so k_rope must be too, got {k_rope.shape[1]}"
+        )
+    if broadcast_k:
+        # Only head 0 stores, so the outputs must be single-head as well.
+        if k_nope_out.shape[1] != 1 or k_rope_out.shape[1] != 1:
+            raise ValueError(
+                f"broadcast key requires single-head outputs, got k_nope_out "
+                f"{tuple(k_nope_out.shape)} k_rope_out {tuple(k_rope_out.shape)}"
+            )
+    elif k_rope_out.shape[1] != num_heads:
         # A one-head k_rope broadcasts on load, but every output slice must
         # carry the full head count -- the grid writes all heads.
         raise ValueError(
@@ -770,7 +805,7 @@ def mla_nope_quantize_fp8_triton(
         q_rope.stride(0),
         q_rope.stride(1),
         k_nope.stride(0),
-        k_nope.stride(1),
+        0 if broadcast_k else k_nope.stride(1),
         k_rope.stride(0),
         0 if k_rope.shape[1] == 1 else k_rope.stride(1),
         q_nope_out.stride(0),
@@ -787,6 +822,7 @@ def mla_nope_quantize_fp8_triton(
         BLOCK_R=max(16, _next_power_of_2(rope_dim)),
         HAS_SCALE_Q_TENSOR=isinstance(quant_scale_q, torch.Tensor),
         HAS_SCALE_KV_TENSOR=isinstance(quant_scale_kv, torch.Tensor),
+        BROADCAST_K=broadcast_k,
         ENABLE_PDL=enable_pdl,
         **extra_kwargs,
     )

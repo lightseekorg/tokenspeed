@@ -34,6 +34,7 @@ import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention import (
     attn_merge_state,
     mla_project_value,
+    mla_project_value_prefers_contiguous_weight,
 )
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.triton.mla_query_assemble import (
@@ -67,7 +68,6 @@ from tokenspeed.runtime.layers.utils import (
 )
 
 _platform = current_platform()
-_is_amd = _platform.is_amd
 _is_blackwell = _platform.is_blackwell
 _is_hopper_plus = _platform.is_hopper_plus
 _device_sm = _platform.arch_version.major * 10 + _platform.arch_version.minor
@@ -145,7 +145,18 @@ def _prepare_mla_kv_b_proj_weights(
     w_kc, w_vc = w.unflatten(
         0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
     ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-    if _is_amd:
+    # Both layouts carry the same logical shape [heads, latent, value]; they
+    # differ in which axis is contiguous. Which one to build is a property of
+    # the kernel that will consume it, not of the vendor: a kernel declaring
+    # `inputs_contiguous` is skipped when handed a strided weight, while the
+    # bmm fallback prefers the strided view. Weights are prepared once at load
+    # time, so this cannot be normalised per call.
+    if mla_project_value_prefers_contiguous_weight(
+        dtype=w.dtype,
+        heads=w_vc.shape[0],
+        latent_dim=w_vc.shape[2],
+        value_dim=w_vc.shape[1],
+    ):
         return w_kc.contiguous(), w_vc.transpose(1, 2).contiguous()
     return (
         w_kc.transpose(1, 2).contiguous().transpose(1, 2),
@@ -868,10 +879,19 @@ class DeepseekV3AttentionMLA(nn.Module):
         # Model-owned fused FP8 decode: RoPE + quantize + KV cache write
         # all done here, so backend only needs to do attention.
         k_scale = getattr(self.attn_mqa, "k_scale_float", 1.0)
+        # NoPE models (rotary_emb is None, e.g. Kimi-K3) belong here too, with
+        # cos_sin_cache=None so the kernel quantizes without rotating — the same
+        # unification prefill received in #923. They were excluded because the
+        # Triton NoPE solution rejected the single-head key that absorbed decode
+        # produces (K = latent_cache.unsqueeze(1)); it now broadcasts it the way
+        # k_rope already did. Excluding them meant the query was quantized alone
+        # and the KV latents reached set_mla_kv_buffer as BF16, where the
+        # bitwise-viewed fp8 pool has to pre-cast — two extra elementwise
+        # kernels per MLA layer per step, 30720 launches / 45.3 ms in an 11.2 s
+        # capture.
         use_fused_fp8_decode = (
             self.attention_backend in self._MLA_KERNEL_BACKENDS
             and getattr(ctx.attn_backend, "data_type", None) == torch.float8_e4m3fn
-            and self.rotary_emb is not None
             and k_scale == 1.0
         )
 
@@ -886,8 +906,16 @@ class DeepseekV3AttentionMLA(nn.Module):
                 k_rope=k_pe_raw,
                 q_nope=q_nope_absorbed,
                 k_nope=k_nope_raw,
-                cos_sin_cache=self.rotary_emb.cos_sin_cache,
-                is_neox=getattr(self.rotary_emb, "is_neox_style", True),
+                cos_sin_cache=(
+                    self.rotary_emb.cos_sin_cache
+                    if self.rotary_emb is not None
+                    else None
+                ),
+                is_neox=(
+                    getattr(self.rotary_emb, "is_neox_style", True)
+                    if self.rotary_emb is not None
+                    else False
+                ),
                 quant_scale_q=1.0,
                 quant_scale_kv=k_scale,
                 enable_pdl=pdl_enabled(),
@@ -903,6 +931,9 @@ class DeepseekV3AttentionMLA(nn.Module):
             return query_fp8, key_fp8
 
         elif self.rotary_emb is not None and q_nope.size(0) > 0:
+            # No vendor test here: the helper returns None unless the cache
+            # layout matches *and* a registered kernel can perform the fused
+            # write, so this reads the same on every platform.
             fused_mla_kv_arg = (
                 create_fused_mla_set_kv_buffer_arg(
                     k_nope=K[..., : self.kv_lora_rank],
@@ -911,7 +942,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                     token_to_kv_pool=ctx.token_to_kv_pool,
                     layer_id=self.attn_mqa.layer_id,
                 )
-                if _is_amd and self.attention_backend in self._MLA_KERNEL_BACKENDS
+                if self.attention_backend in self._MLA_KERNEL_BACKENDS
                 else None
             )
             if fused_mla_kv_arg is not None:
@@ -1007,7 +1038,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         return mla_project_value(
             attn_output,
-            self.w_vc.contiguous() if _is_amd else self.w_vc,
+            self.w_vc,
             gate=output_gate,
             out=output,
         )
