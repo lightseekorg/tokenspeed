@@ -271,6 +271,56 @@ def test_slim_out_engine_index_defaults_for_older_senders():
     assert rt.engine_index == 0
 
 
+def test_slim_out_piggybacks_the_load_snapshot():
+    # The msgpack wire has no control-reply channel for the GetLoad poll, so
+    # the output batch carries the producing rank's scheduler-load snapshot:
+    # (num_running, num_waiting, kv_active_pages, kv_total_pages).
+    slim = BatchTokenIDOutSlim.from_full(_make_batch_out(), load=(2, 5, 100, 400))
+    rt = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(_encode_payload(slim))
+    assert rt.num_running == 2
+    assert rt.num_waiting == 5
+    assert rt.kv_active_pages == 100
+    assert rt.kv_total_pages == 400
+
+
+def test_slim_out_load_defaults_for_older_senders():
+    # Appended fields: a 10-element array (engine_index era, pre-load) must
+    # still decode with the zero "no snapshot" defaults — kv_total_pages == 0
+    # is the frontend's signal that no load rode this batch.
+    slim = BatchTokenIDOutSlim.from_full(_make_batch_out(), load=(2, 5, 100, 400))
+    raw = msgspec.msgpack.decode(_encode_payload(slim))
+    rt = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(
+        msgspec.msgpack.encode(raw[:10])
+    )
+    assert rt.num_running == 0
+    assert rt.num_waiting == 0
+    assert rt.kv_active_pages == 0
+    assert rt.kv_total_pages == 0
+
+
+def test_send_socket_samples_load_fn_per_batch():
+    # MsgpackSendSocket late-binds a load sampler (the socket exists before
+    # the scheduler); every BatchTokenIDOut send must sample it fresh.
+    sent = []
+
+    class _Sock:
+        def send_multipart(self, frames, copy=False):
+            sent.append(list(frames))
+
+    sender = zmq_msgpack.MsgpackSendSocket(_Sock(), engine_index=1)
+    samples = iter([(1, 0, 10, 400), (0, 0, 0, 400)])
+    sender.load_fn = lambda: next(samples)
+    sender.send_pyobj(_make_batch_out())
+    sender.send_pyobj(_make_batch_out())
+
+    decoder = msgspec.msgpack.Decoder(BatchTokenIDOutSlim)
+    first = decoder.decode(sent[0][0])
+    second = decoder.decode(sent[1][0])
+    assert (first.num_running, first.kv_active_pages) == (1, 10)
+    assert (second.num_running, second.kv_active_pages) == (0, 0)
+    assert first.engine_index == second.engine_index == 1
+
+
 def test_slim_out_sources_output_ids_not_the_detok_window():
     # ``decode_ids`` on the io_struct is the incremental-detokenization window,
     # which starts at the prompt tail for context; ``output_ids`` is the
@@ -305,22 +355,24 @@ def test_slim_out_carries_logprob_columns():
 
 
 def test_slim_out_is_tagged_positional_tuple():
-    """The wire form must be a 10-element tagged array (the frontend's codec
-    depends on the tag and column order; engine_index is the appended tail)."""
+    """The wire form must be a 14-element tagged array (the frontend's codec
+    depends on the tag and column order; engine_index and the load snapshot
+    are the appended tail)."""
     out = _make_batch_out(
         output_token_logprobs_val=[[-0.5]], output_token_logprobs_idx=[[10]]
     )
-    slim = BatchTokenIDOutSlim.from_full(out, engine_index=1)
+    slim = BatchTokenIDOutSlim.from_full(out, engine_index=1, load=(2, 5, 100, 400))
     raw = msgspec.msgpack.decode(_encode_payload(slim))
     assert isinstance(raw, list)
     assert raw[0] == "BatchTokenIDOutSlim"
-    assert len(raw) == 10
+    assert len(raw) == 14
     assert raw[1] == ["r1"]  # rids
     assert raw[2] == [[10, 11]]  # output_ids
     assert raw[3] == ["length"]  # finished_reasons
     assert raw[7] == [[pytest.approx(-0.5)]]
     assert raw[8] == [[10]]
-    assert raw[9] == 1  # engine_index (appended)
+    assert raw[9] == 1  # engine_index (appended, #1046)
+    assert raw[10:14] == [2, 5, 100, 400]  # load snapshot (appended)
 
 
 def test_slim_out_finish_reason_none_maps_to_empty():
