@@ -743,3 +743,114 @@ def test_two_dp_ranks_connect_with_distinct_identities():
         frontend.close()
         ctx.term()
         tmp.cleanup()
+
+
+# --------------------------------------------------------------------------
+# Multimodal ingest materialization
+# --------------------------------------------------------------------------
+
+
+def _mm_payload(**overrides):
+    """A precomputed-mm request as the gateway ships it: expanded placeholder
+    input_ids plus one image item carrying feature/hash/offsets, with M-RoPE
+    precomputed upstream (the scalar-only contract) so materialization on the
+    ingest is deterministic without a real HF config."""
+    import torch
+
+    from tokenspeed.runtime.multimodal.inputs import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputs,
+    )
+
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=1234567,
+        offsets=[(2, 4)],
+        feature=torch.zeros(3, 2, 2),
+    )
+    mm = MultimodalInputs(
+        mm_items=[item],
+        im_token_id=9,
+        mrope_position_delta_scalar=0,
+    )
+    fields = dict(
+        rid="mm-1",
+        # tokens 2..4 are the expanded <image> placeholder run.
+        input_ids=[1, 2, 9, 9, 9, 3],
+        sampling_params=SamplingParams(),
+        multimodal_inputs=mm,
+    )
+    fields.update(overrides)
+    return TokenizedGenerateReqInput(**fields)
+
+
+class _MultimodalModelConfig:
+    is_multimodal_active = True
+    hf_config = object()  # never consulted: M-RoPE arrives precomputed
+
+
+class _FakeRecvZmqSocket:
+    def __init__(self, frames_list):
+        import collections
+
+        self._frames = collections.deque(frames_list)
+
+    def recv_multipart(self, flags=0):
+        if not self._frames:
+            raise zmq.Again()
+        return self._frames.popleft()
+
+
+def _recv_one(payload_obj, model_config):
+    frames = [zmq_wire.REQ_TYPE_ADD, _ENCODER.encode(payload_obj)[0]]
+    sock = zmq_msgpack.MsgpackRecvSocket(
+        _FakeRecvZmqSocket([frames]),
+        vocab_size=32000,
+        model_config=model_config,
+    )
+    return sock.recv_pyobj()
+
+
+def test_mm_ingest_materializes_pad_values_and_padded_ids():
+    io = _recv_one(_mm_payload(), _MultimodalModelConfig())
+    assert io.validation_error is None
+    # Original ids preserved for detokenization; placeholder run rewritten to
+    # the item's hash-derived pad value for prefix-cache uniqueness.
+    assert io.input_ids_unpadded == [1, 2, 9, 9, 9, 3]
+    item = io.multimodal_inputs.mm_items[0]
+    assert item.pad_value is not None
+    assert io.input_ids == [1, 2, item.pad_value, item.pad_value, item.pad_value, 3]
+
+
+def test_mm_ingest_rejects_text_only_model():
+    class _TextOnly:
+        is_multimodal_active = False
+        hf_config = object()
+
+    io = _recv_one(_mm_payload(), _TextOnly())
+    # Rejected requests still flow, pre-marked, so the frontend's stream gets
+    # a terminal abort instead of a silent drop.
+    assert io.validation_error is not None
+    assert "text-only" in io.validation_error
+
+
+def test_mm_ingest_passes_through_upstream_materialized_payloads():
+    io = _recv_one(
+        _mm_payload(
+            input_ids=[1, 2, 777, 777, 777, 3],
+            input_ids_unpadded=[1, 2, 9, 9, 9, 3],
+        ),
+        _MultimodalModelConfig(),
+    )
+    assert io.validation_error is None
+    # input_ids_unpadded set means fully materialized upstream: untouched.
+    assert io.input_ids == [1, 2, 777, 777, 777, 3]
+    assert io.multimodal_inputs.mm_items[0].pad_value is None
+
+
+def test_text_requests_untouched_by_mm_ingest():
+    io = _recv_one(_make_request(), _MultimodalModelConfig())
+    assert io.validation_error is None
+    assert io.multimodal_inputs is None
+    assert io.input_ids_unpadded is None

@@ -37,8 +37,9 @@ from tokenspeed.runtime.engine.io_struct import (
 from tokenspeed.runtime.grammar.reasoning_structural_tag import (
     structural_tag_for_reasoning_json_schema,
 )
-from tokenspeed.runtime.multimodal.embedder import pad_input_tokens
-from tokenspeed.runtime.multimodal.mrope import compute_mrope_positions
+from tokenspeed.runtime.multimodal.materialize import (
+    materialize_precomputed_inputs,
+)
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 if TYPE_CHECKING:
@@ -157,39 +158,21 @@ class InputProcessor:
                 raise ValueError(
                     "precomputed_multimodal_inputs is provided for a text-only model."
                 )
+            # Shared with the direct msgpack ZMQ ingest (which bypasses this
+            # frontend): pad values, M-RoPE on the un-padded ids, then
+            # pad_input_tokens — see materialize.py for the ordering contract.
             multimodal_inputs = obj.precomputed_multimodal_inputs
-            multimodal_inputs.ensure_pad_values()
-            # MRoPE-aware models (Qwen2/3-VL, …) require 3-axis position_ids
-            # derived from image_grid_thw + the image_token_id placeholders in
-            # input_ids. SMG ships precomputed mm inputs with mrope_* unset; if
-            # left None, model_executor falls back to a 1-D linear position
-            # override — silently degrading OCR accuracy. Compute them here, on
-            # the un-padded input_ids (so get_rope_index can still locate the
-            # image regions) BEFORE pad_input_tokens substitutes per-image
-            # pad_value over the placeholders, then pad for the embed splice.
-            input_ids_list = None
             if input_ids is not None:
                 input_ids_list = (
                     input_ids if isinstance(input_ids, list) else list(input_ids)
                 )
-            if (
-                input_ids_list is not None
-                and getattr(multimodal_inputs, "mrope_positions", None) is None
-            ):
-                mrope_positions, mrope_position_delta = compute_mrope_positions(
+                input_ids, input_ids_unpadded = materialize_precomputed_inputs(
                     self.engine.model_config.hf_config,
                     input_ids_list,
-                    multimodal_inputs.mm_items,
+                    multimodal_inputs,
                 )
-                multimodal_inputs.mrope_positions = mrope_positions
-                multimodal_inputs.mrope_position_delta = mrope_position_delta
-                if mrope_position_delta is not None:
-                    multimodal_inputs.mrope_position_delta_scalar = int(
-                        mrope_position_delta.flatten()[0].item()
-                    )
-            if input_ids_list is not None:
-                input_ids_unpadded = input_ids_list
-                input_ids = pad_input_tokens(input_ids_list, multimodal_inputs)
+            else:
+                multimodal_inputs.ensure_pad_values()
 
         if self.engine.is_generation:
             session_params = (
