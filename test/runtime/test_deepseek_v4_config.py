@@ -40,7 +40,7 @@ from tokenspeed.runtime.configs.model_config import (
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     CudaGraphWrapper,
-    _should_update_mamba_state_after_mtp_verify,
+    _should_settle_with_accept_lengths,
 )
 from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (
     DeepseekV4DSpark,
@@ -955,31 +955,23 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_cuda_graph_mamba_verify_state_update_keeps_decode_mode_speculation(self):
         class BackendWithMambaUpdate:
-            def update_mamba_state_after_mtp_verify(self, accepted_length, model):
+            def settle_deferred_state(self, accepted_length):
                 pass
 
         backend = BackendWithMambaUpdate()
         drafter = object()
 
         self.assertTrue(
-            _should_update_mamba_state_after_mtp_verify(
-                drafter, backend, ForwardMode.DECODE
-            )
+            _should_settle_with_accept_lengths(drafter, backend, ForwardMode.DECODE)
         )
         self.assertFalse(
-            _should_update_mamba_state_after_mtp_verify(
-                drafter, backend, ForwardMode.EXTEND
-            )
+            _should_settle_with_accept_lengths(drafter, backend, ForwardMode.EXTEND)
         )
         self.assertFalse(
-            _should_update_mamba_state_after_mtp_verify(
-                None, backend, ForwardMode.DECODE
-            )
+            _should_settle_with_accept_lengths(None, backend, ForwardMode.DECODE)
         )
         self.assertFalse(
-            _should_update_mamba_state_after_mtp_verify(
-                drafter, object(), ForwardMode.DECODE
-            )
+            _should_settle_with_accept_lengths(drafter, object(), ForwardMode.DECODE)
         )
 
     def test_cuda_graph_eager_draft_prefill_uses_single_non_v4_metadata_init(self):

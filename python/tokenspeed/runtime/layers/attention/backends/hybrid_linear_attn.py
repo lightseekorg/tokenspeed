@@ -2357,6 +2357,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             q, k, v, layer, out_cache_loc, token_to_kv_pool, bs, **kwargs
         )
 
-    def update_mamba_state_after_mtp_verify(self, accepted_length, model):
+    def settle_deferred_state(self, accepted_length):
         if accepted_length is not None:
             self.linear_attn_backend.commit_verified_state(accepted_length)

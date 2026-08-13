@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-    _should_update_mamba_state_after_mtp_verify,
+    _should_settle_with_accept_lengths,
 )
 from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import DeepseekV4DSpark
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
@@ -351,7 +351,7 @@ def test_proposals_are_valid_token_ids() -> None:
 
 
 class _BackendWithCommit:
-    def update_mamba_state_after_mtp_verify(self, accept_lengths, model):
+    def settle_deferred_state(self, accept_lengths):
         return None
 
 
@@ -366,7 +366,7 @@ def test_kda_commit_fires_for_a_dspark_drafter() -> None:
     this test is what keeps that true if the predicate ever grows an
     algorithm check.
     """
-    assert _should_update_mamba_state_after_mtp_verify(
+    assert _should_settle_with_accept_lengths(
         drafter=DSpark.__new__(DSpark),
         attn_backend=_BackendWithCommit(),
         forward_mode=ForwardMode.DECODE,
@@ -374,7 +374,7 @@ def test_kda_commit_fires_for_a_dspark_drafter() -> None:
 
 
 def test_kda_commit_is_skipped_without_a_drafter() -> None:
-    assert not _should_update_mamba_state_after_mtp_verify(
+    assert not _should_settle_with_accept_lengths(
         drafter=None,
         attn_backend=_BackendWithCommit(),
         forward_mode=ForwardMode.DECODE,
@@ -382,7 +382,7 @@ def test_kda_commit_is_skipped_without_a_drafter() -> None:
 
 
 def test_kda_commit_is_skipped_on_a_stateless_backend() -> None:
-    assert not _should_update_mamba_state_after_mtp_verify(
+    assert not _should_settle_with_accept_lengths(
         drafter=DSpark.__new__(DSpark),
         attn_backend=_BackendWithoutCommit(),
         forward_mode=ForwardMode.DECODE,
@@ -391,7 +391,7 @@ def test_kda_commit_is_skipped_on_a_stateless_backend() -> None:
 
 def test_kda_commit_is_skipped_outside_decode() -> None:
     """Prefill writes state inline; there is no verify to commit."""
-    assert not _should_update_mamba_state_after_mtp_verify(
+    assert not _should_settle_with_accept_lengths(
         drafter=DSpark.__new__(DSpark),
         attn_backend=_BackendWithCommit(),
         forward_mode=ForwardMode.EXTEND,
