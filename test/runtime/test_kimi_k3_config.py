@@ -355,6 +355,14 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         ep_group = tuple(range(8))
         mapping = SimpleNamespace(
+            world_size=8,
+            attn=SimpleNamespace(
+                tp_size=8,
+                cp_size=1,
+                dp_size=1,
+                dp_rank=0,
+                dp_group=(0,),
+            ),
             moe=SimpleNamespace(
                 tp_rank=0,
                 tp_size=1,
@@ -414,6 +422,47 @@ class KimiK3RegistrationTests(unittest.TestCase):
         joint_reduce = layer.native_latent_moe.components["joint_reduce"]
         self.assertIs(joint_reduce.func, kimi_k3.all_reduce_two)
         self.assertEqual(joint_reduce.keywords, {"group": ep_group})
+
+    def test_cross_dp_ep_gather_uses_dp_group_and_returns_local_offset(self):
+        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
+
+        layer = KimiLinearMoE.__new__(KimiLinearMoE)
+        layer.mapping = SimpleNamespace(
+            attn=SimpleNamespace(
+                tp_size=8,
+                cp_size=1,
+                dp_size=4,
+                dp_rank=2,
+                dp_group=(2, 10, 18, 26),
+            )
+        )
+        ctx = SimpleNamespace(
+            collective_global_num_tokens=None,
+            global_num_tokens=[3] * 8 + [5] * 8 + [7] * 8 + [11] * 8,
+        )
+        hidden = torch.arange(14, dtype=torch.float32).reshape(7, 2)
+        prefix = hidden + 100
+        gathered = []
+
+        def gather(tensor, group, scattered_num_tokens):
+            gathered.append((tensor, group, scattered_num_tokens))
+            return torch.cat((tensor, tensor), dim=0)
+
+        with mock.patch(
+            "tokenspeed.runtime.models.kimi_k3.token_all_gather", side_effect=gather
+        ):
+            gathered_hidden, gathered_prefix, total, offset = layer._gather_dp_tokens(
+                hidden, prefix, ctx
+            )
+
+        self.assertEqual(total, 26)
+        self.assertEqual(offset, 8)
+        self.assertEqual(len(gathered), 2)
+        for _, group, counts in gathered:
+            self.assertEqual(group, (2, 10, 18, 26))
+            self.assertEqual(counts, [3, 5, 7, 11])
+        torch.testing.assert_close(gathered_hidden, torch.cat((hidden, hidden)))
+        torch.testing.assert_close(gathered_prefix, torch.cat((prefix, prefix)))
 
     def test_mla_gate_projection_uses_api_selected_layout(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention

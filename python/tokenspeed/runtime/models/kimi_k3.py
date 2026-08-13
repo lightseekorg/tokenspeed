@@ -101,6 +101,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce_two,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
+    token_all_gather,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
@@ -981,15 +982,23 @@ class KimiLinearMoE(nn.Module):
             load_packaged_flashinfer_tuning_cache(
                 "kimi-k3", mapping.moe.ep_size, mapping.moe.tp_size
             )
-        if not self.execution_plan.use_native:
-            # Both the TRT-LLM and Marlin SiTU paths currently require a
-            # replicated-token all-reduce topology (attn TP == MoE TP*EP);
-            # Attn-DP/MoE-EP RSAG is not wired for either.
-            if mapping.moe.has_tp_ep and mapping.attn.tp_size != mapping.moe.tp_ep_size:
+        # Attention DP partitions the batch when its TP group is smaller than
+        # the MoE TP×EP group. Gather those DP shards so every rank enters the
+        # K3 MoE with the same complete token batch.
+        self._gather_dp_tokens_for_moe = (
+            mapping.attn.tp_size != mapping.moe.tp_ep_size
+        )
+        if self._gather_dp_tokens_for_moe:
+            if (
+                mapping.attn.cp_size != 1
+                or mapping.moe.dp_size != 1
+                or mapping.moe.tp_ep_size != mapping.world_size
+                or mapping.attn.tp_size * mapping.attn.dp_size
+                != mapping.moe.tp_ep_size
+            ):
                 raise ValueError(
-                    "Kimi-K3's SiTU MoE currently requires a "
-                    "replicated-token all-reduce topology: attn TP size must equal "
-                    "MoE TP*EP size. Attn-DP/MoE-EP RSAG is not supported."
+                    "Kimi-K3 cross-DP-EP MoE requires attn CP=1, MoE DP=1, "
+                    "and attn TP*DP == MoE TP*EP == world size."
                 )
         self.gate = KimiLinearMoEGate(config.hidden_size, config.num_experts)
 
@@ -1282,27 +1291,87 @@ class KimiLinearMoE(nn.Module):
             shared_output,
         )
 
+    def _gather_dp_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+        """Gather DP batches before the temporary cross-DP-EP MoE path.
+
+        Attention-TP replicas hold identical rows. Gathering on the matching
+        DP group collects each DP batch exactly once and leaves every MoE rank
+        with the complete global batch for the existing expert all-reduce.
+        """
+        global_counts = (
+            ctx.collective_global_num_tokens
+            if ctx.collective_global_num_tokens is not None
+            else ctx.global_num_tokens
+        )
+        if global_counts is None:
+            raise RuntimeError(
+                "Kimi-K3 cross-DP-EP MoE requires global_num_tokens for token-gather sizing."
+            )
+        dp_counts = [
+            global_counts[
+                dp_rank * self.mapping.attn.tp_size * self.mapping.attn.cp_size
+            ]
+            for dp_rank in range(self.mapping.attn.dp_size)
+        ]
+        local_count = dp_counts[self.mapping.attn.dp_rank]
+        if hidden_states.shape[0] != local_count or prefix_sum.shape[0] != local_count:
+            raise RuntimeError(
+                "Kimi-K3 cross-DP-EP MoE rows do not match global_num_tokens."
+            )
+        return (
+            token_all_gather(
+                hidden_states,
+                group=self.mapping.attn.dp_group,
+                scattered_num_tokens=dp_counts,
+            ),
+            token_all_gather(
+                prefix_sum,
+                group=self.mapping.attn.dp_group,
+                scattered_num_tokens=dp_counts,
+            ),
+            sum(dp_counts),
+            sum(dp_counts[: self.mapping.attn.dp_rank]),
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         prefix_sum: torch.Tensor,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
+        ctx: ForwardContext | None = None,
     ) -> torch.Tensor:
         """Routed + shared experts, accumulated onto ``prefix_sum``.
 
         Returns the new prefix (``prefix_sum + routed + shared``); at bs=1
         the up-projection's store performs the accumulate in-kernel.
         """
+        local_num_tokens = hidden_states.shape[0]
+        local_offset = 0
+        if self._gather_dp_tokens_for_moe:
+            if ctx is None:
+                raise RuntimeError("Kimi-K3 cross-DP-EP MoE requires a ForwardContext.")
+            hidden_states, prefix_sum, num_global_tokens, local_offset = (
+                self._gather_dp_tokens(hidden_states, prefix_sum, ctx)
+            )
+            max_num_tokens_per_gpu = num_global_tokens
+
         if self.native_latent_moe is not None:
             if self._use_fused_decode_pipeline and hidden_states.shape[0] == 1:
-                return self._forward_fused_decode_pipeline(hidden_states, prefix_sum)
-            return self.native_latent_moe(
-                hidden_states,
-                num_global_tokens=num_global_tokens,
-                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-                prefix_sum=prefix_sum,
-            )
+                output = self._forward_fused_decode_pipeline(hidden_states, prefix_sum)
+            else:
+                output = self.native_latent_moe(
+                    hidden_states,
+                    num_global_tokens=num_global_tokens,
+                    max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                    prefix_sum=prefix_sum,
+                )
+            return output[local_offset : local_offset + local_num_tokens]
 
         num_tokens, hidden_size = hidden_states.shape
         if num_tokens == 0:
@@ -1357,7 +1426,7 @@ class KimiLinearMoE(nn.Module):
                 enable_lane_norm=self.execution_plan.lane_latent_norm_ar,
                 max_token_num=self.execution_plan.comm_fusion_max_num_tokens,
             )
-            return kimi3_latent_projection_add3(
+            output = kimi3_latent_projection_add3(
                 routed_out,
                 self.routed_expert_up_proj.weight,
                 prefix_sum,
@@ -1365,13 +1434,14 @@ class KimiLinearMoE(nn.Module):
             ).view(num_tokens, hidden_size)
         else:
             shared_out = self._reduce_shared(shared_partial)
-        # routed_scaling_factor already applied in TopK; not re-applied here
-        # (matches the reference).
-        return add3(
-            prefix_sum,
-            routed_out.view(num_tokens, hidden_size),
-            shared_out.view(num_tokens, hidden_size),
-        )
+            # routed_scaling_factor already applied in TopK; not re-applied here
+            # (matches the reference).
+            output = add3(
+                prefix_sum,
+                routed_out.view(num_tokens, hidden_size),
+                shared_out.view(num_tokens, hidden_size),
+            )
+        return output[local_offset : local_offset + local_num_tokens]
 
     def _reduce_shared(self, shared_partial: torch.Tensor) -> torch.Tensor:
         """Reduce the shared experts' TP partial on the current (default) stream."""
@@ -1723,6 +1793,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 prefix_sum,
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                ctx=ctx,
             )
         else:
             prefix_sum = prefix_sum + self.mlp(h)
