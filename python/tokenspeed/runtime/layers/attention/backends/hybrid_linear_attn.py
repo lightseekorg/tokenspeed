@@ -39,7 +39,6 @@ from tokenspeed_kernel.ops.attention.triton.linear.index import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
 )
-from typing_extensions import override
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,

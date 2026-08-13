@@ -53,7 +53,7 @@ from test.runtime.conftest import requires_cuda
 from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends import hybrid_linear_attn
+from tokenspeed.runtime.layers.attention.backends import hybrid_kda, hybrid_linear_attn
 from tokenspeed.runtime.layers.attention.backends.hybrid_kda import KdaAttnBackend
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
     compute_state_page_indices,
@@ -809,7 +809,7 @@ def test_kda_cache_pool_component_views_end_to_end(
         raise AssertionError("AMD paged cache decode must bypass the FLA KDA megafuse")
 
     indexed_decode_calls = 0
-    indexed_decode = hybrid_linear_attn.kda_paged_decode
+    indexed_decode = hybrid_kda.kda_paged_decode
 
     def _indexed_decode_spy(*args, **kwargs):
         nonlocal indexed_decode_calls
@@ -822,7 +822,7 @@ def test_kda_cache_pool_component_views_end_to_end(
         _unexpected_megafuse,
     )
     monkeypatch.setattr(
-        hybrid_linear_attn,
+        hybrid_kda,
         "kda_paged_decode",
         _indexed_decode_spy,
     )
