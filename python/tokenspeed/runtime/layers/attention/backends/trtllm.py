@@ -26,7 +26,6 @@ Supports sliding window, attention sinks, and FP8 KV cache.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
