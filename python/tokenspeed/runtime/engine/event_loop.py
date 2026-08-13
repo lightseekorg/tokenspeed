@@ -267,7 +267,7 @@ class EventLoop:
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
         # Resolve the scheduler limit before ModelExecutorConfig sizes input
         # buffers. Lowering the limit is safe; a configured chunk smaller than
-        # one state page is rejected by aligned_max_scheduled_tokens instead of
+        # one state checkpoint block is rejected by aligned_max_scheduled_tokens instead of
         # silently increasing a frozen buffer limit.
         max_scheduled_tokens = server_args.chunked_prefill_size
         if server_args.enable_prefix_caching:
@@ -278,7 +278,7 @@ class EventLoop:
             if max_scheduled_tokens != server_args.chunked_prefill_size:
                 logger.warning(
                     "chunked_prefill_size=%s is not a multiple of the "
-                    "state-snapshot page grain; using %s so recurrent-state "
+                    "state-snapshot checkpoint grain; using %s so recurrent-state "
                     "pages can register for prefix-cache reuse.",
                     server_args.chunked_prefill_size,
                     max_scheduled_tokens,

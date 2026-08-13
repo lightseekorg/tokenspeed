@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    MXFP8_KV_SCALE_TILE_TOKENS,
     PagedCacheGroupSpec,
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -305,7 +306,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         """(num_ids, heads_l, k_l, 32, 4, 4) view over a layer's SF slots
         (the paged interleaved layout the blockscaled kernels consume)."""
         heads_l = self._layer_heads_per_rank(layer_id)
-        k_l = self._layer_page_tokens(layer_id) // 128
+        k_l = self._layer_page_tokens(layer_id) // MXFP8_KV_SCALE_TILE_TOKENS
         sf_dim = self.head_dim // self.MXFP8_SCALE_BLOCK_SIZE
         return buf.view(buf.shape[0], heads_l, k_l, 32, sf_dim, sf_dim)
 
@@ -367,7 +368,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
                 page_size=page_tokens,
                 enable_pdl=pdl_enabled(),
             )
-        elif self.page_size == 128:
+        elif self.page_size == MXFP8_KV_SCALE_TILE_TOKENS:
             store_sf_interleaved(
                 k_scale, self.k_scale_buffer[layer_id], loc, enable_pdl=pdl_enabled()
             )
@@ -398,8 +399,8 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         )
         if self._layer_kv_head_counts is not None:
             page_tokens = self._layer_page_tokens(layer_id)
-        elif self.page_size == 128:
-            page_tokens = 128
+        elif self.page_size == MXFP8_KV_SCALE_TILE_TOKENS:
+            page_tokens = MXFP8_KV_SCALE_TILE_TOKENS
         else:
             return False
         if self.head_dim != 128:

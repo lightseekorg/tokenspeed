@@ -182,7 +182,6 @@ def _make_planned_deepseek_v4_pool(
         layer_num=len(layout.layer_ratio),
         device="cpu",
         enable_memory_saver=False,
-        page_size=layout.page_size,
         rank=0,
         memory_plan=plan,
         paged_cache_group_specs=specs,
@@ -2344,7 +2343,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 layer_num=1,
                 device="cpu",
                 enable_memory_saver=False,
-                page_size=64,
                 rank=0,
                 memory_plan=solve_deepseek_v4_memory_layout(
                     build_deepseek_v4_cache_fields(
@@ -3305,7 +3303,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 layer_num=2,
                 device="cpu",
                 enable_memory_saver=False,
-                page_size=64,
                 rank=0,
                 memory_plan=solve_deepseek_v4_memory_layout(
                     build_deepseek_v4_cache_fields(

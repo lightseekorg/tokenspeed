@@ -577,20 +577,20 @@ def _logical_slots(
     policy: TransferPolicy,
     prefix_len: int,
     prompt_len: int,
-    page_size: int,
+    block_granularity: int,
     retention: Retention,
     sliding_window_tokens: int | None,
 ) -> tuple[int, ...]:
     if policy == "full_suffix":
-        begin = prefix_len // page_size
+        begin = prefix_len // block_granularity
         if retention == "sliding_window":
             # The next decode token can attend the preceding window - 1 raw
-            # tokens. Include every group page intersecting that retained tail.
+            # tokens. Include every slot intersecting that retained tail.
             retained_begin = max(0, prompt_len - sliding_window_tokens + 1)
-            begin = max(begin, retained_begin // page_size)
-        end = (prompt_len + page_size - 1) // page_size
+            begin = max(begin, retained_begin // block_granularity)
+        end = (prompt_len + block_granularity - 1) // block_granularity
         return tuple(range(begin, end))
-    return ((prompt_len - 1) // page_size,)
+    return ((prompt_len - 1) // block_granularity,)
 
 
 def validate_cache_peer_layout(
@@ -598,7 +598,7 @@ def validate_cache_peer_layout(
 ) -> None:
     if layout.plan.prefix_granularity != peer_layout.plan.prefix_granularity:
         raise CacheContractError(
-            "Paged cache P/D contract mismatch: scheduler_block_tokens"
+            "Paged cache P/D contract mismatch: prefix_granularity"
         )
     local_group_ids = tuple(spec.group_id for spec in layout.group_specs)
     peer_group_ids = tuple(spec.group_id for spec in peer_layout.group_specs)

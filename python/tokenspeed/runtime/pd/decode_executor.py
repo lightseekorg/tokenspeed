@@ -196,7 +196,7 @@ class DisaggDecodeExecutor:
         # the runtime row with the complete remotely-computed prompt length
         # before the first local decode.  This is required for both cache
         # layouts: Paged cache additionally uses the resulting sequence length to
-        # select the transferred recurrent-state snapshot page.
+        # select the transferred recurrent-state snapshot block.
         extend_request_pool_indices = torch.tensor(
             forward_op.request_pool_indices[:num_extends],
             dtype=torch.int64,

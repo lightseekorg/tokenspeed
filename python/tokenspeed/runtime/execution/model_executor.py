@@ -1182,10 +1182,10 @@ class ModelExecutor:
             return None
 
         def sanitize(pool, pool_pages) -> bool:
-            zero_new_pages = getattr(pool, "zero_new_pages", None)
+            zero_new_blocks = getattr(pool, "zero_new_blocks", None)
             zero_pages = getattr(pool, "zero_pages", None)
-            if isinstance(pool_pages, Mapping) and callable(zero_new_pages):
-                zero_new_pages(pool_pages)
+            if isinstance(pool_pages, Mapping) and callable(zero_new_blocks):
+                zero_new_blocks(pool_pages)
                 return True
             if callable(zero_pages):
                 page_ids = (

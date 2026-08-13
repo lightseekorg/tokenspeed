@@ -108,7 +108,7 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
                     raise ValueError(
                         f"state plane for layer {layer_id} has padding "
                         "between pages; the GDN decode ABI requires contiguous "
-                        "state page rows"
+                        "state block rows"
                     )
                 self._state_buffers_by_layer[layer_id] = (conv, ssm)
                 continue
@@ -162,7 +162,7 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
             return recurrent
         raise ValueError(f"unknown state component {component_name!r}")
 
-    def zero_new_pages(self, new_page_ids: dict[str, list[int]]) -> None:
+    def zero_new_blocks(self, new_page_ids: dict[str, list[int]]) -> None:
         if new_page_ids:
             self.zero_blocks(new_page_ids)
 

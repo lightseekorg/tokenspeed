@@ -424,7 +424,6 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
-        page_size: int,
         rank: int,
         memory_plan: CacheMemoryPlan,
         paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...],
@@ -477,7 +476,7 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         )
         self.swa_block_bytes = layout.swa_block_bytes(self.swa_block_size)
         self.compressed_block_sizes = tuple(
-            layout.storage_block_size(ratio) if ratio > 1 else page_size
+            layout.storage_block_size(ratio) if ratio > 1 else scheduler_page_size
             for ratio in layout.layer_ratio
         )
         self.indexer_block_sizes = tuple(
@@ -490,7 +489,7 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         )
         self.compressor_state_block_sizes = tuple(
             (
-                _group_rows(v4_compressor_state_group_id(ratio), page_size)
+                _group_rows(v4_compressor_state_group_id(ratio), scheduler_page_size)
                 if ratio > 1
                 else scheduler_page_size
             )
@@ -666,5 +665,5 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         assert self.buffer is not None
         return int(self.buffer.nbytes)
 
-    def zero_new_pages(self, new_page_ids: dict[str, list[int]]) -> None:
+    def zero_new_blocks(self, new_page_ids: dict[str, list[int]]) -> None:
         self.zero_blocks(new_page_ids)

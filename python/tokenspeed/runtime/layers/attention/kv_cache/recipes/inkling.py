@@ -118,7 +118,7 @@ def inkling_cache_fields(
             scale_dim = head_dim // kv_scale_block_size
             scale_shape = (
                 kv_heads,
-                prefix_granularity // 128,
+                prefix_granularity // MXFP8_KV_SCALE_TILE_TOKENS,
                 32,
                 scale_dim,
                 scale_dim,

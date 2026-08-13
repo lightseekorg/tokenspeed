@@ -476,9 +476,10 @@ def _mha_fields(config, num_layers: int):
     from tokenspeed.runtime.layers.attention.kv_cache.recipes import spec
 
     if config.kv_cache_mxfp8:
-        assert config.page_size == 128, (
-            "mxfp8 KV cache requires --block-size 128 (the attention "
-            "kernel consumes the interleaved paged scale layout)"
+        assert config.page_size == MXFP8_KV_SCALE_TILE_TOKENS, (
+            "mxfp8 KV cache requires --block-size "
+            f"{MXFP8_KV_SCALE_TILE_TOKENS} (the attention kernel consumes "
+            "the interleaved paged scale layout)"
         )
     layer_types = tuple(config.layer_types)
     group_ids = (

@@ -52,7 +52,6 @@ def create_cache_pool(
             layer_num=num_layers,
             device=config.device,
             enable_memory_saver=enable_memory_saver,
-            page_size=config.page_size,
             rank=rank,
             memory_plan=plan,
             paged_cache_group_specs=spec.paged_cache_group_specs,

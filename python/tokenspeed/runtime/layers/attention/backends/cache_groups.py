@@ -70,7 +70,7 @@ class CacheGroupsMixin:
 
     cache_consumer_families = frozenset({"history"})
 
-    # family="state" group ids (GDN/mamba state pages); learned from the
+    # family="state" group ids (GDN/mamba state blocks); learned from the
     # pool's specs in init_cuda_graph_state, shed from every table here.
     state_group_ids: frozenset[str] = frozenset()
 
@@ -161,7 +161,7 @@ class CacheGroupsMixin:
         return self._select_out_cache_loc(layer, metadata, out_cache_loc)
 
     def _shed_state_groups(self, tables):
-        """Drop family="state" groups (GDN/mamba state pages, consumed by the
+        """Drop family="state" groups (GDN/mamba state blocks, consumed by the
         mamba backend): computing write locs / capture buffers over the
         hole-heavy state table writes the dummy page and trips
         TOKENSPEED_CACHE_DEBUG. Returns None when nothing is left.

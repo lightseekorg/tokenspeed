@@ -260,11 +260,21 @@ def _validate_lcm_page_size(
 
 
 def _set_cache_group_page_sizes(config: BaseAttnConfig, spec: CachePoolSpec) -> None:
-    """Publish scheduler page sizes to group-aware MHA backends."""
+    """Publish each group's scheduler table grain to group-aware backends.
+
+    This seed must be per-group: under --enforce-eager the backend never runs
+    _learn_cache_groups (a CUDA-graph hook), so whatever is published here is
+    what group-table expansion uses.
+    """
     if not hasattr(config, "group_page_sizes"):
         return
-    page_size = spec.memory_plan.prefix_granularity
-    config.group_page_sizes = {group_id: page_size for group_id in spec.layer_group_ids}
+    grain_by_group = {
+        group_spec.group_id: group_spec.block_granularity
+        for group_spec in spec.paged_cache_group_specs
+    }
+    config.group_page_sizes = {
+        group_id: grain_by_group[group_id] for group_id in spec.layer_group_ids
+    }
 
 
 # ---------- arch -> config class ----------
@@ -508,13 +518,21 @@ def _inkling_conv_columns(pool, text_config):
     """Return the ShortConv checkpoint groups backed by the cache plan."""
     layer_labels = text_config.paged_cache_layer_types
     prefix_granularity = pool.plan.prefix_granularity
+    # The checkpoint grain belongs to the conv groups' own specs; P is only
+    # the fallback when a group is absent from the plan.
+    specs_by_id = {spec.group_id: spec for spec in pool.paged_cache_group_specs}
+
+    def conv_grain(group_id):
+        spec = specs_by_id.get(group_id)
+        return spec.block_granularity if spec is not None else prefix_granularity
+
     conv_columns = {
-        "block_tokens": prefix_granularity,
+        "block_tokens": conv_grain("kvconv"),
         "conv_group_of_layer": ("kvconv",) * len(layer_labels),
         "hidden_group_of_layer": ("hiddenconv",) * len(layer_labels),
         "group_block_tokens": {
-            "kvconv": prefix_granularity,
-            "hiddenconv": prefix_granularity,
+            "kvconv": conv_grain("kvconv"),
+            "hiddenconv": conv_grain("hiddenconv"),
         },
         "pd_endpoint_snapshots": all(
             spec.transfer_policy == "latest_snapshot"

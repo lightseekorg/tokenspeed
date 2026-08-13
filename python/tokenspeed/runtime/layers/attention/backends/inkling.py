@@ -271,22 +271,22 @@ class InklingAttnBackend(AttentionBackend):
         return out
 
     @staticmethod
-    def _checkpoint_pages_at_endpoints(
+    def _checkpoint_blocks_at_endpoints(
         table: torch.Tensor,
         lengths: torch.Tensor,
-        page_size: int,
+        checkpoint_granularity: int,
     ) -> torch.Tensor:
-        """Resolve each positive endpoint to its latest-snapshot page."""
+        """Resolve each positive endpoint to its latest-snapshot block."""
         lengths = lengths.to(torch.int64)
         valid = lengths > 0
-        slots = torch.div(lengths - 1, page_size, rounding_mode="floor")
+        slots = torch.div(lengths - 1, checkpoint_granularity, rounding_mode="floor")
         slots = slots.clamp(min=0, max=table.shape[1] - 1)
-        pages = table.gather(1, slots.unsqueeze(1)).squeeze(1).to(torch.int32)
+        blocks = table.gather(1, slots.unsqueeze(1)).squeeze(1).to(torch.int32)
         torch._assert_async(
-            ((~valid) | (pages > 0)).all(),
+            ((~valid) | (blocks > 0)).all(),
             "ShortConv endpoint checkpoint is a hole or pad",
         )
-        return torch.where(valid, pages, torch.zeros_like(pages))
+        return torch.where(valid, blocks, torch.zeros_like(blocks))
 
     def restore_shortconv_endpoint(
         self,
@@ -307,7 +307,7 @@ class InklingAttnBackend(AttentionBackend):
             boundary,
             torch.zeros_like(boundary),
         )
-        pages = self._checkpoint_pages_at_endpoints(
+        pages = self._checkpoint_blocks_at_endpoints(
             metadata.col_block_table[group_id][:n],
             masked_boundary,
             int(self.conv_columns["block_tokens"]),
@@ -345,10 +345,10 @@ class InklingAttnBackend(AttentionBackend):
         metadata: InklingConvMetadata,
         group_id: str,
     ) -> None:
-        """Publish the final ``W - 1`` ring rows to the PD snapshot page."""
+        """Publish the final ``W - 1`` ring rows to the PD snapshot block."""
         n = metadata.cache_indices.shape[0]
         lengths = metadata.seq_lens[:n].to(torch.int64)
-        pages = self._checkpoint_pages_at_endpoints(
+        pages = self._checkpoint_blocks_at_endpoints(
             metadata.col_block_table[group_id][:n],
             lengths,
             int(self.conv_columns["block_tokens"]),

@@ -2,8 +2,8 @@
 
 Coverage:
 
-- per-group KDA state metadata: ``state_in_pages_by_group`` /
-  ``state_out_pages_by_group``
+- per-group KDA state metadata: ``state_in_blocks_by_group`` /
+  ``state_out_blocks_by_group``
   mappings keyed by state group id, dual-index computed ONCE per group per
   batch, with a proof the three groups' indices are independent and selected
   per layer via ``pool.group_id_for_layer``;
@@ -56,7 +56,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends import hybrid_linear_attn
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
     MambaAttnBackend,
-    compute_state_page_indices,
+    compute_state_block_indices,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     PagedCacheRuntimeContract,
@@ -228,14 +228,14 @@ def test_dual_index_reuses_one_slot_plan_and_groups_are_independent(
     page_size = pool.page_size
 
     plan_calls = 0
-    real = hybrid_linear_attn._compute_state_page_index_plan
+    real = hybrid_linear_attn._compute_state_block_index_plan
 
     def counting(*args, **kwargs):
         nonlocal plan_calls
         plan_calls += 1
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(hybrid_linear_attn, "_compute_state_page_index_plan", counting)
+    monkeypatch.setattr(hybrid_linear_attn, "_compute_state_block_index_plan", counting)
 
     bs = 2
     tables = _kimi_tables(bs, width=2)
@@ -257,16 +257,16 @@ def test_dual_index_reuses_one_slot_plan_and_groups_are_independent(
     assert plan_calls == 1
 
     md = backend.forward_metadata
-    assert tuple(sorted(md.state_in_pages_by_group)) == _STATE_GROUPS
-    assert tuple(sorted(md.state_out_pages_by_group)) == _STATE_GROUPS
+    assert tuple(sorted(md.state_in_blocks_by_group)) == _STATE_GROUPS
+    assert tuple(sorted(md.state_out_blocks_by_group)) == _STATE_GROUPS
     for group_id in _STATE_GROUPS:
         rows = tables[group_id]
         # req 0: before=P -> in slot 0, out slot 1; req 1: before=4 -> slot 0.
-        assert md.state_in_pages_by_group[group_id].tolist() == [
+        assert md.state_in_blocks_by_group[group_id].tolist() == [
             int(rows[0, 0]),
             int(rows[1, 0]),
         ]
-        assert md.state_out_pages_by_group[group_id].tolist() == [
+        assert md.state_out_blocks_by_group[group_id].tolist() == [
             int(rows[0, 1]),
             int(rows[1, 0]),
         ]
@@ -274,7 +274,7 @@ def test_dual_index_reuses_one_slot_plan_and_groups_are_independent(
     all_pages = [
         page
         for group_id in _STATE_GROUPS
-        for page in md.state_out_pages_by_group[group_id].tolist()
+        for page in md.state_out_blocks_by_group[group_id].tolist()
     ]
     assert len(set(all_pages)) == len(all_pages)
 
@@ -312,9 +312,9 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
         buf = backend.state_in_by_group[gid][1]
         # Same storage as capture (in-place refresh, no realloc).
         assert buf.data_ptr() == captured_ptrs[gid]
-        assert md.state_in_pages_by_group[gid].data_ptr() == captured_ptrs[gid]
+        assert md.state_in_blocks_by_group[gid].data_ptr() == captured_ptrs[gid]
         # Real row 0 refreshed from this group's table; padded row 1 -> pad.
-        expected_in, _ = compute_state_page_indices(
+        expected_in, _ = compute_state_block_indices(
             torch.as_tensor(tables[gid][:1]),
             pool.runtime_contract.prefix_granularity,
             torch.tensor([4]),  # before = seq_len 5 - 1
@@ -568,8 +568,8 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
     )
     md = h.backend.forward_metadata
     for gid in _STATE_GROUPS:
-        assert md.state_in_pages_by_group[gid].tolist() == [0]
-        assert md.state_out_pages_by_group[gid].tolist() == [tables[gid][0][0]]
+        assert md.state_in_blocks_by_group[gid].tolist() == [0]
+        assert md.state_out_blocks_by_group[gid].tolist() == [tables[gid][0][0]]
     for layer_id in [0, 1, 2]:
         s = streams[layer_id]
         outputs[layer_id].append(
@@ -590,10 +590,10 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
         h.init_metadata(tables, seq_lens=[pos + 1], mode=ForwardMode.DECODE)
         md = h.backend.forward_metadata
         for gid in _STATE_GROUPS:
-            assert md.state_in_pages_by_group[gid].tolist() == [
+            assert md.state_in_blocks_by_group[gid].tolist() == [
                 expected_pages[gid][step][0]
             ]
-            assert md.state_out_pages_by_group[gid].tolist() == [
+            assert md.state_out_blocks_by_group[gid].tolist() == [
                 expected_pages[gid][step][1]
             ]
         for layer_id in [0, 1, 2]:
@@ -703,8 +703,8 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     # 2) A decodes token 5: crossing out of the snapshot (in=1, out=2).
     h.init_metadata(tables_for([[1, 2]]), seq_lens=[5], mode=ForwardMode.DECODE)
     md = h.backend.forward_metadata
-    assert md.state_in_pages_by_group[gid].tolist() == [1]
-    assert md.state_out_pages_by_group[gid].tolist() == [2]
+    assert md.state_in_blocks_by_group[gid].tolist() == [1]
+    assert md.state_out_blocks_by_group[gid].tolist() == [2]
     a_outs.append(
         h.decode(
             layer_id,
@@ -726,8 +726,8 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
         extend_prefix_lens=[4],
     )
     md = h.backend.forward_metadata
-    assert md.state_in_pages_by_group[gid].tolist() == [1]
-    assert md.state_out_pages_by_group[gid].tolist() == [3]
+    assert md.state_in_blocks_by_group[gid].tolist() == [1]
+    assert md.state_out_blocks_by_group[gid].tolist() == [3]
     b_outs = [
         h.extend(
             layer_id, b_new["mixed"][:3], b_new["g_raw"][:3], b_new["beta_raw"][:3]
@@ -744,8 +744,8 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
         mode=ForwardMode.DECODE,
     )
     md = h.backend.forward_metadata
-    assert md.state_in_pages_by_group[gid].tolist() == [2, 3]
-    assert md.state_out_pages_by_group[gid].tolist() == [2, 3]
+    assert md.state_in_blocks_by_group[gid].tolist() == [2, 3]
+    assert md.state_out_blocks_by_group[gid].tolist() == [2, 3]
     mixed = torch.cat([a_new["mixed"][1:2], b_new["mixed"][3:4]], dim=0)
     g_raw = torch.cat([a_new["g_raw"][1:2], b_new["g_raw"][3:4]], dim=0)
     beta_raw = torch.cat([a_new["beta_raw"][1:2], b_new["beta_raw"][3:4]], dim=0)

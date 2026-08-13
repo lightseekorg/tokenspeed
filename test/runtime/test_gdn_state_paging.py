@@ -1,6 +1,6 @@
 """GDN dual-index state paging.
 
-compute_state_page_indices maps per-request (seq_len_before, seq_len_after)
+compute_state_block_indices maps per-request (seq_len_before, seq_len_after)
 to (in, out) state page ids over the "linear_attention" block table;
 the GPU test drives MambaAttnBackend (prefill + decodes over
 paged state slabs) against the FLA chunk_gated_delta_rule oracle run once
@@ -65,12 +65,12 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
             import torch
 
             from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (  # noqa: E501
-                compute_state_page_indices,
+                compute_state_block_indices,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
-        self.fn = compute_state_page_indices
+        self.fn = compute_state_block_indices
 
     def _run(self, rows, before, after, page_size=4):
         torch = self.torch
@@ -217,8 +217,8 @@ class CacheContractMetadataTest(unittest.TestCase):
         )
         md = backend.forward_metadata
         # before = 8 -> page slot 1 (row 2); after = 9 -> page slot 2 (row 3).
-        self.assertEqual(md.state_in_pages_by_group["linear_attention"].tolist(), [2])
-        self.assertEqual(md.state_out_pages_by_group["linear_attention"].tolist(), [3])
+        self.assertEqual(md.state_in_blocks_by_group["linear_attention"].tolist(), [2])
+        self.assertEqual(md.state_out_blocks_by_group["linear_attention"].tolist(), [3])
 
     def test_extend_metadata(self):
         torch = self.torch
@@ -234,8 +234,8 @@ class CacheContractMetadataTest(unittest.TestCase):
             ),
         )
         md = backend.forward_metadata
-        self.assertEqual(md.state_in_pages_by_group["linear_attention"].tolist(), [0])
-        self.assertEqual(md.state_out_pages_by_group["linear_attention"].tolist(), [2])
+        self.assertEqual(md.state_in_blocks_by_group["linear_attention"].tolist(), [0])
+        self.assertEqual(md.state_out_blocks_by_group["linear_attention"].tolist(), [2])
 
     def test_capture_replay_metadata(self):
         torch = self.torch
@@ -249,8 +249,10 @@ class CacheContractMetadataTest(unittest.TestCase):
         )
         md = backend.forward_metadata
         # Capture binds the persistent pad-filled buffers.
-        self.assertEqual(md.state_in_pages_by_group["linear_attention"].tolist(), [-1])
-        self.assertEqual(md.state_out_pages_by_group["linear_attention"].tolist(), [-1])
+        self.assertEqual(md.state_in_blocks_by_group["linear_attention"].tolist(), [-1])
+        self.assertEqual(
+            md.state_out_blocks_by_group["linear_attention"].tolist(), [-1]
+        )
 
         backend.init_forward_metadata_replay_cuda_graph(
             bs=1,
@@ -262,8 +264,8 @@ class CacheContractMetadataTest(unittest.TestCase):
             ),
         )
         md = backend.forward_metadata
-        self.assertEqual(md.state_in_pages_by_group["linear_attention"].tolist(), [2])
-        self.assertEqual(md.state_out_pages_by_group["linear_attention"].tolist(), [3])
+        self.assertEqual(md.state_in_blocks_by_group["linear_attention"].tolist(), [2])
+        self.assertEqual(md.state_out_blocks_by_group["linear_attention"].tolist(), [3])
 
 
 class VerifyMetadataTest(unittest.TestCase):
@@ -334,11 +336,11 @@ class VerifyMetadataTest(unittest.TestCase):
         self.assertEqual(metadata.mamba_output_indices.tolist(), [[1, 2, 3, 4]])
         self.assertEqual(metadata.mamba_output_indices.dtype, torch.int32)
         self.assertEqual(
-            metadata.state_in_pages_by_group["linear_attention_0"].tolist(),
+            metadata.state_in_blocks_by_group["linear_attention_0"].tolist(),
             [3],
         )
         self.assertEqual(
-            metadata.state_in_pages_by_group["linear_attention_1"].tolist(),
+            metadata.state_in_blocks_by_group["linear_attention_1"].tolist(),
             [5],
         )
         self.assertEqual(set(self.backend._verify_scratch), {0, 1})
@@ -551,13 +553,13 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            backend.forward_metadata.state_in_pages_by_group[
+            backend.forward_metadata.state_in_blocks_by_group[
                 "linear_attention"
             ].tolist(),
             [0],
         )
         self.assertEqual(
-            backend.forward_metadata.state_out_pages_by_group[
+            backend.forward_metadata.state_out_blocks_by_group[
                 "linear_attention"
             ].tolist(),
             [2],
@@ -596,13 +598,13 @@ class GDNStatePagingGPUTest(unittest.TestCase):
                 cache_metadata=_CacheMetadata({"linear_attention": rows}),
             )
             self.assertEqual(
-                backend.forward_metadata.state_in_pages_by_group[
+                backend.forward_metadata.state_in_blocks_by_group[
                     "linear_attention"
                 ].tolist(),
                 [expected_pages[i][0]],
             )
             self.assertEqual(
-                backend.forward_metadata.state_out_pages_by_group[
+                backend.forward_metadata.state_out_blocks_by_group[
                     "linear_attention"
                 ].tolist(),
                 [expected_pages[i][1]],
