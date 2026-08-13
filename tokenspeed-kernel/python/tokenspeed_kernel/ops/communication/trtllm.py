@@ -60,6 +60,7 @@ if current_platform().is_nvidia:
     from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
     from tokenspeed_kernel.thirdparty.cuda.trtllm import (
         _MNNVL_SUPPORTED_WORLD_SIZES,
+        MNNVL_FLASHINFER_MIN_TOKENS,
         MNNVL_ONESHOT_MAX_TOKEN,
         MNNVL_PREFER_IPC_BYTES,
         AllGatherFusionPattern,
@@ -67,9 +68,11 @@ if current_platform().is_nvidia:
         ReduceScatterFusionPattern,
         _ar_should_use_oneshot,
         _load_trtllm_comm_module,
+        flashinfer_mnnvl_module_available,
         minimax_allreduce_rms_qk,
         trtllm_allgather_fusion,
         trtllm_allreduce_fusion,
+        trtllm_create_flashinfer_mnnvl_workspace_for_all_reduce_fusion,
         trtllm_create_ipc_workspace_for_all_reduce_fusion,
         trtllm_create_ipc_workspace_for_minimax,
         trtllm_create_mnnvl_workspace_for_all_reduce_fusion,
@@ -168,6 +171,105 @@ if current_platform().is_nvidia:
         )
         return workspace
 
+    def _mnnvl_fi_locally_available(world_size: int) -> bool:
+        """Non-collective capability probe for the upstream flashinfer MNNVL AR.
+
+        Same hardware requirements as the private kernel (NVLS multicast,
+        fabric-handle memory for cross-host groups) minus the world-size
+        whitelist: the upstream kernels serve arbitrary group sizes. Purely
+        local: safe to call before any collective.
+        """
+        if world_size <= 1 or not flashinfer_mnnvl_module_available():
+            return False
+        try:
+            if torch.cuda.get_device_capability()[0] < 9:
+                return False
+            from torch._C._autograd import DeviceType
+            from torch._C._distributed_c10d import _SymmetricMemory
+
+            if not _SymmetricMemory.has_multicast_support(
+                DeviceType.CUDA, torch.cuda.current_device()
+            ):
+                return False
+            # Cross-host groups need fabric-handle memory; the multicast
+            # capability alone is advertised even where the IMEX stack is
+            # absent and the handle exchange would then hang.
+            if world_size > torch.cuda.device_count() and not (
+                fabric_allocation_supported(torch.cuda.current_device())
+            ):
+                return False
+            return True
+        except Exception as exc:  # noqa: BLE001 - capability probe must not raise
+            logger.debug("flashinfer mnnvl capability probe failed: %s", exc)
+            return False
+
+    # One flashinfer workspace per process group, shared by every arming site
+    # (comm_backend per-group managers and the fused-pattern manager here).
+    # The multicast allocation granularity (hundreds of MB) dwarfs any
+    # requested size, so the first allocation has capacity for all callers;
+    # per-call sufficiency is still checked in supports(). Keyed by the
+    # group's global ranks -- distinct ProcessGroup objects over the same
+    # ranks share one workspace. Process-lifetime, like symm_mem allocations.
+    # Sharing requires all users of a group to issue their AR calls in a
+    # single total order (one compute stream), which the engine guarantees.
+    _mnnvl_fi_workspace_cache: dict = {}
+
+    def _try_create_mnnvl_fi_workspace(
+        rank: int,
+        world_size: int,
+        max_token_num: int,
+        hidden_dim: int,
+        group,
+    ):
+        """Collectively arm (or reuse) the upstream flashinfer MNNVL workspace.
+
+        Same two-phase agreement as :func:`_try_create_mnnvl_workspace`:
+        (1) all-reduce the local capability probe before the multicast handle
+        exchange, (2) all-reduce the creation result. Returns None on fallback
+        so every rank takes the same path. The cache lookup key is local
+        metadata computed identically on every rank, so hits and misses are
+        rank-uniform too.
+        """
+        cache_key = tuple(dist.get_process_group_ranks(group))
+        cached = _mnnvl_fi_workspace_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        device = torch.device("cuda", torch.cuda.current_device())
+        ok = torch.tensor(
+            [1 if _mnnvl_fi_locally_available(world_size) else 0],
+            dtype=torch.int32,
+            device=device,
+        )
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
+        if ok.item() == 0:
+            return None
+
+        workspace = None
+        try:
+            workspace = trtllm_create_flashinfer_mnnvl_workspace_for_all_reduce_fusion(
+                rank, world_size, max_token_num, hidden_dim, group=group
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to private/IPC
+            logger.warning("flashinfer mnnvl workspace creation failed: %s", exc)
+
+        ok = torch.tensor(
+            [1 if workspace is not None else 0], dtype=torch.int32, device=device
+        )
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
+        if ok.item() == 0:
+            return None
+        logger.info(
+            "flashinfer MNNVL AR workspace armed: rank=%s world_size=%s "
+            "max_token_num=%s hidden_dim=%s buffer=%s bytes",
+            rank,
+            world_size,
+            workspace.max_token_num,
+            hidden_dim,
+            workspace.buffer_size_bytes,
+        )
+        _mnnvl_fi_workspace_cache[cache_key] = workspace
+        return workspace
+
     def _group_spans_nodes(group) -> bool:
         """True when the process group spans hosts.
 
@@ -206,6 +308,7 @@ if current_platform().is_nvidia:
             self.workspace_tensor = None
             self.ipc_handles = None
             self.mnnvl_workspace = None
+            self.mnnvl_fi_workspace = None
             self.world_size = None
             self.rank = None
             self.max_token_num = None
@@ -263,12 +366,23 @@ if current_platform().is_nvidia:
             self.mnnvl_workspace = _try_create_mnnvl_workspace(
                 rank, world_size, max_token_num, hidden_dim, group
             )
+            # Upstream flashinfer MNNVL workspace: preferred provider for the
+            # generic kAllReduce / kARResidualRMSNorm patterns (faster kernels,
+            # maintained upstream). The private mnnvl workspace above remains
+            # for the K3-specific epilogue patterns upstream does not have.
+            self.mnnvl_fi_workspace = _try_create_mnnvl_fi_workspace(
+                rank, world_size, max_token_num, hidden_dim, group
+            )
 
             # With IPC skipped, mnnvl is the only workspace; if it failed to
             # arm there is nothing to fuse with -- stay uninitialized so
             # prepare_allreduce_fusion() returns False and the model layer
             # keeps the plain NCCL path.
-            if self.workspace_tensor is None and self.mnnvl_workspace is None:
+            if (
+                self.workspace_tensor is None
+                and self.mnnvl_workspace is None
+                and self.mnnvl_fi_workspace is None
+            ):
                 logger.warning(
                     "trtllm AR: no workspace available (ipc skipped, mnnvl "
                     "failed); fusion disabled for this group"
@@ -314,6 +428,10 @@ if current_platform().is_nvidia:
                     # symm_mem allocations are process-lifetime; dropping the
                     # reference is all we can (and need to) do here.
                     self.mnnvl_workspace = None
+                    # The flashinfer workspace is shared across arming sites
+                    # via the process-lifetime cache; drop the reference only,
+                    # never destroy() it out from under other users.
+                    self.mnnvl_fi_workspace = None
                     self.initialized = False
                     self.world_size = None
                     self.rank = None
@@ -400,16 +518,21 @@ if current_platform().is_nvidia:
         Decision, first match wins:
           1. IPC exists (single-node) AND (payload >= MNNVL_PREFER_IPC_BYTES
              OR pattern == kAllReduceLatentNorm) ....... IPC lamport/twoshot
-          2. mnnvl supports this shape ................. mnnvl (one-shot <=128
-             tokens, two-shot 129..2048; device picks by token count)
+          2. between the mnnvl workspaces: upstream flashinfer when
+             token_num >= MNNVL_FLASHINFER_MIN_TOKENS or cross-node (generic
+             patterns only), the private kernel otherwise (and always for the
+             K3-specific epilogue patterns); whichever was not preferred is
+             the fallback when the preferred one rejects the shape
           3. no IPC fallback (cross-node) ............. None (caller degrades:
              the rmsnorm family runs unfused NCCL + torch epilogue, the rest
              raise loudly -- never a null workspace into the kernel)
           4. otherwise ................................ IPC
-        Cross-node, workspace_tensor is None so only 2/3 apply -- mnnvl serves
-        the whole range (it beats NCCL everywhere there).
+        Cross-node, workspace_tensor is None so only 2-3 apply -- the two
+        mnnvl workspaces together serve the whole range (they beat NCCL
+        everywhere there).
         """
         mnnvl = _workspace_manager.mnnvl_workspace
+        mnnvl_fi = _workspace_manager.mnnvl_fi_workspace
         # Byte-based split between the two fused workspaces: multicast (mnnvl)
         # for small payloads, IPC lamport once bandwidth dominates. Only bites
         # single-node -- cross-node workspace_tensor is None and mnnvl is the
@@ -425,6 +548,31 @@ if current_platform().is_nvidia:
         )
         if _workspace_manager.workspace_tensor is not None and prefer_ipc:
             return _workspace_manager.workspace_tensor
+        # Between the two mnnvl workspaces, prefer upstream flashinfer from
+        # MNNVL_FLASHINFER_MIN_TOKENS up and cross-node (no IPC): that is
+        # where it decisively wins (1.8-3.2x by M=64-128). Decode-sized calls
+        # stay on the private kernel -- in-situ the two are equals there and
+        # flashinfer's multicast traffic slows overlapped neighbors (see the
+        # constant's note). Either serves as the other's fallback when its
+        # supports() rejects a shape.
+        prefer_fi = (
+            token_num >= MNNVL_FLASHINFER_MIN_TOKENS
+            or _workspace_manager.workspace_tensor is None
+        )
+        if (
+            prefer_fi
+            and mnnvl_fi is not None
+            and mnnvl_fi.supports(
+                token_num,
+                hidden_dim,
+                dtype,
+                _workspace_manager.world_size,
+                pattern_code,
+                use_oneshot=use_oneshot,
+                residual_reduce_scattered=residual_reduce_scattered,
+            )
+        ):
+            return mnnvl_fi
         if mnnvl is not None and mnnvl.supports(
             token_num,
             hidden_dim,
@@ -435,6 +583,20 @@ if current_platform().is_nvidia:
             residual_reduce_scattered=residual_reduce_scattered,
         ):
             return mnnvl
+        if (
+            not prefer_fi
+            and mnnvl_fi is not None
+            and mnnvl_fi.supports(
+                token_num,
+                hidden_dim,
+                dtype,
+                _workspace_manager.world_size,
+                pattern_code,
+                use_oneshot=use_oneshot,
+                residual_reduce_scattered=residual_reduce_scattered,
+            )
+        ):
+            return mnnvl_fi
         # Cross-node there is no IPC workspace, so a shape/pattern mnnvl rejects
         # has no fused home. Return None and let the caller decide: the rmsnorm
         # family degrades to the unfused NCCL path, the rest raise loudly. Never
