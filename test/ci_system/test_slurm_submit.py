@@ -288,7 +288,12 @@ def test_render_script_orchestrates_multi_node_server_and_head_client():
     assert "--ntasks=4" in script
     assert "--ntasks-per-node=1" in script
     assert "--gres=gpu:4" in script
-    assert "--relative=0" in script
+    assert (
+        'head_node="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n \'1p\')"'
+        in script
+    )
+    assert 'client_prepare_args+=(--nodelist="$head_node")' in script
+    assert 'client_srun_args+=(--nodelist="$head_node")' in script
     assert "--serve-only" in script
     assert "--external-server" in script
     assert "SLURM_STEP_NUM_NODES" in script

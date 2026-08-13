@@ -391,7 +391,6 @@ srun "${{srun_args[@]}}" "${{container_command[@]}}"
         "--overlap",
         "--nodes=1",
         "--ntasks=1",
-        "--relative=0",
         "--gres=none",
         "--unbuffered",
         "--kill-on-bad-exit=1",
@@ -409,7 +408,6 @@ srun "${{srun_args[@]}}" "${{container_command[@]}}"
         "--overlap",
         "--nodes=1",
         "--ntasks=1",
-        "--relative=0",
         "--gres=none",
         *container_args,
     ]
@@ -450,6 +448,8 @@ server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" "${{mounts[@]}}")
 client_mounts=("$client_src:/workspace" "$client_tmp:/tmp" "${{mounts[@]}}")
 server_container_mounts="$(IFS=,; printf '%s' "${{server_mounts[*]}}")"
 client_container_mounts="$(IFS=,; printf '%s' "${{client_mounts[*]}}")"
+head_node="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n '1p')"
+client_prepare_args+=(--nodelist="$head_node")
 
 server_step_pid=""
 client_step_pid=""
@@ -484,6 +484,7 @@ srun "${{server_srun_args[@]}}" "${{server_command[@]}}" &
 server_step_pid=$!
 
 {shell_array("client_srun_args", client_srun)}
+client_srun_args+=(--nodelist="$head_node")
 client_srun_args+=(--container-mounts="$client_container_mounts")
 {shell_array("client_command", client_command)}
 srun "${{client_srun_args[@]}}" "${{client_command[@]}}" &
