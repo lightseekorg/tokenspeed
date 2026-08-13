@@ -241,9 +241,13 @@ def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[
     A dead metrics server makes the gateway exit during startup, the
     tokenizer registration job never runs, and the first request surfaces
     ``tokenizer_not_found`` / ``no worker available``. Allocating a fresh
-    free port per launch (like the engine and control ports) avoids every
-    collision; callers that need a stable scrape target can still pass an
-    explicit ``--prometheus-port``.
+    free port per launch (like the engine and control ports) avoids stale
+    collisions, but only if it happens right before ``spawn_gateway``: a
+    port picked at argv-build time sits unreserved through the whole engine
+    startup — minutes for large models — and the kernel can hand it to any
+    outbound connection (engine bootstrap, readiness probes) as an ephemeral
+    source port, failing the gateway bind. Callers that need a stable scrape
+    target can still pass an explicit ``--prometheus-port``.
     """
     if "--prometheus-port" in gateway_args:
         return gateway_args
@@ -436,8 +440,7 @@ def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     gateway_args = _gateway_args_with_smg_disable_defaults(gateway_args)
     gateway_args = _gateway_args_with_default_policy(gateway_args)
     gateway_args = _gateway_args_with_default_tokenizer_cache(gateway_args)
-    gateway_args = _gateway_args_with_default_log_level(gateway_args)
-    return _gateway_args_with_default_prometheus_port(gateway_args)
+    return _gateway_args_with_default_log_level(gateway_args)
 
 
 def _add_rl_control_port(engine_args: list[str]) -> tuple[list[str], str]:
@@ -596,6 +599,9 @@ async def run_smg(
             label=ENGINE_TAG,
         )
 
+        # Allocate the metrics port only now — see
+        # _gateway_args_with_default_prometheus_port for why earlier is racy.
+        gateway_args = _gateway_args_with_default_prometheus_port(gateway_args)
         gateway = await spawn_gateway(
             gateway_args, engine_host="127.0.0.1", engine_port=engine_port
         )
