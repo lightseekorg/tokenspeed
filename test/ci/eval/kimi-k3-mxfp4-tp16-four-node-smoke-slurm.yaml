@@ -1,0 +1,39 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-kimi-k3-mxfp4-tp16-four-node-smoke-slurm
+type: eval
+workflow_stage: model-test
+triggers:
+  - slurm
+runner:
+  labels:
+    - slurm-gb200-4node-4gpu
+slurm:
+  nodes: 4
+  gpus_per_node: 4
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+  - python3 -m pip install flash-linear-attention
+server:
+  command: >-
+    ts serve moonshotai/Kimi-K3
+    --served-model-name kimi-k3
+    --trust-remote-code
+    --max-model-len 32768
+    --kv-cache-dtype fp8
+    --tensor-parallel-size 16
+    --mm-encoder-tp-mode data
+    --moe-backend flashinfer_trtllm
+    --gpu-memory-utilization 0.94
+    --max-num-seqs 32
+    --disable-kvstore
+    --host 0.0.0.0
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 7200
+    interval: 10
+eval:
+  command: >-
+    python3 -c "import json,urllib.request;request=urllib.request.Request('http://127.0.0.1:8000/v1/completions',json.dumps({'model':'kimi-k3','prompt':'Hello','max_tokens':8}).encode(),{'Content-Type':'application/json'});print(urllib.request.urlopen(request,timeout=120).read().decode())"
