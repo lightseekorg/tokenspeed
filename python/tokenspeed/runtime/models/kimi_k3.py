@@ -961,7 +961,7 @@ class KimiLinearMoEGate(nn.Module):
 ATTNRES_FAST_PATH_MAX_TOKENS = 32
 # Paired MI350 measurements show that stream scheduling costs more than the
 # available attention/AttnRes overlap through M=16. Preserve NVIDIA's policy.
-ATTNRES_STREAM_FORK_MIN_TOKENS = 17 if current_platform().is_amd else 0
+ATTNRES_STREAM_FORK_THRESHOLD = 16 if current_platform().is_amd else 0
 
 
 def _attnres_mlp_slot(layer_id: int) -> int:
@@ -1833,7 +1833,7 @@ class KimiLinearDecoderLayer(nn.Module):
         with self.attn_fork.scope(
             enable=(
                 get_is_capture_mode()
-                and num_tokens >= ATTNRES_STREAM_FORK_MIN_TOKENS
+                and num_tokens > ATTNRES_STREAM_FORK_THRESHOLD
                 and (attnres_partial_args is None or own_mlp)
             )
         ) as fork:
