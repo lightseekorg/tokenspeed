@@ -73,18 +73,28 @@ class WeightLoader:
 
         set_cuda_arch()
 
+        # Weight cache daemon (CUDA IPC zero-copy loading). When enabled, weights
+        # are mapped from a running daemon's GPU memory instead of read from disk.
+        weight_cache_mode = getattr(server_args, "weight_cache_mode", "off")
+        use_weight_cache = weight_cache_mode != "off"
+
         # Create load config
         load_config = LoadConfig(
-            load_format=server_args.load_format,
+            load_format=("ipc_cache" if use_weight_cache else server_args.load_format),
             download_dir=server_args.download_dir,
             ext_yaml=server_args.ext_yaml,
             weight_loader_prefetch_checkpoints=server_args.weight_loader_prefetch_checkpoints,
             weight_loader_prefetch_num_threads=server_args.weight_loader_prefetch_num_threads,
+            weight_cache_mode=weight_cache_mode,
+            weight_cache_socket=getattr(server_args, "weight_cache_socket", None),
         )
 
-        # Load model with memory saver context. Tag as "weights" with CPU backup
-        # so release_memory_occupation offloads (and restores) them byte-exact.
-        with memory_saver_adapter.region(tag="weights", enable_cpu_backup=True):
+        # In zero-copy IPC mode the weights already live in the daemon's GPU
+        # memory and are shared read-only, so a CPU backup would both waste host
+        # memory and (on restore) detach the engine from the shared mapping.
+        with memory_saver_adapter.region(
+            tag="weights", enable_cpu_backup=not use_weight_cache
+        ):
             model = get_model(
                 model_config=model_config,
                 load_config=load_config,
