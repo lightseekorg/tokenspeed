@@ -192,7 +192,12 @@ class KimiK3LatentTailOp:
                 max_m=_MAX_NUM_TOKENS,
                 max_token_ctas=_COLLECTIVE_TOKEN_CTAS,
                 rms_eps=contract.rms_eps,
-                fp32_internal=True,
+                # Diagnostic override: the fp32-internal collective keeps
+                # sub-bf16-ulp perturbations alive that the bf16 tiers round
+                # away; flipping this tests whether that is the amplifier.
+                fp32_internal=(
+                    os.environ.get("TOKENSPEED_K3_TAIL_BF16_INTERNAL") != "1"
+                ),
             )
             self._up_projection = AdaptiveUpProjectionKernel(
                 group=group,
@@ -232,8 +237,11 @@ class KimiK3LatentTailOp:
                 (contiguous BF16, pre-all-reduce).
             shared_partial: This rank's shared-expert partial ``[M, 7168]``.
             rms_weight: Latent RMSNorm weight ``[3584]``.
-            up_weight: Replicated up-projection weight ``[7168, 3584]``; this
-                rank's ``hidden/tp`` row shard is consumed.
+            up_weight: Up-projection weight. Either replicated
+                ``[7168, 3584]``, of which this rank's ``hidden/tp`` row shard
+                is consumed, or that shard already stored on its own
+                (``[7168/tp, 3584]``) when the caller keeps the weight column
+                parallel.
             prefix: Optional residual stream ``[M, 7168]``; when given the
                 lamport gather fuses ``+ prefix`` (same rounding as an eager
                 add) and the caller's accumulate disappears.
@@ -257,7 +265,16 @@ class KimiK3LatentTailOp:
             rms_weight,
         )
         local_hidden = self.contract.hidden_size // self.contract.tp_size
-        local_up_weight = up_weight.narrow(0, self.rank * local_hidden, local_hidden)
+        if up_weight.shape[0] == local_hidden:
+            local_up_weight = up_weight
+        elif up_weight.shape[0] == self.contract.hidden_size:
+            local_up_weight = up_weight.narrow(0, self.rank * local_hidden, local_hidden)
+        else:
+            raise ValueError(
+                f"up_weight must have {self.contract.hidden_size} rows "
+                f"(replicated) or {local_hidden} (this rank's shard), got "
+                f"{up_weight.shape[0]}"
+            )
         mailbox = self._up_projection(latent, local_up_weight, shared_shard)
         return self._lamport_copy(mailbox, m=m, residual=prefix).squeeze(0)
 

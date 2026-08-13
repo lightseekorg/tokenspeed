@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import os
+
 from typing import Any
 
 import cuda.bindings.driver as cuda
@@ -117,7 +119,15 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         # up-projection and gather keep PDL, whose primaries are the tail's
         # own kernels with sound trigger placement. (Bound in host Python:
         # the JIT resolves names off self, not module globals.)
-        self.use_pdl = False if use_pdl is None else (use_pdl and PDL_ENABLED)
+        # TOKENSPEED_K3_TAIL_COLLECTIVE_PDL=1 restores the pre-fix launch for
+        # A/B calibration; it re-enables the race and is never a serving knob.
+        # TOKENSPEED_K3_TAIL_COLLECTIVE_PDL=0 downgrades this kernel's launch
+        # to plain stream order (the interim a33e2eeb mitigation) for A/B.
+        _off = os.environ.get("TOKENSPEED_K3_TAIL_COLLECTIVE_PDL") == "0"
+        if use_pdl is None:
+            self.use_pdl = (not _off) and PDL_ENABLED
+        else:
+            self.use_pdl = use_pdl and PDL_ENABLED
         validate_shape(
             tp_size=tp_size,
             latent_dim=latent_dim,
@@ -253,6 +263,14 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 tidx,
             )
             token = token + self.token_ctas
+        # PDL trigger only after this CTA's LAST token wave is stored: the
+        # dependent GEMM's griddepcontrol.wait releases once every primary
+        # CTA has *triggered*, not completed. The old "early PDL point
+        # before RMSNorm" (inside the token loop, pre-store) let the GEMM
+        # read the previous iteration's latent -- plausible values, wrong
+        # step, and invisible to any fixed-input bitwise test. Placed after
+        # the loop, a multi-wave m cannot release dependents between waves.
+        cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
     def _token_device(
@@ -384,9 +402,6 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 ).to(Float32)
                 for element in cutlass.range_constexpr(VEC_BF16):
                     accum[element] = accum[element] + values[element]
-
-            # Preserve the original early PDL point before RMSNorm.
-            cute.arch.griddepcontrol_launch_dependents()
 
             if cutlass.const_expr(self.fp32_internal):
                 # High-precision fused mode: keep the rank reduction in FP32 through the RMS square.
@@ -598,7 +613,8 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             if destination == self.rank:
                 cute.arch.barrier()
 
-            cute.arch.griddepcontrol_launch_dependents()
+            # (PDL trigger moved to kernel(), after the token loop -- a
+            # per-wave trigger here releases dependents between waves.)
 
             if (
                 token_cta == 0

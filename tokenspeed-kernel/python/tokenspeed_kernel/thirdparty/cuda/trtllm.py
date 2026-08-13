@@ -570,6 +570,19 @@ def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
     _destroy_ipc_workspace(workspace, group)
 
 
+def _ts_pdl_census(where: str, flag: bool) -> None:
+    """Diagnostic: env-gated census of PDL launch flags at cubin choke points."""
+    import os as _os
+
+    _c = _os.environ.get("TOKENSPEED_LAUNCH_PDL_CENSUS")
+    if _c and flag:
+        seen = globals().setdefault("_TS_PDL_SEEN", set())
+        if where not in seen:
+            seen.add(where)
+            with open(_c, "a") as f:
+                f.write(f"TRTLLM {where}\n")
+
+
 def trtllm_allreduce_fusion(
     allreduce_in: torch.Tensor,
     world_size: int,
@@ -603,6 +616,7 @@ def trtllm_allreduce_fusion(
     attnres_out_norm_w: Optional[torch.Tensor] = None,
     latent_width: Optional[int] = None,
 ) -> None:
+    _ts_pdl_census("allreduce_fusion", launch_with_pdl)
     if use_oneshot is None:
         use_oneshot = _ar_should_use_oneshot(
             token_num, hidden_dim, allreduce_in.dtype, world_size

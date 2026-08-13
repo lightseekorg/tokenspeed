@@ -118,7 +118,7 @@ def _epilogue_tma_store_add_shared(
     acc_pipeline: pipeline.PipelineAsync,
     c_pipeline: pipeline.PipelineTmaStore,
 ) -> pipeline.PipelineState:
-    """BF16 GEMM rounding + BF16 shared shard addition, then swizzled S2G TMA."""
+    """FP32 GEMM + shared shard addition, one BF16 rounding, swizzled S2G TMA."""
     sm100 = utils.gemm.sm100
     tCgC = sm100.transform_partitioned_tensor_layout(tCgC_base)
     tCgShared = sm100.transform_partitioned_tensor_layout(tCgShared_base)
@@ -210,9 +210,13 @@ def _epilogue_tma_store_add_shared(
         tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
         cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
-        gemm_vec = tiled_copy_r2s.retile(tTR_rAcc).load().to(gemm_kernel.c_dtype)
+        # Single rounding: keep the FP32 accumulator exact through the shared
+        # add. Rounding the GEMM result to BF16 first and again after the add
+        # doubles the epilogue's rounding error for nothing (the join baseline
+        # rounds once).
+        gemm_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
         shared_vec = tiled_copy_r2s.retile(tTR_rShared).load()
-        fused_vec = (gemm_vec.to(cutlass.Float32) + shared_vec.to(cutlass.Float32)).to(
+        fused_vec = (gemm_vec + shared_vec.to(cutlass.Float32)).to(
             gemm_kernel.c_dtype
         )
         # The Lamport mailbox empty marker is BF16 -0: normalize signed zeros to +0 so a real result is never mistaken for an unwritten fragment.

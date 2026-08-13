@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import IntEnum
@@ -35,8 +36,10 @@ from tokenspeed_kernel.ops.communication import (
 from tokenspeed_kernel.ops.moe import native_latent_moe_available
 from torch import nn
 
+from tokenspeed.runtime.distributed.comm_backend import Group
 from tokenspeed.runtime.distributed.comm_ops import (
     COMM_ONESHOT_MAX_BYTES,
+    all_gather_into_tensor,
     all_reduce,
     all_reduce_latent_norm,
     all_reduce_two,
@@ -102,11 +105,31 @@ def select_k3_moe_tail_tier(
     """
     # Tested first, so a fused-tail capacity that ever reached into the
     # multimem window would still resolve here rather than overlap.
+    # Diagnostic override: let an eager forward select the fused tail so its
+    # numerics can be probed outside CUDA graphs (rank-uniform env only).
+    if os.environ.get("TOKENSPEED_K3_TAIL_EAGER_DEBUG") == "1":
+        graph_phase = True
+    # Diagnostic: clamp the fused-tail capacity (rank-uniform env only). With
+    # e.g. 5 the tail keeps its skinny sizes but m in [6, capacity] falls to
+    # the ordinary tiers -- the arm that separates the WGMMA up-projection
+    # path from the rest of the tail.
+    _cap = os.environ.get("TOKENSPEED_K3_TAIL_MAX_M")
+    if _cap is not None:
+        tail_fusion_max_tokens = min(tail_fusion_max_tokens, int(_cap))
     if graph_phase and 1 <= num_tokens <= tail_fusion_max_tokens:
         return K3MoETailTier.TAIL_FUSION
     if not fused_moe_ar:
         return K3MoETailTier.SEPARATE_REDUCE
-    if multimem_ok and MULTIMEM_AR_MIN_TOKENS <= num_tokens <= MULTIMEM_AR_MAX_TOKENS:
+    # Diagnostic: lower the multimem floor so decode-sized batches take the
+    # in-switch reduce. It is not the fused tail but it *is* a different
+    # reduction order than the join tier's ring -- the control that separates
+    # "the tail is broken" from "any reduction-order change costs quality".
+    _mm_min = (
+        1
+        if os.environ.get("TOKENSPEED_K3_MULTIMEM_DECODE_DEBUG") == "1"
+        else MULTIMEM_AR_MIN_TOKENS
+    )
+    if multimem_ok and _mm_min <= num_tokens <= MULTIMEM_AR_MAX_TOKENS:
         return K3MoETailTier.MULTIMEM_AR
     return K3MoETailTier.FUSED_LANE_AR
 
@@ -284,10 +307,17 @@ class Kimi3MoEExecutionPlan:
 
 
 class Kimi3LatentProjection(ReplicatedLinear):
-    """Replicated latent projection with kernel-owned specialization.
+    """Latent projection with kernel-owned specialization.
 
     Tuned shapes use registered accelerator kernels. Other shapes retain the
     ordinary dense projection without requiring model-side shape selection.
+
+    With ``shard_group`` the output dimension is partitioned across the group
+    (column parallel): each rank stores ``output_size / tp`` rows of the weight
+    and the projection ends with one all-gather. The fused multicast tail
+    consumes exactly this shard and gathers it itself, so under the tail the
+    gather here never runs; the other tiers pay one all-gather in exchange for
+    ``(tp-1)/tp`` of the weight's memory.
     """
 
     def __init__(
@@ -298,10 +328,22 @@ class Kimi3LatentProjection(ReplicatedLinear):
         params_dtype: torch.dtype | None = None,
         prefix: str = "",
         solution: str = "auto",
+        shard_group: Group | None = None,
+        shard_rank: int = 0,
+        shard_size: int = 1,
     ) -> None:
+        if shard_group is not None and output_size % shard_size:
+            raise ValueError(
+                f"output_size {output_size} is not divisible by the shard size "
+                f"{shard_size}"
+            )
+        self.shard_group = shard_group
+        self.shard_rank = shard_rank
+        self.shard_size = shard_size if shard_group is not None else 1
+        self.output_size_full = output_size
         super().__init__(
             input_size=input_size,
-            output_size=output_size,
+            output_size=output_size // self.shard_size,
             bias=False,
             params_dtype=params_dtype,
             quant_config=None,
@@ -309,13 +351,58 @@ class Kimi3LatentProjection(ReplicatedLinear):
         )
         self.solution = solution
 
+    def weight_loader(self, param, loaded_weight, shard_id=None, begin_size=None):
+        """Take this rank's contiguous row block of the full weight."""
+        if self.shard_group is not None and shard_id is None and begin_size is None:
+            rows = self.output_size_full // self.shard_size
+            loaded_weight = loaded_weight.narrow(0, self.shard_rank * rows, rows)
+        return super().weight_loader(
+            param, loaded_weight, shard_id=shard_id, begin_size=begin_size
+        )
+
+    def _gather_shards(self, local: torch.Tensor) -> torch.Tensor:
+        """Concatenate every rank's column block into the full width."""
+        if self.shard_group is None:
+            return local
+        num_tokens, shard = local.shape
+        stacked = torch.empty(
+            (self.shard_size, num_tokens, shard),
+            dtype=local.dtype,
+            device=local.device,
+        )
+        all_gather_into_tensor(stacked, local.contiguous(), self.shard_group)
+        # Rank r owns columns [r*shard, (r+1)*shard); the gather stacks on a new
+        # leading axis, so the transpose is what puts the blocks side by side.
+        return stacked.permute(1, 0, 2).reshape(num_tokens, self.output_size_full)
+
+    def project_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's ``output_size/tp`` columns, ungathered.
+
+        For callers that fold the gather into a collective they already run:
+        the column blocks are disjoint, so placing each rank's block into a
+        buffer that is about to be summed makes the sum concatenate them.
+        """
+        if self.shard_group is None:
+            raise ValueError("project_shard requires a column-parallel projection")
+        return tokenspeed_kernel.kimi3_latent_projection(
+            hidden_states,
+            self.weight,
+            solution=self.solution,
+        )
+
+    @property
+    def shard_slice(self) -> tuple[int, int]:
+        """``(start, width)`` of this rank's column block in the full width."""
+        width = self.output_size_full // self.shard_size
+        return self.shard_rank * width, width
+
     def forward(self, hidden_states: torch.Tensor):
         output = tokenspeed_kernel.kimi3_latent_projection(
             hidden_states,
             self.weight,
             solution=self.solution,
         )
-        return output, None
+        return self._gather_shards(output), None
 
     def forward_add3(
         self,
@@ -327,12 +414,26 @@ class Kimi3LatentProjection(ReplicatedLinear):
 
         ``result = addend_a + hidden_states @ self.weight.T + addend_c``
         """
-        return tokenspeed_kernel.kimi3_latent_projection_add3(
+        if self.shard_group is None:
+            return tokenspeed_kernel.kimi3_latent_projection_add3(
+                hidden_states,
+                self.weight,
+                addend_a,
+                addend_c,
+            )
+        # Accumulate inside the shard, then gather once: the addends are
+        # replicated (prefix) or already reduced (shared), so their column
+        # blocks are final here and the gather moves the finished sum instead
+        # of an intermediate.
+        rows = self.output_size_full // self.shard_size
+        start = self.shard_rank * rows
+        local = tokenspeed_kernel.kimi3_latent_projection_add3(
             hidden_states,
             self.weight,
-            addend_a,
-            addend_c,
+            addend_a.narrow(-1, start, rows),
+            addend_c.narrow(-1, start, rows),
         )
+        return self._gather_shards(local)
 
 
 def _module_tensor_output(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -442,11 +543,29 @@ class LatentMoELayer(nn.Module):
 
         output_shape = tuple(shared_output.shape)
         _check_shape(prefix_sum, output_shape, "prefix_sum")
-        output = self.routed_up_proj.forward_add3(
-            routed_latent,
-            prefix_sum,
-            shared_output,
-        )
+        if (
+            os.environ.get("TOKENSPEED_K3_JOIN_EXTRA_ROUND") == "1"
+            and routed_latent.shape[0] <= 16
+        ):
+            # Diagnostic: emulate the multicast tail's rounding structure on
+            # the join path. The tail rounds (gemm + shared) to bf16 at the
+            # mailbox store and again after the prefix add; the join rounds the
+            # whole fp32 sum once. Splitting the fused add3 into add2 + eager
+            # add reproduces exactly that one extra intermediate rounding, so a
+            # GPQA arm with this flag isolates the mailbox rounding's cost with
+            # no kernel change.
+            mailbox_like = self.routed_up_proj.forward_add3(
+                routed_latent,
+                torch.zeros_like(prefix_sum),
+                shared_output,
+            )
+            output = mailbox_like + prefix_sum
+        else:
+            output = self.routed_up_proj.forward_add3(
+                routed_latent,
+                prefix_sum,
+                shared_output,
+            )
         _check_shape(output, output_shape, "routed_up_proj")
         return output
 

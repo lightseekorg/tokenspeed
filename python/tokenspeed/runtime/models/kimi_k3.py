@@ -56,6 +56,7 @@ Module hierarchy matches the checkpoint::
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Iterable
 from functools import partial
 from typing import TYPE_CHECKING
@@ -80,7 +81,6 @@ from tokenspeed_kernel.ops.communication.multimem import (
     multimem_stage,
 )
 from tokenspeed_kernel.ops.gemm import (
-    kimi3_latent_projection_add3,
     kimi3_mla_qkv_gate_projection,
     kimi3_qkvfab_projection,
     kimi3_router_projection,
@@ -1067,10 +1067,28 @@ class KimiLinearMoE(nn.Module):
             self.routed_hidden,
             prefix=add_prefix("routed_expert_down_proj", prefix),
         )
+        # Column-parallel up projection: the replicated weight is 49 MiB per
+        # layer, so sharding it frees (tp-1)/tp of that on every rank and the
+        # freed memory goes straight into the KV pool. Every tier either
+        # computes on the shard natively (the fused tail) or folds the gather
+        # into a reduction it already runs, so the wire bytes never grow.
+        # Default on for NVIDIA; AMD keeps the replicated fallback because its
+        # joined reduction is the Iris fused two-segment primitive, which the
+        # fold's AR->GEMM->AR ordering cannot use (untested trade there).
+        # TOKENSPEED_K3_SHARD_UP_PROJ=0/1 overrides either way.
+        _shard_env = os.environ.get("TOKENSPEED_K3_SHARD_UP_PROJ")
+        shard_up = (
+            (_shard_env == "1" or (_shard_env != "0" and torch.version.hip is None))
+            and mapping.moe.tp_ep_size > 1
+            and config.hidden_size % mapping.moe.tp_ep_size == 0
+        )
         self.routed_expert_up_proj = Kimi3LatentProjection(
             self.routed_hidden,
             config.hidden_size,
             prefix=add_prefix("routed_expert_up_proj", prefix),
+            shard_group=mapping.moe.tp_ep_group if shard_up else None,
+            shard_rank=mapping.moe.tp_ep_rank,
+            shard_size=mapping.moe.tp_ep_size,
         )
         self.routed_expert_norm = (
             RMSNorm(self.routed_hidden, eps=config.rms_norm_eps)
@@ -1194,6 +1212,9 @@ class KimiLinearMoE(nn.Module):
 
         self._multimem_ar_ok = False
         self._latent_tail = None
+        # For the diagnostic dump/cksum hooks: filename-safe layer identity.
+        self.layer_dump_key = prefix.replace("/", "_").replace(".", "_")
+        self._settle_twin = None
         if torch.distributed.is_initialized():
             votes = torch.tensor(
                 [int(multimem_local), int(tail_local)],
@@ -1224,6 +1245,7 @@ class KimiLinearMoE(nn.Module):
                     device=torch.device("cuda", torch.cuda.current_device()),
                     owner=prefix,
                 )
+
                 logger.info("multicast latent tail engaged")
 
     def pack_input_projection_weights(self) -> None:
@@ -1398,10 +1420,15 @@ class KimiLinearMoE(nn.Module):
         router_logits = self.gate(hidden_states)
         tier = self._select_tail_tier(num_tokens)
         # Lane only materializes at bs==1, below the multimem tier window.
+        # Shard mode splits the joined reduction (see _tail_fused_lane_ar), so
+        # the packed lane would never be reduced as one piece: keep it off.
         lane = allreduce_fusion_lane(
             hidden_states,
             self.routed_hidden + hidden_size,
-            enabled=tier is K3MoETailTier.FUSED_LANE_AR,
+            enabled=(
+                tier is K3MoETailTier.FUSED_LANE_AR
+                and self.routed_expert_up_proj.shard_group is None
+            ),
         )
         if lane is not None:
             self.experts._situ_output_buffer = lane[:, : self.routed_hidden]
@@ -1432,6 +1459,30 @@ class KimiLinearMoE(nn.Module):
                 # No fused collective to hide behind: reduce and project here
                 # so the work overlaps the shared branch inside the fork.
                 routed_out = self._reduce_project_routed(routed_out)
+        ck = os.environ.get("TOKENSPEED_TAIL_CKSUM_DIR")
+        if ck and not get_is_capture_mode():
+            out = self._moe_tail(
+                tier,
+                routed_out,
+                shared_partial,
+                prefix_sum,
+                lane,
+                num_tokens,
+                hidden_size,
+            )
+            # Per-layer bit-sensitive fingerprints of the tail's inputs and
+            # output: where the FIRST divergence between two identical serial
+            # forwards appears localizes the impure op (upstream vs the tail).
+            rank = torch.distributed.get_rank()
+            with open(f"{ck}/cksum_rank{rank}.txt", "a") as f:
+                f.write(
+                    f"{self.layer_dump_key} tier={int(tier)} nt={num_tokens} "
+                    f"r={routed_out.float().sum().item():.17e} "
+                    f"s={shared_partial.float().sum().item():.17e} "
+                    f"p={prefix_sum.float().sum().item():.17e} "
+                    f"o={out.float().sum().item():.17e}\n"
+                )
+            return out
         return self._moe_tail(
             tier, routed_out, shared_partial, prefix_sum, lane, num_tokens, hidden_size
         )
@@ -1464,6 +1515,22 @@ class KimiLinearMoE(nn.Module):
         already ran inside the fork scope to overlap the shared branch.
         """
         if tier is K3MoETailTier.TAIL_FUSION:
+            # Diagnostic: run the fused tail but DISCARD its output and return
+            # the join tier's result computed from the same partials. The
+            # decode graph then contains the tail's kernels, allocations and
+            # collectives, while the model consumes baseline bits -- the arm
+            # that separates "the deficit rides on the tail's output" from
+            # "the deficit rides on the tail's presence in the graph".
+            if os.environ.get("TOKENSPEED_K3_TAIL_INERT") == "1":
+                self._tail_fusion(routed_out, shared_partial, prefix_sum)
+                return self._tail_fused_lane_ar(
+                    routed_out,
+                    shared_partial,
+                    prefix_sum,
+                    None,
+                    num_tokens,
+                    hidden_size,
+                )
             # Selector pins the graph phase: warmup/capture/replay all take
             # this path, and eager serving keeps the join/portable tiers.
             return self._tail_fusion(routed_out, shared_partial, prefix_sum)
@@ -1485,6 +1552,83 @@ class KimiLinearMoE(nn.Module):
         shared_partial: torch.Tensor,
         prefix_sum: torch.Tensor,
     ) -> torch.Tensor:
+        # Diagnostic: dump real tail inputs/outputs for offline determinism
+        # replay (eager only -- torch.save is not graph-capturable).
+        dump_dir = os.environ.get("TOKENSPEED_TAIL_DUMP_DIR")
+        if dump_dir and not get_is_capture_mode():
+            n = getattr(self, "_tail_dump_count", 0)
+            if n < int(os.environ.get("TOKENSPEED_TAIL_DUMP_N", "8")):
+                self._tail_dump_count = n + 1
+                rank = torch.distributed.get_rank()
+                out = self._latent_tail(
+                    routed_out,
+                    shared_partial,
+                    self.routed_expert_norm.weight,
+                    self.routed_expert_up_proj.weight,
+                    prefix=prefix_sum,
+                )
+                torch.save(
+                    {
+                        "routed": routed_out.cpu(),
+                        "shared": shared_partial.cpu(),
+                        "rms_w": self.routed_expert_norm.weight.cpu(),
+                        "up_w": self.routed_expert_up_proj.weight.cpu(),
+                        "prefix": prefix_sum.cpu(),
+                        "out": out.cpu(),
+                    },
+                    f"{dump_dir}/rank{rank}_{self.layer_dump_key}_{n}.pt",
+                )
+                return out
+        # Direct settled-input test: run the tail, then run it again on the
+        # SAME tensors after a full sync (inputs provably final) using a
+        # second mailbox. The kernels are bitwise deterministic given settled
+        # inputs (verified offline), so any difference means the first call
+        # observed the routed partial before its producer finished -- exactly
+        # what a PDL launch behind the flashinfer MoE chain's early trigger
+        # allows. Eager only; costs a sync and a second tail per layer.
+        probe_dir = os.environ.get("TOKENSPEED_TAIL_SETTLE_PROBE")
+        if probe_dir and not get_is_capture_mode():
+            first = self._latent_tail(
+                routed_out,
+                shared_partial,
+                self.routed_expert_norm.weight,
+                self.routed_expert_up_proj.weight,
+                prefix=prefix_sum,
+            ).clone()
+            torch.cuda.synchronize()
+            if self._settle_twin is None:
+                from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
+
+                self._settle_twin = KimiK3LatentTailOp.initialize(
+                    group=torch.distributed.group.WORLD,
+                    hidden_size=prefix_sum.shape[-1],
+                    latent_size=self.routed_hidden,
+                    rms_eps=self.routed_expert_norm.variance_epsilon,
+                    device=prefix_sum.device,
+                    owner=f"settle_twin.{self.layer_dump_key}",
+                )
+            second = self._settle_twin(
+                routed_out,
+                shared_partial,
+                self.routed_expert_norm.weight,
+                self.routed_expert_up_proj.weight,
+                prefix=prefix_sum,
+            )
+            torch.cuda.synchronize()
+            same = bool(torch.equal(first, second))
+            if not same:
+                delta = (first.float() - second.float()).abs()
+                bad = int((delta > 0).sum().item())
+                worst = delta.max().item()
+            else:
+                bad, worst = 0, 0.0
+            rank = torch.distributed.get_rank()
+            with open(f"{probe_dir}/settle_rank{rank}.txt", "a") as f:
+                f.write(
+                    f"{self.layer_dump_key} same={int(same)} bad={bad} "
+                    f"worst={worst:.6e}\n"
+                )
+            return first
         # Partials are pre-reduce; the tail owns all communication.
         return self._latent_tail(
             routed_out,
@@ -1523,6 +1667,26 @@ class KimiLinearMoE(nn.Module):
                 "init-time capability vote and the runtime shapes disagree"
             )
         routed_red = multimem_all_reduce_staged(routed_stage, group_name)
+        if self.routed_expert_up_proj.shard_group is not None:
+            # Fold the whole projection tail into the shared reduction. Each
+            # rank owns a disjoint column block, so placing its block into the
+            # buffer that is about to be summed makes the sum concatenate the
+            # blocks: one all-reduce then yields shared + up_proj + prefix at
+            # full width, for the same bytes the shared reduction already
+            # moved, while the projection GEMM shrinks to 1/tp of the rows.
+            routed_red = (
+                self.routed_expert_norm(routed_red)
+                if self.routed_expert_norm is not None
+                else routed_red
+            )
+            start, width = self.routed_expert_up_proj.shard_slice
+            block = self.routed_expert_up_proj.project_shard(routed_red)
+            shared_stage[:, start : start + width] += block + prefix_sum.view(
+                num_tokens, hidden_size
+            ).narrow(-1, start, width)
+            return multimem_all_reduce_staged(shared_stage, group_name).view(
+                num_tokens, hidden_size
+            )
         shared_red = multimem_all_reduce_staged(shared_stage, group_name)
         if self.routed_expert_norm is not None:
             routed_red = self.routed_expert_norm(routed_red)
@@ -1538,13 +1702,39 @@ class KimiLinearMoE(nn.Module):
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
-        # Replicated up_proj + prefix/shared accumulate; both AR tiers end here.
-        return kimi3_latent_projection_add3(
+        # up_proj + prefix/shared accumulate; both AR tiers end here. Going
+        # through the module (rather than the raw weight) keeps this correct
+        # when the projection is column parallel, where it also gathers.
+        return self.routed_expert_up_proj.forward_add3(
             routed_red,
-            self.routed_expert_up_proj.weight,
             prefix_sum,
             shared_red,
         ).view(num_tokens, hidden_size)
+
+    def _fold_projection_into_shared(
+        self,
+        latent_normed: torch.Tensor,
+        shared_partial: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_tokens: int,
+        hidden_size: int,
+        block: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Add this rank's projection block into its columns of the shared
+        partial, in place, so the shared reduction also gathers the projection.
+
+        The column blocks are disjoint across ranks, so summing the partials
+        concatenates the blocks and adds ``prefix`` exactly once per column.
+        Works with any sum all-reduce; the caller runs it right after this.
+        """
+        start, width = self.routed_expert_up_proj.shard_slice
+        if block is None:
+            block = self.routed_expert_up_proj.project_shard(latent_normed)
+        shared_partial = shared_partial.view(num_tokens, hidden_size)
+        shared_partial[:, start : start + width] += block + prefix_sum.view(
+            num_tokens, hidden_size
+        ).narrow(-1, start, width)
+        return shared_partial
 
     def _tail_fused_lane_ar(
         self,
@@ -1555,6 +1745,20 @@ class KimiLinearMoE(nn.Module):
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
+        if self.routed_expert_up_proj.shard_group is not None:
+            # Split the joined reduction so the projection has a collective to
+            # fold into: reduce the routed lane, norm, project this rank's
+            # column block, then let the shared reduction gather it. Bytes on
+            # the wire equal the joined AR's; the extra launch is paid for by
+            # the projection GEMM shrinking to 1/tp. (The lane is disabled in
+            # shard mode, so routed_out is always a standalone tensor here.)
+            routed_red = all_reduce(routed_out, self.mapping.moe.tp_ep_group)
+            if self.routed_expert_norm is not None:
+                routed_red = self.routed_expert_norm(routed_red)
+            folded = self._fold_projection_into_shared(
+                routed_red, shared_partial, prefix_sum, num_tokens, hidden_size
+            )
+            return all_reduce(folded, self.mapping.moe.tp_ep_group)
         # The join owns the lane/cat/grouped-NCCL strategy per size and lane hit.
         routed_red, shared_out = kimi3_join_reduce_moe(
             routed_out,
@@ -1581,6 +1785,12 @@ class KimiLinearMoE(nn.Module):
             routed_out = all_reduce(routed_out, self.mapping.moe.tp_ep_group)
         if self.routed_expert_norm is not None:
             routed_out = self.routed_expert_norm(routed_out)
+        if self.routed_expert_up_proj.shard_group is not None:
+            # Column block only; _tail_separate_reduce folds it into the
+            # shared reduction it runs anyway (the fold itself must wait for
+            # the fork to join, since the shared partial is produced on the
+            # other branch).
+            return self.routed_expert_up_proj.project_shard(routed_out)
         return self.routed_expert_up_proj(routed_out)[0]
 
     def _tail_separate_reduce(
@@ -1591,6 +1801,18 @@ class KimiLinearMoE(nn.Module):
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
+        if self.routed_expert_up_proj.shard_group is not None:
+            # routed_out is this rank's projected column block; the shared
+            # reduction below gathers it for free.
+            folded = self._fold_projection_into_shared(
+                routed_out,  # unused when block is given
+                shared_partial,
+                prefix_sum,
+                num_tokens,
+                hidden_size,
+                block=routed_out,
+            )
+            return self._reduce_shared(folded).view(num_tokens, hidden_size)
         # routed_out arrives reduced and projected from the fork scope.
         shared_out = self._reduce_shared(shared_partial)
         # routed_scaling_factor already applied in TopK (matches reference).
@@ -1717,8 +1939,11 @@ class KimiLinearDecoderLayer(nn.Module):
         # Fused AR+residual for the attention reduce: ones-weight RMSNorm rides
         # the one-shot pattern; its norm output is discarded. Enabled when the
         # attention TP group's one-shot lane is armed.
+        # Diagnostic kill-switch: fall back to the plain NCCL AR + separate
+        # AttnRes path, isolating the fused AR kernel in the serving repro.
         self._attn_ar_residual_fusion = (
-            mapping.attn.tp_size > 1
+            os.environ.get("TOKENSPEED_DISABLE_ATTN_AR_FUSION") != "1"
+            and mapping.attn.tp_size > 1
             and prepare_all_reduce_lane(mapping.attn.tp_group, config.hidden_size)
             and prepare_all_reduce_fusion(
                 mapping.attn.tp_group,
@@ -1861,6 +2086,21 @@ class KimiLinearDecoderLayer(nn.Module):
         block_residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         h, prefix_sum = self._mix_into_attention(hidden_states, block_residual)
+        _ckd = os.environ.get("TOKENSPEED_TAIL_CKSUM_DIR")
+        _cke = _ckd and not get_is_capture_mode() and hidden_states.shape[0] <= 16
+        if _cke:
+
+            def _s(t):
+                if t is None:
+                    return "None"
+                f = t.float()
+                return f"{f.sum().item():.17e}/{f.abs().max().item():.17e}"
+
+            _ckf = open(f"{_ckd}/lyr_rank{torch.distributed.get_rank()}.txt", "a")
+            _ckf.write(
+                f"L{self.layer_id} in={_s(hidden_states)} br={_s(block_residual)} "
+                f"mix={_s(h)} pre={_s(prefix_sum)} "
+            )
         # The mlp-side mixing's block partial hides under attention on the aux
         # stream (blocks are final for this layer once the snapshot above ran);
         # the combine after the attention AR only touches the prefix candidate.
@@ -1920,6 +2160,8 @@ class KimiLinearDecoderLayer(nn.Module):
             prefix_sum, h_fused = self._reduce_attn_accumulate(
                 attn_out, prefix_sum, combine=ar_combine
             )
+        if _cke:
+            _ckf.write(f"attn={_s(attn_out)} pAR={_s(prefix_sum)} ")
         # --- mlp: AttnRes mixing -> norm -> FFN -> accumulate ---
         if h_fused is not None:
             h = h_fused
@@ -1953,6 +2195,9 @@ class KimiLinearDecoderLayer(nn.Module):
             )
         else:
             prefix_sum = prefix_sum + self.mlp(h)
+        if _cke:
+            _ckf.write(f"h={_s(h)} out={_s(prefix_sum)}\n")
+            _ckf.close()
         return prefix_sum, block_residual
 
 

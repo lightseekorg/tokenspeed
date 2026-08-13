@@ -256,9 +256,12 @@ class FusedAddMulticastSkinnyGemm:
                             reduction_profile=0,
                         )
                     )
-                    gemm_value = Float32(total).to(BFloat16)
+                    # Single rounding: keep the FP32 accumulator exact through
+                    # the shared add. Rounding the GEMM result to BF16 first
+                    # and again after the add doubles the epilogue's rounding
+                    # error for nothing (the join baseline rounds once).
                     fused[ni] = (
-                        gemm_value.to(Float32) + gShared[mi, n_base + ni].to(Float32)
+                        Float32(total) + gShared[mi, n_base + ni].to(Float32)
                     ).to(BFloat16)
                 output_offset = Int64((mi * self.hidden_dim + n_base) * 2)
                 if const_expr(outputs_per_block == 2):
