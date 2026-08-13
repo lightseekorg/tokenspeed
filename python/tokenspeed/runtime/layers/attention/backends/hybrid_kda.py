@@ -45,7 +45,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 
 
-# --kda-backend prefill policies; "auto" resolves by platform probe at registry time.
 KDA_PREFILL_BACKENDS = ("auto", "fla", "flashkda", "cutedsl_kda")
 
 
@@ -136,26 +135,28 @@ class KdaAttnBackend(MambaAttnBackend):
         head_v_dim: int,
         lower_bound: float | None,
     ) -> torch.Tensor | None:
+
         if f_a_out is None:
             return None
-        num_value_heads = value_dim // attn_tp_size // head_v_dim
-        return try_kda_fused_paged_decode(
-            mixed_qkv,
-            conv_weights,
-            conv_states,
-            f_a_out,
-            f_b_weight,
-            beta_raw,
-            A_log,
-            dt_bias,
-            state_pool=ssm_states,
-            read_indices=read_indices,
-            write_indices=write_indices,
-            num_heads=num_value_heads,
-            head_dim=head_v_dim,
-            cu_seqlens=self.forward_metadata.query_start_loc,
-            lower_bound=lower_bound,
-        )
+        else:
+            num_value_heads = value_dim // attn_tp_size // head_v_dim
+            return try_kda_fused_paged_decode(
+                mixed_qkv,
+                conv_weights,
+                conv_states,
+                f_a_out,
+                f_b_weight,
+                beta_raw,
+                A_log,
+                dt_bias,
+                state_pool=ssm_states,
+                read_indices=read_indices,
+                write_indices=write_indices,
+                num_heads=num_value_heads,
+                head_dim=head_v_dim,
+                cu_seqlens=self.forward_metadata.query_start_loc,
+                lower_bound=lower_bound,
+            )
 
     @override
     def _decode_scan(
@@ -177,11 +178,13 @@ class KdaAttnBackend(MambaAttnBackend):
         beta_raw: torch.Tensor | None,
         lower_bound: float | None,
     ) -> torch.Tensor:
+
         seq_len = query.shape[0]
         num_heads = query.shape[2]
         head_k_dim = query.shape[3]
         num_value_heads = value.shape[2]
         head_v_dim = value.shape[3]
+
         query_start_loc = self.forward_metadata.query_start_loc
         g_raw = self._kda_gate(g_raw, f_a_out, f_b_weight)
         query = query.view(1, seq_len, num_heads, head_k_dim)
@@ -189,20 +192,24 @@ class KdaAttnBackend(MambaAttnBackend):
         value = value.view(1, seq_len, num_value_heads, head_v_dim)
         g_kda = g_raw.view(1, seq_len, num_value_heads, head_k_dim)
         beta_kda = beta_raw.view(1, seq_len, num_value_heads)
-        return kda_paged_decode(
-            query,
-            key,
-            value,
-            g_kda,
-            beta_kda,
-            A_log,
-            dt_bias,
-            state_pool=ssm_states,
-            read_indices=read_indices,
-            write_indices=write_indices,
-            cu_seqlens=query_start_loc,
-            lower_bound=lower_bound,
-        ).squeeze(0)
+
+        return (
+            kda_paged_decode(
+                query,
+                key,
+                value,
+                g_kda,
+                beta_kda,
+                A_log,
+                dt_bias,
+                state_pool=ssm_states,
+                read_indices=read_indices,
+                write_indices=write_indices,
+                cu_seqlens=query_start_loc,
+                lower_bound=lower_bound,
+            )
+            .squeeze(0)
+        )
 
     @override
     def _verify(
@@ -229,28 +236,30 @@ class KdaAttnBackend(MambaAttnBackend):
         head_v_dim: int,
         lower_bound: float | None,
     ) -> torch.Tensor | None:
+
         if f_a_out is None or bias is not None:
             return None
-        num_value_heads = value_dim // attn_tp_size // head_v_dim
-        return try_kda_fused_paged_verify(
-            mixed_qkv,
-            conv_weights,
-            conv_comp,
-            conv_scratch,
-            f_a_out,
-            f_b_weight,
-            beta_raw,
-            A_log,
-            dt_bias,
-            state_pool=ssm_comp,
-            state_scratch=ssm_scratch,
-            read_indices=state_in_pages[:batch_size],
-            write_indices=output_indices[:batch_size],
-            num_heads=num_value_heads,
-            head_dim=head_v_dim,
-            draft_token_num=draft_token_num,
-            lower_bound=lower_bound,
-        )
+        else:
+            num_value_heads = value_dim // attn_tp_size // head_v_dim
+            return try_kda_fused_paged_verify(
+                mixed_qkv,
+                conv_weights,
+                conv_comp,
+                conv_scratch,
+                f_a_out,
+                f_b_weight,
+                beta_raw,
+                A_log,
+                dt_bias,
+                state_pool=ssm_comp,
+                state_scratch=ssm_scratch,
+                read_indices=state_in_pages[:batch_size],
+                write_indices=output_indices[:batch_size],
+                num_heads=num_value_heads,
+                head_dim=head_v_dim,
+                draft_token_num=draft_token_num,
+                lower_bound=lower_bound,
+            )
 
     @override
     def _verify_scan(
@@ -276,6 +285,7 @@ class KdaAttnBackend(MambaAttnBackend):
         seq_len: int,
         lower_bound: float | None,
     ) -> torch.Tensor:
+
         from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
             fused_recurrent_kda_mtp,
         )
@@ -284,28 +294,35 @@ class KdaAttnBackend(MambaAttnBackend):
         head_k_dim = query.shape[3]
         num_value_heads = value.shape[2]
         head_v_dim = value.shape[3]
+
         query_b = query.view(batch_size, draft_token_num, num_heads, head_k_dim)
         key_b = key.view(batch_size, draft_token_num, num_heads, head_k_dim)
         value_b = value.view(batch_size, draft_token_num, num_value_heads, head_v_dim)
+
         g_b = self._kda_gate(g_raw, f_a_out, f_b_weight).view(
             batch_size, draft_token_num, num_value_heads, head_k_dim
         )
+
         beta_b = beta_raw.view(batch_size, draft_token_num, num_value_heads)
         grid = output_indices[:batch_size]
-        return fused_recurrent_kda_mtp(
-            query_b,
-            key_b,
-            value_b,
-            g_b,
-            beta_b,
-            A_log,
-            dt_bias,
-            ssm_comp,
-            state_in_pages[:batch_size].to(torch.int64),
-            grid,
-            h_pool_out=ssm_scratch,
-            lower_bound=lower_bound,
-        ).reshape(1, seq_len, num_value_heads, head_v_dim)
+
+        return (
+            fused_recurrent_kda_mtp(
+                query_b,
+                key_b,
+                value_b,
+                g_b,
+                beta_b,
+                A_log,
+                dt_bias,
+                ssm_comp,
+                state_in_pages[:batch_size].to(torch.int64),
+                grid,
+                h_pool_out=ssm_scratch,
+                lower_bound=lower_bound,
+            )
+            .reshape(1, seq_len, num_value_heads, head_v_dim)
+        )
 
     @override
     def _prefill_scan(
@@ -337,13 +354,17 @@ class KdaAttnBackend(MambaAttnBackend):
         """
         head_k_dim = query.shape[3]
         num_value_heads = value.shape[2]
+
         g_kda = self._kda_gate(g_raw, f_a_out, f_b_weight).view(
             1, seq_len, num_value_heads, head_k_dim
         )
+
         beta_kda = beta_raw.view(1, seq_len, num_value_heads)
+
         query, key, value, g_kda, beta_kda = _slice_kda_prefill_inputs(
             num_real_tokens, query, key, value, g_kda, beta_kda
         )
+
         kda_result = kda_paged_prefill(
             query,
             key,
@@ -357,6 +378,7 @@ class KdaAttnBackend(MambaAttnBackend):
             lower_bound=lower_bound,
             solution=None if self.kda_backend == "auto" else self.kda_backend,
         )
+
         return kda_result.out.squeeze(0), kda_result.final_state
 
 
