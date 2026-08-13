@@ -57,7 +57,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -79,13 +78,14 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_router_projection,
     kimi3_shared_down_projection,
     kimi3_shared_situ_projection,
+    linear_attnres_partials,
+    linear_attnres_partials_available,
 )
 from tokenspeed_kernel.ops.gemm.triton_gemv import (
     decode_gemv,
 )
 from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
-    latent_moe_expert_shared,
     latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
@@ -98,7 +98,6 @@ from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearCo
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
-    all_reduce_two,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
     token_all_gather,
@@ -122,6 +121,7 @@ from tokenspeed.runtime.layers.moe.latent import (
     Kimi3MoEExecutionPlan,
     LatentMoELayer,
     kimi3_join_reduce_moe,
+    latent_moe_expert_shared_all_reduce,
 )
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
@@ -372,6 +372,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         ctx: "ForwardContext",
         comm_manager: CommManager,
         block_scale: torch.Tensor | None,
+        attnres_partial_args: tuple | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Project MLA Q, latent KV, and the local output gate in one GEMM.
 
@@ -384,6 +385,29 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         if block_scale is not None:
             qkv_gate = self.fused_qkv_a_proj_with_mqa(
                 hidden_states, block_scale, torch.bfloat16
+            )
+            if attnres_partial_args is not None:
+                attnres_partial_dual(*attnres_partial_args)
+            qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
+            q_a, latent_cache, gate = qkv_gate.split(
+                [
+                    self.q_lora_rank,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    self._gate_width,
+                ],
+                dim=-1,
+            )
+        elif attnres_partial_args is not None:
+            blocks, weight_a, weight_b, eps, scratch_a, scratch_b = attnres_partial_args
+            qkv_gate = linear_attnres_partials(
+                hidden_states,
+                self.fused_qkv_a_proj_with_mqa.weight,
+                blocks,
+                weight_a,
+                weight_b,
+                scratch_a,
+                scratch_b,
+                eps=eps,
             )
             qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
             q_a, latent_cache, gate = qkv_gate.split(
@@ -431,6 +455,26 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         )
         return projection.query, latent_cache, gate, projection.absorbed_query
 
+    def can_fuse_attnres_partials(
+        self,
+        hidden_states: torch.Tensor,
+        args: tuple,
+    ) -> bool:
+        projection = getattr(self, "fused_qkv_a_proj_with_mqa", None)
+        if projection is None:
+            return False
+        blocks, weight_a, weight_b, eps, scratch_a, scratch_b = args
+        return linear_attnres_partials_available(
+            hidden_states,
+            projection.weight,
+            blocks,
+            weight_a,
+            weight_b,
+            scratch_a,
+            scratch_b,
+            eps=eps,
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -439,14 +483,21 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         out_cache_loc: torch.Tensor,
         comm_manager,
         block_scale: torch.Tensor | None = None,
+        attnres_partial_args: tuple | None = None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
         if self.use_output_gate:
             q, latent_cache, gate, absorbed_query = self._project_q_latent_gated(
-                hidden_states, ctx, comm_manager, block_scale
+                hidden_states,
+                ctx,
+                comm_manager,
+                block_scale,
+                attnres_partial_args,
             )
         else:
+            if attnres_partial_args is not None:
+                attnres_partial_dual(*attnres_partial_args)
             q, latent_cache = self._project_q_latent(
                 hidden_states, ctx, comm_manager, block_scale
             )
@@ -500,8 +551,8 @@ def _apply_attn_res(
     unsupported shapes. Both paths are CUDA-graph capture-compatible.
 
     ``block_residual`` is block-major ``[num_blocks, T, hidden]``. When
-    ``out_norm`` is given (same eps as ``norm``), the following RMSNorm is
-    fused into the kernel epilogue and the normed mix is returned.
+    ``out_norm`` is given, the following RMSNorm is fused into the kernel
+    epilogue and the normed mix is returned.
     """
     if num_valid_blocks <= 0:
         return prefix_sum if out_norm is None else out_norm(prefix_sum)
@@ -512,6 +563,7 @@ def _apply_attn_res(
         norm.weight,
         norm.variance_epsilon,
         out_norm_weight=None if out_norm is None else out_norm.weight,
+        out_norm_eps=None if out_norm is None else out_norm.variance_epsilon,
     )
 
 
@@ -748,20 +800,55 @@ class KimiLinearKDA(nn.Module):
         ).squeeze(1)
 
     def _project_qkvfab(
-        self, hidden_states: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        attnres_partial_args: tuple | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project every KDA hidden-state consumer in one decode GEMV."""
+        """Project every KDA hidden-state consumer."""
         proj_local = self.local_num_heads * self.head_dim
-        output = kimi3_qkvfab_projection(
-            hidden_states,
-            self.qkvgb_proj.weight,
-        )
+        if attnres_partial_args is None:
+            output = kimi3_qkvfab_projection(
+                hidden_states,
+                self.qkvgb_proj.weight,
+            )
+        else:
+            blocks, weight_a, weight_b, eps, scratch_a, scratch_b = attnres_partial_args
+            output = linear_attnres_partials(
+                hidden_states,
+                self.qkvgb_proj.weight,
+                blocks,
+                weight_a,
+                weight_b,
+                scratch_a,
+                scratch_b,
+                eps=eps,
+            )
         f_a_end = 4 * proj_local + self.head_dim
+        mixed_qkv = output[:, : 3 * proj_local]
+        if not mixed_qkv.is_contiguous():
+            mixed_qkv = mixed_qkv.contiguous()
         return (
-            output[:, : 3 * proj_local].contiguous(),
+            mixed_qkv,
             output[:, 3 * proj_local : 4 * proj_local],
             output[:, 4 * proj_local : f_a_end],
             output[:, f_a_end : self.qkvgb_proj.used_rows],
+        )
+
+    def can_fuse_attnres_partials(
+        self,
+        hidden_states: torch.Tensor,
+        args: tuple,
+    ) -> bool:
+        blocks, weight_a, weight_b, eps, scratch_a, scratch_b = args
+        return linear_attnres_partials_available(
+            hidden_states,
+            self.qkvgb_proj.weight,
+            blocks,
+            weight_a,
+            weight_b,
+            scratch_a,
+            scratch_b,
+            eps=eps,
         )
 
     def forward(
@@ -772,6 +859,7 @@ class KimiLinearKDA(nn.Module):
         out_cache_loc: torch.Tensor,
         comm_manager,
         block_scale: torch.Tensor | None = None,
+        attnres_partial_args: tuple | None = None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -790,7 +878,9 @@ class KimiLinearKDA(nn.Module):
         # the short causal conv (+ SiLU) and manages the conv / recurrent state
         # cache (KDA branch of MambaAttnBackend). g_raw is the raw decay-gate
         # input, beta the per-head logits (sigmoid applied in-kernel).
-        mixed_qkv, out_gate, f_a_out, beta = self._project_qkvfab(h)
+        mixed_qkv, out_gate, f_a_out, beta = self._project_qkvfab(
+            h, attnres_partial_args
+        )
         # f_b runs inside the backend: fused into the decode scan kernel, a
         # plain GEMV on the prefill path.
         # Fused [3*proj, k] conv kernel bank, built once in post_load_weights.
@@ -870,6 +960,13 @@ class KimiLinearMoEGate(nn.Module):
 # allocated to exactly this many rows. Raise together with --max-num-seqs.
 ATTNRES_FAST_PATH_MAX_TOKENS = 32
 
+
+def _attnres_mlp_slot(layer_id: int) -> int:
+    """Slot (0 or 2) for this layer's mlp-side partial; alternates so a layer
+    never reads the buffer its own aux branch is writing for the next one."""
+    return 2 * (layer_id % 2)
+
+
 _ATTNRES_SCRATCH: list | None = None
 
 
@@ -878,8 +975,8 @@ def _attnres_scratch(
 ):
     """Shared (m, s, acc) scratch for the split attn_res mixing (bs <= cap).
 
-    slot 0 = the layer's mlp-side mix; slot 1 = the next layer's attn-side mix
-    (their lifetimes overlap, so they get separate buffers).
+    slot 1 = the next layer's attn-side mix; slots 0/2 = the mlp-side mix,
+    ping-ponged on layer parity so the hoist needs no ordering edge.
     """
     global _ATTNRES_SCRATCH
     sc = _ATTNRES_SCRATCH
@@ -896,7 +993,7 @@ def _attnres_scratch(
                     cap, like.shape[-1], dtype=torch.float32, device=like.device
                 ),
             )
-            for _ in range(2)
+            for _ in range(3)
         ]
         _ATTNRES_SCRATCH = sc
     return sc[slot]
@@ -1113,11 +1210,7 @@ class KimiLinearMoE(nn.Module):
                     if self.execution_plan.joint_moe_reduce
                     else self._reduce_shared
                 ),
-                joint_reduce=(
-                    partial(all_reduce_two, group=mapping.moe.ep_group)
-                    if self.execution_plan.joint_moe_reduce
-                    else None
-                ),
+                joint_reduce=self.execution_plan.joint_moe_reduce,
                 shared_expert_stream=(
                     alt_stream if self.execution_plan.overlap_shared_experts else None
                 ),
@@ -1174,7 +1267,9 @@ class KimiLinearMoE(nn.Module):
             offset += rows
 
     def _latent_input_projections(
-        self, hidden_states: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        shared_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Project the router, routed latent, and shared partial in one pass.
 
@@ -1196,6 +1291,7 @@ class KimiLinearMoE(nn.Module):
         shared_output = kimi3_shared_down_projection(
             shared_input,
             self.shared_experts.down_proj.weight,
+            out=shared_out,
         )
         return router_logits, routed_input, shared_output
 
@@ -1239,8 +1335,9 @@ class KimiLinearMoE(nn.Module):
         W13 and SiTU run separately; the next launch computes routed W2 beside
         the shared down projection. One collective reduces both partials. The
         final routed up projection adds ``prefix_sum`` and the shared output in
-        its epilogue when a specialized implementation is available. Top-k and
-        the optional routed norm remain separate launches.
+        its epilogue when a specialized implementation is available. The
+        optional routed norm folds into that final projection; top-k remains
+        a separate launch.
         """
 
         router_logits, routed_input, shared_input = latent_moe_input_projections(
@@ -1252,13 +1349,7 @@ class KimiLinearMoE(nn.Module):
             up_clamp=self.shared_experts.act_fn.linear_beta,
         )
         topk_output = self.topk(hidden_states, router_logits)
-        routed_output = hidden_states.new_empty(
-            (hidden_states.shape[0], self.routed_expert_down_proj.weight.shape[0])
-        )
-        shared_output = hidden_states.new_empty(
-            (hidden_states.shape[0], self.shared_experts.down_proj.weight.shape[0])
-        )
-        routed_latent, shared_output = latent_moe_expert_shared(
+        routed_latent, shared_output = latent_moe_expert_shared_all_reduce(
             routed_input,
             self.experts.w13_weight,
             self.experts.w13_weight_scale,
@@ -1272,16 +1363,8 @@ class KimiLinearMoE(nn.Module):
             linear_clamp=self.experts.activation_situ_linear_beta,
             expert_start=self.experts.ep_rank * self.experts.num_local_experts,
             w13_interleaved=self.experts.w13_input_layout == "interleaved",
-            routed_out=routed_output,
-            shared_out=shared_output,
-        )
-        shared_output, routed_latent = all_reduce_two(
-            shared_output,
-            routed_latent,
             group=self.mapping.moe.ep_group,
         )
-        if self.routed_expert_norm is not None:
-            routed_latent = self.routed_expert_norm(routed_latent)
         return self.native_latent_moe.finalize_output(
             routed_latent,
             prefix_sum,
@@ -1580,11 +1663,16 @@ class KimiLinearDecoderLayer(nn.Module):
         # mix; set by the backbone after all layers exist. The partial launches
         # from this (MoE) layer's aux branch, hidden under the routed experts.
         self._next_attn_mix = None
+        # Whether the next layer's mlp-side partial rides our sweep too.
+        self._hoist_next_mlp = False
+        self._mlp_slot = _attnres_mlp_slot(layer_id)
         # Precomputed rms_w * res_w products (filled in post_load_weights).
         self._attn_wp = None
         self._mlp_wp = None
         # True when the PREVIOUS layer precomputes our attn-side block partial.
         self._attn_split = False
+        # True when the PREVIOUS layer precomputes our mlp-side block partial.
+        self._mlp_split = False
         # True when the NEXT layer folds our routed+shared residual accumulate
         # into its attn-side combine (we return the parts unsummed).
         self.comm_manager = CommManager(
@@ -1647,6 +1735,52 @@ class KimiLinearDecoderLayer(nn.Module):
             )
             if residual_out is not None:
                 return residual_out, None
+        if combine is not None and prefix_sum is not None and num_tokens == 1:
+            scratch, _, _, out_norm_w, eps = combine
+            if out_norm_w is not None:
+                from tokenspeed_kernel.ops.communication.triton import (
+                    allreduce_residual_attnres_combine,
+                    allreduce_residual_attnres_combine_supported,
+                )
+
+                group = _get_process_group(self.mapping.attn.tp_group)
+                fused_supported = not global_server_args_dict.get(
+                    "force_deterministic_rsag", False
+                ) and allreduce_residual_attnres_combine_supported(
+                    attn_partial,
+                    prefix_sum,
+                    self._mlp_wp,
+                    out_norm_w,
+                    scratch,
+                    rank=self.mapping.attn.tp_rank,
+                    group=group,
+                    local_world_size=self.mapping.nprocs_per_node,
+                )
+                if fused_supported:
+                    h, residual_out = allreduce_residual_attnres_combine(
+                        attn_partial,
+                        prefix_sum,
+                        self._mlp_wp,
+                        out_norm_w,
+                        scratch,
+                        rank=self.mapping.attn.tp_rank,
+                        group=group,
+                        local_world_size=self.mapping.nprocs_per_node,
+                        eps=eps,
+                    )
+                else:
+                    residual_out = prefix_sum + all_reduce(
+                        attn_partial, self.mapping.attn.tp_group
+                    )
+                    h = attnres_combine(
+                        residual_out,
+                        self._mlp_wp,
+                        out_norm_w,
+                        eps,
+                        scratch,
+                        torch.empty_like(residual_out),
+                    )
+                return residual_out, h
         reduced = all_reduce(attn_partial, self.mapping.attn.tp_group)
         return (reduced if prefix_sum is None else prefix_sum + reduced), None
 
@@ -1713,9 +1847,9 @@ class KimiLinearDecoderLayer(nn.Module):
             and h.is_cuda
             and mlp_valid_blocks > 0
         )
-        scratch = _sliced_scratch(h, 0, num_tokens) if split_mix else None
-        # The next layer's attn-side partial reads the same (now final) block
-        # set as our mlp-side partial, so both ride one sweep when armed.
+        scratch = _sliced_scratch(h, self._mlp_slot, num_tokens) if split_mix else None
+        # Block-write layers only: theirs cannot ride the previous sweep.
+        own_mlp = split_mix and not self._mlp_split
         next_mix = self._next_attn_mix if split_mix else None
         sc1 = _sliced_scratch(h, 1, num_tokens) if next_mix is not None else None
         # The mlp-side combine (blocks partial + post-AR prefix) rides the
@@ -1731,19 +1865,58 @@ class KimiLinearDecoderLayer(nn.Module):
             if split_mix
             else None
         )
-        with self.attn_fork.scope(enable=get_is_capture_mode()) as fork:
+        attnres_partial_args = None
+        if next_mix is not None and self._hoist_next_mlp and num_tokens == 1:
+            next_layer, _ = next_mix
+            # This layer's attention projection writes both block partials
+            # hoisted for the next layer, which consumes their scratch slots.
+            candidate_args = (
+                block_residual[:mlp_valid_blocks],
+                next_layer._mlp_wp,
+                next_layer._attn_wp,
+                self.mlp_res_norm.variance_epsilon,
+                _sliced_scratch(h, next_layer._mlp_slot, num_tokens),
+                sc1,
+            )
+            if self.self_attn.can_fuse_attnres_partials(h, candidate_args):
+                attnres_partial_args = candidate_args
+        reduce_consumes_scratch = (
+            own_mlp
+            and ar_combine is not None
+            and prefix_sum is not None
+            and (
+                num_tokens == 1
+                or (
+                    self._attn_ar_residual_fusion
+                    and num_tokens
+                    <= global_server_args_dict["comm_fusion_max_num_tokens"]
+                )
+            )
+        )
+        with self.attn_fork.scope(
+            enable=get_is_capture_mode() and (attnres_partial_args is None or own_mlp)
+        ) as fork:
             with fork.branch():
                 if next_mix is not None:
-                    nxt_layer, _ = next_mix
-                    attnres_partial_dual(
-                        block_residual[:mlp_valid_blocks],
-                        self._mlp_wp,
-                        nxt_layer._attn_wp,
-                        self.mlp_res_norm.variance_epsilon,
-                        scratch,
-                        sc1,
-                    )
-                elif split_mix:
+                    next_layer, _ = next_mix
+                    if self._hoist_next_mlp:
+                        if attnres_partial_args is None:
+                            attnres_partial_dual(
+                                block_residual[:mlp_valid_blocks],
+                                next_layer._mlp_wp,
+                                next_layer._attn_wp,
+                                self.mlp_res_norm.variance_epsilon,
+                                _sliced_scratch(h, next_layer._mlp_slot, num_tokens),
+                                sc1,
+                            )
+                    else:
+                        attnres_partial(
+                            block_residual[:mlp_valid_blocks],
+                            next_layer._attn_wp,
+                            self.mlp_res_norm.variance_epsilon,
+                            sc1,
+                        )
+                if own_mlp:
                     attnres_partial(
                         block_residual[:mlp_valid_blocks],
                         self._mlp_wp,
@@ -1756,7 +1929,13 @@ class KimiLinearDecoderLayer(nn.Module):
                 ctx=ctx,
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
+                attnres_partial_args=attnres_partial_args,
             )
+            if not reduce_consumes_scratch:
+                prefix_sum, h_fused = self._reduce_attn_accumulate(
+                    attn_out, prefix_sum, combine=ar_combine
+                )
+        if reduce_consumes_scratch:
             prefix_sum, h_fused = self._reduce_attn_accumulate(
                 attn_out, prefix_sum, combine=ar_combine
             )
@@ -1859,9 +2038,13 @@ class KimiLinearModel(nn.Module):
                 assert (
                     cur.mlp_res_norm.variance_epsilon
                     == nxt.self_attention_res_norm.variance_epsilon
+                    == nxt.mlp_res_norm.variance_epsilon
                 ), "dual partial assumes one shared RMS epsilon"
                 cur._next_attn_mix = (nxt, nxt.prev_valid_blocks)
                 nxt._attn_split = True
+                # A block-write layer's own block does not exist a layer earlier.
+                cur._hoist_next_mlp = not nxt.is_block_write_layer
+                nxt._mlp_split = cur._hoist_next_mlp
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

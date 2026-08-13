@@ -1584,6 +1584,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 block_table=compressed_block_table,
                 block_size=compressed_block_size,
                 offset=0,
+                max_gather_len=compressed_base,
             )
             deepseek_v4_dequantize_and_gather_k_cache(
                 out=kv_workspace,
@@ -1594,6 +1595,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 block_table_base_offsets=cache_metadata.swa_base_logical_page,
                 block_size=token_to_kv_pool.swa_block_size,
                 offset=compressed_base,
+                max_gather_len=max_gather_len,
             )
             indices, lens = deepseek_v4_combine_topk_swa_indices(
                 topk_indices=topk_indices,
@@ -1632,6 +1634,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 block_table=compressed_block_table,
                 block_size=compressed_block_size,
                 offset=0,
+                max_gather_len=compressed_base,
             )
         deepseek_v4_dequantize_and_gather_k_cache(
             out=kv_workspace,
@@ -1642,6 +1645,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             block_table_base_offsets=cache_metadata.swa_base_logical_page,
             block_size=token_to_kv_pool.swa_block_size,
             offset=compressed_base,
+            max_gather_len=max_gather_len,
         )
         if compress_ratio > 1:
             dense_compressed_indices = self._dense_prefill_local_compressed_indices(
@@ -1939,13 +1943,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         max_bs: int,
         paged_cache_group_specs=(),
         paged_cache_group_page_counts=None,
-        logical_page_size: int | None = None,
         max_tokens_per_req: int = 1,
         overlap_schedule_depth: int = 0,
     ):
-        # logical_page_size accepted for signature uniformity with other
-        # backends; DSA derives its page geometry from cache metadata per step.
-        del logical_page_size
         self._decode_tile_metadata = {}
         self._cuda_graph_max_tokens_per_req = max(
             1,
@@ -2004,7 +2004,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
         self._cuda_graph_max_bs = max_bs
         self._cuda_graph_paged_cache_block_tables = {}
-        specs, page_counts = self._configure_cache_group_contract(
+        specs, _ = self._configure_cache_group_contract(
             paged_cache_group_specs,
             paged_cache_group_page_counts,
         )

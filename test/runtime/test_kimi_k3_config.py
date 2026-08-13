@@ -419,9 +419,10 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         self.assertFalse(shared_calls[0]["reduce_results"])
         self.assertEqual(expert_calls[0]["internal_activation_dtype_override"], "input")
-        joint_reduce = layer.native_latent_moe.components["joint_reduce"]
-        self.assertIs(joint_reduce.func, kimi_k3.all_reduce_two)
-        self.assertEqual(joint_reduce.keywords, {"group": ep_group})
+        self.assertTrue(layer.native_latent_moe.components["joint_reduce"])
+        self.assertEqual(
+            layer.native_latent_moe.components["expert_parallel_group"], ep_group
+        )
 
     def test_cross_dp_ep_gather_uses_dp_group_and_returns_local_offset(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
@@ -544,6 +545,14 @@ class KimiK3RegistrationTests(unittest.TestCase):
             )
         self.assertIsNone(decode_absorbed)
         self.assertEqual(attention.fused_qkv_a_proj_with_mqa.calls, 0)
+
+    def test_ungated_mla_does_not_select_attnres_projection_fusion(self):
+        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
+
+        attention = KimiLinearMLAAttention.__new__(KimiLinearMLAAttention)
+        torch.nn.Module.__init__(attention)
+
+        self.assertFalse(attention.can_fuse_attnres_partials(torch.empty(1, 4), ()))
 
     def test_config_registry_maps_model_type(self):
         from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY

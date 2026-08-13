@@ -768,8 +768,8 @@ def test_mla_decode_small_batch_fixed_entrypoints_use_out(
 def test_mla_decode_with_kvcache_projected_value_matches_split_and_captures(
     device: str,
 ) -> None:
-    if not platform.is_cdna4:
-        pytest.skip("K3 fused MLA epilogue requires CDNA4")
+    if not (platform.is_cdna4 or platform.is_cdna5):
+        pytest.skip("K3 fused MLA epilogue requires CDNA4 or CDNA5")
     from tokenspeed_kernel import mla_project_value
 
     torch.manual_seed(67)
@@ -784,6 +784,9 @@ def test_mla_decode_with_kvcache_projected_value_matches_split_and_captures(
     weight = torch.randn(12, 512, 128, device=device, dtype=torch.bfloat16)
     gate = torch.randn(1, 1536, device=device, dtype=torch.bfloat16)
     output = torch.empty_like(gate)
+    projected_override = (
+        "gluon_mla_decode_projected_value_gfx1250" if platform.is_cdna5 else None
+    )
     attention = mla_decode_with_kvcache(
         q=q,
         kv_cache=kv_cache,
@@ -815,6 +818,7 @@ def test_mla_decode_with_kvcache_projected_value_matches_split_and_captures(
         value_weight=weight,
         gate=gate,
         out=output,
+        override=projected_override,
     )
     eager_output = output.clone()
     graph = torch.cuda.CUDAGraph()
@@ -832,14 +836,14 @@ def test_mla_decode_with_kvcache_projected_value_matches_split_and_captures(
             value_weight=weight,
             gate=gate,
             out=output,
+            override=projected_override,
         )
     assert returned.data_ptr() == output.data_ptr()
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(output, eager_output, atol=0, rtol=0)
-    # The fused path retains opt69's 16-split schedule, while the generic
-    # native-FP8 path uses 64 splits. Validate the resulting FP8 reduction
-    # against the generic composition within its quantized numerical envelope.
+    # Split scheduling and reducer order can differ from the generic
+    # composition. Validate within the established FP8 reduction envelope.
     torch.testing.assert_close(output, expected, atol=0.125, rtol=0.05)
 
 
@@ -1072,9 +1076,11 @@ def test_mla_normalize_project_query_cuda_fallback(
     torch.testing.assert_close(returned.query, expected_output, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("heads", [12, 16])
 def test_mla_normalize_project_query_split_output(
     device: str,
     require,
+    heads: int,
 ) -> None:
     import tokenspeed_kernel.ops.attention as attention_ops
 
@@ -1085,7 +1091,6 @@ def test_mla_normalize_project_query_split_output(
         torch.bfloat16,
         "query",
     )
-    heads = 12
     query = torch.randn(1, 1536, device=device, dtype=torch.bfloat16)
     kv = torch.randn(1, 512, device=device, dtype=torch.bfloat16)
     query_weight = torch.randn(1536, device=device, dtype=torch.bfloat16)

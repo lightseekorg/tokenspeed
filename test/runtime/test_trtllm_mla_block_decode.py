@@ -42,7 +42,7 @@ def _backend(*, draft_block_decode: bool) -> TRTLLMMLABackend:
 
 def test_eager_draft_page_table_is_not_expanded_twice() -> None:
     backend = _backend(draft_block_decode=True)
-    backend.mark_cache_contract(logical_page_size=4)
+    backend.mark_cache_contract()
     kernel_page_table = torch.tensor([[6, 7, 10, 11, 14, 15]], dtype=torch.int32)
 
     backend.init_forward_metadata(

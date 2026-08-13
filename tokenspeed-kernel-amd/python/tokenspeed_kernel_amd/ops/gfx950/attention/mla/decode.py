@@ -886,10 +886,27 @@ class AttentionProgram:
         gl.amd.cdna4.async_copy.commit_group()
 
     @gluon.jit
+    def physical_token_location(
+        self, page_number, token_offset, WITHIN_2GB: gl.constexpr
+    ):
+        cfg = self.cfg
+        page_offset = token_offset % cfg.PAGE_SIZE
+        if WITHIN_2GB:
+            # Keep the buffer-load specialization in 32-bit arithmetic; its
+            # cache size guarantees the final byte offset remains below 2 GiB.
+            location = page_number * cfg.PAGE_SIZE + page_offset
+        else:
+            # Widen before multiplying so neither this row nor its later
+            # stride can wrap for a large-cache global load.
+            location = page_number.to(gl.int64) * cfg.PAGE_SIZE + page_offset.to(
+                gl.int64
+            )
+        return location
+
+    @gluon.jit
     def issue_kv_load(self, smem, ptr, offsets, mask):
-        # buffer_load (<=2 GB pools) is bounds-checked via mask; global_load
-        # (>2 GB) uses 64-bit pointers and relies on in-bounds arithmetic /
-        # the qk score mask instead.
+        # Buffer loads use 32-bit offsets. Large pools use 64-bit global loads;
+        # initialized page scratch keeps addresses for tail lanes in bounds.
         if self.cfg.WITHIN_2GB:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(smem, ptr, offsets, mask=mask)
         else:
@@ -1157,6 +1174,14 @@ def _mla_decode_gluon(
     bufs_page = gl.allocate_shared_memory(
         gl.int32, shape=[2, cfg.BLOCK_N], layout=cfg.shared_page
     )
+    if not cfg.WITHIN_2GB:
+        # Large-cache global loads are unmasked, so every page-ID lane must be
+        # valid. Initialize each ping-pong buffer once; masked page loads then
+        # retain either zero or a valid ID written by an earlier tile.
+        page_zeros = gl.zeros([cfg.BLOCK_N], dtype=gl.int32, layout=cfg.blocked_page)
+        bufs_page.index(0).store(page_zeros)
+        bufs_page.index(1).store(page_zeros)
+        gl.barrier()
 
     # prologue: global load page numbers for the first two tiles
     program.issue_page_load(bufs_page.index(0), start_n)
@@ -1185,7 +1210,9 @@ def _mla_decode_gluon(
     offs_n_pe0 = split_kv_start + gl.arange(
         0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.blocked_kpe)
     )
-    kv_loc_pe = kv_page_number_pe * cfg.PAGE_SIZE + (offs_n_pe0 % cfg.PAGE_SIZE)
+    kv_loc_pe = program.physical_token_location(
+        kv_page_number_pe, offs_n_pe0, cfg.WITHIN_2GB
+    )
 
     # local load page number for slice 0
     bufs_page_0 = bufs_page.index(0).slice(0, cfg.BLOCK_N // 2, 0)
@@ -1195,7 +1222,9 @@ def _mla_decode_gluon(
     offs_n_nope0 = split_kv_start + gl.arange(
         0, cfg.BLOCK_N // 2, layout=gl.SliceLayout(0, cfg.blocked_kv_slice)
     )
-    kv_loc0 = kv_page_number_0 * cfg.PAGE_SIZE + (offs_n_nope0 % cfg.PAGE_SIZE)
+    kv_loc0 = program.physical_token_location(
+        kv_page_number_0, offs_n_nope0, cfg.WITHIN_2GB
+    )
 
     # global load K_nope slice 0
     offs_d_ckv_10 = gl.arange(
@@ -1232,7 +1261,9 @@ def _mla_decode_gluon(
         bufs_page_1, gl.SliceLayout(0, cfg.blocked_kv_slice)
     )
     offs_n_nope1 = offs_n_nope0 + cfg.BLOCK_N // 2
-    kv_loc1 = kv_page_number_1 * cfg.PAGE_SIZE + (offs_n_nope1 % cfg.PAGE_SIZE)
+    kv_loc1 = program.physical_token_location(
+        kv_page_number_1, offs_n_nope1, cfg.WITHIN_2GB
+    )
 
     # global load K_nope slice 1
     bufs_kv1 = bufs_kv.index(0).slice(cfg.BLOCK_N // 2, cfg.BLOCK_N // 2, 1)
@@ -1264,7 +1295,9 @@ def _mla_decode_gluon(
         offs_n_nope0 = start_n + gl.arange(
             0, cfg.BLOCK_N // 2, layout=gl.SliceLayout(0, cfg.blocked_kv_slice)
         )
-        kv_loc0 = kv_page_number_0 * cfg.PAGE_SIZE + (offs_n_nope0 % cfg.PAGE_SIZE)
+        kv_loc0 = program.physical_token_location(
+            kv_page_number_0, offs_n_nope0, cfg.WITHIN_2GB
+        )
         # global load K_nope slice 0
         offs_d_ckv_10 = gl.arange(
             0, cfg.HEAD_DIM_CKV, layout=gl.SliceLayout(1, cfg.blocked_kv_slice)
@@ -1284,7 +1317,9 @@ def _mla_decode_gluon(
         offs_n_pe = start_n + gl.arange(
             0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.blocked_kpe)
         )
-        kv_loc_pe = kv_page_number_pe * cfg.PAGE_SIZE + (offs_n_pe % cfg.PAGE_SIZE)
+        kv_loc_pe = program.physical_token_location(
+            kv_page_number_pe, offs_n_pe, cfg.WITHIN_2GB
+        )
         offs_d_kpe_1 = gl.arange(
             0, cfg.HEAD_DIM_KPE, layout=gl.SliceLayout(1, cfg.blocked_kpe)
         )
@@ -1313,7 +1348,9 @@ def _mla_decode_gluon(
             bufs_page_1, gl.SliceLayout(0, cfg.blocked_kv_slice)
         )
         offs_n1 = offs_n_nope0 + cfg.BLOCK_N // 2
-        kv_loc1 = kv_page_number_1 * cfg.PAGE_SIZE + (offs_n1 % cfg.PAGE_SIZE)
+        kv_loc1 = program.physical_token_location(
+            kv_page_number_1, offs_n1, cfg.WITHIN_2GB
+        )
         offs_k_c1 = kv_loc1[None, :] * cfg.stride_kv_c_bs + offs_d_ckv_10[:, None]
         program.issue_kv_load(
             bufs_kv1,
@@ -1348,8 +1385,12 @@ def _mla_decode_gluon(
         offs_n_pe = start_n + gl.arange(
             0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.blocked_kpe)
         )
-        kv_loc = kv_page_number * cfg.PAGE_SIZE + (offs_n_nope % cfg.PAGE_SIZE)
-        kv_loc_pe = kv_page_number_pe * cfg.PAGE_SIZE + (offs_n_pe % cfg.PAGE_SIZE)
+        kv_loc = program.physical_token_location(
+            kv_page_number, offs_n_nope, cfg.WITHIN_2GB
+        )
+        kv_loc_pe = program.physical_token_location(
+            kv_page_number_pe, offs_n_pe, cfg.WITHIN_2GB
+        )
         # global load K_nope
         offs_d_ckv_1 = gl.arange(
             0, cfg.HEAD_DIM_CKV, layout=gl.SliceLayout(1, cfg.blocked_kv)
@@ -1595,17 +1636,17 @@ def _gluon_mla_decode_gfx950(
             "gluon MLA decode requires kv_lora_rank=512, qk_rope_head_dim=64, "
             f"got {kv_lora_rank}/{qk_rope_head_dim}"
         )
-    is_fp8_q = q.dtype == torch.float8_e4m3fn
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    is_fp8_q = q.dtype in fp8_dtypes
     valid_bf16_q = q.dtype == torch.bfloat16 and kv_cache.dtype in (
         torch.bfloat16,
-        torch.float8_e4m3fn,
-        torch.float8_e5m2,
+        *fp8_dtypes,
     )
-    valid_fp8_q = is_fp8_q and kv_cache.dtype == torch.float8_e4m3fn
+    valid_fp8_q = is_fp8_q and kv_cache.dtype == q.dtype
     if not (valid_bf16_q or valid_fp8_q):
         raise NotImplementedError(
             "gluon MLA decode requires bf16 q with bf16/fp8 kv_cache or "
-            "float8_e4m3fn q with float8_e4m3fn kv_cache, got "
+            "matching fp8 q and kv_cache, got "
             f"{q.dtype}/{kv_cache.dtype}"
         )
     is_fp8_kv = kv_cache.dtype != torch.bfloat16
@@ -2088,10 +2129,9 @@ def gluon_mla_decode_projected_value_gfx950(
     logit_cap: float = 0.0,
 ) -> torch.Tensor:
     """Run native FP8 MLA with a projected-value epilogue."""
-    if q.dtype != torch.float8_e4m3fn or kv_cache.dtype != torch.float8_e4m3fn:
-        raise NotImplementedError(
-            "projected-value MLA requires float8_e4m3fn q and kv_cache"
-        )
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    if q.dtype not in fp8_dtypes or kv_cache.dtype != q.dtype:
+        raise NotImplementedError("projected-value MLA requires matching fp8 q and kv")
     if (qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim) != (128, 512, 64):
         raise NotImplementedError(
             "projected-value MLA requires qk_nope/kv_lora/qk_rope dimensions "

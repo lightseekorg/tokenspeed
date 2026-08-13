@@ -15,6 +15,7 @@ if not is_cdna4():
     )
 
 
+import tokenspeed_kernel.ops.attn_res as attn_res  # noqa: E402
 from tokenspeed_kernel.ops.attn_res import attn_res_fwd  # noqa: E402
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk  # noqa: E402
 from tokenspeed_kernel.ops.moe.sigmoid_topk import _gluon_eligible  # noqa: E402
@@ -27,21 +28,24 @@ def _attn_res_reference(
     score_weight: torch.Tensor,
     output_weight: torch.Tensor,
     valid_blocks: int,
+    score_eps: float,
+    output_eps: float,
 ) -> torch.Tensor:
     values = torch.cat((history[:, :valid_blocks], layer.unsqueeze(1)), dim=1).float()
-    inverse_rms = torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-6)
+    inverse_rms = torch.rsqrt(values.square().mean(-1, keepdim=True) + score_eps)
     logits = values.mul(inverse_rms) @ (score_weight * res_weight.float())
     mixed = torch.matmul(logits.softmax(-1).unsqueeze(1), values).squeeze(1)
     mixed = mixed.to(torch.bfloat16).float()
     return (
         mixed
-        * torch.rsqrt(mixed.square().mean(-1, keepdim=True) + 1e-6)
+        * torch.rsqrt(mixed.square().mean(-1, keepdim=True) + output_eps)
         * output_weight
     ).to(torch.bfloat16)
 
 
 def test_attn_res_public_block_major_dispatch_matches_reference() -> None:
     tokens, valid_blocks = 256, 8
+    score_eps, output_eps = 1e-6, 2e-6
     generator = torch.Generator(device="cuda").manual_seed(91)
     layer = torch.randn(
         tokens, 7168, device="cuda", dtype=torch.bfloat16, generator=generator
@@ -65,8 +69,9 @@ def test_attn_res_public_block_major_dispatch_matches_reference() -> None:
         history,
         res_weight,
         score_weight,
-        eps=1e-6,
+        eps=score_eps,
         out_norm_weight=output_weight,
+        out_norm_eps=output_eps,
     )
     expected = _attn_res_reference(
         layer,
@@ -75,8 +80,49 @@ def test_attn_res_public_block_major_dispatch_matches_reference() -> None:
         score_weight,
         output_weight,
         valid_blocks,
+        score_eps,
+        output_eps,
     )
     torch.testing.assert_close(actual, expected, rtol=5e-3, atol=1.6e-2)
+
+
+def test_attn_res_large_prefill_dispatch_boundary(monkeypatch) -> None:
+    selected = []
+    real_select = attn_res.select_kernel
+
+    def capture_selection(*args, **kwargs):
+        selected.append(real_select(*args, **kwargs).name)
+        return lambda **kwargs: None
+
+    monkeypatch.setattr(attn_res, "select_kernel", capture_selection)
+    cases = (
+        (16384, 7168, True),
+        (16385, 7168, True),
+        (65536, 7168, True),
+        (65537, 7168, True),
+        (32768, 7168, False),
+        (64, 4096, True),
+    )
+    for tokens, hidden, fuse_output_norm in cases:
+        weight = torch.empty(hidden, device="meta", dtype=torch.bfloat16)
+        layer = torch.empty(tokens, hidden, device="meta", dtype=torch.bfloat16)
+        history = torch.empty(11, tokens, hidden, device="meta", dtype=torch.bfloat16)
+        attn_res.attn_res_fwd(
+            layer,
+            history,
+            weight,
+            weight,
+            out_norm_weight=weight if fuse_output_norm else None,
+        )
+
+    assert selected == [
+        "gluon_attn_res_fwd_gfx950",
+        "gluon_attn_res_fwd_gfx950",
+        "gluon_attn_res_fwd_gfx950",
+        "torch_attn_res_fwd",
+        "torch_attn_res_fwd",
+        "torch_attn_res_fwd",
+    ]
 
 
 @pytest.mark.parametrize("tokens", [1, 17, 8192])

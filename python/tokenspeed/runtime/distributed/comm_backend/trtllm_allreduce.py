@@ -140,6 +140,7 @@ class TrtllmAllReduceBackend(CommBackend):
                 "max_token_num": max_token_num,
                 "hidden_dim": hidden_dim,
                 "device_group": device_group,
+                "use_fp32_lamport": use_fp32_lamport,
             }
 
             return True
@@ -198,7 +199,14 @@ class TrtllmAllReduceBackend(CommBackend):
     # CommBackend interface
     # ------------------------------------------------------------------
 
-    def all_reduce(self, tensor: torch.Tensor, group: Group, op=None) -> torch.Tensor:
+    def all_reduce(
+        self,
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
+        group: Group,
+        op=None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        if not isinstance(tensor, torch.Tensor):
+            return super().all_reduce(tensor, group, op=op)
 
         if op is None:
             op = torch.distributed.ReduceOp.SUM
@@ -237,6 +245,15 @@ class TrtllmAllReduceBackend(CommBackend):
             return None
         if token_num == 0:
             return tensor
+        # The Lamport workspace is monomorphic in element type: it was
+        # initialized (and is re-armed after each call) with either fp16/bf16
+        # or fp32 negative-zero sentinels. A payload whose dtype width differs
+        # reads the sentinel pattern as ordinary data and spins forever waiting
+        # for completion flags that never arrive -- e.g. the DSpark Markov
+        # head's fp32 embedding all-reduce during CUDA-graph capture.
+        expected_fp32 = bool(res.get("use_fp32_lamport", False))
+        if (tensor_2d.dtype == torch.float32) != expected_fp32:
+            return None
 
         from tokenspeed_kernel.ops.communication.trtllm import (
             MNNVL_PREFER_IPC_BYTES,

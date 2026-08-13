@@ -20,6 +20,13 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _inert_publish(bs, dim, rows=3):
+    """Publish plumbing that never fires: a hole-only table."""
+    table = torch.zeros(bs, 64, dtype=torch.int32, device="cuda")
+    ckpt = torch.zeros(1, rows, dim, device="cuda")
+    return table, ckpt
+
+
 class TestInklingCacheContract(unittest.TestCase):
     def test_wrapper_consumes_history_and_checkpoint_state(self):
         from tokenspeed.runtime.layers.attention.backends.inkling import (
@@ -130,6 +137,10 @@ class TestInklingConvRingState(unittest.TestCase):
             cache_indices,
             torch.ones(self.BS, dtype=torch.bool).cuda(),
             seq_lens,
+            *_inert_publish(self.BS, self.DIM),
+            None,
+            num_extends=0,
+            page_size=128,
         )
 
         for i in range(self.BS):
@@ -169,6 +180,10 @@ class TestInklingConvRingState(unittest.TestCase):
             cache_indices,
             torch.ones(self.BS, dtype=torch.bool).cuda(),
             seq_lens,
+            *_inert_publish(self.BS, self.DIM),
+            None,
+            num_extends=0,
+            page_size=128,
         )
 
         expected = pre.clone()
@@ -208,6 +223,10 @@ class TestInklingConvRingState(unittest.TestCase):
             cache_indices,
             torch.ones(self.BS, dtype=torch.bool).cuda(),
             seq_lens,
+            *_inert_publish(self.BS, dim),
+            None,
+            num_extends=0,
+            page_size=128,
         )
 
         # Outside the channel slice (and other layers): unchanged.
@@ -221,43 +240,6 @@ class TestInklingConvRingState(unittest.TestCase):
                 self.assertTrue(
                     torch.equal(state[slot, (20 + j) % self.R], chunk[i * self.K + j])
                 )
-
-    def test_restore_into_ring_rows(self):
-        """Checkpoint restore lands the W-1 pre-boundary rows at their
-        positions' ring rows; invalid rows (hole page / PAD slot) are
-        untouched."""
-        from tokenspeed.runtime.layers.attention.backends.inkling import (
-            InklingAttnBackend,
-            InklingConvMetadata,
-            ShortConvCheckpointMetadata,
-        )
-
-        pool = self._make_pool()
-        state = pool.layer_state_wd(0)
-        pre = state.clone()
-        n = 3
-        buf = torch.randn(10, self.W - 1, self.DIM, device="cuda")
-        md = InklingConvMetadata(
-            query_start_loc=torch.tensor([0, 4, 8, 12], dtype=torch.int32).cuda(),
-            cache_indices=torch.tensor([2, 3, -1], dtype=torch.int32).cuda(),
-            has_initial_state=torch.ones(n, dtype=torch.bool).cuda(),
-            is_decode=False,
-            seq_lens=torch.tensor([132, 260, 132], dtype=torch.int32).cuda(),
-            checkpoints=ShortConvCheckpointMetadata(
-                restore_pages={"state": torch.tensor([5, 0, 7]).cuda()},
-                write_pages={},
-                write_requests=torch.zeros(n, dtype=torch.int32).cuda(),
-            ),
-        )
-
-        InklingAttnBackend.restore_shortconv_checkpoint(state, (buf,), md, "state")
-
-        expected = pre.clone()
-        # req0: boundary 132 - 4 = 128 -> positions 125..127.
-        for j, p in enumerate(range(125, 128)):
-            expected[2, p % self.R] = buf[5, j]
-        # req1: page 0 is a hole; req2: PAD slot. Both untouched.
-        self.assertTrue(torch.equal(state, expected))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
@@ -328,6 +310,10 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             cache_indices,
             torch.ones(B, dtype=torch.bool, device="cuda"),
             seq_lens,
+            *_inert_publish(B, self.DIM),
+            None,
+            num_extends=0,
+            page_size=128,
         )
 
         expected = pre.clone()
@@ -380,7 +366,11 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             cache_indices,
             torch.ones(4, dtype=torch.bool, device="cuda"),
             seq_lens,
-            publish=(table, checkpoint, None, 8),
+            table,
+            checkpoint,
+            None,
+            num_extends=0,
+            page_size=8,
         )
 
         # req0: p*=4 -> page table[0,0]=11
@@ -431,9 +421,13 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             qsl,
             seq_idx,
             cache_indices,
-            torch.zeros(1, dtype=torch.bool, device="cuda"),  # fresh: no borrow
+            torch.zeros(1, dtype=torch.bool, device="cuda"),  # fresh: no taps
             seq_lens,
-            publish=(table, checkpoint, None, page_size),
+            table,
+            checkpoint,
+            None,
+            num_extends=1,
+            page_size=page_size,
         )
 
         zeros = torch.zeros(self.W - 1, self.DIM, device="cuda")
@@ -466,7 +460,11 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             cache_indices,
             torch.ones(1, dtype=torch.bool, device="cuda"),
             seq_lens,
-            publish=(table, field_a, field_b, 8),
+            table,
+            field_a,
+            field_b,
+            num_extends=0,
+            page_size=8,
         )
 
         window = self._ref_window(torch.zeros(3, self.DIM, device="cuda"), x, 4)
@@ -502,7 +500,11 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             cache_indices,
             ones,
             seq_lens,
-            publish=(table, checkpoint, None, 8),
+            table,
+            checkpoint,
+            None,
+            num_extends=0,
+            page_size=8,
         )
         self.assertTrue(
             torch.equal(
@@ -525,7 +527,11 @@ class TestSconvUnifiedKernel(unittest.TestCase):
             cache_indices,
             ones,
             seq_lens,
-            publish=(table, checkpoint, None, 8),
+            table,
+            checkpoint,
+            None,
+            num_extends=0,
+            page_size=8,
         )
         expect = torch.stack([pre[1, 5 % self.R], x1[0], x2[0]])
         self.assertTrue(torch.equal(checkpoint[11], expect))
@@ -553,7 +559,11 @@ class TestSconvUnifiedKernel(unittest.TestCase):
                 cache_indices,
                 ones,
                 seq_lens,
-                publish=(table, checkpoint, None, 8),
+                table,
+                checkpoint,
+                None,
+                num_extends=0,
+                page_size=8,
             )
 
         run()  # warmup compiles outside capture
@@ -603,108 +613,88 @@ class TestCheckpointMetadata(unittest.TestCase):
     W = 4
     DIM = 8
 
-    def test_checkpoint_metadata_keeps_only_chunk_endpoint(self):
+    def test_draft_lookback_window_keeps_paged_checkpoints(self):
+        """enter_draft_lookback_window must carry the paged bridges into the
+        widened metadata: the in-kernel publish resolves pages from
+        col_page_table by position, so dropping it (the old refusal path)
+        would silently disable draft publication on every decode round."""
         from types import SimpleNamespace
 
         from tokenspeed.runtime.layers.attention.backends.inkling import (
             InklingAttnBackend,
+            InklingConvMetadata,
         )
 
+        k, lookback, bs = 4, 2, 1
         backend = InklingAttnBackend.__new__(InklingAttnBackend)
         backend.conv_pool = SimpleNamespace(kernel_size=self.W)
         backend.conv_columns = {
-            "block_tokens": 4,
-            "group_block_tokens": {"state": 4},
+            "block_tokens": 128,
+            "group_block_tokens": {"state": 128},
         }
-        metadata = backend._new_checkpoint_metadata(
-            size=2,
-            groups=("state",),
-            device=torch.device("cuda"),
-            include_prefill_rows=True,
-        )
-        pointers = tuple(
-            tensor.data_ptr()
-            for tensor in (
-                metadata.restore_pages["state"],
-                metadata.write_pages["state"],
-                metadata.packed_rows,
-            )
-        )
-        table = torch.tensor([[11, 12, 13], [21, 22, 23]], device="cuda")
-        backend._fill_checkpoint_metadata(
-            metadata,
-            before=torch.tensor([0, 7], device="cuda"),
-            after=torch.tensor([8, 8], device="cuda"),
-            query_start_loc=torch.tensor([0, 8, 9], device="cuda"),
-            col_page_table={"state": table},
-            write_endpoint=True,
+        backend.conv_is_draft = True
+        backend.conv_spec_num_tokens = k
+        backend._draft_lookback = lookback
+        backend.inner = SimpleNamespace()
+        table = torch.tensor([[11, 12, 13]], dtype=torch.int32, device="cuda")
+        seq_lens = torch.tensor([132], dtype=torch.int32, device="cuda")
+        qsl = torch.arange(0, bs * k + 1, k, dtype=torch.int32, device="cuda")
+        backend.conv_metadata = InklingConvMetadata(
+            query_start_loc=qsl,
+            cache_indices=torch.tensor([2], dtype=torch.int32, device="cuda"),
+            has_initial_state=torch.ones(bs, dtype=torch.bool, device="cuda"),
+            is_decode=False,
+            seq_idx=torch.zeros(bs * k, dtype=torch.int32, device="cuda"),
+            seq_lens=seq_lens,
+            col_page_table={"state": table[:bs]},
         )
 
-        self.assertEqual(metadata.restore_pages["state"].tolist(), [0, 0])
-        # Request 0 crosses two boundaries, but only its published endpoint is
-        # materialized. Request 1 borrows two rows from its prior window.
-        self.assertEqual(metadata.write_pages["state"].tolist(), [12, 22])
-        self.assertEqual(
-            metadata.packed_row_mask.tolist(), [[True] * 3, [False, False, True]]
-        )
-        self.assertEqual(metadata.packed_rows.tolist(), [[5, 6, 7], [6, 7, 8]])
-        self.assertEqual(metadata.prior_state_rows.tolist(), [[2, 2, 2], [1, 2, 2]])
-        self.assertEqual(
-            pointers,
-            tuple(
-                tensor.data_ptr()
-                for tensor in (
-                    metadata.restore_pages["state"],
-                    metadata.write_pages["state"],
-                    metadata.packed_rows,
-                )
-            ),
-        )
+        self.assertTrue(backend.enter_draft_lookback_window(bs))
 
-    def test_fill_restore_false_leaves_restore_pages_untouched(self):
+        md = backend.conv_metadata
+        self.assertEqual(
+            md.query_start_loc.tolist(), [0, k + lookback], "widened chunk"
+        )
+        self.assertIsNotNone(md.col_page_table)
+        self.assertTrue(torch.equal(md.col_page_table["state"], table[:bs]))
+        # Same through-chunk end: the boundary the accept landed on (128)
+        # is inside the widened chunk (132 - 6, 132], so the kernel's
+        # positional publish re-covers it with committed rows.
+        self.assertEqual(md.seq_lens.tolist(), [132])
+
+    def test_advance_draft_metadata_keeps_paged_checkpoints(self):
+        """The classic per-step rebuild (catch-up -> T=1 decode metadata)
+        must also carry the paged bridges, or single-token draft steps
+        landing on a boundary silently skip their publish."""
         from types import SimpleNamespace
 
         from tokenspeed.runtime.layers.attention.backends.inkling import (
             InklingAttnBackend,
+            InklingConvMetadata,
         )
 
+        k, bs = 4, 2
         backend = InklingAttnBackend.__new__(InklingAttnBackend)
-        backend.conv_pool = SimpleNamespace(kernel_size=self.W)
-        backend.conv_columns = {
-            "block_tokens": 4,
-            "group_block_tokens": {"state": 4},
-        }
-        metadata = backend._new_checkpoint_metadata(
-            size=2,
-            groups=("state",),
-            device=torch.device("cuda"),
-            include_prefill_rows=False,
-        )
-        metadata.restore_pages["state"].fill_(-9)
-        table = torch.tensor([[11, 12, 13], [21, 22, 23]], device="cuda")
-        # before rows are aligned boundaries with real pages, so a restore
-        # fill would resolve them — fill_restore=False must not touch them.
-        backend._fill_checkpoint_metadata(
-            metadata,
-            before=torch.tensor([4, 8], device="cuda"),
-            after=torch.tensor([8, 12], device="cuda"),
-            query_start_loc=None,
+        backend.inner = SimpleNamespace()
+        backend._graph_has_initial_state = None
+        backend._decode_qsl = None
+        table = torch.tensor([[11, 12], [21, 22]], dtype=torch.int32, device="cuda")
+        qsl = torch.arange(0, bs * k + 1, k, dtype=torch.int32, device="cuda")
+        backend.conv_metadata = InklingConvMetadata(
+            query_start_loc=qsl,
+            cache_indices=torch.tensor([2, 3], dtype=torch.int32, device="cuda"),
+            has_initial_state=torch.ones(bs, dtype=torch.bool, device="cuda"),
+            is_decode=False,
+            seq_idx=torch.zeros(bs * k, dtype=torch.int32, device="cuda"),
+            seq_lens=torch.tensor([200, 260], dtype=torch.int32, device="cuda"),
             col_page_table={"state": table},
-            write_endpoint=True,
-            fill_restore=False,
         )
-        self.assertEqual(metadata.restore_pages["state"].tolist(), [-9, -9])
-        self.assertEqual(metadata.write_pages["state"].tolist(), [12, 23])
 
-        backend._fill_checkpoint_metadata(
-            metadata,
-            before=torch.tensor([4, 8], device="cuda"),
-            after=torch.tensor([8, 12], device="cuda"),
-            query_start_loc=None,
-            col_page_table={"state": table},
-            write_endpoint=True,
-        )
-        self.assertEqual(metadata.restore_pages["state"].tolist(), [11, 22])
+        backend.advance_draft_forward_metadata()
+
+        md = backend.conv_metadata
+        self.assertTrue(md.is_decode)
+        self.assertTrue(torch.equal(md.col_page_table["state"], table))
 
 
 if __name__ == "__main__":

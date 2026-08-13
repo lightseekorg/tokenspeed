@@ -31,6 +31,7 @@ __all__ = [
 ]
 
 _REGISTERED_TOPK_WIDTHS = (512, 1024, 2048)
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 @gluon.constexpr_function
@@ -146,73 +147,87 @@ def _dsa_dense_mfma_kv_kernel(
     TILE_K: gl.constexpr,
     D_V: gl.constexpr,
     D_ROPE: gl.constexpr,
+    IS_FP8: gl.constexpr,
+    TRIM_EMPTY_TILES: gl.constexpr,
 ):
+    INSTR_K: gl.constexpr = 32 if IS_FP8 else 16
+    QK_K_WIDTH: gl.constexpr = 16 if IS_FP8 else 8
+    PV_K_WIDTH: gl.constexpr = 8 if IS_FP8 else 4
+    INPUT_VEC: gl.constexpr = 16 if IS_FP8 else 8
+    ROPE_LOAD_VEC: gl.constexpr = 4 if IS_FP8 else 2
+    SHARED_INTERVAL: gl.constexpr = 1024 if IS_FP8 else 512
+    SHARED_PADDING: gl.constexpr = 32 if IS_FP8 else 16
     mfma_s: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16, 16],
+        instr_shape=[16, 16, INSTR_K],
         transposed=True,
         warps_per_cta=[4, 1],
     )
     mfma_acc: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16, 16],
+        instr_shape=[16, 16, INSTR_K],
         transposed=True,
         warps_per_cta=[4, 1],
     )
 
-    _qlora_tpw_k: gl.constexpr = min(64, D_V // 8)
+    _qlora_tpw_k: gl.constexpr = min(64, D_V // INPUT_VEC)
     _qlora_tpw_m: gl.constexpr = 64 // _qlora_tpw_k
     blk_qlora: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
+        size_per_thread=[1, INPUT_VEC],
         threads_per_warp=[_qlora_tpw_m, _qlora_tpw_k],
         warps_per_cta=[4, 1],
         order=[1, 0],
     )
-    blk_qrope: gl.constexpr = gl.BlockedLayout(
+    _out_tpw_k: gl.constexpr = min(64, D_V // 8)
+    _out_tpw_m: gl.constexpr = 64 // _out_tpw_k
+    blk_out: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
-        threads_per_warp=[8, 8],
+        threads_per_warp=[_out_tpw_m, _out_tpw_k],
         warps_per_cta=[4, 1],
         order=[1, 0],
     )
-    _klora_tpw_m: gl.constexpr = min(64, D_V // 8)
+    _qrope_tpw_k: gl.constexpr = min(64, D_ROPE // INPUT_VEC)
+    _qrope_tpw_m: gl.constexpr = 64 // _qrope_tpw_k
+    blk_qrope: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, INPUT_VEC],
+        threads_per_warp=[_qrope_tpw_m, _qrope_tpw_k],
+        warps_per_cta=[4, 1],
+        order=[1, 0],
+    )
+    _klora_tpw_m: gl.constexpr = min(64, D_V // INPUT_VEC)
     _klora_tpw_n: gl.constexpr = 64 // _klora_tpw_m
     blk_klora: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[8, 1],
+        size_per_thread=[INPUT_VEC, 1],
         threads_per_warp=[_klora_tpw_m, _klora_tpw_n],
         warps_per_cta=[1, 4],
         order=[0, 1],
     )
+    _krope_tpw_m: gl.constexpr = min(64, D_ROPE // ROPE_LOAD_VEC)
+    _krope_tpw_n: gl.constexpr = 64 // _krope_tpw_m
     blk_krope: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[2, 1],
-        threads_per_warp=[32, 2],
+        size_per_thread=[ROPE_LOAD_VEC, 1],
+        threads_per_warp=[_krope_tpw_m, _krope_tpw_n],
         warps_per_cta=[1, 4],
         order=[0, 1],
     )
-    blk_topk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1],
-        threads_per_warp=[64],
-        warps_per_cta=[4],
-        order=[0],
-    )
-
     sh_qlora: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[512, 16]],
+        [[SHARED_INTERVAL, SHARED_PADDING]],
         [BLOCK_H, D_V],
         [1, 0],
     )
     sh_qrope: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=8,
+        vec=INPUT_VEC,
         per_phase=2,
         max_phase=8,
         order=[1, 0],
     )
     sh_klora: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[512, 16]],
+        [[SHARED_INTERVAL, SHARED_PADDING]],
         [D_V, TILE_K],
         [0, 1],
     )
     sh_krope: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=8,
+        vec=INPUT_VEC,
         per_phase=2,
         max_phase=8,
         order=[0, 1],
@@ -221,32 +236,32 @@ def _dsa_dense_mfma_kv_kernel(
     dot_qlora_a: gl.constexpr = gl.DotOperandLayout(
         operand_index=0,
         parent=mfma_s,
-        k_width=8,
+        k_width=QK_K_WIDTH,
     )
     dot_qrope_a: gl.constexpr = gl.DotOperandLayout(
         operand_index=0,
         parent=mfma_s,
-        k_width=8,
+        k_width=QK_K_WIDTH,
     )
     dot_klora_b: gl.constexpr = gl.DotOperandLayout(
         operand_index=1,
         parent=mfma_s,
-        k_width=8,
+        k_width=QK_K_WIDTH,
     )
     dot_krope_b: gl.constexpr = gl.DotOperandLayout(
         operand_index=1,
         parent=mfma_s,
-        k_width=8,
+        k_width=QK_K_WIDTH,
     )
     dot_p_a: gl.constexpr = gl.DotOperandLayout(
         operand_index=0,
         parent=mfma_acc,
-        k_width=4,
+        k_width=PV_K_WIDTH,
     )
     dot_v_b: gl.constexpr = gl.DotOperandLayout(
         operand_index=1,
         parent=mfma_acc,
-        k_width=4,
+        k_width=PV_K_WIDTH,
     )
 
     token_idx = gl.program_id(axis=0)
@@ -306,6 +321,13 @@ def _dsa_dense_mfma_kv_kernel(
     gl.amd.cdna4.async_copy.commit_group()
 
     NUM_TILES: gl.constexpr = (TOPK + TILE_K - 1) // TILE_K
+    if TRIM_EMPTY_TILES:
+        num_tiles = gl.maximum(
+            gl.cdiv(gl.minimum(gl.maximum(valid_len, 0), TOPK), TILE_K),
+            1,
+        )
+    else:
+        num_tiles: gl.constexpr = NUM_TILES
     topk_base = token_idx.to(tl.int64) * stride_topk_t
 
     offs_tile_klora = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, blk_klora))
@@ -390,7 +412,7 @@ def _dsa_dense_mfma_kv_kernel(
     acc = gl.zeros([BLOCK_H, D_V], dtype=gl.float32, layout=mfma_acc)
 
     cur_buf = 0
-    for tile_idx in range(NUM_TILES - 1):
+    for tile_idx in range(num_tiles - 1):
         next_base = (tile_idx + 1) * TILE_K
         next_offs_klora = next_base + offs_tile_klora
         next_offs_krope = next_base + offs_tile_krope
@@ -517,8 +539,8 @@ def _dsa_dense_mfma_kv_kernel(
     acc = acc / safe_l_i[:, None]
     acc = gl.where(l_i_acc[:, None] > 0.0, acc, 0.0)
 
-    offs_h_o = hg_offset + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blk_qlora))
-    offs_v_o = gl.arange(0, D_V, layout=gl.SliceLayout(0, blk_qlora))
+    offs_h_o = hg_offset + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blk_out))
+    offs_v_o = gl.arange(0, D_V, layout=gl.SliceLayout(0, blk_out))
     mask_h_o = offs_h_o < num_heads
     o_base = token_idx.to(tl.int64) * stride_o_t
     o_offs = (
@@ -526,7 +548,7 @@ def _dsa_dense_mfma_kv_kernel(
         + offs_h_o[:, None].to(tl.int64) * stride_o_h
         + offs_v_o[None, :].to(tl.int64)
     )
-    out_vals = gl.convert_layout(acc.to(out.dtype.element_ty), blk_qlora)
+    out_vals = gl.convert_layout(acc.to(out.dtype.element_ty), blk_out)
     gl.amd.cdna4.buffer_store(
         stored_value=out_vals,
         ptr=out,
@@ -774,7 +796,7 @@ def _check_inputs(
     qk_rope_head_dim: int,
     page_size: int,
 ) -> None:
-    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+    if q.dtype != torch.bfloat16 and q.dtype not in _FP8_DTYPES:
         raise TypeError(f"Gluon DSA supports BF16/FP8 q, got {q.dtype}")
     if page_size != 64:
         raise ValueError(f"Gluon DSA supports page_size=64, got {page_size}")
@@ -806,7 +828,7 @@ def _check_inputs(
 
 
 def _output_dtype(q: torch.Tensor) -> torch.dtype:
-    return torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
+    return torch.bfloat16 if q.dtype in _FP8_DTYPES else q.dtype
 
 
 def _trim_topk_slots_for_context(
@@ -834,13 +856,17 @@ def _run_dense_kv(
     softmax_scale: float,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    max_seqlen_k: int,
 ) -> torch.Tensor:
     out = torch.empty(
         (q.shape[0], q.shape[1], kv_lora_rank),
         dtype=_output_dtype(q),
         device=q.device,
     )
-    grid = lambda meta: (q.shape[0], triton.cdiv(q.shape[1], meta["BLOCK_H"]))
+
+    def grid(meta):
+        return q.shape[0], triton.cdiv(q.shape[1], meta["BLOCK_H"])
+
     _dsa_dense_mfma_kv_kernel[grid](
         q,
         kv_cache,
@@ -858,6 +884,8 @@ def _run_dense_kv(
         topk_slots.shape[1],
         D_V=kv_lora_rank,
         D_ROPE=qk_rope_head_dim,
+        IS_FP8=q.dtype in _FP8_DTYPES,
+        TRIM_EMPTY_TILES=int(max_seqlen_k) < int(topk_slots.shape[1]),
         BLOCK_H=16,
         TILE_K=32,
         num_warps=4,
@@ -969,8 +997,9 @@ def _run_dsa(
     topk_lens = topk_lens.contiguous()
     topk_slots = _trim_topk_slots_for_context(topk_slots, max_seqlen_k)
     softmax_scale = float(softmax_scale) * float(k_scale)
-    # The AITER-style tiled kernel maps to dense BF16 KV. TokenSpeed's packed
-    # sparse FP8 rows use a different physical layout and stay on the scalar path.
+    # The tiled kernel maps to dense BF16 or FP8 KV. TokenSpeed's packed sparse
+    # FP8 rows use a different physical layout, so they use the packed sparse
+    # implementation instead of the dense tiled implementation.
     if sparse_kv_cache is not None:
         result = _run_packed_kv(
             q,
@@ -983,11 +1012,12 @@ def _run_dsa(
         )
     elif kv_cache is not None:
         dense_kv = _flatten_dense_kv_cache(kv_cache).contiguous()
-        if (
-            q.dtype == torch.bfloat16
-            and dense_kv.dtype == torch.bfloat16
+        use_tiled_kernel = (
+            q.dtype == dense_kv.dtype
+            and (q.dtype == torch.bfloat16 or q.dtype in _FP8_DTYPES)
             and int(kv_lora_rank) == 512
-        ):
+        )
+        if use_tiled_kernel:
             result = _run_dense_kv(
                 q,
                 dense_kv,
@@ -996,6 +1026,7 @@ def _run_dsa(
                 softmax_scale=softmax_scale,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
+                max_seqlen_k=max_seqlen_k,
             )
         else:
             result = _run_dense_kv_scalar(

@@ -33,15 +33,13 @@ if not is_cdna4():
     )
 
 
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import decode_kernels  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_kernels import (  # noqa: E402
-    gluon_topk_route_supported,
-    invoke_sigmoid_bias_topk_route_gluon,
-)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import routing  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
     _biased_grouped_topk_reference,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (  # noqa: E402
+    gluon_topk_route_supported,
+    invoke_sigmoid_bias_topk_route_gluon,
     invoke_sigmoid_bias_topk_route_prefill_gluon,
 )
 
@@ -119,7 +117,7 @@ def test_sigmoid_bias_topk_route_gluon_fuses_sigmoid(
         assert topk == 2
         return sentinel_ids, sentinel_weights
 
-    monkeypatch.setattr(decode_kernels, "_launch_sigmoid_bias_topk_route_gluon", launch)
+    monkeypatch.setattr(routing, "_launch_sigmoid_bias_topk_route_gluon", launch)
     actual_ids, actual_weights = invoke_sigmoid_bias_topk_route_gluon(
         logits, correction_bias, 2
     )

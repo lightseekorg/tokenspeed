@@ -53,6 +53,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     make_config,
     pool_to_paged_cache_groups,
     pop_common_cache_event_payloads,
+    resolve_dspark_prefix_replay_tokens,
     scheduler_cache_geometry_from_pool,
     should_use_overlap_schedule,
 )
@@ -205,6 +206,15 @@ class EventLoop:
             )
         else:
             draft_model_config = None
+
+        prefix_replay_tokens = resolve_dspark_prefix_replay_tokens(
+            speculative_algorithm=server_args.speculative_algorithm,
+            enable_prefix_caching=server_args.enable_prefix_caching,
+            enable_kvstore=server_args.enable_kvstore,
+            disaggregation_mode=server_args.disaggregation_mode,
+            draft_model_path_use_base=server_args.draft_model_path_use_base,
+            draft_model_config=draft_model_config,
+        )
 
         min_per_gpu_mem = self._init_distributed()
 
@@ -377,8 +387,6 @@ class EventLoop:
                 unsupported.append("mixed prefill/decode batches")
             if server_args.speculative_algorithm is not None:
                 unsupported.append("speculative/MTP decoding")
-            if server_args.enable_mla_l1_5_cache:
-                unsupported.append("MLA L1.5 cache transfer")
             if server_args.disaggregation_layerwise_interval > 0:
                 unsupported.append("layerwise cache transfer")
             if server_args.enable_memory_saver:
@@ -415,6 +423,7 @@ class EventLoop:
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=self.overlap_schedule_depth,
             disable_prefix_cache=not server_args.enable_prefix_caching,
+            prefix_replay_tokens=prefix_replay_tokens,
             paged_cache_groups=paged_cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         )
@@ -424,7 +433,8 @@ class EventLoop:
             "max_scheduled_tokens=%s decode_input_tokens=%s "
             "overlap_schedule_depth=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
-            "disable_prefix_cache=%s paged_cache_groups=%s",
+            "disable_prefix_cache=%s prefix_replay_tokens=%s "
+            "paged_cache_groups=%s",
             scheduler_cfg.block_size,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
@@ -435,6 +445,7 @@ class EventLoop:
             server_args.max_num_seqs,
             self.dp_size,
             scheduler_cfg.disable_prefix_cache,
+            scheduler_cfg.prefix_replay_tokens,
             [group.group_id for group in paged_cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
@@ -560,7 +571,6 @@ class EventLoop:
                 is_mla_backend=False,
                 draft_is_mla_backend=False,
                 enable_metrics=False,
-                enable_mla_l1_5_cache=server_args.enable_mla_l1_5_cache,
                 served_model_name=server_args.served_model_name,
                 app_key=server_args.app_key,
                 metrics_reporters=server_args.metrics_reporters,
@@ -1067,13 +1077,12 @@ class EventLoop:
         input/output sockets."""
         from tokenspeed.runtime.engine import zmq_msgpack, zmq_wire
 
-        if self.dp_size > 1:
-            # Shared choke point for every launch path: all DP-rank engines
-            # would connect to SMG's ROUTER with the same zmq_engine_index
-            # identity, so their inputs and outputs would collide.
-            raise NotImplementedError(
-                "--zmq-msgpack does not support data-parallel size > 1 yet"
-            )
+        # Each DP rank dials SMG with its own engine identity
+        # (zmq_engine_index + dp_rank): the frontend's grouped worker awaits
+        # dp_size engines on one socket set and tells the ranks apart — and
+        # routes inputs back — by this index. The ready response carries the
+        # true dp rank/size alongside.
+        engine_index = self.server_args.zmq_engine_index + self.dp_rank
         geometry = self._scheduler_cache_geometry
         ready_response = zmq_wire.WireEngineCoreReadyResponse(
             max_model_len=self.model_config.context_len,
@@ -1096,7 +1105,7 @@ class EventLoop:
         return zmq_msgpack.connect_msgpack_engine(
             context,
             self.server_args.zmq_handshake_endpoint(),
-            self.server_args.zmq_engine_index,
+            engine_index,
             ready_response,
             self.model_config.vocab_size,
             enable_output_logprobs=self.server_args.enable_output_logprobs,

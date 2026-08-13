@@ -81,7 +81,14 @@ class NcclBackend(CommBackend):
 
     # ---- Public CommBackend interface ----
 
-    def all_reduce(self, tensor: torch.Tensor, group: Group, op=None) -> torch.Tensor:
+    def all_reduce(
+        self,
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
+        group: Group,
+        op=None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        if not isinstance(tensor, torch.Tensor):
+            return super().all_reduce(tensor, group, op=op)
         res = self._get_or_create_resources(group)
         if res["world_size"] == 1:
             return tensor

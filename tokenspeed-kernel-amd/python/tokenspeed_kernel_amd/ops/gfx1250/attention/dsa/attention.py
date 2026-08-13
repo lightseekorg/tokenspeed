@@ -21,9 +21,9 @@
 """GFX1250 Gluon kernels for DSA sparse attention.
 
 The kernels consume padded global KV slots (``topk_slots`` and
-``topk_lens``) and support dense BF16/FP8 or packed FP8 KV cache rows.
-Packed rows contain FP8 latent values, one FP32 scale per 128 latent
-elements, and BF16 RoPE values.
+``topk_lens``) and support dense BF16/E4M3/E5M2 or packed E4M3 KV cache
+rows. Dense FP8 rows use native Wave32 WMMA, while packed rows contain E4M3
+latent values, one FP32 scale per 128 latent elements, and BF16 RoPE values.
 
 The Wave32 WMMA and TDM gather design is adapted from ROCm/AITER commit
 00b271b.
@@ -41,6 +41,7 @@ __all__ = [
 ]
 
 _REGISTERED_TOPK_WIDTHS = (512, 1024, 2048)
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 @gluon.jit
@@ -66,41 +67,51 @@ def _dsa_selected_dense_wmma_kernel(
     SOFTMAX_SCALE: gl.constexpr,
     BLOCK_H: gl.constexpr,
     BLOCK_K: gl.constexpr,
+    IS_FP8: gl.constexpr,
 ):
     """Wave32 WMMA attention with a two-stage selected-row TDM pipeline."""
 
     WARP_SIZE: gl.constexpr = 32
     NUM_WARPS: gl.constexpr = gl.num_warps()
-    K_WIDTH: gl.constexpr = 8
+    K_WIDTH: gl.constexpr = 16 if IS_FP8 else 8
+    INSTR_K: gl.constexpr = 64 if IS_FP8 else 32
     qk_layout: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
         warp_bases=[[1, 0], [2, 0]],
         reg_bases=[],
-        instr_shape=[16, 16, 32],
+        instr_shape=[16, 16, INSTR_K],
     )
     pv_layout: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
         warp_bases=[[0, 1], [0, 2]],
         reg_bases=[],
-        instr_shape=[16, 16, 32],
+        instr_shape=[16, 16, INSTR_K],
     )
     q_dot_layout: gl.constexpr = gl.DotOperandLayout(0, qk_layout, K_WIDTH)
     k_dot_layout: gl.constexpr = gl.DotOperandLayout(1, qk_layout, K_WIDTH)
-    p_dot_layout: gl.constexpr = gl.DotOperandLayout(0, pv_layout, K_WIDTH)
-    v_dot_layout: gl.constexpr = gl.DotOperandLayout(1, pv_layout, K_WIDTH)
+    p_dot_layout: gl.constexpr = gl.DotOperandLayout(0, pv_layout, 8)
+    v_dot_layout: gl.constexpr = gl.DotOperandLayout(1, pv_layout, 8)
+    lora_threads: gl.constexpr = min(max(KV_LORA_RANK // K_WIDTH, 1), WARP_SIZE)
     q_lora_load_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 8], [1, WARP_SIZE], [NUM_WARPS, 1], [1, 0]
+        [1, K_WIDTH],
+        [WARP_SIZE // lora_threads, lora_threads],
+        [NUM_WARPS, 1],
+        [1, 0],
     )
+    rope_threads: gl.constexpr = min(max(QK_ROPE_HEAD_DIM // K_WIDTH, 1), WARP_SIZE)
     q_rope_load_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 8], [4, 8], [NUM_WARPS, 1], [1, 0]
+        [1, K_WIDTH],
+        [WARP_SIZE // rope_threads, rope_threads],
+        [NUM_WARPS, 1],
+        [1, 0],
     )
     kv_lora_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[KV_LORA_RANK, 8]], [BLOCK_K, KV_LORA_RANK], [1, 0]
+        [[KV_LORA_RANK, K_WIDTH]], [BLOCK_K, KV_LORA_RANK], [1, 0]
     )
     k_rope_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[QK_ROPE_HEAD_DIM, 8]], [BLOCK_K, QK_ROPE_HEAD_DIM], [1, 0]
+        [[QK_ROPE_HEAD_DIM, K_WIDTH]], [BLOCK_K, QK_ROPE_HEAD_DIM], [1, 0]
     )
     slot_layout: gl.constexpr = gl.BlockedLayout(
         [BLOCK_K], [WARP_SIZE], [NUM_WARPS], [0]
@@ -148,12 +159,13 @@ def _dsa_selected_dense_wmma_kernel(
     )
     q_lora_dot = gl.convert_layout(q_lora_val, q_dot_layout)
     q_rope_dot = gl.convert_layout(q_rope_val, q_dot_layout)
-    q_lora_dot = (q_lora_dot.to(gl.float32) * (SOFTMAX_SCALE * _INV_LN2)).to(
-        gl.bfloat16
-    )
-    q_rope_dot = (q_rope_dot.to(gl.float32) * (SOFTMAX_SCALE * _INV_LN2)).to(
-        gl.bfloat16
-    )
+    if not IS_FP8:
+        q_lora_dot = (q_lora_dot.to(gl.float32) * (SOFTMAX_SCALE * _INV_LN2)).to(
+            gl.bfloat16
+        )
+        q_rope_dot = (q_rope_dot.to(gl.float32) * (SOFTMAX_SCALE * _INV_LN2)).to(
+            gl.bfloat16
+        )
 
     lora_buffers = gl.allocate_shared_memory(
         kv_lora.dtype.element_ty,
@@ -238,14 +250,17 @@ def _dsa_selected_dense_wmma_kernel(
 
             k_lora = lora_buffers.index(buffer_index).permute([1, 0]).load(k_dot_layout)
             k_rope = rope_buffers.index(buffer_index).permute([1, 0]).load(k_dot_layout)
-            k_lora = k_lora.to(gl.bfloat16)
-            k_rope = k_rope.to(gl.bfloat16)
+            if not IS_FP8:
+                k_lora = k_lora.to(gl.bfloat16)
+                k_rope = k_rope.to(gl.bfloat16)
             scores = gl.amd.gfx1250.wmma(
                 q_lora_dot,
                 k_lora,
                 gl.zeros([BLOCK_H, BLOCK_K], gl.float32, layout=qk_layout),
             )
             scores = gl.amd.gfx1250.wmma(q_rope_dot, k_rope, scores)
+            if IS_FP8:
+                scores *= SOFTMAX_SCALE * _INV_LN2
             valid_col = gl.convert_layout(cur_valid, valid_col_layout)
             scores = gl.where(valid_col[None, :], scores, -float("inf"))
             m_new = gl.maximum(m_i, gl.max(scores, axis=1))
@@ -254,8 +269,18 @@ def _dsa_selected_dense_wmma_kernel(
             probs = gl.where(valid_col[None, :], probs, 0.0)
             l_i = l_i * alpha + gl.sum(probs, axis=1)
             acc = acc * gl.convert_layout(alpha[:, None], pv_layout)
-            p_dot = gl.convert_layout(probs.to(gl.bfloat16), p_dot_layout)
-            v_lora = lora_buffers.index(buffer_index).load(v_dot_layout).to(gl.bfloat16)
+            if IS_FP8:
+                probs = probs.to(
+                    kv_lora.dtype.element_ty,
+                    fp_downcast_rounding="rtne",
+                )
+                v_lora = lora_buffers.index(buffer_index).load(v_dot_layout)
+            else:
+                probs = probs.to(gl.bfloat16)
+                v_lora = (
+                    lora_buffers.index(buffer_index).load(v_dot_layout).to(gl.bfloat16)
+                )
+            p_dot = gl.convert_layout(probs, p_dot_layout)
             acc = gl.amd.gfx1250.wmma(p_dot, v_lora, acc)
             m_i = m_new
             cur_valid = next_valid
@@ -265,14 +290,17 @@ def _dsa_selected_dense_wmma_kernel(
         final_valid = ((num_tiles - 1) * BLOCK_K + slot_offsets < valid_len) & cur_valid
         k_lora = lora_buffers.index(buffer_index).permute([1, 0]).load(k_dot_layout)
         k_rope = rope_buffers.index(buffer_index).permute([1, 0]).load(k_dot_layout)
-        k_lora = k_lora.to(gl.bfloat16)
-        k_rope = k_rope.to(gl.bfloat16)
+        if not IS_FP8:
+            k_lora = k_lora.to(gl.bfloat16)
+            k_rope = k_rope.to(gl.bfloat16)
         scores = gl.amd.gfx1250.wmma(
             q_lora_dot,
             k_lora,
             gl.zeros([BLOCK_H, BLOCK_K], gl.float32, layout=qk_layout),
         )
         scores = gl.amd.gfx1250.wmma(q_rope_dot, k_rope, scores)
+        if IS_FP8:
+            scores *= SOFTMAX_SCALE * _INV_LN2
         valid_col = gl.convert_layout(final_valid, valid_col_layout)
         scores = gl.where(valid_col[None, :], scores, -float("inf"))
         m_new = gl.maximum(m_i, gl.max(scores, axis=1))
@@ -281,8 +309,16 @@ def _dsa_selected_dense_wmma_kernel(
         probs = gl.where(valid_col[None, :], probs, 0.0)
         l_i = l_i * alpha + gl.sum(probs, axis=1)
         acc = acc * gl.convert_layout(alpha[:, None], pv_layout)
-        p_dot = gl.convert_layout(probs.to(gl.bfloat16), p_dot_layout)
-        v_lora = lora_buffers.index(buffer_index).load(v_dot_layout).to(gl.bfloat16)
+        if IS_FP8:
+            probs = probs.to(
+                kv_lora.dtype.element_ty,
+                fp_downcast_rounding="rtne",
+            )
+            v_lora = lora_buffers.index(buffer_index).load(v_dot_layout)
+        else:
+            probs = probs.to(gl.bfloat16)
+            v_lora = lora_buffers.index(buffer_index).load(v_dot_layout).to(gl.bfloat16)
+        p_dot = gl.convert_layout(probs, p_dot_layout)
         acc = gl.amd.gfx1250.wmma(p_dot, v_lora, acc)
 
     denom = gl.convert_layout(l_i, gl.SliceLayout(1, pv_layout))
@@ -822,7 +858,7 @@ def _check_inputs(
     qk_rope_head_dim: int,
     page_size: int,
 ) -> None:
-    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+    if q.dtype != torch.bfloat16 and q.dtype not in _FP8_DTYPES:
         raise TypeError(f"Gluon DSA supports BF16/FP8 q, got {q.dtype}")
     if page_size != 64:
         raise ValueError(f"Gluon DSA supports page_size=64, got {page_size}")
@@ -863,7 +899,7 @@ def _trim_topk_slots(topk_slots: torch.Tensor, max_seqlen_k: int) -> torch.Tenso
 
 
 def _allocate_output(q: torch.Tensor, kv_lora_rank: int) -> torch.Tensor:
-    dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
+    dtype = torch.bfloat16 if q.dtype in _FP8_DTYPES else q.dtype
     return torch.empty(
         (q.shape[0], q.shape[1], kv_lora_rank), dtype=dtype, device=q.device
     )
@@ -883,9 +919,8 @@ def _run_dense(
     dense = _flatten_dense_cache(kv_cache)
     expected_dim = kv_lora_rank + qk_rope_head_dim
     if (
-        dense.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
-        or dense.shape[1] != expected_dim
-    ):
+        dense.dtype != torch.bfloat16 and dense.dtype not in _FP8_DTYPES
+    ) or dense.shape[1] != expected_dim:
         raise ValueError(
             "dense DSA cache must be BF16/FP8 with trailing dimension "
             f"{expected_dim}, got dtype={dense.dtype}, shape={tuple(dense.shape)}"
@@ -893,6 +928,7 @@ def _run_dense(
     dense = dense.contiguous()
     q = q.contiguous()
     out = _allocate_output(q, kv_lora_rank)
+    is_fp8 = q.dtype == dense.dtype and q.dtype in _FP8_DTYPES
     grid = (q.shape[0], triton.cdiv(q.shape[1], block_h))
     _dsa_selected_dense_wmma_kernel[grid](
         q,
@@ -915,7 +951,8 @@ def _run_dense(
         QK_ROPE_HEAD_DIM=qk_rope_head_dim,
         SOFTMAX_SCALE=float(softmax_scale),
         BLOCK_H=block_h,
-        BLOCK_K=32,
+        BLOCK_K=64 if is_fp8 else 32,
+        IS_FP8=is_fp8,
         num_warps=4,
     )
     return out
@@ -938,14 +975,12 @@ def _run_packed(
     expected_bytes = kv_lora_rank + scale_bytes + qk_rope_head_dim * 2
     if packed.shape[1] != expected_bytes:
         raise ValueError(
-            f"packed DSA row must contain {expected_bytes} bytes, got "
-            f"{packed.shape[1]}"
+            f"packed DSA row must contain {expected_bytes} bytes, got {packed.shape[1]}"
         )
     q = q.contiguous()
     out = _allocate_output(q, kv_lora_rank)
-    if kv_lora_rank in (128, 512) and q.dtype in (
-        torch.bfloat16,
-        torch.float8_e4m3fn,
+    if kv_lora_rank in (128, 512) and (
+        q.dtype == torch.bfloat16 or q.dtype in _FP8_DTYPES
     ):
         kv_splits = 16
         partial_m = torch.empty(

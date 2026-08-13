@@ -39,6 +39,10 @@ from tokenspeed_kernel.ops.gemm.kimi3 import (
     kimi3_shared_down_projection,
     kimi3_shared_situ_projection,
 )
+from tokenspeed_kernel.ops.gemm.linear_attnres_partials import (
+    linear_attnres_partials,
+    linear_attnres_partials_available,
+)
 from tokenspeed_kernel.platform import ArchVersion, Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -54,6 +58,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "bmm",
+    "linear_attnres_partials",
+    "linear_attnres_partials_available",
     "kimi3_latent_projection",
     "kimi3_mla_qkv_gate_projection",
     "kimi3_latent_projection_add3",

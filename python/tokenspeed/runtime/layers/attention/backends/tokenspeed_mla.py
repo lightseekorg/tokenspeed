@@ -44,6 +44,7 @@ from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.trtllm_mla import (
     TRTLLM_BLOCK_CONSTRAINT,
@@ -65,34 +66,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# CuteDSL decode workspace. The kernel's own `get_workspace_size` formula is
-#   B * H * q_len * split_kv * (D + 1) * (acc_dtype.width // 8)   (bytes)
-# and `B * split_kv <= num_SMs`, so a closed-form upper bound (Float32 acc) is
-#   num_SMs * H * q_len * (D + 1) * 4
-# Buffer is per-device and does NOT need zero-init.
-_cutedsl_workspace_buffer: dict[torch.device, torch.Tensor] = {}
-
-# Initial q_len capacity for the per-device decode workspace. The buffer grows
-# on demand before each launch, so larger verify/draft batches are supported.
-_CUTEDSL_INITIAL_Q_LEN_CAPACITY = 8
-
-
-def get_cutedsl_workspace_buffer(
-    device: torch.device,
-    num_heads_per_tp: int,
-    kv_lora_rank: int,
-    q_len_capacity: int = _CUTEDSL_INITIAL_Q_LEN_CAPACITY,
-) -> torch.Tensor:
-    """Get or grow the per-device CuteDSL workspace buffer."""
-    num_sms = get_num_sm(device)
-    required = num_sms * num_heads_per_tp * q_len_capacity * (kv_lora_rank + 1) * 4
-
-    existing = _cutedsl_workspace_buffer.get(device)
-    if existing is None or existing.numel() < required:
-        _cutedsl_workspace_buffer[device] = torch.empty(
-            required, dtype=torch.int8, device=device
-        )
-    return _cutedsl_workspace_buffer[device]
+# Fallback q_len capacity for warming the decode workspace when the backend
+# runs without speculative decoding (q_len is then 1, but keep the historical
+# floor so draft experiments do not immediately hit the frozen-pool error).
+_CUTEDSL_WARMUP_Q_LEN_FLOOR = 8
 
 
 @dataclass
@@ -155,10 +132,17 @@ class CuteDSLMLABackend(AttentionBackend):
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
 
-        # Workspace buffers — sized from config's num_heads / kv_lora_rank.
-        num_heads_per_tp = config.num_attention_heads // config.attn_tp_size
-        self.cutedsl_workspace = get_cutedsl_workspace_buffer(
-            config.device, num_heads_per_tp, self.kv_lora_rank
+        # Decode scratch comes from the shared WorkspacePool: the kernel's own
+        # get_workspace_size formula is B*H*q_len*split_kv*(D+1)*acc_bytes with
+        # B*split_kv <= num_SMs, giving the closed-form bound used in
+        # _cutedsl_workspace. The content is partial decode accumulators,
+        # consumed within each op and never zero-initialized, so sharing the
+        # block is safe. Warm to the verify-path peak now: graph capture runs
+        # the decode forward with the pool frozen.
+        self._num_heads_per_tp = config.num_attention_heads // config.attn_tp_size
+        self._workspace_pool = workspace_pool(config.device)
+        self.cutedsl_workspace = self._cutedsl_workspace(
+            max(_CUTEDSL_WARMUP_Q_LEN_FLOOR, self.spec_num_tokens or 1)
         )
 
         # Pre-compile prefill kernel variants so JIT doesn't run during serving.
@@ -192,7 +176,7 @@ class CuteDSLMLABackend(AttentionBackend):
                 f"got {kv_cache_dtype!r}."
             )
 
-        self.num_local_heads = num_heads_per_tp
+        self.num_local_heads = self._num_heads_per_tp
 
         # Metadata
         self.forward_decode_metadata: CuteDSLMLADecodeMetadata | None = None
@@ -205,17 +189,26 @@ class CuteDSLMLABackend(AttentionBackend):
         self.decode_cuda_graph_group_out_cache_loc: torch.Tensor | None = None
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None
 
-    def mark_cache_contract(self, logical_page_size: int | None = None) -> None:
+    def _cutedsl_workspace(self, q_len_capacity: int) -> torch.Tensor:
+        """Per-use view of the shared block, sized by the closed-form bound."""
+        required = (
+            get_num_sm(self.device)
+            * self._num_heads_per_tp
+            * q_len_capacity
+            * (self.kv_lora_rank + 1)
+            * 4
+        )
+        (buf,) = self._workspace_pool.allocate(((required,), torch.int8))
+        return buf
+
+    def mark_cache_contract(self) -> None:
         """Mark this MLA backend as a Kimi-K3 Paged cache contract sub-backend.
 
         Called by the registry when the backend is constructed for the
         Kimi-K3 LCM contract path. Enables grouped CUDA-graph
         capture/replay with stable full-attention block-table and write-location
-        buffers. ``logical_page_size`` is accepted for signature uniformity with
-        the other contract sub-backends; this backend derives its page geometry
-        from the cache metadata each forward.
+        buffers.
         """
-        del logical_page_size
         if self.is_draft:
             # The CuteDSL draft keeps its batch-ordered page table. Only target
             # forwards consume scheduler cache-group metadata.
@@ -258,50 +251,24 @@ class CuteDSLMLABackend(AttentionBackend):
 
     def _resolve_full_history_table(
         self, cache_metadata, forward_batch, bs: int
-    ) -> tuple[torch.Tensor, int]:
-        """Fresh full-attention table and logical page size for this forward.
+    ) -> torch.Tensor:
+        """This forward's full-attention table in this backend's kernel pages.
 
         Host-side structural validation only (no GPU sync): operation
-        freshness, row coverage, and kernel-page divisibility.
+        freshness, row coverage, and kernel-page divisibility all check inside
+        ``kernel_table``.
         """
-        table = cache_metadata.require_full_attention_table(
-            active_forward_op=forward_batch
+        table = cache_metadata.kernel_table(
+            page_size=self.page_size,
+            max_pages=self._calc_padded_blocks(self.max_context_len),
+            active_forward_op=forward_batch,
         )
         if table.shape[0] < bs:
             raise RuntimeError(
                 f"full-attention table has {table.shape[0]} rows but the "
                 f"batch has {bs} requests"
             )
-        logical_page_size = int(cache_metadata.block_size)
-        if logical_page_size <= 0 or logical_page_size % self.page_size:
-            raise RuntimeError(
-                f"logical page size {logical_page_size} is not a positive multiple "
-                f"of the kernel page size {self.page_size}"
-            )
-        if table.stride(0) != table.shape[1] and table.shape[0] > 1:
-            # The chunked-prefill kernel derives the row stride from shape[1].
-            table = table.contiguous()
-        return table, logical_page_size
-
-    def _maybe_debug_check_group_table(
-        self, table: torch.Tensor, seq_lens: torch.Tensor, logical_page_size: int
-    ) -> None:
-        """TOKENSPEED_CACHE_DEBUG=1 (GPU sync): no -1/null page inside a live
-        table range."""
-        if not cache_debug_enabled() or table.numel() == 0 or seq_lens.numel() == 0:
-            return
-        bs = seq_lens.shape[0]
-        live_pages = (
-            (seq_lens.to(torch.int64) + logical_page_size - 1) // logical_page_size
-        ).clamp_max_(table.shape[1])
-        columns = torch.arange(table.shape[1], device=table.device)
-        live_mask = columns.unsqueeze(0) < live_pages.unsqueeze(1)
-        live_entries = table[:bs][live_mask]
-        if live_entries.numel() and not bool((live_entries > 0).all().item()):
-            raise RuntimeError(
-                "full-attention table contains -1 or the null page 0 "
-                "inside a live range"
-            )
+        return table
 
     def _maybe_debug_check_write_pages(self, pages: torch.Tensor) -> None:
         """TOKENSPEED_CACHE_DEBUG=1 (GPU sync): latent writes must never land
@@ -313,39 +280,11 @@ class CuteDSLMLABackend(AttentionBackend):
                 "MLA write location resolves to the null page 0 or a " "-1 table hole"
             )
 
-    def _expand_group_block_kv_indices(
-        self,
-        bs: int,
-        max_blocks: int,
-        group_table: torch.Tensor,
-        logical_page_size: int,
-        block_kv_indices: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Expand logical pages into kernel pages for ``block_kv_indices``.
-
-        A logical page holds ``logical_page_size`` consecutive tokens, i.e.
-        ``ratio = logical_page_size // self.page_size`` kernel pages; kernel page
-        ``page * ratio + k`` covers tokens ``page * logical_page_size +
-        [k * page_size, (k + 1) * page_size)`` — the absolute token location
-        formula is preserved. -1 table tails clamp to the null page 0, whose
-        kernel expansion stays inside the physical null page.
-        """
-        if self.cache_pool is None:
-            raise RuntimeError("MLA backend has no bound CachePool")
-        return self.cache_pool.expand_block_table(
-            None,
-            group_table[:bs],
-            kernel_block_tokens=self.page_size,
-            max_kernel_blocks=max_blocks,
-            out=block_kv_indices,
-        )
-
     def _cache_decode_out_cache_loc(
         self,
         bs: int,
         seq_lens: torch.Tensor,
         group_table: torch.Tensor,
-        logical_page_size: int,
         out: torch.Tensor | None = None,
         q_len_per_req: int = 1,
     ) -> torch.Tensor:
@@ -358,6 +297,7 @@ class CuteDSLMLABackend(AttentionBackend):
         the persistent buffer the graph recorded — same ``data_ptr`` — instead
         of allocating a fresh tensor. No host sync on either path.
         """
+        page_size = self.page_size
         last = (seq_lens[:bs].to(torch.int64) - 1).clamp_min(0)
         if q_len_per_req == 1:
             pos = last.unsqueeze(1)
@@ -366,12 +306,11 @@ class CuteDSLMLABackend(AttentionBackend):
                 1 - q_len_per_req, 1, device=seq_lens.device, dtype=torch.int64
             )
             pos = (last.unsqueeze(1) + steps).clamp_min(0)  # [bs, q_len]
-        page_idx = torch.div(pos, logical_page_size, rounding_mode="floor")
+        page_idx = torch.div(pos, page_size, rounding_mode="floor")
         pages = group_table[:bs].gather(1, page_idx)
         self._maybe_debug_check_write_pages(pages)
         locs = (
-            pages.clamp_min(0).to(torch.int64) * logical_page_size
-            + (pos % logical_page_size)
+            pages.clamp_min(0).to(torch.int64) * page_size + (pos % page_size)
         ).reshape(-1)
         if out is not None:
             out[: bs * q_len_per_req].copy_(locs)
@@ -383,13 +322,13 @@ class CuteDSLMLABackend(AttentionBackend):
         group_table: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
-        logical_page_size: int,
     ) -> torch.Tensor:
         """Absolute latent write locations for extend tokens.
 
         Positions ``[prefix_len, seq_len)`` per request, flattened in q/k/v
         token order. Bounds come from the CPU length mirrors — no GPU sync.
         """
+        page_size = self.page_size
         device = group_table.device
         chunks: list[torch.Tensor] = []
         pages_for_check: list[torch.Tensor] = []
@@ -400,20 +339,18 @@ class CuteDSLMLABackend(AttentionBackend):
             num_new = int(num_new)
             if num_new <= 0:
                 continue
-            max_col = (start + num_new - 1) // logical_page_size
+            max_col = (start + num_new - 1) // page_size
             if max_col >= group_table.shape[1]:
                 raise RuntimeError(
                     "extend write locations out of table bounds: "
                     f"table {tuple(group_table.shape)} req={row} prefix={start} "
-                    f"new={num_new} logical_page_size={logical_page_size} needs "
+                    f"new={num_new} page_size={page_size} needs "
                     f"column {max_col}"
                 )
             pos = torch.arange(start, start + num_new, dtype=torch.int64, device=device)
-            pages = group_table[row].gather(0, pos // logical_page_size)
+            pages = group_table[row].gather(0, pos // page_size)
             pages_for_check.append(pages)
-            chunks.append(
-                pages.to(torch.int64) * logical_page_size + pos % logical_page_size
-            )
+            chunks.append(pages.to(torch.int64) * page_size + pos % page_size)
         if not chunks:
             return torch.empty(0, dtype=torch.int64, device=device)
         if cache_debug_enabled():
@@ -436,7 +373,6 @@ class CuteDSLMLABackend(AttentionBackend):
         cache_metadata = kwargs.pop("cache_metadata", None)
         forward_batch = kwargs.pop("forward_batch", None)
         group_table = None
-        logical_page_size = None
         if cache_metadata is not None and self.is_draft:
             # The MTP draft runs on its own classic paged pool; the target's
             # Cache metadata rides the shared forward kwargs; ignore it here.
@@ -444,12 +380,13 @@ class CuteDSLMLABackend(AttentionBackend):
             forward_batch = None
         if cache_metadata is not None:
             self._cache_groups_bound = True
-            group_table, logical_page_size = self._resolve_full_history_table(
+            group_table = self._resolve_full_history_table(
                 cache_metadata, forward_batch, bs
             )
-            self._maybe_debug_check_group_table(
-                group_table, seq_lens[:bs], logical_page_size
-            )
+            if cache_debug_enabled():
+                cache_metadata.validate_live_pages(
+                    seq_lens[:bs], active_forward_op=forward_batch
+                )
         elif self._cache_groups_bound and bs > 0 and not forward_mode.is_idle():
             # Missing Paged cache metadata must never select the legacy page_table
             # path after the backend is bound to the contract.
@@ -468,7 +405,6 @@ class CuteDSLMLABackend(AttentionBackend):
                 extend_seq_lens=kwargs.pop("extend_seq_lens"),
                 extend_seq_lens_cpu=kwargs.pop("extend_seq_lens_cpu"),
                 group_table=group_table,
-                logical_page_size=logical_page_size,
             )
         # Drafter steps 1..N are pure DECODE on full bs regardless of target
         # mode, so under is_draft we also fill decode_metadata under EXTEND
@@ -498,7 +434,6 @@ class CuteDSLMLABackend(AttentionBackend):
                 seq_lens,
                 page_table,
                 group_table=group_table,
-                logical_page_size=logical_page_size,
                 q_len_per_req=verify_q_len,
             )
 
@@ -558,21 +493,19 @@ class CuteDSLMLABackend(AttentionBackend):
         seq_lens: torch.Tensor,
         page_table: torch.Tensor,
         group_table: torch.Tensor | None = None,
-        logical_page_size: int | None = None,
         q_len_per_req: int = 1,
     ):
         max_blocks = self._calc_padded_blocks(self.max_context_len)
         if group_table is not None:
             # Paged cache path: kernel pages and write locations both derive from
             # the full-attention table; page_table is never consulted.
-            block_kv_indices = self._expand_group_block_kv_indices(
-                bs, max_blocks, group_table, logical_page_size
+            block_kv_indices = self._create_block_kv_indices(
+                bs, max_blocks, group_table
             )
             group_out_cache_loc = self._cache_decode_out_cache_loc(
                 bs,
                 seq_lens,
                 group_table,
-                logical_page_size,
                 q_len_per_req=q_len_per_req,
             )
         else:
@@ -598,7 +531,6 @@ class CuteDSLMLABackend(AttentionBackend):
         extend_seq_lens: torch.Tensor | None = None,
         extend_seq_lens_cpu: torch.Tensor | None = None,
         group_table: torch.Tensor | None = None,
-        logical_page_size: int | None = None,
     ):
         # Worst-case bound to avoid GPU->CPU sync from seq_lens.max().item().
         # TODO: track a loose CPU upper bound (advance by chunked_prefill_size /
@@ -619,7 +551,6 @@ class CuteDSLMLABackend(AttentionBackend):
                 group_table[:num_extends],
                 extend_prefix_lens_cpu,
                 extend_seq_lens_cpu,
-                logical_page_size,
             )
         else:
             group_out_cache_loc = None
@@ -637,13 +568,12 @@ class CuteDSLMLABackend(AttentionBackend):
         if group_table is not None:
             # Paged cache path: chunked history reads gather from the
             # full-attention table (rows are batch-ordered, prefill rows
-            # first), at the logical-page granularity — the produced KV slots
-            # are the same absolute token locations either way.
+            # first) in kernel pages.
             chunk_page_table = group_table[:num_extends]
             chunk_req_pool_indices = torch.arange(
                 num_extends, dtype=torch.int64, device=group_table.device
             )
-            chunk_page_size = logical_page_size
+            chunk_page_size = self.page_size
         else:
             # Idle/warmup placeholder: page_table is batch-ordered (row i ==
             # batch position i), so identity row indices apply.
@@ -858,23 +788,19 @@ class CuteDSLMLABackend(AttentionBackend):
         if cache_metadata is not None:
             # Row coverage is not required here (bs is the padded batch size
             # and the table carries one row per REAL request), so pass 0.
-            table, logical_page_size = self._resolve_full_history_table(
-                cache_metadata, forward_batch, 0
-            )
+            table = self._resolve_full_history_table(cache_metadata, forward_batch, 0)
             real_bs = min(int(table.shape[0]), bs)
             if real_bs > 0:
-                self._expand_group_block_kv_indices(
+                self._create_block_kv_indices(
                     real_bs,
                     max_blocks,
                     table,
-                    logical_page_size,
                     metadata.block_kv_indices,
                 )
                 self._cache_decode_out_cache_loc(
                     real_bs,
                     seq_lens,
                     table,
-                    logical_page_size,
                     out=metadata.group_out_cache_loc[: real_bs * replay_q_len],
                     q_len_per_req=replay_q_len,
                 )
@@ -950,9 +876,7 @@ class CuteDSLMLABackend(AttentionBackend):
             )
             CuteDSLMLABackend._logged_decode = True
 
-        self.cutedsl_workspace = get_cutedsl_workspace_buffer(
-            query.device, layer.tp_q_head_num, self.kv_lora_rank, query.shape[1]
-        )
+        self.cutedsl_workspace = self._cutedsl_workspace(query.shape[1])
 
         raw_out = tokenspeed_mla_decode(
             query=query,

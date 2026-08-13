@@ -37,7 +37,14 @@ from tokenspeed_kernel.signature import format_signatures
     tags={"portability"},
 )
 def torch_attn_res_fwd(
-    *, layer_residual, block_residual, res_weight, rms_weight, eps, out_norm_weight=None
+    *,
+    layer_residual,
+    block_residual,
+    res_weight,
+    rms_weight,
+    eps,
+    out_norm_weight=None,
+    out_norm_eps=None,
 ) -> torch.Tensor:
     # Candidates [N, T, H] = blocks then layer; RMSNorm + softmax score + mix in
     # fp32 (this sits on the global residual backbone), bf16 out.
@@ -52,6 +59,7 @@ def torch_attn_res_fwd(
         # Fused following RMSNorm: stats over the bf16-rounded mix (matches the
         # separate rmsnorm-kernel path).
         of = out.float()
-        rs = (of.square().mean(-1, keepdim=True) + eps).rsqrt()
+        output_eps = eps if out_norm_eps is None else out_norm_eps
+        rs = (of.square().mean(-1, keepdim=True) + output_eps).rsqrt()
         out = (of * rs * out_norm_weight.float()).to(layer_residual.dtype)
     return out
