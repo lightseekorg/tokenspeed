@@ -92,6 +92,7 @@ from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
     situ_moe_unavailable_reason,
 )
 from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearConfig
@@ -959,6 +960,9 @@ class KimiLinearMoEGate(nn.Module):
 # this is a prefill chunk and takes the unsplit path; the scratch buffers are
 # allocated to exactly this many rows. Raise together with --max-num-seqs.
 ATTNRES_FAST_PATH_MAX_TOKENS = 32
+# Paired MI350 measurements show that stream scheduling costs more than the
+# available attention/AttnRes overlap through M=16. Preserve NVIDIA's policy.
+ATTNRES_STREAM_FORK_THRESHOLD = 16 if current_platform().is_amd else 0
 
 
 def _attnres_mlp_slot(layer_id: int) -> int:
@@ -1894,7 +1898,11 @@ class KimiLinearDecoderLayer(nn.Module):
             )
         )
         with self.attn_fork.scope(
-            enable=get_is_capture_mode() and (attnres_partial_args is None or own_mlp)
+            enable=(
+                get_is_capture_mode()
+                and num_tokens > ATTNRES_STREAM_FORK_THRESHOLD
+                and (attnres_partial_args is None or own_mlp)
+            )
         ) as fork:
             with fork.branch():
                 if next_mix is not None:
