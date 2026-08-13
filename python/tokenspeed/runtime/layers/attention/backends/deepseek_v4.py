@@ -578,7 +578,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         max_tokens_per_req: int,
         overlap_schedule_depth: int,
     ) -> int:
-        page_size = spec.page_size
+        page_size = spec.block_granularity
         if page_size <= 0:
             raise ValueError(
                 f"DeepSeek V4 cache group {spec.group_id!r} has invalid page size"
