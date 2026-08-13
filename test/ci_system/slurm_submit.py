@@ -42,6 +42,7 @@ class Task:
     task_type: str
     runner: str
     gpus: int
+    nodes: int = 1
 
 
 @dataclass(frozen=True)
@@ -74,9 +75,16 @@ def load_task(repo: Path, config: str, runner: str | None = None) -> Task:
         runner = labels[0]
     if runner not in labels:
         raise ValueError(f"{runner!r} is not declared by {relative}")
-    return Task(
-        relative, str(data["name"]), str(data["type"]), runner, gpu_count(runner)
-    )
+    gpus = gpu_count(runner)
+    slurm = data.get("slurm", {})
+    nodes = int(slurm.get("nodes", 1))
+    gpus_per_node = int(slurm.get("gpus_per_node", gpus))
+    if gpus_per_node != gpus:
+        raise ValueError(
+            f"{relative}: slurm.gpus_per_node={gpus_per_node} does not match "
+            f"runner {runner!r} ({gpus} GPUs)"
+        )
+    return Task(relative, str(data["name"]), str(data["type"]), runner, gpus, nodes)
 
 
 def task_matches(repo: Path, task: Task, patterns: list[str]) -> bool:
@@ -224,10 +232,10 @@ def pr_worktree(repo: Path, value: str):
 
 
 def print_tasks(tasks: list[Task]) -> None:
-    print("TYPE\tRUNNER\tGPUS\tCONFIG\tNAME")
+    print("TYPE\tRUNNER\tNODES\tGPUS/NODE\tCONFIG\tNAME")
     for task in tasks:
         print(
-            f"{task.task_type}\t{task.runner}\t{task.gpus}\t"
+            f"{task.task_type}\t{task.runner}\t{task.nodes}\t{task.gpus}\t"
             f"{task.config}\t{task.name}"
         )
 
@@ -277,7 +285,6 @@ def render_script(
         "--work-dir=/workspace",
         "--setup-mode=slurm",
         "--print-plan",
-        "--result-json=/workspace/.ci-artifacts/result.json",
     ]
     bootstrap = (
         'export LD_LIBRARY_PATH="/opt/tokenspeed-cuda-runtime'
@@ -288,10 +295,7 @@ def render_script(
         'export PYTHONPATH="/tmp/tokenspeed-ci-python'
         '${PYTHONPATH:+:${PYTHONPATH}}"; fi; exec "$@"'
     )
-    srun = [
-        "--nodes=1",
-        "--ntasks=1",
-        f"--gres=gpu:{task.gpus}",
+    container_args = [
         "--unbuffered",
         "--kill-on-bad-exit=1",
         "--export=ALL",
@@ -302,10 +306,11 @@ def render_script(
         "--container-writable",
         "--container-remap-root",
         "--container-env=SLURM_JOB_ID,RUNNER_NAME,HF_TOKEN,"
-        "HUGGING_FACE_HUB_TOKEN,HF_HOME,XDG_CACHE_HOME",
+        "HUGGING_FACE_HUB_TOKEN,HF_HOME,XDG_CACHE_HOME,"
+        "SLURM_STEP_ID,SLURM_STEP_NUM_NODES,SLURM_STEP_NODELIST,SLURM_NODEID,"
+        "SLURM_PROCID,SLURM_LOCALID",
     ]
-    command = ["bash", "-c", bootstrap, "tokenspeed-pipeline", *pipeline]
-    return f"""#!/usr/bin/env bash
+    common = f"""#!/usr/bin/env bash
 set -euo pipefail
 
 export RUNNER_NAME="slurm-${{SLURM_JOB_ID}}"
@@ -314,17 +319,14 @@ export XDG_CACHE_HOME=/home/runner/.cache
 unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STATE \
   GITHUB_EVENT_PATH
 
-scratch="${{SLURM_TMPDIR:-/tmp}}/tokenspeed-${{SLURM_JOB_ID}}"
+scratch={"/tmp" if task.nodes > 1 else '"${SLURM_TMPDIR:-/tmp}"'}/tokenspeed-${{SLURM_JOB_ID}}
 src="$scratch/src"
 tmp="$scratch/tmp"
 run={shlex.quote(str(run_root))}/"${{SLURM_JOB_ID}}"
-trap 'rm -rf -- "$scratch"' EXIT
-mkdir -p "$src/.ci-artifacts" "$tmp" "$run"
-tar -xf {shlex.quote(str(source))} -C "$src"
+source_archive={shlex.quote(str(source))}
+mkdir -p "$run"
 
 mounts=(
-  "$src:/workspace"
-  "$tmp:/tmp"
   "$run:/workspace/.ci-artifacts"
   {shlex.quote(str(cache) + ":/home/runner/.cache")}
 )
@@ -348,12 +350,162 @@ if [ -n "$cudart" ] && [ -e "$cudart" ]; then
 fi
 nvidia_smi="$(command -v nvidia-smi 2>/dev/null || true)"
 [ -z "$nvidia_smi" ] || mounts+=("$nvidia_smi:/usr/bin/nvidia-smi:ro")
-
+"""
+    if task.nodes == 1:
+        srun = [
+            "--nodes=1",
+            "--ntasks=1",
+            f"--gres=gpu:{task.gpus}",
+            *container_args,
+        ]
+        command = [
+            "bash",
+            "-c",
+            bootstrap,
+            "tokenspeed-pipeline",
+            *pipeline,
+            "--result-json=/workspace/.ci-artifacts/result.json",
+        ]
+        return common + f"""
+trap 'rm -rf -- "$scratch"' EXIT
+mkdir -p "$src/.ci-artifacts" "$tmp"
+tar -xf "$source_archive" -C "$src"
+mounts=("$src:/workspace" "$tmp:/tmp" "${{mounts[@]}}")
 container_mounts="$(IFS=,; printf '%s' "${{mounts[*]}}")"
 {shell_array("srun_args", srun)}
 srun_args+=(--container-mounts="$container_mounts")
 {shell_array("container_command", command)}
 srun "${{srun_args[@]}}" "${{container_command[@]}}"
+"""
+
+    prepare_args = [
+        "--overlap",
+        f"--nodes={task.nodes}",
+        f"--ntasks={task.nodes}",
+        "--ntasks-per-node=1",
+        "--gres=none",
+        "--unbuffered",
+        "--kill-on-bad-exit=1",
+    ]
+    client_prepare_args = [
+        "--overlap",
+        "--nodes=1",
+        "--ntasks=1",
+        "--relative=0",
+        "--gres=none",
+        "--unbuffered",
+        "--kill-on-bad-exit=1",
+    ]
+    server_srun = [
+        "--overlap",
+        "--label",
+        f"--nodes={task.nodes}",
+        f"--ntasks={task.nodes}",
+        "--ntasks-per-node=1",
+        f"--gres=gpu:{task.gpus}",
+        *container_args,
+    ]
+    client_srun = [
+        "--overlap",
+        "--nodes=1",
+        "--ntasks=1",
+        "--relative=0",
+        "--gres=none",
+        *container_args,
+    ]
+    cleanup_args = [
+        "--overlap",
+        f"--nodes={task.nodes}",
+        f"--ntasks={task.nodes}",
+        "--ntasks-per-node=1",
+        "--gres=none",
+    ]
+    server_command = [
+        "bash",
+        "-c",
+        bootstrap,
+        "tokenspeed-server",
+        *pipeline,
+        "--serve-only",
+    ]
+    client_command = [
+        "bash",
+        "-c",
+        bootstrap,
+        "tokenspeed-client",
+        *pipeline,
+        "--external-server",
+        "--result-json=/workspace/.ci-artifacts/result.json",
+    ]
+    return common + f"""
+{shell_array("prepare_args", prepare_args)}
+{shell_array("client_prepare_args", client_prepare_args)}
+{shell_array("cleanup_args", cleanup_args)}
+
+server_src="$scratch/server-src"
+client_src="$scratch/client-src"
+server_tmp="$scratch/server-tmp"
+client_tmp="$scratch/client-tmp"
+server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" "${{mounts[@]}}")
+client_mounts=("$client_src:/workspace" "$client_tmp:/tmp" "${{mounts[@]}}")
+server_container_mounts="$(IFS=,; printf '%s' "${{server_mounts[*]}}")"
+client_container_mounts="$(IFS=,; printf '%s' "${{client_mounts[*]}}")"
+
+server_step_pid=""
+client_step_pid=""
+cleanup() {{
+  status=$?
+  trap - EXIT INT TERM
+  for pid in "$client_step_pid" "$server_step_pid"; do
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done
+  [ -z "$client_step_pid" ] || wait "$client_step_pid" 2>/dev/null || true
+  [ -z "$server_step_pid" ] || wait "$server_step_pid" 2>/dev/null || true
+  srun "${{cleanup_args[@]}}" bash -c 'rm -rf -- "$1"' tokenspeed-cleanup "$scratch" || true
+  exit "$status"
+}}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+srun "${{prepare_args[@]}}" \
+  bash -c 'set -euo pipefail; mkdir -p "$1/.ci-artifacts" "$2"; tar -xf "$3" -C "$1"' \
+  tokenspeed-prepare "$server_src" "$server_tmp" "$source_archive"
+srun "${{client_prepare_args[@]}}" \
+  bash -c 'set -euo pipefail; mkdir -p "$1/.ci-artifacts" "$2"; tar -xf "$3" -C "$1"' \
+  tokenspeed-client-prepare "$client_src" "$client_tmp" "$source_archive"
+
+{shell_array("server_srun_args", server_srun)}
+server_srun_args+=(--container-mounts="$server_container_mounts")
+{shell_array("server_command", server_command)}
+srun "${{server_srun_args[@]}}" "${{server_command[@]}}" &
+server_step_pid=$!
+
+{shell_array("client_srun_args", client_srun)}
+client_srun_args+=(--container-mounts="$client_container_mounts")
+{shell_array("client_command", client_command)}
+srun "${{client_srun_args[@]}}" "${{client_command[@]}}" &
+client_step_pid=$!
+
+while kill -0 "$server_step_pid" 2>/dev/null && \
+      kill -0 "$client_step_pid" 2>/dev/null; do
+  sleep 2
+done
+
+set +e
+if ! kill -0 "$server_step_pid" 2>/dev/null; then
+  wait "$server_step_pid"
+  status=$?
+  [ "$status" -ne 0 ] || status=1
+  echo "multi-node server step exited before the client step" >&2
+else
+  wait "$client_step_pid"
+  status=$?
+fi
+set -e
+exit "$status"
 """
 
 
@@ -379,8 +531,9 @@ def submit(
         "--export=ALL",
         f"--job-name=ts-{stem}",
         f"--partition={args.partition}",
-        "--nodes=1",
-        "--ntasks=1",
+        f"--nodes={task.nodes}",
+        f"--ntasks={task.nodes}",
+        "--ntasks-per-node=1",
         f"--gres=gpu:{task.gpus}",
         "--exclusive",
         "--mem=0",
@@ -711,7 +864,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pr", help="PR number or GitHub pull request URL to merge.")
     parser.add_argument("--list", action="store_true", help="List matching tasks only.")
     parser.add_argument(
-        "--trigger", choices=("per-commit", "manual", "nightly", "debug")
+        "--trigger", choices=("per-commit", "manual", "nightly", "debug", "slurm")
     )
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--artifact-root", required=True)

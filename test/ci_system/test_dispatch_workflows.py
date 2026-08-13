@@ -4,7 +4,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 K8S_RUNNER_PREFIXES = ("b200-", "amd-", "gb200-", "b300-")
-SLURM_RUNNER_PREFIXES = ("b200-", "gb200-")
+SLURM_RUNNER_PREFIXES = ("b200-", "gb200-", "slurm-")
 
 
 def workflow_dispatch_inputs(name: str) -> dict:
@@ -47,7 +47,14 @@ def test_slurm_dispatch_lists_every_b200_and_gb200_ci_yaml():
 
 def test_slurm_dispatch_lists_every_supported_trigger():
     choices = workflow_dispatch_inputs("slurm-dispatch.yml")["trigger"]["options"]
-    assert set(choices) == {"all", "per-commit", "manual", "nightly", "debug"}
+    assert set(choices) == {
+        "all",
+        "per-commit",
+        "manual",
+        "nightly",
+        "debug",
+        "slurm",
+    }
 
 
 def test_qwen35_agentic_allows_declared_80k_context():

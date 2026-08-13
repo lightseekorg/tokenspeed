@@ -9,7 +9,7 @@ on:
         default: ""
         type: string
       yaml:
-        description: "Optional single B200/GB200 CI YAML"
+        description: "Optional single B200/GB200 or multi-node Slurm CI YAML"
         required: true
         default: "off"
         type: choice
@@ -72,6 +72,7 @@ on:
           - nightly
           - debug
           - per-commit
+          - slurm
 
 concurrency:
   group: slurm-dispatch-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}
@@ -122,14 +123,14 @@ jobs:
           task = normalize_task(repo / sys.argv[1], repo)
           print(f"type:{task['type']}")
           for label in task["runner"]["labels"]:
-              if label.startswith(("b200-", "gb200-")):
+              if label.startswith(("b200-", "gb200-", "slurm-")):
                   print(label)
           PY
             )
             yaml_task_type="${yaml_metadata[0]#type:}"
             yaml_runners=("${yaml_metadata[@]:1}")
             ((${#yaml_runners[@]})) || {
-              echo "No B200/GB200 runners declared by $YAML_SELECTION" >&2
+              echo "No supported Slurm runners declared by $YAML_SELECTION" >&2
               exit 2
             }
             args+=(--type "$yaml_task_type")

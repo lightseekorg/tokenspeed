@@ -121,6 +121,7 @@ def test_nvidia_runner_groups_split_arm_from_x86():
 def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
     assert is_gb200_runner("gb200-1gpu")
     assert is_gb200_runner("gb200-4gpu-perf")
+    assert is_gb200_runner("slurm-gb200-4node-4gpu")
     assert not is_gb200_runner("b300-4gpu")
 
     assert should_run_nvidia_gpu_cleanup("gb200-1gpu")
@@ -173,6 +174,163 @@ def test_execute_cli_accepts_slurm_setup_mode():
     assert args.setup_mode == "slurm"
 
 
+def test_execute_cli_accepts_slurm_server_modes():
+    serve = parse_args(
+        [
+            "execute",
+            "--config",
+            "test/ci/eval/task.yaml",
+            "--runner",
+            "slurm-gb200-4node-4gpu",
+            "--setup-mode",
+            "slurm",
+            "--serve-only",
+        ]
+    )
+    client = parse_args(
+        [
+            "execute",
+            "--config",
+            "test/ci/eval/task.yaml",
+            "--runner",
+            "slurm-gb200-4node-4gpu",
+            "--setup-mode",
+            "slurm",
+            "--external-server",
+        ]
+    )
+
+    assert serve.serve_only is True
+    assert serve.external_server is False
+    assert client.serve_only is False
+    assert client.external_server is True
+
+
+def test_multi_node_slurm_task_validation():
+    task = {
+        "api_version": "ci.tokenspeed.io/v1",
+        "name": "multi-node",
+        "type": "eval",
+        "workflow_stage": "model-test",
+        "triggers": ["slurm"],
+        "runner": {"labels": ["slurm-gb200-4node-4gpu"]},
+        "slurm": {"nodes": 4, "gpus_per_node": 4},
+        "server": {
+            "command": "ts serve --model example/model",
+            "ready": {"url": "http://127.0.0.1:8000/readiness"},
+        },
+        "eval": {"command": "run eval"},
+    }
+
+    validate_task(task, Path("task.yaml"))
+
+    task["triggers"] = ["manual"]
+    with pytest.raises(ValueError, match="only the 'slurm' trigger"):
+        validate_task(task, Path("task.yaml"))
+
+
+def test_slurm_server_modes_split_server_from_client(monkeypatch, tmp_path):
+    task = {
+        "name": "multi-node",
+        "type": "eval",
+        "runner": {"labels": ["slurm-gb200-4node-4gpu"]},
+        "install": ["install project"],
+        "server": {
+            "command": "ts serve --model example/model",
+            "ready": {"url": "http://127.0.0.1:8000/readiness"},
+        },
+        "eval": {
+            "install": ["install eval"],
+            "command": "run eval",
+        },
+    }
+
+    class FakeProcessGroupManager:
+        def __init__(self):
+            self.commands = []
+
+        def run(self, command, *, cwd, env, dry_run):
+            self.commands.append(command)
+            return {"returncode": 0, "output": ""}
+
+        def start(self, *args, **kwargs):
+            raise AssertionError("server modes must not start a managed server")
+
+        def terminate_all(self, *, dry_run):
+            pass
+
+    monkeypatch.setattr(pipeline, "normalize_task", lambda path, root: task)
+    monkeypatch.setattr(pipeline, "summarize_task_targets", lambda *_: {})
+    monkeypatch.setattr(pipeline, "get_jit_cache_env", lambda *_: {})
+
+    serve_manager = FakeProcessGroupManager()
+    monkeypatch.setattr(
+        pipeline,
+        "setup_runner",
+        lambda *args, **kwargs: (args[1], serve_manager),
+    )
+    assert (
+        pipeline.execute_task(
+            config="task.yaml",
+            runner="slurm-gb200-4node-4gpu",
+            work_dir=str(tmp_path),
+            dry_run=False,
+            print_plan=False,
+            result_json=None,
+            setup_mode="slurm",
+            serve_only=True,
+        )
+        == 0
+    )
+    assert serve_manager.commands == [
+        "install project",
+        "ts serve --model example/model --engine-startup-timeout 7200",
+    ]
+
+    ready_calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "poll_readiness",
+        lambda ready, dry_run, **kwargs: ready_calls.append((ready, dry_run)),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "ensure_ready_port_available",
+        lambda *_: (_ for _ in ()).throw(
+            AssertionError("external server mode must not check for a free port")
+        ),
+    )
+    client_manager = FakeProcessGroupManager()
+    monkeypatch.setattr(
+        pipeline,
+        "setup_runner",
+        lambda *args, **kwargs: (args[1], client_manager),
+    )
+    assert (
+        pipeline.execute_task(
+            config="task.yaml",
+            runner="slurm-gb200-4node-4gpu",
+            work_dir=str(tmp_path),
+            dry_run=False,
+            print_plan=False,
+            result_json=None,
+            setup_mode="slurm",
+            external_server=True,
+        )
+        == 0
+    )
+    assert client_manager.commands == ["install project", "install eval", "run eval"]
+    assert ready_calls == [
+        (
+            {
+                "url": "http://127.0.0.1:8000/readiness",
+                "timeout": 7200,
+            },
+            False,
+        )
+    ]
+
+
 def test_slurm_setup_is_scoped_to_job_id(monkeypatch, tmp_path):
     class FakeProcessGroupManager:
         def __init__(self, runner_id):
@@ -193,6 +351,25 @@ def test_slurm_setup_is_scoped_to_job_id(monkeypatch, tmp_path):
     assert local_env["CI_RUNNER_ID"] == "slurm-12345"
     assert local_env["CI_VENV_PATH"] == "/shared/venv"
     assert "CI_RUNNER_ID" not in original_env
+
+
+def test_slurm_setup_isolates_overlapping_steps(monkeypatch, tmp_path):
+    class FakeProcessGroupManager:
+        def __init__(self, runner_id):
+            self.runner_id = runner_id
+
+    monkeypatch.setattr(pipeline, "ProcessGroupManager", FakeProcessGroupManager)
+
+    local_env, manager = setup_runner(
+        "slurm-gb200-4node-4gpu",
+        {"SLURM_JOB_ID": "12345", "SLURM_STEP_ID": "7", "SLURM_PROCID": "3"},
+        tmp_path,
+        dry_run=False,
+        setup_mode="slurm",
+    )
+
+    assert manager.runner_id == "slurm-12345-step-7-proc-3"
+    assert local_env["CI_RUNNER_ID"] == manager.runner_id
 
 
 def test_slurm_setup_requires_job_id(tmp_path):
