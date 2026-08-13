@@ -39,6 +39,8 @@ if _attn_res_rmsnorm_impl is not None:
         traits={
             "fused_output_norm": frozenset({True}),
             "large_prefill": frozenset({True}),
+            "hidden_size": frozenset({4096, 5120, 6144, 7168, 8192}),
+            "separate_output_eps": frozenset({False, True}),
         },
         tags={"prefill", "fusion"},
     )
@@ -50,6 +52,7 @@ if _attn_res_rmsnorm_impl is not None:
         rms_weight: torch.Tensor,
         eps: float,
         out_norm_weight: torch.Tensor | None,
+        out_norm_eps: float,
     ) -> torch.Tensor:
         """Adapt block-major runtime storage to the Gluon token-major kernel."""
         if out_norm_weight is None:
@@ -61,7 +64,7 @@ if _attn_res_rmsnorm_impl is not None:
             score_rms_weight=rms_weight,
             score_eps=eps,
             output_rms_weight=out_norm_weight,
-            output_eps=eps,
+            output_eps=out_norm_eps,
             num_valid_blocks=block_residual.shape[0],
         )
 

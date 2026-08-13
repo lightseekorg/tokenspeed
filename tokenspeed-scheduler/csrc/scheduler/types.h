@@ -63,6 +63,10 @@ struct SchedulerConfig {
     bool enable_pd_cache{false};
 
     bool disable_prefix_cache{false};
+    // Minimum prompt tail that must be recomputed after a prefix-cache hit.
+    // Zero preserves the default logits contract, which already recomputes at
+    // least the final prompt token. The effective hit is page-aligned down.
+    std::int32_t prefix_replay_tokens{0};
 };
 
 }  // namespace tokenspeed

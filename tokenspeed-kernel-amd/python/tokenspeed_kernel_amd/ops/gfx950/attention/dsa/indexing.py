@@ -60,6 +60,7 @@ def _dsa_decode_logits_fp8_kernel(
     num_groups: gl.constexpr,
     softmax_scale: gl.constexpr,
     q_len_per_req: gl.constexpr,
+    FOLD_WEIGHTED_HEADS: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_D: gl.constexpr,
 ):
@@ -97,23 +98,24 @@ def _dsa_decode_logits_fp8_kernel(
         dtype=gl.float32,
         layout=row_layout,
     )
-
-    for head in gl.static_range(0, num_heads):
-        head_weight = gl.load(weights + token * num_heads + head).to(gl.float32)
-        head_score = gl.full(
-            [BLOCK_N],
-            value=0.0,
-            dtype=gl.float32,
-            layout=row_layout,
-        )
+    if FOLD_WEIGHTED_HEADS:
         for dim_start in gl.static_range(0, head_dim, BLOCK_D):
             dims = dim_start + dim_offsets
-            q_vals = gl.amd.cdna4.buffer_load(
-                ptr=q,
-                offsets=((token * num_heads + head) * head_dim + dims).to(gl.int32),
-                mask=dims < head_dim,
-                other=0.0,
-            ).to(gl.float32)
+            weighted_q = gl.full(
+                [BLOCK_D],
+                value=0.0,
+                dtype=gl.float32,
+                layout=dim_layout,
+            )
+            for head in gl.static_range(0, num_heads):
+                head_weight = gl.load(weights + token * num_heads + head).to(gl.float32)
+                q_vals = gl.amd.cdna4.buffer_load(
+                    ptr=q,
+                    offsets=((token * num_heads + head) * head_dim + dims).to(gl.int32),
+                    mask=dims < head_dim,
+                    other=0.0,
+                ).to(gl.float32)
+                weighted_q += q_vals * head_weight
             k_vals = gl.amd.cdna4.buffer_load(
                 ptr=index_k_fp8,
                 offsets=(fp8_base[:, None] + dims[None, :]).to(gl.int32),
@@ -126,8 +128,40 @@ def _dsa_decode_logits_fp8_kernel(
                 mask=valid,
                 other=0.0,
             ).to(gl.float32)
-            head_score += gl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
-        scores += head_score * head_weight
+            scores += gl.sum(k_vals * k_scale[:, None] * weighted_q[None, :], axis=1)
+    else:
+        head_weight: gl.constexpr = 1.0
+        for head in gl.static_range(0, num_heads):
+            head_score = gl.full(
+                [BLOCK_N],
+                value=0.0,
+                dtype=gl.float32,
+                layout=row_layout,
+            )
+            for dim_start in gl.static_range(0, head_dim, BLOCK_D):
+                dims = dim_start + dim_offsets
+                q_vals = gl.amd.cdna4.buffer_load(
+                    ptr=q,
+                    offsets=((token * num_heads + head) * head_dim + dims).to(gl.int32),
+                    mask=dims < head_dim,
+                    other=0.0,
+                ).to(gl.float32)
+                k_vals = gl.amd.cdna4.buffer_load(
+                    ptr=index_k_fp8,
+                    offsets=(fp8_base[:, None] + dims[None, :]).to(gl.int32),
+                    mask=valid[:, None] & (dims[None, :] < head_dim),
+                    other=0.0,
+                ).to(gl.float32)
+                k_scale = gl.amd.cdna4.buffer_load(
+                    ptr=index_k_scale,
+                    offsets=(scale_base + dim_start // 128).to(gl.int32),
+                    mask=valid,
+                    other=0.0,
+                ).to(gl.float32)
+                head_score += gl.sum(
+                    k_vals * k_scale[:, None] * q_vals[None, :], axis=1
+                )
+            scores += head_score * head_weight
 
     scores *= softmax_scale
     scores = gl.where(valid, scores, -float("inf"))
@@ -143,7 +177,6 @@ def _dsa_prefill_logits_fp8_kernel(
     q,
     index_k_fp8,
     index_k_scale,
-    weights,
     kv_workspace_slots,
     row_starts,
     row_ends,
@@ -190,9 +223,9 @@ def _dsa_prefill_logits_fp8_kernel(
         dtype=gl.float32,
         layout=row_layout,
     )
+    head_weight: gl.constexpr = 1.0
 
     for head in gl.static_range(0, num_heads):
-        head_weight = gl.load(weights + token * num_heads + head).to(gl.float32)
         head_score = gl.full(
             [BLOCK_N],
             value=0.0,
@@ -237,8 +270,10 @@ def _check_packed_fp8_inputs(
 ) -> int:
     if q.dtype != torch.bfloat16:
         raise TypeError(f"DSA Gluon top-k expects BF16 q, got {q.dtype}")
-    if weights.dtype != torch.float32:
-        raise TypeError(f"DSA Gluon top-k expects FP32 weights, got {weights.dtype}")
+    if weights.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(
+            f"DSA Gluon top-k expects BF16 or FP32 weights, got {weights.dtype}"
+        )
     if q.dim() != 3:
         raise ValueError(f"q must be [tokens, heads, dim], got {tuple(q.shape)}")
     if weights.shape != q.shape[:2]:

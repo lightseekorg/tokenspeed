@@ -33,16 +33,20 @@ import torch
 from tokenspeed_kernel.ops.communication import (
     allreduce_lane_latent_norm_supported,
 )
-from tokenspeed_kernel.ops.moe import native_latent_moe_available
+from tokenspeed_kernel.ops.moe import (
+    latent_moe_expert_shared,
+    native_latent_moe_available,
+)
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_backend import Group
 from tokenspeed.runtime.distributed.comm_ops import (
     COMM_ONESHOT_MAX_BYTES,
+    acquire_all_reduce_outputs,
     all_gather_into_tensor,
     all_reduce,
     all_reduce_latent_norm,
-    all_reduce_two,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
 )
@@ -51,13 +55,10 @@ from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 TensorReducer = Callable[[torch.Tensor], torch.Tensor]
-TensorPairReducer = Callable[
-    [torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]
-]
 # Projects hidden states to router logits, routed latent, and the unreduced
 # shared-expert partial in one pass, or returns None to use the modules.
 InputProjector = Callable[
-    [torch.Tensor],
+    [torch.Tensor, torch.Tensor | None],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
 ]
 _SUPPORTED_EP_SIZES = {1, 2, 4, 8}
@@ -178,9 +179,8 @@ def kimi3_join_reduce_moe(
     elif (
         routed_partial.numel() * routed_partial.element_size() > COMM_ONESHOT_MAX_BYTES
     ):
-        routed_out, shared_out = all_reduce_two(
-            routed_partial,
-            shared_partial,
+        routed_out, shared_out = all_reduce(
+            (routed_partial, shared_partial),
             group=group,
         )
         if routed_norm is not None:
@@ -210,6 +210,54 @@ def kimi3_join_reduce_moe(
     shared_out = fused[:, routed_hidden:]
     if routed_norm is not None and not lane_norm_applied:
         routed_out = routed_norm(routed_out)
+    return routed_out, shared_out
+
+
+def latent_moe_expert_shared_all_reduce(
+    hidden_states: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    shared_input: torch.Tensor,
+    shared_weight: torch.Tensor,
+    *,
+    activation_clamp: float,
+    linear_clamp: float | None,
+    expert_start: int,
+    w13_interleaved: bool,
+    group: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Produce and reduce the routed latent and shared-expert output."""
+    outputs = acquire_all_reduce_outputs(
+        (
+            (hidden_states.shape[0], shared_weight.shape[0]),
+            tuple(hidden_states.shape),
+        ),
+        hidden_states,
+        group,
+    )
+    shared_out, routed_out = outputs
+    latent_moe_expert_shared(
+        hidden_states,
+        w13_weight,
+        w13_scale,
+        w2_weight,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        shared_input,
+        shared_weight,
+        activation_clamp=activation_clamp,
+        linear_clamp=linear_clamp,
+        expert_start=expert_start,
+        w13_interleaved=w13_interleaved,
+        routed_out=routed_out,
+        shared_out=shared_out,
+    )
+    shared_out, routed_out = all_reduce(outputs, group)
     return routed_out, shared_out
 
 
@@ -409,6 +457,9 @@ class Kimi3LatentProjection(ReplicatedLinear):
         hidden_states: torch.Tensor,
         addend_a: torch.Tensor,
         addend_c: torch.Tensor,
+        *,
+        norm_weight: torch.Tensor | None = None,
+        eps: float | None = None,
     ) -> torch.Tensor:
         """Project routed latents and accumulate two full-width addends.
 
@@ -420,11 +471,15 @@ class Kimi3LatentProjection(ReplicatedLinear):
                 self.weight,
                 addend_a,
                 addend_c,
+                norm_weight=norm_weight,
+                eps=eps,
             )
         # Accumulate inside the shard, then gather once: the addends are
         # replicated (prefix) or already reduced (shared), so their column
         # blocks are final here and the gather moves the finished sum instead
-        # of an intermediate.
+        # of an intermediate. The fused norm composes with the shard: it
+        # normalizes the K-width input rows, which every column block reads in
+        # full.
         rows = self.output_size_full // self.shard_size
         start = self.shard_rank * rows
         local = tokenspeed_kernel.kimi3_latent_projection_add3(
@@ -432,6 +487,8 @@ class Kimi3LatentProjection(ReplicatedLinear):
             self.weight,
             addend_a.narrow(-1, start, rows),
             addend_c.narrow(-1, start, rows),
+            norm_weight=norm_weight,
+            eps=eps,
         )
         return self._gather_shards(local)
 
@@ -475,7 +532,7 @@ class LatentMoELayer(nn.Module):
         shared_experts: nn.Module | None = None,
         latent_reduce: TensorReducer | None = None,
         shared_reduce: TensorReducer | None = None,
-        joint_reduce: TensorPairReducer | None = None,
+        joint_reduce: bool = False,
         shared_expert_stream: torch.cuda.Stream | None = None,
         expert_parallel_group: tuple[int, ...] | None = None,
         return_separate_outputs: bool = False,
@@ -486,11 +543,9 @@ class LatentMoELayer(nn.Module):
             raise ValueError("input_projections requires shared_experts")
         if shared_reduce is not None and shared_experts is None:
             raise ValueError("shared_reduce requires shared_experts")
-        if joint_reduce is not None and shared_experts is None:
+        if joint_reduce and shared_experts is None:
             raise ValueError("joint_reduce requires shared_experts")
-        if joint_reduce is not None and (
-            latent_reduce is not None or shared_reduce is not None
-        ):
+        if joint_reduce and (latent_reduce is not None or shared_reduce is not None):
             raise ValueError(
                 "joint_reduce cannot be combined with latent_reduce or shared_reduce"
             )
@@ -512,7 +567,9 @@ class LatentMoELayer(nn.Module):
                     "expert_parallel_group size must match experts.ep_size: "
                     f"{len(expert_parallel_group)} != {expert_parallel_size}"
                 )
-        if expert_parallel_size > 1 and latent_reduce is None and joint_reduce is None:
+        if joint_reduce and expert_parallel_group is None:
+            raise ValueError("joint_reduce requires expert_parallel_group")
+        if expert_parallel_size > 1 and latent_reduce is None and not joint_reduce:
             if expert_parallel_group is None:
                 raise ValueError(
                     "Kimi 3 EP requires expert_parallel_group or an explicit "
@@ -529,6 +586,7 @@ class LatentMoELayer(nn.Module):
         self.latent_reduce = latent_reduce
         self.shared_reduce = shared_reduce
         self.joint_reduce = joint_reduce
+        self.expert_parallel_group = expert_parallel_group
         self.stream_fork = StreamFork(shared_expert_stream)
         self.return_separate_outputs = return_separate_outputs
         self.input_projections = input_projections
@@ -539,33 +597,46 @@ class LatentMoELayer(nn.Module):
         prefix_sum: torch.Tensor,
         shared_output: torch.Tensor,
     ) -> torch.Tensor:
-        """Project the routed latent and add both full-width residuals."""
+        """Finish routed normalization/projection and add both residuals."""
 
         output_shape = tuple(shared_output.shape)
         _check_shape(prefix_sum, output_shape, "prefix_sum")
-        if (
-            os.environ.get("TOKENSPEED_K3_JOIN_EXTRA_ROUND") == "1"
-            and routed_latent.shape[0] <= 16
-        ):
-            # Diagnostic: emulate the multicast tail's rounding structure on
-            # the join path. The tail rounds (gemm + shared) to bf16 at the
-            # mailbox store and again after the prefix add; the join rounds the
-            # whole fp32 sum once. Splitting the fused add3 into add2 + eager
-            # add reproduces exactly that one extra intermediate rounding, so a
-            # GPQA arm with this flag isolates the mailbox rounding's cost with
-            # no kernel change.
-            mailbox_like = self.routed_up_proj.forward_add3(
-                routed_latent,
-                torch.zeros_like(prefix_sum),
-                shared_output,
-            )
-            output = mailbox_like + prefix_sum
-        else:
+        if self.routed_norm is None:
             output = self.routed_up_proj.forward_add3(
                 routed_latent,
                 prefix_sum,
                 shared_output,
             )
+        elif routed_latent.shape[0] == 1 and current_platform().is_cdna4:
+            output = self.routed_up_proj.forward_add3(
+                routed_latent,
+                prefix_sum,
+                shared_output,
+                norm_weight=self.routed_norm.weight,
+                eps=self.routed_norm.variance_epsilon,
+            )
+        else:
+            routed_latent = _module_tensor_output(self.routed_norm, routed_latent)
+            if (
+                os.environ.get("TOKENSPEED_K3_JOIN_EXTRA_ROUND") == "1"
+                and routed_latent.shape[0] <= 16
+            ):
+                # Diagnostic: emulate the multicast tail's rounding structure
+                # on the join path (split add3 -> add2 + eager add = one extra
+                # bf16 intermediate rounding); a GPQA arm with this flag
+                # isolates the mailbox rounding's cost with no kernel change.
+                mailbox_like = self.routed_up_proj.forward_add3(
+                    routed_latent,
+                    torch.zeros_like(prefix_sum),
+                    shared_output,
+                )
+                output = mailbox_like + prefix_sum
+            else:
+                output = self.routed_up_proj.forward_add3(
+                    routed_latent,
+                    prefix_sum,
+                    shared_output,
+                )
         _check_shape(output, output_shape, "routed_up_proj")
         return output
 
@@ -591,6 +662,18 @@ class LatentMoELayer(nn.Module):
         )
 
         output_shape = (num_tokens, hidden_size)
+        reduction_outputs = (
+            acquire_all_reduce_outputs(
+                (output_shape, (num_tokens, int(self.experts.hidden_size))),
+                hidden_states,
+                self.expert_parallel_group,
+            )
+            if self.joint_reduce and num_tokens > 0
+            else None
+        )
+        shared_target, routed_target = (
+            reduction_outputs if reduction_outputs is not None else (None, None)
+        )
         shared_output = None
         overlap_shared = (
             self.shared_experts is not None
@@ -608,7 +691,7 @@ class LatentMoELayer(nn.Module):
         # worth taking when the branches were not going to overlap anyway.
         packed = None
         if self.input_projections is not None and not overlap_shared and num_tokens > 0:
-            packed = self.input_projections(hidden_states)
+            packed = self.input_projections(hidden_states, shared_target)
         packed_router, packed_routed, packed_shared = (
             (None, None, None) if packed is None else packed
         )
@@ -627,7 +710,11 @@ class LatentMoELayer(nn.Module):
             shared_output = (
                 packed_shared
                 if packed_shared is not None
-                else _module_tensor_output(self.shared_experts, hidden_states)
+                else (
+                    self.shared_experts(hidden_states, down_out=shared_target)
+                    if shared_target is not None
+                    else _module_tensor_output(self.shared_experts, hidden_states)
+                )
             )
             _check_shape(shared_output, output_shape, "shared_experts")
             # In graph mode the branch is serial. Reduce here to retain the
@@ -674,12 +761,19 @@ class LatentMoELayer(nn.Module):
             if routed_input.ndim != 2 or routed_input.shape[0] != num_tokens:
                 raise ValueError("routed_down_proj must return [T, L]")
             latent_shape = tuple(routed_input.shape)
-            routed_latent = self.experts(
-                hidden_states=routed_input,
-                topk_output=topk_output,
-                num_global_tokens=num_global_tokens,
-                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-            )
+            previous_output = getattr(self.experts, "_situ_output_buffer", None)
+            if routed_target is not None:
+                self.experts._situ_output_buffer = routed_target
+            try:
+                routed_latent = self.experts(
+                    hidden_states=routed_input,
+                    topk_output=topk_output,
+                    num_global_tokens=num_global_tokens,
+                    max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                )
+            finally:
+                if routed_target is not None:
+                    self.experts._situ_output_buffer = previous_output
             _check_shape(routed_latent, latent_shape, "routed experts")
 
         # Spin-wait collectives cannot safely overlap an all-device GEMM.
@@ -691,26 +785,28 @@ class LatentMoELayer(nn.Module):
             _check_shape(shared_output, output_shape, "shared_reduce")
             shared_reduction_applied = True
 
-        if self.joint_reduce is not None:
-            shared_output, routed_latent = self.joint_reduce(
-                shared_output,
-                routed_latent,
+        if reduction_outputs is not None:
+            shared_output, routed_latent = all_reduce(
+                reduction_outputs,
+                self.expert_parallel_group,
             )
-            _check_shape(shared_output, output_shape, "joint_reduce shared output")
-            _check_shape(routed_latent, latent_shape, "joint_reduce routed latent")
+            _check_shape(shared_output, output_shape, "joint shared output")
+            _check_shape(routed_latent, latent_shape, "joint routed latent")
             shared_reduction_applied = True
         elif self.latent_reduce is not None:
             routed_latent = self.latent_reduce(routed_latent)
             _check_shape(routed_latent, latent_shape, "latent_reduce")
-        if self.routed_norm is not None:
-            routed_latent = _module_tensor_output(self.routed_norm, routed_latent)
-            _check_shape(routed_latent, latent_shape, "routed_norm")
-
         if shared_output is None:
+            if self.routed_norm is not None:
+                routed_latent = _module_tensor_output(self.routed_norm, routed_latent)
+                _check_shape(routed_latent, latent_shape, "routed_norm")
             routed_output = _module_tensor_output(self.routed_up_proj, routed_latent)
             _check_shape(routed_output, output_shape, "routed_up_proj")
             return routed_output
         if prefix_sum is None:
+            if self.routed_norm is not None:
+                routed_latent = _module_tensor_output(self.routed_norm, routed_latent)
+                _check_shape(routed_latent, latent_shape, "routed_norm")
             routed_output = _module_tensor_output(self.routed_up_proj, routed_latent)
             _check_shape(routed_output, output_shape, "routed_up_proj")
         if self.shared_reduce is not None and not shared_reduction_applied:
@@ -729,5 +825,6 @@ __all__ = [
     "Kimi3MoEExecutionPlan",
     "LatentMoELayer",
     "kimi3_join_reduce_moe",
+    "latent_moe_expert_shared_all_reduce",
     "select_k3_moe_tail_tier",
 ]

@@ -55,6 +55,7 @@ from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
+from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.grammar.capturable_grammar import (
     create_grammar_runtime,
     setup_grammar_step,
@@ -521,6 +522,8 @@ class ModelExecutor:
         )
 
         self._autotune()
+
+        workspace_pool(self.device).freeze()
 
         if not self.forward_step.disable:
             self.forward_step.capture()

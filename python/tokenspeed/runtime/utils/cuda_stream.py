@@ -29,11 +29,23 @@ class StreamFork:
         self.fork_event = torch.cuda.Event() if aux_stream is not None else None
         self.join_event = torch.cuda.Event() if aux_stream is not None else None
         self._active = False
+        self._overlap = True
         self._current: torch.cuda.Stream | None = None
 
     @contextmanager
-    def scope(self, *, enable: bool):
+    def scope(self, *, enable: bool, overlap: bool = True):
+        """Configure auxiliary-stream execution for work in this scope.
+
+        Args:
+            enable: Whether calls to ``branch()`` use the auxiliary stream.
+            overlap: Whether the main stream may overlap with auxiliary-stream
+                work. If false, the main stream waits after each branch.
+
+        Yields:
+            This stream fork, ready to create branches with ``branch()``.
+        """
         self._active = enable and self.aux_stream is not None
+        self._overlap = overlap
         if self._active:
             self._current = torch.cuda.current_stream()
             self.fork_event.record(self._current)
@@ -43,6 +55,7 @@ class StreamFork:
             if self._active:
                 self.join_event.wait(self._current)
                 self._active = False
+                self._overlap = True
                 self._current = None
 
     @contextmanager
@@ -54,3 +67,5 @@ class StreamFork:
             self.fork_event.wait(self.aux_stream)
             yield
             self.join_event.record(self.aux_stream)
+        if not self._overlap:
+            self.join_event.wait(self._current)

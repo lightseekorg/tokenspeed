@@ -52,6 +52,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
+from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
@@ -62,8 +63,11 @@ logger = logging.getLogger(__name__)
 # Block constraint from flashinfer: block_num % (128 / page_size) == 0
 TRTLLM_BLOCK_CONSTRAINT = 128
 
-# Shared workspace buffer for fused kernels (256 MB, zero-initialized).
-# Zero-init is required for the kernel's internal semaphore mechanism.
+# Shared workspace buffer for fused kernels, zero-initialized. NOT eligible
+# for the WorkspacePool: zero-init is required for the kernel's internal
+# semaphore mechanism, i.e. the content carries state between launches, and
+# the pool's shared block hands the same bytes to every consumer. Size in MB
+# via TOKENSPEED_WORKSPACE_TRTLLM_MLA_MB.
 _trtllm_workspace_buffer = None
 
 
@@ -72,7 +76,7 @@ def get_trtllm_workspace_buffer(device):
     global _trtllm_workspace_buffer
     if _trtllm_workspace_buffer is None:
         _trtllm_workspace_buffer = torch.zeros(
-            256 * 1024 * 1024,
+            envs.TOKENSPEED_WORKSPACE_TRTLLM_MLA_MB.get() * (1 << 20),
             dtype=torch.uint8,
             device=device,
         )
@@ -221,10 +225,9 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         forward_batch = kwargs.pop("forward_batch", None)
         kwargs.pop("block_tables", None)
         group_table = None
-        logical_page_size = None
         if cache_metadata is not None:
             self._cache_groups_bound = True
-            group_table, logical_page_size = self._resolve_full_history_table(
+            group_table = self._resolve_full_history_table(
                 cache_metadata, forward_batch, bs
             )
         elif self._draft_reads_batch_pages(bs, forward_mode):
@@ -258,7 +261,6 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 seq_lens,
                 page_table,
                 group_table=group_table,
-                logical_page_size=logical_page_size,
                 q_len_per_req=self._verify_q_len(forward_mode),
             )
 
@@ -280,7 +282,6 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         seq_lens: torch.Tensor,
         page_table: torch.Tensor,
         group_table: torch.Tensor | None = None,
-        logical_page_size: int | None = None,
         q_len_per_req: int = 1,
     ):
         # For target_verify, the draft tokens have already been written to the KV
@@ -290,25 +291,17 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
 
         group_out_cache_loc = None
         if group_table is not None:
-            assert logical_page_size is not None
-            # Expand scheduler pages into the kernel's page_size pages, padded to
-            # the fused-kernel block constraint. DSA's sparse top-k slots are
-            # mapped through this same table, so it must come from the group
-            # geometry rather than page_table.
-            block_kv_indices = torch.zeros(
-                (bs, max_blocks), dtype=torch.int32, device=self.device
-            )
-            self._expand_group_page_table(
-                group_table,
-                batch_size=bs,
-                logical_page_size=logical_page_size,
-                out=block_kv_indices,
+            # The table is already in kernel pages; copy into a buffer padded
+            # to the fused-kernel block constraint. DSA's sparse top-k slots
+            # are mapped through this same table, so it must come from the
+            # group geometry rather than page_table.
+            block_kv_indices = self._create_block_kv_indices(
+                bs, max_blocks, group_table
             )
             group_out_cache_loc = self._cache_decode_out_cache_loc(
                 group_table,
                 seq_lens,
                 batch_size=bs,
-                logical_page_size=logical_page_size,
                 validate_pages=cache_debug_enabled(),
                 q_len_per_req=q_len_per_req,
             )
@@ -524,33 +517,38 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
 
         cache_metadata = kwargs.get("cache_metadata")
         group_table = None
-        logical_page_size = None
-        if self._cache_groups_bound and cache_metadata is not None:
-            group_table, logical_page_size = self._resolve_full_history_table(
+        # See FlashMLABackend.init_forward_metadata_replay_cuda_graph: a PD
+        # decode-only node never runs eager init, so _cache_groups_bound stays
+        # False and this refresh must also fire on the registry-set
+        # _cache_contract_bound, or the captured kernel reads a stale/zero
+        # block table (null page 0) instead of the transferred KV.
+        if (
+            self._cache_groups_bound or self._cache_contract_bound
+        ) and cache_metadata is not None:
+            self._cache_groups_bound = True
+            group_table = self._resolve_full_history_table(
                 cache_metadata, kwargs.get("forward_batch"), 0
             )
         elif self._draft_reads_batch_pages(bs, forward_mode) and (
             page_table is not None
         ):
             # DraftPageStaging.publish already expanded into kernel pages, so
-            # the staged table is read with an identity expand (logical==kernel).
+            # the staged table is read as-is.
             group_table = page_table[:bs]
-            logical_page_size = self.page_size
         if group_table is not None:
             real_bs = min(int(group_table.shape[0]), bs)
             if real_bs > 0 and not self._block_table_aliased:
-                self._expand_group_page_table(
+                self._create_block_kv_indices(
+                    real_bs,
+                    metadata.block_kv_indices.shape[1],
                     group_table,
-                    batch_size=real_bs,
-                    logical_page_size=logical_page_size,
-                    out=metadata.block_kv_indices,
+                    metadata.block_kv_indices,
                 )
             if metadata.group_out_cache_loc is not None and real_bs > 0:
                 self._cache_decode_out_cache_loc(
                     group_table,
                     self.cuda_graph_seq_lens_buf,
                     batch_size=real_bs,
-                    logical_page_size=logical_page_size,
                     validate_pages=cache_debug_enabled(),
                     out=metadata.group_out_cache_loc,
                     q_len_per_req=q_len,

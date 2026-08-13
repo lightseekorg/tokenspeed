@@ -230,7 +230,7 @@ jobs:
 
               "${PYBIN}/python" -m pip install --upgrade \
                 pip "setuptools<82" wheel build twine packaging "apache-tvm-ffi==0.1.13"
-              "${PYBIN}/python" -m pip install --no-cache-dir "torch==2.11.0" --index-url "${TORCH_INDEX_URL}"
+              "${PYBIN}/python" -m pip install --no-cache-dir "torch==2.13.0" --index-url "${TORCH_INDEX_URL}"
 
               rm -rf build *.egg-info
               PIP_EXTRA_INDEX_URL="${TORCH_INDEX_URL}" \

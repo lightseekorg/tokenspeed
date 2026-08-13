@@ -26,7 +26,6 @@ import numpy.typing as npt
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import CachePDPageManifest
 from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
-from tokenspeed.runtime.pd.utils import PageTransferMetadata
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -63,7 +62,6 @@ class MooncakeKVSender:
         kv_indices: npt.NDArray[np.int64],
         aux_index,
         is_last,
-        mla_l1_5_args: PageTransferMetadata | None = None,
         bootstrap_token: int = -1,
         spec_candidate_ids: list[int] | None = None,
         mamba_indices: npt.NDArray[np.int64] | None = None,
@@ -71,9 +69,6 @@ class MooncakeKVSender:
     ):
         """
         Send the kv cache at the given kv indices to the decoder server
-        mla_l1_5_args: optional (page_transfer_mask, page_local_indices)
-            page_transfer_mask: boolean mask to select decode pages that will receive data from this prefill rank
-            page_local_indices: remapped local page indices that this prefill rank will send
         bootstrap_token: first output token produced by prefill (shipped via ZMQ status msg).
         """
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
@@ -94,7 +89,6 @@ class MooncakeKVSender:
                 kv_indices,
                 index_slice,
                 False,
-                mla_l1_5_args=mla_l1_5_args,
                 mamba_indices=mamba_indices,
                 page_manifest=page_manifest,
             )
@@ -105,7 +99,6 @@ class MooncakeKVSender:
                 index_slice,
                 True,
                 aux_index=aux_index,
-                mla_l1_5_args=mla_l1_5_args,
                 bootstrap_token=bootstrap_token,
                 spec_candidate_ids=spec_candidate_ids,
                 mamba_indices=mamba_indices,
@@ -120,11 +113,11 @@ class MooncakeKVSender:
         is_last,
         begin_cache_step: int,
         layerwise_interval: int,
-        mla_l1_5_args: PageTransferMetadata | None = None,
         bootstrap_token: int = -1,
         wait_for_bootstrap_token: bool = False,
         spec_candidate_ids: list[int] | None = None,
         mamba_indices: npt.NDArray[np.int64] | None = None,
+        page_manifest: CachePDPageManifest | None = None,
     ):
         self._layerwise_transfer_started = True
         self.curr_idx = max(self.curr_idx, index_slice.stop)
@@ -149,13 +142,13 @@ class MooncakeKVSender:
             index_slice,
             is_last,
             aux_index=aux_index if is_last else None,
-            mla_l1_5_args=mla_l1_5_args,
             bootstrap_token=bootstrap_token,
             begin_cache_step=begin_cache_step,
             layerwise_interval=layerwise_interval,
             wait_for_bootstrap_token=wait_for_bootstrap_token,
             spec_candidate_ids=spec_candidate_ids,
             mamba_indices=mamba_indices,
+            page_manifest=page_manifest,
         )
 
     def poll(self) -> TransferPoll:

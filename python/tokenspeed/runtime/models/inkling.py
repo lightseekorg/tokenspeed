@@ -81,7 +81,7 @@ from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.conv import inkling_ring_sconv, inkling_ring_sconv_update
+from tokenspeed_kernel.ops.conv import inkling_ring_sconv
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
@@ -100,7 +100,10 @@ from tokenspeed.runtime.configs.inkling_config import (
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+    get_is_capture_mode,
+    get_is_cuda_graph_phase,
+)
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -367,66 +370,44 @@ def _sconv_apply(
     layer_id: int,
     channel_offset: int,
     dim: int,
-    conv_group: str | None = None,
+    conv_group: str,
 ) -> torch.Tensor:
     """Run one sconv stream (or several adjacent ones fused) over ``x``.
 
     ``weight`` is ``[dim, W]``; ``channel_offset``/``dim`` select the state
     channels in the layer's conv pool buffer. Fusing adjacent streams (K+V)
-    is just a wider ``dim`` with concatenated weights.
+    is just a wider ``dim`` with concatenated weights. The paged bridges are
+    mandatory and fused: extend chunks tap the checkpoint at their aligned
+    start (the prefill kernel never reads the ring), decode rounds tap the
+    ring (the decode kernel never reads the paged cache), and both publish
+    every covered boundary in-kernel.
     """
     backend = ctx.attn_backend
     md = backend.conv_metadata
-
-    geo = backend.conv_columns if md.col_page_table is not None else None
-    checkpoint_mode = geo is not None
 
     # Channel slice of the layer's [slots, R, conv_dim] ring.
     state = backend.conv_pool.layer_state_wd(layer_id)[
         :, :, channel_offset : channel_offset + dim
     ]
 
-    checkpoint_buffers = ()
-    checkpoint_group = None
-    if checkpoint_mode:
-        if conv_group == "kvconv":
-            checkpoint_group = "kvconv"
-            checkpoint_buffers = ctx.token_to_kv_pool.kvconv_checkpoint_buffers(
-                layer_id
-            )
-        elif conv_group in ("attnconv", "mlpconv"):
-            checkpoint_group = "hiddenconv"
-            checkpoint_buffers = (
-                ctx.token_to_kv_pool.hiddenconv_checkpoint_buffer(layer_id, conv_group),
-            )
-        if checkpoint_buffers:
-            backend.register_shortconv_checkpoint_stream(
-                layer_id=layer_id,
-                channel_offset=channel_offset,
-                dim=dim,
-                group_id=checkpoint_group,
-                buffers=checkpoint_buffers,
-            )
-            if md.needs_restore:
-                backend.restore_shortconv_checkpoint(
-                    state,
-                    checkpoint_buffers,
-                    md,
-                    checkpoint_group,
-                )
-
-    # In-kernel speculative boundary publish: every covered 128-boundary,
-    # accept-independent; rejected content is overwritten by a later round.
-    publish = None
-    if checkpoint_buffers:
-        publish = (
-            md.col_page_table[checkpoint_group],
-            checkpoint_buffers[0],
-            checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
-            geo["block_tokens"],
+    if conv_group == "kvconv":
+        checkpoint_group = "kvconv"
+        checkpoint_buffers = ctx.token_to_kv_pool.kvconv_checkpoint_buffers(layer_id)
+    elif conv_group in ("attnconv", "mlpconv"):
+        checkpoint_group = "hiddenconv"
+        checkpoint_buffers = (
+            ctx.token_to_kv_pool.hiddenconv_checkpoint_buffer(layer_id, conv_group),
         )
-
-    y = inkling_ring_sconv(
+    else:
+        raise ValueError(f"unknown sconv stream group {conv_group!r}")
+    backend.register_shortconv_checkpoint_stream(
+        layer_id=layer_id,
+        channel_offset=channel_offset,
+        dim=dim,
+        group_id=checkpoint_group,
+        buffers=checkpoint_buffers,
+    )
+    return inkling_ring_sconv(
         x,
         weight,
         state,
@@ -435,23 +416,13 @@ def _sconv_apply(
         md.cache_indices,
         md.has_initial_state,
         md.seq_lens,
-        activation=None,
-        use_residual=True,
-        publish=publish,
+        md.col_page_table[checkpoint_group],
+        checkpoint_buffers[0],
+        checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
+        num_extends=md.num_extends,
+        page_size=backend.conv_columns["block_tokens"],
         enable_pdl=pdl_enabled(),
     )
-    if md.needs_ring_update:
-        # Extend chunks can exceed the compute kernel's in-kernel persistence
-        # bound; refill the full ring depth in a follow-up pass.
-        inkling_ring_sconv_update(
-            x,
-            state,
-            md.query_start_loc,
-            md.seq_lens,
-            md.cache_indices,
-            kernel_width=weight.shape[1],
-        )
-    return y
 
 
 class InklingRelLogitsProj(nn.Module):
@@ -613,10 +584,11 @@ class InklingAttention(nn.Module):
         qkvr, _ = self.qkvr(hidden_states)
         q, kv, r = qkvr.split([self.q_size, 2 * self.kv_size, self.r_size], dim=-1)
 
-        # Fork the R-slice-only rel projection onto the aux stream (capture
-        # only; joins before attention). INKLING_ATTN_RELFORK=0 = serial.
+        # Warm the R-slice projection serially on the capture topology, then
+        # overlap it during capture. INKLING_ATTN_RELFORK=0 stays serial.
         with self.stream_fork.scope(
-            enable=_ATTN_RELFORK and get_is_capture_mode()
+            enable=_ATTN_RELFORK and get_is_cuda_graph_phase(),
+            overlap=get_is_capture_mode(),
         ) as fork:
             with fork.branch():
                 rel_logits = self.rel_logits_proj(
@@ -964,8 +936,11 @@ class InklingSparseMoeBlock(nn.Module):
             num_global_tokens, max_tokens_per_gpu = self.comm_manager.get_num_tokens(
                 ctx
             )
-            # Shared experts depend only on x: fork before the gate (capture-only, allocator stream safety).
-            with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+            # Warm this branch serially on the aux stream, then overlap it with
+            # the gate during capture.
+            with self.stream_fork.scope(
+                enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
+            ) as fork:
                 with fork.branch():
                     shared_out = self.shared_experts(x, do_finalize=False)
                 weights, topk_ids, router_logits = self.gate(x)
@@ -1007,7 +982,9 @@ class InklingSparseMoeBlock(nn.Module):
                     topk_ids=topk_ids,
                     router_logits=router_logits,
                 )
-                with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+                with self.stream_fork.scope(
+                    enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
+                ) as fork:
                     routed_out = self.experts(
                         hidden_states=x,
                         topk_output=topk_output,

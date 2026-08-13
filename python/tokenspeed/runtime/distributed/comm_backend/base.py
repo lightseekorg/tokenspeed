@@ -38,26 +38,45 @@ class CommBackend(ABC):
 
     @abstractmethod
     def all_reduce(
-        self, tensor: torch.Tensor, group: Group, op=None
-    ) -> torch.Tensor: ...
-
-    def all_reduce_two(
         self,
-        first: torch.Tensor,
-        second: torch.Tensor,
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
         group: Group,
         op=None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reduce two tensors, falling back to two ordinary collectives."""
-        return (
-            self.all_reduce(first, group, op=op),
-            self.all_reduce(second, group, op=op),
-        )
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Reduce one tensor or a collection of independent tensors."""
+        if isinstance(tensor, torch.Tensor):
+            raise NotImplementedError
+        tensors = tensor
+        if len(tensors) == 0:
+            raise ValueError("all-reduce requires at least one tensor")
+        return tuple(self.all_reduce(value, group, op=op) for value in tensors)
 
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         """Prepare an implementation-specific one-shot lane when supported."""
 
         return False
+
+    def acquire_all_reduce_outputs(
+        self,
+        shapes: tuple[tuple[int, ...], ...],
+        like: torch.Tensor,
+        group: Group,
+        op=None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Acquire writable outputs for a later all-reduce.
+
+        Args:
+            shapes: Shapes of the outputs the producer will write.
+            like: Tensor providing dtype and device for ordinary allocations.
+            group: Global ranks participating in every reduction.
+            op: Reduction operation.
+
+        Returns:
+            Writable outputs accepted by ``all_reduce`` after production.
+        """
+        if not shapes:
+            raise ValueError("all-reduce requires at least one output")
+        return tuple(like.new_empty(shape) for shape in shapes)
 
     @abstractmethod
     def all_gather(

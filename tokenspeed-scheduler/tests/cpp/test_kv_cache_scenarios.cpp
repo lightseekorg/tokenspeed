@@ -28,6 +28,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 #include <spdlog/sinks/ostream_sink.h>
@@ -40,6 +41,15 @@
 namespace tokenspeed::test {
 
 namespace {
+
+static_assert(
+    std::is_same_v<decltype(std::declval<fsm::SchedulePrefillFirstChunkEvent&>()(std::declval<fsm::Submitted&&>())),
+                   std::variant<fsm::PrefillDone, fsm::Prefilling>>);
+static_assert(
+    std::is_same_v<decltype(std::declval<fsm::SchedulePrefillFirstChunkEvent&>()(std::declval<fsm::Retracted&&>())),
+                   std::variant<fsm::PrefillDone, fsm::Prefilling>>);
+static_assert(std::is_same_v<decltype(std::declval<fsm::SchedulePrefillEvent&>()(std::declval<fsm::Prefilling&&>())),
+                             std::variant<fsm::PrefillDone, fsm::Prefilling>>);
 
 std::pair<bool, std::string> ClearL1CacheWithCapturedLog(Scheduler* scheduler) {
     std::ostringstream output;
@@ -806,7 +816,7 @@ namespace {
 
 void SendAbort(Scheduler& scheduler, const std::string& id) {
     ExecutionEvent event;
-    event.With(ForwardEvent{forward::Abort{.request_id = id}});
+    event.With(forward::Abort{.request_id = id});
     scheduler.Advance(std::move(event));
 }
 
@@ -2356,6 +2366,194 @@ TEST_F(PrefixHitSuite, FullHitCapsAtLastToken) {
     SendFinish("r2");
     PlanOnce();
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+}
+
+class PrefixReplaySuite : public PrefixHitSuite {
+protected:
+    virtual std::int32_t PrefixReplayTokens() const { return 4; }
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = PrefixHitSuite::MakeConfig();
+        cfg.prefix_replay_tokens = PrefixReplayTokens();
+        return cfg;
+    }
+};
+
+TEST_F(PrefixReplaySuite, FullHitReplaysPrivateTailPages) {
+    const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
+    const RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/4);  // 8 tokens
+    const auto first_rows = RunLifecycle(first);
+    ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
+
+    Submit(MakeSpecWithTokens("r2", first.tokens));
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+
+    // Four replay tokens cap the hit at two 2-token pages. The remaining
+    // prompt tail is ordinary prefill input, not a claimed shared page.
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 4);
+    EXPECT_EQ(op->input_lengths.at(0), 4);
+    EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/4, /*start=*/5));
+    for (const char* group_id : {"full", "swa"}) {
+        const auto& row = op->block_tables.at(group_id).at(0);
+        ASSERT_EQ(row.size(), 5u);  // 2 hit + 2 private replay + 1 decode reserve
+        EXPECT_EQ(row[0], first_rows.at(group_id)[0]);
+        EXPECT_EQ(row[1], first_rows.at(group_id)[1]);
+        EXPECT_NE(row[2], first_rows.at(group_id)[2])
+            << group_id << " replay page must not alias the cached shared page";
+        EXPECT_GT(row[2], 0);
+        EXPECT_GT(row[3], 0);
+        EXPECT_GT(row[4], 0);
+    }
+}
+
+TEST_F(PrefixReplaySuite, ExistingUncachedSuffixSatisfiesReplayRequirement) {
+    RunLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));  // tokens 1..8
+
+    // Only four tokens match. The eight-token uncached suffix already exceeds
+    // prefix_replay_tokens=4, so the ordinary partial hit stays unchanged.
+    std::vector<std::int32_t> tokens = MakeTokens(/*count=*/4);
+    const std::vector<std::int32_t> suffix = MakeTokens(/*count=*/8, /*start=*/801);
+    tokens.insert(tokens.end(), suffix.begin(), suffix.end());
+    Submit(MakeSpecWithTokens("r2", tokens));
+
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 4);
+    EXPECT_EQ(op->input_lengths.at(0), 8);
+    EXPECT_EQ(op->input_ids, suffix);
+}
+
+TEST_F(PrefixReplaySuite, ReplayedPagesArePublishedForTheNextRequest) {
+    const RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/4);
+    RunLifecycle(first);
+
+    // r2 recomputes and republishes the tail behind the capped four-token hit.
+    RunLifecycle(MakeSpecWithTokens("r2", first.tokens));
+
+    // Extending the prompt lets r3 probe beyond its own four-token replay tail.
+    // It must hit all eight tokens from r2, including r2's replayed pages.
+    std::vector<std::int32_t> extended = first.tokens;
+    const std::vector<std::int32_t> suffix = MakeTokens(/*count=*/4, /*start=*/801);
+    extended.insert(extended.end(), suffix.begin(), suffix.end());
+    Submit(MakeSpecWithTokens("r3", extended));
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 8);
+    EXPECT_EQ(op->input_lengths.at(0), 4);
+    EXPECT_EQ(op->input_ids, suffix);
+}
+
+class PrefixReplayLargerThanPromptSuite : public PrefixReplaySuite {
+protected:
+    std::int32_t PrefixReplayTokens() const override { return 32; }
+};
+
+TEST_F(PrefixReplayLargerThanPromptSuite, FallsBackToFullPromptPrefill) {
+    const RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/4);
+    RunLifecycle(first);
+
+    Submit(MakeSpecWithTokens("r2", first.tokens));
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 0);
+    EXPECT_EQ(op->input_lengths.at(0), 8);
+    EXPECT_EQ(op->input_ids, first.tokens);
+}
+
+class PrefixReplayDisabledSuite : public PrefixReplaySuite {
+protected:
+    bool DisablePrefixCache() const override { return true; }
+};
+
+TEST_F(PrefixReplayDisabledSuite, DisabledPrefixCacheStillPrefillsTheFullPrompt) {
+    const RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/4);
+    RunLifecycle(first);
+
+    Submit(MakeSpecWithTokens("r2", first.tokens));
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 0);
+    EXPECT_EQ(op->input_lengths.at(0), 8);
+    EXPECT_EQ(op->input_ids, first.tokens);
+}
+
+class PrefixReplayHeterogeneousSuite : public PrefixHitSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.block_size = 8;
+        cfg.device_allocator.total_pages = 128;
+        cfg.host_allocator.total_pages = 0;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = false;
+        cfg.prefix_replay_tokens = 8;
+
+        PagedCacheGroupConfig history =
+            MakeGroup("history", /*block_size=*/8, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History);
+        PagedCacheGroupConfig state =
+            MakeGroup("state", /*block_size=*/2, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      /*sliding_window_tokens=*/32);
+        state.cache_blocks_per_lcm_block = 4;
+        cfg.paged_cache_groups = {history, state};
+        return cfg;
+    }
+};
+
+TEST_F(PrefixReplayHeterogeneousSuite, ReplayTailIsPrivateAcrossPackedGroups) {
+    const RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/4);  // 32 tokens
+    const auto first_rows = RunLifecycle(first);
+
+    Submit(MakeSpecWithTokens("r2", first.tokens));
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 24);
+    EXPECT_EQ(op->input_lengths.at(0), 8);
+    EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/8, /*start=*/25));
+
+    const auto& history = op->block_tables.at("history").at(0);
+    ASSERT_EQ(history.size(), 5u);  // 3 hit + 1 replay + 1 decode reserve
+    EXPECT_EQ(history[0], first_rows.at("history")[0]);
+    EXPECT_EQ(history[1], first_rows.at("history")[1]);
+    EXPECT_EQ(history[2], first_rows.at("history")[2]);
+    EXPECT_NE(history[3], first_rows.at("history")[3]);
+
+    const auto& state = op->block_tables.at("state").at(0);
+    ASSERT_EQ(state.size(), 17u);  // 12 hit + 4 replay + 1 decode reserve
+    for (std::size_t i = 0; i < 12; ++i) {
+        EXPECT_EQ(state[i], first_rows.at("state")[i]);
+    }
+    for (std::size_t i = 12; i < 16; ++i) {
+        EXPECT_NE(state[i], first_rows.at("state")[i]);
+        EXPECT_GT(state[i], 0);
+    }
+    EXPECT_GT(state[16], 0);
+}
+
+TEST(PrefixReplayConfigTest, RejectsNegativeReplayTokens) {
+    SchedulerConfig cfg{};
+    cfg.block_size = 2;
+    cfg.device_allocator.total_pages = 8;
+    cfg.max_scheduled_tokens = 8;
+    cfg.max_batch_size = 1;
+    cfg.prefix_replay_tokens = -1;
+    cfg.paged_cache_groups = {
+        MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+                  PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+    };
+    EXPECT_THROW((void)Scheduler(std::move(cfg)), std::invalid_argument);
 }
 
 class PrefixHitDisabledSuite : public PrefixHitSuite {

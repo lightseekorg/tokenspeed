@@ -63,6 +63,13 @@ def _make_config() -> ts.SchedulerConfig:
     return cfg
 
 
+def test_prefix_replay_tokens_binding_defaults_to_zero_and_round_trips() -> None:
+    cfg = _make_config()
+    assert cfg.prefix_replay_tokens == 0
+    cfg.prefix_replay_tokens = 4
+    assert cfg.prefix_replay_tokens == 4
+
+
 def _make_spec(
     request_id: str, num_pages: int, page_size: int = 2, start: int = 1
 ) -> ts.RequestSpec:

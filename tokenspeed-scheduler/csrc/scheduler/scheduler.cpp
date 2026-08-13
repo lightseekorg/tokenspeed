@@ -95,6 +95,9 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (config_.overlap_schedule_depth > 0 && config_.decode_input_tokens == 0) {
         throw std::invalid_argument("Scheduler: overlapped decode requires decode_input_tokens > 0");
     }
+    if (config_.prefix_replay_tokens < 0) {
+        throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
+    }
     if (config_.enable_l3_storage) {
         throw std::invalid_argument("Scheduler: L3 storage is not supported by the cache coordinator");
     }
@@ -448,9 +451,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
 }
 
 void Scheduler::Advance(const ExecutionEvent& event) {
-    const auto dispatch = [this](const auto& inner) { handleEvent(inner); };
     for (const auto& item : event.Events()) {
-        std::visit([&](const auto& outer) { std::visit(dispatch, outer); }, item);
+        std::visit([this](const auto& inner) { handleEvent(inner); }, item);
     }
 }
 

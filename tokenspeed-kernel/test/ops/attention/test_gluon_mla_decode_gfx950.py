@@ -132,6 +132,57 @@ def test_native_fp8_mla_ignores_recycled_tail_nan() -> None:
     torch.testing.assert_close(got, clean, rtol=0, atol=0)
 
 
+def test_native_fp8_mla_large_pool_uses_safe_64_bit_addresses() -> None:
+    batch_size = 32
+    first_seqlen = 2049
+    last_seqlen = 2112
+    max_seqlen_k = 8192
+    q, compact_cache, _, cache_seqlens = _make_inputs(last_seqlen, batch_size)
+
+    bytes_per_page = _PAGE_SIZE * _QK_DIM * compact_cache.element_size()
+    pool_pages = 0x80000000 // bytes_per_page + 1
+    large_cache = torch.empty(
+        (pool_pages, _PAGE_SIZE, 1, _QK_DIM),
+        dtype=compact_cache.dtype,
+        device="cuda",
+    )
+    active_pages = compact_cache.shape[0]
+    large_cache[:active_pages].copy_(compact_cache)
+    large_cache[-active_pages:].copy_(compact_cache)
+
+    pages_per_batch = compact_cache.shape[0] // batch_size
+    table_pages = max_seqlen_k // _PAGE_SIZE
+    page_table = torch.full(
+        (batch_size, table_pages),
+        pool_pages + 1,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    low_pages = torch.arange(active_pages, device="cuda", dtype=torch.int32).view(
+        batch_size, pages_per_batch
+    )
+    high_pages = low_pages + (pool_pages - active_pages)
+
+    got = None
+    for active_mapping in (low_pages, high_pages):
+        page_table[:, :pages_per_batch].copy_(active_mapping)
+        for seqlen in range(first_seqlen, last_seqlen + 1):
+            cache_seqlens.fill_(seqlen)
+            got = _run(
+                q,
+                large_cache,
+                page_table,
+                cache_seqlens,
+                return_lse=False,
+                max_seqlen_k=max_seqlen_k,
+            )
+    torch.cuda.synchronize()
+
+    assert got is not None
+    ref_out, _ = _reference(q, compact_cache, last_seqlen)
+    torch.testing.assert_close(got.float(), ref_out, rtol=0.12, atol=0.12)
+
+
 @pytest.mark.parametrize("batch_size", [1, 8, 32, 64])
 def test_native_fp8_mla_single_split_cuda_graph_replay(batch_size: int) -> None:
     q, kv_cache, page_table, cache_seqlens = _make_inputs(_PAGE_SIZE, batch_size)

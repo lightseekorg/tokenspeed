@@ -26,8 +26,12 @@ back to NCCL.
 """
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
+from tokenspeed.runtime.distributed.comm_backend.base import (
+    CommBackend,
+    Group,
+)
 from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
 from tokenspeed.runtime.distributed.comm_backend.triton_allreduce import (
     TritonAllReduceBackend,
@@ -96,7 +100,40 @@ class AutoBackend(CommBackend):
 
     # ---- Public CommBackend interface ----
 
-    def all_reduce(self, tensor: torch.Tensor, group: Group, op=None) -> torch.Tensor:
+    def all_reduce(
+        self,
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
+        group: Group,
+        op=None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        if not isinstance(tensor, torch.Tensor):
+            tensors = tensor
+            if len(tensors) == 0:
+                raise ValueError("all-reduce requires at least one tensor")
+            use_nccl = self._force_deterministic_rsag() or self._group_spans_nodes(
+                group
+            )
+            # Collections past the one-shot window are headed for NCCL;
+            # grouping avoids the copy required to concatenate them first.
+            use_nccl = use_nccl or all(
+                value.numel() * value.element_size() > MAX_ONESHOT_BYTES
+                for value in tensors
+            )
+            use_nccl = use_nccl or (
+                current_platform().is_amd
+                and sum(value.numel() * value.element_size() for value in tensors)
+                > self._triton_ar.producer_direct_max_bytes
+            )
+            if (
+                not use_nccl
+                and current_platform().is_amd
+                and self._triton_ar.can_reduce_outputs(tensors, group, op=op)
+            ):
+                return self._triton_ar.all_reduce(tensors, group, op=op)
+            if use_nccl and len(tensors) == 2:
+                return self._nccl.all_reduce_two(*tensors, group, op=op)
+            return super().all_reduce(tensors, group, op=op)
+
         # AR backend dispatch -- first match wins. This is Tier 1 (which
         # backend); the trtllm backend then runs Tier 2 (mnnvl vs IPC, by
         # payload bytes) inside _ar_fusion_workspace.
@@ -121,37 +158,36 @@ class AutoBackend(CommBackend):
             return self._triton_ar.all_reduce(tensor, group, op=op)
         return self._nccl.all_reduce(tensor, group, op=op)
 
-    def all_reduce_two(
-        self,
-        first: torch.Tensor,
-        second: torch.Tensor,
-        group: Group,
-        op=None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._force_deterministic_rsag() or self._group_spans_nodes(group):
-            return self._nccl.all_reduce_two(first, second, group, op=op)
-        # The fused two-segment primitive currently exists only in Iris. Keep
-        # all configured custom backends authoritative, and use the ordinary
-        # two-call fallback for unsupported devices, dtypes, and sizes.
-        if not self._trtllm_ar.has_trtllm_ar(group):
-            if self._triton_ar.can_run_two(first, second, group, op=op):
-                return self._triton_ar.all_reduce_two(
-                    first,
-                    second,
-                    group,
-                    op=op,
-                )
-        # Both segments past the one-shot window are headed for NCCL either
-        # way; a grouped launch reduces them in one kernel without the
-        # cat/copy a fused lane would need.
-        if first.numel() * first.element_size() > MAX_ONESHOT_BYTES and (
-            second.numel() * second.element_size() > MAX_ONESHOT_BYTES
-        ):
-            return self._nccl.all_reduce_two(first, second, group, op=op)
-        return super().all_reduce_two(first, second, group, op=op)
-
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         return self._trtllm_ar.ensure_group_lane(group, hidden_dim)
+
+    def acquire_all_reduce_outputs(
+        self,
+        shapes: tuple[tuple[int, ...], ...],
+        like: torch.Tensor,
+        group: Group,
+        op=None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Acquire ordinary or producer-direct all-reduce outputs."""
+        if (
+            self._force_deterministic_rsag()
+            or self._group_spans_nodes(group)
+            or self._trtllm_ar.has_trtllm_ar(group)
+        ):
+            return super().acquire_all_reduce_outputs(shapes, like, group, op=op)
+        if current_platform().is_amd and not self._triton_ar.can_acquire_outputs(
+            shapes,
+            like,
+            group,
+            op=op,
+        ):
+            return super().acquire_all_reduce_outputs(shapes, like, group, op=op)
+        return self._triton_ar.acquire_all_reduce_outputs(
+            shapes,
+            like,
+            group,
+            op=op,
+        )
 
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0

@@ -45,6 +45,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     is_breakable_capture_active,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.cache_groups import (
     CacheGroupsMixin,
@@ -53,15 +54,12 @@ from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.common import fp8_cast_contiguous
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 logger = get_colorful_logger(__name__)
-
-# Workspace buffer shared across all trtllm_mha wrappers.
-_global_workspace_buffer: torch.Tensor | None = None
-TRTLLM_MHA_WORKSPACE = 512 * 1024 * 1024
 
 
 def canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
@@ -149,15 +147,14 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         self.kv_cache_dtype = config.kv_cache_dtype
         max_bs = config.max_bs
 
-        # Shared workspace buffer (allocated once per process).
-        global _global_workspace_buffer
-        if _global_workspace_buffer is None:
-            _global_workspace_buffer = torch.zeros(
-                TRTLLM_MHA_WORKSPACE,
-                dtype=torch.uint8,
-                device=config.device,
-            )
-        self.workspace_buffer = _global_workspace_buffer
+        self._workspace_pool = workspace_pool(config.device)
+        self._workspace_nbytes = envs.TOKENSPEED_WORKSPACE_TRTLLM_MHA_MB.get() * (
+            1 << 20
+        )
+        # Warm the shared block to this backend's peak now: graph capture runs
+        # the forward with the pool frozen, and under --disable-autotune no
+        # earlier forward will have grown the block by then.
+        self._workspace_pool.allocate(((self._workspace_nbytes,), torch.uint8))
 
         # Max pages per request.
         self.max_num_pages = (config.context_len + self.page_size - 1) // self.page_size
@@ -204,6 +201,17 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     # ------------------------------------------------------------------
     # Page table helpers
     # ------------------------------------------------------------------
+
+    @property
+    def workspace_buffer(self) -> torch.Tensor:
+        """Per-use view of the shared scratch block (contract: workspace.py).
+
+        Fetched on every use rather than held: the content (softmax stats plus
+        multi-CTA KV scratch) is consumed within each attention op, so sharing
+        the block is safe, and a held view would go stale if the block grew.
+        """
+        (buf,) = self._workspace_pool.allocate(((self._workspace_nbytes,), torch.uint8))
+        return buf
 
     def _build_page_table(
         self,

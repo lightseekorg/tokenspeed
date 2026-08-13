@@ -21,6 +21,7 @@
 
 import socket
 import traceback
+from types import SimpleNamespace
 from typing import List, Tuple
 
 import pytest
@@ -66,6 +67,98 @@ def _spawn_and_collect(worker_fn, args, world_size: int) -> None:
         raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
 
 
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_producer_direct_admission_supported_world_sizes(
+    monkeypatch,
+    world_size,
+    dtype,
+):
+    from tokenspeed_kernel.ops.communication import triton as triton_ops
+
+    monkeypatch.setattr(
+        triton_ops,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=True),
+    )
+    state = SimpleNamespace(world_size=world_size, max_bytes=64)
+
+    assert triton_ops.symm_outputs_can_run(
+        state,
+        ((3, 5), (1, 1)),
+        dtype,
+    )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "shapes"),
+    [
+        (torch.bfloat16, ((32,),)),
+        (torch.float16, ((32,),)),
+        (torch.float32, ((16,),)),
+    ],
+)
+def test_producer_direct_admission_uses_byte_capacity(monkeypatch, dtype, shapes):
+    from tokenspeed_kernel.ops.communication import triton as triton_ops
+
+    monkeypatch.setattr(
+        triton_ops,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=True),
+    )
+    state = SimpleNamespace(world_size=8, max_bytes=64)
+
+    assert triton_ops.symm_outputs_can_run(state, shapes, dtype)
+
+
+@pytest.mark.parametrize(
+    ("world_size", "shapes", "dtype", "op"),
+    [
+        (1, ((4,),), torch.bfloat16, dist.ReduceOp.SUM),
+        (8, ((3,),), torch.bfloat16, dist.ReduceOp.SUM),
+        (8, ((3,),), torch.float32, dist.ReduceOp.SUM),
+        (8, ((36,),), torch.bfloat16, dist.ReduceOp.SUM),
+        (8, ((18,),), torch.float32, dist.ReduceOp.SUM),
+        (8, ((4,),), torch.float64, dist.ReduceOp.SUM),
+        (8, ((4,),), torch.bfloat16, dist.ReduceOp.PRODUCT),
+    ],
+)
+def test_producer_direct_admission_rejects_unsupported_requests(
+    monkeypatch,
+    world_size,
+    shapes,
+    dtype,
+    op,
+):
+    from tokenspeed_kernel.ops.communication import triton as triton_ops
+
+    monkeypatch.setattr(
+        triton_ops,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=True),
+    )
+    state = SimpleNamespace(world_size=world_size, max_bytes=64)
+
+    assert not triton_ops.symm_outputs_can_run(state, shapes, dtype, op)
+
+
+def test_producer_direct_admission_is_cdna4_only(monkeypatch):
+    from tokenspeed_kernel.ops.communication import triton as triton_ops
+
+    monkeypatch.setattr(
+        triton_ops,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=False),
+    )
+    state = SimpleNamespace(world_size=8, max_bytes=64)
+
+    assert not triton_ops.symm_outputs_can_run(
+        state,
+        ((4,),),
+        torch.bfloat16,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Suite 1: iris_all_reduce
 # ---------------------------------------------------------------------------
@@ -80,9 +173,19 @@ def _ar_shape_cases() -> List[Tuple[int, ...]]:
     ]
 
 
-def _ar_two_shape_case() -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
-    """Production Kimi K3 shared-output and routed-latent decode widths."""
-    return (1, 7168), (1, 3584)
+def _ar_output_shape_cases() -> List[Tuple[Tuple[int, ...], ...]]:
+    """Producer-direct collections spanning one, two, and three outputs."""
+    return [
+        ((1, 7168), (1, 3584)),
+        ((2, 7168), (2, 3584)),
+        ((4, 7168), (4, 3584)),
+        ((8, 7168), (8, 3584)),
+        ((16, 7168), (16, 3584)),
+        ((3, 20), (2, 12)),
+        ((3, 5), (1, 1)),
+        ((2, 16),),
+        ((3, 20), (2, 12), (4, 4)),
+    ]
 
 
 def _ar_worker_fn(rank, world_size, port, error_dict):
@@ -110,11 +213,13 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         # process (which has no distributed context).
         from tokenspeed_kernel.ops.communication.iris import create_iris_state
 
-        first_shape, second_shape = _ar_two_shape_case()
+        output_shape_cases = _ar_output_shape_cases()
         max_numel = max(
             max(int(torch.tensor(s).prod()) for s in _ar_shape_cases()),
-            int(torch.tensor(first_shape).prod())
-            + int(torch.tensor(second_shape).prod()),
+            max(
+                sum(int(torch.tensor(shape).prod()) for shape in shapes)
+                for shapes in output_shape_cases
+            ),
         )
         state = create_iris_state(
             group=dist.group.WORLD,
@@ -124,14 +229,44 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         )
         for shape in _ar_shape_cases():
             _check_all_reduce(state, rank, world_size, shape, device)
-        _check_all_reduce_two(
-            state,
+        for shapes in output_shape_cases:
+            _check_all_reduce_symmetric_outputs(
+                state,
+                rank,
+                world_size,
+                shapes,
+                device,
+            )
+
+        fp16_state = create_iris_state(
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            max_numel=max_numel,
+            dtype=torch.float16,
+        )
+        _check_all_reduce_symmetric_outputs(
+            fp16_state,
             rank,
             world_size,
-            first_shape,
-            second_shape,
+            ((3, 5), (1, 1)),
             device,
         )
+
+        fp32_state = create_iris_state(
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            max_numel=max_numel,
+            dtype=torch.float32,
+        )
+        _check_all_reduce_symmetric_outputs(
+            fp32_state,
+            rank,
+            world_size,
+            ((3, 5), (1, 1)),
+            device,
+        )
+        if world_size == 8:
+            _check_all_reduce_residual_attnres(state, rank, device)
     finally:
         dist.destroy_process_group()
 
@@ -154,44 +289,151 @@ def _check_all_reduce(state, rank: int, world_size: int, shape, device) -> None:
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
 
 
-def _check_all_reduce_two(
+def _check_all_reduce_symmetric_outputs(
     state,
     rank: int,
     world_size: int,
-    first_shape,
-    second_shape,
+    shapes,
     device,
 ) -> None:
-    from tokenspeed_kernel.ops.communication.iris import iris_all_reduce_two
+    if not current_platform().is_cdna4:
+        return
 
-    first = torch.full(
-        first_shape,
-        rank + 1,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    second = torch.full(
-        second_shape,
-        2 * (rank + 1),
-        dtype=torch.bfloat16,
-        device=device,
+    from tokenspeed_kernel.ops.communication.iris import (
+        iris_acquire_outputs,
+        iris_all_reduce_symmetric,
     )
 
-    first_result, second_result = iris_all_reduce_two(state, first, second)
-
+    outputs = iris_acquire_outputs(state, shapes)
+    assert state.owns_outputs(outputs)
+    assert not state.owns_outputs(tuple(torch.empty_like(output) for output in outputs))
+    for index, output in enumerate(outputs, start=1):
+        output.fill_(index * (rank + 1))
+    results = iris_all_reduce_symmetric(state, outputs)
     expected_value = world_size * (world_size + 1) // 2
-    torch.testing.assert_close(
-        first_result,
-        torch.full_like(first, expected_value),
-        atol=0,
-        rtol=0,
+    for index, (output, result) in enumerate(zip(outputs, results), start=1):
+        torch.testing.assert_close(
+            result,
+            torch.full_like(output, index * expected_value),
+            atol=0,
+            rtol=0,
+        )
+
+    snapshots = []
+    for scale in range(1, 5):
+        for index, output in enumerate(outputs, start=1):
+            output.fill_(scale * index * (rank + 1))
+        results = iris_all_reduce_symmetric(state, outputs)
+        snapshots.append(tuple(result.clone() for result in results))
+    torch.cuda.synchronize()
+    for scale, results in enumerate(snapshots, start=1):
+        for index, (output, result) in enumerate(zip(outputs, results), start=1):
+            torch.testing.assert_close(
+                result,
+                torch.full_like(output, scale * index * expected_value),
+                atol=0,
+                rtol=0,
+            )
+
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for index, output in enumerate(outputs, start=1):
+            output.fill_(index * (rank + 1))
+        graph_results = iris_all_reduce_symmetric(state, outputs)
+    dist.barrier()
+    graph.replay()
+    torch.cuda.synchronize()
+    for index, (output, result) in enumerate(zip(outputs, graph_results), start=1):
+        torch.testing.assert_close(
+            result,
+            torch.full_like(output, index * expected_value),
+            atol=0,
+            rtol=0,
+        )
+
+
+def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
+    from tokenspeed_kernel.ops.activation.triton import (
+        attnres_combine,
+        attnres_partial,
     )
-    torch.testing.assert_close(
-        second_result,
-        torch.full_like(second, 2 * expected_value),
-        atol=0,
-        rtol=0,
+    from tokenspeed_kernel.ops.communication.iris import (
+        iris_all_reduce,
     )
+    from tokenspeed_kernel.ops.communication.triton import (
+        allreduce_residual_attnres_combine,
+        allreduce_residual_attnres_combine_supported,
+    )
+
+    torch.manual_seed(101)
+    hidden = 7168
+    blocks = (torch.randn(4, 1, hidden, device=device) * 0.1).to(torch.bfloat16)
+    score_weight = (torch.randn(hidden, device=device) * 0.02).to(torch.bfloat16)
+    output_weight = (1.0 + torch.randn(hidden, device=device) * 0.02).to(torch.bfloat16)
+    residual = (torch.randn(1, hidden, device=device) * 0.1).to(torch.bfloat16)
+    local = (torch.randn(1, hidden, device=device) * 0.01 + (rank + 1) * 0.002).to(
+        torch.bfloat16
+    )
+    scratch = (
+        torch.empty(1, device=device, dtype=torch.float32),
+        torch.empty(1, device=device, dtype=torch.float32),
+        torch.empty(1, hidden, device=device, dtype=torch.float32),
+    )
+    attnres_partial(blocks, score_weight, 1e-6, scratch)
+
+    reduced = iris_all_reduce(state, local.clone(), safe=False)
+    expected_residual = residual + reduced
+    expected_hidden = attnres_combine(
+        expected_residual,
+        score_weight,
+        output_weight,
+        1e-6,
+        scratch,
+        torch.empty_like(residual),
+    )
+    assert allreduce_residual_attnres_combine_supported(
+        local,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        rank=rank,
+        group=state.group,
+        local_world_size=8,
+    )
+    for _ in range(4):
+        actual_hidden, actual_residual = allreduce_residual_attnres_combine(
+            local,
+            residual,
+            score_weight,
+            output_weight,
+            scratch,
+            rank=rank,
+            group=state.group,
+            local_world_size=8,
+            eps=1e-6,
+        )
+        torch.testing.assert_close(actual_residual, expected_residual, atol=0, rtol=0)
+        torch.testing.assert_close(actual_hidden, expected_hidden, atol=2e-2, rtol=2e-2)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_hidden, graph_residual = allreduce_residual_attnres_combine(
+            local,
+            residual,
+            score_weight,
+            output_weight,
+            scratch,
+            rank=rank,
+            group=state.group,
+            local_world_size=8,
+            eps=1e-6,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_residual, expected_residual, atol=0, rtol=0)
+    torch.testing.assert_close(graph_hidden, expected_hidden, atol=2e-2, rtol=2e-2)
 
 
 def _run_ar_test(world_size: int) -> None:
@@ -210,6 +452,61 @@ def test_iris_all_reduce_correctness_world4():
 
 def test_iris_all_reduce_correctness_world8():
     _run_ar_test(world_size=8)
+
+
+def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
+    try:
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://localhost:{port}",
+            rank=rank,
+            world_size=world_size,
+        )
+        groups = (
+            tuple(range(0, world_size, 2)),
+            tuple(range(1, world_size, 2)),
+        )
+        process_groups = tuple(dist.new_group(ranks) for ranks in groups)
+        group_index = rank % 2
+        group = process_groups[group_index]
+        group_rank = groups[group_index].index(rank)
+
+        from tokenspeed_kernel.ops.communication.iris import create_iris_state
+
+        state = create_iris_state(
+            group=group,
+            rank_in_group=group_rank,
+            max_numel=32,
+            dtype=torch.bfloat16,
+        )
+        _check_all_reduce(
+            state,
+            group_rank,
+            len(groups[group_index]),
+            (4, 7),
+            device,
+        )
+        _check_all_reduce_symmetric_outputs(
+            state,
+            group_rank,
+            len(groups[group_index]),
+            ((3, 5), (1, 1)),
+            device,
+        )
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_iris_all_reduce_noncontiguous_subgroups():
+    world_size = 8
+    _skip_if_unsupported(world_size, "Iris subgroup all-reduce tests")
+    port = _get_open_port()
+    _spawn_and_collect(_ar_subgroup_worker_fn, (world_size, port), world_size)
 
 
 # ---------------------------------------------------------------------------

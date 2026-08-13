@@ -126,39 +126,15 @@ class FusionParams:
 
 
 def all_reduce(
-    tensor: torch.Tensor,
+    tensor: torch.Tensor | tuple[torch.Tensor, ...],
     group: Group,
     backend: CommBackend | None = None,
     op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
-) -> torch.Tensor:
-    """All-reduce the tensor across the given communication group."""
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    """All-reduce one tensor or independent tensors across a group."""
     if backend is None:
         backend = get_global_backend()
     return backend.all_reduce(tensor, group, op=op)
-
-
-def all_reduce_two(
-    first: torch.Tensor,
-    second: torch.Tensor,
-    group: Group,
-    backend: CommBackend | None = None,
-    op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """All-reduce two tensors, using a fused backend primitive when available.
-
-    Args:
-        first: First tensor to reduce.
-        second: Second tensor to reduce.
-        group: Global ranks participating in both reductions.
-        backend: Optional communication backend override.
-        op: Reduction operation.
-
-    Returns:
-        The two reduced tensors in input order.
-    """
-    if backend is None:
-        backend = get_global_backend()
-    return backend.all_reduce_two(first, second, group, op=op)
 
 
 def prepare_all_reduce_lane(
@@ -219,6 +195,23 @@ def all_reduce_latent_norm(
         launch_with_pdl=pdl_enabled(),
         trigger_completion_at_end=True,
     )
+
+
+def acquire_all_reduce_outputs(
+    shapes: tuple[tuple[int, ...], ...],
+    like: torch.Tensor,
+    group: Group,
+    backend: CommBackend | None = None,
+    op: torch.distributed.ReduceOp = torch.distributed.ReduceOp.SUM,
+) -> tuple[torch.Tensor, ...]:
+    """Acquire writable producer outputs for a later all-reduce.
+
+    This function does not launch a collective. Fill the returned outputs,
+    then pass them to ``all_reduce``.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.acquire_all_reduce_outputs(shapes, like, group, op=op)
 
 
 def all_gather(
