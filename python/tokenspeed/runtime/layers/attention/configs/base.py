@@ -67,8 +67,12 @@ class BaseAttnConfig:
     attn_tp_size: int
     dtype: torch.dtype
     kv_cache_dtype: torch.dtype
-    # Tokens covered by one page as seen by the attention kernel.
-    page_size: int
+    # Scheduler prefix granularity (CLI --block-size): the identity axis.
+    prefix_granularity: int
+    # Tokens covered by one attention-kernel page. None picks the backend's
+    # per-kernel default (flexible kernels use the prefix granularity;
+    # fixed-page kernels use their own constant).
+    kernel_page_size: int | None = None
     # Physical per-request KV extent: the model's logical context_len plus
     # ServerArgs.spec_context_pad (spec verify overshoot for a finished request
     # lingering one overlap step). Backends size page tables and clamp seq_lens

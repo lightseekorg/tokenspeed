@@ -51,7 +51,7 @@ struct PagedCacheGroupConfig {
     PagedCacheGroupFamily family{PagedCacheGroupFamily::History};
     PagedCacheTransferPolicy transfer_policy{PagedCacheTransferPolicy::Unspecified};
 
-    std::int32_t PageSize() const { return rows_per_page * entry_stride_tokens; }
+    std::int32_t BlockGranularity() const { return rows_per_page * entry_stride_tokens; }
     void Validate() const;
 };
 

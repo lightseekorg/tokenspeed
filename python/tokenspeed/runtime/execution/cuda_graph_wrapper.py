@@ -265,8 +265,8 @@ class CudaGraphWrapper:
             )
             # Drafter reads the TARGET's group tables (_draft_group_tables):
             # its page-size view must match the target's hetero geometry.
-            target_ps = getattr(attn_backend, "group_page_sizes", None)
-            draft_ps = getattr(draft_attn_backend, "group_page_sizes", None)
+            target_ps = getattr(attn_backend, "group_block_granularities", None)
+            draft_ps = getattr(draft_attn_backend, "group_block_granularities", None)
             if target_ps and draft_ps is not None:
                 for gid in self._draft_cache_group_ids():
                     if gid in target_ps:

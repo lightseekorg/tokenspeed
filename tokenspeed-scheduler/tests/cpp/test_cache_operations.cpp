@@ -147,7 +147,7 @@ TEST(CacheOperationTest, RetractionStoreIsBestEffortAndUsesOrdinaryTransferPins)
     const std::array specs{CacheGroupSpec{
         .kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
-        .page_size = 2,
+        .block_granularity = 2,
     }};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
                                                      /*stream_device_cache_to_host=*/false);
@@ -177,7 +177,7 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     const std::array specs{CacheGroupSpec{
         .kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
-        .page_size = 2,
+        .block_granularity = 2,
     }};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
                                                      /*stream_device_cache_to_host=*/false);
@@ -203,7 +203,7 @@ TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRe
     const std::array specs{CacheGroupSpec{
         .kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
-        .page_size = 2,
+        .block_granularity = 2,
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*host_pool=*/nullptr,

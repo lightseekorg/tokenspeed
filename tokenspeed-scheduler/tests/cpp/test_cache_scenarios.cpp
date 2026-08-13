@@ -54,12 +54,12 @@ std::pair<bool, std::string> ClearL1CacheWithCapturedLog(Scheduler* scheduler) {
     return {cleared, output.str()};
 }
 
-PagedCacheGroupConfig MakeGroup(const std::string& id, std::int32_t page_size, std::int32_t total_pages,
+PagedCacheGroupConfig MakeGroup(const std::string& id, std::int32_t block_granularity, std::int32_t total_pages,
                                 PagedCacheGroupConfig::Retention retention, PagedCacheGroupFamily family,
                                 std::int32_t sliding_window_tokens = 0) {
     PagedCacheGroupConfig g;
     g.group_id = id;
-    g.rows_per_page = page_size;
+    g.rows_per_page = block_granularity;
     g.entry_stride_tokens = 1;
     g.total_pages = total_pages;
     g.retention = retention;
@@ -507,7 +507,7 @@ TEST_F(PoolAccountingSuite, ThreeRequestsOutOfOrderFinishReclaimExactly) {
 // Chunked prefill slides the SWA window DURING prefill, then decode keeps
 // sliding. Window convention used below: with N = tokens computed BEFORE a
 // round's forward, the pending query at N attends keys [N-W+1, N], so the
-// first kept page is (N-W+1)/page_size and everything below it is freed.
+// first kept page is (N-W+1)/block_granularity and everything below it is freed.
 TEST_F(ChunkedPrefillSuite, ChunkedPrefillThenSwaSlidesToNullHole) {
     const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
 
@@ -1749,14 +1749,14 @@ TEST_F(RetractStateGroupSuite, StateGroupRequestRetractsCleanly) {
 TEST(CacheProgressTest, PromotionBoundarySurvivesPrefillRounds) {
     BlockPool pool(/*num_lcm_blocks=*/8);
     std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
-        CacheGroupSpec{.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     ReqPoolAllocator req_pool{4};
 
-    RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/6, /*page_size=*/2)};
-    Request request{spec, /*page_size=*/2, Role::kFused};
+    RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/6, /*granularity=*/2)};
+    Request request{spec, /*prefix_granularity=*/2, Role::kFused};
     std::vector<BlockTable> tables(coordinator.NumGroups());
     const std::optional<CacheCoordinator::AdmissionResult> admission =
         AdmitForTest(coordinator, tables, /*num_tokens=*/4);
@@ -1836,13 +1836,13 @@ TEST_F(PromotionBoundaryHeadOfLineSuite, DoesNotStartSecondIncompletePrefill) {
 TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     BlockPool pool(/*num_lcm_blocks=*/8);
     std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     ReqPoolAllocator req_pool{4};
 
-    RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*page_size=*/2)};
-    Request request{spec, /*page_size=*/2, Role::kD};
+    RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
+    Request request{spec, /*prefix_granularity=*/2, Role::kD};
     request.Apply(fsm::BootstrappedEvent{});
     std::vector<BlockTable> tables(coordinator.NumGroups());
     const std::optional<CacheCoordinator::AdmissionResult> admission =
@@ -1866,12 +1866,12 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
 TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) {
     BlockPool device_pool(/*num_lcm_blocks=*/12);
     std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool);
     ReqPoolAllocator req_pool{4};
-    RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*page_size=*/2)};
-    Request request{spec, /*page_size=*/2, Role::kD};
+    RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
+    Request request{spec, /*prefix_granularity=*/2, Role::kD};
     request.Apply(fsm::BootstrappedEvent{});
     std::vector<BlockTable> tables(coordinator.NumGroups());
     auto admission = AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = 4, .reserve_tokens = 1});
@@ -1919,14 +1919,14 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
 TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
     BlockPool pool(/*num_lcm_blocks=*/8);
     std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
-        CacheGroupSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     ReqPoolAllocator req_pool{4};
 
-    RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*page_size=*/2)};
-    Request request{spec, /*page_size=*/2, Role::kFused};
+    RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
+    Request request{spec, /*prefix_granularity=*/2, Role::kFused};
     std::vector<BlockTable> tables(coordinator.NumGroups());
     const std::optional<CacheCoordinator::AdmissionResult> admission =
         AdmitForTest(coordinator, tables, /*num_tokens=*/4);
@@ -1993,16 +1993,16 @@ TEST_F(ChunkedPrefillSuite, AbortDuringDecodeRestoresPoolBaseline) {
 TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
     BlockPool pool(/*num_lcm_blocks=*/31);  // Pages are not the constraint.
     std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
-        CacheGroupSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     ReqPoolAllocator req_pool{1};
     ReqPoolIndex held = req_pool.Allocate();  // exhaust the single slot
     ASSERT_EQ(req_pool.AvailableSlots(), 0);
 
-    RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*page_size=*/2)};
-    Request request{spec, /*page_size=*/2, Role::kFused};
+    RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
+    Request request{spec, /*prefix_granularity=*/2, Role::kFused};
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
     ASSERT_EQ(pool.NumEmptyLcmBlocks(), 27);
@@ -2029,8 +2029,8 @@ TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
 TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     BlockPool pool(/*num_lcm_blocks=*/32);
     std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
-        CacheGroupSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
@@ -2522,10 +2522,10 @@ protected:
         cfg.prefix_replay_tokens = 8;
 
         PagedCacheGroupConfig history =
-            MakeGroup("history", /*page_size=*/8, cfg.device_allocator.total_pages,
+            MakeGroup("history", /*block_granularity=*/8, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History);
         PagedCacheGroupConfig state =
-            MakeGroup("state", /*page_size=*/2, cfg.device_allocator.total_pages,
+            MakeGroup("state", /*block_granularity=*/2, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
                       /*sliding_window_tokens=*/32);
         state.cache_blocks_per_lcm_block = 4;

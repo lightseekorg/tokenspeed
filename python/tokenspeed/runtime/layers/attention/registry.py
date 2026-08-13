@@ -246,8 +246,14 @@ def _validate_lcm_page_size(
     *,
     prefix_granularity: int,
 ) -> None:
-    """Require the scheduler page to contain whole configured kernel pages."""
-    kernel_page_size = int(config.page_size)
+    """Require the scheduler page to contain whole configured kernel pages.
+
+    An unset kernel_page_size means the backend resolves its registry
+    default itself and owns the divisibility check for it.
+    """
+    if config.kernel_page_size is None:
+        return
+    kernel_page_size = int(config.kernel_page_size)
     if (
         prefix_granularity <= 0
         or kernel_page_size <= 0
@@ -259,20 +265,22 @@ def _validate_lcm_page_size(
         )
 
 
-def _set_cache_group_page_sizes(config: BaseAttnConfig, spec: CachePoolSpec) -> None:
+def _set_cache_group_block_granularities(
+    config: BaseAttnConfig, spec: CachePoolSpec
+) -> None:
     """Publish each group's scheduler table grain to group-aware backends.
 
     This seed must be per-group: under --enforce-eager the backend never runs
     _learn_cache_groups (a CUDA-graph hook), so whatever is published here is
     what group-table expansion uses.
     """
-    if not hasattr(config, "group_page_sizes"):
+    if not hasattr(config, "group_block_granularities"):
         return
     grain_by_group = {
         group_spec.group_id: group_spec.block_granularity
         for group_spec in spec.paged_cache_group_specs
     }
-    config.group_page_sizes = {
+    config.group_block_granularities = {
         group_id: grain_by_group[group_id] for group_id in spec.layer_group_ids
     }
 
@@ -984,13 +992,13 @@ def create_attn_components(
         config,
         prefix_granularity=prefix_granularity,
     )
-    _set_cache_group_page_sizes(config, spec)
+    _set_cache_group_block_granularities(config, spec)
     if draft_attn_config is not None:
         _validate_lcm_page_size(
             draft_attn_config,
             prefix_granularity=prefix_granularity,
         )
-        _set_cache_group_page_sizes(draft_attn_config, spec)
+        _set_cache_group_block_granularities(draft_attn_config, spec)
     cache_budget_bytes = cache_setup.cache_budget_bytes
     fixed_workspace_bytes = cache_setup.fixed_workspace_bytes
     max_num_tokens = spec.pool_size

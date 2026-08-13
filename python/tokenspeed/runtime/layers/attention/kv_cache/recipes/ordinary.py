@@ -361,13 +361,13 @@ def _ordinary_setup(
         CacheSetup,
     )
 
-    page_size = int(attn_config.page_size)
+    page_size = int(attn_config.prefix_granularity)
     target_layers = model_config.num_attention_layers
     bytes_per_token = attn_config.cache_cell_size() * _storage_layers(
         attn_config, target_layers
     )
     if draft_attn_config is not None:
-        if draft_attn_config.page_size != page_size:
+        if draft_attn_config.prefix_granularity != page_size:
             raise ValueError("target and draft cache page sizes must match")
         bytes_per_token += draft_attn_config.cache_cell_size() * _storage_layers(
             draft_attn_config,
@@ -476,8 +476,8 @@ def _mha_fields(config, num_layers: int):
     from tokenspeed.runtime.layers.attention.kv_cache.recipes import spec
 
     if config.kv_cache_mxfp8:
-        assert config.page_size == MXFP8_KV_SCALE_TILE_TOKENS, (
-            "mxfp8 KV cache requires --block-size "
+        assert config.prefix_granularity == MXFP8_KV_SCALE_TILE_TOKENS, (
+            "mxfp8 KV cache requires --prefix-granularity "
             f"{MXFP8_KV_SCALE_TILE_TOKENS} (the attention kernel consumes "
             "the interleaved paged scale layout)"
         )
@@ -496,7 +496,7 @@ def _mha_fields(config, num_layers: int):
         raise ValueError("cache group ids must cover every MHA layer")
     fields = mha_cache_fields(
         layer_group_ids=group_ids,
-        prefix_granularity=config.page_size,
+        prefix_granularity=config.prefix_granularity,
         kv_heads=max(config.num_kv_heads // config.attn_tp_size, 1),
         head_dim=config.head_dim,
         kv_element_size=(
@@ -561,13 +561,13 @@ def _mla_fields(config, num_layers: int):
             for name, shape, dtype in (
                 (
                     "latent_kv",
-                    (config.page_size, 1, config.kv_lora_rank),
+                    (config.prefix_granularity, 1, config.kv_lora_rank),
                     config.kv_cache_dtype,
                 ),
-                ("latent_scale", (config.page_size, 1, 1), torch.float32),
+                ("latent_scale", (config.prefix_granularity, 1, 1), torch.float32),
                 (
                     "rope_k",
-                    (config.page_size, 1, config.qk_rope_head_dim),
+                    (config.prefix_granularity, 1, config.qk_rope_head_dim),
                     config.dtype,
                 ),
             ):
@@ -583,7 +583,7 @@ def _mla_fields(config, num_layers: int):
         return tuple(fields)
     return mla_cache_fields(
         layer_group_ids=("full_attention",) * num_layers,
-        prefix_granularity=config.page_size,
+        prefix_granularity=config.prefix_granularity,
         latent_width=config.kv_lora_rank + config.qk_rope_head_dim,
         element_size=torch.empty((), dtype=config.kv_cache_dtype).element_size(),
     )
@@ -601,7 +601,7 @@ def _dsa_fields(config, num_layers: int):
             "full_attention",
             f"layer.{layer_id}.index_k",
             f"layer.{layer_id}.index_k",
-            (config.page_size, index_row_bytes),
+            (config.prefix_granularity, index_row_bytes),
             1,
         )
         for layer_id in range(num_layers)
@@ -620,7 +620,7 @@ def _msa_fields(config, num_layers: int):
             "full_attention",
             f"layer.{layer_id}.index_k",
             f"layer.{layer_id}.index_k",
-            (config.page_size, config.index_head_dim),
+            (config.prefix_granularity, config.index_head_dim),
             element_size,
         )
         for layer_id in sorted(config.sparse_layer_ids)

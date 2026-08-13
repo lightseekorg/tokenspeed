@@ -59,7 +59,7 @@ def _bare_mla_backend(
     paths touch — the full ctor JIT-compiles CuteDSL kernels (GPU only)."""
     backend = object.__new__(CuteDSLMLABackend)
     backend.device = "cpu"
-    backend.page_size = _PAGE_SIZE
+    backend.kernel_page_size = _PAGE_SIZE
     backend.max_context_len = _MAX_CTX
     backend.is_draft = is_draft
     backend.spec_num_tokens = spec_num_tokens
@@ -116,7 +116,7 @@ def _bare_amd_mla_backend(
 ) -> MLAAttnBackend:
     backend = object.__new__(MLAAttnBackend)
     backend.device = "cpu"
-    backend.page_size = _PAGE_SIZE
+    backend.kernel_page_size = _PAGE_SIZE
     backend.max_context_len = _MAX_CTX
     backend.max_num_pages = _MAX_CTX // _PAGE_SIZE
     backend.is_draft = False
@@ -165,7 +165,7 @@ class _StubFullAttnMeta:
         if cached is None:
             cached = expand_page_table(
                 self._table,
-                table_page_size=self.prefix_granularity,
+                block_granularity=self.prefix_granularity,
                 kernel_page_size=page_size,
                 max_kernel_pages=max_pages,
             )

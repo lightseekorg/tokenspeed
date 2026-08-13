@@ -370,7 +370,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             self.assertTrue(math.isfinite(n), spec.group_id)
             self.assertLess(n, bound, spec.group_id)
 
-    def test_lcm_specs_preserve_group_page_sizes_and_publish_packing(self):
+    def test_lcm_specs_preserve_group_block_granularities_and_publish_packing(self):
         packing = {
             "v4.swa_kv": 1,
             "v4.c4a.compressor_state": 16,

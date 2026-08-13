@@ -109,7 +109,7 @@ Scheduler::Scheduler(SchedulerConfig config)
     for (const PagedCacheGroupConfig& group : config_.paged_cache_groups) {
         group.Validate();
         cache_group_ids_.push_back(group.group_id);
-        const std::int32_t child_entries = config_.prefix_granularity / group.PageSize();
+        const std::int32_t child_entries = config_.prefix_granularity / group.BlockGranularity();
         if (cache_entries_per_event_boundary_ > std::numeric_limits<std::int32_t>::max() - child_entries) {
             throw std::invalid_argument("Scheduler: cache entries per event boundary exceed int32 range");
         }
@@ -142,24 +142,24 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
 
     std::vector<std::int64_t> group_pages(static_cast<std::size_t>(coordinator_.NumGroups()));
     for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
-        const std::int64_t page_size = coordinator_.GroupPageSize(i);
+        const std::int64_t block_granularity = coordinator_.GroupBlockGranularity(i);
         const auto local_prefill_peak = [&] {
             // Across every prompt up to max_prompt_tokens, retain the largest
             // resident window seen by either the first chunk or a later chunk.
             const std::int64_t first_prompt = std::min(max_prompt_tokens, chunk_tokens);
-            std::int64_t pages = ceilDiv(first_prompt + decode_width + protected_tokens, page_size);
+            std::int64_t pages = ceilDiv(first_prompt + decode_width + protected_tokens, block_granularity);
             if (max_prompt_tokens > chunk_tokens) {
                 const std::int64_t later_prompt = std::min(max_prompt_tokens - chunk_tokens, chunk_tokens);
                 const std::int64_t lookback_pages = coordinator_.GroupBoundaryLookbackPages(i);
-                pages = std::max(pages, lookback_pages + ceilDiv(chunk_tokens, page_size));
+                pages = std::max(pages, lookback_pages + ceilDiv(chunk_tokens, block_granularity));
                 pages = std::max(pages,
-                                 lookback_pages + ceilDiv(later_prompt + decode_width + protected_tokens, page_size));
+                                 lookback_pages + ceilDiv(later_prompt + decode_width + protected_tokens, block_granularity));
             }
             return pages;
         };
         std::int64_t child_pages = 0;
         if (coordinator_.GroupIsPrefixClosed(i)) {
-            child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, page_size);
+            child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
         } else if (config_.role == Role::kD) {
             const PagedCacheGroupConfig& group = config_.paged_cache_groups[static_cast<std::size_t>(i)];
             const bool latest_snapshot =
@@ -168,17 +168,17 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
                 // The final prompt page may be full, so a non-zero decode
                 // reservation can span one more page than its own page count.
                 const std::int64_t reserved_tokens = decode_width + protected_tokens;
-                const std::int64_t snapshot_pages = reserved_tokens == 0 ? 1 : 1 + ceilDiv(reserved_tokens, page_size);
+                const std::int64_t snapshot_pages = reserved_tokens == 0 ? 1 : 1 + ceilDiv(reserved_tokens, block_granularity);
                 // A retracted Decode request may recover by locally
                 // recomputing its suffix. Old State checkpoints are
                 // evictable, but one recovery chunk and its lookback must fit.
                 child_pages = std::max(snapshot_pages, local_prefill_peak());
             } else if (config_.enable_pd_cache && group.retention == PagedCacheGroupConfig::Retention::SlidingWindow) {
                 const std::int64_t dense_pages =
-                    ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, page_size);
+                    ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
                 const std::int64_t window_pages = ceilDiv(static_cast<std::int64_t>(*group.sliding_window_tokens - 1) +
-                                                              decode_width + protected_tokens + page_size - 1,
-                                                          page_size);
+                                                              decode_width + protected_tokens + block_granularity - 1,
+                                                          block_granularity);
                 // A sliding prefix probe can retain one older lookback island
                 // across null holes while the remote prompt tail is restored at
                 // absolute slots. Bound both intervals, capped by a dense table.
@@ -187,7 +187,7 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
             } else {
                 // Decode-only restores its destination in one admission, so a
                 // non-sparse group cannot slide old prompt pages first.
-                child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, page_size);
+                child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
             }
         } else {
             child_pages = local_prefill_peak();

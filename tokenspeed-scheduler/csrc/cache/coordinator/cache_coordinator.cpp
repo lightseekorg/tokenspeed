@@ -33,14 +33,6 @@
 
 namespace tokenspeed {
 
-namespace {
-
-std::int32_t EffectivePageSize(const CacheGroupSpec& spec, std::int32_t prefix_granularity) {
-    return spec.page_size > 0 ? spec.page_size : prefix_granularity;
-}
-
-}  // namespace
-
 CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
                                        BlockPool* host_pool, bool stream_device_cache_to_host)
     : groups_{std::move(groups)},
@@ -52,12 +44,12 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
     geometry_.reserve(groups_.size());
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         _assert(groups_[i].Id() == static_cast<std::uint32_t>(i), "cache group id must equal its group index");
-        const std::int32_t group_page_size = EffectivePageSize(groups_[i].Spec(), prefix_granularity_);
-        _assert(group_page_size > 0 && prefix_granularity_ % group_page_size == 0,
-                "group page_size must divide the prefix granularity");
+        const std::int32_t group_block_granularity = groups_[i].Spec().block_granularity;
+        _assert(group_block_granularity > 0 && prefix_granularity_ % group_block_granularity == 0,
+                "group block_granularity must be a positive divisor of the prefix granularity");
         _assert(groups_[i].Allocator().CacheBlocksPerLcmBlock() == groups_[i].Spec().cache_blocks_per_lcm_block,
                 "group allocator packing must match its group spec");
-        geometry_.emplace_back(group_page_size);
+        geometry_.emplace_back(group_block_granularity);
         if (groups_[i].Matcher().IsPrefixClosed()) {
             match_order_.push_back(i);
         }
@@ -126,8 +118,8 @@ bool CacheCoordinator::ClearCache() {
 std::vector<CacheKey> CacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
                                                        std::uint32_t group_id) const {
     _assert(group_id < groups_.size(), "cache key group id out of range");
-    const std::int32_t group_page_size = geometry_[group_id].PageSize();
-    const std::int32_t pages_per_prefix_hash = prefix_granularity_ / group_page_size;
+    const std::int32_t group_block_granularity = geometry_[group_id].BlockGranularity();
+    const std::int32_t pages_per_prefix_hash = prefix_granularity_ / group_block_granularity;
     _assert(content_hashes.size() <=
                 std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(pages_per_prefix_hash),
             "expanded cache key count exceeds size_t range");
@@ -222,7 +214,7 @@ const BlockPool& CacheCoordinator::tierPool() const {
 // The one tier matcher: slots below floor_tokens are assumed valid in a lower tier; per_group
 // blocks are relative to the floor, num_common_tokens is the absolute converged boundary (in
 // TOKENS). num_prefix_pages = content_hashes.size() in prefix pages;
-// each group key vector is expanded to that group's page_size.
+// each group key vector is expanded to that group's block_granularity.
 template <CacheTier Tier>
 CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTierWithKeys(
     std::span<const std::vector<CacheKey>> group_keys, std::span<const std::size_t> match_order,
@@ -236,22 +228,22 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTierWithKeys(
     const ConvergedBoundary boundary = SweepThenConverge(
         match_order, groups_, num_prefix_pages * prefix_granularity_, prefix_granularity_,
         [&](std::size_t i, std::int32_t bound_tokens) {
-            const std::int32_t group_page_size = geometry_[i].PageSize();
+            const std::int32_t group_block_granularity = geometry_[i].BlockGranularity();
             out.per_group[i] = groups_[i].Matcher().Probe(groups_[i].Index(), pool, group_keys[i],
-                                                          floor_tokens / group_page_size,
-                                                          bound_tokens / group_page_size);
+                                                          floor_tokens / group_block_granularity,
+                                                          bound_tokens / group_block_granularity);
         },
         [&](std::size_t i) {
             return floor_tokens +
-                   static_cast<std::int32_t>(out.per_group[i].hits.size()) * geometry_[i].PageSize();
+                   static_cast<std::int32_t>(out.per_group[i].hits.size()) * geometry_[i].BlockGranularity();
         });
 
     // A matcher can find a q-aligned resume point above the final P-aligned
     // boundary. Only acquire the CacheBlocks covered by the shared boundary.
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         GroupPrefixProbe& probe = out.per_group[i];
-        const std::int32_t group_page_size = geometry_[i].PageSize();
-        const std::int32_t covered_pages = (boundary.common_tokens - floor_tokens) / group_page_size;
+        const std::int32_t group_block_granularity = geometry_[i].BlockGranularity();
+        const std::int32_t covered_pages = (boundary.common_tokens - floor_tokens) / group_block_granularity;
         if (static_cast<std::int32_t>(probe.hits.size()) > covered_pages) {
             probe.hits.resize(static_cast<std::size_t>(covered_pages));
         }
@@ -270,7 +262,7 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
     out.num_common_tokens = probe.num_common_tokens;
     out.per_group.resize(groups_.size());
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        const std::int32_t floor_pages = floor_tokens / geometry_[i].PageSize();
+        const std::int32_t floor_pages = floor_tokens / geometry_[i].BlockGranularity();
         out.per_group[i] =
             groups_[i].Index().AcquireMatched(pool, group_keys[i], floor_pages, probe.per_group[i], access_epoch);
     }
@@ -317,7 +309,7 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(
         _assert(covered_tokens >= 0, "decode destination state coverage is negative");
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             if (groups_[i].Spec().kind == AttnKind::kMambaState) {
-                const std::int64_t num_holes = covered_tokens / geometry_[i].PageSize();
+                const std::int64_t num_holes = covered_tokens / geometry_[i].BlockGranularity();
                 _assert(num_holes <= static_cast<std::int64_t>(out.group_keys[i].size()),
                         "decode destination state hole count is outside the probed range");
                 const std::size_t hole_count = static_cast<std::size_t>(num_holes);
@@ -452,7 +444,7 @@ void CacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<c
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         std::vector<CacheKey> keys = keysForGroup(content_hashes, groups_[i].Id());
-        const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[i].PageSize();
+        const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[i].BlockGranularity();
         cacheFullBlocksForGroup<CacheTier::kDevice>(i, tables[i], keys, first_slot * pages_per_prefix_hash,
                                                     access_epoch, boundary_kind);
     }
@@ -610,7 +602,7 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
 template <CacheTier Tier>
 void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
                                                       std::uint64_t access_epoch) {
-    const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[group_index].PageSize();
+    const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[group_index].BlockGranularity();
     if (groups_[group_index].Matcher().IsPrefixClosed()) {
         std::vector<CacheKey> keys =
             keysForGroup(demand.prefix_hashes.subspan(static_cast<std::size_t>(demand.new_prefix_hash_begin)),
@@ -728,9 +720,9 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
         const CacheGroupSpec& spec = specs[i];
         const std::uint32_t group_id = static_cast<std::uint32_t>(i);
         _assert(spec.cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
-        const std::int32_t group_page_size = EffectivePageSize(spec, prefix_granularity);
-        _assert(group_page_size > 0 && prefix_granularity % group_page_size == 0,
-                "group page_size must divide the prefix granularity");
+        const std::int32_t group_block_granularity = spec.block_granularity;
+        _assert(group_block_granularity > 0 && prefix_granularity % group_block_granularity == 0,
+                "group block_granularity must be a positive divisor of the prefix granularity");
         auto allocator = std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id);
         std::unique_ptr<PrefixMatcher> matcher;
         switch (spec.kind) {
@@ -738,11 +730,11 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
                 matcher = std::make_unique<FullAttnMatcher>();
                 break;
             case AttnKind::kMambaState:
-                matcher = std::make_unique<SwaMatcher>(group_page_size, GroupGeometry::kMambaStateWindow);
+                matcher = std::make_unique<SwaMatcher>(group_block_granularity, GroupGeometry::kMambaStateWindow);
                 break;
             case AttnKind::kSlidingWindow:
                 _assert(spec.sliding_window > 0, "sliding window group requires a positive window");
-                matcher = std::make_unique<SwaMatcher>(group_page_size, spec.sliding_window);
+                matcher = std::make_unique<SwaMatcher>(group_block_granularity, spec.sliding_window);
                 break;
             default:
                 FatalCheck(false, "unknown AttnKind in coordinator group spec");

@@ -33,21 +33,21 @@ namespace tokenspeed {
 // One cache group's token -> page arithmetic. This is the logical side of the
 // placement seam: it turns token demands into the token-free AcquirePlan /
 // block counts that GroupAllocator executes, so the allocator never perceives
-// page_size or any other token quantity.
+// block_granularity or any other token quantity.
 class GroupGeometry {
 public:
-    explicit GroupGeometry(std::int32_t page_size) : page_size_{page_size} {
-        _assert(page_size > 0, "page_size must be > 0");
+    explicit GroupGeometry(std::int32_t block_granularity) : block_granularity_{block_granularity} {
+        _assert(block_granularity > 0, "block_granularity must be > 0");
     }
 
-    std::int32_t PageSize() const noexcept { return page_size_; }
+    std::int32_t BlockGranularity() const noexcept { return block_granularity_; }
 
     std::int32_t BlocksNeededFor(const BlockTable& table, std::int32_t num_tokens) const {
         if (num_tokens <= table.AvailableTokens()) {
             return 0;
         }
         const std::int32_t over = num_tokens - table.AvailableTokens();
-        return (over + page_size_ - 1) / page_size_;
+        return (over + block_granularity_ - 1) / block_granularity_;
     }
 
     std::int32_t BlocksNeededFor(const BlockTable& table, const GroupDemand& demand) const {
@@ -63,12 +63,12 @@ public:
         }
         const std::int32_t num_blocks = sparseSuffixBlocks(table, demand);
         const std::int64_t extent = static_cast<std::int64_t>(demand.num_tokens) + demand.reserve_tokens;
-        const std::int32_t logical_blocks = static_cast<std::int32_t>((extent + page_size_ - 1) / page_size_);
+        const std::int32_t logical_blocks = static_cast<std::int32_t>((extent + block_granularity_ - 1) / block_granularity_);
         return AcquirePlan{
             .num_blocks = num_blocks,
             .suffix_start = demand.materialized_suffix_start,
             .table_blocks_after = logical_blocks,
-            .available_tokens_after = logical_blocks * page_size_ - demand.num_tokens,
+            .available_tokens_after = logical_blocks * block_granularity_ - demand.num_tokens,
         };
     }
 
@@ -79,7 +79,7 @@ public:
             .num_blocks = num_blocks,
             .suffix_start = -1,
             .table_blocks_after = table.NumBlocks() + num_blocks,
-            .available_tokens_after = table.AvailableTokens() + num_blocks * page_size_ - num_tokens,
+            .available_tokens_after = table.AvailableTokens() + num_blocks * block_granularity_ - num_tokens,
         };
     }
 
@@ -105,7 +105,7 @@ public:
         _assert(window > 0, "retention window must be > 0");
         const std::int32_t skipped = num_computed_tokens - window + 1;
         // Only fully-slid-out pages expire.
-        return skipped <= 0 ? 0 : skipped / page_size_;
+        return skipped <= 0 ? 0 : skipped / block_granularity_;
     }
 
     static constexpr std::int32_t kMambaStateWindow = 2;
@@ -122,13 +122,13 @@ private:
                 "sparse suffix materialization requires a positive extent");
         const std::int64_t extent = static_cast<std::int64_t>(demand.num_tokens) + demand.reserve_tokens;
         _assert(extent <= std::numeric_limits<std::int32_t>::max(), "sparse suffix extent exceeds int32 range");
-        const std::int32_t last_block = static_cast<std::int32_t>((extent - 1) / page_size_);
+        const std::int32_t last_block = static_cast<std::int32_t>((extent - 1) / block_granularity_);
         _assert(demand.materialized_suffix_start <= last_block,
                 "materialized suffix starts beyond the requested extent");
         return last_block - demand.materialized_suffix_start + 1;
     }
 
-    std::int32_t page_size_;
+    std::int32_t block_granularity_;
 };
 
 }  // namespace tokenspeed

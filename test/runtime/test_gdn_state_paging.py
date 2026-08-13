@@ -32,7 +32,7 @@ class _CacheMetadata:
 class _ContractPool:
     def __init__(self, page_size, components):
         self.runtime_contract = SimpleNamespace(
-            block_size=page_size,
+            prefix_granularity=page_size,
             group_specs=tuple(
                 SimpleNamespace(
                     group_id=group_id,

@@ -213,7 +213,7 @@ TEST(ComputePrefixHashesTest, MissingExtraKeysPerPageTreatedAsEmpty) {
 }
 
 TEST(ComputePrefixHashesTest, IncrementalChainEqualsOneShot) {
-    // 12-token stream, page_size 2 -> 6 pages.
+    // 12-token stream, prefix_granularity 2 -> 6 pages.
     std::vector<std::int32_t> tokens(12);
     for (std::int32_t i = 0; i < 12; ++i) {
         tokens[i] = 100 + i;

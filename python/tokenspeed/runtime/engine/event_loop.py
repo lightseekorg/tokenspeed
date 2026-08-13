@@ -259,7 +259,7 @@ class EventLoop:
         self._scheduler_cache_geometry = scheduler_cache_geometry_from_pool(
             token_to_kv_pool,
             fallback_token_capacity=self.max_total_num_tokens,
-            fallback_prefix_granularity=server_args.block_size,
+            fallback_prefix_granularity=server_args.prefix_granularity,
         )
         geometry = self._scheduler_cache_geometry
         self.max_total_num_tokens = geometry.token_capacity
@@ -1098,7 +1098,7 @@ class EventLoop:
         ready_response = zmq_wire.WireEngineCoreReadyResponse(
             max_model_len=self.model_config.context_len,
             num_gpu_blocks=geometry.num_device_pages,
-            block_size=geometry.prefix_granularity,
+            prefix_granularity=geometry.prefix_granularity,
             dtype=_wire_dtype(self.model_config.dtype),
             multimodal_encoder_dtype=self.multimodal_encoder_dtype,
             vllm_version=f"tokenspeed-{_tokenspeed_version()}",

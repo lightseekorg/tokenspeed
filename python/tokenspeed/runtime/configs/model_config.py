@@ -102,7 +102,7 @@ class _AttentionFamilySpec:
     configure: Callable[[object], None]
     default_backend: str | None = None
     supports_target_verify_forward_mode: bool = False
-    default_block_size: int | None = None
+    default_prefix_granularity: int | None = None
 
 
 def override_model_config(model_config, ext_yaml):
@@ -234,7 +234,7 @@ _ATTENTION_FAMILY_SPECS = (
         architectures=_DEEPSEEK_V4_ARCHITECTURES,
         configure=configure_deepseek_v4_attention,
         supports_target_verify_forward_mode=True,
-        default_block_size=256,
+        default_prefix_granularity=256,
     ),
     _AttentionFamilySpec(
         name="GLM",
@@ -252,7 +252,7 @@ _ATTENTION_FAMILY_SPECS = (
         name="MiniMax MSA",
         architectures=_MSA_ARCHITECTURES,
         configure=configure_minimax_m3_attention,
-        default_block_size=128,
+        default_prefix_granularity=128,
     ),
 )
 
@@ -283,17 +283,19 @@ def _apply_attention_family_defaults(
     server_args: ServerArgs,
     spec: _AttentionFamilySpec,
 ) -> None:
-    if spec.default_block_size is not None:
-        block_size_default = ServerArgs.__dataclass_fields__["block_size"].default
-        if server_args.block_size == block_size_default:
+    if spec.default_prefix_granularity is not None:
+        granularity_default = ServerArgs.__dataclass_fields__[
+            "prefix_granularity"
+        ].default
+        if server_args.prefix_granularity == granularity_default:
             logger.info(
-                "%s default block_size=%d; pass --block-size with a value other "
-                "than %d to keep that value.",
+                "%s default prefix_granularity=%d; pass --prefix-granularity "
+                "with a value other than %d to keep that value.",
                 spec.name,
-                spec.default_block_size,
-                block_size_default,
+                spec.default_prefix_granularity,
+                granularity_default,
             )
-            server_args.block_size = spec.default_block_size
+            server_args.prefix_granularity = spec.default_prefix_granularity
     if spec.default_backend is not None and server_args.attention_backend is None:
         server_args.attention_backend = spec.default_backend
 

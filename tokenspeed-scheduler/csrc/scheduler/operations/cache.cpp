@@ -52,10 +52,10 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
     specs.reserve(config.paged_cache_groups.size());
     for (const PagedCacheGroupConfig& group : config.paged_cache_groups) {
         _assert(group.cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
-        const std::int32_t page_size = group.PageSize();
-        _assert(page_size > 0, "cache group must have a positive page_size");
-        _assert(config.prefix_granularity % page_size == 0,
-                "group page_size must divide the scheduler prefix granularity");
+        const std::int32_t block_granularity = group.BlockGranularity();
+        _assert(block_granularity > 0, "cache group must have a positive block_granularity");
+        _assert(config.prefix_granularity % block_granularity == 0,
+                "group block_granularity must divide the scheduler prefix granularity");
         // family=State marks trailing-window prefix reuse and covers both SWA and
         // linear-attention groups; only a State group WITHOUT SlidingWindow
         // retention is a mamba-style state group.
@@ -79,7 +79,7 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
                 .kind = AttnKind::kMambaState,
                 .sliding_window = 0,
                 .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
-                .page_size = page_size,
+                .block_granularity = block_granularity,
             });
             continue;
         }
@@ -91,7 +91,7 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
             .kind = is_swa ? AttnKind::kSlidingWindow : AttnKind::kFull,
             .sliding_window = is_swa ? *group.sliding_window_tokens : 0,
             .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
-            .page_size = page_size,
+            .block_granularity = block_granularity,
         });
     }
     return specs;

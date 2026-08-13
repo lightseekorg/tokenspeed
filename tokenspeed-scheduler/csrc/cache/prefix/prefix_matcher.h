@@ -76,9 +76,9 @@ public:
 // bound-first.
 class SwaMatcher : public PrefixMatcher {
 public:
-    SwaMatcher(std::int32_t page_size, std::int32_t sliding_window)
-        : page_size_{page_size}, sliding_window_{sliding_window} {
-        _assert(page_size > 0, "page_size must be > 0");
+    SwaMatcher(std::int32_t block_granularity, std::int32_t sliding_window)
+        : block_granularity_{block_granularity}, sliding_window_{sliding_window} {
+        _assert(block_granularity > 0, "block_granularity must be > 0");
         _assert(sliding_window > 0, "sliding_window must be > 0");
     }
 
@@ -114,7 +114,7 @@ public:
 
 private:
     // Cached pages a boundary needs behind it: they cover the window's last (window - 1) tokens.
-    std::int32_t pagesNeededToResume() const { return (sliding_window_ - 1 + page_size_ - 1) / page_size_; }
+    std::int32_t pagesNeededToResume() const { return (sliding_window_ - 1 + block_granularity_ - 1) / block_granularity_; }
 
     struct ResumableBoundary {
         std::int32_t boundary;    // == begin_blocks when no boundary qualifies
@@ -144,7 +144,7 @@ private:
         return {begin_blocks, begin_blocks};
     }
 
-    std::int32_t page_size_;
+    std::int32_t block_granularity_;
     std::int32_t sliding_window_;
 };
 

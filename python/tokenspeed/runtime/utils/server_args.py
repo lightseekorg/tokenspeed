@@ -137,7 +137,7 @@ class ServerArgs:
     enable_mixed_batch: bool = False
     # Kernel page size. Scheduler prefix pages come from the LCM
     # runtime contract and must not overwrite this value.
-    block_size: int = 64
+    prefix_granularity: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
 
@@ -347,7 +347,7 @@ class ServerArgs:
 
     @property
     def mamba_cache_chunk_size(self) -> int:
-        return max(FLA_CHUNK_SIZE, self.block_size)
+        return max(FLA_CHUNK_SIZE, self.prefix_granularity)
 
     @property
     def spec_context_pad(self) -> int:
@@ -1119,11 +1119,14 @@ class ServerArgs:
             help="Allow the scheduler to issue prefill and decode requests in the same iteration.",
         )
         parser.add_argument(
-            "--block-size",
-            metavar="BLOCK_SIZE",
+            "--prefix-granularity",
+            "--block-size",  # deprecated alias
+            dest="prefix_granularity",
+            metavar="PREFIX_GRANULARITY",
             type=int,
-            default=ServerArgs.block_size,
-            help="Kernel cache page size in tokens.",
+            default=ServerArgs.prefix_granularity,
+            help="Scheduler prefix granularity in tokens: the identity "
+            "boundary of cache reuse. (--block-size is a deprecated alias.)",
         )
 
         # KVStore

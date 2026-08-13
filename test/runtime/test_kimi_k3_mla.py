@@ -94,7 +94,7 @@ def test_bridge_exposes_full_attention_group_and_block_size() -> None:
     metadata, forward_op = _metadata_for(pool, table, "cpu")
 
     assert metadata.full_attention_group_id == "full_attention"
-    assert metadata.prefix_granularity == pool.page_size
+    assert metadata.block_granularity == pool.page_size
     resolved = metadata.require_full_attention_table(active_forward_op=forward_op)
     assert torch.equal(resolved, torch.tensor(table, dtype=torch.int32))
 
@@ -222,7 +222,8 @@ def backend_factory(cuda_env, gpu_pool):
             attn_tp_size=1,
             dtype=torch.bfloat16,
             kv_cache_dtype=torch.float8_e4m3fn,
-            page_size=_KERNEL_PAGE,
+            prefix_granularity=_KERNEL_PAGE,
+            kernel_page_size=_KERNEL_PAGE,
             context_len=4 * gpu_pool.page_size,
             max_bs=8,
             max_graph_bs=8,

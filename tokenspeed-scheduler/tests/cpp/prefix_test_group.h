@@ -43,15 +43,15 @@ namespace tokenspeed::test {
 // coordinator's geometry.
 class PrefixTestGroup {
 public:
-    PrefixTestGroup(std::int32_t page_size, std::int32_t cache_blocks_per_lcm_block, std::uint32_t group_id,
+    PrefixTestGroup(std::int32_t block_granularity, std::int32_t cache_blocks_per_lcm_block, std::uint32_t group_id,
                     std::int32_t sliding_window)
-        : geometry_{page_size},
+        : geometry_{block_granularity},
           allocator_{cache_blocks_per_lcm_block, group_id},
           index_{group_id},
           sliding_window_{sliding_window} {}
 
     // --- geometry / identity ---
-    std::int32_t PageSize() const { return geometry_.PageSize(); }
+    std::int32_t BlockGranularity() const { return geometry_.BlockGranularity(); }
     std::int32_t CacheBlocksPerLcmBlock() const { return allocator_.CacheBlocksPerLcmBlock(); }
     std::uint32_t Id() const { return allocator_.Id(); }
     PrefixCacheIndex& Index() { return index_; }
@@ -104,7 +104,7 @@ public:
     GroupPrefixProbe Probe(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
                            std::int32_t max_blocks) const {
         if (sliding_window_ > 0) {
-            return SwaMatcher(geometry_.PageSize(), sliding_window_).Probe(index_, pool, keys, begin_blocks,
+            return SwaMatcher(geometry_.BlockGranularity(), sliding_window_).Probe(index_, pool, keys, begin_blocks,
                                                                            max_blocks);
         }
         return FullAttnMatcher{}.Probe(index_, pool, keys, begin_blocks, max_blocks);
@@ -161,7 +161,9 @@ private:
         if (sliding_window_ == 0) {
             return 0;
         }
-        const CacheGroupSpec spec{.kind = AttnKind::kSlidingWindow, .sliding_window = sliding_window_};
+        const CacheGroupSpec spec{.kind = AttnKind::kSlidingWindow,
+                                  .sliding_window = sliding_window_,
+                                  .block_granularity = geometry_.BlockGranularity()};
         return geometry_.ExpiredBlocksAt(spec, num_computed_tokens);
     }
 
@@ -175,18 +177,18 @@ private:
 // The pre-split class names, so test bodies keep reading naturally.
 class FullAttnManager : public PrefixTestGroup {
 public:
-    explicit FullAttnManager(std::int32_t page_size, std::int32_t cache_blocks_per_lcm_block = 1,
+    explicit FullAttnManager(std::int32_t block_granularity, std::int32_t cache_blocks_per_lcm_block = 1,
                              std::uint32_t group_id = 0)
-        : PrefixTestGroup(page_size, cache_blocks_per_lcm_block, group_id, /*sliding_window=*/0) {}
+        : PrefixTestGroup(block_granularity, cache_blocks_per_lcm_block, group_id, /*sliding_window=*/0) {}
 };
 
 class SwaManager : public PrefixTestGroup {
 public:
-    SwaManager(std::int32_t page_size, std::int32_t sliding_window)
-        : PrefixTestGroup(page_size, /*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, sliding_window) {}
-    SwaManager(std::int32_t page_size, std::int32_t cache_blocks_per_lcm_block, std::int32_t sliding_window,
+    SwaManager(std::int32_t block_granularity, std::int32_t sliding_window)
+        : PrefixTestGroup(block_granularity, /*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, sliding_window) {}
+    SwaManager(std::int32_t block_granularity, std::int32_t cache_blocks_per_lcm_block, std::int32_t sliding_window,
                std::uint32_t group_id = 0)
-        : PrefixTestGroup(page_size, cache_blocks_per_lcm_block, group_id, sliding_window) {}
+        : PrefixTestGroup(block_granularity, cache_blocks_per_lcm_block, group_id, sliding_window) {}
 };
 
 }  // namespace tokenspeed::test

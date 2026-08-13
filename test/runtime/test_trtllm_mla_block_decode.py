@@ -20,7 +20,7 @@ def _backend(*, draft_block_decode: bool) -> TRTLLMMLABackend:
     backend.draft_block_decode = draft_block_decode
     backend.spec_num_tokens = 4
     backend.max_context_len = 64
-    backend.page_size = 2
+    backend.kernel_page_size = 2
     backend.kv_lora_rank = 2
     backend.qk_nope_head_dim = 2
     backend.qk_rope_head_dim = 2
@@ -31,7 +31,7 @@ def _backend(*, draft_block_decode: bool) -> TRTLLMMLABackend:
     backend.trtllm_workspace = torch.empty(1, dtype=torch.uint8)
     backend.device = torch.device("cpu")
     backend.max_num_pages = backend._calc_padded_blocks(backend.max_context_len)
-    backend._block_table_aliased = False
+    backend._page_table_aliased = False
     backend._cache_groups_bound = False
     backend._cache_contract_bound = False
     backend.decode_cuda_graph_metadata = {}

@@ -334,16 +334,21 @@ class ModelExecutor:
         self._draft_final_step_counter = None
 
         # fill_input_buffers indexes the scheduler table in its own table pages; the drafter indexes draft_page_table in its backend's kernel pages.
-        self._prefix_granularity = int(
+        self._block_granularity = int(
             getattr(draft_token_to_kv_pool, "page_size", 0) or config.prefix_granularity
         )
-        self._draft_page_size = int(
-            getattr(draft_attn_backend, "page_size", 0) or self._prefix_granularity
+        draft_kernel_page_size = getattr(draft_attn_backend, "kernel_page_size", None)
+        if draft_attn_backend is not None and draft_kernel_page_size is None:
+            raise RuntimeError("draft attention backend must expose kernel_page_size")
+        # Without a draft backend the staging path degenerates to the
+        # scheduler table grain (identity expansion).
+        self._draft_kernel_page_size = int(
+            draft_kernel_page_size or self._block_granularity
         )
-        if self._prefix_granularity % self._draft_page_size:
+        if self._block_granularity % self._draft_kernel_page_size:
             raise ValueError(
-                f"prefix granularity {self._prefix_granularity} is not a multiple "
-                f"of the draft kernel page size {self._draft_page_size}"
+                f"prefix granularity {self._block_granularity} is not a multiple "
+                f"of the draft kernel page size {self._draft_kernel_page_size}"
             )
         # DraftPageStaging.publish expands the target full-history table into the
         # draft backend's kernel pages once, and every draft backend reads that
@@ -356,8 +361,8 @@ class ModelExecutor:
         # A write past this width would go out of bounds and hang the attention
         # kernel; the output processor's physical-extent tripwire raises first.
         max_num_pages_per_req = (
-            config.physical_context_len + self._draft_page_size - 1
-        ) // self._draft_page_size
+            config.physical_context_len + self._draft_kernel_page_size - 1
+        ) // self._draft_kernel_page_size
 
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
@@ -368,8 +373,8 @@ class ModelExecutor:
         self._draft_staging = DraftPageStaging(
             max_bs=max_bs,
             max_pages_per_req=max_num_pages_per_req,
-            table_page_size=self._prefix_granularity,
-            draft_page_size=self._draft_page_size,
+            block_granularity=self._block_granularity,
+            draft_kernel_page_size=self._draft_kernel_page_size,
             full_history_group_id=self._full_history_group_id,
             enabled=not getattr(
                 attn_backend, "cache_group_tables_replace_draft_page_table", False
@@ -382,7 +387,7 @@ class ModelExecutor:
             max_bs=max_bs,
             max_num_tokens=config.chunked_prefill_size,
             # Indexes the scheduler's full-history table: scheduler-table page ids.
-            page_size=self._prefix_granularity,
+            page_size=self._block_granularity,
             # token_to_kv_pool allocates size+page_size slots; index `size` is
             # the reserved dummy slot (see MHATokenToKVPool._create_buffers).
             dummy_kv_slot=0,

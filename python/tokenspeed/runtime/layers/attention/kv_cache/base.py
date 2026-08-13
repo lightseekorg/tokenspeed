@@ -163,7 +163,10 @@ class CachePool:
         self.paged_cache_group_specs = tuple(aligned)
         self.paged_cache_group_page_counts = counts
         self.runtime_contract = PagedCacheRuntimeContract(
-            prefix_granularity=self.page_size,
+            # The identity axis comes from the plan; page_size is geometry.
+            # They are equal by the 1:1 prefix-page <-> CacheBlock convention
+            # (pinned at pool construction), but they are different concepts.
+            prefix_granularity=self.plan.prefix_granularity,
             num_lcm_blocks=self.plan.num_lcm_blocks,
             token_capacity=token_capacity,
             group_specs=self.paged_cache_group_specs,

@@ -46,6 +46,30 @@ None of these say anything about storage. A slot of `block_granularity = 64`
 tokens may be backed by only 16 units of physical storage under compression —
 the logical world neither knows nor cares.
 
+A fourth quantity lives outside the logical world entirely:
+
+* **`kernel_page_size`** — the token span of one attention-kernel page, a
+  property of the *kernel implementation*, not of the scheduler. All kernel
+  page geometry is registered in one file
+  (`runtime/layers/attention/kernel_page_sizes.py`): fixed-page kernels pin a
+  constant (FlashMLA = 64), constrained kernels choose within a supported
+  set (trtllm-mla ∈ {32, 64}), and flexible kernels carry a chosen default.
+  `config.kernel_page_size` overrides any default; deriving kernel_page_size
+  from `prefix_granularity` is considered as a category error and a bug.
+
+  DeepSeek V4 is the special case: its kernel geometry is **pre-folded into
+  its cache spec**, so scheduler tables arrive kernel-ready with zero
+  runtime expansion. Since 2026-08-13 that geometry is fully
+  registry-sourced: the compressed full-history chains declare
+  `DEEPSEEK_V4_PAGE_SIZE // ratio` rows × ratio-token stride, the SWA
+  window declares `V4_KERNEL_BLOCK_ROWS`, and the layout's field byte
+  shapes are built from the kernel page constant — nothing derives from
+  `prefix_granularity`. The V4 backend's scalar is therefore a true
+  registry-sourced `kernel_page_size` (config-overridable), and the
+  scheduler grain is free: any positive multiple of the kernel page is
+  accepted (asserted at backend construction and in the fields builder;
+  P defaults to the kernel page, `DEEPSEEK_V4_PREFIX_GRANULARITY`).
+
 ### Physical world (storage units)
 
 * **`CacheBlock`** (and its aggregation, the **LCM block**) is the unit of
@@ -61,15 +85,27 @@ the logical world neither knows nor cares.
 
 Scheduling decisions — admission, prefix matching, chunk alignment, capacity —
 are made in **exactly two token-based quantities**: `prefix_granularity` and
-the per-group slot span (spelled `page_size` in `CacheGroupSpec`; semantically
-this is `block_granularity` — the Python bridge folds a checkpoint
-declaration to it at the single mapping point). Physical geometry (LCM
-packing, storage counts, bytes) is confined to the scheduler's
-cache/allocator layer; scheduling, FSM, and config-consuming code must not
-reason about it.
+the per-group `block_granularity` (`CacheGroupSpec.block_granularity`,
+wrapped by the coordinator's `GroupGeometry`; the Python bridge folds both a
+row-geometry and a checkpoint declaration to it at the single mapping
+point). Physical geometry (LCM packing, storage counts, bytes) is confined
+to the scheduler's cache/allocator layer; scheduling, FSM, and
+config-consuming code must not reason about it.
+
+**The identifier `page_size` must not appear anywhere in
+`tokenspeed-scheduler`.** The scheduler has no kernel pages and no row
+geometry — its only slot-span word is `block_granularity`. A `page_size`
+showing up there means a paged-KV concept is leaking across the boundary;
+name it `block_granularity` (generic span), `prefix_granularity` (identity
+span), or keep it on the Python side where the page actually exists.
+
+`CacheGroupSpec.block_granularity` is **required and explicit**: a positive
+divisor of `prefix_granularity`, asserted at coordinator construction. There
+is no zero-means-default fallback — every group states its span.
 
 The block tables the scheduler emits are logically *indexed*: row *i* of a
-request's table covers tokens `[i * page_size, (i + 1) * page_size)`. The
+request's table covers tokens
+`[i * block_granularity, (i + 1) * block_granularity)`. The
 entry *values*, however, are **`CacheBlock` ids** — handles to the physical
 storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
 Consumers outside the cache layer treat the ids as opaque.
@@ -77,13 +113,23 @@ Consumers outside the cache layer treat the ids as opaque.
 ### Python runtime: maps logical to physical, perceives as little as possible
 
 The Python side owns the translation from the scheduler's cache-block tables
-to the kernel page tables that attention kernels consume. This mapping should
+to the kernel page tables that attention kernels consume (the
+`block_granularity → kernel_page_size` subdivision). This mapping should
 happen at **one designated point**; beyond that point, kernels see physical
 page tables and nothing upstream sees them at all.
 
 Outside the mapping point, Python code should perceive `prefix_granularity`
 and `page_size` as little as possible. If a Python component needs either
 value, that is a design smell to justify, not a default to reach for.
+
+Provenance discipline: each quantity is sourced from its own domain and never
+laundered through another's name. The pool's `page_size` is geometry (pinned
+to `prefix_granularity` at construction — the 1:1 prefix-page ↔ CacheBlock
+convention's single point); the contract's `prefix_granularity` comes from
+the memory plan, not read back out of pool geometry; a backend's
+`kernel_page_size` comes from the kernel registry or an explicit config
+override, never from `prefix_granularity` as a fallback. The CLI flag is
+`--prefix-granularity` (`--block-size` remains a deprecated alias).
 
 ## block vs. page
 
@@ -143,9 +189,9 @@ Perception rules per directory:
   span** — prefix matching is defined in token space, so its hashing,
   key expansion, and window-resume arithmetic legitimately speak tokens.
 * **`cache/allocator/` perceives no logical token quantity at all** — no
-  `prefix_granularity`, no `page_size`, no windows. Its vocabulary is
-  blocks: `CacheBlock`, packing (`cache_blocks_per_lcm_block`), pool slots,
-  block counts.
+  `prefix_granularity`, no `block_granularity`, no windows. Its vocabulary
+  is blocks: `CacheBlock`, packing (`cache_blocks_per_lcm_block`), pool
+  slots, block counts.
 * The conversion between the two lives in the **coordinator's
   `GroupGeometry`** (`cache/coordinator/group_geometry.h`).
 
@@ -310,13 +356,14 @@ carve-out Principle 3 makes for CacheBlock ids.
 
 Decision (2026-08-13): emitted table entries are **`CacheBlock` ids**, and
 that is the accepted contract. The code already works this way: rows are
-logical (row *i* covers `[i*page_size, (i+1)*page_size)`), entries come from
-`ResolveKernelPageId` (`csrc/cache/allocator/group_allocator.h`), and Python
-folds the packing into the contract sent to C++
+logical (row *i* covers `[i*block_granularity, (i+1)*block_granularity)`),
+entries come from `ResolveKernelPageId`
+(`csrc/cache/allocator/group_allocator.h`), and Python folds the packing
+into the contract sent to C++
 (`page_counts = num_lcm_blocks * packing + 1` in `recipes/cache_runtime.py`,
 via `engine/scheduler_utils.py`), so Python's per-forward mapping only
-subdivides `prefix_granularity → page_size` and never touches packing. No
-refactor needed here.
+subdivides `block_granularity → kernel_page_size` and never touches packing.
+No refactor needed here.
 
 ### Principle 4 — page_table vs. block_table: fixed in Python's own naming
 

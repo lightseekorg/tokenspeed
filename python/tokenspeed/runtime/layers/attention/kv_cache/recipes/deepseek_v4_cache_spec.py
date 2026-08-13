@@ -20,6 +20,9 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    DEEPSEEK_V4_PAGE_SIZE,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     PagedCacheGroupSpec,
     compute_paged_cache_group_page_counts,
@@ -36,7 +39,10 @@ DEEPSEEK_V4_FP8_SCALE_BYTES = 4
 DEEPSEEK_V4_MXFP4_BLOCK_SIZE = 32
 DEEPSEEK_V4_MXFP4_SCALE_BYTES = 1
 DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT = 128
-DEEPSEEK_V4_PREFIX_GRANULARITY = 256
+# V4's default scheduler prefix granularity. Kernel geometry never derives
+# from it (that sources from DEEPSEEK_V4_PAGE_SIZE); any positive multiple of
+# the kernel page is a valid prefix granularity.
+DEEPSEEK_V4_PREFIX_GRANULARITY = DEEPSEEK_V4_PAGE_SIZE
 _COMPRESSOR_STATE_WINDOW_TOKENS = {4: 8, 128: 128}
 _COMPRESSOR_STATE_ROWS_PER_PAGE = {4: 4, 128: 8}
 
@@ -185,7 +191,7 @@ class DeepseekV4CacheLayout:
 
     def storage_block_size(self, compress_ratio: int) -> int:
         if compress_ratio > 1:
-            return max(1, DEEPSEEK_V4_PREFIX_GRANULARITY // compress_ratio)
+            return max(1, DEEPSEEK_V4_PAGE_SIZE // compress_ratio)
         return self.page_size
 
     def compressor_state_block_size(self, compress_ratio: int) -> int:
@@ -295,9 +301,11 @@ def first_v4_compressed_kv_group_id(group_ids) -> str | None:
 
 
 def _compressed_kernel_block_size(ratio: int) -> int:
+    # Kernel geometry sources from the kernel-page registry constant, never
+    # from the scheduler prefix granularity.
     if ratio <= 1:
         raise ValueError(f"ratio must be > 1, got {ratio}")
-    return max(1, DEEPSEEK_V4_PREFIX_GRANULARITY // ratio)
+    return max(1, DEEPSEEK_V4_PAGE_SIZE // ratio)
 
 
 def _resolve_sliding_window(hf_config: Any) -> int:

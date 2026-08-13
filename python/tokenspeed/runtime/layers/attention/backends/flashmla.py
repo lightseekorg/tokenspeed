@@ -45,6 +45,9 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    FLASH_MLA_PAGE_SIZE as PAGE_SIZE,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
@@ -54,8 +57,6 @@ from tokenspeed.runtime.layers.attention.utils import (
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.flashinfer_config import get_flashinfer_workspace_size
-
-PAGE_SIZE = 64
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -135,7 +136,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # richer cache_metadata instead and must stay off the block_tables
         # path (its capture/eager guards key on this flag).
         self.uses_cache_groups = bool(config.is_draft)
-        self.page_size = PAGE_SIZE
+        self.kernel_page_size = PAGE_SIZE
         self.max_num_pages = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
 
         # MLA-specific dimensions
@@ -440,14 +441,14 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             prefill_table = self._group_per_token_slot_table(
                 group_table,
                 batch_size=seq_lens.shape[0],
-                page_size=self.page_size,
+                page_size=self.kernel_page_size,
                 max_context_len=self.max_context_len,
             ).to(torch.int32)
             prefill_req_pool_indices = torch.arange(
                 seq_lens.shape[0], dtype=torch.int64, device=prefill_table.device
             )
             chunk_table = group_table[: seq_lens.shape[0]]
-            chunk_page_size = self.page_size
+            chunk_page_size = self.kernel_page_size
             group_out_cache_loc = self._extend_out_cache_loc(
                 group_table[: seq_lens.shape[0]],
                 extend_prefix_lens_cpu,

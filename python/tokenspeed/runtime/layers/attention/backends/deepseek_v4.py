@@ -45,6 +45,9 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_decode_swa_indices_and_lens,
     deepseek_v4_dequantize_and_gather_k_cache,
 )
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    DEEPSEEK_V4_PAGE_SIZE,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
     _split_block_tables_into_v4_metadata,
@@ -251,7 +254,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
 
     def __init__(self, config) -> None:
         super().__init__(config)
-        self.page_size = config.page_size
+        self.kernel_page_size = (
+            config.kernel_page_size
+            if config.kernel_page_size is not None
+            else DEEPSEEK_V4_PAGE_SIZE
+        )
+        # V4 has no expansion path: its cache spec pre-folds group geometry
+        # to the kernel page, so scheduler tables arrive kernel-ready for any
+        # prefix granularity that is a positive multiple of the kernel page.
+        if (
+            config.prefix_granularity <= 0
+            or config.prefix_granularity % self.kernel_page_size
+        ):
+            raise ValueError(
+                "DeepSeek V4 kernels require prefix_granularity to be a "
+                f"positive multiple of kernel_page_size "
+                f"({self.kernel_page_size}), got {config.prefix_granularity}"
+            )
         self.swa_storage_rows = int(
             getattr(config, "sliding_window_tokens", V4_KERNEL_BLOCK_ROWS * 2)
         )
@@ -271,7 +290,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self.prefill_chunk_size = max(1, int(prefill_chunk_size))
         self.max_num_pages = max(
             1,
-            (self.context_len + self.page_size - 1) // self.page_size,
+            (self.context_len + self.kernel_page_size - 1) // self.kernel_page_size,
         )
         self.forward_metadata: DeepseekV4ForwardMetadata | None = None
         self.forward_prefill_metadata: DeepseekV4ForwardMetadata | None = None
@@ -971,7 +990,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             max_seq_len += max(self.speculative_num_steps - 1, 0)
         if is_packed_decode:
             max_seq_len += max(int(query_lens.max().item()) - 1, 0)
-        max_pages = (max_seq_len + self.page_size - 1) // self.page_size
+        max_pages = (max_seq_len + self.kernel_page_size - 1) // self.kernel_page_size
         if base_page_table is not None:
             # The full-history group's batch-ordered table (row i == batch
             # position i); slice by batch rows directly.
@@ -1036,7 +1055,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             (1, 0),
         )
         cache_metadata = DeepseekV4CacheMetadata(
-            page_size=self.page_size,
+            page_size=self.kernel_page_size,
             page_table=page_table,
             block_tables=block_tables,
             block_table_base_offsets=base_offsets_on_device,
@@ -2249,7 +2268,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             else {}
         )
         cache_metadata = DeepseekV4CacheMetadata(
-            page_size=self.page_size,
+            page_size=self.kernel_page_size,
             page_table=self._cuda_graph_page_table[:bs, : self.max_num_pages],
             block_tables=metadata_block_tables,
             block_table_base_offsets=metadata_base_offsets,
@@ -2434,7 +2453,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata.token_to_req_indices = self._cuda_graph_token_to_req[:total_tokens]
         metadata.is_valid_token = self._cuda_graph_is_valid_token[:total_tokens]
         metadata.cache = DeepseekV4CacheMetadata(
-            page_size=self.page_size,
+            page_size=self.kernel_page_size,
             page_table=self._cuda_graph_page_table[:bs, : self.max_num_pages],
             block_tables=metadata_block_tables,
             block_table_base_offsets=metadata_base_offsets,

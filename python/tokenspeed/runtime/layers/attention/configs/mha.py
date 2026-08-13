@@ -45,7 +45,7 @@ class MHAConfig(BaseAttnConfig):
     pd_disaggregation_enabled: bool = False
     # Per-group scheduler page sizes, published by the registry for
     # group-aware backends (backends/cache_groups.py).
-    group_page_sizes: dict[str, int] | None = None
+    group_block_granularities: dict[str, int] | None = None
     layer_kv_head_counts: tuple[int, ...] | None = None
 
     @classmethod
@@ -97,7 +97,7 @@ class MHAConfig(BaseAttnConfig):
             dtype=model_config.dtype,
             kv_cache_dtype=resolve_dtype(kv_cache_dtype),
             kv_cache_mxfp8=kv_cache_dtype == "mxfp8",
-            page_size=server_args.block_size,
+            prefix_granularity=server_args.prefix_granularity,
             max_bs=server_args.max_num_seqs
             // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
             max_graph_bs=server_args.max_cudagraph_capture_size,

@@ -174,7 +174,7 @@ def test_batch_admission_debits_simulated_free_pages():
     assert len(admitted & {"r0", "r1"}) <= 1
 
 
-def test_group_tables_use_each_groups_page_size():
+def test_group_tables_use_each_groups_block_granularity():
     cfg = _base_config(num_device_pages=17)
     cfg.prefix_granularity = 8
     cfg.paged_cache_groups = [

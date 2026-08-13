@@ -117,7 +117,7 @@ class MSAConfig(BaseAttnConfig):
             attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
             dtype=model_config.dtype,
             kv_cache_dtype=resolved_kv_cache_dtype,
-            page_size=server_args.block_size,
+            prefix_granularity=server_args.prefix_granularity,
             max_bs=server_args.max_num_seqs
             // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
             max_graph_bs=server_args.max_cudagraph_capture_size,

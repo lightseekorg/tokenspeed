@@ -48,6 +48,10 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    TRTLLM_MLA_DEFAULT_PAGE_SIZE,
+    TRTLLM_MLA_SUPPORTED_PAGE_SIZES,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
@@ -128,7 +132,11 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         super().__init__(config)
 
         self.max_context_len = config.context_len
-        self.page_size = config.page_size
+        self.kernel_page_size = (
+            config.kernel_page_size
+            if config.kernel_page_size is not None
+            else TRTLLM_MLA_DEFAULT_PAGE_SIZE
+        )
         # Cache-group (LCM) state. The trtllm kernel walks pages at page_size,
         # padded to the fused-kernel block constraint (see _calc_padded_blocks).
         self._cache_groups_bound = False
@@ -154,9 +162,9 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         self.trtllm_workspace = get_trtllm_workspace_buffer(config.device)
 
         # Validate page_size
-        if self.page_size not in (32, 64):
+        if self.kernel_page_size not in TRTLLM_MLA_SUPPORTED_PAGE_SIZES:
             raise ValueError(
-                f"trtllm_mla backend requires page_size 32 or 64, got {self.page_size}"
+                f"trtllm_mla backend requires page_size 32 or 64, got {self.kernel_page_size}"
             )
 
         self.num_local_heads = config.num_attention_heads // config.attn_tp_size
@@ -170,8 +178,8 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """Calculate block count padded to satisfy the fused-kernel constraint."""
-        blocks = triton.cdiv(max_seq_len, self.page_size)
-        constraint = TRTLLM_BLOCK_CONSTRAINT // self.page_size
+        blocks = triton.cdiv(max_seq_len, self.kernel_page_size)
+        constraint = TRTLLM_BLOCK_CONSTRAINT // self.kernel_page_size
         if blocks % constraint != 0:
             blocks = triton.cdiv(blocks, constraint) * constraint
         return blocks
@@ -391,7 +399,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 dtype=torch.int64,
                 device=page_table.device,
             ),
-            self.page_size,
+            self.kernel_page_size,
         )
         self.chunked_prefill_metadata = TRTLLMMLAChunkedPrefillMetadata(
             extend_prefix_lens=extend_prefix_lens,
@@ -648,7 +656,9 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         if self.data_type != k_cache.dtype:
             k_cache = k_cache.to(self.data_type)
-        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+        kv_cache = k_cache.view(-1, self.kernel_page_size, self.kv_cache_dim).unsqueeze(
+            1
+        )
 
         raw_out = trtllm_batch_decode_with_kv_cache_mla(
             query=query,

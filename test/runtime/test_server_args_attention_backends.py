@@ -123,29 +123,35 @@ class TestAttentionBackendChoices(unittest.TestCase):
         self.assertEqual(registry._get_default_backend_name(AttentionArch.MLA), "mla")
 
     def test_lcm_kernel_page_size_is_validated_without_rewriting_it(self):
-        config = SimpleNamespace(page_size=64)
+        config = SimpleNamespace(kernel_page_size=64)
 
         registry._validate_lcm_page_size(config, prefix_granularity=128)
 
-        self.assertEqual(config.page_size, 64)
+        self.assertEqual(config.kernel_page_size, 64)
         with self.assertRaisesRegex(ValueError, "positive multiple"):
             registry._validate_lcm_page_size(
-                SimpleNamespace(page_size=96),
+                SimpleNamespace(kernel_page_size=96),
                 prefix_granularity=128,
             )
 
-    def test_lcm_group_page_sizes_are_published_before_backend_construction(self):
-        config = SimpleNamespace(group_page_sizes={"stale": 64})
+    def test_lcm_group_block_granularities_are_published_before_backend_construction(
+        self,
+    ):
+        config = SimpleNamespace(group_block_granularities={"stale": 64})
         spec = SimpleNamespace(
             memory_plan=SimpleNamespace(prefix_granularity=128),
             layer_group_ids=("full_attention", "linear_attention_0"),
+            paged_cache_group_specs=(
+                SimpleNamespace(group_id="full_attention", block_granularity=128),
+                SimpleNamespace(group_id="linear_attention_0", block_granularity=64),
+            ),
         )
 
-        registry._set_cache_group_page_sizes(config, spec)
+        registry._set_cache_group_block_granularities(config, spec)
 
         self.assertEqual(
-            config.group_page_sizes,
-            {"full_attention": 128, "linear_attention_0": 128},
+            config.group_block_granularities,
+            {"full_attention": 128, "linear_attention_0": 64},
         )
 
     def test_mha_config_propagates_speculative_settings(self):
@@ -158,7 +164,8 @@ class TestAttentionBackendChoices(unittest.TestCase):
             kv_cache_dtype="auto",
             max_num_seqs=8,
             data_parallel_size=None,
-            block_size=64,
+            prefix_granularity=64,
+            kernel_page_size=None,
             max_cudagraph_capture_size=4,
             kv_cache_quant_method="none",
             speculative_algorithm="EAGLE3",

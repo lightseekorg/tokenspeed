@@ -39,7 +39,7 @@ namespace tokenspeed {
 
 // One cache group's physical placement: it moves CacheBlocks between the
 // BlockPool and BlockTables and resolves kernel page ids. It is deliberately
-// token-free -- it perceives no prefix_granularity, page_size, or window;
+// token-free -- it perceives no prefix_granularity, block_granularity, or window;
 // every token quantity is converted to block counts by GroupGeometry in the
 // coordinator layer before it reaches this class. Prefix reuse lives in the
 // group's PrefixCacheIndex, match policy in its PrefixMatcher.

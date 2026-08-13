@@ -45,7 +45,7 @@ CacheKey RealKey(const std::vector<std::int32_t>& tokens, std::uint32_t group_id
 
 TEST(FullAttnManagerTest, ConstructsWithPageSize) {
     BlockPool pool(8);
-    FullAttnManager mgr(/*page_size=*/4);
+    FullAttnManager mgr(/*block_granularity=*/4);
     BlockTable table;
     EXPECT_EQ(table.NumBlocks(), 0);
     EXPECT_EQ(table.AvailableTokens(), 0);
@@ -448,7 +448,7 @@ TEST(FullAttnManagerTest, ChainedPriorPreventsSecondPageCollision) {
 
 TEST(FullAttnManagerLcmTest, ManagerOnlyCacheOwnerRetainsChild) {
     BlockPool pool(1);
-    FullAttnManager mgr(/*page_size=*/4, /*cache_blocks_per_lcm_block=*/2, /*group_id=*/0);
+    FullAttnManager mgr(/*block_granularity=*/4, /*cache_blocks_per_lcm_block=*/2, /*group_id=*/0);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 4));
     const CacheBlockLocation location = table.Blocks().front()->Location();

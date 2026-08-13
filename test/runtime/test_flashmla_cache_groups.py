@@ -67,7 +67,8 @@ def _make_flashmla_backend(pool, speculative_num_draft_tokens: int = 1):
         attn_tp_size=1,
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
-        page_size=_KERNEL_PAGE,
+        prefix_granularity=_KERNEL_PAGE,
+        kernel_page_size=_KERNEL_PAGE,
         context_len=8 * pool.page_size,
         max_bs=8,
         max_graph_bs=8,
@@ -164,7 +165,7 @@ def test_flashmla_grouped_prefill_index_math() -> None:
     logical_table = torch.tensor([[3, 5]], device="cuda", dtype=torch.int32)
     table = expand_page_table(
         logical_table,
-        table_page_size=page_size,
+        block_granularity=page_size,
         kernel_page_size=_KERNEL_PAGE,
     )
 
@@ -262,7 +263,8 @@ def _make_draft_flashmla_backend(pool):
         attn_tp_size=1,
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
-        page_size=_KERNEL_PAGE,
+        prefix_granularity=_KERNEL_PAGE,
+        kernel_page_size=_KERNEL_PAGE,
         context_len=8 * pool.page_size,
         max_bs=8,
         max_graph_bs=8,

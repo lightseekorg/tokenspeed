@@ -8,7 +8,7 @@ floors the scheduler's max_scheduled_tokens to the LCM of those groups' page
 grains so state pages can register and prefix-cache reuse stays live; the
 admission probe takes the min across groups, so a never-registering state
 group silently zeroes reuse for the whole model (observed on Kimi-K3:
-chunked_prefill_size=8192 with block_size=1536 -> #cached-token: 0).
+chunked_prefill_size=8192 with prefix_granularity=1536 -> #cached-token: 0).
 """
 
 from __future__ import annotations

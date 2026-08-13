@@ -77,9 +77,9 @@ struct CacheGroupSpec {
     // Number of this group's CacheBlocks packed into one physical LCM block.
     // It affects placement only, not the scheduler-wide prefix granularity.
     std::int32_t cache_blocks_per_lcm_block{1};
-    // Tokens represented by one CacheBlock in this group. Zero keeps the
-    // legacy meaning: use the coordinator-wide prefix granularity.
-    std::int32_t page_size{0};
+    // Tokens represented by one CacheBlock in this group. Required: must be
+    // a positive divisor of the coordinator-wide prefix granularity.
+    std::int32_t block_granularity{0};
 };
 
 // Per-group input for one admission. prefix_hashes is the request's cumulative

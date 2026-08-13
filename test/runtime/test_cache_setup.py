@@ -49,7 +49,8 @@ def _mha_config() -> MHAConfig:
         context_len=1024,
         max_graph_bs=2,
         max_bs=2,
-        page_size=64,
+        prefix_granularity=64,
+        kernel_page_size=64,
         kv_cache_quant_method="none",
         max_scheduled_tokens=128,
     )
@@ -68,7 +69,8 @@ def _mla_config() -> MLAConfig:
         context_len=1024,
         max_graph_bs=2,
         max_bs=2,
-        page_size=64,
+        prefix_granularity=64,
+        kernel_page_size=64,
         kv_cache_quant_method="none",
         kv_lora_rank=4,
         qk_nope_head_dim=2,
@@ -93,7 +95,8 @@ def _msa_config() -> MSAConfig:
         context_len=1024,
         max_graph_bs=2,
         max_bs=2,
-        page_size=64,
+        prefix_granularity=64,
+        kernel_page_size=64,
         kv_cache_quant_method="none",
         compute_layer_types=("full_attention", "sparse_attention"),
         sparse_layer_ids=frozenset({1}),
@@ -212,12 +215,13 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         context_len=1024,
         max_graph_bs=2,
         max_bs=2,
-        page_size=64,
+        prefix_granularity=64,
+        kernel_page_size=64,
         kv_cache_quant_method="none",
         max_scheduled_tokens=128,
     )
     server_args = SimpleNamespace(
-        block_size=64,
+        prefix_granularity=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=0,
     )
@@ -234,8 +238,9 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         overlap_schedule_depth=0,
     )
 
-    assert server_args.block_size == 64
-    assert attn_config.page_size == 64
+    assert server_args.prefix_granularity == 64
+    assert attn_config.prefix_granularity == 64
+    assert attn_config.kernel_page_size == 64
     assert setup.spec.memory_plan.prefix_granularity == 128
     assert setup.num_draft_layers == 0
     assert setup.spec.layer_group_ids == (

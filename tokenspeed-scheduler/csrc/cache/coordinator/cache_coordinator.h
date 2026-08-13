@@ -83,7 +83,7 @@ public:
     std::int32_t GroupBoundaryLookbackPages(std::int32_t i) const {
         return groups_[static_cast<std::size_t>(i)].Matcher().BoundaryLookbackPages();
     }
-    std::int32_t GroupPageSize(std::int32_t i) const { return geometry_[static_cast<std::size_t>(i)].PageSize(); }
+    std::int32_t GroupBlockGranularity(std::int32_t i) const { return geometry_[static_cast<std::size_t>(i)].BlockGranularity(); }
     std::int32_t GroupBlocksNeededFor(std::int32_t i, const BlockTable& table, std::int32_t num_tokens) const {
         return geometry_[static_cast<std::size_t>(i)].BlocksNeededFor(table, num_tokens);
     }

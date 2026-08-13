@@ -1247,10 +1247,10 @@ class TestDeepseekV4Config(unittest.TestCase):
                 quantization_config=None,
             )
 
-        def build(block_size):
+        def build(prefix_granularity):
             server_args = SimpleNamespace(
                 mapping=None,
-                block_size=block_size,
+                prefix_granularity=prefix_granularity,
                 load_format="auto",
                 ext_yaml=None,
             )
@@ -1281,8 +1281,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                 )
             return server_args
 
-        self.assertEqual(build(64).block_size, 256)
-        self.assertEqual(build(128).block_size, 128)
+        self.assertEqual(build(64).prefix_granularity, 256)
+        self.assertEqual(build(128).prefix_granularity, 128)
 
     def test_model_config_advertises_v4_dspark_prefix_replay_requirement(self):
         hf_config = SimpleNamespace(
@@ -1306,7 +1306,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             speculative_algorithm="DSPARK",
             enable_prefix_caching=True,
             speculative_num_draft_tokens=6,
-            block_size=256,
+            prefix_granularity=256,
             load_format="auto",
             ext_yaml=None,
         )
@@ -1742,10 +1742,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.equal(next_context_lengths, torch.tensor([128])))
 
     def test_dspark_hc_head_preserves_batch_and_block_axes(self):
-        batch_size, block_size, hc_mult, hidden_size = 2, 5, 4, 8
+        batch_size, prefix_granularity, hc_mult, hidden_size = 2, 5, 4, 8
         hidden_states = torch.randn(
             batch_size,
-            block_size,
+            prefix_granularity,
             hc_mult,
             hidden_size,
         )
@@ -1771,12 +1771,14 @@ class TestDeepseekV4Config(unittest.TestCase):
                     1e-6,
                     1e-6,
                 )
-                for step in range(block_size)
+                for step in range(prefix_granularity)
             ],
             dim=1,
         )
 
-        self.assertEqual(tuple(actual.shape), (batch_size, block_size, hidden_size))
+        self.assertEqual(
+            tuple(actual.shape), (batch_size, prefix_granularity, hidden_size)
+        )
         self.assertTrue(torch.allclose(actual, expected))
 
     def test_dspark_context_projection_materializes_strided_decode_slice(self):
@@ -2382,7 +2384,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_backend_preserves_compact_paged_cache_contract(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -2416,7 +2419,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_lcm_graph_tables_keep_absolute_logical_positions(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -2465,7 +2469,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_lcm_tables_are_already_kernel_ready(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -2504,7 +2509,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_runtime_configures_eager_cache_group_contract(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -2732,7 +2738,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         def make_backend(*, is_draft: bool) -> DeepseekV4AttentionBackend:
             return DeepseekV4AttentionBackend(
                 SimpleNamespace(
-                    page_size=64,
+                    prefix_granularity=64,
+                    kernel_page_size=64,
                     device="cuda",
                     num_attention_heads=64,
                     num_kv_heads=1,
@@ -2871,7 +2878,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_mixed_metadata_keeps_decode_rows_single_token(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -2913,7 +2921,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             with self.subTest(verify_width=verify_width):
                 backend = DeepseekV4AttentionBackend(
                     SimpleNamespace(
-                        page_size=64,
+                        prefix_granularity=64,
+                        kernel_page_size=64,
                         device="cpu",
                         num_attention_heads=64,
                         num_kv_heads=1,
@@ -2971,7 +2980,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_mixed_metadata_rejects_packed_token_mismatch(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -3003,7 +3013,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         verify_width = 4
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -3060,7 +3071,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_cuda_graph_refresh_keeps_compact_table_columns(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -3100,7 +3112,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_metadata_splits_named_cache_groups(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -3175,7 +3188,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_metadata_slice_preserves_compact_base_offsets(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -3454,7 +3468,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_mixed_metadata_splits_prefill_and_decode(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=8,
                 num_kv_heads=1,
@@ -3556,7 +3571,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_mixed_metadata_accepts_prefill_prefix_lens_only(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=8,
                 num_kv_heads=1,
@@ -3601,7 +3617,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_mixed_backend_slices_prefill_and_decode(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=8,
                 num_kv_heads=1,
@@ -3695,7 +3712,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_mixed_prefill_replaces_stale_slice(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=8,
                 num_kv_heads=1,
@@ -3787,10 +3805,63 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.equal(out[:3], torch.ones((3, 1, 2))))
         self.assertTrue(torch.equal(out[3:], torch.full((2, 1, 2), 2.0)))
 
+    def test_deepseek_v4_prefix_granularity_decoupled_from_kernel_page(self):
+        """The scheduler grain only has to be a positive multiple of the
+        kernel page: kernel geometry is registry-sourced, never P-derived."""
+
+        def build(prefix_granularity):
+            return DeepseekV4AttentionBackend(
+                SimpleNamespace(
+                    prefix_granularity=prefix_granularity,
+                    kernel_page_size=None,
+                    device="cpu",
+                    num_attention_heads=64,
+                    num_kv_heads=1,
+                    attn_tp_size=1,
+                    dtype=torch.bfloat16,
+                    is_draft=False,
+                    head_dim=512,
+                    context_len=4096,
+                    speculative_num_draft_tokens=1,
+                )
+            )
+
+        for granularity in (256, 512, 1024):
+            with self.subTest(prefix_granularity=granularity):
+                backend = build(granularity)
+                # The kernel scalar stays registry-sourced regardless of P.
+                self.assertEqual(backend.kernel_page_size, 256)
+                self.assertEqual(backend.max_num_pages, 4096 // 256)
+        for granularity in (0, -256, 64, 128, 384):
+            with self.subTest(prefix_granularity=granularity):
+                with self.assertRaisesRegex(ValueError, "positive multiple"):
+                    build(granularity)
+
+    def test_deepseek_v4_spec_geometry_is_prefix_granularity_free(self):
+        """build_v4_cache_specs takes no P; block spans come from the kernel
+        page registry (256 // ratio rows x ratio-token stride)."""
+        specs = {
+            spec.group_id: spec
+            for spec in build_v4_cache_specs(
+                SimpleNamespace(sliding_window=128),
+                layer_ratio=(1, 4, 128),
+                decode_input_tokens=1,
+            )
+        }
+        c4 = specs["v4.c4a.compressed_kv"]
+        self.assertEqual(c4.rows_per_page, 64)
+        self.assertEqual(c4.entry_stride_tokens, 4)
+        self.assertEqual(c4.block_granularity, 256)
+        c128 = specs["v4.c128a.compressed_kv"]
+        self.assertEqual(c128.rows_per_page, 2)
+        self.assertEqual(c128.entry_stride_tokens, 128)
+        self.assertEqual(c128.block_granularity, 256)
+
     def test_deepseek_v4_spec_metadata_requires_uniform_pack(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -3824,7 +3895,8 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         draft_backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -3868,7 +3940,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_decode_metadata_defaults_to_one_token(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -3901,7 +3974,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_select_decode_metadata_ignores_prefill_fallback(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -3946,7 +4020,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_cuda_graph_replay_without_num_tokens_uses_plain_decode(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -3985,7 +4060,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_decode_backend_maps_compressed_slots_batched(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -4074,7 +4150,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         device = torch.device("cuda")
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cuda",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -4141,7 +4218,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_c128a_prefill_local_compressed_indices_contract(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -4222,7 +4300,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_decode_backend_masks_padding_tokens(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -4291,7 +4370,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_cuda_graph_replay_marks_padding_tokens_invalid(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -4340,7 +4420,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_cuda_graph_replay_preserves_padded_cache_tables(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -4545,7 +4626,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_cuda_graph_decode_uses_packed_metadata(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -4626,7 +4708,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_cuda_graph_packed_draft_decode_advances_metadata(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -4718,7 +4801,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_eager_draft_decode_refreshes_stale_graph_metadata(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -4775,7 +4859,8 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_prefill_uses_prefill_metadata_slot(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
-                page_size=64,
+                prefix_granularity=64,
+                kernel_page_size=64,
                 device="cpu",
                 num_attention_heads=64,
                 num_kv_heads=1,
@@ -5810,7 +5895,7 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
         ),
         attn_config=SimpleNamespace(
             pd_disaggregation_enabled=True,
-            page_size=256,
+            prefix_granularity=256,
             max_bs=2,
             context_len=1024,
         ),

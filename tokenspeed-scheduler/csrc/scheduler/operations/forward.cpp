@@ -286,15 +286,15 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     if (config_.enable_pd_cache && source == fsm::PrefillSource::kRemote) {
         for (std::size_t i = 0; i < demands.size(); ++i) {
             const PagedCacheGroupConfig& group = config_.paged_cache_groups[i];
-            const std::int32_t page_size = coordinator_.GroupPageSize(i);
+            const std::int32_t block_granularity = coordinator_.GroupBlockGranularity(i);
             if (group.transfer_policy == PagedCacheTransferPolicy::LatestSnapshot) {
                 demands[i].num_tokens = request->PrefillSize();
-                demands[i].materialized_suffix_start = (request->PrefillSize() - 1) / page_size;
+                demands[i].materialized_suffix_start = (request->PrefillSize() - 1) / block_granularity;
             } else if (group.retention == PagedCacheGroupConfig::Retention::SlidingWindow) {
                 const std::int32_t retained_begin =
                     std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
                 demands[i].num_tokens = request->PrefillSize();
-                demands[i].materialized_suffix_start = std::max(hit_tokens / page_size, retained_begin / page_size);
+                demands[i].materialized_suffix_start = std::max(hit_tokens / block_granularity, retained_begin / block_granularity);
             }
         }
     }

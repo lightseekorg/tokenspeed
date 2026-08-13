@@ -45,7 +45,8 @@ class CacheBatchMetadata:
         group_ids: Cache group IDs in runtime-contract order.
         num_requests: Number of request rows in each group table.
         max_page_ids: Inclusive maximum page ID accepted for each group.
-        prefix_granularity: Prefix granularity in tokens (uniform across contract groups).
+        block_granularity: Full-history table grain in tokens (equals the
+            contract prefix_granularity by the 1:1 convention).
         full_attention_group_id: The unique ``family="history"`` +
             ``retention="full_history"`` group ID, or ``None`` when the
             contract does not contain exactly one such group.
@@ -55,10 +56,12 @@ class CacheBatchMetadata:
     _group_tables: Mapping[str, torch.Tensor] = field(repr=False, compare=False)
     num_requests: int
     max_page_ids: Mapping[str, int]
-    prefix_granularity: int
+    # Grain of the scheduler's full-history table (equals prefix_granularity
+    # by the 1:1 prefix-page <-> CacheBlock convention).
+    block_granularity: int
     full_attention_group_id: str | None
     _forward_op: Any = field(repr=False, compare=False)
-    # Kernel-page expansions memoized per (group_id, page_size, max_pages);
+    # Kernel-page expansions memoized per (group_id, kernel_page_size, max_pages);
     # metadata lives exactly one forward operation, so entries never go stale.
     _kernel_tables: dict = field(repr=False, compare=False)
 
@@ -96,7 +99,7 @@ class CacheBatchMetadata:
             raise ValueError(
                 "runtime contract must provide ordered nonempty unique group IDs"
             )
-        prefix_granularity = require_positive_int(
+        block_granularity = require_positive_int(
             "contract prefix_granularity", contract.prefix_granularity
         )
         full_attention_ids = tuple(
@@ -116,7 +119,7 @@ class CacheBatchMetadata:
             group_tables=tables,
             num_requests=num_requests,
             max_page_ids=max_page_ids,
-            prefix_granularity=prefix_granularity,
+            block_granularity=block_granularity,
             full_attention_group_id=(
                 full_attention_ids[0] if len(full_attention_ids) == 1 else None
             ),
@@ -131,7 +134,7 @@ class CacheBatchMetadata:
         group_tables: Mapping[str, torch.Tensor],
         num_requests: int,
         max_page_ids: Mapping[str, int],
-        prefix_granularity: int,
+        block_granularity: int,
         full_attention_group_id: str | None,
         forward_op: Any,
     ) -> CacheBatchMetadata:
@@ -168,7 +171,7 @@ class CacheBatchMetadata:
         object.__setattr__(
             metadata, "max_page_ids", MappingProxyType(dict(max_page_ids))
         )
-        object.__setattr__(metadata, "prefix_granularity", prefix_granularity)
+        object.__setattr__(metadata, "block_granularity", block_granularity)
         object.__setattr__(metadata, "full_attention_group_id", full_attention_group_id)
         # A strong reference makes Python/nanobind object identity safe against
         # id reuse until all metadata views become unreachable.
@@ -230,27 +233,27 @@ class CacheBatchMetadata:
         self,
         group_id: str | None = None,
         *,
-        page_size: int,
+        kernel_page_size: int,
         max_pages: int | None = None,
         active_forward_op: Any,
     ) -> torch.Tensor:
         """Return a group's table expanded into a backend's kernel pages.
 
-        Scheduler tables address prefix pages of ``prefix_granularity`` tokens; a
-        backend's kernel walks pages of ``page_size`` tokens. This expands
-        page ids once per (group, page_size, max_pages) and memoizes the
+        Scheduler tables address prefix pages of ``block_granularity`` tokens; a
+        backend's kernel walks pages of ``kernel_page_size`` tokens. This expands
+        page ids once per (group, kernel_page_size, max_pages) and memoizes the
         result on the metadata, so every consumer of the same geometry within
         one forward (eager init, graph replay, chunked prefill) shares one
         expansion. The token-location invariant holds by construction:
         ``expanded[i, t // p] * p + t % p == table[i, t // P] * P + t % P``
         for every token position ``t``, so write-location math on the
-        expanded table with ``page_size`` is exact.
+        expanded table with ``kernel_page_size`` is exact.
 
         Args:
             group_id: Cache group to expand; ``None`` selects the unique
                 full-attention history group.
-            page_size: The consuming kernel's page size in tokens. Must
-                divide ``prefix_granularity``.
+            kernel_page_size: The consuming kernel's page size in tokens. Must
+                divide ``block_granularity``.
             max_pages: Width of the returned table in kernel pages. ``None``
                 keeps the full expanded width. The returned tensor is padded
                 with the null page 0 past the source width.
@@ -263,8 +266,8 @@ class CacheBatchMetadata:
             kernel pages ``0..ratio-1``, all inside the physical null page).
 
         Raises:
-            RuntimeError: If the metadata is stale or ``prefix_granularity`` is not a
-                positive multiple of ``page_size``.
+            RuntimeError: If the metadata is stale or ``block_granularity`` is not a
+                positive multiple of ``kernel_page_size``.
         """
         if group_id is None:
             table = self.require_full_attention_table(
@@ -273,27 +276,27 @@ class CacheBatchMetadata:
             group_id = self.full_attention_group_id
         else:
             table = self.require_table(group_id, active_forward_op=active_forward_op)
-        if self.prefix_granularity % page_size:
+        if self.block_granularity % kernel_page_size:
             raise RuntimeError(
-                f"prefix granularity {self.prefix_granularity} is not a positive "
-                f"multiple of the kernel page size {page_size}"
+                f"block granularity {self.block_granularity} is not a positive "
+                f"multiple of the kernel page size {kernel_page_size}"
             )
-        key = (group_id, int(page_size), max_pages)
+        key = (group_id, int(kernel_page_size), max_pages)
         cached = self._kernel_tables.get(key)
         if cached is not None:
             return cached
         if table.stride(0) != table.shape[1] and table.shape[0] > 1:
             # Chunked-prefill kernels derive the row stride from shape[1].
             table = table.contiguous()
-        if self.prefix_granularity == page_size and (
+        if self.block_granularity == kernel_page_size and (
             max_pages is None or max_pages <= table.shape[1]
         ):
             expanded = table if max_pages is None else table[:, :max_pages]
         else:
             expanded = expand_page_table(
                 table,
-                table_page_size=self.prefix_granularity,
-                kernel_page_size=page_size,
+                block_granularity=self.block_granularity,
+                kernel_page_size=kernel_page_size,
                 max_kernel_pages=max_pages,
             )
         self._kernel_tables[key] = expanded
@@ -313,8 +316,8 @@ class CacheBatchMetadata:
             return
         batch_size = min(int(seq_lens.shape[0]), int(table.shape[0]))
         live_pages = (
-            (seq_lens[:batch_size].to(torch.int64) + self.prefix_granularity - 1)
-            // self.prefix_granularity
+            (seq_lens[:batch_size].to(torch.int64) + self.block_granularity - 1)
+            // self.block_granularity
         ).clamp_max_(table.shape[1])
         columns = torch.arange(table.shape[1], device=table.device)
         live_entries = table[:batch_size][

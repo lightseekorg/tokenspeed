@@ -52,6 +52,9 @@ from tokenspeed.runtime.layers.attention.backends.cache_groups import (
 from tokenspeed.runtime.layers.attention.configs.msa import (
     MSAConfig,
 )
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    MSA_PAGE_SIZE,
+)
 from tokenspeed.runtime.layers.attention.registry import (
     register_backend,
 )
@@ -129,8 +132,12 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
 
         # Static information needed for metadata construction and kernel dispatch
         self.max_context_len = config.context_len
-        self.page_size = config.page_size
-        self.max_num_pages = ceil_div(self.max_context_len, self.page_size)
+        self.kernel_page_size = (
+            config.kernel_page_size
+            if config.kernel_page_size is not None
+            else MSA_PAGE_SIZE
+        )
+        self.max_num_pages = ceil_div(self.max_context_len, self.kernel_page_size)
         self.tp_q_head_num = max(config.num_attention_heads // config.attn_tp_size, 1)
         self.tp_kv_head_num = max(config.num_kv_heads // config.attn_tp_size, 1)
         self.head_dim = config.head_dim
@@ -217,24 +224,24 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
                     group_page_tables,
                     extend_prefix_lens_cpu[:bs],
                     extend_seq_lens_cpu[:bs],
-                    self.page_size,
+                    self.kernel_page_size,
                 )
             else:
                 group_out_cache_locs = self._compute_decode_group_out_cache_locs(
                     group_page_tables,
                     seq_lens,
-                    self.page_size,
+                    self.kernel_page_size,
                     self.tokens_per_req,
                 )
             self._maybe_check_group_write_locs(
-                group_page_tables, group_out_cache_locs, self.page_size
+                group_page_tables, group_out_cache_locs, self.kernel_page_size
             )
             group_page_tables = self._kernel_page_tables(group_page_tables)
         else:
             page_table = build_page_table(
                 req_pool_indices[:bs],
                 page_table,
-                self.page_size,
+                self.kernel_page_size,
                 self.max_context_len,
             )
 
@@ -561,7 +568,7 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
             page_table=page_table,
             cache_seqlens=metadata.seq_lens,
             topk=self.index_topk_blocks,
-            page_size=self.page_size,
+            page_size=self.kernel_page_size,
             index_scale=self.index_head_dim**-0.5,
             attention_scale=layer.scaling,
             init_blocks=self.index_init_blocks,
@@ -641,7 +648,7 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
             max_seqlen_q=metadata.max_extend_seq_len,
             max_seqlen_k=max_seq_len,
             topk=self.index_topk_blocks,
-            page_size=self.page_size,
+            page_size=self.kernel_page_size,
             index_scale=self.index_head_dim**-0.5,
             attention_scale=layer.scaling,
             init_blocks=self.index_init_blocks,
@@ -682,7 +689,7 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 cache_loc=out_cache_loc,
                 k_scale=layer.k_scale,
                 v_scale=layer.v_scale,
-                page_size=self.page_size,
+                page_size=self.kernel_page_size,
                 enable_pdl=pdl_enabled(),
             )
         else:
@@ -698,13 +705,13 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
     def _get_kv_cache(self, layer: PagedAttention, token_to_kv_pool):
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id).view(
             -1,
-            self.page_size,
+            self.kernel_page_size,
             layer.tp_k_head_num,
             layer.qk_head_dim,
         )
         v_cache = token_to_kv_pool.get_value_buffer(layer.layer_id).view(
             -1,
-            self.page_size,
+            self.kernel_page_size,
             layer.tp_v_head_num,
             layer.v_head_dim,
         )

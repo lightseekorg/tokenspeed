@@ -64,7 +64,7 @@ std::int32_t Put(Manager& manager, BlockPool& host_pool, const CacheKey& key) {
 
 TEST(HostTierMatchTest, FullWalksContiguousRunFromBegin) {
     BlockPool host_pool(9);
-    FullAttnManager mgr(/*page_size=*/4);
+    FullAttnManager mgr(/*block_granularity=*/4);
     EXPECT_TRUE(mgr.MatchIsPrefixClosed());
     std::vector<CacheKey> keys{Key("k0"), Key("k1"), Key("k2"), Key("k3"), Key("k4")};
     std::vector<std::int32_t> put;
@@ -98,7 +98,7 @@ TEST(HostTierMatchTest, FullEmptyOnBeginMissOrEmptyRange) {
 
 TEST(HostTierMatchTest, SwaTrailingRunAtEnd) {
     BlockPool host_pool(9);
-    // page_size 4, window 10 -> pages_needed = ceil(9/4) = 3.
+    // block_granularity 4, window 10 -> pages_needed = ceil(9/4) = 3.
     SwaManager mgr(4, /*sliding_window=*/10);
     EXPECT_FALSE(mgr.MatchIsPrefixClosed());
     std::vector<CacheKey> keys{Key("k0"), Key("k1"), Key("k2"), Key("k3"), Key("k4")};

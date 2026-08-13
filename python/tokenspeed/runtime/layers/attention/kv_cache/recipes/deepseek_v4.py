@@ -4,6 +4,9 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    DEEPSEEK_V4_PAGE_SIZE,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import (
     configured_token_limit,
 )
@@ -24,7 +27,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     apply_pd_transfer_policies,
 )
 
-_PREFIX_GRANULARITY = 256
 _MAX_PADDING_FRACTION = 2.0
 
 
@@ -77,7 +79,10 @@ def build_deepseek_v4_cache_fields(
     )
 
 
-def solve_deepseek_v4_memory_layout(fields: list[CacheFieldSpec]):
+def solve_deepseek_v4_memory_layout(
+    fields: list[CacheFieldSpec],
+    prefix_granularity: int = DEEPSEEK_V4_PREFIX_GRANULARITY,
+):
     """Solve DSV4's power-of-two group packing for one physical parent."""
     raw_bytes: dict[str, int] = {}
     for field in fields:
@@ -93,7 +98,7 @@ def solve_deepseek_v4_memory_layout(fields: list[CacheFieldSpec]):
     }
     return solve_cache_layout(
         fields,
-        prefix_granularity=_PREFIX_GRANULARITY,
+        prefix_granularity=prefix_granularity,
         cache_blocks_per_lcm_block=packing,
         alignment=256,
         max_padding_fraction=_MAX_PADDING_FRACTION,
@@ -112,8 +117,11 @@ def deepseek_v4_cache_fields(
     kv_page_stride_alignment_bytes: int,
 ) -> tuple[CacheFieldSpec, ...]:
     """Describe DSV4 history pages and bounded live-tail state."""
-    if prefix_granularity != 256:
-        raise ValueError("DeepSeek V4 LCM scheduling requires P=256")
+    if prefix_granularity <= 0 or prefix_granularity % DEEPSEEK_V4_PAGE_SIZE:
+        raise ValueError(
+            "DeepSeek V4 prefix granularity must be a positive multiple of "
+            f"the kernel page ({DEEPSEEK_V4_PAGE_SIZE}), got {prefix_granularity}"
+        )
     ratios = tuple(int(ratio) for ratio in layer_ratios)
     if any(ratio not in (1, 4, 128) for ratio in ratios):
         raise ValueError("DeepSeek V4 layer ratios must be 1, 4, or 128")
@@ -247,16 +255,18 @@ def prepare_deepseek_v4_cache(
         return current_platform().arch_version.major >= 10
 
     def layout_and_fields(config, runtime_config, *, layer_indices=None):
+        # Kernel geometry sources from the kernel-page registry; the scheduler
+        # prefix granularity only has to be a positive multiple of it.
         layout = deepseek_v4_cache_layout_from_config(
             config,
-            page_size=runtime_config.page_size,
+            page_size=DEEPSEEK_V4_PAGE_SIZE,
             use_fp4_indexer_cache=use_fp4_indexer(config),
             layer_indices=layer_indices,
         )
         fields = build_deepseek_v4_cache_fields(
             layout,
             sliding_window=int(config.sliding_window),
-            prefix_granularity=_PREFIX_GRANULARITY,
+            prefix_granularity=runtime_config.prefix_granularity,
         )
         return layout, fields
 
@@ -279,7 +289,9 @@ def prepare_deepseek_v4_cache(
         attn_config,
         layer_indices=range(num_target_layers + num_draft_layers),
     )
-    merged_layout_plan = solve_deepseek_v4_memory_layout(merged_fields)
+    merged_layout_plan = solve_deepseek_v4_memory_layout(
+        merged_fields, attn_config.prefix_granularity
+    )
     packing = dict(merged_layout_plan.group_packing)
 
     num_lcm_blocks = cache_budget_bytes // merged_layout_plan.lcm_block_bytes - 1
@@ -303,10 +315,12 @@ def prepare_deepseek_v4_cache(
     upper_bound = (
         token_limit
         if token_limit is not None
-        else num_lcm_blocks * max_packing * _PREFIX_GRANULARITY
+        # Tokens per parent = packing x the group block span (kernel page),
+        # independent of the scheduler prefix granularity.
+        else num_lcm_blocks * max_packing * DEEPSEEK_V4_PAGE_SIZE
     )
     sizing = {
-        "prefix_granularity": _PREFIX_GRANULARITY,
+        "prefix_granularity": attn_config.prefix_granularity,
         "max_live_requests": attn_config.max_bs,
         "max_scheduled_tokens": max(0, int(server_args.chunked_prefill_size)),
         "max_context_len": attn_config.context_len,

@@ -62,7 +62,7 @@ def test_kernel_table_expansion_preserves_token_locations() -> None:
 
     logical = metadata.require_full_attention_table(active_forward_op=op)
     kernel = metadata.kernel_table(
-        page_size=_KERNEL_PAGE, max_pages=None, active_forward_op=op
+        kernel_page_size=_KERNEL_PAGE, max_pages=None, active_forward_op=op
     )
     ratio = P // _KERNEL_PAGE
     assert kernel.shape == (2, logical.shape[1] * ratio)
@@ -81,11 +81,17 @@ def test_kernel_table_is_memoized_per_geometry() -> None:
     pool = _make_pool("cuda", usable_pages=6)
     metadata, op = _metadata(pool, [[3, 5]])
 
-    a = metadata.kernel_table(page_size=_KERNEL_PAGE, max_pages=8, active_forward_op=op)
-    b = metadata.kernel_table(page_size=_KERNEL_PAGE, max_pages=8, active_forward_op=op)
+    a = metadata.kernel_table(
+        kernel_page_size=_KERNEL_PAGE, max_pages=8, active_forward_op=op
+    )
+    b = metadata.kernel_table(
+        kernel_page_size=_KERNEL_PAGE, max_pages=8, active_forward_op=op
+    )
     assert a is b
     # A different width is a different view, not the cached one.
-    c = metadata.kernel_table(page_size=_KERNEL_PAGE, max_pages=4, active_forward_op=op)
+    c = metadata.kernel_table(
+        kernel_page_size=_KERNEL_PAGE, max_pages=4, active_forward_op=op
+    )
     assert c is not a
     assert c.shape[1] == 4
 
@@ -96,7 +102,7 @@ def test_kernel_table_identity_when_sizes_match() -> None:
     metadata, op = _metadata(pool, [[3, 5]])
 
     table = metadata.kernel_table(
-        page_size=pool.page_size, max_pages=None, active_forward_op=op
+        kernel_page_size=pool.page_size, max_pages=None, active_forward_op=op
     )
     logical = metadata.require_full_attention_table(active_forward_op=op)
     assert table.data_ptr() == logical.data_ptr()
@@ -110,7 +116,7 @@ def test_kernel_table_max_pages_pads_with_null_page() -> None:
     metadata, op = _metadata(pool, [[3, 5]])
 
     wide = metadata.kernel_table(
-        page_size=_KERNEL_PAGE, max_pages=10 * ratio, active_forward_op=op
+        kernel_page_size=_KERNEL_PAGE, max_pages=10 * ratio, active_forward_op=op
     )
     assert wide.shape[1] == 10 * ratio
     # Columns past the source width are the null page 0 (always dereferenceable).
@@ -122,7 +128,7 @@ def test_kernel_table_rejects_non_divisible_page_size() -> None:
     pool = _make_pool("cuda", usable_pages=6)
     metadata, op = _metadata(pool, [[3, 5]])
     with pytest.raises(RuntimeError, match="not a positive multiple"):
-        metadata.kernel_table(page_size=48, max_pages=None, active_forward_op=op)
+        metadata.kernel_table(kernel_page_size=48, max_pages=None, active_forward_op=op)
 
 
 @requires_cuda
@@ -131,7 +137,7 @@ def test_kernel_table_rejects_stale_forward_op() -> None:
     metadata, _ = _metadata(pool, [[3, 5]])
     with pytest.raises(RuntimeError, match="stale"):
         metadata.kernel_table(
-            page_size=_KERNEL_PAGE, max_pages=None, active_forward_op=object()
+            kernel_page_size=_KERNEL_PAGE, max_pages=None, active_forward_op=object()
         )
 
 

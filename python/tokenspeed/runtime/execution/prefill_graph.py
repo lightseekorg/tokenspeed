@@ -434,7 +434,9 @@ class PrefillGraph:
         if not state_group_ids:
             state_group_ids = set(getattr(backend, "state_group_ids", frozenset()))
         # Composite wrappers hold the cache-group consumer as a child.
-        if not hasattr(backend, "page_size") and hasattr(backend, "full_attn_backend"):
+        if not hasattr(backend, "kernel_page_size") and hasattr(
+            backend, "full_attn_backend"
+        ):
             backend = backend.full_attn_backend
         require_real_active_pages = bool(
             getattr(backend, "cache_active_pages_must_be_real", False)
@@ -442,7 +444,7 @@ class PrefillGraph:
         # Full width: backends that derive the row stride from max_kv_len
         # (trtllm) index the whole row even when the bucket is small.
         width = getattr(backend, "max_num_pages", 0) or -(
-            -req_tokens // backend.page_size
+            -req_tokens // backend.kernel_page_size
         )
         # ALL groups, state included: hybrid wrappers forward the dict to the
         # mamba child, which requires its state group; KV children shed state

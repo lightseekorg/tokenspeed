@@ -19,23 +19,23 @@ from __future__ import annotations
 import torch
 
 
-def _page_ratio(table_page_size: int, kernel_page_size: int) -> int:
+def _page_ratio(block_granularity: int, kernel_page_size: int) -> int:
     if (
-        table_page_size <= 0
+        block_granularity <= 0
         or kernel_page_size <= 0
-        or table_page_size % kernel_page_size
+        or block_granularity % kernel_page_size
     ):
         raise ValueError(
-            "table_page_size must be a positive multiple of kernel_page_size, "
-            f"got {table_page_size} and {kernel_page_size}"
+            "block_granularity must be a positive multiple of kernel_page_size, "
+            f"got {block_granularity} and {kernel_page_size}"
         )
-    return table_page_size // kernel_page_size
+    return block_granularity // kernel_page_size
 
 
 def expand_page_table(
     page_table: torch.Tensor,
     *,
-    table_page_size: int,
+    block_granularity: int,
     kernel_page_size: int,
     max_kernel_pages: int | None = None,
     out: torch.Tensor | None = None,
@@ -43,7 +43,7 @@ def expand_page_table(
     """Expand scheduler page IDs into the smaller pages consumed by a kernel."""
     if page_table.ndim != 2:
         raise ValueError(f"page_table must be 2-D, got shape {tuple(page_table.shape)}")
-    ratio = _page_ratio(table_page_size, kernel_page_size)
+    ratio = _page_ratio(block_granularity, kernel_page_size)
     if max_kernel_pages is None:
         max_kernel_pages = page_table.shape[1] * ratio
     if max_kernel_pages < 0:
