@@ -744,6 +744,117 @@ class TestCheckpointMetadata(unittest.TestCase):
         # positional publish re-covers it with committed rows.
         self.assertEqual(md.seq_lens.tolist(), [132])
 
+    def test_draft_frontier_window_reanchors_conv_metadata(self):
+        """enter_draft_frontier_window keeps the k-row chunk shape and moves
+        only its anchor: seq_lens becomes the committed frontier, the paged
+        bridges ride through (positional publish re-covers rewritten
+        boundaries with committed content), and the inner backend gets the
+        same frontier for its seq_lens/write-loc re-anchor."""
+        from types import SimpleNamespace
+
+        from tokenspeed.runtime.layers.attention.backends.inkling import (
+            InklingAttnBackend,
+            InklingConvMetadata,
+        )
+
+        k, bs = 4, 1
+        backend = InklingAttnBackend.__new__(InklingAttnBackend)
+        backend.conv_is_draft = True
+        backend._draft_frontier = True
+        inner_calls = []
+        backend.inner = SimpleNamespace(
+            enter_draft_frontier=lambda bs, f: inner_calls.append((bs, f))
+        )
+        table = torch.tensor([[11, 12, 13]], dtype=torch.int32, device="cuda")
+        qsl = torch.arange(0, bs * k + 1, k, dtype=torch.int32, device="cuda")
+        backend.conv_metadata = InklingConvMetadata(
+            query_start_loc=qsl,
+            cache_indices=torch.tensor([2], dtype=torch.int32, device="cuda"),
+            has_initial_state=torch.ones(bs, dtype=torch.bool, device="cuda"),
+            is_decode=False,
+            seq_idx=torch.zeros(bs * k, dtype=torch.int32, device="cuda"),
+            seq_lens=torch.tensor([132], dtype=torch.int32, device="cuda"),
+            col_page_table={"state": table[:bs]},
+        )
+        frontier = torch.tensor([130], dtype=torch.int32, device="cuda")
+
+        backend.enter_draft_frontier_window(bs, frontier)
+
+        md = backend.conv_metadata
+        self.assertEqual(md.query_start_loc.tolist(), [0, k], "same k-row chunk")
+        self.assertEqual(md.seq_lens.tolist(), [130], "chunk end at the frontier")
+        self.assertFalse(md.is_decode)
+        self.assertIsNotNone(md.col_page_table)
+        self.assertTrue(torch.equal(md.col_page_table["state"], table[:bs]))
+        self.assertEqual(len(inner_calls), 1)
+        self.assertEqual(inner_calls[0][0], bs)
+        self.assertEqual(inner_calls[0][1].tolist(), [130])
+
+    def test_draft_frontier_window_raises_instead_of_falling_back(self):
+        """Every refusal condition must raise: an unarmed backend, and
+        wrong-shape (single-token decode) conv metadata."""
+        from types import SimpleNamespace
+
+        from tokenspeed.runtime.layers.attention.backends.inkling import (
+            InklingAttnBackend,
+            InklingConvMetadata,
+        )
+
+        backend = InklingAttnBackend.__new__(InklingAttnBackend)
+        backend.conv_is_draft = True
+        backend._draft_frontier = False
+        frontier = torch.tensor([10], dtype=torch.int32, device="cuda")
+        with self.assertRaisesRegex(RuntimeError, "configure_draft_frontier"):
+            backend.enter_draft_frontier_window(1, frontier)
+
+        backend._draft_frontier = True
+        backend.inner = SimpleNamespace(enter_draft_frontier=lambda bs, f: None)
+        qsl = torch.arange(2, dtype=torch.int32, device="cuda")
+        backend.conv_metadata = InklingConvMetadata(
+            query_start_loc=qsl,
+            cache_indices=torch.tensor([2], dtype=torch.int32, device="cuda"),
+            has_initial_state=torch.ones(1, dtype=torch.bool, device="cuda"),
+            is_decode=True,
+            seq_idx=qsl[:1],
+            seq_lens=torch.tensor([12], dtype=torch.int32, device="cuda"),
+            col_page_table=None,
+        )
+        with self.assertRaisesRegex(RuntimeError, "catch-up conv metadata"):
+            backend.enter_draft_frontier_window(1, frontier)
+
+    def test_enter_draft_frontier_recomputes_group_locs(self):
+        """The mixin hook must replace seq_lens with the frontier and point
+        the grouped write locs at the k positions ending there."""
+        from tokenspeed.runtime.layers.attention.backends.cache_groups import (
+            CacheGroupsMixin,
+        )
+        from tokenspeed.runtime.layers.attention.backends.mha import (
+            MHADecodeMetadata,
+        )
+
+        class _Host(CacheGroupsMixin):
+            pass
+
+        host = _Host()
+        host.page_size = 2
+        host.spec_num_tokens = 4
+        host.group_page_sizes = {"g": 2}
+        table = torch.tensor([[7, 8, 9]], dtype=torch.int32, device="cuda")
+        host.forward_decode_metadata = MHADecodeMetadata(
+            page_table=None,
+            seq_lens=torch.tensor([8], dtype=torch.int32, device="cuda"),
+            page_tables={"g": table},
+            out_cache_locs={"g": torch.zeros(4, dtype=torch.int32, device="cuda")},
+        )
+        frontier = torch.tensor([6], dtype=torch.int32, device="cuda")
+
+        host.enter_draft_frontier(1, frontier)
+
+        md = host.forward_decode_metadata
+        self.assertEqual(md.seq_lens.tolist(), [6])
+        # Positions 2..5 with page size 2 over table row [7, 8, 9].
+        self.assertEqual(md.out_cache_locs["g"].tolist(), [16, 17, 18, 19])
+
     def test_advance_draft_metadata_keeps_paged_checkpoints(self):
         """The classic per-step rebuild (catch-up -> T=1 decode metadata)
         must also carry the paged bridges, or single-token draft steps

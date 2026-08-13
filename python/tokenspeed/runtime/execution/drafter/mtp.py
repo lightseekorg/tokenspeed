@@ -23,7 +23,8 @@
 Hosts speculative drafting for MTP heads with multiple distinct depth
 layers, where speculative step ``d`` runs depth layer ``d`` over a shifted
 window and rejected drafts leave per-depth KV slots to repair (extend
-catch-up, decode windows, lookback stashes).
+catch-up, decode windows, lookback and frontier drafter stashes; the
+INKLING_MTP_DECODE_LOOKBACK knob selects the decode-window repair design).
 
 Eagle-like MTP (MTP-Eagle: a single MTP layer chained on its own hidden,
 e.g. DeepSeek) stays in ``eagle.py``. Both register under
@@ -212,6 +213,81 @@ def _lookback_shifted_ids(
     return ids.reshape(-1)
 
 
+def _frontier_shifted_ids(
+    v: torch.Tensor,
+    accept: torch.Tensor,
+    next_tokens: torch.Tensor,
+    stash_tokens: torch.Tensor,
+    depth: int,
+) -> torch.Tensor:
+    """Depth-``depth`` input ids over a frontier-anchored decode window.
+
+    The window's k rows end at the last committed position: row ``j`` sits
+    at source position ``frontier - k + j`` (frontier = vc + accept) and
+    consumes the token at source + depth + 1; in verify-output coordinates
+    that is ``src = accept - k + depth + j`` — per-request, unlike the
+    verify-anchored windows' static shifts. ``src < 0`` reads the stash of
+    the last k-1 committed tokens (entry ``src + k - 1``), ``src < accept``
+    this round's verify output ``v[src]``, else this round's own draft
+    ``d_m`` (m = src - accept + 1 <= depth) — every row holds a committed
+    token or a fresh draft, never garbage. Depth 0 never reaches past the
+    accepted prefix (``src <= accept - 1``).
+
+    Args:
+        v: [bs, k] int64 verify outputs (token at position vc+j+1 = v[:, j]);
+            entries at or past ``accept`` are never read.
+        accept: [bs, 1] int64 accepted lengths clamped to [1, k].
+        next_tokens: [bs, >= depth+1] col 0 = last verified id, cols 1.. =
+            this round's drafts.
+        stash_tokens: [bs, k-1] int64 committed tokens at positions
+            vc-k+2 .. vc.
+        depth: draft depth d >= 0.
+
+    Returns:
+        [bs * k] int64 input ids.
+    """
+    bs, k = v.shape
+    col = torch.arange(k, dtype=torch.int64, device=v.device).view(1, k)
+    src = accept - k + depth + col
+    if depth == 0:
+        ids = torch.gather(v, 1, src.clamp(0, k - 1))
+    else:
+        ids = _decode_shifted_ids(v, accept, next_tokens, depth, src=src)
+    from_stash = stash_tokens.gather(1, (src + k - 1).clamp(0, k - 2))
+    return torch.where(src < 0, from_stash, ids).reshape(-1)
+
+
+def _frontier_hidden_splice(
+    stash_hidden: torch.Tensor,
+    fresh_hidden: torch.Tensor,
+    accept: torch.Tensor,
+) -> torch.Tensor:
+    """Depth-0 chain hiddens for a frontier-anchored decode window.
+
+    Row ``j`` needs the target hidden of its source position
+    ``frontier - k + j``: the last ``accept`` window rows take this round's
+    verify hiddens (rows 0..accept-1, exactly the committed-input rows),
+    earlier rows the stash of the k-1 preceding target hiddens. Over the
+    concatenation [stash || fresh] both cases are one gather at
+    ``accept - 1 + j``.
+
+    Args:
+        stash_hidden: [bs, k-1, H] target hiddens at positions vc-k+1..vc-1.
+        fresh_hidden: [bs, k, H] this round's verify hiddens (row j = the
+            hidden at position vc+j); rows at or past ``accept`` are never
+            read.
+        accept: [bs, 1] int64 accepted lengths clamped to [1, k].
+
+    Returns:
+        [bs * k, H] chain hidden rows for the depth-0 pass.
+    """
+    bs, k = fresh_hidden.shape[:2]
+    h = torch.cat([stash_hidden, fresh_hidden], 1)
+    col = torch.arange(k, dtype=torch.int64, device=h.device).view(1, k)
+    idx = (accept - 1 + col).view(bs, k, 1).expand(bs, k, h.shape[-1])
+    return h.gather(1, idx).reshape(bs * k, -1)
+
+
 def _committed_tail_update(
     stash: torch.Tensor,
     fresh: torch.Tensor,
@@ -338,9 +414,10 @@ class Mtp(BaseDrafter):
         # place during multi-step decode.
         self.draft_seq_lens_buf = torch.zeros_like(self.input_buffers.seq_lens_buf)
 
-        # Persistent output buffer for the draft step's compute_out_cache_loc.
+        # Persistent output buffer for the draft step's compute_out_cache_loc:
+        # D lookback rows per request, or the full k-row frontier window.
         self.draft_out_cache_loc_buf = torch.empty(
-            (self.input_buffers.max_bs * (spec_num_steps - 1),),
+            (self.input_buffers.max_bs * max(spec_num_steps - 1, spec_num_tokens),),
             dtype=torch.int32,
             device=self.device,
         )
@@ -369,23 +446,38 @@ class Mtp(BaseDrafter):
                 f"(dp_size={self.dp_size})"
             )
 
-        # Decode-window lookback (INKLING_MTP_DECODE_LOOKBACK A/B knob via
-        # the model's draft_decode_lookback); armed only when the backend
-        # supports the lagged-conv recurrence.
+        # Decode-window repair mode (INKLING_MTP_DECODE_LOOKBACK A/B knob via
+        # the model's draft_decode_lookback): 1 = verify-anchored window plus
+        # D lookback rows (armed only when the backend supports it), 2 =
+        # frontier-anchored k-row window (the backend MUST support it).
         model = draft_model_runner.model
+        mode = int(getattr(model, "draft_decode_lookback", 0) or 0)
         lookback = 0
-        if spec_num_steps > 1 and getattr(model, "draft_decode_lookback", False):
+        frontier = False
+        if spec_num_steps > 1 and mode == 1:
             lookback = spec_num_steps - 1
             configure = getattr(self.attn_backend, "configure_draft_lookback", None)
             if configure is None or not configure(lookback):
                 lookback = 0
+        elif spec_num_steps > 1 and mode == 2:
+            configure = getattr(self.attn_backend, "configure_draft_frontier", None)
+            if configure is None or not configure():
+                raise RuntimeError(
+                    "Inkling MTP frontier window: the draft attention backend "
+                    "cannot arm it (configure_draft_frontier missing or refused)"
+                )
+            frontier = True
         self.draft_lookback = lookback
-        # Cross-round stashes keyed by req_pool_indices (PAD rows clamp to the
-        # reserved slot 0): the last D committed tokens and depth-0 chain rows
-        # per request. Allocated eagerly — the decode rounds that fill them
-        # run inside CUDA graph capture, where allocation is off-limits.
+        self.draft_frontier = frontier
+        # Cross-round drafter stashes keyed by req_pool_indices (PAD rows
+        # clamp to the reserved slot 0). Lookback: the last D committed
+        # tokens and depth-0 chain rows. Frontier: the last k-1 committed
+        # tokens and the target hiddens one position behind them. Allocated
+        # eagerly — the decode rounds that fill them run inside CUDA graph
+        # capture, where allocation is off-limits.
+        self._stash_width = (spec_num_tokens - 1) if frontier else lookback
         self._lookback_hidden_buf: torch.Tensor | None = None
-        if lookback:
+        if self._stash_width:
             if self.runtime_states is None:
                 raise RuntimeError("MTP lookback requires request-pool runtime state")
             model_config = draft_model_runner.model_config
@@ -393,12 +485,12 @@ class Mtp(BaseDrafter):
             # request-pool indices used to address these persistent stashes.
             request_pool_rows = self.runtime_states.valid_cache_lengths.shape[0]
             self._lookback_tokens_buf = torch.zeros(
-                (request_pool_rows, lookback),
+                (request_pool_rows, self._stash_width),
                 dtype=torch.int64,
                 device=self.device,
             )
             self._lookback_hidden_buf = torch.zeros(
-                (request_pool_rows, lookback, model_config.hidden_size),
+                (request_pool_rows, self._stash_width, model_config.hidden_size),
                 dtype=model_config.dtype,
                 device=self.device,
             )
@@ -766,6 +858,108 @@ class Mtp(BaseDrafter):
                 next_tokens[:, d + 1] = self._sample_step_tokens(logits_output)
         return True
 
+    @nvtx_range("draft_frontier_window", color="purple")
+    def _run_frontier_window(
+        self,
+        bs: int,
+        next_tokens: torch.Tensor,
+        draft_input: MtpDraftInput,
+        slot: torch.Tensor,
+        v: torch.Tensor,
+        accept: torch.Tensor,
+    ) -> None:
+        """Frontier-anchored decode window: every depth 0..steps-1 runs the
+        SAME k rows per request, ending at the last committed position
+        (``frontier = vc + accept``, computed once before depth 0; nothing
+        advances between depths).
+
+        Every row's input token is committed or a fresh draft — rejected
+        drafts and garbage rows are structurally impossible — so re-running
+        a depth over the window rewrites its provisional tail slots (KV and
+        sconv ring rows written last round from then-unverified drafts) with
+        exact values in place, while accepted-region rows are exact-value
+        no-ops. Depth 0 re-runs purely to regenerate fresh chain hiddens for
+        depth 1: its inputs splice the drafter stash (pre-window history)
+        with this round's verify hiddens at the accept boundary.
+
+        The sample gather is static (always the last row, at position
+        frontier-1) and the row count stays bs*k, so the attention metadata
+        only needs its anchor moved: seq_lens, positions and cache write
+        locations shift back by ``k - accept`` (the backend hook re-anchors
+        the conv metadata and grouped write locations the same way; all of
+        it is plain tensor math, CUDA-graph-recorded and recomputed per
+        replay). Runs inside graph capture — no host syncs; sub-k prompts,
+        whose window would cross position 0, are clamped GPU-side (their
+        first positions get wrong-shift rewrites, bounded to prompts shorter
+        than k-1 tokens — below any real chat traffic).
+        """
+        k = self.spec_num_tokens
+        buffers = self.input_buffers
+        positions = buffers.positions_buf[: bs * k].view(bs, k)
+        # positions[:, 0] is vc, the position before the verify window.
+        frontier = (positions[:, 0] + accept.view(-1).to(positions.dtype)).to(
+            torch.int32
+        )
+        step_positions = (
+            (positions + (accept - k).to(positions.dtype)).clamp_min(0).reshape(-1)
+        )
+        out_cache_loc = self.draft_out_cache_loc_buf[: bs * k]
+        self.cache_view.out_cache_loc_uniform(
+            out=out_cache_loc,
+            cache_start=(frontier - k).clamp_min(0),
+            num_tokens=k,
+        )
+        enter = getattr(self.attn_backend, "enter_draft_frontier_window", None)
+        if enter is None:
+            raise RuntimeError(
+                "Inkling MTP frontier window: the draft attention backend "
+                "lacks enter_draft_frontier_window"
+            )
+        enter(bs, frontier)
+        # Static sample gather: the last window row sits at frontier-1 for
+        # every depth (row at position p and depth d predicts p + d + 2).
+        gather_ids = self.padded_gather_ids_offsets_buf[:bs] + k
+        stash_tokens = self._lookback_tokens_buf[slot]
+        prev_hidden = _frontier_hidden_splice(
+            self._lookback_hidden_buf[slot],
+            draft_input.base_out_hidden_states.view(bs, k, -1),
+            accept,
+        )
+        for d in range(self.spec_num_steps):
+            input_ids = self._prepare_draft_input_ids(
+                _frontier_shifted_ids(v, accept, next_tokens, stash_tokens, d)
+            )
+
+            ctx = ForwardContext(
+                bs=bs,
+                num_extends=0,
+                attn_backend=self.attn_backend,
+                token_to_kv_pool=self.token_to_kv_pool,
+                input_num_tokens=bs * k,
+                forward_mode=ForwardMode.DECODE,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                gather_ids=gather_ids,
+                global_num_tokens=draft_input.global_num_tokens,
+                global_bs=draft_input.global_bs,
+                all_decode_or_idle=draft_input.all_decode_or_idle,
+                draft_seq_lens_buf=self.draft_seq_lens_buf,
+                accept_lengths=draft_input.accept_lengths,
+            )
+
+            with nvtx_range("draft_frontier_forward", color="red"):
+                logits_output = self.draft_model_runner.forward(
+                    ctx=ctx,
+                    input_ids=input_ids,
+                    positions=step_positions,
+                    out_cache_loc=out_cache_loc,
+                    captured_hidden_states=prev_hidden,
+                    spec_step_idx=d,
+                )
+            prev_hidden = logits_output.hidden_states
+
+            with nvtx_range("draft_sample", color="yellow"):
+                next_tokens[:, d + 1] = self._sample_step_tokens(logits_output)
+
     def _decode_slices(
         self, bs: int, draft_input: MtpDraftInput
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -785,13 +979,18 @@ class Mtp(BaseDrafter):
         v: torch.Tensor,
         h0: torch.Tensor,
     ) -> None:
-        """Roll the cross-round stashes past a round's decode-row commits.
+        """Roll the cross-round drafter stashes past a round's decode-row
+        commits.
 
         Args come pre-sliced per decode row: ``slot`` [n] int64 stash slots,
         ``accept`` [n]-viewable int64 accepts clamped to [1, k], ``v`` [n, k]
-        int64 verify outputs, ``h0`` [n, k, H] depth-0 hidden rows.
+        int64 verify outputs, ``h0`` [n, k, H] hidden rows — depth-0 chain
+        rows in lookback mode, this round's target verify hiddens in
+        frontier mode (verify hidden row j sits one position behind verify
+        token j, which is why the frontier hidden stash ends one position
+        before the token stash).
         """
-        lb = self.draft_lookback
+        lb = self._stash_width
         tokens = self._lookback_tokens_buf
         tokens[slot] = _committed_tail_update(tokens[slot], v, accept, lb)
         hidden = self._lookback_hidden_buf
@@ -804,12 +1003,14 @@ class Mtp(BaseDrafter):
     ) -> None:
         """Roll the stashes across an EXTEND/MIXED round's chunk rows.
 
-        Prefill requests stash the last D shift-1 ids and depth-0 rows of
-        their chunk (blending across chunk boundaries when a chunk is
-        shorter than D); MIXED decode rows roll the same committed-tail
-        update as pure decode, offset past the prefill rows.
+        Prefill requests stash the last stash-width shift-1 ids and hidden
+        rows of their chunk (blending across chunk boundaries when a chunk
+        is shorter than the stash); MIXED decode rows roll the same
+        committed-tail update as pure decode, offset past the prefill rows.
+        ``h0_full`` is the caller's per-mode hidden source: depth-0 chain
+        rows (lookback) or the target's full rows (frontier).
         """
-        lb = self.draft_lookback
+        lb = self._stash_width
         k = self.spec_num_tokens
         buffers = self.input_buffers
         ne = draft_input.num_extends
@@ -875,10 +1076,18 @@ class Mtp(BaseDrafter):
         input_num_tokens = draft_input.input_num_tokens
         num_prefill_tokens = input_num_tokens - nd * k
 
-        if self.draft_lookback:
+        if self._stash_width:
             # Before the loop rebinds logits_output: this round's chunk tail
-            # (tokens + depth-0 rows) feeds the next decode round's lookback.
-            self._update_lookback_stash_extend(draft_input, logits_output.hidden_states)
+            # feeds the next decode round's window (depth-0 rows for the
+            # lookback window, target rows for the frontier window).
+            self._update_lookback_stash_extend(
+                draft_input,
+                (
+                    draft_input.base_out_hidden_states
+                    if self.draft_frontier
+                    else logits_output.hidden_states
+                ),
+            )
 
         shift1_ids = buffers.shifted_prefill_ids_buf[:num_prefill_tokens]
         input_lengths = buffers.input_lengths_buf[:ne]
@@ -1005,6 +1214,22 @@ class Mtp(BaseDrafter):
 
         # Seed the draft attn backend's aliased seq_lens for the first step.
         self.draft_seq_lens_buf[:bs].copy_(self.input_buffers.seq_lens_buf[:bs])
+
+        if self.draft_frontier and draft_input.num_extends == 0:
+            # Frontier-anchored decode round: no verify-anchored pass exists
+            # in this mode — depth 0 runs inside the re-anchored window loop.
+            with self.attn_backend.override_num_extends(0):
+                slot, v, accept = self._decode_slices(bs, draft_input)
+                self._run_frontier_window(bs, next_tokens, draft_input, slot, v, accept)
+                self._update_lookback_stash_decode(
+                    slot,
+                    accept,
+                    v,
+                    draft_input.base_out_hidden_states.view(
+                        bs, self.spec_num_tokens, -1
+                    ),
+                )
+            return next_tokens
 
         # First draft step. LogitsProcessor prunes `[num_prefill_tokens + num_decodes * spec_num_tokens, ...]`
         # down to `[bs, ...]`, so logits/hidden_states arrive here already aligned to one row per request.

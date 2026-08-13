@@ -345,6 +345,33 @@ class CacheGroupsMixin:
         self.forward_decode_metadata = replace(md, out_cache_locs=locs)
         return True
 
+    def enter_draft_frontier(self, bs: int, frontier: torch.Tensor) -> None:
+        """Drafter hook (via the Inkling conv wrapper): re-anchor the k-row
+        decode metadata to end at the committed frontier.
+
+        Replaces ``seq_lens`` with the per-request frontier and recomputes
+        the grouped write locs for k tokens ending there (positions
+        ``frontier-k..frontier-1``). The frontier depends on this round's
+        accept lengths, which are only known inside the captured graph, so
+        both replacements are plain tensor ops recorded at capture and
+        recomputed on every replay — unlike the lookback variant, whose
+        accept-independent locs are refilled host-side. The next round's
+        metadata init restores the plain metadata.
+        """
+        md = self.forward_decode_metadata
+        if md is None:
+            raise RuntimeError("frontier window: no decode metadata to re-anchor")
+        fields = {"seq_lens": frontier[:bs]}
+        if md.out_cache_locs is not None:
+            spec_n = max(int(getattr(self, "spec_num_tokens", 1) or 1), 1)
+            fields["out_cache_locs"] = self._compute_decode_group_out_cache_locs(
+                md.page_tables,
+                frontier[:bs],
+                self.page_size,
+                spec_n,
+            )
+        self.forward_decode_metadata = replace(md, **fields)
+
     def _maybe_check_group_write_locs(self, page_tables, out_cache_locs, page_size):
         """TOKENSPEED_CACHE_DEBUG=1 (eager only, GPU sync): write pages must
         be real and inside the group's table. Not for graph-padded batches —

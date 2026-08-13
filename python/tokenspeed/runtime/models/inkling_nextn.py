@@ -44,7 +44,6 @@ weight loading, and pool sizing (see ``inkling_mtp_text_config``).
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Iterable
 
 import torch
@@ -53,6 +52,7 @@ from torch import nn
 from tokenspeed.runtime.configs.inkling_config import (
     InklingMMConfig,
     InklingModelConfig,
+    inkling_mtp_decode_lookback_mode,
     inkling_mtp_text_config,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -221,13 +221,14 @@ class InklingForConditionalGenerationNextN(nn.Module):
     # previous depth's full-row hidden), so every used depth gets dense
     # prompt KV and sconv prompt state.
     draft_extend_depth_catchup = True
-    # Provisional-tail recompute: decode windows carry D=steps-1
-    # lookback rows so the previous round's provisional tail entries (written
-    # from then-unverified drafts) are recomputed from committed tokens.
-    # Kept as an A/B knob for further experiments:
-    # INKLING_MTP_DECODE_LOOKBACK=0 reverts (depth-d KV/conv then keeps
-    # ~d/<a>*(1-p) stale slots).
-    draft_decode_lookback = os.environ.get("INKLING_MTP_DECODE_LOOKBACK", "1") != "0"
+    # Provisional-tail recompute mode (INKLING_MTP_DECODE_LOOKBACK A/B knob):
+    # the previous round's provisional tail entries (written from
+    # then-unverified drafts) are recomputed from committed tokens either by
+    # D=steps-1 lookback rows prepended to the verify-anchored window (1) or
+    # by re-anchoring the k-row window to end at the committed frontier
+    # (2, default, zero garbage rows); 0 reverts to the unrepaired window
+    # (depth-d KV/conv then keeps ~d/<a>*(1-p) stale slots).
+    draft_decode_lookback = inkling_mtp_decode_lookback_mode()
 
     def __init__(
         self,

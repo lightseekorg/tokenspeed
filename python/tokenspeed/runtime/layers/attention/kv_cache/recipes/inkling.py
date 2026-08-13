@@ -210,15 +210,19 @@ def _workspace_bytes(
 ) -> int:
     import torch
 
-    from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
+    from tokenspeed.runtime.configs.inkling_config import (
+        inkling_conv_total_dim,
+        inkling_mtp_decode_lookback_mode,
+    )
 
     rows = int(attn_config.max_bs) + 2
-    # Must match _wrap_inkling_backend's ring sizing:
-    # (W-1) taps + K chunk rows + draft lookback depth (K-2).
+    # Must match _wrap_inkling_backend's ring sizing: (W-1) taps + K chunk
+    # rows, plus the draft lookback depth (K-2) in lookback mode only.
     spec_tokens = max(1, int(spec_tokens))
-    ring_rows = (
-        int(text_config.sconv_kernel_size) - 1 + spec_tokens + max(spec_tokens - 2, 0)
+    lookback_rows = (
+        max(spec_tokens - 2, 0) if inkling_mtp_decode_lookback_mode() == 1 else 0
     )
+    ring_rows = int(text_config.sconv_kernel_size) - 1 + spec_tokens + lookback_rows
     conv_dim = inkling_conv_total_dim(text_config, attn_config.attn_tp_size)
     element_size = torch.bfloat16.itemsize
     pending_bytes = rows * torch.bool.itemsize

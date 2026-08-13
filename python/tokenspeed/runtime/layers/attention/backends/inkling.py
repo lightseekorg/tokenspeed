@@ -200,6 +200,10 @@ class InklingAttnBackend(AttentionBackend):
         # D extra leading rows that re-run committed positions (ring reads go
         # D deeper). Configured by the drafter via configure_draft_lookback.
         self._draft_lookback = 0
+        # Draft frontier-anchored window: the k-row catch-up chunk is
+        # re-anchored to end at the committed frontier each decode round.
+        # Configured by the drafter via configure_draft_frontier.
+        self._draft_frontier = False
         # Persistent spec conv metadata buffers for CUDA graphs; sized in init_cuda_graph_state.
         self._graph_spec_qsl: torch.Tensor | None = None
         self._graph_spec_seq_idx: torch.Tensor | None = None
@@ -627,6 +631,63 @@ class InklingAttnBackend(AttentionBackend):
             col_block_table=md.col_block_table,
         )
         return True
+
+    def configure_draft_frontier(self) -> bool:
+        """Drafter hook (draft wrapper only): arm the frontier-anchored
+        decode window.
+
+        The window keeps the plain k-row catch-up shape — only its anchor
+        (seq_lens) moves back to the committed frontier — so no extra state
+        or widened location stacks are needed; ring reads simply follow the
+        shifted positions. Returns True when armed; False when this backend
+        cannot support it (target wrapper).
+        """
+        if not self.conv_is_draft:
+            return False
+        self._draft_frontier = True
+        return True
+
+    def enter_draft_frontier_window(self, bs: int, frontier: torch.Tensor) -> None:
+        """Drafter hook before the frontier window loop (all depths): rebuild
+        the k-row conv metadata to end at ``frontier`` and re-anchor the
+        inner backend's seq_lens and grouped write locs the same way. The
+        frontier is accept-dependent, so everything here must be (and is)
+        plain tensor ops — recorded at capture, recomputed per replay. The
+        next round's ``init_forward_metadata`` restores the plain shape.
+
+        Raises instead of falling back: with the frontier window armed, a
+        missing hook or wrong-shape metadata is a wiring bug, and a silent
+        plain-window round would leave stale per-depth KV unrepaired.
+        """
+        if not self._draft_frontier or not self.conv_is_draft:
+            raise RuntimeError(
+                "frontier window pass on a backend without configure_draft_frontier"
+            )
+        md = self.conv_metadata
+        if md is None or md.is_decode:
+            raise RuntimeError(
+                "frontier window needs the k-row catch-up conv metadata; got "
+                f"{'no metadata' if md is None else 'single-token decode metadata'}"
+            )
+        inner_enter = getattr(self.inner, "enter_draft_frontier", None)
+        if inner_enter is None:
+            raise RuntimeError("inner attention backend lacks enter_draft_frontier")
+        frontier_i32 = frontier[:bs].to(torch.int32)
+        inner_enter(bs, frontier_i32)
+        self.conv_metadata = InklingConvMetadata(
+            query_start_loc=md.query_start_loc,
+            cache_indices=md.cache_indices[:bs],
+            has_initial_state=md.has_initial_state[:bs],
+            is_decode=False,
+            seq_idx=md.seq_idx,
+            # Chunk end moves to the committed frontier; the k rows re-run
+            # the last k committed positions in place.
+            seq_lens=frontier_i32,
+            # Paged draft conv rides through: the in-kernel publish resolves
+            # pages from the table by position, so boundaries rewritten by
+            # the re-anchored rows are re-published with committed content.
+            col_page_table=md.col_page_table,
+        )
 
     def register_shortconv_checkpoint_stream(
         self,

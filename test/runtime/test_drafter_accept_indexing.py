@@ -11,6 +11,8 @@ from tokenspeed.runtime.execution.drafter.mtp import (
     _committed_tail_update,
     _extend_depth_precompute,
     _extend_depth_shifted_ids_from,
+    _frontier_hidden_splice,
+    _frontier_shifted_ids,
     _lookback_shifted_ids,
     _ragged_tail_rows,
 )
@@ -204,6 +206,144 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             depth2.view(2, 6).tolist(),
             [[500, 501, 51, 52, 52, 52], [600, 601, 602, 603, 61, 62]],
         )
+
+    def test_frontier_shifted_ids_reads_stash_verify_and_drafts(self):
+        # k=4. Request A accepts 2 of [v0..v3]; request B accepts all 4.
+        # Stash entry i holds the committed token at position vc-k+2+i.
+        v = torch.tensor([[500, 501, 502, 503], [600, 601, 602, 603]])
+        accept = torch.tensor([[2], [4]])
+        next_tokens = torch.tensor(
+            [[0, 51, 52, 53], [0, 61, 62, 63]], dtype=torch.int32
+        )
+        stash = torch.tensor([[41, 42, 43], [71, 72, 73]])
+
+        depth0 = _frontier_shifted_ids(v, accept, next_tokens, stash, 0)
+        depth1 = _frontier_shifted_ids(v, accept, next_tokens, stash, 1)
+        depth2 = _frontier_shifted_ids(v, accept, next_tokens, stash, 2)
+
+        # depth 0: src = accept - 4 + j, all rows committed (stash/verify).
+        self.assertEqual(
+            depth0.view(2, 4).tolist(),
+            [[42, 43, 500, 501], [600, 601, 602, 603]],
+        )
+        # depth d >= 1: the trailing d rows take this round's drafts d_1..d_d.
+        self.assertEqual(
+            depth1.view(2, 4).tolist(),
+            [[43, 500, 501, 51], [601, 602, 603, 61]],
+        )
+        self.assertEqual(
+            depth2.view(2, 4).tolist(),
+            [[500, 501, 51, 52], [602, 603, 61, 62]],
+        )
+
+    def test_frontier_hidden_splice_gathers_at_accept_boundary(self):
+        # H=1; stash rows are the hiddens at positions vc-3..vc-1, fresh
+        # rows this round's verify hiddens at vc..vc+3.
+        stash = torch.tensor([[[-3.0], [-2.0], [-1.0]], [[-13.0], [-12.0], [-11.0]]])
+        fresh = torch.tensor(
+            [[[0.0], [1.0], [2.0], [3.0]], [[10.0], [11.0], [12.0], [13.0]]]
+        )
+        accept = torch.tensor([[2], [4]])
+
+        spliced = _frontier_hidden_splice(stash, fresh, accept)
+
+        # accept=2: window rows at vc-2..vc+1; accept=4: rows at vc..vc+3.
+        self.assertEqual(
+            spliced.view(2, 4).tolist(),
+            [[-2.0, -1.0, 0.0, 1.0], [10.0, 11.0, 12.0, 13.0]],
+        )
+
+    def test_frontier_ids_and_stash_track_positions_over_rounds(self):
+        # Positional oracle: the committed token at position p has id
+        # 1000+p, the draft candidate for position frontier+m has id
+        # 7000+m, and rejected verify entries (junk, id 9000+) must never
+        # be read. The stash rolls with the same _committed_tail_update as
+        # the drafter will use; row j of depth d must always compose the
+        # token at (frontier - k + j) + d + 1.
+        torch.manual_seed(0)
+        k, steps = 4, 3
+        vc = 10
+        stash = torch.tensor([[1000 + vc - 2, 1000 + vc - 1, 1000 + vc]])
+        for accept in [1, 4, 2, 1, 3, 4, 1, 2]:
+            a = torch.tensor([[accept]])
+            v = torch.tensor(
+                [[1000 + vc + 1 + i if i < accept else 9000 + i for i in range(k)]]
+            )
+            next_tokens = torch.tensor([[0] + [7000 + m for m in range(1, steps + 1)]])
+            frontier = vc + accept
+            for d in range(steps):
+                ids = _frontier_shifted_ids(v, a, next_tokens, stash, d).view(1, k)
+                for j in range(k):
+                    consumed = (frontier - k + j) + d + 1
+                    if consumed <= frontier:
+                        self.assertEqual(ids[0, j].item(), 1000 + consumed)
+                    else:
+                        self.assertEqual(ids[0, j].item(), 7000 + consumed - frontier)
+            stash = _committed_tail_update(stash, v, torch.tensor([accept]), k - 1)
+            vc = frontier
+            self.assertEqual(stash.tolist(), [[1000 + vc - 2 + i for i in range(3)]])
+
+    def test_frontier_hidden_splice_tracks_positions_over_rounds(self):
+        # Same oracle for the hidden side: the target hidden of position p
+        # is encoded as float(p); the stash must always hold positions
+        # vc-3..vc-1 and the splice must yield the window rows
+        # frontier-4..frontier-1.
+        k = 4
+        vc = 10
+        stash = torch.tensor([float(vc - 3 + i) for i in range(3)]).view(1, 3, 1)
+        for accept in [1, 4, 2, 1, 3]:
+            a = torch.tensor([[accept]])
+            fresh = torch.tensor(
+                [float(vc + i) if i < accept else 9000.0 for i in range(k)]
+            ).view(1, k, 1)
+            frontier = vc + accept
+
+            spliced = _frontier_hidden_splice(stash, fresh, a)
+
+            self.assertEqual(
+                spliced.view(k).tolist(),
+                [float(frontier - k + j) for j in range(k)],
+            )
+            stash = _committed_tail_update(stash, fresh, torch.tensor([accept]), k - 1)
+            vc = frontier
+            self.assertEqual(
+                stash.view(3).tolist(), [float(vc - 3 + i) for i in range(3)]
+            )
+
+    def test_frontier_ids_match_lookback_ids_on_shared_positions(self):
+        # Designs (2) and (3) must compose identical tokens wherever their
+        # windows overlap. Design (2)'s D+k rows cover positions
+        # vc-D .. vc+k-1 (row r at vc-D+r); design (3)'s k rows cover
+        # frontier-k .. frontier-1 (row j at vc+accept-k+j). Both read the
+        # token at row position + depth + 1, so aligned rows satisfy
+        # r = j + accept + D - k. Stashes are consistent by construction:
+        # (2)'s D tokens are the tail of (3)'s k-1.
+        k, steps = 4, 3
+        lookback = steps - 1
+        v = torch.tensor([[500, 501, 502, 503], [600, 601, 602, 603]])
+        next_tokens = torch.tensor(
+            [[0, 51, 52, 53], [0, 61, 62, 63]], dtype=torch.int32
+        )
+        stash3 = torch.tensor([[41, 42, 43], [71, 72, 73]])
+        stash2 = stash3[:, -lookback:]
+        for accept_a, accept_b in [(1, 4), (2, 3), (4, 1)]:
+            accept = torch.tensor([[accept_a], [accept_b]])
+            for d in range(1, steps):
+                ids2 = _lookback_shifted_ids(
+                    v, accept, next_tokens, stash2, d, lookback
+                ).view(2, lookback + k)
+                ids3 = _frontier_shifted_ids(v, accept, next_tokens, stash3, d).view(
+                    2, k
+                )
+                for req, a in ((0, accept_a), (1, accept_b)):
+                    for j in range(k):
+                        r = j + a + lookback - k
+                        if 0 <= r < lookback + k:
+                            self.assertEqual(
+                                ids3[req, j].item(),
+                                ids2[req, r].item(),
+                                f"accept={a} depth={d} row={j}",
+                            )
 
     def test_committed_tail_update_blends_across_rounds(self):
         stash = torch.tensor([[10, 11], [20, 21]])
