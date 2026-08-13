@@ -22,9 +22,9 @@ from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     k3_dspark_inactive_features,
     validate_k3_dspark_config,
 )
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.models import kimi_k3_dspark as dspark_model_module
 from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkModel
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
 # The published Inferact/Kimi-K3-DSpark config.json.
 INFERACT_CONFIG = dict(

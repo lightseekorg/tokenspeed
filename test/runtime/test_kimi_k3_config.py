@@ -373,7 +373,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 tp_ep_size=8,
                 tp_ep_rank=0,
                 tp_ep_group=ep_group,
-            )
+            ),
         )
         config = KimiLinearConfig(
             hidden_size=64,

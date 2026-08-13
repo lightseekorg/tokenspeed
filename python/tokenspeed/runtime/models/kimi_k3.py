@@ -985,16 +985,13 @@ class KimiLinearMoE(nn.Module):
         # Attention DP partitions the batch when its TP group is smaller than
         # the MoE TP×EP group. Gather those DP shards so every rank enters the
         # K3 MoE with the same complete token batch.
-        self._gather_dp_tokens_for_moe = (
-            mapping.attn.tp_size != mapping.moe.tp_ep_size
-        )
+        self._gather_dp_tokens_for_moe = mapping.attn.tp_size != mapping.moe.tp_ep_size
         if self._gather_dp_tokens_for_moe:
             if (
                 mapping.attn.cp_size != 1
                 or mapping.moe.dp_size != 1
                 or mapping.moe.tp_ep_size != mapping.world_size
-                or mapping.attn.tp_size * mapping.attn.dp_size
-                != mapping.moe.tp_ep_size
+                or mapping.attn.tp_size * mapping.attn.dp_size != mapping.moe.tp_ep_size
             ):
                 raise ValueError(
                     "Kimi-K3 cross-DP-EP MoE requires attn CP=1, MoE DP=1, "
