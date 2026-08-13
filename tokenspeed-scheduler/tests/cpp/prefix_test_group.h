@@ -72,8 +72,8 @@ public:
         allocator_.ConsumeReservedTokens(table, num_tokens);
     }
     void Free(BlockTable& table) { allocator_.Free(table); }
-    std::int32_t ResolveKernelPageId(CacheBlockLocation location) const {
-        return allocator_.ResolveKernelPageId(location);
+    std::int32_t ResolveCacheBlockId(CacheBlockLocation location) const {
+        return allocator_.ResolveCacheBlockId(location);
     }
     std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) const {
         return allocator_.BlockTablePageIds(table);

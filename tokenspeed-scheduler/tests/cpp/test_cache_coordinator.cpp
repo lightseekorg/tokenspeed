@@ -267,15 +267,15 @@ TEST(GroupAllocatorTest, ResolvesAffineKernelPageIdsAndRejectsInvalidLocations) 
     FullAttnManager full(/*block_granularity=*/128, /*cache_blocks_per_lcm_block=*/8);
     FullAttnManager state(/*block_granularity=*/128, /*cache_blocks_per_lcm_block=*/1);
 
-    EXPECT_EQ(full.ResolveKernelPageId({.lcm_block_id = 1, .slot_index = 0}), 1);
-    EXPECT_EQ(full.ResolveKernelPageId({.lcm_block_id = 1, .slot_index = 7}), 8);
-    EXPECT_EQ(full.ResolveKernelPageId({.lcm_block_id = 2, .slot_index = 0}), 9);
-    EXPECT_EQ(state.ResolveKernelPageId({.lcm_block_id = 2, .slot_index = 0}), 2);
+    EXPECT_EQ(full.ResolveCacheBlockId({.lcm_block_id = 1, .slot_index = 0}), 1);
+    EXPECT_EQ(full.ResolveCacheBlockId({.lcm_block_id = 1, .slot_index = 7}), 8);
+    EXPECT_EQ(full.ResolveCacheBlockId({.lcm_block_id = 2, .slot_index = 0}), 9);
+    EXPECT_EQ(state.ResolveCacheBlockId({.lcm_block_id = 2, .slot_index = 0}), 2);
 
-    EXPECT_THROW(full.ResolveKernelPageId({.lcm_block_id = 0, .slot_index = 0}), std::runtime_error);
-    EXPECT_THROW(full.ResolveKernelPageId({.lcm_block_id = 1, .slot_index = -1}), std::runtime_error);
-    EXPECT_THROW(full.ResolveKernelPageId({.lcm_block_id = 1, .slot_index = 8}), std::runtime_error);
-    EXPECT_THROW(full.ResolveKernelPageId({.lcm_block_id = std::numeric_limits<std::int32_t>::max(), .slot_index = 7}),
+    EXPECT_THROW(full.ResolveCacheBlockId({.lcm_block_id = 0, .slot_index = 0}), std::runtime_error);
+    EXPECT_THROW(full.ResolveCacheBlockId({.lcm_block_id = 1, .slot_index = -1}), std::runtime_error);
+    EXPECT_THROW(full.ResolveCacheBlockId({.lcm_block_id = 1, .slot_index = 8}), std::runtime_error);
+    EXPECT_THROW(full.ResolveCacheBlockId({.lcm_block_id = std::numeric_limits<std::int32_t>::max(), .slot_index = 7}),
                  std::runtime_error);
 }
 

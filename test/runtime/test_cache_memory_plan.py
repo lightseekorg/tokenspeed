@@ -257,7 +257,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
             usable_pages = ordinary._profiled_pages(
                 cache_budget_bytes=16_384,
                 bytes_per_token=16,
-                page_size=64,
+                prefix_granularity=64,
                 max_total_tokens=None,
             )
 

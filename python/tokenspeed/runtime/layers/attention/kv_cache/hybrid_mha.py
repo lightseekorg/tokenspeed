@@ -74,15 +74,15 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
             self._bind_buffers()
 
     def _bind_buffers(self) -> None:
-        if self.plan.prefix_granularity != self.page_size:
+        if self.plan.prefix_granularity != self.prefix_granularity:
             raise ValueError(
                 f"cache plan P={self.plan.prefix_granularity} does not match pool "
-                f"page_size={self.page_size}"
+                f"prefix_granularity={self.prefix_granularity}"
             )
         max_packing = max(
             group.cache_blocks_per_lcm_block for group in self.plan.groups
         )
-        expected_size = self.plan.num_lcm_blocks * max_packing * self.page_size
+        expected_size = self.plan.num_lcm_blocks * max_packing * self.prefix_granularity
         if self.size != expected_size:
             raise ValueError(
                 f"cache pool size {self.size} does not match plan child capacity "
@@ -197,4 +197,4 @@ class HybridMHATokenToKVPoolMXFP8(
         ]
 
     def _layer_page_tokens(self, layer_id: int) -> int:
-        return self.page_size
+        return self.kv_page_size

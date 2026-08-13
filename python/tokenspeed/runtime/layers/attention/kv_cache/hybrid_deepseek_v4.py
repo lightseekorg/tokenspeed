@@ -436,12 +436,12 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
                 "DeepSeek V4 KV pool layer_num must match cache layout ratios: "
                 f"layer_num={layer_num}, ratios={len(layout.layer_ratio)}"
             )
-        scheduler_page_size = memory_plan.prefix_granularity
+        prefix_granularity = memory_plan.prefix_granularity
         super().__init__(
             size=size,
             dtype=torch.uint8,
             device=device,
-            page_size=scheduler_page_size,
+            prefix_granularity=prefix_granularity,
             rank=rank,
             memory_plan=memory_plan,
             paged_cache_group_specs=paged_cache_group_specs,
@@ -476,7 +476,7 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         )
         self.swa_block_bytes = layout.swa_block_bytes(self.swa_block_size)
         self.compressed_block_sizes = tuple(
-            layout.storage_block_size(ratio) if ratio > 1 else scheduler_page_size
+            layout.storage_block_size(ratio) if ratio > 1 else prefix_granularity
             for ratio in layout.layer_ratio
         )
         self.indexer_block_sizes = tuple(
@@ -489,9 +489,9 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         )
         self.compressor_state_block_sizes = tuple(
             (
-                _group_rows(v4_compressor_state_group_id(ratio), scheduler_page_size)
+                _group_rows(v4_compressor_state_group_id(ratio), prefix_granularity)
                 if ratio > 1
-                else scheduler_page_size
+                else prefix_granularity
             )
             for ratio in layout.layer_ratio
         )

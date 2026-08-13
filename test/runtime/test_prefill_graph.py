@@ -111,7 +111,7 @@ class DummyGroupTablesTest(unittest.TestCase):
     def test_backend_gets_writable_state_tables(self):
         backend = SimpleNamespace(
             uses_cache_groups=True,
-            prefix_granularity=32,
+            kernel_page_size=32,
             max_num_pages=0,  # fall back to bucket-derived width
             state_group_ids=frozenset({"linear_attention"}),
         )
@@ -141,7 +141,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         # must span the full table width, not just the bucket.
         backend = SimpleNamespace(
             uses_cache_groups=True,
-            prefix_granularity=32,
+            kernel_page_size=32,
             max_num_pages=2500,
             state_group_ids=frozenset(),
         )
@@ -184,7 +184,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         # full_attn_backend; the helper must not AttributeError (which would
         # silently disable the prefill graph via the capture fallback).
         child = SimpleNamespace(
-            prefix_granularity=32, max_num_pages=0, state_group_ids=frozenset()
+            kernel_page_size=32, max_num_pages=0, state_group_ids=frozenset()
         )
         wrapper = SimpleNamespace(uses_cache_groups=True, full_attn_backend=child)
         pool = SimpleNamespace(

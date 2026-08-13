@@ -54,12 +54,12 @@ def _make_pool(page_size: int, size: int = 512):
         layer_num=LAYERS,
         device="cuda",
         enable_memory_saver=False,
-        page_size=page_size,
+        prefix_granularity=page_size,
         rank=0,
         layer_group_ids=("full_attention",) * LAYERS,
         memory_plan=make_mha_memory_plan(
             size=size,
-            page_size=page_size,
+            prefix_granularity=page_size,
             layer_num=LAYERS,
             kv_heads=HEADS,
             head_dim=HEAD_DIM,
@@ -144,7 +144,7 @@ def test_requires_prequantized_and_scales():
 def test_size_accounting_includes_scales():
     pool = _make_pool(128)
     k_size, v_size = pool.get_kv_size_bytes()
-    slots = pool.size + pool.page_size
+    slots = pool.size + pool.prefix_granularity
     expect_data = slots * HEADS * HEAD_DIM * LAYERS  # 1 byte/elem
     expect_sf = slots * HEADS * SF_DIM * LAYERS
     assert k_size == expect_data + expect_sf
@@ -181,14 +181,14 @@ def _make_shared_pool(size: int = 512):
         layer_num=len(SHARED_LAYER_TYPES),
         device="cuda",
         enable_memory_saver=False,
-        page_size=128,
+        prefix_granularity=128,
         rank=0,
         layer_types=SHARED_LAYER_TYPES,
         layer_group_ids=SHARED_LAYER_TYPES,
         layer_kv_head_counts=SHARED_KV_HEADS,
         memory_plan=make_mha_memory_plan(
             size=size,
-            page_size=128,
+            prefix_granularity=128,
             layer_num=len(SHARED_LAYER_TYPES),
             kv_heads=HEADS,
             head_dim=HEAD_DIM,
@@ -264,7 +264,7 @@ def test_shared_field_store_matches_standalone_scatter(layer_id: int, heads_l: i
     assert torch.equal(k_view.view(torch.uint8), ref.view(torch.uint8))
 
 
-def _make_config(page_size: int):
+def _make_config(prefix_granularity: int):
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 
     return MHAConfig(
@@ -277,8 +277,8 @@ def _make_config(page_size: int):
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.float8_e4m3fn,
         kv_cache_mxfp8=True,
-        prefix_granularity=page_size,
-        kernel_page_size=page_size,
+        prefix_granularity=prefix_granularity,
+        kernel_page_size=prefix_granularity,
         context_len=4096,
         max_bs=8,
         max_graph_bs=8,
@@ -319,7 +319,7 @@ def test_config_selects_mxfp8_pool_and_sizes():
         MHATokenToKVPoolMXFP8,
     )
 
-    config = _make_config(page_size=128)
+    config = _make_config(prefix_granularity=128)
     # fp8 data + 1 scale byte per 32: 33/32 of the fp8 cell.
     assert (
         config.cache_cell_size() == HEADS * HEAD_DIM * 2 + (HEADS * HEAD_DIM * 2) // 32
@@ -329,7 +329,7 @@ def test_config_selects_mxfp8_pool_and_sizes():
 
 
 def test_config_rejects_non_128_page():
-    config = _make_config(page_size=64)
+    config = _make_config(prefix_granularity=64)
     with pytest.raises(AssertionError, match="block-size 128"):
         _create_config_pool(config)
 

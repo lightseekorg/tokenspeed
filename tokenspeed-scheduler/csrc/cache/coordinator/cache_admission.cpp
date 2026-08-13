@@ -401,7 +401,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
                 continue;
             }
             result.new_page_ids[i].push_back(
-                groups_[i].Allocator().ResolveKernelPageId(blocks[static_cast<std::size_t>(block)]->Location()));
+                groups_[i].Allocator().ResolveCacheBlockId(blocks[static_cast<std::size_t>(block)]->Location()));
         }
     }
     return result;

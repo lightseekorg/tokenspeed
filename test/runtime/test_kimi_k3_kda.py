@@ -198,7 +198,7 @@ def test_set_kv_pool_binds_contract_state_groups() -> None:
     backend = _backend("cpu", contract_pool=pool)
     assert backend.state_paging_active
     assert backend._state_group_ids == _STATE_GROUPS
-    assert backend._checkpoint_granularity == pool.page_size
+    assert backend._checkpoint_granularity == pool.prefix_granularity
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +225,7 @@ def test_dual_index_reuses_one_slot_plan_and_groups_are_independent(
 ) -> None:
     pool = _make_kimi_pool("cpu", usable_pages=24)
     backend = _backend("cpu", contract_pool=pool)
-    page_size = pool.page_size
+    page_size = pool.prefix_granularity
 
     plan_calls = 0
     real = hybrid_linear_attn._compute_state_block_index_plan

@@ -56,7 +56,7 @@ public:
     std::int32_t CacheBlocksPerLcmBlock() const noexcept { return cache_blocks_per_lcm_block_; }
     std::uint32_t Id() const noexcept { return group_id_; }
 
-    std::int32_t ResolveKernelPageId(CacheBlockLocation location) const {
+    std::int32_t ResolveCacheBlockId(CacheBlockLocation location) const {
         _assert(location.lcm_block_id > 0, "LCM block id must be > 0");
         _assert(0 <= location.slot_index && location.slot_index < cache_blocks_per_lcm_block_,
                 "cache block slot is out of range");
@@ -70,7 +70,7 @@ public:
         std::vector<std::int32_t> ids;
         ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
         for (const CacheBlockRef& block_ref : table.Blocks()) {
-            ids.push_back(block_ref ? ResolveKernelPageId(block_ref->Location()) : 0);
+            ids.push_back(block_ref ? ResolveCacheBlockId(block_ref->Location()) : 0);
         }
         return ids;
     }

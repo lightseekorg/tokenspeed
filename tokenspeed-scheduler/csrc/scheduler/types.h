@@ -33,7 +33,7 @@ struct SchedulerConfig {
     struct AllocatorConfig {
         // Page 0 is the null placeholder, so usable = total - 1.
         std::int32_t total_pages{};
-        std::int32_t NumUsablePages() const { return total_pages - 1; }
+        std::int32_t NumUsableBlocks() const { return total_pages - 1; }
     };
     AllocatorConfig host_allocator;
     AllocatorConfig device_allocator;

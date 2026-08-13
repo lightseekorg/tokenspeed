@@ -21,7 +21,7 @@ def test_scheduler_uses_lcm_parents_and_per_group_child_counts() -> None:
     geometry = scheduler_cache_geometry_from_pool(
         pool,
         fallback_token_capacity=pool.size,
-        fallback_prefix_granularity=pool.page_size,
+        fallback_prefix_granularity=pool.prefix_granularity,
     )
     assert geometry.num_usable_pages == 2
     assert geometry.num_device_pages == 3

@@ -46,7 +46,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             "layer_num": 2,
             "device": "cpu",
             "enable_memory_saver": False,
-            "page_size": 16,
+            "prefix_granularity": 16,
             "rank": 0,
         }
         kwargs.update(overrides)
@@ -54,7 +54,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
 
         kwargs["memory_plan"] = make_mha_memory_plan(
             size=kwargs["size"],
-            page_size=kwargs["page_size"],
+            prefix_granularity=kwargs["prefix_granularity"],
             layer_num=kwargs["layer_num"],
             kv_heads=kwargs["head_num"],
             head_dim=kwargs["head_dim"],
@@ -80,7 +80,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
                 layer_types=kwargs.get("layer_types", ()),
                 group_ids=kwargs["layer_group_ids"],
                 sliding_window_tokens=kwargs.get("sliding_window_tokens"),
-                prefix_granularity=kwargs["page_size"],
+                prefix_granularity=kwargs["prefix_granularity"],
             ),
         )
         kwargs.pop("sliding_window_tokens", None)

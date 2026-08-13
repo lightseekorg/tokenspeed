@@ -54,7 +54,7 @@ class MHATokenToKVPool(CachePool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
-        page_size: int,
+        prefix_granularity: int,
         rank: int,
         *,
         memory_plan: CacheMemoryPlan,
@@ -71,7 +71,7 @@ class MHATokenToKVPool(CachePool):
             size,
             dtype,
             device,
-            page_size,
+            prefix_granularity,
             rank,
             memory_plan,
             paged_cache_group_specs=paged_cache_group_specs,
@@ -300,7 +300,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         """Tokens represented by one page id for this layer."""
         # Byte-uniform slots factor one id through the layer's head count.
         heads_l = self._layer_heads_per_rank(layer_id)
-        return self.page_size * self.head_num // heads_l
+        return self.kv_page_size * self.head_num // heads_l
 
     def _layer_scale_view(self, buf: torch.Tensor, layer_id: int) -> torch.Tensor:
         """(num_ids, heads_l, k_l, 32, 4, 4) view over a layer's SF slots
@@ -368,7 +368,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
                 page_size=page_tokens,
                 enable_pdl=pdl_enabled(),
             )
-        elif self.page_size == MXFP8_KV_SCALE_TILE_TOKENS:
+        elif self.kv_page_size == MXFP8_KV_SCALE_TILE_TOKENS:
             store_sf_interleaved(
                 k_scale, self.k_scale_buffer[layer_id], loc, enable_pdl=pdl_enabled()
             )
@@ -399,7 +399,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         )
         if self._layer_kv_head_counts is not None:
             page_tokens = self._layer_page_tokens(layer_id)
-        elif self.page_size == MXFP8_KV_SCALE_TILE_TOKENS:
+        elif self.kv_page_size == MXFP8_KV_SCALE_TILE_TOKENS:
             page_tokens = MXFP8_KV_SCALE_TILE_TOKENS
         else:
             return False

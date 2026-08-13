@@ -298,20 +298,20 @@ def _profiled_pages(
     *,
     cache_budget_bytes: int,
     bytes_per_token: int,
-    page_size: int,
+    prefix_granularity: int,
     max_total_tokens: int | None,
 ) -> int:
     """Return usable pages while keeping the reserved null page in budget."""
     if bytes_per_token <= 0:
         raise ValueError(f"KV cache cell size must be positive, got {bytes_per_token}")
-    bytes_per_page = bytes_per_token * page_size
+    bytes_per_page = bytes_per_token * prefix_granularity
     num_pages = cache_budget_bytes // bytes_per_page - 1
     if max_total_tokens is not None:
-        requested_pages = max_total_tokens // page_size
+        requested_pages = max_total_tokens // prefix_granularity
         if requested_pages < 1:
             raise ValueError(
                 f"max_total_tokens={max_total_tokens} must contain at least "
-                f"one full page (page_size={page_size})"
+                f"one full prefix page (prefix_granularity={prefix_granularity})"
             )
         num_pages = min(num_pages, requested_pages)
 
@@ -320,11 +320,11 @@ def _profiled_pages(
     ci_size = envs.TOKENSPEED_CI_SMALL_KV_SIZE.get_set_value_or(None)
     if ci_size is not None and int(ci_size) > 0:
         ci_tokens = int(ci_size)
-        if ci_tokens % page_size:
+        if ci_tokens % prefix_granularity:
             raise ValueError(
-                "TOKENSPEED_CI_SMALL_KV_SIZE must be divisible by page_size"
+                "TOKENSPEED_CI_SMALL_KV_SIZE must be divisible by prefix_granularity"
             )
-        num_pages = min(num_pages, ci_tokens // page_size)
+        num_pages = min(num_pages, ci_tokens // prefix_granularity)
     if num_pages < 1:
         raise ValueError("KV cache token pool size must be positive")
     return num_pages
@@ -376,7 +376,7 @@ def _ordinary_setup(
     num_pages = _profiled_pages(
         cache_budget_bytes=cache_budget_bytes,
         bytes_per_token=bytes_per_token,
-        page_size=page_size,
+        prefix_granularity=page_size,
         max_total_tokens=server_args.max_total_tokens,
     )
     # One merged solve, one spec (see build_hybrid_cache_setup): draft

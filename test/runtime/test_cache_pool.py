@@ -37,7 +37,7 @@ class CachePoolContractTest(unittest.TestCase):
                 size=16,
                 dtype=torch.uint8,
                 device="cpu",
-                page_size=4,
+                prefix_granularity=4,
                 rank=0,
             )
 
@@ -46,7 +46,7 @@ class CachePoolContractTest(unittest.TestCase):
             size=16,
             dtype=torch.uint8,
             device="cpu",
-            page_size=4,
+            prefix_granularity=4,
             rank=0,
             memory_plan=_plan(),
         )
@@ -67,7 +67,7 @@ class CachePoolCudaTest(unittest.TestCase):
             size=16,
             dtype=torch.uint8,
             device="cuda",
-            page_size=4,
+            prefix_granularity=4,
             rank=0,
             memory_plan=_plan(),
         )
@@ -85,7 +85,7 @@ class CachePoolCudaTest(unittest.TestCase):
             size=16,
             dtype=torch.uint8,
             device="cuda",
-            page_size=4,
+            prefix_granularity=4,
             rank=0,
             memory_plan=_plan(),
         )
@@ -98,7 +98,7 @@ class CachePoolCudaTest(unittest.TestCase):
             size=16,
             dtype=torch.uint8,
             device="cuda",
-            page_size=4,
+            prefix_granularity=4,
             rank=0,
             memory_plan=_plan(),
         )
@@ -120,7 +120,7 @@ class CachePoolCudaTest(unittest.TestCase):
             size=16,
             dtype=torch.uint8,
             device="cuda",
-            page_size=4,
+            prefix_granularity=4,
             rank=0,
             memory_plan=_plan(),
         )

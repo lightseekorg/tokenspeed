@@ -55,7 +55,7 @@ class CachePool:
         size: int,
         dtype: torch.dtype,
         device: str,
-        page_size: int,
+        prefix_granularity: int,
         rank: int,
         memory_plan: CacheMemoryPlan,
         *,
@@ -67,7 +67,12 @@ class CachePool:
         self.dtype = dtype
         self.rank = rank
         self.size = size
-        self.page_size = page_size
+        self.prefix_granularity = prefix_granularity
+        # KV arena page span for paged consumers. Pinned 1:1 to the identity
+        # grain at construction — this assignment is the single point of the
+        # prefix-page <-> KV-page convention; geometry math must read this,
+        # never prefix_granularity.
+        self.kv_page_size = prefix_granularity
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
             #  Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
@@ -126,7 +131,7 @@ class CachePool:
         # default state for optional layer-wise transfer control
         self.layerwise_load_tracker = None
         logger.info(
-            f"Initialized token to kv pool with size {size}, dtype {dtype}, device {device}, page size {page_size}, rank {rank}"
+            f"Initialized token to kv pool with size {size}, dtype {dtype}, device {device}, prefix granularity {prefix_granularity}, rank {rank}"
         )
 
     def _publish_runtime_contract(
@@ -163,9 +168,10 @@ class CachePool:
         self.paged_cache_group_specs = tuple(aligned)
         self.paged_cache_group_page_counts = counts
         self.runtime_contract = PagedCacheRuntimeContract(
-            # The identity axis comes from the plan; page_size is geometry.
-            # They are equal by the 1:1 prefix-page <-> CacheBlock convention
-            # (pinned at pool construction), but they are different concepts.
+            # The identity axis comes from the plan, never read back out of
+            # pool state. The pool's prefix_granularity scalar is pinned to
+            # it at construction; per-group CacheBlock spans live in the
+            # group specs as block_granularity.
             prefix_granularity=self.plan.prefix_granularity,
             num_lcm_blocks=self.plan.num_lcm_blocks,
             token_capacity=token_capacity,
@@ -381,8 +387,10 @@ class LayerMappedKVPool:
                 for pool_idx, global_id in enumerate(full_attention_layer_ids)
             }
         )
-        # Expose page_size from inner pool for the scheduler
-        self.page_size = getattr(inner_pool, "page_size", 1)
+        # Expose the identity grain for the scheduler and the KV page span
+        # for paged consumers.
+        self.prefix_granularity = getattr(inner_pool, "prefix_granularity", 1)
+        self.kv_page_size = getattr(inner_pool, "kv_page_size", 1)
 
     def _map(self, layer_id: int) -> int:
         return self.layer_map.get(layer_id, layer_id)

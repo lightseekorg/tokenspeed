@@ -98,7 +98,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
             has shape ``[num_pages, page_size, num_groups]`` (float32), both
             indexed as ``view[page, slot_in_page]``.
         """
-        ps = self.page_size
+        # DSA requires kv_page_size == DSA_SPARSE_PAGE_SIZE (64), the only
+        # implemented sparse layout.
+        ps = self.kv_page_size
         hd = self.index_head_dim
         ng = hd // _INDEX_K_FP8_GROUP_SIZE
         row = hd + ng * _INDEX_K_SCALE_BYTES
@@ -141,8 +143,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         buf = self.get_index_k_buffer(layer_id)
         fp8_view, scale_view = self._index_k_block_views(buf)
         slots = slots.to(torch.long)
-        page = slots // self.page_size
-        slot_in_page = slots % self.page_size
+        page = slots // self.kv_page_size
+        slot_in_page = slots % self.kv_page_size
         k_fp8 = fp8_view[page, slot_in_page]
         k_scale = scale_view[page, slot_in_page]
         return k_fp8, k_scale
@@ -167,7 +169,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             index_k_fp8,
             index_k_scale,
             loc,
-            page_size=self.page_size,
+            page_size=self.kv_page_size,
             head_dim=self.index_head_dim,
             group_size=_INDEX_K_FP8_GROUP_SIZE,
         )

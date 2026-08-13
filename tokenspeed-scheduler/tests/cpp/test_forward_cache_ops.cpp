@@ -664,13 +664,13 @@ TEST(ForwardCacheOpsBuildBlockTables, ResolvesEachGroupsPackingRecipe) {
     ASSERT_EQ(tables[1].NumBlocks(), 2);
     EXPECT_EQ(built.at("packed"),
               (std::vector<std::int32_t>{
-                  coordinator.Allocator(0).ResolveKernelPageId(tables[0].Blocks()[0]->Location()),
-                  coordinator.Allocator(0).ResolveKernelPageId(tables[0].Blocks()[1]->Location()),
+                  coordinator.Allocator(0).ResolveCacheBlockId(tables[0].Blocks()[0]->Location()),
+                  coordinator.Allocator(0).ResolveCacheBlockId(tables[0].Blocks()[1]->Location()),
               }));
     EXPECT_EQ(built.at("single"),
               (std::vector<std::int32_t>{
-                  coordinator.Allocator(1).ResolveKernelPageId(tables[1].Blocks()[0]->Location()),
-                  coordinator.Allocator(1).ResolveKernelPageId(tables[1].Blocks()[1]->Location()),
+                  coordinator.Allocator(1).ResolveCacheBlockId(tables[1].Blocks()[0]->Location()),
+                  coordinator.Allocator(1).ResolveCacheBlockId(tables[1].Blocks()[1]->Location()),
               }));
 }
 

@@ -55,11 +55,9 @@ A fourth quantity lives outside the logical world entirely:
   constant (FlashMLA = 64), constrained kernels choose within a supported
   set (trtllm-mla ∈ {32, 64}), and flexible kernels carry a chosen default.
   `config.kernel_page_size` overrides any default; deriving kernel_page_size
-  from `prefix_granularity` is considered as a category error and a bug.
+  from `prefix_granularity` is a category error and a bug.
 
-  DeepSeek V4 is the special case: its kernel geometry is **pre-folded into
-  its cache spec**, so scheduler tables arrive kernel-ready with zero
-  runtime expansion. Since 2026-08-13 that geometry is fully
+  DeepSeek V4's geometry is fully
   registry-sourced: the compressed full-history chains declare
   `DEEPSEEK_V4_PAGE_SIZE // ratio` rows × ratio-token stride, the SWA
   window declares `V4_KERNEL_BLOCK_ROWS`, and the layout's field byte
@@ -123,10 +121,18 @@ and `page_size` as little as possible. If a Python component needs either
 value, that is a design smell to justify, not a default to reach for.
 
 Provenance discipline: each quantity is sourced from its own domain and never
-laundered through another's name. The pool's `page_size` is geometry (pinned
-to `prefix_granularity` at construction — the 1:1 prefix-page ↔ CacheBlock
-convention's single point); the contract's `prefix_granularity` comes from
-the memory plan, not read back out of pool geometry; a backend's
+laundered through another's name. The contract's `prefix_granularity` comes
+from the memory plan, not read back out of pool state. The pool carries
+**two** scalars with distinct roles: `CachePool.prefix_granularity` is the
+identity grain, used only for contract publication and plan-consistency
+checks — `prefix_granularity` exists to compute prefix hits, and runtime
+arithmetic must not reach for it; `CachePool.kv_page_size` is the KV arena
+page span that paged-KV geometry math (row views, slot↔page arithmetic,
+scale-tile branching) reads. The two are pinned 1:1 at construction — that
+assignment is the single point of the prefix-page ↔ KV-page convention.
+Neither is a statement about per-group CacheBlock geometry: group spans live
+in the specs as `block_granularity`, and blocks narrower than P (V4's SWA
+window, state checkpoints) are the norm, not the exception. A backend's
 `kernel_page_size` comes from the kernel registry or an explicit config
 override, never from `prefix_granularity` as a fallback. The CLI flag is
 `--prefix-granularity` (`--block-size` remains a deprecated alias).
@@ -317,36 +323,48 @@ eviction set.
 4. New attention backends declare which view of `CacheBlock` they need
    (paged KV view or state view); they do not invent new table concepts.
 
-## Current state vs. principles (audit 2026-08-13, updated post-refactor)
+## Current state vs. principles (audit 2026-08-13, re-verified after the kernel-page round)
 
 A snapshot of where the code stands relative to each principle, after the
 2026-08-13 refactor series (prefix layer extraction, coordinator capacity
-API, table-naming cleanup, Python leak fixes).
+API, table-naming cleanup, spec geometry shapes, kernel-page registry, and
+the V4 decoupling milestone). Every claim below was re-checked against the
+code at this date.
 
 ### Principle 1 — prefix matching isolated from the allocator: fixed
 
-`csrc/cache/prefix/` now owns the concern: `prefix_index.h`
+`csrc/cache/prefix/` owns the concern: `prefix_index.h`
 (`PrefixCacheIndex`, the CacheKey → canonical CacheBlock index),
 `prefix_matcher.h` (`FullAttnMatcher`/`SwaMatcher` policy hierarchy; mamba is
 `SwaMatcher` at window 2), and `prefix_hasher.h` (moved from `scheduler/`).
-`GroupAllocator` is allocation/reclaim only; `CacheGroup` pairs
-spec + manager + matcher + index, and that pairing is the only place the two
-concerns meet. Remaining known item: `csrc/scheduler/kv_cache_events.cpp`
+`GroupAllocator` (`csrc/cache/allocator/`) is token-free physical placement
+only — `GroupGeometry` in the coordinator owns the token arithmetic — and
+`CacheGroup` pairs spec + allocator + matcher + index, the only place the
+two concerns meet. Remaining known item: `csrc/scheduler/kv_cache_events.cpp`
 still hosts a second, independent block-hash implementation for external KV
 events (wire-format constrained; unify deliberately if ever).
 
-### Principle 2 — scheduler perceives only logical quantities: fixed (with the Principle 3 carve-out)
+### Principle 2 — scheduler perceives only logical quantities: fixed, now with hard vocabulary rules
 
-Scheduling and FSM code no longer do geometry arithmetic. The coordinator
-exposes capacity views — `LcmBlocksNeededFor(group_pages)`,
+Scheduling and FSM code do no geometry arithmetic. The coordinator exposes
+capacity views — `LcmBlocksNeededFor(group_pages)`,
 `NumActiveLcmBlocks(request_tables)`, `NumAvailableLcmBlocks`,
 `TotalLcmBlocks`, `GroupAvailablePages(group)` — and the scheduler treats the
 counts as opaque capacity units. `ForwardState::ActiveLcmBlockIds()` is gone;
 the null-page reservation lives in
-`SchedulerConfig::AllocatorConfig::NumUsablePages()`.
+`SchedulerConfig::AllocatorConfig::NumUsableBlocks()`.
 
-Note on naming: these counts intentionally keep *LCM block* names. An LCM
-parent is a byte-uniform storage unit whose token span differs per group
+Enforced since this round:
+
+* the identifier `page_size` is grep-zero across `tokenspeed-scheduler`
+  (csrc, tests, python bindings) — the slot span is spelled
+  `block_granularity` everywhere;
+* `CacheGroupSpec.block_granularity` is required and explicit — the
+  zero-means-prefix-granularity fallback is deleted, and the coordinator
+  asserts a positive divisor of P at construction.
+
+Note on naming: the capacity counts intentionally keep *LCM block* names. An
+LCM parent is a byte-uniform storage unit whose token span differs per group
 (packing is solved from field byte ratios), so no token-unit name would be
 truthful. What Principle 2 requires is that the scheduler not *reason* about
 the geometry — opaque physical counts crossing the boundary is the same
@@ -355,15 +373,15 @@ carve-out Principle 3 makes for CacheBlock ids.
 ### Principle 3 — emitted table entries: settled by decision, compliant
 
 Decision (2026-08-13): emitted table entries are **`CacheBlock` ids**, and
-that is the accepted contract. The code already works this way: rows are
-logical (row *i* covers `[i*block_granularity, (i+1)*block_granularity)`),
-entries come from `ResolveKernelPageId`
-(`csrc/cache/allocator/group_allocator.h`), and Python folds the packing
-into the contract sent to C++
-(`page_counts = num_lcm_blocks * packing + 1` in `recipes/cache_runtime.py`,
-via `engine/scheduler_utils.py`), so Python's per-forward mapping only
-subdivides `block_granularity → kernel_page_size` and never touches packing.
-No refactor needed here.
+that is the accepted contract. The code works this way: rows are logical
+(row *i* covers `[i*block_granularity, (i+1)*block_granularity)`), entries
+come from `ResolveCacheBlockId`
+(`csrc/cache/allocator/group_allocator.h`), and the packing fold lives on
+the Python side of the contract (`recipes/cache_runtime.py` validates
+`group page counts == num_lcm_blocks * packing + 1`; the bridge in
+`engine/scheduler_utils.py` ships the folded counts), so Python's
+per-forward mapping only subdivides `block_granularity → kernel_page_size`
+and never touches packing. No refactor needed here.
 
 ### Principle 4 — page_table vs. block_table: fixed in Python's own naming
 
@@ -377,18 +395,20 @@ No refactor needed here.
   `CacheGroupsMixin` docstring. Third-party kernel keyword names
   (`flash_mla`'s `block_table=`, TRT-LLM's `block_tables=`) are an external
   boundary and stay as the kernels spell them.
-* Remaining known items: the shared replay signature still passes a
-  `page_table` parameter into the state backend
-  (`backends/hybrid_linear_attn.py`), and `input_buffer.py`'s one
-  `page_table` argument carries scheduler-table pages on the target path but
-  kernel pages on the drafter path.
+* Former residues, both closed on 2026-08-13: the state backend's replay
+  hook no longer names a `page_table` parameter (the shared call's keyword
+  is absorbed unused via `**kwargs` — state attention has no page table),
+  and `input_buffer.py::fill_input_buffers` takes a unit-neutral
+  `out_loc_table` (the batch-ordered table `out_cache_loc` derives from:
+  scheduler full-history table on the target path, staged draft table on
+  the drafter path).
 
 ### Principle 5 — Python perceives the logical quantities minimally: leaks fixed, mapping owners still four
 
 Compliant: the recipes/planner layer *owns* the vocabulary rather than
-leaking it; `expand_page_table` is the single expansion primitive; state
-attention and KV share one plan/arena/`CacheBlock` view, mirrored by the host
-tier. Fixed on 2026-08-13:
+leaking it; `expand_page_table` (`attention/page_table.py`) is the single
+expansion primitive; state attention and KV share one plan/arena/`CacheBlock`
+view, mirrored by the host tier. Fixed on 2026-08-13:
 
 * The magic `prefix_granularity == 128` branches now name the real
   constraint — `MXFP8_KV_SCALE_TILE_TOKENS` in `recipes/spec.py`, used by
@@ -399,6 +419,9 @@ tier. Fixed on 2026-08-13:
   `spec.checkpoint_granularity` (snapshot-state groups declare it directly;
   `page_size` no longer exists on them) instead of
   `contract.prefix_granularity`.
+* Spec geometry is shape-checked at construction: row geometry and
+  `checkpoint_granularity` are mutually exclusive, both positive, and
+  family-gated (`PagedCacheGroupSpec.__post_init__`).
 
 Remaining known item (deliberate, separate project): the mapping *primitive*
 is single but the *owners* are four — MLA `CacheBatchMetadata.kernel_table`,
@@ -407,3 +430,22 @@ the MHA `CacheGroupsMixin` (eager plus two graph paths),
 with its own caching and validation, and the write-location math triplicated
 alongside. Consolidating them means touching every backend family at once;
 do it as its own milestone.
+
+### Principle 6 — provenance discipline: fixed
+
+* The contract's `prefix_granularity` comes from the memory plan
+  (`kv_cache/base.py` builds the runtime contract from `plan.prefix_granularity`,
+  never from pool geometry). ✓
+* Every backend's `kernel_page_size` is registry- or config-sourced
+  (`kernel_page_sizes.py`); the registry LCM validator checks explicitly
+  configured values, and a backend that resolves its own registry default
+  owns the divisibility check for it. The V4 milestone closed the last
+  P-derivation: compressed-chain rows, SWA rows, and layout byte shapes all
+  build from `DEEPSEEK_V4_PAGE_SIZE`, and V4 accepts any P that is a
+  positive multiple of it (e2e-verified against the `bt_v4` baseline). ✓
+* The former pool-scalar naming debt is paid by a role split:
+  `CachePool.prefix_granularity` (identity grain; contract publication and
+  plan checks only) and `CachePool.kv_page_size` (KV arena geometry, read by
+  row/slot/tile math in the paged pools and their consumers), pinned 1:1 at
+  construction. Prefix-hit computation is the only computational consumer of
+  `prefix_granularity`.

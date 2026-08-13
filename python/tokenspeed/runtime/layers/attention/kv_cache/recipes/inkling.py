@@ -9,6 +9,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     merge_continuation_layers,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    MXFP8_KV_SCALE_TILE_TOKENS,
+)
 
 
 def inkling_cache_fields(

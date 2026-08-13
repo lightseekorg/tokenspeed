@@ -50,7 +50,7 @@ std::int64_t ceilDiv(std::int64_t value, std::int64_t divisor) {
 }
 
 std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
-    return config.HasHostCache() ? config.host_allocator.NumUsablePages() : 0;
+    return config.HasHostCache() ? config.host_allocator.NumUsableBlocks() : 0;
 }
 
 CacheKey eventKey(const CacheKey& key) {
@@ -68,7 +68,7 @@ CacheKey eventKey(const CacheKey& key) {
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{std::move(config)},
       req_pool_allocator_{config_.max_batch_size},
-      block_pool_{config_.device_allocator.NumUsablePages()},
+      block_pool_{config_.device_allocator.NumUsableBlocks()},
       host_pool_{hostPoolBlocks(config_)},
       coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.prefix_granularity, block_pool_,
                                    hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,

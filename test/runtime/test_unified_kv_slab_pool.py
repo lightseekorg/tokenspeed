@@ -184,7 +184,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             "layer_num": 24,
             "device": "cpu",
             "enable_memory_saver": False,
-            "page_size": 16,
+            "prefix_granularity": 16,
             "rank": 0,
             "layer_types": GPT_OSS_LAYER_TYPES,
             "sliding_window_tokens": 128,
@@ -192,7 +192,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         kwargs.update(overrides)
         kwargs["memory_plan"] = make_mha_memory_plan(
             size=kwargs["size"],
-            page_size=kwargs["page_size"],
+            prefix_granularity=kwargs["prefix_granularity"],
             layer_num=kwargs["layer_num"],
             kv_heads=kwargs["head_num"],
             head_dim=kwargs["head_dim"],
@@ -340,7 +340,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             "layer_num": 1,
             "device": "cpu",
             "enable_memory_saver": False,
-            "page_size": 16,
+            "prefix_granularity": 16,
             "rank": 0,
             "layer_types": ("full_attention",),
             "layer_group_ids": ("full_attention",),
@@ -349,7 +349,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
 
         kwargs["memory_plan"] = make_mha_memory_plan(
             size=kwargs["size"],
-            page_size=kwargs["page_size"],
+            prefix_granularity=kwargs["prefix_granularity"],
             layer_num=kwargs["layer_num"],
             kv_heads=kwargs["head_num"],
             head_dim=kwargs["head_dim"],
@@ -372,7 +372,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             "layer_num": 1,
             "device": "cpu",
             "enable_memory_saver": False,
-            "page_size": 16,
+            "prefix_granularity": 16,
             "rank": 0,
             "layer_types": ("full_attention",),
             "layer_group_ids": ("full_attention",),
@@ -381,7 +381,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
 
         kwargs["memory_plan"] = make_mha_memory_plan(
             size=kwargs["size"],
-            page_size=kwargs["page_size"],
+            prefix_granularity=kwargs["prefix_granularity"],
             layer_num=kwargs["layer_num"],
             kv_heads=kwargs["head_num"],
             head_dim=kwargs["head_dim"],
@@ -392,7 +392,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             layer_types=kwargs["layer_types"],
             group_ids=kwargs["layer_group_ids"],
             sliding_window_tokens=None,
-            prefix_granularity=kwargs["page_size"],
+            prefix_granularity=kwargs["prefix_granularity"],
         )
         pool = self.MHATokenToKVPool(**kwargs)
 
@@ -431,7 +431,7 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
                 self.allocation_hook_called = True
                 self.kv_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
+                        (self.size + self.prefix_granularity, 1, self.kv_cache_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -448,11 +448,11 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
             layer_num=1,
             device="cpu",
             enable_memory_saver=False,
-            page_size=4,
+            prefix_granularity=4,
             rank=0,
             memory_plan=make_mla_memory_plan(
                 size=8,
-                page_size=4,
+                prefix_granularity=4,
                 layer_num=1,
                 latent_width=6,
                 dtype=torch.bfloat16,
@@ -569,7 +569,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
             layer_num=2,
             device="cpu",
             enable_memory_saver=False,
-            page_size=4,
+            prefix_granularity=4,
             rank=0,
             layer_types=("linear_attention", "full_attention"),
             state_field_dtypes={
@@ -597,13 +597,13 @@ class CachePoolFieldBindingTest(unittest.TestCase):
             layer_num=2,
             device="cpu",
             enable_memory_saver=False,
-            page_size=4,
+            prefix_granularity=4,
             rank=0,
             layer_types=("linear_attention", "full_attention"),
             layer_group_ids=("linear_attention", "full_attention"),
             memory_plan=make_mha_memory_plan(
                 size=8,
-                page_size=4,
+                prefix_granularity=4,
                 layer_num=2,
                 kv_heads=1,
                 head_dim=2,

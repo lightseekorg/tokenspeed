@@ -125,10 +125,13 @@ class InputBuffers:
         forward_op,
         runtime_states: RuntimeStates,
         total_tokens: int,
-        page_table: torch.Tensor,
+        out_loc_table: torch.Tensor,
     ):
-        # out_cache_loc derives from the per-forward, batch-ordered full-history
-        # table (row i == batch position i) exported by the scheduler.
+        # out_cache_loc derives from this batch-ordered table (row i == batch
+        # position i): the scheduler's full-history table on the target path,
+        # the staged draft table on the drafter path. Its column grain is the
+        # ctor's page_size; the name stays unit-neutral because the two paths
+        # feed tables of different provenance.
         batch_size = len(forward_op.request_ids)
         num_extends = forward_op.num_extends()
 
@@ -253,7 +256,7 @@ class InputBuffers:
                 req_pool_indices=req_pool_indices_device,
                 valid_cache_lengths=runtime_states.valid_cache_lengths,
                 uniform_input_length=total_tokens // batch_size,
-                page_table=page_table,
+                page_table=out_loc_table,
                 page_size=self.page_size,
             )
             # Decode path's seq_lens / positions / out_cache_loc are done.
@@ -269,7 +272,7 @@ class InputBuffers:
                 out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
                 input_lengths=input_lengths_device,
                 cache_start=valid_cache_lengths,
-                page_table=page_table,
+                page_table=out_loc_table,
                 page_size=self.page_size,
             )
 

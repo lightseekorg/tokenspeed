@@ -730,7 +730,7 @@ def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
         size=setup.spec.pool_size,
         dtype=torch.uint8,
         device="cpu",
-        page_size=4,
+        prefix_granularity=4,
         rank=0,
         memory_plan=setup.spec.memory_plan,
         paged_cache_group_specs=setup.spec.paged_cache_group_specs,

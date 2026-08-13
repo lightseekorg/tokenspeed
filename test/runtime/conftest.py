@@ -90,7 +90,7 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
         layer_num=text_config.num_hidden_layers,
         device=device,
         enable_memory_saver=False,
-        page_size=plan.prefix_granularity,
+        prefix_granularity=plan.prefix_granularity,
         rank=0,
         layer_types=layer_types,
         layer_group_ids=group_ids,

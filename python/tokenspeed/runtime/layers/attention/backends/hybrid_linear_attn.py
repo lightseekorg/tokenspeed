@@ -1051,9 +1051,10 @@ class MambaAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
-        page_table: torch.Tensor = None,
         **kwargs,
     ):
+        # State attention has no page table; the shared replay call's
+        # page_table keyword is absorbed by **kwargs unused.
         num_padding = kwargs.get("num_padding", 0)
 
         real_bs = bs - num_padding

@@ -335,7 +335,8 @@ class ModelExecutor:
 
         # fill_input_buffers indexes the scheduler table in its own table pages; the drafter indexes draft_page_table in its backend's kernel pages.
         self._block_granularity = int(
-            getattr(draft_token_to_kv_pool, "page_size", 0) or config.prefix_granularity
+            getattr(draft_token_to_kv_pool, "prefix_granularity", 0)
+            or config.prefix_granularity
         )
         draft_kernel_page_size = getattr(draft_attn_backend, "kernel_page_size", None)
         if draft_attn_backend is not None and draft_kernel_page_size is None:
@@ -1333,7 +1334,7 @@ class ModelExecutor:
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 total_tokens=total_tokens,
-                page_table=page_table,
+                out_loc_table=page_table,
             )
             if self.drafter is not None and hasattr(
                 self.drafter, "prepare_request_state"
