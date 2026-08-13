@@ -1296,20 +1296,21 @@ class CudaGraphWrapper:
             )
 
             result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
-            # Work the backend enqueued inside the forward is on the device now.
-            # Releasing it here rather than after the state update below is what
-            # keeps a round that never reaches that update from leaving the work
-            # owed -- and applied a second time by the next round.
-            self.attn_backend.notify_forward_issued()
 
         if use_graph and padded_bs != bs:
             ctx.bs = bs
 
-        # Update mamba/GDN state after speculative verify
-        if _should_update_mamba_state_after_mtp_verify(
-            self.drafter, self.attn_backend, ctx.forward_mode
-        ):
-            accept_lengths = result[1]
-            self.attn_backend.update_mamba_state_after_mtp_verify(accept_lengths, None)
+        # Settle mamba/GDN state deferred into the forward that just ran. This
+        # fires on EVERY forward, with the accept lengths only when there was a
+        # speculative verify to record: a backend that enqueued work inside the
+        # forward has to be told it landed even on the rounds that record
+        # nothing, or it would still be owed -- and applied twice -- next round.
+        if hasattr(self.attn_backend, "update_mamba_state_after_mtp_verify"):
+            verified = _should_update_mamba_state_after_mtp_verify(
+                self.drafter, self.attn_backend, ctx.forward_mode
+            )
+            self.attn_backend.update_mamba_state_after_mtp_verify(
+                result[1] if verified else None, None
+            )
 
         return result

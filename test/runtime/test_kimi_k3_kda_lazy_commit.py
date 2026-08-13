@@ -142,8 +142,9 @@ class _Harness:
                 a=None,
                 b=None,
             )
-        # The graph wrapper's forward-issue fence: the window the arm composed
-        # is on the device once the layers have run.
+        # The graph wrapper settles state after every forward; with no accept
+        # lengths yet this is just the release of the window the arm composed,
+        # which is on the device once the layers have run.
         self.backend.notify_forward_issued()
         return outs
 
@@ -1110,8 +1111,8 @@ def test_forward_without_a_record_does_not_double_apply_next_round():
     already-committed pending live, and with anchor == commit (every window
     that stays inside one state page) the next round replays it onto its
     own result, applying the accepted tokens twice. The forward-issue fence
-    (``notify_forward_issued``) must release the record even when no accept
-    follows.
+    (the settle hook the graph wrapper calls after every forward) must
+    release the record even when no accept follows.
     """
     rpis = [0, 1]
     h_lazy = _Harness(seed=67)

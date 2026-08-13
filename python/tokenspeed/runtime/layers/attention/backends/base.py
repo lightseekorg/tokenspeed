@@ -221,7 +221,8 @@ class AttentionBackend(ABC):
     # that produced it -- lazy speculative-verify commits today; future state
     # or kv-cache variants belong here too rather than growing new engine
     # hooks. The engine calls these at the points a backend cannot observe on
-    # its own (the forward-issue boundary, the pause fence) and owns all
+    # its own (the pause fence here; the forward-issue boundary through the
+    # optional per-forward settle hook the graph wrapper calls) and owns all
     # stream fencing; implementations run on the caller's current stream.
 
     def has_pending(self) -> bool:
@@ -230,15 +231,6 @@ class AttentionBackend(ABC):
         Must be a cheap host-side probe: it gates the engine's stream fence.
         """
         return False
-
-    def notify_forward_issued(self) -> None:
-        """The forward this round prepared has been issued to the device.
-
-        Called once per forward, whether or not the step that follows it
-        succeeds. Work a backend enqueued INSIDE that forward is done being
-        owed at this point; anything that reads a later result to decide is
-        racing the failures between here and there.
-        """
 
     def flush_pending(self, resident_request_ids: set[str]) -> None:
         """Resolve all pending work now, under the current weights.

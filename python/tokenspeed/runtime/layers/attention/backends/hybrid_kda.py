@@ -1583,6 +1583,8 @@ class HybridKDABackend(HybridLinearAttnBackend):
     def flush_pending(self, resident_request_ids: set[str]) -> None:
         self.linear_attn_backend.flush_pending(resident_request_ids)
 
-    @override
-    def notify_forward_issued(self) -> None:
+    def update_mamba_state_after_mtp_verify(self, accepted_length, model):
+        """Release issued replay work, then record a verified state window."""
         self.linear_attn_backend.notify_forward_issued()
+        if accepted_length is not None:
+            self.linear_attn_backend.commit_verified_state(accepted_length)

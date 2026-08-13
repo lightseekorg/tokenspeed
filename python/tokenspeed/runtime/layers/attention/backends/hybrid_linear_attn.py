@@ -2358,4 +2358,5 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
 
     def update_mamba_state_after_mtp_verify(self, accepted_length, model):
-        self.linear_attn_backend.commit_verified_state(accepted_length)
+        if accepted_length is not None:
+            self.linear_attn_backend.commit_verified_state(accepted_length)
