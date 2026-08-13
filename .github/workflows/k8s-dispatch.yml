@@ -198,6 +198,8 @@ jobs:
           for task in matrix["include"]:
               searchable = f"{task['name']} {task['config']}".lower()
               runner = task["runner"]
+              if runner.startswith("slurm-"):
+                  continue
               pool = os.environ["RUNNER_POOL"]
               runner_families = {
                   "b200v2": runner.startswith("b200v2-"),
