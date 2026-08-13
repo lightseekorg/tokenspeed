@@ -193,23 +193,20 @@ class KdaAttnBackend(MambaAttnBackend):
         g_kda = g_raw.view(1, seq_len, num_value_heads, head_k_dim)
         beta_kda = beta_raw.view(1, seq_len, num_value_heads)
 
-        return (
-            kda_paged_decode(
-                query,
-                key,
-                value,
-                g_kda,
-                beta_kda,
-                A_log,
-                dt_bias,
-                state_pool=ssm_states,
-                read_indices=read_indices,
-                write_indices=write_indices,
-                cu_seqlens=query_start_loc,
-                lower_bound=lower_bound,
-            )
-            .squeeze(0)
-        )
+        return kda_paged_decode(
+            query,
+            key,
+            value,
+            g_kda,
+            beta_kda,
+            A_log,
+            dt_bias,
+            state_pool=ssm_states,
+            read_indices=read_indices,
+            write_indices=write_indices,
+            cu_seqlens=query_start_loc,
+            lower_bound=lower_bound,
+        ).squeeze(0)
 
     @override
     def _verify(
@@ -306,23 +303,20 @@ class KdaAttnBackend(MambaAttnBackend):
         beta_b = beta_raw.view(batch_size, draft_token_num, num_value_heads)
         grid = output_indices[:batch_size]
 
-        return (
-            fused_recurrent_kda_mtp(
-                query_b,
-                key_b,
-                value_b,
-                g_b,
-                beta_b,
-                A_log,
-                dt_bias,
-                ssm_comp,
-                state_in_pages[:batch_size].to(torch.int64),
-                grid,
-                h_pool_out=ssm_scratch,
-                lower_bound=lower_bound,
-            )
-            .reshape(1, seq_len, num_value_heads, head_v_dim)
-        )
+        return fused_recurrent_kda_mtp(
+            query_b,
+            key_b,
+            value_b,
+            g_b,
+            beta_b,
+            A_log,
+            dt_bias,
+            ssm_comp,
+            state_in_pages[:batch_size].to(torch.int64),
+            grid,
+            h_pool_out=ssm_scratch,
+            lower_bound=lower_bound,
+        ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
     @override
     def _prefill_scan(
