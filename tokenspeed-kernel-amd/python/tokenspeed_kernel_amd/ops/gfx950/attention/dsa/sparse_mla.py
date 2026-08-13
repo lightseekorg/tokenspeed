@@ -31,6 +31,7 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.indexing import (
     _check_packed_fp8_inputs,
+    _combine_scoring_query_heads_kernel,
     _dsa_decode_logits_fp8_kernel,
     _dsa_prefill_logits_fp8_kernel,
 )
@@ -1900,7 +1901,25 @@ def _combine_scoring_query_heads(
     q: torch.Tensor,
     weights: torch.Tensor,
 ) -> torch.Tensor:
-    return (q.float() * weights.float().unsqueeze(-1)).sum(dim=1)
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
+    combined = torch.empty(
+        (q.shape[0], q.shape[2]),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    if q.shape[0] == 0:
+        return combined
+    _combine_scoring_query_heads_kernel[(q.shape[0],)](
+        q,
+        weights,
+        combined,
+        num_heads=q.shape[1],
+        head_dim=q.shape[2],
+        BLOCK_D=128,
+        num_warps=4,
+    )
+    return combined
 
 
 def gluon_dsa_decode_topk_fp8_gfx950(
