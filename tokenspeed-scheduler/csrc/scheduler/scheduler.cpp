@@ -37,7 +37,7 @@
 #include "cache/tier/transfer.h"
 #include "fsm/forward_states.h"
 #include "scheduler/operations/forward.h"
-#include "scheduler/page_hasher.h"
+#include "cache/prefix/prefix_hasher.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -50,7 +50,7 @@ std::int64_t ceilDiv(std::int64_t value, std::int64_t divisor) {
 }
 
 std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
-    return config.HasHostCache() ? config.host_allocator.total_pages - 1 : 0;
+    return config.HasHostCache() ? config.host_allocator.NumUsablePages() : 0;
 }
 
 CacheKey eventKey(const CacheKey& key) {
@@ -68,14 +68,14 @@ CacheKey eventKey(const CacheKey& key) {
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{std::move(config)},
       req_pool_allocator_{config_.max_batch_size},
-      block_pool_{config_.device_allocator.total_pages - 1},
+      block_pool_{config_.device_allocator.NumUsablePages()},
       host_pool_{hostPoolBlocks(config_)},
-      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.block_size, block_pool_,
-                                   host_pool_.NumLcmBlocks() > 0 ? &host_pool_ : nullptr,
+      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.prefix_granularity, block_pool_,
+                                   hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
                                    config_.StreamsDeviceCacheToHost())},
       tier_transfers_{coordinator_} {
-    if (config_.block_size <= 0) {
-        throw std::invalid_argument("Scheduler: block_size must be > 0");
+    if (config_.prefix_granularity <= 0) {
+        throw std::invalid_argument("Scheduler: prefix_granularity must be > 0");
     }
     if (config_.device_allocator.total_pages <= 1) {
         throw std::invalid_argument("Scheduler: device cache must contain a null page and usable capacity");
@@ -101,7 +101,7 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (config_.enable_l3_storage) {
         throw std::invalid_argument("Scheduler: L3 storage is not supported by the cache coordinator");
     }
-    if (coordinator_.HasMambaStateGroup() && config_.max_scheduled_tokens < coordinator_.CacheBlockTokens()) {
+    if (coordinator_.HasMambaStateGroup() && config_.max_scheduled_tokens < coordinator_.PrefixGranularity()) {
         throw std::invalid_argument("Scheduler: Mamba max_scheduled_tokens must cover one cache block");
     }
 
@@ -109,16 +109,16 @@ Scheduler::Scheduler(SchedulerConfig config)
     for (const PagedCacheGroupConfig& group : config_.paged_cache_groups) {
         group.Validate();
         cache_group_ids_.push_back(group.group_id);
-        const std::int32_t child_entries = config_.block_size / group.CacheBlockTokens();
+        const std::int32_t child_entries = config_.prefix_granularity / group.PageSize();
         if (cache_entries_per_event_boundary_ > std::numeric_limits<std::int32_t>::max() - child_entries) {
             throw std::invalid_argument("Scheduler: cache entries per event boundary exceed int32 range");
         }
         cache_entries_per_event_boundary_ += child_entries;
     }
-    max_single_request_tokens_ = calculateMaxSingleRequestTokens(block_pool_.NumLcmBlocks());
+    max_single_request_tokens_ = calculateMaxSingleRequestTokens(coordinator_.TotalLcmBlocks());
 
     if (config_.enable_kv_cache_events) {
-        coordinator_.SetCacheMutationSink([this](const CacheKey& key, KvCacheCoordinator::CacheMutation mutation) {
+        coordinator_.SetCacheMutationSink([this](const CacheKey& key, CacheCoordinator::CacheMutation mutation) {
             handleCacheMutation(key, mutation);
         });
     }
@@ -128,7 +128,7 @@ Scheduler::Scheduler(SchedulerConfig config)
     }
 }
 
-std::int64_t Scheduler::singleRequestParentsRequired(std::int32_t token_limit) const {
+std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit) const {
     _assert(token_limit >= 0, "single-request token limit must be non-negative");
     const std::int64_t decode_width = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
     // An overlapped forward protects one additional decode reservation that
@@ -140,27 +140,26 @@ std::int64_t Scheduler::singleRequestParentsRequired(std::int32_t token_limit) c
         std::max<std::int64_t>(static_cast<std::int64_t>(token_limit) - decode_width, 0);
     const std::int64_t chunk_tokens = config_.max_scheduled_tokens;
 
-    std::int64_t required_parents = 0;
+    std::vector<std::int64_t> group_pages(static_cast<std::size_t>(coordinator_.NumGroups()));
     for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
-        const KvCacheManager& manager = coordinator_.GroupManager(i);
-        const std::int64_t page_tokens = manager.CacheBlockTokens();
+        const std::int64_t page_size = coordinator_.GroupPageSize(i);
         const auto local_prefill_peak = [&] {
             // Across every prompt up to max_prompt_tokens, retain the largest
             // resident window seen by either the first chunk or a later chunk.
             const std::int64_t first_prompt = std::min(max_prompt_tokens, chunk_tokens);
-            std::int64_t pages = ceilDiv(first_prompt + decode_width + protected_tokens, page_tokens);
+            std::int64_t pages = ceilDiv(first_prompt + decode_width + protected_tokens, page_size);
             if (max_prompt_tokens > chunk_tokens) {
                 const std::int64_t later_prompt = std::min(max_prompt_tokens - chunk_tokens, chunk_tokens);
-                const std::int64_t lookback_pages = manager.BoundaryLookbackBlocks();
-                pages = std::max(pages, lookback_pages + ceilDiv(chunk_tokens, page_tokens));
+                const std::int64_t lookback_pages = coordinator_.GroupBoundaryLookbackPages(i);
+                pages = std::max(pages, lookback_pages + ceilDiv(chunk_tokens, page_size));
                 pages = std::max(pages,
-                                 lookback_pages + ceilDiv(later_prompt + decode_width + protected_tokens, page_tokens));
+                                 lookback_pages + ceilDiv(later_prompt + decode_width + protected_tokens, page_size));
             }
             return pages;
         };
         std::int64_t child_pages = 0;
-        if (manager.MatchIsPrefixClosed()) {
-            child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, page_tokens);
+        if (coordinator_.GroupIsPrefixClosed(i)) {
+            child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, page_size);
         } else if (config_.role == Role::kD) {
             const PagedCacheGroupConfig& group = config_.paged_cache_groups[static_cast<std::size_t>(i)];
             const bool latest_snapshot =
@@ -169,41 +168,41 @@ std::int64_t Scheduler::singleRequestParentsRequired(std::int32_t token_limit) c
                 // The final prompt page may be full, so a non-zero decode
                 // reservation can span one more page than its own page count.
                 const std::int64_t reserved_tokens = decode_width + protected_tokens;
-                const std::int64_t snapshot_pages =
-                    reserved_tokens == 0 ? 1 : 1 + ceilDiv(reserved_tokens, page_tokens);
+                const std::int64_t snapshot_pages = reserved_tokens == 0 ? 1 : 1 + ceilDiv(reserved_tokens, page_size);
                 // A retracted Decode request may recover by locally
                 // recomputing its suffix. Old State checkpoints are
                 // evictable, but one recovery chunk and its lookback must fit.
                 child_pages = std::max(snapshot_pages, local_prefill_peak());
             } else if (config_.enable_pd_cache && group.retention == PagedCacheGroupConfig::Retention::SlidingWindow) {
                 const std::int64_t dense_pages =
-                    ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, page_tokens);
+                    ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, page_size);
                 const std::int64_t window_pages = ceilDiv(static_cast<std::int64_t>(*group.sliding_window_tokens - 1) +
-                                                              decode_width + protected_tokens + page_tokens - 1,
-                                                          page_tokens);
+                                                              decode_width + protected_tokens + page_size - 1,
+                                                          page_size);
                 // A sliding prefix probe can retain one older lookback island
                 // across null holes while the remote prompt tail is restored at
                 // absolute slots. Bound both intervals, capped by a dense table.
-                child_pages = std::min<std::int64_t>(dense_pages, manager.BoundaryLookbackBlocks() + window_pages);
+                child_pages =
+                    std::min<std::int64_t>(dense_pages, coordinator_.GroupBoundaryLookbackPages(i) + window_pages);
             } else {
                 // Decode-only restores its destination in one admission, so a
                 // non-sparse group cannot slide old prompt pages first.
-                child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, page_tokens);
+                child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, page_size);
             }
         } else {
             child_pages = local_prefill_peak();
         }
-        required_parents += ceilDiv(child_pages, manager.CacheBlocksPerLcmBlock());
+        group_pages[static_cast<std::size_t>(i)] = child_pages;
     }
-    return required_parents;
+    return coordinator_.LcmBlocksNeededFor(group_pages);
 }
 
-std::int32_t Scheduler::calculateMaxSingleRequestTokens(std::int64_t usable_parents) const {
+std::int32_t Scheduler::calculateMaxSingleRequestTokens(std::int64_t usable_lcm_blocks) const {
     std::int64_t low = 0;
     std::int64_t high = std::numeric_limits<std::int32_t>::max();
     while (low < high) {
         const std::int64_t candidate = low + (high - low + 1) / 2;
-        if (singleRequestParentsRequired(static_cast<std::int32_t>(candidate)) <= usable_parents) {
+        if (singleRequestLcmBlocksRequired(static_cast<std::int32_t>(candidate)) <= usable_lcm_blocks) {
             low = candidate;
         } else {
             high = candidate - 1;
@@ -259,34 +258,35 @@ bool Scheduler::clearCache(bool include_host) {
     return true;
 }
 
-std::vector<CacheKey> Scheduler::registerKvEventPages(const Request& request, std::span<const std::string> page_hashes,
-                                                      std::int32_t first_page) {
+std::vector<CacheKey> Scheduler::registerKvEventPrefixPages(const Request& request,
+                                                            std::span<const std::string> prefix_hashes,
+                                                            std::int32_t first_page) {
     if (!config_.enable_kv_cache_events) {
         return {};
     }
-    _assert(first_page >= 0 && static_cast<std::size_t>(first_page) <= page_hashes.size(),
+    _assert(first_page >= 0 && static_cast<std::size_t>(first_page) <= prefix_hashes.size(),
             "KV event page range is invalid");
-    const std::vector<std::span<const std::int32_t>> token_pages = request.FullPagedTokens(false);
-    _assert(page_hashes.size() <= token_pages.size(), "KV event hashes exceed the request's complete pages");
+    const std::vector<std::span<const std::int32_t>> token_pages = request.FullPrefixPages(false);
+    _assert(prefix_hashes.size() <= token_pages.size(), "KV event hashes exceed the request's complete pages");
 
     KvEventHashProgress& progress = kv_event_hash_progress_[request.Id()];
-    for (std::size_t i = progress.block_hashes.size(); i < page_hashes.size(); ++i) {
+    for (std::size_t i = progress.block_hashes.size(); i < prefix_hashes.size(); ++i) {
         const std::optional<std::uint64_t> parent_hash =
             i == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes[i - 1]};
         progress.block_hashes.push_back(HashKvBlock(token_pages[i], parent_hash));
     }
 
     std::vector<CacheKey> registered_keys;
-    registered_keys.reserve(page_hashes.size() - static_cast<std::size_t>(first_page));
-    for (std::size_t i = static_cast<std::size_t>(first_page); i < page_hashes.size(); ++i) {
-        CacheKey key{.content_hash = page_hashes[i]};
+    registered_keys.reserve(prefix_hashes.size() - static_cast<std::size_t>(first_page));
+    for (std::size_t i = static_cast<std::size_t>(first_page); i < prefix_hashes.size(); ++i) {
+        CacheKey key{.content_hash = prefix_hashes[i]};
         const std::optional<std::uint64_t> parent_hash =
             i == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes[i - 1]};
         KvBlockStoredEvent event{
             .block_hashes = {progress.block_hashes[i]},
             .parent_block_hash = parent_hash,
             .token_ids = std::vector<std::int32_t>(token_pages[i].begin(), token_pages[i].end()),
-            .block_size = config_.block_size,
+            .block_size = config_.prefix_granularity,
         };
         const auto [it, inserted] = kv_event_pages_.try_emplace(key, std::move(event));
         FatalCheck(inserted || it->second.block_hashes.front() == progress.block_hashes[i],
@@ -304,9 +304,9 @@ void Scheduler::discardUncachedKvEventPages(std::span<const CacheKey> keys) {
     }
 }
 
-void Scheduler::handleCacheMutation(const CacheKey& key, KvCacheCoordinator::CacheMutation mutation) {
+void Scheduler::handleCacheMutation(const CacheKey& key, CacheCoordinator::CacheMutation mutation) {
     const CacheKey prefix_key = eventKey(key);
-    if (mutation == KvCacheCoordinator::CacheMutation::kStored) {
+    if (mutation == CacheCoordinator::CacheMutation::kStored) {
         std::int32_t& child_count = cached_event_child_counts_[prefix_key];
         FatalCheck(child_count < cache_entries_per_event_boundary_, "duplicate child entry for one KV event boundary");
         ++child_count;
@@ -356,7 +356,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         if (token_limit > max_single_request_tokens_) {
             throw std::invalid_argument("Scheduler: request token limit exceeds paged-cache capacity");
         }
-        pending_requests.push_back(std::make_unique<Request>(spec, config_.block_size, config_.role));
+        pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, config_.role));
     }
 
     for (std::size_t i = 0; i < request_specs.size(); ++i) {
@@ -387,18 +387,15 @@ std::size_t Scheduler::AvailableKvPages() const {
 }
 
 std::size_t Scheduler::ActiveKvPages() const {
-    std::unordered_set<std::int32_t> active_lcm_blocks;
+    std::vector<std::span<const BlockTable>> request_tables;
+    request_tables.reserve(requests_.size());
     for (const auto& [_, request] : requests_) {
         if (!request->Is<fsm::Prefilling>() && !request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
             continue;
         }
-        for (std::int32_t block_id : request->ActiveLcmBlockIds()) {
-            if (block_id > 0) {
-                active_lcm_blocks.insert(block_id);
-            }
-        }
+        request_tables.emplace_back(request->BlockTablesRef());
     }
-    return active_lcm_blocks.size();
+    return coordinator_.NumActiveLcmBlocks(request_tables);
 }
 
 std::int32_t Scheduler::PagedCacheGroupTotalPages(const std::string& group_id) const {
@@ -406,15 +403,7 @@ std::int32_t Scheduler::PagedCacheGroupTotalPages(const std::string& group_id) c
 }
 
 std::int32_t Scheduler::PagedCacheGroupAvailablePages(const std::string& group_id) const {
-    const std::size_t index = groupIndex(group_id);
-    const std::int32_t slots_per_parent = config_.paged_cache_groups[index].cache_blocks_per_lcm_block;
-    std::int32_t available = block_pool_.NumEmptyLcmBlocks() * slots_per_parent;
-    for (std::int32_t id = 1; id <= block_pool_.NumLcmBlocks(); ++id) {
-        if (block_pool_.BoundGroup(id) == static_cast<std::uint32_t>(index)) {
-            available += slots_per_parent - block_pool_.OccupiedCount(id);
-        }
-    }
-    return available;
+    return coordinator_.GroupAvailablePages(static_cast<std::int32_t>(groupIndex(group_id)));
 }
 
 std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {

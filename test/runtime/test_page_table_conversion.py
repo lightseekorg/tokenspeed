@@ -43,7 +43,7 @@ class PageTableConversionTest(unittest.TestCase):
 
         actual = self.module.expand_page_table(
             logical,
-            logical_page_size=128,
+            table_page_size=128,
             kernel_page_size=64,
             max_kernel_pages=6,
         )
@@ -60,7 +60,7 @@ class PageTableConversionTest(unittest.TestCase):
 
         actual = self.module.expand_page_table(
             logical,
-            logical_page_size=128,
+            table_page_size=128,
             kernel_page_size=64,
         )
 
@@ -75,7 +75,7 @@ class PageTableConversionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive multiple"):
             self.module.expand_page_table(
                 torch.tensor([[1]], dtype=torch.int32),
-                logical_page_size=96,
+                table_page_size=96,
                 kernel_page_size=64,
             )
 
@@ -84,7 +84,7 @@ class PageTableConversionTest(unittest.TestCase):
 
         actual = self.module.expand_page_table(
             table,
-            logical_page_size=64,
+            table_page_size=64,
             kernel_page_size=64,
         )
 

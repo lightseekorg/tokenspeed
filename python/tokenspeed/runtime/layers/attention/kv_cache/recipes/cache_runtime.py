@@ -55,14 +55,16 @@ def require_positive_int(name: str, value: object) -> int:
 
 @dataclass(frozen=True)
 class PagedCacheRuntimeContract:
-    block_size: int
+    prefix_granularity: int
     num_lcm_blocks: int
     token_capacity: int
     group_specs: tuple[PagedCacheGroupSpec, ...]
     group_page_counts: Mapping[str, int]
 
     def __post_init__(self) -> None:
-        block_size = require_positive_int("block_size", self.block_size)
+        prefix_granularity = require_positive_int(
+            "prefix_granularity", self.prefix_granularity
+        )
         num_lcm_blocks = require_positive_int("num_lcm_blocks", self.num_lcm_blocks)
         token_capacity = require_positive_int("token_capacity", self.token_capacity)
         if not isinstance(self.group_specs, tuple) or not self.group_specs:
@@ -103,7 +105,7 @@ class PagedCacheRuntimeContract:
                 f"expected={expected_counts}, got={counts}"
             )
         max_child_pages = max(counts.values()) - 1
-        if token_capacity > max_child_pages * block_size:
+        if token_capacity > max_child_pages * prefix_granularity:
             raise ValueError(
                 "token_capacity exceeds the largest group's child-page capacity"
             )

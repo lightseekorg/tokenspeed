@@ -54,12 +54,12 @@ std::pair<bool, std::string> ClearL1CacheWithCapturedLog(Scheduler* scheduler) {
     return {cleared, output.str()};
 }
 
-PagedCacheGroupConfig MakeGroup(const std::string& id, std::int32_t block_size, std::int32_t total_pages,
+PagedCacheGroupConfig MakeGroup(const std::string& id, std::int32_t page_size, std::int32_t total_pages,
                                 PagedCacheGroupConfig::Retention retention, PagedCacheGroupFamily family,
                                 std::int32_t sliding_window_tokens = 0) {
     PagedCacheGroupConfig g;
     g.group_id = id;
-    g.rows_per_page = block_size;
+    g.rows_per_page = page_size;
     g.entry_stride_tokens = 1;
     g.total_pages = total_pages;
     g.retention = retention;
@@ -90,7 +90,7 @@ class ChunkedPrefillSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
         cfg.max_scheduled_tokens = 4;  // 4 tokens = 2 pages per chunk
@@ -100,9 +100,9 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
                       /*sliding_window_tokens=*/4),
         };
@@ -150,7 +150,7 @@ class MambaChunkAlignmentSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 4;
+        cfg.prefix_granularity = 4;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
         cfg.max_scheduled_tokens = 6;
@@ -159,9 +159,9 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("state", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::State),
         };
         return cfg;
@@ -186,7 +186,7 @@ class MambaMixedBudgetSuite : public MambaChunkAlignmentSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = MambaChunkAlignmentSuite::MakeConfig();
-        cfg.max_scheduled_tokens = cfg.block_size;
+        cfg.max_scheduled_tokens = cfg.prefix_granularity;
         cfg.enable_mixed_prefill_decode = true;
         return cfg;
     }
@@ -203,14 +203,14 @@ TEST_F(MambaMixedBudgetSuite, StatePrefillKeepsOnePageOfMixedBudget) {
     ASSERT_NE(op, nullptr);
     ASSERT_EQ(op->request_ids.size(), 1u);
     EXPECT_EQ(op->request_ids.front(), "prefill");
-    EXPECT_EQ(op->input_lengths.front(), config_.block_size);
+    EXPECT_EQ(op->input_lengths.front(), config_.prefix_granularity);
 }
 
 class MambaMixedSpareBudgetSuite : public MambaMixedBudgetSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = MambaMixedBudgetSuite::MakeConfig();
-        cfg.max_scheduled_tokens = cfg.block_size + cfg.decode_input_tokens;
+        cfg.max_scheduled_tokens = cfg.prefix_granularity + cfg.decode_input_tokens;
         return cfg;
     }
 };
@@ -230,12 +230,12 @@ TEST_F(MambaMixedSpareBudgetSuite, DecodeUsesOnlyBudgetAboveReservedStatePage) {
     ASSERT_NE(decode, op->request_ids.end());
     ASSERT_NE(prefill, op->request_ids.end());
     EXPECT_EQ(op->input_lengths[std::distance(op->request_ids.begin(), decode)], config_.decode_input_tokens);
-    EXPECT_EQ(op->input_lengths[std::distance(op->request_ids.begin(), prefill)], config_.block_size);
+    EXPECT_EQ(op->input_lengths[std::distance(op->request_ids.begin(), prefill)], config_.prefix_granularity);
 }
 
 TEST(MambaChunkAlignmentConfigTest, RejectsBudgetSmallerThanStatePage) {
     SchedulerConfig cfg{};
-    cfg.block_size = 4;
+    cfg.prefix_granularity = 4;
     cfg.device_allocator.total_pages = 64;
     cfg.host_allocator.total_pages = 64;
     cfg.max_scheduled_tokens = 3;
@@ -243,9 +243,9 @@ TEST(MambaChunkAlignmentConfigTest, RejectsBudgetSmallerThanStatePage) {
     cfg.disable_l2_cache = true;
     cfg.disable_prefix_cache = true;
     cfg.paged_cache_groups = {
-        MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+        MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                   PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-        MakeGroup("state", cfg.block_size, cfg.device_allocator.total_pages,
+        MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                   PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::State),
     };
 
@@ -260,7 +260,7 @@ class ThreeGroupSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 96;
         cfg.host_allocator.total_pages = 96;
         cfg.max_scheduled_tokens = 64;
@@ -270,12 +270,12 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("swa_small", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa_small", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
                       /*sliding_window_tokens=*/4),
-            MakeGroup("swa_big", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa_big", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
                       /*sliding_window_tokens=*/8),
         };
@@ -321,7 +321,7 @@ class SubPageWindowSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 4;
+        cfg.prefix_granularity = 4;
         cfg.device_allocator.total_pages = 96;
         cfg.host_allocator.total_pages = 96;
         cfg.max_scheduled_tokens = 64;
@@ -331,12 +331,12 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("swa_w3", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa_w3", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
                       /*sliding_window_tokens=*/3),
-            MakeGroup("swa_w5", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa_w5", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
                       /*sliding_window_tokens=*/5),
         };
@@ -402,7 +402,7 @@ class AllFullTwoGroupSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
         cfg.max_scheduled_tokens = 64;
@@ -412,9 +412,9 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full_a", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("full_b", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
         };
         return cfg;
@@ -456,7 +456,7 @@ class PoolAccountingSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
         cfg.max_scheduled_tokens = 64;
@@ -466,9 +466,9 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
                       /*sliding_window_tokens=*/4),
         };
@@ -507,7 +507,7 @@ TEST_F(PoolAccountingSuite, ThreeRequestsOutOfOrderFinishReclaimExactly) {
 // Chunked prefill slides the SWA window DURING prefill, then decode keeps
 // sliding. Window convention used below: with N = tokens computed BEFORE a
 // round's forward, the pending query at N attends keys [N-W+1, N], so the
-// first kept page is (N-W+1)/block_size and everything below it is freed.
+// first kept page is (N-W+1)/page_size and everything below it is freed.
 TEST_F(ChunkedPrefillSuite, ChunkedPrefillThenSwaSlidesToNullHole) {
     const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
 
@@ -635,7 +635,7 @@ class MixedBatchSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
         cfg.max_scheduled_tokens = 64;
@@ -646,9 +646,9 @@ protected:
         cfg.enable_mixed_prefill_decode = true;  // decode + prefill in one plan
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
                       /*sliding_window_tokens=*/4),
         };
@@ -744,13 +744,13 @@ TEST_F(MixedBatchSuite, PerRequestSwaHoleAtDifferentDecodeDepths) {
 }
 
 // ---------------------------------------------------------------------------
-// block_size = 1: the batch path is not hard-wired to block_size=2.
+// prefix_granularity = 1: the batch path is not hard-wired to prefix_granularity=2.
 // ---------------------------------------------------------------------------
-class PageSizeOneSuite : public SchedulerTestSuite {
+class PrefixGranularityOneSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 1;
+        cfg.prefix_granularity = 1;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
         cfg.max_scheduled_tokens = 64;
@@ -760,9 +760,9 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
                       /*sliding_window_tokens=*/2),
         };
@@ -770,7 +770,7 @@ protected:
     }
 };
 
-TEST_F(PageSizeOneSuite, TokenGranularPagesSlideAndReclaim) {
+TEST_F(PrefixGranularityOneSuite, TokenGranularPagesSlideAndReclaim) {
     const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/3));
@@ -791,11 +791,11 @@ TEST_F(PageSizeOneSuite, TokenGranularPagesSlideAndReclaim) {
     const ForwardBatch* op = FindForwardBatch(*last);
     ASSERT_NE(op, nullptr);
     for (std::int32_t id : op->block_tables.at("full").at(0)) {
-        EXPECT_GT(id, 0) << "full group hole-free at block_size=1";
+        EXPECT_GT(id, 0) << "full group hole-free at prefix_granularity=1";
     }
     const auto& swa = op->block_tables.at("swa").at(0);
     EXPECT_NE(std::find(swa.begin(), swa.end(), 0), swa.end())
-        << "swa group must develop a null hole at block_size=1 too";
+        << "swa group must develop a null hole at prefix_granularity=1 too";
 
     SendFinish("r1");
     PlanOnce();
@@ -814,13 +814,13 @@ void SendAbort(Scheduler& scheduler, const std::string& id) {
 
 // ---------------------------------------------------------------------------
 // Pool-exhaustion admission. The first-chunk gate charges prompt + decode
-// reserve = groups * ceil((tokens + 1) / block_size) blocks.
+// reserve = groups * ceil((tokens + 1) / prefix_granularity) blocks.
 // ---------------------------------------------------------------------------
 class TinyPoolSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         // 11 physical pages -> 10 usable (page 0 is the null placeholder):
         // one 4-page prompt over 2 groups (8 prefill + 2 reserve) = the pool.
         cfg.device_allocator.total_pages = 11;
@@ -832,9 +832,9 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
                       /*sliding_window_tokens=*/4),
         };
@@ -888,7 +888,7 @@ class PrefillSlideAdmissionSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 13;
         cfg.host_allocator.total_pages = 14;  // 13 usable + the null placeholder (page 0)
         cfg.max_scheduled_tokens = 4;         // 4-token prefill chunks
@@ -898,9 +898,9 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
                       /*sliding_window_tokens=*/4),
         };
@@ -1067,7 +1067,7 @@ class CapacityBlockSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         // 13 physical pages -> 12 usable: two 2-page prompts charge
         // 2*ceil(5/2) = 6 blocks each at admission = exactly the pool.
         cfg.device_allocator.total_pages = 13;
@@ -1079,9 +1079,9 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full_a", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("full_b", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
         };
         return cfg;
@@ -1212,7 +1212,7 @@ class RetractSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         // 15 physical pages -> 14 usable: "a" (3-page prompt) charges
         // 2*ceil(7/2) = 8 and "b" (2-page prompt) 2*ceil(5/2) = 6 = the pool.
         cfg.device_allocator.total_pages = 15;
@@ -1224,9 +1224,9 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full_a", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("full_b", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
         };
         return cfg;
@@ -1541,7 +1541,7 @@ TEST_F(RetractExactFitSuite, IncludesOverlapDecodeReserveInTokenCapacity) {
 
 TEST(PdSlidingCapacityTest, CountsPrefixIslandPhasePageAndGroupPacking) {
     SchedulerConfig cfg{};
-    cfg.block_size = 4;
+    cfg.prefix_granularity = 4;
     cfg.device_allocator.total_pages = 3;  // null + two usable LCM parents
     cfg.host_allocator.total_pages = 0;
     cfg.max_scheduled_tokens = 16;
@@ -1704,9 +1704,9 @@ protected:
         cfg.device_allocator.total_pages = 9;  // 8 usable
         cfg.host_allocator.total_pages = 10;
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("state", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::State),
         };
         return cfg;
@@ -1748,17 +1748,17 @@ TEST_F(RetractStateGroupSuite, StateGroupRequestRetractsCleanly) {
 
 TEST(CacheProgressTest, PromotionBoundarySurvivesPrefillRounds) {
     BlockPool pool(/*num_lcm_blocks=*/8);
-    std::vector<KvCacheSpec> specs{
-        KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
-        KvCacheSpec{.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
     };
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/6, /*page_size=*/2)};
     Request request{spec, /*page_size=*/2, Role::kFused};
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    const std::optional<KvCacheCoordinator::AdmissionResult> admission =
+    const std::optional<CacheCoordinator::AdmissionResult> admission =
         AdmitForTest(coordinator, tables, /*num_tokens=*/4);
     ASSERT_TRUE(admission);
 
@@ -1787,7 +1787,7 @@ class PromotionBoundaryHeadOfLineSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
         cfg.max_scheduled_tokens = 8;
@@ -1796,9 +1796,9 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = false;
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("state", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::State),
         };
         return cfg;
@@ -1835,17 +1835,17 @@ TEST_F(PromotionBoundaryHeadOfLineSuite, DoesNotStartSecondIncompletePrefill) {
 
 TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     BlockPool pool(/*num_lcm_blocks=*/8);
-    std::vector<KvCacheSpec> specs{
-        KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
     };
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*page_size=*/2)};
     Request request{spec, /*page_size=*/2, Role::kD};
     request.Apply(fsm::BootstrappedEvent{});
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    const std::optional<KvCacheCoordinator::AdmissionResult> admission =
+    const std::optional<CacheCoordinator::AdmissionResult> admission =
         AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = 4, .reserve_tokens = 3});
     ASSERT_TRUE(admission);
 
@@ -1865,10 +1865,10 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
 
 TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) {
     BlockPool device_pool(/*num_lcm_blocks=*/12);
-    std::vector<KvCacheSpec> specs{
-        KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
     };
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool);
     ReqPoolAllocator req_pool{4};
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*page_size=*/2)};
     Request request{spec, /*page_size=*/2, Role::kD};
@@ -1918,17 +1918,17 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
 // Drive the FSM directly to pin the PrefillDone retract overload.
 TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
     BlockPool pool(/*num_lcm_blocks=*/8);
-    std::vector<KvCacheSpec> specs{
-        KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
-        KvCacheSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1},
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1},
     };
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     ReqPoolAllocator req_pool{4};
 
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*page_size=*/2)};
     Request request{spec, /*page_size=*/2, Role::kFused};
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    const std::optional<KvCacheCoordinator::AdmissionResult> admission =
+    const std::optional<CacheCoordinator::AdmissionResult> admission =
         AdmitForTest(coordinator, tables, /*num_tokens=*/4);
     ASSERT_TRUE(admission);
 
@@ -1992,11 +1992,11 @@ TEST_F(ChunkedPrefillSuite, AbortDuringDecodeRestoresPoolBaseline) {
 // slot allocation fails, event destruction releases those refs through RAII.
 TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
     BlockPool pool(/*num_lcm_blocks=*/31);  // Pages are not the constraint.
-    std::vector<KvCacheSpec> specs{
-        KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
-        KvCacheSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1},
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1},
     };
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     ReqPoolAllocator req_pool{1};
     ReqPoolIndex held = req_pool.Allocate();  // exhaust the single slot
     ASSERT_EQ(req_pool.AvailableSlots(), 0);
@@ -2028,11 +2028,11 @@ TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
 // ---------------------------------------------------------------------------
 TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     BlockPool pool(/*num_lcm_blocks=*/32);
-    std::vector<KvCacheSpec> specs{
-        KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
-        KvCacheSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1},
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1},
     };
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
@@ -2087,7 +2087,7 @@ class PhysicalReserveSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 11;
         cfg.host_allocator.total_pages = 11;
         cfg.max_scheduled_tokens = 64;
@@ -2097,9 +2097,9 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full_a", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("full_b", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
         };
         return cfg;
@@ -2187,7 +2187,7 @@ protected:
 
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = TotalPages();
         cfg.host_allocator.total_pages = TotalPages();
         cfg.max_scheduled_tokens = 64;
@@ -2197,9 +2197,9 @@ protected:
         cfg.disable_prefix_cache = DisablePrefixCache();
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
                       SlidingWindowTokens()),
         };
@@ -2252,7 +2252,8 @@ TEST_F(PrefixHitSuite, TwoRequestsSharePrefixReusePages) {
     // r2: 12 tokens, first 8 == r1's. Hit: cap = (12-1)/2 = 5 pages; r1
     // registered 4, r2's page-4 hash chains off different tail tokens -> full
     // hits 4; swa (W=32, needed 16 > 4) keeps 4 -> fixpoint 4 blocks = 8 tokens.
-    std::vector<std::int32_t> r2_tokens = MakeAlignedTokens(/*num_pages=*/4, PageSize());  // tokens 1..8 == r1's
+    std::vector<std::int32_t> r2_tokens =
+        MakeAlignedTokens(/*num_pages=*/4, PrefixGranularity());  // tokens 1..8 == r1's
     const std::vector<std::int32_t> tail = MakeTokens(/*count=*/4, /*start=*/901);
     r2_tokens.insert(r2_tokens.end(), tail.begin(), tail.end());
     Submit(MakeSpecWithTokens("r2", r2_tokens));
@@ -2352,7 +2353,7 @@ TEST_F(PrefixHitSuite, ClearL1CacheRejectsAnActiveRequestAndPreservesItsPrefix) 
     EXPECT_EQ(second->extend_prefix_lens.at(0), 6);
 }
 
-// The hit is capped at (PrefillSize-1)/block_size pages so the last token is
+// The hit is capped at (PrefillSize-1)/prefix_granularity pages so the last token is
 // always recomputed to produce logits.
 TEST_F(PrefixHitSuite, FullHitCapsAtLastToken) {
     const std::int32_t free_at_start = scheduler_->PoolFreeBlocks();
@@ -2510,7 +2511,7 @@ class PrefixReplayHeterogeneousSuite : public PrefixHitSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 8;
+        cfg.prefix_granularity = 8;
         cfg.device_allocator.total_pages = 128;
         cfg.host_allocator.total_pages = 0;
         cfg.max_scheduled_tokens = 64;
@@ -2521,10 +2522,10 @@ protected:
         cfg.prefix_replay_tokens = 8;
 
         PagedCacheGroupConfig history =
-            MakeGroup("history", /*block_size=*/8, cfg.device_allocator.total_pages,
+            MakeGroup("history", /*page_size=*/8, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History);
         PagedCacheGroupConfig state =
-            MakeGroup("state", /*block_size=*/2, cfg.device_allocator.total_pages,
+            MakeGroup("state", /*page_size=*/2, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
                       /*sliding_window_tokens=*/32);
         state.cache_blocks_per_lcm_block = 4;
@@ -2566,13 +2567,13 @@ TEST_F(PrefixReplayHeterogeneousSuite, ReplayTailIsPrivateAcrossPackedGroups) {
 
 TEST(PrefixReplayConfigTest, RejectsNegativeReplayTokens) {
     SchedulerConfig cfg{};
-    cfg.block_size = 2;
+    cfg.prefix_granularity = 2;
     cfg.device_allocator.total_pages = 8;
     cfg.max_scheduled_tokens = 8;
     cfg.max_batch_size = 1;
     cfg.prefix_replay_tokens = -1;
     cfg.paged_cache_groups = {
-        MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+        MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                   PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
     };
     EXPECT_THROW((void)Scheduler(std::move(cfg)), std::invalid_argument);
@@ -2589,7 +2590,7 @@ TEST_F(PrefixHitDisabledSuite, DisablePrefixCacheSkipsMatch) {
     RunLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));
     ASSERT_EQ(scheduler_->PoolFreeBlocks(), free_at_start);
 
-    std::vector<std::int32_t> r2_tokens = MakeAlignedTokens(/*num_pages=*/4, PageSize());
+    std::vector<std::int32_t> r2_tokens = MakeAlignedTokens(/*num_pages=*/4, PrefixGranularity());
     const std::vector<std::int32_t> tail = MakeTokens(/*count=*/4, /*start=*/901);
     r2_tokens.insert(r2_tokens.end(), tail.begin(), tail.end());
     Submit(MakeSpecWithTokens("r2", r2_tokens));
@@ -2675,7 +2676,7 @@ TEST_F(PrefixHitSmallWindowSuite, SwaGroupHitRespectsWindow) {
     // r2: 10 tokens, first 8 == r1's. Fixpoint (W=4, page=2, pages_needed
     // = ceil(3/2) = 2): cap = (10-1)/2 = 4, full matches 4; swa scan stops at
     // run 2 -> keep 4 with 2 holes -> common stays 4 = 8 hit tokens.
-    std::vector<std::int32_t> r2_tokens = MakeAlignedTokens(/*num_pages=*/4, PageSize());  // 1..8 == r1's
+    std::vector<std::int32_t> r2_tokens = MakeAlignedTokens(/*num_pages=*/4, PrefixGranularity());  // 1..8 == r1's
     const std::vector<std::int32_t> tail = MakeTokens(/*count=*/2, /*start=*/901);
     r2_tokens.insert(r2_tokens.end(), tail.begin(), tail.end());
     Submit(MakeSpecWithTokens("r2", r2_tokens));
@@ -2756,7 +2757,8 @@ TEST_F(PrefixHitTightPoolSuite, ProtectedHitAndFreshDemandMustFitTogether) {
     // r2: 8 tokens, first 4 == r1's. The 4 cached hit parents are protected.
     // Its suffix and reserve need 6 empty parents, but r3 pins 4 and leaves only
     // 2 empty, so the whole admission defers without acquiring the hits.
-    std::vector<std::int32_t> r2_tokens = MakeAlignedTokens(/*num_pages=*/2, PageSize());  // tokens 1..4 == r1's
+    std::vector<std::int32_t> r2_tokens =
+        MakeAlignedTokens(/*num_pages=*/2, PrefixGranularity());  // tokens 1..4 == r1's
     const std::vector<std::int32_t> tail = MakeTokens(/*count=*/4, /*start=*/901);
     r2_tokens.insert(r2_tokens.end(), tail.begin(), tail.end());
     Submit(MakeSpecWithTokens("r2", r2_tokens));
@@ -2799,7 +2801,7 @@ TEST_F(PrefixHitTightPoolSuite, ProtectedHitAndFreshDemandMustFitTogether) {
 // M13 decode-block caching: pages filled DURING decode register via the hash
 // chain (admission: register -> slide -> acquire), so a later turn hits PAST
 // the previous prompt boundary. Fill timing: a round at container Size s has
-// N = s - 1 computed and registers pages up to N/block_size -- a tail page
+// N = s - 1 computed and registers pages up to N/prefix_granularity -- a tail page
 // registers one round late (finishing earlier frees its block hashless).
 // ---------------------------------------------------------------------------
 class DecodeCachingSuite : public PrefixHitSuite {
@@ -2841,7 +2843,8 @@ protected:
     // Turn-2 prompt: r1's 4 prompt tokens + first 4 generated + 2 new = 10;
     // pages 0..3 match r1's registration by content.
     std::vector<std::int32_t> MakeTurnTwoPrompt() {
-        std::vector<std::int32_t> tokens = MakeAlignedTokens(/*num_pages=*/2, PageSize());  // {1,2,3,4} == r1's prompt
+        std::vector<std::int32_t> tokens =
+            MakeAlignedTokens(/*num_pages=*/2, PrefixGranularity());                        // {1,2,3,4} == r1's prompt
         const std::vector<std::int32_t> response = MakeTokens(/*count=*/4, /*start=*/101);  // r1's generated 101..104
         tokens.insert(tokens.end(), response.begin(), response.end());
         const std::vector<std::int32_t> fresh = MakeTokens(/*count=*/2, /*start=*/901);
@@ -3070,7 +3073,7 @@ class StreamingSinkSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 7;  // 6 usable + the null placeholder (page 0, device convention)
         cfg.max_scheduled_tokens = 64;
@@ -3080,9 +3083,9 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
-            MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
                       /*sliding_window_tokens=*/4),
         };

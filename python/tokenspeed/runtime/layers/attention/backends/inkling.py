@@ -109,7 +109,7 @@ class InklingConvMetadata:
     # armed for exactly the first decode after a successful remote transfer.
     remote_restore_mask: torch.Tensor | None = None
     # Checkpoint groups: per-group tables {group: [bs, max_conv_blocks]}; None -> no paged groups.
-    col_page_table: dict[str, torch.Tensor] | None = None
+    col_block_table: dict[str, torch.Tensor] | None = None
 
 
 class InklingConvStatePool:
@@ -308,7 +308,7 @@ class InklingAttnBackend(AttentionBackend):
             torch.zeros_like(boundary),
         )
         pages = self._checkpoint_pages_at_endpoints(
-            metadata.col_page_table[group_id][:n],
+            metadata.col_block_table[group_id][:n],
             masked_boundary,
             int(self.conv_columns["block_tokens"]),
         )
@@ -349,7 +349,7 @@ class InklingAttnBackend(AttentionBackend):
         n = metadata.cache_indices.shape[0]
         lengths = metadata.seq_lens[:n].to(torch.int64)
         pages = self._checkpoint_pages_at_endpoints(
-            metadata.col_page_table[group_id][:n],
+            metadata.col_block_table[group_id][:n],
             lengths,
             int(self.conv_columns["block_tokens"]),
         )
@@ -439,10 +439,10 @@ class InklingAttnBackend(AttentionBackend):
             )
         if pfg_total >= 0:
             # The stream-ordered copy into the statics doubles as the plain path's clone() snapshot.
-            col_page_table = self._pfg_refresh_col_tables(found, bs)
+            col_block_table = self._pfg_refresh_col_tables(found, bs)
         else:
             # clone(): the scheduler can recycle these live tables while extend kernels are in flight.
-            col_page_table = {g: t.clone() for g, t in found.items()}
+            col_block_table = {g: t.clone() for g, t in found.items()}
         self.inner.init_forward_metadata(
             bs,
             num_extends,
@@ -528,7 +528,7 @@ class InklingAttnBackend(AttentionBackend):
             seq_lens=(
                 self._pfg_seq_lens if pfg_total >= 0 else seq_lens[:bs].to(torch.int32)
             ),
-            col_page_table=col_page_table,
+            col_block_table=col_block_table,
             num_extends=num_extends,
             remote_restore_mask=remote_restore_mask,
         )
@@ -552,7 +552,7 @@ class InklingAttnBackend(AttentionBackend):
             is_decode=False,
             seq_idx=self._graph_spec_seq_idx[: bs * k],
             seq_lens=self._graph_seq_lens[:bs],
-            col_page_table={
+            col_block_table={
                 g: table[:bs] for g, table in self._graph_col_tables.items()
             },
         )
@@ -567,7 +567,7 @@ class InklingAttnBackend(AttentionBackend):
             is_decode=True,
             seq_idx=self._decode_qsl[:bs],
             seq_lens=self._graph_seq_lens[:bs],
-            col_page_table={g: t[:bs] for g, t in self._graph_col_tables.items()},
+            col_block_table={g: t[:bs] for g, t in self._graph_col_tables.items()},
             remote_restore_mask=(
                 self._graph_remote_restore_mask[:bs]
                 if self.conv_columns.get("pd_endpoint_snapshots", False)
@@ -624,7 +624,7 @@ class InklingAttnBackend(AttentionBackend):
             # Paged draft conv rides through: the in-kernel publish resolves
             # pages from the table by position, so a boundary rewritten by
             # the lookback rows is re-published with committed content.
-            col_page_table=md.col_page_table,
+            col_block_table=md.col_block_table,
         )
         return True
 
@@ -679,7 +679,7 @@ class InklingAttnBackend(AttentionBackend):
             ),
             # Paged conv rides through every per-step rebuild: dropping the
             # table silently disables the T=1 landing publish for the step.
-            col_page_table=md.col_page_table,
+            col_block_table=md.col_block_table,
         )
 
     # ------------------------------------------------------------------

@@ -76,7 +76,7 @@ class DSABackend(AttentionBackend):
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
         self.num_local_heads = config.num_attention_heads // config.attn_tp_size
-        self._prefill_block_tables: torch.Tensor | None = None
+        self._prefill_page_table: torch.Tensor | None = None
 
     @property
     def forward_decode_metadata(self):
@@ -111,13 +111,13 @@ class DSABackend(AttentionBackend):
         return self._dense_backend.trtllm_workspace
 
     @property
-    def _block_table_aliased(self):
-        return getattr(self._dense_backend, "_block_table_aliased", False)
+    def _page_table_aliased(self):
+        return getattr(self._dense_backend, "_page_table_aliased", False)
 
-    @_block_table_aliased.setter
-    def _block_table_aliased(self, value):
+    @_page_table_aliased.setter
+    def _page_table_aliased(self, value):
         if hasattr(self, "_dense_backend"):
-            self._dense_backend._block_table_aliased = value
+            self._dense_backend._page_table_aliased = value
 
     def register_step_counter(self, step_counter):
         super().register_step_counter(step_counter)
@@ -256,7 +256,7 @@ class DSABackend(AttentionBackend):
                 seq_lens_2d=seq_lens_2d, page_size=self.page_size
             )
 
-        self._prefill_block_tables = None
+        self._prefill_page_table = None
         if num_extends > 0 and forward_mode.is_extend_or_mixed():
             cache_metadata = kwargs.get("cache_metadata")
             cmeta = getattr(self._dense_backend, "chunked_prefill_metadata", None)
@@ -272,8 +272,8 @@ class DSABackend(AttentionBackend):
                 elif page_table is not None:
                     table = page_table
                 if table is not None:
-                    self._prefill_block_tables = table[:num_extends]
-                    cmeta.block_tables = self._prefill_block_tables
+                    self._prefill_page_table = table[:num_extends]
+                    cmeta.page_table = self._prefill_page_table
 
     def _validate_logit_cap(self, logits_soft_cap: float) -> None:
         if logits_soft_cap and logits_soft_cap > 0:
@@ -390,7 +390,7 @@ class DSABackend(AttentionBackend):
         q: torch.Tensor,
         layer,
         token_to_kv_pool,
-        block_tables: torch.Tensor,
+        page_table: torch.Tensor,
         seq_lens: torch.Tensor,
         workspace_indices: torch.Tensor,
         topk_lens: torch.Tensor,

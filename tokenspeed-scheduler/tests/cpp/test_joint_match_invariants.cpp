@@ -37,7 +37,7 @@
 #include <string>
 #include <vector>
 
-#include "cache/coordinator/kv_cache_coordinator.h"
+#include "cache/coordinator/cache_coordinator.h"
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_types.h"
 #include "cache_test_access.h"
@@ -61,15 +61,15 @@ CacheKey KeyFor(const std::string& content_hash, std::uint32_t group_id) {
 
 std::uint64_t g_epoch = 0;
 
-std::int32_t CacheBlockFor(KvCacheCoordinator& coordinator, BlockPool& pool, const std::string& content_hash,
+std::int32_t CacheBlockFor(CacheCoordinator& coordinator, BlockPool& pool, const std::string& content_hash,
                            std::uint32_t group_id) {
-    KvCacheManager& manager = coordinator.GroupManager(static_cast<std::int32_t>(group_id));
-    CacheBlockRef block_ref = pool.AcquireBlock(group_id, manager.CacheBlocksPerLcmBlock());
+    const std::int32_t group_index = static_cast<std::int32_t>(group_id);
+    CacheBlockRef block_ref = pool.AcquireBlock(group_id, coordinator.Allocator(group_index).CacheBlocksPerLcmBlock());
     if (!block_ref) {
         return -1;
     }
     const std::int32_t id = block_ref->Location().lcm_block_id;
-    manager.RegisterCachedBlock(pool, block_ref, KeyFor(content_hash, group_id), ++g_epoch);
+    coordinator.GroupPrefixIndex(group_index).Register(pool, block_ref, KeyFor(content_hash, group_id), ++g_epoch);
     block_ref.reset();
     return id;
 }
@@ -77,15 +77,16 @@ std::int32_t CacheBlockFor(KvCacheCoordinator& coordinator, BlockPool& pool, con
 // Ground truth for one group in isolation: the deepest prefix (in blocks)
 // this group alone can support, given which of its blocks are cached.
 // Full attention is prefix-closed; a sliding group needs its lookback run.
-std::int32_t GroupPrefixBlocks(const KvCacheCoordinator& coordinator, const BlockPool& pool,
+std::int32_t GroupPrefixBlocks(const CacheCoordinator& coordinator, const BlockPool& pool,
                                std::span<const std::string> hashes, std::uint32_t group_id, std::int32_t bound_blocks) {
-    const KvCacheManager& manager = coordinator.GroupManager(static_cast<std::int32_t>(group_id));
+    const std::int32_t group_index = static_cast<std::int32_t>(group_id);
     std::vector<CacheKey> keys;
     keys.reserve(hashes.size());
     for (const std::string& hash : hashes) {
         keys.push_back(KeyFor(hash, group_id));
     }
-    const GroupPrefixProbe probe = manager.Probe(pool, keys, 0, bound_blocks);
+    const GroupPrefixProbe probe = coordinator.GroupMatcher(group_index)
+                                       .Probe(coordinator.GroupPrefixIndex(group_index), pool, keys, 0, bound_blocks);
     return static_cast<std::int32_t>(probe.hits.size());
 }
 
@@ -94,7 +95,7 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
     constexpr std::int32_t kBlockTokens = 4;
     // full target group + a sliding "draft" group (window 8 -> lookback 2
     // blocks): the draft-SWA-under-full-target shape.
-    const std::vector<KvCacheSpec> specs = {
+    const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
         {.kind = AttnKind::kSlidingWindow, .sliding_window = 8, .cache_blocks_per_lcm_block = 1},
     };
@@ -105,7 +106,7 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
     for (int round = 0; round < 200; ++round) {
         BlockPool pool(64);
         {
-            KvCacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool);
+            CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool);
 
             // Random per-group caching: each group caches a random prefix
             // subset of the request's blocks (front-truncated to mimic the
@@ -131,8 +132,8 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
                     if (to_evict-- <= 0 || lcm_block_id < 0) {
                         break;
                     }
-                    coordinator.GroupManager(static_cast<std::int32_t>(group))
-                        .EvictCachedBlock(pool, CacheBlockLocation{.lcm_block_id = lcm_block_id, .slot_index = 0});
+                    coordinator.GroupPrefixIndex(static_cast<std::int32_t>(group))
+                        .Evict(pool, CacheBlockLocation{.lcm_block_id = lcm_block_id, .slot_index = 0});
                 }
             }
 
@@ -164,13 +165,13 @@ TEST(JointMatchInvariantsTest, DraftOnlyGroupJoinsConvergenceAsOrdinaryGroup) {
     // all three — no group is special.
     constexpr std::int32_t kBlocks = 8;
     constexpr std::int32_t kBlockTokens = 4;
-    const std::vector<KvCacheSpec> specs = {
+    const std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2},
         {.kind = AttnKind::kSlidingWindow, .sliding_window = 8, .cache_blocks_per_lcm_block = 1},
     };
     BlockPool pool(64);
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool);
     const std::vector<std::string> hashes = MakeHashes(kBlocks);
 
     // Cache depth 6 for the full groups, but only blocks [2, 5) for the

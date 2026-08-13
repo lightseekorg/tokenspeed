@@ -132,7 +132,7 @@ def test_flashmla_grouped_decode_block_table_and_write_locs() -> None:
     expected_row0 = []
     for lpage in logical_rows[0]:
         expected_row0.extend(lpage * ratio + k for k in range(ratio))
-    got_row0 = meta.block_table[0, : len(expected_row0)].tolist()
+    got_row0 = meta.page_table[0, : len(expected_row0)].tolist()
     assert got_row0 == expected_row0, (got_row0, expected_row0)
 
     # Write locations: position seq-1 -> logical page (from table) * page_size
@@ -164,7 +164,7 @@ def test_flashmla_grouped_prefill_index_math() -> None:
     logical_table = torch.tensor([[3, 5]], device="cuda", dtype=torch.int32)
     table = expand_page_table(
         logical_table,
-        logical_page_size=page_size,
+        table_page_size=page_size,
         kernel_page_size=_KERNEL_PAGE,
     )
 
@@ -322,5 +322,5 @@ def test_flashmla_draft_consumes_staged_page_table() -> None:
     )
     assert backend._cache_groups_bound is True
     meta = backend.forward_decode_metadata
-    got_row0 = meta.block_table[0, : len(staged_rows[0])].tolist()
+    got_row0 = meta.page_table[0, : len(staged_rows[0])].tolist()
     assert got_row0 == staged_rows[0], (got_row0, staged_rows[0])

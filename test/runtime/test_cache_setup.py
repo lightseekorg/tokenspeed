@@ -135,15 +135,14 @@ def _hybrid_setup_with_narrow_draft():
             layer_types=layer_types,
             group_ids=group_ids,
             sliding_window_tokens=None,
-            page_size=4,
+            prefix_granularity=4,
         ),
         PagedCacheGroupSpec(
             group_id="state",
             retention="full_history",
-            rows_per_page=4,
-            entry_stride_tokens=1,
             sliding_window_tokens=None,
             family="state",
+            checkpoint_granularity=4,
         ),
     )
     return build_hybrid_cache_setup(
@@ -158,7 +157,7 @@ def _hybrid_setup_with_narrow_draft():
         num_draft_layers=num_draft_layers,
         cache_budget_bytes=2_048,
         fixed_workspace_bytes=0,
-        logical_block_tokens=4,
+        prefix_granularity=4,
         max_padding_fraction=1.0,
     )
 
@@ -237,7 +236,7 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
 
     assert server_args.block_size == 64
     assert attn_config.page_size == 64
-    assert setup.spec.memory_plan.logical_block_tokens == 128
+    assert setup.spec.memory_plan.prefix_granularity == 128
     assert setup.num_draft_layers == 0
     assert setup.spec.layer_group_ids == (
         f"{LINEAR_ATTENTION}_0",
@@ -280,7 +279,7 @@ def test_ordinary_mha_reserves_null_parent_within_cache_budget() -> None:
     )
 
     assert setup.spec.family == "mha"
-    assert setup.spec.memory_plan.logical_block_tokens == 64
+    assert setup.spec.memory_plan.prefix_granularity == 64
     assert setup.spec.memory_plan.num_lcm_blocks == 15
     assert setup.spec.memory_plan.arena_bytes <= 16_384
     assert setup.spec.token_capacity == 960
@@ -325,7 +324,7 @@ def test_ordinary_mla_reserves_null_parent_within_cache_budget() -> None:
     )
 
     assert setup.spec.family == "mla"
-    assert setup.spec.memory_plan.logical_block_tokens == 64
+    assert setup.spec.memory_plan.prefix_granularity == 64
     assert setup.spec.memory_plan.num_lcm_blocks == 15
     assert setup.spec.memory_plan.arena_bytes <= 24_576
     assert setup.spec.token_capacity == 960
@@ -405,7 +404,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
         setup.spec.pool_size,
         target_pool.dtype,
         "cpu",
-        setup.spec.memory_plan.logical_block_tokens,
+        setup.spec.memory_plan.prefix_granularity,
         0,
         setup.spec.memory_plan,
     )
@@ -414,7 +413,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
             setup.spec.pool_size,
             target_pool.dtype,
             "cpu",
-            setup.spec.memory_plan.logical_block_tokens,
+            setup.spec.memory_plan.prefix_granularity,
             0,
             setup.spec.memory_plan,
             backing_pool=unbound_pool,
@@ -424,7 +423,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
             setup.spec.pool_size,
             target_pool.dtype,
             "cpu",
-            setup.spec.memory_plan.logical_block_tokens,
+            setup.spec.memory_plan.prefix_granularity,
             0,
             setup.spec.memory_plan,
             paged_cache_group_specs=target_spec.paged_cache_group_specs,
@@ -637,7 +636,7 @@ def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:
         layer_types=layer_types,
         group_ids=group_ids,
         sliding_window_tokens=(None, None, 8),
-        page_size=4,
+        prefix_granularity=4,
     )
     setup = build_hybrid_cache_setup(
         family="inkling",
@@ -651,7 +650,7 @@ def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:
         num_draft_layers=num_draft_layers,
         cache_budget_bytes=4_096,
         fixed_workspace_bytes=0,
-        logical_block_tokens=4,
+        prefix_granularity=4,
         max_padding_fraction=1.0,
     )
 
@@ -705,7 +704,7 @@ def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
         layer_types=layer_types,
         group_ids=group_ids,
         sliding_window_tokens=(None, None, 8),
-        page_size=4,
+        prefix_granularity=4,
     )
     setup = build_hybrid_cache_setup(
         family="inkling",
@@ -719,7 +718,7 @@ def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
         num_draft_layers=num_draft_layers,
         cache_budget_bytes=4_096,
         fixed_workspace_bytes=0,
-        logical_block_tokens=4,
+        prefix_granularity=4,
         max_padding_fraction=1.0,
     )
     pool = CachePool(

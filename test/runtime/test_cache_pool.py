@@ -24,7 +24,7 @@ def _plan():
             CacheFieldSpec("history", "history.k", "plane.a", (4,), 1),
             CacheFieldSpec("state", "state.ssm", "plane.b", (8,), 1),
         ),
-        logical_block_tokens=4,
+        prefix_granularity=4,
         cache_blocks_per_lcm_block={"history": 2, "state": 1},
         max_padding_fraction=1.0,
     ).with_num_lcm_blocks(2)

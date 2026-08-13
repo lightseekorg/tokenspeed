@@ -163,7 +163,7 @@ class CachePool:
         self.paged_cache_group_specs = tuple(aligned)
         self.paged_cache_group_page_counts = counts
         self.runtime_contract = PagedCacheRuntimeContract(
-            block_size=self.page_size,
+            prefix_granularity=self.page_size,
             num_lcm_blocks=self.plan.num_lcm_blocks,
             token_capacity=token_capacity,
             group_specs=self.paged_cache_group_specs,

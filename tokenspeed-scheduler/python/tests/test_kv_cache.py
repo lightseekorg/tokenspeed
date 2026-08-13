@@ -33,7 +33,7 @@ ts = pytest.importorskip("tokenspeed_scheduler")
 
 def _make_config() -> ts.SchedulerConfig:
     cfg = ts.SchedulerConfig()
-    cfg.block_size = 2
+    cfg.prefix_granularity = 2
     cfg.num_device_pages = 32
     cfg.num_host_pages = 32
     cfg.max_scheduled_tokens = 64
@@ -44,7 +44,7 @@ def _make_config() -> ts.SchedulerConfig:
 
     full = ts.PagedCacheGroupConfig(
         group_id="full",
-        rows_per_page=cfg.block_size,
+        rows_per_page=cfg.prefix_granularity,
         entry_stride_tokens=1,
         total_pages=cfg.num_device_pages,
         retention=ts.PagedCacheRetention.FullHistory,
@@ -52,7 +52,7 @@ def _make_config() -> ts.SchedulerConfig:
     )
     swa = ts.PagedCacheGroupConfig(
         group_id="swa",
-        rows_per_page=cfg.block_size,
+        rows_per_page=cfg.prefix_granularity,
         entry_stride_tokens=1,
         total_pages=cfg.num_device_pages,
         retention=ts.PagedCacheRetention.SlidingWindow,
@@ -71,11 +71,11 @@ def test_prefix_replay_tokens_binding_defaults_to_zero_and_round_trips() -> None
 
 
 def _make_spec(
-    request_id: str, num_pages: int, page_size: int = 2, start: int = 1
+    request_id: str, num_pages: int, prefix_granularity: int = 2, start: int = 1
 ) -> ts.RequestSpec:
-    # page_size must stay in sync with cfg.block_size: the token count below
-    # (num_pages * page_size) is what determines how many pages get allocated.
-    return _spec(request_id, list(range(start, start + num_pages * page_size)))
+    # prefix_granularity must stay in sync with cfg.prefix_granularity: the token count below
+    # (num_pages * prefix_granularity) is what determines how many pages get allocated.
+    return _spec(request_id, list(range(start, start + num_pages * prefix_granularity)))
 
 
 def _abort(scheduler, request_id: str) -> None:
@@ -95,7 +95,7 @@ def test_decode_slides_swa_window_to_null_hole():
 
     last_plan = None
     token = 43
-    # sliding_window_tokens=4, page_size=2 => window spans 2 pages; ~4 decode
+    # sliding_window_tokens=4, prefix_granularity=2 => window spans 2 pages; ~4 decode
     # steps push total pages past 2, so the oldest page slides out and leaves a
     # null hole in the swa block table.
     for _ in range(4):
@@ -183,12 +183,12 @@ def test_k3_finish_restores_all_usable_pages() -> None:
 
 def _make_k3_128k_config(num_device_pages: int) -> ts.SchedulerConfig:
     cfg = _make_k3_config()
-    cfg.block_size = 128
+    cfg.prefix_granularity = 128
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = 8_192
     cfg.max_batch_size = 1
     for group in cfg.paged_cache_groups:
-        group.rows_per_page = cfg.block_size
+        group.rows_per_page = cfg.prefix_granularity
         group.cache_blocks_per_lcm_block = (
             12 if group.group_id == K3_GROUP_IDS[0] else 1
         )
@@ -300,11 +300,13 @@ def test_k3_readmit_rebuilds_all_four_tables_and_restores_pages() -> None:
     assert readmit.extend_prefix_lens[0] + readmit.input_lengths[0] == 11
     tables = dict(readmit.block_tables)
     assert tuple(tables) == K3_GROUP_IDS
-    page_size = _make_k3_config().block_size
-    assert readmit.extend_prefix_lens[0] % page_size == 0
-    prefix_slots = readmit.extend_prefix_lens[0] // page_size
+    prefix_granularity = _make_k3_config().prefix_granularity
+    assert readmit.extend_prefix_lens[0] % prefix_granularity == 0
+    prefix_slots = readmit.extend_prefix_lens[0] // prefix_granularity
     assert prefix_slots == 4
-    expected_slots = (readmit.prefill_lengths[0] + page_size - 1) // page_size
+    expected_slots = (
+        readmit.prefill_lengths[0] + prefix_granularity - 1
+    ) // prefix_granularity
     assert expected_slots == 6
 
     all_positive_entries = []

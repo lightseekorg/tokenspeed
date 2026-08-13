@@ -18,7 +18,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "cache/coordinator/kv_cache_coordinator.h"
+#include "cache/coordinator/cache_coordinator.h"
+
+#include "cache/coordinator/group_geometry.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -33,17 +35,19 @@ namespace tokenspeed {
 namespace {
 
 struct AdmissionPlan {
-    KvCacheCoordinator::PrefixProbe prefix;
+    CacheCoordinator::PrefixProbe prefix;
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
 };
 
 class AdmissionPlanner {
 public:
-    AdmissionPlanner(const std::vector<CacheGroup>& groups, const BlockPool& pool, std::span<const GroupDemand> demands,
-                     const KvCacheCoordinator::PrefixProbe& prefix,
+    AdmissionPlanner(const std::vector<CacheGroup>& groups, std::span<const GroupGeometry> geometry,
+                     const BlockPool& pool, std::span<const GroupDemand> demands,
+                     const CacheCoordinator::PrefixProbe& prefix,
                      std::span<const std::pair<std::uint32_t, CacheBlockLocation>> pending_store_releases,
                      std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims)
         : groups_{groups},
+          geometry_{geometry},
           pool_{pool},
           demands_{demands},
           prefix_{prefix},
@@ -129,8 +133,7 @@ private:
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             const GroupDemand& demand = demands_[i];
             _assert(demand.table != nullptr, "group demand requires a block table");
-            const KvCacheManager& manager = groups_[i].Manager();
-            const std::int32_t device_blocks = manager.BlocksNeededFor(*demand.table, demand);
+            const std::int32_t device_blocks = geometry_[i].BlocksNeededFor(*demand.table, demand);
             const std::int32_t host_blocks =
                 prefix_.host.per_group.empty()
                     ? 0
@@ -147,7 +150,7 @@ private:
 
             _assert(*group_id < groups_.size(), "LCM parent has invalid group binding");
             const std::int32_t occupied = pool_.OccupiedCount(parent_id);
-            const std::int32_t slots = groups_[*group_id].Manager().CacheBlocksPerLcmBlock();
+            const std::int32_t slots = groups_[*group_id].Allocator().CacheBlocksPerLcmBlock();
             _assert(0 < occupied && occupied <= slots, "bound LCM parent has invalid occupancy");
             remaining_occupied_[static_cast<std::size_t>(parent_id)] = occupied;
             local_free_slots_[*group_id] += slots - occupied;
@@ -157,7 +160,7 @@ private:
     void collectCandidates() {
         std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> protected_locations;
         for (std::size_t i = 0; i < groups_.size(); ++i) {
-            const std::vector<CacheBlockLocation> hits = groups_[i].Manager().MatchedBlockLocations(
+            const std::vector<CacheBlockLocation> hits = groups_[i].Index().MatchedLocations(
                 pool_, prefix_.group_keys[i], /*begin_blocks=*/0, prefix_.device.per_group[i]);
             protected_locations.insert(hits.begin(), hits.end());
         }
@@ -167,13 +170,12 @@ private:
             if (protected_locations.contains(location) || !candidates.insert(location).second) {
                 return;
             }
-            const KvCacheManager& manager = groups_[group_id].Manager();
-            const std::optional<KvCacheManager::CachedBlockMetadata> metadata =
-                manager.CachedBlockMetadataFor(pool_, location);
+            const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
+                groups_[group_id].Index().MetadataFor(pool_, location);
             const std::uint64_t last_access_epoch = metadata ? metadata->last_access_epoch : 0;
             const std::int32_t logical_block_index = metadata ? metadata->logical_block_index : -1;
             const CacheBoundaryKind boundary_kind = metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk;
-            const bool is_prefix_closed = manager.MatchIsPrefixClosed();
+            const bool is_prefix_closed = groups_[group_id].Matcher().IsPrefixClosed();
             const bool is_probationary_boundary = !is_prefix_closed && boundary_kind == CacheBoundaryKind::kChunk &&
                                                   !(metadata && metadata->was_acquired) && logical_block_index >= 0;
             const EvictionTier eviction_tier = [&] {
@@ -206,7 +208,6 @@ private:
 
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             const std::uint32_t group_id = static_cast<std::uint32_t>(i);
-            const KvCacheManager& manager = groups_[i].Manager();
             std::vector<CacheBlockLocation> group_pending_store_releases;
             for (const auto& [released_group_id, location] : pending_store_releases_) {
                 if (released_group_id == group_id) {
@@ -214,12 +215,14 @@ private:
                 }
             }
             for (CacheBlockLocation location :
-                 manager.EvictableBlockLocationsAfterReleasing(pool_, group_pending_store_releases)) {
+                 groups_[i].Index().EvictableLocationsAfterReleasing(pool_, group_pending_store_releases)) {
                 add_candidate(group_id, location);
             }
             if (demands_[i].num_computed_tokens >= 0) {
-                for (CacheBlockLocation location : manager.ReclaimableBlockLocationsAt(
-                         *demands_[i].table, demands_[i].num_computed_tokens, group_pending_store_releases)) {
+                const std::int32_t expired_blocks =
+                    geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), demands_[i].num_computed_tokens);
+                for (CacheBlockLocation location : groups_[i].Allocator().ReclaimableBlockLocationsAt(
+                         groups_[i].Index(), *demands_[i].table, expired_blocks, group_pending_store_releases)) {
                     add_candidate(group_id, location);
                 }
             }
@@ -232,7 +235,7 @@ private:
                 "released admission location belongs to another group");
         std::int32_t& occupied = remaining_occupied_[static_cast<std::size_t>(location.lcm_block_id)];
         _assert(occupied > 0, "admission released the same location twice");
-        const std::int32_t slots = groups_[group_id].Manager().CacheBlocksPerLcmBlock();
+        const std::int32_t slots = groups_[group_id].Allocator().CacheBlocksPerLcmBlock();
         if (occupied == 1) {
             local_free_slots_[group_id] -= slots - 1;
             occupied = 0;
@@ -245,7 +248,7 @@ private:
 
     void restoreOccupant(std::uint32_t group_id, CacheBlockLocation location) {
         std::int32_t& occupied = remaining_occupied_[static_cast<std::size_t>(location.lcm_block_id)];
-        const std::int32_t slots = groups_[group_id].Manager().CacheBlocksPerLcmBlock();
+        const std::int32_t slots = groups_[group_id].Allocator().CacheBlocksPerLcmBlock();
         if (occupied == 0) {
             _assert(empty_parent_count_ > 0, "restoring an admission victim underflowed empty parents");
             --empty_parent_count_;
@@ -262,16 +265,17 @@ private:
         std::int64_t parents_needed = 0;
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             const std::int64_t remaining = std::max<std::int64_t>(blocks_needed_[i] - local_free_slots_[i], 0);
-            const std::int64_t slots = groups_[i].Manager().CacheBlocksPerLcmBlock();
+            const std::int64_t slots = groups_[i].Allocator().CacheBlocksPerLcmBlock();
             parents_needed += (remaining + slots - 1) / slots;
         }
         return parents_needed <= empty_parent_count_;
     }
 
     const std::vector<CacheGroup>& groups_;
+    std::span<const GroupGeometry> geometry_;
     const BlockPool& pool_;
     std::span<const GroupDemand> demands_;
-    const KvCacheCoordinator::PrefixProbe& prefix_;
+    const CacheCoordinator::PrefixProbe& prefix_;
     // These locations are still pinned by in-flight Store tickets. The planner only discounts those ticket refs to
     // decide whether waiting for Store ACK makes admission feasible; it never mutates the real pool.
     std::span<const std::pair<std::uint32_t, CacheBlockLocation>> pending_store_releases_;
@@ -283,13 +287,14 @@ private:
     std::vector<VictimCandidate> victim_candidates_;
 };
 
-std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups, const BlockPool& pool,
-                                           KvCacheCoordinator::PrefixProbe&& prefix,
+std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups,
+                                           std::span<const GroupGeometry> geometry, const BlockPool& pool,
+                                           CacheCoordinator::PrefixProbe&& prefix,
                                            std::span<const GroupDemand> demands) {
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
-    AdmissionPlanner planner{groups, pool, demands, prefix, {}, victims};
+    AdmissionPlanner planner{groups, geometry, pool, demands, prefix, {}, victims};
     if (!planner.Plan()) {
         return std::nullopt;
     }
@@ -298,36 +303,36 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
 
 }  // namespace
 
-bool KvCacheCoordinator::CanAdmitAfterReleasing(
+bool CacheCoordinator::CanAdmitAfterReleasing(
     const PrefixProbe& prefix, std::span<const GroupDemand> demands,
     std::span<const std::pair<std::uint32_t, CacheBlockLocation>> pending_store_releases) const {
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
-    AdmissionPlanner planner{groups_, pool_, demands, prefix, pending_store_releases, victims};
+    AdmissionPlanner planner{groups_, geometry_, pool_, demands, prefix, pending_store_releases, victims};
     return planner.Plan();
 }
 
-std::int32_t KvCacheCoordinator::PromotionBoundaryTokens(const PrefixProbe& prefix) const {
+std::int32_t CacheCoordinator::PromotionBoundaryTokens(const PrefixProbe& prefix) const {
     const std::int32_t matched_tokens = std::max(prefix.device.num_common_tokens, prefix.host.num_common_tokens);
     const std::int32_t prefix_closed_tokens =
         std::max(prefix.device.prefix_closed_tokens, prefix.host.prefix_closed_tokens);
     return prefix_closed_tokens > matched_tokens ? prefix_closed_tokens : 0;
 }
 
-std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
+std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     PrefixProbe&& prefix, std::span<const GroupDemand> demands, std::optional<std::uint64_t> request_access_epoch) {
     _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
     for (const GroupDemand& demand : demands) {
         _assert(demand.table != nullptr, "group demand requires a block table");
-        _assert(demand.new_page_hash_begin >= 0 &&
-                    static_cast<std::size_t>(demand.new_page_hash_begin) <= demand.page_hashes.size(),
+        _assert(demand.new_prefix_hash_begin >= 0 &&
+                    static_cast<std::size_t>(demand.new_prefix_hash_begin) <= demand.prefix_hashes.size(),
                 "new page hash begin is outside the hash history");
-        const bool has_new_page_hashes =
-            static_cast<std::size_t>(demand.new_page_hash_begin) < demand.page_hashes.size();
-        _assert(demand.completed_boundary_kind.has_value() == has_new_page_hashes,
+        const bool has_new_prefix_hashes =
+            static_cast<std::size_t>(demand.new_prefix_hash_begin) < demand.prefix_hashes.size();
+        _assert(demand.completed_boundary_kind.has_value() == has_new_prefix_hashes,
                 "completed boundary kind must match newly completed page hashes");
     }
 
-    std::optional<AdmissionPlan> candidate = planAdmission(groups_, pool_, std::move(prefix), demands);
+    std::optional<AdmissionPlan> candidate = planAdmission(groups_, geometry_, pool_, std::move(prefix), demands);
     if (!candidate) {
         return std::nullopt;
     }
@@ -349,7 +354,7 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
     };
     if (acquired_prefix.device.num_common_tokens > 0) {
         for (std::size_t i = 0; i < groups_.size(); ++i) {
-            groups_[i].Manager().ClaimHitBlocks(*demands[i].table, std::move(acquired_prefix.device.per_group[i]));
+            groups_[i].Allocator().ClaimHitBlocks(*demands[i].table, std::move(acquired_prefix.device.per_group[i]));
         }
     }
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> prospective_victims;
@@ -369,7 +374,9 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
             cacheDeviceCompletedBlocksForGroup(i, demand, access_epoch);
         }
         if (demand.num_computed_tokens >= 0) {
-            groups_[i].Manager().ReclaimExpired(pool_, *demand.table, demand.num_computed_tokens);
+            groups_[i].Allocator().ReclaimExpired(
+                pool_, *demand.table,
+                geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), demand.num_computed_tokens));
         }
     }
     for (const auto& [group_id, location] : prospective_victims) {
@@ -381,11 +388,12 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const GroupDemand& demand = demands[i];
         if (!acquired_prefix.host.per_group.empty() && !acquired_prefix.host.per_group[i].blocks.empty()) {
-            groups_[i].Manager().AppendHostExtension(
+            groups_[i].Allocator().AppendHostExtension(
                 pool_, *demand.table, std::move(acquired_prefix.host.per_group[i].blocks), result.load_pairs);
         }
         const std::int32_t first_new_block = demand.table->NumBlocks();
-        const bool acquired = groups_[i].Manager().Acquire(pool_, *demand.table, demand);
+        const bool acquired =
+            groups_[i].Allocator().Acquire(pool_, *demand.table, geometry_[i].PlanAcquire(*demand.table, demand));
         FatalCheck(acquired, "admission plan no longer fits the block pool");
         const std::span<const CacheBlockRef> blocks = demand.table->Blocks();
         for (std::int32_t block = first_new_block; block < demand.table->NumBlocks(); ++block) {
@@ -393,7 +401,7 @@ std::optional<KvCacheCoordinator::AdmissionResult> KvCacheCoordinator::Admit(
                 continue;
             }
             result.new_page_ids[i].push_back(
-                groups_[i].Manager().ResolveKernelPageId(blocks[static_cast<std::size_t>(block)]->Location()));
+                groups_[i].Allocator().ResolveKernelPageId(blocks[static_cast<std::size_t>(block)]->Location()));
         }
     }
     return result;

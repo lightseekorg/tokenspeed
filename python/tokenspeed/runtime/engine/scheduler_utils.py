@@ -70,7 +70,7 @@ _TRANSFER_POLICY_MAP = {
 
 @dataclass(frozen=True)
 class SchedulerCacheGeometry:
-    page_size: int
+    prefix_granularity: int
     num_device_pages: int
     num_usable_pages: int
     token_capacity: int
@@ -80,7 +80,7 @@ def scheduler_cache_geometry_from_pool(
     pool: Any,
     *,
     fallback_token_capacity: int,
-    fallback_page_size: int,
+    fallback_prefix_granularity: int,
 ) -> SchedulerCacheGeometry:
     contract = getattr(pool, "runtime_contract", None)
     num_lcm_blocks = getattr(pool, "num_lcm_blocks", None)
@@ -89,9 +89,17 @@ def scheduler_cache_geometry_from_pool(
         if contract is not None and contract.num_lcm_blocks != num_lcm_blocks:
             raise ValueError("pool and runtime contract disagree on num_lcm_blocks")
         return SchedulerCacheGeometry(
-            page_size=require_positive_int(
-                "contract.block_size" if contract is not None else "fallback_page_size",
-                contract.block_size if contract is not None else fallback_page_size,
+            prefix_granularity=require_positive_int(
+                (
+                    "contract.prefix_granularity"
+                    if contract is not None
+                    else "fallback_prefix_granularity"
+                ),
+                (
+                    contract.prefix_granularity
+                    if contract is not None
+                    else fallback_prefix_granularity
+                ),
             ),
             # Parent 0 is reserved as the null LCM block.
             num_device_pages=num_lcm_blocks + 1,
@@ -114,20 +122,20 @@ def scheduler_cache_geometry_from_pool(
             "contract.num_lcm_blocks", contract.num_lcm_blocks
         )
         return SchedulerCacheGeometry(
-            page_size=contract.block_size,
+            prefix_granularity=contract.prefix_granularity,
             num_device_pages=num_lcm_blocks + 1,
             num_usable_pages=num_lcm_blocks,
             token_capacity=contract.token_capacity,
         )
-    if fallback_page_size <= 0 or fallback_token_capacity <= 0:
+    if fallback_prefix_granularity <= 0 or fallback_token_capacity <= 0:
         raise ValueError("fallback scheduler cache geometry must be positive")
-    if fallback_token_capacity % fallback_page_size:
+    if fallback_token_capacity % fallback_prefix_granularity:
         raise ValueError(
-            "fallback token capacity must be divisible by fallback page size"
+            "fallback token capacity must be divisible by the fallback prefix granularity"
         )
-    pages = fallback_token_capacity // fallback_page_size
+    pages = fallback_token_capacity // fallback_prefix_granularity
     return SchedulerCacheGeometry(
-        page_size=fallback_page_size,
+        prefix_granularity=fallback_prefix_granularity,
         # Ordinary pools allocate page 0 separately from their profiled,
         # usable token capacity, just like LCM pools reserve parent 0.
         num_device_pages=pages + 1,
@@ -199,7 +207,7 @@ def make_config(
     num_device_pages: int,
     max_scheduled_tokens: int,
     max_batch_size: int,
-    page_size: int,
+    prefix_granularity: int,
     num_host_pages: int,
     disable_l2_cache: bool,
     enable_l3_storage: bool,
@@ -221,7 +229,7 @@ def make_config(
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
-    cfg.block_size = page_size
+    cfg.prefix_granularity = prefix_granularity
 
     cfg.num_host_pages = num_host_pages
     cfg.enable_l3_storage = enable_l3_storage
@@ -270,10 +278,19 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
                 f"pool_to_paged_cache_groups: unsupported family "
                 f"{spec.family!r} for group {spec.group_id!r}"
             )
+        # The C++ scheduler config only carries row geometry. A snapshot-state
+        # group folds to (rows=checkpoint_granularity, stride=1) at this single
+        # mapping point; both encode the same block_granularity.
+        if spec.checkpoint_granularity is not None:
+            rows_per_page = int(spec.checkpoint_granularity)
+            entry_stride_tokens = 1
+        else:
+            rows_per_page = int(spec.rows_per_page)
+            entry_stride_tokens = int(spec.entry_stride_tokens)
         kwargs = dict(
             group_id=spec.group_id,
-            rows_per_page=int(spec.rows_per_page),
-            entry_stride_tokens=int(spec.entry_stride_tokens),
+            rows_per_page=rows_per_page,
+            entry_stride_tokens=entry_stride_tokens,
             total_pages=int(counts[spec.group_id]),
             retention=retention,
             family=family,

@@ -19,7 +19,7 @@ def _staging(page_ratio: int, page_size: int, columns: int, rows: int = 8):
     return DraftPageStaging(
         max_bs=rows,
         max_pages_per_req=columns,
-        logical_page_size=page_size * page_ratio,
+        table_page_size=page_size * page_ratio,
         draft_page_size=page_size,
         full_history_group_id="full_attention",
         enabled=True,
@@ -91,7 +91,7 @@ class DraftPageTableUnitsTest(unittest.TestCase):
             DraftPageStaging(
                 max_bs=4,
                 max_pages_per_req=4,
-                logical_page_size=100,
+                table_page_size=100,
                 draft_page_size=64,
                 full_history_group_id="full_attention",
                 enabled=True,

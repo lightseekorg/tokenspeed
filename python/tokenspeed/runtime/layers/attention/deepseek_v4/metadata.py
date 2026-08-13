@@ -72,7 +72,7 @@ class DeepseekV4IndexerPrefillMetadata:
 @dataclass
 class DeepseekV4IndexerDecodePlan:
     context_lens: torch.Tensor
-    block_table: torch.Tensor
+    page_table: torch.Tensor
     max_context_len: int
 
 

@@ -135,7 +135,7 @@ class ServerArgs:
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
     enable_mixed_batch: bool = False
-    # Kernel page size. Flat scheduler logical pages come from the LCM
+    # Kernel page size. Scheduler prefix pages come from the LCM
     # runtime contract and must not overwrite this value.
     block_size: int = 64
     # special kv cache

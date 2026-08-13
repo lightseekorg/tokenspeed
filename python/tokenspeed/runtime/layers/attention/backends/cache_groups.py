@@ -20,9 +20,10 @@
 
 """Shared cache-group machinery for attention backends.
 
-A group-aware backend (``uses_cache_groups = True``) receives one page
-table per cache group (``block_tables: dict[group_id, [bs, max_pages]]``)
-and must route every cache read and write through the layer's own group. This
+A group-aware backend (``uses_cache_groups = True``) receives the
+scheduler's per-group block tables (``block_tables: dict[group_id,
+[bs, max_pages]]``), expands them to kernel page tables, and must route
+every cache read and write through the layer's own group. This
 mixin holds the group-selection,
 write-location, and CUDA-graph per-group buffer machinery shared by the MHA
 and TRT-LLM backends; model/kernel-specific constraints (spec decode, DFLASH)
@@ -192,7 +193,7 @@ class CacheGroupsMixin:
             if spec.family == "state"
         )
         self.group_page_sizes = {
-            str(spec.group_id): spec.cache_block_tokens
+            str(spec.group_id): spec.page_size
             for spec in paged_cache_group_specs
             if spec.family != "state"
         }
@@ -222,7 +223,7 @@ class CacheGroupsMixin:
         return {
             gid: expand_page_table(
                 table,
-                logical_page_size=self._group_page_size(gid),
+                table_page_size=self._group_page_size(gid),
                 kernel_page_size=self._consumer_page_size(gid),
                 max_kernel_pages=self.max_num_pages,
             )
@@ -638,7 +639,7 @@ class CacheGroupsMixin:
                 if ratio != 1:
                     expand_page_table(
                         src[:rows, :source_cols],
-                        logical_page_size=self._group_page_size(gid),
+                        table_page_size=self._group_page_size(gid),
                         kernel_page_size=self._consumer_page_size(gid),
                         max_kernel_pages=buf.shape[1],
                         out=buf[:rows],

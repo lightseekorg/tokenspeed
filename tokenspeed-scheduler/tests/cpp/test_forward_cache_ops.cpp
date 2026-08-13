@@ -27,31 +27,36 @@
 
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_types.h"
-#include "cache/coordinator/kv_cache_coordinator.h"
+#include "cache/coordinator/cache_coordinator.h"
 #include "cache_test_access.h"
 #include "scheduler/operations/cache.h"
-#include "scheduler/page_hasher.h"
+#include "cache/prefix/prefix_hasher.h"
 #include "scheduler/types.h"
 
 namespace tokenspeed::test {
 namespace {
 
 template <class T>
-concept HasLogicalBlockSize = requires(T value) { value.block_size; };
+concept HasLegacyGranularityField = requires(T value) {
+    value.block_size;
+}
+|| requires(T value) {
+    value.cache_block_tokens;
+};
 
-static_assert(!HasLogicalBlockSize<KvCacheSpec>);
+static_assert(!HasLegacyGranularityField<CacheGroupSpec>);
 
-KvCacheCoordinator MakeTwoGroup(BlockPool& pool) {
-    std::vector<KvCacheSpec> specs{
-        KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
-        KvCacheSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1},
+CacheCoordinator MakeTwoGroup(BlockPool& pool) {
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1},
     };
     return MakeCoordinator(specs, 2, pool);
 }
 
 TEST(ForwardCacheOpsFree, ReturnsAllPagesToPool) {
     BlockPool pool(/*num_lcm_blocks=*/32);
-    KvCacheCoordinator coordinator = MakeTwoGroup(pool);
+    CacheCoordinator coordinator = MakeTwoGroup(pool);
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
 
     std::vector<BlockTable> tables(coordinator.NumGroups());
@@ -94,7 +99,7 @@ TEST(AlignPrefillChunkTest, ReachedPromotionUsesOrdinaryPageAlignment) {
 
 TEST(ForwardCacheOpsPrefill, FirstChunkAcquiresPagesForTokens) {
     BlockPool pool(/*num_lcm_blocks=*/32);
-    KvCacheCoordinator coordinator = MakeTwoGroup(pool);
+    CacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
@@ -106,11 +111,11 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
     BlockPool pool(/*num_lcm_blocks=*/32);
     // W=16: the SWA bounded match needs ceil((16-1)/2) = 8 > 4 contiguous pages,
     // so all 4 prefix pages stay real hits and nothing slides out of window.
-    std::vector<KvCacheSpec> specs{
-        KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
-        KvCacheSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 16, .cache_blocks_per_lcm_block = 1},
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 16, .cache_blocks_per_lcm_block = 1},
     };
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
 
     // r1: 8 tokens -> 4 pages/group; freed blocks keep their hashes (prefix-hittable).
     std::vector<std::string> hashes8(4);
@@ -126,7 +131,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
 
     // r2: same 8-token prefix, 12-token prefill target -> 4 NEW tokens.
     {
-        const KvCacheCoordinator::PrefixProbe prefix = coordinator.ProbePrefix(hashes8);
+        const CacheCoordinator::PrefixProbe prefix = coordinator.ProbePrefix(hashes8);
         ASSERT_EQ(prefix.device.num_common_tokens, 8);
         ASSERT_EQ(std::ranges::count(prefix.device.per_group[1].hits, std::uint8_t{1}), 4)
             << "W=16 must keep every SWA prefix page real";
@@ -138,14 +143,14 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
         ASSERT_TRUE(AdmitForTest(coordinator, probe, coordinator.ProbePrefix(hashes8), GroupDemand{}));
         EXPECT_EQ(probe[0].AvailableTokens(), 0);
         EXPECT_EQ(probe[1].AvailableTokens(), 0);
-        EXPECT_EQ(coordinator.GroupManager(0).BlocksNeededFor(probe[0], /*num_tokens=*/4), 2);
-        EXPECT_EQ(coordinator.GroupManager(1).BlocksNeededFor(probe[1], /*num_tokens=*/4), 2);
+        EXPECT_EQ(coordinator.GroupBlocksNeededFor(0, probe[0], /*num_tokens=*/4), 2);
+        EXPECT_EQ(coordinator.GroupBlocksNeededFor(1, probe[1], /*num_tokens=*/4), 2);
         FreeRequest(coordinator, probe);
     }
 
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
     std::vector<BlockTable> r2(coordinator.NumGroups());
-    KvCacheCoordinator::PrefixProbe prefix = coordinator.ProbePrefix(hashes8);
+    CacheCoordinator::PrefixProbe prefix = coordinator.ProbePrefix(hashes8);
     ASSERT_TRUE(AdmitForTest(coordinator, r2, std::move(prefix), GroupDemand{.num_tokens = 4}));
 
     // Per-group table: 4 claimed prefix pages + ceil(4 new / 2) = 2 fresh = 6.
@@ -164,7 +169,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
 
 TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
     BlockPool pool(/*num_lcm_blocks=*/32);
-    KvCacheCoordinator coordinator = MakeTwoGroup(pool);
+    CacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
@@ -175,7 +180,7 @@ TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 4,
-                                 .page_hashes = hashes2,
+                                 .prefix_hashes = hashes2,
                                  .completed_boundary_kind = CacheBoundaryKind::kChunk,
                                  .num_computed_tokens = 4,
                              }));
@@ -190,7 +195,7 @@ TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
 // must be registered before the slide.
 TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
     BlockPool pool(/*num_lcm_blocks=*/32);
-    KvCacheCoordinator coordinator = MakeTwoGroup(pool);  // page=2, W=4
+    CacheCoordinator coordinator = MakeTwoGroup(pool);  // page=2, W=4
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
     // Chunk 0: 8 tokens -> 4 pages/group (chunk >> window is fine: the slide
@@ -205,7 +210,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 4,
-                                 .page_hashes = hashes,
+                                 .prefix_hashes = hashes,
                                  .completed_boundary_kind = CacheBoundaryKind::kChunk,
                                  .num_computed_tokens = 8,
                              }));
@@ -226,19 +231,19 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before_chunk - 2);
 
     EXPECT_FALSE(
-        coordinator.GroupManager(1).ContainsCachedBlock(pool, CacheKey{.group_id = 1, .content_hash = hashes[0]}));
+        coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[0]}));
     EXPECT_FALSE(
-        coordinator.GroupManager(1).ContainsCachedBlock(pool, CacheKey{.group_id = 1, .content_hash = hashes[1]}));
+        coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[1]}));
     EXPECT_TRUE(
-        coordinator.GroupManager(1).ContainsCachedBlock(pool, CacheKey{.group_id = 1, .content_hash = hashes[2]}));
+        coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[2]}));
     EXPECT_TRUE(
-        coordinator.GroupManager(1).ContainsCachedBlock(pool, CacheKey{.group_id = 1, .content_hash = hashes[3]}));
+        coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[3]}));
 }
 
 // The first decode step (query at position P) only reads keys back to P - W + 1.
 TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
     BlockPool pool(/*num_lcm_blocks=*/32);
-    KvCacheCoordinator coordinator = MakeTwoGroup(pool);  // page=2, W=4
+    CacheCoordinator coordinator = MakeTwoGroup(pool);  // page=2, W=4
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
     // 12-token prefill -> 6 pages/group, tails full.
@@ -254,7 +259,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 1,
-                                 .page_hashes = hashes,
+                                 .prefix_hashes = hashes,
                                  .completed_boundary_kind = CacheBoundaryKind::kChunk,
                                  .num_computed_tokens = 12,
                              }));
@@ -274,7 +279,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
 
 TEST(ForwardCacheOpsDecode, StepAcquiresAndSlidesSwaWindow) {
     BlockPool pool(/*num_lcm_blocks=*/64);
-    KvCacheCoordinator coordinator = MakeTwoGroup(pool);  // swa window=4, block_size=2
+    CacheCoordinator coordinator = MakeTwoGroup(pool);  // swa window=4, prefix_granularity=2
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/6));  // 3 pages/group
@@ -302,10 +307,10 @@ TEST(ForwardCacheOpsDecode, StepAcquiresAndSlidesSwaWindow) {
 
 TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
     BlockPool pool(/*num_lcm_blocks=*/32);
-    std::vector<KvCacheSpec> specs{
-        KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
     };
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
     // 8 tokens -> 4 full pages; pages 0-1 registered at prefill time.
@@ -320,8 +325,8 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 1,
-                                 .page_hashes = hashes,
-                                 .new_page_hash_begin = 2,
+                                 .prefix_hashes = hashes,
+                                 .new_prefix_hash_begin = 2,
                                  .completed_boundary_kind = CacheBoundaryKind::kChunk,
                                  .num_computed_tokens = 8,
                              }));
@@ -337,7 +342,7 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
 
 TEST(ForwardCacheOpsDecode, AdmissionWithEmptyHashesOnlySlidesAndAllocates) {
     BlockPool pool(/*num_lcm_blocks=*/32);
-    KvCacheCoordinator coordinator = MakeTwoGroup(pool);  // page=2, W=4
+    CacheCoordinator coordinator = MakeTwoGroup(pool);  // page=2, W=4
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));  // 4 pages/group
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
@@ -354,14 +359,14 @@ TEST(ForwardCacheOpsDecode, AdmissionWithEmptyHashesOnlySlidesAndAllocates) {
     EXPECT_FALSE(tables[1].Blocks()[0]);
     EXPECT_FALSE(tables[1].Blocks()[1]);
     for (std::int32_t g = 0; g < coordinator.NumGroups(); ++g) {
-        EXPECT_EQ(coordinator.GroupManager(g).NumCachedBlocks(pool), 0);
+        EXPECT_EQ(coordinator.GroupPrefixIndex(g).NumEntries(pool), 0);
         EXPECT_EQ(tables[static_cast<std::size_t>(g)].AvailableTokens(), 1);
     }
 }
 
 TEST(MakeSpecsFromConfigTest, TranslatesPagedCacheGroups) {
     SchedulerConfig config;
-    config.block_size = 16;
+    config.prefix_granularity = 16;
     PagedCacheGroupConfig full_grp;
     full_grp.group_id = "full";
     full_grp.rows_per_page = 16;
@@ -375,7 +380,7 @@ TEST(MakeSpecsFromConfigTest, TranslatesPagedCacheGroups) {
     swa_grp.sliding_window_tokens = 128;
     config.paged_cache_groups = {full_grp, swa_grp};
 
-    std::vector<KvCacheSpec> specs = MakeSpecsFromConfig(config);
+    std::vector<CacheGroupSpec> specs = MakeSpecsFromConfig(config);
     ASSERT_EQ(specs.size(), 2u);
     EXPECT_EQ(specs[0].kind, AttnKind::kFull);
     EXPECT_EQ(specs[0].sliding_window, 0);
@@ -387,7 +392,7 @@ TEST(MakeSpecsFromConfigTest, TranslatesPagedCacheGroups) {
 
 TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
     SchedulerConfig config;
-    config.block_size = 4;
+    config.prefix_granularity = 4;
     PagedCacheGroupConfig full_grp;
     full_grp.group_id = "full_attention";
     full_grp.rows_per_page = 4;
@@ -400,7 +405,7 @@ TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
     state_grp.family = PagedCacheGroupFamily::State;
     config.paged_cache_groups = {full_grp, state_grp};
 
-    std::vector<KvCacheSpec> specs = MakeSpecsFromConfig(config);
+    std::vector<CacheGroupSpec> specs = MakeSpecsFromConfig(config);
     ASSERT_EQ(specs.size(), 2u);
     EXPECT_EQ(specs[0].kind, AttnKind::kFull);
     EXPECT_EQ(specs[1].kind, AttnKind::kMambaState);
@@ -410,7 +415,7 @@ TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
 
 TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
     SchedulerConfig config;
-    config.block_size = 128;
+    config.prefix_granularity = 128;
     PagedCacheGroupConfig full;
     full.group_id = "full";
     full.rows_per_page = 128;
@@ -427,7 +432,7 @@ TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
     state2.group_id = "state2";
     config.paged_cache_groups = {full, state0, state1, state2};
 
-    std::vector<KvCacheSpec> specs = MakeSpecsFromConfig(config);
+    std::vector<CacheGroupSpec> specs = MakeSpecsFromConfig(config);
 
     ASSERT_EQ(specs.size(), 4u);
     EXPECT_EQ(specs[0].cache_blocks_per_lcm_block, 16);
@@ -438,7 +443,7 @@ TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
 
 TEST(MakeSpecsFromConfigTest, PreservesPerGroupCachePageTokens) {
     SchedulerConfig config;
-    config.block_size = 256;
+    config.prefix_granularity = 256;
     PagedCacheGroupConfig history;
     history.group_id = "history";
     history.rows_per_page = 64;
@@ -450,26 +455,26 @@ TEST(MakeSpecsFromConfigTest, PreservesPerGroupCachePageTokens) {
     state.entry_stride_tokens = 1;
     config.paged_cache_groups = {history, state};
 
-    const std::vector<KvCacheSpec> specs = MakeSpecsFromConfig(config);
+    const std::vector<CacheGroupSpec> specs = MakeSpecsFromConfig(config);
 
     ASSERT_EQ(specs.size(), 2u);
-    EXPECT_EQ(specs[0].cache_block_tokens, 256);
-    EXPECT_EQ(specs[1].cache_block_tokens, 4);
+    EXPECT_EQ(specs[0].page_size, 256);
+    EXPECT_EQ(specs[1].page_size, 4);
 }
 
 TEST(MakeSpecsFromConfigTest, RejectsNonPositiveGlobalP) {
     SchedulerConfig config;
-    config.block_size = 0;
+    config.prefix_granularity = 0;
     config.paged_cache_groups.resize(1);
     EXPECT_THROW(MakeSpecsFromConfig(config), std::runtime_error);
 
-    config.block_size = -1;
+    config.prefix_granularity = -1;
     EXPECT_THROW(MakeSpecsFromConfig(config), std::runtime_error);
 }
 
 TEST(MakeSpecsFromConfigTest, RejectsNonPositivePerGroupPacking) {
     SchedulerConfig config;
-    config.block_size = 128;
+    config.prefix_granularity = 128;
     config.paged_cache_groups.resize(1);
     config.paged_cache_groups[0].cache_blocks_per_lcm_block = 0;
     EXPECT_THROW(MakeSpecsFromConfig(config), std::runtime_error);
@@ -480,7 +485,7 @@ TEST(MakeSpecsFromConfigTest, RejectsNonPositivePerGroupPacking) {
 
 TEST(MakeSpecsFromConfigTest, RejectsMissingSlidingWindowWithGroupId) {
     SchedulerConfig config;
-    config.block_size = 128;
+    config.prefix_granularity = 128;
     PagedCacheGroupConfig group;
     group.group_id = "missing_window";
     group.rows_per_page = 128;
@@ -498,7 +503,7 @@ TEST(MakeSpecsFromConfigTest, RejectsMissingSlidingWindowWithGroupId) {
 
 TEST(MakeSpecsFromConfigTest, RejectsNonPositiveSlidingWindowWithGroupId) {
     SchedulerConfig config;
-    config.block_size = 128;
+    config.prefix_granularity = 128;
     PagedCacheGroupConfig group;
     group.group_id = "nonpositive_window";
     group.rows_per_page = 128;
@@ -533,9 +538,9 @@ TEST(MakeSpecsFromConfigTest, PagedCacheGroupConfigRejectsNonPositivePacking) {
 
 TEST(ForwardCacheOpsBuildBlockTables, TwoGroupsRowsAndIds) {
     BlockPool pool(/*num_lcm_blocks=*/32);
-    KvCacheCoordinator coordinator = MakeTwoGroup(pool);
+    CacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    // 6 tokens, block_size 2 -> 3 pages per group.
+    // 6 tokens, prefix_granularity 2 -> 3 pages per group.
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/6));
 
     std::vector<std::string> group_ids{"full", "swa"};
@@ -550,22 +555,19 @@ TEST(ForwardCacheOpsBuildBlockTables, TwoGroupsRowsAndIds) {
         EXPECT_GT(id, 0);
     }
     // Rows match the source span verbatim: no compaction, null hole = 0 in its slot.
-    const std::vector<std::int32_t> expected_full = coordinator.GroupManager(0).BlockTablePageIds(tables[0]);
-    const std::vector<std::int32_t> expected_swa = coordinator.GroupManager(1).BlockTablePageIds(tables[1]);
+    const std::vector<std::int32_t> expected_full = coordinator.Allocator(0).BlockTablePageIds(tables[0]);
+    const std::vector<std::int32_t> expected_swa = coordinator.Allocator(1).BlockTablePageIds(tables[1]);
     EXPECT_EQ(built.at("full"), expected_full);
     EXPECT_EQ(built.at("swa"), expected_swa);
 }
 
 TEST(ForwardCacheOpsBuildBlockTables, SwaRowGetsNullHoleAfterAdvance) {
     BlockPool pool(/*num_lcm_blocks=*/32);
-    KvCacheCoordinator coordinator = MakeTwoGroup(pool);
+    CacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     // Window = 4 tokens = 2 pages, so 8 tokens leave earlier pages out of window.
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));  // 4 pages/group
-    for (std::int32_t g = 0; g < coordinator.NumGroups(); ++g) {
-        coordinator.GroupManager(g).ReclaimExpired(pool, tables[static_cast<std::size_t>(g)],
-                                                   /*num_computed_tokens=*/8);
-    }
+    coordinator.ReclaimExpired(tables, /*num_computed_tokens=*/8);
 
     std::vector<std::string> group_ids{"full", "swa"};
     auto built = BuildBlockTables(coordinator, tables, group_ids);
@@ -574,13 +576,13 @@ TEST(ForwardCacheOpsBuildBlockTables, SwaRowGetsNullHoleAfterAdvance) {
     }
     const auto& swa = built.at("swa");
     EXPECT_NE(std::find(swa.begin(), swa.end(), 0), swa.end());
-    const std::vector<std::int32_t> expected_swa = coordinator.GroupManager(1).BlockTablePageIds(tables[1]);
+    const std::vector<std::int32_t> expected_swa = coordinator.Allocator(1).BlockTablePageIds(tables[1]);
     EXPECT_EQ(swa, expected_swa);
 }
 
 TEST(ForwardCacheOpsBuildBlockTables, FreshTablesProduceEmptyRows) {
     BlockPool pool(/*num_lcm_blocks=*/32);
-    KvCacheCoordinator coordinator = MakeTwoGroup(pool);
+    CacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
     std::vector<std::string> group_ids{"full", "swa"};
@@ -593,10 +595,10 @@ TEST(ForwardCacheOpsBuildBlockTables, FreshTablesProduceEmptyRows) {
 
 TEST(ForwardCacheOpsBuildBlockTables, SingleGroupRowMatchesSource) {
     BlockPool pool(/*num_lcm_blocks=*/32);
-    std::vector<KvCacheSpec> specs{
-        KvCacheSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
     };
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));  // 2 pages
 
@@ -604,7 +606,7 @@ TEST(ForwardCacheOpsBuildBlockTables, SingleGroupRowMatchesSource) {
     auto built = BuildBlockTables(coordinator, tables, group_ids);
 
     ASSERT_EQ(built.size(), 1u);
-    const std::vector<std::int32_t> expected = coordinator.GroupManager(0).BlockTablePageIds(tables[0]);
+    const std::vector<std::int32_t> expected = coordinator.Allocator(0).BlockTablePageIds(tables[0]);
     EXPECT_EQ(built.at("only"), expected);
     // Sanity: keyed by the supplied group_id, not a bare index.
     EXPECT_EQ(built.count("0"), 0u);
@@ -612,7 +614,7 @@ TEST(ForwardCacheOpsBuildBlockTables, SingleGroupRowMatchesSource) {
 
 TEST(ForwardCacheOpsBuildBlockTables, KeyMatchesSuppliedGroupIdStrings) {
     BlockPool pool(/*num_lcm_blocks=*/32);
-    KvCacheCoordinator coordinator = MakeTwoGroup(pool);
+    CacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
 
@@ -622,16 +624,16 @@ TEST(ForwardCacheOpsBuildBlockTables, KeyMatchesSuppliedGroupIdStrings) {
     ASSERT_EQ(built.size(), 2u);
     EXPECT_TRUE(built.count("alpha"));
     EXPECT_TRUE(built.count("beta"));
-    const std::vector<std::int32_t> expected_alpha = coordinator.GroupManager(0).BlockTablePageIds(tables[0]);
+    const std::vector<std::int32_t> expected_alpha = coordinator.Allocator(0).BlockTablePageIds(tables[0]);
     EXPECT_EQ(built.at("alpha"), expected_alpha);
 }
 
 TEST(ForwardCacheOpsBuildBlockTables, ChildSlotsWithinOneParentHaveDistinctKernelPageIds) {
     BlockPool pool(/*num_lcm_blocks=*/4);
-    const std::vector<KvCacheSpec> specs{
+    const std::vector<CacheGroupSpec> specs{
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2},
     };
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
 
@@ -647,11 +649,11 @@ TEST(ForwardCacheOpsBuildBlockTables, ChildSlotsWithinOneParentHaveDistinctKerne
 
 TEST(ForwardCacheOpsBuildBlockTables, ResolvesEachGroupsPackingRecipe) {
     BlockPool pool(/*num_lcm_blocks=*/16);
-    const std::vector<KvCacheSpec> specs{
+    const std::vector<CacheGroupSpec> specs{
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2},
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
     };
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/2, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
 
@@ -662,13 +664,13 @@ TEST(ForwardCacheOpsBuildBlockTables, ResolvesEachGroupsPackingRecipe) {
     ASSERT_EQ(tables[1].NumBlocks(), 2);
     EXPECT_EQ(built.at("packed"),
               (std::vector<std::int32_t>{
-                  coordinator.GroupManager(0).ResolveKernelPageId(tables[0].Blocks()[0]->Location()),
-                  coordinator.GroupManager(0).ResolveKernelPageId(tables[0].Blocks()[1]->Location()),
+                  coordinator.Allocator(0).ResolveKernelPageId(tables[0].Blocks()[0]->Location()),
+                  coordinator.Allocator(0).ResolveKernelPageId(tables[0].Blocks()[1]->Location()),
               }));
     EXPECT_EQ(built.at("single"),
               (std::vector<std::int32_t>{
-                  coordinator.GroupManager(1).ResolveKernelPageId(tables[1].Blocks()[0]->Location()),
-                  coordinator.GroupManager(1).ResolveKernelPageId(tables[1].Blocks()[1]->Location()),
+                  coordinator.Allocator(1).ResolveKernelPageId(tables[1].Blocks()[0]->Location()),
+                  coordinator.Allocator(1).ResolveKernelPageId(tables[1].Blocks()[1]->Location()),
               }));
 }
 

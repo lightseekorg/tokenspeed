@@ -311,7 +311,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             layer_types=GPT_OSS_LAYER_TYPES,
             group_ids=group_ids,
             sliding_window_tokens=128,
-            page_size=16,
+            prefix_granularity=16,
             pd_disaggregation_enabled=True,
         )
         pool = self._pool(
@@ -392,7 +392,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             layer_types=kwargs["layer_types"],
             group_ids=kwargs["layer_group_ids"],
             sliding_window_tokens=None,
-            page_size=kwargs["page_size"],
+            prefix_granularity=kwargs["page_size"],
         )
         pool = self.MHATokenToKVPool(**kwargs)
 
@@ -462,7 +462,7 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
                 layer_types=(),
                 group_ids=("full_attention",),
                 sliding_window_tokens=None,
-                page_size=4,
+                prefix_granularity=4,
             ),
         )
 
@@ -498,7 +498,7 @@ class StatePagedCacheGroupPageCountTest(unittest.TestCase):
             layer_types=("linear_attention", "full_attention"),
             group_ids=("linear_attention", "full_attention"),
             sliding_window_tokens=None,
-            page_size=16,
+            prefix_granularity=16,
         )
         params = {
             "max_live_requests": 2,
@@ -545,7 +545,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
         fields = qwen_gdn_cache_fields(
             layer_types=("linear_attention", "full_attention"),
             layer_group_ids=("linear_attention_0", "full_attention"),
-            logical_block_tokens=4,
+            prefix_granularity=4,
             kv_shape=(4, 1, 2),
             kv_element_size=2,
             conv_shape=(2, 2),
@@ -555,7 +555,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
         )
         self.plan = plan_fields(
             fields,
-            logical_block_tokens=4,
+            prefix_granularity=4,
             budget_bytes=64,
             alignment=2,
         )
@@ -582,7 +582,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
                 layer_types=("linear_attention", "full_attention"),
                 group_ids=("linear_attention_0", "full_attention"),
                 sliding_window_tokens=None,
-                page_size=4,
+                prefix_granularity=4,
             ),
         )
 
@@ -634,7 +634,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
     def test_pool_publishes_runtime_contract_and_component_mapping(self):
         pool = self._pool()
 
-        self.assertEqual(pool.runtime_contract.block_size, 4)
+        self.assertEqual(pool.runtime_contract.prefix_granularity, 4)
         self.assertEqual(pool.runtime_contract.num_lcm_blocks, 1)
         self.assertEqual(
             pool.runtime_contract.group_page_counts,

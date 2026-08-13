@@ -91,7 +91,7 @@ class AttentionBackend(ABC):
         # True when this backend's CUDA-graph block-table (kv_indices) buffer is
         # aliased to a peer backend's (e.g. a drafter sharing the target's), so
         # the replay path skips rebuilding it — the peer already populates it.
-        self._block_table_aliased = False
+        self._page_table_aliased = False
 
     def set_cache_pool(self, cache_pool: CachePool) -> None:
         self.cache_pool = cache_pool

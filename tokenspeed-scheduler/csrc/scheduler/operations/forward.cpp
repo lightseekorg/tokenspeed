@@ -40,7 +40,7 @@
 #include "fsm/forward_states.h"
 #include "scheduler/operations/cache.h"
 #include "scheduler/operations/forward.h"
-#include "scheduler/page_hasher.h"
+#include "cache/prefix/prefix_hasher.h"
 #include "scheduler/request.h"
 #include "utils.h"
 
@@ -49,7 +49,7 @@ namespace tokenspeed {
 namespace {
 
 template <typename Operation>
-void fillBlockTables(Operation& operation, Request& request, const KvCacheCoordinator& coordinator,
+void fillBlockTables(Operation& operation, Request& request, const CacheCoordinator& coordinator,
                      std::span<const std::string> group_ids) {
     operation.block_tables = BuildBlockTables(coordinator, request.BlockTablesRef(), group_ids);
 }
@@ -64,24 +64,24 @@ std::vector<GroupDemand> makeGroupDemands(std::vector<BlockTable>& tables, Group
     return demands;
 }
 
-void appendCompletedPageHashes(std::vector<std::string>& page_hashes,
-                               const std::vector<std::span<const std::int32_t>>& paged_tokens,
-                               std::int32_t filled_pages) {
-    const std::int32_t first_new_page = static_cast<std::int32_t>(page_hashes.size());
-    _assert(filled_pages > first_new_page, "caller must pre-check page-hash progress");
-    const std::string previous_hash = page_hashes.empty() ? std::string{} : page_hashes.back();
-    std::vector<std::string> new_hashes = AdvancePagedHashes(paged_tokens, first_new_page, previous_hash, filled_pages);
-    page_hashes.insert(page_hashes.end(), std::make_move_iterator(new_hashes.begin()),
-                       std::make_move_iterator(new_hashes.end()));
+void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes,
+                                 const std::vector<std::span<const std::int32_t>>& prefix_pages,
+                                 std::int32_t filled_prefix_pages) {
+    const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(prefix_hashes.size());
+    _assert(filled_prefix_pages > first_new_prefix_page, "caller must pre-check page-hash progress");
+    const std::string previous_hash = prefix_hashes.empty() ? std::string{} : prefix_hashes.back();
+    std::vector<std::string> new_hashes =
+        AdvancePrefixHashes(prefix_pages, first_new_prefix_page, previous_hash, filled_prefix_pages);
+    prefix_hashes.insert(prefix_hashes.end(), std::make_move_iterator(new_hashes.begin()),
+                         std::make_move_iterator(new_hashes.end()));
 }
 
-bool canConsumeReservedTokensInPlace(const KvCacheCoordinator& coordinator, std::span<const BlockTable> tables,
+bool canConsumeReservedTokensInPlace(const CacheCoordinator& coordinator, std::span<const BlockTable> tables,
                                      std::int32_t num_tokens, std::int32_t num_computed_tokens) {
     for (std::int32_t i = 0; i < coordinator.NumGroups(); ++i) {
-        const KvCacheManager& manager = coordinator.GroupManager(i);
         const BlockTable& table = tables[static_cast<std::size_t>(i)];
-        if (manager.BlocksNeededFor(table, num_tokens) != 0 ||
-            !manager.ReclaimableBlockLocationsAt(table, num_computed_tokens, {}).empty()) {
+        if (coordinator.GroupBlocksNeededFor(i, table, num_tokens) != 0 ||
+            coordinator.GroupHasReclaimableBlocksAt(i, table, num_computed_tokens)) {
             return false;
         }
     }
@@ -101,21 +101,21 @@ CacheBoundaryKind consumeCompletedBoundaryKind(fsm::CacheProgress& cache_progres
     return num_computed_tokens == prefill_size ? CacheBoundaryKind::kEndpoint : CacheBoundaryKind::kChunk;
 }
 
-struct CompletedCachePages {
-    std::int32_t first_new_page{0};
+struct CompletedPrefixPages {
+    std::int32_t first_new_prefix_page{0};
     std::optional<CacheBoundaryKind> boundary_kind;
 };
 
-CompletedCachePages updateCompletedPageHashes(Request& request, fsm::CacheProgress& cache_progress,
-                                              std::int32_t num_computed_tokens, std::int32_t cache_block_tokens) {
-    CompletedCachePages completed{
-        .first_new_page = static_cast<std::int32_t>(cache_progress.page_hashes.size()),
+CompletedPrefixPages updateCompletedPrefixHashes(Request& request, fsm::CacheProgress& cache_progress,
+                                                 std::int32_t num_computed_tokens, std::int32_t prefix_granularity) {
+    CompletedPrefixPages completed{
+        .first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size()),
     };
-    const std::int32_t filled_pages = num_computed_tokens / cache_block_tokens;
-    if (filled_pages > static_cast<std::int32_t>(cache_progress.page_hashes.size())) {
-        appendCompletedPageHashes(cache_progress.page_hashes, request.FullPagedTokens(false), filled_pages);
+    const std::int32_t filled_prefix_pages = num_computed_tokens / prefix_granularity;
+    if (filled_prefix_pages > static_cast<std::int32_t>(cache_progress.prefix_hashes.size())) {
+        appendCompletedPrefixHashes(cache_progress.prefix_hashes, request.FullPrefixPages(false), filled_prefix_pages);
     }
-    if (completed.first_new_page < static_cast<std::int32_t>(cache_progress.page_hashes.size())) {
+    if (completed.first_new_prefix_page < static_cast<std::int32_t>(cache_progress.prefix_hashes.size())) {
         completed.boundary_kind =
             consumeCompletedBoundaryKind(cache_progress, num_computed_tokens, request.PrefillSize());
     }
@@ -123,9 +123,10 @@ CompletedCachePages updateCompletedPageHashes(Request& request, fsm::CacheProgre
 }
 
 template <typename Event>
-    requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> || std::same_as<Event, fsm::SchedulePrefillEvent>)
-PrefillOperation applyPrefillEvent(Request& request, Event& event, const KvCacheCoordinator& coordinator,
-                                   std::span<const std::string> group_ids) {
+requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> ||
+         std::same_as<Event, fsm::SchedulePrefillEvent>) PrefillOperation
+    applyPrefillEvent(Request& request, Event& event, const CacheCoordinator& coordinator,
+                      std::span<const std::string> group_ids) {
     const fsm::PrefillSource source = [&] {
         if constexpr (std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent>) {
             return event.Source();
@@ -149,7 +150,7 @@ PrefillOperation applyPrefillEvent(Request& request, Event& event, const KvCache
 }
 
 DecodeOperation applyDecodeEvent(Request& request, fsm::ScheduleDecodeEvent event, std::int32_t decode_input_tokens,
-                                 const KvCacheCoordinator& coordinator, std::span<const std::string> group_ids) {
+                                 const CacheCoordinator& coordinator, std::span<const std::string> group_ids) {
     request.Apply(std::move(event));
 
     DecodeOperation operation{{
@@ -171,7 +172,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         }
         return coordinator_.ProbePrefix(hashes);
     };
-    const std::int32_t cache_block_tokens = coordinator_.CacheBlockTokens();
+    const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
     // The final prompt token is always recomputed to produce logits. Some
     // consumers additionally require a larger prompt tail (for example, to
     // rebuild request-persistent state that is not stored in the KV cache).
@@ -179,16 +180,16 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     // will allocate private writable pages for the replayed suffix.
     const std::int32_t replay_tokens = std::max(config_.prefix_replay_tokens, 1);
     const std::int32_t max_cacheable_tokens = std::max(request->PrefillSize() - replay_tokens, 0);
-    const std::int32_t probe_pages = max_cacheable_tokens / cache_block_tokens;
-    const std::int32_t candidate_pages = std::max((request->PrefillSize() - 1) / cache_block_tokens, 0);
-    std::vector<std::span<const std::int32_t>> paged_tokens = request->FullPagedTokens(false);
-    paged_tokens.resize(std::min(paged_tokens.size(), static_cast<std::size_t>(candidate_pages)));
-    std::vector<std::string> hashes = ComputePagedHashes(paged_tokens, "");
-    const auto probe_hashes =
-        std::span<const std::string>(hashes).first(std::min(hashes.size(), static_cast<std::size_t>(probe_pages)));
+    const std::int32_t probe_prefix_pages = max_cacheable_tokens / prefix_granularity;
+    const std::int32_t candidate_prefix_pages = std::max((request->PrefillSize() - 1) / prefix_granularity, 0);
+    std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(false);
+    prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
+    std::vector<std::string> hashes = ComputePrefixHashes(prefix_pages, "");
+    const auto probe_hashes = std::span<const std::string>(hashes).first(
+        std::min(hashes.size(), static_cast<std::size_t>(probe_prefix_pages)));
 
     AdmissionMatch match;
-    match.candidate_page_hashes = hashes;
+    match.candidate_prefix_hashes = hashes;
     // Retraction recovery may reuse its own L2 snapshot even when ordinary
     // request-to-request prefix reuse is disabled.
     if (config_.disable_prefix_cache && !request->Is<fsm::Retracted>()) {
@@ -196,22 +197,22 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         return match;
     }
     match.probe = probe(probe_hashes);
-    const std::int32_t hit_pages =
-        std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens) / cache_block_tokens;
-    match.page_hashes.assign(hashes.begin(), hashes.begin() + hit_pages);
+    const std::int32_t hit_prefix_pages =
+        std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens) / prefix_granularity;
+    match.prefix_hashes.assign(hashes.begin(), hashes.begin() + hit_prefix_pages);
 
     const std::int32_t extension_pages =
-        std::max(match.probe.host.num_common_tokens - match.probe.device.num_common_tokens, 0) / cache_block_tokens;
-    const auto extension_begin = hashes.begin() + match.probe.device.num_common_tokens / cache_block_tokens;
+        std::max(match.probe.host.num_common_tokens - match.probe.device.num_common_tokens, 0) / prefix_granularity;
+    const auto extension_begin = hashes.begin() + match.probe.device.num_common_tokens / prefix_granularity;
     match.extension_hashes.assign(extension_begin, extension_begin + extension_pages);
     return match;
 }
 
-std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::admit(PlanBuildContext& context,
-                                                                    KvCacheCoordinator::PrefixProbe&& prefix,
+std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(PlanBuildContext& context,
+                                                                    CacheCoordinator::PrefixProbe&& prefix,
                                                                     std::span<const GroupDemand> demands,
                                                                     std::optional<std::uint64_t> request_access_epoch) {
-    std::optional<KvCacheCoordinator::AdmissionResult> result =
+    std::optional<CacheCoordinator::AdmissionResult> result =
         coordinator_.Admit(std::move(prefix), demands, request_access_epoch);
     if (!result) {
         context.admission_failed = true;
@@ -233,16 +234,17 @@ std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::admit(PlanBuildCon
     return result;
 }
 
-std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::admit(PlanBuildContext& context,
+std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(PlanBuildContext& context,
                                                                     std::span<const GroupDemand> demands,
                                                                     std::uint64_t request_access_epoch) {
     return admit(context, coordinator_.ProbePrefix({}), demands, request_access_epoch);
 }
 
 bool Scheduler::admitWithKvEventTracking(PlanBuildContext& context, Request& request,
-                                         const fsm::CacheProgress& cache_progress, std::int32_t new_page_hash_begin,
+                                         const fsm::CacheProgress& cache_progress, std::int32_t new_prefix_hash_begin,
                                          std::span<const GroupDemand> demands) {
-    std::vector<CacheKey> event_keys = registerKvEventPages(request, cache_progress.page_hashes, new_page_hash_begin);
+    std::vector<CacheKey> event_keys =
+        registerKvEventPrefixPages(request, cache_progress.prefix_hashes, new_prefix_hash_begin);
     const bool admitted = admit(context, demands, cache_progress.access_epoch).has_value();
     discardUncachedKvEventPages(event_keys);
     return admitted;
@@ -258,14 +260,14 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     const std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
     const std::int32_t promotion_boundary_tokens = coordinator_.PromotionBoundaryTokens(match.probe);
     _assert(promotion_boundary_tokens == 0 ||
-                (promotion_boundary_tokens % coordinator_.CacheBlockTokens() == 0 &&
+                (promotion_boundary_tokens % coordinator_.PrefixGranularity() == 0 &&
                  promotion_boundary_tokens > hit_tokens && promotion_boundary_tokens < request->PrefillSize()),
             "promotion boundary must be page-aligned and inside the unmatched prompt");
 
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
     if (coordinator_.HasMambaStateGroup() || promotion_boundary_tokens > 0) {
-        tokens_this_round = AlignPrefillChunk(hit_tokens, unscheduled, remaining, coordinator_.CacheBlockTokens(),
+        tokens_this_round = AlignPrefillChunk(hit_tokens, unscheduled, remaining, coordinator_.PrefixGranularity(),
                                               promotion_boundary_tokens);
         if (tokens_this_round == 0) {
             return std::nullopt;
@@ -284,22 +286,21 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     if (config_.enable_pd_cache && source == fsm::PrefillSource::kRemote) {
         for (std::size_t i = 0; i < demands.size(); ++i) {
             const PagedCacheGroupConfig& group = config_.paged_cache_groups[i];
-            const std::int32_t cache_block_tokens = coordinator_.GroupManager(i).CacheBlockTokens();
+            const std::int32_t page_size = coordinator_.GroupPageSize(i);
             if (group.transfer_policy == PagedCacheTransferPolicy::LatestSnapshot) {
                 demands[i].num_tokens = request->PrefillSize();
-                demands[i].materialized_suffix_start = (request->PrefillSize() - 1) / cache_block_tokens;
+                demands[i].materialized_suffix_start = (request->PrefillSize() - 1) / page_size;
             } else if (group.retention == PagedCacheGroupConfig::Retention::SlidingWindow) {
                 const std::int32_t retained_begin =
                     std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
                 demands[i].num_tokens = request->PrefillSize();
-                demands[i].materialized_suffix_start =
-                    std::max(hit_tokens / cache_block_tokens, retained_begin / cache_block_tokens);
+                demands[i].materialized_suffix_start = std::max(hit_tokens / page_size, retained_begin / page_size);
             }
         }
     }
 
-    std::vector<CacheKey> event_keys = registerKvEventPages(*request, match.candidate_page_hashes, 0);
-    std::optional<KvCacheCoordinator::AdmissionResult> admission = admit(context, std::move(match.probe), demands);
+    std::vector<CacheKey> event_keys = registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
+    std::optional<CacheCoordinator::AdmissionResult> admission = admit(context, std::move(match.probe), demands);
     if (!admission) {
         context.capacity_blocker = request->Id();
         discardUncachedKvEventPages(event_keys);
@@ -310,7 +311,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 
     if (!match.extension_hashes.empty()) {
         coordinator_.CacheFullBlocks(tables, match.extension_hashes, admission->access_epoch,
-                                     admission->device_prefix_tokens / coordinator_.CacheBlockTokens());
+                                     admission->device_prefix_tokens / coordinator_.PrefixGranularity());
     }
     discardUncachedKvEventPages(event_keys);
     return fsm::SchedulePrefillFirstChunkEvent{
@@ -322,7 +323,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         std::move(tables),
         hit_tokens,
         fsm::CacheProgress{
-            .page_hashes = std::move(match.page_hashes),
+            .prefix_hashes = std::move(match.prefix_hashes),
             .access_epoch = admission->access_epoch,
             .promotion_boundary_tokens = admission->promotion_boundary_tokens,
         },
@@ -338,7 +339,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     fsm::CacheProgress cache_progress = request->CacheProgress();
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
     if (coordinator_.HasMambaStateGroup() || cache_progress.promotion_boundary_tokens > 0) {
-        tokens_this_round = AlignPrefillChunk(first_pos, unscheduled, remaining, coordinator_.CacheBlockTokens(),
+        tokens_this_round = AlignPrefillChunk(first_pos, unscheduled, remaining, coordinator_.PrefixGranularity(),
                                               cache_progress.promotion_boundary_tokens);
         if (tokens_this_round == 0) {
             return std::nullopt;
@@ -349,19 +350,20 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const std::int32_t decode_reserve = completes_prefill ? reserve_num_tokens_in_next_schedule_event : 0;
     const PrefillInfo previous = request->CurrentPrefillInfo();
     const std::int32_t num_computed_tokens = previous.already_scheduled_len + previous.extend_len;
-    const CompletedCachePages completed =
-        updateCompletedPageHashes(*request, cache_progress, num_computed_tokens, coordinator_.CacheBlockTokens());
+    const CompletedPrefixPages completed =
+        updateCompletedPrefixHashes(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity());
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
-    std::vector<GroupDemand> demands = makeGroupDemands(tables, GroupDemand{
-                                                                    .num_tokens = tokens_this_round,
-                                                                    .page_hashes = cache_progress.page_hashes,
-                                                                    .new_page_hash_begin = completed.first_new_page,
-                                                                    .completed_boundary_kind = completed.boundary_kind,
-                                                                    .num_computed_tokens = num_computed_tokens,
-                                                                    .reserve_tokens = decode_reserve,
-                                                                });
-    if (!admitWithKvEventTracking(context, *request, cache_progress, completed.first_new_page, demands)) {
+    std::vector<GroupDemand> demands =
+        makeGroupDemands(tables, GroupDemand{
+                                     .num_tokens = tokens_this_round,
+                                     .prefix_hashes = cache_progress.prefix_hashes,
+                                     .new_prefix_hash_begin = completed.first_new_prefix_page,
+                                     .completed_boundary_kind = completed.boundary_kind,
+                                     .num_computed_tokens = num_computed_tokens,
+                                     .reserve_tokens = decode_reserve,
+                                 });
+    if (!admitWithKvEventTracking(context, *request, cache_progress, completed.first_new_prefix_page, demands)) {
         context.capacity_blocker = request->Id();
         return std::nullopt;
     }
@@ -385,22 +387,22 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(PlanBuildConte
         num_computed_tokens = request->TokenSize() - config_.decode_input_tokens;
     }
 
-    const CompletedCachePages completed =
-        updateCompletedPageHashes(*request, cache_progress, num_computed_tokens, coordinator_.CacheBlockTokens());
+    const CompletedPrefixPages completed =
+        updateCompletedPrefixHashes(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity());
 
-    if (completed.first_new_page == static_cast<std::int32_t>(cache_progress.page_hashes.size()) &&
+    if (completed.first_new_prefix_page == static_cast<std::int32_t>(cache_progress.prefix_hashes.size()) &&
         canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
         coordinator_.ConsumeReservedTokens(tables, reserve_tokens);
     } else {
         std::vector<GroupDemand> demands =
             makeGroupDemands(tables, GroupDemand{
                                          .num_tokens = reserve_tokens,
-                                         .page_hashes = cache_progress.page_hashes,
-                                         .new_page_hash_begin = completed.first_new_page,
+                                         .prefix_hashes = cache_progress.prefix_hashes,
+                                         .new_prefix_hash_begin = completed.first_new_prefix_page,
                                          .completed_boundary_kind = completed.boundary_kind,
                                          .num_computed_tokens = num_computed_tokens,
                                      });
-        if (!admitWithKvEventTracking(context, *request, cache_progress, completed.first_new_page, demands)) {
+        if (!admitWithKvEventTracking(context, *request, cache_progress, completed.first_new_prefix_page, demands)) {
             context.capacity_blocker = request->Id();
             return std::nullopt;
         }
@@ -439,14 +441,14 @@ DecodeOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::Sc
 std::optional<WriteBackOperation> Scheduler::beginRetraction(Request& request) {
     fsm::CacheProgress cache_progress = request.CacheProgress();
     const std::int32_t num_computed_tokens = request.TokenSize() - config_.decode_input_tokens;
-    const CompletedCachePages completed =
-        updateCompletedPageHashes(request, cache_progress, num_computed_tokens, coordinator_.CacheBlockTokens());
+    const CompletedPrefixPages completed =
+        updateCompletedPrefixHashes(request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity());
     if (completed.boundary_kind) {
-        coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), cache_progress.page_hashes,
-                                          cache_progress.access_epoch, completed.first_new_page, num_computed_tokens,
-                                          *completed.boundary_kind);
+        coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), cache_progress.prefix_hashes,
+                                          cache_progress.access_epoch, completed.first_new_prefix_page,
+                                          num_computed_tokens, *completed.boundary_kind);
     }
-    coordinator_.QueueCachedBlocksForStore(cache_progress.page_hashes);
+    coordinator_.QueueCachedBlocksForStore(cache_progress.prefix_hashes);
     std::optional<WriteBackOperation> write_back = tier_transfers_.StartPendingStores();
     request.Apply(fsm::RetractionEvent{&coordinator_});
     recovery_queue_.push_back(request.Id());
@@ -476,7 +478,7 @@ void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<
             }
         }
         FatalCheck(victim != nullptr,
-                   "LCM admission failed without a retractable Decode request or asynchronous capacity release");
+                   "cache admission failed without a retractable Decode request or asynchronous capacity release");
         recovery_barrier_ = context.capacity_blocker;
         if (!recovery_barrier_ || *recovery_barrier_ == victim->Id()) {
             const auto waiting = std::ranges::find_if(candidates, [victim](const Request* request) {
@@ -500,7 +502,7 @@ void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<
             request_to_retract = request;
         }
     }
-    FatalCheck(request_to_retract != nullptr, "LCM admission failed without a retractable request");
+    FatalCheck(request_to_retract != nullptr, "cache admission failed without a retractable request");
     if (config_.HasHostCache() && request_to_retract->Is<fsm::Decoding>()) {
         if (auto operation = beginRetraction(*request_to_retract)) {
             write_back_operations.push_back(std::move(*operation));
@@ -510,7 +512,7 @@ void Scheduler::retractForCapacity(PlanBuildContext& context, const std::vector<
         return;
     }
     request_to_retract->Apply(fsm::RetractEvent{&coordinator_});
-    spdlog::info("[Scheduler] retract: released request {} ({} tokens) for LCM capacity", request_to_retract->Id(),
+    spdlog::info("[Scheduler] retract: released request {} ({} tokens) for cache capacity", request_to_retract->Id(),
                  request_to_retract->TokenSize());
 }
 
@@ -571,7 +573,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     });
     const std::int32_t state_prefill_reserve =
         config_.enable_mixed_prefill_decode && coordinator_.HasMambaStateGroup() && has_local_prefill
-            ? coordinator_.CacheBlockTokens()
+            ? coordinator_.PrefixGranularity()
             : 0;
 
     std::vector<ForwardOperation> operations;

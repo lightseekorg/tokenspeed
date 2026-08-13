@@ -139,7 +139,7 @@ class ModelExecutorConfig:
     max_req_pool_size: int
     output_length: int
     enforce_eager: bool
-    logical_page_size: int
+    prefix_granularity: int
     max_num_seqs: int
     chunked_prefill_size: int
     vocab_size: int
@@ -201,7 +201,7 @@ class ModelExecutorConfig:
         gpu_id: int,
         global_rank: int,
         num_total_pages: int,
-        logical_page_size: int,
+        prefix_granularity: int,
         overlap_schedule_depth: int = 0,
     ) -> ModelExecutorConfig:
         output_length = (
@@ -247,7 +247,7 @@ class ModelExecutorConfig:
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
             enforce_eager=server_args.enforce_eager,
-            logical_page_size=logical_page_size,
+            prefix_granularity=prefix_granularity,
             max_num_seqs=server_args.max_num_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,
             vocab_size=model_config.vocab_size,
@@ -333,16 +333,16 @@ class ModelExecutor:
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._draft_final_step_counter = None
 
-        # fill_input_buffers indexes the scheduler table in logical pages; the drafter indexes draft_page_table in its backend's kernel pages.
-        self._logical_page_size = int(
-            getattr(draft_token_to_kv_pool, "page_size", 0) or config.logical_page_size
+        # fill_input_buffers indexes the scheduler table in its own table pages; the drafter indexes draft_page_table in its backend's kernel pages.
+        self._prefix_granularity = int(
+            getattr(draft_token_to_kv_pool, "page_size", 0) or config.prefix_granularity
         )
         self._draft_page_size = int(
-            getattr(draft_attn_backend, "page_size", 0) or self._logical_page_size
+            getattr(draft_attn_backend, "page_size", 0) or self._prefix_granularity
         )
-        if self._logical_page_size % self._draft_page_size:
+        if self._prefix_granularity % self._draft_page_size:
             raise ValueError(
-                f"logical page size {self._logical_page_size} is not a multiple "
+                f"prefix granularity {self._prefix_granularity} is not a multiple "
                 f"of the draft kernel page size {self._draft_page_size}"
             )
         # DraftPageStaging.publish expands the target full-history table into the
@@ -368,7 +368,7 @@ class ModelExecutor:
         self._draft_staging = DraftPageStaging(
             max_bs=max_bs,
             max_pages_per_req=max_num_pages_per_req,
-            logical_page_size=self._logical_page_size,
+            table_page_size=self._prefix_granularity,
             draft_page_size=self._draft_page_size,
             full_history_group_id=self._full_history_group_id,
             enabled=not getattr(
@@ -381,8 +381,8 @@ class ModelExecutor:
         self.input_buffers = InputBuffers(
             max_bs=max_bs,
             max_num_tokens=config.chunked_prefill_size,
-            # Indexes the scheduler's full-history table: logical page ids.
-            page_size=self._logical_page_size,
+            # Indexes the scheduler's full-history table: scheduler-table page ids.
+            page_size=self._prefix_granularity,
             # token_to_kv_pool allocates size+page_size slots; index `size` is
             # the reserved dummy slot (see MHATokenToKVPool._create_buffers).
             dummy_kv_slot=0,

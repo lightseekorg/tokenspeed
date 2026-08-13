@@ -750,7 +750,7 @@ class CuteDSLMLABackend(AttentionBackend):
 
         # Block indices are refreshed separately; when the block table is
         # aliased to a peer backend, that peer's replay already populated it.
-        if page_table is not None and not self._block_table_aliased:
+        if page_table is not None and not self._page_table_aliased:
             self._create_block_kv_indices(
                 bs,
                 metadata.block_kv_indices.shape[1],

@@ -22,30 +22,41 @@
 
 #include <cstdint>
 #include <memory>
+#include <utility>
 
 #include "cache/core/cache_types.h"
-#include "cache/manager/kv_cache_manager.h"
+#include "cache/allocator/group_allocator.h"
+#include "cache/prefix/prefix_index.h"
+#include "cache/prefix/prefix_matcher.h"
 
 namespace tokenspeed {
 
-// One attention group: spec plus the manager that owns its group identity.
+// One attention group: its spec, the allocator (where blocks live), the
+// prefix-match policy (matcher), and the prefix-reuse index. Allocation and
+// prefix matching stay separate; the group is the only place they are paired.
 class CacheGroup {
 public:
-    CacheGroup(KvCacheSpec spec, std::unique_ptr<KvCacheManager> manager) : spec_{spec}, manager_{std::move(manager)} {}
+    CacheGroup(CacheGroupSpec spec, std::unique_ptr<GroupAllocator> allocator, std::unique_ptr<PrefixMatcher> matcher)
+        : spec_{spec}, allocator_{std::move(allocator)}, matcher_{std::move(matcher)}, index_{allocator_->Id()} {}
 
     CacheGroup(const CacheGroup&) = delete;
     CacheGroup& operator=(const CacheGroup&) = delete;
     CacheGroup(CacheGroup&&) = default;
     CacheGroup& operator=(CacheGroup&&) = default;
 
-    KvCacheManager& Manager() { return *manager_; }
-    const KvCacheManager& Manager() const { return *manager_; }
-    const KvCacheSpec& Spec() const { return spec_; }
-    std::uint32_t Id() const { return manager_->Id(); }
+    GroupAllocator& Allocator() { return *allocator_; }
+    const GroupAllocator& Allocator() const { return *allocator_; }
+    const PrefixMatcher& Matcher() const { return *matcher_; }
+    PrefixCacheIndex& Index() { return index_; }
+    const PrefixCacheIndex& Index() const { return index_; }
+    const CacheGroupSpec& Spec() const { return spec_; }
+    std::uint32_t Id() const { return allocator_->Id(); }
 
 private:
-    KvCacheSpec spec_;
-    std::unique_ptr<KvCacheManager> manager_;
+    CacheGroupSpec spec_;
+    std::unique_ptr<GroupAllocator> allocator_;
+    std::unique_ptr<PrefixMatcher> matcher_;
+    PrefixCacheIndex index_;
 };
 
 }  // namespace tokenspeed

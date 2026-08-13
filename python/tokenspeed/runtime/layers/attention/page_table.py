@@ -19,23 +19,23 @@ from __future__ import annotations
 import torch
 
 
-def _page_ratio(logical_page_size: int, kernel_page_size: int) -> int:
+def _page_ratio(table_page_size: int, kernel_page_size: int) -> int:
     if (
-        logical_page_size <= 0
+        table_page_size <= 0
         or kernel_page_size <= 0
-        or logical_page_size % kernel_page_size
+        or table_page_size % kernel_page_size
     ):
         raise ValueError(
-            "logical_page_size must be a positive multiple of kernel_page_size, "
-            f"got {logical_page_size} and {kernel_page_size}"
+            "table_page_size must be a positive multiple of kernel_page_size, "
+            f"got {table_page_size} and {kernel_page_size}"
         )
-    return logical_page_size // kernel_page_size
+    return table_page_size // kernel_page_size
 
 
 def expand_page_table(
     page_table: torch.Tensor,
     *,
-    logical_page_size: int,
+    table_page_size: int,
     kernel_page_size: int,
     max_kernel_pages: int | None = None,
     out: torch.Tensor | None = None,
@@ -43,7 +43,7 @@ def expand_page_table(
     """Expand scheduler page IDs into the smaller pages consumed by a kernel."""
     if page_table.ndim != 2:
         raise ValueError(f"page_table must be 2-D, got shape {tuple(page_table.shape)}")
-    ratio = _page_ratio(logical_page_size, kernel_page_size)
+    ratio = _page_ratio(table_page_size, kernel_page_size)
     if max_kernel_pages is None:
         max_kernel_pages = page_table.shape[1] * ratio
     if max_kernel_pages < 0:
@@ -95,3 +95,48 @@ def expand_page_table(
     copy_columns = min(max_kernel_pages, expanded.shape[1])
     result[:, :copy_columns].copy_(expanded[:, :copy_columns])
     return result
+
+
+def build_prefill_kv_workspace_slots(
+    *,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    page_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Flatten a kernel page table into per-token KV cache slot ids.
+
+    Args:
+        page_table: ``[num_reqs, num_pages]`` kernel page table whose entries
+            index pages of ``page_size`` tokens.
+        seq_lens: ``[num_reqs]`` number of valid tokens per request.
+        max_seq_len: Upper bound of ``seq_lens``; fixes the gather width.
+        page_size: Tokens covered by one kernel page.
+        device: Device the slot tensor is built on.
+
+    Returns:
+        1-D int64 tensor of cache slot ids, request-major, covering exactly
+        the first ``seq_lens[i]`` positions of each request.
+    """
+    local_offsets = torch.arange(
+        int(max_seq_len),
+        dtype=torch.int64,
+        device=device,
+    )
+    page_offsets = torch.div(
+        local_offsets,
+        int(page_size),
+        rounding_mode="floor",
+    )
+    block_offsets = local_offsets % int(page_size)
+    pages = page_table.to(device=device, dtype=torch.int64).index_select(
+        1,
+        page_offsets,
+    )
+    slots = pages * int(page_size) + block_offsets
+    valid = local_offsets.unsqueeze(0) < seq_lens.to(
+        device=device,
+        dtype=torch.int64,
+    ).unsqueeze(1)
+    return slots[valid].contiguous()

@@ -124,7 +124,7 @@ def _mask_fresh_initial_state(
 
 @dataclass(frozen=True)
 class _StatePageIndexPlan:
-    page_size: int
+    checkpoint_granularity: int
     before: torch.Tensor
     after: torch.Tensor
     has_history: torch.Tensor
@@ -133,16 +133,18 @@ class _StatePageIndexPlan:
 
 
 def _compute_state_page_index_plan(
-    page_size: int,
+    checkpoint_granularity: int,
     seq_lens_before: torch.Tensor,
     seq_lens_after: torch.Tensor,
 ) -> _StatePageIndexPlan:
     before = seq_lens_before.to(torch.int64)
     after = seq_lens_after.to(torch.int64)
-    in_slots = torch.div(before - 1, page_size, rounding_mode="floor").clamp_(min=0)
-    out_slots = torch.div(after - 1, page_size, rounding_mode="floor")
+    in_slots = torch.div(
+        before - 1, checkpoint_granularity, rounding_mode="floor"
+    ).clamp_(min=0)
+    out_slots = torch.div(after - 1, checkpoint_granularity, rounding_mode="floor")
     return _StatePageIndexPlan(
-        page_size=page_size,
+        checkpoint_granularity=checkpoint_granularity,
         before=before,
         after=after,
         has_history=before > 0,
@@ -177,7 +179,8 @@ def _gather_state_page_indices(
         if bool((plan.out_slots >= max_slots).any()):
             raise ValueError(
                 "state paging: out page slot exceeds table width "
-                f"{max_slots} (page_size={plan.page_size})"
+                f"{max_slots} (checkpoint_granularity="
+                f"{plan.checkpoint_granularity})"
             )
         if bool((state_in[plan.has_history] <= 0).any()):
             raise ValueError(
@@ -215,23 +218,23 @@ def _gather_state_page_indices(
 
 def compute_state_page_indices(
     rows: torch.Tensor,
-    page_size: int,
+    checkpoint_granularity: int,
     seq_lens_before: torch.Tensor,
     seq_lens_after: torch.Tensor,
     *,
     validate: bool = True,
     group_id: str = _STATE_GROUP_ID,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dual-index state pages: in = page of position n-1 (0/null when no
-    history), out = page of the step's last position. rows: [bs, max_pages]
-    int32 page ids (-1 pad, 0 hole). Within a page in == out (in-place
-    evolution); crossing a boundary reads the old page and writes the new
-    one; resuming from a prefix hit reads the claimed snapshot page and
-    writes the fresh working page.
+    """Dual-index state pages: in = slot of position n-1 (0/null when no
+    history), out = slot of the step's last position. rows: [bs, max_slots]
+    int32 page ids (-1 pad, 0 hole). Within a slot in == out (in-place
+    evolution); crossing a checkpoint boundary reads the old slot and writes
+    the new one; resuming from a prefix hit reads the claimed snapshot slot
+    and writes the fresh working slot.
 
     Args:
-        rows: ``[bs, max_pages]`` int32 page-id table of one state group.
-        page_size: Tokens per logical state page (``P``).
+        rows: ``[bs, max_slots]`` int32 page-id table of one state group.
+        checkpoint_granularity: Tokens between two state checkpoints (``P``).
         seq_lens_before: Per-request token count before this forward.
         seq_lens_after: Per-request token count after this forward.
         validate: Run the host-synchronizing write-side checks.
@@ -241,7 +244,9 @@ def compute_state_page_indices(
     Returns:
         ``(state_in, state_out)`` int32 page ids per request.
     """
-    plan = _compute_state_page_index_plan(page_size, seq_lens_before, seq_lens_after)
+    plan = _compute_state_page_index_plan(
+        checkpoint_granularity, seq_lens_before, seq_lens_after
+    )
     return _gather_state_page_indices(rows, plan, validate=validate, group_id=group_id)
 
 
@@ -345,7 +350,7 @@ class MambaAttnBackend(AttentionBackend):
         )
         self.kv_pool = None
         self.state_paging_active = False
-        self._state_page_size = 1
+        self._checkpoint_granularity = 1
         self._state_group_ids: tuple[str, ...] = ()
         # CUDA-graph buffers: one persistent dual-index
         # (state_in/state_out) [bs] buffer per state group and captured batch
@@ -376,7 +381,17 @@ class MambaAttnBackend(AttentionBackend):
             )
         self._state_group_ids = state_group_ids
         self.state_paging_active = True
-        self._state_page_size = int(contract.block_size)
+        checkpoint_granularities = {
+            spec.checkpoint_granularity
+            for spec in contract.group_specs
+            if spec.family == "state"
+        }
+        if len(checkpoint_granularities) != 1 or None in checkpoint_granularities:
+            raise RuntimeError(
+                "MambaAttnBackend requires one shared state-group "
+                f"checkpoint_granularity, got {sorted(checkpoint_granularities, key=str)}"
+            )
+        self._checkpoint_granularity = int(checkpoint_granularities.pop())
 
     def _state_page_bounds(
         self,
@@ -450,7 +465,7 @@ class MambaAttnBackend(AttentionBackend):
         committed = (seq_lens[:bs].to(torch.int64) - draft_token_num).clamp_min(0)
         in_slots = torch.div(
             (committed - 1).clamp_min(0),
-            self._state_page_size,
+            self._checkpoint_granularity,
             rounding_mode="floor",
         )
         has_history = committed > 0
@@ -671,7 +686,7 @@ class MambaAttnBackend(AttentionBackend):
         bs = accepted_length.shape[0]
         k = accepted_length.to(torch.int64).clamp(min=1, max=draft_token_num)
         new_last = committed[:bs] + k - 1
-        slot = torch.div(new_last, self._state_page_size, rounding_mode="floor")
+        slot = torch.div(new_last, self._checkpoint_granularity, rounding_mode="floor")
         stride = draft_token_num + 1
         src_rows = (
             torch.arange(bs, dtype=torch.int64, device=accepted_length.device) * stride
@@ -750,7 +765,9 @@ class MambaAttnBackend(AttentionBackend):
             )
         forward_batch = kwargs.get("forward_batch")
         before, after = self._state_page_bounds(bs, seq_lens, forward_mode, kwargs)
-        plan = _compute_state_page_index_plan(self._state_page_size, before, after)
+        plan = _compute_state_page_index_plan(
+            self._checkpoint_granularity, before, after
+        )
         out_slots_by_width: dict[int, torch.Tensor] = {}
         state_in_pages: dict[str, torch.Tensor] = {}
         state_out_pages: dict[str, torch.Tensor] = {}
@@ -1204,7 +1221,7 @@ class MambaAttnBackend(AttentionBackend):
                         seq_lens_ptr=Reg.PTR4,
                         bs=Reg.REAL_BS,
                         max_slots=Reg(Reg.USER0 + i),
-                        page_size=self._state_page_size,
+                        page_size=self._checkpoint_granularity,
                     )
                     tape.filltail(
                         sin, live=Reg.REAL_BS, total=bs, value=self.pad_slot_id

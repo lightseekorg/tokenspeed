@@ -142,9 +142,11 @@ class _StubFullAttnMeta:
 
     full_attention_group_id = "full_attention"
 
-    def __init__(self, table: torch.Tensor, block_size: int, forward_op: object):
+    def __init__(
+        self, table: torch.Tensor, prefix_granularity: int, forward_op: object
+    ):
         self._table = table
-        self.block_size = block_size
+        self.prefix_granularity = prefix_granularity
         self._forward_op = forward_op
         self._kernel_tables = {}
 
@@ -163,7 +165,7 @@ class _StubFullAttnMeta:
         if cached is None:
             cached = expand_page_table(
                 self._table,
-                logical_page_size=self.block_size,
+                table_page_size=self.prefix_granularity,
                 kernel_page_size=page_size,
                 max_kernel_pages=max_pages,
             )

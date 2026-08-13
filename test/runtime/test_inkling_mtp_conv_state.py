@@ -91,7 +91,7 @@ class TestInklingCacheContract(unittest.TestCase):
                 has_initial_state=torch.ones(1, dtype=torch.bool),
                 is_decode=restore,
                 seq_lens=torch.tensor([seq_len], dtype=torch.int32),
-                col_page_table={"state": torch.full((1, 2), page, dtype=torch.int32)},
+                col_block_table={"state": torch.full((1, 2), page, dtype=torch.int32)},
                 remote_restore_mask=torch.tensor([True]) if restore else None,
             )
 
@@ -698,7 +698,7 @@ class TestCheckpointMetadata(unittest.TestCase):
     def test_draft_lookback_window_keeps_paged_checkpoints(self):
         """enter_draft_lookback_window must carry the paged bridges into the
         widened metadata: the in-kernel publish resolves pages from
-        col_page_table by position, so dropping it (the old refusal path)
+        col_block_table by position, so dropping it (the old refusal path)
         would silently disable draft publication on every decode round."""
         from types import SimpleNamespace
 
@@ -728,7 +728,7 @@ class TestCheckpointMetadata(unittest.TestCase):
             is_decode=False,
             seq_idx=torch.zeros(bs * k, dtype=torch.int32, device="cuda"),
             seq_lens=seq_lens,
-            col_page_table={"state": table[:bs]},
+            col_block_table={"state": table[:bs]},
         )
 
         self.assertTrue(backend.enter_draft_lookback_window(bs))
@@ -737,8 +737,8 @@ class TestCheckpointMetadata(unittest.TestCase):
         self.assertEqual(
             md.query_start_loc.tolist(), [0, k + lookback], "widened chunk"
         )
-        self.assertIsNotNone(md.col_page_table)
-        self.assertTrue(torch.equal(md.col_page_table["state"], table[:bs]))
+        self.assertIsNotNone(md.col_block_table)
+        self.assertTrue(torch.equal(md.col_block_table["state"], table[:bs]))
         # Same through-chunk end: the boundary the accept landed on (128)
         # is inside the widened chunk (132 - 6, 132], so the kernel's
         # positional publish re-covers it with committed rows.
@@ -769,14 +769,14 @@ class TestCheckpointMetadata(unittest.TestCase):
             is_decode=False,
             seq_idx=torch.zeros(bs * k, dtype=torch.int32, device="cuda"),
             seq_lens=torch.tensor([200, 260], dtype=torch.int32, device="cuda"),
-            col_page_table={"state": table},
+            col_block_table={"state": table},
         )
 
         backend.advance_draft_forward_metadata()
 
         md = backend.conv_metadata
         self.assertTrue(md.is_decode)
-        self.assertTrue(torch.equal(md.col_page_table["state"], table))
+        self.assertTrue(torch.equal(md.col_block_table["state"], table))
 
 
 if __name__ == "__main__":

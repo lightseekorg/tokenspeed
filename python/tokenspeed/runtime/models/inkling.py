@@ -420,7 +420,7 @@ def _sconv_apply(
         md.cache_indices,
         md.has_initial_state,
         md.seq_lens,
-        md.col_page_table[checkpoint_group],
+        md.col_block_table[checkpoint_group],
         checkpoint_buffers[0],
         checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
         num_extends=md.num_extends,

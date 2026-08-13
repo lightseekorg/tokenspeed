@@ -27,9 +27,9 @@
 namespace tokenspeed {
 
 std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
-                               std::int32_t page_size, std::int32_t promotion_boundary_tokens) {
+                               std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens) {
     _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
-    _assert(page_size > 0, "page_size must be > 0");
+    _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
     std::int32_t chunk_size = std::min(unscheduled, token_budget);
     if (promotion_boundary_tokens > first_pos) {
         chunk_size = std::min(chunk_size, promotion_boundary_tokens - first_pos);
@@ -38,24 +38,24 @@ std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled,
         return chunk_size;
     }
 
-    const std::int32_t page_offset = first_pos % page_size;
-    if (page_offset != 0) {
-        const std::int32_t tokens_to_boundary = page_size - page_offset;
+    const std::int32_t prefix_page_offset = first_pos % prefix_granularity;
+    if (prefix_page_offset != 0) {
+        const std::int32_t tokens_to_boundary = prefix_granularity - prefix_page_offset;
         return token_budget >= tokens_to_boundary ? tokens_to_boundary : 0;
     }
-    return chunk_size - chunk_size % page_size;
+    return chunk_size - chunk_size % prefix_granularity;
 }
 
-std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
-    _assert(config.block_size > 0, "scheduler block_size must be > 0");
-    std::vector<KvCacheSpec> specs;
+std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
+    _assert(config.prefix_granularity > 0, "scheduler prefix_granularity must be > 0");
+    std::vector<CacheGroupSpec> specs;
     specs.reserve(config.paged_cache_groups.size());
     for (const PagedCacheGroupConfig& group : config.paged_cache_groups) {
         _assert(group.cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
-        const std::int32_t cache_block_tokens = group.CacheBlockTokens();
-        _assert(cache_block_tokens > 0, "cache group must have positive tokens per cache block");
-        _assert(config.block_size % cache_block_tokens == 0,
-                "cache group block tokens must divide the scheduler cache block tokens");
+        const std::int32_t page_size = group.PageSize();
+        _assert(page_size > 0, "cache group must have a positive page_size");
+        _assert(config.prefix_granularity % page_size == 0,
+                "group page_size must divide the scheduler prefix granularity");
         // family=State marks trailing-window prefix reuse and covers both SWA and
         // linear-attention groups; only a State group WITHOUT SlidingWindow
         // retention is a mamba-style state group.
@@ -75,11 +75,11 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
             }
         }
         if (final_state_manager) {
-            specs.push_back(KvCacheSpec{
+            specs.push_back(CacheGroupSpec{
                 .kind = AttnKind::kMambaState,
                 .sliding_window = 0,
                 .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
-                .cache_block_tokens = cache_block_tokens,
+                .page_size = page_size,
             });
             continue;
         }
@@ -87,24 +87,24 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
         if (is_swa && (!group.sliding_window_tokens || *group.sliding_window_tokens <= 0)) {
             throw std::invalid_argument("Cache group '" + group.group_id + "' requires positive sliding_window_tokens");
         }
-        specs.push_back(KvCacheSpec{
+        specs.push_back(CacheGroupSpec{
             .kind = is_swa ? AttnKind::kSlidingWindow : AttnKind::kFull,
             .sliding_window = is_swa ? *group.sliding_window_tokens : 0,
             .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
-            .cache_block_tokens = cache_block_tokens,
+            .page_size = page_size,
         });
     }
     return specs;
 }
 
-void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables) {
+void FreeRequest(CacheCoordinator& coordinator, std::vector<BlockTable>& tables) {
     if (tables.empty()) {
         return;  // request never got tables, or a failure path already released them
     }
     coordinator.Free(tables);
 }
 
-std::map<std::string, std::vector<std::int32_t>> BuildBlockTables(const KvCacheCoordinator& coordinator,
+std::map<std::string, std::vector<std::int32_t>> BuildBlockTables(const CacheCoordinator& coordinator,
                                                                   const std::vector<BlockTable>& tables,
                                                                   std::span<const std::string> group_ids) {
     _assert(tables.size() == group_ids.size(), "BuildBlockTables: tables/group_ids size mismatch");
@@ -112,7 +112,7 @@ std::map<std::string, std::vector<std::int32_t>> BuildBlockTables(const KvCacheC
             "BuildBlockTables: tables/coordinator size mismatch");
     std::map<std::string, std::vector<std::int32_t>> out;
     for (std::size_t i = 0; i < tables.size(); ++i) {
-        out.emplace(group_ids[i], coordinator.GroupManager(static_cast<std::int32_t>(i)).BlockTablePageIds(tables[i]));
+        out.emplace(group_ids[i], coordinator.Allocator(static_cast<std::int32_t>(i)).BlockTablePageIds(tables[i]));
     }
     return out;
 }

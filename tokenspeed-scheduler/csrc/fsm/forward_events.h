@@ -28,7 +28,7 @@
 #include <variant>
 #include <vector>
 
-#include "cache/coordinator/kv_cache_coordinator.h"
+#include "cache/coordinator/cache_coordinator.h"
 #include "fsm/base_event.h"
 #include "fsm/forward_states.h"
 #include "utils.h"
@@ -43,7 +43,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
     SchedulePrefillFirstChunkEvent(std::int32_t tokens_this_round,
                                    std::int32_t reserve_num_tokens_in_next_schedule_event,
                                    ReqPoolAllocator* req_pool_allocator, PrefillSource source,
-                                   KvCacheCoordinator* coordinator, std::vector<BlockTable> block_tables,
+                                   CacheCoordinator* coordinator, std::vector<BlockTable> block_tables,
                                    std::int32_t hit_tokens, CacheProgress cache_progress,
                                    std::vector<BlockTransfer> load_pairs)
         : tokens_this_round_{tokens_this_round},
@@ -69,7 +69,7 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
     ReqPoolAllocator* req_pool_allocator_{};
     PrefillSource source_{PrefillSource::kLocal};
-    KvCacheCoordinator* coordinator_{};
+    CacheCoordinator* coordinator_{};
     std::vector<BlockTable> block_tables_;
     std::int32_t hit_tokens_{0};
     CacheProgress cache_progress_;
@@ -113,7 +113,7 @@ private:
 struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
     using InvalidTransitionHandler<FinishEvent>::operator();
 
-    explicit FinishEvent(KvCacheCoordinator* coordinator) : coordinator_{coordinator} {}
+    explicit FinishEvent(CacheCoordinator* coordinator) : coordinator_{coordinator} {}
 
     Finished operator()(PrefillDone&& state);
     Finished operator()(Decoding&& state);
@@ -124,13 +124,13 @@ private:
     template <typename State>
     Finished finish(State&& state);
 
-    KvCacheCoordinator* coordinator_{};
+    CacheCoordinator* coordinator_{};
 };
 
 struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     using InvalidTransitionHandler<AbortEvent>::operator();
 
-    explicit AbortEvent(KvCacheCoordinator* coordinator) : coordinator_{coordinator} {}
+    explicit AbortEvent(CacheCoordinator* coordinator) : coordinator_{coordinator} {}
 
     Finished operator()(Bootstrapping&&);
     Finished operator()(Submitted&&);
@@ -144,7 +144,7 @@ private:
     template <typename State>
     Finished abortForward(State&& state);
 
-    KvCacheCoordinator* coordinator_{};
+    CacheCoordinator* coordinator_{};
 };
 
 // Decode Retraction releases Device ownership immediately. Cached blocks may
@@ -152,19 +152,19 @@ private:
 struct RetractionEvent : InvalidTransitionHandler<RetractionEvent> {
     using InvalidTransitionHandler<RetractionEvent>::operator();
 
-    explicit RetractionEvent(KvCacheCoordinator* coordinator) : coordinator_{coordinator} {}
+    explicit RetractionEvent(CacheCoordinator* coordinator) : coordinator_{coordinator} {}
 
     Retracted operator()(Decoding&& state);
 
 private:
-    KvCacheCoordinator* coordinator_{};
+    CacheCoordinator* coordinator_{};
 };
 
 // Release every request-owned page and requeue all accepted tokens as prefill.
 struct RetractEvent : InvalidTransitionHandler<RetractEvent> {
     using InvalidTransitionHandler<RetractEvent>::operator();
 
-    explicit RetractEvent(KvCacheCoordinator* coordinator) : coordinator_{coordinator} {}
+    explicit RetractEvent(CacheCoordinator* coordinator) : coordinator_{coordinator} {}
 
     Submitted operator()(PrefillDone&& state);
     Submitted operator()(Decoding&& state);
@@ -173,7 +173,7 @@ private:
     template <typename State>
     Submitted retract(State&& state);
 
-    KvCacheCoordinator* coordinator_{};
+    CacheCoordinator* coordinator_{};
 };
 
 struct UpdateReserveNumTokensEvent : InvalidTransitionHandler<UpdateReserveNumTokensEvent> {

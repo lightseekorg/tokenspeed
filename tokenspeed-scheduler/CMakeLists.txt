@@ -50,8 +50,8 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/scheduler/scheduler.cpp
 
     csrc/cache/core/cache_config.cpp
-    csrc/cache/coordinator/kv_cache_admission.cpp
-    csrc/cache/coordinator/kv_cache_coordinator.cpp
+    csrc/cache/coordinator/cache_admission.cpp
+    csrc/cache/coordinator/cache_coordinator.cpp
     csrc/cache/core/cache_block_ref.cpp
     csrc/scheduler/operations/cache.cpp
     csrc/cache/tier/transfer_manager.cpp
@@ -69,7 +69,7 @@ target_link_libraries(tokenspeed_scheduler_core
 )
 
 # OpenSSL 3.0 deprecates the one-shot SHA256_* API in favor of EVP_*. We keep
-# the SHA256_* calls in page_hasher.h; suppress the deprecation warnings.
+# the SHA256_* calls in prefix_hasher.h; suppress the deprecation warnings.
 target_compile_definitions(tokenspeed_scheduler_core
     PUBLIC
         OPENSSL_SUPPRESS_DEPRECATED
@@ -104,18 +104,18 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     FetchContent_MakeAvailable(googletest)
 
     add_executable(tokenspeed_scheduler_tests
-        tests/cpp/test_page_hasher.cpp
+        tests/cpp/test_prefix_hasher.cpp
         tests/cpp/test_block_pool.cpp
         tests/cpp/test_cache_block_ref.cpp
-        tests/cpp/test_full_attn_manager.cpp
-        tests/cpp/test_swa_manager.cpp
+        tests/cpp/test_full_attn_group.cpp
+        tests/cpp/test_swa_group.cpp
         tests/cpp/test_match_host_pages.cpp
-        tests/cpp/test_kv_cache_coordinator.cpp
+        tests/cpp/test_cache_coordinator.cpp
         tests/cpp/test_joint_match_invariants.cpp
         tests/cpp/test_forward_cache_ops.cpp
         tests/cpp/test_forward_batch.cpp
         tests/cpp/test_kv_cache_lifecycle.cpp
-        tests/cpp/test_kv_cache_scenarios.cpp
+        tests/cpp/test_cache_scenarios.cpp
         tests/cpp/test_scheduler_plan.cpp
         tests/cpp/test_outside_event_handler.cpp
         tests/cpp/test_cache_operations.cpp

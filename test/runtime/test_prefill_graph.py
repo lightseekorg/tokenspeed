@@ -163,13 +163,11 @@ class DummyGroupTablesTest(unittest.TestCase):
             paged_cache_group_specs=(
                 SimpleNamespace(
                     group_id="fine",
-                    rows_per_page=4,
-                    entry_stride_tokens=1,
+                    block_granularity=4,
                 ),
                 SimpleNamespace(
                     group_id="coarse",
-                    rows_per_page=64,
-                    entry_stride_tokens=4,
+                    block_granularity=256,
                 ),
             )
         )

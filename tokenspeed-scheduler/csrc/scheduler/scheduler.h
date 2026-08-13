@@ -32,7 +32,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "cache/coordinator/kv_cache_coordinator.h"
+#include "cache/coordinator/cache_coordinator.h"
 #include "cache/core/block_pool.h"
 #include "cache/tier/transfer_manager.h"
 #include "fsm/forward_events.h"
@@ -80,16 +80,16 @@ public:
     bool PdTransferPinned(const std::string& request_id) const { return pd_transfer_pins_.contains(request_id); }
     std::int32_t PoolFreeBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
     std::int32_t HostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
-    std::int32_t HostPoolFreeBlocks() const { return host_pool_.NumEmptyLcmBlocks(); }
+    std::int32_t HostPoolFreeBlocks() const { return coordinator_.NumFreeHostLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
 
 private:
     bool clearCache(bool include_host);
     struct AdmissionMatch {
-        KvCacheCoordinator::PrefixProbe probe;
-        std::vector<std::string> candidate_page_hashes;
+        CacheCoordinator::PrefixProbe probe;
+        std::vector<std::string> candidate_prefix_hashes;
         std::vector<std::string> extension_hashes;
-        std::vector<std::string> page_hashes;
+        std::vector<std::string> prefix_hashes;
     };
 
     struct KvEventHashProgress {
@@ -122,18 +122,18 @@ private:
     DecodeOperation applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event);
 
     AdmissionMatch matchPrefixAtAdmission(Request* request);
-    std::optional<KvCacheCoordinator::AdmissionResult> admit(
-        PlanBuildContext& context, KvCacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
+    std::optional<CacheCoordinator::AdmissionResult> admit(
+        PlanBuildContext& context, CacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
         std::optional<std::uint64_t> request_access_epoch = std::nullopt);
-    std::optional<KvCacheCoordinator::AdmissionResult> admit(PlanBuildContext& context,
+    std::optional<CacheCoordinator::AdmissionResult> admit(PlanBuildContext& context,
                                                              std::span<const GroupDemand> demands,
                                                              std::uint64_t request_access_epoch);
     bool admitWithKvEventTracking(PlanBuildContext& context, Request& request, const fsm::CacheProgress& cache_progress,
-                                  std::int32_t new_page_hash_begin, std::span<const GroupDemand> demands);
-    std::vector<CacheKey> registerKvEventPages(const Request& request, std::span<const std::string> page_hashes,
-                                               std::int32_t first_page);
+                                  std::int32_t new_prefix_hash_begin, std::span<const GroupDemand> demands);
+    std::vector<CacheKey> registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
+                                                     std::int32_t first_page);
     void discardUncachedKvEventPages(std::span<const CacheKey> keys);
-    void handleCacheMutation(const CacheKey& key, KvCacheCoordinator::CacheMutation mutation);
+    void handleCacheMutation(const CacheKey& key, CacheCoordinator::CacheMutation mutation);
     void publishCompletedPages(Request& request);
     void retractForCapacity(PlanBuildContext& context, const std::vector<Request*>& candidates,
                             std::vector<WriteBackOperation>& write_back_operations);
@@ -153,8 +153,8 @@ private:
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
 
-    std::int32_t calculateMaxSingleRequestTokens(std::int64_t usable_parents) const;
-    std::int64_t singleRequestParentsRequired(std::int32_t token_limit) const;
+    std::int32_t calculateMaxSingleRequestTokens(std::int64_t usable_lcm_blocks) const;
+    std::int64_t singleRequestLcmBlocksRequired(std::int32_t token_limit) const;
 
     SchedulerConfig config_;
     ReqPoolAllocator req_pool_allocator_;
@@ -162,7 +162,7 @@ private:
     // Pools outlive every CacheBlockRef stored below.
     BlockPool block_pool_;
     BlockPool host_pool_;
-    KvCacheCoordinator coordinator_;
+    CacheCoordinator coordinator_;
     TierTransferManager tier_transfers_;
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};

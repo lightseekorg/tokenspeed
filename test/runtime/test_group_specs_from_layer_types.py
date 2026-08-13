@@ -68,7 +68,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
         specs = _specs(
             layer_types=layer_types,
             sliding_window_tokens=128,
-            page_size=16,
+            prefix_granularity=16,
         )
         self.assertEqual(len(specs), 2)
         by_id = {s.group_id: s for s in specs}
@@ -92,7 +92,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
         specs = _specs(
             layer_types=["full_attention"] * 8,
             sliding_window_tokens=None,
-            page_size=16,
+            prefix_granularity=16,
         )
         self.assertEqual(len(specs), 1)
         self.assertEqual(specs[0].group_id, "full_attention")
@@ -103,7 +103,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
         specs = _specs(
             layer_types=["sliding_attention", "full_attention", "full_attention"],
             sliding_window_tokens=64,
-            page_size=8,
+            prefix_granularity=8,
         )
         self.assertEqual(
             [s.group_id for s in specs],
@@ -117,7 +117,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
         specs = _specs(
             layer_types=block * 2,
             sliding_window_tokens=512,
-            page_size=128,
+            prefix_granularity=128,
         )
         self.assertEqual(
             [s.group_id for s in specs],
@@ -140,7 +140,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
             _specs(
                 layer_types=["full_attention", "sliding_attention_x"],
                 sliding_window_tokens=64,
-                page_size=16,
+                prefix_granularity=16,
             )
 
     def test_unknown_layer_type_raises(self):
@@ -148,7 +148,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
             _specs(
                 layer_types=["full_attention", "banana_attention"],
                 sliding_window_tokens=None,
-                page_size=16,
+                prefix_granularity=16,
             )
 
     def test_sliding_without_window_raises(self):
@@ -156,7 +156,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
             _specs(
                 layer_types=["sliding_attention"],
                 sliding_window_tokens=None,
-                page_size=16,
+                prefix_granularity=16,
             )
 
     def test_sliding_with_nonpositive_window_raises(self):
@@ -164,7 +164,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
             _specs(
                 layer_types=["sliding_attention"],
                 sliding_window_tokens=0,
-                page_size=16,
+                prefix_granularity=16,
             )
 
     def test_qwen35_linear_attention_yields_state_group(self):
@@ -172,7 +172,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
         specs = _specs(
             layer_types=layer_types,
             sliding_window_tokens=None,
-            page_size=16,
+            prefix_granularity=16,
         )
         self.assertEqual(len(specs), 2)
         by_id = {s.group_id: s for s in specs}
@@ -180,14 +180,25 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
         self.assertEqual(state.family, "state")
         self.assertEqual(state.retention, "full_history")
         self.assertIsNone(state.sliding_window_tokens)
-        self.assertEqual(by_id["full_attention"].family, "history")
+        # Snapshot-state groups declare checkpoint_granularity, not rows.
+        self.assertEqual(state.checkpoint_granularity, 16)
+        self.assertIsNone(state.rows_per_page)
+        self.assertIsNone(state.entry_stride_tokens)
+        self.assertEqual(state.block_granularity, 16)
+        with self.assertRaises(TypeError):
+            _ = state.page_size
+        full = by_id["full_attention"]
+        self.assertEqual(full.family, "history")
+        self.assertIsNone(full.checkpoint_granularity)
+        self.assertEqual(full.page_size, 16)
+        self.assertEqual(full.block_granularity, 16)
 
     def test_qwen35_mixed_with_sliding_and_state_layers(self):
         layer_types = ["sliding_attention", "linear_attention", "full_attention"]
         specs = _specs(
             layer_types=layer_types,
             sliding_window_tokens=[128, None, None],
-            page_size=16,
+            prefix_granularity=16,
         )
         by_id = {s.group_id: s for s in specs}
         self.assertEqual(by_id["sliding_attention"].family, "history")
@@ -254,7 +265,7 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
                 "full_attention",
             ],
             sliding_window_tokens=[None, 4, 512, None],
-            page_size=16,
+            prefix_granularity=16,
         )
         self.assertEqual(
             [s.group_id for s in specs],
@@ -272,7 +283,7 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
             _specs(
                 layer_types=["full_attention", "sliding_attention"],
                 sliding_window_tokens=[None, 4, 512],
-                page_size=16,
+                prefix_granularity=16,
             )
 
     def test_sliding_layer_without_window_in_sequence_raises(self):
@@ -280,7 +291,7 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
             _specs(
                 layer_types=["full_attention", "sliding_attention"],
                 sliding_window_tokens=[None, None],
-                page_size=16,
+                prefix_granularity=16,
             )
 
     def test_sliding_layer_nonpositive_window_in_sequence_raises(self):
@@ -288,7 +299,7 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
             _specs(
                 layer_types=["sliding_attention"],
                 sliding_window_tokens=[0],
-                page_size=16,
+                prefix_granularity=16,
             )
 
     def test_full_layer_with_positive_window_in_sequence_raises(self):
@@ -296,7 +307,7 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
             _specs(
                 layer_types=["full_attention", "sliding_attention"],
                 sliding_window_tokens=[64, 64],
-                page_size=16,
+                prefix_granularity=16,
             )
 
     def test_linear_layer_with_positive_window_in_sequence_raises(self):
@@ -304,7 +315,7 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
             _specs(
                 layer_types=["linear_attention", "full_attention"],
                 sliding_window_tokens=[128, None],
-                page_size=16,
+                prefix_granularity=16,
             )
 
     def test_repeated_window_across_layers_dedups_to_one_group(self):
@@ -316,7 +327,7 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
                 "sliding_attention",
             ],
             sliding_window_tokens=[None, 4, 512, 4],
-            page_size=16,
+            prefix_granularity=16,
         )
         self.assertEqual(
             [s.group_id for s in specs],
@@ -328,13 +339,13 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
             _specs(
                 layer_types=["sliding_attention"],
                 sliding_window_tokens=True,
-                page_size=16,
+                prefix_granularity=16,
             )
         with self.assertRaises(ValueError):
             _specs(
                 layer_types=["sliding_attention"],
                 sliding_window_tokens=[True],
-                page_size=16,
+                prefix_granularity=16,
             )
 
     def test_float_window_raises(self):
@@ -342,7 +353,7 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
             _specs(
                 layer_types=["sliding_attention"],
                 sliding_window_tokens=[4.7],
-                page_size=16,
+                prefix_granularity=16,
             )
 
     def test_scalar_str_window_raises(self):
@@ -350,7 +361,7 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
             _specs(
                 layer_types=["sliding_attention"],
                 sliding_window_tokens="128",
-                page_size=16,
+                prefix_granularity=16,
             )
 
     def test_scalar_float_window_raises(self):
@@ -358,16 +369,115 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
             _specs(
                 layer_types=["sliding_attention"],
                 sliding_window_tokens=4.5,
-                page_size=16,
+                prefix_granularity=16,
             )
 
     def test_scalar_window_with_full_layers_does_not_raise(self):
         specs = _specs(
             layer_types=["full_attention", "sliding_attention"],
             sliding_window_tokens=128,
-            page_size=16,
+            prefix_granularity=16,
         )
         self.assertEqual(len(specs), 2)
+
+
+class PagedCacheGroupSpecShapeTest(unittest.TestCase):
+    """A spec declares exactly one geometry shape: row geometry (paged KV)
+    or checkpoint_granularity (snapshot state)."""
+
+    def test_row_geometry_shape(self):
+        spec = PagedCacheGroupSpec(
+            group_id="kv",
+            retention="full_history",
+            rows_per_page=16,
+            entry_stride_tokens=4,
+            sliding_window_tokens=None,
+        )
+        self.assertEqual(spec.page_size, 64)
+        self.assertEqual(spec.block_granularity, 64)
+        self.assertIsNone(spec.checkpoint_granularity)
+
+    def test_checkpoint_shape(self):
+        spec = PagedCacheGroupSpec(
+            group_id="state",
+            retention="full_history",
+            sliding_window_tokens=None,
+            family="state",
+            checkpoint_granularity=64,
+        )
+        self.assertEqual(spec.block_granularity, 64)
+        with self.assertRaises(TypeError):
+            _ = spec.page_size
+
+    def test_shapes_are_mutually_exclusive(self):
+        with self.assertRaises(ValueError):
+            PagedCacheGroupSpec(
+                group_id="state",
+                retention="full_history",
+                rows_per_page=16,
+                entry_stride_tokens=1,
+                sliding_window_tokens=None,
+                family="state",
+                checkpoint_granularity=16,
+            )
+
+    def test_missing_shape_raises(self):
+        with self.assertRaises(ValueError):
+            PagedCacheGroupSpec(
+                group_id="kv",
+                retention="full_history",
+                sliding_window_tokens=None,
+            )
+
+    def test_partial_row_geometry_raises(self):
+        with self.assertRaises(ValueError):
+            PagedCacheGroupSpec(
+                group_id="kv",
+                retention="full_history",
+                rows_per_page=16,
+                sliding_window_tokens=None,
+            )
+
+    def test_checkpoint_requires_state_family(self):
+        with self.assertRaises(ValueError):
+            PagedCacheGroupSpec(
+                group_id="kv",
+                retention="full_history",
+                sliding_window_tokens=None,
+                family="history",
+                checkpoint_granularity=16,
+            )
+
+    def test_nonpositive_geometry_raises(self):
+        with self.assertRaises(ValueError):
+            PagedCacheGroupSpec(
+                group_id="kv",
+                retention="full_history",
+                rows_per_page=0,
+                entry_stride_tokens=1,
+                sliding_window_tokens=None,
+            )
+        with self.assertRaises(ValueError):
+            PagedCacheGroupSpec(
+                group_id="state",
+                retention="full_history",
+                sliding_window_tokens=None,
+                family="state",
+                checkpoint_granularity=0,
+            )
+
+    def test_state_family_may_keep_row_geometry(self):
+        # V4-style row-buffer groups are state-family with real rows.
+        spec = PagedCacheGroupSpec(
+            group_id="v4.compressor",
+            retention="sliding_window",
+            rows_per_page=16,
+            entry_stride_tokens=4,
+            sliding_window_tokens=256,
+            family="state",
+        )
+        self.assertEqual(spec.page_size, 64)
+        self.assertEqual(spec.block_granularity, 64)
 
 
 class PoolToPagedCacheGroupsIntegrationTest(unittest.TestCase):
@@ -395,7 +505,7 @@ class PoolToPagedCacheGroupsIntegrationTest(unittest.TestCase):
         specs = _specs(
             layer_types=["full_attention", "sliding_attention"],
             sliding_window_tokens=128,
-            page_size=16,
+            prefix_granularity=16,
         )
         # Duck-typed stand-in: only the two attributes the converter reads.
         fake_pool = SimpleNamespace(
@@ -408,6 +518,27 @@ class PoolToPagedCacheGroupsIntegrationTest(unittest.TestCase):
         self.assertEqual(len(groups), 2)
         group_ids = {g.group_id for g in groups}
         self.assertEqual(group_ids, {"full_attention", "sliding_attention"})
+
+    def test_checkpoint_spec_folds_to_row_geometry_at_the_bridge(self):
+        from types import SimpleNamespace
+
+        pool_to_paged_cache_groups = self._import_converter()
+
+        specs = _specs(
+            layer_types=["linear_attention", "full_attention"],
+            sliding_window_tokens=None,
+            prefix_granularity=16,
+        )
+        fake_pool = SimpleNamespace(
+            paged_cache_group_specs=specs,
+            paged_cache_group_page_counts={s.group_id: 1024 for s in specs},
+        )
+
+        groups = {g.group_id: g for g in pool_to_paged_cache_groups(fake_pool)}
+
+        state = groups["linear_attention"]
+        self.assertEqual(state.rows_per_page, 16)
+        self.assertEqual(state.entry_stride_tokens, 1)
 
     def test_empty_specs_convert_to_no_groups(self):
         pool_to_paged_cache_groups = self._import_converter()

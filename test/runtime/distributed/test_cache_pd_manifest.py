@@ -47,7 +47,7 @@ def _group_spec(
     family: str,
     policy: str,
     *,
-    logical_block_tokens: int = 4,
+    prefix_granularity: int = 4,
     retention: str = "full_history",
     sliding_window_tokens: int | None = None,
     packing: int = 1,
@@ -55,7 +55,7 @@ def _group_spec(
     return PagedCacheGroupSpec(
         group_id=group_id,
         retention=retention,
-        rows_per_page=logical_block_tokens,
+        rows_per_page=prefix_granularity,
         entry_stride_tokens=1,
         sliding_window_tokens=sliding_window_tokens,
         family=family,
@@ -97,7 +97,7 @@ def _contract(
     transfer_schema: CacheTransferSchema = CacheTransferSchema(),
 ) -> CacheTransferContract:
     plan = CacheMemoryPlan(
-        logical_block_tokens=block_size,
+        prefix_granularity=block_size,
         lcm_block_bytes=page_bytes,
         num_lcm_blocks=capacity - 1,
         groups=tuple(
@@ -329,7 +329,7 @@ def test_destination_manifest_uses_peer_local_group_packing() -> None:
             "history",
             "history",
             "full_suffix",
-            logical_block_tokens=2,
+            prefix_granularity=2,
             packing=packing,
         )
         return _contract(
@@ -409,7 +409,7 @@ def _two_plane_lcm_plan(num_lcm_blocks: int) -> CacheMemoryPlan:
     plane_bytes = 512
     lcm_block_bytes = 1024
     return CacheMemoryPlan(
-        logical_block_tokens=4,
+        prefix_granularity=4,
         lcm_block_bytes=lcm_block_bytes,
         num_lcm_blocks=num_lcm_blocks,
         groups=(
@@ -484,7 +484,7 @@ def _recipe_contract(
 
     plan = solve_cache_layout(
         fields,
-        logical_block_tokens=q,
+        prefix_granularity=q,
         max_padding_fraction=1.0,
         **solve,
     ).with_num_lcm_blocks(3)
@@ -604,7 +604,7 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
         layer_types=(),
         group_ids=group_ids,
         sliding_window_tokens=None,
-        page_size=config.page_size,
+        prefix_granularity=config.page_size,
         cache_blocks_per_lcm_block=packing,
         pd_disaggregation_enabled=True,
     )
@@ -637,7 +637,7 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
         ),
     )
 
-    assert layout.plan.logical_block_tokens == 16
+    assert layout.plan.prefix_granularity == 16
     assert len(layout.group_specs) == 1
     group = layout.group_specs[0]
     assert (

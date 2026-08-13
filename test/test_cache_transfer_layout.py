@@ -99,7 +99,7 @@ def test_lcm_layout_is_derived_from_planned_field_offsets():
         plane_id="kv", bytes_per_lcm_block=4096, arena_offset_bytes=8192
     )
     plan = SimpleNamespace(
-        logical_block_tokens=128,
+        prefix_granularity=128,
         num_lcm_blocks=10,
         planes=(plane,),
         groups=(

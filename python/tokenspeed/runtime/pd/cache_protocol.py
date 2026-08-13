@@ -41,6 +41,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CachePlaneLayout,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    MXFP8_KV_SCALE_TILE_TOKENS,
     PagedCacheGroupSpec,
     Retention,
     TransferPolicy,
@@ -212,7 +213,7 @@ def _partition_for_field(
     *,
     model_config: ModelConfig,
     draft_model_config: ModelConfig | None,
-    logical_block_tokens: int,
+    prefix_granularity: int,
     inkling_layers: frozenset[int],
 ) -> CacheFieldPartition | None:
     layer_id = _field_layer_id(field.field_id)
@@ -240,7 +241,8 @@ def _partition_for_field(
     if suffix in ("k", "v"):
         return CacheFieldPartition(1, source_model.num_key_value_heads)
     if suffix in ("k_scale", "v_scale"):
-        axis = 0 if logical_block_tokens == 128 else 1
+        # Tiled mxfp8 scales are head-major; per-token scales are token-major.
+        axis = 0 if prefix_granularity == MXFP8_KV_SCALE_TILE_TOKENS else 1
         return CacheFieldPartition(axis, source_model.num_key_value_heads)
 
     text_config = _text_config(source_model)
@@ -288,7 +290,7 @@ def build_cache_transfer_schema(
             field,
             model_config=model_config,
             draft_model_config=draft_model_config,
-            logical_block_tokens=plan.logical_block_tokens,
+            prefix_granularity=plan.prefix_granularity,
             inkling_layers=inkling_layers,
         )
         if partition is not None:
@@ -340,7 +342,7 @@ class CacheTransferContract:
         try:
             plan_payload = payload["plan"]
             plan = CacheMemoryPlan(
-                logical_block_tokens=plan_payload["logical_block_tokens"],
+                prefix_granularity=plan_payload["prefix_granularity"],
                 lcm_block_bytes=plan_payload["lcm_block_bytes"],
                 num_lcm_blocks=plan_payload["num_lcm_blocks"],
                 groups=tuple(
@@ -575,26 +577,26 @@ def _logical_slots(
     policy: TransferPolicy,
     prefix_len: int,
     prompt_len: int,
-    block_size: int,
+    page_size: int,
     retention: Retention,
     sliding_window_tokens: int | None,
 ) -> tuple[int, ...]:
     if policy == "full_suffix":
-        begin = prefix_len // block_size
+        begin = prefix_len // page_size
         if retention == "sliding_window":
             # The next decode token can attend the preceding window - 1 raw
             # tokens. Include every group page intersecting that retained tail.
             retained_begin = max(0, prompt_len - sliding_window_tokens + 1)
-            begin = max(begin, retained_begin // block_size)
-        end = (prompt_len + block_size - 1) // block_size
+            begin = max(begin, retained_begin // page_size)
+        end = (prompt_len + page_size - 1) // page_size
         return tuple(range(begin, end))
-    return ((prompt_len - 1) // block_size,)
+    return ((prompt_len - 1) // page_size,)
 
 
 def validate_cache_peer_layout(
     layout: CacheTransferContract, peer_layout: CacheTransferContract
 ) -> None:
-    if layout.plan.logical_block_tokens != peer_layout.plan.logical_block_tokens:
+    if layout.plan.prefix_granularity != peer_layout.plan.prefix_granularity:
         raise CacheContractError(
             "Paged cache P/D contract mismatch: scheduler_block_tokens"
         )
@@ -607,9 +609,9 @@ def validate_cache_peer_layout(
     ):
         if (
             local_spec.family != peer_spec.family
-            or local_spec.cache_block_tokens != peer_spec.cache_block_tokens
             or local_spec.rows_per_page != peer_spec.rows_per_page
             or local_spec.entry_stride_tokens != peer_spec.entry_stride_tokens
+            or local_spec.checkpoint_granularity != peer_spec.checkpoint_granularity
             or local_spec.retention != peer_spec.retention
             or local_spec.sliding_window_tokens != peer_spec.sliding_window_tokens
             or local_spec.transfer_policy != peer_spec.transfer_policy
@@ -663,14 +665,14 @@ def validate_cache_manifest(
     actual = tuple(group.group_id for group in manifest.groups)
     if actual != expected:
         raise CacheContractError(f"{peer} manifest group order disagrees with layout")
-    if manifest.prefix_len % layout.plan.logical_block_tokens:
+    if manifest.prefix_len % layout.plan.prefix_granularity:
         raise CacheContractError(f"{peer} manifest prefix_len is not page aligned")
     for group, spec in zip(manifest.groups, layout.group_specs, strict=True):
         required = _logical_slots(
             spec.transfer_policy,
             manifest.prefix_len,
             manifest.prompt_len,
-            spec.cache_block_tokens,
+            spec.block_granularity,
             spec.retention,
             spec.sliding_window_tokens,
         )
@@ -697,7 +699,7 @@ def build_cache_page_manifest(
     """Select each group's pages according to its explicit transfer policy."""
     if prefix_len >= prompt_len:
         raise CacheContractError("Paged cache PD requires prefix_len < prompt_len")
-    if prefix_len % layout.plan.logical_block_tokens:
+    if prefix_len % layout.plan.prefix_granularity:
         raise CacheContractError("Paged cache PD prefix_len must be page aligned")
     mapping = forward_op.block_tables_arrays()  # type: ignore[attr-defined]
     expected_ids = {group.group_id for group in layout.group_specs}
@@ -715,7 +717,7 @@ def build_cache_page_manifest(
             spec.transfer_policy,
             prefix_len,
             prompt_len,
-            spec.cache_block_tokens,
+            spec.block_granularity,
             spec.retention,
             spec.sliding_window_tokens,
         )
@@ -761,7 +763,7 @@ def build_cache_layerwise_page_selection(
     snapshot. The returned destination positions refer to Decode's immutable
     full manifest.
     """
-    if prefix_len % layout.plan.logical_block_tokens:
+    if prefix_len % layout.plan.prefix_granularity:
         raise CacheContractError("Paged cache PD prefix_len must be page aligned")
     if prefix_len >= prompt_len:
         raise CacheContractError("layerwise selection requires prefix_len < prompt_len")
@@ -783,11 +785,12 @@ def build_cache_layerwise_page_selection(
     selections = []
     for spec in layout.group_specs:
         table = mapping[spec.group_id]
+        block_granularity = spec.block_granularity
         final_slots = _logical_slots(
             spec.transfer_policy,
             prefix_len,
             prompt_len,
-            spec.cache_block_tokens,
+            block_granularity,
             spec.retention,
             spec.sliding_window_tokens,
         )
@@ -797,16 +800,16 @@ def build_cache_layerwise_page_selection(
                     0,
                     min(
                         len(final_slots),
-                        chunk_start // spec.cache_block_tokens - final_slots[0],
+                        chunk_start // block_granularity - final_slots[0],
                     ),
                 )
                 if final_slots
                 else 0
             )
             ready_end = (
-                (chunk_end + spec.cache_block_tokens - 1) // spec.cache_block_tokens
+                (chunk_end + block_granularity - 1) // block_granularity
                 if is_final
-                else chunk_end // spec.cache_block_tokens
+                else chunk_end // block_granularity
             )
             ready_count = (
                 max(0, min(len(final_slots), ready_end - final_slots[0]))

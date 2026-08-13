@@ -259,7 +259,7 @@ class EventLoop:
         self._scheduler_cache_geometry = scheduler_cache_geometry_from_pool(
             token_to_kv_pool,
             fallback_token_capacity=self.max_total_num_tokens,
-            fallback_page_size=server_args.block_size,
+            fallback_prefix_granularity=server_args.block_size,
         )
         geometry = self._scheduler_cache_geometry
         self.max_total_num_tokens = geometry.token_capacity
@@ -298,7 +298,7 @@ class EventLoop:
             gpu_id=gpu_id,
             global_rank=global_rank,
             num_total_pages=num_total_pages,
-            logical_page_size=geometry.page_size,
+            prefix_granularity=geometry.prefix_granularity,
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
         self.model_executor = create_model_executor(
@@ -423,7 +423,7 @@ class EventLoop:
             num_device_pages=geometry.num_device_pages,
             max_scheduled_tokens=max_scheduled_tokens,
             max_batch_size=per_rank_max_batch,
-            page_size=geometry.page_size,
+            prefix_granularity=geometry.prefix_granularity,
             num_host_pages=num_host_pages,
             disable_l2_cache=not server_args.enable_kvstore,
             enable_l3_storage=server_args.kvstore_storage_backend is not None,
@@ -438,13 +438,13 @@ class EventLoop:
         )
         scheduler_cfg.enable_pd_cache = self._pd_cache_enabled
         logger.info(
-            "Scheduler config: block_size=%s num_device_pages=%s "
+            "Scheduler config: prefix_granularity=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s "
             "overlap_schedule_depth=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
             "disable_prefix_cache=%s prefix_replay_tokens=%s "
             "paged_cache_groups=%s",
-            scheduler_cfg.block_size,
+            scheduler_cfg.prefix_granularity,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
             scheduler_cfg.decode_input_tokens,
@@ -1098,7 +1098,7 @@ class EventLoop:
         ready_response = zmq_wire.WireEngineCoreReadyResponse(
             max_model_len=self.model_config.context_len,
             num_gpu_blocks=geometry.num_device_pages,
-            block_size=geometry.page_size,
+            block_size=geometry.prefix_granularity,
             dtype=_wire_dtype(self.model_config.dtype),
             multimodal_encoder_dtype=self.multimodal_encoder_dtype,
             vllm_version=f"tokenspeed-{_tokenspeed_version()}",

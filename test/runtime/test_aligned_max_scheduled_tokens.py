@@ -36,12 +36,12 @@ def _group(
     group_id: str,
     family: PagedCacheGroupFamily,
     retention: PagedCacheRetention,
-    cache_block_tokens: int = 64,
+    page_size: int = 64,
     sliding_window_tokens: int | None = None,
 ) -> PagedCacheGroupConfig:
     kwargs = dict(
         group_id=group_id,
-        rows_per_page=cache_block_tokens,
+        rows_per_page=page_size,
         entry_stride_tokens=1,
         total_pages=8,
         retention=retention,
@@ -52,13 +52,13 @@ def _group(
     return PagedCacheGroupConfig(**kwargs)
 
 
-def _kimi_k3_groups(cache_block_tokens: int = 1536) -> list[PagedCacheGroupConfig]:
+def _kimi_k3_groups(page_size: int = 1536) -> list[PagedCacheGroupConfig]:
     groups = [
         _group(
             "full_attention",
             PagedCacheGroupFamily.History,
             PagedCacheRetention.FullHistory,
-            cache_block_tokens=cache_block_tokens,
+            page_size=page_size,
         )
     ]
     groups.extend(
@@ -66,7 +66,7 @@ def _kimi_k3_groups(cache_block_tokens: int = 1536) -> list[PagedCacheGroupConfi
             f"linear_attention_{i}",
             PagedCacheGroupFamily.State,
             PagedCacheRetention.FullHistory,
-            cache_block_tokens=cache_block_tokens,
+            page_size=page_size,
         )
         for i in range(3)
     )
@@ -87,7 +87,7 @@ class AlignedMaxScheduledTokensTest(unittest.TestCase):
                 "full_attention",
                 PagedCacheGroupFamily.History,
                 PagedCacheRetention.FullHistory,
-                cache_block_tokens=1536,
+                page_size=1536,
             )
         ]
         self.assertEqual(aligned_max_scheduled_tokens(8192, groups), 8192)
@@ -104,7 +104,7 @@ class AlignedMaxScheduledTokensTest(unittest.TestCase):
                 "v4.swa_kv",
                 PagedCacheGroupFamily.State,
                 PagedCacheRetention.SlidingWindow,
-                cache_block_tokens=1536,
+                page_size=1536,
                 sliding_window_tokens=1536,
             )
         ]
@@ -116,13 +116,13 @@ class AlignedMaxScheduledTokensTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "minimum 1536"):
             aligned_max_scheduled_tokens(512, _kimi_k3_groups())
 
-    def test_state_grain_comes_from_cache_block_tokens(self):
+    def test_state_grain_comes_from_page_size(self):
         groups = [
             _group(
                 "state",
                 PagedCacheGroupFamily.State,
                 PagedCacheRetention.FullHistory,
-                cache_block_tokens=96,
+                page_size=96,
             )
         ]
         self.assertEqual(aligned_max_scheduled_tokens(1000, groups), 960)
@@ -133,13 +133,13 @@ class AlignedMaxScheduledTokensTest(unittest.TestCase):
                 "state_a",
                 PagedCacheGroupFamily.State,
                 PagedCacheRetention.FullHistory,
-                cache_block_tokens=64,
+                page_size=64,
             ),
             _group(
                 "state_b",
                 PagedCacheGroupFamily.State,
                 PagedCacheRetention.FullHistory,
-                cache_block_tokens=96,
+                page_size=96,
             ),
         ]
         # lcm(64, 96) = 192; floor(1000 / 192) * 192 = 960.

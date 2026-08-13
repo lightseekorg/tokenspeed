@@ -40,7 +40,7 @@ enum class PrefillSource { kLocal, kRemote };
 struct CacheProgress {
     // One source of truth for both the next hash-chain seed and the cumulative
     // history needed to publish a resumable boundary across chunk edges.
-    std::vector<std::string> page_hashes;
+    std::vector<std::string> prefix_hashes;
     std::uint64_t access_epoch{0};
     // Pending closed-prefix boundary; zero once published or when absent.
     std::int32_t promotion_boundary_tokens{0};
@@ -63,22 +63,23 @@ inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* to
 }
 
 struct Submitted {
-    Submitted(TokenContainer* token_container, std::int32_t page_size)
-        : token_container_{token_container}, page_size_{page_size} {}
+    Submitted(TokenContainer* token_container, std::int32_t prefix_granularity)
+        : token_container_{token_container}, prefix_granularity_{prefix_granularity} {}
 
     TokenContainer* TokenContainerPtr() const { return token_container_; }
-    std::int32_t PageSize() const { return page_size_; }
+    std::int32_t PrefixGranularity() const { return prefix_granularity_; }
 
 private:
     TokenContainer* token_container_{};
-    std::int32_t page_size_{};
+    std::int32_t prefix_granularity_{};
 };
 
 struct ForwardState {
-    ForwardState(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<ReqPoolIndex> req_pool_index,
-                 std::vector<BlockTable> block_tables, CacheProgress cache_progress)
+    ForwardState(TokenContainer* token_container, std::int32_t prefix_granularity,
+                 std::unique_ptr<ReqPoolIndex> req_pool_index, std::vector<BlockTable> block_tables,
+                 CacheProgress cache_progress)
         : token_container_{token_container},
-          page_size_{page_size},
+          prefix_granularity_{prefix_granularity},
           req_pool_index_{std::move(req_pool_index)},
           block_tables_{std::move(block_tables)},
           cache_progress_{std::move(cache_progress)} {}
@@ -89,7 +90,7 @@ struct ForwardState {
     ForwardState& operator=(ForwardState&&) noexcept = default;
 
     TokenContainer* TokenContainerPtr() const { return token_container_; }
-    std::int32_t PageSize() const { return page_size_; }
+    std::int32_t PrefixGranularity() const { return prefix_granularity_; }
 
     std::unique_ptr<ReqPoolIndex> TakeRequestPoolIndex() && { return std::move(req_pool_index_); }
     std::int32_t RequestPoolIndex() const { return req_pool_index_ ? req_pool_index_->slot_ : -1; }
@@ -101,21 +102,9 @@ struct ForwardState {
     CacheProgress TakeCacheProgress() && { return std::move(cache_progress_); }
     const CacheProgress& CacheProgressRef() const { return cache_progress_; }
 
-    std::vector<std::int32_t> ActiveLcmBlockIds() const {
-        std::vector<std::int32_t> ids;
-        for (const BlockTable& table : block_tables_) {
-            for (const CacheBlockRef& block_ref : table.Blocks()) {
-                if (block_ref) {
-                    ids.push_back(block_ref->Location().lcm_block_id);
-                }
-            }
-        }
-        return ids;
-    }
-
 protected:
     TokenContainer* token_container_{};
-    std::int32_t page_size_{};
+    std::int32_t prefix_granularity_{};
 
 private:
     std::unique_ptr<ReqPoolIndex> req_pool_index_;
@@ -124,11 +113,11 @@ private:
 };
 
 struct Prefilling : public ForwardState {
-    Prefilling(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<ReqPoolIndex> req_pool_index,
-               TokenContainer::Window window, std::int32_t reserve_num_tokens_in_next_schedule_event,
-               std::vector<BlockTable> block_tables, CacheProgress cache_progress,
-               PrefillSource source = PrefillSource::kLocal)
-        : ForwardState(token_container, page_size, std::move(req_pool_index), std::move(block_tables),
+    Prefilling(TokenContainer* token_container, std::int32_t prefix_granularity,
+               std::unique_ptr<ReqPoolIndex> req_pool_index, TokenContainer::Window window,
+               std::int32_t reserve_num_tokens_in_next_schedule_event, std::vector<BlockTable> block_tables,
+               CacheProgress cache_progress, PrefillSource source = PrefillSource::kLocal)
+        : ForwardState(token_container, prefix_granularity, std::move(req_pool_index), std::move(block_tables),
                        std::move(cache_progress)),
           window{window},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event},
@@ -156,10 +145,11 @@ private:
 };
 
 struct PrefillDone : public ForwardState {
-    PrefillDone(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<ReqPoolIndex> req_pool_index,
-                TokenContainer::Window window, std::int32_t reserve_num_tokens_in_next_schedule_event,
-                std::vector<BlockTable> block_tables, CacheProgress cache_progress)
-        : ForwardState(token_container, page_size, std::move(req_pool_index), std::move(block_tables),
+    PrefillDone(TokenContainer* token_container, std::int32_t prefix_granularity,
+                std::unique_ptr<ReqPoolIndex> req_pool_index, TokenContainer::Window window,
+                std::int32_t reserve_num_tokens_in_next_schedule_event, std::vector<BlockTable> block_tables,
+                CacheProgress cache_progress)
+        : ForwardState(token_container, prefix_granularity, std::move(req_pool_index), std::move(block_tables),
                        std::move(cache_progress)),
           window{window},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
@@ -184,10 +174,10 @@ private:
 };
 
 struct Decoding : public ForwardState {
-    Decoding(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<ReqPoolIndex> req_pool_index,
-             std::int32_t reserve_num_tokens_in_next_schedule_event, std::vector<BlockTable> block_tables,
-             CacheProgress cache_progress)
-        : ForwardState(token_container, page_size, std::move(req_pool_index), std::move(block_tables),
+    Decoding(TokenContainer* token_container, std::int32_t prefix_granularity,
+             std::unique_ptr<ReqPoolIndex> req_pool_index, std::int32_t reserve_num_tokens_in_next_schedule_event,
+             std::vector<BlockTable> block_tables, CacheProgress cache_progress)
+        : ForwardState(token_container, prefix_granularity, std::move(req_pool_index), std::move(block_tables),
                        std::move(cache_progress)),
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
 
@@ -206,10 +196,10 @@ private:
 
 struct Retracted {
     TokenContainer* token_container{};
-    std::int32_t page_size{};
+    std::int32_t prefix_granularity{};
 
     TokenContainer* TokenContainerPtr() const { return token_container; }
-    std::int32_t PageSize() const { return page_size; }
+    std::int32_t PrefixGranularity() const { return prefix_granularity; }
 };
 
 struct Finished {};

@@ -27,31 +27,31 @@
 #include <utility>
 #include <vector>
 
-#include "cache/coordinator/kv_cache_coordinator.h"
+#include "cache/coordinator/cache_coordinator.h"
 
 namespace tokenspeed {
 
-struct KvCacheCoordinatorTestAccess {
-    static auto MatchPrefix(KvCacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
+struct CacheCoordinatorTestAccess {
+    static auto MatchPrefix(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
         return coordinator.acquirePrefix(coordinator.ProbePrefix(content_hashes), ++coordinator.next_access_epoch_);
     }
 
-    static std::uint64_t NextAccessEpoch(KvCacheCoordinator& coordinator) { return ++coordinator.next_access_epoch_; }
+    static std::uint64_t NextAccessEpoch(CacheCoordinator& coordinator) { return ++coordinator.next_access_epoch_; }
 };
 
-inline auto MatchPrefixForTest(KvCacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
-    return KvCacheCoordinatorTestAccess::MatchPrefix(coordinator, content_hashes);
+inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
+    return CacheCoordinatorTestAccess::MatchPrefix(coordinator, content_hashes);
 }
 
-inline void CacheFullBlocksForTest(KvCacheCoordinator& coordinator, std::span<BlockTable> tables,
+inline void CacheFullBlocksForTest(CacheCoordinator& coordinator, std::span<BlockTable> tables,
                                    std::span<const std::string> content_hashes, std::int32_t first_slot = 0) {
-    coordinator.CacheFullBlocks(tables, content_hashes, KvCacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+    coordinator.CacheFullBlocks(tables, content_hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
                                 first_slot);
 }
 
-inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(KvCacheCoordinator& coordinator,
+inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
                                                                        std::vector<BlockTable>& tables,
-                                                                       KvCacheCoordinator::PrefixProbe&& prefix,
+                                                                       CacheCoordinator::PrefixProbe&& prefix,
                                                                        GroupDemand prototype) {
     std::vector<GroupDemand> demands;
     demands.reserve(tables.size());
@@ -62,13 +62,13 @@ inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(KvCacheCo
     return coordinator.Admit(std::move(prefix), demands);
 }
 
-inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(KvCacheCoordinator& coordinator,
+inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
                                                                        std::vector<BlockTable>& tables,
                                                                        GroupDemand prototype) {
     return AdmitForTest(coordinator, tables, coordinator.ProbePrefix({}), prototype);
 }
 
-inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(KvCacheCoordinator& coordinator,
+inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
                                                                        std::vector<BlockTable>& tables,
                                                                        std::int32_t num_tokens) {
     return AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = num_tokens});

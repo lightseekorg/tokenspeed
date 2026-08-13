@@ -74,9 +74,9 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
             self._bind_buffers()
 
     def _bind_buffers(self) -> None:
-        if self.plan.logical_block_tokens != self.page_size:
+        if self.plan.prefix_granularity != self.page_size:
             raise ValueError(
-                f"cache plan P={self.plan.logical_block_tokens} does not match pool "
+                f"cache plan P={self.plan.prefix_granularity} does not match pool "
                 f"page_size={self.page_size}"
             )
         max_packing = max(

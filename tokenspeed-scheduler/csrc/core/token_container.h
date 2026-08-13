@@ -47,7 +47,7 @@ public:
     // requeued request prefills prompt + generated as one fresh extend.
     void RebasePrefill() { num_prefill_tokens_ = static_cast<std::int32_t>(tokens_.size()); }
 
-    std::vector<std::span<const std::int32_t>> FullPagedTokens(std::int32_t page_size, bool except_last) const;
+    std::vector<std::span<const std::int32_t>> FullPrefixPages(std::int32_t prefix_granularity, bool except_last) const;
     std::int32_t Size() const { return static_cast<std::int32_t>(tokens_.size()); }
     std::int32_t PrefillSize() const { return num_prefill_tokens_; }
     std::span<const std::int32_t> TokenSlice(Window window) const;

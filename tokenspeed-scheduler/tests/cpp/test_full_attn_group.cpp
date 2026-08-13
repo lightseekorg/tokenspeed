@@ -25,47 +25,27 @@
 #include <vector>
 
 #include "cache/core/block_pool.h"
-#include "cache/manager/full_attn_manager.h"
-#include "scheduler/page_hasher.h"
+#include "cache/allocator/group_allocator.h"
+#include "prefix_test_group.h"
+#include "cache/prefix/prefix_hasher.h"
 
 namespace tokenspeed::test {
 namespace {
 
 using token_span = std::span<const std::int32_t>;
 
-// A real key from page_hasher.h, not a synthetic placeholder.
+// A real key from prefix_hasher.h, not a synthetic placeholder.
 CacheKey RealKey(const std::vector<std::int32_t>& tokens, std::uint32_t group_id) {
     std::vector<token_span> pages = {token_span(tokens.data(), tokens.size())};
-    std::vector<std::string> hashes = ComputePagedHashes(pages, "");
+    std::vector<std::string> hashes = ComputePrefixHashes(pages, "");
     return CacheKey{.group_id = group_id, .content_hash = std::move(hashes.front())};
 }
 
-class FullAttnManager : public ::tokenspeed::FullAttnManager {
-public:
-    using ::tokenspeed::FullAttnManager::CacheFullBlocks;
-    using ::tokenspeed::FullAttnManager::FullAttnManager;
-    using ::tokenspeed::FullAttnManager::RegisterCachedBlock;
 
-    PrefixMatch Match(BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
-                      std::int32_t max_blocks) {
-        return AcquireMatchedBlocks(pool, keys, begin_blocks, Probe(pool, keys, begin_blocks, max_blocks),
-                                    ++next_access_epoch_);
-    }
-    void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key) {
-        ::tokenspeed::FullAttnManager::RegisterCachedBlock(pool, block, key, ++next_access_epoch_);
-    }
-    void CacheFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
-                         std::int32_t first_slot = 0) {
-        ::tokenspeed::FullAttnManager::CacheFullBlocks(pool, table, keys, ++next_access_epoch_, first_slot);
-    }
-
-private:
-    std::uint64_t next_access_epoch_{0};
-};
 
 TEST(FullAttnManagerTest, ConstructsWithPageSize) {
     BlockPool pool(8);
-    FullAttnManager mgr(/*block_size=*/4);
+    FullAttnManager mgr(/*page_size=*/4);
     BlockTable table;
     EXPECT_EQ(table.NumBlocks(), 0);
     EXPECT_EQ(table.AvailableTokens(), 0);
@@ -92,7 +72,7 @@ TEST(FullAttnManagerTest, MatchAllMissReturnsNoHitAndDoesNotChangeRefs) {
 
 TEST(FullAttnManagerTest, ProbeAcceptsTypedCacheKeys) {
     BlockPool pool(8);
-    ::tokenspeed::FullAttnManager mgr(4);
+    FullAttnManager mgr(4);
     const std::vector<CacheKey> keys{
         CacheKey{.group_id = 0, .content_hash = "hash"},
     };
@@ -444,11 +424,11 @@ TEST(FullAttnManagerTest, ChainedPriorPreventsSecondPageCollision) {
     std::vector<token_span> pages_a = {token_span(p_a.data(), p_a.size()), token_span(q.data(), q.size())};
     std::vector<token_span> pages_b = {token_span(p_b.data(), p_b.size()), token_span(q.data(), q.size())};
     std::vector<CacheKey> keys_a;
-    for (std::string& hash : ComputePagedHashes(pages_a, "")) {
+    for (std::string& hash : ComputePrefixHashes(pages_a, "")) {
         keys_a.push_back(CacheKey{.group_id = 0, .content_hash = std::move(hash)});
     }
     std::vector<CacheKey> keys_b;
-    for (std::string& hash : ComputePagedHashes(pages_b, "")) {
+    for (std::string& hash : ComputePrefixHashes(pages_b, "")) {
         keys_b.push_back(CacheKey{.group_id = 0, .content_hash = std::move(hash)});
     }
     ASSERT_EQ(keys_a.size(), 2u);
@@ -468,13 +448,13 @@ TEST(FullAttnManagerTest, ChainedPriorPreventsSecondPageCollision) {
 
 TEST(FullAttnManagerLcmTest, ManagerOnlyCacheOwnerRetainsChild) {
     BlockPool pool(1);
-    FullAttnManager mgr(/*cache_block_tokens=*/4, /*cache_blocks_per_lcm_block=*/2, /*group_id=*/0);
+    FullAttnManager mgr(/*page_size=*/4, /*cache_blocks_per_lcm_block=*/2, /*group_id=*/0);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 4));
     const CacheBlockLocation location = table.Blocks().front()->Location();
     const CacheKey key = RealKey({1, 2, 3, 4}, 0);
     const std::uint64_t access_epoch = 1;
-    mgr.CacheFullBlocks(pool, table, std::vector<CacheKey>{key}, access_epoch);
+    mgr.Index().RegisterFullBlocks(pool, table, std::vector<CacheKey>{key}, access_epoch);
 
     mgr.Free(table);
 
@@ -502,7 +482,7 @@ TEST(FullAttnManagerLcmTest, ChildEvictionLeavesSiblingLocationValid) {
     const CacheKey second_key = RealKey({5, 6, 7, 8}, 0);
     const CacheBlockLocation sibling = table.Blocks()[1]->Location();
     const std::uint64_t access_epoch = 1;
-    mgr.CacheFullBlocks(pool, table, std::vector<CacheKey>{first_key, second_key}, access_epoch);
+    mgr.Index().RegisterFullBlocks(pool, table, std::vector<CacheKey>{first_key, second_key}, access_epoch);
     mgr.Free(table);
 
     EXPECT_TRUE(mgr.EvictCachedBlock(pool, CacheBlockLocation{.lcm_block_id = 1, .slot_index = 0}));
@@ -518,7 +498,8 @@ TEST(FullAttnManagerLcmTest, PinnedChildBlocksWholeParentEviction) {
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 8));
     const std::uint64_t access_epoch = 1;
-    mgr.CacheFullBlocks(pool, table, std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)},
+    mgr.Index().RegisterFullBlocks(pool, table,
+                                   std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)},
                         access_epoch);
 
     EXPECT_FALSE(mgr.ParentIsFullyEvictable(pool, 1));
@@ -532,7 +513,8 @@ TEST(FullAttnManagerLcmTest, CrossGroupRebindRequiresErasingEveryChildEntry) {
     BlockTable table;
     ASSERT_TRUE(first_group.Acquire(pool, table, 8));
     const std::uint64_t access_epoch = 1;
-    first_group.CacheFullBlocks(pool, table, std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)},
+    first_group.Index().RegisterFullBlocks(pool, table,
+                                           std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)},
                                 access_epoch);
     first_group.Free(table);
 
@@ -558,19 +540,19 @@ TEST(FullAttnManagerLcmTest, DuplicateRegistrationUpdatesEpochWithoutReorderingE
     const CacheKey key = RealKey({1, 2, 3, 4}, 0);
     const CacheKey other_key = RealKey({5, 6, 7, 8}, 0);
     std::uint64_t next_access_epoch = 0;
-    mgr.CacheFullBlocks(pool, first, std::vector<CacheKey>{key}, ++next_access_epoch);
-    mgr.CacheFullBlocks(pool, other, std::vector<CacheKey>{other_key}, ++next_access_epoch);
+    mgr.Index().RegisterFullBlocks(pool, first, std::vector<CacheKey>{key}, ++next_access_epoch);
+    mgr.Index().RegisterFullBlocks(pool, other, std::vector<CacheKey>{other_key}, ++next_access_epoch);
     const CacheBlockLocation first_location = first.Blocks()[0]->Location();
     const CacheBlockLocation other_location = other.Blocks()[0]->Location();
 
-    mgr.CacheFullBlocks(pool, duplicate, std::vector<CacheKey>{key}, ++next_access_epoch);
+    mgr.Index().RegisterFullBlocks(pool, duplicate, std::vector<CacheKey>{key}, ++next_access_epoch);
     mgr.Free(first);
     mgr.Free(other);
     mgr.Free(duplicate);
 
     EXPECT_EQ(mgr.NumCachedBlocks(pool), 2);
     EXPECT_EQ(mgr.EvictableBlockLocations(pool), (std::vector<CacheBlockLocation>{first_location, other_location}));
-    const std::optional<KvCacheManager::CachedBlockMetadata> metadata =
+    const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
         mgr.CachedBlockMetadataFor(pool, first_location);
     ASSERT_TRUE(metadata);
     EXPECT_EQ(metadata->last_access_epoch, next_access_epoch);
@@ -586,7 +568,7 @@ TEST(FullAttnManagerLcmTest, NamespaceIsPartOfPrefixIndex) {
     const CacheKey second{.namespace_id = 2, .group_id = 0, .content_hash = "shared-content"};
     const std::uint64_t access_epoch = 1;
 
-    mgr.CacheFullBlocks(pool, table, std::vector<CacheKey>{first, second}, access_epoch);
+    mgr.Index().RegisterFullBlocks(pool, table, std::vector<CacheKey>{first, second}, access_epoch);
 
     EXPECT_EQ(mgr.NumCachedBlocks(pool), 2);
     EXPECT_TRUE(mgr.ContainsCachedBlock(pool, first));
@@ -605,8 +587,8 @@ TEST(FullAttnManagerLcmTest, LocationBasedEvictionIsScopedToItsPool) {
     const CacheKey device_key = RealKey({1, 2, 3, 4}, 0);
     const CacheKey host_key = RealKey({5, 6, 7, 8}, 0);
     std::uint64_t next_access_epoch = 0;
-    mgr.RegisterCachedBlock(device_pool, device, device_key, ++next_access_epoch);
-    mgr.RegisterCachedBlock(host_pool, host, host_key, ++next_access_epoch);
+    mgr.Index().Register(device_pool, device, device_key, ++next_access_epoch);
+    mgr.Index().Register(host_pool, host, host_key, ++next_access_epoch);
     device.reset();
     host.reset();
 

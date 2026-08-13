@@ -27,11 +27,11 @@
 namespace tokenspeed {
 namespace fsm {
 struct Bootstrapping {
-    Bootstrapping(TokenContainer* _token_container, std::int32_t _page_size)
-        : token_container{_token_container}, page_size{_page_size} {}
+    Bootstrapping(TokenContainer* _token_container, std::int32_t _prefix_granularity)
+        : token_container{_token_container}, prefix_granularity{_prefix_granularity} {}
 
     TokenContainer* token_container{};
-    std::int32_t page_size{};
+    std::int32_t prefix_granularity{};
 };
 
 }  // namespace fsm

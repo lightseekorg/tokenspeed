@@ -70,7 +70,7 @@ class CacheMemoryPlan:
     ``num_lcm_blocks`` excludes the null parent. ``arena_bytes`` includes it.
     """
 
-    logical_block_tokens: int
+    prefix_granularity: int
     lcm_block_bytes: int
     num_lcm_blocks: int
     groups: tuple[CacheGroupLayout, ...]
@@ -187,7 +187,7 @@ class CacheMemoryPlan:
                     "binding_utilization": binding_utilization,
                 }
                 continue
-            token_capacity = usable_pages * self.logical_block_tokens
+            token_capacity = usable_pages * self.prefix_granularity
             if group.group_id in window_tokens:
                 window = max(1, window_tokens[group.group_id])
                 demand_tokens = max_num_seqs * window if max_num_seqs else None
@@ -198,7 +198,7 @@ class CacheMemoryPlan:
                     "supported_requests": supported,
                     "dead_bytes": (
                         max(0, token_capacity - demand_tokens)
-                        // self.logical_block_tokens
+                        // self.prefix_granularity
                         * block_bytes
                         if demand_tokens is not None
                         else None
@@ -241,7 +241,7 @@ class CacheFieldSpec:
 class CacheLayout:
     """Capacity-independent byte geometry for one LCM block."""
 
-    logical_block_tokens: int
+    prefix_granularity: int
     lcm_block_bytes: int
     group_packing: tuple[tuple[str, int], ...]
     plane_bytes: tuple[tuple[str, int], ...]
@@ -283,7 +283,7 @@ class CacheLayout:
             arena_offset += (num_lcm_blocks + 1) * bytes_per_lcm_block
 
         return CacheMemoryPlan(
-            logical_block_tokens=self.logical_block_tokens,
+            prefix_granularity=self.prefix_granularity,
             lcm_block_bytes=self.lcm_block_bytes,
             num_lcm_blocks=num_lcm_blocks,
             groups=tuple(groups),
@@ -480,14 +480,14 @@ def _check_exact_page_strides(fields, plane_bytes, packing):
 def solve_cache_layout(
     fields,
     *,
-    logical_block_tokens,
+    prefix_granularity,
     cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
     alignment=1,
     max_padding_fraction=0.25,
 ):
     """Solve one capacity-independent, plane-major LCM block layout."""
-    if logical_block_tokens <= 0:
-        raise ValueError("logical_block_tokens must be > 0")
+    if prefix_granularity <= 0:
+        raise ValueError("prefix_granularity must be > 0")
     if alignment <= 0:
         raise ValueError("alignment must be > 0")
     if max_padding_fraction < 0:
@@ -697,7 +697,7 @@ def solve_cache_layout(
         )
 
     return CacheLayout(
-        logical_block_tokens=logical_block_tokens,
+        prefix_granularity=prefix_granularity,
         lcm_block_bytes=lcm_block_bytes,
         group_packing=tuple(
             (group_id, packing[group_id]) for group_id in ordered_group_ids

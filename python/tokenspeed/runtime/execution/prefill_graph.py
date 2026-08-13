@@ -452,13 +452,7 @@ class PrefillGraph:
             group_id = str(spec.group_id)
             group_width = width
             if require_real_active_pages:
-                raw_tokens_per_page = int(spec.rows_per_page) * int(
-                    spec.entry_stride_tokens
-                )
-                if raw_tokens_per_page <= 0:
-                    raise RuntimeError(
-                        f"cache group {group_id!r} has invalid page geometry"
-                    )
+                raw_tokens_per_page = int(spec.block_granularity)
                 group_width = max(
                     1,
                     (req_tokens + raw_tokens_per_page - 1) // raw_tokens_per_page,
@@ -541,11 +535,11 @@ class PrefillGraph:
             getattr(self.attn_backend, "uses_paged_cache_groups", False)
             and decode_wrapper is not None
         ):
-            tables = decode_wrapper._capture_paged_cache_block_tables(
+            tables = decode_wrapper._capture_group_block_tables(
                 bs, self.token_to_kv_pool
             )
             if tables is not None:
-                extra_metadata_kwargs["paged_cache_block_tables"] = tables
+                extra_metadata_kwargs["block_tables"] = tables
             extra_metadata_kwargs["num_tokens"] = num_tokens
             extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
         group_tables = self._dummy_group_tables(max(seq_lens), bs)

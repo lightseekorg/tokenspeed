@@ -41,9 +41,9 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 logger = get_colorful_logger(__name__)
 
 
-def _split_paged_cache_block_tables_into_v4_metadata(
-    paged_cache_block_tables: dict[str, torch.Tensor],
-    paged_cache_block_table_base_offsets: dict[str, torch.Tensor] | None = None,
+def _split_block_tables_into_v4_metadata(
+    block_tables: dict[str, torch.Tensor],
+    block_table_base_offsets: dict[str, torch.Tensor] | None = None,
 ) -> tuple[
     torch.Tensor | None,
     dict[int, torch.Tensor],
@@ -58,14 +58,14 @@ def _split_paged_cache_block_tables_into_v4_metadata(
     {ratio: compressor_state_base}, indexer_state_base). Unknown group ids
     are ignored. Base offsets are None / missing when the input lacks them.
     """
-    offsets = paged_cache_block_table_base_offsets or {}
-    swa = paged_cache_block_tables.get(V4_SWA_KV_GROUP_ID)
-    indexer_state = paged_cache_block_tables.get(V4_INDEXER_COMPRESSOR_STATE_GROUP_ID)
+    offsets = block_table_base_offsets or {}
+    swa = block_tables.get(V4_SWA_KV_GROUP_ID)
+    indexer_state = block_tables.get(V4_INDEXER_COMPRESSOR_STATE_GROUP_ID)
     swa_base = offsets.get(V4_SWA_KV_GROUP_ID)
     indexer_state_base = offsets.get(V4_INDEXER_COMPRESSOR_STATE_GROUP_ID)
     compressor_state: dict[int, torch.Tensor] = {}
     compressor_state_base: dict[int, torch.Tensor] = {}
-    for gid, table in paged_cache_block_tables.items():
+    for gid, table in block_tables.items():
         ratio = parse_v4_compressor_state_group_id(gid)
         if ratio is None:
             continue
@@ -186,15 +186,13 @@ def _compressed_boundary_mask(
 @dataclass
 class DeepseekV4CacheMetadata:
     page_size: int
-    block_table: torch.Tensor
-    paged_cache_block_tables: dict[str, torch.Tensor] = field(default_factory=dict)
+    page_table: torch.Tensor
+    block_tables: dict[str, torch.Tensor] = field(default_factory=dict)
     # Per-sliding-group [num_reqs] int32 base logical-page offset that
-    # accompanies each compact block table. Consumers index sliding tables as
+    # accompanies each compact per-group table. Consumers index sliding tables as
     # logical_page - base_offset; full-history groups omit the key (base 0).
-    paged_cache_block_table_base_offsets: dict[str, torch.Tensor] = field(
-        default_factory=dict
-    )
-    swa_block_table: torch.Tensor | None = None
+    block_table_base_offsets: dict[str, torch.Tensor] = field(default_factory=dict)
+    swa_page_table: torch.Tensor | None = None
     swa_base_logical_page: torch.Tensor | None = None
     compressor_state_block_tables: dict[int, torch.Tensor] = field(default_factory=dict)
     compressor_state_base_logical_pages: dict[int, torch.Tensor] = field(
@@ -206,17 +204,15 @@ class DeepseekV4CacheMetadata:
         default_factory=dict
     )
 
-    def compressed_block_table(
+    def compressed_page_table(
         self,
         compress_ratio: int,
         kv_cache_block_size: int | None = None,
     ) -> torch.Tensor:
         del kv_cache_block_size
         if compress_ratio <= 1:
-            return self.block_table
-        table = self.paged_cache_block_tables.get(
-            v4_compressed_kv_group_id(compress_ratio)
-        )
+            return self.page_table
+        table = self.block_tables.get(v4_compressed_kv_group_id(compress_ratio))
         if table is None:
             raise RuntimeError(
                 "DeepSeek V4 missing paged-cache block table for compressed "
@@ -255,8 +251,8 @@ class DeepseekV4CacheMetadata:
                 out = torch.empty(num_tokens, dtype=torch.int64, device=seq_lens.device)
             self.decode_compressed_slot_mappings[key] = out
 
-        block_table = self.compressed_block_table(compress_ratio, kv_cache_block_size)
-        if block_table is not self.block_table:
+        page_table = self.compressed_page_table(compress_ratio, kv_cache_block_size)
+        if page_table is not self.page_table:
             req_idx = token_to_req_indices[:num_tokens].to(torch.int64)
             query_starts = query_start_loc[req_idx].to(torch.int64)
             query_lens = query_start_loc[req_idx + 1].to(torch.int64) - query_starts
@@ -278,7 +274,7 @@ class DeepseekV4CacheMetadata:
                 rounding_mode="floor",
             )
             offsets = compressed_pos % kv_cache_block_size
-            base_offsets = self.paged_cache_block_table_base_offsets.get(
+            base_offsets = self.block_table_base_offsets.get(
                 v4_compressed_kv_group_id(compress_ratio)
             )
             if base_offsets is not None:
@@ -289,7 +285,7 @@ class DeepseekV4CacheMetadata:
                         dtype=torch.int64,
                     )[req_idx]
                 )
-            page_ids = _safe_page_ids(block_table, req_idx, page_indices)
+            page_ids = _safe_page_ids(page_table, req_idx, page_indices)
             valid_slots = (page_ids >= 0) & _compressed_boundary_mask(
                 positions,
                 compress_ratio,
@@ -306,7 +302,7 @@ class DeepseekV4CacheMetadata:
             num_tokens=num_tokens,
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
-            block_table=self.block_table,
+            block_table=self.page_table,
             block_size=kv_cache_block_size,
             compress_ratio=compress_ratio,
             out=out,
@@ -349,11 +345,11 @@ class DeepseekV4CacheMetadata:
     ) -> torch.Tensor:
         if kv_cache_block_size is None:
             kv_cache_block_size = self.page_size
-        block_table = self.compressed_block_table(compress_ratio, kv_cache_block_size)
+        page_table = self.compressed_page_table(compress_ratio, kv_cache_block_size)
         if (
             use_decode_cache
             and positions.is_cuda
-            and (block_table.is_cuda or self.block_table.is_cuda)
+            and (page_table.is_cuda or self.page_table.is_cuda)
         ):
             cached = self.decode_compressed_slot_mappings.get(
                 (compress_ratio, kv_cache_block_size)
@@ -381,10 +377,10 @@ class DeepseekV4CacheMetadata:
         )
         offsets = compressed_pos % kv_cache_block_size
         req_idx = token_to_req_indices[: positions.numel()].long()
-        if block_table is self.block_table:
-            page_ids = block_table[req_idx, page_indices.long()].to(torch.int64)
+        if page_table is self.page_table:
+            page_ids = page_table[req_idx, page_indices.long()].to(torch.int64)
         else:
-            base_offsets = self.paged_cache_block_table_base_offsets.get(
+            base_offsets = self.block_table_base_offsets.get(
                 v4_compressed_kv_group_id(compress_ratio)
             )
             if base_offsets is not None:
@@ -395,7 +391,7 @@ class DeepseekV4CacheMetadata:
                         dtype=torch.int64,
                     )[req_idx]
                 )
-            page_ids = _safe_page_ids(block_table, req_idx, page_indices.long())
+            page_ids = _safe_page_ids(page_table, req_idx, page_indices.long())
         slots = page_ids.to(torch.int64) * kv_cache_block_size + offsets
         valid_slots = (page_ids >= 0) & _compressed_boundary_mask(
             positions,
@@ -441,7 +437,7 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
                 "DeepSeek V4 KV pool layer_num must match cache layout ratios: "
                 f"layer_num={layer_num}, ratios={len(layout.layer_ratio)}"
             )
-        scheduler_page_size = memory_plan.logical_block_tokens
+        scheduler_page_size = memory_plan.prefix_granularity
         super().__init__(
             size=size,
             dtype=torch.uint8,
@@ -514,7 +510,7 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         expected_size = (
             memory_plan.num_lcm_blocks
             * max(group.cache_blocks_per_lcm_block for group in memory_plan.groups)
-            * memory_plan.logical_block_tokens
+            * memory_plan.prefix_granularity
         )
         if size != expected_size:
             raise ValueError(
@@ -527,7 +523,7 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
             "Initialized DeepSeek V4 cache pool: %d parents, P=%d, %d layers, "
             "fp4 indexer=%s, compressed block sizes=%s",
             memory_plan.num_lcm_blocks,
-            memory_plan.logical_block_tokens,
+            memory_plan.prefix_granularity,
             layer_num,
             layout.use_fp4_indexer_cache,
             self.compressed_block_sizes,

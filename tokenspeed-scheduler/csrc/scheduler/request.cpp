@@ -26,12 +26,12 @@
 
 namespace tokenspeed {
 
-Request::Request(const RequestSpec& spec, std::int32_t page_size, Role role)
+Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role)
     : id_{spec.request_id},
       token_container_{spec.tokens},
-      page_size_{page_size},
-      state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, page_size}}
-                                  : fsm::State{fsm::Bootstrapping{&token_container_, page_size}}} {}
+      prefix_granularity_{prefix_granularity},
+      state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, prefix_granularity}}
+                                  : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {}
 
 PrefillInfo Request::CurrentPrefillInfo() const {
     return std::visit(

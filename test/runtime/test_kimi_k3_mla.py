@@ -71,9 +71,9 @@ def _token_locs(pages: list[int], positions: torch.Tensor, page_size: int):
     return page_tensor[positions // page_size] * page_size + positions % page_size
 
 
-def _kernel_page_table(logical_rows: list[list[int]], logical_page_size: int, device):
+def _kernel_page_table(logical_rows: list[list[int]], prefix_granularity: int, device):
     """Legacy page_table equivalent: each logical page as 24 kernel pages."""
-    ratio = logical_page_size // _KERNEL_PAGE
+    ratio = prefix_granularity // _KERNEL_PAGE
     rows = []
     for pages in logical_rows:
         row: list[int] = []
@@ -94,7 +94,7 @@ def test_bridge_exposes_full_attention_group_and_block_size() -> None:
     metadata, forward_op = _metadata_for(pool, table, "cpu")
 
     assert metadata.full_attention_group_id == "full_attention"
-    assert metadata.block_size == pool.page_size
+    assert metadata.prefix_granularity == pool.page_size
     resolved = metadata.require_full_attention_table(active_forward_op=forward_op)
     assert torch.equal(resolved, torch.tensor(table, dtype=torch.int32))
 

@@ -27,8 +27,8 @@
 
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_types.h"
-#include "scheduler/page_hasher.h"
-#include "cache/manager/swa_manager.h"
+#include "cache/prefix/prefix_hasher.h"
+#include "prefix_test_group.h"
 
 namespace tokenspeed::test {
 namespace {
@@ -46,30 +46,11 @@ using token_span = std::span<const std::int32_t>;
 
 CacheKey RealKey(const std::vector<std::int32_t>& tokens, std::uint32_t group_id) {
     std::vector<token_span> pages = {token_span(tokens.data(), tokens.size())};
-    std::vector<std::string> hashes = ComputePagedHashes(pages, "");
+    std::vector<std::string> hashes = ComputePrefixHashes(pages, "");
     return CacheKey{.group_id = group_id, .content_hash = std::move(hashes.front())};
 }
 
-class SwaManager : public ::tokenspeed::SwaManager {
-public:
-    using ::tokenspeed::SwaManager::SwaManager;
 
-    PrefixMatch Match(BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
-                      std::int32_t max_blocks) {
-        return AcquireMatchedBlocks(pool, keys, begin_blocks, Probe(pool, keys, begin_blocks, max_blocks),
-                                    ++next_access_epoch_);
-    }
-    void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key) {
-        ::tokenspeed::SwaManager::RegisterCachedBlock(pool, block, key, ++next_access_epoch_);
-    }
-    void CacheFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
-                         std::int32_t first_slot = 0) {
-        ::tokenspeed::SwaManager::CacheFullBlocks(pool, table, keys, ++next_access_epoch_, first_slot);
-    }
-
-private:
-    std::uint64_t next_access_epoch_{0};
-};
 
 // Cache then free, so the page is prefix-hittable via MatchPrefix.
 std::int32_t CacheOnePage(SwaManager& manager, BlockPool& pool, const CacheKey& key) {
@@ -82,7 +63,7 @@ std::int32_t CacheOnePage(SwaManager& manager, BlockPool& pool, const CacheKey& 
 
 TEST(SwaManagerTest, ConstructsWithWindow) {
     BlockPool pool(8);
-    SwaManager mgr(/*block_size=*/4, /*sliding_window=*/10);
+    SwaManager mgr(/*page_size=*/4, /*sliding_window=*/10);
     BlockTable table;
     EXPECT_EQ(table.NumBlocks(), 0);
 }
@@ -98,7 +79,7 @@ TEST(SwaManagerTest, MatchAllMissReturnsEmpty) {
 }
 
 TEST(SwaManagerTest, MatchStopsAfterContiguousNeededFromRight) {
-    // block_size 4, window 10 -> pages_needed = ceil(9/4) = 3.
+    // page_size 4, window 10 -> pages_needed = ceil(9/4) = 3.
     BlockPool pool(16);
     SwaManager mgr(4, 10);
     CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
@@ -221,7 +202,7 @@ TEST(SwaManagerTest, SpeculativeHitsDoNotRefreshAccessEpoch) {
     const std::int32_t b3 = CacheOnePage(mgr, pool, h3);
     CacheOnePage(mgr, pool, h4);
     const CacheBlockLocation speculative_location{.lcm_block_id = b3, .slot_index = 0};
-    const std::optional<KvCacheManager::CachedBlockMetadata> before =
+    const std::optional<PrefixCacheIndex::CachedBlockMetadata> before =
         mgr.CachedBlockMetadataFor(pool, speculative_location);
     ASSERT_TRUE(before);
 
@@ -229,7 +210,7 @@ TEST(SwaManagerTest, SpeculativeHitsDoNotRefreshAccessEpoch) {
     PrefixMatch match = mgr.Match(pool, keys, 0, 5);
     ASSERT_EQ(BlockIds(match.blocks), (std::vector<std::int32_t>{b0, b1}));
 
-    const std::optional<KvCacheManager::CachedBlockMetadata> after =
+    const std::optional<PrefixCacheIndex::CachedBlockMetadata> after =
         mgr.CachedBlockMetadataFor(pool, speculative_location);
     ASSERT_TRUE(after);
     EXPECT_EQ(after->last_access_epoch, before->last_access_epoch);
@@ -353,7 +334,7 @@ TEST(SwaManagerTest, ReclaimExpiredMirrorsVllmBoundarySequence) {
     // Mirrors vLLM test_sliding_window_remove_skipped_blocks.
     // skipped = max(0, n - 4 + 1); skipped_blocks = skipped / 2.
     BlockPool pool(32);
-    SwaManager mgr(/*block_size=*/2, /*sliding_window=*/4);
+    SwaManager mgr(/*page_size=*/2, /*sliding_window=*/4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 10));  // 5 real pages (10 tokens / page 2)
     ASSERT_EQ(table.NumBlocks(), 5);
@@ -464,7 +445,7 @@ TEST(SwaManagerTest, ReclaimExpiredFreedCachedPageStaysPrefixReusable) {
 
 TEST(SwaManagerTest, WriteBackAckMakesSlidCachedPageReclaimable) {
     BlockPool pool(2);
-    SwaManager mgr(/*cache_block_tokens=*/4, /*sliding_window=*/4);
+    SwaManager mgr(/*page_size=*/4, /*sliding_window=*/4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 4));
     mgr.CacheFullBlocks(pool, table, std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0)});
@@ -489,7 +470,7 @@ TEST(SwaManagerTest, ReclaimExpiredLeavesAvailableCapacityUnchanged) {
 }
 
 TEST(SwaManagerTest, AcquireAdvancePairingKeepsPhysicalPagesBounded) {
-    // Steady state: active pages stay bounded near ceil(window/block_size) = 2.
+    // Steady state: active pages stay bounded near ceil(window/page_size) = 2.
     BlockPool pool(64);
     SwaManager mgr(2, 4);
     BlockTable table;

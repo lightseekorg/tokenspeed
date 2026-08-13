@@ -34,7 +34,7 @@ class KvCacheLifecycleTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 32;
         cfg.host_allocator.total_pages = 32;
         cfg.max_scheduled_tokens = 64;
@@ -45,7 +45,7 @@ protected:
 
         PagedCacheGroupConfig full_grp;
         full_grp.group_id = "full";
-        full_grp.rows_per_page = cfg.block_size;
+        full_grp.rows_per_page = cfg.prefix_granularity;
         full_grp.entry_stride_tokens = 1;
         full_grp.total_pages = cfg.device_allocator.total_pages;
         full_grp.cache_blocks_per_lcm_block = 2;
@@ -54,7 +54,7 @@ protected:
 
         PagedCacheGroupConfig swa_grp;
         swa_grp.group_id = "swa";
-        swa_grp.rows_per_page = cfg.block_size;
+        swa_grp.rows_per_page = cfg.prefix_granularity;
         swa_grp.entry_stride_tokens = 1;
         swa_grp.total_pages = cfg.device_allocator.total_pages;
         swa_grp.retention = PagedCacheGroupConfig::Retention::SlidingWindow;

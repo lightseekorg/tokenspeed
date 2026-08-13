@@ -34,7 +34,11 @@ class _ContractPool:
         self.runtime_contract = SimpleNamespace(
             block_size=page_size,
             group_specs=tuple(
-                SimpleNamespace(group_id=group_id, family="state")
+                SimpleNamespace(
+                    group_id=group_id,
+                    family="state",
+                    checkpoint_granularity=page_size,
+                )
                 for group_id in dict.fromkeys(
                     group_id for group_id, _, _ in components.values()
                 )

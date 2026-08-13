@@ -45,7 +45,7 @@ class CacheBatchMetadata:
         group_ids: Cache group IDs in runtime-contract order.
         num_requests: Number of request rows in each group table.
         max_page_ids: Inclusive maximum page ID accepted for each group.
-        block_size: Tokens per logical page (uniform across contract groups).
+        prefix_granularity: Prefix granularity in tokens (uniform across contract groups).
         full_attention_group_id: The unique ``family="history"`` +
             ``retention="full_history"`` group ID, or ``None`` when the
             contract does not contain exactly one such group.
@@ -55,7 +55,7 @@ class CacheBatchMetadata:
     _group_tables: Mapping[str, torch.Tensor] = field(repr=False, compare=False)
     num_requests: int
     max_page_ids: Mapping[str, int]
-    block_size: int
+    prefix_granularity: int
     full_attention_group_id: str | None
     _forward_op: Any = field(repr=False, compare=False)
     # Kernel-page expansions memoized per (group_id, page_size, max_pages);
@@ -96,7 +96,9 @@ class CacheBatchMetadata:
             raise ValueError(
                 "runtime contract must provide ordered nonempty unique group IDs"
             )
-        block_size = require_positive_int("contract block_size", contract.block_size)
+        prefix_granularity = require_positive_int(
+            "contract prefix_granularity", contract.prefix_granularity
+        )
         full_attention_ids = tuple(
             spec.group_id
             for spec in contract.group_specs
@@ -114,7 +116,7 @@ class CacheBatchMetadata:
             group_tables=tables,
             num_requests=num_requests,
             max_page_ids=max_page_ids,
-            block_size=block_size,
+            prefix_granularity=prefix_granularity,
             full_attention_group_id=(
                 full_attention_ids[0] if len(full_attention_ids) == 1 else None
             ),
@@ -129,7 +131,7 @@ class CacheBatchMetadata:
         group_tables: Mapping[str, torch.Tensor],
         num_requests: int,
         max_page_ids: Mapping[str, int],
-        block_size: int,
+        prefix_granularity: int,
         full_attention_group_id: str | None,
         forward_op: Any,
     ) -> CacheBatchMetadata:
@@ -166,7 +168,7 @@ class CacheBatchMetadata:
         object.__setattr__(
             metadata, "max_page_ids", MappingProxyType(dict(max_page_ids))
         )
-        object.__setattr__(metadata, "block_size", block_size)
+        object.__setattr__(metadata, "prefix_granularity", prefix_granularity)
         object.__setattr__(metadata, "full_attention_group_id", full_attention_group_id)
         # A strong reference makes Python/nanobind object identity safe against
         # id reuse until all metadata views become unreachable.
@@ -234,7 +236,7 @@ class CacheBatchMetadata:
     ) -> torch.Tensor:
         """Return a group's table expanded into a backend's kernel pages.
 
-        Scheduler tables address logical pages of ``block_size`` tokens; a
+        Scheduler tables address prefix pages of ``prefix_granularity`` tokens; a
         backend's kernel walks pages of ``page_size`` tokens. This expands
         page ids once per (group, page_size, max_pages) and memoizes the
         result on the metadata, so every consumer of the same geometry within
@@ -248,7 +250,7 @@ class CacheBatchMetadata:
             group_id: Cache group to expand; ``None`` selects the unique
                 full-attention history group.
             page_size: The consuming kernel's page size in tokens. Must
-                divide ``block_size``.
+                divide ``prefix_granularity``.
             max_pages: Width of the returned table in kernel pages. ``None``
                 keeps the full expanded width. The returned tensor is padded
                 with the null page 0 past the source width.
@@ -261,7 +263,7 @@ class CacheBatchMetadata:
             kernel pages ``0..ratio-1``, all inside the physical null page).
 
         Raises:
-            RuntimeError: If the metadata is stale or ``block_size`` is not a
+            RuntimeError: If the metadata is stale or ``prefix_granularity`` is not a
                 positive multiple of ``page_size``.
         """
         if group_id is None:
@@ -271,9 +273,9 @@ class CacheBatchMetadata:
             group_id = self.full_attention_group_id
         else:
             table = self.require_table(group_id, active_forward_op=active_forward_op)
-        if self.block_size % page_size:
+        if self.prefix_granularity % page_size:
             raise RuntimeError(
-                f"scheduler page size {self.block_size} is not a positive "
+                f"prefix granularity {self.prefix_granularity} is not a positive "
                 f"multiple of the kernel page size {page_size}"
             )
         key = (group_id, int(page_size), max_pages)
@@ -283,14 +285,14 @@ class CacheBatchMetadata:
         if table.stride(0) != table.shape[1] and table.shape[0] > 1:
             # Chunked-prefill kernels derive the row stride from shape[1].
             table = table.contiguous()
-        if self.block_size == page_size and (
+        if self.prefix_granularity == page_size and (
             max_pages is None or max_pages <= table.shape[1]
         ):
             expanded = table if max_pages is None else table[:, :max_pages]
         else:
             expanded = expand_page_table(
                 table,
-                logical_page_size=self.block_size,
+                table_page_size=self.prefix_granularity,
                 kernel_page_size=page_size,
                 max_kernel_pages=max_pages,
             )
@@ -311,8 +313,8 @@ class CacheBatchMetadata:
             return
         batch_size = min(int(seq_lens.shape[0]), int(table.shape[0]))
         live_pages = (
-            (seq_lens[:batch_size].to(torch.int64) + self.block_size - 1)
-            // self.block_size
+            (seq_lens[:batch_size].to(torch.int64) + self.prefix_granularity - 1)
+            // self.prefix_granularity
         ).clamp_max_(table.shape[1])
         columns = torch.arange(table.shape[1], device=table.device)
         live_entries = table[:batch_size][

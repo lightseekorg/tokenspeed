@@ -43,7 +43,7 @@ protected:
     // Subclasses can override this to customize the config.
     virtual SchedulerConfig MakeConfig() {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 32;
         cfg.host_allocator.total_pages = 32;
         cfg.max_scheduled_tokens = 64;
@@ -51,7 +51,7 @@ protected:
         cfg.enable_l3_storage = false;
         cfg.paged_cache_groups.push_back(PagedCacheGroupConfig{
             .group_id = "full_attention",
-            .rows_per_page = cfg.block_size,
+            .rows_per_page = cfg.prefix_granularity,
             .entry_stride_tokens = 1,
             .total_pages = cfg.device_allocator.total_pages,
             .retention = PagedCacheGroupConfig::Retention::FullHistory,
@@ -66,9 +66,9 @@ protected:
     }
 
     const SchedulerConfig& Config() const { return config_; }
-    std::int32_t PageSize() const { return config_.block_size; }
+    std::int32_t PrefixGranularity() const { return config_.prefix_granularity; }
     RequestSpec MakeRequestSpec(const std::string& id, std::int32_t num_pages, std::int32_t start = 1) {
-        auto tokens = MakeAlignedTokens(num_pages, PageSize(), start);
+        auto tokens = MakeAlignedTokens(num_pages, PrefixGranularity(), start);
         return RequestSpec{
             .request_id = id,
             .tokens = tokens,
@@ -188,7 +188,7 @@ inline std::size_t CollectDisjointRealPages(const std::vector<std::vector<std::i
 
 // Kimi-K3-shaped KV-cache fixture: one full-attention (history) group
 // plus three linear-attention (state) groups drawing from one global pool.
-// Shared by test_kv_cache_lifecycle.cpp and test_kv_cache_scenarios.cpp.
+// Shared by test_kv_cache_lifecycle.cpp and test_cache_scenarios.cpp.
 class KimiFourGroupSuite : public SchedulerTestSuite {
 protected:
     static const std::array<std::string, 4>& GroupIds() {
@@ -199,7 +199,7 @@ protected:
 
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 33;
         cfg.host_allocator.total_pages = 0;
         cfg.max_scheduled_tokens = 64;
@@ -211,7 +211,7 @@ protected:
         for (std::size_t i = 0; i < GroupIds().size(); ++i) {
             PagedCacheGroupConfig group;
             group.group_id = GroupIds()[i];
-            group.rows_per_page = cfg.block_size;
+            group.rows_per_page = cfg.prefix_granularity;
             group.entry_stride_tokens = 1;
             group.total_pages = cfg.device_allocator.total_pages;
             group.retention = PagedCacheGroupConfig::Retention::FullHistory;

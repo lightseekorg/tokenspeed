@@ -10,17 +10,20 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     merge_continuation_layers,
     solve_cache_layout,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    MXFP8_KV_SCALE_TILE_TOKENS,
+)
 
 
 def mla_cache_fields(
     *,
     layer_group_ids,
-    logical_block_tokens,
+    prefix_granularity,
     latent_width,
     element_size,
 ) -> tuple[CacheFieldSpec, ...]:
     """Describe MLA full-attention cache fields."""
-    if logical_block_tokens <= 0 or latent_width <= 0 or element_size <= 0:
+    if prefix_granularity <= 0 or latent_width <= 0 or element_size <= 0:
         raise ValueError("MLA full-attention geometry must be positive")
     occurrences: dict[str, int] = {}
     fields = []
@@ -32,7 +35,7 @@ def mla_cache_fields(
                 group_id,
                 f"layer.{layer_id}.latent_kv",
                 f"slot.{slot}",
-                (logical_block_tokens, 1, latent_width),
+                (prefix_granularity, 1, latent_width),
                 element_size,
             )
         )
@@ -42,7 +45,7 @@ def mla_cache_fields(
 def mha_cache_fields(
     *,
     layer_group_ids,
-    logical_block_tokens,
+    prefix_granularity,
     kv_heads,
     head_dim,
     kv_element_size,
@@ -50,7 +53,7 @@ def mha_cache_fields(
     kv_scale_element_size=0,
 ) -> tuple[CacheFieldSpec, ...]:
     """Describe fixed per-layer MHA views and their physical placement."""
-    if logical_block_tokens <= 0 or kv_heads <= 0 or head_dim <= 0:
+    if prefix_granularity <= 0 or kv_heads <= 0 or head_dim <= 0:
         raise ValueError("MHA full-attention geometry must be positive")
     if kv_element_size <= 0:
         raise ValueError("MHA KV element size must be positive")
@@ -67,7 +70,7 @@ def mha_cache_fields(
     for layer_id, group_id in enumerate(layer_group_ids):
         unit = occurrences.get(group_id, 0)
         occurrences[group_id] = unit + 1
-        shape = (logical_block_tokens, kv_heads, head_dim)
+        shape = (prefix_granularity, kv_heads, head_dim)
         fields.extend(
             (
                 CacheFieldSpec(
@@ -90,8 +93,8 @@ def mha_cache_fields(
             scale_dim = head_dim // kv_scale_block_size
             scale_shape = (
                 (kv_heads, 32, scale_dim, scale_dim)
-                if logical_block_tokens == 128
-                else (logical_block_tokens, kv_heads, scale_dim)
+                if prefix_granularity == MXFP8_KV_SCALE_TILE_TOKENS
+                else (prefix_granularity, kv_heads, scale_dim)
             )
             fields.extend(
                 (
@@ -118,7 +121,7 @@ def draft_cache_fields(
     *,
     layer_group_ids,
     enabled_layer_ids,
-    logical_block_tokens,
+    prefix_granularity,
     layer_kv_heads,
     head_dim,
     kv_element_size,
@@ -131,7 +134,7 @@ def draft_cache_fields(
             f"layer_group_ids has {len(layer_group_ids)} entries but "
             f"layer_kv_heads has {len(layer_kv_heads)}"
         )
-    if logical_block_tokens <= 0 or head_dim <= 0 or kv_element_size <= 0:
+    if prefix_granularity <= 0 or head_dim <= 0 or kv_element_size <= 0:
         raise ValueError("draft full-attention geometry must be positive")
     if bool(kv_scale_block_size) != bool(kv_scale_element_size):
         raise ValueError(
@@ -139,7 +142,7 @@ def draft_cache_fields(
             "or both be positive"
         )
     if kv_scale_block_size and (
-        logical_block_tokens % 128
+        prefix_granularity % MXFP8_KV_SCALE_TILE_TOKENS
         or head_dim % kv_scale_block_size
         or kv_scale_block_size <= 0
     ):
@@ -164,7 +167,7 @@ def draft_cache_fields(
             raise ValueError("draft layer KV heads must be positive")
         unit = occurrences.get(group_id, 0)
         occurrences[group_id] = unit + 1
-        kv_shape = (logical_block_tokens, kv_heads, head_dim)
+        kv_shape = (prefix_granularity, kv_heads, head_dim)
         fields.extend(
             (
                 CacheFieldSpec(
@@ -187,7 +190,7 @@ def draft_cache_fields(
             scale_dim = head_dim // kv_scale_block_size
             scale_shape = (
                 kv_heads,
-                logical_block_tokens // 128,
+                prefix_granularity // MXFP8_KV_SCALE_TILE_TOKENS,
                 32,
                 scale_dim,
                 scale_dim,
@@ -226,7 +229,7 @@ def build_hybrid_cache_setup(
     num_draft_layers: int,
     cache_budget_bytes: int,
     fixed_workspace_bytes: int,
-    logical_block_tokens: int,
+    prefix_granularity: int,
     max_padding_fraction: float,
 ):
     """Bind one hybrid cache layout to a capacity.
@@ -250,7 +253,7 @@ def build_hybrid_cache_setup(
     merged_head_counts = layer_kv_head_counts
     merged_layout = solve_cache_layout(
         merged_fields,
-        logical_block_tokens=logical_block_tokens,
+        prefix_granularity=prefix_granularity,
         alignment=256,
         max_padding_fraction=max_padding_fraction,
     )
@@ -266,11 +269,11 @@ def build_hybrid_cache_setup(
     max_packing = max(packing.values())
     token_limit = configured_token_limit(server_args)
     if token_limit is not None:
-        requested = token_limit // logical_block_tokens // max_packing
+        requested = token_limit // prefix_granularity // max_packing
         if requested < 1:
             raise ValueError(
                 "the configured token limit must hold at least one LCM parent "
-                f"({logical_block_tokens * max_packing} child tokens)"
+                f"({prefix_granularity * max_packing} child tokens)"
             )
         num_lcm_blocks = min(num_lcm_blocks, requested)
 
@@ -282,7 +285,7 @@ def build_hybrid_cache_setup(
             layer_group_ids=merged_group_ids,
             paged_cache_group_specs=merged_specs,
             state_field_dtypes=state_dtypes,
-            token_capacity=(num_lcm_blocks * max_packing * logical_block_tokens),
+            token_capacity=(num_lcm_blocks * max_packing * prefix_granularity),
             layer_kv_head_counts=merged_head_counts,
         ),
         num_draft_layers=num_draft_layers,
@@ -409,7 +412,7 @@ def _ordinary_setup(
         merged_layer_types = ()
     merged_layout = solve_cache_layout(
         merged_fields,
-        logical_block_tokens=page_size,
+        prefix_granularity=page_size,
         cache_blocks_per_lcm_block={field.group_id: 1 for field in merged_fields},
         alignment=1,
         max_padding_fraction=1.0,
@@ -435,7 +438,7 @@ def _ordinary_setup(
                 sliding_window_tokens=getattr(
                     attn_config, "sliding_window_tokens", None
                 ),
-                page_size=page_size,
+                prefix_granularity=page_size,
                 pd_disaggregation_enabled=getattr(
                     attn_config, "pd_disaggregation_enabled", False
                 ),
@@ -492,7 +495,7 @@ def _mha_fields(config, num_layers: int):
         raise ValueError("cache group ids must cover every MHA layer")
     fields = mha_cache_fields(
         layer_group_ids=group_ids,
-        logical_block_tokens=config.page_size,
+        prefix_granularity=config.page_size,
         kv_heads=max(config.num_kv_heads // config.attn_tp_size, 1),
         head_dim=config.head_dim,
         kv_element_size=(
@@ -579,7 +582,7 @@ def _mla_fields(config, num_layers: int):
         return tuple(fields)
     return mla_cache_fields(
         layer_group_ids=("full_attention",) * num_layers,
-        logical_block_tokens=config.page_size,
+        prefix_granularity=config.page_size,
         latent_width=config.kv_lora_rank + config.qk_rope_head_dim,
         element_size=torch.empty((), dtype=config.kv_cache_dtype).element_size(),
     )

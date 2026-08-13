@@ -71,7 +71,7 @@ class _MLACfg:
 def _plan(fields):
     layout = solve_cache_layout(
         fields,
-        logical_block_tokens=_P,
+        prefix_granularity=_P,
         cache_blocks_per_lcm_block={f.group_id: 1 for f in fields},
         alignment=1,
         max_padding_fraction=1.0,
@@ -84,7 +84,7 @@ def _specs(plan, pd_enabled: bool):
         layer_types=("full_attention",) * _NUM_LAYERS,
         group_ids=("full_attention",) * _NUM_LAYERS,
         sliding_window_tokens=None,
-        page_size=_P,
+        prefix_granularity=_P,
         pd_disaggregation_enabled=pd_enabled,
     )
 

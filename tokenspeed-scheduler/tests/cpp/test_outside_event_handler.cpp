@@ -99,13 +99,14 @@ TEST_F(LoadBackDoneTestSuite, LoadBackDone_Success_PrefixLenChangesInForward) {
     auto idx = FindRequestIndex(fwd, "r2");
     ASSERT_GE(idx, 0) << "r2 should be in forward after host cache hit";
 
-    // With block_size=2 and 4 prefill tokens, FullPagedTokens(except_last=true)
+    // With prefix_granularity=2 and 4 prefill tokens, FullPrefixPages(except_last=true)
     // yields 3 tokens → 1 matchable page. Host has 2 pages but only 1 matches.
-    // unscheduled = 4 - 1*2 = 2, so input_length = 2 and extend_prefix_len = 1*block_size = 2.
+    // unscheduled = 4 - 1*2 = 2, so input_length = 2 and extend_prefix_len = 1*prefix_granularity = 2.
     EXPECT_EQ(fwd->input_lengths[idx], 2) << "host hit covers 1 page; 2 tokens remain";
 
     if (!fwd->extend_prefix_lens.empty()) {
-        EXPECT_EQ(fwd->extend_prefix_lens[idx], 1 * PageSize()) << "extend_prefix_len should cover the 1 loadback page";
+        EXPECT_EQ(fwd->extend_prefix_lens[idx], 1 * PrefixGranularity())
+            << "extend_prefix_len should cover the 1 loadback page";
     }
 }
 
@@ -113,7 +114,7 @@ class DisaggDecodeAdmissionTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.block_size = 2;
+        cfg.prefix_granularity = 2;
         // Cache block 0 is the null page, leaving three usable pages.
         cfg.device_allocator.total_pages = 4;
         cfg.host_allocator.total_pages = 4;
@@ -128,7 +129,7 @@ protected:
 
         PagedCacheGroupConfig full;
         full.group_id = "full";
-        full.rows_per_page = cfg.block_size;
+        full.rows_per_page = cfg.prefix_granularity;
         full.entry_stride_tokens = 1;
         full.total_pages = cfg.device_allocator.total_pages;
         full.retention = PagedCacheGroupConfig::Retention::FullHistory;
@@ -653,7 +654,7 @@ class PdSlidingSparseDecodeAdmissionTestSuite : public DisaggDecodeAdmissionTest
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
-        cfg.block_size = 4;
+        cfg.prefix_granularity = 4;
         cfg.device_allocator.total_pages = 8;
         cfg.host_allocator.total_pages = 0;
         cfg.max_scheduled_tokens = 16;

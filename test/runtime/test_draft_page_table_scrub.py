@@ -22,7 +22,7 @@ def _staging(rows: int = 8, columns: int = 4, page_ratio: int = 1):
     return DraftPageStaging(
         max_bs=rows,
         max_pages_per_req=columns,
-        logical_page_size=128,
+        table_page_size=128,
         draft_page_size=page_size,
         full_history_group_id="full_attention",
         enabled=True,
@@ -83,7 +83,7 @@ class DraftPageTableScrubTest(unittest.TestCase):
         st = DraftPageStaging(
             max_bs=8,
             max_pages_per_req=4,
-            logical_page_size=128,
+            table_page_size=128,
             draft_page_size=128,
             full_history_group_id="full_attention",
             enabled=False,

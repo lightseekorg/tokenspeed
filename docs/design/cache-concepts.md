@@ -1,0 +1,362 @@
+# Cache Concepts: Prefix Matching vs. Storage
+
+This document defines the conceptual layering of the cache subsystem: which
+concepts are *logical* (token-based, storage-agnostic) and which are *physical*
+(storage-based), and which components are allowed to see which. It is the
+reference for naming, code placement, and layering decisions in both the C++
+scheduler (`tokenspeed-scheduler`) and the Python runtime.
+
+## Two worlds: logical tokens vs. physical storage
+
+### Logical world (token units, storage-agnostic)
+
+**Naming convention: every `*_granularity` quantity (`prefix_granularity`,
+`block_granularity`, `checkpoint_granularity`) and `page_size` is measured in
+logical tokens.** A name in this family never counts rows, blocks, or bytes;
+conversely, a quantity counting storage must not borrow one of these names.
+
+Two quantities anchor the vocabulary:
+
+* **`prefix_granularity`** — the granularity at which prefixes are hashed and
+  matched for cache reuse. It defines the *identity boundary* of cached
+  prefixes: two requests share cache only at multiples of this many tokens.
+* **`block_granularity`** — the number of tokens covered by one block-table
+  slot (one `CacheBlock`) of a cache group. This is the unit in which
+  family-agnostic code (admission, capacity planning, PD slot selection)
+  addresses the cache.
+
+`block_granularity` is the generic quantity; a group *declares* it through
+one of two family-specific shapes (Python
+`PagedCacheGroupSpec`):
+
+* **Row geometry** (`rows_per_page` × `entry_stride_tokens`, exposed as
+  **`page_size`**) — for paged KV-cache consumers, whose blocks physically
+  hold rows of entries (per-token KV, sliding windows, compressed entries).
+  "Page" vocabulary is *only* legal here.
+* **`checkpoint_granularity`** — for snapshot-style state groups
+  (recurrent/conv state), whose blocks each hold one state snapshot taken
+  every this-many tokens. Such a group has no rows and no pages; declaring
+  fictional row geometry for it is a bug, not a convention.
+
+The two shapes are mutually exclusive, and the split is by *shape*, not by
+family: V4's sliding-window tail and compressor buffers are state-family yet
+have real row geometry, so they declare rows.
+
+None of these say anything about storage. A slot of `block_granularity = 64`
+tokens may be backed by only 16 units of physical storage under compression —
+the logical world neither knows nor cares.
+
+### Physical world (storage units)
+
+* **`CacheBlock`** (and its aggregation, the **LCM block**) is the unit of
+  physical storage. Allocation, refcounting, eviction, and tiering operate on
+  physical blocks.
+* A `CacheBlock` is attention-agnostic storage: it can be *viewed* by
+  KV-cache-based attention (as paged KV entries) and by state-based attention
+  (as a state slot). The view is defined by the consumer, not by the block.
+
+## Who is allowed to see what
+
+### C++ scheduler: schedules in logical units
+
+Scheduling decisions — admission, prefix matching, chunk alignment, capacity —
+are made in **exactly two token-based quantities**: `prefix_granularity` and
+the per-group slot span (spelled `page_size` in `CacheGroupSpec`; semantically
+this is `block_granularity` — the Python bridge folds a checkpoint
+declaration to it at the single mapping point). Physical geometry (LCM
+packing, storage counts, bytes) is confined to the scheduler's
+cache/allocator layer; scheduling, FSM, and config-consuming code must not
+reason about it.
+
+The block tables the scheduler emits are logically *indexed*: row *i* of a
+request's table covers tokens `[i * page_size, (i + 1) * page_size)`. The
+entry *values*, however, are **`CacheBlock` ids** — handles to the physical
+storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
+Consumers outside the cache layer treat the ids as opaque.
+
+### Python runtime: maps logical to physical, perceives as little as possible
+
+The Python side owns the translation from the scheduler's cache-block tables
+to the kernel page tables that attention kernels consume. This mapping should
+happen at **one designated point**; beyond that point, kernels see physical
+page tables and nothing upstream sees them at all.
+
+Outside the mapping point, Python code should perceive `prefix_granularity`
+and `page_size` as little as possible. If a Python component needs either
+value, that is a design smell to justify, not a default to reach for.
+
+## block vs. page
+
+**`block` is the general concept; `page` is its specialization under
+KV-cache-based attention.** A block is one addressable cache unit of a
+group — one block-table slot, one `CacheBlock`, spanning `block_granularity`
+tokens — regardless of what it holds. A page is a block whose contents are
+rows of KV entries consumed by paged attention kernels. Every page is a
+block; a state-checkpoint block is not a page.
+
+Every pairing in this document is a corollary of that relation:
+
+* `block_granularity` (generic slot span) vs. `page_size` (the row-geometry
+  reading of it);
+* `block_table` (generic container) vs. `page_table` (the paged-KV kernel
+  table);
+* `CacheBlock` (storage unit) vs. "cache page" (that unit viewed as paged
+  KV).
+
+Naming rule: reach for a `block` word by default; a `page` word asserts that
+the consumer is paged KV-cache attention, and is wrong anywhere that
+assertion doesn't hold.
+
+## page_table vs. block_table
+
+The two names are distinct concepts, not synonyms:
+
+* **`page_table`** — exists *only* for KV-cache-based (paged) attention. It
+  maps logical token pages to cache pages. State-based attention has no pages
+  and therefore no page table.
+* **`block_table`** — the table used by state-based attention (e.g. Mamba /
+  linear attention state slots), and the generic name for the container that
+  carries per-group tables between scheduler and runtime.
+
+Use `page_table` when **(and only when)** the consumer is paged KV-cache
+attention; use `block_table` otherwise.
+
+## The prefix layer and the cache group (`csrc/cache/prefix/`, `csrc/cache/allocator/`)
+
+One attention structure (full attention, SWA, Mamba state, …) is one **cache
+group**, and a group is built from three single-purpose pieces plus its spec:
+
+```
+CacheGroup = CacheGroupSpec          what the group is (kind, slot geometry)
+           + GroupAllocator     physical placement  (cache/allocator/)
+           + PrefixMatcher        match policy        (cache/prefix/)
+           + PrefixCacheIndex     reuse index         (cache/prefix/)
+```
+
+`CacheGroup` is the **only place the allocation and prefix-matching concerns
+meet**; neither side holds the other's data structures. The group's token
+arithmetic (`GroupGeometry`) lives one level up, in the coordinator.
+
+Perception rules per directory:
+
+* **`cache/prefix/` may perceive `prefix_granularity` and the group's slot
+  span** — prefix matching is defined in token space, so its hashing,
+  key expansion, and window-resume arithmetic legitimately speak tokens.
+* **`cache/allocator/` perceives no logical token quantity at all** — no
+  `prefix_granularity`, no `page_size`, no windows. Its vocabulary is
+  blocks: `CacheBlock`, packing (`cache_blocks_per_lcm_block`), pool slots,
+  block counts.
+* The conversion between the two lives in the **coordinator's
+  `GroupGeometry`** (`cache/coordinator/group_geometry.h`).
+
+### `cache/prefix/` — what is reusable
+
+* **`PrefixCacheIndex`** (`prefix_index.h`) — the CacheKey → canonical
+  `CacheBlock` index, extracted from the old `GroupAllocator`. It owns
+  register/lookup/evict/pin (`Register`, `RegisterFullBlocks`, `Contains`,
+  `Find`, `Evict`, `AcquireMatched`, eviction metadata). Indices are
+  pool-scoped: one index serves both the Device and Host tiers of its group.
+* **`PrefixMatcher`** (`prefix_matcher.h`) — the per-attention-kind match
+  policy, extracted from the old manager subclasses. `FullAttnMatcher` walks
+  left-to-right until the first miss (prefix-closed); `SwaMatcher` scans
+  right-to-left for a run backing a resumable boundary (non-closed). Mamba
+  needs no matcher of its own: it is `SwaMatcher` at window 2 — "keep the
+  live state page plus its snapshot". A matcher only *reads* the group's
+  index; it never touches allocation or physical placement.
+* **`prefix_hasher.h`** — SHA-256 prefix-page hashing (moved from
+  `scheduler/`).
+
+### `cache/allocator/` — where things live (token-free)
+
+`GroupAllocator` is **physical placement only**, and there is exactly one of
+it — no subclasses. It moves `CacheBlock`s between the `BlockPool` and
+`BlockTable`s (`Acquire`, `AppendHostExtension`, `Free`), resolves kernel
+page ids, and executes retention (`ReclaimExpired` punches the first *N*
+slots to null holes). It is deliberately token-free: every token quantity is
+converted to block counts before it reaches the manager.
+
+The conversion is `GroupGeometry` in the coordinator layer:
+
+* `PlanAcquire(table, demand)` turns a token demand into a token-free
+  **`AcquirePlan`** (`cache/core/acquire_plan.h`) — block counts plus the
+  bookkeeping values the manager stores verbatim; the manager executes the
+  plan without deriving anything.
+* `ExpiredBlocksAt(spec, num_computed_tokens)` is the retention *policy*
+  (full attention never expires; SWA and Mamba-at-window-2 slide out whole
+  pages); the manager only *executes* the resulting block count. This is
+  what dissolved the old `SwaManager`/`MambaStateManager` subclasses.
+
+Where reclaim needs to know whether a block is still cached, it takes the
+group's `PrefixCacheIndex` as an explicit read-only parameter — the
+dependency is visible in the signature, not hidden in shared state.
+
+## The coordinator layer (`csrc/cache/coordinator/`)
+
+The coordinator is the scheduler's *sole* entry point into the cache
+subsystem — the facade that hides "multiple attention structures, one shared
+physical pool, two storage tiers" behind a token-unit request lifecycle:
+probe → admit → publish → free.
+
+### `CacheCoordinator` (`cache_coordinator.h`)
+
+A model may mix attention kinds (full attention, SWA, Mamba state, …); each
+becomes one `CacheGroup` (manager + prefix index + matcher). The coordinator
+fans every request-level operation out across all groups, which share a
+single `BlockPool` of LCM blocks, and folds the results back into one answer.
+It holds no per-request state; it only advances the global access-epoch
+clock, with each request carrying its issued epoch.
+
+Its responsibilities:
+
+* **Prefix probe and admission.** `ProbePrefix` is a read-only lookup of
+  prefix hits per group on both tiers, converged to the common prefix length
+  across groups; `Admit` then allocates, pins the hit prefix, and produces
+  host→device `load_pairs` plus each group's fresh pages. Probe and admit are
+  deliberately split so that a failed admission can be retried under a
+  hypothetical release (`CanAdmitAfterReleasing`) without mutating cache
+  state. `ProbeDecodeDevicePrefix` is the PD-decode variant: local history
+  pages are reused while final-state groups are restored from the remote
+  endpoint snapshot.
+* **Prefix publication.** `CacheFullBlocks` / `CacheCompletedBlocks` register
+  computed blocks into the prefix indexes for later requests. Prefix-closed
+  groups match first; non-closed groups (SWA, Mamba) match only within the
+  boundary the closed groups settled (`match_order_` enforces this).
+* **Two tiers (Device/Host).** Device prefix publication can optionally
+  stream to the Host tier (`stream_device_cache_to_host_`); a
+  `pending_stores_` queue drives D2H transfers, alongside Host-side
+  acquire/contains/pin queries.
+* **Reclamation and lifecycle.** `ReclaimExpired`, `Free`,
+  `ClearDeviceCache`/`ClearCache`, and `NumNewlyReleasableLcmBlocks` for
+  ranking retraction (preemption) victims.
+* **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
+  insertions/removals; the scheduler folds them into one externally visible
+  prefix event.
+
+`MakeCoordinator` is the factory: one `CacheGroup` per `CacheGroupSpec`
+(group_id = index), all sharing one scheduler-level `prefix_granularity`
+while each manager may use a smaller cache-page token count.
+
+### `AdmissionPlanner` (`cache_admission.cpp`, anonymous namespace)
+
+The internal capacity planner behind `Admit`. It runs entirely on shadow
+occupancy — never mutating the real pool — and answers: *which cached blocks
+must be evicted for this admission to fit, while protecting the current
+prefix hits?* The algorithm: first check whether existing local holes plus
+empty parents fit with zero eviction; otherwise pop victims from a heap
+ordered by eviction policy (LRU access epoch, then tier: uncached
+request-only block → probationary boundary → established boundary → suffix of
+a closed prefix) until the plan fits; finally walk the victim list in reverse
+and restore every victim that is not strictly required, yielding a minimal
+eviction set.
+
+## Code placement
+
+* Prefix-matching code (prefix hashing, match/lookup, reuse boundaries) lives
+  in its **own directory**, isolated from allocator/storage code. Prefix
+  matching decides *what* is reusable; the allocator decides *where* things
+  live. Neither should be entangled with the other's data structures.
+* Allocator/storage code (`CacheBlock`, pools, LCM planning, eviction) is the
+  only place physical concepts appear.
+
+## Rules of thumb
+
+1. If a value is in tokens, it belongs to the logical world; if it is in
+   blocks-of-storage or bytes, it belongs to the physical world. Never mix the
+   two in one interface without an explicit mapping.
+2. The C++ scheduler schedules in tokens; physical geometry stays inside its
+   cache/allocator layer. Emitted table entries are `CacheBlock` ids, opaque
+   to everything outside that layer.
+3. There is exactly one logical→physical mapping point in Python. Adding a
+   second one is a bug.
+4. New attention backends declare which view of `CacheBlock` they need
+   (paged KV view or state view); they do not invent new table concepts.
+
+## Current state vs. principles (audit 2026-08-13, updated post-refactor)
+
+A snapshot of where the code stands relative to each principle, after the
+2026-08-13 refactor series (prefix layer extraction, coordinator capacity
+API, table-naming cleanup, Python leak fixes).
+
+### Principle 1 — prefix matching isolated from the allocator: fixed
+
+`csrc/cache/prefix/` now owns the concern: `prefix_index.h`
+(`PrefixCacheIndex`, the CacheKey → canonical CacheBlock index),
+`prefix_matcher.h` (`FullAttnMatcher`/`SwaMatcher` policy hierarchy; mamba is
+`SwaMatcher` at window 2), and `prefix_hasher.h` (moved from `scheduler/`).
+`GroupAllocator` is allocation/reclaim only; `CacheGroup` pairs
+spec + manager + matcher + index, and that pairing is the only place the two
+concerns meet. Remaining known item: `csrc/scheduler/kv_cache_events.cpp`
+still hosts a second, independent block-hash implementation for external KV
+events (wire-format constrained; unify deliberately if ever).
+
+### Principle 2 — scheduler perceives only logical quantities: fixed (with the Principle 3 carve-out)
+
+Scheduling and FSM code no longer do geometry arithmetic. The coordinator
+exposes capacity views — `LcmBlocksNeededFor(group_pages)`,
+`NumActiveLcmBlocks(request_tables)`, `NumAvailableLcmBlocks`,
+`TotalLcmBlocks`, `GroupAvailablePages(group)` — and the scheduler treats the
+counts as opaque capacity units. `ForwardState::ActiveLcmBlockIds()` is gone;
+the null-page reservation lives in
+`SchedulerConfig::AllocatorConfig::NumUsablePages()`.
+
+Note on naming: these counts intentionally keep *LCM block* names. An LCM
+parent is a byte-uniform storage unit whose token span differs per group
+(packing is solved from field byte ratios), so no token-unit name would be
+truthful. What Principle 2 requires is that the scheduler not *reason* about
+the geometry — opaque physical counts crossing the boundary is the same
+carve-out Principle 3 makes for CacheBlock ids.
+
+### Principle 3 — emitted table entries: settled by decision, compliant
+
+Decision (2026-08-13): emitted table entries are **`CacheBlock` ids**, and
+that is the accepted contract. The code already works this way: rows are
+logical (row *i* covers `[i*page_size, (i+1)*page_size)`), entries come from
+`ResolveKernelPageId` (`csrc/cache/allocator/group_allocator.h`), and Python
+folds the packing into the contract sent to C++
+(`page_counts = num_lcm_blocks * packing + 1` in `recipes/cache_runtime.py`,
+via `engine/scheduler_utils.py`), so Python's per-forward mapping only
+subdivides `prefix_granularity → page_size` and never touches packing. No
+refactor needed here.
+
+### Principle 4 — page_table vs. block_table: fixed in Python's own naming
+
+* C++ keeps its single generic `BlockTable` container — per this doc's
+  vocabulary that is the correct name for the scheduler-side container; the
+  `page_table` concept exists only where paged-KV kernel tables exist, i.e.
+  in Python.
+* The Python residues are cleaned: `FlashMLADecodeMetadata.page_table`, the
+  TRT-LLM MLA chunked-prefill metadata's `page_table`,
+  `_page_table_aliased`, inkling's `col_block_table` (conv state), and the
+  `CacheGroupsMixin` docstring. Third-party kernel keyword names
+  (`flash_mla`'s `block_table=`, TRT-LLM's `block_tables=`) are an external
+  boundary and stay as the kernels spell them.
+* Remaining known items: the shared replay signature still passes a
+  `page_table` parameter into the state backend
+  (`backends/hybrid_linear_attn.py`), and `input_buffer.py`'s one
+  `page_table` argument carries scheduler-table pages on the target path but
+  kernel pages on the drafter path.
+
+### Principle 5 — Python perceives the logical quantities minimally: leaks fixed, mapping owners still four
+
+Compliant: the recipes/planner layer *owns* the vocabulary rather than
+leaking it; `expand_page_table` is the single expansion primitive; state
+attention and KV share one plan/arena/`CacheBlock` view, mirrored by the host
+tier. Fixed on 2026-08-13:
+
+* The magic `prefix_granularity == 128` branches now name the real
+  constraint — `MXFP8_KV_SCALE_TILE_TOKENS` in `recipes/spec.py`, used by
+  `recipes/ordinary.py` and `pd/cache_protocol.py`.
+* glm5's private page→slot arithmetic moved to the mapping layer
+  (`attention/page_table.py::build_prefill_kv_workspace_slots`).
+* The mamba backend derives its checkpoint span from the state group's
+  `spec.checkpoint_granularity` (snapshot-state groups declare it directly;
+  `page_size` no longer exists on them) instead of
+  `contract.prefix_granularity`.
+
+Remaining known item (deliberate, separate project): the mapping *primitive*
+is single but the *owners* are four — MLA `CacheBatchMetadata.kernel_table`,
+the MHA `CacheGroupsMixin` (eager plus two graph paths),
+`DraftPageStaging.publish`, and DeepSeek-V4's bespoke slot mapping — each
+with its own caching and validation, and the write-location math triplicated
+alongside. Consolidating them means touching every backend family at once;
+do it as its own milestone.

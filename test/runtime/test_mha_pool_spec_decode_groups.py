@@ -80,7 +80,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
                 layer_types=kwargs.get("layer_types", ()),
                 group_ids=kwargs["layer_group_ids"],
                 sliding_window_tokens=kwargs.get("sliding_window_tokens"),
-                page_size=kwargs["page_size"],
+                prefix_granularity=kwargs["page_size"],
             ),
         )
         kwargs.pop("sliding_window_tokens", None)

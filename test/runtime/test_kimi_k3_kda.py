@@ -94,24 +94,33 @@ def _backend(device: str, *, contract_pool, spec_tokens: int = 1) -> MambaAttnBa
     return backend
 
 
-def _stub_contract(*, block_size: int, usable_pages: int):
+def _stub_contract(*, prefix_granularity: int, usable_pages: int):
     """Small-P contract with the Kimi group topology (1 history + 3 state)."""
     group_ids = ("full_attention", *_STATE_GROUPS)
     specs = tuple(
-        PagedCacheGroupSpec(
-            group_id=group_id,
-            retention="full_history",
-            rows_per_page=block_size,
-            entry_stride_tokens=1,
-            sliding_window_tokens=None,
-            family="history" if group_id == "full_attention" else "state",
+        (
+            PagedCacheGroupSpec(
+                group_id=group_id,
+                retention="full_history",
+                rows_per_page=prefix_granularity,
+                entry_stride_tokens=1,
+                sliding_window_tokens=None,
+            )
+            if group_id == "full_attention"
+            else PagedCacheGroupSpec(
+                group_id=group_id,
+                retention="full_history",
+                sliding_window_tokens=None,
+                family="state",
+                checkpoint_granularity=prefix_granularity,
+            )
         )
         for group_id in group_ids
     )
     return PagedCacheRuntimeContract(
-        block_size=block_size,
+        prefix_granularity=prefix_granularity,
         num_lcm_blocks=usable_pages,
-        token_capacity=usable_pages * block_size,
+        token_capacity=usable_pages * prefix_granularity,
         group_specs=specs,
         group_page_counts={spec.group_id: usable_pages + 1 for spec in specs},
     )
@@ -189,7 +198,7 @@ def test_set_kv_pool_binds_contract_state_groups() -> None:
     backend = _backend("cpu", contract_pool=pool)
     assert backend.state_paging_active
     assert backend._state_group_ids == _STATE_GROUPS
-    assert backend._state_page_size == pool.page_size
+    assert backend._checkpoint_granularity == pool.page_size
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +316,7 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
         # Real row 0 refreshed from this group's table; padded row 1 -> pad.
         expected_in, _ = compute_state_page_indices(
             torch.as_tensor(tables[gid][:1]),
-            pool.runtime_contract.block_size,
+            pool.runtime_contract.prefix_granularity,
             torch.tensor([4]),  # before = seq_len 5 - 1
             torch.tensor([5]),
             validate=False,
@@ -538,7 +547,7 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
     """Prefill from zero state, same-page decode, boundary-crossing decode,
     per-group table independence — vs naive fp32 recurrence AND FLA."""
     P, usable = 4, 8
-    contract = _stub_contract(block_size=P, usable_pages=usable)
+    contract = _stub_contract(prefix_granularity=P, usable_pages=usable)
     pool = _StubContractPool(
         contract, "cuda", conv_dim=3 * 4 * 128, width=4, num_heads=4, head_dim=128
     )
@@ -647,7 +656,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     """Prefix hit at a P boundary: the shared snapshot page is read-only for
     both branches (CoW), and batched decode keeps requests isolated."""
     P, usable = 4, 12
-    contract = _stub_contract(block_size=P, usable_pages=usable)
+    contract = _stub_contract(prefix_granularity=P, usable_pages=usable)
     pool = _StubContractPool(
         contract, "cuda", conv_dim=3 * 4 * 128, width=4, num_heads=4, head_dim=128
     )

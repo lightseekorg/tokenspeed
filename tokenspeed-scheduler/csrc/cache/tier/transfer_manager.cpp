@@ -51,7 +51,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
         if (!device_block_ref) {
             continue;
         }
-        const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(candidate.key.group_id));
+        const GroupAllocator& manager = coordinator_.Allocator(static_cast<std::int32_t>(candidate.key.group_id));
         CacheBlockRef host_block_ref = coordinator_.AcquireHostBlock(candidate.key.group_id);
         if (!host_block_ref) {
             continue;
@@ -124,7 +124,7 @@ std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const
     for (const BlockTransfer& block_transfer : block_transfers) {
         _assert(block_transfer.source && block_transfer.destination,
                 "cache transfer requires pinned source and destination blocks");
-        const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(block_transfer.group_id));
+        const GroupAllocator& manager = coordinator_.Allocator(static_cast<std::int32_t>(block_transfer.group_id));
         transfers.push_back(CacheTransfer{
             .group_id = block_transfer.group_id,
             .source_page = manager.ResolveKernelPageId(block_transfer.source->Location()),

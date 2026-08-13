@@ -120,16 +120,14 @@ def _cache_storage_report(
         group.group_id: int(group.cache_blocks_per_lcm_block) for group in plan.groups
     }
     physical_token_capacity = (
-        int(plan.num_lcm_blocks)
-        * max(packing.values())
-        * int(plan.logical_block_tokens)
+        int(plan.num_lcm_blocks) * max(packing.values()) * int(plan.prefix_granularity)
     )
     if physical_token_capacity != int(pool.size):
         raise RuntimeError(
             "LCM geometry capacity does not match the allocated pool size"
         )
     geometry = {
-        "logical_block_tokens": int(plan.logical_block_tokens),
+        "prefix_granularity": int(plan.prefix_granularity),
         "num_lcm_blocks": int(plan.num_lcm_blocks),
         "cache_blocks_per_lcm_block": packing,
         # Fraction of a parent each group's binding actually uses;
@@ -246,18 +244,18 @@ def _get_backend_cls(name: str, arch: AttentionArch) -> type[AttentionBackend]:
 def _validate_lcm_page_size(
     config: BaseAttnConfig,
     *,
-    logical_page_size: int,
+    prefix_granularity: int,
 ) -> None:
     """Require the scheduler page to contain whole configured kernel pages."""
     kernel_page_size = int(config.page_size)
     if (
-        logical_page_size <= 0
+        prefix_granularity <= 0
         or kernel_page_size <= 0
-        or logical_page_size % kernel_page_size
+        or prefix_granularity % kernel_page_size
     ):
         raise ValueError(
-            "logical page size must be a positive multiple of kernel page "
-            f"size, got {logical_page_size} and {kernel_page_size}"
+            "prefix granularity must be a positive multiple of kernel page "
+            f"size, got {prefix_granularity} and {kernel_page_size}"
         )
 
 
@@ -265,7 +263,7 @@ def _set_cache_group_page_sizes(config: BaseAttnConfig, spec: CachePoolSpec) -> 
     """Publish scheduler page sizes to group-aware MHA backends."""
     if not hasattr(config, "group_page_sizes"):
         return
-    page_size = spec.memory_plan.logical_block_tokens
+    page_size = spec.memory_plan.prefix_granularity
     config.group_page_sizes = {group_id: page_size for group_id in spec.layer_group_ids}
 
 
@@ -509,14 +507,14 @@ def _wrap_inkling_backend(
 def _inkling_conv_columns(pool, text_config):
     """Return the ShortConv checkpoint groups backed by the cache plan."""
     layer_labels = text_config.paged_cache_layer_types
-    block_tokens = pool.plan.logical_block_tokens
+    prefix_granularity = pool.plan.prefix_granularity
     conv_columns = {
-        "block_tokens": block_tokens,
+        "block_tokens": prefix_granularity,
         "conv_group_of_layer": ("kvconv",) * len(layer_labels),
         "hidden_group_of_layer": ("hiddenconv",) * len(layer_labels),
         "group_block_tokens": {
-            "kvconv": block_tokens,
-            "hiddenconv": block_tokens,
+            "kvconv": prefix_granularity,
+            "hiddenconv": prefix_granularity,
         },
         "pd_endpoint_snapshots": all(
             spec.transfer_policy == "latest_snapshot"
@@ -530,7 +528,7 @@ def _inkling_conv_columns(pool, text_config):
     }
     logger.info(
         "Inkling ShortConv boundary checkpoints: P=%d, groups=%s",
-        block_tokens,
+        prefix_granularity,
         tuple(conv_columns["group_block_tokens"]),
     )
     return conv_columns
@@ -963,16 +961,16 @@ def create_attn_components(
             family=heterogeneous_draft_family,
             publish_runtime_contract=False,
         )
-    logical_page_size = spec.memory_plan.logical_block_tokens
+    prefix_granularity = spec.memory_plan.prefix_granularity
     _validate_lcm_page_size(
         config,
-        logical_page_size=logical_page_size,
+        prefix_granularity=prefix_granularity,
     )
     _set_cache_group_page_sizes(config, spec)
     if draft_attn_config is not None:
         _validate_lcm_page_size(
             draft_attn_config,
-            logical_page_size=logical_page_size,
+            prefix_granularity=prefix_granularity,
         )
         _set_cache_group_page_sizes(draft_attn_config, spec)
     cache_budget_bytes = cache_setup.cache_budget_bytes
@@ -982,7 +980,7 @@ def create_attn_components(
         "Cache profile: parent_bytes=%d, P=%d, parents=%d, token_capacity=%d, "
         "layers=%d (draft %d), groups=%s",
         spec.memory_plan.lcm_block_bytes,
-        spec.memory_plan.logical_block_tokens,
+        spec.memory_plan.prefix_granularity,
         spec.memory_plan.num_lcm_blocks,
         spec.token_capacity,
         len(spec.layer_group_ids),

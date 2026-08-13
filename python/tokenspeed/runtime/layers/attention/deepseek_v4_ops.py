@@ -384,7 +384,7 @@ def deepseek_v4_prepare_indexer_q_fp8(
 
 def gather_paged_indexer_fp8_cache(
     cache_2d: torch.Tensor,
-    block_table: torch.Tensor,
+    page_table: torch.Tensor,
     cu_seq_lens: torch.Tensor,
     block_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -395,7 +395,7 @@ def gather_paged_indexer_fp8_cache(
 
     Args:
         cache_2d: ``[pages, block_size * (index_head_dim + 4)]`` uint8 fp8 cache.
-        block_table: ``[num_reqs, max_blocks]`` int32 logical->physical pages.
+        page_table: ``[num_reqs, max_blocks]`` int32 logical->physical pages.
         cu_seq_lens: ``[num_reqs + 1]`` int32 cumulative compressed key lengths.
         block_size: cache block size (tokens per page), e.g. 64.
 
@@ -416,16 +416,16 @@ def gather_paged_indexer_fp8_cache(
             torch.empty((0,), dtype=torch.float32, device=device),
         )
 
-    block_table = block_table.to(device=device, dtype=torch.int64)
+    page_table = page_table.to(device=device, dtype=torch.int64)
     row_ids = torch.arange(total_rows, device=device, dtype=torch.int64)
     # searchsorted over the per-req end offsets maps each output row to its req.
     req = torch.searchsorted(cu_seq_lens[1:].contiguous(), row_ids, right=True)
-    req = req.clamp_max(block_table.shape[0] - 1)
+    req = req.clamp_max(page_table.shape[0] - 1)
     local = row_ids - cu_seq_lens[req]
     logical_block = torch.div(local, block_size, rounding_mode="floor")
-    logical_block = logical_block.clamp_max(block_table.shape[1] - 1)
+    logical_block = logical_block.clamp_max(page_table.shape[1] - 1)
     in_block = local % block_size
-    phys = block_table[req, logical_block]
+    phys = page_table[req, logical_block]
 
     # Index pages via advanced indexing on the 2-D cache, NOT via
     # page * stride(0) into reshape(-1): the indexer cache can be a strided

@@ -31,7 +31,7 @@ def _plan(num_lcm_blocks: int, *, tp_size: int = 8):
 def test_lcm_reference_geometry_is_exact() -> None:
     plan = _plan(7)
 
-    assert plan.logical_block_tokens == 128
+    assert plan.prefix_granularity == 128
     assert plan.lcm_block_bytes == TP8_PAGE_SET_BYTES
     assert len(plan.planes) == 24
     assert {
@@ -135,7 +135,7 @@ def test_k3_merged_solve_with_draft_shares_page_ids():
 
     draft_fields = mla_cache_fields(
         layer_group_ids=("full_attention",) * 5,
-        logical_block_tokens=128,
+        prefix_granularity=128,
         latent_width=576,
         element_size=torch.bfloat16.itemsize,
     )
@@ -193,7 +193,7 @@ def test_k3_binding_utilization_with_real_bf16_draft_geometry():
 
     draft_fields = mla_cache_fields(
         layer_group_ids=("full_attention",) * 5,
-        logical_block_tokens=128,
+        prefix_granularity=128,
         latent_width=576,
         element_size=torch.bfloat16.itemsize,
     )

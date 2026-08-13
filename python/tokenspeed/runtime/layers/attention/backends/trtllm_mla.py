@@ -102,9 +102,9 @@ class TRTLLMMLAChunkedPrefillMetadata:
     chunked_seq_len: torch.Tensor  # (chunked_loop_num, num_extends) int32 GPU
     cu_chunked_seq_len: torch.Tensor  # (chunked_loop_num, num_extends+1) int32 GPU
     max_chunk_len_per_loop: list  # List[int], one per loop_idx
-    # Per-request batch-ordered page table. Populated only by the DSA backend
-    # for sparse-prefill top-k; plain MLA leaves it None.
-    block_tables: torch.Tensor | None = None
+    # Per-request batch-ordered kernel page table. Populated only by the DSA
+    # backend for sparse-prefill top-k; plain MLA leaves it None.
+    page_table: torch.Tensor | None = None
 
 
 @dataclass
@@ -533,7 +533,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             group_table = page_table[:bs]
         if group_table is not None:
             real_bs = min(int(group_table.shape[0]), bs)
-            if real_bs > 0 and not self._block_table_aliased:
+            if real_bs > 0 and not self._page_table_aliased:
                 self._create_block_kv_indices(
                     real_bs,
                     metadata.block_kv_indices.shape[1],
@@ -553,7 +553,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             metadata.block_kv_indices[real_bs:bs].zero_()
             if metadata.group_out_cache_loc is not None:
                 metadata.group_out_cache_loc[real_bs * q_len : bs * q_len].zero_()
-        elif page_table is not None and not self._block_table_aliased:
+        elif page_table is not None and not self._page_table_aliased:
             self._create_block_kv_indices(
                 bs,
                 metadata.block_kv_indices.shape[1],
@@ -609,7 +609,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
 
         if q_len_per_req > 1 and self.is_draft:
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
-            block_tables = metadata.block_kv_indices[num_extends:].repeat_interleave(
+            page_table = metadata.block_kv_indices[num_extends:].repeat_interleave(
                 q_len_per_req, dim=0
             )
             base_lens = metadata.seq_lens_k[num_extends:].repeat_interleave(
@@ -630,7 +630,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         else:
             # Plain decode (q_len=1) or bs-grouped multi-token decode.
             query = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-            block_tables = metadata.block_kv_indices[num_extends:]
+            page_table = metadata.block_kv_indices[num_extends:]
             seq_lens = metadata.seq_lens_k[num_extends:]
             max_seq_len = metadata.max_seq_len_k
 
@@ -657,7 +657,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=block_tables,
+            block_tables=page_table,
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
             bmm1_scale=bmm1_scale,

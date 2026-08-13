@@ -64,7 +64,7 @@ class _TestCacheGroup:
 
     group_id: str
     family: str
-    logical_block_tokens: int
+    prefix_granularity: int
     retention: str
     sliding_window_tokens: int | None
     fields: tuple[_TestCacheField, ...]
@@ -141,15 +141,27 @@ def layout(
         for entry in groups
     )
     specs = tuple(
-        PagedCacheGroupSpec(
-            group_id=entry.group_id,
-            retention=entry.retention,
-            rows_per_page=entry.logical_block_tokens,
-            entry_stride_tokens=1,
-            sliding_window_tokens=entry.sliding_window_tokens,
-            family=entry.family,
-            cache_blocks_per_lcm_block=entry.cache_blocks_per_lcm_block,
-            transfer_policy=entry.transfer_policy,
+        (
+            PagedCacheGroupSpec(
+                group_id=entry.group_id,
+                retention=entry.retention,
+                sliding_window_tokens=entry.sliding_window_tokens,
+                family=entry.family,
+                cache_blocks_per_lcm_block=entry.cache_blocks_per_lcm_block,
+                transfer_policy=entry.transfer_policy,
+                checkpoint_granularity=entry.prefix_granularity,
+            )
+            if entry.family == "state" and entry.retention == "full_history"
+            else PagedCacheGroupSpec(
+                group_id=entry.group_id,
+                retention=entry.retention,
+                rows_per_page=entry.prefix_granularity,
+                entry_stride_tokens=1,
+                sliding_window_tokens=entry.sliding_window_tokens,
+                family=entry.family,
+                cache_blocks_per_lcm_block=entry.cache_blocks_per_lcm_block,
+                transfer_policy=entry.transfer_policy,
+            )
         )
         for entry in groups
     )
@@ -182,7 +194,7 @@ def layout(
 
     return CacheTransferContract(
         plan=CacheMemoryPlan(
-            logical_block_tokens=block_size,
+            prefix_granularity=block_size,
             lcm_block_bytes=page_bytes,
             num_lcm_blocks=capacity - 1,
             groups=plan_groups,

@@ -14,7 +14,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
 def inkling_cache_fields(
     *,
     layer_group_ids,
-    logical_block_tokens,
+    prefix_granularity,
     layer_kv_heads,
     head_dim,
     kv_element_size,
@@ -39,7 +39,7 @@ def inkling_cache_fields(
     if kv_scale_block_size and head_dim % kv_scale_block_size:
         raise ValueError("head_dim must be divisible by kv_scale_block_size")
     if kv_scale_block_size and (
-        logical_block_tokens % 128 or head_dim != 128 or kv_scale_block_size != 32
+        prefix_granularity % 128 or head_dim != 128 or kv_scale_block_size != 32
     ):
         raise ValueError(
             "Inkling MXFP8 scale fields require P divisible by 128, "
@@ -61,7 +61,7 @@ def inkling_cache_fields(
         else:
             hidden_k_plane = k_plane
             hidden_v_plane = v_plane
-        kv_shape = (logical_block_tokens, kv_heads, head_dim)
+        kv_shape = (prefix_granularity, kv_heads, head_dim)
         kvconv_shape = (checkpoint_rows, kv_heads * head_dim)
         hiddenconv_shape = (checkpoint_rows, hidden_size)
         fields.extend(
@@ -118,7 +118,7 @@ def inkling_cache_fields(
             scale_dim = head_dim // kv_scale_block_size
             scale_shape = (
                 kv_heads,
-                logical_block_tokens // 128,
+                prefix_granularity // 128,
                 32,
                 scale_dim,
                 scale_dim,
@@ -154,7 +154,7 @@ def inkling_layer_kv_head_counts(model_config) -> tuple[int, ...]:
     )
 
 
-def _inkling_fields(attn_config, model_config, logical_block_tokens: int):
+def _inkling_fields(attn_config, model_config, prefix_granularity: int):
     text_config = model_config.hf_config.get_text_config()
     layer_kv_head_counts = inkling_layer_kv_head_counts(model_config)
     per_rank_heads = tuple(
@@ -165,7 +165,7 @@ def _inkling_fields(attn_config, model_config, logical_block_tokens: int):
     )
     fields = inkling_cache_fields(
         layer_group_ids=attn_config.layer_types,
-        logical_block_tokens=logical_block_tokens,
+        prefix_granularity=prefix_granularity,
         layer_kv_heads=per_rank_heads,
         head_dim=attn_config.head_dim,
         kv_element_size=attn_config.kv_cache_dtype.itemsize,
@@ -179,7 +179,7 @@ def _inkling_fields(attn_config, model_config, logical_block_tokens: int):
     return fields, layer_kv_head_counts
 
 
-def _checkpoint_groups(logical_block_tokens: int):
+def _checkpoint_groups(prefix_granularity: int):
     # Physical packing is aligned with the memory plan by the pool at
     # construction; the recipe only declares the scheduler semantics.
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -190,10 +190,9 @@ def _checkpoint_groups(logical_block_tokens: int):
         PagedCacheGroupSpec(
             group_id=group_id,
             retention="full_history",
-            rows_per_page=logical_block_tokens,
-            entry_stride_tokens=1,
             sliding_window_tokens=None,
             family="state",
+            checkpoint_granularity=prefix_granularity,
         )
         for group_id in ("kvconv", "hiddenconv")
     )
@@ -235,9 +234,9 @@ def prepare_inkling_cache(
     overlap_schedule_depth: int,
 ):
     """Build target and optional draft cache specs for Inkling."""
-    logical_block_tokens = 128
+    prefix_granularity = 128
     fields, layer_kv_head_counts = _inkling_fields(
-        attn_config, model_config, logical_block_tokens
+        attn_config, model_config, prefix_granularity
     )
     layer_types = tuple(attn_config.layer_types)
     text_config = model_config.hf_config.get_text_config()
@@ -272,7 +271,7 @@ def prepare_inkling_cache(
         # checkpoint fields as continuation tenants of the existing groups,
         # so the draft conv ring gains the same publish/restore bridges.
         draft_fields, draft_layer_kv_head_counts = _inkling_fields(
-            draft_attn_config, draft_model_config, logical_block_tokens
+            draft_attn_config, draft_model_config, prefix_granularity
         )
         fixed_workspace_bytes += _workspace_bytes(
             text_config=draft_model_config.hf_config.get_text_config(),
@@ -315,9 +314,9 @@ def prepare_inkling_cache(
             layer_types=merged_layer_types,
             group_ids=merged_group_ids,
             sliding_window_tokens=attn_config.sliding_window_tokens,
-            page_size=logical_block_tokens,
+            prefix_granularity=prefix_granularity,
         ),
-        *_checkpoint_groups(logical_block_tokens),
+        *_checkpoint_groups(prefix_granularity),
     )
     if attn_config.pd_disaggregation_enabled:
         group_specs = tuple(apply_pd_transfer_policies(group_specs))
@@ -333,6 +332,6 @@ def prepare_inkling_cache(
         num_draft_layers=num_draft_layers,
         cache_budget_bytes=cache_budget_bytes,
         fixed_workspace_bytes=fixed_workspace_bytes,
-        logical_block_tokens=logical_block_tokens,
+        prefix_granularity=prefix_granularity,
         max_padding_fraction=max_padding_fraction,
     )

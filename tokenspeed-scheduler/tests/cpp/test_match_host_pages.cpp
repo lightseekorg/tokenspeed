@@ -26,8 +26,8 @@
 #include <vector>
 
 #include "cache/core/block_pool.h"
-#include "cache/manager/full_attn_manager.h"
-#include "cache/manager/swa_manager.h"
+#include "cache/allocator/group_allocator.h"
+#include "prefix_test_group.h"
 
 namespace tokenspeed::test {
 namespace {
@@ -41,26 +41,7 @@ std::vector<std::int32_t> BlockIds(const std::vector<CacheBlockRef>& refs) {
     return ids;
 }
 
-template <typename Base>
-class TestManager : public Base {
-public:
-    using Base::Base;
 
-    PrefixMatch Match(BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
-                      std::int32_t max_blocks) {
-        return this->AcquireMatchedBlocks(pool, keys, begin_blocks, this->Probe(pool, keys, begin_blocks, max_blocks),
-                                          recency_);
-    }
-    void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key) {
-        Base::RegisterCachedBlock(pool, block, key, recency_);
-    }
-
-private:
-    std::uint64_t recency_{0};
-};
-
-using FullAttnManager = TestManager<::tokenspeed::FullAttnManager>;
-using SwaManager = TestManager<::tokenspeed::SwaManager>;
 
 CacheKey Key(std::string content_hash) {
     return CacheKey{.content_hash = std::move(content_hash)};
@@ -83,7 +64,7 @@ std::int32_t Put(Manager& manager, BlockPool& host_pool, const CacheKey& key) {
 
 TEST(HostTierMatchTest, FullWalksContiguousRunFromBegin) {
     BlockPool host_pool(9);
-    FullAttnManager mgr(/*block_size=*/4);
+    FullAttnManager mgr(/*page_size=*/4);
     EXPECT_TRUE(mgr.MatchIsPrefixClosed());
     std::vector<CacheKey> keys{Key("k0"), Key("k1"), Key("k2"), Key("k3"), Key("k4")};
     std::vector<std::int32_t> put;
@@ -117,7 +98,7 @@ TEST(HostTierMatchTest, FullEmptyOnBeginMissOrEmptyRange) {
 
 TEST(HostTierMatchTest, SwaTrailingRunAtEnd) {
     BlockPool host_pool(9);
-    // block_size 4, window 10 -> pages_needed = ceil(9/4) = 3.
+    // page_size 4, window 10 -> pages_needed = ceil(9/4) = 3.
     SwaManager mgr(4, /*sliding_window=*/10);
     EXPECT_FALSE(mgr.MatchIsPrefixClosed());
     std::vector<CacheKey> keys{Key("k0"), Key("k1"), Key("k2"), Key("k3"), Key("k4")};

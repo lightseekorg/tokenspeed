@@ -28,7 +28,7 @@ void TokenContainer::Extend(const std::vector<std::int32_t>& new_tokens) {
     tokens_.insert(tokens_.end(), new_tokens.begin(), new_tokens.end());
 }
 
-std::vector<std::span<const std::int32_t>> TokenContainer::FullPagedTokens(std::int32_t page_size,
+std::vector<std::span<const std::int32_t>> TokenContainer::FullPrefixPages(std::int32_t prefix_granularity,
                                                                            bool except_last) const {
     std::vector<std::span<const std::int32_t>> result;
 
@@ -37,11 +37,11 @@ std::vector<std::span<const std::int32_t>> TokenContainer::FullPagedTokens(std::
     }
 
     std::int32_t token_size = except_last ? tokens_.size() - 1 : tokens_.size();
-    std::size_t num_full_pages = token_size / page_size;
+    std::size_t num_full_pages = token_size / prefix_granularity;
     result.reserve(num_full_pages);
     for (std::size_t i = 0; i < num_full_pages; ++i) {
-        std::size_t start = i * page_size;
-        result.emplace_back(tokens_.data() + start, page_size);
+        std::size_t start = i * prefix_granularity;
+        result.emplace_back(tokens_.data() + start, prefix_granularity);
     }
 
     return result;

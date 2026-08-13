@@ -86,7 +86,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
         self,
         fields,
         *,
-        logical_block_tokens,
+        prefix_granularity,
         budget_bytes=None,
         num_lcm_blocks=None,
         **kwargs,
@@ -94,7 +94,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
         """Solve a layout and bind capacity the way the recipes do."""
         layout = self.plan_module.solve_cache_layout(
             fields,
-            logical_block_tokens=logical_block_tokens,
+            prefix_granularity=prefix_granularity,
             **kwargs,
         )
         if budget_bytes is not None:
@@ -106,7 +106,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
         fields = self.layouts_module.qwen_gdn_cache_fields(
             layer_types=("linear_attention", "full_attention"),
             layer_group_ids=("linear_attention_0", "full_attention"),
-            logical_block_tokens=128,
+            prefix_granularity=128,
             kv_shape=(128, 1, 128),
             kv_element_size=2,
             conv_shape=(256, 3),
@@ -145,7 +145,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
                 target_fields = self.layouts_module.qwen_gdn_cache_fields(
                     layer_types=layer_types,
                     layer_group_ids=group_ids,
-                    logical_block_tokens=128,
+                    prefix_granularity=128,
                     kv_shape=(128, 2, 256),
                     kv_element_size=1,
                     conv_shape=(conv_dim, 3),
@@ -156,7 +156,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
                 draft_fields = self.layouts_module.draft_cache_fields(
                     layer_group_ids=("full_attention",),
                     enabled_layer_ids=(0,),
-                    logical_block_tokens=128,
+                    prefix_granularity=128,
                     layer_kv_heads=(2,),
                     head_dim=256,
                     kv_element_size=1,
@@ -168,7 +168,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
 
                 target_layout = self.plan_module.solve_cache_layout(
                     target_fields,
-                    logical_block_tokens=128,
+                    prefix_granularity=128,
                     alignment=256,
                     max_padding_fraction=1.0,
                 )
@@ -178,7 +178,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
                 ):
                     self.plan_module.solve_cache_layout(
                         merged_fields,
-                        logical_block_tokens=128,
+                        prefix_granularity=128,
                         alignment=256,
                         max_padding_fraction=1.0,
                     )
@@ -189,7 +189,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
                 )
                 merged_layout = self.plan_module.solve_cache_layout(
                     merged_fields,
-                    logical_block_tokens=128,
+                    prefix_granularity=128,
                     alignment=256,
                     max_padding_fraction=padding_limit,
                 )
@@ -271,7 +271,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
                 "sliding_attention",
                 "full_attention",
             ),
-            logical_block_tokens=128,
+            prefix_granularity=128,
             kv_heads=2,
             head_dim=8,
             kv_element_size=2,
@@ -288,7 +288,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
 
         plan = self._plan_fields(
             fields,
-            logical_block_tokens=128,
+            prefix_granularity=128,
             num_lcm_blocks=2,
             cache_blocks_per_lcm_block={
                 "sliding_attention": 1,
@@ -425,7 +425,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
     def test_deepseek_v4_recipe_uses_one_p256_scheduler_domain(self):
         fields = self.layouts_module.deepseek_v4_cache_fields(
             layer_ratios=(1, 4, 128),
-            logical_block_tokens=256,
+            prefix_granularity=256,
             swa_shape=(128,),
             compressed_shapes={4: (64,), 128: (2,)},
             compressor_state_shapes={4: (8, 16), 128: (128, 8)},
@@ -456,12 +456,12 @@ class CacheMemoryPlanTest(unittest.TestCase):
 
         plan = self._plan_fields(
             fields,
-            logical_block_tokens=256,
+            prefix_granularity=256,
             num_lcm_blocks=4,
             max_padding_fraction=float("inf"),
         )
 
-        self.assertEqual(plan.logical_block_tokens, 256)
+        self.assertEqual(plan.prefix_granularity, 256)
         self.assertEqual(
             {group.group_id for group in plan.groups},
             {
@@ -492,12 +492,12 @@ class CacheMemoryPlanTest(unittest.TestCase):
 
         plan = self._plan_fields(
             fields,
-            logical_block_tokens=128,
+            prefix_granularity=128,
             budget_bytes=8192,
             alignment=256,
         )
 
-        self.assertEqual(plan.logical_block_tokens, 128)
+        self.assertEqual(plan.prefix_granularity, 128)
         self.assertEqual(
             plan.group("history").cache_blocks_per_lcm_block,
             1,
@@ -516,7 +516,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
 
         layout = self.plan_module.solve_cache_layout(
             fields,
-            logical_block_tokens=128,
+            prefix_granularity=128,
             alignment=16,
         )
         small = layout.with_num_lcm_blocks(2)
@@ -556,7 +556,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
                     exact_page_stride=False,
                 ),
             ),
-            logical_block_tokens=256,
+            prefix_granularity=256,
             num_lcm_blocks=2,
             cache_blocks_per_lcm_block={"compressed": 8, "wide": 1},
             alignment=256,
@@ -583,7 +583,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
             page_stride_bytes=256,
         )
         plan = self.plan_module.CacheMemoryPlan(
-            logical_block_tokens=128,
+            prefix_granularity=128,
             lcm_block_bytes=1024,
             num_lcm_blocks=4,
             groups=(group,),
@@ -603,7 +603,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "field ids must be unique"):
             self._plan_fields(
                 fields,
-                logical_block_tokens=16,
+                prefix_granularity=16,
                 budget_bytes=4096,
             )
 
@@ -616,7 +616,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
 
         plan = self._plan_fields(
             fields,
-            logical_block_tokens=128,
+            prefix_granularity=128,
             num_lcm_blocks=7,
             cache_blocks_per_lcm_block={"history": 1, "state": 4},
             alignment=256,
@@ -632,7 +632,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
         field = self.plan_module.CacheFieldSpec
         plan = self._plan_fields(
             (field("history", "history.k", "plane.k", (1,), 1),),
-            logical_block_tokens=16,
+            prefix_granularity=16,
             num_lcm_blocks=2,
             cache_blocks_per_lcm_block={"history": 256},
         )
@@ -650,7 +650,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
                 field("history", "history.k", "plane.shared", (1,), 1),
                 field("state", "state.ssm", "plane.shared", (256,), 1),
             ),
-            logical_block_tokens=16,
+            prefix_granularity=16,
             num_lcm_blocks=2,
         )
 
@@ -671,7 +671,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
             ):
                 self._plan_fields(
                     fields,
-                    logical_block_tokens=128,
+                    prefix_granularity=128,
                     num_lcm_blocks=count,
                 )
 
@@ -685,7 +685,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside the plan"):
             self._plan_fields(
                 fields,
-                logical_block_tokens=128,
+                prefix_granularity=128,
                 num_lcm_blocks=2,
                 cache_blocks_per_lcm_block={"history": 1, "state": 4, "extra": 1},
             )
@@ -701,14 +701,14 @@ class CacheMemoryPlanTest(unittest.TestCase):
 
         unpinned = self._plan_fields(
             fields,
-            logical_block_tokens=128,
+            prefix_granularity=128,
             num_lcm_blocks=2,
             max_padding_fraction=1.0,
         )
         history_count = unpinned.group("history").cache_blocks_per_lcm_block
         pinned = self._plan_fields(
             fields,
-            logical_block_tokens=128,
+            prefix_granularity=128,
             num_lcm_blocks=2,
             max_padding_fraction=1.0,
             cache_blocks_per_lcm_block={"history": history_count},
@@ -733,7 +733,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
             ):
                 self._plan_fields(
                     fields,
-                    logical_block_tokens=128,
+                    prefix_granularity=128,
                     num_lcm_blocks=2,
                     cache_blocks_per_lcm_block={"history": count},
                 )
@@ -748,7 +748,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "needs page stride"):
             self._plan_fields(
                 fields,
-                logical_block_tokens=128,
+                prefix_granularity=128,
                 num_lcm_blocks=2,
                 cache_blocks_per_lcm_block={"history": 1, "state": 2},
             )
@@ -757,7 +757,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
         fields = self.layouts_module.draft_cache_fields(
             layer_group_ids=("full", "swa", "unused"),
             enabled_layer_ids=(0, 1),
-            logical_block_tokens=128,
+            prefix_granularity=128,
             layer_kv_heads=(2, 4, 8),
             head_dim=64,
             kv_element_size=2,
@@ -772,7 +772,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
     def test_inkling_bf16_and_fp8_checkpoint_planes(self):
         bf16 = self.layouts_module.inkling_cache_fields(
             layer_group_ids=("swa",),
-            logical_block_tokens=128,
+            prefix_granularity=128,
             layer_kv_heads=(2,),
             head_dim=128,
             kv_element_size=2,
@@ -783,7 +783,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
         )
         fp8 = self.layouts_module.inkling_cache_fields(
             layer_group_ids=("swa",),
-            logical_block_tokens=128,
+            prefix_granularity=128,
             layer_kv_heads=(2,),
             head_dim=128,
             kv_element_size=1,
@@ -814,7 +814,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
         (no draft-specific namespace), planes shifted to the continuation
         range, kvconv tails squatting in the draft kv planes."""
         recipe_kwargs = dict(
-            logical_block_tokens=128,
+            prefix_granularity=128,
             head_dim=128,
             kv_element_size=2,
             hidden_size=256,
@@ -856,7 +856,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
         )
         plan = self._plan_fields(
             merged,
-            logical_block_tokens=128,
+            prefix_granularity=128,
             num_lcm_blocks=2,
             max_padding_fraction=float("inf"),
         )
@@ -893,7 +893,7 @@ class CapacityReportTest(unittest.TestCase):
             CacheFieldSpec("state", "state.ssm", "plane.shared", (128, 8), 2),
             CacheFieldSpec("swa", "swa.kv", "plane.shared", (128, 8), 2),
         )
-        return solve_cache_layout(fields, logical_block_tokens=128).with_num_lcm_blocks(
+        return solve_cache_layout(fields, prefix_granularity=128).with_num_lcm_blocks(
             100
         )
 
@@ -970,7 +970,7 @@ class ContinuationLayerFieldsTest(CacheMemoryPlanTest):
         draft = (CacheFieldSpec("history", "layer.0.kv", "slot.0", (128, 8), 2),)
         merged = self.plan_module.solve_cache_layout(
             target + continue_layer_fields(draft, first_layer_id=2),
-            logical_block_tokens=128,
+            prefix_granularity=128,
         )
         plan = merged.with_num_lcm_blocks(2)
         # One group, one packing, one page-id space; the draft layer is
@@ -1007,7 +1007,7 @@ class BindingUtilizationTest(CacheMemoryPlanTest):
                     exact_page_stride=False,
                 ),
             ),
-            logical_block_tokens=16,
+            prefix_granularity=16,
             num_lcm_blocks=2,
             cache_blocks_per_lcm_block={"wide": 1, "narrow": 1},
             max_padding_fraction=2.0,
