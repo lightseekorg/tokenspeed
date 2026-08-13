@@ -52,7 +52,6 @@ from torch import nn
 from tokenspeed.runtime.configs.inkling_config import (
     InklingMMConfig,
     InklingModelConfig,
-    inkling_mtp_decode_lookback_mode,
     inkling_mtp_text_config,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -211,25 +210,6 @@ class InklingMultiTokenPredictor(nn.Module):
 
 
 class InklingForConditionalGenerationNextN(nn.Module):
-    # Catch-up runs the full padded window; ctx.gather_ids narrows to one row per request.
-    draft_first_step_reduce_for_catchup = True
-    # Full-sequence depths: re-run each depth over the whole verify window
-    # (mtp.py window mode); the trained dataflow, not optional.
-    draft_multi_depth_windows = True
-    # Prompt catch-up: at EXTEND rounds run depths
-    # 1..steps-1 over the prompt rows too (inputs shifted d+1, chaining the
-    # previous depth's full-row hidden), so every used depth gets dense
-    # prompt KV and sconv prompt state.
-    draft_extend_depth_catchup = True
-    # Provisional-tail recompute mode (INKLING_MTP_DECODE_LOOKBACK A/B knob):
-    # the previous round's provisional tail entries (written from
-    # then-unverified drafts) are recomputed from committed tokens either by
-    # D=steps-1 lookback rows prepended to the verify-anchored window (1) or
-    # by re-anchoring the k-row window to end at the committed frontier
-    # (2, default, zero garbage rows); 0 reverts to the unrepaired window
-    # (depth-d KV/conv then keeps ~d/<a>*(1-p) stale slots).
-    draft_decode_lookback = inkling_mtp_decode_lookback_mode()
-
     def __init__(
         self,
         config: InklingMMConfig,

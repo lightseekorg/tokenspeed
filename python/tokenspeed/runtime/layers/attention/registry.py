@@ -484,10 +484,7 @@ def _wrap_inkling_backend(
     The wrapper only adds conv metadata; all attention delegates to ``inner``.
     Returns ``(backend, conv_pool)``.
     """
-    from tokenspeed.runtime.configs.inkling_config import (
-        inkling_conv_total_dim,
-        inkling_mtp_decode_lookback_mode,
-    )
+    from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
     from tokenspeed.runtime.layers.attention.backends.inkling import (
         InklingAttnBackend,
         InklingConvStatePool,
@@ -497,13 +494,8 @@ def _wrap_inkling_backend(
     spec_tokens = max(1, int(getattr(attn_config, "speculative_num_draft_tokens", 1)))
     # Ring row of absolute position p is p % R. R must keep a round's
     # pre-chunk tap reads and chunk-row writes disjoint mod R: (W-1) history
-    # taps + K chunk rows, plus the draft's lookback depth (spec steps - 1
-    # = K - 2) in lookback mode; the frontier-anchored window keeps k rows.
-    # Uniform across target and draft.
-    lookback_rows = (
-        max(spec_tokens - 2, 0) if inkling_mtp_decode_lookback_mode() == 1 else 0
-    )
-    ring_size = (kernel_size - 1) + spec_tokens + lookback_rows
+    # taps + K chunk rows. Uniform across target and draft.
+    ring_size = (kernel_size - 1) + spec_tokens
     conv_pool = InklingConvStatePool(
         num_layers=num_layers,
         # Row 0 is reserved (1-based indices); +2 covers it plus a padding slot
@@ -781,19 +773,6 @@ def _prepare_verify_workspace(
         )
     elif is_inkling:
         model_name = "Inkling"
-        if draft_backend is not None:
-            from tokenspeed.runtime.configs.inkling_config import (
-                inkling_mtp_decode_lookback_mode,
-            )
-
-            steps = int(server_args.speculative_num_steps)
-            mode = inkling_mtp_decode_lookback_mode() if steps > 1 else 0
-            if mode == 1 and not draft_backend.configure_draft_lookback(steps - 1):
-                raise RuntimeError("Inkling MTP draft rejected its planned lookback")
-            if mode == 2 and not draft_backend.configure_draft_frontier():
-                raise RuntimeError(
-                    "Inkling MTP draft rejected the frontier-anchored window"
-                )
         actual_bytes = backend.fixed_workspace_bytes()
         if draft_backend is not None:
             actual_bytes += draft_backend.fixed_workspace_bytes()

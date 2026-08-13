@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import copy
 import enum
-import os
 from typing import Any, Literal
 
 from transformers.configuration_utils import PretrainedConfig
@@ -174,22 +173,6 @@ def inkling_conv_total_dim(config: "InklingModelConfig", attn_tp_size: int) -> i
     layout = inkling_conv_stream_layout(config, attn_tp_size)
     last_offset, last_dim = layout[InklingConvStream.MLP]
     return last_offset + last_dim
-
-
-def inkling_mtp_decode_lookback_mode() -> int:
-    """Parse the ``INKLING_MTP_DECODE_LOOKBACK`` MTP decode-window A/B knob.
-
-    Returns:
-        0: verify-anchored window only — stale per-depth KV/sconv entries
-           from rejected drafts are never repaired.
-        1: verify-anchored window plus steps-1 lookback repair rows.
-        2: frontier-anchored window (default) — the k rows end at the last
-           committed position, repairing in place with zero garbage rows.
-    """
-    mode = int(os.environ.get("INKLING_MTP_DECODE_LOOKBACK", "2"))
-    if mode not in (0, 1, 2):
-        raise ValueError(f"INKLING_MTP_DECODE_LOOKBACK must be 0, 1 or 2, got {mode}")
-    return mode
 
 
 class InklingModelConfig(PretrainedConfig):

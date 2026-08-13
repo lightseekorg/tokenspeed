@@ -117,7 +117,7 @@ class InklingConvStatePool:
 
     Memory layout: ``[num_layers, num_slots, R, conv_dim]`` — the feature dim
     is contiguous (the ``tokenspeed_kernel.ops.conv`` kernels' contract). Ring
-    row of absolute position ``p`` is ``p % R``; ``R >= (W-1) + K + lookback``
+    row of absolute position ``p`` is ``p % R``; ``R >= (W-1) + K``
     so a round's pre-chunk tap reads and chunk-row writes never alias. The
     four streams of a block live at fixed channel offsets given by
     ``inkling_conv_stream_layout``; modules take channel slices.
@@ -196,14 +196,6 @@ class InklingAttnBackend(AttentionBackend):
         self.conv_spec_num_tokens = max(1, int(spec_num_tokens))
         self.conv_is_draft = is_draft
         self.enable_layerwise_cache_ready = enable_layerwise_cache_ready
-        # Draft decode-window lookback: D > 0 makes the catch-up chunk carry
-        # D extra leading rows that re-run committed positions (ring reads go
-        # D deeper). Configured by the drafter via configure_draft_lookback.
-        self._draft_lookback = 0
-        # Draft frontier-anchored window: the k-row catch-up chunk is
-        # re-anchored to end at the committed frontier each decode round.
-        # Configured by the drafter via configure_draft_frontier.
-        self._draft_frontier = False
         # Persistent spec conv metadata buffers for CUDA graphs; sized in init_cuda_graph_state.
         self._graph_spec_qsl: torch.Tensor | None = None
         self._graph_spec_seq_idx: torch.Tensor | None = None
@@ -579,74 +571,6 @@ class InklingAttnBackend(AttentionBackend):
             ),
         )
 
-    def configure_draft_lookback(self, lookback: int) -> bool:
-        """Drafter hook (draft wrapper only): arm decode-window lookback.
-
-        Lookback rows are ring reads ``lookback`` positions behind the
-        committed frontier, so arming only widens the catch-up chunk; no
-        extra state is allocated. Paged conv columns coexist with it: the
-        ring stays the working store, the columns are only the
-        publish/restore bridge. Returns True when armed; False when this
-        backend cannot support it (target wrapper).
-        """
-        if not self.conv_is_draft or lookback <= 0:
-            return False
-        self._draft_lookback = int(lookback)
-        # Arm the inner backend's grouped lookback-location stack (sized at graph
-        # init, which runs after this): the lookback pass writes N + D rows
-        # per request, so its cache write locations need their own variant.
-        self.inner.draft_lookback = int(lookback)
-        return True
-
-    def enter_draft_lookback_window(self, bs: int) -> bool:
-        """Drafter hook before the lookback window loop: rebuild the
-        catch-up conv metadata for ``k + D`` rows per request. The next
-        round's ``init_forward_metadata`` restores the plain shape."""
-        lookback = self._draft_lookback
-        md = self.conv_metadata
-        if lookback <= 0 or md is None or md.is_decode or not self.conv_is_draft:
-            return False
-        # Cache write locations must widen to the lookback rows too; refusal falls
-        # back to the plain window pass before any metadata is mutated.
-        inner_enter = getattr(self.inner, "enter_draft_lookback", None)
-        if inner_enter is not None and not inner_enter(bs):
-            return False
-        tokens = self.conv_spec_num_tokens + lookback
-        device = md.cache_indices.device
-        qsl = torch.arange(
-            0, bs * tokens + 1, step=tokens, dtype=torch.int32, device=device
-        )
-        self.conv_metadata = InklingConvMetadata(
-            query_start_loc=qsl,
-            cache_indices=md.cache_indices[:bs],
-            has_initial_state=md.has_initial_state[:bs],
-            is_decode=False,
-            seq_idx=seq_idx_from_cu_seqlens(qsl, bs * tokens),
-            # Same through-chunk lengths: the wider chunk keeps its end, the
-            # lookback rows extend it backwards.
-            seq_lens=md.seq_lens[:bs] if md.seq_lens is not None else None,
-            # Paged draft conv rides through: the in-kernel publish resolves
-            # pages from the table by position, so a boundary rewritten by
-            # the lookback rows is re-published with committed content.
-            col_block_table=md.col_block_table,
-        )
-        return True
-
-    def configure_draft_frontier(self) -> bool:
-        """Drafter hook (draft wrapper only): arm the frontier-anchored
-        decode window.
-
-        The window keeps the plain k-row catch-up shape — only its anchor
-        (seq_lens) moves back to the committed frontier — so no extra state
-        or widened location stacks are needed; ring reads simply follow the
-        shifted positions. Returns True when armed; False when this backend
-        cannot support it (target wrapper).
-        """
-        if not self.conv_is_draft:
-            return False
-        self._draft_frontier = True
-        return True
-
     def enter_draft_frontier_window(self, bs: int, frontier: torch.Tensor) -> None:
         """Drafter hook before the frontier window loop (all depths): rebuild
         the k-row conv metadata to end at ``frontier`` and re-anchor the
@@ -654,26 +578,10 @@ class InklingAttnBackend(AttentionBackend):
         frontier is accept-dependent, so everything here must be (and is)
         plain tensor ops — recorded at capture, recomputed per replay. The
         next round's ``init_forward_metadata`` restores the plain shape.
-
-        Raises instead of falling back: with the frontier window armed, a
-        missing hook or wrong-shape metadata is a wiring bug, and a silent
-        plain-window round would leave stale per-depth KV unrepaired.
         """
-        if not self._draft_frontier or not self.conv_is_draft:
-            raise RuntimeError(
-                "frontier window pass on a backend without configure_draft_frontier"
-            )
         md = self.conv_metadata
-        if md is None or md.is_decode:
-            raise RuntimeError(
-                "frontier window needs the k-row catch-up conv metadata; got "
-                f"{'no metadata' if md is None else 'single-token decode metadata'}"
-            )
-        inner_enter = getattr(self.inner, "enter_draft_frontier", None)
-        if inner_enter is None:
-            raise RuntimeError("inner attention backend lacks enter_draft_frontier")
         frontier_i32 = frontier[:bs].to(torch.int32)
-        inner_enter(bs, frontier_i32)
+        self.inner.enter_draft_frontier(bs, frontier_i32)
         self.conv_metadata = InklingConvMetadata(
             query_start_loc=md.query_start_loc,
             cache_indices=md.cache_indices[:bs],
@@ -686,7 +594,7 @@ class InklingAttnBackend(AttentionBackend):
             # Paged draft conv rides through: the in-kernel publish resolves
             # pages from the table by position, so boundaries rewritten by
             # the re-anchored rows are re-published with committed content.
-            col_page_table=md.col_page_table,
+            col_block_table=md.col_block_table,
         )
 
     def register_shortconv_checkpoint_stream(
@@ -712,37 +620,6 @@ class InklingAttnBackend(AttentionBackend):
                 f"ShortConv checkpoint stream {key!r} changed storage buffer"
             )
 
-    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor | None = None):
-        """Drafter hook before each multi-step decode step: the catch-up
-        (k tokens/request) metadata becomes single-token decode metadata."""
-        inner_advance = getattr(self.inner, "advance_draft_forward_metadata", None)
-        if inner_advance is not None:
-            inner_advance(seq_lens)
-        md = self.conv_metadata
-        if md is None or md.is_decode:
-            return
-        bs = md.cache_indices.shape[0]
-        if self._graph_has_initial_state is not None:
-            has_initial = self._graph_has_initial_state[:bs]
-        else:
-            has_initial = torch.ones(
-                bs, dtype=torch.bool, device=md.cache_indices.device
-            )
-        query_start_loc = self._decode_query_start_loc(bs, md.cache_indices.device)
-        self.conv_metadata = InklingConvMetadata(
-            query_start_loc=query_start_loc,
-            cache_indices=md.cache_indices,
-            has_initial_state=has_initial,
-            is_decode=True,
-            seq_idx=query_start_loc[:bs],
-            seq_lens=(
-                seq_lens[:bs].to(torch.int32) if seq_lens is not None else md.seq_lens
-            ),
-            # Paged conv rides through every per-step rebuild: dropping the
-            # table silently disables the T=1 landing publish for the step.
-            col_block_table=md.col_block_table,
-        )
-
     # ------------------------------------------------------------------
     # Attention delegation
     # ------------------------------------------------------------------
@@ -754,10 +631,11 @@ class InklingAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Cached ``arange(bs + 1) * max_seqlen_q`` for rel decode.
 
-        Cached PER ``max_seqlen_q``: under MTP the draft backend alternates
-        between the catch-up chunk (``spec_num_tokens``) and single-token
-        steps, and a single keyed-on-last-step buffer would be reallocated on
-        every switch — invalidating the pointer captured CUDA graphs hold.
+        Cached PER ``max_seqlen_q``: one wrapper instance can see several
+        row-per-request shapes (non-spec decode at 1, spec windows at
+        ``spec_num_tokens``), and a single keyed-on-last-step buffer would be
+        reallocated on every switch — invalidating the pointer captured CUDA
+        graphs hold.
         Grown buffers are retained (never freed): their static contents stay
         correct for any graph that recorded them.
         """
@@ -1114,7 +992,7 @@ class InklingAttnBackend(AttentionBackend):
         # unseeded (zero) length would address position -1 during capture.
         self._graph_seq_lens[:bs].copy_(seq_lens[:bs])
         if self.conv_spec_num_tokens > 1:
-            # k-token spec chunk; drafter capture swaps to 1-token steps via advance_draft_forward_metadata.
+            # k-token spec chunk (target verify / draft window).
             self.conv_metadata = self._spec_conv_metadata(bs)
             return
         if self.conv_columns.get("pd_endpoint_snapshots", False):

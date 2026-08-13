@@ -13,7 +13,6 @@ from tokenspeed.runtime.execution.drafter.mtp import (
     _extend_depth_shifted_ids_from,
     _frontier_hidden_splice,
     _frontier_shifted_ids,
-    _lookback_shifted_ids,
     _ragged_tail_rows,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -30,9 +29,10 @@ def _make_eagle(spec_num_tokens: int = 4, max_bs: int = 8) -> Eagle:
 
 
 class TestDrafterAcceptIndexing(unittest.TestCase):
-    def test_mtp_lookback_stash_uses_request_pool_capacity(self):
+    def test_mtp_stash_uses_request_pool_capacity(self):
         max_bs = 16
         request_pool_rows = 18
+        spec_num_tokens = 4
         input_buffers = SimpleNamespace(
             max_bs=max_bs,
             seq_lens_buf=torch.zeros(max_bs, dtype=torch.int32),
@@ -40,28 +40,34 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         model_runner = SimpleNamespace(
             device="cpu",
             mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
-            model=SimpleNamespace(draft_decode_lookback=True),
+            model=SimpleNamespace(),
             model_config=SimpleNamespace(hidden_size=8, dtype=torch.float32),
         )
         runtime_states = SimpleNamespace(
             valid_cache_lengths=torch.zeros(request_pool_rows, dtype=torch.int32)
         )
-        backend = SimpleNamespace(configure_draft_lookback=lambda _: True)
+        backend = SimpleNamespace()
 
         drafter = Mtp(
-            spec_num_tokens=4,
+            spec_num_tokens=spec_num_tokens,
             spec_num_steps=3,
             draft_model_runner=model_runner,
             cache_view=CacheView(
-                torch.zeros((max_bs, 4), dtype=torch.int32), page_size=128
+                torch.zeros((max_bs, 4), dtype=torch.int32), kernel_page_size=128
             ),
             attn_backend=backend,
             runtime_states=runtime_states,
             input_buffers=input_buffers,
         )
 
-        self.assertEqual(drafter._lookback_tokens_buf.shape[0], request_pool_rows)
-        self.assertEqual(drafter._lookback_hidden_buf.shape[0], request_pool_rows)
+        self.assertEqual(
+            list(drafter._stash_tokens_buf.shape),
+            [request_pool_rows, spec_num_tokens - 1],
+        )
+        self.assertEqual(
+            list(drafter._stash_hidden_buf.shape),
+            [request_pool_rows, spec_num_tokens - 1, 8],
+        )
 
     def test_prepare_draft_input_ids_maps_media_then_clamps_to_vocab(self):
         drafter = _make_eagle()
@@ -180,33 +186,6 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         # row i consumes t_{i+4}, i.e. drafts d_1..d_3.
         self.assertEqual(depth3.tolist(), [701, 702, 703])
 
-    def test_lookback_shifted_ids_reads_stash_verify_and_drafts(self):
-        # k=4, D=2. Request A accepts 2 of [v0..v3]; request B accepts all 4.
-        # Stash entry i holds the committed token at position vc-D+1+i, so
-        # entry 1 (= token at vc) is the only one any depth >= 1 consumes.
-        v = torch.tensor([[500, 501, 502, 503], [600, 601, 602, 603]])
-        accept = torch.tensor([[2], [4]])
-        next_tokens = torch.tensor(
-            [[0, 51, 52, 53], [0, 61, 62, 63]], dtype=torch.int32
-        )
-        stash = torch.tensor([[41, 42], [71, 72]])
-
-        depth1 = _lookback_shifted_ids(v, accept, next_tokens, stash, 1, 2)
-        depth2 = _lookback_shifted_ids(v, accept, next_tokens, stash, 2, 2)
-
-        # depth 1: src = [-1, 0, 1, 2, 3, 4] per request.
-        self.assertEqual(
-            depth1.view(2, 6).tolist(),
-            [[42, 500, 501, 51, 51, 51], [72, 600, 601, 602, 603, 61]],
-        )
-        # depth 2: src = [0, 1, 2, 3, 4, 5]; past the accept the drafts
-        # continue from the accept point (m = src - accept -> d_{m+1}),
-        # clamped to this depth's filled columns.
-        self.assertEqual(
-            depth2.view(2, 6).tolist(),
-            [[500, 501, 51, 52, 52, 52], [600, 601, 602, 603, 61, 62]],
-        )
-
     def test_frontier_shifted_ids_reads_stash_verify_and_drafts(self):
         # k=4. Request A accepts 2 of [v0..v3]; request B accepts all 4.
         # Stash entry i holds the committed token at position vc-k+2+i.
@@ -309,41 +288,6 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             self.assertEqual(
                 stash.view(3).tolist(), [float(vc - 3 + i) for i in range(3)]
             )
-
-    def test_frontier_ids_match_lookback_ids_on_shared_positions(self):
-        # Designs (2) and (3) must compose identical tokens wherever their
-        # windows overlap. Design (2)'s D+k rows cover positions
-        # vc-D .. vc+k-1 (row r at vc-D+r); design (3)'s k rows cover
-        # frontier-k .. frontier-1 (row j at vc+accept-k+j). Both read the
-        # token at row position + depth + 1, so aligned rows satisfy
-        # r = j + accept + D - k. Stashes are consistent by construction:
-        # (2)'s D tokens are the tail of (3)'s k-1.
-        k, steps = 4, 3
-        lookback = steps - 1
-        v = torch.tensor([[500, 501, 502, 503], [600, 601, 602, 603]])
-        next_tokens = torch.tensor(
-            [[0, 51, 52, 53], [0, 61, 62, 63]], dtype=torch.int32
-        )
-        stash3 = torch.tensor([[41, 42, 43], [71, 72, 73]])
-        stash2 = stash3[:, -lookback:]
-        for accept_a, accept_b in [(1, 4), (2, 3), (4, 1)]:
-            accept = torch.tensor([[accept_a], [accept_b]])
-            for d in range(1, steps):
-                ids2 = _lookback_shifted_ids(
-                    v, accept, next_tokens, stash2, d, lookback
-                ).view(2, lookback + k)
-                ids3 = _frontier_shifted_ids(v, accept, next_tokens, stash3, d).view(
-                    2, k
-                )
-                for req, a in ((0, accept_a), (1, accept_b)):
-                    for j in range(k):
-                        r = j + a + lookback - k
-                        if 0 <= r < lookback + k:
-                            self.assertEqual(
-                                ids3[req, j].item(),
-                                ids2[req, r].item(),
-                                f"accept={a} depth={d} row={j}",
-                            )
 
     def test_committed_tail_update_blends_across_rounds(self):
         stash = torch.tensor([[10, 11], [20, 21]])
