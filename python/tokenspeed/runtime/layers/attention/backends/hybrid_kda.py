@@ -45,6 +45,10 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 
 
+# --kda-backend prefill policies; "auto" resolves by platform probe at registry time.
+KDA_PREFILL_BACKENDS = ("auto", "fla", "flashkda", "cutedsl_kda")
+
+
 def _slice_kda_prefill_inputs(
     num_real_tokens: int,
     query: torch.Tensor,
@@ -61,10 +65,6 @@ def _slice_kda_prefill_inputs(
         gate[:, :num_real_tokens],
         beta[:, :num_real_tokens],
     )
-
-
-# --kda-backend prefill policies; "auto" resolves by platform probe at registry time.
-KDA_PREFILL_BACKENDS = ("auto", "fla", "flashkda", "cutedsl_kda")
 
 
 class KdaAttnBackend(MambaAttnBackend):
