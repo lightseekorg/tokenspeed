@@ -403,7 +403,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         self.assertTrue(backend.state_paging_active)
         return backend
 
-    def test_verify_scratch_starts_from_committed_conv_and_ssm_state(self):
+    def test_verify_scratch_seeds_conv_but_omits_replayed_ssm_state(self):
         torch = self.torch
         conv_dim = 8
         conv_slab = torch.zeros(
@@ -417,6 +417,8 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         ssm_slab[3].fill_(3)
         ssm_slab[5].fill_(5)
         backend = self._make_backend(conv_slab, ssm_slab, spec_num_tokens=4)
+        if not backend._gdn_replay_active():
+            self.skipTest("GDN ReplaySSM kernel unavailable")
         backend.init_forward_metadata(
             bs=2,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
@@ -438,8 +440,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(conv_scratch[0], conv_slab[3]))
         self.assertTrue(torch.equal(conv_scratch[5], conv_slab[5]))
-        self.assertTrue(torch.equal(ssm_scratch[0], ssm_slab[3]))
-        self.assertTrue(torch.equal(ssm_scratch[5], ssm_slab[5]))
+        self.assertIsNone(ssm_scratch)
 
     def test_paged_states_match_fla_oracle(self):
         if not self.gdn.is_available():

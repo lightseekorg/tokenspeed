@@ -279,6 +279,8 @@ class MambaForwardMetadata:
 class MambaAttnBackend(AttentionBackend):
     """Attention backend for Mamba/GDN linear attention layers."""
 
+    supports_gdn_replay = True
+
     # This backend consumes state-family tables through dual-index state
     # paging; history-family groups belong to the full-attention sub-backend.
     # The hybrid wrapper unions the sub-backends' declarations, so a Kimi-K3
@@ -304,6 +306,10 @@ class MambaAttnBackend(AttentionBackend):
         # size. Values are keyed by group ID and indexed by ``bs - 1``.
         self.state_in_by_group: dict[str, list[torch.Tensor]] = {}
         self.state_out_by_group: dict[str, list[torch.Tensor]] = {}
+        self._gdn_replay_active_cache: bool | None = None
+        self._gdn_replay_payload_cache: dict | None = None
+        self._gdn_replay_tables: dict | None = None
+        self._verify_scratch: dict | None = None
 
     def set_kv_pool(self, kv_pool) -> None:
         """Bind a unified pool that publishes state groups and component views."""
@@ -329,6 +335,7 @@ class MambaAttnBackend(AttentionBackend):
         self._state_group_ids = state_group_ids
         self.state_paging_active = True
         self._state_page_size = int(contract.block_size)
+        self._gdn_replay_tables = None
 
     def _state_page_bounds(
         self,
@@ -393,11 +400,12 @@ class MambaAttnBackend(AttentionBackend):
         """Target-verify state paging: per-group committed-state pages.
 
         Verify reads the state at the last COMMITTED position
-        (``seq_lens - draft_token_num``); per-position outputs go to the
-        verify scratch, and the accepted state is committed back by
-        ``update_mamba_state_after_mtp_verify``. Returns the per-group in
-        pages, the committed lengths, and the per-group group tables (kept
-        for the commit's dynamic page resolve).
+        (``seq_lens - draft_token_num``). The scratch fallback stores each
+        position's state; ReplaySSM instead stores the much smaller per-token
+        recurrence inputs and recomputes only the accepted prefix. The result
+        is committed by ``update_mamba_state_after_mtp_verify``. Returns the
+        per-group input pages, committed lengths, and group tables (kept for
+        the commit's dynamic page resolve).
         """
         committed = (seq_lens[:bs].to(torch.int64) - draft_token_num).clamp_min(0)
         in_slots = torch.div(
@@ -430,15 +438,208 @@ class MambaAttnBackend(AttentionBackend):
             tables[group_id] = rows
         return state_in_pages, committed, tables
 
+    def _gdn_replay_active(self) -> bool:
+        """Whether Qwen-style GDN verification can commit with ReplaySSM.
+
+        GDN only needs post-convolution K/V plus its two scalar gate inputs to
+        reconstruct a recurrent state. When the portable replay kernel is
+        present, target verify therefore keeps those inputs and the small conv
+        checkpoints, but never allocates one full recurrent state per draft
+        position.
+        """
+        active = self._gdn_replay_active_cache
+        if active is None:
+            device_type = torch.device(self.device).type
+            active = False
+            if (
+                self.supports_gdn_replay
+                and self.speculative_num_draft_tokens > 1
+                and device_type == "cuda"
+            ):
+                from tokenspeed_kernel.ops.attention import (
+                    gdn_replay_commit_supported,
+                )
+
+                active = gdn_replay_commit_supported(self.dtype)
+            self._gdn_replay_active_cache = active
+        return active
+
+    def _gdn_replay_payload(
+        self,
+        layer_id: int,
+        rows: int,
+        widths: tuple[int, int, int, int],
+        dtypes: tuple[torch.dtype, torch.dtype, torch.dtype, torch.dtype],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return one layer's views into the packed GDN replay allocation.
+
+        Qwen GDN commits immediately after sampling returns ``accept_len``.
+        All layers share one ``[layer, token, packed-channel]`` allocation;
+        the verify graph writes disjoint layer views and the post-verify
+        kernel indexes the original allocation directly.
+
+        Args:
+            layer_id: GDN layer whose verify inputs are cached.
+            rows: Required token capacity (``max_bs * draft_token_num``).
+            widths: Flattened widths of K, V, a, and b respectively.
+            dtypes: Dtype of each corresponding payload.
+
+        Returns:
+            Four ``[rows, width]`` views for K, V, a, and b. Their row stride
+            is the full packed payload width, so no per-layer allocation or
+            repack is needed at commit time.
+        """
+        layer_ids = tuple(self._state_layer_ids())
+        if layer_id not in layer_ids:
+            raise RuntimeError(f"GDN ReplaySSM received unknown layer {layer_id}")
+        if len(set(dtypes)) != 1:
+            raise RuntimeError("GDN ReplaySSM packed K/V/a/b must share one dtype")
+        dtype = dtypes[0]
+        cache = self._gdn_replay_payload_cache
+        if cache is not None and (
+            cache["widths"] != widths
+            or cache["dtype"] != dtype
+            or cache["layer_ids"] != layer_ids
+        ):
+            raise RuntimeError(
+                "GDN ReplaySSM requires uniform K/V/a/b geometry across layers"
+            )
+        rebuild = cache is None or cache["rows"] < rows
+        if rebuild:
+            assert (
+                not torch.cuda.is_current_stream_capturing()
+            ), "GDN ReplaySSM payloads must be pre-sized before graph capture"
+            payload_width = sum(widths)
+            with torch.inference_mode(False):
+                payload = torch.empty(
+                    (len(layer_ids), rows, payload_width),
+                    dtype=dtype,
+                    device=self.device,
+                )
+                parameters = torch.empty(
+                    (len(layer_ids), 2, widths[2]),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            offsets = [0]
+            for width in widths:
+                offsets.append(offsets[-1] + width)
+            buffers = {
+                replay_layer_id: tuple(
+                    payload[layer_slot, :, offsets[i] : offsets[i + 1]]
+                    for i in range(4)
+                )
+                for layer_slot, replay_layer_id in enumerate(layer_ids)
+            }
+            cache = self._gdn_replay_payload_cache = {
+                "rows": rows,
+                "widths": widths,
+                "dtype": dtype,
+                "layer_ids": layer_ids,
+                "layer_slots": {
+                    replay_layer_id: layer_slot
+                    for layer_slot, replay_layer_id in enumerate(layer_ids)
+                },
+                "payload": payload,
+                "parameters": parameters,
+                "buffers": buffers,
+                "geometry": None,
+                "captured_layers": set(),
+            }
+        return cache["buffers"][layer_id]
+
+    def _capture_gdn_replay_payload(
+        self,
+        layer_id: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        batch_size: int,
+        draft_token_num: int,
+        weights: tuple,
+    ) -> None:
+        """Copy one Qwen GDN verify window into layer-major replay storage."""
+        rows = batch_size * draft_token_num
+        max_rows = max(len(self.query_start_loc_list), batch_size) * draft_token_num
+        sources = tuple(tensor.reshape(rows, -1) for tensor in (key, value, a, b))
+        widths = tuple(tensor.shape[-1] for tensor in sources)
+        dtypes = tuple(tensor.dtype for tensor in sources)
+        buffers = self._gdn_replay_payload(layer_id, max_rows, widths, dtypes)
+        for dst, src in zip(buffers, sources):
+            dst[:rows].copy_(src)
+        A_log, dt_bias, *geometry = weights
+        cache = self._gdn_replay_payload_cache
+        geometry = tuple(geometry)
+        if cache["geometry"] is None:
+            cache["geometry"] = geometry
+        elif cache["geometry"] != geometry:
+            raise RuntimeError("GDN ReplaySSM layer geometry must be uniform")
+        layer_slot = cache["layer_slots"][layer_id]
+        cache["parameters"][layer_slot, 0].copy_(A_log)
+        cache["parameters"][layer_slot, 1].copy_(dt_bias)
+        cache["captured_layers"].add(layer_id)
+
+    def _gdn_replay_tables_get(self) -> dict:
+        """Build stable layer-indexed recurrent-pool address/stride tables."""
+        tables = self._gdn_replay_tables
+        if tables is not None:
+            return tables
+        layer_ids = tuple(self._state_layer_ids())
+        group_index = {
+            group_id: index for index, group_id in enumerate(self._state_groups())
+        }
+        state_addresses: list[int] = []
+        state_row_strides: list[int] = []
+        group_sel: list[int] = []
+        state_geometry: tuple[int, int, int] | None = None
+        state_dtype: torch.dtype | None = None
+        for replay_layer_id in layer_ids:
+            state = self.kv_pool.get_component(replay_layer_id, "recurrent_state")
+            if state.dim() != 4 or not state[0].is_contiguous():
+                raise RuntimeError(
+                    "GDN ReplaySSM requires contiguous K-last state rows"
+                )
+            geometry = tuple(state.shape[1:])
+            if state_geometry is None:
+                state_geometry = geometry
+                state_dtype = state.dtype
+            elif geometry != state_geometry or state.dtype != state_dtype:
+                raise RuntimeError(
+                    "GDN ReplaySSM requires uniform recurrent-state geometry "
+                    "and dtype across layers"
+                )
+            state_addresses.append(state.data_ptr())
+            state_row_strides.append(state.stride(0))
+            group_sel.append(group_index[self._state_group_for(replay_layer_id)])
+        tables = {
+            "layer_ids": layer_ids,
+            "state_addresses": torch.tensor(
+                state_addresses, dtype=torch.uint64, device=self.device
+            ),
+            "state_row_strides": torch.tensor(
+                state_row_strides, dtype=torch.int64, device=self.device
+            ),
+            "group_sel": torch.tensor(group_sel, dtype=torch.int64, device=self.device),
+            "state_geometry": state_geometry,
+            "state_dtype": state_dtype,
+        }
+        self._gdn_replay_tables = tables
+        return tables
+
     def _ensure_verify_scratch(self, bs: int, draft_token_num: int) -> None:
-        """Lazily allocate per-group verify scratch: one init row plus
-        ``draft_token_num`` per-position rows per request, for both the conv
-        window and the recurrent state (rollback source for partial accepts).
-        Sized once at the max the backend can see; graph warmup runs this
-        path eagerly before capture."""
+        """Lazily allocate graph-stable verify scratch.
+
+        The fallback keeps one init row plus ``draft_token_num`` output rows
+        per request for both conv and recurrent state. GDN ReplaySSM allocates
+        that row grid only for the small conv window and reconstructs the
+        recurrent state from cached K/V and gate inputs after acceptance.
+        Graph warmup sizes the selected layout before capture.
+        """
         max_bs = max(len(self.query_start_loc_list), bs)
         rows_needed = max_bs * (draft_token_num + 1)
-        scratch = getattr(self, "_verify_scratch", None)
+        scratch = self._verify_scratch
         if scratch is not None and next(iter(scratch.values()))[0].shape[0] >= (
             rows_needed
         ):
@@ -447,36 +648,44 @@ class MambaAttnBackend(AttentionBackend):
         self._verify_copy_tables = None
         for layer_id in self._state_layer_ids():
             conv, ssm = self._state_components(layer_id)
-            self._verify_scratch[layer_id] = (
-                torch.zeros(
-                    (rows_needed, *conv.shape[1:]),
-                    dtype=conv.dtype,
-                    device=conv.device,
-                ),
-                torch.zeros(
+            conv_scratch = torch.zeros(
+                (rows_needed, *conv.shape[1:]),
+                dtype=conv.dtype,
+                device=conv.device,
+            )
+            ssm_scratch = None
+            if not self._gdn_replay_active():
+                ssm_scratch = torch.zeros(
                     (rows_needed, *ssm.shape[1:]),
                     dtype=ssm.dtype,
                     device=ssm.device,
-                ),
-            )
+                )
+            self._verify_scratch[layer_id] = (conv_scratch, ssm_scratch)
 
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
         """Allocate graph-stable verify state and return its byte size."""
         if not self.state_paging_active or self.is_draft:
             return 0
         self._ensure_verify_scratch(max_bs, draft_token_num)
+        # GDN ReplaySSM reports conv scratch only.
+        scratch = self._verify_scratch
+        if scratch is None:
+            return 0
         return sum(
             tensor.nbytes
-            for layer_scratch in self._verify_scratch.values()
+            for layer_scratch in scratch.values()
             for tensor in layer_scratch
+            if tensor is not None
         )
 
     def _verify_copy_tables_get(self) -> dict:
-        """Pointer tables for the batched verify state copies: per-layer base
-        addresses of the state slabs and their verify scratches, plus each
-        layer's index into ``_state_group_ids``. Rebuilt only when the
-        scratch is (re)allocated; the tensors are stable so CUDA-graph capture
-        can record them."""
+        """Pointer tables for batched slab/scratch copies.
+
+        Conv tables always exist when this helper is reachable. Recurrent
+        tables are omitted for GDN ReplaySSM and retained by the full-scratch
+        fallback. Every table is rebuilt only when scratch storage changes so
+        CUDA graph capture can safely record its pointers.
+        """
         tables = getattr(self, "_verify_copy_tables", None)
         if tables is not None:
             return tables
@@ -504,20 +713,31 @@ class MambaAttnBackend(AttentionBackend):
             conv, ssm = self._state_components(layer_id)
             conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
             row_c = conv[0].numel() * conv.element_size()
-            row_s = ssm[0].numel() * ssm.element_size()
             conv_bytes = row_c if conv_bytes is None else conv_bytes
-            ssm_bytes = row_s if ssm_bytes is None else ssm_bytes
-            if row_c != conv_bytes or row_s != ssm_bytes:
-                raise RuntimeError("verify state rows must be uniform per kind")
+            if row_c != conv_bytes:
+                raise RuntimeError("verify conv-state rows must be uniform")
             conv_src.append(conv.data_ptr())
             conv_dst.append(conv_scratch.data_ptr())
-            ssm_src.append(ssm.data_ptr())
-            ssm_dst.append(ssm_scratch.data_ptr())
             conv_src_st.append(_row_stride_i32(conv))
             conv_dst_st.append(_row_stride_i32(conv_scratch))
-            ssm_src_st.append(_row_stride_i32(ssm))
-            ssm_dst_st.append(_row_stride_i32(ssm_scratch))
+            if ssm_scratch is not None:
+                row_s = ssm[0].numel() * ssm.element_size()
+                ssm_bytes = row_s if ssm_bytes is None else ssm_bytes
+                if row_s != ssm_bytes:
+                    raise RuntimeError("verify recurrent-state rows must be uniform")
+                ssm_src.append(ssm.data_ptr())
+                ssm_dst.append(ssm_scratch.data_ptr())
+                ssm_src_st.append(_row_stride_i32(ssm))
+                ssm_dst_st.append(_row_stride_i32(ssm_scratch))
             group_sel.append(group_index[self._state_group_for(layer_id)])
+
+        has_ssm_scratch = bool(ssm_src)
+        if has_ssm_scratch != all(
+            self._verify_scratch[layer_id][1] is not None for layer_id in layer_ids
+        ):
+            raise RuntimeError(
+                "verify recurrent scratch must be enabled for every layer"
+            )
 
         def _u64(values: list[int]) -> torch.Tensor:
             return torch.tensor(values, dtype=torch.uint64, device=self.device)
@@ -531,10 +751,10 @@ class MambaAttnBackend(AttentionBackend):
             "conv_comp_stride": _i64(conv_src_st),
             "conv_scratch_stride": _i64(conv_dst_st),
             "conv_bytes": conv_bytes,
-            "ssm_comp": _u64(ssm_src),
-            "ssm_scratch": _u64(ssm_dst),
-            "ssm_comp_stride": _i64(ssm_src_st),
-            "ssm_scratch_stride": _i64(ssm_dst_st),
+            "ssm_comp": _u64(ssm_src) if has_ssm_scratch else None,
+            "ssm_scratch": _u64(ssm_dst) if has_ssm_scratch else None,
+            "ssm_comp_stride": _i64(ssm_src_st) if has_ssm_scratch else None,
+            "ssm_scratch_stride": _i64(ssm_dst_st) if has_ssm_scratch else None,
             "ssm_bytes": ssm_bytes,
             "group_sel": _i64(group_sel),
             "num_layers": len(layer_ids),
@@ -561,8 +781,11 @@ class MambaAttnBackend(AttentionBackend):
         return rows
 
     def _seed_verify_scratch_batched(self, bs: int, draft_token_num: int) -> None:
-        """Seed every state layer's verify-scratch init conv and recurrent rows
-        from its group's committed state page. Negative page ids zero-fill."""
+        """Seed verify init rows from each layer's committed state page.
+
+        GDN ReplaySSM copies only conv rows; the scratch fallback copies conv
+        and recurrent rows. Negative page ids zero-fill.
+        """
         from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
 
         tables = self._verify_copy_tables_get()
@@ -580,21 +803,25 @@ class MambaAttnBackend(AttentionBackend):
             src_row_strides=tables["conv_comp_stride"],
             dst_row_strides=tables["conv_scratch_stride"],
         )
-        copy_state_rows(
-            tables["ssm_comp"],
-            tables["ssm_scratch"],
-            src_rows,
-            self._verify_seed_dst_rows(bs, draft_token_num),
-            row_bytes=tables["ssm_bytes"],
-            src_row_strides=tables["ssm_comp_stride"],
-            dst_row_strides=tables["ssm_scratch_stride"],
-        )
+        if tables["ssm_scratch"] is not None:
+            copy_state_rows(
+                tables["ssm_comp"],
+                tables["ssm_scratch"],
+                src_rows,
+                self._verify_seed_dst_rows(bs, draft_token_num),
+                row_bytes=tables["ssm_bytes"],
+                src_row_strides=tables["ssm_comp_stride"],
+                dst_row_strides=tables["ssm_scratch_stride"],
+            )
 
     def _verify_scratch_grid(self, bs: int, draft_token_num: int) -> torch.Tensor:
-        """Scratch row grid ``[bs, draft_token_num]``: row ``req*(T+1)`` is
-        the seeded init window, rows ``req*(T+1)+1+t`` the per-position
-        outputs. Memoized per (bs, T): CUDA-graph capture records the tensor's
-        storage, so replays must present the identical tensor."""
+        """Scratch row grid ``[bs, draft_token_num]``.
+
+        Row ``req*(T+1)`` is the seeded init window and rows
+        ``req*(T+1)+1+t`` hold per-position conv outputs plus, only on the
+        fallback, recurrent outputs. The tensor is memoized because CUDA graph
+        replay must see the same storage.
+        """
         cache = getattr(self, "_verify_grid_cache", None)
         if cache is None:
             cache = self._verify_grid_cache = {}
@@ -613,13 +840,16 @@ class MambaAttnBackend(AttentionBackend):
         return grid
 
     def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
-        """Commit the accepted draft position's state (conv window +
-        recurrent) from the verify scratch into each group's state slab at
-        the new committed page. All device-side; graph-safe."""
+        """Commit the state for the accepted draft prefix into each group's
+        state slab at the new committed page. All device-side; graph-safe.
+
+        On the GDN ReplaySSM path the accepted prefix is re-run immediately
+        from the committed page using cached K/V/gate inputs. The scratch
+        fallback copies the accepted position's full recurrent state."""
         ctx = getattr(self, "_verify_commit_ctx", None)
         if ctx is None:
             return
-        committed, tables, draft_token_num = ctx
+        committed, tables, draft_token_num, read_pages_by_group = ctx[:4]
         bs = accepted_length.shape[0]
         k = accepted_length.to(torch.int64).clamp(min=1, max=draft_token_num)
         new_last = committed[:bs] + k - 1
@@ -640,8 +870,72 @@ class MambaAttnBackend(AttentionBackend):
                 .to(torch.int64)
                 .clamp_min(0)
             )
-        # Batched commit: scratch row -> committed page for every state layer in
-        # one launch per state kind (was a per-layer gather/scatter pair).
+        if self._gdn_replay_active():
+            from tokenspeed_kernel.ops.attention import try_gdn_replay_commit_layers
+
+            payloads = self._gdn_replay_payload_cache
+            if payloads is None or payloads["geometry"] is None:
+                raise RuntimeError("GDN ReplaySSM commit has no captured verify inputs")
+            replay_tables = self._gdn_replay_tables_get()
+            layer_ids = replay_tables["layer_ids"]
+            missing = set(layer_ids) - payloads["captured_layers"]
+            if missing:
+                raise RuntimeError(
+                    "GDN ReplaySSM payload is missing for layers "
+                    + ", ".join(str(layer_id) for layer_id in sorted(missing))
+                )
+            if payloads["layer_ids"] != layer_ids:
+                raise RuntimeError("GDN ReplaySSM payload/state layer order differs")
+            (
+                num_k_heads,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+            ) = payloads["geometry"]
+            if replay_tables["state_geometry"] != (
+                num_v_heads,
+                head_v_dim,
+                head_k_dim,
+            ):
+                raise RuntimeError(
+                    "GDN ReplaySSM payload and recurrent-state geometry differ"
+                )
+            accepted_i32 = k.to(torch.int32)
+            read_stack = torch.stack(
+                [
+                    read_pages_by_group[group_id][:bs].to(torch.int32)
+                    for group_id in self._state_groups()
+                ]
+            )
+            write_stack = torch.stack(
+                [
+                    pages_by_group[group_id].to(torch.int32)
+                    for group_id in self._state_groups()
+                ]
+            )
+            read_by_layer = read_stack.index_select(0, replay_tables["group_sel"])
+            write_by_layer = write_stack.index_select(0, replay_tables["group_sel"])
+            ok = try_gdn_replay_commit_layers(
+                payloads["payload"],
+                payloads["parameters"],
+                state_addresses=replay_tables["state_addresses"],
+                state_row_strides=replay_tables["state_row_strides"],
+                read_indices=read_by_layer,
+                write_indices=write_by_layer,
+                accepted_length=accepted_i32,
+                draft_token_num=draft_token_num,
+                num_k_heads=num_k_heads,
+                num_v_heads=num_v_heads,
+                head_k_dim=head_k_dim,
+                head_v_dim=head_v_dim,
+                state_dtype=replay_tables["state_dtype"],
+            )
+            if not ok:
+                raise RuntimeError(
+                    "GDN ReplaySSM kernel vanished after its capability probe"
+                )
+
+        # Batched conv commit: accepted scratch row -> committed page.
         from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
 
         copy_tables = self._verify_copy_tables_get()
@@ -659,6 +953,10 @@ class MambaAttnBackend(AttentionBackend):
             src_row_strides=copy_tables["conv_scratch_stride"],
             dst_row_strides=copy_tables["conv_comp_stride"],
         )
+        if self._gdn_replay_active():
+            self._verify_commit_ctx = None
+            return
+        # Scratch fallback also copies the accepted full recurrent state.
         copy_state_rows(
             copy_tables["ssm_scratch"],
             copy_tables["ssm_comp"],
@@ -834,8 +1132,7 @@ class MambaAttnBackend(AttentionBackend):
 
         state_in_pages_by_group = None
         state_out_pages_by_group = None
-        # Idle/bs==0 forwards carry no requests and never reach the mamba
-        # forward (router returns early), so no tables are required.
+        # Idle/bs==0 forwards never reach the mamba forward; no tables needed.
         if bs > 0 and not forward_mode.is_idle():
             if is_draft_extend:
                 raise RuntimeError("state paging on a draft worker is unsupported")
@@ -848,8 +1145,9 @@ class MambaAttnBackend(AttentionBackend):
                     verify_committed,
                     verify_tables,
                 ) = self._verify_state_pages(bs, seq_lens, draft_token_num, kwargs)
-                # Slab out pages are unused under verify (per-position states
-                # land in the scratch); alias in so shape contracts hold.
+                # Verify never writes slab output pages directly. The fallback
+                # writes per-position scratch; ReplaySSM only captures inputs.
+                # Alias input pages here so the metadata shape contract holds.
                 state_out_pages_by_group = state_in_pages_by_group
                 self._ensure_verify_scratch(bs, draft_token_num)
                 mamba_output_indices = self._verify_scratch_grid(bs, draft_token_num)
@@ -857,6 +1155,7 @@ class MambaAttnBackend(AttentionBackend):
                     verify_committed,
                     verify_tables,
                     draft_token_num,
+                    state_in_pages_by_group,
                 )
             else:
                 (
@@ -913,6 +1212,34 @@ class MambaAttnBackend(AttentionBackend):
             )
         self._qsl_dirty = [False] * max_num_tokens
         self._qsl_last_mode = [None] * max_num_tokens
+        if self._gdn_replay_active() and self.speculative_num_draft_tokens > 1:
+            self._preallocate_gdn_replay_buffers(max_num_tokens)
+
+    def _preallocate_gdn_replay_buffers(self, max_bs: int) -> None:
+        """Pre-size Qwen's layer-major replay payload and state tables."""
+        rows = max(max_bs, 1) * int(self.speculative_num_draft_tokens)
+        for layer_id in self._state_layer_ids():
+            conv = self.kv_pool.get_component(layer_id, "conv_state")
+            ssm = self.kv_pool.get_component(layer_id, "recurrent_state")
+            num_v_heads, head_v_dim, head_k_dim = ssm.shape[1:]
+            value_width = num_v_heads * head_v_dim
+            qk_width = conv.shape[1] - value_width
+            if qk_width <= 0 or qk_width % 2:
+                raise RuntimeError(
+                    "GDN ReplaySSM cannot infer Q/K widths from conv-state geometry"
+                )
+            key_width = qk_width // 2
+            if key_width % head_k_dim:
+                raise RuntimeError(
+                    "GDN ReplaySSM key width is not divisible by the state head dim"
+                )
+            self._gdn_replay_payload(
+                layer_id,
+                rows,
+                (key_width, value_width, num_v_heads, num_v_heads),
+                (self.dtype, self.dtype, self.dtype, self.dtype),
+            )
+        self._gdn_replay_tables_get()
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -955,7 +1282,8 @@ class MambaAttnBackend(AttentionBackend):
                 raise RuntimeError("state paging on a draft worker is unsupported")
             if is_target_verify:
                 # Verify capture/prewarm: pad state_in (reads zeros / writes
-                # skip) + the real scratch grid; commit stays disarmed.
+                # skip) and bind the stable index grid. ReplaySSM does not
+                # allocate the state scratch; commit stays disarmed.
                 draft_token_num = int(self.speculative_num_draft_tokens)
                 self._ensure_verify_scratch(bs, draft_token_num)
                 mamba_output_indices = self._verify_scratch_grid(bs, draft_token_num)
@@ -1044,16 +1372,12 @@ class MambaAttnBackend(AttentionBackend):
         state_in_pages_by_group = None
         state_out_pages_by_group = None
         if self.state_paging_active and is_target_verify:
-            # Target-verify replay: refresh the CAPTURED per-bs state_in
-            # buffers with each group's committed-state page (page of
-            # ``seq_lens - T - 1``), re-arm the commit context for the
-            # post-round scratch->slab commit, and keep the memoized scratch
-            # grid the graph recorded. Padded rows stay pad_slot_id — the
-            # state kernels skip them to protect the dummy page.
+            # Refresh captured state_in from committed pages; re-arm the commit ctx.
             draft_token_num = int(self.speculative_num_draft_tokens)
             self._ensure_verify_scratch(bs, draft_token_num)
             mamba_output_indices = self._verify_scratch_grid(bs, draft_token_num)
             pages_by_group = None
+            verify_committed = None
             if real_bs > 0:
                 (
                     pages_by_group,
@@ -1064,6 +1388,7 @@ class MambaAttnBackend(AttentionBackend):
                     verify_committed,
                     verify_tables,
                     draft_token_num,
+                    pages_by_group,
                 )
             else:
                 self._verify_commit_ctx = None
@@ -1084,8 +1409,8 @@ class MambaAttnBackend(AttentionBackend):
                     state_in[:real_bs].copy_(pages_by_group[group_id][:real_bs])
                 if real_bs < bs:
                     state_in[real_bs:].fill_(self.pad_slot_id)
-                # Slab out pages are unused under verify (per-position states
-                # land in the scratch); keep the captured buffer inert.
+                # Slab out pages are unused under verify: fallback state goes
+                # to scratch and ReplaySSM stores only inputs. Keep inert.
                 state_out.fill_(self.pad_slot_id)
                 state_in_pages_by_group[group_id] = state_in
                 state_out_pages_by_group[group_id] = state_out
@@ -1633,6 +1958,28 @@ class MambaAttnBackend(AttentionBackend):
         )
 
         if is_target_verify:
+            if self._gdn_replay_active():
+                key_b = key.view(batch_size, draft_token_num, num_heads, head_k_dim)
+                value_b = value.view(
+                    batch_size, draft_token_num, num_value_heads, head_v_dim
+                )
+                self._capture_gdn_replay_payload(
+                    layer_id,
+                    key_b,
+                    value_b,
+                    a.view(batch_size, draft_token_num, -1),
+                    b.view(batch_size, draft_token_num, -1),
+                    batch_size=batch_size,
+                    draft_token_num=draft_token_num,
+                    weights=(
+                        A_log,
+                        dt_bias,
+                        num_heads,
+                        num_value_heads,
+                        head_k_dim,
+                        head_v_dim,
+                    ),
+                )
             core_attn_out = self._verify_scan(
                 query,
                 key,
@@ -1747,7 +2094,7 @@ class MambaAttnBackend(AttentionBackend):
         key: torch.Tensor,
         value: torch.Tensor,
         ssm_comp: torch.Tensor,
-        ssm_scratch: torch.Tensor,
+        ssm_scratch: torch.Tensor | None,
         state_in_pages: torch.Tensor,
         output_indices: torch.Tensor,
         *,
@@ -1766,19 +2113,18 @@ class MambaAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Per-position recurrent scan of a target-verify round.
 
-        Both families write one recurrent state per draft position into
-        ``ssm_scratch`` so ``commit_verified_state`` can publish the accepted
-        one, and both fold the shared ``[1, seq_len, H, D]`` split into
-        ``[B, T, H, D]``. They diverge on gating (scalar a/b vs per-channel
-        gate) and on where the round's initial state comes from: GDN reads the
-        seeded scratch init row, KDA reads the committed slab page directly.
+        The scratch fallback writes one recurrent state per draft position so
+        ``commit_verified_state`` can publish the accepted one. ReplaySSM reads
+        the committed slab directly, suppresses speculative state writes, and
+        reconstructs the accepted prefix during commit.
 
         Args:
             query: ``[1, seq_len, H, K]`` conv'd, split query.
             key: ``[1, seq_len, H, K]`` conv'd, split key.
             value: ``[1, seq_len, Hv, V]`` conv'd, split value.
             ssm_comp: Recurrent component of this layer's state slab.
-            ssm_scratch: Per-position recurrent verify scratch.
+            ssm_scratch: Per-position recurrent verify scratch, or None on
+                ReplaySSM.
             state_in_pages: Per-request committed-state page ids.
             output_indices: ``[bs, T]`` verify scratch row grid.
             A_log: Per-channel decay parameter.
@@ -1808,15 +2154,25 @@ class MambaAttnBackend(AttentionBackend):
         a_b = a.view(batch_size, draft_token_num, -1)
         b_b = b.view(batch_size, draft_token_num, -1)
 
-        cache_indices = output_indices[:batch_size, 0] - 1
+        replay = self._gdn_replay_active()
+        if replay:
+            initial_state = ssm_comp
+            initial_indices = state_in_pages[:batch_size]
+            output_state_indices = None
+        else:
+            if ssm_scratch is None:
+                raise RuntimeError("GDN verify fallback requires recurrent scratch")
+            initial_state = ssm_scratch
+            initial_indices = output_indices[:batch_size, 0] - 1
+            output_state_indices = output_indices
         (
             mtp_initial_indices,
             mtp_output_indices,
             mtp_solution,
         ) = _prepare_gdn_decode_state_path(
-            ssm_scratch,
-            cache_indices,
-            output_indices,
+            initial_state,
+            initial_indices,
+            output_state_indices,
         )
         return gdn_decode_mtp(
             query_b,
@@ -1826,11 +2182,11 @@ class MambaAttnBackend(AttentionBackend):
             a=a_b,
             dt_bias=dt_bias,
             b=b_b,
-            initial_state=ssm_scratch,
+            initial_state=initial_state,
             initial_state_indices=mtp_initial_indices,
             use_qk_l2norm=True,
             output_state_indices=mtp_output_indices,
-            disable_state_update=False,
+            disable_state_update=replay,
             solution=mtp_solution,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
@@ -1910,8 +2266,8 @@ class HybridLinearAttnBackend(AttentionBackend):
     """Hybrid backend that routes between full attention and linear attention by layer ID."""
 
     # Both sub-backends consume per-group tables (MHA: KV pages; Mamba:
-    # dual-index state pages). Target verify keeps speculative state in a
-    # fixed scratch and publishes only the accepted position.
+    # dual-index state pages). Target verify either uses ReplaySSM inputs or a
+    # fixed state scratch, then publishes only the accepted position.
     uses_cache_groups: bool = True
 
     def __init__(

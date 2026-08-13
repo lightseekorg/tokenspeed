@@ -255,6 +255,74 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
     assert pool.buffer is not None
 
 
+@pytest.mark.parametrize(
+    ("replay_supported", "expected_workspace_bytes"),
+    ((True, 64), (False, 192)),
+)
+def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
+    monkeypatch,
+    replay_supported: bool,
+    expected_workspace_bytes: int,
+) -> None:
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.gdn_replay_commit_supported",
+        lambda dtype: replay_supported,
+    )
+    text_config = SimpleNamespace(
+        mamba2_cache_params=(
+            (2, 2),
+            (1, 2, 2),
+            torch.bfloat16,
+            torch.float32,
+            (0,),
+        )
+    )
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(text_config=text_config),
+    )
+    attn_config = MHAConfig(
+        device="cuda",
+        backend_name="fa2",
+        num_attention_heads=1,
+        layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
+        kv_cache_mxfp8=False,
+        num_kv_heads=1,
+        attn_tp_size=1,
+        head_dim=2,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        context_len=1024,
+        max_graph_bs=2,
+        max_bs=2,
+        page_size=64,
+        kv_cache_quant_method="none",
+        max_scheduled_tokens=128,
+    )
+    draft_config = replace(
+        attn_config,
+        layer_types=(FULL_ATTENTION,),
+    )
+    server_args = SimpleNamespace(
+        block_size=64,
+        max_total_tokens=None,
+        speculative_num_draft_tokens=3,
+    )
+
+    setup = prepare_cache_setup(
+        family="qwen_gdn",
+        server_args=server_args,
+        model_config=model_config,
+        attn_config=attn_config,
+        draft_model_config=SimpleNamespace(num_attention_layers=1),
+        draft_attn_config=draft_config,
+        cache_budget_bytes=16_384,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+
+    assert setup.fixed_workspace_bytes == expected_workspace_bytes
+
+
 def test_ordinary_mha_reserves_null_parent_within_cache_budget() -> None:
     model_config = SimpleNamespace(
         num_attention_layers=2,

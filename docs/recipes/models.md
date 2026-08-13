@@ -305,10 +305,24 @@ tokenspeed serve Qwen/Qwen3-30B-A3B \
   --port 8000
 ```
 
+## Qwen3.5
+
+Qwen3.5 uses hybrid Gated DeltaNet (GDN) and full-attention layers. During MTP
+target verification, TokenSpeed automatically enables ReplaySSM whenever the
+portable GDN replay kernel is available. Verify stores each draft position's
+post-convolution K/V and scalar gate inputs instead of a full recurrent state.
+After sampling determines `accept_len`, only the accepted prefix is replayed
+from the committed state and one final SSM state is written. K/V/a/b use one
+layer-major packed allocation, while recurrent pools are exposed through a
+layer-indexed address/stride table, so a single ReplaySSM kernel launch handles
+every GDN layer. The much smaller per-position convolution checkpoints remain
+available to select the accepted conv window. This path works through the
+vendor-neutral kernel boundary on NVIDIA and AMD and requires no serving flag.
+
 ## Qwen3.8
 
 Qwen3.8 shares the hybrid linear-attention (GDN) / full-attention layer
-pattern with Qwen3.5.
+pattern with Qwen3.5 and uses the same ReplaySSM path for MTP verification.
 
 ### Qwen3.8-2.4T-A95B
 

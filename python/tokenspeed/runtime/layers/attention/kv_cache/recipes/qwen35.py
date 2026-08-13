@@ -1,5 +1,7 @@
 """Qwen3.5 cache field recipe."""
 
+import torch
+
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     build_hybrid_cache_setup,
     draft_cache_fields,
@@ -186,10 +188,21 @@ def prepare_qwen35_cache(
         verify_rows = attn_config.max_bs * (
             int(server_args.speculative_num_draft_tokens) + 1
         )
+        replay_ssm = (
+            int(server_args.speculative_num_draft_tokens) > 1
+            and torch.device(attn_config.device).type == "cuda"
+        )
+        if replay_ssm:
+            from tokenspeed_kernel.ops.attention import (
+                gdn_replay_commit_supported,
+            )
+
+            replay_ssm = gdn_replay_commit_supported(attn_config.dtype)
+        workspace_suffixes = (".conv",) if replay_ssm else (".conv", ".ssm")
         fixed_workspace_bytes = verify_rows * sum(
             field.payload_bytes
             for field in fields
-            if field.field_id.endswith((".conv", ".ssm"))
+            if field.field_id.endswith(workspace_suffixes)
         )
 
     (
