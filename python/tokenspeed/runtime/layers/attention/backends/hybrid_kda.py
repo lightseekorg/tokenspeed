@@ -27,6 +27,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention import (
     kda_paged_decode,
     kda_paged_prefill,
@@ -134,29 +135,50 @@ class KdaAttnBackend(MambaAttnBackend):
         attn_tp_size: int,
         head_v_dim: int,
         lower_bound: float | None,
+        output_gate: torch.Tensor | None,
+        norm_weight: torch.Tensor | None,
+        norm_eps: float | None,
     ) -> torch.Tensor | None:
-
+        if output_gate is not None and (norm_weight is None or norm_eps is None):
+            raise ValueError(
+                "norm_weight and norm_eps are required with a KDA output gate"
+            )
         if f_a_out is None:
             return None
-        else:
-            num_value_heads = value_dim // attn_tp_size // head_v_dim
-            return try_kda_fused_paged_decode(
-                mixed_qkv,
-                conv_weights,
-                conv_states,
-                f_a_out,
-                f_b_weight,
-                beta_raw,
-                A_log,
-                dt_bias,
-                state_pool=ssm_states,
-                read_indices=read_indices,
-                write_indices=write_indices,
-                num_heads=num_value_heads,
-                head_dim=head_v_dim,
-                cu_seqlens=self.forward_metadata.query_start_loc,
-                lower_bound=lower_bound,
-            )
+
+        num_value_heads = value_dim // attn_tp_size // head_v_dim
+        result = try_kda_fused_paged_decode(
+            mixed_qkv,
+            conv_weights,
+            conv_states,
+            f_a_out,
+            f_b_weight,
+            beta_raw,
+            A_log,
+            dt_bias,
+            state_pool=ssm_states,
+            read_indices=read_indices,
+            write_indices=write_indices,
+            num_heads=num_value_heads,
+            head_dim=head_v_dim,
+            cu_seqlens=self.forward_metadata.query_start_loc,
+            lower_bound=lower_bound,
+            output_gate=output_gate,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+        if result is None:
+            return None
+        if result.output_norm_applied or output_gate is None:
+            return result.out
+        return rmsnorm_gated_sigmoid(
+            result.out.reshape(-1, num_value_heads * head_v_dim).contiguous(),
+            output_gate.contiguous(),
+            norm_weight,
+            norm_eps,
+            num_value_heads,
+            head_v_dim,
+        ).view(1, -1, num_value_heads, head_v_dim)
 
     @override
     def _decode_scan(
@@ -177,8 +199,10 @@ class KdaAttnBackend(MambaAttnBackend):
         f_b_weight: torch.Tensor | None,
         beta_raw: torch.Tensor | None,
         lower_bound: float | None,
+        output_gate: torch.Tensor | None,
+        norm_weight: torch.Tensor | None,
+        norm_eps: float | None,
     ) -> torch.Tensor:
-
         seq_len = query.shape[0]
         num_heads = query.shape[2]
         head_k_dim = query.shape[3]
@@ -193,7 +217,7 @@ class KdaAttnBackend(MambaAttnBackend):
         g_kda = g_raw.view(1, seq_len, num_value_heads, head_k_dim)
         beta_kda = beta_raw.view(1, seq_len, num_value_heads)
 
-        return kda_paged_decode(
+        core_attn_out = kda_paged_decode(
             query,
             key,
             value,
@@ -206,7 +230,17 @@ class KdaAttnBackend(MambaAttnBackend):
             write_indices=write_indices,
             cu_seqlens=query_start_loc,
             lower_bound=lower_bound,
-        ).squeeze(0)
+        )
+        if output_gate is not None:
+            core_attn_out = rmsnorm_gated_sigmoid(
+                core_attn_out.reshape(-1, num_value_heads * head_v_dim).contiguous(),
+                output_gate.contiguous(),
+                norm_weight,
+                norm_eps,
+                num_value_heads,
+                head_v_dim,
+            ).view(1, -1, num_value_heads, head_v_dim)
+        return core_attn_out.squeeze(0)
 
     @override
     def _verify(
