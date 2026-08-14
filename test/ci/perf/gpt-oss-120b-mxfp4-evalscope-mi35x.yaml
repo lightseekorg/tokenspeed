@@ -3,7 +3,6 @@ name: perf-gpt-oss-120b-mxfp4-mi35x
 type: perf
 workflow_stage: model-test
 triggers:
-  - per-commit
   - manual
 runner:
   labels:

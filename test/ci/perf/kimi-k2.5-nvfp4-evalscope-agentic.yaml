@@ -3,7 +3,6 @@ name: perf-kimi-k2.5-nvfp4-agentic
 type: perf
 workflow_stage: model-test
 triggers:
-  - per-commit
   - manual
 # Agentic perf claims the b300-4gpu box ahead of the b300-4gpu evals so
 # the long-running sweep starts on the freshest runner state.

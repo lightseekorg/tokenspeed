@@ -3,7 +3,6 @@ name: ut-runtime-2gpu
 type: ut
 workflow_stage: unit-test
 triggers:
-  - per-commit
   - manual
 runner:
   labels:

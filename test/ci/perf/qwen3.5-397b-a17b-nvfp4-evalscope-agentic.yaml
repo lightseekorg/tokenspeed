@@ -27,7 +27,6 @@ server:
     --trust-remote-code
     --attention-backend trtllm
     --moe-backend flashinfer_trtllm
-    --draft-moe-backend flashinfer_cutlass
     --quantization nvfp4
     --kv-cache-dtype fp8
     --speculative-algorithm MTP
