@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -246,24 +245,6 @@ def compute_state_page_indices(
     return _gather_state_page_indices(rows, plan, validate=validate, group_id=group_id)
 
 
-def _badidx_probe(where: str, idx: torch.Tensor) -> None:
-    """Diagnostic: unguarded paged-state writes assume idx has no pad(-1)
-    and no duplicates; a violation writes another request's page (python -1
-    indexes the LAST page, it does not skip). Logs violations when the cksum
-    debug dir is armed."""
-    ck = os.environ.get("TOKENSPEED_TAIL_CKSUM_DIR")
-    if not ck:
-        return
-    flat = idx.reshape(-1)
-    neg = int((flat < 0).sum().item())
-    dup = int(flat.numel() - torch.unique(flat).numel())
-    if neg or dup:
-        import torch.distributed as dist
-
-        with open(f"{ck}/badidx_rank{dist.get_rank()}.txt", "a") as f:
-            f.write(f"{where} neg={neg} dup={dup} vals={flat.tolist()[:32]}\n")
-
-
 def _prepare_cache_prefill_state_inputs(
     conv_states: torch.Tensor,
     ssm_states: torch.Tensor,
@@ -279,7 +260,6 @@ def _prepare_cache_prefill_state_inputs(
 
     # A fresh row copies its working page to itself. Only a resumed row reads
     # the checkpoint named by state_in_pages.
-    _badidx_probe("prefill_conv_copy", state_out_pages)
     conv_states[state_out_pages] = conv_states[safe_input_pages]
     recurrent_state = ssm_states[safe_input_pages]
     broadcast_mask = has_initial_state.reshape(
@@ -1352,57 +1332,7 @@ class MambaAttnBackend(AttentionBackend):
 
         if self.is_kda and f_a_out is not None:
             num_value_heads = value_dim // attn_tp_size // head_v_dim
-            _ck = os.environ.get("TOKENSPEED_TAIL_CKSUM_DIR")
-            if _ck and mixed_qkv.shape[0] <= 16:
-                import torch.distributed as _dist
-
-                def _fp(t):
-                    f = t.float()
-                    return f"{f.sum().item():.17e}/{f.abs().max().item():.17e}"
-
-                _r64 = read_indices.to(torch.int64)
-                with open(f"{_ck}/kda_rank{_dist.get_rank()}.txt", "a") as _f:
-                    _f.write(
-                        f"KDA L{layer_id} ri={read_indices.tolist()} "
-                        f"wi={state_out_pages.tolist()} "
-                        f"qkv={_fp(mixed_qkv)} fa={_fp(f_a_out)} "
-                        f"convrd={_fp(conv_states[_r64])} "
-                        f"ssmrd={_fp(ssm_states[_r64])}\n"
-                    )
-            _kd = os.environ.get("TOKENSPEED_KDA_DUMP_DIR")
-            if _kd:
-                import torch.distributed as _dist
-
-                _n = getattr(self, "_kda_dump_n", 0)
-                if _n < int(os.environ.get("TOKENSPEED_KDA_DUMP_N", "2")):
-                    self._kda_dump_n = _n + 1
-                    _ri64 = read_indices.to(torch.int64)
-                    torch.save(
-                        {
-                            "mixed_qkv": mixed_qkv.cpu(),
-                            "conv_weights": conv_weights.cpu(),
-                            # pools are ~18 GB; save only the touched pages
-                            "conv_read": conv_states[_ri64].cpu(),
-                            "ssm_read": ssm_states[_ri64].cpu(),
-                            "f_a_out": f_a_out.cpu(),
-                            "f_b_weight": f_b_weight.cpu(),
-                            "beta_raw": beta_raw.cpu(),
-                            "A_log": A_log.cpu(),
-                            "dt_bias": dt_bias.cpu(),
-                            "same_page": bool(
-                                (read_indices == state_out_pages).all().item()
-                            ),
-                            "num_heads": num_value_heads,
-                            "head_dim": head_v_dim,
-                            "cu_seqlens": self.forward_metadata.query_start_loc.cpu(),
-                            "lower_bound": kda_lower_bound,
-                            "layer_id": layer_id,
-                        },
-                        f"{_kd}/kda_r{_dist.get_rank()}_L{layer_id}_{_n}.pt",
-                    )
-            _badidx_probe("kda_fused_decode_read", read_indices)
-            _badidx_probe("kda_fused_decode_write", state_out_pages)
-            _core = try_kda_fused_paged_decode(
+            core_attn_out = try_kda_fused_paged_decode(
                 mixed_qkv,
                 conv_weights,
                 conv_states,
@@ -1419,10 +1349,6 @@ class MambaAttnBackend(AttentionBackend):
                 cu_seqlens=self.forward_metadata.query_start_loc,
                 lower_bound=kda_lower_bound,
             )
-            if _ck and mixed_qkv.shape[0] <= 16 and _core is not None:
-                with open(f"{_ck}/kda_rank{_dist.get_rank()}.txt", "a") as _f:
-                    _f.write(f"CORE L{layer_id} core={_fp(_core)}\n")
-            core_attn_out = _core
             if core_attn_out is not None:
                 return core_attn_out
 
@@ -1795,7 +1721,6 @@ class MambaAttnBackend(AttentionBackend):
             last_recurrent_state = kda_result.final_state
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             # Extend indices never carry pad(-1) — unguarded like the GDN write below.
-            _badidx_probe("kda_extend_state_write", state_out_long)
             ssm_states[state_out_long] = last_recurrent_state
         else:
             beta = b.sigmoid()
@@ -1819,7 +1744,6 @@ class MambaAttnBackend(AttentionBackend):
             core_attn_out = gdn_result.out
             last_recurrent_state = gdn_result.final_state
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-            _badidx_probe("gdn_extend_state_write", state_out_long)
             ssm_states[state_out_long] = last_recurrent_state
 
         return core_attn_out

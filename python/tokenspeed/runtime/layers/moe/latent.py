@@ -106,14 +106,9 @@ def select_k3_moe_tail_tier(
     """
     # Tested first, so a fused-tail capacity that ever reached into the
     # multimem window would still resolve here rather than overlap.
-    # Diagnostic override: let an eager forward select the fused tail so its
-    # numerics can be probed outside CUDA graphs (rank-uniform env only).
-    if os.environ.get("TOKENSPEED_K3_TAIL_EAGER_DEBUG") == "1":
-        graph_phase = True
-    # Diagnostic: clamp the fused-tail capacity (rank-uniform env only). With
-    # e.g. 5 the tail keeps its skinny sizes but m in [6, capacity] falls to
-    # the ordinary tiers -- the arm that separates the WGMMA up-projection
-    # path from the rest of the tail.
+    # Operational clamp (rank-uniform env only): with e.g. 5 the tail keeps
+    # its skinny sizes while larger decode batches fall to the ordinary
+    # tiers -- a no-rebuild way to narrow the fused tail's coverage.
     _cap = os.environ.get("TOKENSPEED_K3_TAIL_MAX_M")
     if _cap is not None:
         tail_fusion_max_tokens = min(tail_fusion_max_tokens, int(_cap))
@@ -121,16 +116,7 @@ def select_k3_moe_tail_tier(
         return K3MoETailTier.TAIL_FUSION
     if not fused_moe_ar:
         return K3MoETailTier.SEPARATE_REDUCE
-    # Diagnostic: lower the multimem floor so decode-sized batches take the
-    # in-switch reduce. It is not the fused tail but it *is* a different
-    # reduction order than the join tier's ring -- the control that separates
-    # "the tail is broken" from "any reduction-order change costs quality".
-    _mm_min = (
-        1
-        if os.environ.get("TOKENSPEED_K3_MULTIMEM_DECODE_DEBUG") == "1"
-        else MULTIMEM_AR_MIN_TOKENS
-    )
-    if multimem_ok and _mm_min <= num_tokens <= MULTIMEM_AR_MAX_TOKENS:
+    if multimem_ok and MULTIMEM_AR_MIN_TOKENS <= num_tokens <= MULTIMEM_AR_MAX_TOKENS:
         return K3MoETailTier.MULTIMEM_AR
     return K3MoETailTier.FUSED_LANE_AR
 
@@ -464,6 +450,21 @@ class Kimi3LatentProjection(ReplicatedLinear):
         """Project routed latents and accumulate two full-width addends.
 
         ``result = addend_a + hidden_states @ self.weight.T + addend_c``
+
+        Args:
+            hidden_states: Routed latent ``[m, input_size]``; with
+                ``norm_weight`` the projection fuses its RMSNorm.
+            addend_a: Full-width addend ``[m, output_size]`` (the residual
+                prefix); column-parallel instances consume only this rank's
+                column block.
+            addend_c: Second full-width addend (the reduced shared output),
+                consumed the same way.
+            norm_weight: Optional fused-RMSNorm weight over ``input_size``.
+            eps: Epsilon for the fused norm; required with ``norm_weight``.
+
+        Returns:
+            The accumulated projection at full width; column-parallel
+            instances gather their blocks before returning.
         """
         if self.shard_group is None:
             return tokenspeed_kernel.kimi3_latent_projection_add3(
@@ -617,26 +618,11 @@ class LatentMoELayer(nn.Module):
             )
         else:
             routed_latent = _module_tensor_output(self.routed_norm, routed_latent)
-            if (
-                os.environ.get("TOKENSPEED_K3_JOIN_EXTRA_ROUND") == "1"
-                and routed_latent.shape[0] <= 16
-            ):
-                # Diagnostic: emulate the multicast tail's rounding structure
-                # on the join path (split add3 -> add2 + eager add = one extra
-                # bf16 intermediate rounding); a GPQA arm with this flag
-                # isolates the mailbox rounding's cost with no kernel change.
-                mailbox_like = self.routed_up_proj.forward_add3(
-                    routed_latent,
-                    torch.zeros_like(prefix_sum),
-                    shared_output,
-                )
-                output = mailbox_like + prefix_sum
-            else:
-                output = self.routed_up_proj.forward_add3(
-                    routed_latent,
-                    prefix_sum,
-                    shared_output,
-                )
+            output = self.routed_up_proj.forward_add3(
+                routed_latent,
+                prefix_sum,
+                shared_output,
+            )
         _check_shape(output, output_shape, "routed_up_proj")
         return output
 

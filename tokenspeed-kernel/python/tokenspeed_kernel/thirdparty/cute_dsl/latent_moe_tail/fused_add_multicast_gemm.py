@@ -216,9 +216,7 @@ def _epilogue_tma_store_add_shared(
         # rounds once).
         gemm_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
         shared_vec = tiled_copy_r2s.retile(tTR_rShared).load()
-        fused_vec = (gemm_vec + shared_vec.to(cutlass.Float32)).to(
-            gemm_kernel.c_dtype
-        )
+        fused_vec = (gemm_vec + shared_vec.to(cutlass.Float32)).to(gemm_kernel.c_dtype)
         # The Lamport mailbox empty marker is BF16 -0: normalize signed zeros to +0 so a real result is never mistaken for an unwritten fragment.
         fused_vec = cute.where(
             fused_vec == cute.zeros_like(fused_vec),

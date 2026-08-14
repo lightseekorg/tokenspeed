@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import inspect
-import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -221,20 +220,6 @@ class ModelRunner:
         if kv_sync_event is not None:
             kwargs["kv_sync_event"] = kv_sync_event
 
-        # Diagnostic: correlate numeric fingerprints with KV placement. The
-        # hypothesis under test is that attention numerics depend on the
-        # physical cache slot of decode-written entries.
-        ck = os.environ.get("TOKENSPEED_TAIL_CKSUM_DIR")
-        if ck and input_ids.shape[0] <= 16:
-            rank = torch.distributed.get_rank()
-            with open(f"{ck}/cksum_rank{rank}.txt", "a") as f:
-                rpi = kwargs.get("req_pool_indices")
-                f.write(
-                    f"FWDMETA nt={input_ids.shape[0]} "
-                    f"ids={input_ids.tolist()} pos={positions.tolist()} "
-                    f"loc={out_cache_loc.tolist()} "
-                    f"slot={rpi.tolist() if rpi is not None else None}\n"
-                )
         return self.model.forward(
             ctx,
             input_ids,

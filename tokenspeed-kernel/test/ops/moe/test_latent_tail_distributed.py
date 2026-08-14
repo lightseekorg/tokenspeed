@@ -34,7 +34,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-H, L, EPS = 7168, 3584, 1e-6
+H, L, EPS = 7168, 3584, 1e-5
 
 
 def _world_size() -> int:
@@ -101,7 +101,7 @@ def test_latent_tail_matches_reference(m):
         latent_size=L,
         rms_eps=EPS,
         device=dev,
-        layer_id=0,
+        owner="test.match_reference",
     )
     routed, shared, rms_w, up_w = _inputs(rank, dev, m, seed=100)
     ref = _reference(routed, shared, rms_w, up_w)
@@ -123,7 +123,7 @@ def test_latent_tail_graph_replay():
         latent_size=L,
         rms_eps=EPS,
         device=dev,
-        layer_id=0,
+        owner="test.graph_replay",
     )
     routed, shared, rms_w, up_w = _inputs(rank, dev, 1, seed=200)
     for _ in range(3):
@@ -146,7 +146,7 @@ def test_latent_tail_graph_replay():
         assert err < 0.05 * max(scale, 1.0), f"seed={seed}: err {err}"
 
 
-@pytest.mark.parametrize("m", [1, 4, 16])
+@pytest.mark.parametrize("m", [1, 4, 6, 8, 16])
 def test_latent_tail_fused_prefix_matches_eager(m):
     from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
 
@@ -158,12 +158,44 @@ def test_latent_tail_fused_prefix_matches_eager(m):
         latent_size=L,
         rms_eps=EPS,
         device=dev,
-        layer_id=0,
+        owner="test.fused_prefix",
     )
     routed, shared, rms_w, up_w = _inputs(rank, dev, m, seed=700)
     torch.manual_seed(900 + rank)
-    prefix = (torch.randn(m, H, dtype=torch.bfloat16, device=dev) * 0.1).contiguous()
+    prefix = (torch.randn(m, H, dtype=torch.bfloat16, device=dev) * 0.9).contiguous()
+    prefix[:, ::911] *= 8  # residual-stream outliers, as in serving
     eager = op(routed, shared, rms_w, up_w) + prefix
     fused = op(routed, shared, rms_w, up_w, prefix=prefix)
     torch.cuda.synchronize()
     assert torch.equal(eager, fused), "fused prefix add must be bit-identical"
+
+
+@pytest.mark.parametrize("m", [1, 8])
+def test_latent_tail_accepts_sharded_weight(m):
+    """A pre-sharded ``[H/tp, L]`` weight must reproduce the replicated path.
+
+    The column-parallel projection stores only this rank's row block; the tail
+    consumes exactly that block either way, so both spellings must agree
+    bitwise.
+    """
+    from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
+
+    rank, dev = _setup()
+    _require_latent_tail()
+    op = KimiK3LatentTailOp.initialize(
+        group=dist.group.WORLD,
+        hidden_size=H,
+        latent_size=L,
+        rms_eps=EPS,
+        device=dev,
+        owner="test.sharded_weight",
+    )
+    routed, shared, rms_w, up_w = _inputs(rank, dev, m, seed=1100)
+    shard = H // _world_size()
+    up_w_shard = up_w.narrow(0, rank * shard, shard).contiguous()
+    full = op(routed, shared, rms_w, up_w).clone()
+    torch.cuda.synchronize()
+    dist.barrier()
+    sharded = op(routed, shared, rms_w, up_w_shard)
+    torch.cuda.synchronize()
+    assert torch.equal(full, sharded), "sharded weight must be bit-identical"

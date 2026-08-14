@@ -334,10 +334,20 @@ def test_kimi3_moe_execution_policy_preserves_nvidia_trtllm() -> None:
         is_marlin=lambda: False,
     )
 
-    with mock.patch.object(
-        latent_module,
-        "native_latent_moe_available",
-        return_value=False,
+    with (
+        mock.patch.object(
+            latent_module,
+            "native_latent_moe_available",
+            return_value=False,
+        ),
+        # The marlin probe is a filesystem check for a locally built .so;
+        # pin it so the policy assertion does not depend on build artifacts
+        # present in the developer's checkout.
+        mock.patch.object(
+            latent_module,
+            "_marlin_moe_available",
+            return_value=False,
+        ),
     ):
         plan = Kimi3MoEExecutionPlan.build(
             mapping,
@@ -678,3 +688,79 @@ def test_latent_moe_rejects_ep_above_eight() -> None:
             _EpExperts(16, num_experts=16),
             latent_reduce=lambda x: x,
         )
+
+
+def _shard_projection(monkeypatch, world: int, rank: int, out: int, k: int):
+    """A CPU Kimi3LatentProjection sharded across a fake ``world``-rank group.
+
+    The kernel projection and the gather collective are replaced with
+    reference implementations so the shard bookkeeping (loader slice, column
+    offsets, gather layout) is what the test exercises.
+    """
+    monkeypatch.setattr(
+        latent_module.tokenspeed_kernel,
+        "kimi3_latent_projection",
+        lambda x, w, solution=None: x @ w.T,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        latent_module.tokenspeed_kernel,
+        "kimi3_latent_projection_add3",
+        lambda x, w, a, c, norm_weight=None, eps=None: a + x @ w.T + c,
+        raising=False,
+    )
+    return latent_module.Kimi3LatentProjection(
+        k,
+        out,
+        params_dtype=torch.float32,
+        shard_group=tuple(range(world)),
+        shard_rank=rank,
+        shard_size=world,
+    )
+
+
+def test_kimi3_latent_projection_shard_loader_takes_row_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world, out, k = 4, 16, 8
+    full = torch.arange(out * k, dtype=torch.float32).view(out, k)
+    for rank in range(world):
+        proj = _shard_projection(monkeypatch, world, rank, out, k)
+        proj.weight_loader(proj.weight, full)
+        rows = out // world
+        assert proj.weight.shape == (rows, k)
+        torch.testing.assert_close(
+            proj.weight.data, full[rank * rows : (rank + 1) * rows]
+        )
+        assert proj.shard_slice == (rank * rows, rows)
+
+
+def test_kimi3_latent_projection_shard_forward_add3_matches_replicated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world, out, k, m = 4, 16, 8, 3
+    torch.manual_seed(0)
+    full = torch.randn(out, k)
+    x = torch.randn(m, k)
+    a = torch.randn(m, out)
+    c = torch.randn(m, out)
+    expected = a + x @ full.T + c
+
+    rows = out // world
+
+    def gather_all(output, local, group):
+        # Emulate the collective: fill each rank's stripe with what that rank
+        # would compute locally (shard GEMM plus its addend column blocks).
+        for r in range(world):
+            output[r] = (
+                a[:, r * rows : (r + 1) * rows]
+                + x @ full[r * rows : (r + 1) * rows].T
+                + c[:, r * rows : (r + 1) * rows]
+            )
+
+    monkeypatch.setattr(latent_module, "all_gather_into_tensor", gather_all)
+    for rank in range(world):
+        proj = _shard_projection(monkeypatch, world, rank, out, k)
+        proj.weight_loader(proj.weight, full)
+        got = proj.forward_add3(x, a, c)
+        torch.testing.assert_close(got, expected)

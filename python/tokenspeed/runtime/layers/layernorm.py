@@ -20,8 +20,6 @@
 
 """Fused operators for normalization layers."""
 
-import os
-
 import torch
 import torch.nn as nn
 from tokenspeed_kernel.ops.communication.triton import (
@@ -116,24 +114,6 @@ class RMSNorm(torch.nn.Module):
                 return x, residual
             else:
                 return x
-
-        # Diagnostic: a torch-reference RMSNorm for the K3 routed latent
-        # (width 3584) only. Same math, different reduction tree and exact
-        # rsqrt -- a 1-ulp-class perturbation of the norm scale, like the
-        # fused tail's. A GPQA arm with this and the tail disabled tests
-        # whether the model is sensitive to that perturbation class at all.
-        if (
-            residual is None
-            and x.shape[-1] == 3584
-            and os.environ.get("TOKENSPEED_K3_NORM_TORCH_REF") == "1"
-        ):
-            xf = x.float()
-            inv = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
-            ref = (xf * inv * self.weight.float()).to(x.dtype)
-            if out is not None:
-                out.copy_(ref)
-                return out
-            return ref
 
         if _is_amd:
             if residual is not None:

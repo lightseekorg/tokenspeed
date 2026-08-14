@@ -26,9 +26,12 @@
 Replaces the ``all-reduce(latent+shared lanes) -> replicated up-projection``
 tail with three fused stages: one kernel doing AR(latent)+RMSNorm+RS(shared),
 a *sharded* up-projection (each rank computes ``hidden/tp`` rows — 1/tp of the
-weight traffic) whose epilogue multicast-stores the shard into every rank's
-mailbox (NVLS), and a barrier-free Lamport gather. Buffers come from stock
-``torch.distributed._symmetric_memory``.
+weight traffic, and 1/tp of the weight storage when the caller passes a
+column-parallel weight) whose epilogue multicast-stores the shard into every
+rank's mailbox (NVLS), and a barrier-free Lamport gather. Symmetric buffers
+come from stock ``torch.distributed._symmetric_memory``; the small per-call
+staging can come from the runtime's shared workspace pool via
+``scratch_allocator``.
 """
 
 from __future__ import annotations
@@ -145,6 +148,7 @@ class KimiK3LatentTailOp:
         rms_eps: float,
         device: torch.device,
         owner: str,
+        scratch_allocator=None,
     ) -> "KimiK3LatentTailOp":
         """Return this caller's tail op, constructing it on first use.
 
@@ -157,6 +161,10 @@ class KimiK3LatentTailOp:
             owner: Globally unique name for the calling module (its weight
                 prefix); part of the key so each caller gets its own mailbox.
                 Must be rank-identical -- it takes part in the rendezvous.
+            scratch_allocator: Optional ``(*specs) -> list[Tensor]`` carving
+                per-call staging views from a shared block (the runtime's
+                workspace pool). The views are re-fetched on every collective
+                call per that pool's contract; None keeps private buffers.
         """
         contract = _Contract(
             group_id=id(group),
@@ -169,11 +177,16 @@ class KimiK3LatentTailOp:
         )
         op = cls._instances.get(contract)
         if op is None:
-            op = cls(contract, group)
+            op = cls(contract, group, scratch_allocator=scratch_allocator)
             cls._instances[contract] = op
         return op
 
-    def __init__(self, contract: _Contract, group: dist.ProcessGroup) -> None:
+    def __init__(
+        self,
+        contract: _Contract,
+        group: dist.ProcessGroup,
+        scratch_allocator=None,
+    ) -> None:
         from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail import (
             AdaptiveUpProjectionKernel,
             CollectiveKernel,
@@ -198,6 +211,9 @@ class KimiK3LatentTailOp:
                 fp32_internal=(
                     os.environ.get("TOKENSPEED_K3_TAIL_BF16_INTERNAL") != "1"
                 ),
+                # Optional runtime workspace pool for the per-layer staging;
+                # documented on CollectiveKernel. None keeps private buffers.
+                scratch_allocator=scratch_allocator,
             )
             self._up_projection = AdaptiveUpProjectionKernel(
                 group=group,
@@ -268,7 +284,9 @@ class KimiK3LatentTailOp:
         if up_weight.shape[0] == local_hidden:
             local_up_weight = up_weight
         elif up_weight.shape[0] == self.contract.hidden_size:
-            local_up_weight = up_weight.narrow(0, self.rank * local_hidden, local_hidden)
+            local_up_weight = up_weight.narrow(
+                0, self.rank * local_hidden, local_hidden
+            )
         else:
             raise ValueError(
                 f"up_weight must have {self.contract.hidden_size} rows "

@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import os
-
 from typing import Any
 
 import cuda.bindings.driver as cuda
@@ -119,10 +118,9 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         # up-projection and gather keep PDL, whose primaries are the tail's
         # own kernels with sound trigger placement. (Bound in host Python:
         # the JIT resolves names off self, not module globals.)
-        # TOKENSPEED_K3_TAIL_COLLECTIVE_PDL=1 restores the pre-fix launch for
-        # A/B calibration; it re-enables the race and is never a serving knob.
         # TOKENSPEED_K3_TAIL_COLLECTIVE_PDL=0 downgrades this kernel's launch
-        # to plain stream order (the interim a33e2eeb mitigation) for A/B.
+        # to plain stream order, giving operators a no-rebuild fallback if a
+        # producer with an early programmatic trigger ever reappears.
         _off = os.environ.get("TOKENSPEED_K3_TAIL_COLLECTIVE_PDL") == "0"
         if use_pdl is None:
             self.use_pdl = (not _off) and PDL_ENABLED
@@ -869,6 +867,7 @@ class CollectiveKernel:
         max_token_ctas: int,
         rms_eps: float,
         fp32_internal: bool,
+        scratch_allocator=None,
     ) -> None:
         validate_shape(
             tp_size=tp_size,
@@ -910,12 +909,30 @@ class CollectiveKernel:
             raise RuntimeError("routed NVLS multicast mapping is unavailable")
         self._routed_multicast_ptr = int(routed_multicast_ptr)
 
-        self._latent_output = torch.empty(
-            (max_m, latent_dim), dtype=torch.bfloat16, device=device
+        # Kernel-visible staging: written by this collective, consumed by the
+        # up-projection immediately after, dead before any later op runs on
+        # the stream. With a scratch allocator (the runtime's workspace pool)
+        # every layer's staging aliases one shared block; the allocator's
+        # contract requires re-fetching the views on every call and warming
+        # the peak size before the first CUDA-graph capture, both done here.
+        self._scratch_allocator = scratch_allocator
+        self._scratch_specs = (
+            ((max_m, latent_dim), torch.bfloat16),
+            ((max_m, hidden_dim), torch.bfloat16),
         )
-        self._shared_output = torch.empty(
-            (max_m, hidden_dim), dtype=torch.bfloat16, device=device
-        )
+        if scratch_allocator is None:
+            self._latent_output = torch.empty(
+                (max_m, latent_dim), dtype=torch.bfloat16, device=device
+            )
+            self._shared_output = torch.empty(
+                (max_m, hidden_dim), dtype=torch.bfloat16, device=device
+            )
+        else:
+            # Warm to peak so the pool can still grow (construction happens
+            # before capture); the views are refreshed per call.
+            self._latent_output, self._shared_output = scratch_allocator(
+                *self._scratch_specs
+            )
         shard_start = rank * self.shard_dim
         shard_end = shard_start + self.shard_dim
         self._shared_shard = self._shared_output[:, shard_start:shard_end]
@@ -993,6 +1010,17 @@ class CollectiveKernel:
                 raise ValueError(f"{name} must be contiguous CUDA BF16 {list(shape)}")
         if not 1 <= m <= self.max_m:
             raise ValueError(f"runtime M={m} must be in [1, {self.max_m}]")
+
+        if self._scratch_allocator is not None:
+            # Pool contract: never hold views across allocate calls -- other
+            # ops share the block and growth before the freeze moves it.
+            self._latent_output, self._shared_output = self._scratch_allocator(
+                *self._scratch_specs
+            )
+            shard_start = self.rank * self.shard_dim
+            self._shared_shard = self._shared_output[
+                :, shard_start : shard_start + self.shard_dim
+            ]
 
         with torch.accelerator.device_index(device.index):
             launch(
