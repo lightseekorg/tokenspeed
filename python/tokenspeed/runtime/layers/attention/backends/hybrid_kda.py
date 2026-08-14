@@ -1040,10 +1040,6 @@ class KdaAttnBackend(MambaAttnBackend):
         else:
             self._kda_pending = None
 
-    def has_pending(self) -> bool:
-        """A lazy KDA window is still awaiting its commit."""
-        return self._kda_pending is not None
-
     def notify_forward_issued(self) -> None:
         """Release the record the just-issued forward commits device-side.
 
@@ -1061,7 +1057,8 @@ class KdaAttnBackend(MambaAttnBackend):
             self._kda_pending = None
             self._kda_table_release()
 
-    def flush_pending(self, resident_request_ids: set[str]) -> None:
+    @override
+    def flush_deferred_state(self, resident_request_ids: set[str]) -> None:
         """Resolve every pending KDA window now (lifecycle escape hatch).
 
         Must run before anything invalidates the replay inputs: a weight
@@ -1588,12 +1585,8 @@ class HybridKDABackend(HybridLinearAttnBackend):
     """
 
     @override
-    def has_pending(self) -> bool:
-        return self.linear_attn_backend.has_pending()
-
-    @override
-    def flush_pending(self, resident_request_ids: set[str]) -> None:
-        self.linear_attn_backend.flush_pending(resident_request_ids)
+    def flush_deferred_state(self, resident_request_ids: set[str]) -> None:
+        self.linear_attn_backend.flush_deferred_state(resident_request_ids)
 
     @override
     def settle_deferred_state(self, accepted_length):

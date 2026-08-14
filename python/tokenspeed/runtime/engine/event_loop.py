@@ -1018,8 +1018,8 @@ class EventLoop:
             else:
                 raise ValueError(f"unsupported cache op kind: {type(op).__name__}")
 
-    def _flush_pending(self) -> None:
-        """Resolve pending state on the execution stream (pause fence).
+    def _flush_deferred_state(self) -> None:
+        """Settle deferred backend state on the execution stream (pause fence).
 
         The stream hop is the loop's job: an overlap-scheduled forward still
         in flight must finish writing the backend's buffers first. A round
@@ -1028,13 +1028,11 @@ class EventLoop:
         resident, so an empty round says nothing about who is still here.
         """
         backend = self.model_executor.attn_backend
-        if not backend.has_pending():
-            return
         resident = set(self.output_processor.rid_to_state)
         stream = self.model_executor.execution_stream
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            backend.flush_pending(resident)
+            backend.flush_deferred_state(resident)
         torch.cuda.current_stream().wait_stream(stream)
 
     # ------------------------------------------------------------------
@@ -1625,7 +1623,7 @@ class EventLoop:
             self._commit_cache_results()
             if self._pause.forward_blocked:
                 # A pause may precede a weight update: flush deferred state under the weights that produced it.
-                self._flush_pending()
+                self._flush_deferred_state()
                 self._paused_idle_step()
                 continue
             execution_plan = self.scheduler.next_execution_plan()
@@ -1775,7 +1773,7 @@ class EventLoop:
             self._commit_cache_results()
             if self._pause.forward_blocked:
                 # Freeze: commit the in-flight overlapped step, flush deferred state under its own weights, then idle.
-                self._flush_pending()
+                self._flush_deferred_state()
                 self._paused_idle_step(prev_forward_op, prev_results)
                 prev_results = None
                 prev_forward_op = None

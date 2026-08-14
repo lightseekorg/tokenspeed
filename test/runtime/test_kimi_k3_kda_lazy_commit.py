@@ -223,7 +223,7 @@ class _Harness:
         pend = self.backend._kda_pending
         if resident is None:
             resident = set() if pend is None else set(pend["id_by_rpi"].values())
-        self.backend.flush_pending(resident)
+        self.backend.flush_deferred_state(resident)
 
     def state_of(self, layer_id, page):
         conv = self.pool.get_component(layer_id, "conv_state")[page].clone()
@@ -436,7 +436,7 @@ def test_abandoned_verify_prep_keeps_pending_for_retract_flush():
     Metadata prep composes the pending into the fused-kernel control buffers
     (the "stage"), but the forward never launches -- the event loop retracted
     the batch between prep and dispatch and fires the retract hook
-    ``flush_pending`` instead. The pending must be consumed at FORWARD
+    ``flush_deferred_state`` instead. The pending must be consumed at FORWARD
     ISSUE, not at stage: an stage-time consume
     would silently lose the accepted window here. The retract-hook flush
     must really write the window, and the next verify round must match an
@@ -1249,7 +1249,7 @@ def test_pause_flush_does_not_write_a_departed_owners_reclaimed_pages():
     assert h.pending() is not None and 1 in h.pending()["slot_by_rpi"]
 
     # The pause fence: req1 has left the engine, req0 is still resident.
-    h.backend.flush_pending({"req0"})
+    h.backend.flush_deferred_state({"req0"})
     assert h.pending() is None
 
     for layer_id in h.layer_ids:

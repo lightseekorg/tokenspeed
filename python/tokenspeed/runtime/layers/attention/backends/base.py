@@ -216,39 +216,28 @@ class AttentionBackend(ABC):
     def register_step_counter(self, step_counter: StepCounter):
         self.step_counter = step_counter
 
-    # --- Pending state ----------------------------------------------------
-    # Extension point for any backend-owned work deferred past the forward
-    # that produced it -- lazy speculative-verify commits today; future state
-    # or kv-cache variants belong here too rather than growing new engine
-    # hooks. The engine calls these at the points a backend cannot observe on
-    # its own (the pause fence here; the forward-issue boundary through the
-    # optional per-forward settle hook the graph wrapper calls) and owns all
-    # stream fencing; implementations run on the caller's current stream.
+    # --- Deferred state ---------------------------------------------------
+    # A backend may defer work past the forward that produced it. The engine
+    # owns stream fencing and calls these settlement hooks on the current
+    # stream at boundaries the backend cannot observe on its own.
 
-    def has_pending(self) -> bool:
-        """Whether backend-owned work is still deferred past its forward.
+    def flush_deferred_state(self, resident_request_ids: set[str]) -> None:
+        """Settle deferred work out of band from a forward.
 
-        Must be a cheap host-side probe: it gates the engine's stream fence.
-        """
-        return False
-
-    def flush_pending(self, resident_request_ids: set[str]) -> None:
-        """Resolve all pending work now, under the current weights.
-
-        The engine calls this before idling under a pause: a pause may
-        precede a weight update, and pending work must land under the
-        weights that produced it. ``resident_request_ids`` is every request
-        the engine still holds; there is no batch here, so a backend whose
-        work targets per-request memory has no other way to tell a live
-        owner from one whose pages are already reclaimed.
+        The engine calls this at a pause fence before a possible weight update
+        and during teardown. Because no batch exists at those points,
+        ``resident_request_ids`` supplies every request still held by the
+        engine so backends can screen the owners of per-request state. See
+        ``settle_deferred_state`` for the per-forward settlement point.
         """
 
     def settle_deferred_state(self, accept_lengths) -> None:
-        """Settle work deferred into the forward that just completed.
+        """Settle deferred work at the per-forward settlement point.
 
         Called by the graph wrapper after every forward. ``accept_lengths`` is
-        present only when a speculative verify produced it; backends that defer
-        work into their forward override this hook.
+        present only when a speculative verify produced it. See
+        ``flush_deferred_state`` for out-of-band settlement at pause fences and
+        teardown.
         """
 
     @contextmanager
