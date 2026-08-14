@@ -50,15 +50,7 @@ def supports_fused_mla_kv_write(
     rotary_dim: int,
     is_neox: bool,
 ) -> bool:
-    """Whether any registered rope kernel can write the MLA KV cache itself.
-
-    Callers used to answer this with a vendor test — the model carried
-    ``if _is_amd ...`` because only the Gluon kernel implements the fused write,
-    and passing the argument elsewhere raises. That put a dispatch question in
-    the model. Ask here instead: the answer follows from what is registered for
-    this platform, so a future NVIDIA implementation starts being used without
-    touching any caller.
-    """
+    """Whether a registered RoPE kernel can write the MLA KV cache."""
     try:
         select_kernel(
             "embedding",

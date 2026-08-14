@@ -694,11 +694,6 @@ def _mla_nope_quantize_fp8_kernel(
         mask=mask_r,
     )
 
-    # BROADCAST_K: the key carries one head (absorbed MLA decode, where the KV
-    # latent is shared by every query head). Zero strides already make the loads
-    # read head 0 for all program ids; the stores must additionally collapse to
-    # head 0, because the output holds one latent per token and heads 1..N-1
-    # would otherwise write past it.
     if BROADCAST_K:
         store_k = head == 0
     else:
@@ -762,27 +757,35 @@ def mla_nope_quantize_fp8_triton(
         raise ValueError(
             f"k_rope heads must be 1 or {num_heads}, got {k_rope.shape[1]}"
         )
-    # Absorbed MLA decode shares one KV latent across every query head, so the
-    # key arrives single-head while the query does not. Broadcast it on load and
-    # emit a single-head key, which is also what the KV cache stores.
     broadcast_k = kv_heads == 1 and num_heads > 1
     if broadcast_k and k_rope.shape[1] != 1:
         raise ValueError(
             f"k_nope is single-head so k_rope must be too, got {k_rope.shape[1]}"
         )
-    if broadcast_k:
-        # Only head 0 stores, so the outputs must be single-head as well.
-        if k_nope_out.shape[1] != 1 or k_rope_out.shape[1] != 1:
+    expected_outputs = (
+        ("q_nope_out", q_nope_out, q_nope.shape, q_nope.device),
+        ("q_rope_out", q_rope_out, q_rope.shape, q_rope.device),
+        ("k_nope_out", k_nope_out, k_nope.shape, k_nope.device),
+        (
+            "k_rope_out",
+            k_rope_out,
+            (num_tokens, kv_heads, rope_dim),
+            k_rope.device,
+        ),
+    )
+    for name, output, expected_shape, expected_device in expected_outputs:
+        if output.shape != expected_shape:
             raise ValueError(
-                f"broadcast key requires single-head outputs, got k_nope_out "
-                f"{tuple(k_nope_out.shape)} k_rope_out {tuple(k_rope_out.shape)}"
+                f"{name} must have shape {tuple(expected_shape)}, got {tuple(output.shape)}"
             )
-    elif k_rope_out.shape[1] != num_heads:
-        # A one-head k_rope broadcasts on load, but every output slice must
-        # carry the full head count -- the grid writes all heads.
-        raise ValueError(
-            f"k_rope_out must carry {num_heads} heads, got {k_rope_out.shape[1]}"
-        )
+        if output.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"{name} must have dtype {torch.float8_e4m3fn}, got {output.dtype}"
+            )
+        if output.device != expected_device:
+            raise ValueError(
+                f"{name} must be on device {expected_device}, got {output.device}"
+            )
     if isinstance(quant_scale_q, torch.Tensor):
         quant_scale_q = quant_scale_q.contiguous()
     if isinstance(quant_scale_kv, torch.Tensor):

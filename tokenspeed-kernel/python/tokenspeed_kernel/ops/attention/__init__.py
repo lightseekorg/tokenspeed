@@ -166,19 +166,7 @@ def mla_project_value_prefers_contiguous_weight(
     gated: bool = False,
     batch_size: int = 1,
 ) -> bool:
-    """Whether the kernel that will be selected wants a contiguous weight.
-
-    Absorbed MLA weights are prepared once at load time, so the layout has to be
-    chosen before any call — a runtime `.contiguous()` would copy the whole
-    projection on every token. Model code used to answer this with `if _is_amd`,
-    which is a guess about dispatch: the Gluon kernel declares
-    `inputs_contiguous: True` and is skipped when handed a strided weight, while
-    the NVIDIA path deliberately keeps it strided for `torch.bmm`.
-
-    Asking here keeps the layout question with the kernels that have the
-    preference, and a newly registered kernel changes the answer without any
-    model edit.
-    """
+    """Whether the selected kernel wants a contiguous weight."""
     signature = format_signature(
         attention=dense_tensor_format(dtype),
         weight=dense_tensor_format(dtype),
@@ -285,13 +273,6 @@ def mla_project_value(
         kernel = None
 
     if kernel is None and not traits["inputs_contiguous"]:
-        # Some specialised kernels declare `inputs_contiguous: True` and are
-        # otherwise a match. Callers used to satisfy that themselves — the model
-        # carried `w_vc.contiguous() if _is_amd else w_vc`, which is a caller
-        # guessing which kernel dispatch will pick. Decide it here instead, and
-        # only pay the copy when it actually unlocks a kernel: layouts that are
-        # deliberately strided (NVIDIA keeps w_kc/w_vc transposed for bmm) find
-        # no such candidate and fall through untouched.
         try:
             candidate = select_kernel(
                 "attention",

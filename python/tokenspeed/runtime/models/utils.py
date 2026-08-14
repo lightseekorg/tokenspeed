@@ -103,10 +103,12 @@ def create_fused_set_kv_buffer_arg(
 def create_fused_mla_set_kv_buffer_arg(
     k_nope: torch.Tensor,
     rope_dim: int,
+    rotary_head_size: int,
+    is_neox_style: bool,
     out_cache_loc: torch.Tensor,
-    token_to_kv_pool,
+    token_to_kv_pool: object,
     layer_id: int,
-):
+) -> FusedMLASetKVBufferArg | None:
     """Build fused MLA RoPE+KV write arguments when the cache layout matches."""
 
     from tokenspeed_kernel.ops.embedding import supports_fused_mla_kv_write
@@ -119,17 +121,12 @@ def create_fused_mla_set_kv_buffer_arg(
     kv_buffer = token_to_kv_pool.get_key_buffer(layer_id)
     if not isinstance(kv_buffer, torch.Tensor):
         return None
-    # Whether any kernel can consume this argument is a dispatch question, not a
-    # vendor one. Callers guarded with `if _is_amd` because only Gluon implements
-    # the fused write and passing it elsewhere raises NoKernelFoundError; asking
-    # the registry keeps that knowledge in the kernel layer, and a future NVIDIA
-    # implementation gets picked up without editing any model.
     if not supports_fused_mla_kv_write(
         q_dtype=k_nope.dtype,
         k_dtype=k_nope.dtype,
-        head_size=k_nope.shape[-1] + rope_dim,
+        head_size=rotary_head_size,
         rotary_dim=rope_dim,
-        is_neox=True,
+        is_neox=is_neox_style,
     ):
         return None
     if kv_buffer.dtype != k_nope.dtype:
