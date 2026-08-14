@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
@@ -40,6 +40,38 @@ class FusedMLASetKVBufferArg:
     k_nope: torch.Tensor
     kv_buffer: torch.Tensor
     cache_loc: torch.Tensor
+
+
+def supports_fused_mla_kv_write(
+    *,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    head_size: int,
+    rotary_dim: int,
+    is_neox: bool,
+) -> bool:
+    """Whether a registered RoPE kernel can write the MLA KV cache."""
+    try:
+        select_kernel(
+            "embedding",
+            "rope",
+            format_signature(
+                q=dense_tensor_format(q_dtype),
+                k=dense_tensor_format(k_dtype),
+            ),
+            traits={
+                "head_size": head_size,
+                "partial_rotary": rotary_dim != head_size,
+                "is_neox": is_neox,
+                "has_fused_kv": False,
+                "has_fused_mla_kv": True,
+                "has_q_out": True,
+                "has_k_out": False,
+            },
+        )
+    except NoKernelFoundError:
+        return False
+    return True
 
 
 def apply_rope(
@@ -373,6 +405,7 @@ __all__ = [
     "FusedSetKVBufferArg",
     "apply_rope",
     "apply_rope_mla",
+    "supports_fused_mla_kv_write",
 ]
 
 
