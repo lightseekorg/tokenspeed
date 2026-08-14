@@ -26,6 +26,7 @@ from types import SimpleNamespace  # noqa: E402  (after torch guard)
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.hybrid_kda import (
+    KDA_SLOT_TABLE_PADDING,
     KdaAttnBackend,
 )
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
@@ -1490,3 +1491,22 @@ def test_condemned_row_survives_an_abandoned_prep_without_flushing():
         conv, ssm = h.state_of(layer_id, sentinel[layer_id])
         assert bool((conv == 3.0).all()), "flush wrote a condemned row's page"
         assert bool((ssm == 3.0).all()), "flush wrote a condemned row's page"
+
+
+def test_slot_table_holds_every_index_the_scheduler_can_deliver():
+    """The sentinel row must outlive both real requests and graph padding.
+
+    The C++ scheduler hands out pool indices 1..max_bs and CUDA graph padding
+    rides in on max_bs + 1 (event_loop's req_pool_padding_index). Sizing the
+    table any tighter aliases the sentinel onto a row a live slot can occupy,
+    and pad rows would then read that live slot instead of -1.
+    """
+    h = _Harness(seed=17)
+    table = h.backend._kda_slot_table
+    max_bs = h.backend.max_bs
+    graph_padding_index = max_bs + 1
+
+    assert KDA_SLOT_TABLE_PADDING >= 2
+    assert graph_padding_index < table.shape[0], "graph padding lands out of range"
+    assert table.shape[0] - 1 > max_bs, "sentinel row can hold a live slot"
+    assert h.backend._kda_table_drop_staging.shape[0] == table.shape[0]

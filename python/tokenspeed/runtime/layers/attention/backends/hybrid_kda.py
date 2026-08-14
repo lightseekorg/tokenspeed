@@ -50,7 +50,12 @@ if TYPE_CHECKING:
 
 
 KDA_PREFILL_BACKENDS = ("auto", "fla", "flashkda", "cutedsl_kda")
-KDA_SLOT_TABLE_PADDING = 8
+# Slot-table rows past ``max_bs``, and the minimum that stays correct. The
+# scheduler hands out pool indices 1..max_bs (row 0 reserved) and CUDA graph
+# padding rides in on max_bs + 1, so the table must hold both; the last row is
+# the sentinel every out-of-range index and every pad slot is pointed at, and
+# it only self-masks because no live slot is ever scattered there.
+KDA_SLOT_TABLE_PADDING = 2
 
 
 def _slice_kda_prefill_inputs(
@@ -1361,8 +1366,8 @@ class KdaAttnBackend(MambaAttnBackend):
             slots = torch.arange(real, dtype=torch.int32, device=self.device)
             table.scatter_(0, safe_rpis, torch.where(in_range, slots, -1))
             # Pad slots point at the table's last row, which nothing ever
-            # scatters a live slot into (legal pool indices stop at
-            # max_bs + 1): the flush gate reads -1 there and they self-mask.
+            # scatters a live slot into (real pool indices stop at max_bs):
+            # the flush gate reads -1 there and they self-mask.
             rpi_by_slot = torch.full(
                 (bs,), table.shape[0] - 1, dtype=torch.int64, device=self.device
             )
