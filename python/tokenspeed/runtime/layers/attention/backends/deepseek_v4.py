@@ -1622,6 +1622,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 block_table=compressed_page_table,
                 block_size=compressed_block_size,
                 offset=0,
+                max_gather_len=compressed_base,
             )
             deepseek_v4_dequantize_and_gather_k_cache(
                 out=kv_workspace,
@@ -1632,6 +1633,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 block_table_base_offsets=cache_metadata.swa_base_logical_page,
                 block_size=token_to_kv_pool.swa_block_size,
                 offset=compressed_base,
+                max_gather_len=max_gather_len,
             )
             indices, lens = deepseek_v4_combine_topk_swa_indices(
                 topk_indices=topk_indices,
@@ -1670,6 +1672,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 block_table=compressed_page_table,
                 block_size=compressed_block_size,
                 offset=0,
+                max_gather_len=compressed_base,
             )
         deepseek_v4_dequantize_and_gather_k_cache(
             out=kv_workspace,
@@ -1680,6 +1683,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             block_table_base_offsets=cache_metadata.swa_base_logical_page,
             block_size=token_to_kv_pool.swa_block_size,
             offset=compressed_base,
+            max_gather_len=max_gather_len,
         )
         if compress_ratio > 1:
             dense_compressed_indices = self._dense_prefill_local_compressed_indices(

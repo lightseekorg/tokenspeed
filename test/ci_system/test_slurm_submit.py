@@ -18,6 +18,7 @@ from slurm_submit import (
     result_detail,
     select_tasks,
     source_pr_url,
+    submit,
     write_report,
 )
 
@@ -27,26 +28,42 @@ def write_task(
     runner: str = "gb200-1gpu",
     task_type: str = "eval",
     model: str = "example/model",
+    nodes: int | None = None,
+    gpus_per_node: int | None = None,
 ) -> str:
     workflow_stage = "unit-test" if task_type == "ut" else "model-test"
+    trigger = "slurm" if nodes and nodes > 1 else "manual"
     relative = Path(f"test/ci/{task_type}/example.yaml")
     path = repo / relative
     path.parent.mkdir(parents=True)
-    path.write_text(textwrap.dedent(f"""\
-            api_version: ci.tokenspeed.io/v1
-            name: example
-            type: {task_type}
-            workflow_stage: {workflow_stage}
-            triggers: [manual]
-            runner:
-              labels: [{runner}]
-            server:
-              command: ts serve --model {model}
-              ready:
-                url: http://127.0.0.1:8000/readiness
-            {task_type}:
-              command: run-eval
-            """))
+    lines = [
+        "api_version: ci.tokenspeed.io/v1",
+        "name: example",
+        f"type: {task_type}",
+        f"workflow_stage: {workflow_stage}",
+        f"triggers: [{trigger}]",
+    ]
+    if nodes is not None:
+        lines.extend(
+            [
+                "slurm:",
+                f"  nodes: {nodes}",
+                f"  gpus_per_node: {gpus_per_node}",
+            ]
+        )
+    lines.extend(
+        [
+            "runner:",
+            f"  labels: [{runner}]",
+            "server:",
+            f"  command: ts serve --model {model}",
+            "  ready:",
+            "    url: http://127.0.0.1:8000/readiness",
+            f"{task_type}:",
+            "  command: run-eval",
+        ]
+    )
+    path.write_text("\n".join(lines) + "\n")
     return relative.as_posix()
 
 
@@ -61,6 +78,31 @@ def test_load_task(tmp_path):
     assert load_task(tmp_path, config) == Task(
         config, "example", "eval", "gb200-1gpu", 1
     )
+
+
+def test_load_task_reads_multi_node_topology(tmp_path):
+    config = write_task(
+        tmp_path,
+        runner="slurm-gb200-4node-4gpu",
+        nodes=4,
+        gpus_per_node=4,
+    )
+
+    assert load_task(tmp_path, config) == Task(
+        config, "example", "eval", "slurm-gb200-4node-4gpu", 4, 4
+    )
+
+
+def test_load_task_rejects_gpu_topology_mismatch(tmp_path):
+    config = write_task(
+        tmp_path,
+        runner="slurm-gb200-4node-4gpu",
+        nodes=4,
+        gpus_per_node=2,
+    )
+
+    with pytest.raises(ValueError, match="does not match runner"):
+        load_task(tmp_path, config)
 
 
 def test_load_task_checks_runner(tmp_path):
@@ -224,6 +266,69 @@ def test_render_script_contains_cluster_requirements():
     assert unset in script
     assert script.index(unset) < script.index('srun "${srun_args[@]}"')
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def test_render_script_orchestrates_multi_node_server_and_head_client():
+    script = render_script(
+        Task(
+            "test/ci/eval/example.yaml",
+            "example",
+            "eval",
+            "slurm-gb200-4node-4gpu",
+            4,
+            4,
+        ),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    assert "--nodes=4" in script
+    assert "--ntasks=4" in script
+    assert "--ntasks-per-node=1" in script
+    assert "--gres=gpu:4" in script
+    assert (
+        'head_node="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n \'1p\')"'
+        in script
+    )
+    assert 'client_prepare_args+=(--nodelist="$head_node")' in script
+    assert 'client_srun_args+=(--nodelist="$head_node")' in script
+    assert "--serve-only" in script
+    assert "--external-server" in script
+    assert "SLURM_STEP_NUM_NODES" in script
+    assert "tokenspeed-prepare" in script
+    assert "tokenspeed-client-prepare" in script
+    assert 'server_src="$scratch/server-src"' in script
+    assert 'client_src="$scratch/client-src"' in script
+    assert "tokenspeed-cleanup" in script
+    assert "trap cleanup EXIT" in script
+    subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def test_submit_requests_multi_node_allocation(capsys, tmp_path):
+    task = Task(
+        "test/ci/eval/example.yaml",
+        "example",
+        "eval",
+        "slurm-gb200-4node-4gpu",
+        4,
+        4,
+    )
+    args = argparse.Namespace(
+        partition="batch",
+        time="01:00:00",
+        nodelist=None,
+        render=True,
+    )
+
+    submit(task, "#!/bin/bash\n", tmp_path, args, "a" * 40)
+
+    command = capsys.readouterr().out.splitlines()[0]
+    assert "--nodes=4" in command
+    assert "--ntasks=4" in command
+    assert "--ntasks-per-node=1" in command
+    assert "--gres=gpu:4" in command
 
 
 def test_result_detail_reports_eval_score(tmp_path):

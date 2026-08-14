@@ -450,9 +450,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
 }
 
 void Scheduler::Advance(const ExecutionEvent& event) {
-    const auto dispatch = [this](const auto& inner) { handleEvent(inner); };
     for (const auto& item : event.Events()) {
-        std::visit([&](const auto& outer) { std::visit(dispatch, outer); }, item);
+        std::visit([this](const auto& inner) { handleEvent(inner); }, item);
     }
 }
 

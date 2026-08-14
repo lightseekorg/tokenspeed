@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
+from tokenspeed_kernel_amd.ops.gfx950.attention._common import select_kv_splits
 
 __all__ = [
     "gluon_dsa_decode_gfx950",
@@ -32,6 +33,8 @@ __all__ = [
 
 _REGISTERED_TOPK_WIDTHS = (512, 1024, 2048)
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+_GFX950_COMPUTE_UNITS = 256
+_GLM52_SINGLE_ROW_DECODE_SPLITS = 16
 
 
 @gluon.constexpr_function
@@ -134,11 +137,16 @@ def _dsa_dense_mfma_kv_kernel(
     topk_indices,
     topk_lens,
     out,
+    partial_lse,
     stride_q_t: tl.int64,
     stride_q_h: tl.int64,
     stride_kv_t: tl.int64,
     stride_o_t: tl.int64,
     stride_o_h: tl.int64,
+    stride_o_s: tl.int64,
+    stride_lse_t: tl.int64,
+    stride_lse_h: tl.int64,
+    stride_lse_s: tl.int64,
     stride_topk_t: tl.int64,
     scale: tl.float32,
     num_heads: tl.int32,
@@ -149,6 +157,7 @@ def _dsa_dense_mfma_kv_kernel(
     D_ROPE: gl.constexpr,
     IS_FP8: gl.constexpr,
     TRIM_EMPTY_TILES: gl.constexpr,
+    NUM_KV_SPLITS: gl.constexpr,
 ):
     INSTR_K: gl.constexpr = 32 if IS_FP8 else 16
     QK_K_WIDTH: gl.constexpr = 16 if IS_FP8 else 8
@@ -266,6 +275,10 @@ def _dsa_dense_mfma_kv_kernel(
 
     token_idx = gl.program_id(axis=0)
     hg_idx = gl.program_id(axis=1)
+    if NUM_KV_SPLITS > 1:
+        split_idx = gl.program_id(axis=2)
+    else:
+        split_idx: gl.constexpr = 0
     hg_offset = hg_idx * BLOCK_H
     valid_len = gl.load(topk_lens + token_idx).to(tl.int32)
 
@@ -322,17 +335,33 @@ def _dsa_dense_mfma_kv_kernel(
 
     NUM_TILES: gl.constexpr = (TOPK + TILE_K - 1) // TILE_K
     if TRIM_EMPTY_TILES:
-        num_tiles = gl.maximum(
-            gl.cdiv(gl.minimum(gl.maximum(valid_len, 0), TOPK), TILE_K),
-            1,
+        total_tiles = gl.cdiv(
+            gl.minimum(gl.maximum(valid_len, 0), TOPK),
+            TILE_K,
         )
     else:
-        num_tiles: gl.constexpr = NUM_TILES
+        total_tiles: gl.constexpr = NUM_TILES
+    if NUM_KV_SPLITS > 1:
+        tile_start = (split_idx * total_tiles) // NUM_KV_SPLITS
+        tile_end = ((split_idx + 1) * total_tiles) // NUM_KV_SPLITS
+        split_has_tiles = tile_start < tile_end
+        num_tiles = gl.maximum(tile_end - tile_start, 1)
+    else:
+        tile_start: gl.constexpr = 0
+        split_has_tiles: gl.constexpr = True
+        if TRIM_EMPTY_TILES:
+            num_tiles = gl.maximum(total_tiles, 1)
+        else:
+            num_tiles: gl.constexpr = NUM_TILES
     topk_base = token_idx.to(tl.int64) * stride_topk_t
 
-    offs_tile_klora = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, blk_klora))
-    offs_tile_krope = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, blk_krope))
-    offs_tile_mma = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, mfma_s))
+    first_tile_base = tile_start * TILE_K
+    local_offs_klora = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, blk_klora))
+    local_offs_krope = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, blk_krope))
+    local_offs_mma = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, mfma_s))
+    offs_tile_klora = first_tile_base + local_offs_klora
+    offs_tile_krope = first_tile_base + local_offs_krope
+    offs_tile_mma = first_tile_base + local_offs_mma
 
     offs_v_klora = gl.arange(0, D_V, layout=gl.SliceLayout(1, blk_klora))
     offs_r_krope = gl.arange(0, D_ROPE, layout=gl.SliceLayout(1, blk_krope))
@@ -340,25 +369,29 @@ def _dsa_dense_mfma_kv_kernel(
     topk_pos_klora = gl.amd.cdna4.buffer_load(
         ptr=topk_indices,
         offsets=topk_base.to(tl.int32) + offs_tile_klora,
-        mask=offs_tile_klora < TOPK,
+        mask=split_has_tiles & (offs_tile_klora < TOPK),
         other=-1,
     )
     topk_pos_krope = gl.amd.cdna4.buffer_load(
         ptr=topk_indices,
         offsets=topk_base.to(tl.int32) + offs_tile_krope,
-        mask=offs_tile_krope < TOPK,
+        mask=split_has_tiles & (offs_tile_krope < TOPK),
         other=-1,
     )
     topk_pos_mma = gl.amd.cdna4.buffer_load(
         ptr=topk_indices,
         offsets=topk_base.to(tl.int32) + offs_tile_mma,
-        mask=offs_tile_mma < TOPK,
+        mask=split_has_tiles & (offs_tile_mma < TOPK),
         other=-1,
     )
 
-    valid_klora = (offs_tile_klora < valid_len) & (topk_pos_klora != -1)
-    valid_krope = (offs_tile_krope < valid_len) & (topk_pos_krope != -1)
-    valid_mma = (offs_tile_mma < valid_len) & (topk_pos_mma != -1)
+    valid_klora = (
+        split_has_tiles & (offs_tile_klora < valid_len) & (topk_pos_klora >= 0)
+    )
+    valid_krope = (
+        split_has_tiles & (offs_tile_krope < valid_len) & (topk_pos_krope >= 0)
+    )
+    valid_mma = split_has_tiles & (offs_tile_mma < valid_len) & (topk_pos_mma >= 0)
     safe_klora = gl.where(valid_klora, topk_pos_klora, 0)
     safe_krope = gl.where(valid_krope, topk_pos_krope, 0)
 
@@ -413,10 +446,10 @@ def _dsa_dense_mfma_kv_kernel(
 
     cur_buf = 0
     for tile_idx in range(num_tiles - 1):
-        next_base = (tile_idx + 1) * TILE_K
-        next_offs_klora = next_base + offs_tile_klora
-        next_offs_krope = next_base + offs_tile_krope
-        next_offs_mma = next_base + offs_tile_mma
+        next_base = (tile_start + tile_idx + 1) * TILE_K
+        next_offs_klora = next_base + local_offs_klora
+        next_offs_krope = next_base + local_offs_krope
+        next_offs_mma = next_base + local_offs_mma
 
         topk_pos_klora_next = gl.amd.cdna4.buffer_load(
             ptr=topk_indices,
@@ -437,9 +470,9 @@ def _dsa_dense_mfma_kv_kernel(
             other=-1,
         )
 
-        valid_klora_next = (next_offs_klora < valid_len) & (topk_pos_klora_next != -1)
-        valid_krope_next = (next_offs_krope < valid_len) & (topk_pos_krope_next != -1)
-        valid_mma_next = (next_offs_mma < valid_len) & (topk_pos_mma_next != -1)
+        valid_klora_next = (next_offs_klora < valid_len) & (topk_pos_klora_next >= 0)
+        valid_krope_next = (next_offs_krope < valid_len) & (topk_pos_krope_next >= 0)
+        valid_mma_next = (next_offs_mma < valid_len) & (topk_pos_mma_next >= 0)
         safe_klora_next = gl.where(valid_klora_next, topk_pos_klora_next, 0)
         safe_krope_next = gl.where(valid_krope_next, topk_pos_krope_next, 0)
         next_buf = 1 - cur_buf
@@ -487,9 +520,9 @@ def _dsa_dense_mfma_kv_kernel(
 
         m_j = gl.max(scores, axis=1)
         m_new = gl.maximum(m_i, m_j)
-        m_new = gl.where(m_new > -float("inf"), m_new, 0.0)
-        alpha = gl.exp(m_i - m_new)
-        probs = gl.exp(scores - m_new[:, None])
+        safe_m_new = gl.where(m_new > -float("inf"), m_new, 0.0)
+        alpha = gl.exp(m_i - safe_m_new)
+        probs = gl.exp(scores - safe_m_new[:, None])
         l_new = alpha * l_i + gl.sum(probs, axis=1)
 
         alpha_acc = gl.convert_layout(alpha, gl.SliceLayout(1, mfma_acc))
@@ -524,9 +557,9 @@ def _dsa_dense_mfma_kv_kernel(
 
     m_j = gl.max(scores, axis=1)
     m_new = gl.maximum(m_i, m_j)
-    m_new = gl.where(m_new > -float("inf"), m_new, 0.0)
-    alpha = gl.exp(m_i - m_new)
-    probs = gl.exp(scores - m_new[:, None])
+    safe_m_new = gl.where(m_new > -float("inf"), m_new, 0.0)
+    alpha = gl.exp(m_i - safe_m_new)
+    probs = gl.exp(scores - safe_m_new[:, None])
     l_new = alpha * l_i + gl.sum(probs, axis=1)
 
     alpha_acc = gl.convert_layout(alpha, gl.SliceLayout(1, mfma_acc))
@@ -542,7 +575,12 @@ def _dsa_dense_mfma_kv_kernel(
     offs_h_o = hg_offset + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blk_out))
     offs_v_o = gl.arange(0, D_V, layout=gl.SliceLayout(0, blk_out))
     mask_h_o = offs_h_o < num_heads
-    o_base = token_idx.to(tl.int64) * stride_o_t
+    if NUM_KV_SPLITS > 1:
+        o_base = (
+            token_idx.to(tl.int64) * stride_o_t + split_idx.to(tl.int64) * stride_o_s
+        )
+    else:
+        o_base = token_idx.to(tl.int64) * stride_o_t
     o_offs = (
         o_base
         + offs_h_o[:, None].to(tl.int64) * stride_o_h
@@ -555,6 +593,66 @@ def _dsa_dense_mfma_kv_kernel(
         offsets=o_offs.to(tl.int32),
         mask=mask_h_o[:, None],
     )
+
+    if NUM_KV_SPLITS > 1:
+        lse = gl.where(l_new > 0.0, m_new + gl.log(l_new), -float("inf"))
+        lse_offsets = (
+            token_idx.to(tl.int64) * stride_lse_t
+            + offs_h_mma.to(tl.int64) * stride_lse_h
+            + split_idx.to(tl.int64) * stride_lse_s
+        )
+        gl.amd.cdna4.buffer_store(
+            stored_value=lse,
+            ptr=partial_lse,
+            offsets=lse_offsets.to(tl.int32),
+            mask=mask_h_mma,
+        )
+
+
+@triton.jit
+def _dsa_dense_mfma_reduce_kernel(
+    partial_out,
+    partial_lse,
+    out,
+    stride_po_t: tl.constexpr,
+    stride_po_h: tl.constexpr,
+    stride_po_s: tl.constexpr,
+    stride_lse_t: tl.constexpr,
+    stride_lse_h: tl.constexpr,
+    stride_lse_s: tl.constexpr,
+    stride_o_t: tl.constexpr,
+    stride_o_h: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    D_V: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    offs_v = tl.arange(0, D_V)
+    lse_base = token_idx * stride_lse_t + head_idx * stride_lse_h
+    partial_base = token_idx * stride_po_t + head_idx * stride_po_h
+
+    max_lse = -float("inf")
+    for split_idx in range(NUM_KV_SPLITS):
+        split_lse = tl.load(partial_lse + lse_base + split_idx * stride_lse_s)
+        max_lse = tl.maximum(max_lse, split_lse)
+
+    denom = 0.0
+    acc = tl.zeros([D_V], dtype=tl.float32)
+    safe_max_lse = tl.where(max_lse > -float("inf"), max_lse, 0.0)
+    for split_idx in range(NUM_KV_SPLITS):
+        split_lse = tl.load(partial_lse + lse_base + split_idx * stride_lse_s)
+        split_valid = split_lse > -float("inf")
+        safe_split_lse = tl.where(split_valid, split_lse, 0.0)
+        weight = tl.where(split_valid, tl.exp(safe_split_lse - safe_max_lse), 0.0)
+        partial = tl.load(
+            partial_out + partial_base + split_idx * stride_po_s + offs_v
+        ).to(tl.float32)
+        acc += weight * partial
+        denom += weight
+
+    safe_denom = tl.where(denom > 0.0, denom, 1.0)
+    result = tl.where(denom > 0.0, acc / safe_denom, 0.0)
+    tl.store(out + token_idx * stride_o_t + head_idx * stride_o_h + offs_v, result)
 
 
 @gluon.jit
@@ -831,6 +929,40 @@ def _output_dtype(q: torch.Tensor) -> torch.dtype:
     return torch.bfloat16 if q.dtype in _FP8_DTYPES else q.dtype
 
 
+def _shares_storage(tensor: torch.Tensor, *others: torch.Tensor | None) -> bool:
+    storage_ptr = tensor.untyped_storage().data_ptr()
+    return any(
+        other is not None and other.untyped_storage().data_ptr() == storage_ptr
+        for other in others
+    )
+
+
+def _select_num_kv_splits(
+    *,
+    num_tokens: int,
+    num_heads: int,
+    topk_width: int,
+    max_seqlen_k: int,
+    is_fp8: bool,
+) -> int:
+    work_tiles = max(1, (min(int(topk_width), int(max_seqlen_k)) + 31) // 32)
+    if not is_fp8 or work_tiles <= 8:
+        return 1
+    if (
+        int(num_tokens) == 1
+        and int(num_heads) == 16
+        and int(topk_width) == 2048
+        and work_tiles == 64
+    ):
+        return _GLM52_SINGLE_ROW_DECODE_SPLITS
+    base_ctas = max(1, int(num_tokens) * triton.cdiv(int(num_heads), 16))
+    return select_kv_splits(
+        base_ctas=base_ctas,
+        num_pages=work_tiles,
+        sm_count=_GFX950_COMPUTE_UNITS,
+    )
+
+
 def _trim_topk_slots_for_context(
     topk_slots: torch.Tensor,
     max_seqlen_k: int,
@@ -857,27 +989,64 @@ def _run_dense_kv(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     max_seqlen_k: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    out = torch.empty(
-        (q.shape[0], q.shape[1], kv_lora_rank),
-        dtype=_output_dtype(q),
-        device=q.device,
+    if out is None:
+        out = torch.empty(
+            (q.shape[0], q.shape[1], kv_lora_rank),
+            dtype=_output_dtype(q),
+            device=q.device,
+        )
+    num_kv_splits = _select_num_kv_splits(
+        num_tokens=q.shape[0],
+        num_heads=q.shape[1],
+        topk_width=topk_slots.shape[1],
+        max_seqlen_k=max_seqlen_k,
+        is_fp8=q.dtype in _FP8_DTYPES,
     )
+    if num_kv_splits == 1:
+        stage_out = out
+        partial_lse = out
+        stride_o_t, stride_o_h = out.stride(0), out.stride(1)
+        stride_o_s = 0
+        stride_lse_t = stride_lse_h = stride_lse_s = 0
+    else:
+        stage_out = torch.empty(
+            (q.shape[0], q.shape[1], num_kv_splits, kv_lora_rank),
+            dtype=out.dtype,
+            device=q.device,
+        )
+        partial_lse = torch.empty(
+            (q.shape[0], q.shape[1], num_kv_splits),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        stride_o_t, stride_o_h, stride_o_s = stage_out.stride()[:3]
+        stride_lse_t, stride_lse_h, stride_lse_s = partial_lse.stride()
 
     def grid(meta):
-        return q.shape[0], triton.cdiv(q.shape[1], meta["BLOCK_H"])
+        return (
+            q.shape[0],
+            triton.cdiv(q.shape[1], meta["BLOCK_H"]),
+            num_kv_splits,
+        )
 
     _dsa_dense_mfma_kv_kernel[grid](
         q,
         kv_cache,
         topk_slots,
         topk_lens,
-        out,
+        stage_out,
+        partial_lse,
         q.stride(0),
         q.stride(1),
         kv_cache.stride(0),
-        out.stride(0),
-        out.stride(1),
+        stride_o_t,
+        stride_o_h,
+        stride_o_s,
+        stride_lse_t,
+        stride_lse_h,
+        stride_lse_s,
         topk_slots.stride(0),
         float(softmax_scale),
         q.shape[1],
@@ -886,10 +1055,28 @@ def _run_dense_kv(
         D_ROPE=qk_rope_head_dim,
         IS_FP8=q.dtype in _FP8_DTYPES,
         TRIM_EMPTY_TILES=int(max_seqlen_k) < int(topk_slots.shape[1]),
+        NUM_KV_SPLITS=num_kv_splits,
         BLOCK_H=16,
         TILE_K=32,
         num_warps=4,
     )
+    if num_kv_splits > 1:
+        _dsa_dense_mfma_reduce_kernel[(q.shape[0], q.shape[1])](
+            stage_out,
+            partial_lse,
+            out,
+            stage_out.stride(0),
+            stage_out.stride(1),
+            stage_out.stride(2),
+            partial_lse.stride(0),
+            partial_lse.stride(1),
+            partial_lse.stride(2),
+            out.stride(0),
+            out.stride(1),
+            NUM_KV_SPLITS=num_kv_splits,
+            D_V=kv_lora_rank,
+            num_warps=4,
+        )
     return out
 
 
@@ -997,6 +1184,23 @@ def _run_dsa(
     topk_lens = topk_lens.contiguous()
     topk_slots = _trim_topk_slots_for_context(topk_slots, max_seqlen_k)
     softmax_scale = float(softmax_scale) * float(k_scale)
+    out_view = None
+    if (
+        out is not None
+        and out.is_contiguous()
+        and out.device == q.device
+        and not _shares_storage(
+            out,
+            q,
+            kv_cache,
+            sparse_kv_cache,
+            topk_slots,
+            topk_lens,
+        )
+    ):
+        expected_numel = q.shape[0] * q.shape[1] * kv_lora_rank
+        if out.numel() == expected_numel and out.dtype == _output_dtype(q):
+            out_view = out.view(q.shape[0], q.shape[1], kv_lora_rank)
     # The tiled kernel maps to dense BF16 or FP8 KV. TokenSpeed's packed sparse
     # FP8 rows use a different physical layout, so they use the packed sparse
     # implementation instead of the dense tiled implementation.
@@ -1027,6 +1231,7 @@ def _run_dsa(
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 max_seqlen_k=max_seqlen_k,
+                out=out_view,
             )
         else:
             result = _run_dense_kv_scalar(
@@ -1042,8 +1247,8 @@ def _run_dsa(
         raise ValueError("Gluon DSA requires kv_cache or sparse_kv_cache")
     if out is None:
         return result
-    out_view = out.reshape_as(result)
-    out_view.copy_(result)
+    if result is not out_view:
+        out.copy_(result.reshape_as(out))
     return out
 
 

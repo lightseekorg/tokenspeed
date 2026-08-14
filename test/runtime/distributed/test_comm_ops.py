@@ -36,6 +36,7 @@ class TestAutoBackendTopology:
         backend._rsag = Mock()
         backend._triton_ar = Mock()
         backend._trtllm_ar = Mock()
+        backend._trtllm_ar.has_trtllm_ar.return_value = False
         return backend
 
     def test_group_spans_nodes(self, backend):
@@ -76,7 +77,7 @@ class TestAutoBackendTopology:
         # workspace spans nodes, and it is only armed when that succeeded.
         # NCCL is the fallback for when it is not armed.
         backend._trtllm_ar.has_trtllm_ar.return_value = False
-        tensor = Mock()
+        tensor = torch.empty(1)
         backend._nccl.all_reduce.return_value = "nccl-result"
 
         result = backend.all_reduce(tensor, tuple(range(8)))
@@ -85,13 +86,14 @@ class TestAutoBackendTopology:
         backend._nccl.all_reduce.assert_called_once_with(
             tensor, tuple(range(8)), op=None
         )
+        backend._trtllm_ar.has_trtllm_ar.assert_called_once_with(tuple(range(8)))
         backend._triton_ar.can_run.assert_not_called()
 
     def test_cross_node_all_reduce_uses_trtllm_when_armed(self, backend):
         """An armed mnnvl workspace serves cross-node groups directly."""
         backend._trtllm_ar.has_trtllm_ar.return_value = True
         backend._trtllm_ar.all_reduce.return_value = "trtllm-result"
-        tensor = Mock()
+        tensor = torch.empty(1)
 
         result = backend.all_reduce(tensor, tuple(range(8)))
 
@@ -206,7 +208,7 @@ DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 
 
 def _test_all_reduce(rank, world_size, device, group, ref_group):
-    from tokenspeed.runtime.distributed.comm_ops import all_reduce, all_reduce_two
+    from tokenspeed.runtime.distributed.comm_ops import all_reduce
 
     for sz in TEST_SIZES:
         for dtype in DTYPES:
@@ -224,21 +226,16 @@ def _test_all_reduce(rank, world_size, device, group, ref_group):
         result = all_reduce(inp.clone(), group)
         torch.testing.assert_close(result, expected)
 
-    # Independent production-sized Kimi shared and routed segments. AMD Iris
-    # handles this with one kernel; other backends use the two-call fallback.
-    first = torch.randint(1, 16, (1, 7168), dtype=torch.bfloat16, device=device)
-    second = torch.randint(1, 16, (1, 3584), dtype=torch.bfloat16, device=device)
-    expected_first = first.clone()
-    expected_second = second.clone()
-    dist.all_reduce(expected_first, group=ref_group)
-    dist.all_reduce(expected_second, group=ref_group)
-    result_first, result_second = all_reduce_two(
-        first.clone(),
-        second.clone(),
-        group,
+    inputs = tuple(
+        torch.randint(1, 16, (size,), dtype=torch.float32, device=device)
+        for size in (8, 12, 16)
     )
-    torch.testing.assert_close(result_first, expected_first)
-    torch.testing.assert_close(result_second, expected_second)
+    expected = tuple(tensor.clone() for tensor in inputs)
+    for tensor in expected:
+        dist.all_reduce(tensor, group=ref_group)
+    results = all_reduce(tuple(tensor.clone() for tensor in inputs), group)
+    for result, reference in zip(results, expected):
+        torch.testing.assert_close(result, reference)
 
 
 def _test_all_gather(rank, world_size, device, group, ref_group):

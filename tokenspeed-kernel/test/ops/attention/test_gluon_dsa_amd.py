@@ -695,12 +695,25 @@ def test_dsa_prefill_topk_fp8_glm52_cases(case: _TopKPrefillCase) -> None:
     _assert_topk_matches(workspace_indices, topk_lens, expected_indices, expected_lens)
 
 
-@pytest.mark.skipif(
-    not is_cdna4(), reason="BF16 split-weight support is specific to gfx950"
-)
+if is_cdna4():
+    _BF16_SPLIT_WEIGHT_DECODE_CASES = (
+        (8192, False),
+        (8192, True),
+        (16384, False),
+        (16384, True),
+    )
+else:
+    _BF16_SPLIT_WEIGHT_DECODE_CASES = (
+        (49152, False),
+        (49152, True),
+        (49153, False),
+        (49153, True),
+    )
+
+
 @pytest.mark.parametrize(
     ("seq_len", "capture_graph"),
-    ((8192, False), (8192, True), (16384, False), (16384, True)),
+    _BF16_SPLIT_WEIGHT_DECODE_CASES,
     ids=("fused-eager", "fused-graph", "precombined-eager", "precombined-graph"),
 )
 def test_dsa_decode_topk_fp8_accepts_glm52_bf16_split_weights(
@@ -773,9 +786,6 @@ def test_dsa_decode_topk_fp8_accepts_glm52_bf16_split_weights(
     _assert_topk_matches(topk_slots, topk_lens, expected_slots, expected_lens)
 
 
-@pytest.mark.skipif(
-    not is_cdna4(), reason="BF16 split-weight support is specific to gfx950"
-)
 def test_dsa_prefill_topk_fp8_accepts_glm52_bf16_split_weights() -> None:
     device = "cuda"
     page_size = 64
@@ -1100,14 +1110,7 @@ def _assert_slots_visible(
     [
         pytest.param(torch.bfloat16, id="q_bf16"),
         pytest.param(torch.float8_e4m3fn, id="q_e4m3"),
-        pytest.param(
-            torch.float8_e5m2,
-            id="q_e5m2",
-            marks=pytest.mark.skipif(
-                not is_cdna4(),
-                reason="E5M2 DSA support is specific to gfx950",
-            ),
-        ),
+        pytest.param(torch.float8_e5m2, id="q_e5m2"),
     ],
 )
 def test_dsa_with_sparse_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
@@ -1176,14 +1179,7 @@ def test_dsa_with_sparse_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
     [
         pytest.param(torch.bfloat16, id="q_bf16"),
         pytest.param(torch.float8_e4m3fn, id="q_e4m3"),
-        pytest.param(
-            torch.float8_e5m2,
-            id="q_e5m2",
-            marks=pytest.mark.skipif(
-                not is_cdna4(),
-                reason="E5M2 DSA support is specific to gfx950",
-            ),
-        ),
+        pytest.param(torch.float8_e5m2, id="q_e5m2"),
     ],
 )
 @pytest.mark.parametrize(
@@ -1253,10 +1249,6 @@ def test_dsa_dense_kvcache(
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 
-@pytest.mark.skipif(
-    not is_cdna4(),
-    reason="dense FP8 specialization is specific to the gfx950 implementation",
-)
 @pytest.mark.parametrize(
     "api",
     [
@@ -1267,8 +1259,31 @@ def test_dsa_dense_kvcache(
 @pytest.mark.parametrize(
     ("valid_lengths", "max_seqlen_k"),
     [
-        pytest.param((0, 1, 33, 2048), 2112, id="static-full-width"),
-        pytest.param((0, 1, 31, 33), 33, id="dynamic-short-list"),
+        pytest.param(
+            (0, 1, 31, 32, 33, 63, 64, 65, 2048),
+            2112,
+            id="static-full-width",
+        ),
+        pytest.param(
+            (0, 1, 31, 32, 33, 63, 64, 65),
+            65,
+            id="dynamic-short-list",
+        ),
+        pytest.param(
+            (2048,),
+            2112,
+            id="single-row-full-width",
+        ),
+        pytest.param(
+            (1024,),
+            1024,
+            id="registered-width-1024",
+        ),
+        pytest.param(
+            (0, 1, 31, 32, 33, 65, 1025),
+            1025,
+            id="dynamic-split-rows",
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -1285,7 +1300,7 @@ def test_dsa_dense_fp8_glm52_production_shape(
     fp8_dtype: torch.dtype,
 ) -> None:
     device = "cuda"
-    tokens = 4
+    tokens = len(valid_lengths)
     num_heads = 16
     num_slots = 2112
     topk = 2048
@@ -1337,6 +1352,16 @@ def test_dsa_dense_fp8_glm52_production_shape(
     )
     assert out.shape == (tokens, num_heads, kv_lora_rank)
     assert out.dtype == torch.bfloat16
+    assert torch.isfinite(out).all()
+    empty_rows = torch.tensor(
+        [row for row, valid_len in enumerate(valid_lengths) if valid_len == 0],
+        device=device,
+        dtype=torch.int64,
+    )
+    empty_out = out.index_select(0, empty_rows)
+    torch.testing.assert_close(
+        empty_out, torch.zeros_like(empty_out), rtol=0.0, atol=0.0
+    )
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 

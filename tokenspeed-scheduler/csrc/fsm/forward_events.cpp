@@ -29,19 +29,18 @@
 
 namespace tokenspeed::fsm {
 
-template <typename State>
-std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::scheduleFirstChunk(State&& state) {
+std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::scheduleFirstChunk(
+    TokenContainer* token_container, std::int32_t prefix_granularity) {
     _assert(coordinator_ != nullptr, "SchedulePrefillFirstChunkEvent requires a cache coordinator");
     _assert(block_tables_.size() == static_cast<std::size_t>(coordinator_->NumGroups()),
             "SchedulePrefillFirstChunkEvent requires one admitted table per cache group");
 
-    TokenContainer* token_container = state.TokenContainerPtr();
     auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
     TokenContainer::Window window{.begin = hit_tokens_, .size = tokens_this_round_};
     const bool is_last_chunk = window.begin + window.size == token_container->PrefillSize();
     if (is_last_chunk && source_ == PrefillSource::kLocal) {
         return PrefillDone{token_container,
-                           state.PrefixGranularity(),
+                           prefix_granularity,
                            std::move(req_pool_index),
                            window,
                            reserve_num_tokens_in_next_schedule_event_,
@@ -49,7 +48,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::scheduleFi
                            std::move(cache_progress_)};
     }
     return Prefilling{token_container,
-                      state.PrefixGranularity(),
+                      prefix_granularity,
                       std::move(req_pool_index),
                       window,
                       reserve_num_tokens_in_next_schedule_event_,
@@ -59,11 +58,11 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::scheduleFi
 }
 
 std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
-    return scheduleFirstChunk(std::move(state));
+    return scheduleFirstChunk(state.TokenContainerPtr(), state.PrefixGranularity());
 }
 
 std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()(Retracted&& state) {
-    return scheduleFirstChunk(std::move(state));
+    return scheduleFirstChunk(state.TokenContainerPtr(), state.PrefixGranularity());
 }
 
 std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefilling&& state) {

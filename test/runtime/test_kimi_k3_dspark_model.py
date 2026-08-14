@@ -22,6 +22,7 @@ from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     k3_dspark_inactive_features,
     validate_k3_dspark_config,
 )
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.models import kimi_k3_dspark as dspark_model_module
 from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkModel
 
@@ -268,6 +269,24 @@ def test_confidence_head_is_reported_inactive_rather_than_dropped() -> None:
 
 def test_no_inactive_features_reported_without_a_confidence_head() -> None:
     assert k3_dspark_inactive_features(make_config(enable_confidence_head=False)) == []
+
+
+def test_idle_forward_with_no_rows_skips_dense_draft_layers() -> None:
+    model = K3DSparkModel.__new__(K3DSparkModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(hidden_size=4)
+    model.context_norm = SimpleNamespace(weight=torch.empty(4))
+    model.layers = [mock.Mock()]
+    model.final_norm = mock.Mock()
+    ctx = SimpleNamespace(forward_mode=ForwardMode.IDLE)
+    empty = torch.empty((0,), dtype=torch.int32)
+
+    output = model(ctx, input_ids=empty, positions=empty, out_cache_loc=empty)
+
+    assert output.next_token_logits is None
+    assert output.hidden_states.shape == (0, 4)
+    model.layers[0].assert_not_called()
+    model.final_norm.assert_not_called()
 
 
 def test_final_norm_reduces_the_last_row_parallel_mlp_output() -> None:

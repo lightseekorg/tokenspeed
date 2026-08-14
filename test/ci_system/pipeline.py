@@ -31,7 +31,7 @@ except ImportError as exc:  # pragma: no cover
 
 
 SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
-SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug"}
+SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug", "slurm"}
 WORKFLOW_STAGE_TYPES = {
     "unit-test": {"ut", "server_smoke"},
     "model-test": {"eval", "perf"},
@@ -65,13 +65,13 @@ JIT_CACHE_ENV_SUBDIRS = {
 }
 RUNNER_SM_PREFIXES = (
     (("h100", "h200"), "sm90"),
-    (("b200", "gb200"), "sm100"),
+    (("b200", "gb200", "slurm-gb200"), "sm100"),
     (("b300", "gb300"), "sm103"),
 )
 
 AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-")
 NVIDIA_ARM_RUNNER_PREFIXES = ("gb200",)
-GB200_RUNNER_PREFIXES = ("gb200",)
+GB200_RUNNER_PREFIXES = ("gb200", "slurm-gb200")
 NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES = ("gb200", "b300")
 PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
 
@@ -227,6 +227,43 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 f"{path}: optional must be a boolean or a per-label mapping; "
                 f"got {type(optional).__name__}"
             )
+    if "slurm" in data:
+        slurm = data["slurm"]
+        if not isinstance(slurm, dict):
+            raise ValueError(f"{path}: slurm must be a mapping")
+        unknown = sorted(set(slurm) - {"nodes", "gpus_per_node"})
+        if unknown:
+            raise ValueError(f"{path}: unsupported slurm keys: {unknown}")
+        missing_slurm = sorted({"nodes", "gpus_per_node"} - set(slurm))
+        if missing_slurm:
+            raise ValueError(f"{path}: missing slurm keys: {missing_slurm}")
+        for key in ("nodes", "gpus_per_node"):
+            value = slurm[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{path}: slurm.{key} must be a positive integer")
+        if slurm["nodes"] > 1:
+            if data["type"] not in {"eval", "perf"}:
+                raise ValueError(
+                    f"{path}: multi-node Slurm tasks must have type 'eval' or 'perf'"
+                )
+            if data["triggers"] != ["slurm"]:
+                raise ValueError(
+                    f"{path}: multi-node Slurm tasks must use only the 'slurm' trigger"
+                )
+            if not all(label.startswith("slurm-") for label in labels):
+                raise ValueError(
+                    f"{path}: multi-node Slurm runner labels must start with 'slurm-'"
+                )
+            server = data.get("server", {})
+            if not isinstance(server, dict) or not server.get("command"):
+                raise ValueError(
+                    f"{path}: multi-node Slurm tasks require server.command"
+                )
+            ready = server.get("ready", {})
+            if not isinstance(ready, dict) or not ready.get("url"):
+                raise ValueError(
+                    f"{path}: multi-node Slurm tasks require server.ready.url"
+                )
 
 
 def normalize_task(path: Path, repo_root: Path) -> Dict[str, Any]:
@@ -586,7 +623,14 @@ def setup_runner(
             raise RuntimeError(
                 "SLURM_JOB_ID is required when --setup-mode=slurm is used"
             )
-        pgm = ProcessGroupManager(runner_id=f"slurm-{job_id}")
+        runner_id = f"slurm-{job_id}"
+        step_id = local_env.get("SLURM_STEP_ID")
+        proc_id = local_env.get("SLURM_PROCID")
+        if step_id:
+            runner_id += f"-step-{step_id}"
+        if proc_id:
+            runner_id += f"-proc-{proc_id}"
+        pgm = ProcessGroupManager(runner_id=runner_id)
         local_env["CI_RUNNER_ID"] = pgm.runner_id
         print(f"[slurm] runner_id={pgm.runner_id}", flush=True)
         return local_env, pgm
@@ -1576,6 +1620,8 @@ def execute_task(
     keep_runner_state: bool = False,
     reuse_runner_state: bool = False,
     setup_mode: str = "ci",
+    serve_only: bool = False,
+    external_server: bool = False,
 ) -> int:
     if setup_mode not in SUPPORTED_SETUP_MODES:
         raise ValueError(f"unsupported setup mode: {setup_mode!r}")
@@ -1583,6 +1629,12 @@ def execute_task(
         raise ValueError(
             "--keep-runner-state and --reuse-runner-state are not supported "
             "with --setup-mode=slurm"
+        )
+    if serve_only and external_server:
+        raise ValueError("--serve-only and --external-server cannot be combined")
+    if (serve_only or external_server) and setup_mode != "slurm":
+        raise ValueError(
+            "--serve-only and --external-server require --setup-mode=slurm"
         )
 
     repo_root = Path(work_dir).resolve()
@@ -1606,8 +1658,23 @@ def execute_task(
         for cache_dir in jit_cache_env.values():
             Path(cache_dir).mkdir(parents=True, exist_ok=True)
 
+    task_stages = get_stage_commands(task)
+    if serve_only or external_server:
+        if task["type"] not in {"eval", "perf"} or not any(
+            name == "server" for name, _ in task_stages
+        ):
+            raise ValueError(
+                "--serve-only and --external-server require an eval/perf task "
+                "with a server stage"
+            )
+    if serve_only:
+        task_stages = [
+            (name, payload)
+            for name, payload in task_stages
+            if name in {"install", "server"}
+        ]
     stages = filter_stage_commands(
-        get_stage_commands(task),
+        task_stages,
         only_stages=only_stages,
         skip_stages=skip_stages or set(),
     )
@@ -1621,6 +1688,11 @@ def execute_task(
                     "config": config,
                     "runner": runner,
                     "setup_mode": setup_mode,
+                    "server_mode": (
+                        "serve-only"
+                        if serve_only
+                        else "external" if external_server else "managed"
+                    ),
                     "stages": [name for name, _ in stages],
                     "targets": targets,
                 },
@@ -1662,6 +1734,27 @@ def execute_task(
                     server_command = configure_slurm_server_command(
                         server_command, int(ready["timeout"])
                     )
+                if serve_only:
+                    if pgm is not None:
+                        command_result = pgm.run(
+                            server_command,
+                            cwd=repo_root,
+                            env=runner_env,
+                            dry_run=dry_run,
+                        )
+                    else:
+                        command_result = shell_run(
+                            server_command,
+                            env=runner_env,
+                            cwd=repo_root,
+                            dry_run=dry_run,
+                        )
+                    command_result["stage"] = stage_name
+                    command_results.append(command_result)
+                    continue
+                if external_server:
+                    poll_readiness(ready, dry_run)
+                    continue
                 if enable_perf_diagnostics:
                     run_perf_diagnostics(
                         "before server", runner_env, repo_root, dry_run
@@ -1775,6 +1868,9 @@ def execute_task(
         "type": task["type"],
         "runner": runner,
         "setup_mode": setup_mode,
+        "server_mode": (
+            "serve-only" if serve_only else "external" if external_server else "managed"
+        ),
         "executed_stages": stages_run,
         "targets": targets,
         "command_results": command_results,
@@ -1872,6 +1968,17 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default="ci",
         help="Runner setup policy. Slurm mode avoids host-wide CI mutations.",
     )
+    server_mode = execute_parser.add_mutually_exclusive_group()
+    server_mode.add_argument(
+        "--serve-only",
+        action="store_true",
+        help="Run install and the server in the foreground for a Slurm server step.",
+    )
+    server_mode.add_argument(
+        "--external-server",
+        action="store_true",
+        help="Wait for an externally managed server before running eval or perf.",
+    )
 
     return parser.parse_args(argv)
 
@@ -1904,6 +2011,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             keep_runner_state=args.keep_runner_state,
             reuse_runner_state=args.reuse_runner_state,
             setup_mode=args.setup_mode,
+            serve_only=args.serve_only,
+            external_server=args.external_server,
         )
 
     raise ValueError(f"unsupported command: {args.command}")

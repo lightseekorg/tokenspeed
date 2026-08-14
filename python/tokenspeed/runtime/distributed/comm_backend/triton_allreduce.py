@@ -23,27 +23,44 @@
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.triton import (
+    acquire_symm_outputs,
     all_reduce,
     all_reduce_can_run,
-    all_reduce_two,
-    all_reduce_two_can_run,
+    all_reduce_symm_can_run,
+    all_reduce_symmetric,
     create_state,
+    symm_outputs_can_run,
 )
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 
+# Preserve the measured ordinary-Iris window while allowing a larger
+# producer-direct backing allocation.
+_DEFAULT_PRODUCER_DIRECT_MAX_BYTES = 1024 * 1024
+_DEFAULT_ALL_REDUCE_MAX_BYTES = 512 * 1024
+
 
 class TritonAllReduceBackend(CommBackend):
-    def __init__(self, fallback: CommBackend):
+    def __init__(
+        self,
+        fallback: CommBackend,
+        producer_direct_max_bytes: int = _DEFAULT_PRODUCER_DIRECT_MAX_BYTES,
+    ):
         self._fallback = fallback
         self._instances = {}
-        self._max_bytes = 512 * 1024
+        self._producer_direct_max_bytes = producer_direct_max_bytes
         self._max_numel = (
-            self._max_bytes // torch.empty((), dtype=torch.bfloat16).element_size()
+            min(producer_direct_max_bytes, _DEFAULT_ALL_REDUCE_MAX_BYTES)
+            // torch.empty((), dtype=torch.bfloat16).element_size()
         )
+
+    @property
+    def producer_direct_max_bytes(self) -> int:
+        return self._producer_direct_max_bytes
 
     def _get_or_create(self, group: Group):
         if group in self._instances:
@@ -53,13 +70,14 @@ class TritonAllReduceBackend(CommBackend):
             group=pg_manager.get_process_group("nccl", group),
             rank_in_group=group.index(dist.get_rank()),
             max_numel=self._max_numel,
+            max_bytes=self._producer_direct_max_bytes,
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
         )
         self._instances[group] = state
         return state
 
     def can_run(self, tensor: torch.Tensor, group: Group, op=None) -> bool:
-        if len(group) <= 1:
+        if len(group) <= 1 or not current_platform().is_amd:
             return False
         if op is None:
             op = torch.distributed.ReduceOp.SUM
@@ -76,42 +94,59 @@ class TritonAllReduceBackend(CommBackend):
         except Exception:
             return False
 
-    def all_reduce(self, tensor: torch.Tensor, group: Group, op=None) -> torch.Tensor:
+    def all_reduce(
+        self,
+        tensor: torch.Tensor | tuple[torch.Tensor, ...],
+        group: Group,
+        op=None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        if not isinstance(tensor, torch.Tensor):
+            if self.can_reduce_outputs(tensor, group, op=op):
+                return all_reduce_symmetric(self._instances[group], tensor)
+            return super().all_reduce(tensor, group, op=op)
+
         state = self._get_or_create(group)
         if all_reduce_can_run(state, tensor, op=op):
             return all_reduce(state, tensor, op=op)
         return self._fallback.all_reduce(tensor, group, op=op)
 
-    def can_run_two(
+    def acquire_all_reduce_outputs(
         self,
-        first: torch.Tensor,
-        second: torch.Tensor,
+        shapes: tuple[tuple[int, ...], ...],
+        like: torch.Tensor,
+        group: Group,
+        op=None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Acquire symmetric outputs when Iris supports the request."""
+        if not self.can_acquire_outputs(shapes, like, group, op=op):
+            return super().acquire_all_reduce_outputs(shapes, like, group, op=op)
+
+        # Do not let one rank silently select a different collective protocol.
+        state = self._get_or_create(group)
+        return acquire_symm_outputs(state, shapes, like.dtype)
+
+    def can_acquire_outputs(
+        self,
+        shapes: tuple[tuple[int, ...], ...],
+        like: torch.Tensor,
         group: Group,
         op=None,
     ) -> bool:
-        if len(group) <= 1:
+        """Check producer-direct eligibility without initializing Iris."""
+        if not current_platform().is_cdna4 or not like.is_cuda:
             return False
-        try:
-            return all_reduce_two_can_run(
-                self._get_or_create(group),
-                first,
-                second,
-                op=op,
-            )
-        except Exception:
-            return False
+        state = self._get_or_create(group)
+        return symm_outputs_can_run(state, shapes, like.dtype, op=op)
 
-    def all_reduce_two(
+    def can_reduce_outputs(
         self,
-        first: torch.Tensor,
-        second: torch.Tensor,
+        tensors: tuple[torch.Tensor, ...],
         group: Group,
         op=None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        state = self._get_or_create(group)
-        if all_reduce_two_can_run(state, first, second, op=op):
-            return all_reduce_two(state, first, second, op=op)
-        return super().all_reduce_two(first, second, group, op=op)
+    ) -> bool:
+        """Check whether tensors are this group's symmetric outputs."""
+        state = self._instances.get(group)
+        return state is not None and all_reduce_symm_can_run(state, tensors, op=op)
 
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0

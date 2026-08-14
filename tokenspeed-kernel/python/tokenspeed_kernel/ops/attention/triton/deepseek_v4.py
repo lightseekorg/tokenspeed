@@ -29,6 +29,7 @@ import logging
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import current_platform
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,15 @@ __all__ = [
     "deepseek_v4_save_compressor_state",
     "write_deepseek_v4_indexer_mxfp4_cache_cuda",
 ]
+
+
+def _as_int32_block_table(block_table: torch.Tensor) -> torch.Tensor:
+    """Return an int32 table with unit column stride for Triton row indexing."""
+
+    block_table_i32 = block_table.to(torch.int32)
+    if block_table_i32.stride(-1) != 1:
+        block_table_i32 = block_table_i32.contiguous()
+    return block_table_i32
 
 
 @triton.jit
@@ -259,7 +269,7 @@ def deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4(
     ), weights_out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["block_table_stride", "block_table_width"])
 def _deepseek_v4_fused_sparse_compress_cache_kernel(
     state_cache_ptr,
     state_cache_stride0,
@@ -270,7 +280,7 @@ def _deepseek_v4_fused_sparse_compress_cache_kernel(
     block_table_ptr,
     block_table_base_offsets_ptr,
     block_table_stride,
-    block_table_width: tl.constexpr,
+    block_table_width,
     state_block_size,
     rms_norm_weight_ptr,
     rms_norm_eps,
@@ -451,6 +461,7 @@ def deepseek_v4_fused_sparse_compress_cache_insert(
     )
     if num_actual == 0:
         return
+    block_table_i32 = _as_int32_block_table(block_table)
     _deepseek_v4_fused_sparse_compress_cache_kernel[(num_actual,)](
         state_cache,
         state_cache.stride(0),
@@ -458,14 +469,14 @@ def deepseek_v4_fused_sparse_compress_cache_insert(
         token_to_req_indices[:num_actual],
         positions[:num_actual],
         compressor_slot_mapping[:num_actual],
-        block_table,
+        block_table_i32,
         (
             block_table_base_offsets.to(torch.int32)
             if block_table_base_offsets is not None
             else None
         ),
-        block_table.stride(0),
-        block_table.shape[-1],
+        block_table_i32.stride(0),
+        block_table_i32.shape[-1],
         compressor_block_size,
         rms_norm_weight,
         rms_norm_eps,
@@ -494,7 +505,7 @@ def deepseek_v4_fused_sparse_compress_cache_insert(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["block_table_stride", "block_table_width"])
 def _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel(
     state_cache_ptr,
     state_cache_stride0,
@@ -505,7 +516,7 @@ def _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel(
     block_table_ptr,
     block_table_base_offsets_ptr,
     block_table_stride,
-    block_table_width: tl.constexpr,
+    block_table_width,
     state_block_size,
     rms_norm_weight_ptr,
     rms_norm_eps,
@@ -663,6 +674,7 @@ def deepseek_v4_fused_csa_indexer_mxfp4_cache_insert(
     )
     if num_actual == 0:
         return
+    block_table_i32 = _as_int32_block_table(block_table)
     _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel[
         (num_actual, DEEPSEEK_V4_INDEXER_MXFP4_SCALE_DIM)
     ](
@@ -672,14 +684,14 @@ def deepseek_v4_fused_csa_indexer_mxfp4_cache_insert(
         token_to_req_indices[:num_actual],
         positions[:num_actual],
         compressor_slot_mapping[:num_actual],
-        block_table,
+        block_table_i32,
         (
             block_table_base_offsets.to(torch.int32)
             if block_table_base_offsets is not None
             else None
         ),
-        block_table.stride(0),
-        block_table.shape[-1],
+        block_table_i32.stride(0),
+        block_table_i32.shape[-1],
         compressor_block_size,
         rms_norm_weight,
         rms_norm_eps,
@@ -980,7 +992,7 @@ def deepseek_v4_gather_indexer_mxfp4_cache(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["block_table_stride", "max_blocks_per_seq"])
 def _deepseek_v4_dequantize_and_gather_k_kernel(
     out_ptr,
     out_stride0,
@@ -991,7 +1003,8 @@ def _deepseek_v4_dequantize_and_gather_k_kernel(
     block_table_base_offsets_ptr,
     offset,
     gather_lens_ptr,
-    max_blocks_per_seq: tl.constexpr,
+    block_table_stride,
+    max_blocks_per_seq,
     fp8_dim: tl.constexpr,
     bf16_dim: tl.constexpr,
     scale_dim: tl.constexpr,
@@ -1020,7 +1033,7 @@ def _deepseek_v4_dequantize_and_gather_k_kernel(
             block_in_seq -= tl.load(block_table_base_offsets_ptr + batch_idx)
         pos_in_block = pos % cache_block_size
 
-        block_table_row = block_table_ptr + batch_idx * max_blocks_per_seq
+        block_table_row = block_table_ptr + batch_idx * block_table_stride
         valid_block = (block_in_seq >= 0) & (block_in_seq < max_blocks_per_seq)
         physical_block_idx = tl.load(
             block_table_row + block_in_seq,
@@ -1063,6 +1076,24 @@ def _deepseek_v4_dequantize_and_gather_k_kernel(
             tl.store(out_row + bf16_out_offset + chunk_offsets, values)
 
 
+def _deepseek_v4_gather_launch_config(
+    num_reqs: int,
+    max_rows: int,
+) -> tuple[int, int]:
+    """Choose the Blackwell per-request grid width and warp count."""
+
+    max_rows = max(1, max_rows)
+    if max_rows <= 512:
+        return 128, 4
+    if max_rows <= 3072:
+        return 512, 1
+    if max_rows <= 6144:
+        return 1024, 1
+    if 3 <= num_reqs <= 4 and max_rows <= 12288:
+        return 1024, 1
+    return 2048, 1
+
+
 def deepseek_v4_dequantize_and_gather_k_cache(
     *,
     out: torch.Tensor,
@@ -1073,6 +1104,7 @@ def deepseek_v4_dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
     block_table_base_offsets: torch.Tensor | None = None,
+    max_gather_len: int | None = None,
 ) -> None:
     """Gather/dequantize fp8_ds_mla cache rows for sparse prefill."""
 
@@ -1083,13 +1115,24 @@ def deepseek_v4_dequantize_and_gather_k_cache(
     if seq_lens.numel() == 0:
         return
 
-    _deepseek_v4_dequantize_and_gather_k_kernel[(seq_lens.numel(), 128)](
+    num_reqs = int(seq_lens.numel())
+    max_rows = (
+        int(out.shape[1]) - int(offset)
+        if max_gather_len is None
+        else int(max_gather_len)
+    )
+    if current_platform().is_blackwell:
+        num_workers, num_warps = _deepseek_v4_gather_launch_config(num_reqs, max_rows)
+    else:
+        num_workers, num_warps = 128, 4
+    block_table_i32 = _as_int32_block_table(block_table)
+    _deepseek_v4_dequantize_and_gather_k_kernel[(num_reqs, num_workers)](
         out,
         out.stride(0),
         out.stride(1),
         cache_2d,
         seq_lens.to(torch.int32),
-        block_table.to(torch.int32),
+        block_table_i32,
         (
             block_table_base_offsets.to(torch.int32)
             if block_table_base_offsets is not None
@@ -1097,7 +1140,8 @@ def deepseek_v4_dequantize_and_gather_k_cache(
         ),
         offset,
         gather_lens.to(torch.int32) if gather_lens is not None else None,
-        max_blocks_per_seq=block_table.shape[-1],
+        block_table_stride=block_table_i32.stride(0),
+        max_blocks_per_seq=block_table_i32.shape[-1],
         fp8_dim=DEEPSEEK_V4_NOPE_DIM,
         bf16_dim=DEEPSEEK_V4_ROPE_DIM,
         scale_dim=DEEPSEEK_V4_SWA_SCALE_DIM,
@@ -1107,6 +1151,7 @@ def deepseek_v4_dequantize_and_gather_k_cache(
         block_stride=cache_2d.stride(0),
         fp8_max=DEEPSEEK_V4_FP8_MAX,
         n_quant_blocks=DEEPSEEK_V4_NOPE_DIM // DEEPSEEK_V4_FP8_QUANT_BLOCK,
+        num_warps=num_warps,
     )
 
 
@@ -1530,7 +1575,7 @@ def deepseek_v4_combine_dense_swa_indices(
     return combined_indices, combined_lens
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["block_table_stride", "max_blocks_per_seq"])
 def _deepseek_v4_decode_swa_indices_and_lens_kernel(
     swa_indices_ptr,
     swa_indices_stride,
@@ -1542,7 +1587,7 @@ def _deepseek_v4_decode_swa_indices_and_lens_kernel(
     block_table_ptr,
     block_table_base_offsets_ptr,
     block_table_stride,
-    max_blocks_per_seq: tl.constexpr,
+    max_blocks_per_seq,
     has_valid_token: tl.constexpr,
     window_size: tl.constexpr,
     block_size: tl.constexpr,
@@ -1627,6 +1672,7 @@ def deepseek_v4_decode_swa_indices_and_lens(
         )
 
     candidate_block = min(1024, triton.next_power_of_2(window_size))
+    block_table_i32 = _as_int32_block_table(block_table)
     _deepseek_v4_decode_swa_indices_and_lens_kernel[(num_tokens,)](
         out_indices,
         out_indices.stride(0),
@@ -1635,14 +1681,14 @@ def deepseek_v4_decode_swa_indices_and_lens(
         seq_lens.to(torch.int32),
         token_to_req_indices.to(torch.int32),
         is_valid_token,
-        block_table.to(torch.int32),
+        block_table_i32,
         (
             block_table_base_offsets.to(torch.int32)
             if block_table_base_offsets is not None
             else None
         ),
-        block_table.stride(0),
-        block_table.shape[-1],
+        block_table_i32.stride(0),
+        block_table_i32.shape[-1],
         is_valid_token.numel() != 0,
         window_size=window_size,
         block_size=block_size,

@@ -116,8 +116,10 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         )
 
     def test_constructor_keeps_group_geometry_for_eager_metadata(self):
+        from tokenspeed.runtime.execution import workspace
         from tokenspeed.runtime.layers.attention.backends import trtllm
         from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+        from tokenspeed.runtime.utils.env import envs
 
         config = MHAConfig(
             device="cpu",
@@ -137,16 +139,18 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             group_block_granularities={"full_attention": 128},
         )
         with (
-            mock.patch.object(trtllm, "TRTLLM_MHA_WORKSPACE", 1),
-            mock.patch.object(trtllm, "_global_workspace_buffer", None),
+            envs.TOKENSPEED_WORKSPACE_TRTLLM_MHA_MB.override(1),
+            mock.patch.object(workspace, "_pools", {}),
         ):
             backend = self.Backend(config)
 
         self.assertEqual(backend.group_block_granularities, {"full_attention": 128})
 
     def test_constructor_accepts_config_without_group_geometry(self):
+        from tokenspeed.runtime.execution import workspace
         from tokenspeed.runtime.layers.attention.backends import trtllm
         from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
+        from tokenspeed.runtime.utils.env import envs
 
         config = MSAConfig(
             device="cpu",
@@ -165,8 +169,8 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             kv_cache_quant_method="none",
         )
         with (
-            mock.patch.object(trtllm, "TRTLLM_MHA_WORKSPACE", 1),
-            mock.patch.object(trtllm, "_global_workspace_buffer", None),
+            envs.TOKENSPEED_WORKSPACE_TRTLLM_MHA_MB.override(1),
+            mock.patch.object(workspace, "_pools", {}),
         ):
             backend = self.Backend(config)
 

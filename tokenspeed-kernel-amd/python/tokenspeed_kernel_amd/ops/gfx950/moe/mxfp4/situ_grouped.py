@@ -710,6 +710,7 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
     situ_linear_beta: float | None,
     block_m: int | None = None,
     expert_start: int = 0,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one rank's grouped A16W4 SiTU contribution without host sync.
 
@@ -733,6 +734,13 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
         raise ValueError("expert_start must be non-negative")
 
     num_tokens, hidden_dim = hidden_states.shape
+    if out is not None and (
+        out.shape != hidden_states.shape
+        or out.dtype != hidden_states.dtype
+        or out.device != hidden_states.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError("output must match the hidden-state shape, dtype, and device")
     if block_m is None:
         # Sparse EP padding dominates until each rank owns roughly 7k routes.
         # Keep BM64 below M=3584; BM128 then amortizes launch/grid overhead.
@@ -871,13 +879,17 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
         num_warps=s2_warps,
     )
     if fuse_combine:
-        return stage2_out.to(torch.bfloat16)
+        if out is None:
+            return stage2_out.to(torch.bfloat16)
+        out.copy_(stage2_out)
+        return out
 
-    out = torch.empty(
-        (num_tokens, hidden_dim),
-        dtype=torch.bfloat16,
-        device=hidden_states.device,
-    )
+    if out is None:
+        out = torch.empty(
+            (num_tokens, hidden_dim),
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
     reduce_block_m = 64
     reduce_block_n = 256
     reduce_grid = triton.cdiv(num_tokens, reduce_block_m) * triton.cdiv(

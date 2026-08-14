@@ -132,10 +132,33 @@ the `nvidia-arm` runner group for `gb200` labels.
 
 `slurm_submit.py` submits an existing task YAML without copying its server,
 evaluation, performance, or threshold configuration into a second format. It
-targets a single node and a single task. The GPU count comes from the selected
-runner label, such as `gb200-4gpu`, and is limited to four GPUs per node by
-default. Tasks that request more GPUs are rejected before submission; only
-raise `--max-gpus-per-node` when the target partition really provides them.
+targets one task at a time. By default the task uses one node, and the GPU count
+comes from the selected runner label, such as `gb200-4gpu`.
+
+An eval or perf task can request multiple nodes with an explicit topology:
+
+```yaml
+triggers: [slurm]
+runner:
+  labels: [slurm-gb200-4node-4gpu]
+slurm:
+  nodes: 4
+  gpus_per_node: 4
+```
+
+Multi-node tasks must use only the `slurm` trigger and a `slurm-*` runner label,
+so GitHub runner matrices cannot select them accidentally. The GPU count in the
+label must equal `slurm.gpus_per_node`.
+
+For a multi-node task, the generated batch script extracts the committed source
+snapshot into a server workspace on every node and a separate client workspace
+on the first node. It starts one containerized server task per node, then runs
+the readiness probe plus eval/perf stages in the first node's client workspace.
+Keeping the workspaces separate prevents concurrent install stages from writing
+the same source tree. The server command is identical on every node. TokenSpeed derives
+`nnodes`, `node_rank`, and the rendezvous address from the Slurm step variables;
+do not add those flags to the task's server command. When the client step exits,
+the script terminates the server step and removes each node's local snapshot.
 
 The submitter expects Pyxis/Enroot support in Slurm. Before submission it
 archives the clean, committed `HEAD` into the artifact root. The compute node
@@ -171,6 +194,10 @@ python3 test/ci_system/slurm_submit.py \
   --partition batch \
   --render
 ```
+
+Rendering a multi-node config also validates the two-step orchestration without
+allocating nodes. The output should contain a four-node `sbatch`, a server
+`srun` with one task per node, and a one-node client `srun` with `--relative=0`.
 
 Submit the same evaluation and follow its output:
 

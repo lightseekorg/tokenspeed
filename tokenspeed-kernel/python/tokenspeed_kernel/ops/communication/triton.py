@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any, List, Tuple
 
@@ -38,8 +39,12 @@ __all__ = [
     "all_gather_inner",
     "all_reduce_can_run",
     "all_reduce",
-    "all_reduce_two_can_run",
-    "all_reduce_two",
+    "symm_outputs_can_run",
+    "acquire_symm_outputs",
+    "all_reduce_symm_can_run",
+    "all_reduce_symmetric",
+    "allreduce_residual_attnres_combine_supported",
+    "allreduce_residual_attnres_combine",
     "allreduce_residual_rmsnorm",
     "create_dp_sampling_state",
     "dp_sampling_gather",
@@ -57,6 +62,7 @@ class TritonCommState:
     world_size: int
     device: torch.device
     max_numel: int = 0
+    max_bytes: int = 0
     max_token_num: int = 0
     hidden_dim: int = 0
     comm_buff: torch.Tensor | None = None
@@ -1793,7 +1799,7 @@ def allreduce_residual_rmsnorm(
 
         token_num, hidden_dim = input_tensor.shape
 
-        from . import iris as _iris_mod
+        import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
         if (
             input_tensor.is_cuda
@@ -1876,6 +1882,7 @@ def create_state(
     hidden_size: int = 0,
     device: torch.device = None,
     max_numel: int = 0,
+    max_bytes: int = 0,
 ) -> TritonCommState:
     assert (
         type(group) == dist.ProcessGroup
@@ -1898,6 +1905,7 @@ def create_state(
             world_size=world_size,
             device=device,
             max_numel=max_numel,
+            max_bytes=max_bytes or max_numel * torch.bfloat16.itemsize,
             comm_buff=comm_buff,
             symm_mem_hdl=symm_mem_hdl,
         )
@@ -1943,9 +1951,9 @@ def all_reduce(state: TritonCommState, tensor: torch.Tensor, op=None) -> torch.T
     assert all_reduce_can_run(state, tensor, op=op)
     platform = current_platform()
     if platform.is_amd:
-        from . import iris as _iris_mod
+        import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
-        key = (id(state.group), state.max_numel, tensor.dtype)
+        key = (id(state.group), state.max_bytes, tensor.dtype)
         iris_state = _iris_mod.IRIS_AR_STATES.get(key)
         if iris_state is None:
             iris_state = _iris_mod.create_iris_state(
@@ -1961,64 +1969,312 @@ def all_reduce(state: TritonCommState, tensor: torch.Tensor, op=None) -> torch.T
     raise AssertionError(f"Unsupported platform: {platform}")
 
 
-def all_reduce_two_can_run(
+def symm_outputs_can_run(
     state: TritonCommState,
-    first: torch.Tensor,
-    second: torch.Tensor,
+    shapes: tuple[tuple[int, ...], ...],
+    dtype: torch.dtype,
     op=None,
 ) -> bool:
-    """Return whether one Iris launch can reduce both tensors."""
+    """Check whether Iris can reduce producer-owned output buffers.
+
+    Args:
+        state: Communication group and symmetric-buffer capacity.
+        shapes: Ordered shapes the producer will write.
+        dtype: Element type shared by all outputs.
+        op: Reduction operation; only SUM is currently supported.
+
+    Returns:
+        Whether the request is supported by the CDNA4 producer-direct kernel.
+    """
     if op is None:
         op = torch.distributed.ReduceOp.SUM
-    platform = current_platform()
+    numels = tuple(math.prod(shape) for shape in shapes)
+    element_bytes = dtype.itemsize
+    elements_per_word = 8 // element_bytes
+    total_numel = sum(numels)
     return (
-        platform.is_amd
+        current_platform().is_cdna4
+        and state.world_size in (2, 4, 8)
+        and dtype in (torch.bfloat16, torch.float16, torch.float32)
         and op == torch.distributed.ReduceOp.SUM
-        and first.is_cuda
-        and second.is_cuda
-        and first.device == second.device == state.device
-        and first.is_contiguous()
-        and second.is_contiguous()
-        and first.dtype == second.dtype == torch.bfloat16
-        and first.numel() > 0
-        and second.numel() > 0
-        and first.numel() + second.numel() <= state.max_numel
-        and state.world_size > 1
+        and bool(numels)
+        and all(numel > 0 for numel in numels)
+        and 8 % element_bytes == 0
+        and total_numel % elements_per_word == 0
+        and total_numel * element_bytes <= state.max_bytes
     )
 
 
-def all_reduce_two(
+def acquire_symm_outputs(
     state: TritonCommState,
-    first: torch.Tensor,
-    second: torch.Tensor,
+    shapes: tuple[tuple[int, ...], ...],
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, ...]:
+    """Acquire consecutive Iris views for producer-direct reduction."""
+    if not symm_outputs_can_run(state, shapes, dtype):
+        raise RuntimeError("unsupported symmetric all-reduce output request")
+    import tokenspeed_kernel.ops.communication.iris as _iris_mod
+
+    max_numel = state.max_bytes // dtype.itemsize
+    key = (id(state.group), state.max_bytes, dtype)
+    iris_state = _iris_mod.IRIS_AR_STATES.get(key)
+    if iris_state is None:
+        iris_state = _iris_mod.create_iris_state(
+            group=state.group,
+            rank_in_group=state.rank_in_group,
+            max_numel=max_numel,
+            dtype=dtype,
+            device=state.device,
+        )
+        _iris_mod.IRIS_AR_STATES[key] = iris_state
+    return _iris_mod.iris_acquire_outputs(iris_state, shapes)
+
+
+def all_reduce_symm_can_run(
+    state: TritonCommState,
+    tensors: tuple[torch.Tensor, ...],
+    op=None,
+) -> bool:
+    """Check whether tensors are Iris-owned symmetric all-reduce outputs."""
+    if op is None:
+        op = torch.distributed.ReduceOp.SUM
+    if not current_platform().is_cdna4 or op != torch.distributed.ReduceOp.SUM:
+        return False
+    if not tensors:
+        return False
+    import tokenspeed_kernel.ops.communication.iris as _iris_mod
+
+    key = (id(state.group), state.max_bytes, tensors[0].dtype)
+    iris_state = _iris_mod.IRIS_AR_STATES.get(key)
+    return iris_state is not None and iris_state.owns_outputs(tensors)
+
+
+def all_reduce_symmetric(
+    state: TritonCommState,
+    tensors: tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, ...]:
+    """Reduce consecutive Iris producer outputs in one launch."""
+    import tokenspeed_kernel.ops.communication.iris as _iris_mod
+
+    key = (id(state.group), state.max_bytes, tensors[0].dtype)
+    iris_state = _iris_mod.IRIS_AR_STATES[key]
+    return _iris_mod.iris_all_reduce_symmetric(iris_state, tensors)
+
+
+def _all_reduce_residual_attnres_can_run(
+    state: TritonCommState,
+    partial: torch.Tensor,
+    residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    output_weight: torch.Tensor,
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    op=None,
+) -> bool:
+    """Return whether Iris can reduce and consume a Kimi-K3 attention partial."""
+    if op is None:
+        op = torch.distributed.ReduceOp.SUM
+    m, s_, acc = scratch
+    platform = current_platform()
+    return (
+        platform.is_cdna4
+        and state.world_size == 8
+        and op == torch.distributed.ReduceOp.SUM
+        and partial.shape == residual.shape == (1, 7168)
+        and score_weight.shape == output_weight.shape == (7168,)
+        and m.shape == s_.shape == (1,)
+        and acc.shape == (1, 7168)
+        and partial.dtype
+        == residual.dtype
+        == score_weight.dtype
+        == output_weight.dtype
+        == torch.bfloat16
+        and m.dtype == s_.dtype == acc.dtype == torch.float32
+        and partial.device
+        == residual.device
+        == score_weight.device
+        == output_weight.device
+        == m.device
+        == s_.device
+        == acc.device
+        == state.device
+        and all(
+            tensor.is_contiguous()
+            for tensor in (
+                partial,
+                residual,
+                score_weight,
+                output_weight,
+                m,
+                s_,
+                acc,
+            )
+        )
+        and partial.numel() <= state.max_numel
+    )
+
+
+def _all_reduce_residual_attnres(
+    state: TritonCommState,
+    partial: torch.Tensor,
+    residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    output_weight: torch.Tensor,
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    eps: float,
     op=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reduce two tensors with a single Iris launch on AMD."""
-    assert all_reduce_two_can_run(state, first, second, op=op)
-    platform = current_platform()
-    if platform.is_amd:
-        from . import iris as _iris_mod
+    """Reduce a Kimi-K3 attention partial and finish its AttnRes epilogue.
 
-        key = (id(state.group), state.max_numel, first.dtype)
-        iris_state = _iris_mod.IRIS_AR_STATES.get(key)
-        if iris_state is None:
-            iris_state = _iris_mod.create_iris_state(
-                group=state.group,
-                rank_in_group=state.rank_in_group,
-                max_numel=state.max_numel,
-                dtype=first.dtype,
-                device=state.device,
-            )
-            _iris_mod.IRIS_AR_STATES[key] = iris_state
-        return _iris_mod.iris_all_reduce_two(
-            iris_state,
-            first,
-            second,
-            op=op,
-            safe=False,
+    Args:
+        state: Initialized communication state for the tensor-parallel group.
+        partial: Contiguous local BF16 attention partial shaped ``[1, 7168]``.
+        residual: Contiguous BF16 residual stream shaped ``[1, 7168]``.
+        score_weight: Contiguous BF16 AttnRes score weight shaped ``[7168]``.
+        output_weight: Contiguous BF16 output RMSNorm weight shaped ``[7168]``.
+        scratch: Contiguous FP32 ``(max_logit, exp_sum, weighted_sum)`` tensors
+            for the historical AttnRes candidates, shaped ``[1]``, ``[1]``,
+            and ``[1, 7168]``.
+        eps: Positive epsilon used for AttnRes scoring and output RMSNorm.
+        op: Reduction operation; only ``SUM`` is supported.
+
+    Returns:
+        A pair containing the normalized AttnRes mixture and the BF16 sum of
+        ``residual`` with the all-reduced attention partial, both shaped
+        ``[1, 7168]``.
+    """
+    assert _all_reduce_residual_attnres_can_run(
+        state,
+        partial,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        op=op,
+    )
+    from . import iris as _iris_mod
+
+    key = (id(state.group), state.max_bytes, partial.dtype)
+    iris_state = _iris_mod.IRIS_AR_STATES.get(key)
+    if iris_state is None:
+        iris_state = _iris_mod.create_iris_state(
+            group=state.group,
+            rank_in_group=state.rank_in_group,
+            max_numel=state.max_numel,
+            dtype=partial.dtype,
+            device=state.device,
         )
+        _iris_mod.IRIS_AR_STATES[key] = iris_state
+    return _iris_mod.iris_all_reduce_residual_attnres(
+        iris_state,
+        partial,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        eps,
+        op=op,
+    )
 
-    raise AssertionError(f"Unsupported platform: {platform}")
+
+def _attnres_comm_state(
+    input_tensor: torch.Tensor,
+    rank: int,
+    group: dist.ProcessGroup,
+) -> TritonCommState:
+    return TritonCommState(
+        group=group,
+        rank_in_group=rank,
+        world_size=group.size(),
+        device=input_tensor.device,
+        max_numel=input_tensor.numel(),
+    )
+
+
+def allreduce_residual_attnres_combine_supported(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    output_weight: torch.Tensor,
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    rank: int,
+    group: dist.ProcessGroup,
+    local_world_size: int,
+    op=None,
+) -> bool:
+    """Return whether the fused Kimi-K3 Iris collective supports this call.
+
+    The Iris all-reduce transport is node-local. ``local_world_size`` maps the
+    process group's global ranks to nodes so multi-node attention groups use
+    the model's ordinary collective fallback instead.
+    """
+    if local_world_size <= 0:
+        return False
+    group_ranks = dist.get_process_group_ranks(group)
+    if len({global_rank // local_world_size for global_rank in group_ranks}) != 1:
+        return False
+    return _all_reduce_residual_attnres_can_run(
+        _attnres_comm_state(input_tensor, rank, group),
+        input_tensor,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        op=op,
+    )
+
+
+def allreduce_residual_attnres_combine(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    output_weight: torch.Tensor,
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    rank: int,
+    group: dist.ProcessGroup,
+    local_world_size: int,
+    eps: float = 1e-6,
+    op=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the fused Kimi-K3 Iris all-reduce and AttnRes epilogue.
+
+    Args:
+        input_tensor: Per-rank BF16 attention partial shaped ``[1, 7168]``.
+        residual: Running BF16 residual stream shaped ``[1, 7168]``.
+        score_weight: Precomputed AttnRes score weight shaped ``[7168]``.
+        output_weight: Output RMSNorm weight shaped ``[7168]``.
+        scratch: FP32 ``(max_logit, exp_sum, weighted_sum)`` partials.
+        rank: Rank within ``group``.
+        group: Eight-rank node-local attention process group.
+        local_world_size: Number of processes on each node.
+        eps: Positive epsilon for AttnRes scoring and output RMSNorm.
+        op: Reduction operation. Only ``SUM`` is supported.
+
+    Returns:
+        The normalized AttnRes output and accumulated residual, in that order.
+    """
+    assert allreduce_residual_attnres_combine_supported(
+        input_tensor,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        rank=rank,
+        group=group,
+        local_world_size=local_world_size,
+        op=op,
+    )
+    return _all_reduce_residual_attnres(
+        _attnres_comm_state(input_tensor, rank, group),
+        input_tensor,
+        residual,
+        score_weight,
+        output_weight,
+        scratch,
+        eps,
+        op=op,
+    )
 
 
 def get_token_dist(state: TritonCommState, total_tokens_in_group: int) -> list:

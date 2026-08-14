@@ -180,10 +180,17 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
     ):
         raise ValueError("ranges must be non-empty and lie within backing")
 
-    range_table = torch.tensor(ranges, dtype=torch.int64, device=backing.device)
+    range_table = (
+        torch.tensor(ranges, dtype=torch.int64)
+        .pin_memory()
+        .to(backing.device, non_blocking=True)
+    )
+
     block_size = 1024
     max_size = max(size for _, size in ranges)
+
     grid = (len(ranges), triton.cdiv(max_size, block_size))
+
     _zero_byte_ranges_kernel[grid](
         backing,
         range_table,

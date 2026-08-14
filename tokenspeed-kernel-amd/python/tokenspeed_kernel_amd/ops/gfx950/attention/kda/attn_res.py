@@ -30,8 +30,9 @@ def _load_candidate(
         ptr = layer_residual
         offset = token * stride_layer_t + hidden
     else:
-        ptr = block_residual
-        offset = token * stride_block_t + candidate * stride_block_n + hidden
+        # Candidate offsets can exceed int32; fold the stride into the pointer.
+        ptr = block_residual + candidate * stride_block_n
+        offset = token * stride_block_t + hidden
     return cdna4.buffer_load(
         ptr,
         offset.to(gl.int32),
@@ -153,8 +154,17 @@ def attn_res_rmsnorm_gfx950(
 ) -> torch.Tensor:
     """Mix AttnRes candidates and apply the following RMSNorm in one launch."""
     tokens, hidden = layer_residual.shape
-    if layer_residual.dtype != torch.bfloat16 or hidden != 7168:
-        raise ValueError("gfx950 AttnRes requires BF16 input with H=7168")
+    if layer_residual.dtype != torch.bfloat16 or hidden not in {
+        4096,
+        5120,
+        6144,
+        7168,
+        8192,
+    }:
+        raise ValueError(
+            "gfx950 AttnRes requires BF16 input with "
+            "H in {4096, 5120, 6144, 7168, 8192}"
+        )
     if not 0 <= num_valid_blocks <= 11:
         raise ValueError("gfx950 AttnRes supports at most 11 block snapshots")
     if layer_residual.stride(1) != 1 or block_residual.stride(2) != 1:

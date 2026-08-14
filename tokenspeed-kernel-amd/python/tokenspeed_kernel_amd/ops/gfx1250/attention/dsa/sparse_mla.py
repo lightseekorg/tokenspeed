@@ -26,6 +26,7 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.indexing import (
     _check_packed_fp8_inputs,
+    _combine_scoring_query_heads_kernel,
     _dsa_decode_logits_fp8_kernel,
     _dsa_prefill_logits_fp8_kernel,
 )
@@ -39,6 +40,8 @@ _RADIX_BITS = (12, 12, 8)
 _MAX_BUCKETS = gl.constexpr(1 << max(_RADIX_BITS))
 _TOPK_BLOCK_N = 4096
 _TOPK_NUM_WARPS = 8
+_GLM52_SCORING_HEADS = 32
+_GLM52_FUSED_DECODE_MAX_CANDIDATES = 98_304
 
 
 @gluon.constexpr_function
@@ -397,6 +400,36 @@ def _dsa_topk_indices(
     return out, lens_out
 
 
+def _combine_scoring_query_heads(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    """Combine weighted query heads with FP32 accumulation on GFX1250."""
+
+    combined = torch.empty(
+        (q.shape[0], q.shape[2]),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    if q.shape[0] == 0:
+        return combined
+    _combine_scoring_query_heads_kernel[(q.shape[0],)](
+        q,
+        weights,
+        combined,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        weights.stride(0),
+        weights.stride(1),
+        num_heads=q.shape[1],
+        head_dim=q.shape[2],
+        BLOCK_D=128,
+        num_warps=1,
+    )
+    return combined
+
+
 def gluon_dsa_decode_topk_fp8_gfx1250(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -424,6 +457,8 @@ def gluon_dsa_decode_topk_fp8_gfx1250(
     if index_k_cache is None:
         raise RuntimeError("Gluon DSA paged top-k requires packed FP8 index_k_cache")
     row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, int(page_size))
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
     _check_score_input_contract(q, weights, index_k_cache)
     if seq_lens.dim() != 1:
         raise ValueError(
@@ -461,6 +496,18 @@ def gluon_dsa_decode_topk_fp8_gfx1250(
         return empty_out, empty_lens
 
     max_seq_len = int(block_table.shape[1]) * int(page_size)
+    fold_weighted_heads = (
+        q.shape[1] == _GLM52_SCORING_HEADS
+        and q.shape[0] * max_seq_len <= _GLM52_FUSED_DECODE_MAX_CANDIDATES
+    )
+    if fold_weighted_heads:
+        score_q = q
+        score_num_heads = q.shape[1]
+    else:
+        # Graph replay measurements favor a separate reduction beyond 98,304
+        # candidate slots on gfx1250.
+        score_q = _combine_scoring_query_heads(q, weights)[:, None, :]
+        score_num_heads = 1
     if out is None:
         out = torch.empty((q.shape[0], topk), dtype=torch.int32, device=q.device)
     if lens_out is None:
@@ -472,7 +519,7 @@ def gluon_dsa_decode_topk_fp8_gfx1250(
     )
     block_n = 32
     _dsa_decode_logits_fp8_kernel[(q.shape[0], triton.cdiv(max_seq_len, block_n))](
-        q,
+        score_q,
         index_k_cache.view(torch.float8_e4m3fn),
         index_k_cache.view(torch.float32),
         weights,
@@ -484,11 +531,12 @@ def gluon_dsa_decode_topk_fp8_gfx1250(
         page_size=int(page_size),
         row_bytes=row_bytes,
         max_seq_len=max_seq_len,
-        num_heads=q.shape[1],
+        num_heads=score_num_heads,
         head_dim=q.shape[2],
         num_groups=q.shape[2] // 128,
         softmax_scale=float(softmax_scale),
         q_len_per_req=q_len_per_req,
+        FOLD_WEIGHTED_HEADS=fold_weighted_heads,
         BLOCK_N=block_n,
         BLOCK_D=128,
         num_warps=4,
@@ -532,6 +580,8 @@ def gluon_dsa_prefill_topk_fp8_gfx1250(
             "Gluon DSA top-k requires packed FP8 index_k_cache and page_size"
         )
     row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, int(page_size))
+    if not weights.is_contiguous():
+        weights = weights.contiguous()
     _check_score_input_contract(q, weights, index_k_cache)
     if kv_workspace_slots.dim() != 1:
         raise ValueError(
@@ -583,6 +633,7 @@ def gluon_dsa_prefill_topk_fp8_gfx1250(
     block_n = 32
     for start in range(0, q.shape[0], max_query_rows):
         end = min(start + max_query_rows, q.shape[0])
+        combined_q = _combine_scoring_query_heads(q[start:end], weights[start:end])
         logits = torch.empty(
             (end - start, seq_len_sum),
             dtype=torch.float32,
@@ -591,10 +642,9 @@ def gluon_dsa_prefill_topk_fp8_gfx1250(
         _dsa_prefill_logits_fp8_kernel[
             (end - start, triton.cdiv(seq_len_sum, block_n))
         ](
-            q[start:end],
+            combined_q[:, None, :],
             index_k_cache.view(torch.float8_e4m3fn),
             index_k_cache.view(torch.float32),
-            weights[start:end],
             kv_workspace_slots,
             row_starts[start:end],
             row_ends[start:end],
@@ -603,7 +653,7 @@ def gluon_dsa_prefill_topk_fp8_gfx1250(
             seq_len_sum=seq_len_sum,
             page_size=int(page_size),
             row_bytes=row_bytes,
-            num_heads=q.shape[1],
+            num_heads=1,
             head_dim=q.shape[2],
             num_groups=q.shape[2] // 128,
             softmax_scale=float(softmax_scale),

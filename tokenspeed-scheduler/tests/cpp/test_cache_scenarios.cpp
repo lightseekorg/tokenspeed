@@ -28,6 +28,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 #include <spdlog/sinks/ostream_sink.h>
@@ -40,6 +41,15 @@
 namespace tokenspeed::test {
 
 namespace {
+
+static_assert(
+    std::is_same_v<decltype(std::declval<fsm::SchedulePrefillFirstChunkEvent&>()(std::declval<fsm::Submitted&&>())),
+                   std::variant<fsm::PrefillDone, fsm::Prefilling>>);
+static_assert(
+    std::is_same_v<decltype(std::declval<fsm::SchedulePrefillFirstChunkEvent&>()(std::declval<fsm::Retracted&&>())),
+                   std::variant<fsm::PrefillDone, fsm::Prefilling>>);
+static_assert(std::is_same_v<decltype(std::declval<fsm::SchedulePrefillEvent&>()(std::declval<fsm::Prefilling&&>())),
+                             std::variant<fsm::PrefillDone, fsm::Prefilling>>);
 
 std::pair<bool, std::string> ClearL1CacheWithCapturedLog(Scheduler* scheduler) {
     std::ostringstream output;
@@ -806,7 +816,7 @@ namespace {
 
 void SendAbort(Scheduler& scheduler, const std::string& id) {
     ExecutionEvent event;
-    event.With(ForwardEvent{forward::Abort{.request_id = id}});
+    event.With(forward::Abort{.request_id = id});
     scheduler.Advance(std::move(event));
 }
 
@@ -1520,7 +1530,7 @@ TEST_F(RetractExactFitSuite, ReportsSingleRequestTokenCapacity) {
     EXPECT_EQ(scheduler_->MaxSingleRequestTokens(), 8);
 }
 
-TEST_F(RetractExactFitSuite, ReportsCapacityUsingEachGroupsCachePageSize) {
+TEST_F(RetractExactFitSuite, ReportsCapacityUsingEachGroupsBlockGranularity) {
     SchedulerConfig config = MakeConfig();
     config.paged_cache_groups[1].rows_per_page = 1;
     Scheduler scheduler{std::move(config)};

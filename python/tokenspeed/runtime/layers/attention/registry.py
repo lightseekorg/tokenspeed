@@ -187,7 +187,7 @@ _HYBRID_GDN_ARCHITECTURES = {
 # and whose linear layers are KDA (per-channel gated delta rule), not GDN.
 # They share the same HybridLinearAttnBackend wrapper and cache-group pool;
 # the base sub-backend auto-resolves to MLA from the arch, and the linear
-# sub-backend runs the KDA kernels (MambaAttnBackend.is_kda branch).
+# sub-backend runs the KDA kernels (KdaAttnBackend).
 _HYBRID_MLA_KDA_ARCHITECTURES = {
     "KimiK3ForConditionalGeneration",
 }
@@ -395,6 +395,10 @@ def _create_hybrid_linear_attn_backend(
     MLA base). ``pool`` is the model's layer-mapped view over the one
     shared cache pool; both sub-backends consume its per-group tables.
     """
+    from tokenspeed.runtime.layers.attention.backends.hybrid_kda import (
+        HybridKDABackend,
+        KdaAttnBackend,
+    )
     from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
         HybridLinearAttnBackend,
         MambaAttnBackend,
@@ -446,17 +450,16 @@ def _create_hybrid_linear_attn_backend(
     kda_backend = (getattr(server_args, "kda_backend", None) or "auto").strip().lower()
     if is_kda:
         kda_backend = _resolve_kda_backend(kda_backend)
-    linear_attn_backend = MambaAttnBackend(
-        config, is_kda=is_kda, kda_backend=kda_backend
-    )
+        linear_attn_backend = KdaAttnBackend(config, kda_backend=kda_backend)
+    else:
+        linear_attn_backend = MambaAttnBackend(config)
 
     # Recurrent state lives in the LCM arena and is addressed by the
     # per-group block tables, so no separate request-indexed Mamba pool exists.
     linear_attn_backend.set_kv_pool(pool)
 
-    backend = HybridLinearAttnBackend(
-        full_attn_backend, linear_attn_backend, full_attn_layers
-    )
+    hybrid_cls = HybridKDABackend if is_kda else HybridLinearAttnBackend
+    backend = hybrid_cls(full_attn_backend, linear_attn_backend, full_attn_layers)
     logger.info(
         "Created hybrid_linear_attn backend: %d full attn layers, %d linear attn layers, %s",
         len(full_attn_layers),

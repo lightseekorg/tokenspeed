@@ -43,7 +43,7 @@ CacheKey RealKey(const std::vector<std::int32_t>& tokens, std::uint32_t group_id
 
 
 
-TEST(FullAttnManagerTest, ConstructsWithPageSize) {
+TEST(FullAttnManagerTest, ConstructsWithBlockGranularity) {
     BlockPool pool(8);
     FullAttnManager mgr(/*block_granularity=*/4);
     BlockTable table;
