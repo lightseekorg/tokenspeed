@@ -51,7 +51,7 @@ def _backend(pool):
     )
     backend = KdaAttnBackend(config)
     backend.set_kv_pool(pool)
-    if not backend._kda_replay_active():
+    if not backend._replay_active:
         pytest.skip("KDA replay kernels unavailable on this platform")
     return backend
 
@@ -143,7 +143,7 @@ class _Harness:
                 b=None,
             )
         # The graph wrapper settles state after every forward; with no accept
-        # lengths yet this is just the release of the window the arm composed,
+        # lengths yet this is just the release of the window the stage composed,
         # which is on the device once the layers have run.
         self.backend.notify_forward_issued()
         return outs
@@ -243,7 +243,7 @@ def test_lazy_rounds_match_eager_flush_every_round():
 def test_departed_request_is_dropped_and_survivors_fuse():
     """Round 2 drops the middle request and re-packs the batch.
 
-    The departed request's pending must be DISCARDED at the next arm -- its
+    The departed request's pending must be DISCARDED at the next stage -- its
     pages may already belong to a new request (see the abort-repro test) --
     while the survivors replay from payload captured at their OLD slots
     (row-base indirection), so their states must still match the eager run.
@@ -346,7 +346,7 @@ def test_all_rejected_window_still_commits():
 def _prep_verify(h, rpis, pages, seq_lens):
     """Verify-shaped metadata prep WITHOUT the forward that should follow.
 
-    This is the arm half of an abandoned round: the event loop prepared the
+    This is the stage half of an abandoned round: the event loop prepared the
     batch, then retracted it before launching the model."""
     tables = {
         gid: np.asarray([[p] for p in pages[gid]], dtype=np.int32)
@@ -366,13 +366,13 @@ def _prep_verify(h, rpis, pages, seq_lens):
 
 
 def test_abandoned_verify_prep_keeps_pending_for_retract_flush():
-    """Adversarial schedule: arm, then abandon the forward (batch retract).
+    """Adversarial schedule: stage, then abandon the forward (batch retract).
 
     Metadata prep composes the pending into the fused-kernel control buffers
-    (the "arm"), but the forward never launches -- the event loop retracted
+    (the "stage"), but the forward never launches -- the event loop retracted
     the batch between prep and dispatch and fires the retract hook
     ``flush_pending`` instead. The pending must be consumed at FORWARD
-    ISSUE, not at arm: an arm-time consume
+    ISSUE, not at stage: an stage-time consume
     would silently lose the accepted window here. The retract-hook flush
     must really write the window, and the next verify round must match an
     eager run that never saw the abandoned prep."""
@@ -395,8 +395,8 @@ def test_abandoned_verify_prep_keeps_pending_for_retract_flush():
         for i in range(len(rpis))
     }
 
-    _prep_verify(h_lazy, rpis, pages, [8, 7])  # armed ...
-    assert h_lazy.pending() is not None  # ... but NOT consumed at arm
+    _prep_verify(h_lazy, rpis, pages, [8, 7])  # staged ...
+    assert h_lazy.pending() is not None  # ... but NOT consumed at stage
     h_lazy.flush()  # the retract hook
     assert h_lazy.pending() is None
     # The flush actually landed the accepted window (every page changed).
@@ -415,12 +415,12 @@ def test_abandoned_verify_prep_keeps_pending_for_retract_flush():
 
 
 def test_rearm_after_abandoned_prep_commits_exactly_once():
-    """Arm, abandon the forward, then arm the SAME batch again and run it.
+    """Stage, abandon the forward, then stage the SAME batch again and run it.
 
-    No retract hook fires between the two arms, so the pending must survive
-    the first (abandoned) arm intact and still fuse-commit during the second
-    round's forward -- exactly once. A consume-at-arm would lose the window;
-    a stale re-arm double-applying the in-place commit would diverge from
+    No retract hook fires between the two stages, so the pending must survive
+    the first (abandoned) stage intact and still fuse-commit during the second
+    round's forward -- exactly once. A consume-at-stage would lose the window;
+    a stale re-stage double-applying the in-place commit would diverge from
     eager. A flush-counting probe pins down that the surviving pending
     really fused (only the final explicit flush may run the standalone
     kernels)."""
@@ -443,7 +443,7 @@ def test_rearm_after_abandoned_prep_commits_exactly_once():
 
     h_lazy.backend._flush_kda_pending = _counting_flush
 
-    _prep_verify(h_lazy, rpis, pages, [7, 8])  # arm #1, abandoned
+    _prep_verify(h_lazy, rpis, pages, [7, 8])  # stage #1, abandoned
     assert h_lazy.pending() is not None
 
     outs = {}
@@ -451,7 +451,7 @@ def test_rearm_after_abandoned_prep_commits_exactly_once():
         sink.update(h.verify_round(rpis, pages, [7, 8], h.window(2, 62)))
         h.accept([2, 1])
         h.flush()
-    # Arm #2 + fused round consumed the pending; only the terminal flush of
+    # Stage #2 + fused round consumed the pending; only the terminal flush of
     # round 2's window ran the standalone kernels.
     assert flushes == [None], flushes
     _assert_pools_match(h_lazy, h_eager, pages, rpis)
@@ -462,8 +462,8 @@ def test_recycled_rpi_pending_is_dropped_not_replayed():
     window, and a NEW request with the same rpi (fresh pages) enters the
     very next verify round with no non-verify forward in between.
 
-    The arm gates each pending entry on pending-commit-page == the
-    request's current committed page, so the impostor is NOT armed: its
+    The stage gates each pending entry on pending-commit-page == the
+    request's current committed page, so the impostor is NOT staged: its
     verify must run fresh from its own page, identical to an eager control
     where the recycled slot never had a predecessor. The dead request's
     window is deliberately DROPPED, never flushed -- by the time the reuse
@@ -607,7 +607,7 @@ def test_overlap_prep_does_not_clobber_the_inflight_slot_map():
 
     Ownership rides the device slot table, so each prep's compose must see
     the table exactly as of its own enqueue order -- the raced round R2 is
-    armed, its record and the NEXT prep all land while the device is still
+    staged, its record and the NEXT prep all land while the device is still
     parked, and any host-visible staging shared between preps (the old
     pinned slot map, a reused drop log) would let the later prep rewrite
     the round already in flight. The batch re-packs between the rounds
@@ -637,7 +637,7 @@ def test_overlap_prep_does_not_clobber_the_inflight_slot_map():
     pages2 = {gid: [pages3[gid][0], pages3[gid][2]] for gid in _STATE_GROUPS}
 
     # Warmup on both harnesses (lazy keeps its pendings). TWO bs=2 rounds:
-    # the first has no pending and its arm returns early, so only the second
+    # the first has no pending and its stage returns early, so only the second
     # walks the full bs=2 compose path -- every allocator size class it needs
     # must be warm, or the raced round below would cudaMalloc (a device
     # synchronization) and drain the sleep that creates the race window.
@@ -661,9 +661,9 @@ def test_overlap_prep_does_not_clobber_the_inflight_slot_map():
     torch.cuda._sleep(6_000_000_000)  # park the device: R2 executes later
     marker = torch.cuda.Event()
     marker.record()
-    outs_lazy = _run_prepped(h_lazy, r2, w_r2[h_lazy])  # arm R2: slot map [0, 2]
+    outs_lazy = _run_prepped(h_lazy, r2, w_r2[h_lazy])  # stage R2: slot map [0, 2]
     h_lazy.backend.commit_verified_state(acc_r2)  # record gen2 {0:0, 2:1}
-    h_lazy.backend.init_forward_metadata(  # P3 arm: writes [0, 1] over the pinned buffer
+    h_lazy.backend.init_forward_metadata(  # P3 stage: writes [0, 1] over the pinned buffer
         bs=p3["bs"],
         req_pool_indices=p3["rpi_dev"],
         seq_lens=p3["seq_dev"],
@@ -675,7 +675,7 @@ def test_overlap_prep_does_not_clobber_the_inflight_slot_map():
     torch.cuda.synchronize()
     if not raced:
         pytest.skip("device outran the host; overlap window not reproduced")
-    h_lazy.flush()  # retract hook for the abandoned P3 arm; commits gen2
+    h_lazy.flush()  # retract hook for the abandoned P3 stage; commits gen2
 
     # Eager control: the same R2 round and abandoned prep, fully synchronous.
     outs_eager = h_eager.verify_round(survivors, pages2, [10, 10], w_r2[h_eager])
@@ -685,7 +685,7 @@ def test_overlap_prep_does_not_clobber_the_inflight_slot_map():
     h_eager.flush()
 
     # R2's verify outputs: the survivor that kept slot 0 is untouched by the
-    # clobber; request 2's rows must ALSO match -- under the race its arm
+    # clobber; request 2's rows must ALSO match -- under the race its stage
     # gathered the departed request's entry and never replayed its pending.
     for layer_id in h_lazy.layer_ids:
         lo = outs_lazy[layer_id].float().flatten(0, -3)  # [bs*T, H, D]
@@ -717,7 +717,7 @@ def test_batch_growth_realigns_capture_base():
     """Batch growth rebuilds the payload ring mid-forward; the device-side
     capture base must be recomputed against the NEW half size.
 
-    The arm fills ``capture_base = armed * old_half`` before the forward
+    The stage fills ``capture_base = staged * old_half`` before the forward
     rebuilds a larger ring, while every later reader -- the fused replay's
     base compose AND the flush slice -- uses ``parity * new_half``. An
     eager-vs-lazy comparison cannot see the misalignment (both modes grow,
@@ -780,7 +780,7 @@ def test_growth_flush_drops_departed_windows():
         h_lazy.pool.get_component(layer_id, "recurrent_state")[page].fill_(7.0)
         sentinel[layer_id] = page
 
-    # Two new requests join: the batch GROWS, so the arm flushes the pending
+    # Two new requests join: the batch GROWS, so the stage flushes the pending
     # (ring rebuild) -- request 0's window only, never request 1's.
     rpis_r2 = [0, 2, 3]
     pages_r2 = {
@@ -811,11 +811,11 @@ def test_idle_replay_prep_with_zero_real_requests_does_not_crash():
     """A DP rank going idle replays the verify graph with real_bs == 0.
 
     The replay prep must survive an all-padding batch (no unbound locals on
-    the pending-arm plumbing) and LEAVE the pending: an empty batch is no
+    the pending-stage plumbing) and LEAVE the pending: an empty batch is no
     evidence about residency (a capacity retraction produces exactly this
     round with every owner resident). Graph state is initialized BEFORE the
     pending is recorded, so the ring-growth flush cannot consume it first
-    and the assertion is about the idle arm, not a side effect."""
+    and the assertion is about the idle stage, not a side effect."""
     h = _Harness(seed=23)
     h.backend.init_cuda_graph_state(max_num_tokens=2 * T)
     rpis = [0, 1]
@@ -931,7 +931,7 @@ def test_control_buffer_rows_stay_16b_aligned():
 def test_payload_ring_rebuild_neutralizes_the_armed_replay_base():
     """A payload-ring rebuild must leave no live replay base behind.
 
-    The arm composes ``base = parity * half + slot * T`` into the graphed
+    The stage composes ``base = parity * half + slot * T`` into the graphed
     control buffer, then the forward may rebuild the ring (a widened f_a,
     the enforce-eager fallback, batch growth) and flush the pending against
     the OLD buffers. The rebuilt ring is a different, zero-filled
@@ -947,9 +947,9 @@ def test_payload_ring_rebuild_neutralizes_the_armed_replay_base():
     h.accept([2, 1])
     assert h.pending() is not None
 
-    _prep_verify(h, rpis, pages, [8, 7])  # arm: base row goes live
+    _prep_verify(h, rpis, pages, [8, 7])  # stage: base row goes live
     bufs = h.backend._kda_lazy_bufs
-    assert bool((bufs["base"][: len(rpis)] >= 0).all()), "arm did not compose a base"
+    assert bool((bufs["base"][: len(rpis)] >= 0).all()), "stage did not compose a base"
 
     # Rebuild the ring the way an odd f_a width does, mid-forward.
     layer_id = h.layer_ids[0]
@@ -968,7 +968,7 @@ def test_window_size_change_flushes_the_pending():
     The payload ring is addressed in the PREVIOUS window's units
     (``base = slot * t_prev``) while the fused kernel replays in THIS
     round's units, so a window-size change mis-indexes the ring and commits
-    a state assembled from the wrong rows -- silently. The arm must flush
+    a state assembled from the wrong rows -- silently. The stage must flush
     instead of composing.
     """
     rpis = [0, 1]
@@ -993,7 +993,7 @@ def test_window_size_change_flushes_the_pending():
     for h in (h_lazy, h_eager):
         _one_token_round(h, rpis, pages, [9, 8], seed=112)
         if h is h_lazy:
-            # The arm must have committed the T=2 window before this forward.
+            # The stage must have committed the T=2 window before this forward.
             pass
         h.accept([1, 1])
         h.flush()
@@ -1091,8 +1091,8 @@ def test_empty_forward_round_keeps_a_resident_owners_window():
 
     # The engine hook is gone entirely; a re-added call must fail loudly.
     assert not hasattr(h_lazy.backend, "drop_pending")
-    # The graph-padded flavor of the same round: an arm with zero real rows.
-    h_lazy.backend._arm_kda_pending(0, len(rpis), {}, None)
+    # The graph-padded flavor of the same round: an stage with zero real rows.
+    h_lazy.backend._stage_pending_replay(0, len(rpis), {}, None)
     assert h_lazy.pending() is not None, "empty round dropped a live window"
 
     for h in (h_lazy, h_eager):
@@ -1289,7 +1289,7 @@ def test_eager_batch_above_the_graph_ceiling_commits_standalone():
     Graph capture freezes the payload ring and control buffers at the
     capture ceiling, while max_num_seqs can schedule a bigger batch that
     runs eagerly. Such a round uses the free-growing overflow set: the
-    pending it inherits is flushed standalone at arm (its ring and this
+    pending it inherits is flushed standalone at stage (its ring and this
     round's ring diverge), its own window is committed standalone the
     moment acceptance is known, and the graph ring's parity chain is left
     untouched -- so the graph-sized round that follows fuses normally.
@@ -1388,7 +1388,7 @@ def test_overflow_round_compiles_no_fresh_kernel_variants():
 def test_condemned_row_survives_an_abandoned_prep_without_flushing():
     """The compose's gate verdict must outlive an abandoned prep.
 
-    The arm's compose finds request 1's page moved (identity gate fails)
+    The stage's compose finds request 1's page moved (identity gate fails)
     and condemns its table row in place; then the forward is abandoned, so
     the pending -- condemned row included -- survives to the retract-hook
     flush. The flush gates its writes on the same table, so the dead
@@ -1415,7 +1415,7 @@ def test_condemned_row_survives_an_abandoned_prep_without_flushing():
         h.pool.get_component(layer_id, "recurrent_state")[p].fill_(3.0)
         sentinel[layer_id] = p
 
-    # Arm against the moved tables: the compose condemns row 1, then the
+    # Stage against the moved tables: the compose condemns row 1, then the
     # forward never runs (batch retracted between prep and dispatch).
     _prep_verify(h, rpis, moved, [8, 7])
     assert h.pending() is not None

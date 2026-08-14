@@ -243,6 +243,14 @@ class AttentionBackend(ABC):
         owner from one whose pages are already reclaimed.
         """
 
+    def settle_deferred_state(self, accept_lengths) -> None:
+        """Settle work deferred into the forward that just completed.
+
+        Called by the graph wrapper after every forward. ``accept_lengths`` is
+        present only when a speculative verify produced it; backends that defer
+        work into their forward override this hook.
+        """
+
     @contextmanager
     def record_pd_cache_step(
         self,

@@ -40,6 +40,7 @@ from tokenspeed_kernel.ops.attention.triton.linear.index import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
 )
+from typing_extensions import override
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
@@ -826,7 +827,7 @@ class MambaAttnBackend(AttentionBackend):
         extend prefix before shared metadata selects state pages.
         """
 
-    def _arm_verify_round(
+    def _stage_verify_round(
         self,
         real_bs: int,
         padded_bs: int,
@@ -835,9 +836,9 @@ class MambaAttnBackend(AttentionBackend):
         verify_committed: torch.Tensor | None,
         req_pool_indices: torch.Tensor,
     ) -> None:
-        """Arm family-specific work after verify state pages are resolved.
+        """Stage family-specific work after verify state pages are resolved.
 
-        Scratch-based verify needs no per-round arming. The boundary is here
+        Scratch-based verify needs no per-round staging. The boundary is here
         because replay-based families need both committed pages and the exact
         padded batch that the shared metadata flow has established.
         """
@@ -988,7 +989,7 @@ class MambaAttnBackend(AttentionBackend):
                     verify_req_ids,
                     req_pool_indices,
                 )
-                self._arm_verify_round(
+                self._stage_verify_round(
                     bs,
                     bs,
                     kwargs,
@@ -1095,7 +1096,7 @@ class MambaAttnBackend(AttentionBackend):
                 raise RuntimeError("state paging on a draft worker is unsupported")
             if is_target_verify:
                 # Verify capture/prewarm: pad state_in (reads zeros / writes
-                # skip) + the real scratch grid; commit stays disarmed.
+                # skip) + the real scratch grid; commit stays unstaged.
                 draft_token_num = int(self.speculative_num_draft_tokens)
                 self._ensure_verify_scratch(bs, draft_token_num)
                 mamba_output_indices = self._verify_scratch_grid(bs, draft_token_num)
@@ -1200,7 +1201,7 @@ class MambaAttnBackend(AttentionBackend):
             )
         if self.state_paging_active and is_target_verify:
             # Target-verify replay: refresh the captured state_in buffers,
-            # re-arm the post-round commit, and keep the recorded scratch grid.
+            # re-stage the post-round commit, and keep the recorded scratch grid.
             draft_token_num = int(self.speculative_num_draft_tokens)
             self._ensure_verify_scratch(bs, draft_token_num)
             mamba_output_indices = self._verify_scratch_grid(bs, draft_token_num)
@@ -1252,7 +1253,7 @@ class MambaAttnBackend(AttentionBackend):
                 state_out.fill_(self.pad_slot_id)
                 state_in_blocks_by_group[group_id] = state_in
                 state_out_blocks_by_group[group_id] = state_out
-            self._arm_verify_round(
+            self._stage_verify_round(
                 real_bs,
                 bs,
                 kwargs,
@@ -1266,7 +1267,7 @@ class MambaAttnBackend(AttentionBackend):
             # which state kernels skip, so they never touch a live page.
             # Decode-only
             # (q_len == 1): before = seq_lens - 1. Validation defaults off on
-            # the replay hot path (host sync); TOKENSPEED_CACHE_DEBUG=1 arms it.
+            # the replay hot path (host sync); TOKENSPEED_CACHE_DEBUG=1 stages it.
             # bs==0 idle replay carries no operation-bound metadata; every row
             # is a dummy padded row, so skip the dual-index gather entirely.
             state_in_blocks_by_group, state_out_blocks_by_group = (
@@ -2357,6 +2358,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             q, k, v, layer, out_cache_loc, token_to_kv_pool, bs, **kwargs
         )
 
+    @override
     def settle_deferred_state(self, accepted_length):
         if accepted_length is not None:
             self.linear_attn_backend.commit_verified_state(accepted_length)

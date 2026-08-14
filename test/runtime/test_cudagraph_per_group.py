@@ -489,6 +489,7 @@ class WrapperEagerGroupGuardTest(_TorchCase):
             attn_backend=SimpleNamespace(
                 uses_cache_groups=True,
                 needs_group_block_tables=False,
+                settle_deferred_state=lambda accept_lengths: None,
             ),
             token_to_kv_pool=SimpleNamespace(
                 arena=SimpleNamespace(

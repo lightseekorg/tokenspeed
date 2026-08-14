@@ -954,25 +954,14 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(wrapper.drafter.draft_seq_lens_buf.tolist(), [1, 1, 1, 1])
 
     def test_cuda_graph_mamba_verify_state_update_keeps_decode_mode_speculation(self):
-        class BackendWithMambaUpdate:
-            def settle_deferred_state(self, accepted_length):
-                pass
-
-        backend = BackendWithMambaUpdate()
         drafter = object()
 
-        self.assertTrue(
-            _should_settle_with_accept_lengths(drafter, backend, ForwardMode.DECODE)
-        )
+        self.assertTrue(_should_settle_with_accept_lengths(drafter, ForwardMode.DECODE))
         self.assertFalse(
-            _should_settle_with_accept_lengths(drafter, backend, ForwardMode.EXTEND)
+            _should_settle_with_accept_lengths(drafter, ForwardMode.EXTEND)
         )
-        self.assertFalse(
-            _should_settle_with_accept_lengths(None, backend, ForwardMode.DECODE)
-        )
-        self.assertFalse(
-            _should_settle_with_accept_lengths(drafter, object(), ForwardMode.DECODE)
-        )
+        self.assertFalse(_should_settle_with_accept_lengths(None, ForwardMode.DECODE))
+        # Every attention backend now inherits the settlement hook.
 
     def test_cuda_graph_eager_draft_prefill_uses_single_non_v4_metadata_init(self):
         captured = {"target": [], "draft": []}

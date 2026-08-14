@@ -74,19 +74,13 @@ def get_is_cuda_graph_phase() -> bool:
     return _is_cuda_graph_phase
 
 
-def _should_settle_with_accept_lengths(
-    drafter, attn_backend, forward_mode: ForwardMode
-) -> bool:
+def _should_settle_with_accept_lengths(drafter, forward_mode: ForwardMode) -> bool:
     """Whether this round produced accept lengths for the backend to record.
 
     The settle hook itself fires on every forward; this only decides whether
     it carries a speculative verify's result.
     """
-    return (
-        drafter is not None
-        and forward_mode.is_decode()
-        and hasattr(attn_backend, "settle_deferred_state")
-    )
+    return drafter is not None and forward_mode.is_decode()
 
 
 @contextmanager
@@ -1310,10 +1304,7 @@ class CudaGraphWrapper:
         # speculative verify to record: a backend that enqueued work inside the
         # forward has to be told it landed even on the rounds that record
         # nothing, or it would still be owed -- and applied twice -- next round.
-        if hasattr(self.attn_backend, "settle_deferred_state"):
-            verified = _should_settle_with_accept_lengths(
-                self.drafter, self.attn_backend, ctx.forward_mode
-            )
-            self.attn_backend.settle_deferred_state(result[1] if verified else None)
+        verified = _should_settle_with_accept_lengths(self.drafter, ctx.forward_mode)
+        self.attn_backend.settle_deferred_state(result[1] if verified else None)
 
         return result

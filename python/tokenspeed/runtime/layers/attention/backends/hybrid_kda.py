@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention import (
     kda_paged_decode,
     kda_paged_prefill,
+    kda_replay_commit_supported,
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
 )
@@ -82,20 +83,24 @@ class KdaAttnBackend(MambaAttnBackend):
 
     def __init__(self, config: BaseAttnConfig, kda_backend: str = "auto") -> None:
         super().__init__(config)
-        self.is_kda = True
         self.max_bs = config.max_bs
         self._kda_pending: dict | None = None
-        self._kda_armed_round = False
+        self._kda_replay_staged = False
         self._kda_overflow_round = False
         self._kda_overflow_payload: dict = {}
         self._kda_lazy_bufs: dict | None = None
-        self._kda_replay_active_cache: bool | None = None
+        self._replay_active: bool = kda_replay_commit_supported()
         self._replay_payload_cache: dict | None = None
         self._replay_layer_weights: dict | None = None
         self._verify_scratch: dict | None = None
-        self._kda_slot_table: torch.Tensor | None = None
+        self._kda_slot_table = torch.full(
+            (self.max_bs + 8,), -1, dtype=torch.int32, device=self.device
+        )
+        self._kda_table_drop_staging = torch.empty(
+            self.max_bs + 8, dtype=torch.int64, pin_memory=True
+        )
         self._payload_parity = 0
-        self._armed_parity = 0
+        self._staged_parity = 0
         self._graphs_captured = False
         self._payload_half_rows: int | None = None
         self.kda_backend = (kda_backend or "auto").strip().lower()
@@ -109,6 +114,13 @@ class KdaAttnBackend(MambaAttnBackend):
             "platform-selected kernels",
             self.kda_backend,
         )
+
+    @override
+    def set_kv_pool(self, kv_pool) -> None:
+        """Bind state storage and allocate replay buffers from its geometry."""
+        super().set_kv_pool(kv_pool)
+        if self._replay_active and self.speculative_num_draft_tokens > 1:
+            self._preallocate_kda_replay_buffers(self.max_bs)
 
     def _kda_gate(
         self,
@@ -286,38 +298,65 @@ class KdaAttnBackend(MambaAttnBackend):
         head_v_dim: int,
         lower_bound: float | None,
     ) -> torch.Tensor | None:
-
-        if f_a_out is None or bias is not None:
-            if self._kda_replay_active():
-                raise RuntimeError(
-                    "KDA verify fell through to the per-position scratch path "
-                    "while replay commit is active; the fused KDA verify kernel "
-                    "must handle every verify batch"
-                )
-            return None
-
-        num_value_heads = value_dim // attn_tp_size // head_v_dim
-        if not self._kda_replay_active():
-            return try_kda_fused_paged_verify(
+        if self._replay_active:
+            return self._replay_verify(
                 mixed_qkv,
                 conv_weights,
                 conv_comp,
-                conv_scratch,
-                f_a_out,
-                f_b_weight,
-                beta_raw,
-                A_log,
-                dt_bias,
-                state_pool=ssm_comp,
-                state_scratch=ssm_scratch,
-                read_indices=state_in_blocks[:batch_size],
-                write_indices=output_indices[:batch_size],
-                num_heads=num_value_heads,
-                head_dim=head_v_dim,
+                ssm_comp,
+                layer_id=layer_id,
+                bias=bias,
+                f_a_out=f_a_out,
+                f_b_weight=f_b_weight,
+                beta_raw=beta_raw,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                batch_size=batch_size,
                 draft_token_num=draft_token_num,
+                value_dim=value_dim,
+                attn_tp_size=attn_tp_size,
+                head_v_dim=head_v_dim,
                 lower_bound=lower_bound,
             )
+        else:
+            return None
 
+    def _replay_verify(
+        self,
+        mixed_qkv: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_comp: torch.Tensor,
+        ssm_comp: torch.Tensor,
+        *,
+        layer_id: int,
+        bias: torch.Tensor | None,
+        f_a_out: torch.Tensor | None,
+        f_b_weight: torch.Tensor | None,
+        beta_raw: torch.Tensor | None,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        batch_size: int,
+        draft_token_num: int,
+        value_dim: int,
+        attn_tp_size: int,
+        head_v_dim: int,
+        lower_bound: float | None,
+    ) -> torch.Tensor:
+        """Run fused verify with replay capture and lazy commit.
+
+        The registry probe that enables replay also registers this fused
+        verify. A decline therefore signals a registry/platform mismatch;
+        replay deliberately omitted scratch, so fallback would only fail later
+        with an obscure missing-scratch error.
+        """
+        if f_a_out is None or bias is not None:
+            raise RuntimeError(
+                "KDA verify fell through to the per-position scratch path "
+                "while replay commit is active; the fused KDA verify kernel "
+                "must handle every verify batch"
+            )
+
+        num_value_heads = value_dim // attn_tp_size // head_v_dim
         gid = self.kv_pool.group_id_for_layer(layer_id)
         bufs = self._kda_lazy_buffers(min_slots=batch_size)
         max_rows = max(len(self.query_start_loc_list), batch_size) * draft_token_num
@@ -495,33 +534,6 @@ class KdaAttnBackend(MambaAttnBackend):
 
         return kda_result.out.squeeze(0), kda_result.final_state
 
-    def _kda_replay_active(self) -> bool:
-        """Whether partial accepts commit by replay instead of by scratch.
-
-        Replay re-runs the accepted prefix from the committed page, so
-        verification never has to store a state per draft position. That
-        scratch is by far the largest verify allocation -- at the K3 TP8
-        geometry it is ~795 KiB per (request, position, layer), i.e. ~10 GiB
-        at bs=64 with two draft tokens across 69 KDA layers -- so the replay
-        path skips allocating it entirely.
-
-        Only the KDA fused verify path can do this; platforms without that
-        kernel fall back to ``fused_recurrent_kda_mtp``, which still writes
-        per-position states and still needs the scratch.
-        """
-        active = self._kda_replay_active_cache
-        if active is None:
-            active = False
-            # Post-radix main: KDA state always lives in the LCM slabs.
-            if self.is_kda:
-                from tokenspeed_kernel.ops.attention import (
-                    kda_replay_commit_supported,
-                )
-
-                active = kda_replay_commit_supported()
-            self._kda_replay_active_cache = active
-        return active
-
     def _kda_lazy_buffers(self, min_slots: int = 1) -> dict:
         """Stable composed control buffers for the fused lazy commit.
 
@@ -576,34 +588,17 @@ class KdaAttnBackend(MambaAttnBackend):
         reads it back, which is what deleted the verdict round-trip this
         replaces.
         """
-        table = self._kda_slot_table
-        if table is None:
-            # Normally allocated by _preallocate_kda_replay_buffers; this
-            # fallback covers enforce-eager and direct-backend tests.
-            assert not torch.cuda.is_current_stream_capturing()
-            with torch.inference_mode(False):
-                # Pool rows are 1..max_bs plus row 0 (reserved) and one
-                # graph-padding row (event_loop's req_pool_padding_index).
-                # The compose masks against this size, so an engine handing
-                # out a wider index degrades to no-fuse, never corruption.
-                size = self.max_bs + 8
-                table = self._kda_slot_table = torch.full(
-                    (size,), -1, dtype=torch.int32, device=self.device
-                )
-        return table
+        return self._kda_slot_table
 
     def _kda_table_drop(self, rpis) -> None:
         """Clear the table rows of dropped requests, without a stream sync.
 
-        The pinned staging is a FRESH allocation per call: a reused buffer
-        races overlap scheduling (the host would rewrite it while an earlier
-        drop's async H2D is still in flight), while a fresh one is
-        event-fenced by the caching host allocator -- same rule as
-        ``InputBuffers._bulk_pinned``.
+        The pinned staging is allocated at construction because its maximum
+        width is fixed by the request-pool bound.
         """
         if self._kda_slot_table is None or not rpis:
             return
-        host = torch.empty(len(rpis), dtype=torch.int64, pin_memory=True)
+        host = self._kda_table_drop_staging[: len(rpis)]
         host.copy_(torch.tensor(rpis, dtype=torch.int64))
         dev = torch.empty_like(host, device=self.device)
         dev.copy_(host, non_blocking=True)
@@ -614,7 +609,7 @@ class KdaAttnBackend(MambaAttnBackend):
         if self._kda_slot_table is not None:
             self._kda_slot_table.fill_(-1)
 
-    def _arm_kda_pending(
+    def _stage_pending_replay(
         self,
         real_bs: int,
         padded_bs: int,
@@ -626,7 +621,10 @@ class KdaAttnBackend(MambaAttnBackend):
         """Compose this verify round's lazy-commit inputs from the pending
         record, flushing any pending request that left the verify batch.
 
-        Runs at metadata prep, outside any captured region. Must refresh the
+        Runs on every target-verify metadata prep through the
+        ``_stage_verify_round`` seam, before the forward launches. Staging
+        writes the pending replay parameters into the device control rows the
+        next fused verify reads. Must refresh the
         buffers on EVERY verify round -- a stale base would make the graphed
         kernel re-replay an already-committed prefix onto its own result,
         which double-applies the accepted tokens when the commit was in
@@ -657,15 +655,15 @@ class KdaAttnBackend(MambaAttnBackend):
             bufs["capture_base"].fill_(0)
         # Payload-ring parity: this round's capture must write the half the
         # pending's replay does NOT read. Derived, not toggled -- an abandoned
-        # prep (armed, forward never ran) must not flip the target half.
+        # prep (staged, forward never ran) must not flip the target half.
         elif self._payload_half_rows is None:
             # First round: the ring is allocated inside the forward, after this
-            # arm, so capture_base is still its zero init -- half 0 it is.
-            self._armed_parity = 0
+            # stage, so capture_base is still its zero init -- half 0 it is.
+            self._staged_parity = 0
         else:
             par = pend["parity"] if pend is not None else self._payload_parity
-            self._armed_parity = 1 - par
-            bufs["capture_base"].fill_(self._armed_parity * self._payload_half_rows)
+            self._staged_parity = 1 - par
+            bufs["capture_base"].fill_(self._staged_parity * self._payload_half_rows)
         n = padded_bs
         # pad_slot_id and every other neutral value is -1; steps rides row 1.
         bufs["flat"][:, :n].fill_(-1)
@@ -692,8 +690,8 @@ class KdaAttnBackend(MambaAttnBackend):
         # Screen corpses and departures BEFORE any flush: a growth flush that
         # still holds a departed request would write its reclaimed pages.
         rpis = list(batch.request_pool_indices)[:real_bs]
-        arm_req_ids = list(batch.request_ids)[:real_bs]
-        _, corpses = self._kda_pending_owner_mask(rpis, arm_req_ids)
+        staged_req_ids = list(batch.request_ids)[:real_bs]
+        _, corpses = self._kda_pending_owner_mask(rpis, staged_req_ids)
         if corpses:
             self._drop_kda_pending(corpses)
             pending = self._kda_pending
@@ -713,7 +711,7 @@ class KdaAttnBackend(MambaAttnBackend):
         if cache is not None and cache["rows"] < needed_rows:
             # The pending's ring and this round's ring diverge here -- eager
             # growth rebuilds the buffers the replay reads, and an overflow
-            # round writes a different set entirely. Commit before arming.
+            # round writes a different set entirely. Commit before staging.
             self._flush_kda_pending()
             return
         t_prev = pending["draft_token_num"]
@@ -751,11 +749,11 @@ class KdaAttnBackend(MambaAttnBackend):
             draft_token_num=t_prev,
             num_groups=n_groups,
         )
-        # The record stays live until the forward it was armed for is issued:
+        # The record stays live until the forward it was staged for is issued:
         # an abandoned prep still owes the window a flush. `notify_forward_issued`
         # releases it -- NOT the next round's record, which never arrives when
         # the round dies between the KDA layers and the accept sampling.
-        self._kda_armed_round = True
+        self._kda_replay_staged = True
 
     def _resolve_kda_pending_before_forward(
         self, bs: int, req_pool_indices, num_extends: int, kwargs: dict
@@ -810,7 +808,7 @@ class KdaAttnBackend(MambaAttnBackend):
             )
 
     @override
-    def _arm_verify_round(
+    def _stage_verify_round(
         self,
         real_bs: int,
         padded_bs: int,
@@ -819,9 +817,9 @@ class KdaAttnBackend(MambaAttnBackend):
         verify_committed: torch.Tensor | None,
         req_pool_indices: torch.Tensor,
     ) -> None:
-        """Arm KDA's fused deferred replay after shared verify page setup."""
-        if self._kda_replay_active():
-            self._arm_kda_pending(
+        """Stage KDA's fused deferred replay after shared verify page setup."""
+        if self._replay_active:
+            self._stage_pending_replay(
                 real_bs,
                 padded_bs,
                 kwargs,
@@ -1040,8 +1038,8 @@ class KdaAttnBackend(MambaAttnBackend):
         equal -- as they are for every window that stays inside one state
         page -- the next round replays it onto its own result.
         """
-        if self._kda_armed_round:
-            self._kda_armed_round = False
+        if self._kda_replay_staged:
+            self._kda_replay_staged = False
             self._kda_pending = None
             self._kda_table_release()
 
@@ -1129,7 +1127,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 not torch.cuda.is_current_stream_capturing()
             ), "KDA payload ring must be pre-sized before graph capture"
             # Rebuild would replace the tensors a live replay reads: commit first.
-            if cache is not None:
+            if cache is not None and self._kda_pending is not None:
                 self._flush_kda_pending()
             cache = self._replay_payload_cache = {
                 "rows": rows,
@@ -1141,9 +1139,9 @@ class KdaAttnBackend(MambaAttnBackend):
             self._payload_half_rows = rows
             bufs = self._kda_lazy_bufs
             if bufs is not None:
-                # The arm filled these against the OLD half size; recompute so
+                # The stage filled these against the OLD half size; recompute so
                 # this round's capture and next round's replay agree on rows.
-                bufs["capture_base"].fill_(self._armed_parity * rows)
+                bufs["capture_base"].fill_(self._staged_parity * rows)
                 bufs["base"].fill_(-1)
             # The startup overflow preallocation guessed its widths from the
             # pool geometry; this rebuild carries the model's true widths, so
@@ -1243,7 +1241,7 @@ class KdaAttnBackend(MambaAttnBackend):
 
         Skipped entirely on the replay path, which commits from the committed
         page instead of from a per-position row."""
-        if self._kda_replay_active():
+        if self._replay_active:
             return
         max_bs = max(len(self.query_start_loc_list), bs)
         rows_needed = max_bs * (draft_token_num + 1)
@@ -1289,7 +1287,7 @@ class KdaAttnBackend(MambaAttnBackend):
         state slab at the new committed page. All device-side; graph-safe.
 
         On the replay path the accepted prefix is re-run from the committed
-        page (see ``_kda_replay_active``); otherwise the accepted position's
+        page (see ``_replay_active``); otherwise the accepted position's
         row is copied out of the per-position verify scratch."""
         ctx = getattr(self, "_verify_commit_ctx", None)
         if ctx is None:
@@ -1315,14 +1313,14 @@ class KdaAttnBackend(MambaAttnBackend):
                 .to(torch.int64)
                 .clamp_min(0)
             )
-        if self._kda_replay_active():
+        if self._replay_active:
             # Record what a replay needs; the NEXT verify's fused kernel commits it.
             rpis = ctx[4] if len(ctx) > 4 else []
             req_ids = ctx[5] if len(ctx) > 5 else []
             overflow = self._kda_overflow_round
             if not overflow:
-                self._payload_parity = self._armed_parity
-            # Group-major stacks: the next arm's compose reads all groups in
+                self._payload_parity = self._staged_parity
+            # Group-major stacks: the next stage's compose reads all groups in
             # one launch, and the per-group views below share their storage.
             gids = self._state_group_ids
             anchor_stack = torch.stack([read_pages_by_group[g][:bs] for g in gids])
@@ -1333,7 +1331,7 @@ class KdaAttnBackend(MambaAttnBackend):
             # because the rpi input buffer is rewritten by the next prep.
             # Only REAL rows scatter: under graph replay ``bs`` is padded and
             # the pad rows' pool index is a live table row -- an entry there
-            # would arm the padding as a replay next round.
+            # would stage the padding as a replay next round.
             real = min(bs, len(rpis))
             rpis_dev = ctx[6][:real].to(torch.int64)
             table = self._kda_table()
@@ -1355,7 +1353,7 @@ class KdaAttnBackend(MambaAttnBackend):
             )
             rpi_by_slot[:real] = safe_rpis
             self._kda_pending = dict(
-                parity=0 if overflow else self._armed_parity,
+                parity=0 if overflow else self._staged_parity,
                 overflow=overflow,
                 rpi_by_slot=rpi_by_slot,
                 slot_by_rpi={r: i for i, r in enumerate(rpis[:bs])},
@@ -1423,7 +1421,7 @@ class KdaAttnBackend(MambaAttnBackend):
         forward_mode: ForwardMode = ForwardMode.DECODE,
         **kwargs,
     ):
-        self._kda_armed_round = False
+        self._kda_replay_staged = False
         return super().init_forward_metadata(
             bs, req_pool_indices, seq_lens, forward_mode, **kwargs
         )
@@ -1466,17 +1464,14 @@ class KdaAttnBackend(MambaAttnBackend):
             )
         self._qsl_dirty = [False] * max_num_tokens
         self._qsl_last_mode = [None] * max_num_tokens
-        if self._kda_replay_active() and self.speculative_num_draft_tokens > 1:
-            self._preallocate_kda_replay_buffers(max_num_tokens)
 
     def _preallocate_kda_replay_buffers(self, max_bs: int) -> None:
         """Allocate every lazy-commit buffer before any forward runs.
 
-        Called from ``init_cuda_graph_state`` -- after ``set_kv_pool`` (so
-        the pool components give the payload geometry) and before any
-        warmup, capture, or inference-mode context. Keeping the forward path
-        allocation-free avoids inference-mode tensor restrictions and any
-        chance of a first touch landing inside a capture mempool.
+        Called from ``set_kv_pool``, when pool geometry first becomes known and
+        before any warmup, capture, or inference-mode context. Keeping the
+        forward path allocation-free avoids inference-mode tensor restrictions
+        and any chance of a first touch landing inside a capture mempool.
 
         The f_a payload width is not in the pool geometry; KDA's low-rank
         gate uses the state head dim (K3: 128 == K). If a model ever
@@ -1545,9 +1540,9 @@ class KdaAttnBackend(MambaAttnBackend):
         forward_mode: ForwardMode,
         **kwargs,
     ):
-        if not self._graphs_captured and self._kda_replay_active():
+        if not self._graphs_captured and self._replay_active:
             self._graphs_captured = True
-        self._kda_armed_round = False
+        self._kda_replay_staged = False
         return super().init_forward_metadata_capture_cuda_graph(
             bs, req_pool_indices, seq_lens, forward_mode, **kwargs
         )
@@ -1561,7 +1556,7 @@ class KdaAttnBackend(MambaAttnBackend):
         page_table: torch.Tensor = None,
         **kwargs,
     ):
-        self._kda_armed_round = False
+        self._kda_replay_staged = False
         return super().init_forward_metadata_replay_cuda_graph(
             bs, req_pool_indices, seq_lens, forward_mode, page_table, **kwargs
         )
@@ -1583,6 +1578,7 @@ class HybridKDABackend(HybridLinearAttnBackend):
     def flush_pending(self, resident_request_ids: set[str]) -> None:
         self.linear_attn_backend.flush_pending(resident_request_ids)
 
+    @override
     def settle_deferred_state(self, accepted_length):
         """Release issued replay work, then record a verified state window."""
         self.linear_attn_backend.notify_forward_issued()

@@ -350,15 +350,6 @@ def test_proposals_are_valid_token_ids() -> None:
 # --------------------------------------------------------------------------
 
 
-class _BackendWithCommit:
-    def settle_deferred_state(self, accept_lengths):
-        return None
-
-
-class _BackendWithoutCommit:
-    pass
-
-
 def test_kda_commit_fires_for_a_dspark_drafter() -> None:
     """K3's recurrent state must be committed after a DSpark verify too.
 
@@ -368,7 +359,6 @@ def test_kda_commit_fires_for_a_dspark_drafter() -> None:
     """
     assert _should_settle_with_accept_lengths(
         drafter=DSpark.__new__(DSpark),
-        attn_backend=_BackendWithCommit(),
         forward_mode=ForwardMode.DECODE,
     )
 
@@ -376,15 +366,6 @@ def test_kda_commit_fires_for_a_dspark_drafter() -> None:
 def test_kda_commit_is_skipped_without_a_drafter() -> None:
     assert not _should_settle_with_accept_lengths(
         drafter=None,
-        attn_backend=_BackendWithCommit(),
-        forward_mode=ForwardMode.DECODE,
-    )
-
-
-def test_kda_commit_is_skipped_on_a_stateless_backend() -> None:
-    assert not _should_settle_with_accept_lengths(
-        drafter=DSpark.__new__(DSpark),
-        attn_backend=_BackendWithoutCommit(),
         forward_mode=ForwardMode.DECODE,
     )
 
@@ -393,6 +374,8 @@ def test_kda_commit_is_skipped_outside_decode() -> None:
     """Prefill writes state inline; there is no verify to commit."""
     assert not _should_settle_with_accept_lengths(
         drafter=DSpark.__new__(DSpark),
-        attn_backend=_BackendWithCommit(),
         forward_mode=ForwardMode.EXTEND,
     )
+
+
+# Every attention backend now inherits the settlement hook.
