@@ -86,7 +86,7 @@ def _fill_fp8_indexer_cache(
             cache,
             slots,
             torch.ones(n, dtype=torch.bool, device=device),
-            prefix_granularity=BLOCK,
+            block_size=BLOCK,
         )
         slots_by_req[req] = slots
     return cache, block_table, slots_by_req
@@ -117,7 +117,7 @@ class TestGatherPagedIndexerFp8Cache(unittest.TestCase):
             start, end = int(cu_seq_lens[req]), int(cu_seq_lens[req + 1])
             gathered = k_fp8[start:end].float() * k_scale[start:end].unsqueeze(1)
             reference = read_deepseek_v4_indexer_fp8_cache(
-                cache, slots_by_req[req], prefix_granularity=BLOCK
+                cache, slots_by_req[req], block_size=BLOCK
             )
             torch.testing.assert_close(gathered, reference, rtol=0, atol=0)
 
@@ -162,14 +162,12 @@ class TestGatherPagedIndexerFp8Cache(unittest.TestCase):
             cache,
             slots,
             torch.ones(n, dtype=torch.bool, device=device),
-            prefix_granularity=BLOCK,
+            block_size=BLOCK,
         )
         # Bytes outside the field view must stay untouched.
         self.assertEqual(int(arena[:, row_bytes:].sum()), 0)
 
-        reference = read_deepseek_v4_indexer_fp8_cache(
-            cache, slots, prefix_granularity=BLOCK
-        )
+        reference = read_deepseek_v4_indexer_fp8_cache(cache, slots, block_size=BLOCK)
         rel_err = (reference - rows.float()).abs().max() / rows.float().abs().max()
         # fp8e4m3 with power-of-two row scales quantizes to ~2^-4 relative
         # granularity near the top of a binade.

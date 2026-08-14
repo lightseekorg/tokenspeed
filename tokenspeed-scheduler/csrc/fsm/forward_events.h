@@ -62,7 +62,8 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
     PrefillSource Source() const { return source_; }
 
 private:
-    std::variant<PrefillDone, Prefilling> scheduleFirstChunk(TokenContainer* token_container, std::int32_t prefix_granularity);
+    std::variant<PrefillDone, Prefilling> scheduleFirstChunk(TokenContainer* token_container,
+                                                             std::int32_t prefix_granularity);
 
     std::int32_t tokens_this_round_{};
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
@@ -196,8 +197,8 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
     explicit ExtendResultEvent(std::vector<std::int32_t> result_tokens) : result_tokens_{std::move(result_tokens)} {}
 
     template <typename State>
-        requires CanExtendTokenContainer<State>
-    std::remove_cvref_t<State> operator()(State&& state) {
+    requires CanExtendTokenContainer<State> std::remove_cvref_t<State>
+    operator()(State&& state) {
         state.ExtendResultTokens(result_tokens_);
         return std::move(state);
     }

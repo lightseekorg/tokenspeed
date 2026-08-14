@@ -161,7 +161,8 @@ TEST(HashPrefixPageTest, FramingDisambiguatesTokensFromExtraKeys) {
     std::vector<std::int32_t> long_toks = {9, 8, 1, 4, 0x7a797877};
     std::vector<std::string> no_keys;
 
-    EXPECT_NE(HashPrefixPage(Tokens(short_toks), "", Keys(one_key)), HashPrefixPage(Tokens(long_toks), "", Keys(no_keys)));
+    EXPECT_NE(HashPrefixPage(Tokens(short_toks), "", Keys(one_key)),
+              HashPrefixPage(Tokens(long_toks), "", Keys(no_keys)));
 }
 
 // ---- ComputePrefixHashes (chaining) -------------------------------------

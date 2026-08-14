@@ -141,11 +141,14 @@ inline void FatalCheck(bool condition, const char* message = "Fatal check failed
 }
 
 template <typename T, typename Variant>
-concept IsAlternativeOf = requires(Variant v) { std::get<T>(v); };
+concept IsAlternativeOf = requires(Variant v) {
+    std::get<T>(v);
+};
 
 template <typename T>
-concept CanExtendTokenContainer =
-    requires(T& state, std::vector<std::int32_t> tokens) { state.ExtendResultTokens(tokens); };
+concept CanExtendTokenContainer = requires(T& state, std::vector<std::int32_t> tokens) {
+    state.ExtendResultTokens(tokens);
+};
 
 enum class Role {
     kP,

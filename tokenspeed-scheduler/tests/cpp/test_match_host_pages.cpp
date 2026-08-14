@@ -41,8 +41,6 @@ std::vector<std::int32_t> BlockIds(const std::vector<CacheBlockRef>& refs) {
     return ids;
 }
 
-
-
 CacheKey Key(std::string content_hash) {
     return CacheKey{.content_hash = std::move(content_hash)};
 }

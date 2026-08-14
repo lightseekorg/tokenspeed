@@ -63,7 +63,8 @@ public:
         }
         const std::int32_t num_blocks = sparseSuffixBlocks(table, demand);
         const std::int64_t extent = static_cast<std::int64_t>(demand.num_tokens) + demand.reserve_tokens;
-        const std::int32_t logical_blocks = static_cast<std::int32_t>((extent + block_granularity_ - 1) / block_granularity_);
+        const std::int32_t logical_blocks =
+            static_cast<std::int32_t>((extent + block_granularity_ - 1) / block_granularity_);
         return AcquirePlan{
             .num_blocks = num_blocks,
             .suffix_start = demand.materialized_suffix_start,

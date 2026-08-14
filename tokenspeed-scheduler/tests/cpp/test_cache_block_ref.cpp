@@ -31,7 +31,9 @@ namespace tokenspeed::test {
 namespace {
 
 template <class T>
-concept HasGet = requires(const T& value) { value.get(); };
+concept HasGet = requires(const T& value) {
+    value.get();
+};
 
 static_assert(!HasGet<CacheBlockRef>);
 static_assert(sizeof(CacheBlockRef) == sizeof(void*));

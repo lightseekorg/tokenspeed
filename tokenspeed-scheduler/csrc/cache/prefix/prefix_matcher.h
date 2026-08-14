@@ -44,9 +44,8 @@ public:
     virtual std::int32_t BoundaryLookbackPages() const = 0;
     // Probes keys[begin_blocks, begin_blocks + max_blocks) against the index.
     // probe.hits[i] marks keys[begin_blocks + i]; holes are 0.
-    virtual GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool,
-                                   std::span<const CacheKey> keys, std::int32_t begin_blocks,
-                                   std::int32_t max_blocks) const = 0;
+    virtual GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
+                                   std::int32_t begin_blocks, std::int32_t max_blocks) const = 0;
 };
 
 // Full attention: a hit is a contiguous run with no holes, so both the device
@@ -114,7 +113,9 @@ public:
 
 private:
     // Cached pages a boundary needs behind it: they cover the window's last (window - 1) tokens.
-    std::int32_t pagesNeededToResume() const { return (sliding_window_ - 1 + block_granularity_ - 1) / block_granularity_; }
+    std::int32_t pagesNeededToResume() const {
+        return (sliding_window_ - 1 + block_granularity_ - 1) / block_granularity_;
+    }
 
     struct ResumableBoundary {
         std::int32_t boundary;    // == begin_blocks when no boundary qualifies

@@ -48,8 +48,12 @@ static_assert(!HasLegacyGranularityField<CacheGroupSpec>);
 
 CacheCoordinator MakeTwoGroup(BlockPool& pool) {
     std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
-        CacheGroupSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 4,
+                       .cache_blocks_per_lcm_block = 1,
+                       .block_granularity = 2},
     };
     return MakeCoordinator(specs, 2, pool);
 }
@@ -112,8 +116,12 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
     // W=16: the SWA bounded match needs ceil((16-1)/2) = 8 > 4 contiguous pages,
     // so all 4 prefix pages stay real hits and nothing slides out of window.
     std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
-        CacheGroupSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 16, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 16,
+                       .cache_blocks_per_lcm_block = 1,
+                       .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
 
@@ -230,14 +238,10 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
     // free before four fresh pages are acquired, for a net cost of two.
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before_chunk - 2);
 
-    EXPECT_FALSE(
-        coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[0]}));
-    EXPECT_FALSE(
-        coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[1]}));
-    EXPECT_TRUE(
-        coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[2]}));
-    EXPECT_TRUE(
-        coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[3]}));
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[0]}));
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[1]}));
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[2]}));
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[3]}));
 }
 
 // The first decode step (query at position P) only reads keys back to P - W + 1.
@@ -308,7 +312,8 @@ TEST(ForwardCacheOpsDecode, StepAcquiresAndSlidesSwaWindow) {
 TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
     BlockPool pool(/*num_lcm_blocks=*/32);
     std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
@@ -596,7 +601,8 @@ TEST(ForwardCacheOpsBuildBlockTables, FreshTablesProduceEmptyRows) {
 TEST(ForwardCacheOpsBuildBlockTables, SingleGroupRowMatchesSource) {
     BlockPool pool(/*num_lcm_blocks=*/32);
     std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
@@ -662,16 +668,14 @@ TEST(ForwardCacheOpsBuildBlockTables, ResolvesEachGroupsPackingRecipe) {
 
     ASSERT_EQ(tables[0].NumBlocks(), 2);
     ASSERT_EQ(tables[1].NumBlocks(), 2);
-    EXPECT_EQ(built.at("packed"),
-              (std::vector<std::int32_t>{
-                  coordinator.Allocator(0).ResolveCacheBlockId(tables[0].Blocks()[0]->Location()),
-                  coordinator.Allocator(0).ResolveCacheBlockId(tables[0].Blocks()[1]->Location()),
-              }));
-    EXPECT_EQ(built.at("single"),
-              (std::vector<std::int32_t>{
-                  coordinator.Allocator(1).ResolveCacheBlockId(tables[1].Blocks()[0]->Location()),
-                  coordinator.Allocator(1).ResolveCacheBlockId(tables[1].Blocks()[1]->Location()),
-              }));
+    EXPECT_EQ(built.at("packed"), (std::vector<std::int32_t>{
+                                      coordinator.Allocator(0).ResolveCacheBlockId(tables[0].Blocks()[0]->Location()),
+                                      coordinator.Allocator(0).ResolveCacheBlockId(tables[0].Blocks()[1]->Location()),
+                                  }));
+    EXPECT_EQ(built.at("single"), (std::vector<std::int32_t>{
+                                      coordinator.Allocator(1).ResolveCacheBlockId(tables[1].Blocks()[0]->Location()),
+                                      coordinator.Allocator(1).ResolveCacheBlockId(tables[1].Blocks()[1]->Location()),
+                                  }));
 }
 
 }  // namespace

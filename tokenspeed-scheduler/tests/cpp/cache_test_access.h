@@ -50,9 +50,9 @@ inline void CacheFullBlocksForTest(CacheCoordinator& coordinator, std::span<Bloc
 }
 
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
-                                                                       std::vector<BlockTable>& tables,
-                                                                       CacheCoordinator::PrefixProbe&& prefix,
-                                                                       GroupDemand prototype) {
+                                                                     std::vector<BlockTable>& tables,
+                                                                     CacheCoordinator::PrefixProbe&& prefix,
+                                                                     GroupDemand prototype) {
     std::vector<GroupDemand> demands;
     demands.reserve(tables.size());
     for (BlockTable& table : tables) {
@@ -63,14 +63,14 @@ inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordi
 }
 
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
-                                                                       std::vector<BlockTable>& tables,
-                                                                       GroupDemand prototype) {
+                                                                     std::vector<BlockTable>& tables,
+                                                                     GroupDemand prototype) {
     return AdmitForTest(coordinator, tables, coordinator.ProbePrefix({}), prototype);
 }
 
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
-                                                                       std::vector<BlockTable>& tables,
-                                                                       std::int32_t num_tokens) {
+                                                                     std::vector<BlockTable>& tables,
+                                                                     std::int32_t num_tokens) {
     return AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = num_tokens});
 }
 

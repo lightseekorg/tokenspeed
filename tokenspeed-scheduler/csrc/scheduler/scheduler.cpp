@@ -152,8 +152,8 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
                 const std::int64_t later_prompt = std::min(max_prompt_tokens - chunk_tokens, chunk_tokens);
                 const std::int64_t lookback_pages = coordinator_.GroupBoundaryLookbackPages(i);
                 pages = std::max(pages, lookback_pages + ceilDiv(chunk_tokens, block_granularity));
-                pages = std::max(pages,
-                                 lookback_pages + ceilDiv(later_prompt + decode_width + protected_tokens, block_granularity));
+                pages = std::max(
+                    pages, lookback_pages + ceilDiv(later_prompt + decode_width + protected_tokens, block_granularity));
             }
             return pages;
         };
@@ -168,7 +168,8 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
                 // The final prompt page may be full, so a non-zero decode
                 // reservation can span one more page than its own page count.
                 const std::int64_t reserved_tokens = decode_width + protected_tokens;
-                const std::int64_t snapshot_pages = reserved_tokens == 0 ? 1 : 1 + ceilDiv(reserved_tokens, block_granularity);
+                const std::int64_t snapshot_pages =
+                    reserved_tokens == 0 ? 1 : 1 + ceilDiv(reserved_tokens, block_granularity);
                 // A retracted Decode request may recover by locally
                 // recomputing its suffix. Old State checkpoints are
                 // evictable, but one recovery chunk and its lookback must fit.

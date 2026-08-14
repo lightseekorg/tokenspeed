@@ -1759,8 +1759,12 @@ TEST_F(RetractStateGroupSuite, StateGroupRequestRetractsCleanly) {
 TEST(CacheProgressTest, PromotionBoundarySurvivesPrefillRounds) {
     BlockPool pool(/*num_lcm_blocks=*/8);
     std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
-        CacheGroupSpec{.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kMambaState,
+                       .sliding_window = 0,
+                       .cache_blocks_per_lcm_block = 1,
+                       .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     ReqPoolAllocator req_pool{4};
@@ -1846,7 +1850,8 @@ TEST_F(PromotionBoundaryHeadOfLineSuite, DoesNotStartSecondIncompletePrefill) {
 TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     BlockPool pool(/*num_lcm_blocks=*/8);
     std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     ReqPoolAllocator req_pool{4};
@@ -1876,7 +1881,8 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
 TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) {
     BlockPool device_pool(/*num_lcm_blocks=*/12);
     std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool);
     ReqPoolAllocator req_pool{4};
@@ -1929,8 +1935,12 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
 TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
     BlockPool pool(/*num_lcm_blocks=*/8);
     std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
-        CacheGroupSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 4,
+                       .cache_blocks_per_lcm_block = 1,
+                       .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     ReqPoolAllocator req_pool{4};
@@ -2003,8 +2013,12 @@ TEST_F(ChunkedPrefillSuite, AbortDuringDecodeRestoresPoolBaseline) {
 TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
     BlockPool pool(/*num_lcm_blocks=*/31);  // Pages are not the constraint.
     std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
-        CacheGroupSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 4,
+                       .cache_blocks_per_lcm_block = 1,
+                       .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     ReqPoolAllocator req_pool{1};
@@ -2039,8 +2053,12 @@ TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
 TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     BlockPool pool(/*num_lcm_blocks=*/32);
     std::vector<CacheGroupSpec> specs{
-        CacheGroupSpec{.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
-        CacheGroupSpec{.kind = AttnKind::kSlidingWindow, .sliding_window = 4, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 4,
+                       .cache_blocks_per_lcm_block = 1,
+                       .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());

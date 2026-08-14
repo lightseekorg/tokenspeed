@@ -34,7 +34,7 @@
 namespace tokenspeed {
 
 CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
-                                       BlockPool* host_pool, bool stream_device_cache_to_host)
+                                   BlockPool* host_pool, bool stream_device_cache_to_host)
     : groups_{std::move(groups)},
       pool_{pool},
       host_pool_{host_pool},
@@ -116,7 +116,7 @@ bool CacheCoordinator::ClearCache() {
 }
 
 std::vector<CacheKey> CacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
-                                                       std::uint32_t group_id) const {
+                                                     std::uint32_t group_id) const {
     _assert(group_id < groups_.size(), "cache key group id out of range");
     const std::int32_t group_block_granularity = geometry_[group_id].BlockGranularity();
     const std::int32_t pages_per_prefix_hash = prefix_granularity_ / group_block_granularity;
@@ -184,8 +184,7 @@ ConvergedBoundary SweepThenConverge(std::span<const std::size_t> order, const st
 
 }  // namespace
 
-std::vector<std::vector<CacheKey>> CacheCoordinator::buildGroupKeys(
-    std::span<const std::string> content_hashes) const {
+std::vector<std::vector<CacheKey>> CacheCoordinator::buildGroupKeys(std::span<const std::string> content_hashes) const {
     std::vector<std::vector<CacheKey>> group_keys(groups_.size());
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         group_keys[i] = keysForGroup(content_hashes, groups_[i].Id());
@@ -255,8 +254,8 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTierWithKeys(
 
 template <CacheTier Tier>
 CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys,
-                                                         std::int32_t floor_tokens, PrefixProbe::Tier&& probe,
-                                                         std::uint64_t access_epoch) {
+                                                       std::int32_t floor_tokens, PrefixProbe::Tier&& probe,
+                                                       std::uint64_t access_epoch) {
     BlockPool& pool = tierPool<Tier>();
     CoordinatorMatch out;
     out.num_common_tokens = probe.num_common_tokens;
@@ -356,8 +355,7 @@ std::int64_t CacheCoordinator::LcmBlocksNeededFor(std::span<const std::int64_t> 
     return prefix_blocks;
 }
 
-std::size_t CacheCoordinator::NumActiveLcmBlocks(
-    std::span<const std::span<const BlockTable>> request_tables) const {
+std::size_t CacheCoordinator::NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const {
     std::unordered_set<std::int32_t> active;
     for (std::span<const BlockTable> tables : request_tables) {
         for (const BlockTable& table : tables) {
@@ -374,7 +372,8 @@ std::size_t CacheCoordinator::NumActiveLcmBlocks(
 std::int32_t CacheCoordinator::GroupAvailablePages(std::int32_t group_index) const {
     _assert(group_index >= 0 && static_cast<std::size_t>(group_index) < groups_.size(),
             "cache group index out of range");
-    const std::int32_t slots_per_parent = groups_[static_cast<std::size_t>(group_index)].Allocator().CacheBlocksPerLcmBlock();
+    const std::int32_t slots_per_parent =
+        groups_[static_cast<std::size_t>(group_index)].Allocator().CacheBlocksPerLcmBlock();
     std::int32_t available = pool_.NumEmptyLcmBlocks() * slots_per_parent;
     for (std::int32_t id = 1; id <= pool_.NumLcmBlocks(); ++id) {
         if (pool_.BoundGroup(id) == static_cast<std::uint32_t>(group_index)) {
@@ -436,8 +435,8 @@ std::int32_t CacheCoordinator::NumNewlyReleasableLcmBlocks(std::span<const Block
 }
 
 void CacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
-                                         std::uint64_t access_epoch, std::int32_t first_slot,
-                                         CacheBoundaryKind boundary_kind) {
+                                       std::uint64_t access_epoch, std::int32_t first_slot,
+                                       CacheBoundaryKind boundary_kind) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     if (content_hashes.empty()) {
         return;  // hot decode rounds usually fill no page
@@ -464,8 +463,8 @@ void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> pr
 }
 
 void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> prefix_hashes,
-                                              std::uint64_t access_epoch, std::int32_t first_new_prefix_page,
-                                              std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind) {
+                                            std::uint64_t access_epoch, std::int32_t first_new_prefix_page,
+                                            std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     _assert(first_new_prefix_page >= 0 && static_cast<std::size_t>(first_new_prefix_page) < prefix_hashes.size(),
             "completed page range must be non-empty");
@@ -483,8 +482,8 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::s
 
 template <CacheTier Tier>
 void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
-                                                 std::span<const CacheKey> keys, std::int32_t first_cache_block,
-                                                 std::uint64_t access_epoch, CacheBoundaryKind boundary_kind) {
+                                               std::span<const CacheKey> keys, std::int32_t first_cache_block,
+                                               std::uint64_t access_epoch, CacheBoundaryKind boundary_kind) {
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
     auto* inserted = [&]() -> std::vector<std::pair<CacheKey, CacheBlockRef>>* {
         if constexpr (Tier == CacheTier::kDevice) {
@@ -551,9 +550,8 @@ CacheBlockRef CacheCoordinator::AcquireHostBlock(std::uint32_t group_id) {
     std::optional<HostCacheValue> victim_value;
     for (std::int32_t parent_id = 1; parent_id <= host_pool_->NumLcmBlocks(); ++parent_id) {
         const std::optional<std::uint32_t> bound_group = host_pool_->BoundGroup(parent_id);
-        if (!bound_group ||
-            !groups_[*bound_group].Index().ParentIsFullyEvictable(
-                *host_pool_, parent_id, groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock())) {
+        if (!bound_group || !groups_[*bound_group].Index().ParentIsFullyEvictable(
+                                *host_pool_, parent_id, groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock())) {
             continue;
         }
         std::optional<HostCacheValue> parent_value;
@@ -601,7 +599,7 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
 
 template <CacheTier Tier>
 void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
-                                                      std::uint64_t access_epoch) {
+                                                    std::uint64_t access_epoch) {
     const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[group_index].BlockGranularity();
     if (groups_[group_index].Matcher().IsPrefixClosed()) {
         std::vector<CacheKey> keys =
@@ -638,15 +636,15 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, con
 }
 
 void CacheCoordinator::cacheDeviceCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
-                                                            std::uint64_t access_epoch) {
+                                                          std::uint64_t access_epoch) {
     cacheCompletedBlocksForGroup<CacheTier::kDevice>(group_index, demand, access_epoch);
 }
 
 void CacheCoordinator::ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        groups_[i].Allocator().ReclaimExpired(
-            pool_, tables[i], groupExpiredBlocksAt(static_cast<std::int32_t>(i), num_computed_tokens));
+        groups_[i].Allocator().ReclaimExpired(pool_, tables[i],
+                                              groupExpiredBlocksAt(static_cast<std::int32_t>(i), num_computed_tokens));
     }
 }
 
@@ -676,8 +674,8 @@ bool CacheCoordinator::IsHostCachedBlock(CacheBlockLocation location) const {
     if (host_pool_ == nullptr) {
         return false;
     }
-    return std::ranges::any_of(
-        groups_, [&](const CacheGroup& group) { return group.Index().Contains(*host_pool_, location); });
+    return std::ranges::any_of(groups_,
+                               [&](const CacheGroup& group) { return group.Index().Contains(*host_pool_, location); });
 }
 
 std::int32_t CacheCoordinator::NumHostCachedBlocks() const {
@@ -708,8 +706,8 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
     groups_[key.group_id].Index().Register(*host_pool_, block_ref, key, ++next_access_epoch_);
 }
 
-CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity, BlockPool& pool,
-                                   BlockPool* host_pool, bool stream_device_cache_to_host) {
+CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
+                                 BlockPool& pool, BlockPool* host_pool, bool stream_device_cache_to_host) {
     _assert(!specs.empty(), "MakeCoordinator requires at least one spec");
     _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
     _assert(specs.size() <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()),

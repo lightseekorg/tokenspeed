@@ -96,8 +96,14 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
     // full target group + a sliding "draft" group (window 8 -> lookback 2
     // blocks): the draft-SWA-under-full-target shape.
     const std::vector<CacheGroupSpec> specs = {
-        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = kBlockTokens},
-        {.kind = AttnKind::kSlidingWindow, .sliding_window = 8, .cache_blocks_per_lcm_block = 1, .block_granularity = kBlockTokens},
+        {.kind = AttnKind::kFull,
+         .sliding_window = 0,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = kBlockTokens},
+        {.kind = AttnKind::kSlidingWindow,
+         .sliding_window = 8,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = kBlockTokens},
     };
 
     std::mt19937 rng(20260807);
@@ -166,9 +172,18 @@ TEST(JointMatchInvariantsTest, DraftOnlyGroupJoinsConvergenceAsOrdinaryGroup) {
     constexpr std::int32_t kBlocks = 8;
     constexpr std::int32_t kBlockTokens = 4;
     const std::vector<CacheGroupSpec> specs = {
-        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = kBlockTokens},
-        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = kBlockTokens},
-        {.kind = AttnKind::kSlidingWindow, .sliding_window = 8, .cache_blocks_per_lcm_block = 1, .block_granularity = kBlockTokens},
+        {.kind = AttnKind::kFull,
+         .sliding_window = 0,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = kBlockTokens},
+        {.kind = AttnKind::kFull,
+         .sliding_window = 0,
+         .cache_blocks_per_lcm_block = 2,
+         .block_granularity = kBlockTokens},
+        {.kind = AttnKind::kSlidingWindow,
+         .sliding_window = 8,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = kBlockTokens},
     };
     BlockPool pool(64);
     CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool);

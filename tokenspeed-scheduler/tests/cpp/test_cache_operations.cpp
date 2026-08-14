@@ -150,7 +150,7 @@ TEST(CacheOperationTest, RetractionStoreIsBestEffortAndUsesOrdinaryTransferPins)
         .block_granularity = 2,
     }};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
-                                                     /*stream_device_cache_to_host=*/false);
+                                                   /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
     std::vector<BlockTable> tables(1);
@@ -180,7 +180,7 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
         .block_granularity = 2,
     }};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
-                                                     /*stream_device_cache_to_host=*/false);
+                                                   /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
     CacheBlockRef host_pin = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
@@ -205,9 +205,8 @@ TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRe
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*host_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
 
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .num_tokens = 4}};

@@ -41,8 +41,6 @@ CacheKey RealKey(const std::vector<std::int32_t>& tokens, std::uint32_t group_id
     return CacheKey{.group_id = group_id, .content_hash = std::move(hashes.front())};
 }
 
-
-
 TEST(FullAttnManagerTest, ConstructsWithBlockGranularity) {
     BlockPool pool(8);
     FullAttnManager mgr(/*block_granularity=*/4);
@@ -498,9 +496,8 @@ TEST(FullAttnManagerLcmTest, PinnedChildBlocksWholeParentEviction) {
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 8));
     const std::uint64_t access_epoch = 1;
-    mgr.Index().RegisterFullBlocks(pool, table,
-                                   std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)},
-                        access_epoch);
+    mgr.Index().RegisterFullBlocks(
+        pool, table, std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)}, access_epoch);
 
     EXPECT_FALSE(mgr.ParentIsFullyEvictable(pool, 1));
     mgr.Free(table);
@@ -513,9 +510,8 @@ TEST(FullAttnManagerLcmTest, CrossGroupRebindRequiresErasingEveryChildEntry) {
     BlockTable table;
     ASSERT_TRUE(first_group.Acquire(pool, table, 8));
     const std::uint64_t access_epoch = 1;
-    first_group.Index().RegisterFullBlocks(pool, table,
-                                           std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)},
-                                access_epoch);
+    first_group.Index().RegisterFullBlocks(
+        pool, table, std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)}, access_epoch);
     first_group.Free(table);
 
     ASSERT_TRUE(first_group.EvictCachedBlock(pool, CacheBlockLocation{.lcm_block_id = 1, .slot_index = 0}));

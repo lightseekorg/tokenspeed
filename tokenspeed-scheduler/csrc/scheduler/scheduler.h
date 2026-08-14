@@ -126,8 +126,8 @@ private:
         PlanBuildContext& context, CacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
         std::optional<std::uint64_t> request_access_epoch = std::nullopt);
     std::optional<CacheCoordinator::AdmissionResult> admit(PlanBuildContext& context,
-                                                             std::span<const GroupDemand> demands,
-                                                             std::uint64_t request_access_epoch);
+                                                           std::span<const GroupDemand> demands,
+                                                           std::uint64_t request_access_epoch);
     bool admitWithKvEventTracking(PlanBuildContext& context, Request& request, const fsm::CacheProgress& cache_progress,
                                   std::int32_t new_prefix_hash_begin, std::span<const GroupDemand> demands);
     std::vector<CacheKey> registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,

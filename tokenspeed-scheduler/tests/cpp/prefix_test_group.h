@@ -95,7 +95,7 @@ public:
         const BlockTable& table, std::int32_t num_computed_tokens,
         std::span<const CacheBlockLocation> released_locations) const {
         return allocator_.ReclaimableBlockLocationsAt(index_, table, expiredBlocksAt(num_computed_tokens),
-                                                    released_locations);
+                                                      released_locations);
     }
 
     // --- prefix matching / index (pre-split convenience API) ---
@@ -104,8 +104,8 @@ public:
     GroupPrefixProbe Probe(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
                            std::int32_t max_blocks) const {
         if (sliding_window_ > 0) {
-            return SwaMatcher(geometry_.BlockGranularity(), sliding_window_).Probe(index_, pool, keys, begin_blocks,
-                                                                           max_blocks);
+            return SwaMatcher(geometry_.BlockGranularity(), sliding_window_)
+                .Probe(index_, pool, keys, begin_blocks, max_blocks);
         }
         return FullAttnMatcher{}.Probe(index_, pool, keys, begin_blocks, max_blocks);
     }

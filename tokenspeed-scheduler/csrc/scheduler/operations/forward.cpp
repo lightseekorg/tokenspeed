@@ -209,9 +209,9 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
 }
 
 std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(PlanBuildContext& context,
-                                                                    CacheCoordinator::PrefixProbe&& prefix,
-                                                                    std::span<const GroupDemand> demands,
-                                                                    std::optional<std::uint64_t> request_access_epoch) {
+                                                                  CacheCoordinator::PrefixProbe&& prefix,
+                                                                  std::span<const GroupDemand> demands,
+                                                                  std::optional<std::uint64_t> request_access_epoch) {
     std::optional<CacheCoordinator::AdmissionResult> result =
         coordinator_.Admit(std::move(prefix), demands, request_access_epoch);
     if (!result) {
@@ -235,8 +235,8 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(PlanBuildConte
 }
 
 std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(PlanBuildContext& context,
-                                                                    std::span<const GroupDemand> demands,
-                                                                    std::uint64_t request_access_epoch) {
+                                                                  std::span<const GroupDemand> demands,
+                                                                  std::uint64_t request_access_epoch) {
     return admit(context, coordinator_.ProbePrefix({}), demands, request_access_epoch);
 }
 
@@ -294,7 +294,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
                 const std::int32_t retained_begin =
                     std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
                 demands[i].num_tokens = request->PrefillSize();
-                demands[i].materialized_suffix_start = std::max(hit_tokens / block_granularity, retained_begin / block_granularity);
+                demands[i].materialized_suffix_start =
+                    std::max(hit_tokens / block_granularity, retained_begin / block_granularity);
             }
         }
     }

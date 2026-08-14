@@ -375,8 +375,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         }
         if (demand.num_computed_tokens >= 0) {
             groups_[i].Allocator().ReclaimExpired(
-                pool_, *demand.table,
-                geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), demand.num_computed_tokens));
+                pool_, *demand.table, geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), demand.num_computed_tokens));
         }
     }
     for (const auto& [group_id, location] : prospective_victims) {

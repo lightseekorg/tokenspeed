@@ -33,7 +33,9 @@ namespace tokenspeed::test {
 namespace {
 
 template <class T>
-concept HasCacheIndex = requires(T& value) { value.ContainsCachedBlock("key"); };
+concept HasCacheIndex = requires(T& value) {
+    value.ContainsCachedBlock("key");
+};
 
 static_assert(!HasCacheIndex<BlockPool>);
 

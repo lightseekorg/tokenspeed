@@ -57,7 +57,7 @@ public:
     // The Host pool is available to explicit tier operations. Streaming controls
     // whether ordinary Device prefix publication also feeds the Host tier.
     CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
-                       BlockPool* host_pool = nullptr, bool stream_device_cache_to_host = true);
+                     BlockPool* host_pool = nullptr, bool stream_device_cache_to_host = true);
 
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
@@ -71,9 +71,7 @@ public:
     const PrefixCacheIndex& GroupPrefixIndex(std::int32_t i) const {
         return groups_[static_cast<std::size_t>(i)].Index();
     }
-    const PrefixMatcher& GroupMatcher(std::int32_t i) const {
-        return groups_[static_cast<std::size_t>(i)].Matcher();
-    }
+    const PrefixMatcher& GroupMatcher(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Matcher(); }
     // Match-policy and geometry views for scheduling code, in logical page
     // units. The managers are token-free; every token -> page conversion goes
     // through the per-group GroupGeometry held here.
@@ -83,7 +81,9 @@ public:
     std::int32_t GroupBoundaryLookbackPages(std::int32_t i) const {
         return groups_[static_cast<std::size_t>(i)].Matcher().BoundaryLookbackPages();
     }
-    std::int32_t GroupBlockGranularity(std::int32_t i) const { return geometry_[static_cast<std::size_t>(i)].BlockGranularity(); }
+    std::int32_t GroupBlockGranularity(std::int32_t i) const {
+        return geometry_[static_cast<std::size_t>(i)].BlockGranularity();
+    }
     std::int32_t GroupBlocksNeededFor(std::int32_t i, const BlockTable& table, std::int32_t num_tokens) const {
         return geometry_[static_cast<std::size_t>(i)].BlocksNeededFor(table, num_tokens);
     }
@@ -96,8 +96,8 @@ public:
     std::int32_t GroupBlocksReclaimableAt(std::int32_t i, const BlockTable& table, std::int32_t num_computed_tokens,
                                           bool count_uncached) const {
         const CacheGroup& group = groups_[static_cast<std::size_t>(i)];
-        return group.Allocator().BlocksReclaimableAt(group.Index(), table,
-                                                   groupExpiredBlocksAt(i, num_computed_tokens), count_uncached);
+        return group.Allocator().BlocksReclaimableAt(group.Index(), table, groupExpiredBlocksAt(i, num_computed_tokens),
+                                                     count_uncached);
     }
 
     struct PrefixProbe {
@@ -250,7 +250,8 @@ private:
 
 // One CacheGroup per spec (group_id = index), sharing one scheduler prefix
 // domain P while each group may use a smaller cache-page token count.
-CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity, BlockPool& pool,
-                                   BlockPool* host_pool = nullptr, bool stream_device_cache_to_host = true);
+CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
+                                 BlockPool& pool, BlockPool* host_pool = nullptr,
+                                 bool stream_device_cache_to_host = true);
 
 }  // namespace tokenspeed
