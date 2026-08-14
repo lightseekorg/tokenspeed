@@ -1509,4 +1509,3 @@ def test_slot_table_holds_every_index_the_scheduler_can_deliver():
     assert KDA_SLOT_TABLE_PADDING >= 2
     assert graph_padding_index < table.shape[0], "graph padding lands out of range"
     assert table.shape[0] - 1 > max_bs, "sentinel row can hold a live slot"
-    assert h.backend._kda_table_drop_staging.shape[0] == table.shape[0]

@@ -105,11 +105,6 @@ class KdaAttnBackend(MambaAttnBackend):
             dtype=torch.int32,
             device=self.device,
         )
-        self._kda_table_drop_staging = torch.empty(
-            self.max_bs + KDA_SLOT_TABLE_PADDING,
-            dtype=torch.int64,
-            pin_memory=True,
-        )
         self._payload_parity = 0
         self._staged_parity = 0
         self._graphs_captured = False
@@ -617,13 +612,11 @@ class KdaAttnBackend(MambaAttnBackend):
     def _kda_table_drop(self, rpis) -> None:
         """Clear the table rows of dropped requests, without a stream sync.
 
-        The pinned staging is allocated at construction because its maximum
-        width is fixed by the request-pool bound.
+        Fresh pinned staging keeps each asynchronous copy's source alive.
         """
         if not rpis:
             return
-        host = self._kda_table_drop_staging[: len(rpis)]
-        host.copy_(torch.tensor(rpis, dtype=torch.int64))
+        host = torch.tensor(rpis, dtype=torch.int64, pin_memory=True)
         dev = torch.empty_like(host, device=self.device)
         dev.copy_(host, non_blocking=True)
         self._kda_slot_table.index_fill_(0, dev, -1)
@@ -778,10 +771,15 @@ class KdaAttnBackend(MambaAttnBackend):
         # the round dies between the KDA layers and the accept sampling.
         self._kda_replay_staged = True
 
-    def _resolve_kda_pending_before_forward(
-        self, bs: int, req_pool_indices, num_extends: int, kwargs: dict
+    @override
+    def _resolve_pending_before_forward(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        num_extends: int,
+        kwargs: dict,
     ) -> None:
-        """Resolve pending windows whose owners sit in a non-verify batch.
+        """Resolve pending replay windows whose owners sit in a non-verify batch.
 
         Owners among the extend rows are having their state rebuilt from
         scratch -- a retract-resume, or a fresh request on a recycled pool
@@ -792,6 +790,8 @@ class KdaAttnBackend(MambaAttnBackend):
         other owner is a resident decoder and commits here, before the
         forward touches its state.
         """
+        if self._kda_pending is None:
+            return
         batch = kwargs.get("forward_batch")
         batch_ids = list(batch.request_ids)[:bs] if batch is not None else []
         # request_pool_indices is host-side on the op; the device tensor's
@@ -815,20 +815,6 @@ class KdaAttnBackend(MambaAttnBackend):
         if owners and self._kda_pending is not None:
             gate = self._kda_owner_commit_gate(owners, batch_rpis, kwargs)
             self._flush_kda_pending(only_rpis=owners, commit_gate_by_group=gate)
-
-    @override
-    def _resolve_pending_before_forward(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        num_extends: int,
-        kwargs: dict,
-    ) -> None:
-        """Resolve KDA's cross-round replay window before shared page setup."""
-        if self._kda_pending is not None:
-            self._resolve_kda_pending_before_forward(
-                bs, req_pool_indices, num_extends, kwargs
-            )
 
     @override
     def _stage_verify_round(
