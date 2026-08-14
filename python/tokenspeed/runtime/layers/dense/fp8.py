@@ -28,6 +28,7 @@ import logging
 import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
+    per_block_quant_fp8,
     per_token_group_quant_fp8,
     per_token_quant_fp8,
     static_quant_fp8,
@@ -103,7 +104,7 @@ class Fp8LinearMethod(LinearMethodBase):
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        if self.block_quant:
+        if self.block_quant and self.quant_config.is_checkpoint_fp8_serialized:
             block_n, block_k = (
                 self.quant_config.weight_block_size[0],
                 self.quant_config.weight_block_size[1],
@@ -210,6 +211,28 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.block_quant:
+            if not self.quant_config.is_checkpoint_fp8_serialized:
+                qweight, weight_scale = per_block_quant_fp8(
+                    layer.weight.data, self.quant_config.weight_block_size
+                )
+                layer.weight = Parameter(qweight, requires_grad=False)
+                layer.register_parameter(
+                    "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
+                )
+                layer.input_scale = None
+            # If ROCm, normalize the weights and scales to e4m3fnuz
+            if platform.is_fp8e4m3fnuz:
+                # activation_scheme: dynamic
+                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale_inv,
+                    input_scale=None,
+                )
+                layer.input_scale = None
+            else:
+                weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
+            layer.weight.data = weight.data
+            layer.weight_scale_inv.data = weight_scale.data
             layer._use_deep_gemm_fp8 = False
             layer._use_flashinfer_fp8_blockscale = False
             is_bmm = getattr(layer, "is_bmm", False)
