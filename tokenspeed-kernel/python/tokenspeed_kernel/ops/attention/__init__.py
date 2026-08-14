@@ -128,8 +128,7 @@ __all__ = [
     "gdn_chunk_prefill",
     "gdn_decode_step",
     "gdn_decode_mtp",
-    "try_gdn_replay_commit",
-    "try_gdn_replay_commit_layers",
+    "gdn_replay_commit",
     "gdn_replay_commit_supported",
     "kda_paged_prefill",
     "kda_paged_decode",
@@ -1170,7 +1169,7 @@ def gdn_decode_mtp(
         )
 
 
-def try_gdn_replay_commit_layers(
+def gdn_replay_commit(
     payload: torch.Tensor,
     parameters: torch.Tensor,
     *,
@@ -1180,14 +1179,11 @@ def try_gdn_replay_commit_layers(
     write_indices: torch.Tensor,
     accepted_length: torch.Tensor,
     draft_token_num: int,
-    num_k_heads: int,
-    num_v_heads: int,
-    head_k_dim: int,
-    head_v_dim: int,
+    geometry: tuple[int, int, int, int],
     state_dtype: torch.dtype,
     override: str | None = None,
     solution: str | None = None,
-) -> bool:
+) -> None:
     """Replay every GDN layer's accepted prefix in one kernel launch.
 
     K/V/a/b share one layer-major allocation. Recurrent slabs may remain
@@ -1208,24 +1204,18 @@ def try_gdn_replay_commit_layers(
         write_indices: Accepted-state destination pages shaped ``[L, B]``.
         accepted_length: Accepted verified-token count per request, shaped ``[B]``.
         draft_token_num: Number of verify positions per request (``T``).
-        num_k_heads: Number of key heads per layer (``H``).
-        num_v_heads: Number of value/state heads per layer (``HV``).
-        head_k_dim: Key/state inner dimension (``K``).
-        head_v_dim: Value/state inner dimension (``V``).
+        geometry: ``(num_k_heads, num_v_heads, head_k_dim, head_v_dim)``.
         state_dtype: Element dtype shared by all recurrent-state pools.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
-
-    Returns:
-        ``True`` when a kernel ran, or ``False`` when the current platform has
-        no compatible implementation.
     """
     if payload.dim() != 3 or not payload.is_contiguous():
         raise ValueError("GDN layer replay payload must be contiguous [L, rows, width]")
     num_layers = payload.shape[0]
     batch_size = accepted_length.numel()
     if num_layers == 0 or batch_size == 0:
-        return True
+        return
+    num_k_heads, num_v_heads, head_k_dim, head_v_dim = geometry
     if draft_token_num <= 0:
         raise ValueError("draft_token_num must be positive")
     if num_v_heads <= 0 or num_k_heads <= 0 or num_v_heads % num_k_heads:
@@ -1291,17 +1281,14 @@ def try_gdn_replay_commit_layers(
         raise ValueError("all GDN replay tensors must reside on the payload device")
 
     signature = _attention_format_signature(q=payload, k=payload, v=payload)
-    try:
-        kernel = select_kernel(
-            "attention",
-            "gdn_replay_commit",
-            signature,
-            traits={"flat_state": True},
-            solution=solution,
-            override=override,
-        )
-    except NoKernelFoundError:
-        return False
+    kernel = select_kernel(
+        "attention",
+        "gdn_replay_commit",
+        signature,
+        traits={"flat_state": True},
+        solution=solution,
+        override=override,
+    )
     with kernel_scope(
         "attention",
         "gdn_replay_commit",
@@ -1329,82 +1316,6 @@ def try_gdn_replay_commit_layers(
             head_v_dim=head_v_dim,
             state_dtype=state_dtype,
         )
-    return True
-
-
-def try_gdn_replay_commit(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    dt_bias: torch.Tensor,
-    b: torch.Tensor,
-    state_pool: torch.Tensor,
-    read_indices: torch.Tensor,
-    write_indices: torch.Tensor,
-    accepted_length: torch.Tensor,
-    override: str | None = None,
-    solution: str | None = None,
-) -> bool:
-    """Compatibility wrapper for replaying a single GDN layer.
-
-    New runtimes should retain an already-packed layer-major payload and call
-    :func:`try_gdn_replay_commit_layers`; this wrapper packs one layer before
-    dispatch and exists for callers of the original ReplaySSM API.
-    """
-    if k.dim() != 4 or v.dim() != 4:
-        raise ValueError("GDN replay expects k and v shaped [B, T, H, D]")
-    batch_size, draft_token_num, num_k_heads, head_k_dim = k.shape
-    if v.shape[:2] != (batch_size, draft_token_num):
-        raise ValueError("GDN replay k/v batch and token dimensions must match")
-    num_v_heads, head_v_dim = v.shape[2:]
-    if a.shape != (batch_size, draft_token_num, num_v_heads):
-        raise ValueError("GDN replay a must have shape [B, T, num_v_heads]")
-    if b.shape != a.shape:
-        raise ValueError("GDN replay b must have shape [B, T, num_v_heads]")
-    if state_pool.dim() != 4 or state_pool.shape[1:] != (
-        num_v_heads,
-        head_v_dim,
-        head_k_dim,
-    ):
-        raise ValueError("GDN replay state_pool has incompatible K-last geometry")
-    if not state_pool[0].is_contiguous():
-        raise ValueError("GDN replay state rows must be contiguous")
-
-    payload = torch.cat(
-        (
-            k.reshape(batch_size, draft_token_num, -1),
-            v.reshape(batch_size, draft_token_num, -1),
-            a,
-            b,
-        ),
-        dim=-1,
-    ).reshape(1, batch_size * draft_token_num, -1)
-    parameters = torch.stack((A_log.float(), dt_bias.float())).unsqueeze(0)
-    state_addresses = torch.tensor(
-        [state_pool.data_ptr()], dtype=torch.uint64, device=state_pool.device
-    )
-    state_row_strides = torch.tensor(
-        [state_pool.stride(0)], dtype=torch.int64, device=state_pool.device
-    )
-    return try_gdn_replay_commit_layers(
-        payload,
-        parameters,
-        state_addresses=state_addresses,
-        state_row_strides=state_row_strides,
-        read_indices=read_indices.reshape(1, batch_size).to(torch.int32).contiguous(),
-        write_indices=write_indices.reshape(1, batch_size).to(torch.int32).contiguous(),
-        accepted_length=accepted_length.to(torch.int32).contiguous(),
-        draft_token_num=draft_token_num,
-        num_k_heads=num_k_heads,
-        num_v_heads=num_v_heads,
-        head_k_dim=head_k_dim,
-        head_v_dim=head_v_dim,
-        state_dtype=state_pool.dtype,
-        override=override,
-        solution=solution,
-    )
 
 
 def gdn_replay_commit_supported(

@@ -307,24 +307,14 @@ tokenspeed serve Qwen/Qwen3-30B-A3B \
 
 ## Qwen3.5
 
-Qwen3.5 uses hybrid Gated DeltaNet (GDN) and full-attention layers. During MTP
-target verification, TokenSpeed automatically enables ReplaySSM whenever the
-portable GDN replay kernel is available. Verify stores each draft position's
-post-convolution K/V and scalar gate inputs instead of a full recurrent state.
-The existing per-layer QKV split kernel writes K/V/a/b directly into the packed
-replay allocation, so verify adds no payload-capture kernel; the model-static
-`A_log`/`dt_bias` table is initialized once during CUDA Graph warmup.
-After sampling determines `accept_len`, only the accepted prefix is replayed
-from the committed state and one final SSM state is written. K/V/a/b use one
-layer-major packed allocation, while recurrent pools are exposed through a
-layer-indexed address/stride table, so a single ReplaySSM kernel launch handles
-every GDN layer. On NVIDIA, one four-warp CTA owns a complete 128x128 GDN state
-head: each warp owns an adjacent V=32 slice, replayed as register-resident V=8
-fragments, while normalized keys and scalar gates are cached once per CTA. The
-portable one-warp tiled path remains the fallback for other geometries and AMD.
-The much smaller per-position convolution checkpoints remain
-available to select the accepted conv window. This path works through the
-vendor-neutral kernel boundary on NVIDIA and AMD and requires no serving flag.
+Qwen3.5 uses hybrid Gated DeltaNet (GDN) and full-attention layers. Add
+`--enable-replay-ssm` to an MTP launch to reduce target-verification workspace
+when a compatible replay kernel is available. Verify then stores each draft
+position's post-convolution K/V and scalar gate inputs instead of its full
+recurrent state. After sampling, one kernel treats every `(layer, request)` pair
+as a batch row, replays only its accepted prefix, and writes the final SSM state.
+The regular full-state scratch path remains the fallback when the option is
+omitted or the current platform has no compatible kernel.
 
 ## Qwen3.8
 

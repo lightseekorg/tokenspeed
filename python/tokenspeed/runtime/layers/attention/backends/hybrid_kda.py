@@ -77,8 +77,6 @@ class KdaAttnBackend(MambaAttnBackend):
     the conv, the gate GEMV and the recurrence into a single launch.
     """
 
-    supports_gdn_replay = False
-
     def __init__(self, config: BaseAttnConfig, kda_backend: str = "auto") -> None:
         super().__init__(config)
         self.kda_backend = (kda_backend or "auto").strip().lower()

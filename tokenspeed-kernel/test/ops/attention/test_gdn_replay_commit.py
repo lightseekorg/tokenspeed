@@ -24,8 +24,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.attention import (
     gdn_decode_mtp,
-    try_gdn_replay_commit,
-    try_gdn_replay_commit_layers,
+    gdn_replay_commit,
 )
 
 
@@ -116,6 +115,49 @@ def _inputs(
     return k, v, a, b, A_log, dt_bias, pool, read, write, accepted
 
 
+def _replay(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    pool: torch.Tensor,
+    read: torch.Tensor,
+    write: torch.Tensor,
+    accepted: torch.Tensor,
+) -> None:
+    """Pack one layer into the same layer-major API used by the runtime."""
+    batch, draft_tokens, num_k_heads, head_k_dim = k.shape
+    num_v_heads, head_v_dim = v.shape[2:]
+    payload = torch.cat(
+        (
+            k.reshape(batch, draft_tokens, -1),
+            v.reshape(batch, draft_tokens, -1),
+            a,
+            b,
+        ),
+        dim=-1,
+    ).reshape(1, batch * draft_tokens, -1)
+    gdn_replay_commit(
+        payload,
+        torch.stack((A_log, dt_bias)).unsqueeze(0),
+        state_addresses=torch.tensor(
+            [pool.data_ptr()], dtype=torch.uint64, device=pool.device
+        ),
+        state_row_strides=torch.tensor(
+            [pool.stride(0)], dtype=torch.int64, device=pool.device
+        ),
+        read_indices=read.unsqueeze(0),
+        write_indices=write.unsqueeze(0),
+        accepted_length=accepted,
+        draft_token_num=draft_tokens,
+        geometry=(num_k_heads, num_v_heads, head_k_dim, head_v_dim),
+        state_dtype=pool.dtype,
+        solution="triton",
+    )
+
+
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("head_dims", [(32, 24), (128, 65), (128, 128)])
 def test_gdn_replay_commit_matches_accepted_prefix_reference(
@@ -136,18 +178,17 @@ def test_gdn_replay_commit_matches_accepted_prefix_reference(
     )
     original = pool.clone()
 
-    assert try_gdn_replay_commit(
+    _replay(
         k,
         v,
-        A_log=A_log,
-        a=a,
-        dt_bias=dt_bias,
-        b=b,
-        state_pool=pool,
-        read_indices=read,
-        write_indices=write,
-        accepted_length=accepted,
-        solution="triton",
+        a,
+        b,
+        A_log,
+        dt_bias,
+        pool,
+        read,
+        write,
+        accepted,
     )
 
     torch.testing.assert_close(
@@ -172,18 +213,17 @@ def test_gdn_replay_commit_ignores_rejected_suffix(device: str, require):
     baseline = pool.clone()
     changed = pool.clone()
 
-    assert try_gdn_replay_commit(
+    _replay(
         k,
         v,
-        A_log=A_log,
-        a=a,
-        dt_bias=dt_bias,
-        b=b,
-        state_pool=baseline,
-        read_indices=read,
-        write_indices=write,
-        accepted_length=accepted,
-        solution="triton",
+        a,
+        b,
+        A_log,
+        dt_bias,
+        baseline,
+        read,
+        write,
+        accepted,
     )
 
     k_changed, v_changed, a_changed, b_changed = (
@@ -194,18 +234,17 @@ def test_gdn_replay_commit_ignores_rejected_suffix(device: str, require):
         v_changed[row, length:].normal_(mean=-3.0, std=0.5)
         a_changed[row, length:].fill_(2.0)
         b_changed[row, length:].fill_(-2.0)
-    assert try_gdn_replay_commit(
+    _replay(
         k_changed,
         v_changed,
-        A_log=A_log,
-        a=a_changed,
-        dt_bias=dt_bias,
-        b=b_changed,
-        state_pool=changed,
-        read_indices=read,
-        write_indices=write,
-        accepted_length=accepted,
-        solution="triton",
+        a_changed,
+        b_changed,
+        A_log,
+        dt_bias,
+        changed,
+        read,
+        write,
+        accepted,
     )
 
     torch.testing.assert_close(changed[write.long()], baseline[write.long()])
@@ -224,18 +263,17 @@ def test_gdn_replay_commit_handles_fresh_and_padding_rows(device: str, require):
     expected = _reference_states(k, v, a, b, A_log, dt_bias, expected_initial, accepted)
     original = pool.clone()
 
-    assert try_gdn_replay_commit(
+    _replay(
         k,
         v,
-        A_log=A_log,
-        a=a,
-        dt_bias=dt_bias,
-        b=b,
-        state_pool=pool,
-        read_indices=read,
-        write_indices=write,
-        accepted_length=accepted,
-        solution="triton",
+        a,
+        b,
+        A_log,
+        dt_bias,
+        pool,
+        read,
+        write,
+        accepted,
     )
 
     torch.testing.assert_close(
@@ -287,18 +325,17 @@ def test_gdn_replay_commit_matches_flashinfer_qwen_geometry(device: str, require
         use_qk_l2norm=True,
         solution="flashinfer",
     )
-    assert try_gdn_replay_commit(
+    _replay(
         k,
         v,
-        A_log=A_log,
-        a=a,
-        dt_bias=dt_bias,
-        b=b,
-        state_pool=replay_pool,
-        read_indices=read,
-        write_indices=write,
-        accepted_length=accepted,
-        solution="triton",
+        a,
+        b,
+        A_log,
+        dt_bias,
+        replay_pool,
+        read,
+        write,
+        accepted,
     )
     expected = torch.stack(
         [flashinfer_pool[scratch_rows[row, accepted[row] - 1]] for row in range(batch)]
@@ -404,7 +441,7 @@ def test_gdn_replay_commit_replays_disjoint_layer_pools_in_one_launch(
         dtype=torch.int64,
         device=device,
     )
-    assert try_gdn_replay_commit_layers(
+    gdn_replay_commit(
         payload,
         parameters,
         state_addresses=state_addresses,
@@ -413,10 +450,7 @@ def test_gdn_replay_commit_replays_disjoint_layer_pools_in_one_launch(
         write_indices=torch.stack(writes),
         accepted_length=accepted,
         draft_token_num=draft_tokens,
-        num_k_heads=num_k_heads,
-        num_v_heads=num_v_heads,
-        head_k_dim=head_k_dim,
-        head_v_dim=head_v_dim,
+        geometry=(num_k_heads, num_v_heads, head_k_dim, head_v_dim),
         state_dtype=torch.float32,
         solution="triton",
     )

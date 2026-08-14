@@ -40,6 +40,8 @@ if not torch.cuda.is_available():
 
 from test.runtime.test_gdn_state_paging import _CacheMetadata, _ContractPool
 
+from tokenspeed_kernel.ops.attention import gdn_replay_commit_supported
+
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
     MambaAttnBackend,
@@ -58,7 +60,7 @@ CONV_DIM = 2 * KEY_DIM + VALUE_DIM
 DEVICE = "cuda"
 
 
-def _config():
+def _config(*, replay: bool):
     return SimpleNamespace(
         device=DEVICE,
         num_attention_heads=NUM_K_HEADS,
@@ -68,19 +70,19 @@ def _config():
         head_dim=HEAD_K_DIM,
         is_draft=False,
         speculative_num_draft_tokens=DRAFT_TOKENS,
+        replay_ssm=replay,
     )
 
 
 def _make_backend(conv_state, recurrent_state, *, replay: bool):
+    if replay and not gdn_replay_commit_supported(torch.bfloat16):
+        pytest.skip("GDN ReplaySSM kernel unavailable on this platform")
     pool = _ContractPool(
         4,
         {0: ("linear_attention", conv_state, recurrent_state)},
     )
-    backend = MambaAttnBackend(_config())
+    backend = MambaAttnBackend(_config(replay=replay))
     backend.set_kv_pool(pool)
-    if replay and not backend._gdn_replay_active():
-        pytest.skip("GDN ReplaySSM kernel unavailable on this platform")
-    backend._gdn_replay_active_cache = replay
     return backend, pool
 
 
@@ -202,15 +204,20 @@ def test_qwen_verify_caches_kv_without_draft_recurrent_states():
     torch.cuda.synchronize()
 
     torch.testing.assert_close(recurrent, before)
-    key, value, a, b = backend._gdn_replay_payload_cache["buffers"][0]
+    workspace = backend._gdn_replay
+    assert workspace is not None
+    payload = workspace.payload[0]
+    a = payload[:, KEY_DIM + VALUE_DIM : -NUM_V_HEADS]
+    b = payload[:, -NUM_V_HEADS:]
+    key = payload[:, :KEY_DIM]
+    value = payload[:, KEY_DIM : KEY_DIM + VALUE_DIM]
     assert key.shape == (BATCH * DRAFT_TOKENS, KEY_DIM)
     assert value.shape == (BATCH * DRAFT_TOKENS, VALUE_DIM)
     torch.testing.assert_close(a, inputs["a"])
     torch.testing.assert_close(b, inputs["b"])
-    cache = backend._gdn_replay_payload_cache
-    assert set(cache["parameter_sources"]) == {0}
-    torch.testing.assert_close(cache["parameters"][0, 0], inputs["A_log"])
-    torch.testing.assert_close(cache["parameters"][0, 1], inputs["dt_bias"])
+    assert workspace.initialized_layers == {0}
+    torch.testing.assert_close(workspace.parameters[0, 0], inputs["A_log"])
+    torch.testing.assert_close(workspace.parameters[0, 1], inputs["dt_bias"])
 
 
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
@@ -282,9 +289,11 @@ def test_qwen_replay_payload_and_commit_survive_cuda_graph_replay():
     with torch.cuda.graph(graph):
         output = _forward_verify(backend, pool, inputs)
 
-    payload = backend._gdn_replay_payload_cache["buffers"][0]
-    payload_ptrs = tuple(tensor.data_ptr() for tensor in payload)
-    captured_key = payload[0].clone()
+    workspace = backend._gdn_replay
+    assert workspace is not None
+    payload = workspace.payload[0]
+    payload_ptr = payload.data_ptr()
+    captured_key = payload[:, :KEY_DIM].clone()
     tables = torch.tensor([[1, 5], [2, 6]], dtype=torch.int32, device=DEVICE)
     backend.init_forward_metadata_replay_cuda_graph(
         BATCH,
@@ -303,8 +312,8 @@ def test_qwen_replay_payload_and_commit_survive_cuda_graph_replay():
     )
     torch.cuda.synchronize()
 
-    assert tuple(tensor.data_ptr() for tensor in payload) == payload_ptrs
-    assert not torch.equal(payload[0], captured_key)
+    assert payload.data_ptr() == payload_ptr
+    assert not torch.equal(payload[:, :KEY_DIM], captured_key)
     assert bool(torch.isfinite(output).all())
     assert bool(torch.isfinite(recurrent[torch.tensor([5, 6], device=DEVICE)]).all())
 
@@ -327,11 +336,10 @@ def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):
                 )
             },
         )
-        backend = MambaAttnBackend(_config())
-        backend.set_kv_pool(pool)
-        if replay and not backend._gdn_replay_active():
+        if replay and not gdn_replay_commit_supported(torch.bfloat16):
             pytest.skip("GDN ReplaySSM kernel unavailable on this platform")
-        backend._gdn_replay_active_cache = replay
+        backend = MambaAttnBackend(_config(replay=replay))
+        backend.set_kv_pool(pool)
         return backend, pool
 
     replay_backend, replay_pool = make_backend(
@@ -351,9 +359,11 @@ def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):
     _prepare_verify(scratch_backend, scratch_pool, inputs[0])
     _forward_verify(scratch_backend, scratch_pool, inputs[1], layer_id=1)
 
-    import tokenspeed_kernel.ops.attention as attention_ops
+    from tokenspeed.runtime.layers.attention.backends import (
+        hybrid_linear_attn as backend_ops,
+    )
 
-    original = attention_ops.try_gdn_replay_commit_layers
+    original = backend_ops.gdn_replay_commit
     launch_calls = 0
 
     def counted_commit(*args, **kwargs):
@@ -361,20 +371,18 @@ def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):
         launch_calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(attention_ops, "try_gdn_replay_commit_layers", counted_commit)
+    monkeypatch.setattr(backend_ops, "gdn_replay_commit", counted_commit)
     accepted = torch.tensor([1, 3], dtype=torch.int32, device=DEVICE)
     replay_backend.commit_verified_state(accepted)
     scratch_backend.commit_verified_state(accepted)
     torch.cuda.synchronize()
 
     assert launch_calls == 1
-    packed = replay_backend._gdn_replay_payload_cache["payload"]
+    workspace = replay_backend._gdn_replay
+    assert workspace is not None
+    packed = workspace.payload
     assert packed.shape[:2] == (2, BATCH * DRAFT_TOKENS)
-    for layer_buffers in replay_backend._gdn_replay_payload_cache["buffers"].values():
-        assert all(
-            view.untyped_storage().data_ptr() == packed.untyped_storage().data_ptr()
-            for view in layer_buffers
-        )
+    assert packed.is_contiguous()
 
     committed_pages = torch.tensor([5, 6], device=DEVICE)
     for layer_id in (0, 1):

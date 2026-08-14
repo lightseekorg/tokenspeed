@@ -255,9 +255,7 @@ def fused_qkv_split_gdn_prefill(
     head_k: int,
     head_v: int,
     fuse_l2norm: bool = False,
-    replay_payload: torch.Tensor | None = None,
-    replay_a: torch.Tensor | None = None,
-    replay_b: torch.Tensor | None = None,
+    replay: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Split packed post-conv GDN QKV into contiguous FLA prefill tensors.
 
@@ -269,12 +267,9 @@ def fused_qkv_split_gdn_prefill(
         fuse_l2norm: when True, Q and K are L2-normalised per head inside the
             kernel (sm100 fast-path only — caller must not call l2norm_fwd
             separately).
-        replay_payload: Optional contiguous ReplaySSM destination shaped
-            ``[T, K_width + V_width + 2 * num_v_heads]``. When provided, raw
-            post-convolution K/V and ``replay_a``/``replay_b`` are packed by
-            the split kernel with no extra capture launch.
-        replay_a: Replay decay input shaped ``[T, num_v_heads]``.
-        replay_b: Replay update-gate input shaped ``[T, num_v_heads]``.
+        replay: Optional ``(payload, a, b)`` tuple. ``payload`` is a contiguous
+            ``[T, K_width + V_width + 2 * num_v_heads]`` destination; ``a`` and
+            ``b`` are scalar gate inputs shaped ``[T, num_v_heads]``.
 
     Returns:
         (q, k, v) each shaped ``[1, T, H, D]``.
@@ -300,13 +295,9 @@ def fused_qkv_split_gdn_prefill(
     )
 
     qkv_dim = num_q_heads * head_q + num_k_heads * head_k + num_v_heads * head_v
-    replay_inputs = (replay_payload, replay_a, replay_b)
-    has_replay_payload = any(tensor is not None for tensor in replay_inputs)
-    if has_replay_payload and not all(tensor is not None for tensor in replay_inputs):
-        raise ValueError(
-            "replay_payload, replay_a, and replay_b must be provided together"
-        )
-    if has_replay_payload:
+    has_replay = replay is not None
+    if has_replay:
+        replay_payload, replay_a, replay_b = replay
         replay_width = num_k_heads * head_k + num_v_heads * head_v + 2 * num_v_heads
         if replay_payload.shape != (seq_len, replay_width):
             raise ValueError(
@@ -325,46 +316,36 @@ def fused_qkv_split_gdn_prefill(
             )
         if any(
             tensor.device != mixed_qkv.device or tensor.dtype != mixed_qkv.dtype
-            for tensor in replay_inputs
+            for tensor in replay
         ):
             raise ValueError(
                 "ReplaySSM payload and gate inputs must match mixed_qkv device/dtype"
             )
-        replay_payload_arg = replay_payload
-        replay_a_arg = replay_a
-        replay_b_arg = replay_b
-        replay_strides = replay_payload.stride()
-        replay_a_strides = replay_a.stride()
-        replay_b_strides = replay_b.stride()
+        replay_strides = (
+            *replay_payload.stride(),
+            *replay_a.stride(),
+            *replay_b.stride(),
+        )
     else:
         # Triton removes every replay access at compile time; valid tensor
         # placeholders keep the no-replay call ABI uniform.
-        replay_payload_arg = q
-        replay_a_arg = q
-        replay_b_arg = q
-        replay_strides = (0, 0)
-        replay_a_strides = (0, 0)
-        replay_b_strides = (0, 0)
+        replay_payload = replay_a = replay_b = q
+        replay_strides = (0,) * 6
 
     block_size = triton.next_power_of_2(qkv_dim)
-    gate_block = triton.next_power_of_2(num_v_heads) if has_replay_payload else 1
+    gate_block = triton.next_power_of_2(num_v_heads) if has_replay else 1
     kernel = _fused_qkv_split_l2norm_kernel if fuse_l2norm else _fused_qkv_split_kernel
     kernel[(seq_len,)](
         q,
         k,
         v,
         mixed_qkv,
-        replay_payload_arg,
-        replay_a_arg,
-        replay_b_arg,
+        replay_payload,
+        replay_a,
+        replay_b,
         mixed_qkv.stride(0),
         mixed_qkv.stride(1),
-        replay_strides[0],
-        replay_strides[1],
-        replay_a_strides[0],
-        replay_a_strides[1],
-        replay_b_strides[0],
-        replay_b_strides[1],
+        *replay_strides,
         num_q_heads,
         num_k_heads,
         num_v_heads,
@@ -374,6 +355,6 @@ def fused_qkv_split_gdn_prefill(
         qkv_dim,
         BLOCK_SIZE=block_size,
         GATE_BLOCK=gate_block,
-        HAS_REPLAY_PAYLOAD=has_replay_payload,
+        HAS_REPLAY_PAYLOAD=has_replay,
     )
     return q, k, v

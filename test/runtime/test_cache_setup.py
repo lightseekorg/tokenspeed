@@ -256,11 +256,12 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
 
 
 @pytest.mark.parametrize(
-    ("replay_supported", "expected_workspace_bytes"),
-    ((True, 64), (False, 192)),
+    ("replay_enabled", "replay_supported", "expected_workspace_bytes"),
+    ((False, True, 192), (True, False, 192), (True, True, 64)),
 )
 def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     monkeypatch,
+    replay_enabled: bool,
     replay_supported: bool,
     expected_workspace_bytes: int,
 ) -> None:
@@ -306,6 +307,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
         block_size=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=3,
+        enable_replay_ssm=replay_enabled,
     )
 
     setup = prepare_cache_setup(
@@ -321,6 +323,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     )
 
     assert setup.fixed_workspace_bytes == expected_workspace_bytes
+    assert attn_config.replay_ssm is (replay_enabled and replay_supported)
 
 
 def test_ordinary_mha_reserves_null_parent_within_cache_budget() -> None:

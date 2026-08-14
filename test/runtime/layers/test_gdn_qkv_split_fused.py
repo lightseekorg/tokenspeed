@@ -149,9 +149,7 @@ def test_split_packs_replay_payload(fuse_l2norm):
         hk,
         hv,
         fuse_l2norm=fuse_l2norm,
-        replay_payload=replay_payload,
-        replay_a=replay_a,
-        replay_b=replay_b,
+        replay=(replay_payload, replay_a, replay_b),
     )
     expected_payload = torch.cat(
         (
