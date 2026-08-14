@@ -1257,7 +1257,7 @@ class KimiLinearKDA(nn.Module):
             # per-head norm implementation.
             core_out = rmsnorm_gated_sigmoid(
                 core_out.contiguous(),
-                out_gate.contiguous(),
+                out_gate,
                 self.o_norm.weight,
                 self.o_norm.variance_epsilon,
                 hn,

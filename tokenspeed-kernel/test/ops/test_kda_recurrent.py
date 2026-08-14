@@ -103,12 +103,14 @@ def test_kda_paged_prefill_uses_canonical_k_major_state() -> None:
 
 
 @pytest.mark.parametrize("lower_bound", [-5.0, None])
+@pytest.mark.parametrize("strided_inputs", [False, True])
 @pytest.mark.parametrize(
     ("heads", "key_dim", "value_dim"),
     [(2, 8, 8), (2, 8, 5), (12, 128, 128)],
 )
 def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
     lower_bound: float | None,
+    strided_inputs: bool,
     heads: int,
     key_dim: int,
     value_dim: int,
@@ -121,11 +123,42 @@ def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
     device = "cuda"
     torch.manual_seed(13)
     tokens = 3
-    q = torch.randn(1, tokens, heads, key_dim, device=device, dtype=torch.bfloat16)
-    k = torch.randn_like(q)
-    v = torch.randn(1, tokens, heads, value_dim, device=device, dtype=torch.bfloat16)
-    raw_g = torch.randn_like(q)
-    beta = torch.randn(1, tokens, heads, device=device, dtype=torch.bfloat16)
+    if strided_inputs:
+        qkv = torch.randn(
+            1,
+            tokens,
+            heads * (2 * key_dim + value_dim) + 7,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        q_end = heads * key_dim
+        k_end = 2 * q_end
+        v_end = k_end + heads * value_dim
+        q = qkv[..., :q_end].view(1, tokens, heads, key_dim)
+        k = qkv[..., q_end:k_end].view(1, tokens, heads, key_dim)
+        v = qkv[..., k_end:v_end].view(1, tokens, heads, value_dim)
+        raw_g = torch.randn(
+            1,
+            tokens,
+            heads * key_dim + 5,
+            device=device,
+            dtype=torch.bfloat16,
+        )[..., :q_end].view(1, tokens, heads, key_dim)
+        beta = torch.randn(
+            1,
+            tokens,
+            heads + 3,
+            device=device,
+            dtype=torch.bfloat16,
+        )[..., :heads]
+    else:
+        q = torch.randn(1, tokens, heads, key_dim, device=device, dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn(
+            1, tokens, heads, value_dim, device=device, dtype=torch.bfloat16
+        )
+        raw_g = torch.randn_like(q)
+        beta = torch.randn(1, tokens, heads, device=device, dtype=torch.bfloat16)
     state_pool = torch.randn(
         6,
         heads,
