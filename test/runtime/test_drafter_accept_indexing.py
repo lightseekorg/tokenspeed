@@ -101,17 +101,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "inside the target vocabulary"):
             drafter.set_mm_pad_substitute_ids({Modality.IMAGE: 256})
 
-    def test_eagle_accept_output_indices_stay_inside_each_decode_row(self):
-        drafter = _make_eagle(spec_num_tokens=4)
-
-        indices = drafter._accepted_output_indices(
-            torch.tensor([0, 1, 4, 99], dtype=torch.int32),
-            row_count=4,
-        )
-
-        self.assertEqual(indices.tolist(), [0, 4, 11, 15])
-
-    def test_eagle_decode_first_step_uses_safe_gather_ids_for_zero_accept(self):
+    def test_eagle_decode_first_step_gathers_last_accepted_output(self):
         drafter = _make_eagle(spec_num_tokens=4)
         output_tokens = torch.arange(12, dtype=torch.int32)
         draft_input = EagleDraftInput(
@@ -119,7 +109,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             num_extends=0,
             forward_mode=ForwardMode.DECODE,
             base_model_output=output_tokens,
-            accept_lengths=torch.tensor([0, 1, 4], dtype=torch.int32),
+            accept_lengths=torch.tensor([1, 2, 4], dtype=torch.int32),
             base_out_hidden_states=torch.empty(0),
         )
 
@@ -130,7 +120,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         )
 
         self.assertIs(input_ids, output_tokens)
-        self.assertEqual(gather_ids.tolist(), [0, 4, 11])
+        self.assertEqual(gather_ids.tolist(), [0, 5, 11])
 
     def test_eagle_mixed_first_step_keeps_decode_gather_ids_in_range(self):
         drafter = _make_eagle(spec_num_tokens=4)
@@ -144,7 +134,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             num_extends=1,
             forward_mode=ForwardMode.MIXED,
             base_model_output=output_tokens,
-            accept_lengths=torch.tensor([1, 0, 4], dtype=torch.int32),
+            accept_lengths=torch.tensor([1, 2, 4], dtype=torch.int32),
             base_out_hidden_states=torch.empty(0),
         )
 
@@ -154,7 +144,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             input_num_tokens=10,
         )
 
-        self.assertEqual(gather_ids.tolist(), [1, 2, 9])
+        self.assertEqual(gather_ids.tolist(), [1, 3, 9])
         self.assertEqual(input_ids[2:].tolist(), output_tokens[1:].tolist())
 
     def test_extend_depth_shifted_ids_shifts_within_each_request(self):
@@ -317,17 +307,17 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
 
         self.assertEqual(updated.tolist(), [[103, 104], [4, 105]])
 
-    def test_dflash_current_tokens_use_safe_in_row_dummy_for_zero_accept(self):
+    def test_dflash_current_tokens_gather_last_accepted_per_row(self):
         output_tokens = torch.arange(12, dtype=torch.int32)
 
         current = DFlash._current_tokens_from_output(
             output_tokens=output_tokens,
-            accept_lengths=torch.tensor([0, 1, 4], dtype=torch.int32),
+            accept_lengths=torch.tensor([1, 2, 4], dtype=torch.int32),
             num_extends=0,
             spec_num_tokens=4,
         )
 
-        self.assertEqual(current.tolist(), [0, 4, 11])
+        self.assertEqual(current.tolist(), [0, 5, 11])
 
     def test_dflash_mixed_current_tokens_do_not_cross_decode_rows(self):
         output_tokens = torch.tensor(
@@ -337,12 +327,12 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
 
         current = DFlash._current_tokens_from_output(
             output_tokens=output_tokens,
-            accept_lengths=torch.tensor([1, 0, 4], dtype=torch.int32),
+            accept_lengths=torch.tensor([1, 2, 4], dtype=torch.int32),
             num_extends=1,
             spec_num_tokens=4,
         )
 
-        self.assertEqual(current.tolist(), [100, 10, 23])
+        self.assertEqual(current.tolist(), [100, 11, 23])
 
 
 if __name__ == "__main__":

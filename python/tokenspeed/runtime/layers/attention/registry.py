@@ -491,7 +491,7 @@ def _wrap_inkling_backend(
     )
 
     kernel_size = text_config.sconv_kernel_size
-    spec_tokens = max(1, int(getattr(attn_config, "speculative_num_draft_tokens", 1)))
+    spec_tokens = attn_config.speculative_num_draft_tokens
     # Ring row of absolute position p is p % R. R must keep a round's
     # pre-chunk tap reads and chunk-row writes disjoint mod R: (W-1) history
     # taps + K chunk rows. Uniform across target and draft.
@@ -517,7 +517,7 @@ def _wrap_inkling_backend(
         inner,
         conv_pool,
         conv_columns=conv_columns,
-        spec_num_tokens=getattr(attn_config, "speculative_num_draft_tokens", 1),
+        spec_num_tokens=spec_tokens,
         is_draft=is_draft,
         enable_layerwise_cache_ready=enable_layerwise_cache_ready,
     )

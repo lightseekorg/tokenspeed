@@ -316,12 +316,11 @@ class CacheGroupsMixin:
         md = self.forward_decode_metadata
         fields = {"seq_lens": frontier[:bs]}
         if md.out_cache_locs is not None:
-            spec_n = max(int(getattr(self, "spec_num_tokens", 1) or 1), 1)
             fields["out_cache_locs"] = self._compute_decode_group_out_cache_locs(
                 md.page_tables,
                 frontier[:bs],
                 self.kernel_page_size,
-                spec_n,
+                self.spec_num_tokens,
             )
         self.forward_decode_metadata = replace(md, **fields)
 
