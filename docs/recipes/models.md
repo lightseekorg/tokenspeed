@@ -436,8 +436,8 @@ A dense 27B-class Qwen3.8 FP8 checkpoint on a single GPU, with self-speculative
 MTP (the draft model path points at the same checkpoint):
 
 ```bash
-tokenspeed serve /path/to/qwen3.8-27b-fp8 \
-  --served-model-name qwen3.8-27b \
+tokenspeed serve Qwen/Qwen3.8-27B-FP8 \
+  --served-model-name Qwen/Qwen3.8-27B-FP8 \
   --world-size 1 \
   --gpu-memory-utilization 0.9 \
   --attention-backend trtllm \
@@ -447,7 +447,7 @@ tokenspeed serve /path/to/qwen3.8-27b-fp8 \
   --max-num-seqs 128 \
   --kv-cache-dtype fp8_e4m3 \
   --speculative-algorithm MTP \
-  --speculative-draft-model-path /path/to/qwen3.8-27b-fp8 \
+  --speculative-draft-model-path Qwen/Qwen3.8-27B-FP8 \
   --speculative-num-steps 3 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \

@@ -34,11 +34,9 @@ import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention import (
     attn_merge_state,
     mla_project_value,
+    mla_project_value_prefers_contiguous_weight,
 )
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
-from tokenspeed_kernel.ops.attention.triton.mla_query_assemble import (
-    mla_nope_query_fp8,
-)
 from tokenspeed_kernel.ops.embedding import apply_rope_mla
 from tokenspeed_kernel.ops.gemm import bmm
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
@@ -67,7 +65,6 @@ from tokenspeed.runtime.layers.utils import (
 )
 
 _platform = current_platform()
-_is_amd = _platform.is_amd
 _is_blackwell = _platform.is_blackwell
 _is_hopper_plus = _platform.is_hopper_plus
 _device_sm = _platform.arch_version.major * 10 + _platform.arch_version.minor
@@ -145,7 +142,12 @@ def _prepare_mla_kv_b_proj_weights(
     w_kc, w_vc = w.unflatten(
         0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
     ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-    if _is_amd:
+    if mla_project_value_prefers_contiguous_weight(
+        dtype=w.dtype,
+        heads=w_vc.shape[0],
+        latent_dim=w_vc.shape[2],
+        value_dim=w_vc.shape[1],
+    ):
         return w_kc.contiguous(), w_vc.transpose(1, 2).contiguous()
     return (
         w_kc.transpose(1, 2).contiguous().transpose(1, 2),
@@ -825,6 +827,20 @@ class DeepseekV3AttentionMLA(nn.Module):
             output_gate=output_gate,
         )
 
+    def _mla_kv_is_fp8(self, ctx, k_scale: float) -> bool:
+        """Whether the model may quantize KV itself and hand the backend fp8.
+
+        True when the MLA backend stores fp8 KV at unit scale. Hybrid models
+        keep ``data_type`` on the full-attention sub-backend, so resolve that
+        before reading it.
+        """
+        kv_backend = getattr(ctx.attn_backend, "full_attn_backend", ctx.attn_backend)
+        return (
+            self.attention_backend in self._MLA_KERNEL_BACKENDS
+            and getattr(kv_backend, "data_type", None) == torch.float8_e4m3fn
+            and k_scale == 1.0
+        )
+
     def forward_absorb_qkv_proj(
         self,
         q: torch.Tensor,
@@ -868,12 +884,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         # Model-owned fused FP8 decode: RoPE + quantize + KV cache write
         # all done here, so backend only needs to do attention.
         k_scale = getattr(self.attn_mqa, "k_scale_float", 1.0)
-        use_fused_fp8_decode = (
-            self.attention_backend in self._MLA_KERNEL_BACKENDS
-            and getattr(ctx.attn_backend, "data_type", None) == torch.float8_e4m3fn
-            and self.rotary_emb is not None
-            and k_scale == 1.0
-        )
+        use_fused_fp8_decode = self._mla_kv_is_fp8(ctx, k_scale)
 
         if use_fused_fp8_decode:
             q_nope_absorbed = Q[..., : self.kv_lora_rank]
@@ -886,8 +897,16 @@ class DeepseekV3AttentionMLA(nn.Module):
                 k_rope=k_pe_raw,
                 q_nope=q_nope_absorbed,
                 k_nope=k_nope_raw,
-                cos_sin_cache=self.rotary_emb.cos_sin_cache,
-                is_neox=getattr(self.rotary_emb, "is_neox_style", True),
+                cos_sin_cache=(
+                    self.rotary_emb.cos_sin_cache
+                    if self.rotary_emb is not None
+                    else None
+                ),
+                is_neox=(
+                    getattr(self.rotary_emb, "is_neox_style", True)
+                    if self.rotary_emb is not None
+                    else False
+                ),
                 quant_scale_q=1.0,
                 quant_scale_kv=k_scale,
                 enable_pdl=pdl_enabled(),
@@ -907,11 +926,13 @@ class DeepseekV3AttentionMLA(nn.Module):
                 create_fused_mla_set_kv_buffer_arg(
                     k_nope=K[..., : self.kv_lora_rank],
                     rope_dim=self.qk_rope_head_dim,
+                    rotary_head_size=self.rotary_emb.head_size,
+                    is_neox_style=self.rotary_emb.is_neox_style,
                     out_cache_loc=out_cache_loc,
                     token_to_kv_pool=ctx.token_to_kv_pool,
                     layer_id=self.attn_mqa.layer_id,
                 )
-                if _is_amd and self.attention_backend in self._MLA_KERNEL_BACKENDS
+                if self.attention_backend in self._MLA_KERNEL_BACKENDS
                 else None
             )
             if fused_mla_kv_arg is not None:
@@ -933,20 +954,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                 )
                 Q[..., self.kv_lora_rank :].copy_(q_pe)
                 K[..., self.kv_lora_rank :].copy_(k_pe)
-        elif (
-            self.attention_backend in self._MLA_KERNEL_BACKENDS
-            # Hybrid models: data_type lives on the full-attention sub-backend.
-            and getattr(
-                getattr(ctx.attn_backend, "full_attn_backend", ctx.attn_backend),
-                "data_type",
-                None,
-            )
-            == torch.float8_e4m3fn
-            and k_scale == 1.0
-            and q_nope.size(0) > 0
-        ):
-            # NoPE + fp8: assemble the query straight into fp8; the KV write casts the bf16 latents in-kernel.
-            Q = mla_nope_query_fp8(Q[..., : self.kv_lora_rank], q_pe)
         else:
             if not query_pe_written:
                 Q[..., self.kv_lora_rank :] = q_pe
@@ -1007,7 +1014,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         return mla_project_value(
             attn_output,
-            self.w_vc.contiguous() if _is_amd else self.w_vc,
+            self.w_vc,
             gate=output_gate,
             out=output,
         )
@@ -1064,11 +1071,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         # them on the BF16 kernel meant a JIT compile of a variant the backend
         # never pre-warms.
         k_scale = getattr(self.attn_mha, "k_scale_float", 1.0)
-        use_fp8_prefill = (
-            self.attention_backend in self._MLA_KERNEL_BACKENDS
-            and getattr(ctx.attn_backend, "data_type", None) == torch.float8_e4m3fn
-            and k_scale == 1.0
-        )
+        use_fp8_prefill = self._mla_kv_is_fp8(ctx, k_scale)
 
         if use_fp8_prefill:
 
