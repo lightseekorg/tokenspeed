@@ -220,19 +220,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
                 )
                 layer.input_scale = None
-            # If ROCm, normalize the weights and scales to e4m3fnuz
-            if platform.is_fp8e4m3fnuz:
-                # activation_scheme: dynamic
-                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=layer.weight,
-                    weight_scale=layer.weight_scale_inv,
-                    input_scale=None,
-                )
-                layer.input_scale = None
-            else:
-                weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
-            layer.weight.data = weight.data
-            layer.weight_scale_inv.data = weight_scale.data
             layer._use_deep_gemm_fp8 = False
             layer._use_flashinfer_fp8_blockscale = False
             is_bmm = getattr(layer, "is_bmm", False)
