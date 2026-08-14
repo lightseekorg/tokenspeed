@@ -1,6 +1,23 @@
-# SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Advanced Micro Devices, Inc.
 # Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 """Absorbed MLA decode over an unshuffled paged cache on AMD GFX1250."""
 
@@ -182,10 +199,11 @@ def _mla_decode_fwd_kernel(
 
     if ALL_DECODE:
         seq_idx = q_block_global_idx // NUM_HEAD_BLOCKS
+        q_start_idx = seq_idx
     else:
         seq_idx = q_block_global_idx // num_q_blocks_per_seq
+        q_start_idx = gl.load(query_start_len_ptr + seq_idx)
 
-    q_start_idx = gl.load(query_start_len_ptr + seq_idx)
     q_block_local_idx = q_block_global_idx - seq_idx * num_q_blocks_per_seq
 
     token_q_block_local_idx = q_block_local_idx // NUM_HEAD_BLOCKS
@@ -659,12 +677,13 @@ def _select_num_kv_splits(
     num_q_programs: int,
     max_seqlen_k: int,
     tile_size: int,
+    split_cap: int = 64,
 ) -> int:
     """Choose enough split-K partitions to occupy the GFX1250 compute units."""
     max_kv_splits = max(1, math.ceil(max_seqlen_k / tile_size))
     # The reduction loads [splits, 512] through one TDM descriptor. Keep its
     # flattened block below the 65,535-element hardware dimension limit.
-    max_kv_splits = min(max_kv_splits, 64)
+    max_kv_splits = min(max_kv_splits, split_cap)
     # A two-wave attention workgroup permits two resident workgroups per CU.
     target = max(1, (num_sms * 4 // 4) * 2 // max(1, num_q_programs))
     return triton.next_power_of_2(min(max_kv_splits, target))
@@ -761,11 +780,19 @@ def gluon_mla_decode_gfx1250(
     num_head_blocks = math.ceil(num_query_heads / block_m)
     total_num_q_blocks = batch_size * num_head_blocks
     num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    if projected_value:
+        if max_seqlen_k > 32768:
+            split_cap = 32
+        else:
+            split_cap = 16
+    else:
+        split_cap = 64
     num_kv_splits = _select_num_kv_splits(
         num_sms=num_sms,
         num_q_programs=total_num_q_blocks,
         max_seqlen_k=max_seqlen_k,
         tile_size=page_size,
+        split_cap=split_cap,
     )
 
     split_output = torch.empty(
@@ -779,10 +806,6 @@ def gluon_mla_decode_gfx1250(
         device=q.device,
     )
     split_expsum = torch.empty_like(split_max)
-    # The device kernel shares its prefill/decode indexing machinery and takes
-    # packed query offsets even when q_len == 1.
-    query_start_lens = torch.arange(batch_size + 1, dtype=torch.int32, device=q.device)
-
     _mla_decode_fwd_kernel[(total_num_q_blocks, num_kv_heads, num_kv_splits)](
         split_output_ptr=split_output,
         split_max_ptr=split_max,
@@ -809,7 +832,9 @@ def gluon_mla_decode_gfx1250(
         stride_kv_buffer_1=kv_cache.stride(1),
         stride_kv_buffer_2=kv_cache.stride(2),
         stride_kv_buffer_3=kv_cache.stride(3),
-        query_start_len_ptr=query_start_lens,
+        # ALL_DECODE derives the query offset from the sequence index, so this
+        # pointer is intentionally unused.
+        query_start_len_ptr=cache_seqlens,
         num_tokens_per_seq=1,
         num_blocks=kv_cache.shape[0],
         TILE_SIZE=page_size,
@@ -871,7 +896,7 @@ def gluon_mla_decode_gfx1250(
             total_num_tokens=batch_size,
             TILE_SIZE=page_size,
             KV_LORA_RANK=kv_lora_rank,
-            query_start_len_ptr=query_start_lens,
+            query_start_len_ptr=cache_seqlens,
             BLOCK_Q=block_q,
             NUM_KV_SPLITS=num_kv_splits,
             ALL_DECODE=True,
