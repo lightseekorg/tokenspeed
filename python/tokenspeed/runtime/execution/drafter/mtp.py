@@ -383,15 +383,14 @@ class Mtp(BaseDrafter):
             draft_input.base_out_hidden_states.view(bs, k, -1),
             accept_lengths,
         )
+        prev_hidden = spliced_hidden
         for d in range(self.spec_num_steps):
             if d == 0:
                 input_ids = window_ids
-                prev_hidden = spliced_hidden
             else:
                 input_ids = torch.cat(
                     [input_ids[:, 1:], next_tokens[:, d : d + 1]], dim=1
                 )
-                prev_hidden = logits_output.hidden_states
 
             ctx = ForwardContext(
                 bs=bs,
@@ -417,6 +416,7 @@ class Mtp(BaseDrafter):
                     captured_hidden_states=prev_hidden,
                     spec_step_idx=d,
                 )
+                prev_hidden = logits_output.hidden_states
 
             with nvtx_range("draft_sample", color="yellow"):
                 next_tokens[:, d + 1] = self._sample_step_tokens(logits_output)
