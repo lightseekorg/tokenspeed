@@ -341,8 +341,8 @@ def _preprocess_intra_fwd_kernel(
         [[K, 8]], [BT, K], [1, 0]
     )
     shared_bg: gl.constexpr = gl.SwizzledSharedLayout(4, 1, 8, order=[1, 0])
-    q_smem = gl.allocate_shared_memory(gl.bfloat16, [BT, K], shared_qk)
-    k_smem = gl.allocate_shared_memory(gl.bfloat16, [BT, K], shared_qk)
+    q_smem = gl.allocate_shared_memory(q.dtype.element_ty, [BT, K], shared_qk)
+    k_smem = gl.allocate_shared_memory(k.dtype.element_ty, [BT, K], shared_qk)
     bg_smem = gl.allocate_shared_memory(gl.float32, [BT, K], shared_bg)
 
     q_desc = gfx1250.tdm.make_tensor_descriptor(
@@ -383,8 +383,8 @@ def _preprocess_intra_fwd_kernel(
     k_value = k_smem.load(producer_layout).to(gl.float32)
     q_norm = gl.rsqrt(gl.sum(q_value * q_value, axis=1) + 1e-6)
     k_norm = gl.rsqrt(gl.sum(k_value * k_value, axis=1) + 1e-6)
-    normalized_q = (q_value * q_norm[:, None]).to(gl.bfloat16)
-    normalized_k = (k_value * k_norm[:, None]).to(gl.bfloat16)
+    normalized_q = (q_value * q_norm[:, None]).to(q.dtype.element_ty)
+    normalized_k = (k_value * k_norm[:, None]).to(k.dtype.element_ty)
     gl.store(kn + offsets, normalized_k, mask=mask)
     q_smem.store(normalized_q)
     k_smem.store(normalized_k)
