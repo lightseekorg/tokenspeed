@@ -57,7 +57,13 @@ if _HAS_CUDA_KERNEL:
             ("layer_residual", "block_residual"), "dense", {torch.bfloat16}
         ),
         priority=Priority.SPECIALIZED,
-        traits={"separate_output_eps": frozenset({False})},
+        traits={
+            "has_delta": frozenset({False}),
+            "inputs_on_same_gpu": frozenset({True}),
+            "partial_block_storage": frozenset({False}),
+            "separate_output_eps": frozenset({False}),
+            "writes_block": frozenset({False}),
+        },
         tags={"latency", "throughput"},
     )
     def cuda_attn_res_fwd(
@@ -69,7 +75,14 @@ if _HAS_CUDA_KERNEL:
         eps,
         out_norm_weight=None,
         out_norm_eps=None,
+        delta=None,
+        num_valid_blocks=None,
+        block_write_idx=-1,
     ) -> torch.Tensor:
+        if delta is not None or block_write_idx >= 0:
+            raise ValueError("CUDA AttnRes does not support prefix updates")
+        if num_valid_blocks is not None and num_valid_blocks != block_residual.shape[0]:
+            raise ValueError("CUDA AttnRes requires tightly sliced block storage")
         if (
             out_norm_weight is not None
             and out_norm_eps is not None

@@ -45,10 +45,23 @@ def torch_attn_res_fwd(
     eps,
     out_norm_weight=None,
     out_norm_eps=None,
+    delta=None,
+    num_valid_blocks=None,
+    block_write_idx=-1,
 ) -> torch.Tensor:
+    valid_blocks = (
+        block_residual.shape[0] if num_valid_blocks is None else num_valid_blocks
+    )
+    if delta is not None:
+        layer_residual.add_(delta)
+    if block_write_idx >= 0:
+        block_residual[block_write_idx].copy_(layer_residual)
+
     # Candidates [N, T, H] = blocks then layer; RMSNorm + softmax score + mix in
     # fp32 (this sits on the global residual backbone), bf16 out.
-    values = torch.cat((block_residual, layer_residual.unsqueeze(0)), dim=0).float()
+    values = torch.cat(
+        (block_residual[:valid_blocks], layer_residual.unsqueeze(0)), dim=0
+    ).float()
     rs = (values.square().mean(-1, keepdim=True) + eps).rsqrt()
     score_weight = rms_weight.float() * res_weight.float()  # [H]
     logits = (values * rs * score_weight).sum(-1)  # [N, T]

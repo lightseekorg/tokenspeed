@@ -1,4 +1,22 @@
 # Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 """Correctness tests for Kimi K3 prefill Gluon kernels."""
 
@@ -16,9 +34,15 @@ if not is_cdna4():
 
 
 import tokenspeed_kernel.ops.attn_res as attn_res  # noqa: E402
-from tokenspeed_kernel.ops.attn_res import attn_res_fwd  # noqa: E402
+from tokenspeed_kernel.ops.attn_res import (  # noqa: E402
+    attn_res_fwd,
+    attn_res_fwd_available,
+)
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk  # noqa: E402
 from tokenspeed_kernel.ops.moe.sigmoid_topk import _gluon_eligible  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.attention.kda.attn_res import (  # noqa: E402
+    attn_res_rmsnorm_gfx950,
+)
 
 
 def _attn_res_reference(
@@ -87,11 +111,10 @@ def test_attn_res_public_block_major_dispatch_matches_reference() -> None:
 
 
 def test_attn_res_large_prefill_dispatch_boundary(monkeypatch) -> None:
-    selected = []
-    real_select = attn_res.select_kernel
+    selected_solutions = []
 
     def capture_selection(*args, **kwargs):
-        selected.append(real_select(*args, **kwargs).name)
+        selected_solutions.append(kwargs["solution"])
         return lambda **kwargs: None
 
     monkeypatch.setattr(attn_res, "select_kernel", capture_selection)
@@ -115,14 +138,325 @@ def test_attn_res_large_prefill_dispatch_boundary(monkeypatch) -> None:
             out_norm_weight=weight if fuse_output_norm else None,
         )
 
-    assert selected == [
-        "gluon_attn_res_fwd_gfx950",
-        "gluon_attn_res_fwd_gfx950",
-        "gluon_attn_res_fwd_gfx950",
-        "torch_attn_res_fwd",
-        "torch_attn_res_fwd",
-        "torch_attn_res_fwd",
-    ]
+    assert selected_solutions == [None, None, None, "torch", "torch", "torch"]
+
+
+def test_attn_res_amd_entrypoint_accepts_legacy_keywords() -> None:
+    tokens, valid_blocks = 2, 3
+    score_eps, output_eps = 1e-6, 2e-6
+    generator = torch.Generator(device="cuda").manual_seed(92)
+    layer = torch.randn(
+        tokens, 7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    history = torch.randn(
+        tokens,
+        valid_blocks,
+        7168,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    res_weight = torch.randn(
+        7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    score_weight = torch.randn(
+        7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    output_weight = torch.randn(
+        7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+
+    actual = attn_res_rmsnorm_gfx950(
+        layer_residual=layer,
+        block_residual=history,
+        res_weight=res_weight,
+        score_rms_weight=score_weight,
+        score_eps=score_eps,
+        output_rms_weight=output_weight,
+        output_eps=output_eps,
+        num_valid_blocks=valid_blocks,
+    )
+    expected = _attn_res_reference(
+        layer,
+        history,
+        res_weight,
+        score_weight,
+        output_weight,
+        valid_blocks,
+        score_eps,
+        output_eps,
+    )
+    torch.testing.assert_close(actual, expected, rtol=5e-3, atol=1.6e-2)
+
+
+def test_attn_res_first_layer_snapshot_write() -> None:
+    tokens = 2
+    generator = torch.Generator(device="cuda").manual_seed(93)
+    prefix = torch.randn(
+        tokens, 7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    blocks = torch.empty(1, tokens, 7168, device="cuda", dtype=torch.bfloat16)
+    res_weight = torch.randn(
+        7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    score_weight = torch.randn(
+        7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    output_weight = torch.randn(
+        7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    original_prefix = prefix.clone()
+
+    assert attn_res_fwd_available(
+        prefix,
+        blocks,
+        res_weight,
+        score_weight,
+        out_norm_weight=output_weight,
+        num_valid_blocks=0,
+        block_write_idx=0,
+    )
+    actual = attn_res_fwd(
+        prefix,
+        blocks,
+        res_weight,
+        score_weight,
+        out_norm_weight=output_weight,
+        num_valid_blocks=0,
+        block_write_idx=0,
+    )
+    expected = _attn_res_reference(
+        original_prefix,
+        blocks.transpose(0, 1),
+        res_weight,
+        score_weight,
+        output_weight,
+        0,
+        1e-6,
+        1e-6,
+    )
+
+    torch.testing.assert_close(prefix, original_prefix, rtol=0, atol=0)
+    torch.testing.assert_close(blocks[0], original_prefix, rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=5e-3, atol=1.6e-2)
+
+
+@pytest.mark.parametrize("tokens", [2, 4, 8, 16, 32, 64, 128, 256, 512])
+def test_attn_res_delta_and_block_write_power_of_two_batches(tokens: int) -> None:
+    valid_blocks = 3
+    score_eps, output_eps = 1e-6, 2e-6
+    generator = torch.Generator(device="cuda").manual_seed(100 + tokens)
+    prefix = torch.randn(
+        tokens, 7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    delta = torch.randn(
+        tokens, 7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    blocks = torch.randn(
+        valid_blocks + 1,
+        tokens,
+        7168,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    res_weight = torch.randn(
+        7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    score_weight = torch.randn(
+        7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    output_weight = torch.randn(
+        7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    original_prefix = prefix.clone()
+    original_blocks = blocks.clone()
+
+    assert attn_res_fwd_available(
+        prefix,
+        blocks,
+        res_weight,
+        score_weight,
+        eps=score_eps,
+        out_norm_weight=output_weight,
+        out_norm_eps=output_eps,
+        delta=delta,
+        num_valid_blocks=valid_blocks,
+        block_write_idx=valid_blocks,
+    )
+    actual = attn_res_fwd(
+        prefix,
+        blocks,
+        res_weight,
+        score_weight,
+        eps=score_eps,
+        out_norm_weight=output_weight,
+        out_norm_eps=output_eps,
+        delta=delta,
+        num_valid_blocks=valid_blocks,
+        block_write_idx=valid_blocks,
+    )
+
+    updated_prefix = (original_prefix + delta).to(torch.bfloat16)
+    expected = _attn_res_reference(
+        updated_prefix,
+        original_blocks.transpose(0, 1),
+        res_weight,
+        score_weight,
+        output_weight,
+        valid_blocks,
+        score_eps,
+        output_eps,
+    )
+    torch.testing.assert_close(prefix, updated_prefix, rtol=0, atol=0)
+    torch.testing.assert_close(blocks[valid_blocks], updated_prefix, rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=5e-3, atol=1.6e-2)
+
+
+def test_attn_res_noncontiguous_delta_uses_fallback() -> None:
+    tokens, valid_blocks = 2, 3
+    generator = torch.Generator(device="cuda").manual_seed(177)
+    prefix = torch.randn(
+        tokens, 7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    delta_storage = torch.randn(
+        tokens, 2 * 7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    delta = delta_storage[:, ::2]
+    blocks = torch.randn(
+        valid_blocks,
+        tokens,
+        7168,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    res_weight = torch.randn(
+        7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    score_weight = torch.randn(
+        7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    output_weight = torch.randn(
+        7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    original_prefix = prefix.clone()
+
+    assert not attn_res_fwd_available(
+        prefix,
+        blocks,
+        res_weight,
+        score_weight,
+        out_norm_weight=output_weight,
+        delta=delta,
+        num_valid_blocks=valid_blocks,
+    )
+    actual = attn_res_fwd(
+        prefix,
+        blocks,
+        res_weight,
+        score_weight,
+        out_norm_weight=output_weight,
+        delta=delta,
+        num_valid_blocks=valid_blocks,
+    )
+    updated_prefix = (original_prefix + delta).to(torch.bfloat16)
+    expected = _attn_res_reference(
+        updated_prefix,
+        blocks.transpose(0, 1),
+        res_weight,
+        score_weight,
+        output_weight,
+        valid_blocks,
+        1e-6,
+        1e-6,
+    )
+    torch.testing.assert_close(prefix, updated_prefix, rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=5e-3, atol=1.6e-2)
+
+
+@pytest.mark.parametrize("tokens", [2, 64, 256])
+@pytest.mark.parametrize(
+    ("use_delta", "write_block"),
+    [(False, True), (True, False)],
+)
+def test_attn_res_model_update_modes_graph_replay(
+    tokens: int, use_delta: bool, write_block: bool
+) -> None:
+    valid_blocks = 3
+    generator = torch.Generator(device="cuda").manual_seed(200 + tokens)
+    prefix = torch.randn(
+        tokens, 7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    delta = torch.randn_like(prefix)
+    blocks = torch.randn(
+        valid_blocks + 1,
+        tokens,
+        7168,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    res_weight = torch.randn(
+        7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    score_weight = torch.randn(
+        7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    output_weight = torch.randn(
+        7168, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    original_prefix = prefix.clone()
+    original_blocks = blocks.clone()
+    call_delta = delta if use_delta else None
+    block_write_idx = valid_blocks if write_block else -1
+
+    # Compile before capture so the graph contains only the steady-state launch.
+    attn_res_fwd(
+        prefix.clone(),
+        blocks.clone(),
+        res_weight,
+        score_weight,
+        out_norm_weight=output_weight,
+        delta=call_delta,
+        num_valid_blocks=valid_blocks,
+        block_write_idx=block_write_idx,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = attn_res_fwd(
+            prefix,
+            blocks,
+            res_weight,
+            score_weight,
+            out_norm_weight=output_weight,
+            delta=call_delta,
+            num_valid_blocks=valid_blocks,
+            block_write_idx=block_write_idx,
+        )
+
+    prefix.copy_(original_prefix)
+    blocks.copy_(original_blocks)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    updated_prefix = (
+        (original_prefix + delta).to(torch.bfloat16) if use_delta else original_prefix
+    )
+    expected = _attn_res_reference(
+        updated_prefix,
+        original_blocks.transpose(0, 1),
+        res_weight,
+        score_weight,
+        output_weight,
+        valid_blocks,
+        1e-6,
+        1e-6,
+    )
+    torch.testing.assert_close(prefix, updated_prefix, rtol=0, atol=0)
+    expected_block = updated_prefix if write_block else original_blocks[valid_blocks]
+    torch.testing.assert_close(blocks[valid_blocks], expected_block, rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=5e-3, atol=1.6e-2)
 
 
 @pytest.mark.parametrize("tokens", [1, 17, 8192])
