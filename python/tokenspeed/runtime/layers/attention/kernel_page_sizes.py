@@ -44,7 +44,11 @@ TOKENSPEED_MLA_SUPPORTED_PAGE_SIZES = (32, 64)
 # Flexible paged kernels: chosen defaults, not hardware constants.
 MHA_PAGE_SIZE = 64
 MLA_PAGE_SIZE = 64
-MSA_PAGE_SIZE = 64
+
+# The MSA sparse-attention kernels register exactly one supported page size
+# (see tokenspeed_kernel/ops/attention/msa.py: page_size {128}); this is a
+# kernel constraint, not a chosen default.
+MSA_PAGE_SIZE = 128
 TRTLLM_MHA_PAGE_SIZE = 64
 
 # Constrained kernels: default within the supported set.
