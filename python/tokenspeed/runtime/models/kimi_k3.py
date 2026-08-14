@@ -29,7 +29,7 @@ Implemented (full text path):
 * ``KimiLinearMLAAttention`` — NoPE MLA + sigmoid output gate.
 * ``KimiLinearKDA`` — per-head gated delta-rule linear attention; routes the
   conv + gated-delta scan + conv/recurrent state cache through the hybrid
-  ``MambaAttnBackend`` KDA branch.
+  ``KdaAttnBackend``.
 * ``KimiLinearMLP`` — dense / shared-expert MLP with the SiTU activation.
 * ``KimiLinearMoE`` — sigmoid/noaux_tc router + Latent MoE + flashinfer's
   TRT-LLM fused SiTU + shared experts.
@@ -698,7 +698,7 @@ class KimiLinearKDA(nn.Module):
 
     The layer owns the projections + gates + output norm and routes the conv +
     gated-delta scan + conv/recurrent state cache through the hybrid attention
-    backend (``ctx.attn_backend`` -> ``MambaAttnBackend`` KDA branch), mirroring
+    backend (``ctx.attn_backend`` -> ``KdaAttnBackend``), mirroring
     ``Qwen3_5GatedDeltaNet``. The ``q/k/v_conv1d_weight`` parameters only hold the
     conv kernels; the convolution itself runs in the backend.
     """
@@ -889,7 +889,7 @@ class KimiLinearKDA(nn.Module):
 
         # Raw (pre-conv) q/k/v projections concatenated; the hybrid backend runs
         # the short causal conv (+ SiLU) and manages the conv / recurrent state
-        # cache (KDA branch of MambaAttnBackend). g_raw is the raw decay-gate
+        # cache (``KdaAttnBackend``). g_raw is the raw decay-gate
         # input, beta the per-head logits (sigmoid applied in-kernel).
         mixed_qkv, out_gate, f_a_out, beta = self._project_qkvfab(
             h, attnres_partial_args

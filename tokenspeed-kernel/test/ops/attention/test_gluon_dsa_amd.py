@@ -1269,6 +1269,21 @@ def test_dsa_dense_kvcache(
             65,
             id="dynamic-short-list",
         ),
+        pytest.param(
+            (2048,),
+            2112,
+            id="single-row-full-width",
+        ),
+        pytest.param(
+            (1024,),
+            1024,
+            id="registered-width-1024",
+        ),
+        pytest.param(
+            (0, 1, 31, 32, 33, 65, 1025),
+            1025,
+            id="dynamic-split-rows",
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -1338,7 +1353,15 @@ def test_dsa_dense_fp8_glm52_production_shape(
     assert out.shape == (tokens, num_heads, kv_lora_rank)
     assert out.dtype == torch.bfloat16
     assert torch.isfinite(out).all()
-    torch.testing.assert_close(out[0], torch.zeros_like(out[0]))
+    empty_rows = torch.tensor(
+        [row for row, valid_len in enumerate(valid_lengths) if valid_len == 0],
+        device=device,
+        dtype=torch.int64,
+    )
+    empty_out = out.index_select(0, empty_rows)
+    torch.testing.assert_close(
+        empty_out, torch.zeros_like(empty_out), rtol=0.0, atol=0.0
+    )
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 
