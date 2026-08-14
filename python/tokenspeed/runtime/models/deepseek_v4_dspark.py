@@ -37,6 +37,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     DeepseekV4MegaMoEExperts,
+    _deepseek_v4_expert_scale_parameter_name,
     hc_head,
     mhc_fused_hc,
     mhc_post,
@@ -668,15 +669,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             return None
         name = self._map_stage_name(stage_id, match.group(2))
         if name.endswith(".scale"):
-            # MegaMoE experts register block scales as ``w{13,2}_weight_scale``;
-            # the generic block-FP8 MoELayer (non-mega, e.g. flashinfer_cutlass
-            # on Hopper) registers ``..._weight_scale_inv``. Mirror
-            # DeepseekV4ForCausalLM._map_weight_name.
-            scale_suffix = (
-                ".weight_scale"
-                if _EXPERT_SCALE_RE.search(name) and get_moe_backend().is_mega_moe()
-                else ".weight_scale_inv"
-            )
+            scale_suffix = ".weight_scale_inv"
+            if _EXPERT_SCALE_RE.search(name):
+                scale_suffix = "." + _deepseek_v4_expert_scale_parameter_name(
+                    self.config,
+                    use_mega_moe=get_moe_backend().is_mega_moe(),
+                )
             name = name.removesuffix(".scale") + scale_suffix
         if ".shared_experts.w2" in name:
             name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")

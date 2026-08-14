@@ -2504,6 +2504,37 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         return y
 
 
+def _deepseek_v4_routed_expert_quant_config(
+    config: PretrainedConfig,
+    quant_config: QuantizationConfig,
+) -> tuple[QuantizationConfig, bool]:
+    # ``quant_method=fp8`` describes the model-wide quantization, but DeepSeek
+    # V4 can still serialize routed experts as packed MXFP4. Prefer the explicit
+    # expert contract so packed FP4 tensors are never allocated as block FP8.
+    is_block_fp8 = isinstance(quant_config, Fp8Config) and (
+        getattr(config, "expert_dtype", None) != "fp4"
+    )
+    if is_block_fp8:
+        return quant_config, True
+    return (
+        Mxfp4Config(
+            ignored_layers=quant_config.ignored_layers,
+            is_checkpoint_mxfp4_serialized=True,
+        ),
+        False,
+    )
+
+
+def _deepseek_v4_expert_scale_parameter_name(
+    config: PretrainedConfig,
+    *,
+    use_mega_moe: bool,
+) -> str:
+    if use_mega_moe or getattr(config, "expert_dtype", None) == "fp4":
+        return "weight_scale"
+    return "weight_scale_inv"
+
+
 class DeepseekV4MoE(nn.Module):
     def __init__(
         self,
@@ -2581,20 +2612,9 @@ class DeepseekV4MoE(nn.Module):
             )
             self.topk = None
         else:
-            # A block-FP8 checkpoint (quant_method=fp8, ue8m0 block scales, e.g.
-            # DeepSeek-V4-Flash) keeps its own Fp8Config and runs weight-only
-            # through the DeepGEMM block-FP8 grouped MoE (SM90 / Hopper via
-            # DeepEP). Its routed experts carry no GEMM bias -- the noaux_tc
-            # correction bias is a routing-only term applied in TopK. Only the
-            # MXFP4-serialized variant needs the Mxfp4 repack + expert bias.
-            is_block_fp8 = isinstance(quant_config, Fp8Config)
-            if is_block_fp8:
-                routed_quant_config = quant_config
-            else:
-                routed_quant_config = Mxfp4Config(
-                    ignored_layers=quant_config.ignored_layers,
-                    is_checkpoint_mxfp4_serialized=True,
-                )
+            routed_quant_config, is_block_fp8 = _deepseek_v4_routed_expert_quant_config(
+                config, quant_config
+            )
             self.experts = MoELayer(
                 top_k=config.num_experts_per_tok,
                 num_experts=config.n_routed_experts
@@ -4265,8 +4285,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
         ]
 
-    @staticmethod
-    def _map_weight_name(name: str) -> str:
+    def _map_weight_name(self, name: str) -> str:
         if name.startswith("layers."):
             name = "model." + name
         elif name.startswith("embed."):
@@ -4282,13 +4301,11 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         if ".ffn.gate.bias" in name:
             name = name.replace(".ffn.gate.bias", ".ffn.gate.e_score_correction_bias")
         if re.search(r"\.experts\.\d+\.w[123]\.scale$", name):
-            # MegaMoE experts register block scales as ``w{13,2}_weight_scale``;
-            # the generic block-FP8 MoELayer (non-mega, Hopper DeepEP path)
-            # registers ``..._weight_scale_inv`` via create_fp8_block_scale_inverses.
-            if get_moe_backend().is_mega_moe():
-                name = name.replace(".scale", ".weight_scale")
-            else:
-                name = name.replace(".scale", ".weight_scale_inv")
+            scale_name = _deepseek_v4_expert_scale_parameter_name(
+                self.config,
+                use_mega_moe=get_moe_backend().is_mega_moe(),
+            )
+            name = name.replace(".scale", f".{scale_name}")
         elif name.endswith(".scale"):
             name = name[:-6] + ".weight_scale_inv"
         return name

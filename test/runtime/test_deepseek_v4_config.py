@@ -95,14 +95,20 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     PagedCacheGroupSpec,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
-from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
+from tokenspeed.runtime.layers.quantization import (
+    QUANTIZATION_METHODS,
+    Fp8Config,
+    Mxfp4Config,
+)
 from tokenspeed.runtime.models import deepseek_v4 as deepseek_v4_model
 from tokenspeed.runtime.models.deepseek_v4 import (
+    DeepseekV4ForCausalLM,
     DeepseekV4Indexer,
     DeepseekV4MLP,
     DeepseekV4Model,
     DeepseekV4MoE,
     DeepseekV4MoEGate,
+    _deepseek_v4_expert_scale_parameter_name,
     _deepseek_v4_forward_metadata,
     _deepseek_v4_fused_select_experts,
     _deepseek_v4_indexer_decode_max_len,
@@ -115,6 +121,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_indexer_topk_from_logits,
     _deepseek_v4_mega_moe_max_num_tokens,
     _deepseek_v4_reorder_c4_ape_2604,
+    _deepseek_v4_routed_expert_quant_config,
     _DeepseekV4TopKBuffer,
     deepseek_v4_rope_config,
     deepseek_v4_select_experts,
@@ -337,6 +344,62 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_config_registry(self):
         self.assertEqual(DeepseekV4Config.model_type, "deepseek_v4")
         self.assertIs(_CONFIG_REGISTRY["deepseek_v4"], DeepseekV4Config)
+
+    def test_fp4_expert_contract_overrides_model_wide_fp8_config(self):
+        quant_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+            scale_fmt="ue8m0",
+        )
+
+        routed_quant_config, is_block_fp8 = _deepseek_v4_routed_expert_quant_config(
+            SimpleNamespace(expert_dtype="fp4"), quant_config
+        )
+
+        self.assertFalse(is_block_fp8)
+        self.assertIsInstance(routed_quant_config, Mxfp4Config)
+        self.assertTrue(routed_quant_config.is_checkpoint_mxfp4_serialized)
+
+    def test_fp8_expert_contract_keeps_model_wide_fp8_config(self):
+        quant_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+            scale_fmt="ue8m0",
+        )
+
+        for expert_dtype in (None, "fp8"):
+            with self.subTest(expert_dtype=expert_dtype):
+                routed_quant_config, is_block_fp8 = (
+                    _deepseek_v4_routed_expert_quant_config(
+                        SimpleNamespace(expert_dtype=expert_dtype), quant_config
+                    )
+                )
+
+                self.assertTrue(is_block_fp8)
+                self.assertIs(routed_quant_config, quant_config)
+
+    def test_expert_scale_name_follows_expert_format_and_backend(self):
+        cases = (
+            ("fp4", False, "weight_scale"),
+            ("fp4", True, "weight_scale"),
+            ("fp8", False, "weight_scale_inv"),
+            ("fp8", True, "weight_scale"),
+            (None, False, "weight_scale_inv"),
+        )
+        for expert_dtype, use_mega_moe, expected in cases:
+            with self.subTest(
+                expert_dtype=expert_dtype,
+                use_mega_moe=use_mega_moe,
+            ):
+                self.assertEqual(
+                    _deepseek_v4_expert_scale_parameter_name(
+                        SimpleNamespace(expert_dtype=expert_dtype),
+                        use_mega_moe=use_mega_moe,
+                    ),
+                    expected,
+                )
 
     def test_forward_mode_mixed_predicate(self):
         self.assertTrue(ForwardMode.MIXED.is_mixed())
@@ -1590,15 +1653,41 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         self.assertIsNone(model._map_checkpoint_name("mtp.3.norm.weight"))
 
-    def test_dspark_expert_scale_mapping_follows_moe_backend(self):
-        # Expert block scales land on `w{13,2}_weight_scale` params only under
-        # the mega-MoE backend; every other backend registers
-        # `..._weight_scale_inv` via create_fp8_block_scale_inverses.
+    def test_target_expert_scale_mapping_follows_expert_format(self):
+        model = object.__new__(DeepseekV4ForCausalLM)
+        non_mega = SimpleNamespace(is_mega_moe=lambda: False)
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4.get_moe_backend",
+            return_value=non_mega,
+        ):
+            model.config = SimpleNamespace(expert_dtype="fp4")
+            self.assertEqual(
+                model._map_weight_name("layers.1.ffn.experts.7.w1.scale"),
+                "model.layers.1.ffn.experts.7.w1.weight_scale",
+            )
+            model.config = SimpleNamespace(expert_dtype="fp8")
+            self.assertEqual(
+                model._map_weight_name("layers.1.ffn.experts.7.w1.scale"),
+                "model.layers.1.ffn.experts.7.w1.weight_scale_inv",
+            )
+
+    def test_dspark_expert_scale_mapping_follows_expert_format(self):
         model = object.__new__(DeepseekV4ForCausalLMDSpark)
         model.model = SimpleNamespace(num_stages=3)
 
         mega = SimpleNamespace(is_mega_moe=lambda: True)
         non_mega = SimpleNamespace(is_mega_moe=lambda: False)
+        model.config = SimpleNamespace(expert_dtype="fp4")
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4_dspark.get_moe_backend",
+            return_value=non_mega,
+        ):
+            self.assertEqual(
+                model._map_checkpoint_name("mtp.1.ffn.experts.7.w1.scale"),
+                "model.stages.1.block.ffn.experts.7.w1.weight_scale",
+            )
+
+        model.config = SimpleNamespace(expert_dtype="fp8")
         with patch(
             "tokenspeed.runtime.models.deepseek_v4_dspark.get_moe_backend",
             return_value=mega,
