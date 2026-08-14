@@ -31,10 +31,6 @@ from tokenspeed_kernel.ops.attention import (
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
-    kda_paged_decode,
-    kda_paged_prefill,
-    try_kda_fused_paged_decode,
-    try_kda_fused_paged_verify,
 )
 from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
     fused_qkv_split_gdn_prefill,
@@ -74,24 +70,6 @@ if TYPE_CHECKING:
 
 # Default cache group id carrying GDN/Mamba state pages.
 _STATE_GROUP_ID = LINEAR_ATTENTION
-
-
-def _slice_kda_prefill_inputs(
-    num_real_tokens: int,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    gate: torch.Tensor,
-    beta: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Slice packed KDA inputs to the real-token prefix along their token axis."""
-    return (
-        query[:, :num_real_tokens],
-        key[:, :num_real_tokens],
-        value[:, :num_real_tokens],
-        gate[:, :num_real_tokens],
-        beta[:, :num_real_tokens],
-    )
 
 
 def _mask_fresh_initial_state(
@@ -307,35 +285,9 @@ class MambaAttnBackend(AttentionBackend):
     # contract (history + state) is covered once both consumers exist.
     cache_consumer_families = frozenset({"state"})
 
-    def __init__(
-        self,
-        config: BaseAttnConfig,
-        is_kda: bool = False,
-        kda_backend: str = "auto",
-    ):
+    def __init__(self, config: BaseAttnConfig):
         super().__init__(config)
         self.pad_slot_id = -1
-        # Kernel family: GDN (scalar decay) or KDA (per-channel, Kimi-K3).
-        self.is_kda = is_kda
-        # KDA prefill kernel policy: unresolved "auto" delegates to the registry;
-        # otherwise this is cutedsl_kda, flashkda, or fla. Decode is unaffected.
-        self.kda_backend = (kda_backend or "auto").strip().lower()
-        if self.is_kda:
-            if self.kda_backend not in (
-                "auto",
-                "fla",
-                "flashkda",
-                "cutedsl_kda",
-            ):
-                raise ValueError(
-                    "--kda-backend must be one of auto, fla, flashkda, cutedsl_kda; "
-                    f"got {self.kda_backend!r}"
-                )
-            logger.info(
-                "KDA prefill routes through %s; decode remains on the "
-                "platform-selected kernels",
-                self.kda_backend,
-            )
         self.forward_metadata: MambaForwardMetadata = None
         self.query_start_loc_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
@@ -609,7 +561,7 @@ class MambaAttnBackend(AttentionBackend):
         return rows
 
     def _seed_verify_scratch_batched(self, bs: int, draft_token_num: int) -> None:
-        """Seed every KDA layer's verify-scratch init conv and recurrent rows
+        """Seed every state layer's verify-scratch init conv and recurrent rows
         from its group's committed state page. Negative page ids zero-fill."""
         from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
 
@@ -688,7 +640,7 @@ class MambaAttnBackend(AttentionBackend):
                 .to(torch.int64)
                 .clamp_min(0)
             )
-        # Batched commit: scratch row -> committed page for every KDA layer in
+        # Batched commit: scratch row -> committed page for every state layer in
         # one launch per state kind (was a per-layer gather/scatter pair).
         from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
 
@@ -731,7 +683,7 @@ class MambaAttnBackend(AttentionBackend):
         forward from the operation-bound cache metadata.
 
         The dual-index gather runs ONCE per state group per batch — never per
-        layer. KDA layers select their group's entry via
+        layer. State layers select their group's entry via
         ``pool.group_id_for_layer(layer_id)`` at forward time.
 
         validate: explicit True/False wins; None (the hot-path default)
@@ -1138,7 +1090,7 @@ class MambaAttnBackend(AttentionBackend):
                 state_in_pages_by_group[group_id] = state_in
                 state_out_pages_by_group[group_id] = state_out
         elif self.state_paging_active:
-            # For multi-group KDA state paging, dual indexing runs once per
+            # For multi-group state paging, dual indexing runs once per
             # state group over the real rows. Padded rows get pad_slot_id (-1),
             # which state kernels skip, so they never touch a live page.
             # Decode-only
@@ -1318,7 +1270,7 @@ class MambaAttnBackend(AttentionBackend):
         f_b_weight = kwargs.get("f_b_weight")
         g_raw = kwargs.get("g_raw")
         beta_raw = kwargs.get("beta_raw")
-        kda_lower_bound = kwargs.get("lower_bound")
+        gate_lower_bound = kwargs.get("lower_bound")
         A_log = kwargs["A_log"]
         dt_bias = kwargs["dt_bias"]
         layer_id = kwargs["layer_id"]
@@ -1330,27 +1282,25 @@ class MambaAttnBackend(AttentionBackend):
         )
         read_indices = state_in_pages
 
-        if self.is_kda and f_a_out is not None:
-            num_value_heads = value_dim // attn_tp_size // head_v_dim
-            core_attn_out = try_kda_fused_paged_decode(
-                mixed_qkv,
-                conv_weights,
-                conv_states,
-                f_a_out,
-                f_b_weight,
-                beta_raw,
-                A_log,
-                dt_bias,
-                state_pool=ssm_states,
-                read_indices=read_indices,
-                write_indices=state_out_pages,
-                num_heads=num_value_heads,
-                head_dim=head_v_dim,
-                cu_seqlens=self.forward_metadata.query_start_loc,
-                lower_bound=kda_lower_bound,
-            )
-            if core_attn_out is not None:
-                return core_attn_out
+        fused_out = self._decode(
+            mixed_qkv,
+            conv_weights,
+            conv_states,
+            ssm_states,
+            read_indices,
+            state_out_pages,
+            f_a_out=f_a_out,
+            f_b_weight=f_b_weight,
+            beta_raw=beta_raw,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            value_dim=value_dim,
+            attn_tp_size=attn_tp_size,
+            head_v_dim=head_v_dim,
+            lower_bound=gate_lower_bound,
+        )
+        if fused_out is not None:
+            return fused_out
 
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
@@ -1380,31 +1330,122 @@ class MambaAttnBackend(AttentionBackend):
         key = key.view(seq_len, 1, num_heads, head_k_dim)
         value = value.view(seq_len, 1, value.shape[1] // head_v_dim, head_v_dim)
 
-        if self.is_kda:
-            num_value_heads = value.shape[2]
-            query_start_loc = self.forward_metadata.query_start_loc
-            if g_raw is None:
-                g_raw = torch.nn.functional.linear(f_a_out, f_b_weight)
-            query = query.view(1, seq_len, num_heads, head_k_dim)
-            key = key.view(1, seq_len, num_heads, head_k_dim)
-            value = value.view(1, seq_len, num_value_heads, head_v_dim)
-            g_kda = g_raw.view(1, seq_len, num_value_heads, head_k_dim)
-            beta_kda = beta_raw.view(1, seq_len, num_value_heads)
-            return kda_paged_decode(
-                query,
-                key,
-                value,
-                g_kda,
-                beta_kda,
-                A_log,
-                dt_bias,
-                state_pool=ssm_states,
-                read_indices=read_indices,
-                write_indices=state_out_pages,
-                cu_seqlens=query_start_loc,
-                lower_bound=kda_lower_bound,
-            ).squeeze(0)
+        return self._decode_scan(
+            query,
+            key,
+            value,
+            ssm_states,
+            read_indices,
+            state_out_pages,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            a=a,
+            b=b,
+            g_raw=g_raw,
+            f_a_out=f_a_out,
+            f_b_weight=f_b_weight,
+            beta_raw=beta_raw,
+            lower_bound=gate_lower_bound,
+        )
 
+    def _decode(
+        self,
+        mixed_qkv: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        read_indices: torch.Tensor,
+        write_indices: torch.Tensor,
+        *,
+        f_a_out: torch.Tensor | None,
+        f_b_weight: torch.Tensor | None,
+        beta_raw: torch.Tensor | None,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        value_dim: int,
+        attn_tp_size: int,
+        head_v_dim: int,
+        lower_bound: float | None,
+    ) -> torch.Tensor | None:
+        """Whole-step decode attempt; ``None`` falls through to the shared flow.
+
+        Sits before the conv update because a family's kernel may absorb it.
+
+        GDN has no fused conv+gate+scan kernel, so the base returns None and
+        the caller runs the shared conv update / qkv split / scan flow. KDA
+        overrides this with a kernel that absorbs all three stages and may
+        itself decline (unsupported shape or platform), which is why the
+        sentinel is "not handled, continue" rather than a family switch.
+
+        Args:
+            mixed_qkv: Packed ``[T, key+key+value]`` conv input.
+            conv_weights: Depthwise conv filters.
+            conv_states: Conv-window component of this layer's state slab.
+            ssm_states: Recurrent component of this layer's state slab.
+            read_indices: Per-request state page holding position n-1.
+            write_indices: Per-request state page receiving position n.
+            f_a_out: Low-rank gate activation (KDA); None on GDN.
+            f_b_weight: Second gate projection consumed inside the fusion.
+            beta_raw: Raw per-head beta logits (KDA).
+            A_log: Per-channel decay parameter.
+            dt_bias: Per-channel timestep bias.
+            value_dim: Pre-TP value width, used to derive the head count.
+            attn_tp_size: Attention tensor-parallel size.
+            head_v_dim: Value head dimension.
+            lower_bound: KDA decay clamp.
+
+        Returns:
+            The layer output when a fused kernel ran, else None.
+        """
+        return None
+
+    def _decode_scan(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        ssm_states: torch.Tensor,
+        read_indices: torch.Tensor,
+        write_indices: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        a: torch.Tensor | None,
+        b: torch.Tensor | None,
+        g_raw: torch.Tensor | None,
+        f_a_out: torch.Tensor | None,
+        f_b_weight: torch.Tensor | None,
+        beta_raw: torch.Tensor | None,
+        lower_bound: float | None,
+    ) -> torch.Tensor:
+        """Single-token recurrent scan over the split, conv'd projections.
+
+        The boundary sits right after the shared split/reshape because that is
+        where the families stop agreeing: GDN consumes scalar-per-head decay
+        ``a``/``b`` through ``gdn_decode_step``, KDA a per-channel gate
+        ``g_raw`` plus raw beta logits through ``kda_paged_decode``. Both
+        return this backend's ``[1, B, Hv, V]`` decode-output convention.
+
+        Args:
+            query: ``[B, 1, H, K]`` conv'd, split query.
+            key: ``[B, 1, H, K]`` conv'd, split key.
+            value: ``[B, 1, Hv, V]`` conv'd, split value.
+            ssm_states: Recurrent component of this layer's state slab.
+            read_indices: Per-request state page holding position n-1.
+            write_indices: Per-request state page receiving position n.
+            A_log: Per-channel decay parameter.
+            dt_bias: Per-channel timestep bias.
+            a: GDN scalar-per-head decay input.
+            b: GDN scalar-per-head beta input.
+            g_raw: KDA per-channel gate, when the model precomputed it.
+            f_a_out: KDA low-rank gate activation (gate GEMV source).
+            f_b_weight: KDA second gate projection.
+            beta_raw: KDA raw per-head beta logits.
+            lower_bound: KDA decay clamp.
+
+        Returns:
+            ``[1, B, Hv, V]`` layer output.
+        """
         (
             decode_initial_indices,
             decode_output_indices,
@@ -1412,7 +1453,7 @@ class MambaAttnBackend(AttentionBackend):
         ) = _prepare_gdn_decode_state_path(
             ssm_states,
             read_indices,
-            state_out_pages,
+            write_indices,
         )
         core_attn_out = gdn_decode_step(
             q=query,
@@ -1455,24 +1496,16 @@ class MambaAttnBackend(AttentionBackend):
         attn_tp_size = kwargs["attention_tp_size"]
         head_k_dim = kwargs["head_k_dim"]
         head_v_dim = kwargs["head_v_dim"]
-        # GDN passes scalar-per-head a/b; KDA (self.is_kda) passes a per-channel
-        # gate g_raw + raw beta logits instead (A_log / dt_bias are per-channel).
+        # Gating inputs are family-specific and are consumed by the scan seams:
+        # scalar-per-head a/b here, a per-channel gate plus raw beta logits in
+        # the subclass (A_log / dt_bias are per-channel for both).
         a = kwargs.get("a")
         b = kwargs.get("b")
         g_raw = kwargs.get("g_raw")
-
-        def _kda_g_raw() -> torch.Tensor:
-            # KDA: the fused decode/verify kernels absorb f_b into the scan;
-            # the remaining paths need the plain GEMV, computed on first use.
-            nonlocal g_raw
-            if g_raw is None and kwargs.get("f_a_out") is not None:
-                g_raw = torch.nn.functional.linear(
-                    kwargs["f_a_out"], kwargs["f_b_weight"]
-                )
-            return g_raw
-
+        f_a_out = kwargs.get("f_a_out")
+        f_b_weight = kwargs.get("f_b_weight")
         beta_raw = kwargs.get("beta_raw")
-        kda_lower_bound = kwargs.get("lower_bound")
+        gate_lower_bound = kwargs.get("lower_bound")
         A_log = kwargs["A_log"]
         dt_bias = kwargs["dt_bias"]
         layer_id = kwargs["layer_id"]
@@ -1496,54 +1529,40 @@ class MambaAttnBackend(AttentionBackend):
             )
             batch_size = seq_len // draft_token_num
             output_indices = self.forward_metadata.mamba_output_indices
-            state = self._layer_state(layer_id)
-            if (
-                self.is_kda
-                and kwargs.get("f_a_out") is not None
-                and kwargs.get("bias") is None
-            ):
-                # Verify megafusion: conv(+silu), f_b gate GEMV, and the
-                # per-position recurrence in one launch, per-position conv
-                # windows and states landing in the verify scratches.
-                state_in_pages, _, conv_comp, ssm_states = state
-                conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
-                num_value_heads = value_dim // attn_tp_size // head_v_dim
-                fused_out = try_kda_fused_paged_verify(
-                    mixed_qkv,
-                    conv_weights,
-                    conv_comp,
-                    conv_scratch,
-                    kwargs["f_a_out"],
-                    kwargs["f_b_weight"],
-                    beta_raw,
-                    A_log,
-                    dt_bias,
-                    state_pool=ssm_states,
-                    state_scratch=ssm_scratch,
-                    read_indices=state_in_pages[:batch_size],
-                    write_indices=output_indices[:batch_size],
-                    num_heads=num_value_heads,
-                    head_dim=head_v_dim,
-                    draft_token_num=draft_token_num,
-                    lower_bound=kda_lower_bound,
-                )
-                if fused_out is not None:
-                    return fused_out
+            state_in_pages, _, conv_comp, ssm_comp = self._layer_state(layer_id)
+            conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
+            fused_out = self._verify(
+                mixed_qkv,
+                conv_weights,
+                conv_comp,
+                conv_scratch,
+                ssm_comp,
+                ssm_scratch,
+                state_in_pages,
+                output_indices,
+                bias=bias,
+                f_a_out=f_a_out,
+                f_b_weight=f_b_weight,
+                beta_raw=beta_raw,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                batch_size=batch_size,
+                draft_token_num=draft_token_num,
+                value_dim=value_dim,
+                attn_tp_size=attn_tp_size,
+                head_v_dim=head_v_dim,
+                lower_bound=gate_lower_bound,
+            )
+            if fused_out is not None:
+                return fused_out
             # Read the committed window and write per-position states into the
             # verify scratch. The accepted position is committed afterward.
-            state_in_pages, _, conv_comp, ssm_states = state
-            conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
             if layer_id == self._state_layer_ids()[0]:
                 self._seed_verify_scratch_batched(batch_size, draft_token_num)
             init_rows = output_indices[:batch_size, 0] - 1
             conv_states = conv_scratch
             conv_read = init_rows
             conv_out = output_indices[:batch_size]
-            self._verify_layer_state = (
-                state_in_pages,
-                ssm_states,
-                ssm_scratch,
-            )
             # shouldn't use contiguous here, because causal_conv1d_update
             # support input non-contiguous
             mixed_qkv_reshaped = mixed_qkv.view(
@@ -1614,139 +1633,277 @@ class MambaAttnBackend(AttentionBackend):
         )
 
         if is_target_verify:
-            if self.is_kda:
-                verify_layer_state = self._verify_layer_state
-                from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
-                    fused_recurrent_kda_mtp,
-                )
-
-                state_in_pages, ssm_comp, ssm_scratch = verify_layer_state
-                draft_token_num = kwargs.get(
-                    "draft_token_num", self.speculative_num_draft_tokens
-                )
-                batch_size = seq_len // draft_token_num
-                query_b = query.view(batch_size, draft_token_num, num_heads, head_k_dim)
-                key_b = key.view(batch_size, draft_token_num, num_heads, head_k_dim)
-                value_b = value.view(
-                    batch_size, draft_token_num, num_value_heads, head_v_dim
-                )
-                g_b = _kda_g_raw().view(
-                    batch_size, draft_token_num, num_value_heads, head_k_dim
-                )
-                beta_b = beta_raw.view(batch_size, draft_token_num, num_value_heads)
-                grid = self.forward_metadata.mamba_output_indices[:batch_size]
-                core_attn_out = fused_recurrent_kda_mtp(
-                    query_b,
-                    key_b,
-                    value_b,
-                    g_b,
-                    beta_b,
-                    A_log,
-                    dt_bias,
-                    ssm_comp,
-                    state_in_pages[:batch_size].to(torch.int64),
-                    grid,
-                    h_pool_out=ssm_scratch,
-                    lower_bound=kda_lower_bound,
-                ).reshape(1, seq_len, num_value_heads, head_v_dim)
-                return core_attn_out
-            draft_token_num = kwargs.get(
-                "draft_token_num", self.speculative_num_draft_tokens
-            )
-            batch_size = seq_len // draft_token_num
-            # fused_qkv_split_gdn_prefill's [1, seq_len, H, D] varlen-style
-            # layout is request-major (token = req * draft_token_num + step),
-            # so reshaping the leading two dims into [B, T, H, D] is a plain
-            # view -- gdn_decode_mtp's dense-batch contract, no data movement.
-            query_b = query.view(batch_size, draft_token_num, num_heads, head_k_dim)
-            key_b = key.view(batch_size, draft_token_num, num_heads, head_k_dim)
-            value_b = value.view(
-                batch_size, draft_token_num, num_value_heads, head_v_dim
-            )
-            a_b = a.view(batch_size, draft_token_num, -1)
-            b_b = b.view(batch_size, draft_token_num, -1)
-
-            output_indices = self.forward_metadata.mamba_output_indices
-            _, _, ssm_states = self._verify_layer_state
-            cache_indices = output_indices[:batch_size, 0] - 1
-            (
-                mtp_initial_indices,
-                mtp_output_indices,
-                mtp_solution,
-            ) = _prepare_gdn_decode_state_path(
-                ssm_states,
-                cache_indices,
+            core_attn_out = self._verify_scan(
+                query,
+                key,
+                value,
+                ssm_comp,
+                ssm_scratch,
+                state_in_pages,
                 output_indices,
-            )
-            core_attn_out = gdn_decode_mtp(
-                query_b,
-                key_b,
-                value_b,
                 A_log=A_log,
-                a=a_b,
                 dt_bias=dt_bias,
-                b=b_b,
-                initial_state=ssm_states,
-                initial_state_indices=mtp_initial_indices,
-                use_qk_l2norm=True,
-                output_state_indices=mtp_output_indices,
-                disable_state_update=False,
-                solution=mtp_solution,
-            ).reshape(1, seq_len, num_value_heads, head_v_dim)
-        elif self.is_kda:
-            # FlashKDA derives its output extent from the input shape but derives
-            # sequence tiles from cu_seqlens. With bucket-sized inputs it leaves
-            # the uncovered output tail unwritten, and its final full-tile loads
-            # can consume in-bounds padding. Run only the real prefix; the graph
-            # handoff clears and restores the bucket tail afterward.
-            g_kda = _kda_g_raw().view(1, seq_len, num_value_heads, head_k_dim)
-            beta_kda = beta_raw.view(1, seq_len, num_value_heads)
-            query, key, value, g_kda, beta_kda = _slice_kda_prefill_inputs(
-                num_real_tokens, query, key, value, g_kda, beta_kda
+                a=a,
+                b=b,
+                g_raw=g_raw,
+                f_a_out=f_a_out,
+                f_b_weight=f_b_weight,
+                beta_raw=beta_raw,
+                batch_size=batch_size,
+                draft_token_num=draft_token_num,
+                seq_len=seq_len,
+                lower_bound=gate_lower_bound,
             )
-            kda_result = kda_paged_prefill(
-                query,
-                key,
-                value,
-                g_kda,
-                beta_kda,
-                A_log,
-                dt_bias,
-                initial_state=recurrent_state,
-                cu_seqlens=query_start_loc,
-                lower_bound=kda_lower_bound,
-                solution=None if self.kda_backend == "auto" else self.kda_backend,
-            )
-            core_attn_out = kda_result.out.squeeze(0)
-            last_recurrent_state = kda_result.final_state
-            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-            # Extend indices never carry pad(-1) — unguarded like the GDN write below.
-            ssm_states[state_out_long] = last_recurrent_state
         else:
-            beta = b.sigmoid()
-            g = fused_gdn_gating(A_log, a, dt_bias)
-            g = g.unsqueeze(0)
-            beta = beta.unsqueeze(0)
-
-            gdn_result = gdn_chunk_prefill(
+            core_attn_out, last_recurrent_state = self._prefill_scan(
                 query,
                 key,
                 value,
-                g,
-                beta,
-                scale=head_k_dim**-0.5,
-                initial_state=recurrent_state,
-                cu_seqlens=query_start_loc,
-                qk_l2norm=True,
-                output_final_state=True,
-                output_h=False,
+                recurrent_state,
+                query_start_loc,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                a=a,
+                b=b,
+                g_raw=g_raw,
+                f_a_out=f_a_out,
+                f_b_weight=f_b_weight,
+                beta_raw=beta_raw,
+                seq_len=seq_len,
+                num_real_tokens=num_real_tokens,
+                lower_bound=gate_lower_bound,
             )
-            core_attn_out = gdn_result.out
-            last_recurrent_state = gdn_result.final_state
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
+            # Extend indices never carry pad(-1), so this write is unguarded.
             ssm_states[state_out_long] = last_recurrent_state
 
         return core_attn_out
+
+    def _verify(
+        self,
+        mixed_qkv: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_comp: torch.Tensor,
+        conv_scratch: torch.Tensor,
+        ssm_comp: torch.Tensor,
+        ssm_scratch: torch.Tensor,
+        state_in_pages: torch.Tensor,
+        output_indices: torch.Tensor,
+        *,
+        bias: torch.Tensor | None,
+        f_a_out: torch.Tensor | None,
+        f_b_weight: torch.Tensor | None,
+        beta_raw: torch.Tensor | None,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        batch_size: int,
+        draft_token_num: int,
+        value_dim: int,
+        attn_tp_size: int,
+        head_v_dim: int,
+        lower_bound: float | None,
+    ) -> torch.Tensor | None:
+        """Whole-round verify attempt; ``None`` falls through to the shared flow.
+
+        Sits before the scratch seeding because a family's kernel may seed
+        (or skip) the scratch itself.
+
+        GDN has no fused verify kernel, so the base returns None and the caller
+        seeds the verify scratch and runs the shared conv update. KDA overrides
+        this with a kernel that fuses conv(+silu), the gate GEMV and the
+        per-position recurrence — it also seeds itself, which is why the seam
+        sits above the seeding rather than only around the scan.
+
+        Args:
+            mixed_qkv: Packed ``[T, key+key+value]`` conv input.
+            conv_weights: Depthwise conv filters.
+            conv_comp: Conv-window component of this layer's state slab.
+            conv_scratch: Per-position conv-window verify scratch.
+            ssm_comp: Recurrent component of this layer's state slab.
+            ssm_scratch: Per-position recurrent verify scratch.
+            state_in_pages: Per-request committed-state page ids.
+            output_indices: ``[bs, T]`` verify scratch row grid.
+            bias: Conv bias; a fused path requires the bias-free conv.
+            f_a_out: Low-rank gate activation (KDA); None on GDN.
+            f_b_weight: Second gate projection consumed inside the fusion.
+            beta_raw: Raw per-head beta logits (KDA).
+            A_log: Per-channel decay parameter.
+            dt_bias: Per-channel timestep bias.
+            batch_size: Requests in this verify round.
+            draft_token_num: Verified positions per request.
+            value_dim: Pre-TP value width, used to derive the head count.
+            attn_tp_size: Attention tensor-parallel size.
+            head_v_dim: Value head dimension.
+            lower_bound: KDA decay clamp.
+
+        Returns:
+            The layer output when a fused kernel ran, else None.
+        """
+        return None
+
+    def _verify_scan(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        ssm_comp: torch.Tensor,
+        ssm_scratch: torch.Tensor,
+        state_in_pages: torch.Tensor,
+        output_indices: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        a: torch.Tensor | None,
+        b: torch.Tensor | None,
+        g_raw: torch.Tensor | None,
+        f_a_out: torch.Tensor | None,
+        f_b_weight: torch.Tensor | None,
+        beta_raw: torch.Tensor | None,
+        batch_size: int,
+        draft_token_num: int,
+        seq_len: int,
+        lower_bound: float | None,
+    ) -> torch.Tensor:
+        """Per-position recurrent scan of a target-verify round.
+
+        Both families write one recurrent state per draft position into
+        ``ssm_scratch`` so ``commit_verified_state`` can publish the accepted
+        one, and both fold the shared ``[1, seq_len, H, D]`` split into
+        ``[B, T, H, D]``. They diverge on gating (scalar a/b vs per-channel
+        gate) and on where the round's initial state comes from: GDN reads the
+        seeded scratch init row, KDA reads the committed slab page directly.
+
+        Args:
+            query: ``[1, seq_len, H, K]`` conv'd, split query.
+            key: ``[1, seq_len, H, K]`` conv'd, split key.
+            value: ``[1, seq_len, Hv, V]`` conv'd, split value.
+            ssm_comp: Recurrent component of this layer's state slab.
+            ssm_scratch: Per-position recurrent verify scratch.
+            state_in_pages: Per-request committed-state page ids.
+            output_indices: ``[bs, T]`` verify scratch row grid.
+            A_log: Per-channel decay parameter.
+            dt_bias: Per-channel timestep bias.
+            a: GDN scalar-per-head decay input.
+            b: GDN scalar-per-head beta input.
+            g_raw: KDA per-channel gate, when the model precomputed it.
+            f_a_out: KDA low-rank gate activation (gate GEMV source).
+            f_b_weight: KDA second gate projection.
+            beta_raw: KDA raw per-head beta logits.
+            batch_size: Requests in this verify round.
+            draft_token_num: Verified positions per request.
+            seq_len: Total tokens in the round (``batch_size * T``).
+            lower_bound: KDA decay clamp.
+
+        Returns:
+            ``[1, seq_len, Hv, V]`` layer output.
+        """
+        num_heads = query.shape[2]
+        head_k_dim = query.shape[3]
+        num_value_heads = value.shape[2]
+        head_v_dim = value.shape[3]
+        # Request-major varlen layout: [B, T, H, D] is a plain view, no movement.
+        query_b = query.view(batch_size, draft_token_num, num_heads, head_k_dim)
+        key_b = key.view(batch_size, draft_token_num, num_heads, head_k_dim)
+        value_b = value.view(batch_size, draft_token_num, num_value_heads, head_v_dim)
+        a_b = a.view(batch_size, draft_token_num, -1)
+        b_b = b.view(batch_size, draft_token_num, -1)
+
+        cache_indices = output_indices[:batch_size, 0] - 1
+        (
+            mtp_initial_indices,
+            mtp_output_indices,
+            mtp_solution,
+        ) = _prepare_gdn_decode_state_path(
+            ssm_scratch,
+            cache_indices,
+            output_indices,
+        )
+        return gdn_decode_mtp(
+            query_b,
+            key_b,
+            value_b,
+            A_log=A_log,
+            a=a_b,
+            dt_bias=dt_bias,
+            b=b_b,
+            initial_state=ssm_scratch,
+            initial_state_indices=mtp_initial_indices,
+            use_qk_l2norm=True,
+            output_state_indices=mtp_output_indices,
+            disable_state_update=False,
+            solution=mtp_solution,
+        ).reshape(1, seq_len, num_value_heads, head_v_dim)
+
+    def _prefill_scan(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        a: torch.Tensor | None,
+        b: torch.Tensor | None,
+        g_raw: torch.Tensor | None,
+        f_a_out: torch.Tensor | None,
+        f_b_weight: torch.Tensor | None,
+        beta_raw: torch.Tensor | None,
+        seq_len: int,
+        num_real_tokens: int,
+        lower_bound: float | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Chunked scan of an extend/prefill batch, from the gathered state.
+
+        The caller owns the state plumbing on both sides (it gathers
+        ``recurrent_state`` before and writes the returned final state to the
+        out page after), so the seam is exactly the kernel call: GDN runs
+        ``gdn_chunk_prefill`` over gates built from scalar a/b, KDA runs
+        ``kda_paged_prefill`` over a per-channel gate under a selectable
+        solution.
+
+        Args:
+            query: ``[1, seq_len, H, K]`` conv'd, split query.
+            key: ``[1, seq_len, H, K]`` conv'd, split key.
+            value: ``[1, seq_len, Hv, V]`` conv'd, split value.
+            recurrent_state: Per-request initial recurrent state.
+            query_start_loc: Varlen cumulative token offsets.
+            A_log: Per-channel decay parameter.
+            dt_bias: Per-channel timestep bias.
+            a: GDN scalar-per-head decay input.
+            b: GDN scalar-per-head beta input.
+            g_raw: KDA per-channel gate, when the model precomputed it.
+            f_a_out: KDA low-rank gate activation (gate GEMV source).
+            f_b_weight: KDA second gate projection.
+            beta_raw: KDA raw per-head beta logits.
+            seq_len: Padded token extent of the batch.
+            num_real_tokens: Token extent excluding the graph padding tail.
+            lower_bound: KDA decay clamp.
+
+        Returns:
+            ``(core_attn_out, last_recurrent_state)``.
+        """
+        head_k_dim = query.shape[3]
+        beta = b.sigmoid()
+        g = fused_gdn_gating(A_log, a, dt_bias)
+        g = g.unsqueeze(0)
+        beta = beta.unsqueeze(0)
+
+        gdn_result = gdn_chunk_prefill(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            scale=head_k_dim**-0.5,
+            initial_state=recurrent_state,
+            cu_seqlens=query_start_loc,
+            qk_l2norm=True,
+            output_final_state=True,
+            output_h=False,
+        )
+        return gdn_result.out, gdn_result.final_state
 
 
 class HybridLinearAttnBackend(AttentionBackend):

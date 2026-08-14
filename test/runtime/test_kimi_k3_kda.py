@@ -53,9 +53,9 @@ from test.runtime.conftest import requires_cuda
 from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends import hybrid_linear_attn
+from tokenspeed.runtime.layers.attention.backends import hybrid_kda, hybrid_linear_attn
+from tokenspeed.runtime.layers.attention.backends.hybrid_kda import KdaAttnBackend
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
-    MambaAttnBackend,
     compute_state_page_indices,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
@@ -83,11 +83,10 @@ def _backend_config(device: str, *, spec_tokens: int = 1) -> SimpleNamespace:
     )
 
 
-def _backend(device: str, *, contract_pool, spec_tokens: int = 1) -> MambaAttnBackend:
+def _backend(device: str, *, contract_pool, spec_tokens: int = 1) -> KdaAttnBackend:
     kda_backend = "auto" if current_platform().is_amd else "fla"
-    backend = MambaAttnBackend(
+    backend = KdaAttnBackend(
         _backend_config(device, spec_tokens=spec_tokens),
-        is_kda=True,
         kda_backend=kda_backend,
     )
     backend.set_kv_pool(contract_pool)
@@ -323,7 +322,7 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
 
 
 class _KDAHarness:
-    """Drives MambaAttnBackend KDA forwards over a contract pool and mirrors
+    """Drives KdaAttnBackend forwards over a contract pool and mirrors
     them with naive fp32 + FLA oracles."""
 
     H = 4
@@ -810,7 +809,7 @@ def test_kda_cache_pool_component_views_end_to_end(
         raise AssertionError("AMD paged cache decode must bypass the FLA KDA megafuse")
 
     indexed_decode_calls = 0
-    indexed_decode = hybrid_linear_attn.kda_paged_decode
+    indexed_decode = hybrid_kda.kda_paged_decode
 
     def _indexed_decode_spy(*args, **kwargs):
         nonlocal indexed_decode_calls
@@ -823,7 +822,7 @@ def test_kda_cache_pool_component_views_end_to_end(
         _unexpected_megafuse,
     )
     monkeypatch.setattr(
-        hybrid_linear_attn,
+        hybrid_kda,
         "kda_paged_decode",
         _indexed_decode_spy,
     )

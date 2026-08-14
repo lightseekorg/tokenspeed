@@ -1077,13 +1077,12 @@ class EventLoop:
         input/output sockets."""
         from tokenspeed.runtime.engine import zmq_msgpack, zmq_wire
 
-        if self.dp_size > 1:
-            # Shared choke point for every launch path: all DP-rank engines
-            # would connect to SMG's ROUTER with the same zmq_engine_index
-            # identity, so their inputs and outputs would collide.
-            raise NotImplementedError(
-                "--zmq-msgpack does not support data-parallel size > 1 yet"
-            )
+        # Each DP rank dials SMG with its own engine identity
+        # (zmq_engine_index + dp_rank): the frontend's grouped worker awaits
+        # dp_size engines on one socket set and tells the ranks apart — and
+        # routes inputs back — by this index. The ready response carries the
+        # true dp rank/size alongside.
+        engine_index = self.server_args.zmq_engine_index + self.dp_rank
         geometry = self._scheduler_cache_geometry
         ready_response = zmq_wire.WireEngineCoreReadyResponse(
             max_model_len=self.model_config.context_len,
@@ -1106,7 +1105,7 @@ class EventLoop:
         return zmq_msgpack.connect_msgpack_engine(
             context,
             self.server_args.zmq_handshake_endpoint(),
-            self.server_args.zmq_engine_index,
+            engine_index,
             ready_response,
             self.model_config.vocab_size,
             enable_output_logprobs=self.server_args.enable_output_logprobs,

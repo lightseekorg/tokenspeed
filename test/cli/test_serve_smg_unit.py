@@ -137,10 +137,10 @@ def test_gateway_args_preserve_user_policy():
 def test_gateway_args_defaults_include_port_and_reasoning_parser():
     gateway_args = _gateway_args_with_defaults(["--model", "/tmp/x"])
 
-    # The Prometheus port is a freshly allocated free port (see
-    # test_gateway_args_default_prometheus_port_is_free_port), so assert the
-    # fixed prefix exactly and the trailing port slot structurally.
-    assert gateway_args[:-1] == [
+    # No --prometheus-port here: run_smg allocates it right before
+    # spawn_gateway so the port cannot be lost during engine startup (see
+    # test_run_smg_allocates_prometheus_port_at_gateway_spawn).
+    assert gateway_args == [
         "--model",
         "/tmp/x",
         "--port",
@@ -155,9 +155,7 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "--tokenizer-cache-enable-l1",
         "--log-level",
         "warn",
-        "--prometheus-port",
     ]
-    assert gateway_args[-1].isdigit()
 
 
 def test_gateway_args_defaults_inject_passthrough_policy():
@@ -702,6 +700,54 @@ async def test_gateway_first_then_engine_on_clean_shutdown():
         )
     assert call_order == ["gateway", "engine"]
     assert rc == 0
+
+
+@pytest.mark.asyncio
+async def test_run_smg_allocates_prometheus_port_at_gateway_spawn():
+    """The metrics port is injected by run_smg right before spawn_gateway:
+    a port allocated at argv-build time can be reclaimed as an ephemeral
+    source port while the engine starts up."""
+    engine = _make_proc(returncode=0)
+    gateway = _make_proc(returncode=0)
+
+    startup_done = asyncio.Event()
+
+    async def wait_then_zero():
+        await startup_done.wait()
+        return 0
+
+    engine.wait = AsyncMock(side_effect=wait_then_zero)
+    gateway.wait = AsyncMock(side_effect=wait_then_zero)
+
+    async def probe_then_schedule_release(*args, **kwargs):
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.05, startup_done.set)
+
+    opts = OrchestratorOpts(engine_startup_timeout=10, gateway_startup_timeout=10)
+    spawn_gateway_mock = AsyncMock(return_value=gateway)
+    with patch(
+        "tokenspeed.cli.serve_smg.spawn_engine", AsyncMock(return_value=engine)
+    ), patch("tokenspeed.cli.serve_smg.spawn_gateway", spawn_gateway_mock), patch(
+        "tokenspeed.cli.serve_smg.wait_grpc_serving", AsyncMock()
+    ), patch(
+        "tokenspeed.cli.serve_smg.wait_http_ready",
+        side_effect=probe_then_schedule_release,
+    ), patch(
+        "tokenspeed.cli.serve_smg.terminate_then_kill", AsyncMock()
+    ):
+        rc = await run_smg(
+            engine_args=[],
+            gateway_args=["--model", "/tmp/x"],
+            opts=opts,
+            user_host="127.0.0.1",
+            user_port=8000,
+        )
+
+    assert rc == 0
+    spawned_args = spawn_gateway_mock.await_args.args[0]
+    idx = spawned_args.index("--prometheus-port")
+    assert spawned_args[idx + 1].isdigit()
+    assert 1 <= int(spawned_args[idx + 1]) <= 65535
 
 
 @pytest.mark.asyncio

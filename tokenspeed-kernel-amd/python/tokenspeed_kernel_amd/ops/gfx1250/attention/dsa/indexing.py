@@ -27,6 +27,7 @@ from tokenspeed_kernel_amd._triton import gl, gluon
 
 __all__ = [
     "_check_packed_fp8_inputs",
+    "_combine_scoring_query_heads_kernel",
     "_dsa_decode_logits_fp8_kernel",
     "_dsa_prefill_logits_fp8_kernel",
 ]
@@ -39,6 +40,42 @@ def _score_layout(
     NUM_WARPS: gl.constexpr,
 ):
     return gl.BlockedLayout([1, 8], [4, 8], [NUM_WARPS, 1], [1, 0])
+
+
+@gluon.jit
+def _combine_scoring_query_heads_kernel(
+    q,
+    weights,
+    out,
+    q_stride_token,
+    q_stride_head,
+    q_stride_dim,
+    weight_stride_token,
+    weight_stride_head,
+    num_heads: gl.constexpr,
+    head_dim: gl.constexpr,
+    BLOCK_D: gl.constexpr,
+):
+    token = gl.program_id(0)
+    layout: gl.constexpr = _score_layout(1, BLOCK_D, gl.num_warps())
+    dim_layout: gl.constexpr = gl.SliceLayout(0, layout)
+    dims = gl.arange(0, BLOCK_D, layout=dim_layout)
+    combined = gl.zeros([BLOCK_D], dtype=gl.float32, layout=dim_layout)
+    for head in gl.static_range(0, num_heads):
+        q_offsets = token * q_stride_token + head * q_stride_head + dims * q_stride_dim
+        weight_offset = token * weight_stride_token + head * weight_stride_head
+        head_weight = gl.load(weights + weight_offset).to(gl.float32)
+        q_vals = gl.load(
+            q + q_offsets,
+            mask=dims < head_dim,
+            other=0.0,
+        ).to(gl.float32)
+        combined += q_vals * head_weight
+    gl.store(
+        out + token * head_dim + dims,
+        combined,
+        mask=dims < head_dim,
+    )
 
 
 @gluon.jit

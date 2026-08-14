@@ -140,13 +140,17 @@ class MsgpackSendSocket:
     and are dropped with a warning rather than crashing the scheduler.
     """
 
-    def __init__(self, socket: zmq.Socket) -> None:
+    def __init__(self, socket: zmq.Socket, engine_index: int = 0) -> None:
         self._socket = socket
+        self._engine_index = engine_index
         self._encoder = MsgpackEncoder()
 
     def send_pyobj(self, obj) -> None:
         if isinstance(obj, BatchTokenIDOut):
-            slim = BatchTokenIDOutSlim.from_full(obj)
+            # The PULL side carries no routing identity, so the batch itself
+            # names its producing rank; the frontend attributes per-rank
+            # outputs and load by this index under DP.
+            slim = BatchTokenIDOutSlim.from_full(obj, engine_index=self._engine_index)
             self._socket.send_multipart(self._encoder.encode(slim), copy=False)
         else:
             logger.warning(
@@ -250,5 +254,5 @@ def connect_msgpack_engine(
     logger.info("msgpack handshake: complete (engine_index=%s)", engine_index)
     return (
         MsgpackRecvSocket(input_socket, vocab_size, enable_output_logprobs),
-        MsgpackSendSocket(output_socket),
+        MsgpackSendSocket(output_socket, engine_index=engine_index),
     )
