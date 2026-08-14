@@ -37,12 +37,8 @@ namespace tokenspeed::test {
 namespace {
 
 template <class T>
-concept HasLegacyGranularityField = requires(T value) {
-    value.block_size;
-}
-|| requires(T value) {
-    value.cache_block_tokens;
-};
+concept HasLegacyGranularityField =
+    requires(T value) { value.block_size; } || requires(T value) { value.cache_block_tokens; };
 
 static_assert(!HasLegacyGranularityField<CacheGroupSpec>);
 

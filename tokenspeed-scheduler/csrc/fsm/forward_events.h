@@ -197,8 +197,8 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
     explicit ExtendResultEvent(std::vector<std::int32_t> result_tokens) : result_tokens_{std::move(result_tokens)} {}
 
     template <typename State>
-    requires CanExtendTokenContainer<State> std::remove_cvref_t<State>
-    operator()(State&& state) {
+        requires CanExtendTokenContainer<State>
+    std::remove_cvref_t<State> operator()(State&& state) {
         state.ExtendResultTokens(result_tokens_);
         return std::move(state);
     }

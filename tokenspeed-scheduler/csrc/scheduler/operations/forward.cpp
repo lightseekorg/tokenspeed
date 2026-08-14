@@ -123,10 +123,9 @@ CompletedPrefixPages updateCompletedPrefixHashes(Request& request, fsm::CachePro
 }
 
 template <typename Event>
-requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> ||
-         std::same_as<Event, fsm::SchedulePrefillEvent>) PrefillOperation
-    applyPrefillEvent(Request& request, Event& event, const CacheCoordinator& coordinator,
-                      std::span<const std::string> group_ids) {
+    requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> || std::same_as<Event, fsm::SchedulePrefillEvent>)
+PrefillOperation applyPrefillEvent(Request& request, Event& event, const CacheCoordinator& coordinator,
+                                   std::span<const std::string> group_ids) {
     const fsm::PrefillSource source = [&] {
         if constexpr (std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent>) {
             return event.Source();
