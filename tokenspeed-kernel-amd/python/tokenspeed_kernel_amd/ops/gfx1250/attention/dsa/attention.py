@@ -68,6 +68,7 @@ def _dsa_selected_dense_wmma_kernel(
     BLOCK_H: gl.constexpr,
     BLOCK_K: gl.constexpr,
     IS_FP8: gl.constexpr,
+    OUTPUT_WITHIN_2GB: gl.constexpr,
 ):
     """Wave32 WMMA attention with a two-stage selected-row TDM pipeline."""
 
@@ -329,16 +330,21 @@ def _dsa_selected_dense_wmma_kernel(
     )
     d_out = gl.arange(0, KV_LORA_RANK, layout=gl.SliceLayout(0, q_lora_load_layout))
     result = gl.convert_layout(result.to(out.dtype.element_ty), q_lora_load_layout)
-    gl.amd.gfx1250.buffer_store(
-        result,
-        out,
-        (
-            token.to(tl.int64) * stride_o_t
-            + h_out[:, None].to(tl.int64) * stride_o_h
-            + d_out[None, :].to(tl.int64)
-        ).to(tl.int32),
-        mask=h_out[:, None] < num_heads,
+    output_offsets = (
+        token.to(tl.int64) * stride_o_t
+        + h_out[:, None].to(tl.int64) * stride_o_h
+        + d_out[None, :].to(tl.int64)
     )
+    output_mask = h_out[:, None] < num_heads
+    if OUTPUT_WITHIN_2GB:
+        gl.amd.gfx1250.buffer_store(
+            result,
+            out,
+            output_offsets.to(tl.int32),
+            mask=output_mask,
+        )
+    else:
+        gl.store(out + output_offsets, result, mask=output_mask)
 
 
 @gluon.constexpr_function
@@ -905,6 +911,15 @@ def _allocate_output(q: torch.Tensor, kv_lora_rank: int) -> torch.Tensor:
     )
 
 
+def _output_within_2gb(out: torch.Tensor) -> bool:
+    """Return whether the output storage span stays below the 2 GiB limit."""
+
+    max_element_offset = sum(
+        (dim - 1) * stride for dim, stride in zip(out.shape, out.stride())
+    )
+    return (max_element_offset + 1) * out.element_size() < 1 << 31
+
+
 def _run_dense(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -953,6 +968,7 @@ def _run_dense(
         BLOCK_H=block_h,
         BLOCK_K=64 if is_fp8 else 32,
         IS_FP8=is_fp8,
+        OUTPUT_WITHIN_2GB=_output_within_2gb(out),
         num_warps=4,
     )
     return out
