@@ -589,7 +589,6 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             if destination == self.rank:
                 cute.arch.barrier()
 
-
             if (
                 token_cta == 0
                 and token + self.token_ctas >= m
