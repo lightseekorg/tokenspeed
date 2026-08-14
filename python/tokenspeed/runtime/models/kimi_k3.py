@@ -1734,12 +1734,11 @@ class KimiLinearMoE(nn.Module):
             else routed_reduced
         )
         start, width = self.routed_expert_up_proj.shard_slice
-        routed_projected_shard = self.routed_expert_up_proj.project_shard(
-            routed_reduced
-        )
-        shared_stage[:, start : start + width] += routed_projected_shard + (
-            prefix_sum.view(num_tokens, hidden_size).narrow(-1, start, width)
-        )
+        target = shared_stage[:, start : start + width]
+        target += prefix_sum.view(num_tokens, hidden_size).narrow(-1, start, width)
+        # Beta-add epilogue: the projection accumulates straight into the
+        # staged columns, no materialized block and no separate add.
+        target.addmm_(routed_reduced, self.routed_expert_up_proj.weight.t())
         shared_reduced = multimem_all_reduce_staged(shared_stage, group_name)
         # Clone: the staging buffer is recycled by the next layer's stage copy.
         return shared_reduced.view(num_tokens, hidden_size).clone()
@@ -1796,16 +1795,15 @@ class KimiLinearMoE(nn.Module):
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
-        routed_projected_shard = self.routed_expert_up_proj.project_shard(
-            routed_reduced
-        )
-        return self._inject_local_block(
-            routed_projected_shard,
-            shared_partial,
-            prefix_sum,
-            num_tokens,
-            hidden_size,
-        )
+        # addmm_ accumulates the projection in the GEMM's beta-add epilogue,
+        # so the block never materializes and the separate adds disappear
+        # (one fewer rounding than projecting then adding).
+        start, width = self.routed_expert_up_proj.shard_slice
+        shared_partial = shared_partial.view(num_tokens, hidden_size)
+        target = shared_partial[:, start : start + width]
+        target += prefix_sum.view(num_tokens, hidden_size)[:, start : start + width]
+        target.addmm_(routed_reduced, self.routed_expert_up_proj.weight.t())
+        return shared_partial
 
     def _inject_local_block(
         self,
