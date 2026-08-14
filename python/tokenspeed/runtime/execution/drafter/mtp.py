@@ -91,27 +91,23 @@ def _extend_depth_shifted_ids_from(
     next_tokens: torch.Tensor,
     depth: int,
 ) -> torch.Tensor:
-    """Depth-``depth`` input ids for the ragged prefill rows of an EXTEND round.
+    """Depth-``depth`` input ids for an EXTEND round's ragged prefill rows.
 
-    ``pre`` is :func:`_extend_depth_precompute` output over the first draft
-    step's prefill inputs ``shift1_ids`` (prompt tokens shifted by one within
-    each request, last row already holding the round's sampled token on final
-    chunks). Depth ``d`` at local row ``i`` consumes the token ``d`` further
-    along: ``shift1_ids[row + d]`` while that stays inside the request, else
-    the request's own draft ``d_m`` (``m = overshoot``) from ``next_tokens``
-    — columns ``1..d`` are already filled when depth ``d`` runs. On mid-chunk
-    rows the overshoot tokens are not staged; those trailing ``d`` rows per
-    chunk consume the placeholder ``next_tokens`` columns (known
-    approximation, <= steps-1 rows per chunk).
+    Depth ``d`` at local row ``i`` consumes the token ``d`` further along:
+    ``shift1_ids[row + d]`` inside the request, else the request's own
+    draft ``d_m`` (``m = overshoot``) from ``next_tokens`` columns 1..d,
+    already filled when depth ``d`` runs. Mid-chunk rows' overshoot tokens
+    are not staged: the trailing ``d`` rows per chunk read placeholder
+    columns (known approximation, <= steps-1 rows per chunk).
 
     Args:
-        pre: :func:`_extend_depth_precompute` output.
-        next_tokens: [>=num_extends, >=depth+1] col 0 = last verified token,
-            cols 1.. = this round's drafts, per request.
+        pre: :func:`_extend_depth_precompute` output over the depth-0 ids.
+        next_tokens: [>=num_extends, >=depth+1] col 0 = last verified
+            token, cols 1.. = this round's drafts.
         depth: draft depth d >= 1.
 
     Returns:
-        [num_prefill_rows] input ids for the depth-``depth`` pass.
+        [num_prefill_rows] input ids.
     """
     shift1_ids, base, req_of_row, row_last = pre
     num_rows = shift1_ids.shape[0]
@@ -129,29 +125,24 @@ def _frontier_shifted_ids(
 ) -> torch.Tensor:
     """Depth-0 input ids over a frontier-anchored decode window.
 
-    The window's k rows end at the last committed position: row ``j`` sits
-    at source position ``frontier - k + j`` (frontier = vc + accept) and
-    consumes the token one past it; in verify-output coordinates that is
-    ``src = accept - k + j`` — per-request, unlike the verify-anchored
-    windows' static shifts. ``src < 0`` reads the stash of the last k-1
-    committed tokens (entry ``src + k - 1``), else this round's verify
-    output ``v[src]`` — depth 0 never reaches past the accepted prefix
-    (``src <= accept - 1``). Deeper depths need no re-splice: they are
-    static slices of [window || drafts], built by the caller.
+    Window row ``j`` sits at position ``frontier - k + j`` (frontier =
+    vc + accept) and consumes the token one past it; in verify coordinates
+    ``src = accept - k + j``: the stash entry ``src + k - 1`` when
+    ``src < 0``, else ``v[src]`` (depth 0 never reads past the accepted
+    prefix). Deeper depths are rolls of [window || drafts], built by the
+    caller.
 
     Args:
-        v: [bs, k] verify outputs (token at position vc+j+1 = v[:, j]);
-            entries at or past ``accept`` are never read.
-        accept: [bs, 1] accepted lengths in [1, k].
-        stash_tokens: [bs, k-1] committed tokens at positions
-            vc-k+2 .. vc.
+        v: [bs, k] verify outputs (token at position vc+j+1 = v[:, j]).
+        accept: [bs] accepted lengths in [1, k].
+        stash_tokens: [bs, k-1] committed tokens at positions vc-k+2..vc.
 
     Returns:
         [bs * k] input ids.
     """
     bs, k = v.shape
     col = torch.arange(k, dtype=torch.int64, device=v.device).view(1, k)
-    src = accept - k + col
+    src = accept.unsqueeze(-1) - k + col
     ids = torch.gather(v, 1, src.clamp_min(0))
     from_stash = stash_tokens.gather(1, (src + k - 1).clamp_max(k - 2))
     return torch.where(src < 0, from_stash, ids).reshape(-1)
@@ -164,27 +155,23 @@ def _frontier_hidden_splice(
 ) -> torch.Tensor:
     """Depth-0 chain hiddens for a frontier-anchored decode window.
 
-    Row ``j`` needs the target hidden of its source position
-    ``frontier - k + j``: the last ``accept`` window rows take this round's
-    verify hiddens (rows 0..accept-1, exactly the committed-input rows),
-    earlier rows the stash of the k-1 preceding target hiddens. Over the
-    concatenation [stash || fresh] both cases are one gather at
+    Row ``j`` needs the target hidden of position ``frontier - k + j``:
+    the last ``accept`` rows take this round's verify hiddens, earlier
+    rows the stash. Over [stash || fresh] both cases are one gather at
     ``accept - 1 + j``.
 
     Args:
         stash_hidden: [bs, k-1, H] target hiddens at positions vc-k+1..vc-1.
-        fresh_hidden: [bs, k, H] this round's verify hiddens (row j = the
-            hidden at position vc+j); rows at or past ``accept`` are never
-            read.
-        accept: [bs, 1] accepted lengths in [1, k].
+        fresh_hidden: [bs, k, H] verify hiddens (row j = position vc+j).
+        accept: [bs] accepted lengths in [1, k].
 
     Returns:
-        [bs * k, H] chain hidden rows for the depth-0 pass.
+        [bs * k, H] depth-0 chain hiddens.
     """
     bs, k = fresh_hidden.shape[:2]
     h = torch.cat([stash_hidden, fresh_hidden], 1)
     col = torch.arange(k, dtype=torch.int64, device=h.device).view(1, k)
-    idx = (accept - 1 + col).view(bs, k, 1).expand(bs, k, h.shape[-1])
+    idx = (accept.unsqueeze(-1) - 1 + col).view(bs, k, 1).expand(bs, k, h.shape[-1])
     return h.gather(1, idx).reshape(bs * k, -1)
 
 
@@ -231,7 +218,7 @@ class MtpDraftInput:
     input_num_tokens: int
     num_extends: int
     forward_mode: ForwardMode
-    base_model_output: torch.Tensor  # [bs]
+    base_model_output: torch.Tensor  # [bs] (extend) / [bs * k] (decode verify outputs)
     accept_lengths: torch.Tensor  # [bs]
     base_out_hidden_states: torch.Tensor
     global_num_tokens: list[int] | None = None
@@ -273,7 +260,15 @@ class Mtp(BaseDrafter):
 
         self.device = draft_model_runner.device
 
-        self.dp_size = draft_model_runner.mapping.attn.dp_size
+        # Multi-depth drafting has no DP support: idle rounds (a DP rank
+        # keeping collectives in sync with no work of its own) have no
+        # window to run.
+        dp_size = draft_model_runner.mapping.attn.dp_size
+        if dp_size > 1:
+            raise NotImplementedError(
+                "multi-depth MTP drafting does not support data parallelism "
+                f"(dp_size={dp_size})"
+            )
 
         # Drafter-owned seq_lens the CUDA-graph wrapper aliases into every
         # draft metadata init (it copies the round's live lengths in; on
@@ -297,21 +292,16 @@ class Mtp(BaseDrafter):
             * spec_num_tokens
             - 1
         )
-
-        # Multi-depth drafting has no DP support: idle rounds (a DP rank
-        # keeping collectives in sync with no work of its own) have no
-        # window to run.
-        if self.dp_size > 1:
-            raise NotImplementedError(
-                "multi-depth MTP drafting does not support data parallelism "
-                f"(dp_size={self.dp_size})"
-            )
+        # Static last-row sample gather (request r's window-final row,
+        # r*k + k-1): the row at frontier-1 predicts frontier+d+1 at depth d.
+        self.padded_gather_ids_buf = (
+            self.padded_gather_ids_offsets_buf + spec_num_tokens
+        )
 
         # Cross-round drafter stash keyed by req_pool_indices (graph-padded
         # rows arrive as the reserved slot 0): the last k-1 committed tokens
-        # and the target hiddens one position behind them. Allocated eagerly
-        # — the decode rounds that fill it run inside CUDA graph capture,
-        # where allocation is off-limits.
+        # and the target hiddens one position behind them. Allocated eagerly:
+        # the decode rounds that fill it run inside CUDA graph capture.
         self._stash_width = spec_num_tokens - 1
         model_config = draft_model_runner.model_config
         # page_table is batch-ordered and may have fewer rows than the
@@ -346,65 +336,52 @@ class Mtp(BaseDrafter):
         next_tokens: torch.Tensor,
         draft_input: MtpDraftInput,
     ) -> None:
-        """Frontier-anchored decode window: every depth 0..steps-1 runs the
-        SAME k rows per request, ending at the last committed position
-        (``frontier = vc + accept``, computed once before depth 0; nothing
-        advances between depths).
+        """Frontier-anchored decode window: every depth 0..steps-1 runs
+        the SAME k rows per request, ending at the committed frontier
+        (= vc + accept); nothing advances between depths.
 
-        Every row's input token is committed or a fresh draft — rejected
-        drafts and garbage rows are structurally impossible — so re-running
-        a depth over the window rewrites its provisional tail slots (KV and
-        sconv ring rows written last round from then-unverified drafts) with
-        exact values in place, while accepted-region rows are exact-value
-        no-ops. Depth 0 re-runs purely to regenerate fresh chain hiddens for
-        depth 1: its inputs splice the drafter stash (pre-window history)
-        with this round's verify hiddens at the accept boundary.
-
-        The sample gather is static (always the last row, at position
-        frontier-1) and the row count stays bs*k, so the attention metadata
-        only needs its anchor moved: seq_lens, positions and cache write
-        locations shift back by ``k - accept`` (the backend hook re-anchors
-        the conv metadata and grouped write locations the same way; all of
-        it is plain tensor math, CUDA-graph-recorded and recomputed per
-        replay). Runs inside graph capture — no host syncs; sub-k prompts,
-        whose window would cross position 0, are clamped GPU-side (their
-        first positions get wrong-shift rewrites, bounded to prompts shorter
-        than k-1 tokens — below any real chat traffic).
+        Every row's input is a committed token or a fresh draft, so each
+        depth rewrites its provisional tail slots (KV / sconv rows written
+        last round from since-rejected drafts) with exact values in place;
+        depth 0 re-runs purely to regenerate chain hiddens for depth 1.
+        Row count and sample gather are static — only the anchor moves
+        (positions, cache locs and backend metadata shift by accept - k),
+        all in-graph tensor math, no host syncs. Sub-k prompts clamp at
+        position 0: wrong-shift rewrites bounded to prompts shorter than
+        k-1 tokens, draft-quality-only.
         """
         k = self.spec_num_tokens
         buffers = self.input_buffers
         slot = buffers.req_pool_indices_buf[:bs]
-        v = draft_input.base_model_output.view(bs, k)
-        accept = draft_input.accept_lengths[:bs].view(bs, 1)
+
+        accept_lengths = draft_input.accept_lengths[:bs]
         positions = buffers.positions_buf[: bs * k].view(bs, k)
         # positions[:, 0] is vc, the position before the verify window.
-        frontier = (positions[:, 0] + accept.view(-1).to(positions.dtype)).to(
-            torch.int32
-        )
+        frontier = positions[:, 0].to(torch.int32) + accept_lengths
         step_positions = (
-            (positions + (accept - k).to(positions.dtype)).clamp_min(0).reshape(-1)
+            (positions + (accept_lengths.unsqueeze(-1) - k)).clamp_min(0).reshape(-1)
         )
+
         out_cache_loc = self.draft_out_cache_loc_buf[: bs * k]
         self.cache_view.out_cache_loc_uniform(
             out=out_cache_loc,
             cache_start=(frontier - k).clamp_min(0),
             num_tokens=k,
         )
-        self.attn_backend.enter_draft_frontier_window(bs, frontier)
-        # Static sample gather: the last window row sits at frontier-1 for
-        # every depth (row at position p and depth d predicts p + d + 2).
-        gather_ids = self.padded_gather_ids_offsets_buf[:bs] + k
+        self.attn_backend.update_draft_forward_metadata(frontier)
         # Depth-0 window = the last k committed (token, hidden) pairs; its
         # tail [:, 1:] is exactly the next round's stash, rolled at the end.
         # Depth d+1's ids roll the window one left, appending depth d's
         # draft: only depth 0 is accept-dependent.
         window_ids = _frontier_shifted_ids(
-            v, accept, self._stash_tokens_buf[slot]
+            draft_input.base_model_output.view(bs, k),
+            accept_lengths,
+            self._stash_tokens_buf[slot],
         ).view(bs, k)
         spliced_hidden = _frontier_hidden_splice(
             self._stash_hidden_buf[slot],
             draft_input.base_out_hidden_states.view(bs, k, -1),
-            accept,
+            accept_lengths,
         )
         for d in range(self.spec_num_steps):
             if d == 0:
@@ -424,7 +401,7 @@ class Mtp(BaseDrafter):
                 input_num_tokens=bs * k,
                 forward_mode=ForwardMode.DECODE,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
-                gather_ids=gather_ids,
+                gather_ids=self.padded_gather_ids_buf[:bs],
                 global_num_tokens=draft_input.global_num_tokens,
                 global_bs=draft_input.global_bs,
                 all_decode_or_idle=draft_input.all_decode_or_idle,
@@ -476,21 +453,14 @@ class Mtp(BaseDrafter):
     ) -> None:
         """Depths 0..steps-1 over an EXTEND round's ragged prompt rows.
 
-        Depth 0 is not special: every depth d runs the SAME ragged rows —
-        identical positions, out_cache_loc, and attention / conv metadata
-        (the KV and conv pools are layer-indexed, so depth d's writes land
-        in its own layer) — consuming inputs shifted d+1 within each request
-        and the previous stage's FULL rows as chained hiddens (the target's
-        rows at depth 0), and sampling its draft token at the request-last
-        rows. Without this pass depths >= 1 would never write KV or sconv
-        state over the prompt region and their decode queries would attend
-        over never-written prompt keys forever.
-
-        Mid-chunk EXTEND rounds are covered too — their drafts get discarded
-        (no verification completes after this forward), but the point is
-        per-depth KV/sconv coverage of THIS chunk's rows; the trailing d
-        rows per chunk consume placeholder ``next_tokens`` columns
-        (backfilled never — known approximation, <= steps-1 rows per chunk).
+        Every depth d runs the SAME rows — same positions, out_cache_loc
+        and metadata (the KV and conv pools are layer-indexed) — consuming
+        inputs shifted d+1 within each request and the previous depth's
+        FULL rows as chain hiddens, sampling at the request-last rows.
+        Without this pass depths >= 1 would never write KV/sconv state
+        over the prompt region. Mid-chunk rounds run it too (their drafts
+        are discarded): the point is per-depth state coverage of THIS
+        chunk's rows.
         """
         buffers = self.input_buffers
         input_num_tokens = draft_input.input_num_tokens
@@ -508,8 +478,6 @@ class Mtp(BaseDrafter):
             last_input_ids,
         )
 
-        # This round's chunk tail (shift-1 ids + target rows) feeds the
-        # next decode round's frontier window.
         self._update_stash_extend(draft_input)
 
         # Depth-invariant pieces of the per-depth shifted-id gathers
@@ -634,5 +602,4 @@ class Mtp(BaseDrafter):
             all_decode_or_idle=base_ctx.all_decode_or_idle,
         )
 
-        # next_tokens layout: column 0 = last verified id, columns 1.. = drafter tokens.
         return self.draft(draft_input)

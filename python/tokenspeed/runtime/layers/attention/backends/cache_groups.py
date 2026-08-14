@@ -301,24 +301,18 @@ class CacheGroupsMixin:
             for gid, chunks in out.items()
         }
 
-    def enter_draft_frontier(self, bs: int, frontier: torch.Tensor) -> None:
-        """Drafter hook (via the Inkling conv wrapper): re-anchor the k-row
-        decode metadata to end at the committed frontier.
-
-        Replaces ``seq_lens`` with the per-request frontier and recomputes
-        the grouped write locs for k tokens ending there (positions
-        ``frontier-k..frontier-1``). The frontier depends on this round's
-        accept lengths, which are only known inside the captured graph, so
-        both replacements are plain tensor ops recorded at capture and
-        recomputed on every replay — a host-side fill could not serve them.
-        The next round's metadata init restores the plain metadata.
-        """
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        """Re-anchor the k-row decode metadata to the committed frontier:
+        seq_lens becomes ``frontier`` and the grouped write locs cover
+        positions ``frontier-k..frontier-1``. Accept-dependent, so pure
+        tensor ops recomputed per graph replay; the next metadata init
+        resets."""
         md = self.forward_decode_metadata
-        fields = {"seq_lens": frontier[:bs]}
+        fields = {"seq_lens": frontier}
         if md.out_cache_locs is not None:
             fields["out_cache_locs"] = self._compute_decode_group_out_cache_locs(
                 md.page_tables,
-                frontier[:bs],
+                frontier,
                 self.kernel_page_size,
                 self.spec_num_tokens,
             )

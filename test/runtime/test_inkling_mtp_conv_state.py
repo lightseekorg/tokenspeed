@@ -89,7 +89,6 @@ class TestInklingCacheContract(unittest.TestCase):
                 ),
                 cache_indices=torch.tensor([1], dtype=torch.int32),
                 has_initial_state=torch.ones(1, dtype=torch.bool),
-                is_decode=restore,
                 seq_lens=torch.tensor([seq_len], dtype=torch.int32),
                 col_block_table={"state": torch.full((1, 2), page, dtype=torch.int32)},
                 remote_restore_mask=torch.tensor([True]) if restore else None,
@@ -696,7 +695,7 @@ class TestCheckpointMetadata(unittest.TestCase):
     DIM = 8
 
     def test_draft_frontier_window_reanchors_conv_metadata(self):
-        """enter_draft_frontier_window keeps the k-row chunk shape and moves
+        """update_draft_forward_metadata keeps the k-row chunk shape and moves
         only its anchor: seq_lens becomes the committed frontier, the paged
         bridges ride through (positional publish re-covers rewritten
         boundaries with committed content), and the inner backend gets the
@@ -712,7 +711,7 @@ class TestCheckpointMetadata(unittest.TestCase):
         backend = InklingAttnBackend.__new__(InklingAttnBackend)
         inner_calls = []
         backend.inner = SimpleNamespace(
-            enter_draft_frontier=lambda bs, f: inner_calls.append((bs, f))
+            update_draft_forward_metadata=lambda f: inner_calls.append(f)
         )
         table = torch.tensor([[11, 12, 13]], dtype=torch.int32, device="cuda")
         qsl = torch.arange(0, bs * k + 1, k, dtype=torch.int32, device="cuda")
@@ -720,26 +719,23 @@ class TestCheckpointMetadata(unittest.TestCase):
             query_start_loc=qsl,
             cache_indices=torch.tensor([2], dtype=torch.int32, device="cuda"),
             has_initial_state=torch.ones(bs, dtype=torch.bool, device="cuda"),
-            is_decode=False,
             seq_idx=torch.zeros(bs * k, dtype=torch.int32, device="cuda"),
             seq_lens=torch.tensor([132], dtype=torch.int32, device="cuda"),
             col_block_table={"state": table[:bs]},
         )
         frontier = torch.tensor([130], dtype=torch.int32, device="cuda")
 
-        backend.enter_draft_frontier_window(bs, frontier)
+        backend.update_draft_forward_metadata(frontier)
 
         md = backend.conv_metadata
         self.assertEqual(md.query_start_loc.tolist(), [0, k], "same k-row chunk")
         self.assertEqual(md.seq_lens.tolist(), [130], "chunk end at the frontier")
-        self.assertFalse(md.is_decode)
         self.assertIsNotNone(md.col_block_table)
         self.assertTrue(torch.equal(md.col_block_table["state"], table[:bs]))
         self.assertEqual(len(inner_calls), 1)
-        self.assertEqual(inner_calls[0][0], bs)
-        self.assertEqual(inner_calls[0][1].tolist(), [130])
+        self.assertEqual(inner_calls[0].tolist(), [130])
 
-    def test_enter_draft_frontier_recomputes_group_locs(self):
+    def test_update_draft_forward_metadata_recomputes_group_locs(self):
         """The mixin hook must replace seq_lens with the frontier and point
         the grouped write locs at the k positions ending there."""
         from tokenspeed.runtime.layers.attention.backends.cache_groups import (
@@ -765,7 +761,7 @@ class TestCheckpointMetadata(unittest.TestCase):
         )
         frontier = torch.tensor([6], dtype=torch.int32, device="cuda")
 
-        host.enter_draft_frontier(1, frontier)
+        host.update_draft_forward_metadata(frontier)
 
         md = host.forward_decode_metadata
         self.assertEqual(md.seq_lens.tolist(), [6])

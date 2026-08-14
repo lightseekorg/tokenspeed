@@ -179,7 +179,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         # k=4. Request A accepts 2 of [v0..v3]; request B accepts all 4.
         # Stash entry i holds the committed token at position vc-k+2+i.
         v = torch.tensor([[500, 501, 502, 503], [600, 601, 602, 603]])
-        accept = torch.tensor([[2], [4]])
+        accept = torch.tensor([2, 4])
         stash = torch.tensor([[41, 42, 43], [71, 72, 73]])
 
         depth0 = _frontier_shifted_ids(v, accept, stash)
@@ -215,7 +215,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         fresh = torch.tensor(
             [[[0.0], [1.0], [2.0], [3.0]], [[10.0], [11.0], [12.0], [13.0]]]
         )
-        accept = torch.tensor([[2], [4]])
+        accept = torch.tensor([2, 4])
 
         spliced = _frontier_hidden_splice(stash, fresh, accept)
 
@@ -237,7 +237,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         vc = 10
         stash = torch.tensor([[1000 + vc - 2, 1000 + vc - 1, 1000 + vc]])
         for accept in [1, 4, 2, 1, 3, 4, 1, 2]:
-            a = torch.tensor([[accept]])
+            a = torch.tensor([accept])
             v = torch.tensor(
                 [[1000 + vc + 1 + i if i < accept else 9000 + i for i in range(k)]]
             )
@@ -267,7 +267,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         vc = 10
         stash = torch.tensor([float(vc - 3 + i) for i in range(3)]).view(1, 3, 1)
         for accept in [1, 4, 2, 1, 3]:
-            a = torch.tensor([[accept]])
+            a = torch.tensor([accept])
             fresh = torch.tensor(
                 [float(vc + i) if i < accept else 9000.0 for i in range(k)]
             ).view(1, k, 1)

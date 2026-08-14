@@ -45,7 +45,7 @@ and overwritten.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from tokenspeed_kernel import (
@@ -85,7 +85,6 @@ class InklingConvMetadata:
             (``req_pool_indices``; ``PAD_SLOT_ID`` marks padded rows).
         has_initial_state: ``[bs]`` bool; False for fresh prefills so stale
             slot contents are ignored.
-        is_decode: True when this is a single-token-per-request decode batch.
         seq_idx: ``[total_tokens]`` int32 sequence id per token (decode:
             the cached arange — token t belongs to request t).
         seq_lens: ``[bs]`` int32 lengths THROUGH the chunk; the source of
@@ -96,7 +95,6 @@ class InklingConvMetadata:
     query_start_loc: torch.Tensor
     cache_indices: torch.Tensor
     has_initial_state: torch.Tensor
-    is_decode: bool
     seq_idx: torch.Tensor | None = None
     seq_lens: torch.Tensor | None = None
     # Extend rows in the batch: 0 (decode-family rounds) or the batch's
@@ -467,7 +465,6 @@ class InklingAttnBackend(AttentionBackend):
                     (1, 0),
                 )
             has_initial_state = extend_prefix_lens[:bs] > 0
-            is_decode = False
             if extend_total is not None:
                 seq_idx = seq_idx_from_cu_seqlens(query_start_loc, extend_total)
             if pfg_total >= 0:
@@ -498,7 +495,6 @@ class InklingAttnBackend(AttentionBackend):
             )
             seq_idx = seq_idx_from_cu_seqlens(query_start_loc, bs * k)
             has_initial_state = torch.ones(bs, dtype=torch.bool, device=device)
-            is_decode = False
         else:
             query_start_loc = self._decode_query_start_loc(bs, req_pool_indices.device)
             # Decode: token t belongs to request t, so seq_idx is the same
@@ -507,7 +503,6 @@ class InklingAttnBackend(AttentionBackend):
             has_initial_state = torch.ones(
                 bs, dtype=torch.bool, device=req_pool_indices.device
             )
-            is_decode = True
         remote_restore_mask = None
         if (
             forward_mode.is_decode()
@@ -519,7 +514,6 @@ class InklingAttnBackend(AttentionBackend):
             query_start_loc=query_start_loc,
             cache_indices=cache_indices,
             has_initial_state=has_initial_state,
-            is_decode=is_decode,
             seq_idx=seq_idx,
             seq_lens=(
                 self._pfg_seq_lens if pfg_total >= 0 else seq_lens[:bs].to(torch.int32)
@@ -545,7 +539,6 @@ class InklingAttnBackend(AttentionBackend):
             query_start_loc=self._graph_spec_qsl[: bs + 1],
             cache_indices=self._graph_cache_indices[:bs],
             has_initial_state=self._graph_has_initial_state[:bs],
-            is_decode=False,
             seq_idx=self._graph_spec_seq_idx[: bs * k],
             seq_lens=self._graph_seq_lens[:bs],
             col_block_table={
@@ -560,7 +553,6 @@ class InklingAttnBackend(AttentionBackend):
             query_start_loc=self._decode_qsl[: bs + 1],
             cache_indices=self._graph_cache_indices[:bs],
             has_initial_state=self._graph_has_initial_state[:bs],
-            is_decode=True,
             seq_idx=self._decode_qsl[:bs],
             seq_lens=self._graph_seq_lens[:bs],
             col_block_table={g: t[:bs] for g, t in self._graph_col_tables.items()},
@@ -571,31 +563,16 @@ class InklingAttnBackend(AttentionBackend):
             ),
         )
 
-    def enter_draft_frontier_window(self, bs: int, frontier: torch.Tensor) -> None:
-        """Drafter hook before the frontier window loop (all depths): rebuild
-        the k-row conv metadata to end at ``frontier`` and re-anchor the
-        inner backend's seq_lens and grouped write locs the same way. The
-        frontier is accept-dependent, so everything here must be (and is)
-        plain tensor ops — recorded at capture, recomputed per replay. The
-        next round's ``init_forward_metadata`` restores the plain shape.
-        """
-        md = self.conv_metadata
-        frontier_i32 = frontier[:bs].to(torch.int32)
-        self.inner.enter_draft_frontier(bs, frontier_i32)
-        self.conv_metadata = InklingConvMetadata(
-            query_start_loc=md.query_start_loc,
-            cache_indices=md.cache_indices[:bs],
-            has_initial_state=md.has_initial_state[:bs],
-            is_decode=False,
-            seq_idx=md.seq_idx,
-            # Chunk end moves to the committed frontier; the k rows re-run
-            # the last k committed positions in place.
-            seq_lens=frontier_i32,
-            # Paged draft conv rides through: the in-kernel publish resolves
-            # pages from the table by position, so boundaries rewritten by
-            # the re-anchored rows are re-published with committed content.
-            col_block_table=md.col_block_table,
-        )
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        """Re-anchor the k-row conv metadata and the inner backend's
+        seq_lens/write locs to end at ``frontier`` ([bs] int32). Accept-
+        dependent, so pure tensor ops — recomputed per graph replay; the
+        next round's ``init_forward_metadata`` resets."""
+        self.inner.update_draft_forward_metadata(frontier)
+        # Paged bridges ride through: the in-kernel publish resolves pages
+        # by position, so boundaries rewritten by the re-anchored rows are
+        # re-published with committed content.
+        self.conv_metadata = replace(self.conv_metadata, seq_lens=frontier)
 
     def register_shortconv_checkpoint_stream(
         self,
