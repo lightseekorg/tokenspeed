@@ -84,9 +84,9 @@ A fourth quantity lives outside the logical world entirely:
 Scheduling decisions — admission, prefix matching, chunk alignment, capacity —
 are made in **exactly two token-based quantities**: `prefix_granularity` and
 the per-group `block_granularity` (`CacheGroupSpec.block_granularity`,
-wrapped by the coordinator's `GroupGeometry`; the Python bridge folds both a
-row-geometry and a checkpoint declaration to it at the single mapping
-point). Physical geometry (LCM packing, storage counts, bytes) is confined
+wrapped by the coordinator's `GroupGeometry`; both declaration shapes fold
+to it at the bridge — see below). Physical geometry (LCM packing, storage
+counts, bytes) is confined
 to the scheduler's cache/allocator layer; scheduling, FSM, and
 config-consuming code must not reason about it.
 
@@ -96,6 +96,19 @@ geometry — its only slot-span word is `block_granularity`. A `page_size`
 showing up there means a paged-KV concept is leaking across the boundary;
 name it `block_granularity` (generic span), `prefix_granularity` (identity
 span), or keep it on the Python side where the page actually exists.
+
+The same boundary holds for `checkpoint_granularity`: the identifier never
+enters `tokenspeed-scheduler` at all. It is a Python-side *declaration
+shape* on `PagedCacheGroupSpec`, and the bridge
+(`scheduler_utils.pool_to_paged_cache_groups`) is the single folding point:
+a snapshot declaration folds to `(rows = checkpoint_granularity,
+stride = 1)` and crosses into C++ as `CacheGroupSpec.block_granularity` — so
+a snapshot group's `block_granularity` equals its `checkpoint_granularity`
+numerically, and the scheduler has no "checkpoint" word, only "how many
+tokens one block-table slot covers". The row-geometry shape
+(`rows_per_page`, `entry_stride_tokens`) folds away at the same point.
+Declaration-shape vocabulary stops at the bridge; only the generic span
+crosses it.
 
 `CacheGroupSpec.block_granularity` is **required and explicit**: a positive
 divisor of `prefix_granularity`, asserted at coordinator construction. There

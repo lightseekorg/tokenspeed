@@ -64,7 +64,7 @@ class ZeroCachePagesContractTest(unittest.TestCase):
         seen = []
         pool = types.SimpleNamespace(
             paged_cache_requires_page_zeroing=True,
-            zero_new_pages=lambda pages: seen.append(dict(pages)),
+            zero_new_blocks=lambda pages: seen.append(dict(pages)),
         )
         pages = {"full": [4, 5], "state": [9]}
         self.assertIsNone(self._call(pool, pages))
@@ -75,7 +75,7 @@ class ZeroCachePagesContractTest(unittest.TestCase):
         draft_seen = []
         target = types.SimpleNamespace(
             paged_cache_requires_page_zeroing=True,
-            zero_new_pages=lambda pages: target_seen.append(dict(pages)),
+            zero_new_blocks=lambda pages: target_seen.append(dict(pages)),
         )
         draft = types.SimpleNamespace(
             paged_cache_requires_page_zeroing=True,
@@ -83,7 +83,7 @@ class ZeroCachePagesContractTest(unittest.TestCase):
                 types.SimpleNamespace(group_id="history"),
                 types.SimpleNamespace(group_id="state"),
             ),
-            zero_new_pages=lambda pages: draft_seen.append(dict(pages)),
+            zero_new_blocks=lambda pages: draft_seen.append(dict(pages)),
         )
         pages = {"history": [4], "state": [9], "target_only": [12]}
 
