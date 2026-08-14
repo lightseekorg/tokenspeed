@@ -3,6 +3,7 @@ name: ut-runtime-qwen35-epd-1e1p2d
 type: ut
 workflow_stage: unit-test
 triggers:
+  - per-commit
   - manual
 runner:
   labels:
