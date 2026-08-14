@@ -442,7 +442,8 @@ do it as its own milestone.
   owns the divisibility check for it. The V4 milestone closed the last
   P-derivation: compressed-chain rows, SWA rows, and layout byte shapes all
   build from `DEEPSEEK_V4_PAGE_SIZE`, and V4 accepts any P that is a
-  positive multiple of it (e2e-verified against the `bt_v4` baseline). ✓
+  positive multiple of it (e2e-verified against the `bt_v4` baseline;
+  GSM8K 1319-question sweep: nospec 0.9651, DSpark 0.9629). ✓
 * The former pool-scalar naming debt is paid by a role split:
   `CachePool.prefix_granularity` (identity grain; contract publication and
   plan checks only) and `CachePool.kv_page_size` (KV arena geometry, read by
