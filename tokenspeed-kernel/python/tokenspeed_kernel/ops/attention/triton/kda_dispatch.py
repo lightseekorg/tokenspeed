@@ -120,7 +120,7 @@ def triton_nvidia_kda_fused_paged_verify(
 ) -> torch.Tensor:
     """Adapt the NVIDIA conv/GEMV/recurrent megafusion to target verify.
 
-    Writes no state of its own; with the ``prev_*`` args armed it also
+    Writes no state of its own; with the ``prev_*`` args staged it also
     replays and commits the previous round's accepted prefix on the way in
     (the deferred lazy commit -- see the kernel docstring).
     """

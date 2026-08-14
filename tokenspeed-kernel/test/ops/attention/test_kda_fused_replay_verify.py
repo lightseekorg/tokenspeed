@@ -194,7 +194,7 @@ def test_fused_commit_in_place_matches_fresh_page():
 
 
 def test_no_pending_degenerates_to_plain_verify():
-    """base = -1 must behave exactly like the un-armed kernel, everywhere."""
+    """base = -1 must behave exactly like the unstaged kernel, everywhere."""
     n, t = 5, 3
     x = _window(n, t, seed=11)
     none_base = torch.full((n,), -1, device=DEV, dtype=torch.int32)

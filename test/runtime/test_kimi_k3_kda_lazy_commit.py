@@ -28,6 +28,9 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.hybrid_kda import (
     KdaAttnBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
+    MambaAttnBackend,
+)
 
 _LOWER_BOUND = -5.0
 H, D, D_FA = 4, 128, 128
@@ -35,6 +38,68 @@ KEY_DIM = H * D
 CONV_DIM = 3 * KEY_DIM
 T = 2  # draft tokens per request
 DEV = "cuda"
+
+
+def _verify_args():
+    tensor = torch.empty(1, device=DEV)
+    return (
+        tensor,
+        tensor,
+        tensor,
+        None,
+        tensor,
+        None,
+        tensor,
+        tensor,
+    )
+
+
+def _verify_kwargs(**overrides):
+    tensor = torch.empty(1, device=DEV)
+    kwargs = dict(
+        layer_id=0,
+        bias=None,
+        f_a_out=tensor,
+        f_b_weight=tensor,
+        beta_raw=tensor,
+        A_log=tensor,
+        dt_bias=tensor,
+        batch_size=1,
+        draft_token_num=2,
+        value_dim=1,
+        attn_tp_size=1,
+        head_v_dim=1,
+        lower_bound=None,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_verify_dispatches_inactive_replay_to_base(monkeypatch):
+    backend = object.__new__(KdaAttnBackend)
+    backend._replay_active = False
+    sentinel = torch.empty(1, device=DEV)
+    monkeypatch.setattr(MambaAttnBackend, "_verify", lambda *args, **kwargs: sentinel)
+
+    assert backend._verify(*_verify_args(), **_verify_kwargs()) is sentinel
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"f_a_out": None}, "requires the model to provide f_a_out"),
+        ({"bias": torch.empty(1, device=DEV)}, "requires a bias-free convolution"),
+    ],
+)
+def test_replay_verify_rejects_scratch_only_inputs(overrides, message):
+    backend = object.__new__(KdaAttnBackend)
+
+    with pytest.raises(RuntimeError, match=message):
+        backend._replay_verify(
+            *_verify_args()[:3],
+            _verify_args()[4],
+            **_verify_kwargs(**overrides),
+        )
 
 
 def _backend(pool):
@@ -166,7 +231,7 @@ class _Harness:
         return conv, ssm
 
     def pending(self):
-        return getattr(self.backend, "_kda_pending", None)
+        return self.backend._kda_pending
 
 
 def _pages_for(h, rpis):
@@ -928,7 +993,7 @@ def test_control_buffer_rows_stay_16b_aligned():
         assert cap >= h.backend.max_bs >= slots
 
 
-def test_payload_ring_rebuild_neutralizes_the_armed_replay_base():
+def test_payload_ring_rebuild_neutralizes_the_staged_replay_base():
     """A payload-ring rebuild must leave no live replay base behind.
 
     The stage composes ``base = parity * half + slot * T`` into the graphed

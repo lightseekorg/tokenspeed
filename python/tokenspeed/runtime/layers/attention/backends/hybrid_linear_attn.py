@@ -323,6 +323,12 @@ class MambaAttnBackend(AttentionBackend):
         self.state_out_by_group: dict[str, list[torch.Tensor]] = {}
         self.replay_ssm = bool(getattr(config, "replay_ssm", False))
         self._gdn_replay: _GDNReplayWorkspace | None = None
+        self._verify_scratch: dict = {}
+        self._verify_copy_tables: dict | None = None
+        self._verify_seed_dst_cache: dict = {}
+        self._verify_grid_cache: dict = {}
+        self._verify_commit_ctx: tuple | None = None
+        self._replay_state_tapes: dict = {}
 
     def set_kv_pool(self, kv_pool) -> None:
         """Bind a unified pool that publishes state groups and component views."""
@@ -463,10 +469,8 @@ class MambaAttnBackend(AttentionBackend):
         """Lazily allocate graph-stable verify scratch and replay inputs."""
         max_bs = max(len(self.query_start_loc_list), bs)
         rows_needed = max_bs * (draft_token_num + 1)
-        scratch = getattr(self, "_verify_scratch", None)
-        if scratch is not None and next(iter(scratch.values()))[0].shape[0] >= (
-            rows_needed
-        ):
+        scratch = self._verify_scratch
+        if scratch and next(iter(scratch.values()))[0].shape[0] >= rows_needed:
             return
         self._verify_scratch = {}
         self._verify_copy_tables = None
@@ -538,7 +542,7 @@ class MambaAttnBackend(AttentionBackend):
         per-layer base addresses, row strides, and state-group selectors.
         Rebuilt only when the scratch is reallocated so CUDA graph capture
         can record stable tensors."""
-        tables = getattr(self, "_verify_copy_tables", None)
+        tables = self._verify_copy_tables
         if tables is not None:
             return tables
         layer_ids = list(self._state_layer_ids())
@@ -611,9 +615,7 @@ class MambaAttnBackend(AttentionBackend):
         """Memoized layer-major ``[L*bs]`` scratch init-row ids (row
         ``req*(T+1)`` per request, tiled per layer). Graph replay must see the
         identical tensor, mirroring ``_verify_scratch_grid``."""
-        cache = getattr(self, "_verify_seed_dst_cache", None)
-        if cache is None:
-            cache = self._verify_seed_dst_cache = {}
+        cache = self._verify_seed_dst_cache
         tables = self._verify_copy_tables_get()
         key = (bs, draft_token_num, tables["num_layers"])
         rows = cache.get(key)
@@ -660,9 +662,7 @@ class MambaAttnBackend(AttentionBackend):
         the seeded init window, rows ``req*(T+1)+1+t`` the per-position
         outputs. Memoized per (bs, T): CUDA-graph capture records the tensor's
         storage, so replays must present the identical tensor."""
-        cache = getattr(self, "_verify_grid_cache", None)
-        if cache is None:
-            cache = self._verify_grid_cache = {}
+        cache = self._verify_grid_cache
         grid = cache.get((bs, draft_token_num))
         if grid is not None:
             return grid
@@ -679,7 +679,7 @@ class MambaAttnBackend(AttentionBackend):
 
     def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
         """Commit the accepted draft prefix into each group's state slab."""
-        ctx = getattr(self, "_verify_commit_ctx", None)
+        ctx = self._verify_commit_ctx
         if ctx is None:
             return
         committed, tables, draft_token_num, read_pages_by_group = ctx[:4]
@@ -1312,9 +1312,7 @@ class MambaAttnBackend(AttentionBackend):
         if use_tape:
             from tokenspeed_kernel.ops.metadata import PrepTape, Reg
 
-            tapes = getattr(self, "_replay_state_tapes", None)
-            if tapes is None:
-                tapes = self._replay_state_tapes = {}
+            tapes = self._replay_state_tapes
             tape = tapes.get(bs)
             if tape is None:
                 tape = PrepTape(self.device)

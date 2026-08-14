@@ -28,7 +28,7 @@ persistent buffers.
 Ownership comes from a device-resident slot table indexed by request pool
 index: ``table[rpi]`` is the pending payload slot that request owns (``-1``
 = none). The table is the single source of truth for every device-side
-write decision -- the compose reads it to arm the replay, and CLEARS the
+write decision -- the compose reads it to stage the replay, and CLEARS the
 row itself when a request fails the identity or causal gate, so the
 standalone flush (which gates on the same table) can never write a window
 the compose already condemned. The host never reads it back.
@@ -46,7 +46,7 @@ from tokenspeed_kernel._triton import tl, triton
 @triton.jit(
     do_not_specialize=["base_offset", "t_prev", "cap", "bs", "pend_bs", "table_size"],
 )
-def _kda_arm_compose_kernel(
+def _kda_stage_replay_kernel(
     flat_ptr,
     table_ptr,
     rpi_ptr,
@@ -122,7 +122,7 @@ def _kda_arm_compose_kernel(
         )
 
 
-def kda_arm_compose(
+def kda_stage_replay(
     flat,
     slot_table,
     rpis,
@@ -145,7 +145,7 @@ def kda_arm_compose(
             rows ``2..2+G`` the anchor page per state group, and the rest the
             commit page per group (``-1`` skips the commit).
         slot_table: ``[req_pool_size]`` int32 pending-slot ownership, indexed
-            by request pool index (``-1`` = no pending). Read to arm each
+            by request pool index (``-1`` = no pending). Read to stage each
             row; written back (``-1``) for rows whose identity or causal
             gate fails, condemning them for every later consumer.
         rpis: ``[bs]`` integer request pool index of each batch row (device).
@@ -171,7 +171,7 @@ def kda_arm_compose(
         return
     cap = flat.shape[1]
     block = 256
-    _kda_arm_compose_kernel[(triton.cdiv(bs, block),)](
+    _kda_stage_replay_kernel[(triton.cdiv(bs, block),)](
         flat,
         slot_table,
         rpis,

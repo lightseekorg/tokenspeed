@@ -1005,7 +1005,7 @@ def fused_recurrent_kda_window_fwd_kernel(
         p_base = tl.load(prev_base + i_n).to(tl.int64)
         r_steps = 0
         if p_base >= 0:
-            # prev_steps is in the PREVIOUS window's units; arm flushes any pending whose window size differs, so <= T holds here.
+            # prev_steps uses the previous window; staging flushes mismatched windows, so prev_steps <= T.
             r_steps = tl.minimum(
                 tl.maximum(tl.load(prev_steps + i_n).to(tl.int32), 0), T
             )
@@ -1632,9 +1632,9 @@ def fused_recurrent_kda_verify_megafuse(
         scale: q scale; defaults to ``head_dim ** -0.5``.
         lower_bound: gate lower bound; ``None`` selects the softplus gate.
         prev_qkv / prev_f_a / prev_beta / prev_base / prev_steps /
-            commit_indices: all together (or all ``None``) arm the fused
+            commit_indices: all together (or all ``None``) stage the fused
             replay prefix -- the previous round's deferred commit. When
-            armed, ``read_indices`` must hold the page from BEFORE the
+            staged, ``read_indices`` must hold the page from BEFORE the
             previous window; the kernel replays ``prev_steps[n]`` tokens of
             the previous window's payload (rows ``prev_base[n]`` onward),
             stores the resulting recurrent state to ``commit_indices[n]``,
@@ -1644,7 +1644,7 @@ def fused_recurrent_kda_verify_megafuse(
             request to a plain verify.
         gate_scratch: caller-provided fp32 scratch for the hoisted gate,
             ``[>= rows, num_heads*head_dim]`` where rows doubles when the
-            replay prefix is armed. Transient within this call; ``None``
+            replay prefix is staged. Transient within this call; ``None``
             falls back to a module-local buffer.
 
     Returns:

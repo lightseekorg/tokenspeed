@@ -17,7 +17,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""``kda_arm_compose`` against the eager tensor chain it replaces.
+"""``kda_stage_replay`` against the eager tensor chain it replaces.
 
 The compose decides, per batch row, whether the previous verify's window may
 fuse into this one. Ownership lives in a device slot table indexed by
@@ -36,7 +36,7 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-from tokenspeed_kernel.ops.metadata import kda_arm_compose  # noqa: E402
+from tokenspeed_kernel.ops.metadata import kda_stage_replay  # noqa: E402
 
 DEV = "cuda"
 
@@ -127,7 +127,7 @@ def test_matches_the_eager_chain_bitwise(bs, pend_bs, G, causal):
     want, want_table = _reference(
         flat, table, rpis, steps, expect, anchor, commit, committed, G, base, t
     )
-    kda_arm_compose(
+    kda_stage_replay(
         flat,
         table,
         rpis,
@@ -162,10 +162,10 @@ def test_out_of_range_pool_index_degrades_to_no_fuse():
     want, want_table = _reference(
         flat, table, ref_rpis, steps, expect, anchor, commit, committed, G, 0, 2
     )
-    # The kernel skips a dead lane outright; the arm's pre-fill already
+    # The kernel skips a dead lane outright; staging pre-fill already
     # neutralized it, so "untouched" is the contract, not "rewritten".
     want[:, 1] = flat[:, 1]
-    kda_arm_compose(
+    kda_stage_replay(
         flat,
         table,
         rpis,
@@ -193,7 +193,7 @@ def test_padded_tail_rows_are_untouched():
         bs, 4, G, seed=5
     )
     flat[:, bs:] = -7
-    kda_arm_compose(
+    kda_stage_replay(
         flat,
         table,
         rpis,
@@ -216,7 +216,7 @@ def test_empty_batch_is_a_noop():
     flat = torch.full((2 + 2 * G, 4), -3, dtype=torch.int32, device=DEV)
     table = torch.full((8,), -1, dtype=torch.int32, device=DEV)
     empty = torch.zeros(0, dtype=torch.int64, device=DEV)
-    kda_arm_compose(
+    kda_stage_replay(
         flat,
         table,
         empty,
@@ -236,9 +236,11 @@ def test_empty_batch_is_a_noop():
 
 def _variant_count():
     """Compiled specializations of the compose kernel on this device."""
-    from tokenspeed_kernel.ops.metadata.kda_arm import _kda_arm_compose_kernel
+    from tokenspeed_kernel.ops.metadata.kda_replay_stage import (
+        _kda_stage_replay_kernel,
+    )
 
-    return sum(len(c[0]) for c in _kda_arm_compose_kernel.device_caches.values())
+    return sum(len(c[0]) for c in _kda_stage_replay_kernel.device_caches.values())
 
 
 def test_one_compiled_variant_across_rounds():
@@ -257,7 +259,7 @@ def test_one_compiled_variant_across_rounds():
     rpis_buf[: rpis_full.shape[0]] = rpis_full
 
     def compose(bs, base):
-        kda_arm_compose(
+        kda_stage_replay(
             flat,
             table,
             rpis_buf[:bs],
@@ -293,13 +295,13 @@ def test_does_not_block_the_host_on_a_busy_stream():
         8, 32, G, seed=4, cap=cap, table_size=64
     )
     args = (flat, table, rpis, steps, expect, anchor, commit, committed)
-    kda_arm_compose(
+    kda_stage_replay(
         *args, flat[2 : 2 + G], base_offset=0, draft_token_num=2, num_groups=G
     )
     torch.cuda.synchronize()
     torch.cuda._sleep(400_000_000)
     t0 = time.perf_counter()
-    kda_arm_compose(
+    kda_stage_replay(
         *args, flat[2 : 2 + G], base_offset=64, draft_token_num=2, num_groups=G
     )
     blocked = (time.perf_counter() - t0) * 1e3

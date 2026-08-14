@@ -20,7 +20,7 @@
 
 """Generic CUDA-graph replay metadata prep (the "prep tape")."""
 
-from tokenspeed_kernel.ops.metadata.kda_arm import kda_arm_compose
+from tokenspeed_kernel.ops.metadata.kda_replay_stage import kda_stage_replay
 from tokenspeed_kernel.ops.metadata.prep_tape import PrepTape, Reg
 
-__all__ = ["PrepTape", "Reg", "kda_arm_compose"]
+__all__ = ["PrepTape", "Reg", "kda_stage_replay"]

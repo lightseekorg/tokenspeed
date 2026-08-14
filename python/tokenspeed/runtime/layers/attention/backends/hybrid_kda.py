@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
 
 KDA_PREFILL_BACKENDS = ("auto", "fla", "flashkda", "cutedsl_kda")
+KDA_SLOT_TABLE_PADDING = 8
 
 
 def _slice_kda_prefill_inputs(
@@ -94,10 +95,15 @@ class KdaAttnBackend(MambaAttnBackend):
         self._replay_layer_weights: dict | None = None
         self._verify_scratch: dict | None = None
         self._kda_slot_table = torch.full(
-            (self.max_bs + 8,), -1, dtype=torch.int32, device=self.device
+            (self.max_bs + KDA_SLOT_TABLE_PADDING,),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
         )
         self._kda_table_drop_staging = torch.empty(
-            self.max_bs + 8, dtype=torch.int64, pin_memory=True
+            self.max_bs + KDA_SLOT_TABLE_PADDING,
+            dtype=torch.int64,
+            pin_memory=True,
         )
         self._payload_parity = 0
         self._staged_parity = 0
@@ -319,7 +325,29 @@ class KdaAttnBackend(MambaAttnBackend):
                 lower_bound=lower_bound,
             )
         else:
-            return None
+            return super()._verify(
+                mixed_qkv,
+                conv_weights,
+                conv_comp,
+                conv_scratch,
+                ssm_comp,
+                ssm_scratch,
+                state_in_pages,
+                output_indices,
+                layer_id=layer_id,
+                bias=bias,
+                f_a_out=f_a_out,
+                f_b_weight=f_b_weight,
+                beta_raw=beta_raw,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                batch_size=batch_size,
+                draft_token_num=draft_token_num,
+                value_dim=value_dim,
+                attn_tp_size=attn_tp_size,
+                head_v_dim=head_v_dim,
+                lower_bound=lower_bound,
+            )
 
     def _replay_verify(
         self,
@@ -349,11 +377,15 @@ class KdaAttnBackend(MambaAttnBackend):
         replay deliberately omitted scratch, so fallback would only fail later
         with an obscure missing-scratch error.
         """
-        if f_a_out is None or bias is not None:
+        if f_a_out is None:
             raise RuntimeError(
-                "KDA verify fell through to the per-position scratch path "
-                "while replay commit is active; the fused KDA verify kernel "
-                "must handle every verify batch"
+                "KDA replay verify requires the model to provide f_a_out; "
+                "replay deliberately does not allocate verify scratch"
+            )
+        if bias is not None:
+            raise RuntimeError(
+                "KDA replay verify requires a bias-free convolution; replay "
+                "deliberately does not allocate verify scratch"
             )
 
         num_value_heads = value_dim // attn_tp_size // head_v_dim
@@ -577,26 +609,13 @@ class KdaAttnBackend(MambaAttnBackend):
         )
         return bufs
 
-    def _kda_table(self) -> torch.Tensor:
-        """The device slot table, sized to the request pool.
-
-        ``table[rpi]`` is the pending payload slot that request owns (``-1``
-        = none). Written at record (fill + scatter), by the compose kernel
-        (condemning gate-failed rows in place), and by the host lifecycle
-        screens (``_kda_table_drop``); read by the compose and by the
-        flush's write gate. Everything is stream-ordered; the host never
-        reads it back, which is what deleted the verdict round-trip this
-        replaces.
-        """
-        return self._kda_slot_table
-
     def _kda_table_drop(self, rpis) -> None:
         """Clear the table rows of dropped requests, without a stream sync.
 
         The pinned staging is allocated at construction because its maximum
         width is fixed by the request-pool bound.
         """
-        if self._kda_slot_table is None or not rpis:
+        if not rpis:
             return
         host = self._kda_table_drop_staging[: len(rpis)]
         host.copy_(torch.tensor(rpis, dtype=torch.int64))
@@ -606,8 +625,7 @@ class KdaAttnBackend(MambaAttnBackend):
 
     def _kda_table_release(self) -> None:
         """Neutralize the whole table (the pending is gone as a unit)."""
-        if self._kda_slot_table is not None:
-            self._kda_slot_table.fill_(-1)
+        self._kda_slot_table.fill_(-1)
 
     def _stage_pending_replay(
         self,
@@ -724,7 +742,7 @@ class KdaAttnBackend(MambaAttnBackend):
             # Payload is in t_prev units: a different window size would mis-replay.
             self._flush_kda_pending()
             return
-        from tokenspeed_kernel.ops.metadata import kda_arm_compose
+        from tokenspeed_kernel.ops.metadata import kda_stage_replay
 
         # One launch for every control row. Ownership comes from the device
         # slot table; a row failing the identity or causal gate is condemned
@@ -735,9 +753,9 @@ class KdaAttnBackend(MambaAttnBackend):
         # fallback before overwriting them.
         assert rpis_dev is not None and rpis_dev.shape[0] >= real_bs
         n_groups = len(self._state_group_ids)
-        kda_arm_compose(
+        kda_stage_replay(
             bufs["flat"],
-            self._kda_table(),
+            self._kda_slot_table,
             rpis_dev[:real_bs],
             pending["steps"],
             pending["expect"],
@@ -838,13 +856,13 @@ class KdaAttnBackend(MambaAttnBackend):
         pending = self._kda_pending
         if pending is None:
             return [], []
-        id_by_rpi = pending.get("id_by_rpi", {})
+        id_by_rpi = pending["id_by_rpi"]
         owners, corpses = [], []
         for i, r in enumerate(rpis):
             if r not in pending["slot_by_rpi"]:
                 continue
-            rec = id_by_rpi.get(r)
-            cur = req_ids[i] if i < len(req_ids) else None
+            rec = id_by_rpi[r]
+            cur = req_ids[i]
             if rec is None or cur is None or rec == cur:
                 owners.append(r)
             else:
@@ -950,7 +968,7 @@ class KdaAttnBackend(MambaAttnBackend):
         # The slot table gates every write: a row the compose condemned (or
         # a drop cleared) since this pending was recorded self-masks here,
         # with no verdict ever crossing back to the host.
-        table = self._kda_table()
+        table = self._kda_slot_table
         owner_rows = pending["rpi_by_slot"]
         mask &= table.gather(0, owner_rows) == torch.arange(
             old_bs, dtype=torch.int32, device=self.device
@@ -1289,7 +1307,7 @@ class KdaAttnBackend(MambaAttnBackend):
         On the replay path the accepted prefix is re-run from the committed
         page (see ``_replay_active``); otherwise the accepted position's
         row is copied out of the per-position verify scratch."""
-        ctx = getattr(self, "_verify_commit_ctx", None)
+        ctx = self._verify_commit_ctx
         if ctx is None:
             return
         committed, tables, draft_token_num, read_pages_by_group = ctx[:4]
@@ -1334,7 +1352,7 @@ class KdaAttnBackend(MambaAttnBackend):
             # would stage the padding as a replay next round.
             real = min(bs, len(rpis))
             rpis_dev = ctx[6][:real].to(torch.int64)
-            table = self._kda_table()
+            table = self._kda_slot_table
             table.fill_(-1)
             # Same bounds contract as the compose: an out-of-range pool
             # index degrades that row to never-fuse (the sentinel row stays
@@ -1508,7 +1526,6 @@ class KdaAttnBackend(MambaAttnBackend):
                         layer_id, overflow_rows, (conv.shape[1], k, hv), self.dtype
                     )
         self._kda_lazy_buffers(min_slots=max_bs)
-        self._kda_table()
 
     def _kda_gate_scratch(self, rows: int, width: int) -> torch.Tensor:
         """This round's gate scratch, carved from the shared workspace pool.
