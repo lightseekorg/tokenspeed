@@ -99,29 +99,102 @@ def test_decode_and_prefill_share_one_gate():
         ), f"the {name} path open-codes the fp8 gate instead of sharing it"
 
 
-def test_every_hybrid_backend_forwards_data_type():
-    """Subclasses must keep forwarding, or they silently lose the fused path.
+def _wrapper_classes():
+    """Every backend class that owns a full-attention sub-backend.
 
-    A hybrid wrapper that owns a sub-backend but no ``data_type`` reads as
-    non-fp8 to the gate, so the model would fall back to the unfused path
-    without any error. ``HybridKDABackend`` is the live example of a subclass
-    that inherits this rather than restating it.
+    Scans the whole backends package rather than one class hierarchy: a wrapper
+    that hides an fp8 sub-backend behind a non-fp8 ``data_type`` breaks the gate
+    no matter what it inherits from.
     """
-    # Subclasses only register once their module is imported.
-    import tokenspeed.runtime.layers.attention.backends.hybrid_kda  # noqa: F401
-    from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
-        HybridLinearAttnBackend,
-    )
+    import importlib
+    import pkgutil
 
-    def descendants(cls):
-        for sub in cls.__subclasses__():
-            yield sub
-            yield from descendants(sub)
+    from tokenspeed.runtime.layers.attention import backends
 
-    for cls in (HybridLinearAttnBackend, *descendants(HybridLinearAttnBackend)):
-        assert isinstance(
-            getattr(cls, "data_type", None), property
-        ), f"{cls.__name__} does not forward data_type; the fused fp8 path dies silently"
+    for info in pkgutil.iter_modules(backends.__path__):
+        try:
+            mod = importlib.import_module(f"{backends.__name__}.{info.name}")
+        except Exception:  # optional vendor backends may not import here
+            continue
+        for _, cls in inspect.getmembers(mod, inspect.isclass):
+            if cls.__module__ != mod.__name__:
+                continue
+            try:
+                owns_sub = any(
+                    "self.full_attn_backend" in inspect.getsource(k)
+                    for k in cls.__mro__
+                    if k is not object
+                )
+            except (OSError, TypeError):
+                continue
+            if owns_sub:
+                yield cls
+
+
+# MSAHybridAttnBackend owns a sub-backend and deliberately does not forward
+# data_type. It belongs to MiniMax M3, which routes through its own
+# MiniMaxM3Attention rather than DeepseekV3AttentionMLA, so the gate never reads
+# it. Any *other* non-forwarding wrapper is a bug, so this list stays explicit.
+NON_FORWARDING_BY_DESIGN = {"MSAHybridAttnBackend"}
+
+
+def _forwards_dtype(cls):
+    """Read ``data_type`` off *cls* given an fp8 sub-backend, without __init__.
+
+    Returns None when the class cannot be probed this way.
+    """
+    try:
+        obj = object.__new__(cls)
+        obj.full_attn_backend = _Plain()
+    except TypeError:  # __slots__ or a custom __new__
+        return None
+    return getattr(obj, "data_type", None) == torch.float8_e4m3fn
+
+
+class _LiesAboutDtype:
+    """A wrapper that has a data_type property which does not forward."""
+
+    full_attn_backend = _Plain()
+
+    @property
+    def data_type(self):
+        return torch.bfloat16
+
+
+def test_the_forwarding_check_rejects_a_broken_wrapper():
+    # Negative control: an existence check would pass _LiesAboutDtype, because
+    # it does define the property. The probe must not.
+    assert isinstance(_LiesAboutDtype.data_type, property)
+    assert _forwards_dtype(_LiesAboutDtype) is False
+    assert _forwards_dtype(_Forwarding) is True
+
+
+def test_every_hybrid_wrapper_forwards_the_sub_backend_dtype():
+    """A wrapper must report the dtype its sub-backend actually stores.
+
+    Checking that ``data_type`` merely *exists* is not enough: a property that
+    returned bfloat16 while the sub-backend held fp8 would pass that and still
+    disable the fused path. So construct each wrapper without running its
+    __init__, give it an fp8 sub-backend, and read the value back.
+    """
+    found = list(_wrapper_classes())
+    assert found, "no hybrid wrapper classes discovered; the scan is broken"
+
+    checked = []
+    for cls in found:
+        if cls.__name__ in NON_FORWARDING_BY_DESIGN:
+            continue
+        forwards = _forwards_dtype(cls)
+        if forwards is None:
+            continue
+        assert (
+            forwards
+        ), f"{cls.__name__} does not report its sub-backend's fp8 dtype; the fused path dies silently"
+        checked.append(cls.__name__)
+
+    # The scan is only worth anything if it reaches the wrappers K3 runs on.
+    for required in ("HybridLinearAttnBackend", "HybridKDABackend"):
+        assert required in checked, f"{required} was not reached by the scan"
 
 
 def test_dead_nope_query_branch_is_gone():
