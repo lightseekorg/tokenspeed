@@ -1,4 +1,4 @@
-# gfx950 MXFP4 MoE kernels
+# CDNA4 MXFP4 MoE kernels
 
 Gluon MXFP4-weight MoE for AMD CDNA4/gfx950, covering BF16, FP8, and
 dynamically quantized MXFP4 activation paths. The package contains two kernel
@@ -15,20 +15,20 @@ execution strategies:
 
 The fused dispatch policy (`fused/moe.py`) is the top of the funnel: it calls
 *into* the staged package for the shapes where that wins (package prefill for
-`M >= 9`, staged MFMA decode), so the dependency arrow always points from
+`M >= 9`, staged MFMA decode), so the kernel dependency arrow points from
 `fused/` to the staged files, never back.
 
 ## Staged package files
 
 | File | Role |
 | --- | --- |
-| `moe.py` | End-to-end staged decode entry (`gluon_mxfp4_moe_decode`): stage1 → quantize → stage2, precomputed top-k in. |
+| `__init__.py` | Package exports: the stage invokers, the top-k route entries, the prefill weight aliases, and the scale gather. |
 | `prefill_stage1.py` / `prefill_stage2.py` | A4W4 block-ragged prefill GEMMs (gdot128-preshuffled weights). |
-| `decode_stage1.py` / `decode_stage2.py` | Staged MFMA decode invokers (thin wrappers over `decode_kernels.py`). |
-| `decode_kernels.py` | A16W4 warp-GEMV / direct-MFMA decode kernels and the dense top-k route kernels (softmax, sigmoid-bias). |
-| `routing.py` | Wrappers over the `decode_kernels.py` top-k route kernels; output is top-k only, **not** ragged metadata (contrast `fused/routing.py`). |
+| `decode_stage1.py` / `decode_stage2.py` | A4W4 direct-MFMA decode kernels plus their invokers: stage 1 fuses SwiGLU, stage 2 fuses the routed-weight top-k combine. |
+| `decode_common.py` | Direct CDNA4 MFMA primitives shared by both decode stages: tile addressing, MXFP4 operand loads, `mfma_scaled`. |
+| `routing.py` | Fused dense top-k route kernels (softmax, sigmoid-bias, and a prefill variant); output is top-k only, **not** ragged metadata (contrast `fused/routing.py`). |
 | `moe_sorting.py` | Block-aligned expert sort feeding the package prefill stages. |
-| `situ_decode.py` / `situ_grouped.py` | In-situ expert-parallel decode paths over the staged kernels. |
+| `situ_decode.py` / `situ_grouped.py` | A16W4 in-situ expert-parallel paths that read the unshuffled MXFP4 weights directly: route-direct warp decode and a contiguous-EP grouped GEMM. |
 | `latent_shared_decode.py` | Latent shared-expert decode entry. |
 | `scale_layout.py` | Single source of truth for the CDNA4 MXFP4 scale swizzle (constants, swizzle/predicate/allocator helpers). Leaf module: torch only. |
 | `scale.py` | Activation-scale gather into sorted-route order for the package stages. |
@@ -52,6 +52,6 @@ Organized by approach; every module states which regime owns it:
 | `tuning.py` | Block autotuning and launch heuristics. |
 | `_common.py` / `_layouts.py` | Shared host floor (constants, ragged helpers, wrapped-tensor extraction) and shared constexpr layout factories / device helpers. |
 
-Same-named files across the two levels are deliberate: `routing.py` and
-`moe.py` fill the same role for their respective family; the import path says
-which family you are in.
+The same-named file at both levels is deliberate: each fills the
+routing role for its own family, and the import path says which family you are
+in.
