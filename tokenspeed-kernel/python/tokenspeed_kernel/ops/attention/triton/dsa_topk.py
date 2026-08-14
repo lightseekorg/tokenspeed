@@ -154,8 +154,7 @@ def local_topk_to_global_slots(
     else:
         if lens_out.shape != (num_tokens,):
             raise ValueError(
-                "lens_out must have shape "
-                f"({num_tokens},), got {tuple(lens_out.shape)}"
+                f"lens_out must have shape ({num_tokens},), got {tuple(lens_out.shape)}"
             )
         if (
             lens_out.dtype != torch.int32
@@ -413,7 +412,9 @@ def _dsa_decode_logits_fp8_kernel(
                 other=0.0,
             ).to(tl.float32)
             head_score += tl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
-        scores += head_score * head_weight
+        scores += (
+            tl.maximum(head_score, 0.0, propagate_nan=tl.PropagateNan.ALL) * head_weight
+        )
 
     scores *= softmax_scale
     scores = tl.where(valid, scores, -float("inf"))
@@ -489,7 +490,9 @@ def _dsa_prefill_logits_fp8_kernel(
                 other=0.0,
             ).to(tl.float32)
             head_score += tl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
-        scores += head_score * head_weight
+        scores += (
+            tl.maximum(head_score, 0.0, propagate_nan=tl.PropagateNan.ALL) * head_weight
+        )
 
     scores *= softmax_scale
     scores = tl.where(valid, scores, -float("inf"))
@@ -527,7 +530,7 @@ def _check_packed_fp8_inputs(
     _check_q_weights(q, weights)
     if q.shape[2] % 128 != 0:
         raise ValueError(
-            "DSA Triton FP8 top-k requires dim multiple of 128, got " f"{q.shape[2]}"
+            f"DSA Triton FP8 top-k requires dim multiple of 128, got {q.shape[2]}"
         )
     if index_k_cache.dtype != torch.uint8:
         raise TypeError(
