@@ -572,7 +572,7 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
         "attn_tp_size": 2,
         "dtype": torch.bfloat16,
         "kv_cache_dtype": torch.bfloat16,
-        "page_size": 16,
+        "prefix_granularity": 16,
         "context_len": 256,
         "max_bs": 4,
         "max_graph_bs": 4,
@@ -604,7 +604,7 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
         layer_types=(),
         group_ids=group_ids,
         sliding_window_tokens=None,
-        prefix_granularity=config.page_size,
+        prefix_granularity=config.prefix_granularity,
         cache_blocks_per_lcm_block=packing,
         pd_disaggregation_enabled=True,
     )
@@ -620,7 +620,7 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
         fields,
         specs,
         field_dtypes,
-        q=config.page_size,
+        q=config.prefix_granularity,
         cache_blocks_per_lcm_block=packing,
         alignment=1,
     )

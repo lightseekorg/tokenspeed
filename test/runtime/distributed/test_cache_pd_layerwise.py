@@ -666,7 +666,7 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
     backend.qk_nope_head_dim = 1
     backend.kv_lora_rank = 1
     backend.qk_rope_head_dim = 0
-    backend.page_size = 64
+    backend.kernel_page_size = 64
     backend.step_counter = SimpleNamespace(record_cache=lambda: events.append("ready"))
 
     monkeypatch.setattr(
@@ -695,7 +695,7 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
             quant_method=None,
             get_key_buffer=lambda _layer_id: torch.zeros(1),
         ),
-        block_tables=torch.zeros((1, 1), dtype=torch.int32),
+        page_table=torch.zeros((1, 1), dtype=torch.int32),
         seq_lens=torch.ones(1, dtype=torch.int32),
         workspace_indices=torch.zeros((1, 2), dtype=torch.int64),
         topk_lens=torch.ones(1, dtype=torch.int32),
