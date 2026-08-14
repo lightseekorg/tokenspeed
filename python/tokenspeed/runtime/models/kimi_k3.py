@@ -1055,8 +1055,9 @@ class KimiLinearMoE(nn.Module):
         self,
         config: KimiLinearConfig,
         mapping: Mapping,
+        layer_index: int,
+        model_scope: str,
         quant_config: QuantizationConfig | None = None,
-        layer_index: int = -1,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
@@ -1279,13 +1280,17 @@ class KimiLinearMoE(nn.Module):
             )
         )
 
-        self._initialize_tail_capabilities(config, mapping, prefix)
+        self._initialize_tail_capabilities(
+            config, mapping, prefix, layer_index, model_scope
+        )
 
     def _initialize_tail_capabilities(
         self,
         config: KimiLinearConfig,
         mapping: Mapping,
         prefix: str,
+        layer_index: int,
+        model_scope: str,
     ) -> None:
         """Probe locally, cast one collective vote, then allocate collectively."""
         # All ranks must agree on eligibility before either collective allocator runs.
@@ -1355,7 +1360,8 @@ class KimiLinearMoE(nn.Module):
                     latent_size=self.routed_hidden,
                     rms_eps=self.routed_expert_norm.variance_epsilon,
                     device=_device,
-                    owner=prefix,
+                    layer_index=layer_index,
+                    model_scope=model_scope,
                     # Staging may alias the workspace pool; each barrier-free mailbox must remain private.
                     scratch_allocator=workspace_pool(_device).allocate,
                 )
@@ -1736,8 +1742,6 @@ class KimiLinearMoE(nn.Module):
         start, width = self.routed_expert_up_proj.shard_slice
         target = shared_stage[:, start : start + width]
         target += prefix_sum.view(num_tokens, hidden_size).narrow(-1, start, width)
-        # Beta-add epilogue: the projection accumulates straight into the
-        # staged columns, no materialized block and no separate add.
         target.addmm_(routed_reduced, self.routed_expert_up_proj.weight.t())
         shared_reduced = multimem_all_reduce_staged(shared_stage, group_name)
         # Clone: the staging buffer is recycled by the next layer's stage copy.
@@ -1795,9 +1799,6 @@ class KimiLinearMoE(nn.Module):
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
-        # addmm_ accumulates the projection in the GEMM's beta-add epilogue,
-        # so the block never materializes and the separate adds disappear
-        # (one fewer rounding than projecting then adding).
         start, width = self.routed_expert_up_proj.shard_slice
         shared_partial = shared_partial.view(num_tokens, hidden_size)
         target = shared_partial[:, start : start + width]
@@ -1980,6 +1981,7 @@ class KimiLinearDecoderLayer(nn.Module):
         config: KimiLinearConfig,
         mapping: Mapping,
         layer_id: int,
+        model_scope: str,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
@@ -2025,11 +2027,12 @@ class KimiLinearDecoderLayer(nn.Module):
             # Named for the checkpoint index; not aliased as self.mlp (double
             # registration would duplicate every MoE param in state_dict).
             self.block_sparse_moe = KimiLinearMoE(
-                config,
-                mapping,
-                quant_config,
-                layer_id,
-                add_prefix("block_sparse_moe", prefix),
+                config=config,
+                mapping=mapping,
+                layer_index=layer_id,
+                model_scope=model_scope,
+                quant_config=quant_config,
+                prefix=add_prefix("block_sparse_moe", prefix),
                 alt_stream=alt_stream,
             )
         else:
@@ -2590,11 +2593,14 @@ class KimiLinearModel(nn.Module):
             tp_group=mapping.attn.tp_group,
         )
 
+        layers_scope = add_prefix("layers", prefix)
+
         def get_layer(idx: int, prefix: str):
             return KimiLinearDecoderLayer(
                 config=config,
                 mapping=mapping,
                 layer_id=idx,
+                model_scope=layers_scope,
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=alt_stream,
@@ -2603,7 +2609,7 @@ class KimiLinearModel(nn.Module):
         self.layers = make_layers(
             config.num_hidden_layers,
             get_layer,
-            prefix=add_prefix("layers", prefix),
+            prefix=layers_scope,
         )
         # Cross-layer attn-side mix precompute: a layer's aux stream computes
         # the NEXT layer's block partial alongside its own mlp-side partial

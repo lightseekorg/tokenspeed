@@ -250,7 +250,8 @@ def test_fused_tail_matches_reference(m):
         latent_size=L,
         rms_eps=EPS,
         device=dev,
-        owner="test.tail_fusion",
+        layer_index=0,
+        model_scope="test",
     )
     moe = _build_moe(dev, latent_tail=tail)
     routed, shared, prefix = _inputs(rank, dev, m, seed=11)
@@ -341,8 +342,8 @@ def test_tiers_agree_with_each_other():
             latent_size=L,
             rms_eps=EPS,
             device=dev,
-            # A mailbox of its own; the name above owns the other one.
-            owner="test.tiers_agree",
+            layer_index=0,
+            model_scope="test",
         )
     moe = _build_moe(dev, latent_tail=tail)
     routed, shared, prefix = _inputs(rank, dev, m, seed=44)

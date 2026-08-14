@@ -29,18 +29,28 @@ a *sharded* up-projection (each rank computes ``hidden/tp`` rows — 1/tp of the
 weight traffic, and 1/tp of the weight storage when the caller passes a
 column-parallel weight) whose epilogue multicast-stores the shard into every
 rank's mailbox (NVLS), and a barrier-free Lamport gather. Symmetric buffers
-come from stock ``torch.distributed._symmetric_memory``; the small per-call
-staging can come from the runtime's shared workspace pool via
-``scratch_allocator``.
+come from stock ``torch.distributed._symmetric_memory``. A depth-d rotation
+pool (d=2 by default) reduces their footprint from about 0.95 GB per rank for
+roughly 92 MoE layers to d x about 6 MB per rank. The small per-call staging
+can come from the runtime's shared workspace pool via ``scratch_allocator``.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.distributed as dist
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail import (
+        AdaptiveUpProjectionKernel,
+        CollectiveKernel,
+    )
+
+_ScratchAllocator = Callable[..., list[torch.Tensor]]
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +63,25 @@ _COLLECTIVE_TOKEN_CTAS = 8
 _LAMPORT_COPY_CTAS = 32
 _LAMPORT_COPY_THREADS = 224
 _SUPPORTED_TP_SIZES = (8, 16)
+# The gather releases its PDL dependents before re-arming this slot's sentinels.
+# Rotating by decoder-layer index keeps adjacent layers off the same mailbox and,
+# in the supported sequential decoder, leaves the intervening layer's stream work
+# between same-slot writes. This is a scheduling assumption, not synchronization:
+# different modules scheduled with repeated/non-sequential indices need separate
+# model scopes (and concurrently executing models must not share a scope).
+_TAIL_POOL_DEPTH = 2
+
+
+def _tail_pool_slot(layer_index: int, depth: int = _TAIL_POOL_DEPTH) -> int:
+    """Map a decoder layer index to its rank-identical pool slot."""
+    if depth <= 0:
+        raise ValueError("tail pool depth must be greater than zero")
+    return layer_index % depth
+
+
+def _allocator_identity(allocator: _ScratchAllocator | None) -> object:
+    """Return the stable owner identity of a possibly bound allocator."""
+    return getattr(allocator, "__self__", allocator)
 
 
 def _multicast_reachable(group: dist.ProcessGroup | None = None) -> bool:
@@ -104,8 +133,10 @@ def latent_tail_supported(
     return _multicast_reachable(group)
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Contract:
+    """Dimensions and identities shared by op construction and pooled slots."""
+
     # The registered group name, not id(group): stable for the process
     # lifetime and the same identity symmetric-memory rendezvous keys on.
     group_name: str
@@ -114,20 +145,29 @@ class _Contract:
     hidden_size: int
     latent_size: int
     rms_eps: float
-    # Mailboxes are owner-private because cleanup may overlap same-stream successors.
-    # Use module prefixes: draft models can repeat base-model layer indices.
-    owner: str
+
+
+@dataclass
+class _SymmetricPoolSlot:
+    """One indivisible collective-workspace and multicast-mailbox bundle."""
+
+    collective: CollectiveKernel
+    up_projection: AdaptiveUpProjectionKernel
+    scratch_allocator_key: object
 
 
 class KimiK3LatentTailOp:
-    """Multicast tail for one calling module; one instance (and mailbox) each.
+    """Multicast tail for one module, statically bound to a rotation-pool slot.
 
     Construction performs a collective symmetric-memory rendezvous — every
     rank in ``group`` must construct with identical arguments in lockstep
     (model-layer initialization satisfies this).
     """
 
-    _instances: dict[_Contract, "KimiK3LatentTailOp"] = {}
+    _symmetric_pools: dict[
+        tuple[str, int, torch.device, int, int, float, str, int],
+        _SymmetricPoolSlot,
+    ] = {}
 
     @classmethod
     def initialize(
@@ -138,10 +178,11 @@ class KimiK3LatentTailOp:
         latent_size: int,
         rms_eps: float,
         device: torch.device,
-        owner: str,
-        scratch_allocator=None,
+        layer_index: int,
+        model_scope: str,
+        scratch_allocator: _ScratchAllocator | None = None,
     ) -> "KimiK3LatentTailOp":
-        """Return this caller's tail op, constructing it on first use.
+        """Construct this caller's tail op with a statically bound pool slot.
 
         Args:
             group: Process group every rank constructs with, in lockstep.
@@ -149,9 +190,9 @@ class KimiK3LatentTailOp:
             latent_size: Routed-expert latent width.
             rms_eps: Epsilon of the routed-expert RMS norm.
             device: CUDA device owning the mailbox.
-            owner: Globally unique name for the calling module (its weight
-                prefix); part of the key so each caller gets its own mailbox.
-                Must be rank-identical -- it takes part in the rendezvous.
+            layer_index: Decoder layer index used to select the rotation slot.
+            model_scope: Rank-identical model scope separating pool bundles,
+                including base and draft models.
             scratch_allocator: Optional ``(*specs) -> list[Tensor]`` carving
                 per-call staging views from a shared block (the runtime's
                 workspace pool). The views are re-fetched on every collective
@@ -164,34 +205,22 @@ class KimiK3LatentTailOp:
             hidden_size=hidden_size,
             latent_size=latent_size,
             rms_eps=float(rms_eps),
-            owner=owner,
         )
-
-        def _alloc_identity(alloc):
-            # Bound method identity is unstable; compare the owning pool object.
-            return getattr(alloc, "__self__", alloc)
-
-        op = cls._instances.get(contract)
-        if op is None:
-            op = cls(contract, group, scratch_allocator=scratch_allocator)
-            op._scratch_allocator_key = _alloc_identity(scratch_allocator)
-            cls._instances[contract] = op
-        elif getattr(op, "_scratch_allocator_key", None) is not _alloc_identity(
-            scratch_allocator
-        ):
-            # Cached ops must not retain an allocator from a replaced workspace pool.
-            raise RuntimeError(
-                "KimiK3LatentTailOp for this contract already exists with a "
-                "different scratch_allocator; reset the instance cache when "
-                "rebuilding engines in one process"
-            )
-        return op
+        return cls(
+            contract,
+            group,
+            layer_index=layer_index,
+            model_scope=model_scope,
+            scratch_allocator=scratch_allocator,
+        )
 
     def __init__(
         self,
         contract: _Contract,
         group: dist.ProcessGroup,
-        scratch_allocator=None,
+        layer_index: int,
+        model_scope: str,
+        scratch_allocator: _ScratchAllocator | None = None,
     ) -> None:
         from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail import (
             AdaptiveUpProjectionKernel,
@@ -201,31 +230,58 @@ class KimiK3LatentTailOp:
 
         self.contract = contract
         self.rank = dist.get_rank(group)
+        slot_index = _tail_pool_slot(layer_index)
+        pool_key = (
+            contract.group_name,
+            contract.tp_size,
+            contract.device,
+            contract.hidden_size,
+            contract.latent_size,
+            contract.rms_eps,
+            model_scope,
+            slot_index,
+        )
+
+        allocator_key = _allocator_identity(scratch_allocator)
         with torch.accelerator.device_index(contract.device.index):
-            self._collective = CollectiveKernel(
-                group=group,
-                rank=self.rank,
-                tp_size=contract.tp_size,
-                latent_dim=contract.latent_size,
-                hidden_dim=contract.hidden_size,
-                max_m=_MAX_NUM_TOKENS,
-                max_token_ctas=_COLLECTIVE_TOKEN_CTAS,
-                rms_eps=contract.rms_eps,
-                fp32_internal=True,
-                scratch_allocator=scratch_allocator,
-            )
-            self._up_projection = AdaptiveUpProjectionKernel(
-                group=group,
-                rank=self.rank,
-                tp_size=contract.tp_size,
-                latent_dim=contract.latent_size,
-                hidden_dim=contract.hidden_size,
-                max_m=_MAX_NUM_TOKENS,
-                skinny_max_m=_SKINNY_MAX_NUM_TOKENS,
-                mma_tiler_mn=_MMA_TILER_MN,
-                cluster_shape_mn=_GEMM_CLUSTER_MN,
-                b_prime_stages=_B_PRIME_STAGES,
-            )
+            slot = type(self)._symmetric_pools.get(pool_key)
+            if slot is None:
+                # Allocate the rendezvous bundle atomically for this static slot.
+                slot = _SymmetricPoolSlot(
+                    collective=CollectiveKernel(
+                        group=group,
+                        rank=self.rank,
+                        tp_size=contract.tp_size,
+                        latent_dim=contract.latent_size,
+                        hidden_dim=contract.hidden_size,
+                        max_m=_MAX_NUM_TOKENS,
+                        max_token_ctas=_COLLECTIVE_TOKEN_CTAS,
+                        rms_eps=contract.rms_eps,
+                        fp32_internal=True,
+                        scratch_allocator=scratch_allocator,
+                    ),
+                    up_projection=AdaptiveUpProjectionKernel(
+                        group=group,
+                        rank=self.rank,
+                        tp_size=contract.tp_size,
+                        latent_dim=contract.latent_size,
+                        hidden_dim=contract.hidden_size,
+                        max_m=_MAX_NUM_TOKENS,
+                        skinny_max_m=_SKINNY_MAX_NUM_TOKENS,
+                        mma_tiler_mn=_MMA_TILER_MN,
+                        cluster_shape_mn=_GEMM_CLUSTER_MN,
+                        b_prime_stages=_B_PRIME_STAGES,
+                    ),
+                    scratch_allocator_key=allocator_key,
+                )
+                type(self)._symmetric_pools[pool_key] = slot
+            elif slot.scratch_allocator_key is not allocator_key:
+                raise RuntimeError(
+                    "KimiK3 latent-tail pool slot already exists with a "
+                    "different scratch_allocator"
+                )
+            self._collective = slot.collective
+            self._up_projection = slot.up_projection
             self._lamport_copy = LamportCopyKernel(
                 hidden_dim=contract.hidden_size,
                 max_m=_MAX_NUM_TOKENS,
@@ -265,7 +321,7 @@ class KimiK3LatentTailOp:
             ``[M, 7168]`` post-communication hidden (up-projection + shared,
             plus ``prefix`` when provided).
         """
-        # Owner-private mailboxes are reused only after every layer's peer-blocking gather.
+        # Same-slot calls are stream-ordered, preserving Lamport buffer rotation.
         m = routed_partial.shape[0]
         # JIT compilation launches kernels; under capture they would be
         # recorded into the graph. Warmup must have compiled this m already.

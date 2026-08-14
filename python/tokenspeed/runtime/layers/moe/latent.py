@@ -72,11 +72,6 @@ class K3MoETailTier(IntEnum):
     SEPARATE_REDUCE = 3  # portable: reduce each partial on its own
 
 
-# Below 256 tokens, two staged reduces lose ~4% TPOT to the joined single AR.
-# From 256..8192 (prefill graphs capture through 8192), the in-switch path wins
-# ~13% TTFT at 1k and ~19% at 8k over the split-AR fold. Above 8192, staging
-# copies grow linearly while grouped NCCL reduces in place; symmetric buffers
-# are pre-sized to the 8192 ceiling, so serving never grows them collectively.
 # Speculative decode may enter this prefill-tuned multimem window.
 MULTIMEM_AR_MIN_TOKENS = 256
 MULTIMEM_AR_MAX_TOKENS = 8192
