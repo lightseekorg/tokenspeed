@@ -46,6 +46,12 @@ def _load_cache_modules():
         "tokenspeed.runtime.layers.attention.kv_cache.recipes",
     ):
         sys.modules.setdefault(package_name, types.ModuleType(package_name))
+    # The V4 recipe imports the kernel-page registry by its real name;
+    # register it from its file path before the recipe loads.
+    _load(
+        "tokenspeed.runtime.layers.attention.kernel_page_sizes",
+        _KV_CACHE_DIR.parent / "kernel_page_sizes.py",
+    )
     plan = _load(
         "tokenspeed.runtime.layers.attention.kv_cache.recipes.plan",
         _RECIPE_DIR / "plan.py",
