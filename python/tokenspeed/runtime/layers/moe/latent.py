@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import IntEnum
@@ -73,14 +72,8 @@ class K3MoETailTier(IntEnum):
     SEPARATE_REDUCE = 3  # portable: reduce each partial on its own
 
 
-# Above plain decode-graph buckets: at decode sizes the two staged reduces
-# lose ~4% TPOT to the single fused-lane AR; the ld_reduce win is prefill's.
-# Caveat: spec-decode buckets reach bs*q tokens and can re-enter this window
-# in-graph (correct, but decode-suboptimal) — a follow-up should add an
-# is_decode axis rather than gate on the graph phase, which prefill graphs
-# legitimately share.
+# Speculative decode may enter this prefill-tuned multimem window.
 MULTIMEM_AR_MIN_TOKENS = 256
-# Upper edge of the measured window; larger batches take the join's grouped path.
 MULTIMEM_AR_MAX_TOKENS = 8192
 
 
@@ -104,14 +97,6 @@ def select_k3_moe_tail_tier(
     Returns:
         The best applicable ``K3MoETailTier``.
     """
-    # Tested first, so a fused-tail capacity that ever reached into the
-    # multimem window would still resolve here rather than overlap.
-    # Operational clamp (rank-uniform env only): with e.g. 5 the tail keeps
-    # its skinny sizes while larger decode batches fall to the ordinary
-    # tiers -- a no-rebuild way to narrow the fused tail's coverage.
-    _cap = os.environ.get("TOKENSPEED_K3_TAIL_MAX_M")
-    if _cap is not None:
-        tail_fusion_max_tokens = min(tail_fusion_max_tokens, int(_cap))
     if graph_phase and 1 <= num_tokens <= tail_fusion_max_tokens:
         return K3MoETailTier.TAIL_FUSION
     if not fused_moe_ar:
@@ -348,10 +333,11 @@ class Kimi3LatentProjection(ReplicatedLinear):
 
     With ``shard_group`` the output dimension is partitioned across the group
     (column parallel): each rank stores ``output_size / tp`` rows of the weight
-    and the projection ends with one all-gather. The fused multicast tail
-    consumes exactly this shard and gathers it itself, so under the tail the
-    gather here never runs; the other tiers pay one all-gather in exchange for
-    ``(tp-1)/tp`` of the weight's memory.
+    and the ordinary projection ends with one all-gather. K3's tail paths avoid
+    that gather: the fused multicast tail consumes the shard directly, while
+    the other tiers inject each rank's column block into a reduction they
+    already run. Thus every tail retains ``(tp-1)/tp`` of the weight's memory
+    savings without adding collective wire bytes.
     """
 
     def __init__(
@@ -387,7 +373,15 @@ class Kimi3LatentProjection(ReplicatedLinear):
 
     def weight_loader(self, param, loaded_weight, shard_id=None, begin_size=None):
         """Take this rank's contiguous row block of the full weight."""
-        if self.shard_group is not None and shard_id is None and begin_size is None:
+        if self.shard_group is not None and (
+            shard_id is not None or begin_size is not None
+        ):
+            # Chunked loads use full-weight row offsets, which sharded params cannot honor.
+            raise ValueError(
+                "column-parallel Kimi3LatentProjection only supports whole-"
+                "tensor loads"
+            )
+        if self.shard_group is not None:
             rows = self.output_size_full // self.shard_size
             loaded_weight = loaded_weight.narrow(0, self.shard_rank * rows, rows)
         return super().weight_loader(
@@ -405,8 +399,6 @@ class Kimi3LatentProjection(ReplicatedLinear):
             device=local.device,
         )
         all_gather_into_tensor(stacked, local.contiguous(), self.shard_group)
-        # Rank r owns columns [r*shard, (r+1)*shard); the gather stacks on a new
-        # leading axis, so the transpose is what puts the blocks side by side.
         return stacked.permute(1, 0, 2).reshape(num_tokens, self.output_size_full)
 
     def project_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -430,7 +422,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
         width = self.output_size_full // self.shard_size
         return self.shard_rank * width, width
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
         output = tokenspeed_kernel.kimi3_latent_projection(
             hidden_states,
             self.weight,
@@ -475,12 +467,6 @@ class Kimi3LatentProjection(ReplicatedLinear):
                 norm_weight=norm_weight,
                 eps=eps,
             )
-        # Accumulate inside the shard, then gather once: the addends are
-        # replicated (prefix) or already reduced (shared), so their column
-        # blocks are final here and the gather moves the finished sum instead
-        # of an intermediate. The fused norm composes with the shard: it
-        # normalizes the K-width input rows, which every column block reads in
-        # full.
         rows = self.output_size_full // self.shard_size
         start = self.shard_rank * rows
         local = tokenspeed_kernel.kimi3_latent_projection_add3(

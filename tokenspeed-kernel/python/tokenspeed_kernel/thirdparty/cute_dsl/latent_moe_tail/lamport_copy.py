@@ -38,9 +38,7 @@ class LamportCopy:
     def __init__(
         self, hidden_dim: int, ctas: int, threads: int, has_residual: bool = False
     ):
-        # Bound here, in host Python: the JIT resolves names off self,
-        # not module globals, so reading the constant at the launch
-        # site itself fails to compile.
+        # Bind in host Python; the JIT resolves names from self, not module globals.
         self.use_pdl = PDL_ENABLED
         self.hidden_dim = hidden_dim
         self.ctas = ctas

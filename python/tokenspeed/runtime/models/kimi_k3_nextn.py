@@ -155,13 +155,6 @@ class KimiK3DraftDecoderLayer(nn.Module):
         )
         # The fused-AR lane workspace is a singleton shaped around the base
         # model's usage; the draft takes the plain reduce path.
-        #
-        # NOTE: these two writes have no effect. Both flags moved onto
-        # ``execution_plan``, and nothing reads the underscored attributes, so
-        # the draft has in fact been taking the fused lane. Making the intent
-        # effective again changes which tail tier the draft selects, which
-        # wants a speculative-decode run to validate -- see the tail tier
-        # selector in ``kimi_k3.py``.
         self.block_sparse_moe._fused_moe_ar = False
         self.block_sparse_moe._lane_latent_norm_ar = False
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

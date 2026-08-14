@@ -165,6 +165,10 @@ def test_latent_tail_fused_prefix_matches_eager(m):
     prefix = (torch.randn(m, H, dtype=torch.bfloat16, device=dev) * 0.9).contiguous()
     prefix[:, ::911] *= 8  # residual-stream outliers, as in serving
     eager = op(routed, shared, rms_w, up_w) + prefix
+    # The mailbox is reused between the two calls; production separates them
+    # by a whole forward, so give the sentinel cleanup the same guarantee.
+    torch.cuda.synchronize()
+    dist.barrier()
     fused = op(routed, shared, rms_w, up_w, prefix=prefix)
     torch.cuda.synchronize()
     assert torch.equal(eager, fused), "fused prefix add must be bit-identical"

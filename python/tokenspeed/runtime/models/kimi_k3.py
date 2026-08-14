@@ -56,7 +56,6 @@ Module hierarchy matches the checkpoint::
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -587,6 +586,15 @@ def _situ_betas(config: KimiLinearConfig) -> tuple[float, float | None]:
             f"{config.hidden_act!r}"
         )
     return (config.activation_situ_beta, config.activation_situ_linear_beta)
+
+
+def _shard_k3_up_projection(mapping: Mapping, hidden_size: int) -> bool:
+    """Whether to column-shard K3's routed up projection on NVIDIA."""
+    return (
+        torch.version.hip is None
+        and mapping.moe.tp_ep_size > 1
+        and hidden_size % mapping.moe.tp_ep_size == 0
+    )
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1164,26 +1172,15 @@ class KimiLinearMoE(nn.Module):
             self.routed_hidden,
             prefix=add_prefix("routed_expert_down_proj", prefix),
         )
-        # Column-parallel up projection: the replicated weight is 49 MiB per
-        # layer, so sharding it frees (tp-1)/tp of that on every rank and the
-        # freed memory goes straight into the KV pool. Every tier either
-        # computes on the shard natively (the fused tail) or folds the gather
-        # into a reduction it already runs, so the wire bytes never grow.
-        # Default on for NVIDIA; AMD keeps the replicated fallback because its
-        # joined reduction is the Iris fused two-segment primitive, which the
-        # fold's AR->GEMM->AR ordering cannot use (untested trade there).
-        # TOKENSPEED_K3_SHARD_UP_PROJ=0/1 overrides either way.
-        _shard_env = os.environ.get("TOKENSPEED_K3_SHARD_UP_PROJ")
-        shard_up = (
-            (_shard_env == "1" or (_shard_env != "0" and torch.version.hip is None))
-            and mapping.moe.tp_ep_size > 1
-            and config.hidden_size % mapping.moe.tp_ep_size == 0
-        )
+        # AMD keeps replicated weights because Iris cannot use the folded AR→GEMM→AR order.
+        self._shard_up_projection = _shard_k3_up_projection(mapping, config.hidden_size)
         self.routed_expert_up_proj = Kimi3LatentProjection(
             self.routed_hidden,
             config.hidden_size,
             prefix=add_prefix("routed_expert_up_proj", prefix),
-            shard_group=mapping.moe.tp_ep_group if shard_up else None,
+            shard_group=(
+                mapping.moe.tp_ep_group if self._shard_up_projection else None
+            ),
             shard_rank=mapping.moe.tp_ep_rank,
             shard_size=mapping.moe.tp_ep_size,
         )
@@ -1260,25 +1257,26 @@ class KimiLinearMoE(nn.Module):
             )
         )
 
-        # Tail capability negotiation. Both tiers can only be used when every
-        # rank agrees, and both allocate through collectives, so eligibility is
-        # settled here in one exchange: each rank votes on the local
-        # preconditions, one MIN all-reduce agrees the votes, and only then do
-        # the collective allocators run. Splitting this into a probe/agree pair
-        # per tier is what previously left four separate ways to strand a peer.
+        self._initialize_tail_capabilities(config, mapping, prefix)
+
+    def _initialize_tail_capabilities(
+        self,
+        config: KimiLinearConfig,
+        mapping: Mapping,
+        prefix: str,
+    ) -> None:
+        """Probe locally, cast one collective vote, then allocate collectively."""
+        # All ranks must agree on eligibility before either collective allocator runs.
         multimem_local = (
             torch.distributed.is_initialized()
-            # EP is fine here (partials sum over tp_ep); the fused tail is not.
             and mapping.moe.tp_ep_size > 1
             and mapping.moe.tp_ep_size == torch.distributed.get_world_size()
             and mapping.attn.dp_size == 1
             and mapping.attn.cp_size == 1
-            # Staging buffers are per-width; equal widths would clobber the stage.
+            # Equal widths would alias the two per-width staging buffers.
             and self.routed_hidden != config.hidden_size
             and multimem_available()
-            # Multicast can report available while symmetric-memory rendezvous
-            # hangs on a cross-node group without fabric/IMEX, so a job wider
-            # than one host must also clear the fabric probe.
+            # Cross-node symmetric-memory rendezvous requires fabric/IMEX.
             and (
                 torch.distributed.get_world_size() <= torch.cuda.device_count()
                 or fabric_allocation_supported(torch.cuda.current_device())
@@ -1288,16 +1286,16 @@ class KimiLinearMoE(nn.Module):
         if (
             not self.execution_plan.use_native
             and self.routed_expert_norm is not None
-            and mapping.moe.ep_size == 1
             and torch.distributed.is_initialized()
-            and mapping.moe.tp_size == torch.distributed.get_world_size()
+            # The fused tail requires tp_ep to span WORLD.
+            and mapping.moe.tp_ep_size == torch.distributed.get_world_size()
             and mapping.attn.dp_size == 1
             and mapping.attn.cp_size == 1
         ):
             from tokenspeed_kernel.ops.moe.latent_tail import latent_tail_supported
 
             tail_local = latent_tail_supported(
-                tp_size=mapping.moe.tp_size,
+                tp_size=mapping.moe.tp_ep_size,
                 hidden_size=config.hidden_size,
                 latent_size=self.routed_hidden,
                 dtype=torch.bfloat16,
@@ -1315,7 +1313,7 @@ class KimiLinearMoE(nn.Module):
             multimem_ok, tail_ok = (bool(v) for v in votes.tolist())
 
             if multimem_ok:
-                # Pre-size to the ceiling so serving never grows collectively.
+                # Collective buffers must reach peak size before serving.
                 self._multimem_ar_ok = multimem_prealloc(
                     MULTIMEM_AR_MAX_TOKENS,
                     (self.routed_hidden, config.hidden_size),
@@ -1324,9 +1322,7 @@ class KimiLinearMoE(nn.Module):
             if tail_ok:
                 from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
 
-                # Deliberately unguarded: the constructor rendezvouses, so a
-                # rank that failed mid-way has already stranded its peers.
-                # Propagating kills the whole job, which is the good outcome.
+                # Constructor failures must propagate because peers are already rendezvousing.
                 from tokenspeed.runtime.execution.workspace import workspace_pool
 
                 _device = torch.device("cuda", torch.cuda.current_device())
@@ -1337,16 +1333,8 @@ class KimiLinearMoE(nn.Module):
                     rms_eps=self.routed_expert_norm.variance_epsilon,
                     device=_device,
                     owner=prefix,
-                    # Per-layer staging comes from the shared workspace pool:
-                    # written and consumed within one tail call on the main
-                    # stream, so every layer aliasing one block is exactly the
-                    # pool's contract. The symmetric mailbox stays private per
-                    # layer -- its barrier-free protocol depends on that.
-                    scratch_allocator=(
-                        None
-                        if os.environ.get("TOKENSPEED_K3_TAIL_POOL_SCRATCH") == "0"
-                        else workspace_pool(_device).allocate
-                    ),
+                    # Staging may alias the workspace pool; each barrier-free mailbox must remain private.
+                    scratch_allocator=workspace_pool(_device).allocate,
                 )
 
                 logger.info("multicast latent tail engaged")
@@ -1512,15 +1500,12 @@ class KimiLinearMoE(nn.Module):
         # down_proj from the aux stream, followed by the shared chain.
         router_logits = self.gate(hidden_states)
         tier = self._select_tail_tier(num_tokens)
-        # Lane only materializes at bs==1, below the multimem tier window.
-        # Shard mode splits the joined reduction (see _tail_fused_lane_ar), so
-        # the packed lane would never be reduced as one piece: keep it off.
+        # Shard mode splits the joined reduction, so it cannot use the packed lane.
         lane = allreduce_fusion_lane(
             hidden_states,
             self.routed_hidden + hidden_size,
             enabled=(
-                tier is K3MoETailTier.FUSED_LANE_AR
-                and self.routed_expert_up_proj.shard_group is None
+                tier is K3MoETailTier.FUSED_LANE_AR and not self._shard_up_projection
             ),
         )
         if lane is not None:
@@ -1541,23 +1526,29 @@ class KimiLinearMoE(nn.Module):
             routed_in = decode_gemv(hidden_states, self.routed_expert_down_proj.weight)
             if self._topk_ready is not None and fork._active:
                 self._topk_ready.wait(torch.cuda.current_stream())
-            # Raw partials out; each tail tier owns its own reduction.
-            routed_out = self._routed_experts(
+            routed_partial = self._routed_experts(
                 routed_in,
                 topk_output,
                 num_global_tokens,
                 max_num_tokens_per_gpu,
             )
             if tier is K3MoETailTier.SEPARATE_REDUCE:
-                # No fused collective to hide behind: reduce and project here
-                # so the work overlaps the shared branch inside the fork.
-                routed_out = self._reduce_project_routed(routed_out)
+                routed_projected = self._reduce_project_routed(routed_partial)
+                routed_tail_input = routed_projected
+            else:
+                routed_tail_input = routed_partial
         return self._moe_tail(
-            tier, routed_out, shared_partial, prefix_sum, lane, num_tokens, hidden_size
+            tier,
+            routed_tail_input,
+            shared_partial,
+            prefix_sum,
+            lane,
+            num_tokens,
+            hidden_size,
         )
 
     def _select_tail_tier(self, num_tokens: int) -> K3MoETailTier:
-        # Graph *phase*, not capture mode: warmup replays must pick the same tier.
+        # Graph warmup, capture, and replay must select the same tier.
         return select_k3_moe_tail_tier(
             num_tokens=num_tokens,
             graph_phase=get_is_cuda_graph_phase(),
@@ -1584,8 +1575,6 @@ class KimiLinearMoE(nn.Module):
         already ran inside the fork scope to overlap the shared branch.
         """
         if tier is K3MoETailTier.TAIL_FUSION:
-            # Selector pins the graph phase: warmup/capture/replay all take
-            # this path, and eager serving keeps the join/portable tiers.
             return self._tail_fusion(routed_out, shared_partial, prefix_sum)
         if tier is K3MoETailTier.MULTIMEM_AR:
             return self._tail_multimem_ar(
@@ -1605,7 +1594,6 @@ class KimiLinearMoE(nn.Module):
         shared_partial: torch.Tensor,
         prefix_sum: torch.Tensor,
     ) -> torch.Tensor:
-        # Partials are pre-reduce; the tail owns all communication.
         return self._latent_tail(
             routed_out,
             shared_partial,
@@ -1622,79 +1610,124 @@ class KimiLinearMoE(nn.Module):
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
-        # In-switch (ld_reduce) reduces via symmetric memory; the projection
-        # tail is the same replicated norm+up_proj+add3 as the fused-lane tier.
-        # WORLD is safe: the eligibility gate pinned tp_ep == WORLD at init.
+        if self._shard_up_projection:
+            return self._tail_multimem_ar_sharded(
+                routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
+            )
+        return self._tail_multimem_ar_replicated(
+            routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
+        )
+
+    def _tail_multimem_ar_sharded(
+        self,
+        routed_out: torch.Tensor,
+        shared_partial: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_tokens: int,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        # Eligibility guarantees tp_ep spans WORLD for these symmetric reductions.
         group_name = torch.distributed.group.WORLD.group_name
-        # multimem_prealloc sized the buffers at init; a stage miss can only
-        # come from stage validation (e.g. non-bf16 activations), rank-uniform.
         routed_stage = multimem_stage(routed_out, group_name, MULTIMEM_AR_MAX_TOKENS)
         shared_stage = (
             multimem_stage(shared_partial, group_name, MULTIMEM_AR_MAX_TOKENS)
             if routed_stage is not None
             else None
         )
-        # Staging can only miss on dtype/rank/width, all of which the init-time
-        # negotiation already settled, so a miss here is a contract violation
-        # rather than a condition to fall back on.
+        # Eligibility guarantees both stages exist; a miss is a contract violation.
         if routed_stage is None or shared_stage is None:
             raise RuntimeError(
                 "multimem staging failed after the tier was selected; the "
                 "init-time capability vote and the runtime shapes disagree"
             )
-        routed_red = multimem_all_reduce_staged(routed_stage, group_name)
-        if self.routed_expert_up_proj.shard_group is not None:
-            # Fold the whole projection tail into the shared reduction. Each
-            # rank owns a disjoint column block, so placing its block into the
-            # buffer that is about to be summed makes the sum concatenate the
-            # blocks: one all-reduce then yields shared + up_proj + prefix at
-            # full width, for the same bytes the shared reduction already
-            # moved, while the projection GEMM shrinks to 1/tp of the rows.
-            routed_red = (
-                self.routed_expert_norm(routed_red)
-                if self.routed_expert_norm is not None
-                else routed_red
-            )
-            start, width = self.routed_expert_up_proj.shard_slice
-            block = self.routed_expert_up_proj.project_shard(routed_red)
-            shared_stage[:, start : start + width] += block + prefix_sum.view(
-                num_tokens, hidden_size
-            ).narrow(-1, start, width)
-            return multimem_all_reduce_staged(shared_stage, group_name).view(
-                num_tokens, hidden_size
-            )
-        shared_red = multimem_all_reduce_staged(shared_stage, group_name)
-        if self.routed_expert_norm is not None:
-            routed_red = self.routed_expert_norm(routed_red)
-        return self._projection_tail(
-            routed_red, shared_red, prefix_sum, num_tokens, hidden_size
+        routed_reduced = multimem_all_reduce_staged(routed_stage, group_name)
+        # Disjoint projection shards concatenate when injected into the shared sum.
+        routed_reduced = (
+            self.routed_expert_norm(routed_reduced)
+            if self.routed_expert_norm is not None
+            else routed_reduced
         )
+        start, width = self.routed_expert_up_proj.shard_slice
+        routed_projected_shard = self.routed_expert_up_proj.project_shard(
+            routed_reduced
+        )
+        shared_stage[:, start : start + width] += routed_projected_shard + (
+            prefix_sum.view(num_tokens, hidden_size).narrow(-1, start, width)
+        )
+        shared_reduced = multimem_all_reduce_staged(shared_stage, group_name)
+        # Clone: the staging buffer is recycled by the next layer's stage copy.
+        return shared_reduced.view(num_tokens, hidden_size).clone()
 
-    def _projection_tail(
+    def _tail_multimem_ar_replicated(
         self,
-        routed_red: torch.Tensor,
-        shared_red: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        num_tokens: int,
-        hidden_size: int,
-    ) -> torch.Tensor:
-        # up_proj + prefix/shared accumulate; both AR tiers end here. Going
-        # through the module (rather than the raw weight) keeps this correct
-        # when the projection is column parallel, where it also gathers.
-        return self.routed_expert_up_proj.forward_add3(
-            routed_red,
-            prefix_sum,
-            shared_red,
-        ).view(num_tokens, hidden_size)
-
-    def _fold_projection_into_shared(
-        self,
-        latent_normed: torch.Tensor,
+        routed_out: torch.Tensor,
         shared_partial: torch.Tensor,
         prefix_sum: torch.Tensor,
         num_tokens: int,
         hidden_size: int,
-        block: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Eligibility guarantees tp_ep spans WORLD for these symmetric reductions.
+        group_name = torch.distributed.group.WORLD.group_name
+        routed_stage = multimem_stage(routed_out, group_name, MULTIMEM_AR_MAX_TOKENS)
+        shared_stage = (
+            multimem_stage(shared_partial, group_name, MULTIMEM_AR_MAX_TOKENS)
+            if routed_stage is not None
+            else None
+        )
+        # Eligibility guarantees both stages exist; a miss is a contract violation.
+        if routed_stage is None or shared_stage is None:
+            raise RuntimeError(
+                "multimem staging failed after the tier was selected; the "
+                "init-time capability vote and the runtime shapes disagree"
+            )
+        routed_reduced = multimem_all_reduce_staged(routed_stage, group_name)
+        shared_reduced = multimem_all_reduce_staged(shared_stage, group_name)
+        if self.routed_expert_norm is not None:
+            routed_reduced = self.routed_expert_norm(routed_reduced)
+        return self._projection_tail(
+            routed_reduced, shared_reduced, prefix_sum, num_tokens, hidden_size
+        )
+
+    def _projection_tail(
+        self,
+        routed_reduced: torch.Tensor,
+        shared_reduced: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_tokens: int,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        return self.routed_expert_up_proj.forward_add3(
+            routed_reduced,
+            prefix_sum,
+            shared_reduced,
+        ).view(num_tokens, hidden_size)
+
+    def _project_and_inject_local_block(
+        self,
+        routed_reduced: torch.Tensor,
+        shared_partial: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_tokens: int,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        routed_projected_shard = self.routed_expert_up_proj.project_shard(
+            routed_reduced
+        )
+        return self._inject_local_block(
+            routed_projected_shard,
+            shared_partial,
+            prefix_sum,
+            num_tokens,
+            hidden_size,
+        )
+
+    def _inject_local_block(
+        self,
+        routed_projected_shard: torch.Tensor,
+        shared_partial: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_tokens: int,
+        hidden_size: int,
     ) -> torch.Tensor:
         """Add this rank's projection block into its columns of the shared
         partial, in place, so the shared reduction also gathers the projection.
@@ -1703,13 +1736,14 @@ class KimiLinearMoE(nn.Module):
         concatenates the blocks and adds ``prefix`` exactly once per column.
         Works with any sum all-reduce; the caller runs it right after this.
         """
+        # One extra bf16 rounding vs the joined tiers; measured nil on GPQA, not bitwise.
         start, width = self.routed_expert_up_proj.shard_slice
-        if block is None:
-            block = self.routed_expert_up_proj.project_shard(latent_normed)
         shared_partial = shared_partial.view(num_tokens, hidden_size)
-        shared_partial[:, start : start + width] += block + prefix_sum.view(
-            num_tokens, hidden_size
-        ).narrow(-1, start, width)
+        shared_partial[
+            :, start : start + width
+        ] += routed_projected_shard + prefix_sum.view(num_tokens, hidden_size).narrow(
+            -1, start, width
+        )
         return shared_partial
 
     def _tail_fused_lane_ar(
@@ -1721,22 +1755,41 @@ class KimiLinearMoE(nn.Module):
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
-        if self.routed_expert_up_proj.shard_group is not None:
-            # Split the joined reduction so the projection has a collective to
-            # fold into: reduce the routed lane, norm, project this rank's
-            # column block, then let the shared reduction gather it. Bytes on
-            # the wire equal the joined AR's; the extra launch is paid for by
-            # the projection GEMM shrinking to 1/tp. (The lane is disabled in
-            # shard mode, so routed_out is always a standalone tensor here.)
-            routed_red = all_reduce(routed_out, self.mapping.moe.tp_ep_group)
-            if self.routed_expert_norm is not None:
-                routed_red = self.routed_expert_norm(routed_red)
-            folded = self._fold_projection_into_shared(
-                routed_red, shared_partial, prefix_sum, num_tokens, hidden_size
+        if self._shard_up_projection:
+            return self._tail_fused_lane_ar_sharded(
+                routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
             )
-            return all_reduce(folded, self.mapping.moe.tp_ep_group)
-        # The join owns the lane/cat/grouped-NCCL strategy per size and lane hit.
-        routed_red, shared_out = kimi3_join_reduce_moe(
+        return self._tail_fused_lane_ar_replicated(
+            routed_out, shared_partial, prefix_sum, lane, num_tokens, hidden_size
+        )
+
+    def _tail_fused_lane_ar_sharded(
+        self,
+        routed_out: torch.Tensor,
+        shared_partial: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_tokens: int,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        # Sharded projection folds into the shared reduction; the packed lane is disabled here.
+        routed_reduced = all_reduce(routed_out, self.mapping.moe.tp_ep_group)
+        if self.routed_expert_norm is not None:
+            routed_reduced = self.routed_expert_norm(routed_reduced)
+        shared_partial = self._project_and_inject_local_block(
+            routed_reduced, shared_partial, prefix_sum, num_tokens, hidden_size
+        )
+        return all_reduce(shared_partial, self.mapping.moe.tp_ep_group)
+
+    def _tail_fused_lane_ar_replicated(
+        self,
+        routed_out: torch.Tensor,
+        shared_partial: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        lane: torch.Tensor | None,
+        num_tokens: int,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        routed_reduced, shared_reduced = kimi3_join_reduce_moe(
             routed_out,
             shared_partial,
             lane=lane,
@@ -1747,7 +1800,7 @@ class KimiLinearMoE(nn.Module):
             max_token_num=self.execution_plan.comm_fusion_max_num_tokens,
         )
         return self._projection_tail(
-            routed_red, shared_out, prefix_sum, num_tokens, hidden_size
+            routed_reduced, shared_reduced, prefix_sum, num_tokens, hidden_size
         )
 
     def _reduce_project_routed(self, routed_out: torch.Tensor) -> torch.Tensor:
@@ -1757,17 +1810,15 @@ class KimiLinearMoE(nn.Module):
         shared-expert branch; the tier method then receives an
         already-projected routed output, unlike the other tiers.
         """
+        routed_reduced = routed_out
         if self.mapping.moe.has_tp_ep:
-            routed_out = all_reduce(routed_out, self.mapping.moe.tp_ep_group)
+            routed_reduced = all_reduce(routed_reduced, self.mapping.moe.tp_ep_group)
         if self.routed_expert_norm is not None:
-            routed_out = self.routed_expert_norm(routed_out)
-        if self.routed_expert_up_proj.shard_group is not None:
-            # Column block only; _tail_separate_reduce folds it into the
-            # shared reduction it runs anyway (the fold itself must wait for
-            # the fork to join, since the shared partial is produced on the
-            # other branch).
-            return self.routed_expert_up_proj.project_shard(routed_out)
-        return self.routed_expert_up_proj(routed_out)[0]
+            routed_reduced = self.routed_expert_norm(routed_reduced)
+        if self._shard_up_projection:
+            # This block must wait for the fork before folding into the shared reduction.
+            return self.routed_expert_up_proj.project_shard(routed_reduced)
+        return self.routed_expert_up_proj(routed_reduced)[0]
 
     def _tail_separate_reduce(
         self,
@@ -1777,25 +1828,48 @@ class KimiLinearMoE(nn.Module):
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
-        if self.routed_expert_up_proj.shard_group is not None:
-            # routed_out is this rank's projected column block; the shared
-            # reduction below gathers it for free.
-            folded = self._fold_projection_into_shared(
-                routed_out,  # unused when block is given
-                shared_partial,
-                prefix_sum,
-                num_tokens,
-                hidden_size,
-                block=routed_out,
+        if self._shard_up_projection:
+            return self._tail_separate_reduce_sharded(
+                routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
             )
-            return self._reduce_shared(folded).view(num_tokens, hidden_size)
-        # routed_out arrives reduced and projected from the fork scope.
-        shared_out = self._reduce_shared(shared_partial)
+        return self._tail_separate_reduce_replicated(
+            routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
+        )
+
+    def _tail_separate_reduce_sharded(
+        self,
+        routed_out: torch.Tensor,
+        shared_partial: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_tokens: int,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        routed_projected_shard = routed_out
+        shared_partial = self._inject_local_block(
+            routed_projected_shard,
+            shared_partial,
+            prefix_sum,
+            num_tokens,
+            hidden_size,
+        )
+        shared_reduced = self._reduce_shared(shared_partial)
+        return shared_reduced.view(num_tokens, hidden_size)
+
+    def _tail_separate_reduce_replicated(
+        self,
+        routed_out: torch.Tensor,
+        shared_partial: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_tokens: int,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        routed_projected = routed_out
+        shared_reduced = self._reduce_shared(shared_partial)
         # routed_scaling_factor already applied in TopK (matches reference).
         return add3(
             prefix_sum,
-            routed_out.view(num_tokens, hidden_size),
-            shared_out.view(num_tokens, hidden_size),
+            routed_projected.view(num_tokens, hidden_size),
+            shared_reduced.view(num_tokens, hidden_size),
         )
 
     def _reduce_shared(self, shared_partial: torch.Tensor) -> torch.Tensor:

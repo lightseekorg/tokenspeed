@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import cuda.bindings.driver as cuda
@@ -108,22 +107,9 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         include_routed: bool = True,
         use_pdl: bool | None = None,
     ):
-        # The collective is the tail's FIRST kernel, so its PDL primary is
-        # whichever kernel the model ran last -- for K3 the flashinfer trtllm
-        # MoE chain, whose routing kernel fires its programmatic-launch
-        # trigger long before GEMM2/finalize finish writing the routed
-        # partial this kernel reads (see flashinfer#3835). A PDL launch here
-        # can therefore consume partially-written expert output. Plain launch
-        # restores full stream ordering against the producer; the
-        # up-projection and gather keep PDL, whose primaries are the tail's
-        # own kernels with sound trigger placement. (Bound in host Python:
-        # the JIT resolves names off self, not module globals.)
-        # TOKENSPEED_K3_TAIL_COLLECTIVE_PDL=0 downgrades this kernel's launch
-        # to plain stream order, giving operators a no-rebuild fallback if a
-        # producer with an early programmatic trigger ever reappears.
-        _off = os.environ.get("TOKENSPEED_K3_TAIL_COLLECTIVE_PDL") == "0"
+        # Bind in host Python; the JIT resolves names from self, not module globals.
         if use_pdl is None:
-            self.use_pdl = (not _off) and PDL_ENABLED
+            self.use_pdl = PDL_ENABLED
         else:
             self.use_pdl = use_pdl and PDL_ENABLED
         validate_shape(
@@ -261,13 +247,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 tidx,
             )
             token = token + self.token_ctas
-        # PDL trigger only after this CTA's LAST token wave is stored: the
-        # dependent GEMM's griddepcontrol.wait releases once every primary
-        # CTA has *triggered*, not completed. The old "early PDL point
-        # before RMSNorm" (inside the token loop, pre-store) let the GEMM
-        # read the previous iteration's latent -- plausible values, wrong
-        # step, and invisible to any fixed-input bitwise test. Placed after
-        # the loop, a multi-wave m cannot release dependents between waves.
+        # Trigger dependents only after every CTA stores its final token wave.
         cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
@@ -294,7 +274,6 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         tidx: Int32,
     ):
         if role == 0:
-            # ---------------- routed AllReduce + RMSNorm ----------------
             packed_idx = cluster_rank * self.threads + tidx
             element_offset = (
                 Int64(token) * self.latent_dim + Int64(packed_idx) * VEC_BF16
@@ -490,7 +469,6 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 cute.arch.store(access_counter.llvm_ptr, Uint32(0))
 
         else:
-            # ---------------- shared ReduceScatter ----------------
             shared_group = role - 1
             destination = shared_group * self.cluster_ctas + cluster_rank
             current_index = cute.arch.load((shared_flags.iterator + 0).llvm_ptr, Uint32)
@@ -611,8 +589,6 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             if destination == self.rank:
                 cute.arch.barrier()
 
-            # (PDL trigger moved to kernel(), after the token loop -- a
-            # per-wave trigger here releases dependents between waves.)
 
             if (
                 token_cta == 0
@@ -909,12 +885,7 @@ class CollectiveKernel:
             raise RuntimeError("routed NVLS multicast mapping is unavailable")
         self._routed_multicast_ptr = int(routed_multicast_ptr)
 
-        # Kernel-visible staging: written by this collective, consumed by the
-        # up-projection immediately after, dead before any later op runs on
-        # the stream. With a scratch allocator (the runtime's workspace pool)
-        # every layer's staging aliases one shared block; the allocator's
-        # contract requires re-fetching the views on every call and warming
-        # the peak size before the first CUDA-graph capture, both done here.
+        # Shared staging views must be reacquired per call and warmed before graph capture.
         self._scratch_allocator = scratch_allocator
         self._scratch_specs = (
             ((max_m, latent_dim), torch.bfloat16),
@@ -928,8 +899,7 @@ class CollectiveKernel:
                 (max_m, hidden_dim), dtype=torch.bfloat16, device=device
             )
         else:
-            # Warm to peak so the pool can still grow (construction happens
-            # before capture); the views are refreshed per call.
+            # Grow the pool to peak before capture freezes its address.
             self._latent_output, self._shared_output = scratch_allocator(
                 *self._scratch_specs
             )
@@ -1012,8 +982,7 @@ class CollectiveKernel:
             raise ValueError(f"runtime M={m} must be in [1, {self.max_m}]")
 
         if self._scratch_allocator is not None:
-            # Pool contract: never hold views across allocate calls -- other
-            # ops share the block and growth before the freeze moves it.
+            # Pool views cannot survive another allocation, which may move the block.
             self._latent_output, self._shared_output = self._scratch_allocator(
                 *self._scratch_specs
             )
@@ -1051,8 +1020,20 @@ class CollectiveKernel:
 
     @property
     def latent_output(self) -> torch.Tensor:
+        if self._scratch_allocator is not None:
+            raise RuntimeError(
+                "staging comes from the shared workspace pool; holding a view "
+                "outside a call violates the pool contract -- use the tensors "
+                "returned by __call__"
+            )
         return self._latent_output
 
     @property
     def shared_output(self) -> torch.Tensor:
+        if self._scratch_allocator is not None:
+            raise RuntimeError(
+                "staging comes from the shared workspace pool; holding a view "
+                "outside a call violates the pool contract -- use the tensors "
+                "returned by __call__"
+            )
         return self._shared_output

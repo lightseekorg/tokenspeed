@@ -37,7 +37,6 @@ staging can come from the runtime's shared workspace pool via
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 
 import torch
@@ -80,17 +79,7 @@ def latent_tail_supported(
     latent_size: int,
     dtype: torch.dtype,
 ) -> bool:
-    """Cheap, non-collective eligibility probe (no rendezvous).
-
-    ``TOKENSPEED_DISABLE_K3_LATENT_TAIL=1`` forces this to False. The tail is
-    the branch's most invasive component -- it replaces the whole tail
-    collective with a multicast mailbox -- so an operator (or an A/B) needs to
-    be able to take it out of the picture without editing code or rebuilding.
-    Reported as unsupported rather than skipped later, so the tier selector
-    sees capacity 0 and every size falls to the ordinary tiers.
-    """
-    if os.environ.get("TOKENSPEED_DISABLE_K3_LATENT_TAIL") == "1":
-        return False
+    """Cheap, non-collective eligibility probe (no rendezvous)."""
     if tp_size not in _SUPPORTED_TP_SIZES:
         return False
     if (hidden_size, latent_size) != (7168, 3584) or dtype != torch.bfloat16:
@@ -116,15 +105,8 @@ class _Contract:
     hidden_size: int
     latent_size: int
     rms_eps: float
-    # Callers must not share a mailbox: the gather releases its same-stream
-    # dependents before it rewrites sentinels, so the next caller's multicast
-    # shard can land in storage the previous one is still clearing. Within a
-    # caller the next collective's completion-scoped wait orders the two;
-    # across callers that edge runs through every kernel in between and is not
-    # guaranteed. The owner string is the module's prefix rather than a layer
-    # index because a draft model repeats the base model's indices -- keying on
-    # the index alone would hand the speculative layer the base layer's
-    # mailbox.
+    # Mailboxes are owner-private because cleanup may overlap same-stream successors.
+    # Use module prefixes: draft models can repeat base-model layer indices.
     owner: str
 
 
@@ -175,10 +157,25 @@ class KimiK3LatentTailOp:
             rms_eps=float(rms_eps),
             owner=owner,
         )
+
+        def _alloc_identity(alloc):
+            # Bound method identity is unstable; compare the owning pool object.
+            return getattr(alloc, "__self__", alloc)
+
         op = cls._instances.get(contract)
         if op is None:
             op = cls(contract, group, scratch_allocator=scratch_allocator)
+            op._scratch_allocator_key = _alloc_identity(scratch_allocator)
             cls._instances[contract] = op
+        elif getattr(op, "_scratch_allocator_key", None) is not _alloc_identity(
+            scratch_allocator
+        ):
+            # Cached ops must not retain an allocator from a replaced workspace pool.
+            raise RuntimeError(
+                "KimiK3LatentTailOp for this contract already exists with a "
+                "different scratch_allocator; reset the instance cache when "
+                "rebuilding engines in one process"
+            )
         return op
 
     def __init__(
@@ -205,14 +202,7 @@ class KimiK3LatentTailOp:
                 max_m=_MAX_NUM_TOKENS,
                 max_token_ctas=_COLLECTIVE_TOKEN_CTAS,
                 rms_eps=contract.rms_eps,
-                # Diagnostic override: the fp32-internal collective keeps
-                # sub-bf16-ulp perturbations alive that the bf16 tiers round
-                # away; flipping this tests whether that is the amplifier.
-                fp32_internal=(
-                    os.environ.get("TOKENSPEED_K3_TAIL_BF16_INTERNAL") != "1"
-                ),
-                # Optional runtime workspace pool for the per-layer staging;
-                # documented on CollectiveKernel. None keeps private buffers.
+                fp32_internal=True,
                 scratch_allocator=scratch_allocator,
             )
             self._up_projection = AdaptiveUpProjectionKernel(
@@ -266,13 +256,7 @@ class KimiK3LatentTailOp:
             ``[M, 7168]`` post-communication hidden (up-projection + shared,
             plus ``prefix`` when provided).
         """
-        # The gather's sentinel cleanup still overlaps successors via PDL, and
-        # a peer's multicast store into this rank's mailbox is ordered only by
-        # the cross-rank latency window, not by a sync edge. What makes that
-        # safe is the mailbox being private to this caller (see ``owner`` on
-        # ``_Contract``): it is reused a whole forward later, and no rank can
-        # drift that far ahead because every layer's gather blocks on its
-        # peers' data.
+        # Owner-private mailboxes are reused only after every layer's peer-blocking gather.
         m = routed_partial.shape[0]
         self._up_projection.ensure_compiled(m)
         latent, shared_shard = self._collective(

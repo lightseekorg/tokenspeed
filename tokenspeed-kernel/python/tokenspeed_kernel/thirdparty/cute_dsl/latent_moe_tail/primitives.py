@@ -19,19 +19,8 @@ PACKED_BYTES = 16
 NUM_LAMPORT_BUFFERS = 3
 import os
 
-# Operator kill-switch for these kernels' Programmatic Dependent Launch. The
-# server's --disable-pdl exports this; the kernel package cannot import runtime
-# modules, so the env var is the only channel. Read once at import: PDL is a
-# process-wide launch property, and a per-launch lookup would also have to
-# become part of every compile cache key. Turning it off is always safe —
-# in-kernel griddepcontrol waits degenerate to no-ops and plain stream
-# ordering is strictly stronger.
-PDL_ENABLED = (
-    os.environ.get("TOKENSPEED_DISABLE_PDL") != "1"
-    # Tail-only kill-switch: disables PDL in just these four kernels while the
-    # rest of the model keeps it, isolating whose PDL chain costs accuracy.
-    and os.environ.get("TOKENSPEED_K3_TAIL_DISABLE_PDL") != "1"
-)
+# Read the runtime's process-wide PDL kill switch once to keep it out of compile keys.
+PDL_ENABLED = os.environ.get("TOKENSPEED_DISABLE_PDL") != "1"
 
 NEG_ZERO_F32_BITS = 0x80000000
 NEG_ZERO_BF16_BITS = 0x8000

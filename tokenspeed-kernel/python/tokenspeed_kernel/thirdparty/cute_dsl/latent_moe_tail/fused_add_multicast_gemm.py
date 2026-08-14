@@ -210,10 +210,7 @@ def _epilogue_tma_store_add_shared(
         tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
         cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
-        # Single rounding: keep the FP32 accumulator exact through the shared
-        # add. Rounding the GEMM result to BF16 first and again after the add
-        # doubles the epilogue's rounding error for nothing (the join baseline
-        # rounds once).
+        # Keep the accumulator in FP32 through the add so the epilogue rounds once.
         gemm_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
         shared_vec = tiled_copy_r2s.retile(tTR_rShared).load()
         fused_vec = (gemm_vec + shared_vec.to(cutlass.Float32)).to(gemm_kernel.c_dtype)
@@ -296,9 +293,7 @@ class FusedAddMulticastGemm:
         cluster_shape_mn: tuple[int, int],
         b_prime_stages: int = 2,
     ):
-        # Bound here, in host Python: the JIT resolves names off self,
-        # not module globals, so reading the constant at the launch
-        # site itself fails to compile.
+        # Bind in host Python; the JIT resolves names from self, not module globals.
         self.use_pdl = PDL_ENABLED
         self.acc_dtype = cutlass.Float32
         self.cluster_shape_mn = cluster_shape_mn
@@ -990,11 +985,8 @@ def launch_kernel(
             stride=(0, full_hidden_dim, 1),
         ),
     )
-    # (l,m,k) -> (m,k,l)
     a = cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0]))
-    # (l,n,k) -> (n,k,l)
     b = cute.make_tensor(b.iterator, cute.select(b.layout, mode=[1, 2, 0]))
-    # (l,m,n) -> (m,n,l)
     c = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
 
     gemm_op(

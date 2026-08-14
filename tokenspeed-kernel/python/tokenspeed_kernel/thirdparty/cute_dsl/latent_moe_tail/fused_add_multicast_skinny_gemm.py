@@ -74,9 +74,7 @@ class FusedAddMulticastSkinnyGemm:
         hidden_dim: int,
         config: SkinnyConfig,
     ) -> None:
-        # Bound here, in host Python: the JIT resolves names off self,
-        # not module globals, so reading the constant at the launch
-        # site itself fails to compile.
+        # Bind in host Python; the JIT resolves names from self, not module globals.
         self.use_pdl = PDL_ENABLED
         if config.block_size % 32:
             raise ValueError("skinny block_size must be a multiple of 32")
@@ -256,10 +254,7 @@ class FusedAddMulticastSkinnyGemm:
                             reduction_profile=0,
                         )
                     )
-                    # Single rounding: keep the FP32 accumulator exact through
-                    # the shared add. Rounding the GEMM result to BF16 first
-                    # and again after the add doubles the epilogue's rounding
-                    # error for nothing (the join baseline rounds once).
+                    # Keep the accumulator in FP32 through the add so the epilogue rounds once.
                     fused[ni] = (
                         Float32(total) + gShared[mi, n_base + ni].to(Float32)
                     ).to(BFloat16)

@@ -748,18 +748,24 @@ def test_kimi3_latent_projection_shard_forward_add3_matches_replicated(
 
     rows = out // world
 
-    def gather_all(output, local, group):
-        # Emulate the collective: fill each rank's stripe with what that rank
-        # would compute locally (shard GEMM plus its addend column blocks).
-        for r in range(world):
-            output[r] = (
-                a[:, r * rows : (r + 1) * rows]
-                + x @ full[r * rows : (r + 1) * rows].T
-                + c[:, r * rows : (r + 1) * rows]
-            )
+    def stripe(r):
+        return (
+            a[:, r * rows : (r + 1) * rows]
+            + x @ full[r * rows : (r + 1) * rows].T
+            + c[:, r * rows : (r + 1) * rows]
+        )
 
-    monkeypatch.setattr(latent_module, "all_gather_into_tensor", gather_all)
     for rank in range(world):
+
+        def gather_all(output, local, group, _rank=rank):
+            # The mock must first CHECK this rank's local block: it is the
+            # narrow-offset shard math under test, and a gather that ignores
+            # it would pass even with the offsets broken.
+            torch.testing.assert_close(local, stripe(_rank))
+            for r in range(world):
+                output[r] = stripe(r)
+
+        monkeypatch.setattr(latent_module, "all_gather_into_tensor", gather_all)
         proj = _shard_projection(monkeypatch, world, rank, out, k)
         proj.weight_loader(proj.weight, full)
         got = proj.forward_add3(x, a, c)
