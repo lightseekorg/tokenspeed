@@ -207,6 +207,10 @@ def test_qwen_verify_caches_kv_without_draft_recurrent_states():
     assert value.shape == (BATCH * DRAFT_TOKENS, VALUE_DIM)
     torch.testing.assert_close(a, inputs["a"])
     torch.testing.assert_close(b, inputs["b"])
+    cache = backend._gdn_replay_payload_cache
+    assert set(cache["parameter_sources"]) == {0}
+    torch.testing.assert_close(cache["parameters"][0, 0], inputs["A_log"])
+    torch.testing.assert_close(cache["parameters"][0, 1], inputs["dt_bias"])
 
 
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])

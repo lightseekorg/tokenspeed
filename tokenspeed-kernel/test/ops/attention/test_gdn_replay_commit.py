@@ -117,7 +117,7 @@ def _inputs(
 
 
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("head_dims", [(32, 24), (128, 128)])
+@pytest.mark.parametrize("head_dims", [(32, 24), (128, 65), (128, 128)])
 def test_gdn_replay_commit_matches_accepted_prefix_reference(
     device: str,
     state_dtype: torch.dtype,
@@ -308,12 +308,16 @@ def test_gdn_replay_commit_matches_flashinfer_qwen_geometry(device: str, require
     )
 
 
+@pytest.mark.parametrize("head_dims", [(32, 24), (128, 128)])
 def test_gdn_replay_commit_replays_disjoint_layer_pools_in_one_launch(
-    device: str, require
+    device: str, require, head_dims: tuple[int, int]
 ):
     require("attention", "gdn_replay_commit", "triton", torch.bfloat16, "q")
     k, v, a, b, A_log, dt_bias, pool, read, write, accepted = _inputs(
-        device, torch.float32
+        device,
+        torch.float32,
+        head_k_dim=head_dims[0],
+        head_v_dim=head_dims[1],
     )
     batch, draft_tokens, num_k_heads, head_k_dim = k.shape
     num_v_heads, head_v_dim = v.shape[2:]

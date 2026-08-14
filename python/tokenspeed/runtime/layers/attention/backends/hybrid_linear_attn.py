@@ -542,33 +542,30 @@ class MambaAttnBackend(AttentionBackend):
                 },
                 "payload": payload,
                 "parameters": parameters,
+                "parameter_sources": {},
                 "buffers": buffers,
                 "geometry": None,
                 "captured_layers": set(),
             }
         return cache["buffers"][layer_id]
 
-    def _capture_gdn_replay_payload(
+    def _prepare_gdn_replay_capture(
         self,
         layer_id: int,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        a: torch.Tensor,
-        b: torch.Tensor,
         *,
-        batch_size: int,
-        draft_token_num: int,
+        rows: int,
+        max_rows: int,
+        widths: tuple[int, int, int, int],
+        dtypes: tuple[torch.dtype, torch.dtype, torch.dtype, torch.dtype],
         weights: tuple,
-    ) -> None:
-        """Copy one Qwen GDN verify window into layer-major replay storage."""
-        rows = batch_size * draft_token_num
-        max_rows = max(len(self.query_start_loc_list), batch_size) * draft_token_num
-        sources = tuple(tensor.reshape(rows, -1) for tensor in (key, value, a, b))
-        widths = tuple(tensor.shape[-1] for tensor in sources)
-        dtypes = tuple(tensor.dtype for tensor in sources)
-        buffers = self._gdn_replay_payload(layer_id, max_rows, widths, dtypes)
-        for dst, src in zip(buffers, sources):
-            dst[:rows].copy_(src)
+    ) -> torch.Tensor:
+        """Prepare one layer's fused QKV-split replay destination.
+
+        K/V/a/b are written directly by the existing QKV split launch. The
+        model-static A_log/dt_bias table is initialized once during graph
+        warmup, rather than captured as two memcpy nodes per layer.
+        """
+        self._gdn_replay_payload(layer_id, max_rows, widths, dtypes)
         A_log, dt_bias, *geometry = weights
         cache = self._gdn_replay_payload_cache
         geometry = tuple(geometry)
@@ -577,9 +574,33 @@ class MambaAttnBackend(AttentionBackend):
         elif cache["geometry"] != geometry:
             raise RuntimeError("GDN ReplaySSM layer geometry must be uniform")
         layer_slot = cache["layer_slots"][layer_id]
-        cache["parameters"][layer_slot, 0].copy_(A_log)
-        cache["parameters"][layer_slot, 1].copy_(dt_bias)
+        if A_log.shape != (widths[2],) or dt_bias.shape != (widths[2],):
+            raise RuntimeError(
+                "GDN ReplaySSM A_log/dt_bias must match the value-head count"
+            )
+        source_signature = (
+            A_log.data_ptr(),
+            dt_bias.data_ptr(),
+            A_log.dtype,
+            dt_bias.dtype,
+        )
+        parameter_sources = cache["parameter_sources"]
+        previous_source = parameter_sources.get(layer_id)
+        if previous_source is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "GDN ReplaySSM parameters must be initialized during "
+                    "CUDA graph warmup"
+                )
+            cache["parameters"][layer_slot, 0].copy_(A_log)
+            cache["parameters"][layer_slot, 1].copy_(dt_bias)
+            parameter_sources[layer_id] = source_signature
+        elif previous_source != source_signature:
+            raise RuntimeError(
+                "GDN ReplaySSM model parameters changed after initialization"
+            )
         cache["captured_layers"].add(layer_id)
+        return cache["payload"][layer_slot, :rows]
 
     def _gdn_replay_tables_get(self) -> dict:
         """Build stable layer-indexed recurrent-pool address/stride tables."""
@@ -1947,6 +1968,42 @@ class MambaAttnBackend(AttentionBackend):
         num_heads = key_split_dim // head_k_dim
         num_value_heads = value_split_dim // head_v_dim
 
+        replay_payload = None
+        replay_a = None
+        replay_b = None
+        if is_target_verify and self._gdn_replay_active():
+            # Let the existing QKV split launch populate ReplaySSM's packed
+            # K/V/a/b row. This avoids six small capture operations per layer
+            # (four strided copies plus two model-parameter copies).
+            replay_a = a.view(seq_len, -1)
+            replay_b = b.view(seq_len, -1)
+            max_rows = max(len(self.query_start_loc_list), batch_size) * draft_token_num
+            replay_payload = self._prepare_gdn_replay_capture(
+                layer_id,
+                rows=seq_len,
+                max_rows=max_rows,
+                widths=(
+                    key_split_dim,
+                    value_split_dim,
+                    num_value_heads,
+                    num_value_heads,
+                ),
+                dtypes=(
+                    mixed_qkv.dtype,
+                    mixed_qkv.dtype,
+                    replay_a.dtype,
+                    replay_b.dtype,
+                ),
+                weights=(
+                    A_log,
+                    dt_bias,
+                    num_heads,
+                    num_value_heads,
+                    head_k_dim,
+                    head_v_dim,
+                ),
+            )
+
         query, key, value = fused_qkv_split_gdn_prefill(
             mixed_qkv,
             num_q_heads=num_heads,
@@ -1955,31 +2012,12 @@ class MambaAttnBackend(AttentionBackend):
             head_q=head_k_dim,
             head_k=head_k_dim,
             head_v=head_v_dim,
+            replay_payload=replay_payload,
+            replay_a=replay_a,
+            replay_b=replay_b,
         )
 
         if is_target_verify:
-            if self._gdn_replay_active():
-                key_b = key.view(batch_size, draft_token_num, num_heads, head_k_dim)
-                value_b = value.view(
-                    batch_size, draft_token_num, num_value_heads, head_v_dim
-                )
-                self._capture_gdn_replay_payload(
-                    layer_id,
-                    key_b,
-                    value_b,
-                    a.view(batch_size, draft_token_num, -1),
-                    b.view(batch_size, draft_token_num, -1),
-                    batch_size=batch_size,
-                    draft_token_num=draft_token_num,
-                    weights=(
-                        A_log,
-                        dt_bias,
-                        num_heads,
-                        num_value_heads,
-                        head_k_dim,
-                        head_v_dim,
-                    ),
-                )
             core_attn_out = self._verify_scan(
                 query,
                 key,

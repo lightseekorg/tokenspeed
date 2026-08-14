@@ -40,12 +40,13 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from tokenspeed_kernel._triton import gl, gluon
 from tokenspeed_kernel.ops.attention.gdn_utils import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
 )
 from tokenspeed_kernel.ops.attention.triton.linear.chunk import chunk_gated_delta_rule
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -509,7 +510,7 @@ def _gdn_replay_commit_kernel(
     BV: tl.constexpr,
     STATE_DTYPE_CODE: tl.constexpr,
 ):
-    """Recompute accepted GDN states across every layer in one launch."""
+    """Recompute accepted GDN states with one cooperative CTA per state head."""
     i_k, i_v, i_lnh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_hv = i_lnh % HV
     i_ln = i_lnh // HV
@@ -593,6 +594,309 @@ def _gdn_replay_commit_kernel(
         tl.store(p_out, b_h.to(p_out.dtype.element_ty), mask=mask_h)
 
 
+@gluon.jit
+def _gdn_replay_prepare_step(p_k, p_a, p_b, key_smem, b_A_log, b_dt_bias):
+    """Normalize one key and cache its scalar recurrence parameters."""
+    b_k = gl.load(p_k).to(gl.float32)
+    b_k = b_k / gl.sqrt(gl.sum(b_k * b_k, axis=0) + 1e-6)
+    key_smem.store(b_k)
+
+    b_a = gl.load(p_a).to(gl.float32)
+    b_beta_raw = gl.load(p_b).to(gl.float32)
+    x = b_a + b_dt_bias
+    softplus_x = gl.where(x <= 20.0, gl.log(1.0 + gl.exp(x)), x)
+    b_g = -gl.exp(b_A_log) * softplus_x
+    decay = gl.exp(b_g)
+    beta = 1.0 / (1.0 + gl.exp(-b_beta_raw))
+    return decay, beta
+
+
+@gluon.jit
+def _gdn_replay_value_chunk(
+    b_h,
+    p_v,
+    o_v,
+    steps,
+    key_smem0,
+    key_smem1,
+    key_smem2,
+    key_smem3,
+    decay0,
+    decay1,
+    decay2,
+    decay3,
+    beta0,
+    beta1,
+    beta2,
+    beta3,
+    payload_width: gl.constexpr,
+    KEY_LAYOUT: gl.constexpr,
+):
+    """Replay one V=8 fragment while its state remains in registers."""
+    if steps > 0:
+        b_k = key_smem0.load(KEY_LAYOUT)
+        b_v = gl.load(p_v + o_v).to(gl.float32)
+        b_h *= decay0
+        delta = b_v - gl.sum(b_h * b_k[:, None, None], axis=0)
+        b_h += b_k[:, None, None] * (delta * beta0)[None, :, :]
+        p_v += payload_width
+    if steps > 1:
+        b_k = key_smem1.load(KEY_LAYOUT)
+        b_v = gl.load(p_v + o_v).to(gl.float32)
+        b_h *= decay1
+        delta = b_v - gl.sum(b_h * b_k[:, None, None], axis=0)
+        b_h += b_k[:, None, None] * (delta * beta1)[None, :, :]
+        p_v += payload_width
+    if steps > 2:
+        b_k = key_smem2.load(KEY_LAYOUT)
+        b_v = gl.load(p_v + o_v).to(gl.float32)
+        b_h *= decay2
+        delta = b_v - gl.sum(b_h * b_k[:, None, None], axis=0)
+        b_h += b_k[:, None, None] * (delta * beta2)[None, :, :]
+        p_v += payload_width
+    if steps > 3:
+        b_k = key_smem3.load(KEY_LAYOUT)
+        b_v = gl.load(p_v + o_v).to(gl.float32)
+        b_h *= decay3
+        delta = b_v - gl.sum(b_h * b_k[:, None, None], axis=0)
+        b_h += b_k[:, None, None] * (delta * beta3)[None, :, :]
+    return b_h
+
+
+@gluon.jit(do_not_specialize=["B", "T", "PAYLOAD_LAYER_STRIDE"])
+def _gdn_replay_commit_4warp_kernel(
+    payload,
+    parameters,
+    state_addresses,
+    state_row_strides,
+    read_indices,
+    write_indices,
+    accepted_length,
+    B,
+    T,
+    PAYLOAD_LAYER_STRIDE,
+    H: gl.constexpr,
+    HV: gl.constexpr,
+    K: gl.constexpr,
+    V: gl.constexpr,
+    BK: gl.constexpr,
+    BV: gl.constexpr,
+    STATE_DTYPE_CODE: gl.constexpr,
+):
+    """Replay one complete state head with four cooperating NVIDIA warps."""
+    i_k, i_v, i_lnh = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    i_hv = i_lnh % HV
+    i_ln = i_lnh // HV
+    i_n = i_ln % B
+    i_l = i_ln // B
+    i_h = i_hv // (HV // H)
+
+    # Shape state fragments as [K, warp, V-chunk]. Each warp owns one adjacent
+    # V=32 slice, processed as four independent V=8 chunks. Recurrence is
+    # separable across V, so each chunk replays every accepted token before the
+    # next chunk starts. Only one state fragment is live in registers.
+    state_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 1], [32, 1, 1], [1, 4, 1], [0, 2, 1]
+    )
+    key_distributed_layout: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
+    key_replicated_layout: gl.constexpr = gl.SliceLayout(
+        1, gl.SliceLayout(2, state_layout)
+    )
+    value_layout: gl.constexpr = gl.SliceLayout(0, state_layout)
+    warp_layout: gl.constexpr = gl.SliceLayout(1, value_layout)
+    chunk_layout: gl.constexpr = gl.SliceLayout(0, value_layout)
+    key_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+    key_smem0 = gl.allocate_shared_memory(gl.float32, [BK], key_shared_layout)
+    key_smem1 = gl.allocate_shared_memory(gl.float32, [BK], key_shared_layout)
+    key_smem2 = gl.allocate_shared_memory(gl.float32, [BK], key_shared_layout)
+    key_smem3 = gl.allocate_shared_memory(gl.float32, [BK], key_shared_layout)
+
+    o_k_distributed = i_k * BK + gl.arange(0, BK, layout=key_distributed_layout)
+    o_k = i_k * BK + gl.arange(0, BK, layout=key_replicated_layout)
+    o_warp = gl.arange(0, 4, layout=warp_layout)
+    o_chunk = gl.arange(0, 8, layout=chunk_layout)
+    o_v0 = i_v * BV + o_warp[:, None] * 32 + o_chunk[None, :]
+    o_v1 = o_v0 + 8
+    o_v2 = o_v0 + 16
+    o_v3 = o_v0 + 24
+    key_width: gl.constexpr = H * K
+    value_width: gl.constexpr = HV * V
+    payload_width: gl.constexpr = key_width + value_width + 2 * HV
+    layer_base = i_l * PAYLOAD_LAYER_STRIDE
+    request_base = layer_base + i_n * T * payload_width
+    p_k = payload + request_base + i_h * K + o_k_distributed
+    p_v = payload + request_base + key_width + i_hv * V
+    p_a = payload + request_base + key_width + value_width + i_hv
+    p_b = p_a + HV
+
+    layer_request = i_l * B + i_n
+    read_idx = gl.load(read_indices + layer_request).to(gl.int64)
+    steps = gl.load(accepted_length + i_n).to(gl.int32)
+    steps = gl.minimum(gl.maximum(steps, 0), T)
+
+    parameter_base = i_l * 2 * HV + i_hv
+    b_A_log = gl.load(parameters + parameter_base).to(gl.float32)
+    b_dt_bias = gl.load(parameters + parameter_base + HV).to(gl.float32)
+    decay0, decay1, decay2, decay3 = 1.0, 1.0, 1.0, 1.0
+    beta0, beta1, beta2, beta3 = 0.0, 0.0, 0.0, 0.0
+    if steps > 0:
+        decay0, beta0 = _gdn_replay_prepare_step(
+            p_k, p_a, p_b, key_smem0, b_A_log, b_dt_bias
+        )
+    if steps > 1:
+        decay1, beta1 = _gdn_replay_prepare_step(
+            p_k + payload_width,
+            p_a + payload_width,
+            p_b + payload_width,
+            key_smem1,
+            b_A_log,
+            b_dt_bias,
+        )
+    if steps > 2:
+        decay2, beta2 = _gdn_replay_prepare_step(
+            p_k + 2 * payload_width,
+            p_a + 2 * payload_width,
+            p_b + 2 * payload_width,
+            key_smem2,
+            b_A_log,
+            b_dt_bias,
+        )
+    if steps > 3:
+        decay3, beta3 = _gdn_replay_prepare_step(
+            p_k + 3 * payload_width,
+            p_a + 3 * payload_width,
+            p_b + 3 * payload_width,
+            key_smem3,
+            b_A_log,
+            b_dt_bias,
+        )
+    gl.barrier()
+
+    state_address = gl.load(state_addresses + i_l)
+    if STATE_DTYPE_CODE == 0:
+        state_pool = state_address.to(gl.pointer_type(gl.bfloat16))
+    elif STATE_DTYPE_CODE == 1:
+        state_pool = state_address.to(gl.pointer_type(gl.float16))
+    else:
+        state_pool = state_address.to(gl.pointer_type(gl.float32))
+    state_row_stride = gl.load(state_row_strides + i_l).to(gl.int64)
+    write_idx = gl.load(write_indices + layer_request).to(gl.int64)
+    p_h_base = state_pool + read_idx * state_row_stride + i_hv * V * K
+    p_out_base = state_pool + write_idx * state_row_stride + i_hv * V * K
+
+    p_h = p_h_base + o_v0[None, :, :] * K + o_k[:, None, None]
+    b_h = gl.zeros([BK, 4, 8], dtype=gl.float32, layout=state_layout)
+    if read_idx >= 0:
+        b_h += gl.load(p_h).to(gl.float32)
+    b_h = _gdn_replay_value_chunk(
+        b_h,
+        p_v,
+        o_v0,
+        steps,
+        key_smem0,
+        key_smem1,
+        key_smem2,
+        key_smem3,
+        decay0,
+        decay1,
+        decay2,
+        decay3,
+        beta0,
+        beta1,
+        beta2,
+        beta3,
+        payload_width,
+        key_replicated_layout,
+    )
+    if write_idx >= 0:
+        p_out = p_out_base + o_v0[None, :, :] * K + o_k[:, None, None]
+        gl.store(p_out, b_h.to(p_out.dtype.element_ty))
+
+    p_h = p_h_base + o_v1[None, :, :] * K + o_k[:, None, None]
+    b_h = gl.zeros([BK, 4, 8], dtype=gl.float32, layout=state_layout)
+    if read_idx >= 0:
+        b_h += gl.load(p_h).to(gl.float32)
+    b_h = _gdn_replay_value_chunk(
+        b_h,
+        p_v,
+        o_v1,
+        steps,
+        key_smem0,
+        key_smem1,
+        key_smem2,
+        key_smem3,
+        decay0,
+        decay1,
+        decay2,
+        decay3,
+        beta0,
+        beta1,
+        beta2,
+        beta3,
+        payload_width,
+        key_replicated_layout,
+    )
+    if write_idx >= 0:
+        p_out = p_out_base + o_v1[None, :, :] * K + o_k[:, None, None]
+        gl.store(p_out, b_h.to(p_out.dtype.element_ty))
+
+    p_h = p_h_base + o_v2[None, :, :] * K + o_k[:, None, None]
+    b_h = gl.zeros([BK, 4, 8], dtype=gl.float32, layout=state_layout)
+    if read_idx >= 0:
+        b_h += gl.load(p_h).to(gl.float32)
+    b_h = _gdn_replay_value_chunk(
+        b_h,
+        p_v,
+        o_v2,
+        steps,
+        key_smem0,
+        key_smem1,
+        key_smem2,
+        key_smem3,
+        decay0,
+        decay1,
+        decay2,
+        decay3,
+        beta0,
+        beta1,
+        beta2,
+        beta3,
+        payload_width,
+        key_replicated_layout,
+    )
+    if write_idx >= 0:
+        p_out = p_out_base + o_v2[None, :, :] * K + o_k[:, None, None]
+        gl.store(p_out, b_h.to(p_out.dtype.element_ty))
+
+    p_h = p_h_base + o_v3[None, :, :] * K + o_k[:, None, None]
+    b_h = gl.zeros([BK, 4, 8], dtype=gl.float32, layout=state_layout)
+    if read_idx >= 0:
+        b_h += gl.load(p_h).to(gl.float32)
+    b_h = _gdn_replay_value_chunk(
+        b_h,
+        p_v,
+        o_v3,
+        steps,
+        key_smem0,
+        key_smem1,
+        key_smem2,
+        key_smem3,
+        decay0,
+        decay1,
+        decay2,
+        decay3,
+        beta0,
+        beta1,
+        beta2,
+        beta3,
+        payload_width,
+        key_replicated_layout,
+    )
+    if write_idx >= 0:
+        p_out = p_out_base + o_v3[None, :, :] * K + o_k[:, None, None]
+        gl.store(p_out, b_h.to(p_out.dtype.element_ty))
+
+
 @register_kernel(
     "attention",
     "gdn_replay_commit",
@@ -655,6 +959,39 @@ def triton_gdn_replay_commit(
         raise ValueError(f"unsupported GDN replay state dtype: {state_dtype}")
 
     BK = triton.next_power_of_2(head_k_dim)
+    if (
+        current_platform().is_nvidia
+        and head_k_dim == 128
+        and head_v_dim == 128
+        and draft_token_num <= 4
+    ):
+        # Qwen's complete state head fits one four-warp CTA. Explicit Gluon
+        # layouts assign one 32-wide value slice to each warp and perform key
+        # normalization cooperatively across the CTA.
+        BV = 128
+        _gdn_replay_commit_4warp_kernel[(1, 1, num_layers * batch_size * num_v_heads)](
+            payload=payload,
+            parameters=parameters,
+            state_addresses=state_addresses,
+            state_row_strides=state_row_strides,
+            read_indices=read_indices,
+            write_indices=write_indices,
+            accepted_length=accepted_length,
+            B=batch_size,
+            T=draft_token_num,
+            PAYLOAD_LAYER_STRIDE=payload.stride(0),
+            H=num_k_heads,
+            HV=num_v_heads,
+            K=head_k_dim,
+            V=head_v_dim,
+            BK=BK,
+            BV=BV,
+            STATE_DTYPE_CODE=state_dtype_codes[state_dtype],
+            num_warps=4,
+            sanitize_overflow=False,
+        )
+        return
+
     BV = min(triton.next_power_of_2(head_v_dim), 32)
     NK, NV = triton.cdiv(head_k_dim, BK), triton.cdiv(head_v_dim, BV)
     if NK != 1:
