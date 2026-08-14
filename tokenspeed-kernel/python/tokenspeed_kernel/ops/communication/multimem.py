@@ -34,7 +34,6 @@ _BUFFERS: dict[tuple[int, int, str], torch.Tensor] = {}
 # Replaced buffers stay referenced: in-flight kernels may still read them.
 _RETIRED: list[torch.Tensor] = []
 _SUPPORTED: bool | None = None
-_AGREED: bool | None = None
 _MIN_BUFFER_ROWS = 2048
 
 
@@ -62,25 +61,6 @@ def multimem_available() -> bool:
         supported = False
     _SUPPORTED = supported
     return _SUPPORTED
-
-
-def multimem_available_all_ranks() -> bool:
-    """Collectively-agreed availability (min over ranks); call in lockstep.
-
-    Returns:
-        True only when every rank's local probe succeeded, so no rank can
-        privately fall back while its peers wait in a multimem barrier.
-    """
-    global _AGREED
-    if _AGREED is None:
-        import torch.distributed as dist
-
-        flag = torch.tensor(
-            [int(multimem_available())], dtype=torch.int32, device="cuda"
-        )
-        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
-        _AGREED = bool(flag.item())
-    return _AGREED
 
 
 def _ensure_buffer(
@@ -193,7 +173,6 @@ def multimem_all_reduce_staged(view: torch.Tensor, group_name: str) -> torch.Ten
 __all__ = [
     "multimem_available",
     "multimem_prealloc",
-    "multimem_available_all_ranks",
     "multimem_stage",
     "multimem_all_reduce_staged",
 ]

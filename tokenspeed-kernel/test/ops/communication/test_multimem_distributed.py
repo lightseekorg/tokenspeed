@@ -61,14 +61,24 @@ def _setup():
     return rank, torch.device("cuda", rank)
 
 
-def _require_multimem():
-    # Collectively-agreed probe (all_reduce inside): every rank calls it in
-    # lockstep at the top of every test, so skips agree across ranks.
-    from tokenspeed_kernel.ops.communication.multimem import (
-        multimem_available_all_ranks,
-    )
+_AGREED: bool | None = None
 
-    if not multimem_available_all_ranks():
+
+def _require_multimem():
+    # Collectively-agreed probe: every rank calls in lockstep at the top of
+    # every test, so skips agree across ranks. The vote lives here (world
+    # group, matching this suite's span) rather than in the ops module, whose
+    # group-less variant invited wrong-group votes from subgroup callers.
+    global _AGREED
+    from tokenspeed_kernel.ops.communication.multimem import multimem_available
+
+    if _AGREED is None:
+        flag = torch.tensor(
+            [int(multimem_available())], dtype=torch.int32, device="cuda"
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+        _AGREED = bool(flag.item())
+    if not _AGREED:
         pytest.skip("platform has no rank-agreed multicast (NVLS) support")
 
 

@@ -1321,6 +1321,7 @@ class KimiLinearMoE(nn.Module):
                 hidden_size=config.hidden_size,
                 latent_size=self.routed_hidden,
                 dtype=torch.bfloat16,
+                group=torch.distributed.group.WORLD,
             )
 
         self._multimem_ar_ok = False
@@ -1336,11 +1337,19 @@ class KimiLinearMoE(nn.Module):
 
             if multimem_ok:
                 # Collective buffers must reach peak size before serving.
-                self._multimem_ar_ok = multimem_prealloc(
+                prealloc_ok = multimem_prealloc(
                     MULTIMEM_AR_MAX_TOKENS,
                     (self.routed_hidden, config.hidden_size),
                     torch.distributed.group.WORLD.group_name,
                 )
+                # Second vote: the capability vote only aligned intent. A rank
+                # whose allocation failed must not fall back alone -- an
+                # asymmetric tier choice deadlocks the collective at decode.
+                done = torch.tensor(
+                    [int(prealloc_ok)], dtype=torch.int32, device="cuda"
+                )
+                torch.distributed.all_reduce(done, op=torch.distributed.ReduceOp.MIN)
+                self._multimem_ar_ok = bool(done.item())
             if tail_ok:
                 from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
 

@@ -1194,6 +1194,12 @@ class AdaptiveUpProjectionKernel:
                 num_rows=m,
             )
 
+    def is_compiled(self, m: int) -> bool:
+        """Whether ``ensure_compiled(m)`` would be a cache hit (no JIT work)."""
+        if m <= self.skinny_max_m:
+            return m in self._skinny_by_m
+        return self._dynamic is not None
+
     def ensure_compiled(self, m: int) -> None:
         if not 1 <= m <= self.max_m:
             raise ValueError(f"runtime M={m} must be in [1, {self.max_m}]")

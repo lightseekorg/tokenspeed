@@ -55,19 +55,21 @@ _LAMPORT_COPY_THREADS = 224
 _SUPPORTED_TP_SIZES = (8, 16)
 
 
-def _multicast_reachable() -> bool:
-    """Whether NVLS multicast can actually map across this job's ranks.
+def _multicast_reachable(group: dist.ProcessGroup | None = None) -> bool:
+    """Whether NVLS multicast can actually map across ``group``'s ranks.
 
     ``symm_mem`` importing is not enough: a cross-host group without fabric or
     IMEX still reports multicast support locally and then hangs inside the
-    rendezvous instead of letting the caller fall back.
+    rendezvous instead of letting the caller fall back. The host-span test is
+    at group granularity: a node-local subgroup of a multi-host job never
+    needs fabric.
     """
     import torch.distributed as dist
     from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
 
     if not dist.is_initialized():
         return False
-    if dist.get_world_size() <= torch.cuda.device_count():
+    if dist.get_world_size(group) <= torch.cuda.device_count():
         return True
     return fabric_allocation_supported(torch.cuda.current_device())
 
@@ -78,8 +80,13 @@ def latent_tail_supported(
     hidden_size: int,
     latent_size: int,
     dtype: torch.dtype,
+    group: dist.ProcessGroup | None = None,
 ) -> bool:
-    """Cheap, non-collective eligibility probe (no rendezvous)."""
+    """Cheap, non-collective eligibility probe (no rendezvous).
+
+    ``group`` scopes the multicast reachability test; None means the default
+    (world) group.
+    """
     if tp_size not in _SUPPORTED_TP_SIZES:
         return False
     if (hidden_size, latent_size) != (7168, 3584) or dtype != torch.bfloat16:
@@ -94,12 +101,14 @@ def latent_tail_supported(
         from torch.distributed import _symmetric_memory  # noqa: F401
     except ImportError:
         return False
-    return _multicast_reachable()
+    return _multicast_reachable(group)
 
 
 @dataclass(frozen=True)
 class _Contract:
-    group_id: int
+    # The registered group name, not id(group): stable for the process
+    # lifetime and the same identity symmetric-memory rendezvous keys on.
+    group_name: str
     tp_size: int
     device: torch.device
     hidden_size: int
@@ -149,7 +158,7 @@ class KimiK3LatentTailOp:
                 call per that pool's contract; None keeps private buffers.
         """
         contract = _Contract(
-            group_id=id(group),
+            group_name=group.group_name,
             tp_size=dist.get_world_size(group),
             device=device,
             hidden_size=hidden_size,
@@ -258,6 +267,11 @@ class KimiK3LatentTailOp:
         """
         # Owner-private mailboxes are reused only after every layer's peer-blocking gather.
         m = routed_partial.shape[0]
+        # JIT compilation launches kernels; under capture they would be
+        # recorded into the graph. Warmup must have compiled this m already.
+        assert not torch.cuda.is_current_stream_capturing() or (
+            self._up_projection.is_compiled(m)
+        ), f"latent-tail up-projection for M={m} must compile in warmup, not capture"
         self._up_projection.ensure_compiled(m)
         latent, shared_shard = self._collective(
             routed_partial,
