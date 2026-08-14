@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
 import torch
 
 
@@ -124,9 +125,16 @@ def test_every_hybrid_backend_forwards_data_type():
 
 
 def test_dead_nope_query_branch_is_gone():
+    import importlib
+
     from tokenspeed.runtime.models import deepseek_v3
 
     src = inspect.getsource(deepseek_v3)
     assert (
         "mla_nope_query_fp8" not in src
     ), "the unreachable NoPE query-assembly branch is back in the model"
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module(
+            "tokenspeed_kernel.ops.attention.triton.mla_query_assemble"
+        )
