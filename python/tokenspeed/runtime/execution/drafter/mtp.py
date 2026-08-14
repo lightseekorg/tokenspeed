@@ -47,7 +47,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.multimodal.inputs import Modality, maybe_substitute_mm_pad
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -57,42 +56,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
-
-
-def _decode_shifted_ids(
-    v: torch.Tensor,
-    accept: torch.Tensor,
-    next_tokens: torch.Tensor,
-    depth: int,
-    src: torch.Tensor,
-) -> torch.Tensor:
-    """Depth-``depth`` input ids over a decode verify window.
-
-    Row ``j`` consumes the token at source position ``p_j + depth``; in
-    verify-output coordinates that is ``src[j]``: ``src < accept`` reads
-    this round's verify output ``v[:, src]``, else the round's own draft
-    ``d_m`` (m = src - accept + 1 <= depth) from ``next_tokens`` columns
-    1..depth. Negative ``src`` rows come out as ``v[:, 0]``; the caller
-    overlays them from its stash (see ``_frontier_shifted_ids``).
-
-    Args:
-        v: [bs, k] verify outputs.
-        accept: [bs, 1] int64 accepted lengths clamped to [1, k].
-        next_tokens: [bs, >= depth+1] col 0 = last verified id, cols 1.. =
-            this round's drafts.
-        depth: draft depth d >= 1.
-        src: [1, n] (or [bs, n]) int64 source coordinates.
-
-    Returns:
-        [bs, n] input ids.
-    """
-    bs, k = v.shape
-    n = src.shape[-1]
-    from_verify = torch.gather(v, 1, src.clamp(0, k - 1).expand(bs, n))
-    drafts = next_tokens[:, 1 : depth + 1]
-    m = (src - accept).clamp_min(0)  # draft index - 1; never exceeds depth - 1
-    from_draft = torch.gather(drafts, 1, m.expand(bs, n))
-    return torch.where(src < accept, from_verify, from_draft)
 
 
 def _extend_depth_precompute(
@@ -162,43 +125,34 @@ def _extend_depth_shifted_ids_from(
 def _frontier_shifted_ids(
     v: torch.Tensor,
     accept: torch.Tensor,
-    next_tokens: torch.Tensor,
     stash_tokens: torch.Tensor,
-    depth: int,
 ) -> torch.Tensor:
-    """Depth-``depth`` input ids over a frontier-anchored decode window.
+    """Depth-0 input ids over a frontier-anchored decode window.
 
     The window's k rows end at the last committed position: row ``j`` sits
     at source position ``frontier - k + j`` (frontier = vc + accept) and
-    consumes the token at source + depth + 1; in verify-output coordinates
-    that is ``src = accept - k + depth + j`` — per-request, unlike the
-    verify-anchored windows' static shifts. ``src < 0`` reads the stash of
-    the last k-1 committed tokens (entry ``src + k - 1``), ``src < accept``
-    this round's verify output ``v[src]``, else this round's own draft
-    ``d_m`` (m = src - accept + 1 <= depth) — every row holds a committed
-    token or a fresh draft, never garbage. Depth 0 never reaches past the
-    accepted prefix (``src <= accept - 1``).
+    consumes the token one past it; in verify-output coordinates that is
+    ``src = accept - k + j`` — per-request, unlike the verify-anchored
+    windows' static shifts. ``src < 0`` reads the stash of the last k-1
+    committed tokens (entry ``src + k - 1``), else this round's verify
+    output ``v[src]`` — depth 0 never reaches past the accepted prefix
+    (``src <= accept - 1``). Deeper depths need no re-splice: they are
+    static slices of [window || drafts], built by the caller.
 
     Args:
         v: [bs, k] verify outputs (token at position vc+j+1 = v[:, j]);
             entries at or past ``accept`` are never read.
-        accept: [bs, 1] int64 accepted lengths clamped to [1, k].
-        next_tokens: [bs, >= depth+1] col 0 = last verified id, cols 1.. =
-            this round's drafts.
+        accept: [bs, 1] accepted lengths in [1, k].
         stash_tokens: [bs, k-1] committed tokens at positions
             vc-k+2 .. vc.
-        depth: draft depth d >= 0.
 
     Returns:
         [bs * k] input ids.
     """
     bs, k = v.shape
     col = torch.arange(k, dtype=torch.int64, device=v.device).view(1, k)
-    src = accept - k + depth + col
-    if depth == 0:
-        ids = torch.gather(v, 1, src.clamp_min(0))
-    else:
-        ids = _decode_shifted_ids(v, accept, next_tokens, depth, src=src)
+    src = accept - k + col
+    ids = torch.gather(v, 1, src.clamp_min(0))
     from_stash = stash_tokens.gather(1, (src + k - 1).clamp_max(k - 2))
     return torch.where(src < 0, from_stash, ids).reshape(-1)
 
@@ -222,7 +176,7 @@ def _frontier_hidden_splice(
         fresh_hidden: [bs, k, H] this round's verify hiddens (row j = the
             hidden at position vc+j); rows at or past ``accept`` are never
             read.
-        accept: [bs, 1] int64 accepted lengths clamped to [1, k].
+        accept: [bs, 1] accepted lengths in [1, k].
 
     Returns:
         [bs * k, H] chain hidden rows for the depth-0 pass.
@@ -232,37 +186,6 @@ def _frontier_hidden_splice(
     col = torch.arange(k, dtype=torch.int64, device=h.device).view(1, k)
     idx = (accept - 1 + col).view(bs, k, 1).expand(bs, k, h.shape[-1])
     return h.gather(1, idx).reshape(bs * k, -1)
-
-
-def _committed_tail_update(
-    stash: torch.Tensor,
-    fresh: torch.Tensor,
-    valid: torch.Tensor,
-    width: int,
-) -> torch.Tensor:
-    """Roll a committed-tail stash: last ``width`` of [stash || fresh[:valid]].
-
-    ``stash``: [bs, width, ...] previous tail; ``fresh``: [bs, k, ...]
-    this round's per-row values whose committed prefix is the first
-    ``valid`` rows (``fresh`` row 0 must directly follow the stash's last
-    entry); ``valid``: [bs] int64 in [1, k].
-
-    Returns:
-        The updated [bs, width, ...] tail.
-    """
-    bs = fresh.shape[0]
-    rows = (
-        valid.view(bs, 1)
-        - width
-        + torch.arange(width, dtype=torch.int64, device=fresh.device).view(1, width)
-    )
-    idx_shape = (bs, width) + (1,) * (fresh.dim() - 2)
-    expand = (bs, width) + fresh.shape[2:]
-    new_rows = fresh.gather(1, rows.clamp_min(0).view(idx_shape).expand(expand))
-    old_rows = stash.gather(
-        1, (rows + width).clamp_max(width - 1).view(idx_shape).expand(expand)
-    )
-    return torch.where((rows >= 0).view(idx_shape), new_rows, old_rows)
 
 
 def _ragged_tail_rows(
@@ -375,11 +298,6 @@ class Mtp(BaseDrafter):
             - 1
         )
 
-        # In-vocab media tokens plumbed by ModelExecutor. The content-derived
-        # prefix-cache pad IDs retain a modality tag and are restored here before
-        # the text-only speculative draft performs its embedding lookup.
-        self.mm_pad_substitute_ids: dict[Modality, int] = {}
-
         # Multi-depth drafting has no DP support: idle rounds (a DP rank
         # keeping collectives in sync with no work of its own) have no
         # window to run.
@@ -410,26 +328,6 @@ class Mtp(BaseDrafter):
             device=self.device,
         )
 
-    def set_mm_pad_substitute_ids(self, substitute_ids: dict[Modality, int]) -> None:
-        if self.vocab_size is None:
-            raise ValueError("MM draft substitution requires a known vocabulary size")
-        invalid = {
-            modality: token_id
-            for modality, token_id in substitute_ids.items()
-            if token_id < 0 or token_id >= self.vocab_size
-        }
-        if invalid:
-            raise ValueError(
-                "MM draft substitute token IDs must be inside the target vocabulary: "
-                f"{invalid} (vocab_size={self.vocab_size})"
-            )
-        self.mm_pad_substitute_ids = dict(substitute_ids)
-
-    def _prepare_draft_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Restore tagged media pads, then guard the draft embedding lookup."""
-        input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_ids)
-        return input_ids.clamp(0, self.vocab_size - 1)
-
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -441,15 +339,12 @@ class Mtp(BaseDrafter):
             return logits_output.next_token_ids
         return sampling_argmax(logits_output.next_token_logits)
 
-    @nvtx_range("run_frontier_window", color="purple")
-    def _run_frontier_window(
+    @nvtx_range("run_decode_depths", color="purple")
+    def _run_decode_depths(
         self,
         bs: int,
         next_tokens: torch.Tensor,
         draft_input: MtpDraftInput,
-        slot: torch.Tensor,
-        v: torch.Tensor,
-        accept: torch.Tensor,
     ) -> None:
         """Frontier-anchored decode window: every depth 0..steps-1 runs the
         SAME k rows per request, ending at the last committed position
@@ -478,6 +373,9 @@ class Mtp(BaseDrafter):
         """
         k = self.spec_num_tokens
         buffers = self.input_buffers
+        slot = buffers.req_pool_indices_buf[:bs]
+        v = draft_input.base_model_output.view(bs, k)
+        accept = draft_input.accept_lengths[:bs].view(bs, 1)
         positions = buffers.positions_buf[: bs * k].view(bs, k)
         # positions[:, 0] is vc, the position before the verify window.
         frontier = (positions[:, 0] + accept.view(-1).to(positions.dtype)).to(
@@ -496,16 +394,27 @@ class Mtp(BaseDrafter):
         # Static sample gather: the last window row sits at frontier-1 for
         # every depth (row at position p and depth d predicts p + d + 2).
         gather_ids = self.padded_gather_ids_offsets_buf[:bs] + k
-        stash_tokens = self._stash_tokens_buf[slot]
-        prev_hidden = _frontier_hidden_splice(
+        # Depth-0 window = the last k committed (token, hidden) pairs; its
+        # tail [:, 1:] is exactly the next round's stash, rolled at the end.
+        # Depth d+1's ids roll the window one left, appending depth d's
+        # draft: only depth 0 is accept-dependent.
+        window_ids = _frontier_shifted_ids(
+            v, accept, self._stash_tokens_buf[slot]
+        ).view(bs, k)
+        spliced_hidden = _frontier_hidden_splice(
             self._stash_hidden_buf[slot],
             draft_input.base_out_hidden_states.view(bs, k, -1),
             accept,
         )
         for d in range(self.spec_num_steps):
-            input_ids = self._prepare_draft_input_ids(
-                _frontier_shifted_ids(v, accept, next_tokens, stash_tokens, d)
-            )
+            if d == 0:
+                input_ids = window_ids
+                prev_hidden = spliced_hidden
+            else:
+                input_ids = torch.cat(
+                    [input_ids[:, 1:], next_tokens[:, d : d + 1]], dim=1
+                )
+                prev_hidden = logits_output.hidden_states
 
             ctx = ForwardContext(
                 bs=bs,
@@ -525,51 +434,18 @@ class Mtp(BaseDrafter):
             with nvtx_range("draft_frontier_forward", color="red"):
                 logits_output = self.draft_model_runner.forward(
                     ctx=ctx,
-                    input_ids=input_ids,
+                    input_ids=input_ids.view(-1),
                     positions=step_positions,
                     out_cache_loc=out_cache_loc,
                     captured_hidden_states=prev_hidden,
                     spec_step_idx=d,
                 )
-            prev_hidden = logits_output.hidden_states
 
             with nvtx_range("draft_sample", color="yellow"):
                 next_tokens[:, d + 1] = self._sample_step_tokens(logits_output)
 
-    def _decode_slices(
-        self, bs: int, draft_input: MtpDraftInput
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``(slot, v, accept)`` shared by the frontier window pass and the
-        decode stash roll: [bs] int64 stash slots, [bs, k] int64 verify
-        outputs, [bs, 1] int64 accepted lengths clamped to [1, k]."""
-        k = self.spec_num_tokens
-        slot = self.input_buffers.req_pool_indices_buf[:bs]
-        v = draft_input.base_model_output.view(bs, k)
-        accept = draft_input.accept_lengths[:bs].to(torch.int64).clamp(1, k).view(bs, 1)
-        return slot, v, accept
-
-    def _update_stash_decode(
-        self,
-        slot: torch.Tensor,
-        accept: torch.Tensor,
-        v: torch.Tensor,
-        hidden_rows: torch.Tensor,
-    ) -> None:
-        """Roll the cross-round drafter stash past a round's decode-row
-        commits.
-
-        Args come pre-sliced per decode row: ``slot`` [n] int64 stash slots,
-        ``accept`` [n]-viewable int64 accepts clamped to [1, k], ``v`` [n, k]
-        int64 verify outputs, ``hidden_rows`` [n, k, H] this round's target
-        verify hiddens (verify hidden row j sits one position behind verify
-        token j, which is why the hidden stash ends one position before the
-        token stash).
-        """
-        width = self._stash_width
-        tokens = self._stash_tokens_buf
-        tokens[slot] = _committed_tail_update(tokens[slot], v, accept, width)
-        hidden = self._stash_hidden_buf
-        hidden[slot] = _committed_tail_update(hidden[slot], hidden_rows, accept, width)
+        self._stash_tokens_buf[slot] = window_ids[:, 1:]
+        self._stash_hidden_buf[slot] = spliced_hidden.view(bs, k, -1)[:, 1:]
 
     def _update_stash_extend(self, draft_input: MtpDraftInput) -> None:
         """Roll the stash across an EXTEND round's chunk rows: the last
@@ -657,7 +533,6 @@ class Mtp(BaseDrafter):
                 if d == 0
                 else _extend_depth_shifted_ids_from(extend_pre, next_tokens, d)
             )
-            step_ids = self._prepare_draft_input_ids(step_ids)
 
             ctx = ForwardContext(
                 bs=bs,
@@ -719,7 +594,12 @@ class Mtp(BaseDrafter):
             device=self.device,
         )
 
-        if draft_input.num_extends == 0:
+        if draft_input.num_extends > 0:
+            # EXTEND round (MIXED batches are rejected at the backend's metadata
+            # init): every depth runs the prompt chunk's ragged rows.
+            next_tokens[:, 0] = draft_input.base_model_output[:bs]
+            self._run_extend_depths(bs, next_tokens, draft_input)
+        else:
             # Pure-decode round: every depth (0 included) runs inside the
             # frontier window loop.
             indices = (
@@ -728,20 +608,8 @@ class Mtp(BaseDrafter):
             torch.index_select(
                 draft_input.base_model_output, 0, indices, out=next_tokens[:, 0]
             )
-            slot, v, accept = self._decode_slices(bs, draft_input)
-            self._run_frontier_window(bs, next_tokens, draft_input, slot, v, accept)
-            self._update_stash_decode(
-                slot,
-                accept,
-                v,
-                draft_input.base_out_hidden_states.view(bs, self.spec_num_tokens, -1),
-            )
-            return next_tokens
+            self._run_decode_depths(bs, next_tokens, draft_input)
 
-        # EXTEND round (MIXED batches are rejected at the backend's metadata
-        # init): every depth runs the prompt chunk's ragged rows.
-        next_tokens[:, 0] = draft_input.base_model_output[:bs]
-        self._run_extend_depths(bs, next_tokens, draft_input)
         return next_tokens
 
     @override

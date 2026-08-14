@@ -7,8 +7,8 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalDataItem,
     is_mm_pad_value,
     is_mm_pad_value_for,
-    maybe_substitute_mm_pad,
     resolve_mm_pad_substitute_ids,
+    substitute_mm_pad_,
 )
 
 
@@ -33,28 +33,20 @@ def test_content_pad_ids_preserve_modality_inside_int32_range():
         assert is_mm_pad_value_for(values, modality).tolist() == expected
 
 
-def test_mtp_substitution_restores_each_modality_token():
+def test_substitution_restores_each_modality_token_in_place():
     image = _item(Modality.IMAGE, 1)
     audio = _item(Modality.AUDIO, 2)
     input_ids = torch.tensor(
         [7, image.pad_value, audio.pad_value, 8], dtype=torch.int32
     )
 
-    output = maybe_substitute_mm_pad(
+    output = substitute_mm_pad_(
         input_ids,
         {Modality.IMAGE: 200005, Modality.AUDIO: 200023},
     )
 
-    assert output.tolist() == [7, 200005, 200023, 8]
-    assert input_ids.tolist() == [7, image.pad_value, audio.pad_value, 8]
-
-
-def test_scalar_mtp_substitution_remains_backward_compatible():
-    image = _item(Modality.IMAGE, 3)
-    audio = _item(Modality.AUDIO, 4)
-    input_ids = torch.tensor([image.pad_value, audio.pad_value], dtype=torch.int32)
-
-    assert maybe_substitute_mm_pad(input_ids, 42).tolist() == [42, 42]
+    assert output is input_ids
+    assert input_ids.tolist() == [7, 200005, 200023, 8]
 
 
 def test_resolve_mtp_tokens_supports_specific_and_shared_model_configs():

@@ -33,7 +33,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.multimodal.inputs import Modality, maybe_substitute_mm_pad
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 DsaTopKState = tuple[Any | None, Any | None]
@@ -133,36 +132,10 @@ class Eagle(BaseDrafter):
             - 1
         )
 
-        # VLM placeholder ids plumbed by ModelExecutor; empty for text-only targets.
-        self.mm_pad_substitute_ids: dict[Modality, int] = {}
         hf_config = getattr(draft_model_runner.model_config, "hf_config", None)
         self._dsa_reuse_mtp_topk = bool(
             getattr(hf_config, "index_share_for_mtp_iteration", False)
         )
-
-    def set_mm_pad_substitute_id(self, token_id: int) -> None:
-        """Legacy one-token substitution used by single-modality callers."""
-        self.set_mm_pad_substitute_ids({modality: token_id for modality in Modality})
-
-    def set_mm_pad_substitute_ids(self, substitute_ids: dict[Modality, int]) -> None:
-        if self.vocab_size is None:
-            raise ValueError("MM draft substitution requires a known vocabulary size")
-        invalid = {
-            modality: token_id
-            for modality, token_id in substitute_ids.items()
-            if token_id < 0 or token_id >= self.vocab_size
-        }
-        if invalid:
-            raise ValueError(
-                "MM draft substitute token IDs must be inside the target vocabulary: "
-                f"{invalid} (vocab_size={self.vocab_size})"
-            )
-        self.mm_pad_substitute_ids = dict(substitute_ids)
-
-    def _prepare_draft_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Restore tagged media pads, then guard the draft embedding lookup."""
-        input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_ids)
-        return input_ids.clamp(0, self.vocab_size - 1)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -257,7 +230,6 @@ class Eagle(BaseDrafter):
         input_ids, gather_ids = self._get_first_step_input(
             draft_input, bs, draft_input.input_num_tokens
         )
-        input_ids = self._prepare_draft_input_ids(input_ids)
         draft_model = self.draft_model_runner.model
         input_num_tokens = draft_input.input_num_tokens
 

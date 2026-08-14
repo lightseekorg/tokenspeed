@@ -8,7 +8,6 @@ from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.eagle import Eagle, EagleDraftInput
 from tokenspeed.runtime.execution.drafter.mtp import (
     Mtp,
-    _committed_tail_update,
     _extend_depth_precompute,
     _extend_depth_shifted_ids_from,
     _frontier_hidden_splice,
@@ -16,7 +15,12 @@ from tokenspeed.runtime.execution.drafter.mtp import (
     _ragged_tail_rows,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
+from tokenspeed.runtime.execution.input_buffer import InputBuffers
+from tokenspeed.runtime.multimodal.inputs import (
+    Modality,
+    MultimodalDataItem,
+    substitute_mm_pad_,
+)
 
 
 def _make_eagle(spec_num_tokens: int = 4, max_bs: int = 8) -> Eagle:
@@ -69,37 +73,32 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             [request_pool_rows, spec_num_tokens - 1, 8],
         )
 
-    def test_prepare_draft_input_ids_maps_media_then_clamps_to_vocab(self):
-        drafter = _make_eagle()
-        drafter.vocab_size = 100
-        drafter.set_mm_pad_substitute_ids({Modality.IMAGE: 10, Modality.AUDIO: 20})
+    def test_substitute_mm_pad_rewrites_media_ids_in_place(self):
         image = MultimodalDataItem(modality=Modality.IMAGE, hash=123)
         audio = MultimodalDataItem(modality=Modality.AUDIO, hash=456)
         image.set_pad_value()
         audio.set_pad_value()
         input_ids = torch.tensor(
-            [-4, image.pad_value, audio.pad_value, 42, 999], dtype=torch.int64
+            [7, image.pad_value, audio.pad_value, 42], dtype=torch.int64
         )
 
-        prepared = drafter._prepare_draft_input_ids(input_ids)
+        out = substitute_mm_pad_(input_ids, {Modality.IMAGE: 10, Modality.AUDIO: 20})
 
-        self.assertEqual(prepared.tolist(), [0, 10, 20, 42, 99])
-        self.assertEqual(
-            input_ids.tolist(),
-            [-4, image.pad_value, audio.pad_value, 42, 999],
+        self.assertIs(out, input_ids)
+        self.assertEqual(input_ids.tolist(), [7, 10, 20, 42])
+
+    def test_input_buffers_validate_modality_specific_mm_substitutes(self):
+        buffers = InputBuffers.__new__(InputBuffers)
+        buffers.set_mm_pad_substitute_ids(
+            {Modality.IMAGE: 10, Modality.AUDIO: 20}, vocab_size=256
         )
-
-    def test_eagle_validates_modality_specific_mm_substitutes(self):
-        drafter = _make_eagle()
-        drafter.vocab_size = 256
-        drafter.set_mm_pad_substitute_ids({Modality.IMAGE: 10, Modality.AUDIO: 20})
         self.assertEqual(
-            drafter.mm_pad_substitute_ids,
+            buffers.mm_pad_substitute_ids,
             {Modality.IMAGE: 10, Modality.AUDIO: 20},
         )
 
-        with self.assertRaisesRegex(ValueError, "inside the target vocabulary"):
-            drafter.set_mm_pad_substitute_ids({Modality.IMAGE: 256})
+        with self.assertRaisesRegex(ValueError, "inside the target"):
+            buffers.set_mm_pad_substitute_ids({Modality.IMAGE: 256}, vocab_size=256)
 
     def test_eagle_decode_first_step_gathers_last_accepted_output(self):
         drafter = _make_eagle(spec_num_tokens=4)
@@ -176,32 +175,36 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         # row i consumes t_{i+4}, i.e. drafts d_1..d_3.
         self.assertEqual(depth3.tolist(), [701, 702, 703])
 
-    def test_frontier_shifted_ids_reads_stash_verify_and_drafts(self):
+    def test_frontier_shifted_ids_reads_stash_and_verify(self):
         # k=4. Request A accepts 2 of [v0..v3]; request B accepts all 4.
         # Stash entry i holds the committed token at position vc-k+2+i.
         v = torch.tensor([[500, 501, 502, 503], [600, 601, 602, 603]])
         accept = torch.tensor([[2], [4]])
-        next_tokens = torch.tensor(
-            [[0, 51, 52, 53], [0, 61, 62, 63]], dtype=torch.int32
-        )
         stash = torch.tensor([[41, 42, 43], [71, 72, 73]])
 
-        depth0 = _frontier_shifted_ids(v, accept, next_tokens, stash, 0)
-        depth1 = _frontier_shifted_ids(v, accept, next_tokens, stash, 1)
-        depth2 = _frontier_shifted_ids(v, accept, next_tokens, stash, 2)
+        depth0 = _frontier_shifted_ids(v, accept, stash)
 
-        # depth 0: src = accept - 4 + j, all rows committed (stash/verify).
+        # src = accept - 4 + j, all rows committed (stash/verify).
         self.assertEqual(
             depth0.view(2, 4).tolist(),
             [[42, 43, 500, 501], [600, 601, 602, 603]],
         )
-        # depth d >= 1: the trailing d rows take this round's drafts d_1..d_d.
+
+    def test_frontier_window_rolls_left_into_drafts(self):
+        # Depth d+1 ids roll depth d's window one left, appending its draft:
+        # the trailing d rows of depth d take this round's drafts d_1..d_d.
+        window0 = torch.tensor([[42, 43, 500, 501], [600, 601, 602, 603]])
+        drafts = torch.tensor([[51, 52], [61, 62]])
+
+        depth1 = torch.cat([window0[:, 1:], drafts[:, 0:1]], 1)
+        depth2 = torch.cat([depth1[:, 1:], drafts[:, 1:2]], 1)
+
         self.assertEqual(
-            depth1.view(2, 4).tolist(),
+            depth1.tolist(),
             [[43, 500, 501, 51], [601, 602, 603, 61]],
         )
         self.assertEqual(
-            depth2.view(2, 4).tolist(),
+            depth2.tolist(),
             [[500, 501, 51, 52], [602, 603, 61, 62]],
         )
 
@@ -226,8 +229,8 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         # Positional oracle: the committed token at position p has id
         # 1000+p, the draft candidate for position frontier+m has id
         # 7000+m, and rejected verify entries (junk, id 9000+) must never
-        # be read. The stash rolls with the same _committed_tail_update as
-        # the drafter will use; row j of depth d must always compose the
+        # be read. The stash rolls the way the drafter does: the depth-0
+        # window's tail [:, 1:]; row j of depth d must always compose the
         # token at (frontier - k + j) + d + 1.
         torch.manual_seed(0)
         k, steps = 4, 3
@@ -238,17 +241,20 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             v = torch.tensor(
                 [[1000 + vc + 1 + i if i < accept else 9000 + i for i in range(k)]]
             )
-            next_tokens = torch.tensor([[0] + [7000 + m for m in range(1, steps + 1)]])
+            drafts = torch.tensor([[7000 + m for m in range(1, steps)]])
             frontier = vc + accept
+            depth0 = _frontier_shifted_ids(v, a, stash).view(1, k)
+            ids = depth0
             for d in range(steps):
-                ids = _frontier_shifted_ids(v, a, next_tokens, stash, d).view(1, k)
+                if d > 0:
+                    ids = torch.cat([ids[:, 1:], drafts[:, d - 1 : d]], 1)
                 for j in range(k):
                     consumed = (frontier - k + j) + d + 1
                     if consumed <= frontier:
                         self.assertEqual(ids[0, j].item(), 1000 + consumed)
                     else:
                         self.assertEqual(ids[0, j].item(), 7000 + consumed - frontier)
-            stash = _committed_tail_update(stash, v, torch.tensor([accept]), k - 1)
+            stash = depth0[:, 1:]
             vc = frontier
             self.assertEqual(stash.tolist(), [[1000 + vc - 2 + i for i in range(3)]])
 
@@ -273,30 +279,11 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
                 spliced.view(k).tolist(),
                 [float(frontier - k + j) for j in range(k)],
             )
-            stash = _committed_tail_update(stash, fresh, torch.tensor([accept]), k - 1)
+            stash = spliced.view(1, k, 1)[:, 1:]
             vc = frontier
             self.assertEqual(
                 stash.view(3).tolist(), [float(vc - 3 + i) for i in range(3)]
             )
-
-    def test_committed_tail_update_blends_across_rounds(self):
-        stash = torch.tensor([[10, 11], [20, 21]])
-        fresh = torch.tensor([[30, 31, 32, 33], [40, 41, 42, 43]])
-        valid = torch.tensor([1, 3])
-
-        updated = _committed_tail_update(stash, fresh, valid, 2)
-
-        # valid=1: rows [-1, 0] -> [old tail, fresh[0]]; valid=3: rows [1, 2].
-        self.assertEqual(updated.tolist(), [[11, 30], [41, 42]])
-
-    def test_committed_tail_update_keeps_feature_dims(self):
-        stash = torch.arange(4, dtype=torch.float32).view(1, 2, 2)
-        fresh = (torch.arange(8, dtype=torch.float32) + 10).view(1, 4, 2)
-        valid = torch.tensor([2])
-
-        updated = _committed_tail_update(stash, fresh, valid, 2)
-
-        self.assertEqual(updated.tolist(), [[[10.0, 11.0], [12.0, 13.0]]])
 
     def test_ragged_tail_rows_borrows_old_tail_on_short_chunks(self):
         flat = torch.arange(6) + 100  # request A rows 0..4, request B row 5
