@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -562,53 +561,6 @@ def _inkling_conv_columns(pool, text_config):
     return conv_columns
 
 
-def _start_inkling_pool_probe(kv_pool, conv_pool, rank, probe_dir) -> None:
-    """Diagnostic (INKLING_POOL_PROBE_DIR=<dir>): background thread
-    checksumming pool regions that must stay INVARIANT under traffic — the
-    dummy page's tail rows and the top quarter of each layer buffer — to catch
-    wrong-location KV writes in the act. One JSONL line per interval per rank;
-    ~seconds of bandwidth per sweep, diagnosis only."""
-    import json
-    import threading
-    import time
-
-    path = f"{probe_dir}/pool_probe_rank{rank}.jsonl"
-
-    def _pool_probe():
-        while True:
-            try:
-                rec = {"t": time.time()}
-                d0 = top = tot = 0.0
-                d0_layers = []
-                for lid, bufs in enumerate(zip(kv_pool.k_buffer, kv_pool.v_buffer)):
-                    for tb in bufs:
-                        if tb is None:
-                            continue
-                        n = tb.shape[0]
-                        v = float(tb[4:128].float().abs().sum())
-                        d0 += v
-                        if v > 0.0:
-                            d0_layers.append((lid, round(v, 3)))
-                        top += float(tb[(3 * n) // 4 :].float().abs().sum())
-                        tot += float(tb.float().abs().sum())
-                rec["dummy_tail_abs"] = round(d0, 4)
-                rec["dummy_tail_layers"] = d0_layers[:8]
-                rec["top_quarter_abs"] = round(top, 4)
-                rec["total_abs"] = round(tot, 2)
-                rec["conv_abs"] = round(
-                    float(conv_pool.conv_state.float().abs().sum()), 2
-                )
-                with open(path, "a") as f:
-                    f.write(json.dumps(rec) + "\n")
-            except Exception as exc:  # noqa: BLE001 - diagnostics must not kill serving
-                with open(path, "a") as f:
-                    f.write(json.dumps({"error": repr(exc)}) + "\n")
-            time.sleep(10)
-
-    threading.Thread(target=_pool_probe, daemon=True).start()
-    logger.info("Inkling pool probe enabled -> %s", probe_dir)
-
-
 def _create_target_components(
     *,
     server_args,
@@ -654,7 +606,7 @@ def _create_target_components(
         return backend, pool
 
     text_config = model_config.hf_config.get_text_config()
-    backend, conv_pool = _wrap_inkling_backend(
+    backend, _ = _wrap_inkling_backend(
         backend,
         text_config,
         config,
@@ -666,9 +618,6 @@ def _create_target_components(
             and getattr(server_args, "disaggregation_layerwise_interval", 0) > 0
         ),
     )
-    probe_dir = os.environ.get("INKLING_POOL_PROBE_DIR")
-    if probe_dir:
-        _start_inkling_pool_probe(pool, conv_pool, rank, probe_dir)
     return backend, pool
 
 

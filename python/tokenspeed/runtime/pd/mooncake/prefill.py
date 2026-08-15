@@ -33,8 +33,8 @@ import requests
 
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
-    CachePDLayerwisePageSelection,
-    CachePDPageManifest,
+    CachePDBlockManifest,
+    CachePDLayerwiseBlockSelection,
     CacheProducerSchedule,
     CacheTransferContract,
     validate_cache_manifest,
@@ -288,8 +288,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         """Validate and cache the route owned by this Prefill rank once."""
         layout = self.kv_args.cache_layout
         peer_layout = registration.peer_cache_layout
-        prefill_tp_size = self.world_size // self.dp_size
-        local_tp_rank = self.attn_tp_rank % prefill_tp_size
+        prefill_tp_size = self.topology.tp_size
+        local_tp_rank = self.topology.tp_rank
         planner = PagedCacheTransferPlanner(
             prefill_tp_size=prefill_tp_size,
             decode_tp_size=registration.decode_tp_size,
@@ -350,11 +350,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self,
         *,
         dst_ptr: int,
-        src_manifest: CachePDPageManifest | None,
-        dst_manifest: CachePDPageManifest,
+        src_block_manifest: CachePDBlockManifest | None,
+        dst_block_manifest: CachePDBlockManifest,
         transfer_fragments: tuple[CacheTransferFragment, ...] = (),
         dst_cache_layout: CacheTransferContract,
-        page_selection: CachePDLayerwisePageSelection | None = None,
+        block_selection: CachePDLayerwiseBlockSelection | None = None,
         field_ids: frozenset[str] | None = None,
     ) -> Iterator[tuple[int, int, int]]:
         layout = self.kv_args.cache_layout
@@ -372,33 +372,35 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         for fragment in cache_fragments:
             fragments_by_group[fragment.group_id].append(fragment)
 
-        # Resolve page ids directly from the validated manifest/selection. This
-        # leaves one authoritative representation of the request's page map.
+        # Resolve block ids directly from the validated manifest/selection. This
+        # leaves one authoritative representation of the request's block map.
         group_transfers = []
         source_groups = (
-            page_selection.groups if page_selection is not None else src_manifest.groups
+            block_selection.groups
+            if block_selection is not None
+            else src_block_manifest.groups
         )
         for group_spec, src_group, dst_group in zip(
-            layout.group_specs, source_groups, dst_manifest.groups, strict=True
+            layout.group_specs, source_groups, dst_block_manifest.groups, strict=True
         ):
-            source_page_ids = (
-                src_group.source_page_ids
-                if page_selection is not None
-                else src_group.page_ids
+            source_block_ids = (
+                src_group.source_block_ids
+                if block_selection is not None
+                else src_group.block_ids
             )
-            destination_page_ids = (
+            destination_block_ids = (
                 tuple(
-                    dst_group.page_ids[position]
+                    dst_group.block_ids[position]
                     for position in src_group.destination_positions
                 )
-                if page_selection is not None
-                else dst_group.page_ids
+                if block_selection is not None
+                else dst_group.block_ids
             )
             group_transfers.append(
                 (
                     group_spec,
-                    source_page_ids,
-                    destination_page_ids,
+                    source_block_ids,
+                    destination_block_ids,
                 )
             )
 
@@ -517,7 +519,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         reqs: tuple[TransferInfo, ...],
     ) -> bool:
         """Wait one producer interval, then fan it out to every Decode peer."""
-        selection = kv_chunk.cache_page_selection
+        block_selection = kv_chunk.cache_block_selection
 
         registered_reqs = []
         for req in reqs:
@@ -562,14 +564,14 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             # Start every peer's lazy generator before transferring this interval.
             prepared = []
             for req, registration in registered_reqs:
-                assert req.page_manifest is not None
+                assert req.block_manifest is not None
                 blocks = self._cache_transfer_blocks(
                     dst_ptr=registration.dst_kv_ptr,
-                    src_manifest=None,
-                    dst_manifest=req.page_manifest,
+                    src_block_manifest=None,
+                    dst_block_manifest=req.block_manifest,
                     transfer_fragments=registration.transfer_fragments,
                     dst_cache_layout=registration.peer_cache_layout,
-                    page_selection=selection,
+                    block_selection=block_selection,
                     field_ids=producer_schedule.fields_in_range(begin_step, end_step),
                 )
                 prepared.append(
@@ -618,7 +620,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 registration.dst_port,
                 req.room,
                 TransferPoll.Success,
-                self.attn_tp_rank,
+                self.topology.tp_rank,
                 bootstrap_token=bootstrap_token,
                 spec_candidate_ids=spec_candidate_ids,
             )
@@ -691,7 +693,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                         dst_port,
                         req.room,
                         TransferPoll.Failed,
-                        self.attn_tp_rank,
+                        self.topology.tp_rank,
                     )
                 except Exception:
                     logger.exception(
@@ -719,7 +721,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                         self.transfer_infos.pop(kv_chunk.room, None)
                     continue
 
-                if kv_chunk.cache_page_selection is not None:
+                if kv_chunk.cache_block_selection is not None:
                     self._send_cache_layerwise_fanout(kv_chunk, reqs)
                     if kv_chunk.room not in self.request_status or self.check_status(
                         kv_chunk.room
@@ -739,11 +741,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                 f"Decode session {req.mooncake_session_id} is not alive"
                             )
                     registration = self.get_decode_registration(req)
-                    assert req.page_manifest is not None
+                    assert req.block_manifest is not None
                     blocks = self._cache_transfer_blocks(
                         dst_ptr=registration.dst_kv_ptr,
-                        src_manifest=kv_chunk.page_manifest,
-                        dst_manifest=req.page_manifest,
+                        src_block_manifest=kv_chunk.block_manifest,
+                        dst_block_manifest=req.block_manifest,
                         transfer_fragments=registration.transfer_fragments,
                         dst_cache_layout=registration.peer_cache_layout,
                     )
@@ -794,7 +796,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                         registration.dst_port,
                         req.room,
                         TransferPoll.Success,
-                        self.attn_tp_rank,
+                        self.topology.tp_rank,
                         bootstrap_token=bootstrap_token,
                         spec_candidate_ids=spec_candidate_ids,
                     )
@@ -870,12 +872,12 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     registration.dst_port,
                     parsed_room,
                     TransferPoll.Failed,
-                    self.attn_tp_rank,
+                    self.topology.tp_rank,
                 )
                 return
-            if transfer_info.page_manifest is not None:
+            if transfer_info.block_manifest is not None:
                 validate_cache_manifest(
-                    transfer_info.page_manifest,
+                    transfer_info.block_manifest,
                     layout=registration.peer_cache_layout,
                     peer="destination",
                 )
@@ -924,7 +926,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     dst_port,
                     parsed_room,
                     TransferPoll.Failed,
-                    self.attn_tp_rank,
+                    self.topology.tp_rank,
                 )
             except Exception:
                 logger.exception(
@@ -944,7 +946,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 registration.dst_port,
                 parsed_room,
                 TransferPoll.Failed,
-                self.attn_tp_rank,
+                self.topology.tp_rank,
             )
             return
         complete = len(candidate_infos) == expected_fanout
@@ -1003,8 +1005,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         layerwise_interval: int = 1,
         wait_for_bootstrap_token: bool = False,
         spec_candidate_ids: list[int] | None = None,
-        page_manifest: CachePDPageManifest | None = None,
-        cache_page_selection: CachePDLayerwisePageSelection | None = None,
+        block_manifest: CachePDBlockManifest | None = None,
+        cache_block_selection: CachePDLayerwiseBlockSelection | None = None,
     ):
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             raise RuntimeError("Transfer requests can only be added in prefill mode.")
@@ -1039,8 +1041,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 layerwise_interval=layerwise_interval,
                 wait_for_bootstrap_token=wait_for_bootstrap_token,
                 spec_candidate_ids=spec_candidate_ids,
-                page_manifest=page_manifest,
-                cache_page_selection=cache_page_selection,
+                block_manifest=block_manifest,
+                cache_block_selection=cache_block_selection,
             )
         )
 
@@ -1055,11 +1057,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         url = f"http://{bootstrap_server_url}/route"
         payload = {
             "role": "Prefill",
-            "world_size": self.world_size,
-            "dp_size": self.dp_size,
+            "world_size": self.topology.world_size,
+            "dp_size": self.topology.dp_size,
             "rank_ip": get_local_ip_by_remote(),
             "rank_port": self.rank_port,
-            "engine_rank": self.kv_args.engine_rank,
+            "engine_rank": self.topology.global_rank,
             "cache_layout": self.kv_args.cache_layout.to_wire_bytes().decode("ascii"),
         }
 

@@ -85,6 +85,7 @@ from tokenspeed.runtime.pd.kv_events import (
 )
 from tokenspeed.runtime.pd.mooncake.entities import KVManagerArgs
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
+from tokenspeed.runtime.pd.topology import PDParallelTopology
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import (
     configure_logger,
@@ -193,6 +194,10 @@ class EventLoop:
         # Do not pass server_args further down the stack after this point.
 
         self.server_args = server_args
+        pd_topology = None
+        if server_args.disaggregation_mode != "null":
+            pd_topology = PDParallelTopology.from_mapping(server_args.mapping)
+            pd_topology.require_cache_pd_supported()
         self.port_args = port_args
         self.gpu_id = gpu_id
         self.global_rank = global_rank
@@ -563,6 +568,7 @@ class EventLoop:
             metrics=self.metrics,
         )
         if server_args.disaggregation_mode != "null":
+            assert pd_topology is not None
             kv_args = get_kv_args(
                 global_rank,
                 global_rank,
@@ -574,9 +580,7 @@ class EventLoop:
             pd_manager_args = KVManagerArgs(
                 bootstrap_port=server_args.disaggregation_bootstrap_port,
                 dist_init_addr=server_args.dist_init_addr,
-                world_size=server_args.world_size or mapping.world_size,
-                dp_size=server_args.data_parallel_size or mapping.attn.dp_size,
-                attn_tp_rank=attn_tp_rank,
+                topology=pd_topology,
                 enable_metrics=False,
                 served_model_name=server_args.served_model_name,
                 app_key=server_args.app_key,

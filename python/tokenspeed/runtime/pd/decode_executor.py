@@ -24,7 +24,7 @@ from tokenspeed_scheduler import PD, Forward
 
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.pd.base.status import TransferPoll
-from tokenspeed.runtime.pd.cache_protocol import build_cache_page_manifest
+from tokenspeed.runtime.pd.cache_protocol import build_cache_block_manifest
 from tokenspeed.runtime.pd.mooncake.decode import MooncakeKVManagerDecode
 from tokenspeed.runtime.pd.mooncake.receiver import MooncakeKVReceiver
 from tokenspeed.runtime.pd.utils import poll_and_all_reduce
@@ -69,7 +69,7 @@ class DisaggDecodeExecutor:
             if receiver is None:
                 continue
             prefix_len = int(op.extend_prefix_lens[index])
-            manifest = build_cache_page_manifest(
+            block_manifest = build_cache_block_manifest(
                 op,
                 layout=self.cache_layout,
                 request_row=index,
@@ -81,15 +81,15 @@ class DisaggDecodeExecutor:
                     request_id,
                     receiver,
                     op.request_pool_indices[index],
-                    manifest,
+                    block_manifest,
                 )
             )
 
         # Validate every row before publishing any destination manifest. A later
         # invalid row must not leave an earlier Prefill sender waiting forever.
-        for request_id, receiver, request_pool_index, manifest in pending:
+        for request_id, receiver, request_pool_index, block_manifest in pending:
             self._request_pool_indices[request_id] = request_pool_index
-            receiver.prefill(page_manifest=manifest)
+            receiver.prefill(block_manifest=block_manifest)
 
     def register(
         self,

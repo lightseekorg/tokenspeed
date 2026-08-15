@@ -20,11 +20,11 @@
 
 """Paged cache transfer contract and per-request PD protocol.
 
-The cache recipe owns semantic group specs and the memory planner owns physical
-geometry. PD transports those objects directly instead of maintaining a second
-physical layout schema. The same module owns the transfer schema, request page
-manifests, producer-step projection, and peer validation so all derived PD cache
-control data stays beside the protocol that consumes it.
+The cache recipe owns semantic group specs and the transfer schema, while the
+memory planner owns physical geometry. PD transports those objects directly
+instead of maintaining a second physical layout schema. This module owns the
+wire contract, request block manifests, producer-step projection, and peer
+validation.
 """
 
 from __future__ import annotations
@@ -32,23 +32,25 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldLayout,
     CacheGroupLayout,
     CacheMemoryPlan,
     CachePlaneLayout,
+    cache_field_layer_id,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    MXFP8_KV_SCALE_TILE_TOKENS,
     PagedCacheGroupSpec,
     Retention,
     TransferPolicy,
 )
-
-if TYPE_CHECKING:
-    from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
+    CacheFieldPartition,
+    CacheFieldTransferSpec,
+    CacheTransferSchema,
+    build_cache_transfer_schema,
+)
 
 MAX_CACHE_CONTRACT_WIRE_BYTES = 256 << 10
 MAX_CACHE_MANIFEST_WIRE_BYTES = 2 << 20
@@ -81,221 +83,6 @@ def _load_wire_json(raw: bytes, *, name: str, maximum: int) -> dict:
     if not isinstance(value, dict):
         raise CacheContractError(f"{name} payload must be a JSON object")
     return value
-
-
-@dataclass(frozen=True, slots=True)
-class CacheFieldPartition:
-    """Dense global-to-rank-local partitioning for one PD cache field."""
-
-    axis: int
-    global_extent: int
-    global_parts: tuple[int, ...] = ()
-
-    def validate(self, *, field_id: str, local_shape: tuple[int, ...]) -> None:
-        if (
-            isinstance(self.axis, bool)
-            or not isinstance(self.axis, int)
-            or not 0 <= self.axis < len(local_shape)
-            or isinstance(self.global_extent, bool)
-            or not isinstance(self.global_extent, int)
-            or self.global_extent < local_shape[self.axis]
-        ):
-            raise ValueError(f"cache field {field_id!r} has invalid partition geometry")
-        local_extent = local_shape[self.axis]
-        if self.global_extent % local_extent:
-            raise ValueError(
-                f"cache field {field_id!r} global partition extent is not "
-                "divisible by its local extent"
-            )
-        distinct_shards = self.global_extent // local_extent
-        if self.global_parts and (
-            len(self.global_parts) < 2
-            or len(self.global_parts) > 16
-            or any(
-                isinstance(part, bool)
-                or not isinstance(part, int)
-                or part <= 0
-                or part % distinct_shards
-                for part in self.global_parts
-            )
-            or sum(self.global_parts) != self.global_extent
-        ):
-            raise ValueError(
-                f"cache field {field_id!r} has invalid global partition parts"
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class CacheFieldTransferSpec:
-    field_id: str
-    partition: CacheFieldPartition
-
-    def __post_init__(self) -> None:
-        if not self.field_id:
-            raise ValueError("cache transfer field_id must be non-empty")
-
-
-@dataclass(frozen=True, slots=True)
-class CacheTransferSchema:
-    """PD wire semantics omitted from the rank-local cache memory plan."""
-
-    fields: tuple[CacheFieldTransferSpec, ...] = ()
-
-    def __post_init__(self) -> None:
-        field_ids = tuple(field.field_id for field in self.fields)
-        if len(field_ids) != len(set(field_ids)):
-            raise ValueError("cache transfer schema contains a duplicate field")
-
-    def partition_for(self, field_id: str) -> CacheFieldPartition | None:
-        for field in self.fields:
-            if field.field_id == field_id:
-                return field.partition
-        return None
-
-    def validate(self, plan: CacheMemoryPlan) -> None:
-        planned_fields = {field.field_id: field for field in plan.fields}
-        unknown = {field.field_id for field in self.fields} - set(planned_fields)
-        if unknown:
-            raise ValueError(
-                f"cache transfer schema references unknown fields {sorted(unknown)}"
-            )
-        for transfer_field in self.fields:
-            field = planned_fields[transfer_field.field_id]
-            transfer_field.partition.validate(
-                field_id=field.field_id,
-                local_shape=field.shape,
-            )
-
-
-def _text_config(model_config: ModelConfig):
-    text_config = getattr(model_config, "hf_text_config", None)
-    if text_config is not None:
-        return text_config
-    return getattr(model_config.hf_config, "text_config", model_config.hf_config)
-
-
-def _field_layer_id(field_id: str) -> int:
-    parts = field_id.split(".", 2)
-    if len(parts) != 3 or parts[0] != "layer":
-        raise ValueError(f"PD cache field {field_id!r} is not layer-owned")
-    try:
-        layer_id = int(parts[1])
-    except ValueError as exc:
-        raise ValueError(
-            f"PD cache field {field_id!r} has an invalid layer id"
-        ) from exc
-    if layer_id < 0:
-        raise ValueError(f"PD cache field {field_id!r} has an invalid layer id")
-    return layer_id
-
-
-def _source_model(
-    layer_id: int,
-    *,
-    model_config: ModelConfig,
-    draft_model_config: ModelConfig | None,
-) -> tuple[ModelConfig, int]:
-    target_layers = model_config.num_attention_layers
-    if layer_id < target_layers:
-        return model_config, layer_id
-    if draft_model_config is None:
-        raise ValueError(
-            f"PD cache field layer {layer_id} exceeds the target model without a draft"
-        )
-    draft_layer_id = layer_id - target_layers
-    if draft_layer_id >= draft_model_config.num_attention_layers:
-        raise ValueError(f"PD cache field layer {layer_id} exceeds the merged model")
-    return draft_model_config, draft_layer_id
-
-
-def _partition_for_field(
-    field: CacheFieldLayout,
-    *,
-    model_config: ModelConfig,
-    draft_model_config: ModelConfig | None,
-    prefix_granularity: int,
-    inkling_layers: frozenset[int],
-) -> CacheFieldPartition | None:
-    layer_id = _field_layer_id(field.field_id)
-    source_model, source_layer_id = _source_model(
-        layer_id,
-        model_config=model_config,
-        draft_model_config=draft_model_config,
-    )
-    suffix = field.field_id.split(".", 2)[2]
-
-    if layer_id in inkling_layers:
-        from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
-            inkling_layer_kv_head_counts,
-        )
-
-        global_heads = inkling_layer_kv_head_counts(source_model)[source_layer_id]
-        if suffix in ("k", "v"):
-            return CacheFieldPartition(1, global_heads)
-        if suffix in ("k_scale", "v_scale"):
-            return CacheFieldPartition(0, global_heads)
-        if suffix.startswith("kvconv_"):
-            return CacheFieldPartition(1, global_heads * source_model.head_dim)
-        return None
-
-    if suffix in ("k", "v"):
-        return CacheFieldPartition(1, source_model.num_key_value_heads)
-    if suffix in ("k_scale", "v_scale"):
-        # Tiled mxfp8 scales are head-major; per-token scales are token-major.
-        axis = 0 if prefix_granularity == MXFP8_KV_SCALE_TILE_TOKENS else 1
-        return CacheFieldPartition(axis, source_model.num_key_value_heads)
-
-    text_config = _text_config(source_model)
-    if suffix in ("conv", "ssm") and hasattr(text_config, "linear_num_key_heads"):
-        key_width = text_config.linear_key_head_dim * text_config.linear_num_key_heads
-        value_width = (
-            text_config.linear_value_head_dim * text_config.linear_num_value_heads
-        )
-        if suffix == "conv":
-            return CacheFieldPartition(
-                0,
-                2 * key_width + value_width,
-                (key_width, key_width, value_width),
-            )
-        return CacheFieldPartition(0, text_config.linear_num_value_heads)
-
-    linear_config = getattr(text_config, "linear_attn_config", None)
-    if suffix in ("conv_state", "recurrent_state") and linear_config is not None:
-        num_heads = int(linear_config["num_heads"])
-        head_dim = int(linear_config["head_dim"])
-        if suffix == "conv_state":
-            width = num_heads * head_dim
-            return CacheFieldPartition(0, 3 * width, (width, width, width))
-        return CacheFieldPartition(0, num_heads)
-
-    return None
-
-
-def build_cache_transfer_schema(
-    plan: CacheMemoryPlan,
-    *,
-    model_config: ModelConfig,
-    draft_model_config: ModelConfig | None = None,
-) -> CacheTransferSchema:
-    """Compile model-specific PD distribution semantics beside a pure plan."""
-
-    inkling_layers = frozenset(
-        _field_layer_id(field.field_id)
-        for field in plan.fields
-        if field.field_id.split(".", 2)[-1].startswith("kvconv_")
-    )
-    fields = []
-    for field in plan.fields:
-        partition = _partition_for_field(
-            field,
-            model_config=model_config,
-            draft_model_config=draft_model_config,
-            prefix_granularity=plan.prefix_granularity,
-            inkling_layers=inkling_layers,
-        )
-        if partition is not None:
-            fields.append(CacheFieldTransferSpec(field.field_id, partition))
-    return CacheTransferSchema(tuple(fields))
 
 
 @dataclass(frozen=True, slots=True)
@@ -487,7 +274,7 @@ def build_cache_fields_by_producer_step(
 
     fields_by_layer: dict[int, list[str]] = {}
     for field in plan.fields:
-        layer_id = _field_layer_id(field.field_id)
+        layer_id = cache_field_layer_id(field.field_id)
         fields_by_layer.setdefault(layer_id, []).append(field.field_id)
 
     if not fields_by_layer:
@@ -519,32 +306,32 @@ def build_cache_fields_by_producer_step(
 
 
 @dataclass(frozen=True, slots=True)
-class CachePDGroupPages:
+class CachePDGroupBlocks:
     group_id: str
-    page_ids: tuple[int, ...]
+    block_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class CachePDPageManifest:
-    groups: tuple[CachePDGroupPages, ...]
+class CachePDBlockManifest:
+    groups: tuple[CachePDGroupBlocks, ...]
     prefix_len: int
     prompt_len: int
 
     def to_wire_bytes(self) -> bytes:
         return _dump_wire_json(
             self,
-            name="Paged cache manifest",
+            name="Cache block manifest",
             maximum=MAX_CACHE_MANIFEST_WIRE_BYTES,
         )
 
     @classmethod
-    def from_wire_bytes(cls, raw: bytes) -> "CachePDPageManifest":
+    def from_wire_bytes(cls, raw: bytes) -> "CachePDBlockManifest":
         payload = _load_wire_json(
-            raw, name="Paged cache manifest", maximum=MAX_CACHE_MANIFEST_WIRE_BYTES
+            raw, name="Cache block manifest", maximum=MAX_CACHE_MANIFEST_WIRE_BYTES
         )
         return cls(
             groups=tuple(
-                CachePDGroupPages(group["group_id"], tuple(group["page_ids"]))
+                CachePDGroupBlocks(group["group_id"], tuple(group["block_ids"]))
                 for group in payload["groups"]
             ),
             prefix_len=payload["prefix_len"],
@@ -554,15 +341,15 @@ class CachePDPageManifest:
 
 @dataclass(frozen=True, slots=True)
 class CachePDLayerwiseGroupSelection:
-    """Source pages for one group and their positions in Decode's manifest."""
+    """Source blocks for one group and their positions in Decode's manifest."""
 
-    source_page_ids: tuple[int, ...]
+    source_block_ids: tuple[int, ...]
     destination_positions: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class CachePDLayerwisePageSelection:
-    """One prompt chunk's group-aware source-to-destination page selection.
+class CachePDLayerwiseBlockSelection:
+    """One prompt chunk's group-aware source-to-destination block selection.
 
     This object stays process-local on Prefill. Decode publishes the full
     request manifest once; each queued layerwise chunk references positions in
@@ -585,7 +372,7 @@ def _logical_slots(
         begin = prefix_len // block_granularity
         if retention == "sliding_window":
             # The next decode token can attend the preceding window - 1 raw
-            # tokens. Include every slot intersecting that retained tail.
+            # tokens. Include every group block intersecting that retained tail.
             retained_begin = max(0, prompt_len - sliding_window_tokens + 1)
             begin = max(begin, retained_begin // block_granularity)
         end = (prompt_len + block_granularity - 1) // block_granularity
@@ -654,7 +441,7 @@ def validate_cache_peer_layout(
 
 
 def validate_cache_manifest(
-    manifest: CachePDPageManifest,
+    manifest: CachePDBlockManifest,
     *,
     layout: CacheTransferContract,
     peer: str,
@@ -666,7 +453,9 @@ def validate_cache_manifest(
     if actual != expected:
         raise CacheContractError(f"{peer} manifest group order disagrees with layout")
     if manifest.prefix_len % layout.plan.prefix_granularity:
-        raise CacheContractError(f"{peer} manifest prefix_len is not page aligned")
+        raise CacheContractError(
+            f"{peer} manifest prefix_len is not aligned to prefix_granularity"
+        )
     for group, spec in zip(manifest.groups, layout.group_specs, strict=True):
         required = _logical_slots(
             spec.transfer_policy,
@@ -676,31 +465,33 @@ def validate_cache_manifest(
             spec.retention,
             spec.sliding_window_tokens,
         )
-        if len(group.page_ids) != len(required):
+        if len(group.block_ids) != len(required):
             raise CacheContractError(
-                f"{peer} manifest group {group.group_id!r} page count disagrees "
+                f"{peer} manifest group {group.group_id!r} block count disagrees "
                 "with its transfer policy"
             )
         group_capacity = layout.plan.group(spec.group_id).page_count
-        if any(page <= 0 or page >= group_capacity for page in group.page_ids):
+        if any(block <= 0 or block >= group_capacity for block in group.block_ids):
             raise CacheContractError(
-                f"{peer} manifest group {group.group_id!r} has an out-of-bounds page"
+                f"{peer} manifest group {group.group_id!r} has an out-of-bounds block"
             )
 
 
-def build_cache_page_manifest(
+def build_cache_block_manifest(
     forward_op: object,
     *,
     layout: CacheTransferContract,
     request_row: int,
     prefix_len: int,
     prompt_len: int,
-) -> CachePDPageManifest:
-    """Select each group's pages according to its explicit transfer policy."""
+) -> CachePDBlockManifest:
+    """Select each group's blocks according to its explicit transfer policy."""
     if prefix_len >= prompt_len:
         raise CacheContractError("Paged cache PD requires prefix_len < prompt_len")
     if prefix_len % layout.plan.prefix_granularity:
-        raise CacheContractError("Paged cache PD prefix_len must be page aligned")
+        raise CacheContractError(
+            "Paged cache PD prefix_len must be aligned to prefix_granularity"
+        )
     mapping = forward_op.block_tables_arrays()  # type: ignore[attr-defined]
     expected_ids = {group.group_id for group in layout.group_specs}
     if set(mapping) != expected_ids:
@@ -710,7 +501,7 @@ def build_cache_page_manifest(
             f"extra={sorted(set(mapping) - expected_ids)}"
         )
 
-    groups: list[CachePDGroupPages] = []
+    groups: list[CachePDGroupBlocks] = []
     for spec in layout.group_specs:
         table = mapping[spec.group_id]
         logical_slots = _logical_slots(
@@ -723,30 +514,30 @@ def build_cache_page_manifest(
         )
         if logical_slots and logical_slots[-1] >= table.shape[1]:
             raise CacheContractError(
-                f"table {spec.group_id!r} misses logical slot " f"{logical_slots[-1]}"
+                f"table {spec.group_id!r} misses logical slot {logical_slots[-1]}"
             )
-        page_ids = tuple(
+        block_ids = tuple(
             int(table[request_row, logical_slot]) for logical_slot in logical_slots
         )
-        for logical_slot, page_id in zip(logical_slots, page_ids, strict=True):
+        for logical_slot, block_id in zip(logical_slots, block_ids, strict=True):
             group_capacity = layout.plan.group(spec.group_id).page_count
-            if page_id <= 0 or page_id >= group_capacity:
+            if block_id <= 0 or block_id >= group_capacity:
                 raise CacheContractError(
                     f"table {spec.group_id!r} logical slot {logical_slot} "
-                    f"has invalid page ID {page_id}"
+                    f"has invalid block ID {block_id}"
                 )
         groups.append(
-            CachePDGroupPages(
+            CachePDGroupBlocks(
                 spec.group_id,
-                page_ids,
+                block_ids,
             )
         )
-    return CachePDPageManifest(
+    return CachePDBlockManifest(
         groups=tuple(groups), prefix_len=prefix_len, prompt_len=prompt_len
     )
 
 
-def build_cache_layerwise_page_selection(
+def build_cache_layerwise_block_selection(
     forward_op: object,
     *,
     layout: CacheTransferContract,
@@ -755,16 +546,18 @@ def build_cache_layerwise_page_selection(
     prompt_len: int,
     chunk_start: int,
     chunk_end: int,
-) -> CachePDLayerwisePageSelection:
-    """Select pages that became transferable during one Prefill chunk.
+) -> CachePDLayerwiseBlockSelection:
+    """Select blocks that became transferable during one Prefill chunk.
 
-    Full-suffix groups publish newly completed retained pages (plus the final
-    partial page). Latest-snapshot groups publish only the prompt's final
+    Full-suffix groups publish newly completed retained blocks (plus the final
+    partial block). Latest-snapshot groups publish only the prompt's final
     snapshot. The returned destination positions refer to Decode's immutable
     full manifest.
     """
     if prefix_len % layout.plan.prefix_granularity:
-        raise CacheContractError("Paged cache PD prefix_len must be page aligned")
+        raise CacheContractError(
+            "Paged cache PD prefix_len must be aligned to prefix_granularity"
+        )
     if prefix_len >= prompt_len:
         raise CacheContractError("layerwise selection requires prefix_len < prompt_len")
     if chunk_start >= chunk_end:
@@ -825,42 +618,42 @@ def build_cache_layerwise_page_selection(
             logical_slots = (final_slots[0],) if is_final else ()
         if logical_slots and logical_slots[-1] >= table.shape[1]:
             raise CacheContractError(
-                f"table {spec.group_id!r} misses logical slot " f"{logical_slots[-1]}"
+                f"table {spec.group_id!r} misses logical slot {logical_slots[-1]}"
             )
-        source_page_ids = tuple(
+        source_block_ids = tuple(
             int(table[request_row, logical_slot]) for logical_slot in logical_slots
         )
         group_capacity = layout.plan.group(spec.group_id).page_count
-        for logical_slot, page_id in zip(logical_slots, source_page_ids, strict=True):
-            if page_id <= 0 or page_id >= group_capacity:
+        for logical_slot, block_id in zip(logical_slots, source_block_ids, strict=True):
+            if block_id <= 0 or block_id >= group_capacity:
                 raise CacheContractError(
                     f"table {spec.group_id!r} logical slot {logical_slot} "
-                    f"has invalid page ID {page_id}"
+                    f"has invalid block ID {block_id}"
                 )
         selections.append(
             CachePDLayerwiseGroupSelection(
-                source_page_ids=source_page_ids,
+                source_block_ids=source_block_ids,
                 destination_positions=destination_positions,
             )
         )
 
-    return CachePDLayerwisePageSelection(groups=tuple(selections))
+    return CachePDLayerwiseBlockSelection(groups=tuple(selections))
 
 
 __all__ = [
     "CacheContractError",
     "CacheFieldPartition",
     "CacheFieldTransferSpec",
-    "CachePDGroupPages",
+    "CachePDBlockManifest",
+    "CachePDGroupBlocks",
     "CachePDLayerwiseGroupSelection",
-    "CachePDLayerwisePageSelection",
-    "CachePDPageManifest",
+    "CachePDLayerwiseBlockSelection",
     "CacheProducerSchedule",
     "CacheTransferContract",
     "CacheTransferSchema",
     "build_cache_fields_by_producer_step",
-    "build_cache_layerwise_page_selection",
-    "build_cache_page_manifest",
+    "build_cache_block_manifest",
+    "build_cache_layerwise_block_selection",
     "build_cache_transfer_schema",
     "build_cache_transfer_contract",
     "build_pool_cache_transfer_contract",

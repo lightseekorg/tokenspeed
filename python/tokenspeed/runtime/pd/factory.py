@@ -20,9 +20,11 @@
 
 """Factories for PD KV transfer helpers."""
 
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
+    build_cache_transfer_schema,
+)
 from tokenspeed.runtime.pd.cache_protocol import (
     build_cache_fields_by_producer_step,
-    build_cache_transfer_schema,
     build_pool_cache_transfer_contract,
 )
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor

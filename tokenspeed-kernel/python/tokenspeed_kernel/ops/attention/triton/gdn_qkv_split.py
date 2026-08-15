@@ -33,15 +33,24 @@ def _autotune_configs():
     ]
 
 
-@triton.autotune(configs=_autotune_configs(), key=["qkv_dim"])
+@triton.autotune(configs=_autotune_configs(), key=["qkv_dim", "HAS_REPLAY_PAYLOAD"])
 @triton.jit
 def _fused_qkv_split_kernel(
     q,
     k,
     v,
     mixed_qkv,
+    replay_payload,
+    replay_a,
+    replay_b,
     stride_t: tl.constexpr,
     stride_d: tl.constexpr,
+    replay_stride_t: tl.constexpr,
+    replay_stride_d: tl.constexpr,
+    replay_a_stride_t: tl.constexpr,
+    replay_a_stride_d: tl.constexpr,
+    replay_b_stride_t: tl.constexpr,
+    replay_b_stride_d: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
     NUM_V_HEADS: tl.constexpr,
@@ -50,6 +59,8 @@ def _fused_qkv_split_kernel(
     HEAD_V: tl.constexpr,
     qkv_dim,
     BLOCK_SIZE: tl.constexpr,
+    GATE_BLOCK: tl.constexpr,
+    HAS_REPLAY_PAYLOAD: tl.constexpr,
 ):
     i_t = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_SIZE)
@@ -81,16 +92,60 @@ def _fused_qkv_split_kernel(
         mask=(offsets >= qk_dim) & (offsets < qkv_dim),
     )
 
+    if HAS_REPLAY_PAYLOAD:
+        replay_row = replay_payload + i_t * replay_stride_t
+        tl.store(
+            replay_row + k_offsets * replay_stride_d,
+            values,
+            mask=(offsets >= q_dim) & (offsets < qk_dim),
+        )
+        tl.store(
+            replay_row + (k_dim + v_offsets) * replay_stride_d,
+            values,
+            mask=(offsets >= qk_dim) & (offsets < qkv_dim),
+        )
 
-@triton.autotune(configs=_autotune_configs(), key=["qkv_dim"])
+        gate_offsets = tl.arange(0, GATE_BLOCK)
+        gate_mask = gate_offsets < NUM_V_HEADS
+        replay_a_values = tl.load(
+            replay_a + i_t * replay_a_stride_t + gate_offsets * replay_a_stride_d,
+            mask=gate_mask,
+        )
+        replay_b_values = tl.load(
+            replay_b + i_t * replay_b_stride_t + gate_offsets * replay_b_stride_d,
+            mask=gate_mask,
+        )
+        gate_base: tl.constexpr = k_dim + v_dim
+        tl.store(
+            replay_row + (gate_base + gate_offsets) * replay_stride_d,
+            replay_a_values,
+            mask=gate_mask,
+        )
+        tl.store(
+            replay_row + (gate_base + NUM_V_HEADS + gate_offsets) * replay_stride_d,
+            replay_b_values,
+            mask=gate_mask,
+        )
+
+
+@triton.autotune(configs=_autotune_configs(), key=["qkv_dim", "HAS_REPLAY_PAYLOAD"])
 @triton.jit
 def _fused_qkv_split_l2norm_kernel(  # noqa: E501
     q,
     k,
     v,
     mixed_qkv,
+    replay_payload,
+    replay_a,
+    replay_b,
     stride_t: tl.constexpr,
     stride_d: tl.constexpr,
+    replay_stride_t: tl.constexpr,
+    replay_stride_d: tl.constexpr,
+    replay_a_stride_t: tl.constexpr,
+    replay_a_stride_d: tl.constexpr,
+    replay_b_stride_t: tl.constexpr,
+    replay_b_stride_d: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
     NUM_V_HEADS: tl.constexpr,
@@ -99,6 +154,8 @@ def _fused_qkv_split_l2norm_kernel(  # noqa: E501
     HEAD_V: tl.constexpr,
     qkv_dim,
     BLOCK_SIZE: tl.constexpr,
+    GATE_BLOCK: tl.constexpr,
+    HAS_REPLAY_PAYLOAD: tl.constexpr,
 ):
     """Split + per-head L2 normalisation of Q and K in one pass.
 
@@ -150,6 +207,44 @@ def _fused_qkv_split_l2norm_kernel(  # noqa: E501
         mask=(offsets >= qk_dim) & (offsets < qkv_dim),
     )
 
+    if HAS_REPLAY_PAYLOAD:
+        # ReplaySSM normalizes K inside the recurrence kernel, so retain the
+        # raw post-convolution K even when this split normalizes the verify K.
+        replay_row = replay_payload + i_t * replay_stride_t
+        k_offsets = offsets - q_dim
+        tl.store(
+            replay_row + k_offsets * replay_stride_d,
+            values,
+            mask=(offsets >= q_dim) & (offsets < qk_dim),
+        )
+        tl.store(
+            replay_row + (k_dim + v_offsets) * replay_stride_d,
+            values,
+            mask=(offsets >= qk_dim) & (offsets < qkv_dim),
+        )
+
+        gate_offsets = tl.arange(0, GATE_BLOCK)
+        gate_mask = gate_offsets < NUM_V_HEADS
+        replay_a_values = tl.load(
+            replay_a + i_t * replay_a_stride_t + gate_offsets * replay_a_stride_d,
+            mask=gate_mask,
+        )
+        replay_b_values = tl.load(
+            replay_b + i_t * replay_b_stride_t + gate_offsets * replay_b_stride_d,
+            mask=gate_mask,
+        )
+        gate_base: tl.constexpr = k_dim + v_dim
+        tl.store(
+            replay_row + (gate_base + gate_offsets) * replay_stride_d,
+            replay_a_values,
+            mask=gate_mask,
+        )
+        tl.store(
+            replay_row + (gate_base + NUM_V_HEADS + gate_offsets) * replay_stride_d,
+            replay_b_values,
+            mask=gate_mask,
+        )
+
 
 def fused_qkv_split_gdn_prefill(
     mixed_qkv: torch.Tensor,
@@ -160,6 +255,7 @@ def fused_qkv_split_gdn_prefill(
     head_k: int,
     head_v: int,
     fuse_l2norm: bool = False,
+    replay: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Split packed post-conv GDN QKV into contiguous FLA prefill tensors.
 
@@ -171,6 +267,10 @@ def fused_qkv_split_gdn_prefill(
         fuse_l2norm: when True, Q and K are L2-normalised per head inside the
             kernel (sm100 fast-path only — caller must not call l2norm_fwd
             separately).
+        replay: Optional ``(payload, a, b)`` tuple. ``payload`` is a contiguous
+            ``[T, K_width + V_width + 2 * num_v_heads]`` destination; ``a`` and
+            ``b`` are scalar gate inputs shaped ``[T, num_v_heads]``.
+
     Returns:
         (q, k, v) each shaped ``[1, T, H, D]``.
     """
@@ -195,15 +295,57 @@ def fused_qkv_split_gdn_prefill(
     )
 
     qkv_dim = num_q_heads * head_q + num_k_heads * head_k + num_v_heads * head_v
+    has_replay = replay is not None
+    if has_replay:
+        replay_payload, replay_a, replay_b = replay
+        replay_width = num_k_heads * head_k + num_v_heads * head_v + 2 * num_v_heads
+        if replay_payload.shape != (seq_len, replay_width):
+            raise ValueError(
+                "replay_payload must have shape "
+                f"{(seq_len, replay_width)}, got {tuple(replay_payload.shape)}"
+            )
+        if not replay_payload.is_contiguous():
+            raise ValueError("replay_payload must be contiguous")
+        expected_gate_shape = (seq_len, num_v_heads)
+        if (
+            replay_a.shape != expected_gate_shape
+            or replay_b.shape != expected_gate_shape
+        ):
+            raise ValueError(
+                f"replay_a and replay_b must have shape {expected_gate_shape}"
+            )
+        if any(
+            tensor.device != mixed_qkv.device or tensor.dtype != mixed_qkv.dtype
+            for tensor in replay
+        ):
+            raise ValueError(
+                "ReplaySSM payload and gate inputs must match mixed_qkv device/dtype"
+            )
+        replay_strides = (
+            *replay_payload.stride(),
+            *replay_a.stride(),
+            *replay_b.stride(),
+        )
+    else:
+        # Triton removes every replay access at compile time; valid tensor
+        # placeholders keep the no-replay call ABI uniform.
+        replay_payload = replay_a = replay_b = q
+        replay_strides = (0,) * 6
+
     block_size = triton.next_power_of_2(qkv_dim)
+    gate_block = triton.next_power_of_2(num_v_heads) if has_replay else 1
     kernel = _fused_qkv_split_l2norm_kernel if fuse_l2norm else _fused_qkv_split_kernel
     kernel[(seq_len,)](
         q,
         k,
         v,
         mixed_qkv,
+        replay_payload,
+        replay_a,
+        replay_b,
         mixed_qkv.stride(0),
         mixed_qkv.stride(1),
+        *replay_strides,
         num_q_heads,
         num_k_heads,
         num_v_heads,
@@ -212,5 +354,7 @@ def fused_qkv_split_gdn_prefill(
         head_v,
         qkv_dim,
         BLOCK_SIZE=block_size,
+        GATE_BLOCK=gate_block,
+        HAS_REPLAY_PAYLOAD=has_replay,
     )
     return q, k, v

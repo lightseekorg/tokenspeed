@@ -30,7 +30,7 @@ import zmq
 
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
-    CachePDPageManifest,
+    CachePDBlockManifest,
     CacheTransferContract,
     validate_cache_manifest,
 )
@@ -121,13 +121,13 @@ class ReceiverRoutePlan:
 
 def _calc(kv_mgr, prefill_parallel_info: PrefillParallelInfo) -> ReceiverRoutePlan:
     prefill_tp_size_per_dp_rank = prefill_parallel_info.prefill_tp_size_per_dp_rank
-    local_tp_size_per_dp_rank = kv_mgr.world_size // kv_mgr.dp_size
+    local_tp_size_per_dp_rank = kv_mgr.topology.tp_size
     local_cache_layout = kv_mgr.kv_args.cache_layout
     prefill_cache_layout = prefill_parallel_info.cache_layout
 
     if prefill_cache_layout is None:
         raise RuntimeError("Paged cache decode connected to a non-Paged cache prefill")
-    decode_tp_rank = kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
+    decode_tp_rank = kv_mgr.topology.tp_rank
     planner = PagedCacheTransferPlanner(
         prefill_tp_size=prefill_tp_size_per_dp_rank,
         decode_tp_size=local_tp_size_per_dp_rank,
@@ -281,8 +281,8 @@ class MooncakeKVReceiver:
             )
             packed_kv_data_ptr = struct.pack("Q", self.kv_mgr.kv_args.kv_data_ptr)
             cache_layout = self.kv_mgr.kv_args.cache_layout
-            decode_tp_size = self.kv_mgr.world_size // self.kv_mgr.dp_size
-            decode_tp_rank = self.kv_mgr.kv_args.engine_rank % decode_tp_size
+            decode_tp_size = self.kv_mgr.topology.tp_size
+            decode_tp_rank = self.kv_mgr.topology.tp_rank
 
             sock, lock = self._connect("tcp://" + self.prefill_server_url)
             with lock:
@@ -311,17 +311,17 @@ class MooncakeKVReceiver:
 
     def prefill(
         self,
-        page_manifest: CachePDPageManifest | None = None,
+        block_manifest: CachePDBlockManifest | None = None,
     ):
         logger.info(
             "[MooncakeKVReceiver.init] bootstrap_room=%s",
             self.bootstrap_room,
         )
         cache_layout = self.kv_mgr.kv_args.cache_layout
-        if page_manifest is None:
-            raise ValueError("Mooncake PD requires a page manifest")
+        if block_manifest is None:
+            raise ValueError("Mooncake PD requires a block manifest")
         validate_cache_manifest(
-            page_manifest,
+            block_manifest,
             layout=cache_layout,
             peer="destination",
         )
@@ -345,7 +345,7 @@ class MooncakeKVReceiver:
                 message_parts = [
                     str(self.bootstrap_room).encode("ascii"),
                     self.session_id.encode("ascii"),
-                    page_manifest.to_wire_bytes() if not is_dummy else b"",
+                    block_manifest.to_wire_bytes() if not is_dummy else b"",
                 ]
                 sock.send_multipart(message_parts)
 

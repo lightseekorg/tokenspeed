@@ -101,35 +101,6 @@ def inkling_conv_stream_layout(
     return layout
 
 
-def inkling_kv_heads_for_layer(
-    config: "InklingModelConfig", layer_id: int, hetero: bool
-) -> int:
-    """Served KV head count for one layer.
-
-    Uniform mode replicates every layer to ``num_key_value_heads`` (the max
-    over layer kinds). Heterogeneous mode (byte-uniform slots, #647) serves
-    each kind's native count: full layers keep the checkpoint's
-    ``ckpt_num_key_value_heads``, so one slot's fixed bytes hold
-    proportionally more tokens for the narrower kind. How much more follows
-    from the two configured head counts, so consumers must derive page sizes
-    from the returned counts.
-
-    Args:
-        config: The Inkling text config.
-        layer_id: Absolute decoder layer index.
-        hetero: Heterogeneous KV block sizes enabled.
-
-    Returns:
-        The KV head count this layer serves (pre-TP).
-    """
-    if not hetero:
-        return config.num_key_value_heads
-    is_local = layer_id in config.local_layer_ids
-    return (
-        config.swa_num_key_value_heads if is_local else config.ckpt_num_key_value_heads
-    )
-
-
 def inkling_mtp_text_config(
     config: "InklingModelConfig", num_steps: int | None = None
 ) -> "InklingModelConfig":
@@ -184,6 +155,7 @@ class InklingModelConfig(PretrainedConfig):
     def __init__(
         self,
         *,
+        model_max_length: int = 1048576,
         vocab_size: int = 201024,
         hidden_size: int = 1536,
         intermediate_size: int = 768,
@@ -269,6 +241,7 @@ class InklingModelConfig(PretrainedConfig):
         if eos_token_id is None and vocab_size > INKLING_MODEL_END_SAMPLING_TOKEN_ID:
             eos_token_id = INKLING_MODEL_END_SAMPLING_TOKEN_ID
 
+        self.model_max_length = model_max_length
         self.vocab_size = vocab_size
         self.padded_vocab_size = padded_vocab_size
         self.hidden_size = hidden_size

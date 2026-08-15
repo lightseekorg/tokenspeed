@@ -32,6 +32,9 @@ from tokenspeed.runtime.cache.transfer.layout import (
     layout_from_lcm_plan,
     select_layer_fields,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    cache_field_layer_id,
+)
 
 
 def _field(field_id: str, *, stride: int = 64, payload: int = 48):
@@ -42,6 +45,19 @@ def _field(field_id: str, *, stride: int = 64, payload: int = 48):
         block_stride_bytes=stride,
         payload_bytes=payload,
     )
+
+
+def test_cache_field_layer_id_parses_layer_owned_field():
+    assert cache_field_layer_id("layer.12.k") == 12
+
+
+@pytest.mark.parametrize(
+    "field_id",
+    ("attention.k", "layer.bad.k", "layer.-1.k", "layer.0"),
+)
+def test_cache_field_layer_id_rejects_invalid_field(field_id):
+    with pytest.raises(ValueError, match="cache field"):
+        cache_field_layer_id(field_id)
 
 
 def test_layout_rejects_duplicate_group_ids():

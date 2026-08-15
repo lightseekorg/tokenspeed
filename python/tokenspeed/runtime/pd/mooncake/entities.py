@@ -22,11 +22,12 @@ import dataclasses
 import struct
 
 from tokenspeed.runtime.pd.cache_protocol import (
-    CachePDLayerwisePageSelection,
-    CachePDPageManifest,
+    CachePDBlockManifest,
+    CachePDLayerwiseBlockSelection,
     CacheProducerSchedule,
     CacheTransferContract,
 )
+from tokenspeed.runtime.pd.topology import PDParallelTopology
 from tokenspeed.runtime.pd.transfer_plan import (
     MAX_PAGED_CACHE_TP_SIZE,
     CacheTransferFragment,
@@ -86,10 +87,10 @@ class TransferKVChunk:
     layerwise_interval: int = 1
     wait_for_bootstrap_token: bool = False
     spec_candidate_ids: list[int] | None = None
-    page_manifest: CachePDPageManifest | None = None
-    # Process-local group-aware page window for CachePD layerwise transfer.
+    block_manifest: CachePDBlockManifest | None = None
+    # Process-local group-aware block window for CachePD layerwise transfer.
     # Decode continues to publish one immutable full request manifest.
-    cache_page_selection: CachePDLayerwisePageSelection | None = None
+    cache_block_selection: CachePDLayerwiseBlockSelection | None = None
 
 
 # decode
@@ -99,11 +100,11 @@ class TransferInfo:
 
     room: int
     mooncake_session_id: str
-    page_manifest: CachePDPageManifest | None = None
+    block_manifest: CachePDBlockManifest | None = None
 
     @property
     def is_dummy(self) -> bool:
-        return self.page_manifest is None
+        return self.block_manifest is None
 
     @staticmethod
     def route_header_from_zmq(msg: list[bytes]) -> tuple[int, str]:
@@ -120,11 +121,13 @@ class TransferInfo:
     @classmethod
     def from_zmq(cls, msg: list[bytes]):
         room, session_id = cls.route_header_from_zmq(msg)
-        page_manifest = CachePDPageManifest.from_wire_bytes(msg[2]) if msg[2] else None
+        block_manifest = (
+            CachePDBlockManifest.from_wire_bytes(msg[2]) if msg[2] else None
+        )
         return cls(
             room=room,
             mooncake_session_id=session_id,
-            page_manifest=page_manifest,
+            block_manifest=block_manifest,
         )
 
 
@@ -196,9 +199,7 @@ class KVManagerArgs:
     bootstrap_port: int
     dist_init_addr: str
 
-    world_size: int
-    dp_size: int
-    attn_tp_rank: int
+    topology: PDParallelTopology
 
     enable_metrics: bool
     enable_dp_attention: bool
