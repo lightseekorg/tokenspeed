@@ -278,14 +278,6 @@ def _load_block_param(
     return False
 
 
-def compute_log_scaling_tau(
-    positions: torch.Tensor, n_floor: int, alpha: float
-) -> torch.Tensor:
-    """Long-context query scaling factor (config-gated; see InklingAttention)."""
-    effective_n = (positions + 1).to(torch.float32)
-    return 1.0 + alpha * torch.log(torch.clamp(effective_n / float(n_floor), min=1.0))
-
-
 class InklingShortConvolution(nn.Module):
     """Residual per-channel causal FIR (sconv) over one stream.
 
@@ -1437,6 +1429,18 @@ class InklingTextModel(nn.Module):
             if config.use_embed_norm
             else None
         )
+        if config.log_scaling_n_floor is not None:
+            effective_n = torch.arange(
+                1, config.model_max_length + 1, dtype=torch.float32
+            )
+            log_scaling_tau_table = 1.0 + config.log_scaling_alpha * torch.log(
+                torch.clamp(effective_n / float(config.log_scaling_n_floor), min=1.0)
+            )
+            self.register_buffer(
+                "log_scaling_tau_table",
+                log_scaling_tau_table,
+                persistent=False,
+            )
 
         alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
@@ -1497,11 +1501,7 @@ class InklingTextModel(nn.Module):
 
         log_scaling_tau = None
         if self.config.log_scaling_n_floor is not None:
-            log_scaling_tau = compute_log_scaling_tau(
-                positions,
-                self.config.log_scaling_n_floor,
-                self.config.log_scaling_alpha,
-            )
+            log_scaling_tau = self.log_scaling_tau_table[positions]
 
         residual = None
         for layer in self.layers:

@@ -155,6 +155,7 @@ class InklingModelConfig(PretrainedConfig):
     def __init__(
         self,
         *,
+        model_max_length: int = 1048576,
         vocab_size: int = 201024,
         hidden_size: int = 1536,
         intermediate_size: int = 768,
@@ -240,6 +241,7 @@ class InklingModelConfig(PretrainedConfig):
         if eos_token_id is None and vocab_size > INKLING_MODEL_END_SAMPLING_TOKEN_ID:
             eos_token_id = INKLING_MODEL_END_SAMPLING_TOKEN_ID
 
+        self.model_max_length = model_max_length
         self.vocab_size = vocab_size
         self.padded_vocab_size = padded_vocab_size
         self.hidden_size = hidden_size
