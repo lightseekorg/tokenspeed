@@ -585,10 +585,10 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
                (config_.role != Role::kD && request->Is<fsm::Submitted>()) ||
                (request->Is<fsm::Retracted>() && !recovery_queue_.empty() && request->Id() == recovery_queue_.front());
     });
-    const std::int32_t state_prefill_reserve =
-        config_.enable_mixed_prefill_decode && coordinator_.HasMambaStateGroup() && has_local_prefill
-            ? coordinator_.PrefixGranularity()
-            : 0;
+    const std::int32_t state_prefill_reserve = !build_prefill_handoff_batch && config_.enable_mixed_prefill_decode &&
+                                                       coordinator_.HasMambaStateGroup() && has_local_prefill
+                                                   ? coordinator_.PrefixGranularity()
+                                                   : 0;
 
     std::vector<ForwardOperation> operations;
     std::vector<LoadBackOperation> load_back_operations;
