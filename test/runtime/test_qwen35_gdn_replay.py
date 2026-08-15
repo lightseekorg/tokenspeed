@@ -30,7 +30,12 @@ import pytest
 import torch
 
 # CI Registration (parsed via AST, runtime no-op)
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# ``test/`` (for ``ci_system``) and the repo root (for ``test.runtime.*``
+# absolute imports) both need to be importable when run_ci_suite executes
+# this file as a standalone script.
+_TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _TEST_DIR)
+sys.path.insert(0, os.path.dirname(_TEST_DIR))
 from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
@@ -398,3 +403,7 @@ def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):
             atol=1e-6,
             rtol=1e-5,
         )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
