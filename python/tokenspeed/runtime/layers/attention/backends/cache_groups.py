@@ -148,12 +148,18 @@ class CacheGroupsMixin:
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
         """Per-group write locations for out-of-backend KV writers (fused
         RoPE prewrite): the write must land in the pages this layer's group
-        reads, never the scheduler's single-table locations.
+        reads, never the scheduler's single-table locations. Draft chains own
+        their per-step locations, so they must keep the caller-provided tensor.
         """
         metadata = self._prewrite_metadata(forward_mode)
         if metadata is None or metadata.out_cache_locs is None:
             return out_cache_loc
-        return self._select_out_cache_loc(layer, metadata, out_cache_loc)
+        return self._select_out_cache_loc(
+            layer,
+            metadata,
+            out_cache_loc,
+            prefer_caller=self.is_draft,
+        )
 
     def _shed_state_groups(self, tables):
         """Drop family="state" groups (GDN/mamba state blocks, consumed by the
