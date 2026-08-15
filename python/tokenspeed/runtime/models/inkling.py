@@ -81,6 +81,9 @@ from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.attention.triton.log_scaling import (
+    log_scaling_tau as compute_log_scaling_tau,
+)
 from tokenspeed_kernel.ops.conv import inkling_ring_sconv
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
@@ -1429,19 +1432,6 @@ class InklingTextModel(nn.Module):
             if config.use_embed_norm
             else None
         )
-        if config.log_scaling_n_floor is not None:
-            effective_n = torch.arange(
-                1, config.model_max_length + 1, dtype=torch.float32
-            )
-            log_scaling_tau_table = 1.0 + config.log_scaling_alpha * torch.log(
-                torch.clamp(effective_n / float(config.log_scaling_n_floor), min=1.0)
-            )
-            self.register_buffer(
-                "log_scaling_tau_table",
-                log_scaling_tau_table,
-                persistent=False,
-            )
-
         alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
         def get_layer(idx: int, prefix: str) -> InklingDecoderLayer:
@@ -1501,7 +1491,11 @@ class InklingTextModel(nn.Module):
 
         log_scaling_tau = None
         if self.config.log_scaling_n_floor is not None:
-            log_scaling_tau = self.log_scaling_tau_table[positions]
+            log_scaling_tau = compute_log_scaling_tau(
+                positions,
+                self.config.log_scaling_n_floor,
+                self.config.log_scaling_alpha,
+            )
 
         residual = None
         for layer in self.layers:
