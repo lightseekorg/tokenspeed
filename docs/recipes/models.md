@@ -430,7 +430,7 @@ Notes:
 - The DeepEP layout pulls ahead from mid batch up, where its expert kernels and
   the second attention replica both pay off.
 
-### Qwen3.8-27B
+### Qwen3.8-27B(Blackwell)
 
 A dense 27B-class Qwen3.8 FP8 checkpoint on a single GPU, with self-speculative
 MTP (the draft model path points at the same checkpoint):
@@ -454,6 +454,34 @@ tokenspeed serve Qwen/Qwen3.8-27B-FP8 \
   --disable-kvstore \
   --host 0.0.0.0 --port 8000
 ```
+
+### Qwen3.8-27B(Hopper)
+
+A dense 27B-class Qwen3.8 FP8 checkpoint on a single GPU, with self-speculative
+MTP (the draft model path points at the same checkpoint):
+
+```bash
+tokenspeed serve Qwen/Qwen3.8-27B-FP8 \
+  --served-model-name Qwen/Qwen3.8-27B-FP8 \
+  --world-size 1 \
+  --gpu-memory-utilization 0.9 \
+  --moe-backend fa3 \
+  --drafter-attention-backend fa3 \
+  --chunked-prefill-size 8192 \
+  --max-model-len 256000 \
+  --max-num-seqs 64 \
+  --kv-cache-dtype fp8_e4m3 \
+  --speculative-algorithm MTP \
+  --speculative-draft-model-path Qwen/Qwen3.8-27B-FP8 \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen \
+  --disable-kvstore \
+  --host 0.0.0.0 --port 8000
+```
+
 
 ## GPT-OSS 20B / 120B
 
