@@ -684,19 +684,33 @@ class KdaAttnBackend(MambaAttnBackend):
         # pad_slot_id and every other neutral value is -1; steps rides row 1.
         bufs["flat"][:, :n].fill_(-1)
         bufs["steps"][:n].fill_(0)
-        if state_in_by_group is not None and real_bs > 0:
-            for gid in self._state_group_ids:
-                bufs["anchor"][gid][:real_bs].copy_(
-                    state_in_by_group[gid][:real_bs].to(torch.int32)
-                )
+        n_groups = len(self._state_group_ids)
+        anchor_rows = bufs["flat"][2 : 2 + n_groups]
+        # The compose reads this round's committed pages as both the identity
+        # reference and the no-pending anchor; stacking hands it one source
+        # instead of copying a row per group.
+        if state_in_by_group is None or real_bs <= 0:
+            state_in = anchor_rows
+            state_in_stride = bufs["flat"].shape[1]
+        else:
+            state_in = torch.stack(
+                [state_in_by_group[gid][:real_bs] for gid in self._state_group_ids]
+            )
+            state_in_stride = state_in.stride(0)
         if real_bs <= 0:
             # Fully padded round: nothing to fuse into, and an empty batch is
             # no evidence the owners left -- a capacity retraction produces
             # exactly this round with every other decoder still resident.
             # Leave the pending for a round that carries its owners.
             return
+        from tokenspeed_kernel.ops.metadata import kda_stage_replay
+
+        assert rpis_dev is not None and rpis_dev.shape[0] >= real_bs
         pending = self._kda_pending
         if pending is None:
+            # No window to fuse, so the anchors are this round's pages verbatim.
+            if state_in is not anchor_rows:
+                anchor_rows[:, :real_bs].copy_(state_in)
             return
         batch = kwargs.get("forward_batch")
         if batch is None or not batch.request_pool_indices:
@@ -740,17 +754,10 @@ class KdaAttnBackend(MambaAttnBackend):
             # Payload is in t_prev units: a different window size would mis-replay.
             self._flush_kda_pending()
             return
-        from tokenspeed_kernel.ops.metadata import kda_stage_replay
-
         # One launch for every control row. Ownership comes from the device
         # slot table; a row failing the identity or causal gate is condemned
         # in the table by the compose itself, so its CPU dict entry can
-        # linger harmlessly (every later write gates on the table). The
-        # anchor rows arrive holding this round's committed pages, which the
-        # compose reads as both the identity reference and the no-pending
-        # fallback before overwriting them.
-        assert rpis_dev is not None and rpis_dev.shape[0] >= real_bs
-        n_groups = len(self._state_group_ids)
+        # linger harmlessly (every later write gates on the table).
         kda_stage_replay(
             bufs["flat"],
             self._kda_slot_table,
@@ -760,13 +767,14 @@ class KdaAttnBackend(MambaAttnBackend):
             pending["anchor_stack"],
             pending["commit_stack"],
             None if committed is None else committed[:real_bs],
-            bufs["flat"][2 : 2 + n_groups],
+            state_in,
+            state_in_stride,
             base_offset=pending["parity"] * self._payload_half_rows,
             draft_token_num=t_prev,
             num_groups=n_groups,
         )
         # The record stays live until the forward it was staged for is issued:
-        # an abandoned prep still owes the window a flush. `notify_forward_issued`
+        # an abandoned prep still owes the window a flush. `release_deferred_state`
         # releases it -- NOT the next round's record, which never arrives when
         # the round dies between the KDA layers and the accept sampling.
         self._kda_replay_staged = True
@@ -1031,8 +1039,12 @@ class KdaAttnBackend(MambaAttnBackend):
         else:
             self._kda_pending = None
 
-    def notify_forward_issued(self) -> None:
-        """Release the record the just-issued forward commits device-side.
+    def release_deferred_state(self) -> None:
+        """Drop the record whose window the just-issued forward already applied.
+
+        The counterpart to ``flush_deferred_state``, which writes a window out:
+        here the device work is already on its way, so only the bookkeeping is
+        retired.
 
         The fused verify applies the pending window inside the KDA layers,
         far upstream of the accept sampling whose result records the next
@@ -1582,6 +1594,6 @@ class HybridKDABackend(HybridLinearAttnBackend):
     @override
     def settle_deferred_state(self, accepted_length):
         """Release issued replay work, then record a verified state window."""
-        self.linear_attn_backend.notify_forward_issued()
+        self.linear_attn_backend.release_deferred_state()
         if accepted_length is not None:
             self.linear_attn_backend.commit_verified_state(accepted_length)

@@ -114,6 +114,7 @@ def _case(bs, pend_bs, G, seed, with_causal=True, cap=None, table_size=64):
         (1, 1, 1, True),
         (2, 3, 3, True),
         (2, 3, 3, False),
+        (3, 3, 3, True),
         (32, 32, 3, True),
         (257, 300, 4, True),  # crosses the kernel's BLOCK
         (7, 4, 2, True),  # pending smaller than the batch
@@ -127,6 +128,7 @@ def test_matches_the_eager_chain_bitwise(bs, pend_bs, G, causal):
     want, want_table = _reference(
         flat, table, rpis, steps, expect, anchor, commit, committed, G, base, t
     )
+    state_in = flat[2 : 2 + G, :bs].clone()
     kda_stage_replay(
         flat,
         table,
@@ -136,7 +138,8 @@ def test_matches_the_eager_chain_bitwise(bs, pend_bs, G, causal):
         anchor,
         commit,
         committed,
-        flat[2 : 2 + G],
+        state_in,
+        state_in.stride(0),
         base_offset=base,
         draft_token_num=t,
         num_groups=G,
@@ -175,6 +178,7 @@ def test_out_of_range_pool_index_degrades_to_no_fuse():
         commit,
         committed,
         flat[2 : 2 + G],
+        flat.stride(0),
         base_offset=0,
         draft_token_num=2,
         num_groups=G,
@@ -203,6 +207,7 @@ def test_padded_tail_rows_are_untouched():
         commit,
         committed,
         flat[2 : 2 + G],
+        flat.stride(0),
         base_offset=0,
         draft_token_num=2,
         num_groups=G,
@@ -226,6 +231,7 @@ def test_empty_batch_is_a_noop():
         torch.zeros((G, 1), dtype=torch.int64, device=DEV),
         None,
         flat[2 : 2 + G],
+        flat.stride(0),
         base_offset=0,
         draft_token_num=2,
         num_groups=G,
@@ -269,6 +275,7 @@ def test_one_compiled_variant_across_rounds():
             commit,
             committed[:bs] if committed is not None else None,
             flat[2 : 2 + G],
+            flat.stride(0),
             base_offset=base,
             draft_token_num=2,
             num_groups=G,
@@ -296,13 +303,23 @@ def test_does_not_block_the_host_on_a_busy_stream():
     )
     args = (flat, table, rpis, steps, expect, anchor, commit, committed)
     kda_stage_replay(
-        *args, flat[2 : 2 + G], base_offset=0, draft_token_num=2, num_groups=G
+        *args,
+        flat[2 : 2 + G],
+        flat.stride(0),
+        base_offset=0,
+        draft_token_num=2,
+        num_groups=G,
     )
     torch.cuda.synchronize()
     torch.cuda._sleep(400_000_000)
     t0 = time.perf_counter()
     kda_stage_replay(
-        *args, flat[2 : 2 + G], base_offset=64, draft_token_num=2, num_groups=G
+        *args,
+        flat[2 : 2 + G],
+        flat.stride(0),
+        base_offset=64,
+        draft_token_num=2,
+        num_groups=G,
     )
     blocked = (time.perf_counter() - t0) * 1e3
     torch.cuda.synchronize()

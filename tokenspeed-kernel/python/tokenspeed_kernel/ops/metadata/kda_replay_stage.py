@@ -44,7 +44,15 @@ from tokenspeed_kernel._triton import tl, triton
 # Left to specialize, Triton would JIT a fresh variant per divisible-by-16 or
 # ==1 bucket and stall the event loop mid-decode to compile it.
 @triton.jit(
-    do_not_specialize=["base_offset", "t_prev", "cap", "bs", "pend_bs", "table_size"],
+    do_not_specialize=[
+        "base_offset",
+        "t_prev",
+        "cap",
+        "bs",
+        "pend_bs",
+        "table_size",
+        "state_in_stride",
+    ],
 )
 def _kda_stage_replay_kernel(
     flat_ptr,
@@ -56,6 +64,7 @@ def _kda_stage_replay_kernel(
     commit_ptr,
     committed_ptr,
     state_in_ptr,
+    state_in_stride,
     base_offset,
     t_prev,
     cap,
@@ -109,7 +118,7 @@ def _kda_stage_replay_kernel(
         commit = tl.load(commit_ptr + g * pend_bs + safe, mask=live & fuse, other=0)
         # Rows without a fusable pending keep this round's committed page as
         # the anchor and skip the commit (-1).
-        stale = tl.load(state_in_ptr + g * cap + offs, mask=live, other=-1)
+        stale = tl.load(state_in_ptr + g * state_in_stride + offs, mask=live, other=-1)
         tl.store(
             flat_ptr + (2 + g) * cap + offs,
             tl.where(fuse, anchor.to(tl.int32), stale),
@@ -132,6 +141,7 @@ def kda_stage_replay(
     pending_commit,
     committed,
     state_in,
+    state_in_stride: int,
     *,
     base_offset: int,
     draft_token_num: int,
@@ -156,8 +166,10 @@ def kda_stage_replay(
         pending_commit: ``[G, pend_bs]`` int64 destination page per slot.
         committed: ``[bs]`` int64 committed position of each batch row, or
             ``None`` to skip the causal gate.
-        state_in: ``[G, cap]`` int32 committed page of each batch row this
-            round -- the anchor fallback and the identity reference.
+        state_in: ``[G, >=bs]`` row-contiguous int32 committed page of each
+            batch row this round. Its rows are read, never written, as the
+            anchor fallback and identity reference.
+        state_in_stride: row stride of ``state_in`` in elements.
         base_offset: first payload ring row of the pending's parity half.
         draft_token_num: payload rows per slot (the window size ``T``).
         num_groups: number of state groups ``G``.
@@ -181,6 +193,7 @@ def kda_stage_replay(
         pending_commit,
         committed if committed is not None else rpis,
         state_in,
+        state_in_stride=state_in_stride,
         base_offset=base_offset,
         t_prev=draft_token_num,
         cap=cap,

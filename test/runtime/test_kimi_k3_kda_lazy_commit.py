@@ -211,7 +211,7 @@ class _Harness:
         # The graph wrapper settles state after every forward; with no accept
         # lengths yet this is just the release of the window the stage composed,
         # which is on the device once the layers have run.
-        self.backend.notify_forward_issued()
+        self.backend.release_deferred_state()
         return outs
 
     def accept(self, accepted):
