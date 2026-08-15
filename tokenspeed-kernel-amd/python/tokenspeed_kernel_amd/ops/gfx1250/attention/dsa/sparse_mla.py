@@ -38,8 +38,12 @@ __all__ = [
 
 _RADIX_BITS = (12, 12, 8)
 _MAX_BUCKETS = gl.constexpr(1 << max(_RADIX_BITS))
-_TOPK_BLOCK_N = 4096
+_TOPK_BLOCK_N = 2048
 _TOPK_NUM_WARPS = 8
+_TOPK_WAVES_PER_EU = 1
+_PREFILL_LOGITS_BLOCK_N = 128
+_PREFILL_LOGITS_NUM_WARPS = 8
+_PREFILL_LOGITS_WAVES_PER_EU = 1
 _GLM52_SCORING_HEADS = 32
 _GLM52_FUSED_DECODE_MAX_CANDIDATES = 98_304
 
@@ -137,7 +141,7 @@ def _emit_topk_tile(
     gl.store(
         out + row * out_stride + reservation,
         logical_offsets,
-        mask=greater,
+        mask=greater & (reservation < count_greater),
     )
     gl.store(
         out + row * out_stride + count_greater + reservation,
@@ -271,7 +275,7 @@ def _dsa_wave32_radix_topk_kernel(
                 BLOCK_N,
                 pass_index == 0,
             )
-        gl.barrier()
+            gl.barrier()
 
         counts = shared_histogram.load(histogram_layout)
         count_pairs = counts.reshape([_MAX_BUCKETS // 2, 2])
@@ -395,7 +399,7 @@ def _dsa_topk_indices(
         BLOCK_N=_TOPK_BLOCK_N,
         LOAD_ELEMS=_TOPK_BLOCK_N // (32 * _TOPK_NUM_WARPS),
         num_warps=_TOPK_NUM_WARPS,
-        waves_per_eu=1,
+        waves_per_eu=_TOPK_WAVES_PER_EU,
     )
     return out, lens_out
 
@@ -630,7 +634,7 @@ def gluon_dsa_prefill_topk_fp8_gfx1250(
     else:
         max_query_rows = max(1, int(max_logits_bytes) // (max(seq_len_sum, 1) * 4))
 
-    block_n = 32
+    block_n = _PREFILL_LOGITS_BLOCK_N
     for start in range(0, q.shape[0], max_query_rows):
         end = min(start + max_query_rows, q.shape[0])
         combined_q = _combine_scoring_query_heads(q[start:end], weights[start:end])
@@ -659,8 +663,8 @@ def gluon_dsa_prefill_topk_fp8_gfx1250(
             softmax_scale=float(softmax_scale),
             BLOCK_N=block_n,
             BLOCK_D=128,
-            num_warps=4,
-            waves_per_eu=1,
+            num_warps=_PREFILL_LOGITS_NUM_WARPS,
+            waves_per_eu=_PREFILL_LOGITS_WAVES_PER_EU,
         )
         _dsa_topk_indices(
             logits,

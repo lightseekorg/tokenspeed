@@ -918,6 +918,7 @@ class KimiLinearKDA(nn.Module):
         # plain GEMV on the prefill path.
         # Fused [3*proj, k] conv kernel bank, built once in post_load_weights.
         conv_weights = self.conv_weights
+        fuse_decode_output_norm = ctx.forward_mode.is_decode() and num_tokens == ctx.bs
 
         core_out = ctx.attn_backend.forward(
             q=None,
@@ -943,19 +944,25 @@ class KimiLinearKDA(nn.Module):
             A_log=self.A_log,
             dt_bias=self.dt_bias,
             lower_bound=self.gate_lower_bound,
+            output_gate=out_gate if fuse_decode_output_norm else None,
+            norm_weight=self.o_norm.weight if fuse_decode_output_norm else None,
+            norm_eps=self.o_norm.variance_epsilon if fuse_decode_output_norm else None,
             layer_id=self.layer_id,
             seq_len=num_tokens,
         )
 
-        # Per-head gated RMSNorm + sigmoid output gate in one kernel.
-        core_out = rmsnorm_gated_sigmoid(
-            core_out.reshape(num_tokens, hn * hd).contiguous(),
-            out_gate.contiguous(),
-            self.o_norm.weight,
-            self.o_norm.variance_epsilon,
-            hn,
-            hd,
-        )
+        core_out = core_out.reshape(num_tokens, hn * hd)
+        if not fuse_decode_output_norm:
+            # Decode kernels may fuse this epilogue; prefill retains the shared
+            # per-head norm implementation.
+            core_out = rmsnorm_gated_sigmoid(
+                core_out.contiguous(),
+                out_gate.contiguous(),
+                self.o_norm.weight,
+                self.o_norm.variance_epsilon,
+                hn,
+                hd,
+            )
         output, _ = self.o_proj(core_out)
         return output
 

@@ -1292,6 +1292,9 @@ class MambaAttnBackend(AttentionBackend):
         f_b_weight = kwargs.get("f_b_weight")
         g_raw = kwargs.get("g_raw")
         beta_raw = kwargs.get("beta_raw")
+        output_gate = kwargs.get("output_gate")
+        norm_weight = kwargs.get("norm_weight")
+        norm_eps = kwargs.get("norm_eps")
         gate_lower_bound = kwargs.get("lower_bound")
         A_log = kwargs["A_log"]
         dt_bias = kwargs["dt_bias"]
@@ -1320,6 +1323,9 @@ class MambaAttnBackend(AttentionBackend):
             attn_tp_size=attn_tp_size,
             head_v_dim=head_v_dim,
             lower_bound=gate_lower_bound,
+            output_gate=output_gate,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
         )
         if fused_out is not None:
             return fused_out
@@ -1368,6 +1374,9 @@ class MambaAttnBackend(AttentionBackend):
             f_b_weight=f_b_weight,
             beta_raw=beta_raw,
             lower_bound=gate_lower_bound,
+            output_gate=output_gate,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
         )
 
     def _decode(
@@ -1388,6 +1397,9 @@ class MambaAttnBackend(AttentionBackend):
         attn_tp_size: int,
         head_v_dim: int,
         lower_bound: float | None,
+        output_gate: torch.Tensor | None,
+        norm_weight: torch.Tensor | None,
+        norm_eps: float | None,
     ) -> torch.Tensor | None:
         """Whole-step decode attempt; ``None`` falls through to the shared flow.
 
@@ -1415,6 +1427,9 @@ class MambaAttnBackend(AttentionBackend):
             attn_tp_size: Attention tensor-parallel size.
             head_v_dim: Value head dimension.
             lower_bound: KDA decay clamp.
+            output_gate: Optional KDA gated-norm logits.
+            norm_weight: Optional KDA output RMSNorm weight.
+            norm_eps: Optional KDA output RMSNorm epsilon.
 
         Returns:
             The layer output when a fused kernel ran, else None.
@@ -1439,6 +1454,9 @@ class MambaAttnBackend(AttentionBackend):
         f_b_weight: torch.Tensor | None,
         beta_raw: torch.Tensor | None,
         lower_bound: float | None,
+        output_gate: torch.Tensor | None,
+        norm_weight: torch.Tensor | None,
+        norm_eps: float | None,
     ) -> torch.Tensor:
         """Single-token recurrent scan over the split, conv'd projections.
 
@@ -1464,6 +1482,9 @@ class MambaAttnBackend(AttentionBackend):
             f_b_weight: KDA second gate projection.
             beta_raw: KDA raw per-head beta logits.
             lower_bound: KDA decay clamp.
+            output_gate: Optional KDA gated-norm logits.
+            norm_weight: Optional KDA output RMSNorm weight.
+            norm_eps: Optional KDA output RMSNorm epsilon.
 
         Returns:
             ``[1, B, Hv, V]`` layer output.

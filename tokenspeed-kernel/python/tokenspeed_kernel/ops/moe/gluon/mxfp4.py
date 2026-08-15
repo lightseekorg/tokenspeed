@@ -33,6 +33,15 @@ platform = current_platform()
 
 # TP8/EP8 model measurements favor warp GEMV through M=16.
 _ROUTE_DIRECT_DECODE_MAX_TOKENS = 16
+_GFX1250_DECODE_MAX_AVERAGE_BPE = 16
+
+
+def _use_gfx1250_moe_decode(num_routed_rows: int, num_experts: int) -> bool:
+    # Compare the average batch per expert without a division or device sync.
+    return (
+        0 < num_routed_rows
+        and num_routed_rows <= _GFX1250_DECODE_MAX_AVERAGE_BPE * num_experts
+    )
 
 
 if platform.is_amd:
@@ -245,6 +254,9 @@ if platform.is_amd:
         swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
         w13_pc = w.w13_precision_config
         w2_pc = w.w2_precision_config
+        decode = _use_gfx1250_moe_decode(
+            topk_ids.numel(), w.w13_weight_triton_tensor.shape[0]
+        )
 
         return fused_mxfp_gfx1250.gluon_mxfp_precomputed_mxfp4_fused_moe(
             x,
@@ -268,6 +280,7 @@ if platform.is_amd:
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
             swiglu_beta=swiglu_beta,
+            decode=decode,
         )
 
     @register_kernel(

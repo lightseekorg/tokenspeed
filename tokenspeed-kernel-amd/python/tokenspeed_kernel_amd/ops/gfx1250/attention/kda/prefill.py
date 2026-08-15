@@ -63,7 +63,9 @@ from tokenspeed_kernel_amd._triton import gl, gluon, triton
 _CHUNK_SIZE = 64
 _SUBCHUNK_SIZE = 16
 _FUSED_PREPROCESS_WARPS = 8
-_SCAN_OUTPUT_BLOCK = 16
+_SCAN_OUTPUT_BLOCK = 8
+_SCAN_WAVES_PER_EU = 2
+_OUTPUT_WAVES_PER_EU = 4
 gfx1250 = gl.amd.gfx1250
 
 
@@ -335,13 +337,30 @@ def _preprocess_intra_fwd_kernel(
     mask = (tokens[:, None] < length) & (keys[None, :] < K)
     offsets = ((begin + tokens[:, None]) * H + head) * K + keys[None, :]
 
-    q_value = gl.load(q + offsets, mask=mask, other=0.0).to(gl.float32)
-    k_value = gl.load(k + offsets, mask=mask, other=0.0).to(gl.float32)
-    q_norm = gl.rsqrt(gl.sum(q_value * q_value, axis=1) + 1e-6)
-    k_norm = gl.rsqrt(gl.sum(k_value * k_value, axis=1) + 1e-6)
-    normalized_q = (q_value * q_norm[:, None]).to(gl.bfloat16)
-    normalized_k = (k_value * k_norm[:, None]).to(gl.bfloat16)
-    gl.store(kn + offsets, normalized_k, mask=mask)
+    shared_qk: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[K, 8]], [BT, K], [1, 0]
+    )
+    shared_bg: gl.constexpr = gl.SwizzledSharedLayout(4, 1, 8, order=[1, 0])
+    q_smem = gl.allocate_shared_memory(q.dtype.element_ty, [BT, K], shared_qk)
+    k_smem = gl.allocate_shared_memory(k.dtype.element_ty, [BT, K], shared_qk)
+    bg_smem = gl.allocate_shared_memory(gl.float32, [BT, K], shared_bg)
+
+    q_desc = gfx1250.tdm.make_tensor_descriptor(
+        base=q + (begin * H + head) * K,
+        shape=(length, K),
+        strides=(H * K, 1),
+        block_shape=(BT, K),
+        layout=shared_qk,
+    )
+    k_desc = gfx1250.tdm.make_tensor_descriptor(
+        base=k + (begin * H + head) * K,
+        shape=(length, K),
+        strides=(H * K, 1),
+        block_shape=(BT, K),
+        layout=shared_qk,
+    )
+    gfx1250.tdm.async_load(q_desc, [token0, 0], q_smem)
+    gfx1250.tdm.async_load(k_desc, [token0, 0], k_smem)
 
     gate_input = gl.load(raw_g + offsets, mask=mask, other=0.0).to(gl.float32)
     gate_input += gl.load(
@@ -358,19 +377,32 @@ def _preprocess_intra_fwd_kernel(
         )
         gate_value = -a * softplus
     gate_value = gl.where(mask, gate_value, 0.0)
-    cumulative_gate = gl.associative_scan(gate_value, 0, _add)
-    gl.store(bg + offsets, cumulative_gate, mask=mask)
-    gated_query = normalized_q.to(gl.float32)
-    gated_query *= gl.exp(cumulative_gate) * SCALE
-    gl.store(qg + offsets, gated_query.to(gl.bfloat16), mask=mask)
 
-    shared_qk: gl.constexpr = gl.SwizzledSharedLayout(8, 2, 8, order=[1, 0])
-    shared_bg: gl.constexpr = gl.SwizzledSharedLayout(4, 1, 8, order=[1, 0])
-    q_smem = gl.allocate_shared_memory(gl.bfloat16, [BT, K], shared_qk)
-    k_smem = gl.allocate_shared_memory(gl.bfloat16, [BT, K], shared_qk)
-    bg_smem = gl.allocate_shared_memory(gl.float32, [BT, K], shared_bg)
+    gfx1250.tdm.async_wait(0)
+    q_value = q_smem.load(producer_layout).to(gl.float32)
+    k_value = k_smem.load(producer_layout).to(gl.float32)
+    q_norm = gl.rsqrt(gl.sum(q_value * q_value, axis=1) + 1e-6)
+    k_norm = gl.rsqrt(gl.sum(k_value * k_value, axis=1) + 1e-6)
+    normalized_q = (q_value * q_norm[:, None]).to(q.dtype.element_ty)
+    normalized_k = (k_value * k_norm[:, None]).to(k.dtype.element_ty)
+    gl.store(kn + offsets, normalized_k, mask=mask)
     q_smem.store(normalized_q)
     k_smem.store(normalized_k)
+    bg_smem.store(gate_value)
+    gl.barrier()
+
+    scan_layout: gl.constexpr = gl.BlockedLayout([1, 2], [4, 8], [1, NUM_WARPS], [1, 0])
+    scan_rows = gl.arange(0, BT, layout=gl.SliceLayout(1, scan_layout))
+    scan_keys = gl.arange(0, K, layout=gl.SliceLayout(0, scan_layout))
+    scan_tokens = token0 + scan_rows
+    scan_mask = (scan_tokens[:, None] < length) & (scan_keys[None, :] < K)
+    scan_offsets = ((begin + scan_tokens[:, None]) * H + head) * K + scan_keys[None, :]
+    gate_scan = bg_smem.load(scan_layout)
+    cumulative_gate = gl.associative_scan(gate_scan, 0, _add)
+    gl.store(bg + scan_offsets, cumulative_gate, mask=scan_mask)
+    gated_query = q_smem.load(scan_layout).to(gl.float32)
+    gated_query *= gl.exp(cumulative_gate) * SCALE
+    gl.store(qg + scan_offsets, gated_query.to(gl.bfloat16), mask=scan_mask)
     bg_smem.store(cumulative_gate)
     gl.barrier()
 
@@ -1066,7 +1098,7 @@ def gluon_kda_paged_prefill_gfx1250(
         BO=scan_output_block,
         num_warps=4,
         num_stages=2,
-        waves_per_eu=1,
+        waves_per_eu=_SCAN_WAVES_PER_EU,
     )
     _output_fwd_kernel[(num_chunks, heads)](
         aqk,
@@ -1079,7 +1111,7 @@ def gluon_kda_paged_prefill_gfx1250(
         BT=chunk_size,
         num_warps=4,
         num_stages=2,
-        waves_per_eu=1,
+        waves_per_eu=_OUTPUT_WAVES_PER_EU,
     )
     return output.unsqueeze(0), final_state
 
