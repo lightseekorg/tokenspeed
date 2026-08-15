@@ -1393,6 +1393,14 @@ if current_platform().is_amd:
     )
     def gluon_rel_mha_prefill_gfx950(*args, **kwargs):
         kwargs.pop("enable_pdl", None)
+        tau = kwargs.pop("tau", None)
+        if tau is not None:
+            # No fused per-row logit scale in the gluon backend; fold tau
+            # into q and the rel bias: tau*(scale*qk + rel).
+            kwargs["q"] = kwargs["q"] * tau[:, None, None].to(kwargs["q"].dtype)
+            kwargs["rel_logits"] = kwargs["rel_logits"] * tau[:, None, None].to(
+                kwargs["rel_logits"].dtype
+            )
         return _rel_prefill_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1418,6 +1426,14 @@ if current_platform().is_amd:
     )
     def gluon_rel_mha_extend_gfx950(*args, **kwargs):
         kwargs.pop("enable_pdl", None)
+        tau = kwargs.pop("tau", None)
+        if tau is not None:
+            # No fused per-row logit scale in the gluon backend; fold tau
+            # into q and the rel bias: tau*(scale*qk + rel).
+            kwargs["q"] = kwargs["q"] * tau[:, None, None].to(kwargs["q"].dtype)
+            kwargs["rel_logits"] = kwargs["rel_logits"] * tau[:, None, None].to(
+                kwargs["rel_logits"].dtype
+            )
         return _rel_extend_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1443,4 +1459,12 @@ if current_platform().is_amd:
     )
     def gluon_rel_mha_decode_gfx950(*args, **kwargs):
         kwargs.pop("enable_pdl", None)
+        tau = kwargs.pop("tau", None)
+        if tau is not None:
+            # No fused per-row logit scale in the gluon backend; fold tau
+            # into q and the rel bias: tau*(scale*qk + rel).
+            kwargs["q"] = kwargs["q"] * tau[:, None, None].to(kwargs["q"].dtype)
+            kwargs["rel_logits"] = kwargs["rel_logits"] * tau[:, None, None].to(
+                kwargs["rel_logits"].dtype
+            )
         return _rel_decode_impl(*args, **kwargs)

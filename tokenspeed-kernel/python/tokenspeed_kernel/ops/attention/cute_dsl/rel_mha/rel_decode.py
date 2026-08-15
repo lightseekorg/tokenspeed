@@ -173,6 +173,7 @@ class _FwdCache:
         use_pdl,
         blocks_per_page=1,
         blockscaled=False,
+        has_tau=False,
     ):
         key = (
             num_q_heads,
@@ -185,6 +186,7 @@ class _FwdCache:
             use_pdl,
             blocks_per_page,
             blockscaled,
+            has_tau,
         )
         if key not in self._cache:
             self._cache[key] = _compile_fwd(*key)
@@ -202,6 +204,7 @@ def _compile_fwd(
     use_pdl=False,
     blocks_per_page=1,
     blockscaled=False,
+    has_tau=False,
 ):
     """``dtype`` is the bias/output dtype. With ``blockscaled`` the data
     tensors are fp8-e4m3 (MXFP8: UE8M0 vec-32 scales, fp8 V dequantized
@@ -284,6 +287,13 @@ def _compile_fwd(
         for t in (pt, seqused)
     ]
     m_lse = to_cute_tensor(lse, assumed_align=4) if lse is not None else None
+    m_tau = (
+        to_cute_tensor(
+            torch.empty(B, 128, device=dev, dtype=torch.float32), assumed_align=4
+        )
+        if has_tau
+        else None
+    )
     compile_args = (
         m_q,
         m_k,
@@ -292,6 +302,7 @@ def _compile_fwd(
         m_lse,  # mLSE (split partials when num_splits > 1)
         None,  # mRowMax
         1.0 / math.sqrt(head_dim),
+        m_tau,
         m_sfq,
         m_sfk,
         m_sfv,
@@ -399,6 +410,7 @@ def rel_mha_decode_tsmha(
     cu_seqlens_q: torch.Tensor,  # unused (batch mode); kept for call parity
     window_left: int,
     softmax_scale: float | None = None,
+    tau: torch.Tensor | None = None,  # (B * prediction,) fp32 per-row logit scale
     enable_pdl: bool = False,
     q_scale: torch.Tensor | None = None,  # (B * P, H, D // 32) e8m0
     k_scale: torch.Tensor | None = None,  # (pages, h_kv, k, 32, 4, 4) e8m0
@@ -473,6 +485,7 @@ def rel_mha_decode_tsmha(
         enable_pdl,
         blocks_per_page,
         blockscaled,
+        tau is not None,
     )
     o = torch.empty(q.shape, device=q.device, dtype=out_dtype)
     if num_splits > 1:
@@ -505,6 +518,7 @@ def rel_mha_decode_tsmha(
         lse_arg,
         None,
         scale,
+        tau.view(B, P) if tau is not None else None,
         *sf_args,
         None,  # mCuSeqlensQ: batch mode
         None,
@@ -537,7 +551,13 @@ def rel_mha_decode_tsmha(
 
 
 def is_compiled_for(
-    q, k_cache, rel_logits, window_left, enable_pdl=False, blockscaled=False
+    q,
+    k_cache,
+    rel_logits,
+    window_left,
+    enable_pdl=False,
+    blockscaled=False,
+    has_tau=False,
 ) -> bool:
     """True when both prepass and fwd kernels for this config are cached."""
     H = q.shape[1]
@@ -556,6 +576,7 @@ def is_compiled_for(
         enable_pdl,
         k_cache.shape[1] // 128,
         blockscaled,
+        has_tau,
     )
     if fwd_key not in _FWD._cache:
         return False
@@ -573,6 +594,7 @@ def warmup(
     enable_pdl=False,
     blocks_per_page=1,
     blockscaled=False,
+    has_tau=False,
 ):
     """Pre-compile shear + fwd kernels outside CUDA-graph capture.
 
@@ -595,6 +617,7 @@ def warmup(
             enable_pdl,
             blocks_per_page,
             blockscaled,
+            has_tau,
         )
         if not is_local and _FULL_ATTN_SPLITS > 1:
             _COMBINE.get(head_dim, dtype, _FULL_ATTN_SPLITS, enable_pdl)

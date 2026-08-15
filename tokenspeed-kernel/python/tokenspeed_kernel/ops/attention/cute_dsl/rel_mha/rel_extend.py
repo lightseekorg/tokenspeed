@@ -60,6 +60,7 @@ def _compile_fwd_varlen(
     use_pdl=False,
     blocks_per_page=1,
     blockscaled=False,
+    has_tau=False,
 ):
     """``dtype`` is the bias/output dtype. ``blockscaled`` (paged only)
     compiles the MXFP8 variant: fp8-e4m3 q/k/v, UE8M0 vec-32 scales (flat
@@ -104,6 +105,13 @@ def _compile_fwd_varlen(
         TOTAL_Q + 128, num_q_heads, extent + 256, device=dev, dtype=dtype
     )
     cu_q = torch.empty(B + 1, device=dev, dtype=torch.int32)
+    m_tau = (
+        to_cute_tensor(
+            torch.empty(TOTAL_Q, device=dev, dtype=torch.float32), assumed_align=4
+        )
+        if has_tau
+        else None
+    )
     m_q, m_o, m_bias = [to_cute_tensor(t) for t in (q, o, bias)]
     m_cu_q = to_cute_tensor(cu_q, assumed_align=4, leading_dim=0)
     if paged:
@@ -154,6 +162,7 @@ def _compile_fwd_varlen(
         None,  # mLSE
         None,  # mRowMax
         1.0 / math.sqrt(head_dim),
+        m_tau,
         m_sfq,
         m_sfk,
         m_sfv,
@@ -278,6 +287,7 @@ def is_compiled_for(
     blocks_per_page=1,
     blockscaled=False,
     out_dtype=None,
+    has_tau=False,
 ) -> bool:
     """True when the prep, shear, and fwd kernels for this config are cached."""
     dtype = out_dtype or (torch.bfloat16 if blockscaled else q.dtype)
@@ -292,6 +302,7 @@ def is_compiled_for(
         enable_pdl,
         blocks_per_page,
         blockscaled,
+        has_tau,
     )
     shear_key = (extent, is_local, dtype, paged)
     return fwd_key in _FWD_VARLEN and shear_key in _SHEAR and "prep" in _PREP
@@ -310,6 +321,7 @@ def rel_mha_varlen_tsmha(
     page_table: torch.Tensor | None = None,  # (B, max_pages) int32, paged extend
     cache_seqlens: torch.Tensor | None = None,  # (B,) int32, paged extend
     softmax_scale: float | None = None,
+    tau: torch.Tensor | None = None,  # (total_q,) fp32 per-row logit scale
     enable_pdl: bool = False,
     q_scale: torch.Tensor | None = None,  # (total_q, H, D // 32) e8m0
     k_scale: torch.Tensor | None = None,  # (pages, h_kv, k, 32, 4, 4) e8m0
@@ -366,6 +378,7 @@ def rel_mha_varlen_tsmha(
         enable_pdl,
         blocks_per_page,
         blockscaled,
+        tau is not None,
     )
     fwd = _FWD_VARLEN.get(fwd_key)
     if fwd is None:
@@ -380,6 +393,7 @@ def rel_mha_varlen_tsmha(
             enable_pdl,
             blocks_per_page,
             blockscaled,
+            tau is not None,
         )
 
     cu_blocks = torch.empty(B + 1, device=dev, dtype=torch.int32)
@@ -423,6 +437,7 @@ def rel_mha_varlen_tsmha(
         None,
         None,
         scale,
+        tau,
         *sf_args,
         cu_seqlens_q,
         cu_seqlens_k,

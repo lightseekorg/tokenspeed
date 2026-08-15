@@ -286,10 +286,6 @@ def compute_log_scaling_tau(
     return 1.0 + alpha * torch.log(torch.clamp(effective_n / float(n_floor), min=1.0))
 
 
-def _apply_log_scaling_tau(x: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
-    return x * tau.to(dtype=x.dtype)
-
-
 class InklingShortConvolution(nn.Module):
     """Residual per-channel causal FIR (sconv) over one stream.
 
@@ -606,10 +602,6 @@ class InklingAttention(nn.Module):
                 rel_logits = self.rel_logits_proj(
                     r.view(num_tokens, self.num_tp_heads, self.d_rel)
                 )
-                if log_scaling_tau is not None and not self.is_local:
-                    rel_logits = _apply_log_scaling_tau(
-                        rel_logits, log_scaling_tau.view(-1, 1, 1)
-                    )
 
             # K/V are adjacent in the qkvr output AND the conv pool, so both
             # sconv streams fuse into one call reading the strided slice.
@@ -636,9 +628,6 @@ class InklingAttention(nn.Module):
                 enable_pdl=pdl_enabled(),
             )
 
-            if log_scaling_tau is not None and not self.is_local:
-                q = _apply_log_scaling_tau(q, log_scaling_tau.view(-1, 1))
-
         attn_output = self.attn(
             q,
             k,
@@ -646,6 +635,7 @@ class InklingAttention(nn.Module):
             ctx,
             out_cache_loc,
             rel_logits=rel_logits,
+            log_scaling_tau=None if self.is_local else log_scaling_tau,
             # Inkling's readiness boundary is after both hidden-state sconv
             # writes below, not immediately after attention KV publication.
             record_kv_cache=False,
