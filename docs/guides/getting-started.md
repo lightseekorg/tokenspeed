@@ -45,10 +45,18 @@ pip install -e "./python" --no-build-isolation
 ```
 
 Install the kernel package. Its Python package metadata installs the selected
-backend dependencies automatically.
+backend dependencies automatically(blackwell).
 
 ```bash
 pip install -e tokenspeed-kernel/python/ --no-build-isolation
+```
+
+Install the kernel package. Its Python package metadata installs the selected
+backend dependencies automatically(hopper).
+
+```bash
+TOKENSPEED_CUDA_ARCH=90a MAX_JOBS=32 \
+  pip install -e tokenspeed-kernel/python/ --no-build-isolation
 ```
 
 Install the scheduler package:
