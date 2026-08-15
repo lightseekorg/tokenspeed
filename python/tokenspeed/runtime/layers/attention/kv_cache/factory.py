@@ -21,9 +21,10 @@ def create_cache_pool(
 ) -> CachePool:
     """Create the concrete compute interface for a prepared cache spec.
 
-    The recipe's group specs and token capacity travel via the spec; the
-    pool base aligns the specs' physical fields with the memory plan and
-    publishes the runtime contract (ModelExecutor fails fast without one).
+    The recipe's group specs, including PD transfer policies, and token
+    capacity travel via the spec; the pool base aligns the specs' physical
+    fields with the memory plan and publishes the runtime contract
+    (ModelExecutor fails fast without one).
     """
     if (backing_pool is not None or field_layer_offset) and not (
         (isinstance(config, MHAConfig) and spec.family == "mha")
@@ -51,12 +52,10 @@ def create_cache_pool(
             layer_num=num_layers,
             device=config.device,
             enable_memory_saver=enable_memory_saver,
-            page_size=config.page_size,
             rank=rank,
             memory_plan=plan,
             paged_cache_group_specs=spec.paged_cache_group_specs,
             token_capacity=spec.token_capacity,
-            pd_disaggregation_enabled=config.pd_disaggregation_enabled,
         )
     if isinstance(config, DSAConfig):
         from tokenspeed.runtime.layers.attention.kv_cache.dsa import (
@@ -73,14 +72,13 @@ def create_cache_pool(
             layer_num=num_layers,
             device=config.device,
             enable_memory_saver=enable_memory_saver,
-            page_size=plan.logical_block_tokens,
+            prefix_granularity=plan.prefix_granularity,
             rank=rank,
             index_head_dim=config.index_head_dim,
             memory_plan=plan,
             paged_cache_group_specs=spec.paged_cache_group_specs,
             token_capacity=spec.token_capacity,
             layer_group_ids=spec.layer_group_ids,
-            pd_disaggregation_enabled=config.pd_disaggregation_enabled,
         )
     if isinstance(config, MSAConfig):
         from tokenspeed.runtime.layers.attention.kv_cache.msa import (
@@ -95,14 +93,13 @@ def create_cache_pool(
             layer_num=num_layers,
             device=config.device,
             enable_memory_saver=enable_memory_saver,
-            page_size=plan.logical_block_tokens,
+            prefix_granularity=plan.prefix_granularity,
             rank=rank,
             index_head_dim=config.index_head_dim,
             index_dtype=config.dtype,
             indexed_layer_ids=config.sparse_layer_ids,
             layer_types=spec.layer_types,
             layer_group_ids=spec.layer_group_ids,
-            pd_disaggregation_enabled=config.pd_disaggregation_enabled,
             memory_plan=plan,
             paged_cache_group_specs=spec.paged_cache_group_specs,
             token_capacity=spec.token_capacity,
@@ -125,11 +122,10 @@ def create_cache_pool(
                 layer_num=num_layers,
                 device=config.device,
                 enable_memory_saver=enable_memory_saver,
-                page_size=plan.logical_block_tokens,
+                prefix_granularity=plan.prefix_granularity,
                 rank=rank,
                 layer_types=spec.layer_types,
                 layer_group_ids=spec.layer_group_ids,
-                pd_disaggregation_enabled=config.pd_disaggregation_enabled,
                 memory_plan=plan,
                 paged_cache_group_specs=spec.paged_cache_group_specs,
                 token_capacity=spec.token_capacity,
@@ -170,10 +166,9 @@ def create_cache_pool(
             layer_num=num_layers,
             device=config.device,
             enable_memory_saver=enable_memory_saver,
-            page_size=plan.logical_block_tokens,
+            prefix_granularity=plan.prefix_granularity,
             rank=rank,
             layer_types=spec.layer_types,
-            pd_disaggregation_enabled=config.pd_disaggregation_enabled,
             layer_kv_head_counts=spec.layer_kv_head_counts,
             kv_alloc_head_count=config.num_kv_heads,
             memory_plan=plan,
@@ -200,7 +195,7 @@ def create_cache_pool(
                 layer_num=num_layers,
                 device=config.device,
                 enable_memory_saver=enable_memory_saver,
-                page_size=plan.logical_block_tokens,
+                prefix_granularity=plan.prefix_granularity,
                 rank=rank,
                 memory_plan=plan,
                 paged_cache_group_specs=spec.paged_cache_group_specs,
@@ -208,7 +203,6 @@ def create_cache_pool(
                 layer_group_ids=spec.layer_group_ids,
                 field_layer_offset=field_layer_offset,
                 backing_pool=backing_pool,
-                pd_disaggregation_enabled=config.pd_disaggregation_enabled,
             )
 
         if spec.family != "kimi_k3":
@@ -230,11 +224,10 @@ def create_cache_pool(
             layer_num=num_layers,
             device=config.device,
             enable_memory_saver=enable_memory_saver,
-            page_size=plan.logical_block_tokens,
+            prefix_granularity=plan.prefix_granularity,
             rank=rank,
             layer_types=spec.layer_types,
             layer_group_ids=spec.layer_group_ids,
-            pd_disaggregation_enabled=config.pd_disaggregation_enabled,
             state_field_dtypes=spec.state_field_dtypes,
             memory_plan=plan,
             paged_cache_group_specs=spec.paged_cache_group_specs,

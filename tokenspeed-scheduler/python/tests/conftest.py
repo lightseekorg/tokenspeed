@@ -7,7 +7,7 @@ try:
 except ImportError:  # test modules importorskip on their own
     ts = None
 
-# Kimi-K3 shape: cfg.block_size == P (1536 in production; ratio semantics
+# Kimi-K3 shape: cfg.prefix_granularity == P (1536 in production; ratio semantics
 # identical at P=2).
 PAGE = 2
 K3_HISTORY_GROUP = "full_attention"
@@ -22,7 +22,7 @@ def _make_k3_config() -> "ts.SchedulerConfig":
     MambaStateManager (SwaManager window=2), i.e. one page per
     state-snapshot slot, exactly the production ratio."""
     cfg = ts.SchedulerConfig()
-    cfg.block_size = PAGE
+    cfg.prefix_granularity = PAGE
     cfg.num_device_pages = 33  # page 0 = null sentinel, 32 usable
     cfg.num_host_pages = 0
     cfg.max_scheduled_tokens = 64
@@ -33,7 +33,7 @@ def _make_k3_config() -> "ts.SchedulerConfig":
     cfg.paged_cache_groups = [
         ts.PagedCacheGroupConfig(
             group_id=group_id,
-            rows_per_page=cfg.block_size,
+            rows_per_page=cfg.prefix_granularity,
             entry_stride_tokens=1,
             total_pages=cfg.num_device_pages,
             retention=ts.PagedCacheRetention.FullHistory,

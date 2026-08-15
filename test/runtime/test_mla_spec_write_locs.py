@@ -40,7 +40,7 @@ def _backend(*, spec_num_tokens: int = 1, is_draft: bool = False) -> MLAAttnBack
     backend._cache_contract_bound = True
     backend.max_context_len = 4096
     backend.max_num_pages = 8
-    backend.page_size = PAGE
+    backend.kernel_page_size = PAGE
     backend.decode_cuda_graph_metadata = {}
     return backend
 

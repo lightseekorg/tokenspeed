@@ -245,7 +245,6 @@ features directly:
 - `--dense-tp-size`
 - `--moe-tp-size`
 - `--kvstore-*`
-- `--enable-mla-l1-5-cache`
 - `--kv-events-config`
 - `--mla-chunk-multiplier`
 - `--disaggregation-*`

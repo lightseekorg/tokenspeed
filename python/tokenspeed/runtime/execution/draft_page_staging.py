@@ -58,26 +58,26 @@ class CacheView:
     groups have no page table and
     no view.
 
-    ``table`` and ``page_size`` remain readable for consumers that hand the
+    ``table`` and ``kernel_page_size`` remain readable for consumers that hand the
     staged placeholder to attention-metadata inits.
     """
 
     def __init__(
         self,
         table: torch.Tensor,
-        page_size: int,
+        kernel_page_size: int,
         retention: str = "full_history",
     ) -> None:
         if retention not in ("full_history", "sliding_window"):
             raise ValueError(f"unsupported cache view retention {retention!r}")
         self.table = table
-        self.page_size = int(page_size)
+        self.kernel_page_size = int(kernel_page_size)
         self.retention = retention
 
     @property
     def max_tokens(self) -> int:
         """Token capacity of one table row (width × kernel page size)."""
-        return self.table.shape[1] * self.page_size
+        return self.table.shape[1] * self.kernel_page_size
 
     def out_cache_loc_uniform(
         self,
@@ -105,7 +105,7 @@ class CacheView:
                 uniform_input_length=num_tokens,
                 cache_start=cache_start,
                 page_table=self.table,
-                page_size=self.page_size,
+                page_size=self.kernel_page_size,
             )
             return out
         compute_out_cache_loc_uniform(
@@ -113,7 +113,7 @@ class CacheView:
             uniform_input_length=num_tokens,
             cache_start=cache_start,
             page_table=self.table,
-            page_size=self.page_size,
+            page_size=self.kernel_page_size,
         )
         return out
 
@@ -126,8 +126,8 @@ class DraftPageStaging:
         *,
         max_bs: int,
         max_pages_per_req: int,
-        logical_page_size: int,
-        draft_page_size: int,
+        block_granularity: int,
+        draft_kernel_page_size: int,
         full_history_group_id: str | None,
         enabled: bool,
         device,
@@ -137,9 +137,9 @@ class DraftPageStaging:
         Args:
             max_bs: Widest replayable batch; the table's row count.
             max_pages_per_req: Table width in draft-kernel pages.
-            logical_page_size: Scheduler page size of the incoming tables.
-            draft_page_size: Draft backend's kernel page size (the staged
-                unit). ``logical_page_size`` must be a positive multiple.
+            block_granularity: Grain of the incoming scheduler tables in tokens.
+            draft_kernel_page_size: Draft backend's kernel page size (the staged
+                unit). ``block_granularity`` must be a positive multiple.
             full_history_group_id: Group whose table is staged; None when the
                 contract has no full-history group (the table then stays a
                 zeros placeholder for idle/warmup consumers).
@@ -148,20 +148,20 @@ class DraftPageStaging:
                 publish is then scrub-only.
             device: CUDA device for the persistent buffer.
         """
-        if logical_page_size % draft_page_size:
+        if block_granularity % draft_kernel_page_size:
             raise ValueError(
-                f"logical page size {logical_page_size} is not a multiple "
-                f"of the draft kernel page size {draft_page_size}"
+                f"block granularity {block_granularity} is not a multiple "
+                f"of the draft kernel page size {draft_kernel_page_size}"
             )
-        self.logical_page_size = int(logical_page_size)
-        self.draft_page_size = int(draft_page_size)
-        self.page_ratio = self.logical_page_size // self.draft_page_size
+        self.block_granularity = int(block_granularity)
+        self.draft_kernel_page_size = int(draft_kernel_page_size)
+        self.page_ratio = self.block_granularity // self.draft_kernel_page_size
         self.full_history_group_id = full_history_group_id
         self.enabled = enabled
         self.table = torch.zeros(
             (max_bs, max_pages_per_req), dtype=torch.int32, device=device
         )
-        self.view = CacheView(self.table, self.draft_page_size)
+        self.view = CacheView(self.table, self.draft_kernel_page_size)
 
     def publish(self, block_tables, bs: int, padded_bs: int) -> None:
         """Stage this forward's full-history table for the draft's kernels.
@@ -191,11 +191,11 @@ class DraftPageStaging:
         rows = self.table[:bs]
         max_width = self.table.shape[1]
         if self.page_ratio > 1:
-            # -1 pads clamp into logical page 0, itself reserved as the null page.
+            # -1 pads clamp into table page 0, itself reserved as the null page.
             expand_page_table(
                 table,
-                logical_page_size=self.logical_page_size,
-                kernel_page_size=self.draft_page_size,
+                block_granularity=self.block_granularity,
+                kernel_page_size=self.draft_kernel_page_size,
                 max_kernel_pages=max_width,
                 out=rows,
             )

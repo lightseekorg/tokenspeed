@@ -49,7 +49,8 @@ def _mha_config() -> MHAConfig:
         context_len=1024,
         max_graph_bs=2,
         max_bs=2,
-        page_size=64,
+        prefix_granularity=64,
+        kernel_page_size=64,
         kv_cache_quant_method="none",
         max_scheduled_tokens=128,
     )
@@ -68,7 +69,8 @@ def _mla_config() -> MLAConfig:
         context_len=1024,
         max_graph_bs=2,
         max_bs=2,
-        page_size=64,
+        prefix_granularity=64,
+        kernel_page_size=64,
         kv_cache_quant_method="none",
         kv_lora_rank=4,
         qk_nope_head_dim=2,
@@ -93,7 +95,8 @@ def _msa_config() -> MSAConfig:
         context_len=1024,
         max_graph_bs=2,
         max_bs=2,
-        page_size=64,
+        prefix_granularity=64,
+        kernel_page_size=64,
         kv_cache_quant_method="none",
         compute_layer_types=("full_attention", "sparse_attention"),
         sparse_layer_ids=frozenset({1}),
@@ -135,15 +138,14 @@ def _hybrid_setup_with_narrow_draft():
             layer_types=layer_types,
             group_ids=group_ids,
             sliding_window_tokens=None,
-            page_size=4,
+            prefix_granularity=4,
         ),
         PagedCacheGroupSpec(
             group_id="state",
             retention="full_history",
-            rows_per_page=4,
-            entry_stride_tokens=1,
             sliding_window_tokens=None,
             family="state",
+            checkpoint_granularity=4,
         ),
     )
     return build_hybrid_cache_setup(
@@ -158,7 +160,7 @@ def _hybrid_setup_with_narrow_draft():
         num_draft_layers=num_draft_layers,
         cache_budget_bytes=2_048,
         fixed_workspace_bytes=0,
-        logical_block_tokens=4,
+        prefix_granularity=4,
         max_padding_fraction=1.0,
     )
 
@@ -185,12 +187,16 @@ def test_attention_configs_do_not_own_cache_setup() -> None:
 def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
     text_config = SimpleNamespace(
         mamba2_cache_params=(
-            (2, 2),
+            (3, 2),
             (1, 2, 2),
             torch.bfloat16,
             torch.float32,
             (0,),
-        )
+        ),
+        linear_key_head_dim=1,
+        linear_num_key_heads=1,
+        linear_value_head_dim=1,
+        linear_num_value_heads=1,
     )
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(text_config=text_config),
@@ -209,12 +215,13 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         context_len=1024,
         max_graph_bs=2,
         max_bs=2,
-        page_size=64,
+        prefix_granularity=64,
+        kernel_page_size=64,
         kv_cache_quant_method="none",
         max_scheduled_tokens=128,
     )
     server_args = SimpleNamespace(
-        block_size=64,
+        prefix_granularity=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=0,
     )
@@ -231,9 +238,10 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         overlap_schedule_depth=0,
     )
 
-    assert server_args.block_size == 64
-    assert attn_config.page_size == 64
-    assert setup.spec.memory_plan.logical_block_tokens == 128
+    assert server_args.prefix_granularity == 64
+    assert attn_config.prefix_granularity == 64
+    assert attn_config.kernel_page_size == 64
+    assert setup.spec.memory_plan.prefix_granularity == 128
     assert setup.num_draft_layers == 0
     assert setup.spec.layer_group_ids == (
         f"{LINEAR_ATTENTION}_0",
@@ -295,7 +303,8 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
         context_len=1024,
         max_graph_bs=2,
         max_bs=2,
-        page_size=64,
+        prefix_granularity=64,
+        kernel_page_size=64,
         kv_cache_quant_method="none",
         max_scheduled_tokens=128,
     )
@@ -347,7 +356,7 @@ def test_ordinary_mha_reserves_null_parent_within_cache_budget() -> None:
     )
 
     assert setup.spec.family == "mha"
-    assert setup.spec.memory_plan.logical_block_tokens == 64
+    assert setup.spec.memory_plan.prefix_granularity == 64
     assert setup.spec.memory_plan.num_lcm_blocks == 15
     assert setup.spec.memory_plan.arena_bytes <= 16_384
     assert setup.spec.token_capacity == 960
@@ -392,7 +401,7 @@ def test_ordinary_mla_reserves_null_parent_within_cache_budget() -> None:
     )
 
     assert setup.spec.family == "mla"
-    assert setup.spec.memory_plan.logical_block_tokens == 64
+    assert setup.spec.memory_plan.prefix_granularity == 64
     assert setup.spec.memory_plan.num_lcm_blocks == 15
     assert setup.spec.memory_plan.arena_bytes <= 24_576
     assert setup.spec.token_capacity == 960
@@ -417,17 +426,20 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
     target_config,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from tokenspeed.runtime.pd.cache_protocol import build_pool_cache_transfer_contract
+
     model_config = SimpleNamespace(num_attention_layers=2, hf_config=SimpleNamespace())
     draft_model_config = SimpleNamespace(
         num_attention_layers=1, hf_config=SimpleNamespace()
     )
-    draft_attn_config = _mha_config()
+    target_attn_config = replace(target_config(), pd_disaggregation_enabled=True)
+    draft_attn_config = replace(_mha_config(), pd_disaggregation_enabled=True)
 
     setup = prepare_cache_setup(
         family=family,
         server_args=SimpleNamespace(max_total_tokens=None),
         model_config=model_config,
-        attn_config=target_config(),
+        attn_config=target_attn_config,
         draft_model_config=draft_model_config,
         draft_attn_config=draft_attn_config,
         cache_budget_bytes=65_536,
@@ -460,7 +472,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
     )
     target_pool = create_cache_pool(
         target_spec,
-        target_config(),
+        target_attn_config,
         num_layers=2,
         rank=0,
         enable_memory_saver=False,
@@ -469,7 +481,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
         setup.spec.pool_size,
         target_pool.dtype,
         "cpu",
-        setup.spec.memory_plan.logical_block_tokens,
+        setup.spec.memory_plan.prefix_granularity,
         0,
         setup.spec.memory_plan,
     )
@@ -478,7 +490,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
             setup.spec.pool_size,
             target_pool.dtype,
             "cpu",
-            setup.spec.memory_plan.logical_block_tokens,
+            setup.spec.memory_plan.prefix_granularity,
             0,
             setup.spec.memory_plan,
             backing_pool=unbound_pool,
@@ -488,7 +500,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
             setup.spec.pool_size,
             target_pool.dtype,
             "cpu",
-            setup.spec.memory_plan.logical_block_tokens,
+            setup.spec.memory_plan.prefix_granularity,
             0,
             setup.spec.memory_plan,
             paged_cache_group_specs=target_spec.paged_cache_group_specs,
@@ -521,7 +533,6 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
     assert set(target_pool._fields) == {
         field.field_id for field in setup.spec.memory_plan.fields
     }
-
     target_layout = target_pool.cache_transfer_layout()
     draft_layout = draft_pool.cache_transfer_layout()
     target_transfer_fields = {
@@ -538,6 +549,14 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
         group_ids=tuple(spec.group_id for spec in target_pool.paged_cache_group_specs),
     )
     assert len(combined_layout.consumers) == 3
+    assert combined_layout.buffers == (target_pool.buffer,)
+    assert {
+        field.field_id for group in combined_layout.groups for field in group.fields
+    } == set(target_pool._fields)
+    contract, base_addr = build_pool_cache_transfer_contract(target_pool)
+    assert contract.plan is target_pool.plan
+    assert base_addr == target_pool.buffer.data_ptr()
+    assert len(contract.field_dtypes) == len(target_pool._fields)
 
     target_last_layer = target_pool.get_key_buffer(1).clone()
 
@@ -572,30 +591,10 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
         _resolve_heterogeneous_draft_family,
     )
 
-    assert (
-        _resolve_heterogeneous_draft_family(
-            "mla", "mha", pd_disaggregation_enabled=False
-        )
-        == "mha"
-    )
-    assert (
-        _resolve_heterogeneous_draft_family(
-            "kimi_k3", "mla", pd_disaggregation_enabled=False
-        )
-        == "mla"
-    )
+    assert _resolve_heterogeneous_draft_family("mla", "mha") == "mha"
+    assert _resolve_heterogeneous_draft_family("kimi_k3", "mla") == "mla"
     with pytest.raises(RuntimeError, match="require an MHA draft"):
-        _resolve_heterogeneous_draft_family(
-            "mha", "mla", pd_disaggregation_enabled=False
-        )
-    with pytest.raises(RuntimeError, match="PD disaggregation does not support"):
-        _resolve_heterogeneous_draft_family(
-            "kimi_k3", "mla", pd_disaggregation_enabled=True
-        )
-    with pytest.raises(RuntimeError, match="PD disaggregation does not support"):
-        _resolve_heterogeneous_draft_family(
-            "msa", "mha", pd_disaggregation_enabled=True
-        )
+        _resolve_heterogeneous_draft_family("mha", "mla")
     with pytest.raises(RuntimeError, match="support ordinary drafts only"):
         _create_draft_components(
             server_args=None,
@@ -608,6 +607,45 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
             is_hybrid_linear=True,
             is_kda=False,
             is_inkling=False,
+        )
+
+
+def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tokenspeed.runtime.layers.attention.registry as registry
+
+    monkeypatch.setattr(
+        registry,
+        "is_deepseek_v4",
+        lambda config: getattr(config, "is_deepseek_v4", False),
+    )
+    server_args = SimpleNamespace(
+        attention_backend=None,
+        drafter_attention_backend=None,
+        disaggregation_mode="prefill",
+    )
+    target = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=("LlamaForCausalLM",),
+            is_deepseek_v4=False,
+        )
+    )
+    draft = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=("DeepseekV4ForCausalLMNextN",),
+            is_deepseek_v4=True,
+        )
+    )
+
+    with pytest.raises(NotImplementedError, match="target-only"):
+        registry.create_attn_components(
+            server_args,
+            target,
+            gpu_id=0,
+            rank=0,
+            gpu_memory=0,
+            draft_model_config=draft,
         )
 
 
@@ -639,13 +677,33 @@ def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:
         _,
         num_draft_layers,
     ) = merge_continuation_layers(
-        fields=(CacheFieldSpec("full_attention", "layer.0.kv", "slot.0", (256,), 1),),
+        fields=(
+            CacheFieldSpec(
+                "full_attention",
+                "layer.0.kv",
+                "slot.0",
+                (256,),
+                1,
+            ),
+        ),
         layer_types=("full_attention",),
         group_ids=("full_attention",),
         draft_fields=(
-            CacheFieldSpec("full_attention", "layer.0.kv", "slot.0", (256,), 1),
+            CacheFieldSpec(
+                "full_attention",
+                "layer.0.kv",
+                "slot.0",
+                (256,),
+                1,
+            ),
             # Draft-only sliding-window layers: not present in the target plan.
-            CacheFieldSpec("draft_swa", "layer.1.kv", "slot.1", (256,), 1),
+            CacheFieldSpec(
+                "draft_swa",
+                "layer.1.kv",
+                "slot.1",
+                (256,),
+                1,
+            ),
         ),
         draft_layer_types=("full_attention", "sliding_attention"),
         draft_group_ids=("full_attention", "draft_swa"),
@@ -655,7 +713,7 @@ def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:
         layer_types=layer_types,
         group_ids=group_ids,
         sliding_window_tokens=(None, None, 8),
-        page_size=4,
+        prefix_granularity=4,
     )
     setup = build_hybrid_cache_setup(
         family="inkling",
@@ -669,7 +727,7 @@ def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:
         num_draft_layers=num_draft_layers,
         cache_budget_bytes=4_096,
         fixed_workspace_bytes=0,
-        logical_block_tokens=4,
+        prefix_granularity=4,
         max_padding_fraction=1.0,
     )
 
@@ -723,7 +781,7 @@ def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
         layer_types=layer_types,
         group_ids=group_ids,
         sliding_window_tokens=(None, None, 8),
-        page_size=4,
+        prefix_granularity=4,
     )
     setup = build_hybrid_cache_setup(
         family="inkling",
@@ -737,14 +795,14 @@ def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
         num_draft_layers=num_draft_layers,
         cache_budget_bytes=4_096,
         fixed_workspace_bytes=0,
-        logical_block_tokens=4,
+        prefix_granularity=4,
         max_padding_fraction=1.0,
     )
     pool = CachePool(
         size=setup.spec.pool_size,
         dtype=torch.uint8,
         device="cpu",
-        page_size=4,
+        prefix_granularity=4,
         rank=0,
         memory_plan=setup.spec.memory_plan,
         paged_cache_group_specs=setup.spec.paged_cache_group_specs,

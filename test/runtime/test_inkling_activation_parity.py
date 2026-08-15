@@ -192,7 +192,8 @@ class _Harness:
             attn_tp_size=1,
             dtype=torch.bfloat16,
             kv_cache_dtype=torch.bfloat16,
-            page_size=PAGE_SIZE,
+            prefix_granularity=PAGE_SIZE,
+            kernel_page_size=PAGE_SIZE,
             context_len=1024,
             max_bs=4,
             max_graph_bs=4,
@@ -209,12 +210,12 @@ class _Harness:
             layer_num=text.num_hidden_layers,
             device=device,
             enable_memory_saver=False,
-            page_size=PAGE_SIZE,
+            prefix_granularity=PAGE_SIZE,
             rank=0,
             layer_group_ids=("full_attention",) * text.num_hidden_layers,
             memory_plan=make_mha_memory_plan(
                 size=1024,
-                page_size=PAGE_SIZE,
+                prefix_granularity=PAGE_SIZE,
                 layer_num=text.num_hidden_layers,
                 kv_heads=text.num_key_value_heads,
                 head_dim=text.head_dim,
@@ -226,7 +227,7 @@ class _Harness:
             num_slots=6,
             conv_dim=inkling_conv_total_dim(text, 1),
             kernel_size=text.sconv_kernel_size,
-            # Non-spec ring: (W-1) + K(1) + lookback(0) = W.
+            # Non-spec ring: (W-1) + K(1) = W.
             ring_size=text.sconv_kernel_size,
             dtype=torch.bfloat16,
             device=device,

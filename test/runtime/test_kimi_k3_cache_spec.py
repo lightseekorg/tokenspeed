@@ -31,7 +31,7 @@ def _plan(num_lcm_blocks: int, *, tp_size: int = 8):
 def test_lcm_reference_geometry_is_exact() -> None:
     plan = _plan(7)
 
-    assert plan.logical_block_tokens == 128
+    assert plan.prefix_granularity == 128
     assert plan.lcm_block_bytes == TP8_PAGE_SET_BYTES
     assert len(plan.planes) == 24
     assert {
@@ -65,6 +65,10 @@ def test_lcm_reference_geometry_is_exact() -> None:
         assert {field.plane_id for field in fields_by_group[group_id]} == {
             f"slot.{slot}" for slot in range(23)
         }
+    conv = next(
+        field for field in plan.fields if field.field_id.endswith(".conv_state")
+    )
+    assert conv.shape[0] == 3 * 96 * 128 // 8
 
 
 def test_lcm_geometry_packs_two_kda_pages_at_tp16() -> None:
@@ -82,6 +86,10 @@ def test_lcm_geometry_packs_two_kda_pages_at_tp16() -> None:
     # MLA planes still dominate, so the LCM block geometry matches TP8.
     assert plan.lcm_block_bytes == TP8_PAGE_SET_BYTES
     assert len(plan.planes) == 24
+    conv = next(
+        field for field in plan.fields if field.field_id.endswith(".conv_state")
+    )
+    assert conv.shape[0] == 3 * 96 * 128 // 16
 
 
 def test_lcm_parent_demand_uses_per_group_packing() -> None:
@@ -127,7 +135,7 @@ def test_k3_merged_solve_with_draft_shares_page_ids():
 
     draft_fields = mla_cache_fields(
         layer_group_ids=("full_attention",) * 5,
-        logical_block_tokens=128,
+        prefix_granularity=128,
         latent_width=576,
         element_size=torch.bfloat16.itemsize,
     )
@@ -137,6 +145,7 @@ def test_k3_merged_solve_with_draft_shares_page_ids():
         mla_cache_dtype=torch.float8_e4m3fn,
         mla_quant_method=None,
         draft_fields=draft_fields,
+        draft_layer_count=5,
     )
     # 24 target MLA planes + 5 draft continuation planes.
     assert len(merged.plane_bytes) == 29
@@ -184,7 +193,7 @@ def test_k3_binding_utilization_with_real_bf16_draft_geometry():
 
     draft_fields = mla_cache_fields(
         layer_group_ids=("full_attention",) * 5,
-        logical_block_tokens=128,
+        prefix_granularity=128,
         latent_width=576,
         element_size=torch.bfloat16.itemsize,
     )
@@ -194,6 +203,7 @@ def test_k3_binding_utilization_with_real_bf16_draft_geometry():
         mla_cache_dtype=torch.float8_e4m3fn,
         mla_quant_method=None,
         draft_fields=draft_fields,
+        draft_layer_count=5,
     ).with_num_lcm_blocks(10)
     widened = merged.capacity_report()
     assert abs(widened["full_attention"]["binding_utilization"] - 1.0) < 1e-3

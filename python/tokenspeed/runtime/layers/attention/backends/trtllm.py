@@ -51,6 +51,9 @@ from tokenspeed.runtime.layers.attention.backends.cache_groups import (
     CacheGroupsMixin,
 )
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    TRTLLM_MHA_PAGE_SIZE,
+)
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.common import fp8_cast_contiguous
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -141,8 +144,14 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     def __init__(self, config: MHAConfig):
         super().__init__(config)
 
-        self.page_size = config.page_size
-        self.group_page_sizes = dict(getattr(config, "group_page_sizes", None) or {})
+        self.kernel_page_size = (
+            config.kernel_page_size
+            if config.kernel_page_size is not None
+            else TRTLLM_MHA_PAGE_SIZE
+        )
+        self.group_block_granularities = dict(
+            getattr(config, "group_block_granularities", None) or {}
+        )
         self.max_context_len = config.context_len
         self.kv_cache_dtype = config.kv_cache_dtype
         max_bs = config.max_bs
@@ -157,7 +166,9 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         self._workspace_pool.allocate(((self._workspace_nbytes,), torch.uint8))
 
         # Max pages per request.
-        self.max_num_pages = (config.context_len + self.page_size - 1) // self.page_size
+        self.max_num_pages = (
+            config.context_len + self.kernel_page_size - 1
+        ) // self.kernel_page_size
 
         # Persistent buffers for page table construction.
         self.page_table_buf = torch.zeros(
@@ -236,10 +247,10 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         """Get KV cache in [num_pages, num_kv_heads, page_size, head_dim] layout."""
         k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
         k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            -1, self.kernel_page_size, layer.tp_k_head_num, layer.head_dim
         ).permute(0, 2, 1, 3)
         v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            -1, self.kernel_page_size, layer.tp_v_head_num, layer.head_dim
         ).permute(0, 2, 1, 3)
 
         if layer.tp_k_head_num == 1:
@@ -286,7 +297,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 cache_loc=out_cache_loc,
                 k_scale=layer.k_scale,
                 v_scale=layer.v_scale,
-                page_size=self.page_size,
+                page_size=self.kernel_page_size,
             )
         elif save_kv_cache and k is not None:
             token_to_kv_pool.set_kv_buffer(
@@ -433,17 +444,17 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                     group_page_tables,
                     extend_prefix_lens_cpu[:bs],
                     extend_seq_lens_cpu[:bs],
-                    self.page_size,
+                    self.kernel_page_size,
                 )
             else:
                 group_out_cache_locs = self._compute_decode_group_out_cache_locs(
                     group_page_tables,
                     seq_lens[:bs],
-                    self.page_size,
+                    self.kernel_page_size,
                     self._verify_tokens(),
                 )
             self._maybe_check_group_write_locs(
-                group_page_tables, group_out_cache_locs, self.page_size
+                group_page_tables, group_out_cache_locs, self.kernel_page_size
             )
             group_page_tables = self._kernel_page_tables(group_page_tables)
 
@@ -943,7 +954,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 out=self.cuda_graph_page_table,
                 bs=bs,
                 max_num_pages=self.max_num_pages,
-                page_size=self.page_size,
+                page_size=self.kernel_page_size,
                 dummy_slot=0,
             )
         if block_tables:

@@ -24,7 +24,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
 _KIMI_K3_LAYERS = 93
 _KIMI_K3_KDA_LAYERS = 69
 _KIMI_K3_MLA_LAYERS = 24
-_KIMI_K3_LOGICAL_BLOCK_TOKENS = 128
+_KIMI_K3_PREFIX_GRANULARITY = 128
 _KIMI_K3_STATE_GROUPS = 3
 _KIMI_K3_MLA_PACKING = 12
 FULL_ATTENTION = "full_attention"
@@ -120,7 +120,7 @@ def kimi_k3_layer_group_ids(text_config: KimiLinearConfig) -> tuple[str, ...]:
 def kimi_k3_cache_fields(
     *,
     layer_group_ids,
-    logical_block_tokens,
+    prefix_granularity,
     latent_width,
     mla_element_size,
     conv_shape,
@@ -129,7 +129,7 @@ def kimi_k3_cache_fields(
     recurrent_element_size,
 ) -> tuple[CacheFieldSpec, ...]:
     """Describe Kimi-K3 full-attention MLA KV and KDA state."""
-    if logical_block_tokens <= 0 or latent_width <= 0 or mla_element_size <= 0:
+    if prefix_granularity <= 0 or latent_width <= 0 or mla_element_size <= 0:
         raise ValueError("Kimi-K3 MLA geometry must be positive")
     if (
         not conv_shape
@@ -138,7 +138,6 @@ def kimi_k3_cache_fields(
         or recurrent_element_size <= 0
     ):
         raise ValueError("Kimi-K3 KDA state geometry must be positive")
-
     occurrences: dict[str, int] = {}
     fields = []
     for layer_id, group_id in enumerate(layer_group_ids):
@@ -151,7 +150,7 @@ def kimi_k3_cache_fields(
                     group_id,
                     f"layer.{layer_id}.latent_kv",
                     plane_id,
-                    (logical_block_tokens, 1, latent_width),
+                    (prefix_granularity, 1, latent_width),
                     mla_element_size,
                 )
             )
@@ -222,7 +221,7 @@ def build_kimi_k3_cache_fields(
     rope_dim = _require_positive_int("qk_rope_head_dim", text_config.qk_rope_head_dim)
     return kimi_k3_cache_fields(
         layer_group_ids=kimi_k3_layer_group_ids(text_config),
-        logical_block_tokens=_KIMI_K3_LOGICAL_BLOCK_TOKENS,
+        prefix_granularity=_KIMI_K3_PREFIX_GRANULARITY,
         latent_width=kv_lora_rank + rope_dim,
         mla_element_size=mla_cache_dtype.itemsize,
         conv_shape=(3 * num_heads * head_dim // tp_size, kernel_size - 1),
@@ -239,6 +238,7 @@ def solve_kimi_k3_cache_layout(
     mla_cache_dtype: torch.dtype,
     mla_quant_method: str | None,
     draft_fields=None,
+    draft_layer_count: int = 0,
 ):
     """Solve Kimi-K3's capacity-independent P=128 LCM layout.
 
@@ -254,13 +254,27 @@ def solve_kimi_k3_cache_layout(
         mla_quant_method=mla_quant_method,
     )
     layer_group_ids = kimi_k3_layer_group_ids(text_config)
+    if (
+        isinstance(draft_layer_count, bool)
+        or not isinstance(draft_layer_count, int)
+        or draft_layer_count < 0
+    ):
+        raise ValueError("draft_layer_count must be a non-negative integer")
     num_draft_layers = 0
     if draft_fields is not None:
+        draft_fields = tuple(draft_fields)
+        if not draft_fields:
+            raise ValueError("draft_fields must not be empty")
+        if draft_layer_count < 1:
+            raise ValueError("draft_fields require a positive draft_layer_count")
+        num_draft_layers = draft_layer_count
         continued = continue_layer_fields(
-            draft_fields, first_layer_id=len(layer_group_ids)
+            draft_fields,
+            first_layer_id=len(layer_group_ids),
         )
-        num_draft_layers = len(continued)
         fields += continued
+    elif draft_layer_count:
+        raise ValueError("draft_layer_count requires draft_fields")
     mla_plane_bytes = _KIMI_K3_MLA_PACKING * next(
         field.payload_bytes for field in fields if field.group_id == FULL_ATTENTION
     )
@@ -280,7 +294,7 @@ def solve_kimi_k3_cache_layout(
     max_padding_fraction = float("inf") if num_draft_layers else 0.25
     layout = solve_cache_layout(
         fields,
-        logical_block_tokens=_KIMI_K3_LOGICAL_BLOCK_TOKENS,
+        prefix_granularity=_KIMI_K3_PREFIX_GRANULARITY,
         cache_blocks_per_lcm_block=packing,
         alignment=256,
         max_padding_fraction=max_padding_fraction,
@@ -309,7 +323,7 @@ def kimi_k3_lcm_blocks_needed(
     overlap_schedule_depth: int = 0,
 ) -> int:
     """Return physical LCM parents needed at the configured concurrency."""
-    _require_positive_int("plan.logical_block_tokens", plan.logical_block_tokens)
+    _require_positive_int("plan.prefix_granularity", plan.prefix_granularity)
     _require_positive_int("token_capacity", token_capacity)
     _require_non_negative_int("max_scheduled_tokens", max_scheduled_tokens)
     _require_positive_int("max_live_requests", max_live_requests)
@@ -321,7 +335,7 @@ def kimi_k3_lcm_blocks_needed(
     if overlap_schedule_depth and decode_input_tokens == 0:
         raise ValueError("overlapped cache sizing requires decode_input_tokens > 0")
 
-    page_tokens = plan.logical_block_tokens
+    page_tokens = plan.prefix_granularity
     protected_pages = max_live_requests * math.ceil(
         overlap_schedule_depth * decode_input_tokens / page_tokens
     )
@@ -358,7 +372,7 @@ def kimi_k3_token_capacity_for_cache_pool(
         upper_bound_tokens = (
             num_lcm_blocks
             * full_group.cache_blocks_per_lcm_block
-            * plan.logical_block_tokens
+            * plan.prefix_granularity
         )
     _require_positive_int("upper_bound_tokens", upper_bound_tokens)
 
@@ -428,7 +442,7 @@ def prepare_kimi_k3_cache(
         draft_layer_types = (FULL_ATTENTION,) * num_draft_layers
         draft_fields = mla_cache_fields(
             layer_group_ids=draft_layer_types,
-            logical_block_tokens=_KIMI_K3_LOGICAL_BLOCK_TOKENS,
+            prefix_granularity=_KIMI_K3_PREFIX_GRANULARITY,
             latent_width=(
                 draft_attn_config.kv_lora_rank + draft_attn_config.qk_rope_head_dim
             ),
@@ -440,6 +454,7 @@ def prepare_kimi_k3_cache(
         mla_cache_dtype=attn_config.kv_cache_dtype,
         mla_quant_method=attn_config.kv_cache_quant_method or None,
         draft_fields=draft_fields,
+        draft_layer_count=num_draft_layers,
     )
     reference_plan = merged_layout.with_num_lcm_blocks(1)
 
@@ -490,7 +505,7 @@ def prepare_kimi_k3_cache(
                 layer_types=merged_layer_types,
                 group_ids=merged_group_ids,
                 sliding_window_tokens=None,
-                page_size=merged_plan.logical_block_tokens,
+                prefix_granularity=merged_plan.prefix_granularity,
                 pd_disaggregation_enabled=attn_config.pd_disaggregation_enabled,
             ),
             state_field_dtypes=state_dtypes,

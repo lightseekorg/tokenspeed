@@ -13,7 +13,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import solve_cach
 def plan_fields(
     fields,
     *,
-    logical_block_tokens,
+    prefix_granularity,
     budget_bytes=None,
     num_lcm_blocks=None,
     **kwargs,
@@ -21,7 +21,7 @@ def plan_fields(
     """Solve a layout and bind capacity the way the recipes do."""
     layout = solve_cache_layout(
         fields,
-        logical_block_tokens=logical_block_tokens,
+        prefix_granularity=prefix_granularity,
         **kwargs,
     )
     if budget_bytes is not None:
@@ -50,7 +50,7 @@ def make_layer_group_ids(
 def make_mha_memory_plan(
     *,
     size: int,
-    page_size: int,
+    prefix_granularity: int,
     layer_num: int,
     kv_heads: int,
     head_dim: int,
@@ -59,8 +59,8 @@ def make_mha_memory_plan(
     sliding_window_tokens: int | tuple[int | None, ...] | None = None,
     mxfp8: bool = False,
 ):
-    if size % page_size:
-        raise ValueError("test pool size must be divisible by page_size")
+    if size % prefix_granularity:
+        raise ValueError("test pool size must be divisible by prefix_granularity")
     group_ids = make_layer_group_ids(
         layer_num=layer_num,
         layer_types=layer_types,
@@ -68,7 +68,7 @@ def make_mha_memory_plan(
     )
     fields = mha_cache_fields(
         layer_group_ids=group_ids,
-        logical_block_tokens=page_size,
+        prefix_granularity=prefix_granularity,
         kv_heads=kv_heads,
         head_dim=head_dim,
         kv_element_size=(1 if mxfp8 else torch.empty((), dtype=dtype).element_size()),
@@ -77,35 +77,35 @@ def make_mha_memory_plan(
     )
     layout = solve_cache_layout(
         fields,
-        logical_block_tokens=page_size,
+        prefix_granularity=prefix_granularity,
         cache_blocks_per_lcm_block={group_id: 1 for group_id in group_ids},
         alignment=1,
         max_padding_fraction=1.0,
     )
-    return layout.with_num_lcm_blocks(size // page_size)
+    return layout.with_num_lcm_blocks(size // prefix_granularity)
 
 
 def make_mla_memory_plan(
     *,
     size: int,
-    page_size: int,
+    prefix_granularity: int,
     layer_num: int,
     latent_width: int,
     dtype: torch.dtype,
 ):
-    if size % page_size:
-        raise ValueError("test pool size must be divisible by page_size")
+    if size % prefix_granularity:
+        raise ValueError("test pool size must be divisible by prefix_granularity")
     fields = mla_cache_fields(
         layer_group_ids=("full_attention",) * layer_num,
-        logical_block_tokens=page_size,
+        prefix_granularity=prefix_granularity,
         latent_width=latent_width,
         element_size=torch.empty((), dtype=dtype).element_size(),
     )
     layout = solve_cache_layout(
         fields,
-        logical_block_tokens=page_size,
+        prefix_granularity=prefix_granularity,
         cache_blocks_per_lcm_block={"full_attention": 1},
         alignment=1,
         max_padding_fraction=1.0,
     )
-    return layout.with_num_lcm_blocks(size // page_size)
+    return layout.with_num_lcm_blocks(size // prefix_granularity)

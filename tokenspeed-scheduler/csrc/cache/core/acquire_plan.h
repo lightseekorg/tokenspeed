@@ -22,18 +22,22 @@
 
 #include <cstdint>
 
-#include "cache/manager/swa_manager.h"
-
 namespace tokenspeed {
 
-// GDN/mamba semantics: hit the nearest P-boundary snapshot and retain only the
-// request's live state page. Completed pages remain cache-owned after the
-// request table releases them.
-class MambaStateManager : public SwaManager {
-public:
-    explicit MambaStateManager(std::int32_t cache_block_tokens, std::int32_t cache_blocks_per_lcm_block = 1,
-                               std::uint32_t group_id = 0)
-        : SwaManager(cache_block_tokens, cache_blocks_per_lcm_block, /*sliding_window=*/2, group_id) {}
+// A token-free placement order for GroupAllocator. All token -> page
+// arithmetic happens on the logical side (GroupGeometry in the coordinator
+// layer); the allocator only executes block counts and bookkeeping values.
+struct AcquirePlan {
+    // Fresh blocks to acquire from the pool.
+    std::int32_t num_blocks{0};
+    // Dense append when < 0. Otherwise the logical slot the sparse suffix
+    // starts at; slots below it stay null holes.
+    std::int32_t suffix_start{-1};
+    // Sparse only: the table's logical block count after placement.
+    std::int32_t table_blocks_after{0};
+    // Unconsumed tail capacity after placement, in tokens. The allocator
+    // stores it verbatim; it never derives it.
+    std::int32_t available_tokens_after{0};
 };
 
 }  // namespace tokenspeed

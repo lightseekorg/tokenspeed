@@ -86,8 +86,8 @@ inline std::vector<uint8_t> HexToBytes(const std::string& hex) {
 // prior_len separates page 0 from a chained page, token_count keeps tokens from
 // bleeding into extra_keys, and per-key length prefixes prevent re-splitting.
 // Feed order is prior_hash -> tokens -> extra_keys.
-inline std::string HashPage(std::span<const std::int32_t> tokens, const std::string& prior_hash,
-                            std::span<const std::string> extra_keys = {}) {
+inline std::string HashPrefixPage(std::span<const std::int32_t> tokens, const std::string& prior_hash,
+                                  std::span<const std::string> extra_keys = {}) {
     SHA256_CTX ctx;
     SHA256_Init(&ctx);
 
@@ -117,16 +117,16 @@ inline std::string HashPage(std::span<const std::int32_t> tokens, const std::str
     return DigestToHex(digest);
 }
 
-inline std::vector<std::string> ComputePagedHashes(
-    std::span<const std::span<const std::int32_t>> paged_tokens, const std::string& prior,
+inline std::vector<std::string> ComputePrefixHashes(
+    std::span<const std::span<const std::int32_t>> prefix_pages, const std::string& prior,
     std::span<const std::span<const std::string>> extra_keys_per_page = {}) {
     std::vector<std::string> hashes;
-    hashes.reserve(paged_tokens.size());
+    hashes.reserve(prefix_pages.size());
     std::string current_prior = prior;
-    for (std::size_t i = 0; i < paged_tokens.size(); ++i) {
+    for (std::size_t i = 0; i < prefix_pages.size(); ++i) {
         std::span<const std::string> extra =
             (i < extra_keys_per_page.size()) ? extra_keys_per_page[i] : std::span<const std::string>{};
-        std::string h = HashPage(paged_tokens[i], current_prior, extra);
+        std::string h = HashPrefixPage(prefix_pages[i], current_prior, extra);
         hashes.push_back(h);
         current_prior = h;
     }
@@ -134,16 +134,16 @@ inline std::vector<std::string> ComputePagedHashes(
 }
 
 // Continues an existing hash chain and returns only [first_page, past_end_page).
-inline std::vector<std::string> AdvancePagedHashes(std::span<const std::span<const std::int32_t>> paged_tokens,
-                                                   std::int32_t first_page, const std::string& prior,
-                                                   std::int32_t past_end_page) {
+inline std::vector<std::string> AdvancePrefixHashes(std::span<const std::span<const std::int32_t>> prefix_pages,
+                                                    std::int32_t first_page, const std::string& prior,
+                                                    std::int32_t past_end_page) {
     _assert(first_page >= 0, "first_page must be >= 0");
     _assert(past_end_page > first_page, "hash range must be non-empty");
-    _assert(past_end_page <= static_cast<std::int32_t>(paged_tokens.size()),
+    _assert(past_end_page <= static_cast<std::int32_t>(prefix_pages.size()),
             "hash range exceeds the available full pages");
-    return ComputePagedHashes(paged_tokens.subspan(static_cast<std::size_t>(first_page),
-                                                   static_cast<std::size_t>(past_end_page - first_page)),
-                              prior);
+    return ComputePrefixHashes(prefix_pages.subspan(static_cast<std::size_t>(first_page),
+                                                    static_cast<std::size_t>(past_end_page - first_page)),
+                               prior);
 }
 
 }  // namespace tokenspeed

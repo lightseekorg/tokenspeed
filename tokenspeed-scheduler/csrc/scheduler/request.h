@@ -39,7 +39,7 @@ namespace tokenspeed {
 
 class Request {
 public:
-    Request(const RequestSpec& spec, std::int32_t page_size, Role role);
+    Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role);
 
     const std::string& Id() const { return id_; }
 
@@ -55,8 +55,8 @@ public:
         return std::holds_alternative<State>(state_);
     }
 
-    std::vector<std::span<const std::int32_t>> FullPagedTokens(bool except_last) const {
-        return token_container_.FullPagedTokens(page_size_, except_last);
+    std::vector<std::span<const std::int32_t>> FullPrefixPages(bool except_last) const {
+        return token_container_.FullPrefixPages(prefix_granularity_, except_last);
     }
 
     std::int32_t TokenSize() const { return token_container_.Size(); }
@@ -76,10 +76,6 @@ public:
     }
 
     std::int32_t RequestPoolIndex() const { return forwardState("RequestPoolIndex").RequestPoolIndex(); }
-
-    std::vector<std::int32_t> ActiveLcmBlockIds() const {
-        return forwardState("ActiveLcmBlockIds").ActiveLcmBlockIds();
-    }
 
     const std::vector<BlockTable>& BlockTablesRef() const { return forwardState("BlockTablesRef").BlockTables(); }
 
@@ -127,7 +123,7 @@ private:
 
     std::string id_;
     TokenContainer token_container_;
-    std::int32_t page_size_{};
+    std::int32_t prefix_granularity_{};
     fsm::State state_;
 };
 

@@ -44,6 +44,9 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 )
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.page_table import (
+    build_prefill_kv_workspace_slots,
+)
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, LayerNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
@@ -80,7 +83,7 @@ class GlmDsaIndexerOutput:
 class GlmDsaPrefillTopK:
     workspace_indices: torch.Tensor
     topk_lens: torch.Tensor
-    block_tables: torch.Tensor
+    page_table: torch.Tensor
     seq_lens: torch.Tensor
     max_seq_len: int
     kv_workspace_slots: torch.Tensor
@@ -122,37 +125,6 @@ def _glm_dsa_skip_indexer_topk(config, layer_id: int | None) -> bool:
             "layer 0 as shared with no prior top-k to reuse"
         )
     return max(layer_id - offset + 1, 0) % freq != 0
-
-
-def _build_prefill_kv_workspace_slots(
-    *,
-    block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
-    max_seq_len: int,
-    page_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    local_offsets = torch.arange(
-        int(max_seq_len),
-        dtype=torch.int64,
-        device=device,
-    )
-    page_offsets = torch.div(
-        local_offsets,
-        int(page_size),
-        rounding_mode="floor",
-    )
-    block_offsets = local_offsets % int(page_size)
-    pages = block_tables.to(device=device, dtype=torch.int64).index_select(
-        1,
-        page_offsets,
-    )
-    slots = pages * int(page_size) + block_offsets
-    valid = local_offsets.unsqueeze(0) < seq_lens.to(
-        device=device,
-        dtype=torch.int64,
-    ).unsqueeze(1)
-    return slots[valid].contiguous()
 
 
 def _glm_dsa_rope_scaling(
@@ -543,7 +515,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if seq_lens.numel() == 0:
             return None
 
-        block_tables = metadata.block_kv_indices[
+        page_table = metadata.block_kv_indices[
             num_extends : num_extends + decode_window.num_reqs
         ]
         topk = self.index_topk
@@ -551,7 +523,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             indexer_output=indexer_output,
             ctx=ctx,
             seq_lens=seq_lens,
-            block_tables=block_tables,
+            page_table=page_table,
             q_len_per_req=decode_window.q_len_per_req,
             decode_start=decode_window.start,
             num_tokens=num_tokens,
@@ -565,7 +537,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         indexer_output: GlmDsaIndexerOutput,
         ctx: ForwardContext,
         seq_lens: torch.Tensor,
-        block_tables: torch.Tensor,
+        page_table: torch.Tensor,
         q_len_per_req: int,
         decode_start: int,
         num_tokens: int,
@@ -609,8 +581,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             q,
             weights,
             seq_lens,
-            block_tables,
-            page_size=ctx.token_to_kv_pool.page_size,
+            page_table,
+            page_size=ctx.token_to_kv_pool.kv_page_size,
             topk=topk,
             softmax_scale=self.indexer.weights_softmax_scale,
             q_len_per_req=q_len_per_req,
@@ -643,21 +615,21 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 f"metadata={int(extend_lens.sum().item())}, "
                 f"tokens={num_prefill_tokens}"
             )
-        if chunk_meta.block_tables is None:
+        if chunk_meta.page_table is None:
             raise RuntimeError(
                 "GLM DSA sparse prefill requires the chunked-prefill block tables"
             )
 
         topk = self.index_topk
-        page_size = ctx.token_to_kv_pool.page_size
+        page_size = ctx.token_to_kv_pool.kv_page_size
         max_seq_len = int(seq_lens.max().item())
         max_pages = (max_seq_len + page_size - 1) // page_size
-        block_tables = chunk_meta.block_tables[:, :max_pages].to(
+        page_table = chunk_meta.page_table[:, :max_pages].to(
             device=indexer_output.query.device,
             dtype=torch.int32,
         )
-        kv_workspace_slots = _build_prefill_kv_workspace_slots(
-            block_tables=block_tables,
+        kv_workspace_slots = build_prefill_kv_workspace_slots(
+            page_table=page_table,
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
             page_size=page_size,
@@ -669,7 +641,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             prefix_lens=prefix_lens,
             extend_lens=extend_lens,
             seq_lens=seq_lens,
-            block_tables=block_tables,
+            page_table=page_table,
             kv_workspace_slots=kv_workspace_slots,
             max_seq_len=max_seq_len,
             num_prefill_tokens=num_prefill_tokens,
@@ -684,7 +656,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         prefix_lens: torch.Tensor,
         extend_lens: torch.Tensor,
         seq_lens: torch.Tensor,
-        block_tables: torch.Tensor,
+        page_table: torch.Tensor,
         kv_workspace_slots: torch.Tensor,
         max_seq_len: int,
         num_prefill_tokens: int,
@@ -736,13 +708,13 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             topk=topk,
             softmax_scale=self.indexer.weights_softmax_scale,
             index_k_cache=index_k_cache,
-            page_size=ctx.token_to_kv_pool.page_size,
+            page_size=ctx.token_to_kv_pool.kv_page_size,
             max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
         )
         return GlmDsaPrefillTopK(
             workspace_indices=workspace_indices,
             topk_lens=topk_lens,
-            block_tables=block_tables,
+            page_table=page_table,
             seq_lens=seq_lens.to(device=q.device, dtype=torch.int32),
             max_seq_len=max_seq_len,
             kv_workspace_slots=kv_workspace_slots,
@@ -931,7 +903,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             q=Q,
             layer=self.attn_mqa,
             token_to_kv_pool=ctx.token_to_kv_pool,
-            block_tables=prefill_topk.block_tables,
+            page_table=prefill_topk.page_table,
             seq_lens=prefill_topk.seq_lens,
             workspace_indices=prefill_topk.workspace_indices,
             topk_lens=prefill_topk.topk_lens,

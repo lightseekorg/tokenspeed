@@ -273,11 +273,14 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                     },
                 )
 
+        # Non-positive row geometry is rejected at spec construction now.
+        with (
+            self.subTest(group="bad-rows"),
+            self.assertRaisesRegex(ValueError, "rows_per_page"),
+        ):
+            PagedCacheGroupSpec("bad-rows", "full_history", 0, 1, None)
+
         invalid_specs = (
-            (
-                PagedCacheGroupSpec("bad-rows", "full_history", 0, 1, None),
-                "rows_per_page",
-            ),
             (
                 PagedCacheGroupSpec("bad-window", "sliding_window", 4, 1, 0),
                 "sliding_window_tokens",
@@ -367,7 +370,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             self.assertTrue(math.isfinite(n), spec.group_id)
             self.assertLess(n, bound, spec.group_id)
 
-    def test_lcm_specs_preserve_group_page_sizes_and_publish_packing(self):
+    def test_lcm_specs_preserve_group_block_granularities_and_publish_packing(self):
         packing = {
             "v4.swa_kv": 1,
             "v4.c4a.compressor_state": 16,
@@ -427,7 +430,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             cache_blocks_per_lcm_block=packing,
         )
         sizing = {
-            "logical_block_tokens": 256,
+            "prefix_granularity": 256,
             "max_live_requests": 1,
             "max_scheduled_tokens": 256,
             "max_context_len": 4096,

@@ -434,7 +434,9 @@ class PrefillGraph:
         if not state_group_ids:
             state_group_ids = set(getattr(backend, "state_group_ids", frozenset()))
         # Composite wrappers hold the cache-group consumer as a child.
-        if not hasattr(backend, "page_size") and hasattr(backend, "full_attn_backend"):
+        if not hasattr(backend, "kernel_page_size") and hasattr(
+            backend, "full_attn_backend"
+        ):
             backend = backend.full_attn_backend
         require_real_active_pages = bool(
             getattr(backend, "cache_active_pages_must_be_real", False)
@@ -442,7 +444,7 @@ class PrefillGraph:
         # Full width: backends that derive the row stride from max_kv_len
         # (trtllm) index the whole row even when the bucket is small.
         width = getattr(backend, "max_num_pages", 0) or -(
-            -req_tokens // backend.page_size
+            -req_tokens // backend.kernel_page_size
         )
         # ALL groups, state included: hybrid wrappers forward the dict to the
         # mamba child, which requires its state group; KV children shed state
@@ -452,13 +454,7 @@ class PrefillGraph:
             group_id = str(spec.group_id)
             group_width = width
             if require_real_active_pages:
-                raw_tokens_per_page = int(spec.rows_per_page) * int(
-                    spec.entry_stride_tokens
-                )
-                if raw_tokens_per_page <= 0:
-                    raise RuntimeError(
-                        f"cache group {group_id!r} has invalid page geometry"
-                    )
+                raw_tokens_per_page = int(spec.block_granularity)
                 group_width = max(
                     1,
                     (req_tokens + raw_tokens_per_page - 1) // raw_tokens_per_page,
@@ -541,11 +537,11 @@ class PrefillGraph:
             getattr(self.attn_backend, "uses_paged_cache_groups", False)
             and decode_wrapper is not None
         ):
-            tables = decode_wrapper._capture_paged_cache_block_tables(
+            tables = decode_wrapper._capture_group_block_tables(
                 bs, self.token_to_kv_pool
             )
             if tables is not None:
-                extra_metadata_kwargs["paged_cache_block_tables"] = tables
+                extra_metadata_kwargs["block_tables"] = tables
             extra_metadata_kwargs["num_tokens"] = num_tokens
             extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
         group_tables = self._dummy_group_tables(max(seq_lens), bs)

@@ -38,7 +38,10 @@ from tokenspeed_kernel.ops.attention.gdn_utils import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
 )
-from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
+from tokenspeed_kernel.ops.attention.kda_utils import (
+    KdaFusedDecodeResult,
+    KdaPrefillResult,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
@@ -134,6 +137,7 @@ __all__ = [
     "kda_paged_decode",
     "try_kda_fused_paged_decode",
     "try_kda_fused_paged_verify",
+    "KdaFusedDecodeResult",
     "KdaPrefillResult",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
@@ -1507,14 +1511,28 @@ def try_kda_fused_paged_decode(
     head_dim: int,
     cu_seqlens: torch.Tensor,
     lower_bound: float | None = -5.0,
+    output_gate: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
     override: str | None = None,
     solution: str | None = None,
-) -> torch.Tensor | None:
+) -> KdaFusedDecodeResult | None:
     """Try a registered pre-convolution KDA decode fusion.
 
+    ``output_gate``, ``norm_weight``, and ``norm_eps`` request a fused gated
+    RMSNorm epilogue. If the selected backend only supports the original core
+    fusion, the returned result reports that the caller must apply the
+    epilogue.
+
     Returns ``None`` only when no implementation supports the current
-    platform. Invalid inputs and execution failures remain visible.
+    platform. Otherwise, returns the output and whether output normalization
+    was applied. Invalid inputs and execution failures remain visible.
     """
+    if (output_gate is None) != (norm_weight is None):
+        raise ValueError("output_gate and norm_weight must be provided together")
+    if output_gate is not None and norm_eps is None:
+        raise ValueError("norm_eps is required with fused KDA output normalization")
+
     signature = _attention_format_signature(
         q=mixed_qkv,
         k=mixed_qkv,
@@ -1525,13 +1543,49 @@ def try_kda_fused_paged_decode(
             "attention",
             "kda_fused_paged_decode",
             signature,
-            traits={"paged_state": True},
+            traits={
+                "paged_state": True,
+                "fused_output_norm": output_gate is not None,
+                "num_heads": num_heads,
+                "head_dim": head_dim,
+                "conv_kernel_size": conv_weights.shape[-1],
+            },
             solution=solution,
             override=override,
         )
     except NoKernelFoundError:
-        return None
-    return kernel(
+        if output_gate is None:
+            return None
+        try:
+            kernel = select_kernel(
+                "attention",
+                "kda_fused_paged_decode",
+                signature,
+                traits={
+                    "paged_state": True,
+                    "fused_output_norm": False,
+                    "num_heads": num_heads,
+                    "head_dim": head_dim,
+                    "conv_kernel_size": conv_weights.shape[-1],
+                },
+                solution=solution,
+                override=override,
+            )
+        except NoKernelFoundError:
+            return None
+
+    selected_spec = KernelRegistry.get().get_by_name(kernel.name)
+    output_norm_applied = (
+        output_gate is not None
+        and selected_spec is not None
+        and spec_matches_traits(
+            selected_spec,
+            {"fused_output_norm": True},
+            require_all_traits=True,
+        )
+    )
+
+    out = kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
         conv_states=conv_states,
@@ -1547,7 +1601,11 @@ def try_kda_fused_paged_decode(
         head_dim=head_dim,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
+        output_gate=output_gate if output_norm_applied else None,
+        norm_weight=norm_weight if output_norm_applied else None,
+        norm_eps=norm_eps if output_norm_applied else None,
     )
+    return KdaFusedDecodeResult(out=out, output_norm_applied=output_norm_applied)
 
 
 def try_kda_fused_paged_verify(

@@ -184,7 +184,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             "layer_num": 24,
             "device": "cpu",
             "enable_memory_saver": False,
-            "page_size": 16,
+            "prefix_granularity": 16,
             "rank": 0,
             "layer_types": GPT_OSS_LAYER_TYPES,
             "sliding_window_tokens": 128,
@@ -192,7 +192,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         kwargs.update(overrides)
         kwargs["memory_plan"] = make_mha_memory_plan(
             size=kwargs["size"],
-            page_size=kwargs["page_size"],
+            prefix_granularity=kwargs["prefix_granularity"],
             layer_num=kwargs["layer_num"],
             kv_heads=kwargs["head_num"],
             head_dim=kwargs["head_dim"],
@@ -295,13 +295,39 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             )
         self.assertNotEqual(pool.k_buffer[0].data_ptr(), pool.k_buffer[6].data_ptr())
 
-    def test_guard_raises_on_pd_with_aliased_plan(self):
-        with self.assertRaisesRegex(
-            RuntimeError,
-            r"aliased MHA cache layout is incompatible with PD disaggregation"
-            r".*disaggregation_mode='null'",
-        ):
-            self._pool(pd_disaggregation_enabled=True)
+    def test_aliased_sliding_plan_publishes_one_typed_pd_arena(self):
+        from cache_pool_test_utils import make_layer_group_ids
+
+        from tokenspeed.runtime.pd.cache_protocol import (
+            build_pool_cache_transfer_contract,
+        )
+
+        group_ids = make_layer_group_ids(
+            layer_num=len(GPT_OSS_LAYER_TYPES),
+            layer_types=GPT_OSS_LAYER_TYPES,
+            sliding_window_tokens=128,
+        )
+        specs = _real_spec().build_paged_cache_group_specs(
+            layer_types=GPT_OSS_LAYER_TYPES,
+            group_ids=group_ids,
+            sliding_window_tokens=128,
+            prefix_granularity=16,
+            pd_disaggregation_enabled=True,
+        )
+        pool = self._pool(
+            layer_group_ids=group_ids,
+            paged_cache_group_specs=specs,
+        )
+
+        layout, base_addr = build_pool_cache_transfer_contract(pool)
+
+        self.assertTrue(pool.supports_disaggregation)
+        self.assertEqual(base_addr, pool.buffer.data_ptr())
+        self.assertEqual(layout.plan, pool.plan)
+        groups = {spec.retention: spec for spec in layout.group_specs}
+        self.assertEqual(set(groups), {"full_history", "sliding_window"})
+        self.assertIsNone(groups["full_history"].sliding_window_tokens)
+        self.assertEqual(groups["sliding_window"].sliding_window_tokens, 128)
 
     def test_constructor_without_specs_publishes_no_contract(self):
         # The recipe is the single source of group specs; a pool constructed
@@ -314,7 +340,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             "layer_num": 1,
             "device": "cpu",
             "enable_memory_saver": False,
-            "page_size": 16,
+            "prefix_granularity": 16,
             "rank": 0,
             "layer_types": ("full_attention",),
             "layer_group_ids": ("full_attention",),
@@ -323,7 +349,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
 
         kwargs["memory_plan"] = make_mha_memory_plan(
             size=kwargs["size"],
-            page_size=kwargs["page_size"],
+            prefix_granularity=kwargs["prefix_granularity"],
             layer_num=kwargs["layer_num"],
             kv_heads=kwargs["head_num"],
             head_dim=kwargs["head_dim"],
@@ -346,7 +372,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             "layer_num": 1,
             "device": "cpu",
             "enable_memory_saver": False,
-            "page_size": 16,
+            "prefix_granularity": 16,
             "rank": 0,
             "layer_types": ("full_attention",),
             "layer_group_ids": ("full_attention",),
@@ -355,7 +381,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
 
         kwargs["memory_plan"] = make_mha_memory_plan(
             size=kwargs["size"],
-            page_size=kwargs["page_size"],
+            prefix_granularity=kwargs["prefix_granularity"],
             layer_num=kwargs["layer_num"],
             kv_heads=kwargs["head_num"],
             head_dim=kwargs["head_dim"],
@@ -366,7 +392,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             layer_types=kwargs["layer_types"],
             group_ids=kwargs["layer_group_ids"],
             sliding_window_tokens=None,
-            page_size=kwargs["page_size"],
+            prefix_granularity=kwargs["prefix_granularity"],
         )
         pool = self.MHATokenToKVPool(**kwargs)
 
@@ -405,7 +431,7 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
                 self.allocation_hook_called = True
                 self.kv_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
+                        (self.size + self.prefix_granularity, 1, self.kv_cache_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -422,11 +448,11 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
             layer_num=1,
             device="cpu",
             enable_memory_saver=False,
-            page_size=4,
+            prefix_granularity=4,
             rank=0,
             memory_plan=make_mla_memory_plan(
                 size=8,
-                page_size=4,
+                prefix_granularity=4,
                 layer_num=1,
                 latent_width=6,
                 dtype=torch.bfloat16,
@@ -436,7 +462,7 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
                 layer_types=(),
                 group_ids=("full_attention",),
                 sliding_window_tokens=None,
-                page_size=4,
+                prefix_granularity=4,
             ),
         )
 
@@ -472,7 +498,7 @@ class StatePagedCacheGroupPageCountTest(unittest.TestCase):
             layer_types=("linear_attention", "full_attention"),
             group_ids=("linear_attention", "full_attention"),
             sliding_window_tokens=None,
-            page_size=16,
+            prefix_granularity=16,
         )
         params = {
             "max_live_requests": 2,
@@ -519,7 +545,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
         fields = qwen_gdn_cache_fields(
             layer_types=("linear_attention", "full_attention"),
             layer_group_ids=("linear_attention_0", "full_attention"),
-            logical_block_tokens=4,
+            prefix_granularity=4,
             kv_shape=(4, 1, 2),
             kv_element_size=2,
             conv_shape=(2, 2),
@@ -529,7 +555,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
         )
         self.plan = plan_fields(
             fields,
-            logical_block_tokens=4,
+            prefix_granularity=4,
             budget_bytes=64,
             alignment=2,
         )
@@ -543,7 +569,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
             layer_num=2,
             device="cpu",
             enable_memory_saver=False,
-            page_size=4,
+            prefix_granularity=4,
             rank=0,
             layer_types=("linear_attention", "full_attention"),
             state_field_dtypes={
@@ -556,7 +582,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
                 layer_types=("linear_attention", "full_attention"),
                 group_ids=("linear_attention_0", "full_attention"),
                 sliding_window_tokens=None,
-                page_size=4,
+                prefix_granularity=4,
             ),
         )
 
@@ -571,13 +597,13 @@ class CachePoolFieldBindingTest(unittest.TestCase):
             layer_num=2,
             device="cpu",
             enable_memory_saver=False,
-            page_size=4,
+            prefix_granularity=4,
             rank=0,
             layer_types=("linear_attention", "full_attention"),
             layer_group_ids=("linear_attention", "full_attention"),
             memory_plan=make_mha_memory_plan(
                 size=8,
-                page_size=4,
+                prefix_granularity=4,
                 layer_num=2,
                 kv_heads=1,
                 head_dim=2,
@@ -608,7 +634,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
     def test_pool_publishes_runtime_contract_and_component_mapping(self):
         pool = self._pool()
 
-        self.assertEqual(pool.runtime_contract.block_size, 4)
+        self.assertEqual(pool.runtime_contract.prefix_granularity, 4)
         self.assertEqual(pool.runtime_contract.num_lcm_blocks, 1)
         self.assertEqual(
             pool.runtime_contract.group_page_counts,

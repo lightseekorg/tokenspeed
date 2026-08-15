@@ -25,12 +25,12 @@ same primitives: resolve the scheduler's full-history table in this backend's
 KERNEL pages, and turn per-request sequence lengths into absolute latent write
 locations. The logical->kernel page expansion happens once upstream
 (``CacheBatchMetadata.kernel_table``); backends only ever see physical kernel
-pages of ``self.page_size`` tokens, so all the location math here uses that
+pages of ``self.kernel_page_size`` tokens, so all the location math here uses that
 one page size. This mixin holds that logic so ``MLAAttnBackend``,
 ``FlashMLABackend`` and ``TRTLLMMLABackend`` share one implementation rather
 than three copies.
 
-Host-class requirements: ``self.page_size`` (kernel page size in tokens),
+Host-class requirements: ``self.kernel_page_size`` (kernel page size in tokens),
 ``self.max_num_pages`` (kernel page-table width), and ``self.device``. The host
 must also define ``self._cache_contract_bound`` / ``self._cache_groups_bound``
 (the mixin's :meth:`mark_cache_contract` sets the former).
@@ -89,7 +89,7 @@ class MlaCacheGroupMixin:
         ``kernel_table``. The returned width is ``self.max_num_pages``.
         """
         table = cache_metadata.kernel_table(
-            page_size=self.page_size,
+            kernel_page_size=self.kernel_page_size,
             max_pages=self.max_num_pages,
             active_forward_op=forward_batch,
         )
@@ -144,7 +144,7 @@ class MlaCacheGroupMixin:
         ``seq-q_len .. seq-1``, flattened request-major to match the query
         layout the verify read path builds.
         """
-        page_size = self.page_size
+        page_size = self.kernel_page_size
         last = (seq_lens[:batch_size].to(torch.int64) - 1).clamp_min(0)
         if q_len_per_req == 1:
             positions = last.unsqueeze(1)
@@ -203,7 +203,7 @@ class MlaCacheGroupMixin:
         validate_pages: bool = False,
     ) -> torch.Tensor:
         """Return packed Paged cache extend-write locations in query order."""
-        page_size = self.page_size
+        page_size = self.kernel_page_size
         chunks: list[torch.Tensor] = []
         pages_for_validation: list[torch.Tensor] = []
         for row, (start, num_new) in enumerate(

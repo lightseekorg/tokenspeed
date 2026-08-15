@@ -51,15 +51,15 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
         if (!device_block_ref) {
             continue;
         }
-        const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(candidate.key.group_id));
+        const GroupAllocator& manager = coordinator_.Allocator(static_cast<std::int32_t>(candidate.key.group_id));
         CacheBlockRef host_block_ref = coordinator_.AcquireHostBlock(candidate.key.group_id);
         if (!host_block_ref) {
             continue;
         }
         transfers.push_back(CacheTransfer{
             .group_id = candidate.key.group_id,
-            .source_page = manager.ResolveKernelPageId(device_block_ref->Location()),
-            .destination_page = manager.ResolveKernelPageId(host_block_ref->Location()),
+            .source_page = manager.ResolveCacheBlockId(device_block_ref->Location()),
+            .destination_page = manager.ResolveCacheBlockId(host_block_ref->Location()),
         });
         tickets.push_back(StoreTicket{
             std::move(candidate.key),
@@ -124,11 +124,11 @@ std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const
     for (const BlockTransfer& block_transfer : block_transfers) {
         _assert(block_transfer.source && block_transfer.destination,
                 "cache transfer requires pinned source and destination blocks");
-        const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(block_transfer.group_id));
+        const GroupAllocator& manager = coordinator_.Allocator(static_cast<std::int32_t>(block_transfer.group_id));
         transfers.push_back(CacheTransfer{
             .group_id = block_transfer.group_id,
-            .source_page = manager.ResolveKernelPageId(block_transfer.source->Location()),
-            .destination_page = manager.ResolveKernelPageId(block_transfer.destination->Location()),
+            .source_page = manager.ResolveCacheBlockId(block_transfer.source->Location()),
+            .destination_page = manager.ResolveCacheBlockId(block_transfer.destination->Location()),
         });
     }
     return transfers;

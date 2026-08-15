@@ -44,7 +44,6 @@ weight loading, and pool sizing (see ``inkling_mtp_text_config``).
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Iterable
 
 import torch
@@ -211,24 +210,6 @@ class InklingMultiTokenPredictor(nn.Module):
 
 
 class InklingForConditionalGenerationNextN(nn.Module):
-    # Catch-up runs the full padded window; ctx.gather_ids narrows to one row per request.
-    draft_first_step_reduce_for_catchup = True
-    # Full-sequence depths: re-run each depth over the whole verify window
-    # (mtp.py window mode); the trained dataflow, not optional.
-    draft_multi_depth_windows = True
-    # Prompt catch-up: at EXTEND rounds run depths
-    # 1..steps-1 over the prompt rows too (inputs shifted d+1, chaining the
-    # previous depth's full-row hidden), so every used depth gets dense
-    # prompt KV and sconv prompt state.
-    draft_extend_depth_catchup = True
-    # Provisional-tail recompute: decode windows carry D=steps-1
-    # lookback rows so the previous round's provisional tail entries (written
-    # from then-unverified drafts) are recomputed from committed tokens.
-    # Kept as an A/B knob for further experiments:
-    # INKLING_MTP_DECODE_LOOKBACK=0 reverts (depth-d KV/conv then keeps
-    # ~d/<a>*(1-p) stale slots).
-    draft_decode_lookback = os.environ.get("INKLING_MTP_DECODE_LOOKBACK", "1") != "0"
-
     def __init__(
         self,
         config: InklingMMConfig,

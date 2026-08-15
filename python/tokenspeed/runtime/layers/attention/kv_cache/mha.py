@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    MXFP8_KV_SCALE_TILE_TOKENS,
     PagedCacheGroupSpec,
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -53,7 +54,7 @@ class MHATokenToKVPool(CachePool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
-        page_size: int,
+        prefix_granularity: int,
         rank: int,
         *,
         memory_plan: CacheMemoryPlan,
@@ -61,7 +62,6 @@ class MHATokenToKVPool(CachePool):
         token_capacity: int | None = None,
         layer_types: tuple[str, ...] = (),
         layer_group_ids: tuple[str, ...] = (),
-        pd_disaggregation_enabled: bool = False,
         layer_kv_head_counts: tuple[int, ...] | None = None,
         kv_alloc_head_count: int | None = None,
         field_layer_offset: int = 0,
@@ -71,14 +71,13 @@ class MHATokenToKVPool(CachePool):
             size,
             dtype,
             device,
-            page_size,
+            prefix_granularity,
             rank,
             memory_plan,
             paged_cache_group_specs=paged_cache_group_specs,
             token_capacity=token_capacity,
             backing_pool=backing_pool,
             field_layer_offset=field_layer_offset,
-            pd_disaggregation_enabled=pd_disaggregation_enabled,
         )
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -142,15 +141,6 @@ class MHATokenToKVPool(CachePool):
             ).view(-1, self.head_num, self.head_dim)
             for layer_id in range(self.layer_num)
         ]
-        aliased = len({buffer.data_ptr() for buffer in self.k_buffer}) < len(
-            self.k_buffer
-        ) or len({buffer.data_ptr() for buffer in self.v_buffer}) < len(self.v_buffer)
-        if aliased and self._pd_disaggregation_enabled:
-            raise RuntimeError(
-                "aliased MHA cache layout is incompatible with PD "
-                "disaggregation: per-layer registrations would transfer the "
-                "same bytes more than once. Set disaggregation_mode='null'."
-            )
         logger.info(
             "KV layout: one buffer with %d per-layer K/V views",
             self.layer_num,
@@ -172,40 +162,6 @@ class MHATokenToKVPool(CachePool):
         k_size_bytes = sum(t.nbytes for t in k_caches.values())
         v_size_bytes = sum(t.nbytes for t in v_caches.values())
         return k_size_bytes, v_size_bytes
-
-    # for disagg
-    def get_contiguous_buf_infos(self):
-        # layer_num x [seq_len, head_num, head_dim]
-        # layer_num x [page_num, page_size, head_num, head_dim]
-        kv_data_ptrs = [
-            self._get_key_buffer(i).data_ptr() for i in range(self.layer_num)
-        ] + [self._get_value_buffer(i).data_ptr() for i in range(self.layer_num)]
-        kv_data_lens = [
-            self._get_key_buffer(i).nbytes for i in range(self.layer_num)
-        ] + [self._get_value_buffer(i).nbytes for i in range(self.layer_num)]
-        kv_item_lens = [
-            self._get_key_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.layer_num)
-        ] + [
-            self._get_value_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.layer_num)
-        ]
-        return kv_data_ptrs, kv_data_lens, kv_item_lens
-
-    def get_contiguous_buf_unit_lens(self):
-        key_units = [
-            self._get_key_buffer(i)[0, 0].nbytes for i in range(self.layer_num)
-        ]
-        value_units = [
-            self._get_value_buffer(i)[0, 0].nbytes for i in range(self.layer_num)
-        ]
-        return key_units + value_units
-
-    def get_layerwise_buf_info_offsets(self, start_idx=0):
-        return [
-            [start_idx + i * self.layer_num + layer_id for i in range(2)]
-            for layer_id in range(self.layer_num)
-        ]
 
     def _layer_row_view(self, buf: torch.Tensor, layer_id: int) -> torch.Tensor:
         """Per-layer token-row view over one byte-uniform cache field.
@@ -344,13 +300,13 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         """Tokens represented by one page id for this layer."""
         # Byte-uniform slots factor one id through the layer's head count.
         heads_l = self._layer_heads_per_rank(layer_id)
-        return self.page_size * self.head_num // heads_l
+        return self.kv_page_size * self.head_num // heads_l
 
     def _layer_scale_view(self, buf: torch.Tensor, layer_id: int) -> torch.Tensor:
         """(num_ids, heads_l, k_l, 32, 4, 4) view over a layer's SF slots
         (the paged interleaved layout the blockscaled kernels consume)."""
         heads_l = self._layer_heads_per_rank(layer_id)
-        k_l = self._layer_page_tokens(layer_id) // 128
+        k_l = self._layer_page_tokens(layer_id) // MXFP8_KV_SCALE_TILE_TOKENS
         sf_dim = self.head_dim // self.MXFP8_SCALE_BLOCK_SIZE
         return buf.view(buf.shape[0], heads_l, k_l, 32, sf_dim, sf_dim)
 
@@ -412,7 +368,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
                 page_size=page_tokens,
                 enable_pdl=pdl_enabled(),
             )
-        elif self.page_size == 128:
+        elif self.kv_page_size == MXFP8_KV_SCALE_TILE_TOKENS:
             store_sf_interleaved(
                 k_scale, self.k_scale_buffer[layer_id], loc, enable_pdl=pdl_enabled()
             )
@@ -443,8 +399,8 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         )
         if self._layer_kv_head_counts is not None:
             page_tokens = self._layer_page_tokens(layer_id)
-        elif self.page_size == 128:
-            page_tokens = 128
+        elif self.kv_page_size == MXFP8_KV_SCALE_TILE_TOKENS:
+            page_tokens = MXFP8_KV_SCALE_TILE_TOKENS
         else:
             return False
         if self.head_dim != 128:

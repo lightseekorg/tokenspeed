@@ -111,7 +111,7 @@ class DummyGroupTablesTest(unittest.TestCase):
     def test_backend_gets_writable_state_tables(self):
         backend = SimpleNamespace(
             uses_cache_groups=True,
-            page_size=32,
+            kernel_page_size=32,
             max_num_pages=0,  # fall back to bucket-derived width
             state_group_ids=frozenset({"linear_attention"}),
         )
@@ -141,7 +141,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         # must span the full table width, not just the bucket.
         backend = SimpleNamespace(
             uses_cache_groups=True,
-            page_size=32,
+            kernel_page_size=32,
             max_num_pages=2500,
             state_group_ids=frozenset(),
         )
@@ -155,7 +155,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         backend = SimpleNamespace(
             uses_cache_groups=True,
             cache_active_pages_must_be_real=True,
-            page_size=256,
+            prefix_granularity=256,
             max_num_pages=257,
             state_group_ids=frozenset(),
         )
@@ -163,13 +163,11 @@ class DummyGroupTablesTest(unittest.TestCase):
             paged_cache_group_specs=(
                 SimpleNamespace(
                     group_id="fine",
-                    rows_per_page=4,
-                    entry_stride_tokens=1,
+                    block_granularity=4,
                 ),
                 SimpleNamespace(
                     group_id="coarse",
-                    rows_per_page=64,
-                    entry_stride_tokens=4,
+                    block_granularity=256,
                 ),
             )
         )
@@ -186,7 +184,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         # full_attn_backend; the helper must not AttributeError (which would
         # silently disable the prefill graph via the capture fallback).
         child = SimpleNamespace(
-            page_size=32, max_num_pages=0, state_group_ids=frozenset()
+            kernel_page_size=32, max_num_pages=0, state_group_ids=frozenset()
         )
         wrapper = SimpleNamespace(uses_cache_groups=True, full_attn_backend=child)
         pool = SimpleNamespace(

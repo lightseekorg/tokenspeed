@@ -97,6 +97,7 @@ def _resolve_draft_query_width(verify_width: int, sample_from_anchor: bool) -> i
 class DFlash(BaseDrafter):
     """DFlash block drafter backed by a native TokenSpeed draft model."""
 
+    supports_pd_layerwise_finalization = True
     sample_from_anchor = False
 
     def __init__(
@@ -863,10 +864,9 @@ class DFlash(BaseDrafter):
                 - 1
                 + num_extends
             )
-            safe_accept_lengths = (
-                accept_lengths[num_extends:].to(torch.int64).clamp(1, spec_num_tokens)
-            )
-            current[num_extends:] = output_tokens[offsets + safe_accept_lengths]
+            current[num_extends:] = output_tokens[
+                offsets + accept_lengths[num_extends:]
+            ]
         return current
 
     def get_candidates(self, base_ctx: ForwardContext) -> torch.Tensor | None:
@@ -1035,7 +1035,7 @@ class DFlash(BaseDrafter):
                 out_cache_loc=draft_cache_locs,
                 verify_width=self.spec_num_tokens,
                 draft_query_width=self.draft_query_width,
-                page_size=self.cache_view.page_size,
+                page_size=self.cache_view.kernel_page_size,
                 max_draft_prefix=max_draft_prefix,
             )
             return self._draft_native(current_tokens, prepared=True)
@@ -1082,7 +1082,7 @@ class DFlash(BaseDrafter):
             out_cache_loc=draft_cache_locs,
             verify_width=self.spec_num_tokens,
             draft_query_width=self.draft_query_width,
-            page_size=self.cache_view.page_size,
+            page_size=self.cache_view.kernel_page_size,
             max_draft_prefix=max_draft_prefix,
         )
 

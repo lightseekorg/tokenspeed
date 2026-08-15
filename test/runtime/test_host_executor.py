@@ -92,6 +92,10 @@ class GroupAwareWireTest(unittest.TestCase):
         pool.buffer = object()
         pool._backing_pool = None
         pool._field_layer_offset = 0
+        pool._fields = {
+            "layer.0.state": object(),
+            "layer.1.k": object(),
+        }
         pool.paged_cache_group_specs = (
             SimpleNamespace(group_id="state"),
             SimpleNamespace(group_id="full"),

@@ -51,7 +51,9 @@ public:
     }
 
 private:
-    friend class KvCacheManager;
+    friend class GroupAllocator;
+    // Registering a block may replace it with the key's canonical block.
+    friend class PrefixCacheIndex;
 
     std::vector<CacheBlockRef> blocks_{};
     // Unconsumed capacity at the logical tail. This may span multiple blocks
@@ -60,7 +62,7 @@ private:
 };
 
 // LCM ownership ids for scheduler accounting/debugging. Kernel-facing page
-// tables must instead go through KvCacheManager::BlockTablePageIds().
+// tables must instead go through GroupAllocator::BlockTablePageIds().
 inline std::vector<std::int32_t> BlockTableLcmBlockIds(const BlockTable& table) {
     std::vector<std::int32_t> ids;
     ids.reserve(static_cast<std::size_t>(table.NumBlocks()));

@@ -20,9 +20,10 @@
 
 """Shared cache-group machinery for attention backends.
 
-A group-aware backend (``uses_cache_groups = True``) receives one page
-table per cache group (``block_tables: dict[group_id, [bs, max_pages]]``)
-and must route every cache read and write through the layer's own group. This
+A group-aware backend (``uses_cache_groups = True``) receives the
+scheduler's per-group block tables (``block_tables: dict[group_id,
+[bs, max_pages]]``), expands them to kernel page tables, and must route
+every cache read and write through the layer's own group. This
 mixin holds the group-selection,
 write-location, and CUDA-graph per-group buffer machinery shared by the MHA
 and TRT-LLM backends; model/kernel-specific constraints (spec decode, DFLASH)
@@ -61,7 +62,7 @@ logger = get_colorful_logger(__name__)
 class CacheGroupsMixin:
     """Per-group table/write-loc selection + CUDA-graph buffer discipline.
 
-    Host class requirements: ``self.device``, ``self.page_size``,
+    Host class requirements: ``self.device``, ``self.kernel_page_size``,
     ``self.max_num_pages``, ``self.forward_decode_metadata`` (with
     ``page_tables``/``out_cache_locs`` fields), and calling
     :meth:`_init_group_graph_buffers` from ``init_cuda_graph_state``.
@@ -69,17 +70,12 @@ class CacheGroupsMixin:
 
     cache_consumer_families = frozenset({"history"})
 
-    # family="state" group ids (GDN/mamba state pages); learned from the
+    # family="state" group ids (GDN/mamba state blocks); learned from the
     # pool's specs in init_cuda_graph_state, shed from every table here.
     state_group_ids: frozenset[str] = frozenset()
 
     # Wrapper-owned (Inkling conv) groups: mixin skips their write-loc math and capture buffers
     engine_owned_group_ids: frozenset[str] = frozenset()
-
-    # Draft decode-window lookback rows (Inkling MTP): armed by the conv
-    # wrapper's configure_draft_lookback BEFORE graph init, so the lookback
-    # loc stack below is sized alongside the main one.
-    draft_lookback: int = 0
 
     # Value for CUDA-graph buffer column tails past this replay's table
     # width. -1 is a debug tripwire (never read past cache_seqlens by the
@@ -160,7 +156,7 @@ class CacheGroupsMixin:
         return self._select_out_cache_loc(layer, metadata, out_cache_loc)
 
     def _shed_state_groups(self, tables):
-        """Drop family="state" groups (GDN/mamba state pages, consumed by the
+        """Drop family="state" groups (GDN/mamba state blocks, consumed by the
         mamba backend): computing write locs / capture buffers over the
         hole-heavy state table writes the dummy page and trips
         TOKENSPEED_CACHE_DEBUG. Returns None when nothing is left.
@@ -178,7 +174,7 @@ class CacheGroupsMixin:
         # init_cuda_graph_state is never reached under --enforce-eager, so
         # establish the empty state at construction.
         self.state_group_ids: frozenset[str] = frozenset()
-        self.group_page_sizes: dict[str, int] = {}
+        self.group_block_granularities: dict[str, int] = {}
         self.cache_pool: CachePool | None = None
 
     def _learn_cache_groups(self, paged_cache_group_specs) -> None:
@@ -191,18 +187,18 @@ class CacheGroupsMixin:
             for spec in paged_cache_group_specs
             if spec.family == "state"
         )
-        self.group_page_sizes = {
-            str(spec.group_id): spec.cache_block_tokens
+        self.group_block_granularities = {
+            str(spec.group_id): spec.page_size
             for spec in paged_cache_group_specs
             if spec.family != "state"
         }
 
-    def _group_page_size(self, gid: str) -> int:
-        return self.group_page_sizes.get(gid, self.page_size)
+    def _group_block_granularity(self, gid: str) -> int:
+        return self.group_block_granularities.get(gid, self.kernel_page_size)
 
     def _layer_page_size(self, layer) -> int:
         """Page size of the layer's cache group (uniform when unknown)."""
-        return self._group_page_size(getattr(layer, "group_id", ""))
+        return self._group_block_granularity(getattr(layer, "group_id", ""))
 
     def _kernel_page_tables(self, page_tables):
         """Convert per-group page IDs to the page size consumed by the kernel.
@@ -215,14 +211,14 @@ class CacheGroupsMixin:
         if not page_tables:
             return page_tables
         if all(
-            self._group_page_size(gid) == self._consumer_page_size(gid)
+            self._group_block_granularity(gid) == self._consumer_page_size(gid)
             for gid in page_tables
         ):
             return page_tables
         return {
             gid: expand_page_table(
                 table,
-                logical_page_size=self._group_page_size(gid),
+                block_granularity=self._group_block_granularity(gid),
                 kernel_page_size=self._consumer_page_size(gid),
                 max_kernel_pages=self.max_num_pages,
             )
@@ -231,7 +227,7 @@ class CacheGroupsMixin:
 
     def _consumer_page_size(self, group_id: str) -> int:
         """Page size used to view a group's cache tensor in this backend."""
-        return self.page_size
+        return self.kernel_page_size
 
     # ------------------------------------------------------------------
     # Write locations
@@ -259,7 +255,7 @@ class CacheGroupsMixin:
             pos = pos.reshape(-1)
         out = {}
         for gid, table in page_tables.items():
-            ps = self._group_page_size(gid) if gid else page_size
+            ps = self._group_block_granularity(gid) if gid else page_size
             page_idx = pos // ps
             off = (pos % ps).to(torch.int32)
             if n == 1:
@@ -285,7 +281,7 @@ class CacheGroupsMixin:
         for i, (start, num_new) in enumerate(zip(prefix_lens, extend_lens)):
             pos = torch.arange(start, start + num_new, dtype=torch.int64, device=device)
             for gid, table in page_tables.items():
-                ps = self._group_page_size(gid)
+                ps = self._group_block_granularity(gid)
                 max_col = (start + num_new - 1) // ps
                 if max_col >= table.shape[1]:
                     raise RuntimeError(
@@ -305,44 +301,22 @@ class CacheGroupsMixin:
             for gid, chunks in out.items()
         }
 
-    def enter_draft_lookback(self, bs: int) -> bool:
-        """Drafter hook (via the Inkling conv wrapper): swap the decode
-        metadata's write locs to the lookback-window variant — N + D tokens
-        per request at positions ``seq-(N+D)..seq-1`` — so the lookback
-        pass's KV writes cover its extra leading rows.
-
-        Metadata without grouped locations needs no swap: the drafter's caller
-        locations are live there. Returns False when grouped locations cannot be
-        provided (lookback disarmed, or a captured metadata without the
-        lookback loc stack), so the caller falls back to the plain window
-        pass. The next round's metadata init restores the plain locs.
-        """
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        """Re-anchor the k-row decode metadata to the committed frontier:
+        seq_lens becomes ``frontier`` and the grouped write locs cover
+        positions ``frontier-k..frontier-1``. Accept-dependent, so pure
+        tensor ops recomputed per graph replay; the next metadata init
+        resets."""
         md = self.forward_decode_metadata
-        if md is None or md.out_cache_locs is None:
-            return True
-        lookback = int(getattr(self, "draft_lookback", 0) or 0)
-        if lookback <= 0:
-            return False
-        spec_n = max(int(getattr(self, "spec_num_tokens", 1) or 1), 1)
-        total = spec_n + lookback
-        captured = getattr(self, "cuda_graph_decode_metadata", None) or {}
-        if md is captured.get(bs):
-            if not self.cuda_graph_lookback_locs:
-                return False
-            locs = {
-                gid: buf[: bs * total]
-                for gid, buf in self.cuda_graph_lookback_locs.items()
-                if gid in md.out_cache_locs
-            }
-        else:
-            locs = self._compute_decode_group_out_cache_locs(
+        fields = {"seq_lens": frontier}
+        if md.out_cache_locs is not None:
+            fields["out_cache_locs"] = self._compute_decode_group_out_cache_locs(
                 md.page_tables,
-                md.seq_lens,
-                self.page_size,
-                total,
+                frontier,
+                self.kernel_page_size,
+                self.spec_num_tokens,
             )
-        self.forward_decode_metadata = replace(md, out_cache_locs=locs)
-        return True
+        self.forward_decode_metadata = replace(md, **fields)
 
     def _maybe_check_group_write_locs(self, page_tables, out_cache_locs, page_size):
         """TOKENSPEED_CACHE_DEBUG=1 (eager only, GPU sync): write pages must
@@ -353,7 +327,7 @@ class CacheGroupsMixin:
         if not cache_debug_enabled():
             return
         for gid, locs in out_cache_locs.items():
-            pages = (locs // self._group_page_size(gid)).to(torch.int32)
+            pages = (locs // self._group_block_granularity(gid)).to(torch.int32)
             table = page_tables[gid]
             assert (
                 pages != 0
@@ -380,44 +354,45 @@ class CacheGroupsMixin:
         are gone, on the spec-verify path too."""
         self.cuda_graph_page_tables: dict[str, torch.Tensor] = {}
         self.cuda_graph_out_cache_locs: dict[str, torch.Tensor] = {}
-        self.cuda_graph_lookback_locs: dict[str, torch.Tensor] = {}
         self._cuda_graph_max_bs = max_bs
         self._group_locs_stack = None
-        self._group_lookback_locs_stack = None
         self._group_tables_stack = None
         self._group_source_widths = {}
-        self._group_page_ratios = ()
+        self._group_grain_ratios = ()
         self._graph_group_ids = []
         self._attention_group_count = 0
         att_gids = sorted(
             gid
-            for gid in self.group_page_sizes
+            for gid in self.group_block_granularities
             if gid not in self.state_group_ids
             and gid not in self.engine_owned_group_ids
         )
         owned_gids = sorted(
-            gid for gid in self.group_page_sizes if gid in self.engine_owned_group_ids
+            gid
+            for gid in self.group_block_granularities
+            if gid in self.engine_owned_group_ids
         )
         gids = att_gids + owned_gids  # attention prefix, wrapper-owned tail
         if not gids:
             return
         source_widths = {
             gid: ceil_div(
-                self.max_num_pages * self.page_size, self._group_page_size(gid)
+                self.max_num_pages * self.kernel_page_size,
+                self._group_block_granularity(gid),
             )
             for gid in gids
         }
         consumer_page_sizes = {gid: self._consumer_page_size(gid) for gid in att_gids}
         ratios = {
             gid: (
-                self._group_page_size(gid) // consumer_page_sizes[gid]
+                self._group_block_granularity(gid) // consumer_page_sizes[gid]
                 if gid in att_gids
                 else 1
             )
             for gid in gids
         }
         if any(
-            ratio <= 0 or self._group_page_size(gid) % consumer_page_sizes[gid]
+            ratio <= 0 or self._group_block_granularity(gid) % consumer_page_sizes[gid]
             for gid, ratio in ratios.items()
             if gid in att_gids
         ):
@@ -430,7 +405,7 @@ class CacheGroupsMixin:
             "cache graph buffers: max_num_pages=%d page_size=%d max_bs=%d "
             "source_widths=%s widths=%s",
             self.max_num_pages,
-            self.page_size,
+            self.kernel_page_size,
             max_bs,
             source_widths,
             widths,
@@ -447,21 +422,9 @@ class CacheGroupsMixin:
         self._group_locs_stack = torch.zeros(
             (len(att_gids), max_bs * spec_n), dtype=torch.int32, device=self.device
         )
-        lookback = int(getattr(self, "draft_lookback", 0) or 0)
-        if lookback > 0:
-            # Draft lookback window passes write N + D rows per request
-            # (positions seq-(N+D)..seq-1); their captured kernels read this
-            # second stack, refilled alongside the main one at replay.
-            self._group_lookback_locs_stack = torch.zeros(
-                (len(att_gids), max_bs * (spec_n + lookback)),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            for i, gid in enumerate(att_gids):
-                self.cuda_graph_lookback_locs[gid] = self._group_lookback_locs_stack[i]
         self._group_source_widths = source_widths
-        self._group_page_ratios = tuple(ratios[gid] for gid in gids)
-        self._group_page_sizes_tensor = torch.tensor(
+        self._group_grain_ratios = tuple(ratios[gid] for gid in gids)
+        self._group_block_granularities_tensor = torch.tensor(
             [consumer_page_sizes[gid] for gid in att_gids],
             dtype=torch.int32,
             device=self.device,
@@ -501,7 +464,7 @@ class CacheGroupsMixin:
                 # Replay write locs are ALWAYS the fused triton launch over
                 # the stacked buffers; a group outside the stack could never
                 # get its locs filled. Groups must be declared (via
-                # group_page_sizes) before init_cuda_graph_state.
+                # group_block_granularities) before init_cuda_graph_state.
                 raise RuntimeError(
                     f"cache group {gid!r} is not in the stacked CUDA-graph "
                     f"buffers (stack: {self._graph_group_ids}); declare every "
@@ -551,7 +514,7 @@ class CacheGroupsMixin:
                 return False
             meta[i, 0] = src.storage_offset()
             meta[i, 1] = src.shape[1]
-            meta[i, 2] = self._group_page_ratios[i]
+            meta[i, 2] = self._group_grain_ratios[i]
         if base_ptr is None:
             return False
         self._unpack_metadata_device.copy_(meta, non_blocking=True)
@@ -634,11 +597,11 @@ class CacheGroupsMixin:
                 # cols >= 1: a zero-width table would leave dummy rows' col 0 unwritten
                 assert source_cols >= 1, f"table for group {gid!r}: zero-width table"
                 rows = min(src.shape[0], bs)
-                ratio = self._group_page_ratios[i]
+                ratio = self._group_grain_ratios[i]
                 if ratio != 1:
                     expand_page_table(
                         src[:rows, :source_cols],
-                        logical_page_size=self._group_page_size(gid),
+                        block_granularity=self._group_block_granularity(gid),
                         kernel_page_size=self._consumer_page_size(gid),
                         max_kernel_pages=buf.shape[1],
                         out=buf[:rows],
@@ -657,20 +620,9 @@ class CacheGroupsMixin:
         # One fused launch writes every group's locs into the stacked buffer the graphs read
         compute_group_decode_locs(
             self._group_tables_stack[: self._attention_group_count],
-            self._group_page_sizes_tensor,
+            self._group_block_granularities_tensor,
             seq_lens[:bs],
             self._group_locs_stack,
             bs,
             tokens_per_req,
         )
-        if self._group_lookback_locs_stack is not None:
-            # Second variant for the draft's lookback window passes: N + D
-            # rows per request ending at the same frontier.
-            compute_group_decode_locs(
-                self._group_tables_stack[: self._attention_group_count],
-                self._group_page_sizes_tensor,
-                seq_lens[:bs],
-                self._group_lookback_locs_stack,
-                bs,
-                tokens_per_req + self.draft_lookback,
-            )

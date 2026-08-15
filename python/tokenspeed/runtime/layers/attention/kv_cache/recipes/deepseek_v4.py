@@ -4,11 +4,14 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    DEEPSEEK_V4_PAGE_SIZE,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import (
     configured_token_limit,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec import (
-    DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE,
+    DEEPSEEK_V4_PREFIX_GRANULARITY,
     V4_KERNEL_BLOCK_ROWS,
     DeepseekV4CacheLayout,
     build_v4_cache_specs,
@@ -20,8 +23,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     solve_cache_layout,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    apply_pd_transfer_policies,
+)
 
-_LOGICAL_BLOCK_TOKENS = 256
 _MAX_PADDING_FRACTION = 2.0
 
 
@@ -34,12 +39,12 @@ def build_deepseek_v4_cache_fields(
     layout: DeepseekV4CacheLayout,
     *,
     sliding_window: int,
-    logical_block_tokens: int = DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE,
+    prefix_granularity: int = DEEPSEEK_V4_PREFIX_GRANULARITY,
 ):
-    """Build DSV4 fields for one scheduler-wide logical page size."""
-    if sliding_window <= 0 or logical_block_tokens % sliding_window:
+    """Build DSV4 fields for one scheduler-wide prefix granularity."""
+    if sliding_window <= 0 or prefix_granularity % sliding_window:
         raise ValueError(
-            "DeepSeek V4 sliding_window must divide the logical block size"
+            "DeepSeek V4 sliding_window must divide the prefix granularity"
         )
     if sliding_window % V4_KERNEL_BLOCK_ROWS:
         raise ValueError(
@@ -61,7 +66,7 @@ def build_deepseek_v4_cache_fields(
     }
     return deepseek_v4_cache_fields(
         layer_ratios=layout.layer_ratio,
-        logical_block_tokens=logical_block_tokens,
+        prefix_granularity=prefix_granularity,
         swa_shape=(layout.swa_block_bytes(V4_KERNEL_BLOCK_ROWS),),
         compressed_shapes=compressed_shapes,
         compressor_state_shapes=compressor_state_shapes,
@@ -74,7 +79,10 @@ def build_deepseek_v4_cache_fields(
     )
 
 
-def solve_deepseek_v4_memory_layout(fields: list[CacheFieldSpec]):
+def solve_deepseek_v4_memory_layout(
+    fields: list[CacheFieldSpec],
+    prefix_granularity: int = DEEPSEEK_V4_PREFIX_GRANULARITY,
+):
     """Solve DSV4's power-of-two group packing for one physical parent."""
     raw_bytes: dict[str, int] = {}
     for field in fields:
@@ -90,7 +98,7 @@ def solve_deepseek_v4_memory_layout(fields: list[CacheFieldSpec]):
     }
     return solve_cache_layout(
         fields,
-        logical_block_tokens=_LOGICAL_BLOCK_TOKENS,
+        prefix_granularity=prefix_granularity,
         cache_blocks_per_lcm_block=packing,
         alignment=256,
         max_padding_fraction=_MAX_PADDING_FRACTION,
@@ -100,7 +108,7 @@ def solve_deepseek_v4_memory_layout(fields: list[CacheFieldSpec]):
 def deepseek_v4_cache_fields(
     *,
     layer_ratios: Sequence[int],
-    logical_block_tokens: int,
+    prefix_granularity: int,
     swa_shape: Sequence[int],
     compressed_shapes: Mapping[int, tuple[int, ...]],
     compressor_state_shapes: Mapping[int, tuple[int, ...]],
@@ -109,8 +117,11 @@ def deepseek_v4_cache_fields(
     kv_page_stride_alignment_bytes: int,
 ) -> tuple[CacheFieldSpec, ...]:
     """Describe DSV4 history pages and bounded live-tail state."""
-    if logical_block_tokens != 256:
-        raise ValueError("DeepSeek V4 LCM scheduling requires P=256")
+    if prefix_granularity <= 0 or prefix_granularity % DEEPSEEK_V4_PAGE_SIZE:
+        raise ValueError(
+            "DeepSeek V4 prefix granularity must be a positive multiple of "
+            f"the kernel page ({DEEPSEEK_V4_PAGE_SIZE}), got {prefix_granularity}"
+        )
     ratios = tuple(int(ratio) for ratio in layer_ratios)
     if any(ratio not in (1, 4, 128) for ratio in ratios):
         raise ValueError("DeepSeek V4 layer ratios must be 1, 4, or 128")
@@ -208,6 +219,18 @@ def prepare_deepseek_v4_cache(
     overlap_schedule_depth: int,
 ):
     """Build target and draft cache specs for DeepSeek V4."""
+    pd_enabled = bool(attn_config.pd_disaggregation_enabled)
+    if pd_enabled and (
+        getattr(server_args, "speculative_algorithm", None) is not None
+        or draft_model_config is not None
+        or draft_attn_config is not None
+        or decode_input_tokens != 1
+    ):
+        raise NotImplementedError(
+            "DeepSeek V4 PD supports target-only decoding; speculative/MTP "
+            "cache transfer is not implemented"
+        )
+
     # Deferred: setup.py imports this recipe at module load.
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
         CachePoolSpec,
@@ -232,16 +255,18 @@ def prepare_deepseek_v4_cache(
         return current_platform().arch_version.major >= 10
 
     def layout_and_fields(config, runtime_config, *, layer_indices=None):
+        # Kernel geometry sources from the kernel-page registry; the scheduler
+        # prefix granularity only has to be a positive multiple of it.
         layout = deepseek_v4_cache_layout_from_config(
             config,
-            page_size=runtime_config.page_size,
+            page_size=DEEPSEEK_V4_PAGE_SIZE,
             use_fp4_indexer_cache=use_fp4_indexer(config),
             layer_indices=layer_indices,
         )
         fields = build_deepseek_v4_cache_fields(
             layout,
             sliding_window=int(config.sliding_window),
-            logical_block_tokens=_LOGICAL_BLOCK_TOKENS,
+            prefix_granularity=runtime_config.prefix_granularity,
         )
         return layout, fields
 
@@ -264,7 +289,9 @@ def prepare_deepseek_v4_cache(
         attn_config,
         layer_indices=range(num_target_layers + num_draft_layers),
     )
-    merged_layout_plan = solve_deepseek_v4_memory_layout(merged_fields)
+    merged_layout_plan = solve_deepseek_v4_memory_layout(
+        merged_fields, attn_config.prefix_granularity
+    )
     packing = dict(merged_layout_plan.group_packing)
 
     num_lcm_blocks = cache_budget_bytes // merged_layout_plan.lcm_block_bytes - 1
@@ -281,15 +308,19 @@ def prepare_deepseek_v4_cache(
             decode_input_tokens=decode_input_tokens,
         )
     )
+    if pd_enabled:
+        specs = tuple(apply_pd_transfer_policies(specs))
     max_packing = max(packing.values())
     token_limit = configured_token_limit(server_args)
     upper_bound = (
         token_limit
         if token_limit is not None
-        else num_lcm_blocks * max_packing * _LOGICAL_BLOCK_TOKENS
+        # Tokens per parent = packing x the group block span (kernel page),
+        # independent of the scheduler prefix granularity.
+        else num_lcm_blocks * max_packing * DEEPSEEK_V4_PAGE_SIZE
     )
     sizing = {
-        "logical_block_tokens": _LOGICAL_BLOCK_TOKENS,
+        "prefix_granularity": attn_config.prefix_granularity,
         "max_live_requests": attn_config.max_bs,
         "max_scheduled_tokens": max(0, int(server_args.chunked_prefill_size)),
         "max_context_len": attn_config.context_len,

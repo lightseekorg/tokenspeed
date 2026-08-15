@@ -153,7 +153,7 @@ def test_minimax_m3_attention_family_selects_msa() -> None:
     spec = _resolve_attention_family(config, config.text_config)
     assert spec is not None
     assert spec.name == "MiniMax MSA"
-    assert spec.default_block_size == 128
+    assert spec.default_prefix_granularity == 128
     # --attention-backend must keep selecting the dense sub-backend; the
     # top-level backend is pinned by MSAConfig itself.
     assert spec.default_backend is None
@@ -185,7 +185,7 @@ def _msa_server_args(**overrides) -> SimpleNamespace:
         spec_context_pad=0,
         attention_backend="trtllm",
         drafter_attention_backend=None,
-        block_size=128,
+        prefix_granularity=128,
         max_num_seqs=16,
         data_parallel_size=1,
         attn_tp_size=4,

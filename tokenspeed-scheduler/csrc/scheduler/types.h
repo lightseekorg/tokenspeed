@@ -29,15 +29,14 @@
 namespace tokenspeed {
 
 struct SchedulerConfig {
-    std::int32_t block_size{};
-    struct {
+    std::int32_t prefix_granularity{};
+    struct AllocatorConfig {
         // Page 0 is the null placeholder, so usable = total - 1.
         std::int32_t total_pages{};
-    } host_allocator;
-
-    struct {
-        std::int32_t total_pages{};
-    } device_allocator;
+        std::int32_t NumUsableBlocks() const { return total_pages - 1; }
+    };
+    AllocatorConfig host_allocator;
+    AllocatorConfig device_allocator;
 
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
 

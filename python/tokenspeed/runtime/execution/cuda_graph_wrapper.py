@@ -265,8 +265,8 @@ class CudaGraphWrapper:
             )
             # Drafter reads the TARGET's group tables (_draft_group_tables):
             # its page-size view must match the target's hetero geometry.
-            target_ps = getattr(attn_backend, "group_page_sizes", None)
-            draft_ps = getattr(draft_attn_backend, "group_page_sizes", None)
+            target_ps = getattr(attn_backend, "group_block_granularities", None)
+            draft_ps = getattr(draft_attn_backend, "group_block_granularities", None)
             if target_ps and draft_ps is not None:
                 for gid in self._draft_cache_group_ids():
                     if gid in target_ps:
@@ -289,7 +289,7 @@ class CudaGraphWrapper:
                 and target_kv.dtype == draft_kv.dtype
             ):
                 draft_attn_backend.decode_cuda_graph_kv_indices = target_kv
-                draft_attn_backend._block_table_aliased = True
+                draft_attn_backend._page_table_aliased = True
 
         self.graph_variants = (
             sampling_backend.cuda_graph_capture_variants(self.max_tokens_per_req)
@@ -613,7 +613,7 @@ class CudaGraphWrapper:
         finally:
             _is_cuda_graph_phase = old_cuda_graph_phase
 
-    def _capture_paged_cache_block_tables(self, bs: int, pool) -> dict | None:
+    def _capture_group_block_tables(self, bs: int, pool) -> dict | None:
         specs = tuple(pool.paged_cache_group_specs)
         if not specs:
             return None
@@ -705,12 +705,12 @@ class CudaGraphWrapper:
     def _init_capture_metadata(self, bs: int):
         capture_kwargs = {}
         if self.attn_backend.uses_paged_cache_groups:
-            paged_cache_block_tables = self._capture_paged_cache_block_tables(
+            group_block_tables = self._capture_group_block_tables(
                 bs,
                 self.token_to_kv_pool,
             )
-            if paged_cache_block_tables is not None:
-                capture_kwargs["paged_cache_block_tables"] = paged_cache_block_tables
+            if group_block_tables is not None:
+                capture_kwargs["block_tables"] = group_block_tables
                 if self.drafter is not None:
                     capture_kwargs["num_tokens"] = bs * self.max_tokens_per_req
         cache_group_ids = self._cache_group_ids(self.token_to_kv_pool)
@@ -729,14 +729,12 @@ class CudaGraphWrapper:
                 self.draft_token_to_kv_pool is not None
                 and self.draft_attn_backend.uses_paged_cache_groups
             ):
-                draft_paged_cache_block_tables = self._capture_paged_cache_block_tables(
+                draft_group_block_tables = self._capture_group_block_tables(
                     bs,
                     self.draft_token_to_kv_pool,
                 )
-                if draft_paged_cache_block_tables is not None:
-                    draft_kwargs["paged_cache_block_tables"] = (
-                        draft_paged_cache_block_tables
-                    )
+                if draft_group_block_tables is not None:
+                    draft_kwargs["block_tables"] = draft_group_block_tables
                     draft_kwargs["num_tokens"] = bs * self.max_tokens_per_req
             draft_group_ids = self._draft_cache_group_ids()
             if draft_group_ids:
@@ -841,10 +839,8 @@ class CudaGraphWrapper:
         **kwargs,
     ):
         """Graph-replay path — update persistent cuda-graph buffers in place."""
-        paged_cache_block_tables = kwargs.pop("paged_cache_block_tables", None)
-        paged_cache_block_table_base_offsets = kwargs.pop(
-            "paged_cache_block_table_base_offsets", None
-        )
+        group_placeholder_tables = kwargs.pop("group_placeholder_tables", None)
+        block_table_base_offsets = kwargs.pop("block_table_base_offsets", None)
         block_tables = kwargs.pop("block_tables", None)
         target_uses_paged_groups = getattr(
             self.attn_backend,
@@ -864,34 +860,32 @@ class CudaGraphWrapper:
             "uses_cache_groups",
             False,
         )
-        if paged_cache_block_tables is not None and (
+        if group_placeholder_tables is not None and (
             target_uses_paged_groups or draft_uses_paged_groups
         ):
             table_bs = next(
                 (
                     int(table.shape[0])
-                    for table in paged_cache_block_tables.values()
+                    for table in group_placeholder_tables.values()
                     if isinstance(table, torch.Tensor)
                 ),
                 int(req_pool_indices.shape[0]),
             )
-            paged_cache_block_tables = self._pad_block_tables_to_padded_bs(
-                paged_cache_block_tables,
+            group_placeholder_tables = self._pad_block_tables_to_padded_bs(
+                group_placeholder_tables,
                 actual_bs=table_bs,
                 padded_bs=padded_bs,
             )
-            if paged_cache_block_table_base_offsets is not None:
-                paged_cache_block_table_base_offsets = self._pad_offsets_to_padded_bs(
-                    paged_cache_block_table_base_offsets,
+            if block_table_base_offsets is not None:
+                block_table_base_offsets = self._pad_offsets_to_padded_bs(
+                    block_table_base_offsets,
                     actual_bs=actual_bs,
                     padded_bs=padded_bs,
                 )
             if target_uses_paged_groups:
-                kwargs["paged_cache_block_tables"] = paged_cache_block_tables
-                if paged_cache_block_table_base_offsets is not None:
-                    kwargs["paged_cache_block_table_base_offsets"] = (
-                        paged_cache_block_table_base_offsets
-                    )
+                kwargs["block_tables"] = group_placeholder_tables
+                if block_table_base_offsets is not None:
+                    kwargs["block_table_base_offsets"] = block_table_base_offsets
         padded_block_tables = None
         if block_tables is not None and (
             (
@@ -936,11 +930,11 @@ class CudaGraphWrapper:
         )
         if self.draft_attn_backend is not None:
             draft_attn_kwargs = {}
-            if draft_uses_paged_groups and paged_cache_block_tables is not None:
-                draft_attn_kwargs["paged_cache_block_tables"] = paged_cache_block_tables
-                if paged_cache_block_table_base_offsets is not None:
-                    draft_attn_kwargs["paged_cache_block_table_base_offsets"] = (
-                        paged_cache_block_table_base_offsets
+            if draft_uses_paged_groups and group_placeholder_tables is not None:
+                draft_attn_kwargs["block_tables"] = group_placeholder_tables
+                if block_table_base_offsets is not None:
+                    draft_attn_kwargs["block_table_base_offsets"] = (
+                        block_table_base_offsets
                     )
             if getattr(self.draft_attn_backend, "uses_padded_decode_token_mask", False):
                 draft_attn_kwargs["actual_bs"] = actual_bs
@@ -1000,13 +994,9 @@ class CudaGraphWrapper:
         if self.draft_attn_backend is not None:
             draft_kwargs = {}
             if getattr(self.draft_attn_backend, "uses_paged_cache_groups", False):
-                for key in (
-                    "paged_cache_block_tables",
-                    "paged_cache_block_table_base_offsets",
-                ):
-                    value = kwargs.get(key)
-                    if value is not None:
-                        draft_kwargs[key] = value
+                value = kwargs.get("block_table_base_offsets")
+                if value is not None:
+                    draft_kwargs["block_table_base_offsets"] = value
             draft_group_tables = self._draft_group_tables(kwargs.get("block_tables"))
             if draft_group_tables is not None:
                 draft_kwargs["block_tables"] = draft_group_tables
@@ -1164,9 +1154,8 @@ class CudaGraphWrapper:
         extend_seq_lens_cpu: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         out_cache_loc: torch.Tensor | None = None,
-        paged_cache_block_tables: dict | None = None,
-        paged_cache_block_table_base_offsets: dict | None = None,
         block_tables: dict | None = None,
+        block_table_base_offsets: dict | None = None,
         cache_metadata=None,
         forward_batch=None,
     ):
@@ -1212,12 +1201,9 @@ class CudaGraphWrapper:
         )
 
         if use_graph:
-            if (
-                bs == 0
-                and paged_cache_block_tables is None
-                and self.attn_backend.uses_paged_cache_groups
-            ):
-                paged_cache_block_tables = self._capture_paged_cache_block_tables(
+            group_placeholder_tables = None
+            if bs == 0 and self.attn_backend.uses_paged_cache_groups:
+                group_placeholder_tables = self._capture_group_block_tables(
                     padded_bs,
                     self.token_to_kv_pool,
                 )
@@ -1234,10 +1220,8 @@ class CudaGraphWrapper:
                 page_table=page_table,
                 forward_mode=ctx.forward_mode,
                 num_padding=padded_bs - bs if padded_bs != bs else 0,
-                paged_cache_block_tables=paged_cache_block_tables,
-                paged_cache_block_table_base_offsets=(
-                    paged_cache_block_table_base_offsets
-                ),
+                group_placeholder_tables=group_placeholder_tables,
+                block_table_base_offsets=block_table_base_offsets,
                 block_tables=block_tables,
                 **cache_kwargs,
             )
@@ -1310,18 +1294,13 @@ class CudaGraphWrapper:
                 all_decode_or_idle=ctx.all_decode_or_idle,
                 capture_hidden_mode=ctx.capture_hidden_mode,
                 **metadata_num_tokens,
-                paged_cache_block_tables=(
-                    paged_cache_block_tables
-                    if self.attn_backend.uses_paged_cache_groups
-                    else None
-                ),
-                paged_cache_block_table_base_offsets=(
-                    paged_cache_block_table_base_offsets
-                    if self.attn_backend.uses_paged_cache_groups
-                    else None
-                ),
                 block_tables=(
                     block_tables if self._any_backend_uses_cache_groups() else None
+                ),
+                block_table_base_offsets=(
+                    block_table_base_offsets
+                    if self.attn_backend.uses_paged_cache_groups
+                    else None
                 ),
                 **cache_kwargs,
             )

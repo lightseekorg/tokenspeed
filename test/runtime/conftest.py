@@ -55,7 +55,7 @@ def _kimi_group_specs(group_ids, layer_types, plan):
         layer_types=layer_types,
         group_ids=group_ids,
         sliding_window_tokens=None,
-        page_size=plan.logical_block_tokens,
+        prefix_granularity=plan.prefix_granularity,
     )
 
 
@@ -81,7 +81,7 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
         for group_id in group_ids
     )
     return HybridKDATokenToKVPool(
-        size=usable_pages * 12 * plan.logical_block_tokens,
+        size=usable_pages * 12 * plan.prefix_granularity,
         model_dtype=torch.bfloat16,
         dtype=torch.float8_e4m3fn,
         quant_method=None,
@@ -90,7 +90,7 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
         layer_num=text_config.num_hidden_layers,
         device=device,
         enable_memory_saver=False,
-        page_size=plan.logical_block_tokens,
+        prefix_granularity=plan.prefix_granularity,
         rank=0,
         layer_types=layer_types,
         layer_group_ids=group_ids,

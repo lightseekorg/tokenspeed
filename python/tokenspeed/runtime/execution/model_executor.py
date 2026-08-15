@@ -140,7 +140,7 @@ class ModelExecutorConfig:
     max_req_pool_size: int
     output_length: int
     enforce_eager: bool
-    logical_page_size: int
+    prefix_granularity: int
     max_num_seqs: int
     chunked_prefill_size: int
     vocab_size: int
@@ -202,7 +202,7 @@ class ModelExecutorConfig:
         gpu_id: int,
         global_rank: int,
         num_total_pages: int,
-        logical_page_size: int,
+        prefix_granularity: int,
         overlap_schedule_depth: int = 0,
     ) -> ModelExecutorConfig:
         output_length = (
@@ -248,7 +248,7 @@ class ModelExecutorConfig:
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
             enforce_eager=server_args.enforce_eager,
-            logical_page_size=logical_page_size,
+            prefix_granularity=prefix_granularity,
             max_num_seqs=server_args.max_num_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,
             vocab_size=model_config.vocab_size,
@@ -332,18 +332,25 @@ class ModelExecutor:
         )
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        self._draft_final_step_counter = None
 
-        # fill_input_buffers indexes the scheduler table in logical pages; the drafter indexes draft_page_table in its backend's kernel pages.
-        self._logical_page_size = int(
-            getattr(draft_token_to_kv_pool, "page_size", 0) or config.logical_page_size
+        # fill_input_buffers indexes the scheduler table in its own table pages; the drafter indexes draft_page_table in its backend's kernel pages.
+        self._block_granularity = int(
+            getattr(draft_token_to_kv_pool, "prefix_granularity", 0)
+            or config.prefix_granularity
         )
-        self._draft_page_size = int(
-            getattr(draft_attn_backend, "page_size", 0) or self._logical_page_size
+        draft_kernel_page_size = getattr(draft_attn_backend, "kernel_page_size", None)
+        if draft_attn_backend is not None and draft_kernel_page_size is None:
+            raise RuntimeError("draft attention backend must expose kernel_page_size")
+        # Without a draft backend the staging path degenerates to the
+        # scheduler table grain (identity expansion).
+        self._draft_kernel_page_size = int(
+            draft_kernel_page_size or self._block_granularity
         )
-        if self._logical_page_size % self._draft_page_size:
+        if self._block_granularity % self._draft_kernel_page_size:
             raise ValueError(
-                f"logical page size {self._logical_page_size} is not a multiple "
-                f"of the draft kernel page size {self._draft_page_size}"
+                f"prefix granularity {self._block_granularity} is not a multiple "
+                f"of the draft kernel page size {self._draft_kernel_page_size}"
             )
         # DraftPageStaging.publish expands the target full-history table into the
         # draft backend's kernel pages once, and every draft backend reads that
@@ -356,8 +363,8 @@ class ModelExecutor:
         # A write past this width would go out of bounds and hang the attention
         # kernel; the output processor's physical-extent tripwire raises first.
         max_num_pages_per_req = (
-            config.physical_context_len + self._draft_page_size - 1
-        ) // self._draft_page_size
+            config.physical_context_len + self._draft_kernel_page_size - 1
+        ) // self._draft_kernel_page_size
 
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
@@ -368,8 +375,8 @@ class ModelExecutor:
         self._draft_staging = DraftPageStaging(
             max_bs=max_bs,
             max_pages_per_req=max_num_pages_per_req,
-            logical_page_size=self._logical_page_size,
-            draft_page_size=self._draft_page_size,
+            block_granularity=self._block_granularity,
+            draft_kernel_page_size=self._draft_kernel_page_size,
             full_history_group_id=self._full_history_group_id,
             enabled=not getattr(
                 attn_backend, "cache_group_tables_replace_draft_page_table", False
@@ -381,8 +388,8 @@ class ModelExecutor:
         self.input_buffers = InputBuffers(
             max_bs=max_bs,
             max_num_tokens=config.chunked_prefill_size,
-            # Indexes the scheduler's full-history table: logical page ids.
-            page_size=self._logical_page_size,
+            # Indexes the scheduler's full-history table: scheduler-table page ids.
+            page_size=self._block_granularity,
             # token_to_kv_pool allocates size+page_size slots; index `size` is
             # the reserved dummy slot (see MHATokenToKVPool._create_buffers).
             dummy_kv_slot=0,
@@ -420,7 +427,7 @@ class ModelExecutor:
             )
             self.drafter.wire_target(self.model_runner.model)
             MultimodalRuntime.wire_drafter(
-                self.drafter, self.model_runner.model_config.hf_config
+                self.input_buffers, self.model_runner.model_config
             )
         else:
             self.drafter = None
@@ -866,6 +873,7 @@ class ModelExecutor:
             self.runtime_states.future_input_map[
                 self.input_buffers.state_write_req_pool_indices_buf[: ctx.bs]
             ] = next_round_input_ids.to(torch.int32)
+            self._record_draft_final_cache_step(ctx.num_extends)
 
         output_logprobs = logits_output.next_token_logprobs
         return output_tokens, accept_lengths, output_logprobs
@@ -1183,10 +1191,10 @@ class ModelExecutor:
             return None
 
         def sanitize(pool, pool_pages) -> bool:
-            zero_new_pages = getattr(pool, "zero_new_pages", None)
+            zero_new_blocks = getattr(pool, "zero_new_blocks", None)
             zero_pages = getattr(pool, "zero_pages", None)
-            if isinstance(pool_pages, Mapping) and callable(zero_new_pages):
-                zero_new_pages(pool_pages)
+            if isinstance(pool_pages, Mapping) and callable(zero_new_blocks):
+                zero_new_blocks(pool_pages)
                 return True
             if callable(zero_pages):
                 page_ids = (
@@ -1329,7 +1337,7 @@ class ModelExecutor:
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
                 total_tokens=total_tokens,
-                page_table=page_table,
+                out_loc_table=page_table,
             )
             if self.drafter is not None and hasattr(
                 self.drafter, "prepare_request_state"
@@ -1615,3 +1623,35 @@ class ModelExecutor:
             self.runtime_states.write_remote_spec_candidate_ids(
                 req_pool_idx, candidate_ids
             )
+
+    def register_draft_final_step_counter(self, step_counter) -> None:
+        """Publish one CachePD step after a supported drafter's complete run."""
+        if self.drafter is None or not getattr(
+            self.drafter, "supports_pd_layerwise_finalization", False
+        ):
+            raise RuntimeError(
+                "the speculative drafter cannot finalize layerwise CachePD writes"
+            )
+        if self.draft_attn_backend is None:
+            raise RuntimeError("draft-final CachePD readiness requires a draft backend")
+        if self.draft_attn_backend is self.attn_backend:
+            raise RuntimeError(
+                "draft-final CachePD readiness requires distinct target and draft backends"
+            )
+        self._draft_final_step_counter = step_counter
+
+    def _record_draft_final_cache_step(self, num_extends: int) -> None:
+        step_counter = self._draft_final_step_counter
+        if step_counter is not None and num_extends > 0:
+            step_counter.record_cache()
+
+    def prepare_remote_cache_slots(self, req_pool_indices: list[int]) -> None:
+        """Clear backend restore state before publishing RDMA destinations."""
+        slots = [int(slot) for slot in req_pool_indices]
+        with torch.cuda.stream(self.execution_stream):
+            self.attn_backend.prepare_remote_cache_slots(slots)
+
+    def mark_remote_cache_ready(self, req_pool_idx: int) -> None:
+        """Arm backend first-decode hydration after remote transfer success."""
+        with torch.cuda.stream(self.execution_stream):
+            self.attn_backend.mark_remote_cache_ready(int(req_pool_idx))

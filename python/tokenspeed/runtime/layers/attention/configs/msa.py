@@ -47,8 +47,8 @@ class MSAConfig(BaseAttnConfig):
     layer_types: tuple[str, ...] = ()
     sliding_window_tokens: None = None
     max_scheduled_tokens: int = 0
-    # True iff server_args.disaggregation_mode != "null"; the pool's
-    # transfer-layout guard consumes it.
+    # True iff server_args.disaggregation_mode != "null"; cache recipes use
+    # it to stamp transfer policies onto the paged-cache group specs.
     pd_disaggregation_enabled: bool = False
 
     index_head_dim: int = 0
@@ -117,7 +117,7 @@ class MSAConfig(BaseAttnConfig):
             attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
             dtype=model_config.dtype,
             kv_cache_dtype=resolved_kv_cache_dtype,
-            page_size=server_args.block_size,
+            prefix_granularity=server_args.prefix_granularity,
             max_bs=server_args.max_num_seqs
             // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
             max_graph_bs=server_args.max_cudagraph_capture_size,

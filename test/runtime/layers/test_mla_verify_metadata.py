@@ -35,7 +35,7 @@ def _run_mla_decode(
     backend.is_draft = is_draft
     backend.draft_block_decode = False
     backend.max_context_len = 256
-    backend.page_size = page_size
+    backend.kernel_page_size = page_size
     backend.kv_lora_rank = 2
     backend.qk_nope_head_dim = 2
     backend.qk_rope_head_dim = 2

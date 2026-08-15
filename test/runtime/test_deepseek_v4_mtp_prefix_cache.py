@@ -37,7 +37,7 @@ def test_deepseek_v4_swa_slot_mapping_expands_mtp_decode_requests():
     metadata = SimpleNamespace(
         token_to_req_indices=torch.tensor([0, 1], dtype=torch.int32),
         cache=SimpleNamespace(
-            swa_block_table=torch.tensor(
+            swa_page_table=torch.tensor(
                 [
                     [10, 11],
                     [20, 21],
@@ -61,7 +61,7 @@ def test_deepseek_v4_swa_slot_mapping_expands_mtp_decode_requests():
 
 def test_deepseek_v4_swa_slot_mapping_prefers_draft_prefill_metadata():
     cache = SimpleNamespace(
-        swa_block_table=torch.tensor(
+        swa_page_table=torch.tensor(
             [
                 [10, 11],
                 [20, 21],
@@ -101,7 +101,7 @@ def test_deepseek_v4_swa_slot_mapping_masks_invalid_and_overflow_slots():
     metadata = SimpleNamespace(
         token_to_req_indices=torch.tensor([0, 1], dtype=torch.int32),
         cache=SimpleNamespace(
-            swa_block_table=torch.tensor(
+            swa_page_table=torch.tensor(
                 [
                     [10, 11],
                     [20, 21],
@@ -133,7 +133,7 @@ def test_deepseek_v4_swa_slot_mapping_fails_closed_without_capacity():
     metadata = SimpleNamespace(
         token_to_req_indices=torch.tensor([0, 1], dtype=torch.int32),
         cache=SimpleNamespace(
-            swa_block_table=torch.tensor(
+            swa_page_table=torch.tensor(
                 [
                     [10, 11],
                     [20, 21],
@@ -167,7 +167,7 @@ def test_deepseek_v4_swa_slot_mapping_falls_back_for_incompatible_draft_metadata
     metadata = SimpleNamespace(
         token_to_req_indices=torch.tensor([0, 1], dtype=torch.int32),
         cache=SimpleNamespace(
-            swa_block_table=torch.tensor(
+            swa_page_table=torch.tensor(
                 [
                     [10, 11],
                     [20, 21],

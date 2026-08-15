@@ -45,6 +45,9 @@ from tokenspeed.runtime.layers.attention.backends.cache_groups import (
     CacheGroupsMixin,
 )
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    MHA_PAGE_SIZE,
+)
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import build_page_table
 from tokenspeed.runtime.utils.common import ceil_div
@@ -132,8 +135,12 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
 
         # Static information needed for metadata construction and kernel dispatch
         self.max_context_len = config.context_len
-        self.page_size = config.page_size
-        self.max_num_pages = ceil_div(self.max_context_len, self.page_size)
+        self.kernel_page_size = (
+            config.kernel_page_size
+            if config.kernel_page_size is not None
+            else MHA_PAGE_SIZE
+        )
+        self.max_num_pages = ceil_div(self.max_context_len, self.kernel_page_size)
         num_q_heads = config.num_attention_heads
         num_kv_heads = config.num_kv_heads
         self.tp_q_head_num = max(num_q_heads // config.attn_tp_size, 1)
@@ -169,7 +176,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         # family="state" ids (GDN/mamba) learned in init_cuda_graph_state; this backend sheds them
         self.state_group_ids: frozenset[str] = frozenset()
         # Group geometry is available to eager metadata before graph setup.
-        self.group_page_sizes = dict(config.group_page_sizes or {})
+        self.group_block_granularities = dict(config.group_block_granularities or {})
 
     # ------------------------------------------------------------------
     # Metadata initialization
@@ -214,7 +221,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                     group_page_tables,
                     extend_prefix_lens_cpu[:bs],
                     extend_seq_lens_cpu[:bs],
-                    self.page_size,
+                    self.kernel_page_size,
                 )
             else:
                 # Spec rounds write multi-token windows on BOTH sides: the
@@ -230,18 +237,18 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 group_out_cache_locs = self._compute_decode_group_out_cache_locs(
                     group_page_tables,
                     seq_lens,
-                    self.page_size,
+                    self.kernel_page_size,
                     verify_tokens,
                 )
             self._maybe_check_group_write_locs(
-                group_page_tables, group_out_cache_locs, self.page_size
+                group_page_tables, group_out_cache_locs, self.kernel_page_size
             )
             group_page_tables = self._kernel_page_tables(group_page_tables)
         else:
             page_table = build_page_table(
                 req_pool_indices[:bs],
                 page_table,
-                self.page_size,
+                self.kernel_page_size,
                 self.max_context_len,
             )
 
@@ -792,7 +799,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 cache_loc=out_cache_loc,
                 k_scale=layer.k_scale,
                 v_scale=layer.v_scale,
-                page_size=self.page_size,
+                page_size=self.kernel_page_size,
             )
         else:
             token_to_kv_pool.set_kv_buffer(
@@ -822,7 +829,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         return k_cache, v_cache
 
     def _consumer_page_size(self, group_id: str) -> int:
-        return self._group_page_size(group_id)
+        return self._group_block_granularity(group_id)
 
     def _make_spec_metadata_buffers(
         self,

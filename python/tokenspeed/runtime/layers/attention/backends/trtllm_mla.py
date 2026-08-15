@@ -48,6 +48,10 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    TRTLLM_MLA_DEFAULT_PAGE_SIZE,
+    TRTLLM_MLA_SUPPORTED_PAGE_SIZES,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
@@ -106,9 +110,9 @@ class TRTLLMMLAChunkedPrefillMetadata:
     chunked_seq_len: torch.Tensor  # (chunked_loop_num, num_extends) int32 GPU
     cu_chunked_seq_len: torch.Tensor  # (chunked_loop_num, num_extends+1) int32 GPU
     max_chunk_len_per_loop: list  # List[int], one per loop_idx
-    # Per-request batch-ordered page table. Populated only by the DSA backend
-    # for sparse-prefill top-k; plain MLA leaves it None.
-    block_tables: torch.Tensor | None = None
+    # Per-request batch-ordered kernel page table. Populated only by the DSA
+    # backend for sparse-prefill top-k; plain MLA leaves it None.
+    page_table: torch.Tensor | None = None
 
 
 @dataclass
@@ -132,7 +136,11 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         super().__init__(config)
 
         self.max_context_len = config.context_len
-        self.page_size = config.page_size
+        self.kernel_page_size = (
+            config.kernel_page_size
+            if config.kernel_page_size is not None
+            else TRTLLM_MLA_DEFAULT_PAGE_SIZE
+        )
         # Cache-group (LCM) state. The trtllm kernel walks pages at page_size,
         # padded to the fused-kernel block constraint (see _calc_padded_blocks).
         self._cache_groups_bound = False
@@ -158,9 +166,9 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         self.trtllm_workspace = get_trtllm_workspace_buffer(config.device)
 
         # Validate page_size
-        if self.page_size not in (32, 64):
+        if self.kernel_page_size not in TRTLLM_MLA_SUPPORTED_PAGE_SIZES:
             raise ValueError(
-                f"trtllm_mla backend requires page_size 32 or 64, got {self.page_size}"
+                f"trtllm_mla backend requires page_size 32 or 64, got {self.kernel_page_size}"
             )
 
         self.num_local_heads = config.num_attention_heads // config.attn_tp_size
@@ -174,8 +182,8 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """Calculate block count padded to satisfy the fused-kernel constraint."""
-        blocks = triton.cdiv(max_seq_len, self.page_size)
-        constraint = TRTLLM_BLOCK_CONSTRAINT // self.page_size
+        blocks = triton.cdiv(max_seq_len, self.kernel_page_size)
+        constraint = TRTLLM_BLOCK_CONSTRAINT // self.kernel_page_size
         if blocks % constraint != 0:
             blocks = triton.cdiv(blocks, constraint) * constraint
         return blocks
@@ -395,7 +403,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 dtype=torch.int64,
                 device=page_table.device,
             ),
-            self.page_size,
+            self.kernel_page_size,
         )
         self.chunked_prefill_metadata = TRTLLMMLAChunkedPrefillMetadata(
             extend_prefix_lens=extend_prefix_lens,
@@ -537,7 +545,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             group_table = page_table[:bs]
         if group_table is not None:
             real_bs = min(int(group_table.shape[0]), bs)
-            if real_bs > 0 and not self._block_table_aliased:
+            if real_bs > 0 and not self._page_table_aliased:
                 self._create_block_kv_indices(
                     real_bs,
                     metadata.block_kv_indices.shape[1],
@@ -557,7 +565,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             metadata.block_kv_indices[real_bs:bs].zero_()
             if metadata.group_out_cache_loc is not None:
                 metadata.group_out_cache_loc[real_bs * q_len : bs * q_len].zero_()
-        elif page_table is not None and not self._block_table_aliased:
+        elif page_table is not None and not self._page_table_aliased:
             self._create_block_kv_indices(
                 bs,
                 metadata.block_kv_indices.shape[1],
@@ -613,7 +621,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
 
         if q_len_per_req > 1 and self.is_draft:
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
-            block_tables = metadata.block_kv_indices[num_extends:].repeat_interleave(
+            page_table = metadata.block_kv_indices[num_extends:].repeat_interleave(
                 q_len_per_req, dim=0
             )
             base_lens = metadata.seq_lens_k[num_extends:].repeat_interleave(
@@ -634,7 +642,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         else:
             # Plain decode (q_len=1) or bs-grouped multi-token decode.
             query = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-            block_tables = metadata.block_kv_indices[num_extends:]
+            page_table = metadata.block_kv_indices[num_extends:]
             seq_lens = metadata.seq_lens_k[num_extends:]
             max_seq_len = metadata.max_seq_len_k
 
@@ -652,7 +660,9 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         if self.data_type != k_cache.dtype:
             k_cache = k_cache.to(self.data_type)
-        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+        kv_cache = k_cache.view(-1, self.kernel_page_size, self.kv_cache_dim).unsqueeze(
+            1
+        )
 
         raw_out = trtllm_batch_decode_with_kv_cache_mla(
             query=query,
@@ -661,7 +671,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=block_tables,
+            block_tables=page_table,
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
             bmm1_scale=bmm1_scale,

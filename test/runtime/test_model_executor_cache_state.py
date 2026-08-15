@@ -66,3 +66,60 @@ def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
     assert executor.runtime_states.valid_cache_lengths[2].item() == 10
     assert executor.runtime_states.valid_cache_lengths[3].item() == 3
     assert executor.runtime_states.valid_cache_lengths[4].item() == 4
+
+
+def test_draft_final_step_follows_the_complete_drafter_run():
+    events = []
+
+    class _Drafter:
+        supports_pd_layerwise_finalization = True
+        _incremental_proj_enabled = False
+
+        def get_candidates(self, _ctx):
+            return None
+
+        def run(self, **_kwargs):
+            events.extend(("draft-write-0", "draft-write-1", "draft-return"))
+            return torch.tensor([7], dtype=torch.int32)
+
+    class _FutureInputMap:
+        def __setitem__(self, _key, _value):
+            events.append("future-input")
+
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.input_buffers = SimpleNamespace(
+        req_pool_indices_buf=torch.tensor([0]),
+        state_write_req_pool_indices_buf=torch.tensor([0]),
+    )
+    executor.grammar_runtime = None
+    executor.drafter = _Drafter()
+    executor.config = SimpleNamespace(spec_algo="EAGLE3")
+    executor.runtime_states = SimpleNamespace(
+        future_input_map=_FutureInputMap(),
+        vocab_size=32,
+    )
+    executor.nan_guard = SimpleNamespace(
+        audit_logits=lambda *_args: None,
+        merge_oov=lambda *_args: None,
+    )
+    executor._run_target_forward = lambda *_args: SimpleNamespace(
+        next_token_logprobs=None
+    )
+    executor._run_sampling = lambda *_args: (
+        torch.tensor([3], dtype=torch.int32),
+        torch.tensor([1], dtype=torch.int32),
+    )
+    executor._draft_final_step_counter = SimpleNamespace(
+        record_cache=lambda: events.append("draft-final")
+    )
+    ctx = SimpleNamespace(bs=1, num_extends=1)
+
+    executor._forward_step(bs=1, ctx=ctx, sampling_info=object())
+
+    assert events == [
+        "draft-write-0",
+        "draft-write-1",
+        "draft-return",
+        "future-input",
+        "draft-final",
+    ]

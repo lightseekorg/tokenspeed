@@ -42,18 +42,18 @@ from tokenspeed_scheduler import (
 def make_config(
     max_scheduled_tokens: int = 512,
     max_batch_size: int = 8,
-    page_size: int = 16,
+    prefix_granularity: int = 16,
     num_device_pages: int = 1024,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
-    cfg.block_size = page_size
+    cfg.prefix_granularity = prefix_granularity
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
     cfg.num_device_pages = num_device_pages
     cfg.paged_cache_groups = [
         PagedCacheGroupConfig(
             group_id="full_attention",
-            rows_per_page=page_size,
+            rows_per_page=prefix_granularity,
             entry_stride_tokens=1,
             total_pages=num_device_pages,
             retention=PagedCacheRetention.FullHistory,

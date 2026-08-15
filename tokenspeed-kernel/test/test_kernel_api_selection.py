@@ -1878,6 +1878,60 @@ def test_gluon_mxfp4_dynamic_apply_forwards_precomputed_topk_by_batch_size(
         assert captured["precomputed_topk_ids"] is None
 
 
+@pytest.mark.parametrize(
+    "num_tokens,expected_decode",
+    [
+        pytest.param(32, True, id="bpe-16"),
+        pytest.param(33, False, id="bpe-16.5"),
+    ],
+)
+def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
+    num_tokens: int,
+    expected_decode: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not hasattr(_moe_gluon_mxfp4, "gluon_mxfp4_gfx1250_precomputed_moe_apply"):
+        pytest.skip("gfx1250 Gluon MXFP4 apply is AMD-only")
+
+    captured: dict[str, object] = {}
+
+    def fake_fused_moe(*args, **kwargs):
+        captured["decode"] = kwargs.get("decode")
+        return "sentinel"
+
+    monkeypatch.setattr(
+        _moe_gluon_mxfp4.fused_mxfp_gfx1250,
+        "gluon_mxfp_precomputed_mxfp4_fused_moe",
+        fake_fused_moe,
+    )
+
+    num_experts = 4
+    top_k = 2
+    w = torch.nn.Module()
+    w.w13_weight_triton_tensor = torch.empty((num_experts, 0, 0))
+    w.w2_weight_triton_tensor = object()
+    w.w13_precision_config = type("PC", (), {"b_mx_scale": object()})()
+    w.w2_precision_config = type(
+        "PC", (), {"b_mx_scale": object(), "out_dtype": torch.bfloat16}
+    )()
+    x = torch.empty((num_tokens, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((num_tokens, num_experts), dtype=torch.float32)
+    topk_weights = torch.ones((num_tokens, top_k), dtype=torch.float32)
+    topk_ids = torch.zeros((num_tokens, top_k), dtype=torch.int32)
+
+    out = _moe_gluon_mxfp4.gluon_mxfp4_gfx1250_precomputed_moe_apply(
+        {},
+        x,
+        w,
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+    assert out == "sentinel"
+    assert captured["decode"] is expected_decode
+
+
 def _moe_apply_unquant_trtllm() -> object:
     plan = tokenspeed_kernel.moe_plan(
         "unquant",

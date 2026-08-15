@@ -89,7 +89,7 @@ TEST(CacheOperationTest, HostCacheAndContinuousStreamingAreSeparatePolicies) {
 TEST(CacheOperationTest, DecodeCanStartWithoutHostL2) {
     const auto make_config = [] {
         SchedulerConfig config;
-        config.block_size = 2;
+        config.prefix_granularity = 2;
         config.device_allocator.total_pages = 4;
         config.host_allocator.total_pages = 4;
         config.max_scheduled_tokens = 2;
@@ -118,7 +118,7 @@ TEST(CacheOperationTest, DecodeCanStartWithoutHostL2) {
 TEST(CacheOperationTest, DeviceRequestLimitDoesNotDependOnHostCapacity) {
     const auto make_config = [](std::int32_t host_pages) {
         SchedulerConfig config;
-        config.block_size = 2;
+        config.prefix_granularity = 2;
         config.device_allocator.total_pages = 9;
         config.host_allocator.total_pages = host_pages;
         config.max_scheduled_tokens = 8;
@@ -144,13 +144,13 @@ TEST(CacheOperationTest, DeviceRequestLimitDoesNotDependOnHostCapacity) {
 TEST(CacheOperationTest, RetractionStoreIsBestEffortAndUsesOrdinaryTransferPins) {
     BlockPool device_pool{2};
     BlockPool host_pool{1};
-    const std::array specs{KvCacheSpec{
+    const std::array specs{CacheGroupSpec{
         .kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
-        .cache_block_tokens = 2,
+        .block_granularity = 2,
     }};
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/2, device_pool, &host_pool,
-                                                     /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
+                                                   /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
     std::vector<BlockTable> tables(1);
@@ -174,13 +174,13 @@ TEST(CacheOperationTest, RetractionStoreIsBestEffortAndUsesOrdinaryTransferPins)
 TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     BlockPool device_pool{2};
     BlockPool host_pool{1};
-    const std::array specs{KvCacheSpec{
+    const std::array specs{CacheGroupSpec{
         .kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
-        .cache_block_tokens = 2,
+        .block_granularity = 2,
     }};
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/2, device_pool, &host_pool,
-                                                     /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
+                                                   /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
     CacheBlockRef host_pin = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
@@ -200,14 +200,13 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
 
 TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRequest) {
     BlockPool device_pool{2};
-    const std::array specs{KvCacheSpec{
+    const std::array specs{CacheGroupSpec{
         .kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
-        .cache_block_tokens = 2,
+        .block_granularity = 2,
     }};
-    KvCacheCoordinator coordinator =
-        MakeCoordinator(specs, /*cache_block_tokens=*/2, device_pool, /*host_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/false);
 
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .num_tokens = 4}};
@@ -224,7 +223,7 @@ TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRe
 
 TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) {
     SchedulerConfig config;
-    config.block_size = 2;
+    config.prefix_granularity = 2;
     config.device_allocator.total_pages = 4;
     config.host_allocator.total_pages = 10;
     config.max_scheduled_tokens = 8;
@@ -251,7 +250,7 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) 
 
 TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeTokens) {
     SchedulerConfig config;
-    config.block_size = 2;
+    config.prefix_granularity = 2;
     config.device_allocator.total_pages = 4;
     config.host_allocator.total_pages = 10;
     config.max_scheduled_tokens = 8;

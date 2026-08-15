@@ -163,7 +163,7 @@ class SuffixedGroupIdFlowTest(unittest.TestCase):
             group_ids=_pcs.layer_group_ids(
                 layer_types=layer_types, sliding_window_tokens=windows
             ),
-            page_size=64,
+            prefix_granularity=64,
             sliding_window_tokens=windows,
         )
         self.assertEqual(

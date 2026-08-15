@@ -120,6 +120,7 @@ class KimiK3DraftDecoderLayer(nn.Module):
         self,
         config: KimiLinearConfig,
         mapping: Mapping,
+        model_scope: str,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
@@ -146,17 +147,15 @@ class KimiK3DraftDecoderLayer(nn.Module):
             alt_stream=alt_stream,
         )
         self.block_sparse_moe = KimiLinearMoE(
-            config,
-            mapping,
-            quant_config,
-            0,
-            add_prefix("block_sparse_moe", prefix),
+            config=config,
+            mapping=mapping,
+            layer_index=0,
+            model_scope=model_scope,
+            quant_config=quant_config,
+            prefix=add_prefix("block_sparse_moe", prefix),
             alt_stream=alt_stream,
         )
-        # The fused-AR lane workspace is a singleton shaped around the base
-        # model's usage; the draft takes the plain reduce path.
-        self.block_sparse_moe._fused_moe_ar = False
-        self.block_sparse_moe._lane_latent_norm_ar = False
+        # The old underscored flag writes were dead; making that intent effective needs a spec-decode run.
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -247,11 +246,13 @@ class KimiK3ModelNextN(nn.Module):
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
         self.alt_stream = torch.cuda.Stream()
+        decoder_scope = add_prefix("decoder", prefix)
         self.decoder = KimiK3DraftDecoderLayer(
-            config,
-            mapping,
-            quant_config,
-            prefix=add_prefix("decoder", prefix),
+            config=config,
+            mapping=mapping,
+            model_scope=decoder_scope,
+            quant_config=quant_config,
+            prefix=decoder_scope,
             alt_stream=self.alt_stream,
         )
 

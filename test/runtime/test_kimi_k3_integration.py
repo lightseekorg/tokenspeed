@@ -21,11 +21,11 @@ def test_scheduler_uses_lcm_parents_and_per_group_child_counts() -> None:
     geometry = scheduler_cache_geometry_from_pool(
         pool,
         fallback_token_capacity=pool.size,
-        fallback_page_size=pool.page_size,
+        fallback_prefix_granularity=pool.prefix_granularity,
     )
     assert geometry.num_usable_pages == 2
     assert geometry.num_device_pages == 3
-    assert geometry.page_size == 128
+    assert geometry.prefix_granularity == 128
     groups = pool_to_paged_cache_groups(pool)
     assert {group.group_id for group in groups} == set(KIMI_GROUP_IDS)
     assert {group.group_id: group.total_pages for group in groups} == {

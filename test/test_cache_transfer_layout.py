@@ -99,7 +99,7 @@ def test_lcm_layout_is_derived_from_planned_field_offsets():
         plane_id="kv", bytes_per_lcm_block=4096, arena_offset_bytes=8192
     )
     plan = SimpleNamespace(
-        logical_block_tokens=128,
+        prefix_granularity=128,
         num_lcm_blocks=10,
         planes=(plane,),
         groups=(
@@ -270,12 +270,18 @@ def test_merged_plan_views_filter_and_remap_fields_before_combining():
         "full",
         "draft_swa",
     )
+    assert combined.buffers == ("shared-buffer",)
     assert tuple(field.field_id for field in combined.groups[2].fields) == (
-        "draft:layer.2.k",
+        "layer.2.k",
+    )
+    assert combined.consumers == (
+        ("layer.0.k",),
+        ("layer.1.state",),
+        ("layer.2.k",),
     )
 
 
-def test_target_and_draft_layouts_share_scheduler_groups_but_keep_both_payloads():
+def test_target_and_draft_layouts_must_share_one_arena():
     target = CacheTransferLayout(
         num_lcm_blocks=10,
         groups=(
@@ -292,20 +298,8 @@ def test_target_and_draft_layouts_share_scheduler_groups_but_keep_both_payloads(
         consumers=(("layer.0.k",),),
     )
 
-    combined = combine_cache_transfer_layouts(target, draft)
-
-    assert tuple(group.group_id for group in combined.groups) == ("full", "state")
-    assert combined.buffers == ("target", "draft")
-    assert tuple(field.field_id for field in combined.groups[0].fields) == (
-        "target:layer.0.k",
-        "draft:layer.0.k",
-    )
-    assert combined.groups[0].fields[1].device_buffer_index == 1
-    assert combined.consumers == (
-        ("target:layer.0.k",),
-        ("target:layer.1.state",),
-        ("draft:layer.0.k",),
-    )
+    with pytest.raises(ValueError, match="share one arena"):
+        combine_cache_transfer_layouts(target, draft)
 
 
 def test_aliased_target_and_draft_layout_is_transferred_once():

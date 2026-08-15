@@ -35,9 +35,9 @@ inline std::vector<std::int32_t> MakeTokens(int32_t count, std::int32_t start = 
     return tokens;
 }
 
-// Generate a token sequence aligned to page_size.
-inline std::vector<std::int32_t> MakeAlignedTokens(int32_t num_pages, int32_t page_size, std::int32_t start = 1) {
-    return MakeTokens(num_pages * page_size, start);
+// Generate a token sequence aligned to granularity.
+inline std::vector<std::int32_t> MakeAlignedTokens(int32_t num_pages, int32_t granularity, std::int32_t start = 1) {
+    return MakeTokens(num_pages * granularity, start);
 }
 
 }  // namespace tokenspeed::test

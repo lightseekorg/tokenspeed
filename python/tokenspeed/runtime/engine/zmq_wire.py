@@ -74,7 +74,7 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
 
     max_model_len: int = 0
     num_gpu_blocks: int = 0
-    block_size: int = 0
+    prefix_granularity: int = 0
     dp_stats_address: str | None = None
     dtype: str = "bfloat16"
     multimodal_encoder_dtype: str | None = None

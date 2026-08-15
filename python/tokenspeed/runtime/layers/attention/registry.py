@@ -77,8 +77,6 @@ def _ordinary_cache_family(config: BaseAttnConfig | None) -> CacheModelFamily | 
 def _resolve_heterogeneous_draft_family(
     target_family: CacheModelFamily,
     draft_family: CacheModelFamily | None,
-    *,
-    pd_disaggregation_enabled: bool,
 ) -> CacheModelFamily | None:
     """Validate and return the supported heterogeneous draft family."""
     if draft_family is None:
@@ -88,22 +86,12 @@ def _resolve_heterogeneous_draft_family(
             raise RuntimeError(
                 "Kimi-K3 unified cache currently requires an ordinary MLA draft view"
             )
-        if pd_disaggregation_enabled:
-            raise RuntimeError(
-                "PD disaggregation does not support heterogeneous target/draft "
-                "cache families"
-            )
         return draft_family
     if target_family not in _ORDINARY_CACHE_FAMILIES or draft_family == target_family:
         return None
     if draft_family != "mha":
         raise RuntimeError(
             "heterogeneous ordinary cache views currently require an MHA draft"
-        )
-    if pd_disaggregation_enabled:
-        raise RuntimeError(
-            "PD disaggregation does not support heterogeneous target/draft "
-            "cache families"
         )
     return draft_family
 
@@ -132,16 +120,14 @@ def _cache_storage_report(
         group.group_id: int(group.cache_blocks_per_lcm_block) for group in plan.groups
     }
     physical_token_capacity = (
-        int(plan.num_lcm_blocks)
-        * max(packing.values())
-        * int(plan.logical_block_tokens)
+        int(plan.num_lcm_blocks) * max(packing.values()) * int(plan.prefix_granularity)
     )
     if physical_token_capacity != int(pool.size):
         raise RuntimeError(
             "LCM geometry capacity does not match the allocated pool size"
         )
     geometry = {
-        "logical_block_tokens": int(plan.logical_block_tokens),
+        "prefix_granularity": int(plan.prefix_granularity),
         "num_lcm_blocks": int(plan.num_lcm_blocks),
         "cache_blocks_per_lcm_block": packing,
         # Fraction of a parent each group's binding actually uses;
@@ -258,27 +244,45 @@ def _get_backend_cls(name: str, arch: AttentionArch) -> type[AttentionBackend]:
 def _validate_lcm_page_size(
     config: BaseAttnConfig,
     *,
-    logical_page_size: int,
+    prefix_granularity: int,
 ) -> None:
-    """Require the scheduler page to contain whole configured kernel pages."""
-    kernel_page_size = int(config.page_size)
+    """Require the scheduler page to contain whole configured kernel pages.
+
+    An unset kernel_page_size means the backend resolves its registry
+    default itself and owns the divisibility check for it.
+    """
+    if config.kernel_page_size is None:
+        return
+    kernel_page_size = int(config.kernel_page_size)
     if (
-        logical_page_size <= 0
+        prefix_granularity <= 0
         or kernel_page_size <= 0
-        or logical_page_size % kernel_page_size
+        or prefix_granularity % kernel_page_size
     ):
         raise ValueError(
-            "logical page size must be a positive multiple of kernel page "
-            f"size, got {logical_page_size} and {kernel_page_size}"
+            "prefix granularity must be a positive multiple of kernel page "
+            f"size, got {prefix_granularity} and {kernel_page_size}"
         )
 
 
-def _set_cache_group_page_sizes(config: BaseAttnConfig, spec: CachePoolSpec) -> None:
-    """Publish scheduler page sizes to group-aware MHA backends."""
-    if not hasattr(config, "group_page_sizes"):
+def _set_cache_group_block_granularities(
+    config: BaseAttnConfig, spec: CachePoolSpec
+) -> None:
+    """Publish each group's scheduler table grain to group-aware backends.
+
+    This seed must be per-group: under --enforce-eager the backend never runs
+    _learn_cache_groups (a CUDA-graph hook), so whatever is published here is
+    what group-table expansion uses.
+    """
+    if not hasattr(config, "group_block_granularities"):
         return
-    page_size = spec.memory_plan.logical_block_tokens
-    config.group_page_sizes = {group_id: page_size for group_id in spec.layer_group_ids}
+    grain_by_group = {
+        group_spec.group_id: group_spec.block_granularity
+        for group_spec in spec.paged_cache_group_specs
+    }
+    config.group_block_granularities = {
+        group_id: grain_by_group[group_id] for group_id in spec.layer_group_ids
+    }
 
 
 # ---------- arch -> config class ----------
@@ -466,7 +470,14 @@ def _create_hybrid_linear_attn_backend(
 
 
 def _wrap_inkling_backend(
-    inner, text_config, attn_config, *, num_layers, is_draft, conv_columns
+    inner,
+    text_config,
+    attn_config,
+    *,
+    num_layers,
+    is_draft,
+    conv_columns,
+    enable_layerwise_cache_ready=False,
 ):
     """Wrap a dense backend with the engine-side Inkling sconv state pool.
 
@@ -480,12 +491,11 @@ def _wrap_inkling_backend(
     )
 
     kernel_size = text_config.sconv_kernel_size
-    spec_tokens = max(1, int(getattr(attn_config, "speculative_num_draft_tokens", 1)))
+    spec_tokens = attn_config.speculative_num_draft_tokens
     # Ring row of absolute position p is p % R. R must keep a round's
-    # pre-chunk tap reads and chunk-row writes disjoint mod R:
-    # (W-1) history taps + K chunk rows + the draft's lookback depth
-    # (spec steps - 1 = K - 2). Uniform across target and draft.
-    ring_size = (kernel_size - 1) + spec_tokens + max(spec_tokens - 2, 0)
+    # pre-chunk tap reads and chunk-row writes disjoint mod R: (W-1) history
+    # taps + K chunk rows. Uniform across target and draft.
+    ring_size = (kernel_size - 1) + spec_tokens
     conv_pool = InklingConvStatePool(
         num_layers=num_layers,
         # Row 0 is reserved (1-based indices); +2 covers it plus a padding slot
@@ -507,8 +517,9 @@ def _wrap_inkling_backend(
         inner,
         conv_pool,
         conv_columns=conv_columns,
-        spec_num_tokens=getattr(attn_config, "speculative_num_draft_tokens", 1),
+        spec_num_tokens=spec_tokens,
         is_draft=is_draft,
+        enable_layerwise_cache_ready=enable_layerwise_cache_ready,
     )
     return backend, conv_pool
 
@@ -516,19 +527,36 @@ def _wrap_inkling_backend(
 def _inkling_conv_columns(pool, text_config):
     """Return the ShortConv checkpoint groups backed by the cache plan."""
     layer_labels = text_config.paged_cache_layer_types
-    block_tokens = pool.plan.logical_block_tokens
+    prefix_granularity = pool.plan.prefix_granularity
+    # The checkpoint grain belongs to the conv groups' own specs; P is only
+    # the fallback when a group is absent from the plan.
+    specs_by_id = {spec.group_id: spec for spec in pool.paged_cache_group_specs}
+
+    def conv_grain(group_id):
+        spec = specs_by_id.get(group_id)
+        return spec.block_granularity if spec is not None else prefix_granularity
+
     conv_columns = {
-        "block_tokens": block_tokens,
+        "block_tokens": conv_grain("kvconv"),
         "conv_group_of_layer": ("kvconv",) * len(layer_labels),
         "hidden_group_of_layer": ("hiddenconv",) * len(layer_labels),
         "group_block_tokens": {
-            "kvconv": block_tokens,
-            "hiddenconv": block_tokens,
+            "kvconv": conv_grain("kvconv"),
+            "hiddenconv": conv_grain("hiddenconv"),
         },
+        "pd_endpoint_snapshots": all(
+            spec.transfer_policy == "latest_snapshot"
+            for spec in pool.paged_cache_group_specs
+            if spec.group_id in ("kvconv", "hiddenconv")
+        )
+        and any(
+            spec.group_id in ("kvconv", "hiddenconv")
+            for spec in pool.paged_cache_group_specs
+        ),
     }
     logger.info(
         "Inkling ShortConv boundary checkpoints: P=%d, groups=%s",
-        block_tokens,
+        prefix_granularity,
         tuple(conv_columns["group_block_tokens"]),
     )
     return conv_columns
@@ -633,6 +661,10 @@ def _create_target_components(
         num_layers=text_config.num_hidden_layers,
         is_draft=False,
         conv_columns=_inkling_conv_columns(pool, text_config),
+        enable_layerwise_cache_ready=(
+            server_args.disaggregation_mode == "prefill"
+            and getattr(server_args, "disaggregation_layerwise_interval", 0) > 0
+        ),
     )
     probe_dir = os.environ.get("INKLING_POOL_PROBE_DIR")
     if probe_dir:
@@ -741,15 +773,6 @@ def _prepare_verify_workspace(
         )
     elif is_inkling:
         model_name = "Inkling"
-        if draft_backend is not None:
-            lookback = (
-                int(server_args.speculative_num_steps) - 1
-                if int(server_args.speculative_num_steps) > 1
-                and os.environ.get("INKLING_MTP_DECODE_LOOKBACK", "1") != "0"
-                else 0
-            )
-            if lookback and not draft_backend.configure_draft_lookback(lookback):
-                raise RuntimeError("Inkling MTP draft rejected its planned lookback")
         actual_bytes = backend.fixed_workspace_bytes()
         if draft_backend is not None:
             actual_bytes += draft_backend.fixed_workspace_bytes()
@@ -794,6 +817,9 @@ def create_attn_components(
         if draft_model_config is not None
         else []
     )
+    is_inkling_draft_model = any(
+        architecture in _INKLING_ARCHITECTURES for architecture in draft_architectures
+    )
     is_dspark_draft_model = any(
         architecture == "DeepseekV4ForCausalLMDSpark"
         for architecture in draft_architectures
@@ -808,6 +834,11 @@ def create_attn_components(
         server_args.attention_backend = "deepseek_v4"
     if is_deepseek_v4_draft_model:
         server_args.drafter_attention_backend = "deepseek_v4"
+        if server_args.disaggregation_mode in ("prefill", "decode"):
+            raise NotImplementedError(
+                "DeepSeek V4 PD supports target-only decoding; a DeepSeek V4 "
+                "draft cache is not transferable"
+            )
     if is_hybrid_linear:
         # GDN (Qwen3.5) / KDA (Kimi-K3) hybrid models always need
         # hybrid_linear_attn. Save the user's original choice for the
@@ -825,8 +856,18 @@ def create_attn_components(
     config = _create_attn_config(server_args, model_config)
     if is_deepseek_v4_model:
         config.sliding_window_tokens = int(model_config.hf_config.sliding_window)
-    if is_inkling and server_args.disaggregation_mode in ("prefill", "decode"):
-        raise NotImplementedError("Inkling PD is not supported")
+    if (
+        (is_inkling or is_inkling_draft_model)
+        and server_args.disaggregation_mode in ("prefill", "decode")
+        and (
+            draft_model_config is not None
+            or getattr(server_args, "speculative_algorithm", None) is not None
+        )
+    ):
+        raise NotImplementedError(
+            "Inkling PD supports target-only decoding; speculative/draft "
+            "ShortConv checkpoint transfer is not implemented"
+        )
     target_text_config = getattr(
         model_config.hf_config, "text_config", model_config.hf_config
     )
@@ -905,11 +946,6 @@ def create_attn_components(
     heterogeneous_draft_family = _resolve_heterogeneous_draft_family(
         cache_family,
         draft_cache_family,
-        pd_disaggregation_enabled=config.pd_disaggregation_enabled
-        or (
-            draft_attn_config is not None
-            and draft_attn_config.pd_disaggregation_enabled
-        ),
     )
     cache_memory = profile_available_cache_memory_bytes(
         attn_config=config,
@@ -944,18 +980,18 @@ def create_attn_components(
             family=heterogeneous_draft_family,
             publish_runtime_contract=False,
         )
-    logical_page_size = spec.memory_plan.logical_block_tokens
+    prefix_granularity = spec.memory_plan.prefix_granularity
     _validate_lcm_page_size(
         config,
-        logical_page_size=logical_page_size,
+        prefix_granularity=prefix_granularity,
     )
-    _set_cache_group_page_sizes(config, spec)
+    _set_cache_group_block_granularities(config, spec)
     if draft_attn_config is not None:
         _validate_lcm_page_size(
             draft_attn_config,
-            logical_page_size=logical_page_size,
+            prefix_granularity=prefix_granularity,
         )
-        _set_cache_group_page_sizes(draft_attn_config, spec)
+        _set_cache_group_block_granularities(draft_attn_config, spec)
     cache_budget_bytes = cache_setup.cache_budget_bytes
     fixed_workspace_bytes = cache_setup.fixed_workspace_bytes
     max_num_tokens = spec.pool_size
@@ -963,7 +999,7 @@ def create_attn_components(
         "Cache profile: parent_bytes=%d, P=%d, parents=%d, token_capacity=%d, "
         "layers=%d (draft %d), groups=%s",
         spec.memory_plan.lcm_block_bytes,
-        spec.memory_plan.logical_block_tokens,
+        spec.memory_plan.prefix_granularity,
         spec.memory_plan.num_lcm_blocks,
         spec.token_capacity,
         len(spec.layer_group_ids),

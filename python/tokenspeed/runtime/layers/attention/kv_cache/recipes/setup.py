@@ -87,7 +87,7 @@ class CachePoolSpec:
         return (
             self.memory_plan.num_lcm_blocks
             * max_packing
-            * self.memory_plan.logical_block_tokens
+            * self.memory_plan.prefix_granularity
         )
 
     def layer_view(

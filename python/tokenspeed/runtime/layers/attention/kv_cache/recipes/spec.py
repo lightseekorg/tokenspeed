@@ -27,25 +27,96 @@ TransferPolicy = Literal["full_suffix", "latest_snapshot"]
 
 @dataclass(frozen=True)
 class PagedCacheGroupSpec:
+    """One cache group's scheduler-facing layout.
+
+    A spec declares exactly one geometry shape:
+
+    * **Row geometry** (``rows_per_page`` + ``entry_stride_tokens``) — for
+      paged KV-cache consumers, whose CacheBlocks physically hold rows of
+      entries (per-token KV, sliding windows, compressed entries).
+    * **Checkpoint** (``checkpoint_granularity``) — for snapshot-style state
+      groups (recurrent/conv state), whose CacheBlocks each hold one state
+      snapshot taken every ``checkpoint_granularity`` tokens. Such a group
+      has no rows and no pages; only state-family groups may use this shape.
+
+    Family-agnostic consumers address either shape through
+    ``block_granularity``; ``page_size`` exists only for row geometry.
+    """
+
     group_id: str
     retention: Retention
-    rows_per_page: int
-    entry_stride_tokens: int
-    sliding_window_tokens: int | None
-    # History groups form a chain; State groups only need the trailing window.
+    rows_per_page: int | None = None
+    entry_stride_tokens: int | None = None
+    sliding_window_tokens: int | None = None
+    # History stores token history; State stores recurrent state. Retention
+    # determines whether either family is full-history or sliding.
     family: Family = "history"
     # Physical child CacheBlocks packed into one shared LCM parent.
     cache_blocks_per_lcm_block: int = 1
     # None preserves standalone/non-PD behavior; PD plans set this explicitly.
     transfer_policy: TransferPolicy | None = None
+    # Snapshot-state shape: raw-token span between two state checkpoints.
+    checkpoint_granularity: int | None = None
+
+    def __post_init__(self) -> None:
+        has_rows = (
+            self.rows_per_page is not None or self.entry_stride_tokens is not None
+        )
+        if self.checkpoint_granularity is not None:
+            if has_rows:
+                raise ValueError(
+                    f"group {self.group_id!r}: checkpoint_granularity is "
+                    "mutually exclusive with rows_per_page/entry_stride_tokens"
+                )
+            if self.family != "state":
+                raise ValueError(
+                    f"group {self.group_id!r}: checkpoint_granularity is only "
+                    "valid for state-family groups"
+                )
+            if self.checkpoint_granularity <= 0:
+                raise ValueError(
+                    f"group {self.group_id!r}: checkpoint_granularity must be "
+                    f"> 0, got {self.checkpoint_granularity}"
+                )
+            return
+        if self.rows_per_page is None or self.entry_stride_tokens is None:
+            raise ValueError(
+                f"group {self.group_id!r}: declare either row geometry "
+                "(rows_per_page + entry_stride_tokens) or "
+                "checkpoint_granularity"
+            )
+        if self.rows_per_page <= 0 or self.entry_stride_tokens <= 0:
+            raise ValueError(
+                f"group {self.group_id!r}: rows_per_page and "
+                "entry_stride_tokens must be > 0, got "
+                f"{self.rows_per_page} and {self.entry_stride_tokens}"
+            )
 
     @property
-    def cache_block_tokens(self) -> int:
-        """Raw-token span represented by one CacheBlock in this group."""
+    def page_size(self) -> int:
+        """Raw-token span of one CacheBlock; row-geometry (paged KV) only."""
+        if self.rows_per_page is None or self.entry_stride_tokens is None:
+            raise TypeError(
+                f"group {self.group_id!r}: page_size is undefined for "
+                "checkpoint (snapshot-state) groups; use block_granularity "
+                "or checkpoint_granularity"
+            )
         return self.rows_per_page * self.entry_stride_tokens
+
+    @property
+    def block_granularity(self) -> int:
+        """Raw-token span of one block-table slot, valid for every shape."""
+        if self.checkpoint_granularity is not None:
+            return self.checkpoint_granularity
+        return self.page_size
 
 
 _PAGED_CACHE_GROUP_DUMMY_PAGES = 1
+
+# Token span of one interleaved mxfp8 KV-scale tile. The fused FP8 attention
+# kernels store k_scale/v_scale in tiles of this many tokens, which changes
+# both the scale field shape and its head-partition axis.
+MXFP8_KV_SCALE_TILE_TOKENS = 128
 
 
 def _ceil_div(dividend: int, divisor: int) -> int:
@@ -138,14 +209,9 @@ def compute_paged_cache_group_page_counts(
 
     counts: dict[str, int] = {}
     for spec in specs:
-        cache_block_tokens = spec.cache_block_tokens
-        if cache_block_tokens <= 0:
-            raise ValueError(
-                f"PagedCacheGroupSpec {spec.group_id}: cache_block_tokens "
-                "(rows_per_page * entry_stride_tokens) must be > 0"
-            )
+        block_granularity = spec.block_granularity
         protected_pages = max_live_requests * _ceil_div(
-            overlap_schedule_depth * decode_input_tokens, cache_block_tokens
+            overlap_schedule_depth * decode_input_tokens, block_granularity
         )
         # Mamba-state kind = family "state" AND retention != sliding_window
         # (the C++ side keys it the same way); V4's sliding-window state tail
@@ -155,7 +221,7 @@ def compute_paged_cache_group_page_counts(
             # floor(T/P) snapshot pages (snapshots are bounded by the shared
             # page-id space), capped at the full-history count.
             full_history_total = (
-                _ceil_div(max_total_tokens, cache_block_tokens)
+                _ceil_div(max_total_tokens, block_granularity)
                 + max_live_requests
                 + protected_pages
                 + _PAGED_CACHE_GROUP_DUMMY_PAGES
@@ -163,14 +229,14 @@ def compute_paged_cache_group_page_counts(
             )
             state_total = (
                 max_live_requests * 2
-                + max_total_tokens // cache_block_tokens
+                + max_total_tokens // block_granularity
                 + protected_pages
                 + _PAGED_CACHE_GROUP_DUMMY_PAGES
                 + safety_margin
             )
             total = min(state_total, full_history_total)
         elif spec.retention == "full_history":
-            full_pages = _ceil_div(max_total_tokens, cache_block_tokens)
+            full_pages = _ceil_div(max_total_tokens, block_granularity)
             total = (
                 full_pages
                 + max_live_requests
@@ -188,10 +254,10 @@ def compute_paged_cache_group_page_counts(
             # Capacity tracks resident history before the next token.
             resident_tokens_per_req = min(max(window - 1, 0), max_context_len)
             resident_pages = max_live_requests * _ceil_div(
-                resident_tokens_per_req, cache_block_tokens
+                resident_tokens_per_req, block_granularity
             )
             scheduled_tokens = min(max_scheduled_tokens, max_total_tokens)
-            scheduled_pages = _ceil_div(scheduled_tokens, cache_block_tokens)
+            scheduled_pages = _ceil_div(scheduled_tokens, block_granularity)
             total = (
                 resident_pages
                 + scheduled_pages
@@ -241,12 +307,7 @@ def compute_max_logical_pages_for_capture(
         raise ValueError(
             f"overlap_schedule_depth must be 0 or 1, got {overlap_schedule_depth}"
         )
-    cache_block_tokens = spec.cache_block_tokens
-    if cache_block_tokens <= 0:
-        raise ValueError(
-            f"PagedCacheGroupSpec {spec.group_id}: cache_block_tokens "
-            "(rows_per_page * entry_stride_tokens) must be > 0"
-        )
+    block_granularity = spec.block_granularity
     reservation_horizon = (overlap_schedule_depth + 1) * max_tokens_per_req
     if spec.retention == "sliding_window":
         window = spec.sliding_window_tokens
@@ -259,10 +320,10 @@ def compute_max_logical_pages_for_capture(
         # per-token attention history counted as window - 1 above.
         retention_bound = min(window, max_context_len)
         live_tokens = retention_bound + reservation_horizon
-        return _ceil_div(live_tokens, cache_block_tokens) + 1
+        return _ceil_div(live_tokens, block_granularity) + 1
     if spec.retention == "full_history":
         live_tokens = max_context_len + reservation_horizon
-        return _ceil_div(live_tokens, cache_block_tokens)
+        return _ceil_div(live_tokens, block_granularity)
     raise ValueError(
         f"PagedCacheGroupSpec {spec.group_id}: unsupported retention {spec.retention!r}"
     )
@@ -476,7 +537,7 @@ def group_specs_from_layer_types(
     layer_types: Sequence[str],
     group_ids: Sequence[str],
     sliding_window_tokens: int | Sequence[int | None] | None,
-    page_size: int,
+    prefix_granularity: int,
     page_sizes: Mapping[str, int] | None = None,
     cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
 ) -> list[PagedCacheGroupSpec]:
@@ -498,10 +559,10 @@ def group_specs_from_layer_types(
         sliding_window_tokens: One window for all sliding layers (today's HF
             scalar), or a per-layer sequence (multi-window models; full-layer
             positions must be None).
-        page_size: Tokens per page (the scheduler's base block size).
+        prefix_granularity: Scheduler-wide prefix granularity in tokens.
         page_sizes: Per-group page sizes keyed by group id (heterogeneous
-            block sizes); values must be positive multiples of page_size.
-            Groups not listed use page_size.
+            block sizes); values must be positive multiples of prefix_granularity.
+            Groups not listed use prefix_granularity.
         cache_blocks_per_lcm_block: Per-group physical packing. Omitted groups
             use one CacheBlock per physical parent.
 
@@ -512,10 +573,10 @@ def group_specs_from_layer_types(
     """
     sizes = dict(page_sizes or {})
     for gid, ps in sizes.items():
-        if ps <= 0 or ps % page_size:
+        if ps <= 0 or ps % prefix_granularity:
             raise ValueError(
                 f"page_sizes[{gid!r}] = {ps} must be a positive "
-                f"multiple of page_size {page_size}"
+                f"multiple of prefix_granularity {prefix_granularity}"
             )
     packing = dict(cache_blocks_per_lcm_block or {})
     for gid, count in packing.items():
@@ -547,8 +608,22 @@ def group_specs_from_layer_types(
                 raise ValueError(f"group_id {gid!r} mixes incompatible layer policies")
             continue
         seen[gid] = (retention, window, family)
-        ps = sizes.pop(gid, None) or page_size
+        ps = sizes.pop(gid, None) or prefix_granularity
         group_packing = packing.pop(gid, 1)
+        if family == "state":
+            # Snapshot-state groups have no rows: one CacheBlock holds one
+            # recurrent-state checkpoint taken every `ps` tokens.
+            specs.append(
+                PagedCacheGroupSpec(
+                    group_id=gid,
+                    retention=retention,
+                    sliding_window_tokens=window,
+                    family=family,
+                    cache_blocks_per_lcm_block=group_packing,
+                    checkpoint_granularity=ps,
+                )
+            )
+            continue
         specs.append(
             PagedCacheGroupSpec(
                 group_id=gid,
@@ -574,8 +649,9 @@ def apply_pd_transfer_policies(
 ) -> list[PagedCacheGroupSpec]:
     """Stamp PD-disaggregation transfer policies onto group specs.
 
-    State groups transfer only their trailing snapshot; history groups
-    transfer the full suffix.
+    Full-history state groups transfer only their trailing snapshot. Sliding
+    state is rolling token history and therefore transfers its complete
+    retained suffix, like an attention-history group.
     """
     from dataclasses import replace
 
@@ -583,7 +659,9 @@ def apply_pd_transfer_policies(
         replace(
             spec,
             transfer_policy=(
-                "latest_snapshot" if spec.family == "state" else "full_suffix"
+                "latest_snapshot"
+                if spec.family == "state" and spec.retention == "full_history"
+                else "full_suffix"
             ),
         )
         for spec in specs
@@ -595,7 +673,7 @@ def build_paged_cache_group_specs(
     layer_types: Sequence[str],
     group_ids: Sequence[str],
     sliding_window_tokens: int | Sequence[int | None] | None,
-    page_size: int,
+    prefix_granularity: int,
     cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
     pd_disaggregation_enabled: bool = False,
 ) -> tuple[PagedCacheGroupSpec, ...]:
@@ -614,7 +692,7 @@ def build_paged_cache_group_specs(
         group_ids: Physical group id per layer, from the cache recipe
             (``CachePoolSpec.layer_group_ids``). Must line up 1:1 with
             layer_types when both are non-empty.
-        sliding_window_tokens / page_size / cache_blocks_per_lcm_block:
+        sliding_window_tokens / prefix_granularity / cache_blocks_per_lcm_block:
             Forwarded to group_specs_from_layer_types.
         pd_disaggregation_enabled: Stamp PD transfer policies on the specs.
     """
@@ -633,7 +711,7 @@ def build_paged_cache_group_specs(
         layer_types=resolved_layer_types,
         group_ids=resolved_group_ids,
         sliding_window_tokens=sliding_window_tokens,
-        page_size=page_size,
+        prefix_granularity=prefix_granularity,
         cache_blocks_per_lcm_block=cache_blocks_per_lcm_block,
     )
     if pd_disaggregation_enabled:

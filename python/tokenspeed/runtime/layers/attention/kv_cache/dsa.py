@@ -98,7 +98,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
             has shape ``[num_pages, page_size, num_groups]`` (float32), both
             indexed as ``view[page, slot_in_page]``.
         """
-        ps = self.page_size
+        # DSA requires kv_page_size == DSA_SPARSE_PAGE_SIZE (64), the only
+        # implemented sparse layout.
+        ps = self.kv_page_size
         hd = self.index_head_dim
         ng = hd // _INDEX_K_FP8_GROUP_SIZE
         row = hd + ng * _INDEX_K_SCALE_BYTES
@@ -141,8 +143,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         buf = self.get_index_k_buffer(layer_id)
         fp8_view, scale_view = self._index_k_block_views(buf)
         slots = slots.to(torch.long)
-        page = slots // self.page_size
-        slot_in_page = slots % self.page_size
+        page = slots // self.kv_page_size
+        slot_in_page = slots % self.kv_page_size
         k_fp8 = fp8_view[page, slot_in_page]
         k_scale = scale_view[page, slot_in_page]
         return k_fp8, k_scale
@@ -167,29 +169,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             index_k_fp8,
             index_k_scale,
             loc,
-            page_size=self.page_size,
+            page_size=self.kv_page_size,
             head_dim=self.index_head_dim,
             group_size=_INDEX_K_FP8_GROUP_SIZE,
         )
-
-    def get_contiguous_buf_infos(self):
-        data_ptrs, data_lens, item_lens = super().get_contiguous_buf_infos()
-        data_ptrs = list(data_ptrs)
-        data_lens = list(data_lens)
-        item_lens = list(item_lens)
-        for buf in self.index_k_buffer:
-            data_ptrs.append(buf.data_ptr())
-            data_lens.append(buf.nbytes)
-            item_lens.append(buf[0].nbytes * self.page_size)
-        return data_ptrs, data_lens, item_lens
-
-    def get_layerwise_buf_info_offsets(self, start_idx=0):
-        offsets = super().get_layerwise_buf_info_offsets(start_idx)
-        if self.quant_method == "per_token_head":
-            base_count = 3 * self.layer_num
-        else:
-            base_count = self.layer_num
-        return [
-            layer_offsets + [start_idx + base_count + layer_id]
-            for layer_id, layer_offsets in enumerate(offsets)
-        ]

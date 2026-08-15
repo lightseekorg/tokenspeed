@@ -42,6 +42,9 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    MLA_PAGE_SIZE,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
@@ -109,8 +112,12 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         self._cache_groups_bound = False
         self._cache_contract_bound = False
         self.max_context_len = config.context_len
-        self.page_size = config.page_size
-        self.max_num_pages = ceil_div(self.max_context_len, self.page_size)
+        self.kernel_page_size = (
+            config.kernel_page_size
+            if config.kernel_page_size is not None
+            else MLA_PAGE_SIZE
+        )
+        self.max_num_pages = ceil_div(self.max_context_len, self.kernel_page_size)
 
         self.kv_lora_rank = config.kv_lora_rank
         self.qk_nope_head_dim = config.qk_nope_head_dim
@@ -147,7 +154,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             q_dtype=self.q_data_type,
             kv_dtype=self.data_type,
             num_q_heads=self.num_local_heads,
-            page_size=self.page_size,
+            page_size=self.kernel_page_size,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
@@ -291,7 +298,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             chunk_req_pool_indices = torch.arange(
                 seq_lens.shape[0], dtype=torch.int64, device=group_table.device
             )
-            chunk_page_size = self.page_size
+            chunk_page_size = self.kernel_page_size
             if use_absorbed_cached_extend:
                 absorbed_page_table = group_table[: seq_lens.shape[0]]
         else:
@@ -302,12 +309,12 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             chunk_req_pool_indices = torch.arange(
                 seq_lens.shape[0], dtype=torch.int64, device=page_table.device
             )
-            chunk_page_size = self.page_size
+            chunk_page_size = self.kernel_page_size
             if use_absorbed_cached_extend:
                 absorbed_page_table = build_page_table(
                     req_pool_indices,
                     page_table,
-                    self.page_size,
+                    self.kernel_page_size,
                     self.max_context_len,
                 )
 
@@ -392,7 +399,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             page_table = build_page_table(
                 req_pool_indices[:bs],
                 page_table,
-                self.page_size,
+                self.kernel_page_size,
                 self.max_context_len,
             )
             group_out_cache_loc = None
@@ -801,7 +808,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         if self.data_type != kv_cache.dtype:
             kv_cache = kv_cache.to(self.data_type)
-        kv_cache = kv_cache.view(-1, self.page_size, 1, self.kv_cache_dim)
+        kv_cache = kv_cache.view(-1, self.kernel_page_size, 1, self.kv_cache_dim)
 
         value_weight = kwargs.get("value_weight")
         gate = kwargs.get("output_gate")
@@ -869,7 +876,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
             if self.data_type != kv_cache.dtype:
                 kv_cache = kv_cache.to(self.data_type)
-            kv_cache = kv_cache.view(-1, self.page_size, 1, self.kv_cache_dim)
+            kv_cache = kv_cache.view(-1, self.kernel_page_size, 1, self.kv_cache_dim)
             result = mla_extend_with_kvcache(
                 q=q,
                 kv_cache=kv_cache,

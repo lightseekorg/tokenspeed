@@ -46,7 +46,6 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
         memory_plan: CacheMemoryPlan,
         layer_group_ids: tuple[str, ...],
         state_field_dtypes: Mapping[str, torch.dtype] | None = None,
-        pd_disaggregation_enabled: bool = False,
         **kwargs,
     ):
         group_ids = tuple(layer_group_ids)
@@ -67,7 +66,6 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
         super().__init__(
             memory_plan=memory_plan,
             layer_group_ids=group_ids,
-            pd_disaggregation_enabled=pd_disaggregation_enabled,
             **kwargs,
         )
 
@@ -76,15 +74,15 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
             self._bind_buffers()
 
     def _bind_buffers(self) -> None:
-        if self.plan.logical_block_tokens != self.page_size:
+        if self.plan.prefix_granularity != self.prefix_granularity:
             raise ValueError(
-                f"cache plan P={self.plan.logical_block_tokens} does not match pool "
-                f"page_size={self.page_size}"
+                f"cache plan P={self.plan.prefix_granularity} does not match pool "
+                f"prefix_granularity={self.prefix_granularity}"
             )
         max_packing = max(
             group.cache_blocks_per_lcm_block for group in self.plan.groups
         )
-        expected_size = self.plan.num_lcm_blocks * max_packing * self.page_size
+        expected_size = self.plan.num_lcm_blocks * max_packing * self.prefix_granularity
         if self.size != expected_size:
             raise ValueError(
                 f"cache pool size {self.size} does not match plan child capacity "
@@ -110,7 +108,7 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
                     raise ValueError(
                         f"state plane for layer {layer_id} has padding "
                         "between pages; the GDN decode ABI requires contiguous "
-                        "state page rows"
+                        "state block rows"
                     )
                 self._state_buffers_by_layer[layer_id] = (conv, ssm)
                 continue
@@ -164,7 +162,7 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
             return recurrent
         raise ValueError(f"unknown state component {component_name!r}")
 
-    def zero_new_pages(self, new_page_ids: dict[str, list[int]]) -> None:
+    def zero_new_blocks(self, new_page_ids: dict[str, list[int]]) -> None:
         if new_page_ids:
             self.zero_blocks(new_page_ids)
 
@@ -172,9 +170,6 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
     def clear_kv_buffers(self) -> None:
         assert self.buffer is not None
         self.buffer.zero_()
-
-    def get_contiguous_buf_infos(self):
-        raise RuntimeError("state MHA transfer uses get_pd_cache_contract()")
 
 
 class HybridMHATokenToKVPoolMXFP8(
@@ -202,4 +197,4 @@ class HybridMHATokenToKVPoolMXFP8(
         ]
 
     def _layer_page_tokens(self, layer_id: int) -> int:
-        return self.page_size
+        return self.kv_page_size

@@ -67,8 +67,9 @@ def _make_flashmla_backend(pool, speculative_num_draft_tokens: int = 1):
         attn_tp_size=1,
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
-        page_size=_KERNEL_PAGE,
-        context_len=8 * pool.page_size,
+        prefix_granularity=_KERNEL_PAGE,
+        kernel_page_size=_KERNEL_PAGE,
+        context_len=8 * pool.prefix_granularity,
         max_bs=8,
         max_graph_bs=8,
         kv_cache_quant_method="",
@@ -112,7 +113,7 @@ def test_flashmla_grouped_decode_block_table_and_write_locs() -> None:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
     pool = _make_pool("cuda", usable_pages=6)
-    page_size = pool.page_size  # logical (scheduler) page size
+    page_size = pool.prefix_granularity  # logical (scheduler) page size
     ratio = page_size // _KERNEL_PAGE
     layer_id = _mla_layer_id(pool)
     layer = type("L", (), {"layer_id": layer_id})()
@@ -132,7 +133,7 @@ def test_flashmla_grouped_decode_block_table_and_write_locs() -> None:
     expected_row0 = []
     for lpage in logical_rows[0]:
         expected_row0.extend(lpage * ratio + k for k in range(ratio))
-    got_row0 = meta.block_table[0, : len(expected_row0)].tolist()
+    got_row0 = meta.page_table[0, : len(expected_row0)].tolist()
     assert got_row0 == expected_row0, (got_row0, expected_row0)
 
     # Write locations: position seq-1 -> logical page (from table) * page_size
@@ -156,7 +157,7 @@ def test_flashmla_grouped_prefill_index_math() -> None:
     from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 
     pool = _make_pool("cuda", usable_pages=6)
-    page_size = pool.page_size
+    page_size = pool.prefix_granularity
     backend = _make_flashmla_backend(pool)
 
     # The mixin consumes the KERNEL-page table (upstream expansion); build it
@@ -164,7 +165,7 @@ def test_flashmla_grouped_prefill_index_math() -> None:
     logical_table = torch.tensor([[3, 5]], device="cuda", dtype=torch.int32)
     table = expand_page_table(
         logical_table,
-        logical_page_size=page_size,
+        block_granularity=page_size,
         kernel_page_size=_KERNEL_PAGE,
     )
 
@@ -199,7 +200,7 @@ def test_flashmla_grouped_target_verify_writes_whole_window() -> None:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
     pool = _make_pool("cuda", usable_pages=6)
-    page_size = pool.page_size
+    page_size = pool.prefix_granularity
     spec = 4
     backend = _make_flashmla_backend(pool, speculative_num_draft_tokens=spec)
 
@@ -262,8 +263,9 @@ def _make_draft_flashmla_backend(pool):
         attn_tp_size=1,
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
-        page_size=_KERNEL_PAGE,
-        context_len=8 * pool.page_size,
+        prefix_granularity=_KERNEL_PAGE,
+        kernel_page_size=_KERNEL_PAGE,
+        context_len=8 * pool.prefix_granularity,
         max_bs=8,
         max_graph_bs=8,
         kv_cache_quant_method="",
@@ -298,7 +300,7 @@ def test_flashmla_draft_consumes_staged_page_table() -> None:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
     pool = _make_pool("cuda", usable_pages=6)
-    page_size = pool.page_size
+    page_size = pool.prefix_granularity
     ratio = page_size // _KERNEL_PAGE
     backend = _make_draft_flashmla_backend(pool)
 
@@ -322,5 +324,5 @@ def test_flashmla_draft_consumes_staged_page_table() -> None:
     )
     assert backend._cache_groups_bound is True
     meta = backend.forward_decode_metadata
-    got_row0 = meta.block_table[0, : len(staged_rows[0])].tolist()
+    got_row0 = meta.page_table[0, : len(staged_rows[0])].tolist()
     assert got_row0 == staged_rows[0], (got_row0, staged_rows[0])

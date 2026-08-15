@@ -259,7 +259,7 @@ class EventLoop:
         self._scheduler_cache_geometry = scheduler_cache_geometry_from_pool(
             token_to_kv_pool,
             fallback_token_capacity=self.max_total_num_tokens,
-            fallback_page_size=server_args.block_size,
+            fallback_prefix_granularity=server_args.prefix_granularity,
         )
         geometry = self._scheduler_cache_geometry
         self.max_total_num_tokens = geometry.token_capacity
@@ -267,7 +267,7 @@ class EventLoop:
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
         # Resolve the scheduler limit before ModelExecutorConfig sizes input
         # buffers. Lowering the limit is safe; a configured chunk smaller than
-        # one state page is rejected by aligned_max_scheduled_tokens instead of
+        # one state checkpoint block is rejected by aligned_max_scheduled_tokens instead of
         # silently increasing a frozen buffer limit.
         max_scheduled_tokens = server_args.chunked_prefill_size
         if server_args.enable_prefix_caching:
@@ -278,7 +278,7 @@ class EventLoop:
             if max_scheduled_tokens != server_args.chunked_prefill_size:
                 logger.warning(
                     "chunked_prefill_size=%s is not a multiple of the "
-                    "state-snapshot page grain; using %s so recurrent-state "
+                    "state-snapshot checkpoint grain; using %s so recurrent-state "
                     "pages can register for prefix-cache reuse.",
                     server_args.chunked_prefill_size,
                     max_scheduled_tokens,
@@ -298,7 +298,7 @@ class EventLoop:
             gpu_id=gpu_id,
             global_rank=global_rank,
             num_total_pages=num_total_pages,
-            logical_page_size=geometry.page_size,
+            prefix_granularity=geometry.prefix_granularity,
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
         self.model_executor = create_model_executor(
@@ -374,21 +374,30 @@ class EventLoop:
             and attn_tp_rank == 0
         )
 
-        # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
-        self._pd_cache_enabled = bool(
-            server_args.disaggregation_mode in ("prefill", "decode")
-            and getattr(token_to_kv_pool, "supports_disaggregation", False) is True
+        self._pd_cache_enabled = server_args.disaggregation_mode in (
+            "prefill",
+            "decode",
         )
         if self._pd_cache_enabled:
+            if not token_to_kv_pool.supports_disaggregation:
+                raise RuntimeError(
+                    "PD disaggregation requires a unified cache contract"
+                )
             unsupported = []
-            if self.has_dp:
-                unsupported.append("data-parallel attention")
             if server_args.enable_mixed_batch:
                 unsupported.append("mixed prefill/decode batches")
-            if server_args.speculative_algorithm is not None:
-                unsupported.append("speculative/MTP decoding")
-            if server_args.disaggregation_layerwise_interval > 0:
-                unsupported.append("layerwise cache transfer")
+            if (
+                server_args.speculative_algorithm is not None
+                and server_args.disaggregation_layerwise_interval > 0
+                and not getattr(
+                    self.model_executor.drafter,
+                    "supports_pd_layerwise_finalization",
+                    False,
+                )
+            ):
+                unsupported.append(
+                    f"{server_args.speculative_algorithm} layerwise transfer"
+                )
             if server_args.enable_memory_saver:
                 unsupported.append("memory saver/release")
             # Prefill is forced onto the non-overlap loop by
@@ -414,7 +423,7 @@ class EventLoop:
             num_device_pages=geometry.num_device_pages,
             max_scheduled_tokens=max_scheduled_tokens,
             max_batch_size=per_rank_max_batch,
-            page_size=geometry.page_size,
+            prefix_granularity=geometry.prefix_granularity,
             num_host_pages=num_host_pages,
             disable_l2_cache=not server_args.enable_kvstore,
             enable_l3_storage=server_args.kvstore_storage_backend is not None,
@@ -429,13 +438,13 @@ class EventLoop:
         )
         scheduler_cfg.enable_pd_cache = self._pd_cache_enabled
         logger.info(
-            "Scheduler config: block_size=%s num_device_pages=%s "
+            "Scheduler config: prefix_granularity=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s "
             "overlap_schedule_depth=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
             "disable_prefix_cache=%s prefix_replay_tokens=%s "
             "paged_cache_groups=%s",
-            scheduler_cfg.block_size,
+            scheduler_cfg.prefix_granularity,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
             scheduler_cfg.decode_input_tokens,
@@ -559,7 +568,8 @@ class EventLoop:
                 global_rank,
                 server_args.disaggregation_ib_device,
                 token_to_kv_pool,
-                draft_token_to_kv_pool,
+                model_config=self.model_config,
+                draft_model_config=draft_model_config,
             )
             pd_manager_args = KVManagerArgs(
                 bootstrap_port=server_args.disaggregation_bootstrap_port,
@@ -567,9 +577,6 @@ class EventLoop:
                 world_size=server_args.world_size or mapping.world_size,
                 dp_size=server_args.data_parallel_size or mapping.attn.dp_size,
                 attn_tp_rank=attn_tp_rank,
-                attn_dp_rank=dp_rank,
-                is_mla_backend=False,
-                draft_is_mla_backend=False,
                 enable_metrics=False,
                 served_model_name=server_args.served_model_name,
                 app_key=server_args.app_key,
@@ -582,7 +589,6 @@ class EventLoop:
                 args=pd_manager_args,
                 kv_args=kv_args,
                 gloo_group=self.attn_tp_cpu_group,
-                page_size=token_to_kv_pool.page_size,
             )
             self._setup_pd_layerwise_transfer(
                 server_args.disaggregation_layerwise_interval
@@ -625,10 +631,11 @@ class EventLoop:
 
         from tokenspeed.runtime.pd.utils import StepCounter
 
+        draft_attn_backend = self.model_executor.draft_attn_backend
         step_counter = StepCounter(self.model_executor.device, self.gpu_id)
         self.model_executor.attn_backend.register_step_counter(step_counter)
-        if self.model_executor.draft_attn_backend is not None:
-            self.model_executor.draft_attn_backend.register_step_counter(step_counter)
+        if draft_attn_backend is not None:
+            self.model_executor.register_draft_final_step_counter(step_counter)
         self.kv_transfer.register_layerwise_step_counter(step_counter, interval)
 
     def _is_epd_request(self, state) -> bool:
@@ -906,6 +913,9 @@ class EventLoop:
             # Decode node
             if forward_op.num_extends() > 0 and not forward_op.is_local_prefill():
                 # Path 2: new requests waiting for remote KV — trigger RDMA receive
+                self.model_executor.prepare_remote_cache_slots(
+                    list(forward_op.request_pool_indices[: forward_op.num_extends()])
+                )
                 self.kv_transfer.reset_valid_cache_length(
                     forward_op,
                     self.model_executor.runtime_states,
@@ -1087,7 +1097,7 @@ class EventLoop:
         ready_response = zmq_wire.WireEngineCoreReadyResponse(
             max_model_len=self.model_config.context_len,
             num_gpu_blocks=geometry.num_device_pages,
-            block_size=geometry.page_size,
+            prefix_granularity=geometry.prefix_granularity,
             dtype=_wire_dtype(self.model_config.dtype),
             multimodal_encoder_dtype=self.multimodal_encoder_dtype,
             vllm_version=f"tokenspeed-{_tokenspeed_version()}",
@@ -1371,6 +1381,7 @@ class EventLoop:
                         self.output_processor.finish_remote_prefill_only_request(req_id)
                     )
                 if isinstance(self.kv_transfer, DisaggDecodeExecutor):
+                    remote_cache_slot = self.kv_transfer.pop_remote_cache_slot(req_id)
                     candidate_info = self.kv_transfer.pop_remote_spec_candidate_ids(
                         req_id
                     )
@@ -1379,13 +1390,21 @@ class EventLoop:
                         self.model_executor.write_remote_spec_candidate_ids(
                             req_pool_idx, candidate_ids
                         )
+                    remaining_state = self.output_processor.rid_to_state.get(req_id)
+                    if (
+                        remote_cache_slot is not None
+                        and remaining_state is not None
+                        and not remaining_state.to_abort
+                        and not remaining_state.finished
+                    ):
+                        self.model_executor.mark_remote_cache_ready(remote_cache_slot)
             elif isinstance(event, PD.FailedEvent):
                 # A PD/EPD transfer failed: the decode KV receiver timed out (e.g. the
                 # prefill aborted on embedding timeout so the KV never arrives), or a
-                # transfer errored. Publish the client-visible failure here. Legacy
-                # PD still needs a following Forward.Abort because its C++ FailedEvent
-                # handler is a no-op; Paged cache FailedEvent atomically terminalizes and
-                # fences the leased scheduler resources itself.
+                # transfer errored. Publish the client-visible failure here. An
+                # encode-only EPD flow still needs a following Forward.Abort because
+                # its C++ FailedEvent handler is a no-op; CachePD FailedEvent
+                # atomically terminalizes and fences the leased scheduler resources.
                 req_id = event.request_id
                 state = self.output_processor.rid_to_state.get(req_id)
                 if state is not None:

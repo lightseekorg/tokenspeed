@@ -43,7 +43,6 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         memory_plan: CacheMemoryPlan,
         layer_group_ids: tuple[str, ...],
         layer_types: tuple[str, ...],
-        pd_disaggregation_enabled: bool = False,
         state_field_dtypes: Mapping[str, torch.dtype] | None = None,
         **kwargs,
     ):
@@ -63,7 +62,6 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         super().__init__(
             memory_plan=memory_plan,
             layer_group_ids=group_ids,
-            pd_disaggregation_enabled=pd_disaggregation_enabled,
             **kwargs,
         )
 
@@ -74,15 +72,15 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
     def _bind_buffers(self) -> None:
         if self.quant_method == "per_token_head":
             raise ValueError("KDA cache does not support per-token-head KV")
-        if self.plan.logical_block_tokens != self.page_size:
+        if self.plan.prefix_granularity != self.prefix_granularity:
             raise ValueError(
-                f"cache plan P={self.plan.logical_block_tokens} does not match "
-                f"pool page_size={self.page_size}"
+                f"cache plan P={self.plan.prefix_granularity} does not match "
+                f"pool prefix_granularity={self.prefix_granularity}"
             )
         max_packing = max(
             group.cache_blocks_per_lcm_block for group in self.plan.groups
         )
-        expected_size = self.plan.num_lcm_blocks * max_packing * self.page_size
+        expected_size = self.plan.num_lcm_blocks * max_packing * self.prefix_granularity
         if self.size != expected_size:
             raise ValueError(
                 f"cache pool size {self.size} does not match child capacity "
@@ -156,7 +154,7 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         except KeyError as exc:
             raise ValueError(f"layer {layer_id} has no KDA state") from exc
 
-    def zero_new_pages(self, new_page_ids: dict[str, list[int]]) -> None:
+    def zero_new_blocks(self, new_page_ids: dict[str, list[int]]) -> None:
         if new_page_ids:
             self.zero_blocks(new_page_ids)
 
@@ -168,9 +166,3 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
     def get_kv_size_bytes(self):
         assert self.buffer is not None
         return self.buffer.nbytes
-
-    def get_contiguous_buf_infos(self):
-        raise RuntimeError("KDA transfer uses get_pd_cache_contract()")
-
-    def get_layerwise_buf_info_offsets(self, start_idx=0):
-        raise RuntimeError("KDA transfer uses get_pd_cache_contract()")

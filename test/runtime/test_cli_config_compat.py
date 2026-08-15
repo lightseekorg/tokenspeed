@@ -334,7 +334,7 @@ class TestCLIConfigCompat(unittest.TestCase):
 
     def test_block_size_arg(self):
         args = self._parse_args(["--model", "test/model", "--block-size", "128"])
-        self.assertEqual(args.block_size, 128)
+        self.assertEqual(args.prefix_granularity, 128)
 
     def test_moe_backend_arg(self):
         args = self._parse_args(["--model", "test/model", "--moe-backend", "triton"])

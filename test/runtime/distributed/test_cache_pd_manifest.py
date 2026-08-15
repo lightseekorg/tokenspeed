@@ -18,41 +18,126 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-from tokenspeed.runtime.pd.cache_protocol import (
-    CACHE_PD_PROTOCOL_VERSION,
-    CachePDGroup,
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheFieldLayout,
+    CacheGroupLayout,
+    CacheMemoryPlan,
+    CachePlaneLayout,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    PagedCacheGroupSpec,
+)
+from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
+    CacheContractError,
     CachePDGroupPages,
-    CachePDLayout,
     CachePDPageManifest,
-    CachePDPeerLayout,
-    CachePDProtocolError,
-    CachePDSlabRegistration,
-    CachePDTransferSegment,
+    CacheTransferContract,
+    CacheTransferSchema,
+    build_cache_fields_by_producer_step,
     build_cache_page_manifest,
-    build_lcm_pd_cache_contract,
-    cache_manifest_page_ids,
-    validate_cache_manifest_pair,
+    build_cache_transfer_contract,
+    build_cache_transfer_schema,
+    validate_cache_manifest,
     validate_cache_peer_layout,
-    validate_cache_slab_registrations,
 )
 
-_FINGERPRINT = "1" * 64
 
-
-def _layout(capacity: int = 64) -> CachePDLayout:
-    return CachePDLayout(
-        version=CACHE_PD_PROTOCOL_VERSION,
-        layout_fingerprint=_FINGERPRINT,
-        block_size=4,
-        num_pages_with_null=capacity,
-        physical_buffer_ids=("slab.0", "slab.1", "slab.2"),
-        physical_page_bytes=128,
-        groups=(
-            CachePDGroup("attention", "history", "full_suffix", (0, 1, 2)),
-            CachePDGroup("linear-a", "state", "latest_snapshot", (0, 1)),
-            CachePDGroup("linear-b", "state", "latest_snapshot", (0, 1)),
-        ),
+def _group_spec(
+    group_id: str,
+    family: str,
+    policy: str,
+    *,
+    prefix_granularity: int = 4,
+    retention: str = "full_history",
+    sliding_window_tokens: int | None = None,
+    packing: int = 1,
+) -> PagedCacheGroupSpec:
+    return PagedCacheGroupSpec(
+        group_id=group_id,
+        retention=retention,
+        rows_per_page=prefix_granularity,
+        entry_stride_tokens=1,
+        sliding_window_tokens=sliding_window_tokens,
+        family=family,
+        cache_blocks_per_lcm_block=packing,
+        transfer_policy=policy,
     )
+
+
+def _field(
+    group_id: str,
+    field_id: str,
+    *,
+    plane_id: str = "cache",
+    shape: tuple[int, ...] = (1,),
+    element_size: int = 1,
+    offset: int = 0,
+    stride: int = 128,
+) -> CacheFieldLayout:
+    return CacheFieldLayout(
+        group_id=group_id,
+        field_id=field_id,
+        plane_id=plane_id,
+        shape=shape,
+        element_size=element_size,
+        field_offset_bytes=offset,
+        page_stride_bytes=stride,
+    )
+
+
+def _contract(
+    specs: tuple[PagedCacheGroupSpec, ...],
+    fields: tuple[CacheFieldLayout, ...],
+    *,
+    block_size: int = 4,
+    capacity: int = 64,
+    page_bytes: int = 128,
+    planes: tuple[CachePlaneLayout, ...] | None = None,
+    dtypes: tuple[str, ...] | None = None,
+    transfer_schema: CacheTransferSchema = CacheTransferSchema(),
+) -> CacheTransferContract:
+    plan = CacheMemoryPlan(
+        prefix_granularity=block_size,
+        lcm_block_bytes=page_bytes,
+        num_lcm_blocks=capacity - 1,
+        groups=tuple(
+            CacheGroupLayout(
+                group_id=spec.group_id,
+                cache_blocks_per_lcm_block=spec.cache_blocks_per_lcm_block,
+                page_count=(1 + (capacity - 1) * spec.cache_blocks_per_lcm_block),
+            )
+            for spec in specs
+        ),
+        planes=planes
+        or (
+            CachePlaneLayout(
+                plane_id="cache",
+                bytes_per_lcm_block=page_bytes,
+                arena_offset_bytes=0,
+            ),
+        ),
+        fields=fields,
+    )
+    return CacheTransferContract(
+        plan=plan,
+        group_specs=specs,
+        field_dtypes=dtypes or tuple("uint8" for _ in fields),
+        transfer_schema=transfer_schema,
+    )
+
+
+def _layout(capacity: int = 64) -> CacheTransferContract:
+    specs = (
+        _group_spec("attention", "history", "full_suffix"),
+        _group_spec("linear-a", "state", "latest_snapshot"),
+        _group_spec("linear-b", "state", "latest_snapshot"),
+    )
+    fields = (
+        _field("attention", "attention.k", offset=0),
+        _field("linear-a", "linear-a.state", offset=1),
+        _field("linear-b", "linear-b.state", offset=2),
+    )
+    return _contract(specs, fields, capacity=capacity)
 
 
 def _op(page_offset: int = 0) -> SimpleNamespace:
@@ -62,21 +147,6 @@ def _op(page_offset: int = 0) -> SimpleNamespace:
         "linear-b": np.array([[21, 22, 23, 24, -1]], dtype=np.int32) + page_offset,
     }
     return SimpleNamespace(block_tables_arrays=lambda: tables)
-
-
-def _registrations(
-    layout: CachePDLayout, start: int
-) -> tuple[CachePDSlabRegistration, ...]:
-    extent = layout.num_pages_with_null * layout.physical_page_bytes
-    return tuple(
-        CachePDSlabRegistration(
-            slot,
-            layout.physical_buffer_ids[slot],
-            start + slot * (extent + 1024),
-            extent,
-        )
-        for slot in range(layout.physical_slot_count)
-    )
 
 
 def test_manifest_selects_history_suffix_and_only_final_state_slot() -> None:
@@ -95,34 +165,14 @@ def test_manifest_selects_history_suffix_and_only_final_state_slot() -> None:
     )
 
 
-def test_transfer_policy_is_model_defined_not_inferred_from_family() -> None:
-    layout = _layout()
-    groups = list(layout.groups)
-    groups[1] = replace(groups[1], transfer_policy="full_suffix")
-    layout = replace(layout, groups=tuple(groups))
-
-    manifest = build_cache_page_manifest(
-        _op(),
-        layout=layout,
-        request_row=0,
-        prefix_len=4,
-        prompt_len=14,
-    )
-
-    assert manifest.groups[1] == CachePDGroupPages("linear-a", (12, 13, 14))
-
-
-def test_layout_rejects_unbound_physical_slots() -> None:
-    layout = _layout()
-
-    assert layout.physical_slot_count == len(layout.physical_buffer_ids)
-    with pytest.raises(CachePDProtocolError, match="leaves physical slots unbound"):
-        replace(
-            layout,
-            groups=tuple(
-                replace(group, physical_slots=(0,)) for group in layout.groups
-            ),
-        )
+def test_contract_serializes_recipe_specs_without_a_pd_group_projection() -> None:
+    contract = _layout()
+    assert contract.group_specs[1].transfer_policy == "latest_snapshot"
+    payload = json.loads(contract.to_wire_bytes())
+    assert "groups" not in payload
+    assert [spec["group_id"] for spec in payload["group_specs"]] == [
+        spec.group_id for spec in contract.group_specs
+    ]
 
 
 def test_source_and_destination_page_ids_are_independent() -> None:
@@ -143,13 +193,7 @@ def test_source_and_destination_page_ids_are_independent() -> None:
         prompt_len=14,
     )
 
-    validate_cache_peer_layout(source_layout, destination_layout.peer)
-    validate_cache_manifest_pair(
-        source,
-        destination,
-        source_layout,
-        dst_num_pages_with_null=destination_layout.num_pages_with_null,
-    )
+    validate_cache_peer_layout(source_layout, destination_layout)
     assert source.groups[0].page_ids != destination.groups[0].page_ids
 
 
@@ -159,7 +203,7 @@ def test_manifest_rejects_null_padding_and_out_of_capacity_page(
 ) -> None:
     operation = _op()
     operation.block_tables_arrays()["linear-a"][0, 3] = bad_page
-    with pytest.raises(CachePDProtocolError, match="invalid page ID"):
+    with pytest.raises(CacheContractError, match="invalid page ID"):
         build_cache_page_manifest(
             operation,
             layout=_layout(),
@@ -170,7 +214,7 @@ def test_manifest_rejects_null_padding_and_out_of_capacity_page(
 
 
 def test_manifest_accepts_reordered_mapping_but_rejects_wrong_keys() -> None:
-    with pytest.raises(CachePDProtocolError, match="aligned"):
+    with pytest.raises(CacheContractError, match="aligned"):
         build_cache_page_manifest(
             _op(),
             layout=_layout(),
@@ -204,7 +248,7 @@ def test_manifest_accepts_reordered_mapping_but_rejects_wrong_keys() -> None:
         {**tables, "extra": tables["attention"]},
     ):
         wrong = SimpleNamespace(block_tables_arrays=lambda: wrong_tables)
-        with pytest.raises(CachePDProtocolError, match="group IDs disagree"):
+        with pytest.raises(CacheContractError, match="group IDs disagree"):
             build_cache_page_manifest(
                 wrong,
                 layout=_layout(),
@@ -213,35 +257,8 @@ def test_manifest_accepts_reordered_mapping_but_rejects_wrong_keys() -> None:
                 prompt_len=14,
             )
 
-    class DuplicateKeyMapping(dict):
-        def __iter__(self):
-            return iter(("attention", "attention", "linear-a", "linear-b"))
 
-    duplicate = SimpleNamespace(block_tables_arrays=lambda: DuplicateKeyMapping(tables))
-    with pytest.raises(CachePDProtocolError, match="duplicate group IDs"):
-        build_cache_page_manifest(
-            duplicate,
-            layout=_layout(),
-            request_row=0,
-            prefix_len=4,
-            prompt_len=14,
-        )
-
-
-def test_manifest_rejects_selected_page_aliasing_a_live_unselected_slot() -> None:
-    aliased = _op()
-    aliased.block_tables_arrays()["attention"][0, 0] = 2
-    with pytest.raises(CachePDProtocolError, match="aliases live unselected"):
-        build_cache_page_manifest(
-            aliased,
-            layout=_layout(),
-            request_row=0,
-            prefix_len=4,
-            prompt_len=14,
-        )
-
-
-def test_layout_and_manifest_wire_encoding_is_canonical_and_strict() -> None:
+def test_contract_and_manifest_wire_round_trip_has_no_version_field() -> None:
     layout = _layout()
     manifest = build_cache_page_manifest(
         _op(),
@@ -250,110 +267,40 @@ def test_layout_and_manifest_wire_encoding_is_canonical_and_strict() -> None:
         prefix_len=4,
         prompt_len=14,
     )
-    layout_wire = layout.peer.to_wire_bytes()
+    layout_wire = layout.to_wire_bytes()
     manifest_wire = manifest.to_wire_bytes()
-    assert json.loads(layout_wire) == {
-        "layout_fingerprint": layout.layout_fingerprint,
-        "num_pages_with_null": layout.num_pages_with_null,
-        "page_zero_offsets": [],
-        "version": CACHE_PD_PROTOCOL_VERSION,
-    }
-    assert CachePDPeerLayout.from_wire_bytes(layout_wire) == layout.peer
+    contract_payload = json.loads(layout_wire)
+    plan_payload = contract_payload["plan"]
+    assert plan_payload["num_lcm_blocks"] == layout.plan.num_lcm_blocks
+    assert plan_payload["lcm_block_bytes"] == layout.plan.lcm_block_bytes
+    assert [spec["group_id"] for spec in contract_payload["group_specs"]] == [
+        "attention",
+        "linear-a",
+        "linear-b",
+    ]
+    assert "version" not in contract_payload
+    assert "version" not in json.loads(manifest_wire)
+    assert CacheTransferContract.from_wire_bytes(layout_wire) == layout
     assert CachePDPageManifest.from_wire_bytes(manifest_wire) == manifest
-
-    pretty = json.dumps(json.loads(layout_wire), indent=2).encode()
-    with pytest.raises(CachePDProtocolError, match="canonical"):
-        CachePDPeerLayout.from_wire_bytes(pretty)
-    with pytest.raises(CachePDProtocolError, match="duplicate key"):
-        CachePDPageManifest.from_wire_bytes(manifest_wire[:-1] + b',"version":1}')
-    payload = json.loads(manifest_wire)
-    payload["unexpected"] = True
-    with pytest.raises(CachePDProtocolError, match="schema keys"):
-        CachePDPageManifest.from_wire_bytes(
-            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
-        )
-
-
-def test_manifest_pair_rejects_layout_and_logical_mismatch() -> None:
-    layout = _layout()
-    source = build_cache_page_manifest(
-        _op(),
-        layout=layout,
-        request_row=0,
-        prefix_len=4,
-        prompt_len=14,
-    )
-    destination = build_cache_page_manifest(
-        _op(30),
-        layout=layout,
-        request_row=0,
-        prefix_len=4,
-        prompt_len=14,
-    )
-    with pytest.raises(CachePDProtocolError, match="fingerprint"):
-        validate_cache_peer_layout(
-            layout, replace(layout.peer, layout_fingerprint="2" * 64)
-        )
-    with pytest.raises(CachePDProtocolError, match="prompt_len"):
-        validate_cache_manifest_pair(
-            source,
-            replace(destination, prompt_len=13),
-            layout,
-            dst_num_pages_with_null=layout.num_pages_with_null,
-        )
-    with pytest.raises(CachePDProtocolError, match="page count"):
-        validate_cache_manifest_pair(
-            source,
-            replace(
-                destination,
-                groups=(
-                    replace(destination.groups[0], page_ids=(31, 32)),
-                    *destination.groups[1:],
-                ),
-            ),
-            layout,
-            dst_num_pages_with_null=layout.num_pages_with_null,
-        )
-    # Kernel page ids are scoped by group in the two-level LCM layout.
-    # Equal integers in different groups do not name the same CacheBlock.
-    replace(
-        source,
-        groups=(
-            source.groups[0],
-            replace(source.groups[1], page_ids=(source.groups[0].page_ids[0],)),
-            source.groups[2],
-        ),
-    )
 
 
 def test_lcm_group_capacity_uses_its_cache_blocks_per_parent() -> None:
-    layout = CachePDLayout(
-        version=CACHE_PD_PROTOCOL_VERSION,
-        layout_fingerprint=_FINGERPRINT,
-        block_size=4,
-        # Null parent plus three usable parents.
-        num_pages_with_null=4,
-        physical_buffer_ids=("arena",),
-        physical_page_bytes=1024,
-        groups=(
-            CachePDGroup(
+    spec = _group_spec("history", "history", "full_suffix", packing=2)
+    # Null parent plus three usable parents, each packing two child pages.
+    layout = _contract(
+        (spec,),
+        (
+            _field(
                 "history",
-                "history",
-                "full_suffix",
-                (0,),
-                cache_blocks_per_lcm_block=2,
-                transfer_segments=(
-                    CachePDTransferSegment(
-                        physical_slot=0,
-                        field_id="layer.0.k",
-                        dtype="bfloat16",
-                        page_zero_offset=384,
-                        page_stride_bytes=128,
-                        payload_bytes=128,
-                    ),
-                ),
+                "layer.0.k",
+                shape=(64,),
+                element_size=2,
+                stride=128,
             ),
         ),
+        capacity=4,
+        page_bytes=1024,
+        dtypes=("bfloat16",),
     )
     tables = {"history": np.array([[5, 6]], dtype=np.int32)}
     operation = SimpleNamespace(block_tables_arrays=lambda: tables)
@@ -366,7 +313,7 @@ def test_lcm_group_capacity_uses_its_cache_blocks_per_parent() -> None:
         prompt_len=8,
     )
     tables["history"][0, 1] = 7
-    with pytest.raises(CachePDProtocolError, match="invalid page ID"):
+    with pytest.raises(CacheContractError, match="invalid page ID"):
         build_cache_page_manifest(
             operation,
             layout=layout,
@@ -376,75 +323,58 @@ def test_lcm_group_capacity_uses_its_cache_blocks_per_parent() -> None:
         )
 
 
-def test_manifest_flattens_to_shared_mooncake_page_vector_order() -> None:
-    source_layout = _layout(64)
-    destination_layout = _layout(128)
-    source = build_cache_page_manifest(
-        _op(),
-        layout=source_layout,
-        request_row=0,
-        prefix_len=8,
-        prompt_len=14,
+def test_destination_manifest_uses_peer_local_group_packing() -> None:
+    def layout(*, packing: int, physical_page_bytes: int) -> CacheTransferContract:
+        spec = _group_spec(
+            "history",
+            "history",
+            "full_suffix",
+            prefix_granularity=2,
+            packing=packing,
+        )
+        return _contract(
+            (spec,),
+            (
+                _field(
+                    "history",
+                    "layer.0.k",
+                    shape=(4,),
+                    element_size=2,
+                    stride=8,
+                ),
+            ),
+            block_size=2,
+            capacity=4,
+            page_bytes=physical_page_bytes,
+            dtypes=("bfloat16",),
+        )
+
+    source_layout = layout(packing=1, physical_page_bytes=8)
+    destination_layout = layout(packing=2, physical_page_bytes=16)
+    source = CachePDPageManifest(
+        groups=(CachePDGroupPages("history", (3,)),),
+        prefix_len=0,
+        prompt_len=2,
     )
-    destination = build_cache_page_manifest(
-        _op(40),
-        layout=destination_layout,
-        request_row=0,
-        prefix_len=8,
-        prompt_len=14,
+    destination = CachePDPageManifest(
+        groups=(CachePDGroupPages("history", (6,)),),
+        prefix_len=0,
+        prompt_len=2,
     )
-    assert cache_manifest_page_ids(
-        source,
-        layout=source_layout,
-        peer="source",
-    ) == (3, 4, 14, 24)
-    assert cache_manifest_page_ids(
+
+    validate_cache_peer_layout(source_layout, destination_layout)
+    validate_cache_manifest(source, layout=source_layout, peer="source")
+    validate_cache_manifest(
         destination,
-        layout=source_layout,
-        num_pages_with_null=destination_layout.num_pages_with_null,
+        layout=destination_layout,
         peer="destination",
-    ) == (43, 44, 54, 64)
-
-
-def test_registration_validation_rejects_bad_extents() -> None:
-    layout = _layout()
-    registrations = _registrations(layout, 10_000)
-    extent = layout.num_pages_with_null * layout.physical_page_bytes
-    assert (
-        validate_cache_slab_registrations(registrations, layout=layout, peer="test")
-        == registrations
     )
-    with pytest.raises(CachePDProtocolError, match="exact physical-slot"):
-        validate_cache_slab_registrations(
-            tuple(reversed(registrations)), layout=layout, peer="test"
+    with pytest.raises(CacheContractError, match="out-of-bounds"):
+        validate_cache_manifest(
+            destination,
+            layout=source_layout,
+            peer="destination",
         )
-    with pytest.raises(CachePDProtocolError, match="extent"):
-        validate_cache_slab_registrations(
-            (replace(registrations[0], length=extent - 1), *registrations[1:]),
-            layout=layout,
-            peer="test",
-        )
-    with pytest.raises(CachePDProtocolError, match="buffer ID"):
-        validate_cache_slab_registrations(
-            (
-                replace(registrations[0], buffer_id="wrong.raw.0"),
-                *registrations[1:],
-            ),
-            layout=layout,
-            peer="test",
-        )
-    with pytest.raises(CachePDProtocolError, match="overlap"):
-        validate_cache_slab_registrations(
-            (
-                registrations[0],
-                replace(registrations[1], base_addr=registrations[0].base_addr),
-                registrations[2],
-            ),
-            layout=layout,
-            peer="test",
-        )
-    with pytest.raises(CachePDProtocolError, match="uint64"):
-        CachePDSlabRegistration(0, "slab.0", (1 << 64) - extent + 1, extent)
 
 
 def _cache_buffer(nbytes: int, data_ptr: int = 0x10000):
@@ -475,35 +405,34 @@ def _cache_buffer(nbytes: int, data_ptr: int = 0x10000):
     return _Backing()
 
 
-def _two_plane_lcm_plan(num_lcm_blocks: int):
+def _two_plane_lcm_plan(num_lcm_blocks: int) -> CacheMemoryPlan:
     plane_bytes = 512
     lcm_block_bytes = 1024
-    return SimpleNamespace(
-        logical_block_tokens=4,
+    return CacheMemoryPlan(
+        prefix_granularity=4,
         lcm_block_bytes=lcm_block_bytes,
         num_lcm_blocks=num_lcm_blocks,
-        arena_bytes=(num_lcm_blocks + 1) * lcm_block_bytes,
         groups=(
-            SimpleNamespace(
+            CacheGroupLayout(
                 group_id="history",
                 cache_blocks_per_lcm_block=2,
                 page_count=1 + num_lcm_blocks * 2,
             ),
         ),
         planes=(
-            SimpleNamespace(
+            CachePlaneLayout(
                 plane_id="k",
                 bytes_per_lcm_block=plane_bytes,
                 arena_offset_bytes=0,
             ),
-            SimpleNamespace(
+            CachePlaneLayout(
                 plane_id="v",
                 bytes_per_lcm_block=plane_bytes,
                 arena_offset_bytes=(num_lcm_blocks + 1) * plane_bytes,
             ),
         ),
         fields=(
-            SimpleNamespace(
+            CacheFieldLayout(
                 group_id="history",
                 field_id="layer.0.k",
                 plane_id="k",
@@ -511,9 +440,8 @@ def _two_plane_lcm_plan(num_lcm_blocks: int):
                 element_size=2,
                 field_offset_bytes=0,
                 page_stride_bytes=256,
-                payload_bytes=64,
             ),
-            SimpleNamespace(
+            CacheFieldLayout(
                 group_id="history",
                 field_id="layer.0.v",
                 plane_id="v",
@@ -521,106 +449,256 @@ def _two_plane_lcm_plan(num_lcm_blocks: int):
                 element_size=2,
                 field_offset_bytes=0,
                 page_stride_bytes=256,
-                payload_bytes=64,
             ),
         ),
     )
 
 
 _LCM_SPECS = (
-    SimpleNamespace(
+    PagedCacheGroupSpec(
         group_id="history",
-        family="history",
-        transfer_policy="full_suffix",
         retention="full_history",
+        rows_per_page=4,
+        entry_stride_tokens=1,
         sliding_window_tokens=None,
+        family="history",
+        cache_blocks_per_lcm_block=2,
+        transfer_policy="full_suffix",
     ),
 )
 
 
-def test_lcm_contract_registers_one_arena_and_preserves_group_geometry() -> None:
-
-    plan = SimpleNamespace(
-        logical_block_tokens=4,
-        lcm_block_bytes=1024,
-        num_lcm_blocks=3,
-        arena_bytes=4096,
-        groups=(
-            SimpleNamespace(
-                group_id="history",
-                cache_blocks_per_lcm_block=2,
-                page_count=7,
-            ),
-        ),
-        planes=(
-            SimpleNamespace(
-                plane_id="k",
-                bytes_per_lcm_block=512,
-                arena_offset_bytes=0,
-            ),
-        ),
-        fields=(
-            SimpleNamespace(
-                group_id="history",
-                field_id="layer.0.k",
-                plane_id="k",
-                shape=(4, 8),
-                element_size=2,
-                field_offset_bytes=0,
-                page_stride_bytes=256,
-                payload_bytes=64,
-            ),
-        ),
+def _recipe_contract(
+    fields,
+    specs,
+    dtypes,
+    *,
+    ptr=0x10000,
+    q=128,
+    transfer_schema=CacheTransferSchema(),
+    **solve,
+):
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+        solve_cache_layout,
     )
-    layout, registrations = build_lcm_pd_cache_contract(
+
+    plan = solve_cache_layout(
+        fields,
+        prefix_granularity=q,
+        max_padding_fraction=1.0,
+        **solve,
+    ).with_num_lcm_blocks(3)
+    aligned_specs = tuple(
+        replace(
+            spec,
+            cache_blocks_per_lcm_block=(
+                plan.group(spec.group_id).cache_blocks_per_lcm_block
+            ),
+        )
+        for spec in specs
+    )
+    return build_cache_transfer_contract(
         plan=plan,
-        buffer=_cache_buffer(4096),
+        buffer=_cache_buffer(plan.arena_bytes, data_ptr=ptr),
+        group_specs=aligned_specs,
+        field_dtypes=dtypes,
+        transfer_schema=transfer_schema,
+    )[0]
+
+
+def test_lcm_contract_registers_one_arena_and_preserves_group_geometry() -> None:
+    plan = _two_plane_lcm_plan(3)
+    layout, base_addr = build_cache_transfer_contract(
+        plan=plan,
+        buffer=_cache_buffer(plan.arena_bytes),
         group_specs=_LCM_SPECS,
-        field_dtypes={"layer.0.k": "bfloat16"},
+        field_dtypes={"layer.0.k": "bfloat16", "layer.0.v": "bfloat16"},
     )
 
-    assert layout.num_pages_with_null == 4
-    assert layout.groups[0].cache_blocks_per_lcm_block == 2
-    assert layout.groups[0].transfer_segments[0].page_zero_offset == 256
-    assert registrations == (CachePDSlabRegistration(0, "lcm_arena", 0x10000, 4096),)
-    assert layout.peer.page_zero_offsets[0].page_zero_offset == 256
+    assert layout.plan.num_lcm_blocks + 1 == 4
+    assert layout.plan.groups[0].cache_blocks_per_lcm_block == 2
+    fields = layout.fields_for_group("history")
+    assert tuple(field.field_id for field in fields) == (
+        "layer.0.k",
+        "layer.0.v",
+    )
+    assert layout.plan.field_page_byte_offset(fields[0].field_id, 0) == 256
+    assert base_addr == 0x10000
 
 
-def test_fingerprint_ignores_num_lcm_blocks_but_peer_offsets_differ() -> None:
-    small, _ = build_lcm_pd_cache_contract(
+def test_peer_layout_allows_capacity_and_offsets_to_differ() -> None:
+    small, _ = build_cache_transfer_contract(
         plan=_two_plane_lcm_plan(3),
         buffer=_cache_buffer(4096),
         group_specs=_LCM_SPECS,
         field_dtypes={"layer.0.k": "bfloat16", "layer.0.v": "bfloat16"},
     )
-    large, _ = build_lcm_pd_cache_contract(
+    large, _ = build_cache_transfer_contract(
         plan=_two_plane_lcm_plan(5),
         buffer=_cache_buffer(6144, data_ptr=0x20000),
         group_specs=_LCM_SPECS,
         field_dtypes={"layer.0.k": "bfloat16", "layer.0.v": "bfloat16"},
     )
 
-    assert small.layout_fingerprint == large.layout_fingerprint
-    assert small.num_pages_with_null != large.num_pages_with_null
-    assert (
-        small.groups[0].transfer_segments[1].page_zero_offset
-        != large.groups[0].transfer_segments[1].page_zero_offset
+    assert small.plan.num_lcm_blocks != large.plan.num_lcm_blocks
+    assert small.plan.field_page_byte_offset(
+        "layer.0.v", 0
+    ) != large.plan.field_page_byte_offset("layer.0.v", 0)
+    validate_cache_peer_layout(small, large)
+
+
+@pytest.mark.parametrize("family", ("mha", "mla", "dsa"))
+def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
+    family: str,
+) -> None:
+    import torch
+
+    from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
+        _ordinary_fields,
     )
-    validate_cache_peer_layout(small, large.peer)
-    assert [offset.field_id for offset in large.peer.page_zero_offsets] == [
-        "layer.0.k",
-        "layer.0.v",
-    ]
-    wire = large.peer.to_wire_bytes()
-    assert CachePDPeerLayout.from_wire_bytes(wire) == large.peer
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        build_paged_cache_group_specs,
+    )
+
+    common = {
+        "device": "cpu",
+        "backend_name": "test",
+        "num_attention_heads": 8,
+        "num_kv_heads": 4,
+        "head_dim": 8,
+        "attn_tp_size": 2,
+        "dtype": torch.bfloat16,
+        "kv_cache_dtype": torch.bfloat16,
+        "prefix_granularity": 16,
+        "context_len": 256,
+        "max_bs": 4,
+        "max_graph_bs": 4,
+        "kv_cache_quant_method": "none",
+    }
+    classes = {"mha": MHAConfig, "mla": MLAConfig, "dsa": DSAConfig}
+    extras = {}
+    if family != "mha":
+        extras.update(
+            kv_lora_rank=6,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=2,
+            v_head_dim=4,
+            scaling=1.0,
+            kv_cache_dim=8,
+        )
+    if family == "dsa":
+        extras.update(index_topk=4, index_head_dim=128, index_n_heads=1)
+    config = classes[family](
+        **common,
+        **extras,
+        layer_types=(),
+        pd_disaggregation_enabled=True,
+    )
+
+    fields, group_ids = _ordinary_fields(config, 2)
+    packing = {group_id: 1 for group_id in group_ids}
+    specs = build_paged_cache_group_specs(
+        layer_types=(),
+        group_ids=group_ids,
+        sliding_window_tokens=None,
+        prefix_granularity=config.prefix_granularity,
+        cache_blocks_per_lcm_block=packing,
+        pd_disaggregation_enabled=True,
+    )
+    field_dtypes = {
+        field.field_id: (
+            "uint8"
+            if family == "dsa" and field.field_id.endswith(".index_k")
+            else "bfloat16"
+        )
+        for field in fields
+    }
+    layout = _recipe_contract(
+        fields,
+        specs,
+        field_dtypes,
+        q=config.prefix_granularity,
+        cache_blocks_per_lcm_block=packing,
+        alignment=1,
+    )
+    model_config = SimpleNamespace(
+        num_attention_layers=2,
+        num_key_value_heads=4,
+        hf_config=SimpleNamespace(),
+    )
+    layout = replace(
+        layout,
+        transfer_schema=build_cache_transfer_schema(
+            layout.plan,
+            model_config=model_config,
+        ),
+    )
+
+    assert layout.plan.prefix_granularity == 16
+    assert len(layout.group_specs) == 1
+    group = layout.group_specs[0]
+    assert (
+        group.group_id,
+        group.family,
+        group.cache_blocks_per_lcm_block,
+    ) == (
+        "full_attention",
+        "history",
+        1,
+    )
+
+    fields_by_id = {
+        field.field_id: field for field in layout.fields_for_group(group.group_id)
+    }
+    suffixes = {
+        "mha": ("k", "v"),
+        "mla": ("latent_kv",),
+        "dsa": ("index_k", "latent_kv"),
+    }[family]
+    expected_field_ids = tuple(
+        f"layer.{layer_id}.{suffix}" for layer_id in range(2) for suffix in suffixes
+    )
+    assert tuple(sorted(fields_by_id)) == expected_field_ids
+    for field_id, field in fields_by_id.items():
+        is_index = field_id.endswith(".index_k")
+        expected_shape = (
+            (16, 132)
+            if family == "dsa" and is_index
+            else (16, 1, 8) if field_id.endswith(".latent_kv") else (16, 2, 8)
+        )
+        expected_element_size = 1 if family == "dsa" and is_index else 2
+        assert layout.field_dtype(field_id) == field_dtypes[field_id]
+        assert field.shape == expected_shape
+        assert field.element_size == expected_element_size
+        partition = layout.transfer_schema.partition_for(field_id)
+        if field_id.endswith((".k", ".v")):
+            assert partition is not None
+            assert partition.axis == 1
+            assert partition.global_extent == 4
+        else:
+            assert partition is None
 
 
-def test_peer_layout_rejects_unsupported_version() -> None:
-    peer = _layout().peer
-    with pytest.raises(
-        CachePDProtocolError, match="unsupported Paged cache layout version"
-    ):
-        replace(peer, version=1)
+def test_producer_schedule_groups_draft_fields_in_the_final_step() -> None:
+    spec = _group_spec("history", "history", "full_suffix")
+    layout = _contract(
+        (spec,),
+        tuple(
+            _field("history", f"layer.{layer_id}.kv", offset=layer_id)
+            for layer_id in range(4)
+        ),
+    )
+
+    schedule = build_cache_fields_by_producer_step(layout.plan, num_target_layers=2)
+
+    assert schedule.fields_by_step == (
+        ("layer.0.kv",),
+        ("layer.1.kv",),
+        ("layer.2.kv", "layer.3.kv"),
+    )
 
 
 if __name__ == "__main__":

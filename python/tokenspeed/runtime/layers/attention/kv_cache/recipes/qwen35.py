@@ -44,7 +44,7 @@ def qwen_gdn_cache_fields(
     *,
     layer_types,
     layer_group_ids,
-    logical_block_tokens,
+    prefix_granularity,
     kv_shape,
     kv_element_size,
     conv_shape,
@@ -58,9 +58,8 @@ def qwen_gdn_cache_fields(
             f"layer_types has {len(layer_types)} entries but layer_group_ids "
             f"has {len(layer_group_ids)}"
         )
-    if next(iter(kv_shape)) != logical_block_tokens:
-        raise ValueError("kv_shape must start with logical_block_tokens")
-
+    if next(iter(kv_shape)) != prefix_granularity:
+        raise ValueError("kv_shape must start with prefix_granularity")
     occurrences: dict[str, int] = {}
     fields = []
     for layer_id, (label, group_id) in enumerate(zip(layer_types, layer_group_ids)):
@@ -131,7 +130,7 @@ def prepare_qwen35_cache(
         raise RuntimeError(
             "Qwen cache buffer does not yet support the MXFP8 interleaved scale layout"
         )
-    logical_block_tokens = 128
+    prefix_granularity = 128
     text_config = getattr(model_config.hf_config, "text_config", model_config.hf_config)
     conv_shape, ssm_shape, conv_dtype, ssm_dtype, _ = text_config.mamba2_cache_params
     layer_types = tuple(attn_config.layer_types)
@@ -139,9 +138,9 @@ def prepare_qwen35_cache(
     fields = qwen_gdn_cache_fields(
         layer_types=layer_types,
         layer_group_ids=group_ids,
-        logical_block_tokens=logical_block_tokens,
+        prefix_granularity=prefix_granularity,
         kv_shape=(
-            logical_block_tokens,
+            prefix_granularity,
             max(attn_config.num_kv_heads // attn_config.attn_tp_size, 1),
             attn_config.head_dim,
         ),
@@ -179,7 +178,7 @@ def prepare_qwen35_cache(
         draft_fields = draft_cache_fields(
             layer_group_ids=draft_group_ids,
             enabled_layer_ids=range(draft_num_layers),
-            logical_block_tokens=logical_block_tokens,
+            prefix_granularity=prefix_granularity,
             layer_kv_heads=per_rank_heads,
             head_dim=draft_attn_config.head_dim,
             kv_element_size=draft_attn_config.kv_cache_dtype.itemsize,
@@ -226,7 +225,7 @@ def prepare_qwen35_cache(
         layer_types=merged_layer_types,
         group_ids=merged_group_ids,
         sliding_window_tokens=None,
-        page_size=logical_block_tokens,
+        prefix_granularity=prefix_granularity,
         pd_disaggregation_enabled=attn_config.pd_disaggregation_enabled,
     )
     return build_hybrid_cache_setup(
@@ -241,7 +240,7 @@ def prepare_qwen35_cache(
         num_draft_layers=num_draft_layers,
         cache_budget_bytes=cache_budget_bytes,
         fixed_workspace_bytes=fixed_workspace_bytes,
-        logical_block_tokens=logical_block_tokens,
+        prefix_granularity=prefix_granularity,
         max_padding_fraction=qwen_gdn_max_padding_fraction(
             layer_types=layer_types,
             num_draft_layers=num_draft_layers,

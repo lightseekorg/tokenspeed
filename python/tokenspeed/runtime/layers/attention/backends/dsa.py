@@ -37,6 +37,9 @@ from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.trtllm_mla import TRTLLMMLABackend
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    DSA_SPARSE_PAGE_SIZE,
+)
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 
@@ -66,7 +69,11 @@ class DSABackend(AttentionBackend):
         self._dense_backend = _make_dense_backend(config, platform)
         self.index_topk = config.index_topk
         self.max_context_len = config.context_len
-        self.page_size = config.page_size
+        self.kernel_page_size = (
+            config.kernel_page_size
+            if config.kernel_page_size is not None
+            else DSA_SPARSE_PAGE_SIZE
+        )
         self.kv_lora_rank = config.kv_lora_rank
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
@@ -76,7 +83,7 @@ class DSABackend(AttentionBackend):
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
         self.num_local_heads = config.num_attention_heads // config.attn_tp_size
-        self._prefill_block_tables: torch.Tensor | None = None
+        self._prefill_page_table: torch.Tensor | None = None
 
     @property
     def forward_decode_metadata(self):
@@ -111,13 +118,13 @@ class DSABackend(AttentionBackend):
         return self._dense_backend.trtllm_workspace
 
     @property
-    def _block_table_aliased(self):
-        return getattr(self._dense_backend, "_block_table_aliased", False)
+    def _page_table_aliased(self):
+        return getattr(self._dense_backend, "_page_table_aliased", False)
 
-    @_block_table_aliased.setter
-    def _block_table_aliased(self, value):
+    @_page_table_aliased.setter
+    def _page_table_aliased(self, value):
         if hasattr(self, "_dense_backend"):
-            self._dense_backend._block_table_aliased = value
+            self._dense_backend._page_table_aliased = value
 
     def register_step_counter(self, step_counter):
         super().register_step_counter(step_counter)
@@ -164,7 +171,7 @@ class DSABackend(AttentionBackend):
             .contiguous()
         )
         metadata._dsa_plan = dsa_plan(
-            seq_lens_2d=metadata._dsa_seq_lens_2d, page_size=self.page_size
+            seq_lens_2d=metadata._dsa_seq_lens_2d, page_size=self.kernel_page_size
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -190,7 +197,7 @@ class DSABackend(AttentionBackend):
         )
         dsa_plan(
             seq_lens_2d=metadata._dsa_seq_lens_2d,
-            page_size=self.page_size,
+            page_size=self.kernel_page_size,
             out=metadata._dsa_plan,
         )
 
@@ -205,7 +212,7 @@ class DSABackend(AttentionBackend):
 
         dsa_plan(
             seq_lens_2d=metadata.seq_lens_k.unsqueeze(1),
-            page_size=self.page_size,
+            page_size=self.kernel_page_size,
             out=metadata._dsa_plan,
         )
 
@@ -253,10 +260,10 @@ class DSABackend(AttentionBackend):
                 # The dsa_plan is unused, alias to full-batch seq_lens_2d to generate dsa_plan as a placeholder
                 seq_lens_2d = metadata._dsa_seq_lens_2d
             metadata._dsa_plan = dsa_plan(
-                seq_lens_2d=seq_lens_2d, page_size=self.page_size
+                seq_lens_2d=seq_lens_2d, page_size=self.kernel_page_size
             )
 
-        self._prefill_block_tables = None
+        self._prefill_page_table = None
         if num_extends > 0 and forward_mode.is_extend_or_mixed():
             cache_metadata = kwargs.get("cache_metadata")
             cmeta = getattr(self._dense_backend, "chunked_prefill_metadata", None)
@@ -272,8 +279,8 @@ class DSABackend(AttentionBackend):
                 elif page_table is not None:
                     table = page_table
                 if table is not None:
-                    self._prefill_block_tables = table[:num_extends]
-                    cmeta.block_tables = self._prefill_block_tables
+                    self._prefill_page_table = table[:num_extends]
+                    cmeta.page_table = self._prefill_page_table
 
     def _validate_logit_cap(self, logits_soft_cap: float) -> None:
         if logits_soft_cap and logits_soft_cap > 0:
@@ -390,7 +397,7 @@ class DSABackend(AttentionBackend):
         q: torch.Tensor,
         layer,
         token_to_kv_pool,
-        block_tables: torch.Tensor,
+        page_table: torch.Tensor,
         seq_lens: torch.Tensor,
         workspace_indices: torch.Tensor,
         topk_lens: torch.Tensor,
@@ -457,10 +464,17 @@ class DSABackend(AttentionBackend):
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             softmax_scale=layer.scaling,
-            page_size=self.page_size,
+            page_size=self.kernel_page_size,
             logit_cap=layer.logit_cap,
             k_scale=k_scale,
         )
+        # GLM's sparse-prefill path writes both the latent KV and index_k before
+        # entering this method, but bypasses AttentionBackend.forward and its
+        # normal PD readiness hook. Publish the layer only after the dependent
+        # sparse-attention launch has been enqueued, so layerwise transfer cannot
+        # observe either cache field before it is ready.
+        if getattr(self, "step_counter", None) is not None:
+            self.step_counter.record_cache()
         return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_sparse_decode(
@@ -477,10 +491,11 @@ class DSABackend(AttentionBackend):
         topk_indices: torch.Tensor,
         topk_lens: torch.Tensor | None,
     ) -> torch.Tensor:
-        if self.page_size != 64:
+        if self.kernel_page_size != DSA_SPARSE_PAGE_SIZE:
             raise RuntimeError(
-                "DSA sparse decode currently requires page_size=64 for "
-                f"sparse KV layout, got {self.page_size}."
+                f"DSA sparse decode requires kernel_page_size="
+                f"{DSA_SPARSE_PAGE_SIZE} for "
+                f"sparse KV layout, got {self.kernel_page_size}."
             )
         if getattr(token_to_kv_pool, "quant_method", None) == "per_token_head":
             raise RuntimeError(
@@ -588,7 +603,7 @@ class DSABackend(AttentionBackend):
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             softmax_scale=layer.scaling,
-            page_size=self.page_size,
+            page_size=self.kernel_page_size,
             q_len_per_req=q_len_per_req,
             logit_cap=layer.logit_cap,
             k_scale=k_scale,

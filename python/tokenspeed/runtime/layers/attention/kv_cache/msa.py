@@ -24,7 +24,7 @@ class MSATokenToKVPool(MHATokenToKVPool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
-        page_size: int,
+        prefix_granularity: int,
         rank: int,
         index_head_dim: int,
         index_dtype: torch.dtype,
@@ -34,7 +34,6 @@ class MSATokenToKVPool(MHATokenToKVPool):
         token_capacity: int | None = None,
         layer_types: tuple[str, ...] = (),
         layer_group_ids: tuple[str, ...] = (),
-        pd_disaggregation_enabled: bool = False,
     ) -> None:
         self.index_head_dim = index_head_dim
         self.index_dtype = index_dtype
@@ -48,11 +47,10 @@ class MSATokenToKVPool(MHATokenToKVPool):
             layer_num=layer_num,
             device=device,
             enable_memory_saver=enable_memory_saver,
-            page_size=page_size,
+            prefix_granularity=prefix_granularity,
             rank=rank,
             layer_types=layer_types,
             layer_group_ids=layer_group_ids,
-            pd_disaggregation_enabled=pd_disaggregation_enabled,
             memory_plan=memory_plan,
             paged_cache_group_specs=paged_cache_group_specs,
             token_capacity=token_capacity,
@@ -79,8 +77,3 @@ class MSATokenToKVPool(MHATokenToKVPool):
         key_bytes, value_bytes = super().get_kv_size_bytes()
         index_bytes = sum(cache.nbytes for cache in self.index_k_buffer.values())
         return key_bytes + index_bytes, value_bytes
-
-    def get_contiguous_buf_infos(self):
-        raise NotImplementedError(
-            "MiniMax sparse cache transfer requires index-key side-cache support."
-        )

@@ -45,6 +45,9 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    FLASH_MLA_PAGE_SIZE as PAGE_SIZE,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
@@ -55,8 +58,6 @@ from tokenspeed.runtime.layers.attention.utils import (
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.flashinfer_config import get_flashinfer_workspace_size
 
-PAGE_SIZE = 64
-
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
@@ -65,7 +66,7 @@ if TYPE_CHECKING:
 class FlashMLADecodeMetadata:
     num_extends: int = 0
     flashmla_metadata: object | None = None
-    block_table: torch.Tensor | None = None
+    page_table: torch.Tensor | None = None
     seq_lens_k: torch.Tensor | None = None
     # Paged cache only: absolute latent write locations, request-major, with
     # ``group_q_len_per_req`` entries per batch row (1 outside target verify).
@@ -135,7 +136,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # richer cache_metadata instead and must stay off the block_tables
         # path (its capture/eager guards key on this flag).
         self.uses_cache_groups = bool(config.is_draft)
-        self.page_size = PAGE_SIZE
+        self.kernel_page_size = PAGE_SIZE
         self.max_num_pages = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
 
         # MLA-specific dimensions
@@ -335,7 +336,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             # The table is already in FlashMLA's PAGE_SIZE kernel pages; resolve
             # the write locations. Target verify writes the whole spec window
             # (seq-N..seq-1); plain decode writes position seq-1.
-            block_table = group_table[:bs]
+            page_table_rows = group_table[:bs]
             group_out_cache_loc = self._cache_decode_out_cache_loc(
                 group_table,
                 seq_lens,
@@ -350,12 +351,12 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             # page table; init_forward_metadata raises if a bound backend gets
             # neither). page_table is only an empty/dummy placeholder here,
             # batch-ordered like the draft table.
-            block_table = page_table[:bs]
+            page_table_rows = page_table[:bs]
             group_out_cache_loc = None
         self.forward_decode_metadata = FlashMLADecodeMetadata(
             num_extends=num_extends,
             flashmla_metadata=self._new_eager_tile_metadata(),
-            block_table=block_table,
+            page_table=page_table_rows,
             seq_lens_k=seq_lens,
             group_out_cache_loc=group_out_cache_loc,
             group_q_len_per_req=q_len_per_req,
@@ -440,14 +441,14 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             prefill_table = self._group_per_token_slot_table(
                 group_table,
                 batch_size=seq_lens.shape[0],
-                page_size=self.page_size,
+                page_size=self.kernel_page_size,
                 max_context_len=self.max_context_len,
             ).to(torch.int32)
             prefill_req_pool_indices = torch.arange(
                 seq_lens.shape[0], dtype=torch.int64, device=prefill_table.device
             )
             chunk_table = group_table[: seq_lens.shape[0]]
-            chunk_page_size = self.page_size
+            chunk_page_size = self.kernel_page_size
             group_out_cache_loc = self._extend_out_cache_loc(
                 group_table[: seq_lens.shape[0]],
                 extend_prefix_lens_cpu,
@@ -595,7 +596,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         self.forward_decode_metadata = FlashMLADecodeMetadata(
             num_extends=0,
             flashmla_metadata=self._capture_decode_tile_metadata(bs),
-            block_table=self.cuda_graph_kv_indices[:bs],
+            page_table=self.cuda_graph_kv_indices[:bs],
             seq_lens_k=self.cuda_graph_seq_lens_k[:bs],
             group_out_cache_loc=group_out_cache_loc,
             group_q_len_per_req=capture_q_len,
@@ -789,7 +790,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             bs = (
                 q.shape[0]
                 if self.is_draft
-                else metadata.block_table.shape[0] - num_extends
+                else metadata.page_table.shape[0] - num_extends
             )
 
         o, _ = self._run_flash_mla_decode(
@@ -894,7 +895,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         ), f"{layer.tp_q_head_num=} != {self.num_q_heads=}"
         reshape_q = q.view(bs, -1, self.num_q_heads, layer.head_dim)
 
-        block_table = metadata.block_table[num_extends : num_extends + bs]
+        page_table = metadata.page_table[num_extends : num_extends + bs]
         cache_seqlens = metadata.seq_lens_k.to(torch.int32) + cache_seqlens_offset
         # Draft block-decode: forward_decode flattened q to one kernel row per
         # drafted block position (bs == bs_orig * draft_query_width), but the
@@ -903,16 +904,16 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # the whole block (block-diffusion), mirroring tokenspeed_mla's
         # _expand_block_decode_metadata; the FlashMLA kernel requires
         # cache_seqlens to be shape (num_kernel_rows).
-        src_rows = block_table.shape[0]
+        src_rows = page_table.shape[0]
         if self.is_draft and 0 < src_rows < bs and bs % src_rows == 0:
             width = bs // src_rows
-            block_table = block_table.repeat_interleave(width, dim=0)
+            page_table = page_table.repeat_interleave(width, dim=0)
             cache_seqlens = cache_seqlens.repeat_interleave(width)
 
         return flash_mla_with_kvcache(
             q=reshape_q,
             k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
-            block_table=block_table,
+            block_table=page_table,
             cache_seqlens=cache_seqlens,
             head_dim_v=self.kv_lora_rank,
             tile_scheduler_metadata=metadata.flashmla_metadata,

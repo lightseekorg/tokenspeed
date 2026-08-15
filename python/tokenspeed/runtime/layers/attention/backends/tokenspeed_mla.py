@@ -54,6 +54,10 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    TOKENSPEED_MLA_DEFAULT_PAGE_SIZE,
+    TOKENSPEED_MLA_SUPPORTED_PAGE_SIZES,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
@@ -120,7 +124,11 @@ class CuteDSLMLABackend(AttentionBackend):
         self._cache_contract_bound = False
 
         self.max_context_len = config.context_len
-        self.page_size = config.page_size
+        self.kernel_page_size = (
+            config.kernel_page_size
+            if config.kernel_page_size is not None
+            else TOKENSPEED_MLA_DEFAULT_PAGE_SIZE
+        )
 
         # MLA dimensions
         self.kv_lora_rank = config.kv_lora_rank
@@ -162,9 +170,9 @@ class CuteDSLMLABackend(AttentionBackend):
         )
 
         # Validate page_size
-        if self.page_size not in (32, 64):
+        if self.kernel_page_size not in TOKENSPEED_MLA_SUPPORTED_PAGE_SIZES:
             raise ValueError(
-                f"tokenspeed_mla backend requires page_size 32 or 64, got {self.page_size}"
+                f"tokenspeed_mla backend requires page_size 32 or 64, got {self.kernel_page_size}"
             )
 
         # tokenspeed_mla's CuTe DSL kernel only supports fp8_e4m3 KV cache; check
@@ -217,8 +225,8 @@ class CuteDSLMLABackend(AttentionBackend):
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """Calculate block count padded to satisfy the fused-kernel constraint."""
-        blocks = triton.cdiv(max_seq_len, self.page_size)
-        constraint = TRTLLM_BLOCK_CONSTRAINT // self.page_size
+        blocks = triton.cdiv(max_seq_len, self.kernel_page_size)
+        constraint = TRTLLM_BLOCK_CONSTRAINT // self.kernel_page_size
         if blocks % constraint != 0:
             blocks = triton.cdiv(blocks, constraint) * constraint
         return blocks
@@ -259,7 +267,7 @@ class CuteDSLMLABackend(AttentionBackend):
         ``kernel_table``.
         """
         table = cache_metadata.kernel_table(
-            page_size=self.page_size,
+            kernel_page_size=self.kernel_page_size,
             max_pages=self._calc_padded_blocks(self.max_context_len),
             active_forward_op=forward_batch,
         )
@@ -297,7 +305,7 @@ class CuteDSLMLABackend(AttentionBackend):
         the persistent buffer the graph recorded — same ``data_ptr`` — instead
         of allocating a fresh tensor. No host sync on either path.
         """
-        page_size = self.page_size
+        page_size = self.kernel_page_size
         last = (seq_lens[:bs].to(torch.int64) - 1).clamp_min(0)
         if q_len_per_req == 1:
             pos = last.unsqueeze(1)
@@ -328,7 +336,7 @@ class CuteDSLMLABackend(AttentionBackend):
         Positions ``[prefix_len, seq_len)`` per request, flattened in q/k/v
         token order. Bounds come from the CPU length mirrors — no GPU sync.
         """
-        page_size = self.page_size
+        page_size = self.kernel_page_size
         device = group_table.device
         chunks: list[torch.Tensor] = []
         pages_for_check: list[torch.Tensor] = []
@@ -573,7 +581,7 @@ class CuteDSLMLABackend(AttentionBackend):
             chunk_req_pool_indices = torch.arange(
                 num_extends, dtype=torch.int64, device=group_table.device
             )
-            chunk_page_size = self.page_size
+            chunk_page_size = self.kernel_page_size
         else:
             # Idle/warmup placeholder: page_table is batch-ordered (row i ==
             # batch position i), so identity row indices apply.
@@ -581,7 +589,7 @@ class CuteDSLMLABackend(AttentionBackend):
             chunk_req_pool_indices = torch.arange(
                 num_extends, dtype=torch.int64, device=page_table.device
             )
-            chunk_page_size = self.page_size
+            chunk_page_size = self.kernel_page_size
         (
             chunked_loop_num,
             chunk_kv_indices_list,
@@ -746,7 +754,7 @@ class CuteDSLMLABackend(AttentionBackend):
 
         # Block indices are refreshed separately; when the block table is
         # aliased to a peer backend, that peer's replay already populated it.
-        if page_table is not None and not self._block_table_aliased:
+        if page_table is not None and not self._page_table_aliased:
             self._create_block_kv_indices(
                 bs,
                 metadata.block_kv_indices.shape[1],
@@ -866,7 +874,7 @@ class CuteDSLMLABackend(AttentionBackend):
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         if self.data_type != k_cache.dtype:
             k_cache = k_cache.to(self.data_type)
-        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim)
+        kv_cache = k_cache.view(-1, self.kernel_page_size, self.kv_cache_dim)
 
         if not CuteDSLMLABackend._logged_decode:
             logger.info(

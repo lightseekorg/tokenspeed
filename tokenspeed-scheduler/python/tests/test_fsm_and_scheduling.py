@@ -51,18 +51,18 @@ from tokenspeed_scheduler import (
 def make_config(
     max_scheduled_tokens: int = 512,
     max_batch_size: int = 8,
-    page_size: int = 16,
+    prefix_granularity: int = 16,
     num_device_pages: int = 1024,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
-    cfg.block_size = page_size
+    cfg.prefix_granularity = prefix_granularity
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
     cfg.num_device_pages = num_device_pages
     cfg.paged_cache_groups = [
         PagedCacheGroupConfig(
             group_id="full_attention",
-            rows_per_page=page_size,
+            rows_per_page=prefix_granularity,
             entry_stride_tokens=1,
             total_pages=num_device_pages,
             retention=PagedCacheRetention.FullHistory,
@@ -554,10 +554,10 @@ class TestUpdateReserveNumTokens:
 
     def test_reserve_causes_extra_page_allocation_on_decode(self):
         """When reserve_num_tokens_in_next_schedule_event exceeds tail capacity, extra pages are allocated."""
-        # page_size=16: after prefilling 8 tokens, tail page has 8 free slots.
+        # prefix_granularity=16: after prefilling 8 tokens, tail page has 8 free slots.
         # First decode: PrefillDone→Decoding uses PrefillDone's built-in reserve (decode_input_tokens=1),
         # no extra page. Then set reserve=16 for next decode step, which needs 1 extra page.
-        s = Scheduler(make_config(page_size=16, num_device_pages=1024))
+        s = Scheduler(make_config(prefix_granularity=16, num_device_pages=1024))
         submit(s, "r0", list(range(8)))
         s.next_execution_plan()  # → PrefillDone (1 page, 8 slots used, 8 free)
         s.next_execution_plan()  # PrefillDone → Decoding (reserve consumed, new reserve=-1)
@@ -573,7 +573,7 @@ class TestUpdateReserveNumTokens:
 
     def test_reserve_update_overrides_previous_value(self):
         """The last UpdateReserveNumTokens wins; earlier values are discarded."""
-        s = Scheduler(make_config(page_size=16, num_device_pages=1024))
+        s = Scheduler(make_config(prefix_granularity=16, num_device_pages=1024))
         submit(s, "r0", list(range(8)))
         s.next_execution_plan()  # → PrefillDone (tail has 8 free slots)
         s.next_execution_plan()  # PrefillDone → Decoding (reserve consumed, new reserve=-1)
@@ -586,9 +586,9 @@ class TestUpdateReserveNumTokens:
 
     def test_reserve_larger_than_one_page_allocates_multiple_pages(self):
         """A reserve requiring more than one extra page allocates all of them."""
-        # page_size=8: after prefilling 4 tokens, first decode step uses PrefillDone reserve.
+        # prefix_granularity=8: after prefilling 4 tokens, first decode step uses PrefillDone reserve.
         # Then set reserve=20, which should require multiple extra pages on next decode step.
-        s = Scheduler(make_config(page_size=8, num_device_pages=1024))
+        s = Scheduler(make_config(prefix_granularity=8, num_device_pages=1024))
         submit(s, "r0", list(range(4)))
         s.next_execution_plan()  # → PrefillDone
         s.next_execution_plan()  # PrefillDone → Decoding (reserve consumed)
@@ -602,7 +602,7 @@ class TestUpdateReserveNumTokens:
 
     def test_reserve_auto_resets_after_allocation(self):
         """After decode allocates for reserve, subsequent steps need no extra pages if reserve is small."""
-        s = Scheduler(make_config(page_size=16, num_device_pages=1024))
+        s = Scheduler(make_config(prefix_granularity=16, num_device_pages=1024))
         submit(s, "r0", list(range(8)))
         s.next_execution_plan()  # → PrefillDone
         s.next_execution_plan()  # PrefillDone → Decoding (reserve consumed)
@@ -618,7 +618,7 @@ class TestUpdateReserveNumTokens:
 
     def test_reserve_updated_during_decoding(self):
         """UpdateReserveNumTokens applied while already Decoding takes effect next decode step."""
-        s = Scheduler(make_config(page_size=16, num_device_pages=1024))
+        s = Scheduler(make_config(prefix_granularity=16, num_device_pages=1024))
         submit(s, "r0", list(range(8)))
         s.next_execution_plan()  # → PrefillDone
         s.next_execution_plan()  # PrefillDone → Decoding (reserve consumed, tail has 8 free slots)
@@ -634,7 +634,7 @@ class TestUpdateReserveNumTokens:
         PrefillDone carries its own built-in reserve (decode_input_tokens=1 by default).
         To test extra pages, transition to Decoding first, then set a large reserve.
         """
-        s = Scheduler(make_config(page_size=16, num_device_pages=1024))
+        s = Scheduler(make_config(prefix_granularity=16, num_device_pages=1024))
         submit(s, "r0", list(range(8)))
         prefill_plan = s.next_execution_plan()  # → PrefillDone
         assert prefill_plan.forward[0].num_extends() > 0
@@ -654,7 +654,7 @@ class TestUpdateReserveNumTokens:
     def test_reserve_independent_per_request(self):
         """Reserve settings on one request do not affect another in the same batch."""
         s = Scheduler(
-            make_config(page_size=16, num_device_pages=1024, max_batch_size=8)
+            make_config(prefix_granularity=16, num_device_pages=1024, max_batch_size=8)
         )
         # Submit both together so they are both Submitted at the first plan → both become PrefillDone.
         submit(s, "r0", list(range(8)))
@@ -685,7 +685,7 @@ class TestDecodeInputIds:
 
     def test_normal_decode_has_minus_one(self):
         """Normal decode (not recovered from Retract) yields decode_input_ids == [-1]."""
-        s = Scheduler(make_config(page_size=16, num_device_pages=1024))
+        s = Scheduler(make_config(prefix_granularity=16, num_device_pages=1024))
         submit(s, "r0", list(range(8)))
         s.next_execution_plan()  # Submitted → PrefillDone
         decode_plan = s.next_execution_plan()  # PrefillDone → Decoding
@@ -695,7 +695,9 @@ class TestDecodeInputIds:
 
     def test_mixed_batch_decode_input_ids_length(self):
         """decode_input_ids has one entry per decode request; all -1 for normal decodes."""
-        cfg = make_config(page_size=16, num_device_pages=1024, max_batch_size=8)
+        cfg = make_config(
+            prefix_granularity=16, num_device_pages=1024, max_batch_size=8
+        )
         cfg.enable_mixed_prefill_decode = True
         s = Scheduler(cfg)
         # Bring r0 to Decoding.

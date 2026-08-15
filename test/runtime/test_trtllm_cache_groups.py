@@ -54,8 +54,8 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         # Capture/replay tests pass device="cuda" and declare their groups —
         # replay write locs are triton-only (no python fallback).
         b = self.Backend.__new__(self.Backend)
-        b.page_size = page_size
-        b.group_page_sizes = dict(groups or {})
+        b.kernel_page_size = page_size
+        b.group_block_granularities = dict(groups or {})
         b.cache_pool = None
         if groups:
             b.cache_pool = CachePool.__new__(CachePool)
@@ -130,12 +130,13 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             attn_tp_size=1,
             dtype=self.torch.bfloat16,
             kv_cache_dtype=self.torch.bfloat16,
-            page_size=64,
+            prefix_granularity=64,
+            kernel_page_size=64,
             context_len=256,
             max_bs=1,
             max_graph_bs=1,
             kv_cache_quant_method="none",
-            group_page_sizes={"full_attention": 128},
+            group_block_granularities={"full_attention": 128},
         )
         with (
             envs.TOKENSPEED_WORKSPACE_TRTLLM_MHA_MB.override(1),
@@ -143,7 +144,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         ):
             backend = self.Backend(config)
 
-        self.assertEqual(backend.group_page_sizes, {"full_attention": 128})
+        self.assertEqual(backend.group_block_granularities, {"full_attention": 128})
 
     def test_constructor_accepts_config_without_group_geometry(self):
         from tokenspeed.runtime.execution import workspace
@@ -160,7 +161,8 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             attn_tp_size=1,
             dtype=self.torch.bfloat16,
             kv_cache_dtype=self.torch.bfloat16,
-            page_size=64,
+            prefix_granularity=64,
+            kernel_page_size=64,
             context_len=256,
             max_bs=1,
             max_graph_bs=1,
@@ -172,7 +174,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         ):
             backend = self.Backend(config)
 
-        self.assertEqual(backend.group_page_sizes, {})
+        self.assertEqual(backend.group_block_granularities, {})
 
     def test_build_page_table_keeps_single_table_direct_copy_path(self):
         b = self._bare_backend(page_size=64, max_num_pages=4)
@@ -244,7 +246,9 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
                 [[21, 22], [23, -1]], dtype=self.torch.int32
             ),
         }
-        locs = b._compute_decode_group_out_cache_locs(tables, seq_lens, b.page_size)
+        locs = b._compute_decode_group_out_cache_locs(
+            tables, seq_lens, b.kernel_page_size
+        )
         b._init_decode_metadata(
             bs,
             req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
@@ -275,7 +279,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             tables,
             self.torch.tensor([64], dtype=self.torch.int32),
             self.torch.tensor([2], dtype=self.torch.int32),
-            b.page_size,
+            b.kernel_page_size,
         )
         b._init_extend_metadata(
             bs,

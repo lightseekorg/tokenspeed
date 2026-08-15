@@ -27,7 +27,7 @@
 #include <utility>
 #include <vector>
 
-#include "cache/coordinator/kv_cache_coordinator.h"
+#include "cache/coordinator/cache_coordinator.h"
 #include "cache/tier/transfer.h"
 
 namespace tokenspeed {
@@ -37,7 +37,7 @@ namespace tokenspeed {
 // Scheduler.
 class TierTransferManager {
 public:
-    explicit TierTransferManager(KvCacheCoordinator& coordinator) : coordinator_{coordinator} {}
+    explicit TierTransferManager(CacheCoordinator& coordinator) : coordinator_{coordinator} {}
 
     std::optional<WriteBackOperation> StartPendingStores();
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
@@ -61,7 +61,7 @@ private:
     LoadBackOperation startLoadBack(std::vector<BlockTransfer> block_transfers);
     std::vector<CacheTransfer> resolveTransfers(std::span<const BlockTransfer> block_transfers) const;
 
-    KvCacheCoordinator& coordinator_;
+    CacheCoordinator& coordinator_;
     std::unordered_map<std::uint32_t, std::vector<StoreTicket>> write_backs_;
     std::unordered_set<CacheKey, CacheKeyHash> store_keys_;
     // Each transfer pins both tiers until the runtime acknowledges the copy.

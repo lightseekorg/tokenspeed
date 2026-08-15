@@ -91,7 +91,7 @@ class AttentionBackend(ABC):
         # True when this backend's CUDA-graph block-table (kv_indices) buffer is
         # aliased to a peer backend's (e.g. a drafter sharing the target's), so
         # the replay path skips rebuilding it — the peer already populates it.
-        self._block_table_aliased = False
+        self._page_table_aliased = False
 
     def set_cache_pool(self, cache_pool: CachePool) -> None:
         self.cache_pool = cache_pool
@@ -200,6 +200,14 @@ class AttentionBackend(ABC):
         not available at backend construction time.  Default: no-op.
         """
         pass
+
+    def prepare_remote_cache_slots(self, slot_indices: list[int]) -> None:
+        """Clear model-specific restore state before remote cache admission."""
+        del slot_indices
+
+    def mark_remote_cache_ready(self, slot_index: int) -> None:
+        """Arm model-specific hydration after a remote cache transfer succeeds."""
+        del slot_index
 
     def register_step_counter(self, step_counter: StepCounter):
         self.step_counter = step_counter

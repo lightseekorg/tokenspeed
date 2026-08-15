@@ -60,7 +60,7 @@ class MLATokenToKVPool(CachePool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
-        page_size: int,
+        prefix_granularity: int,
         rank: int,
         *,
         memory_plan: CacheMemoryPlan,
@@ -69,20 +69,18 @@ class MLATokenToKVPool(CachePool):
         layer_group_ids: tuple[str, ...] = (),
         field_layer_offset: int = 0,
         backing_pool: CachePool | None = None,
-        pd_disaggregation_enabled: bool = False,
     ):
         super().__init__(
             size,
             dtype,
             device,
-            page_size,
+            prefix_granularity,
             rank,
             memory_plan,
             paged_cache_group_specs=paged_cache_group_specs,
             token_capacity=token_capacity,
             backing_pool=backing_pool,
             field_layer_offset=field_layer_offset,
-            pd_disaggregation_enabled=pd_disaggregation_enabled,
         )
         self.model_dtype = model_dtype
         self.quant_method = quant_method
@@ -148,41 +146,6 @@ class MLATokenToKVPool(CachePool):
         for kv_cache in self.kv_buffer:
             kv_size_bytes += _get_tensor_size_bytes(kv_cache)
         return kv_size_bytes
-
-    # for disagg
-    def get_contiguous_buf_infos(self):
-        if self.quant_method == "per_token_head":
-            kv_data_ptrs = [
-                sub_tuple[i].data_ptr()
-                for i in range(3)
-                for sub_tuple in self.kv_buffer
-            ]
-            kv_data_lens = [
-                sub_tuple[i].nbytes for i in range(3) for sub_tuple in self.kv_buffer
-            ]
-            kv_item_lens = [
-                sub_tuple[i][0].nbytes * self.page_size
-                for i in range(3)
-                for sub_tuple in self.kv_buffer
-            ]
-        else:
-            # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
-            kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
-            kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
-            kv_item_lens = [
-                self.kv_buffer[i][0].nbytes * self.page_size
-                for i in range(self.layer_num)
-            ]
-        return kv_data_ptrs, kv_data_lens, kv_item_lens
-
-    def get_layerwise_buf_info_offsets(self, start_idx=0):
-        if self.quant_method == "per_token_head":
-            return [
-                [start_idx + i * self.layer_num + layer_id for i in range(3)]
-                for layer_id in range(self.layer_num)
-            ]
-        else:
-            return [[start_idx + layer_id] for layer_id in range(self.layer_num)]
 
     def get_key_buffer(self, layer_id: int):
         if self.layerwise_load_tracker is not None:

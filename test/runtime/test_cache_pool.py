@@ -24,7 +24,7 @@ def _plan():
             CacheFieldSpec("history", "history.k", "plane.a", (4,), 1),
             CacheFieldSpec("state", "state.ssm", "plane.b", (8,), 1),
         ),
-        logical_block_tokens=4,
+        prefix_granularity=4,
         cache_blocks_per_lcm_block={"history": 2, "state": 1},
         max_padding_fraction=1.0,
     ).with_num_lcm_blocks(2)
@@ -37,7 +37,7 @@ class CachePoolContractTest(unittest.TestCase):
                 size=16,
                 dtype=torch.uint8,
                 device="cpu",
-                page_size=4,
+                prefix_granularity=4,
                 rank=0,
             )
 
@@ -46,7 +46,7 @@ class CachePoolContractTest(unittest.TestCase):
             size=16,
             dtype=torch.uint8,
             device="cpu",
-            page_size=4,
+            prefix_granularity=4,
             rank=0,
             memory_plan=_plan(),
         )
@@ -67,7 +67,7 @@ class CachePoolCudaTest(unittest.TestCase):
             size=16,
             dtype=torch.uint8,
             device="cuda",
-            page_size=4,
+            prefix_granularity=4,
             rank=0,
             memory_plan=_plan(),
         )
@@ -85,7 +85,7 @@ class CachePoolCudaTest(unittest.TestCase):
             size=16,
             dtype=torch.uint8,
             device="cuda",
-            page_size=4,
+            prefix_granularity=4,
             rank=0,
             memory_plan=_plan(),
         )
@@ -98,7 +98,7 @@ class CachePoolCudaTest(unittest.TestCase):
             size=16,
             dtype=torch.uint8,
             device="cuda",
-            page_size=4,
+            prefix_granularity=4,
             rank=0,
             memory_plan=_plan(),
         )
@@ -120,7 +120,7 @@ class CachePoolCudaTest(unittest.TestCase):
             size=16,
             dtype=torch.uint8,
             device="cuda",
-            page_size=4,
+            prefix_granularity=4,
             rank=0,
             memory_plan=_plan(),
         )

@@ -46,7 +46,7 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
         linear["head_dim"],
     )
     pool = HybridKDATokenToKVPool(
-        size=num_lcm_blocks * 12 * plan.logical_block_tokens,
+        size=num_lcm_blocks * 12 * plan.prefix_granularity,
         model_dtype=torch.bfloat16,
         dtype=torch.float8_e4m3fn,
         quant_method=None,
@@ -55,16 +55,15 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
         layer_num=text_config.num_hidden_layers,
         device="cuda",
         enable_memory_saver=False,
-        page_size=plan.logical_block_tokens,
+        prefix_granularity=plan.prefix_granularity,
         rank=0,
         layer_types=layer_types,
         layer_group_ids=group_ids,
-        pd_disaggregation_enabled=True,
         paged_cache_group_specs=build_paged_cache_group_specs(
             layer_types=layer_types,
             group_ids=group_ids,
             sliding_window_tokens=None,
-            page_size=plan.logical_block_tokens,
+            prefix_granularity=plan.prefix_granularity,
             pd_disaggregation_enabled=True,
         ),
         state_field_dtypes={
@@ -136,7 +135,7 @@ def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
     draft_layer_types = (FULL_ATTENTION,) * num_draft_layers
     draft_fields = mla_cache_fields(
         layer_group_ids=draft_layer_types,
-        logical_block_tokens=128,
+        prefix_granularity=128,
         latent_width=576,
         element_size=torch.bfloat16.itemsize,
     )
@@ -146,6 +145,7 @@ def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
         mla_cache_dtype=torch.float8_e4m3fn,
         mla_quant_method=None,
         draft_fields=draft_fields,
+        draft_layer_count=num_draft_layers,
     ).with_num_lcm_blocks(1)
     merged_layer_types = target_layer_types + draft_layer_types
     merged_group_ids = target_group_ids + draft_layer_types
@@ -167,7 +167,7 @@ def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
             layer_types=merged_layer_types,
             group_ids=merged_group_ids,
             sliding_window_tokens=None,
-            page_size=plan.logical_block_tokens,
+            prefix_granularity=plan.prefix_granularity,
             pd_disaggregation_enabled=False,
         ),
         state_field_dtypes=state_dtypes,
@@ -195,7 +195,7 @@ def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
         context_len=1024,
         max_graph_bs=1,
         max_bs=1,
-        page_size=plan.logical_block_tokens,
+        prefix_granularity=plan.prefix_granularity,
         kv_cache_quant_method="none",
         kv_lora_rank=512,
         qk_nope_head_dim=128,

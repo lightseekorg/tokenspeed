@@ -40,7 +40,7 @@ def _send_reserve(scheduler: Scheduler, request_id: str, n: int = 0) -> None:
 
 def _base_config(num_device_pages: int = 64) -> SchedulerConfig:
     cfg = SchedulerConfig()
-    cfg.block_size = 64
+    cfg.prefix_granularity = 64
     cfg.max_scheduled_tokens = 4096
     cfg.max_batch_size = 8
     cfg.num_device_pages = num_device_pages
@@ -63,7 +63,7 @@ def _overlap_admission_scheduler(verify_width: int) -> Scheduler:
     protected_pages = verify_width
     total_pages = reservation_end + 1 + protected_pages
     cfg = _base_config(num_device_pages=total_pages)
-    cfg.block_size = 1
+    cfg.prefix_granularity = 1
     cfg.decode_input_tokens = verify_width
     cfg.overlap_schedule_depth = 1
     # Paged-cache group page 0 is reserved by the allocator.
@@ -99,7 +99,7 @@ def test_overlap_schedule_depth_defaults_to_zero_and_rejects_deeper_pipeline():
     cfg.paged_cache_groups = [
         PagedCacheGroupConfig(
             group_id="history",
-            rows_per_page=cfg.block_size,
+            rows_per_page=cfg.prefix_granularity,
             entry_stride_tokens=1,
             total_pages=cfg.num_device_pages,
         )
@@ -122,7 +122,7 @@ def test_overlap_schedule_depth_defaults_to_zero_and_rejects_deeper_pipeline():
 
 def test_sliding_release_before_admit_prevents_oom():
     cfg = _base_config(num_device_pages=8)
-    cfg.block_size = 2
+    cfg.prefix_granularity = 2
     cfg.max_scheduled_tokens = 1024
     cfg.paged_cache_groups = [
         PagedCacheGroupConfig(
@@ -149,7 +149,7 @@ def test_sliding_release_before_admit_prevents_oom():
 
 def test_batch_admission_debits_simulated_free_pages():
     cfg = _base_config(num_device_pages=12)
-    cfg.block_size = 2
+    cfg.prefix_granularity = 2
     cfg.max_batch_size = 4
     cfg.max_scheduled_tokens = 512
     cfg.paged_cache_groups = [
@@ -174,9 +174,9 @@ def test_batch_admission_debits_simulated_free_pages():
     assert len(admitted & {"r0", "r1"}) <= 1
 
 
-def test_group_tables_use_each_groups_cache_block_tokens():
+def test_group_tables_use_each_groups_block_granularity():
     cfg = _base_config(num_device_pages=17)
-    cfg.block_size = 8
+    cfg.prefix_granularity = 8
     cfg.paged_cache_groups = [
         PagedCacheGroupConfig(
             group_id="history",

@@ -26,7 +26,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.attention.kv_cache.plan import CacheMemoryPlan
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+        CacheMemoryPlan,
+    )
 
 
 def _positive(name: str, value: int) -> int:
@@ -256,7 +258,7 @@ def combine_cache_transfer_layouts(
 
     Args:
         target: Target model's local transfer view.
-        draft: Optional draft model's local transfer view.
+        draft: Optional draft model view into the target's arena.
         group_ids: Optional scheduler order for the merged groups.
 
     Returns:
@@ -303,33 +305,38 @@ def combine_cache_transfer_layouts(
             raise ValueError("scheduler and transfer cache groups do not match")
         ordered_group_ids = group_ids
 
-    draft_buffer_base = len(target.buffers)
-
-    def namespaced_field(
-        field: CacheField, namespace: str, buffer_base: int
-    ) -> CacheField:
-        return CacheField(
-            field_id=f"{namespace}:{field.field_id}",
-            device_buffer_index=buffer_base + field.device_buffer_index,
-            device_block_zero_offset_bytes=field.device_block_zero_offset_bytes,
-            block_stride_bytes=field.block_stride_bytes,
-            payload_bytes=field.payload_bytes,
+    shared_arena = (
+        len(target.buffers) == 1
+        and len(draft.buffers) == 1
+        and target.buffers[0] is draft.buffers[0]
+    )
+    if not shared_arena:
+        raise ValueError("target and draft cache views must share one arena")
+    target_fields = {
+        field.field_id for group in target.groups for field in group.fields
+    }
+    draft_fields = {field.field_id for group in draft.groups for field in group.fields}
+    overlap = target_fields & draft_fields
+    if overlap:
+        raise ValueError(
+            "shared target/draft arena views overlap fields " f"{sorted(overlap)}"
         )
-
+    if any(
+        field.device_buffer_index != 0
+        for layout in (target, draft)
+        for group in layout.groups
+        for field in group.fields
+    ):
+        raise ValueError("shared arena fields must use device buffer zero")
     groups = []
     for group_id in ordered_group_ids:
         target_group = target_groups.get(group_id)
         draft_group = draft_groups.get(group_id)
         fields = ()
         if target_group is not None:
-            fields = tuple(
-                namespaced_field(field, "target", 0) for field in target_group.fields
-            )
+            fields += target_group.fields
         if draft_group is not None:
-            fields += tuple(
-                namespaced_field(field, "draft", draft_buffer_base)
-                for field in draft_group.fields
-            )
+            fields += draft_group.fields
         geometry = target_group if target_group is not None else draft_group
         groups.append(
             CacheGroupLayout(
@@ -338,17 +345,9 @@ def combine_cache_transfer_layouts(
                 fields=fields,
             )
         )
-
-    consumers = tuple(
-        tuple(f"target:{field_id}" for field_id in consumer)
-        for consumer in target.consumers
-    ) + tuple(
-        tuple(f"draft:{field_id}" for field_id in consumer)
-        for consumer in draft.consumers
-    )
     return CacheTransferLayout(
         num_lcm_blocks=target.num_lcm_blocks,
         groups=tuple(groups),
-        buffers=target.buffers + draft.buffers,
-        consumers=consumers,
+        buffers=target.buffers,
+        consumers=target.consumers + draft.consumers,
     )

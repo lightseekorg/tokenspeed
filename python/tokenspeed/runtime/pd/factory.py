@@ -20,36 +20,15 @@
 
 """Factories for PD KV transfer helpers."""
 
-from tokenspeed.runtime.pd.cache_protocol import validate_cache_slab_registrations
+from tokenspeed.runtime.pd.cache_protocol import (
+    build_cache_fields_by_producer_step,
+    build_cache_transfer_schema,
+    build_pool_cache_transfer_contract,
+)
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.pd.utils import TransferBackend
-
-
-def _get_contiguous_buf_unit_lens(pool, item_lens):
-    getter = getattr(pool, "get_contiguous_buf_unit_lens", None)
-    if getter is None:
-        return [1] * len(item_lens)
-    unit_lens = list(getter())
-    if len(unit_lens) != len(item_lens):
-        raise ValueError(
-            f"contiguous buffer unit count mismatch: units={len(unit_lens)}, items={len(item_lens)}"
-        )
-    return unit_lens
-
-
-def _get_cache_contract(pool):
-    if getattr(pool, "supports_disaggregation", False) is not True:
-        return None
-
-    contract_getter = getattr(pool, "get_pd_cache_contract", None)
-    if not callable(contract_getter):
-        raise RuntimeError(
-            "cache pool advertises cache-contract disaggregation but is missing the "
-            "required get_pd_cache_contract() ABI"
-        )
-    return contract_getter()
 
 
 def get_kv_args(
@@ -57,100 +36,34 @@ def get_kv_args(
     gpu_id,
     ib_device,
     token_to_kv_pool,
-    draft_token_to_kv_pool,
+    *,
+    model_config,
+    draft_model_config=None,
 ):
-    cache_contract = _get_cache_contract(token_to_kv_pool)
-    if cache_contract is not None:
-        # One big model, one arena: the draft's continuation-layer planes
-        # live inside the same merged plan the contract describes, so slab
-        # pages carry the draft KV with no extra registration
-        # (draft_token_to_kv_pool is a layer-mapped view of the same pool).
-        layout, registrations = cache_contract
-        registrations = validate_cache_slab_registrations(
-            registrations,
-            layout=layout,
-            peer="local",
-        )
-        physical_slot_count = layout.physical_slot_count
-        item_lens = [layout.physical_page_bytes] * physical_slot_count
-        return KVArgs(
-            engine_rank=engine_rank,
-            kv_data_ptrs=[registration.base_addr for registration in registrations],
-            kv_data_lens=[registration.length for registration in registrations],
-            kv_item_lens=item_lens,
-            target_layer_num=physical_slot_count,
-            draft_layer_num=0,
-            kv_layer_ids=list(range(physical_slot_count)),
-            # One logical Mooncake unit is one complete raw-slab page. This
-            # makes equal-TP cache-contract routes identity routes and prevents the
-            # generic heterogeneous-TP planner from splitting a raw page.
-            kv_unit_lens=item_lens,
-            state_data_ptrs=[],
-            state_data_lens=[],
-            state_item_lens=[],
-            state_unit_lens=[],
-            state_type="none",
-            state_layer_ids=[],
-            mamba_offsets=[],
-            offsets=[(physical_slot,) for physical_slot in range(physical_slot_count)],
-            aux_data_ptrs=[],
-            aux_data_lens=[],
-            aux_item_lens=[],
-            ib_device=ib_device,
-            gpu_id=gpu_id,
-            cache_layout=layout,
-        )
-
-    # One big model, one pool: the pool's buffers already cover the draft's
-    # continuation layers (the pool binds every planned layer), so a single
-    # enumeration registers everything. The draft pool is a layer-mapped
-    # view of the same pool; only the layer partition is derived from it.
-    kv_data_ptrs, kv_data_lens, kv_item_lens = (
-        token_to_kv_pool.get_contiguous_buf_infos()
+    # One big model, one arena: a draft's continuation-layer planes live in
+    # the target pool's merged plan, so exactly one typed slab registration is
+    # published for both target and draft caches.
+    transfer_schema = build_cache_transfer_schema(
+        token_to_kv_pool.plan,
+        model_config=model_config,
+        draft_model_config=draft_model_config,
     )
-    kv_unit_lens = _get_contiguous_buf_unit_lens(token_to_kv_pool, kv_item_lens)
-    # [[layer0buf0, layer0buf1...], [layer1buf0, layer1buf1...], ...]
-    offsets = token_to_kv_pool.get_layerwise_buf_info_offsets()
-    total_layer_num = token_to_kv_pool.layer_num
-    kv_layer_ids = list(getattr(token_to_kv_pool, "layer_ids", range(total_layer_num)))
-    draft_layer_num = (
-        len(draft_token_to_kv_pool.layer_ids)
-        if draft_token_to_kv_pool is not None
-        else 0
+    producer_schedule = build_cache_fields_by_producer_step(
+        token_to_kv_pool.plan,
+        num_target_layers=model_config.num_attention_layers,
     )
-    target_layer_num = total_layer_num - draft_layer_num
-
-    state_data_ptrs = []
-    state_data_lens = []
-    state_item_lens = []
-    state_unit_lens = []
-    state_type = "none"
-    state_layer_ids = []
-    kv_args = KVArgs(
+    layout, base_addr = build_pool_cache_transfer_contract(
+        token_to_kv_pool,
+        transfer_schema=transfer_schema,
+    )
+    return KVArgs(
         engine_rank=engine_rank,
-        kv_data_ptrs=kv_data_ptrs,
-        kv_data_lens=kv_data_lens,
-        kv_item_lens=kv_item_lens,
-        target_layer_num=target_layer_num,
-        draft_layer_num=draft_layer_num,
-        kv_layer_ids=kv_layer_ids,
-        kv_unit_lens=kv_unit_lens,
-        state_data_ptrs=state_data_ptrs,
-        state_data_lens=state_data_lens,
-        state_item_lens=state_item_lens,
-        state_unit_lens=state_unit_lens,
-        state_type=state_type,
-        state_layer_ids=state_layer_ids,
-        mamba_offsets=[],
-        offsets=offsets,
-        aux_data_ptrs=[],
-        aux_data_lens=[],
-        aux_item_lens=[],
+        kv_data_ptr=base_addr,
         ib_device=ib_device,
         gpu_id=gpu_id,
+        cache_layout=layout,
+        cache_producer_schedule=producer_schedule,
     )
-
-    return kv_args
 
 
 def create_kv_transfer(
@@ -159,16 +72,12 @@ def create_kv_transfer(
     args: KVManagerArgs,
     kv_args: KVArgs,
     gloo_group,
-    page_size,
 ):
-    if kv_args.cache_layout is not None:
-        if backend not in (TransferBackend.MOONCAKE, TransferBackend.MOONCAKE.value):
-            raise NotImplementedError(
-                "Paged-cache PD currently supports only the Mooncake backend"
-            )
+    if backend not in (TransferBackend.MOONCAKE, TransferBackend.MOONCAKE.value):
+        raise NotImplementedError("CachePD supports only the Mooncake backend")
     if mode == "prefill":
-        return DisaggPrefillExecutor(backend, args, kv_args, gloo_group, page_size)
+        return DisaggPrefillExecutor(args, kv_args, gloo_group)
     elif mode == "decode":
-        return DisaggDecodeExecutor(backend, args, kv_args, gloo_group, page_size)
+        return DisaggDecodeExecutor(args, kv_args, gloo_group)
     else:
         raise NotImplementedError(f"Unsupported disaggregation mode: {mode}")

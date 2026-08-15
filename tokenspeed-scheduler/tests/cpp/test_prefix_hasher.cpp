@@ -25,7 +25,7 @@
 #include <string>
 #include <vector>
 
-#include "scheduler/page_hasher.h"
+#include "cache/prefix/prefix_hasher.h"
 
 namespace tokenspeed::test {
 namespace {
@@ -33,7 +33,7 @@ namespace {
 using token_span = std::span<const std::int32_t>;
 using key_span = std::span<const std::string>;
 
-// HashPage frames the input as [prior_len][prior][token_count][tokens][extra...];
+// HashPrefixPage frames the input as [prior_len][prior][token_count][tokens][extra...];
 // all-empty input is two zero u32s (8 zero bytes), whose SHA-256 is below.
 constexpr const char* kEmptyFramedSha256 = "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc";
 
@@ -68,73 +68,73 @@ TEST(PageHasherHexTest, HexToBytesAcceptsUppercase) {
     EXPECT_EQ(HexToBytes("ABCDEF"), HexToBytes("abcdef"));
 }
 
-// ---- HashPage -----------------------------------------------------------
+// ---- HashPrefixPage -----------------------------------------------------------
 
-TEST(HashPageTest, EmptyPageMatchesKnownSha256) {
+TEST(HashPrefixPageTest, EmptyPageMatchesKnownSha256) {
     std::vector<std::int32_t> none;
-    EXPECT_EQ(HashPage(Tokens(none), ""), kEmptyFramedSha256);
+    EXPECT_EQ(HashPrefixPage(Tokens(none), ""), kEmptyFramedSha256);
 }
 
-TEST(HashPageTest, OutputIs64HexChars) {
+TEST(HashPrefixPageTest, OutputIs64HexChars) {
     std::vector<std::int32_t> toks = {1, 2, 3};
-    std::string h = HashPage(Tokens(toks), "");
+    std::string h = HashPrefixPage(Tokens(toks), "");
     EXPECT_EQ(h.size(), 64u);
     EXPECT_EQ(h.find_first_not_of("0123456789abcdef"), std::string::npos);
 }
 
-TEST(HashPageTest, Deterministic) {
+TEST(HashPrefixPageTest, Deterministic) {
     std::vector<std::int32_t> toks = {7, 8, 9};
-    EXPECT_EQ(HashPage(Tokens(toks), "seed"), HashPage(Tokens(toks), "seed"));
+    EXPECT_EQ(HashPrefixPage(Tokens(toks), "seed"), HashPrefixPage(Tokens(toks), "seed"));
 }
 
-TEST(HashPageTest, DifferentTokensDifferentHash) {
+TEST(HashPrefixPageTest, DifferentTokensDifferentHash) {
     std::vector<std::int32_t> a = {1, 2, 3};
     std::vector<std::int32_t> b = {1, 2, 4};
-    EXPECT_NE(HashPage(Tokens(a), ""), HashPage(Tokens(b), ""));
+    EXPECT_NE(HashPrefixPage(Tokens(a), ""), HashPrefixPage(Tokens(b), ""));
 }
 
-TEST(HashPageTest, TokenOrderMatters) {
+TEST(HashPrefixPageTest, TokenOrderMatters) {
     std::vector<std::int32_t> a = {1, 2};
     std::vector<std::int32_t> b = {2, 1};
-    EXPECT_NE(HashPage(Tokens(a), ""), HashPage(Tokens(b), ""));
+    EXPECT_NE(HashPrefixPage(Tokens(a), ""), HashPrefixPage(Tokens(b), ""));
 }
 
-TEST(HashPageTest, PriorHashChangesOutput) {
+TEST(HashPrefixPageTest, PriorHashChangesOutput) {
     std::vector<std::int32_t> toks = {5, 6};
-    std::string no_prior = HashPage(Tokens(toks), "");
-    std::string with_prior = HashPage(Tokens(toks), no_prior);
+    std::string no_prior = HashPrefixPage(Tokens(toks), "");
+    std::string with_prior = HashPrefixPage(Tokens(toks), no_prior);
     EXPECT_NE(no_prior, with_prior);
 }
 
-TEST(HashPageTest, EmptyExtraKeysEqualsTwoArgForm) {
+TEST(HashPrefixPageTest, EmptyExtraKeysEqualsTwoArgForm) {
     std::vector<std::int32_t> toks = {1, 2, 3};
     std::vector<std::string> empty;
-    EXPECT_EQ(HashPage(Tokens(toks), "p"), HashPage(Tokens(toks), "p", Keys(empty)));
+    EXPECT_EQ(HashPrefixPage(Tokens(toks), "p"), HashPrefixPage(Tokens(toks), "p", Keys(empty)));
 }
 
-TEST(HashPageTest, ExtraKeysChangeOutput) {
+TEST(HashPrefixPageTest, ExtraKeysChangeOutput) {
     std::vector<std::int32_t> toks = {1, 2, 3};
     std::vector<std::string> keys = {"lora-A"};
-    EXPECT_NE(HashPage(Tokens(toks), "p"), HashPage(Tokens(toks), "p", Keys(keys)));
+    EXPECT_NE(HashPrefixPage(Tokens(toks), "p"), HashPrefixPage(Tokens(toks), "p", Keys(keys)));
 }
 
-TEST(HashPageTest, FramingDisambiguatesKeySplits) {
+TEST(HashPrefixPageTest, FramingDisambiguatesKeySplits) {
     std::vector<std::int32_t> toks = {1};
     std::vector<std::string> split_a = {"ab", "c"};
     std::vector<std::string> split_b = {"a", "bc"};
-    EXPECT_NE(HashPage(Tokens(toks), "", Keys(split_a)), HashPage(Tokens(toks), "", Keys(split_b)));
+    EXPECT_NE(HashPrefixPage(Tokens(toks), "", Keys(split_a)), HashPrefixPage(Tokens(toks), "", Keys(split_b)));
 }
 
-TEST(HashPageTest, FramingDisambiguatesKeyCount) {
+TEST(HashPrefixPageTest, FramingDisambiguatesKeyCount) {
     std::vector<std::int32_t> toks = {1};
     std::vector<std::string> one = {"abc"};
     std::vector<std::string> two = {"a", "bc"};
-    EXPECT_NE(HashPage(Tokens(toks), "", Keys(one)), HashPage(Tokens(toks), "", Keys(two)));
+    EXPECT_NE(HashPrefixPage(Tokens(toks), "", Keys(one)), HashPrefixPage(Tokens(toks), "", Keys(two)));
 }
 
 // A 32-byte prior reinterpreted as 8 LE tokens in page 0 must not produce the
 // same stream as a chained page carrying that digest as prior.
-TEST(HashPageTest, FramingDisambiguatesEmptyPriorFromChainedPage) {
+TEST(HashPrefixPageTest, FramingDisambiguatesEmptyPriorFromChainedPage) {
     const std::string prior = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
     std::vector<uint8_t> pb = HexToBytes(prior);
     ASSERT_EQ(pb.size(), 32u);
@@ -146,14 +146,14 @@ TEST(HashPageTest, FramingDisambiguatesEmptyPriorFromChainedPage) {
             (static_cast<uint32_t>(pb[4 * i + 2]) << 16) | (static_cast<uint32_t>(pb[4 * i + 3]) << 24));
     }
     std::vector<std::int32_t> none;
-    std::string as_page0 = HashPage(Tokens(toks), "");
-    std::string as_chained = HashPage(Tokens(none), prior);
+    std::string as_page0 = HashPrefixPage(Tokens(toks), "");
+    std::string as_chained = HashPrefixPage(Tokens(none), prior);
     EXPECT_NE(as_page0, as_chained);
 }
 
 // A 4-byte extra key must not produce the same stream as count(1) + len(4) +
 // the key's LE int32 folded back into the token list.
-TEST(HashPageTest, FramingDisambiguatesTokensFromExtraKeys) {
+TEST(HashPrefixPageTest, FramingDisambiguatesTokensFromExtraKeys) {
     std::vector<std::int32_t> short_toks = {9, 8};
     std::vector<std::string> one_key = {"wxyz"};
 
@@ -161,22 +161,23 @@ TEST(HashPageTest, FramingDisambiguatesTokensFromExtraKeys) {
     std::vector<std::int32_t> long_toks = {9, 8, 1, 4, 0x7a797877};
     std::vector<std::string> no_keys;
 
-    EXPECT_NE(HashPage(Tokens(short_toks), "", Keys(one_key)), HashPage(Tokens(long_toks), "", Keys(no_keys)));
+    EXPECT_NE(HashPrefixPage(Tokens(short_toks), "", Keys(one_key)),
+              HashPrefixPage(Tokens(long_toks), "", Keys(no_keys)));
 }
 
-// ---- ComputePagedHashes (chaining) -------------------------------------
+// ---- ComputePrefixHashes (chaining) -------------------------------------
 
-TEST(ComputePagedHashesTest, MatchesManualRollingChain) {
+TEST(ComputePrefixHashesTest, MatchesManualRollingChain) {
     std::vector<std::int32_t> p0 = {1, 2};
     std::vector<std::int32_t> p1 = {3, 4};
     std::vector<std::int32_t> p2 = {5, 6};
     std::vector<token_span> pages = {Tokens(p0), Tokens(p1), Tokens(p2)};
 
-    std::vector<std::string> got = ComputePagedHashes(pages, "root");
+    std::vector<std::string> got = ComputePrefixHashes(pages, "root");
 
-    std::string h0 = HashPage(Tokens(p0), "root");
-    std::string h1 = HashPage(Tokens(p1), h0);
-    std::string h2 = HashPage(Tokens(p2), h1);
+    std::string h0 = HashPrefixPage(Tokens(p0), "root");
+    std::string h1 = HashPrefixPage(Tokens(p1), h0);
+    std::string h2 = HashPrefixPage(Tokens(p2), h1);
 
     ASSERT_EQ(got.size(), 3u);
     EXPECT_EQ(got[0], h0);
@@ -184,19 +185,19 @@ TEST(ComputePagedHashesTest, MatchesManualRollingChain) {
     EXPECT_EQ(got[2], h2);
 }
 
-TEST(ComputePagedHashesTest, SamePageDifferentPrefixDiffers) {
+TEST(ComputePrefixHashesTest, SamePageDifferentPrefixDiffers) {
     std::vector<std::int32_t> same = {9, 9};
     std::vector<std::int32_t> other = {1, 1};
     std::vector<token_span> a = {Tokens(same), Tokens(same)};
     std::vector<token_span> b = {Tokens(other), Tokens(same)};
 
-    std::vector<std::string> ha = ComputePagedHashes(a, "");
-    std::vector<std::string> hb = ComputePagedHashes(b, "");
+    std::vector<std::string> ha = ComputePrefixHashes(a, "");
+    std::vector<std::string> hb = ComputePrefixHashes(b, "");
     EXPECT_NE(ha[0], hb[0]);
     EXPECT_NE(ha[1], hb[1]);
 }
 
-TEST(ComputePagedHashesTest, MissingExtraKeysPerPageTreatedAsEmpty) {
+TEST(ComputePrefixHashesTest, MissingExtraKeysPerPageTreatedAsEmpty) {
     std::vector<std::int32_t> p0 = {1};
     std::vector<std::int32_t> p1 = {2};
     std::vector<token_span> pages = {Tokens(p0), Tokens(p1)};
@@ -204,16 +205,16 @@ TEST(ComputePagedHashesTest, MissingExtraKeysPerPageTreatedAsEmpty) {
     std::vector<std::string> k0 = {"salt"};
     std::vector<key_span> extra = {Keys(k0)};
 
-    std::vector<std::string> got = ComputePagedHashes(pages, "", extra);
+    std::vector<std::string> got = ComputePrefixHashes(pages, "", extra);
 
-    std::string h0 = HashPage(Tokens(p0), "", Keys(k0));
-    std::string h1 = HashPage(Tokens(p1), h0);
+    std::string h0 = HashPrefixPage(Tokens(p0), "", Keys(k0));
+    std::string h1 = HashPrefixPage(Tokens(p1), h0);
     EXPECT_EQ(got[0], h0);
     EXPECT_EQ(got[1], h1);
 }
 
-TEST(ComputePagedHashesTest, IncrementalChainEqualsOneShot) {
-    // 12-token stream, page_size 2 -> 6 pages.
+TEST(ComputePrefixHashesTest, IncrementalChainEqualsOneShot) {
+    // 12-token stream, prefix_granularity 2 -> 6 pages.
     std::vector<std::int32_t> tokens(12);
     for (std::int32_t i = 0; i < 12; ++i) {
         tokens[i] = 100 + i;
@@ -223,18 +224,18 @@ TEST(ComputePagedHashesTest, IncrementalChainEqualsOneShot) {
         pages.push_back(token_span(tokens.data() + start, 2));
     }
 
-    const std::vector<std::string> one_shot = ComputePagedHashes(pages, "");
+    const std::vector<std::string> one_shot = ComputePrefixHashes(pages, "");
 
     const std::vector<token_span> head(pages.begin(), pages.begin() + 3);
     const std::vector<token_span> tail(pages.begin() + 3, pages.end());
-    std::vector<std::string> incremental = ComputePagedHashes(head, "");
-    const std::vector<std::string> rest = ComputePagedHashes(tail, incremental.back());
+    std::vector<std::string> incremental = ComputePrefixHashes(head, "");
+    const std::vector<std::string> rest = ComputePrefixHashes(tail, incremental.back());
     incremental.insert(incremental.end(), rest.begin(), rest.end());
 
     EXPECT_EQ(incremental, one_shot);
 }
 
-TEST(ComputePagedHashesTest, AdvancePagedHashesReturnsOnlyNewPages) {
+TEST(ComputePrefixHashesTest, AdvancePrefixHashesReturnsOnlyNewPages) {
     std::vector<std::int32_t> tokens(12);
     for (std::int32_t i = 0; i < 12; ++i) {
         tokens[i] = 100 + i;
@@ -244,9 +245,9 @@ TEST(ComputePagedHashesTest, AdvancePagedHashesReturnsOnlyNewPages) {
         pages.push_back(token_span(tokens.data() + start, 2));
     }
 
-    const std::vector<std::string> one_shot = ComputePagedHashes(pages, "");
-    const std::vector<std::string> first = AdvancePagedHashes(pages, 0, "", 2);
-    const std::vector<std::string> second = AdvancePagedHashes(pages, 2, first.back(), 5);
+    const std::vector<std::string> one_shot = ComputePrefixHashes(pages, "");
+    const std::vector<std::string> first = AdvancePrefixHashes(pages, 0, "", 2);
+    const std::vector<std::string> second = AdvancePrefixHashes(pages, 2, first.back(), 5);
 
     EXPECT_EQ(first, std::vector<std::string>(one_shot.begin(), one_shot.begin() + 2));
     EXPECT_EQ(second, std::vector<std::string>(one_shot.begin() + 2, one_shot.begin() + 5));
