@@ -453,7 +453,7 @@ class InklingRelLogitsProj(nn.Module):
 
     def forward(self, r_out: torch.Tensor) -> torch.Tensor:
         # r_out: [T, num_heads, d_rel] -> rel_logits [T, num_heads, rel_extent]
-        return torch.einsum("thd,de->the", r_out, self.proj)
+        return torch.matmul(r_out, self.proj)
 
 
 class InklingAttention(nn.Module):
@@ -650,7 +650,7 @@ class InklingAttention(nn.Module):
             v,
             ctx,
             out_cache_loc,
-            rel_logits=rel_logits.contiguous(),
+            rel_logits=rel_logits,
             # Inkling's readiness boundary is after both hidden-state sconv
             # writes below, not immediately after attention KV publication.
             record_kv_cache=False,
