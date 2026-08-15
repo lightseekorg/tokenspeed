@@ -26,6 +26,15 @@ from tokenspeed_kernel.ops.attention import (
     gdn_decode_mtp,
     gdn_replay_commit,
 )
+from tokenspeed_kernel.registry import KernelRegistry
+
+
+def test_gdn_replay_commit_registration_stays_portable():
+    spec = KernelRegistry.get().get_by_name("triton_gdn_replay_commit")
+
+    assert spec is not None
+    assert spec.solution == "triton"
+    assert spec.capability.vendors == frozenset({"nvidia", "amd"})
 
 
 def _reference_states(
