@@ -616,10 +616,11 @@ class InklingAttention(nn.Module):
                         rel_logits, log_scaling_tau.view(-1, 1, 1)
                     )
 
-            # K/V are adjacent in the qkvr output AND the conv pool, so both sconv streams fuse into one call.
+            # K/V are adjacent in the qkvr output AND the conv pool, so both
+            # sconv streams fuse into one call reading the strided slice.
             if self.use_sconv:
                 kv = _sconv_apply(
-                    kv.contiguous(),
+                    kv,
                     self._merged_kv_sconv_weight(),
                     ctx,
                     self.layer_id,
