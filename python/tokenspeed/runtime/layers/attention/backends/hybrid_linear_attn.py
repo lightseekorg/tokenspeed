@@ -1693,6 +1693,8 @@ class MambaAttnBackend(AttentionBackend):
         if is_target_verify and self.replay_ssm:
             replay = self._gdn_replay
             layer_slot = replay.layer_ids.index(layer_id)
+            # A_log and dt_bias are model-static; copy them once per layer
+            # during warmup so CUDA graph capture records no copy nodes.
             if layer_id not in replay.initialized_layers:
                 replay.parameters[layer_slot, 0].copy_(A_log)
                 replay.parameters[layer_slot, 1].copy_(dt_bias)
