@@ -32,12 +32,14 @@ Covers:
 
 import pytest
 from tokenspeed_scheduler import (
+    PD,
     ExecutionEvent,
     ExecutionPlan,
     ForwardEvent,
     PagedCacheGroupConfig,
     PagedCacheGroupFamily,
     PagedCacheRetention,
+    PagedCacheTransferPolicy,
     RequestSpec,
     Scheduler,
     SchedulerConfig,
@@ -283,6 +285,38 @@ class TestPrefillFirst:
         assert s.decoding_size() == 0
         assert plan2.forward[0].num_extends() > 0
         assert plan2.forward[0].request_ids == ["r0"]
+
+    def test_prefill_role_batches_handoffs_before_new_admission(self):
+        """Priority selects a pure, batched P-side handoff round."""
+        cfg = make_config(max_scheduled_tokens=8)
+        cfg.role = SchedulerConfig.Role.P
+        cfg.decode_input_tokens = 0
+        cfg.enable_pd_cache = True
+        cfg.paged_cache_groups[0].transfer_policy = PagedCacheTransferPolicy.FullSuffix
+        s = Scheduler(cfg)
+        s.submit_requests(
+            [
+                make_spec("r0", list(range(4))),
+                make_spec("r1", list(range(4, 8))),
+            ]
+        )
+        s.advance(
+            ExecutionEvent()
+            .add_event(PD.BootstrappedEvent("r0"))
+            .add_event(PD.BootstrappedEvent("r1"))
+        )
+
+        first_prefill = s.next_execution_plan()
+        assert first_prefill.forward[0].request_ids == ["r0", "r1"]
+        assert first_prefill.forward[0].num_extends() == 2
+
+        s.submit_requests([make_spec("r2", list(range(8, 12)))])
+        s.advance(ExecutionEvent().add_event(PD.BootstrappedEvent("r2")))
+
+        transfer_start = s.next_execution_plan()
+        assert transfer_start.forward[0].request_ids == ["r0", "r1"]
+        assert transfer_start.forward[0].num_extends() == 0
+        assert s.waiting_size() == 1
 
     def test_decode_batch_only_when_no_prefill_work(self):
         """Decode batch is only scheduled when there are no prefilling/submitted requests."""
