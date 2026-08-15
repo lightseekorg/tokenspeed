@@ -465,7 +465,6 @@ tokenspeed serve Qwen/Qwen3.8-27B-FP8 \
   --served-model-name Qwen/Qwen3.8-27B-FP8 \
   --world-size 1 \
   --gpu-memory-utilization 0.9 \
-  --moe-backend fa3 \
   --drafter-attention-backend fa3 \
   --chunked-prefill-size 8192 \
   --max-model-len 256000 \
