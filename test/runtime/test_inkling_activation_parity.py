@@ -244,14 +244,15 @@ class _Harness:
             },
         }
         self.backend = InklingAttnBackend(inner, conv_pool, conv_columns=conv_columns)
-        from tokenspeed.runtime.configs.inkling_config import (
-            inkling_kv_heads_for_layer,
-        )
-
         self.pool_view = _ConvCheckpointPool(
             self.kv_pool,
             layer_kv_widths=[
-                inkling_kv_heads_for_layer(text, i, True) * text.head_dim
+                (
+                    text.swa_num_key_value_heads
+                    if i in text.local_layer_ids
+                    else text.ckpt_num_key_value_heads
+                )
+                * text.head_dim
                 for i in range(text.num_hidden_layers)
             ],
             num_pages=num_conv_pages + 1,

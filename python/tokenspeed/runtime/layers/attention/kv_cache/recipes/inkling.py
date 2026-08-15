@@ -148,11 +148,16 @@ def inkling_cache_fields(
 
 
 def inkling_layer_kv_head_counts(model_config) -> tuple[int, ...]:
-    from tokenspeed.runtime.configs.inkling_config import inkling_kv_heads_for_layer
-
+    """Served KV heads per layer: each kind's native checkpoint count
+    (hetero byte-uniform slots, #647), so page sizes derive from these."""
     text_config = model_config.hf_config.get_text_config()
+    local = set(text_config.local_layer_ids)
     return tuple(
-        inkling_kv_heads_for_layer(text_config, layer_id, True)
+        (
+            text_config.swa_num_key_value_heads
+            if layer_id in local
+            else text_config.ckpt_num_key_value_heads
+        )
         for layer_id in range(text_config.num_hidden_layers)
     )
 

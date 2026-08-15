@@ -44,8 +44,8 @@ Layer layout: ``local_layer_ids`` use SWA (``sliding_window_size``) with
 ``rel_extent == sliding_window_size``; the rest are full attention with the
 config ``rel_extent``. KV heads default to the hetero layout (#647
 byte-uniform slots): full-attention layers keep their checkpoint-native
-head count (unconditional; the INKLING_HETERO_KV gate is retired) — uniform serving with
-full-layer KV replicated at load (see the config docstring).
+head count — uniform serving with full-layer KV replicated at load (see the
+config docstring).
 
 Multimodal towers (gated on ``*_config.decoder_dmodel`` being set; text-only
 checkpoints leave both off):
@@ -95,7 +95,6 @@ from tokenspeed.runtime.configs.inkling_config import (
     InklingModelConfig,
     InklingVisionConfig,
     inkling_conv_stream_layout,
-    inkling_kv_heads_for_layer,
 )
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -139,12 +138,6 @@ from tokenspeed.runtime.utils.pdl import pdl_enabled
 logger = logging.getLogger(__name__)
 
 _is_hopper_plus = current_platform().is_hopper_plus
-
-# Escape hatch: disable the rel-logits aux-stream fork (serial pre-attention).
-_ATTN_RELFORK = os.environ.get("INKLING_ATTN_RELFORK", "1") == "1"
-# Hetero KV (#647 byte-uniform slots): full layers keep their native half KV
-# head count. Unconditional since 2026-07-15 (INKLING_HETERO_KV gate retired).
-_HETERO_KV = True
 
 
 # Checkpoint attention projections -> qkvr fused shard ids.
@@ -484,7 +477,11 @@ class InklingAttention(nn.Module):
         self.scaling = 1.0 / self.head_dim
 
         total_heads = config.num_attention_heads
-        total_kv_heads = inkling_kv_heads_for_layer(config, layer_id, _HETERO_KV)
+        total_kv_heads = (
+            config.swa_num_key_value_heads
+            if is_local
+            else config.ckpt_num_key_value_heads
+        )
         assert total_heads % attn_tp_size == 0
         self.num_tp_heads = total_heads // attn_tp_size
         if total_kv_heads >= attn_tp_size:
@@ -601,10 +598,8 @@ class InklingAttention(nn.Module):
         qkvr, _ = self.qkvr(hidden_states)
         q, kv, r = qkvr.split([self.q_size, 2 * self.kv_size, self.r_size], dim=-1)
 
-        # Warm the R-slice projection serially on the capture topology, then
-        # overlap it during capture. INKLING_ATTN_RELFORK=0 stays serial.
         with self.stream_fork.scope(
-            enable=_ATTN_RELFORK and get_is_cuda_graph_phase(),
+            enable=get_is_cuda_graph_phase(),
             overlap=get_is_capture_mode(),
         ) as fork:
             with fork.branch():
@@ -1769,8 +1764,7 @@ class InklingForConditionalGeneration(nn.Module):
         ckpt_heads = (
             cfg.swa_num_key_value_heads if is_local else cfg.ckpt_num_key_value_heads
         )
-        served = inkling_kv_heads_for_layer(cfg, layer_id, _HETERO_KV)
-        target_heads = max(served, self.mapping.attn.tp_size)
+        target_heads = max(ckpt_heads, self.mapping.attn.tp_size)
         if target_heads == ckpt_heads:
             return loaded_weight
         assert (

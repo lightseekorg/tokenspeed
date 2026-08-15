@@ -12,10 +12,7 @@ import os
 import sys
 import unittest
 
-from tokenspeed.runtime.configs.inkling_config import (
-    inkling_kv_heads_for_layer,
-    inkling_mtp_text_config,
-)
+from tokenspeed.runtime.configs.inkling_config import inkling_mtp_text_config
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -58,17 +55,6 @@ class TestInklingMTPTextConfig(unittest.TestCase):
         self.assertEqual(cfg.num_nextn_predict_layers, 3)
         self.assertEqual(cfg.local_layer_ids, [0, 2])
         self.assertEqual(cfg.dense_mlp_idx, 3)
-        # Depth 1 is full attention at the ckpt head count; depths 0/2 are
-        # SWA at the swa count — the target model's byte-uniform pairing.
-        heads = [inkling_kv_heads_for_layer(cfg, i, True) for i in range(3)]
-        self.assertEqual(
-            heads,
-            [
-                cfg.swa_num_key_value_heads,
-                cfg.ckpt_num_key_value_heads,
-                cfg.swa_num_key_value_heads,
-            ],
-        )
         # Every depth gets its own paged-cache group so the shared slab has
         # no dead rows (1 full + 2 sliding sub-groups of one layer each).
         self.assertEqual(
