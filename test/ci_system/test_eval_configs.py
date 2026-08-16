@@ -69,6 +69,22 @@ def test_fork_pr_context_is_exposed_to_ci_tasks():
     )
 
 
+def test_evalscope_generation_configs_do_not_use_unsupported_seed():
+    # SMG's TokenSpeed scheduler proto has no seed field, so a configured seed
+    # would be silently dropped before the request reaches SamplingParams.
+    for path in sorted(EVAL_CONFIG_DIR.glob("*.yaml")):
+        task = yaml.safe_load(path.read_text(encoding="utf-8"))
+        command = task.get("eval", {}).get("command", "")
+        if "evalscope eval" not in command or "--generation-config" not in command:
+            continue
+
+        generation_config = json.loads(
+            flag_value(shlex.split(command), "--generation-config")
+        )
+        assert "seed" not in generation_config, path
+        assert "seed" not in generation_config.get("extra_body", {}), path
+
+
 def test_evalscope_configs_use_expected_dataset_sources():
     counts = Counter()
     paths = []
