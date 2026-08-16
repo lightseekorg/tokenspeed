@@ -33,10 +33,6 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    CacheGroupSpec,
-)
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)

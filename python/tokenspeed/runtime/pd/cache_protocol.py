@@ -30,7 +30,7 @@ validation.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -41,7 +41,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     cache_field_layer_id,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    MXFP8_KV_SCALE_TILE_TOKENS,
     CacheGroupSpec,
     Retention,
     TransferPolicy,

@@ -24,7 +24,6 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-import numpy as np
 import torch
 
 from tokenspeed.runtime.layers.attention.kv_cache.mha import (
