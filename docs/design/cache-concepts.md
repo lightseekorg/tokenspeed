@@ -415,13 +415,11 @@ concurrency, so demand and capacity cannot size against different numbers.
 4. New attention backends declare which view of `CacheBlock` they need
    (paged KV view or state view); they do not invent new table concepts.
 
-## Current state vs. principles (audit 2026-08-13, re-verified after the kernel-page round)
+## Current state vs. principles (audit 2026-08-16)
 
-A snapshot of where the code stands relative to each principle, after the
-2026-08-13 refactor series (prefix layer extraction, coordinator capacity
-API, table-naming cleanup, spec geometry shapes, kernel-page registry, and
-the V4 decoupling milestone). Every claim below was re-checked against the
-code at this date.
+Where the code stands relative to each principle. Every claim below was
+re-checked against the code at this date; a ✓ means the principle holds with
+no known exception, and the exceptions that remain say so explicitly.
 
 ### Principle 1 — prefix matching isolated from the allocator: fixed
 
@@ -442,17 +440,17 @@ Scheduling and FSM code do no geometry arithmetic. The coordinator exposes
 capacity views — `LcmBlocksNeededFor(group_pages)`,
 `NumActiveLcmBlocks(request_tables)`, `NumAvailableLcmBlocks`,
 `TotalLcmBlocks`, `GroupAvailablePages(group)` — and the scheduler treats the
-counts as opaque capacity units. `ForwardState::ActiveLcmBlockIds()` is gone;
-the null-page reservation lives in
-`SchedulerConfig::AllocatorConfig::NumUsableBlocks()`.
+counts as opaque capacity units. The null-page reservation lives in
+`SchedulerConfig::AllocatorConfig::NumUsableBlocks()`, and nothing outside the
+cache layer enumerates LCM block ids.
 
-Enforced since this round:
+Enforced:
 
 * the identifier `page_size` is grep-zero across `tokenspeed-scheduler`
   (csrc, tests, python bindings) — the slot span is spelled
   `block_granularity` everywhere;
-* `CacheGroupSpec.block_granularity` is required and explicit — the
-  zero-means-prefix-granularity fallback is deleted, and the coordinator
+* `CacheGroupSpec.block_granularity` is required and explicit: every group
+  states its span, with no zero-means-default fallback, and the coordinator
   asserts a positive divisor of P at construction;
 * `SchedulerConfig::Validate()` is the **single** configuration gate: every
   scheduler scalar, every `CacheGroupConfig::Validate()`, and the cross-checks
@@ -498,30 +496,31 @@ and never touches packing. No refactor needed here.
   `CacheGroupsMixin` docstring. Third-party kernel keyword names
   (`flash_mla`'s `block_table=`, TRT-LLM's `block_tables=`) are an external
   boundary and stay as the kernels spell them.
-* Former residues, both closed on 2026-08-13: the state backend's replay
-  hook no longer names a `page_table` parameter (the shared call's keyword
-  is absorbed unused via `**kwargs` — state attention has no page table),
-  and `input_buffer.py::fill_input_buffers` takes a unit-neutral
-  `out_loc_table` (the batch-ordered table `out_cache_loc` derives from:
-  scheduler full-history table on the target path, staged draft table on
-  the drafter path).
+* The state backend's replay hook names no `page_table` parameter — state
+  attention has no page table, so the shared call's keyword is absorbed unused
+  via `**kwargs`. And `input_buffer.py::fill_input_buffers` takes a
+  unit-neutral `out_loc_table`: the batch-ordered table `out_cache_loc`
+  derives from, which is the scheduler's full-history table on the target path
+  and the staged draft table on the drafter path.
 
 ### Principle 5 — Python perceives the logical quantities minimally: leaks fixed, mapping owners still four
 
 Compliant: the recipes/planner layer *owns* the vocabulary rather than
 leaking it; `expand_page_table` (`attention/page_table.py`) is the single
 expansion primitive; state attention and KV share one plan/arena/`CacheBlock`
-view, mirrored by the host tier. Fixed on 2026-08-13:
+view, mirrored by the host tier. Specifically:
 
-* The magic `prefix_granularity == 128` branches now name the real
-  constraint — `MXFP8_KV_SCALE_TILE_TOKENS` in `recipes/spec.py`, used by
-  `recipes/ordinary.py` and `pd/cache_protocol.py`.
-* glm5's private page→slot arithmetic moved to the mapping layer
-  (`attention/page_table.py::build_prefill_kv_workspace_slots`).
+* No magic `prefix_granularity == 128` branches: the constraint is named
+  `MXFP8_KV_SCALE_TILE_TOKENS`, defined in `recipes/plan.py` beside the scale
+  field geometry it fixes and re-exported from `recipes/spec.py` for callers
+  that read it as a token span.
+* glm5's page→slot arithmetic lives in the mapping layer
+  (`attention/page_table.py::build_prefill_kv_workspace_slots`), not in the
+  model.
 * The mamba backend derives its checkpoint span from the state group's
-  `spec.checkpoint_granularity` (snapshot-state groups declare it directly;
-  `page_size` no longer exists on them) instead of
-  `contract.prefix_granularity`.
+  `spec.checkpoint_granularity`, which snapshot-state groups declare directly
+  — asking such a group for `page_size` is a `TypeError`, since it has no
+  rows.
 * Spec geometry is shape-checked at construction: row geometry and
   `checkpoint_granularity` are mutually exclusive, both positive, and
   family-gated (`CacheGroupSpec.__post_init__`).
