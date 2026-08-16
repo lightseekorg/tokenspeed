@@ -31,7 +31,8 @@ class _CacheMetadata:
 
 class _ContractPool:
     def __init__(self, page_size, components):
-        self.runtime_contract = SimpleNamespace(
+        # The arena publishes the contract; a view only names its arena.
+        contract = SimpleNamespace(
             prefix_granularity=page_size,
             group_specs=tuple(
                 SimpleNamespace(
@@ -44,6 +45,7 @@ class _ContractPool:
                 )
             ),
         )
+        self.arena = SimpleNamespace(runtime_contract=contract)
         self._components = components
         self._group_ids_by_layer = {
             layer_id: group_id for layer_id, (group_id, _, _) in components.items()

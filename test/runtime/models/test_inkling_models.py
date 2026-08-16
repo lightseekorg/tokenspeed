@@ -114,23 +114,23 @@ class TestInklingConfigRegistry(unittest.TestCase):
         self.assertEqual(layout[InklingConvStream.MLP], (2 * kv_dim + h, h))
         self.assertEqual(inkling_conv_total_dim(text, 1), 2 * kv_dim + 2 * h)
 
-    def test_paged_cache_layer_types_sliding_subgroups(self):
+    def test_cache_layer_types_sliding_subgroups(self):
         """Cache-group labels: sliding layers split round-robin into
         equal-count sub-groups sized by the full-layer count, so every
         hybrid slab is bound by one layer of each group (5+1 truncated,
         5x11+11 at full depth; see kv_cache.recipes.publish.hybrid_slab_group_size).
-        Exposed as paged_cache_layer_types, NOT layer_types: transformers
+        Exposed as cache_layer_types, NOT layer_types: transformers
         validates layer_types against ALLOWED_LAYER_TYPES, which rejects
         sub-group labels."""
         text = load_inkling_config().get_text_config()
         self.assertEqual(
-            text.paged_cache_layer_types,
+            text.cache_layer_types,
             [f"sliding_attention_{k}" for k in range(5)] + ["full_attention"],
         )
         # Full depth: 66 layers -> 5 sub-groups of 11 sliding + 11 full.
         full = load_inkling_config(num_layers=None).get_text_config()
         full_ids = list(range(5, 66, 6))
-        lt = full.paged_cache_layer_types
+        lt = full.cache_layer_types
         self.assertEqual(
             [i for i, t in enumerate(lt) if t == "full_attention"], full_ids
         )
@@ -140,7 +140,7 @@ class TestInklingConfigRegistry(unittest.TestCase):
         # Draft (nextn) shape: local_layer_ids=[] -> all full, indexable
         # by draft layer_id.
         draft = InklingModelConfig(num_hidden_layers=4, local_layer_ids=[])
-        self.assertEqual(draft.paged_cache_layer_types, ["full_attention"] * 4)
+        self.assertEqual(draft.cache_layer_types, ["full_attention"] * 4)
 
     def test_local_layer_ids_validation(self):
         with self.assertRaises(ValueError):

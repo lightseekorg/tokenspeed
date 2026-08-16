@@ -9,19 +9,19 @@ from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layo
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
-from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-from tokenspeed.runtime.layers.attention.kv_cache.factory import create_cache_pool
+from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+from tokenspeed.runtime.layers.attention.kv_cache.factory import (
+    create_cache_arena,
+    create_cache_pool,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
     HybridMHATokenToKVPool,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
-    build_hybrid_cache_setup,
-)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
-    merge_continuation_layers,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     prepare_cache_setup,
@@ -29,9 +29,20 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
-    PagedCacheGroupSpec,
-    build_paged_cache_group_specs,
+    CacheGroupSpec,
 )
+
+
+def _pool_over_new_arena(spec, config, *, num_layers: int, rank: int = 0):
+    """Allocate an arena for ``spec`` and bind one compute view onto it."""
+    arena = create_cache_arena(spec, device=config.device, enable_memory_saver=False)
+    return create_cache_pool(
+        spec,
+        config,
+        arena,
+        num_layers=num_layers,
+        rank=rank,
+    )
 
 
 def _mha_config() -> MHAConfig:
@@ -110,59 +121,96 @@ def _msa_config() -> MSAConfig:
     )
 
 
-def _hybrid_setup_with_narrow_draft():
-    # The recipe merges target and draft layers BEFORE the builder
-    # (merge_continuation_layers); "state" here is a layer-external group,
-    # plain tuple concatenation like Inkling's checkpoint columns.
-    (
-        fields,
+class _SyntheticHybridRecipe(CacheRecipe):
+    """A minimal hybrid family, expressed the way a real one is.
+
+    Its layer vocabulary and byte shapes are fixtures; everything else comes
+    from the base pipeline. That a made-up family needs only these seams is
+    the point -- the shared stages carry the rest.
+    """
+
+    family = "inkling"
+
+    def __init__(
+        self,
+        *,
         layer_types,
         group_ids,
-        _,
-        num_draft_layers,
-    ) = merge_continuation_layers(
-        fields=(
-            CacheFieldSpec("full_attention", "layer.0.kv", "slot.0", (256,), 1),
-            CacheFieldSpec("state", "layer.0.state", "slot.0", (128,), 1),
-        ),
-        layer_types=("full_attention",),
-        group_ids=("full_attention",),
-        draft_fields=(
-            CacheFieldSpec("full_attention", "layer.0.kv", "slot.0", (256,), 1),
-        ),
-        draft_layer_types=("full_attention",),
-        draft_group_ids=("full_attention",),
-    )
-    group_specs = (
-        *build_paged_cache_group_specs(
-            layer_types=layer_types,
-            group_ids=group_ids,
-            sliding_window_tokens=None,
-            prefix_granularity=4,
-        ),
-        PagedCacheGroupSpec(
-            group_id="state",
-            retention="full_history",
-            sliding_window_tokens=None,
-            family="state",
-            checkpoint_granularity=4,
-        ),
-    )
-    return build_hybrid_cache_setup(
-        family="inkling",
-        server_args=SimpleNamespace(max_total_tokens=None),
-        fields=fields,
-        layer_types=layer_types,
-        group_ids=group_ids,
-        group_specs=group_specs,
-        state_dtypes={},
-        layer_kv_head_counts=None,
-        num_draft_layers=num_draft_layers,
+        num_draft_layers=0,
+        windows=None,
+        extra_state_group=None,
         cache_budget_bytes=2_048,
-        fixed_workspace_bytes=0,
-        prefix_granularity=4,
-        max_padding_fraction=1.0,
-    )
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            server_args=SimpleNamespace(max_total_tokens=None),
+            model_config=None,
+            attn_config=SimpleNamespace(
+                prefix_granularity=4, sliding_window_tokens=windows
+            ),
+            draft_model_config=None,
+            draft_attn_config=None,
+            cache_budget_bytes=cache_budget_bytes,
+            decode_input_tokens=1,
+            overlap_schedule_depth=0,
+            **kwargs,
+        )
+        self._layer_types = tuple(layer_types)
+        self._group_ids = tuple(group_ids)
+        self._num_draft_layers = num_draft_layers
+        self._extra_state_group = extra_state_group
+
+    @property
+    def layer_types(self):
+        return self._layer_types
+
+    @property
+    def group_ids(self):
+        return self._group_ids
+
+    @property
+    def num_draft_layers(self):
+        return self._num_draft_layers
+
+    @property
+    def max_padding_fraction(self) -> float:
+        return 1.0
+
+    def fields_for_layer(self, layer_id, group_id, occurrence):
+        return (
+            CacheFieldSpec(
+                f"layer.{layer_id}.kv", f"slot.{occurrence}", (256,), "uint8"
+            ),
+        )
+
+    def groups(self):
+        groups = super().groups()
+        if self._extra_state_group is None:
+            return groups
+        # A layer-external state group, like Inkling's checkpoint columns:
+        # declared whole, its id written once.
+        return groups + (
+            (
+                CacheGroupSpec(
+                    group_id=self._extra_state_group,
+                    retention="full_history",
+                    sliding_window_tokens=None,
+                    family="state",
+                    checkpoint_granularity=self.prefix_granularity,
+                ),
+                (CacheFieldSpec("layer.0.state", "slot.0", (128,), "uint8"),),
+            ),
+        )
+
+
+def _hybrid_setup_with_narrow_draft():
+    """One KV group shared by target and draft, plus a state column."""
+    return _SyntheticHybridRecipe(
+        layer_types=("full_attention", "full_attention"),
+        group_ids=("full_attention", "full_attention"),
+        num_draft_layers=1,
+        extra_state_group="state",
+    ).setup()
 
 
 def test_attention_configs_do_not_own_cache_setup() -> None:
@@ -247,20 +295,16 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         f"{LINEAR_ATTENTION}_0",
         FULL_ATTENTION,
     )
-    assert setup.spec.state_field_dtypes == {
-        "layer.0.conv": torch.bfloat16,
-        "layer.0.ssm": torch.float32,
+    # The plan is the single source of field dtypes; no side channel.
+    plan_dtypes = {
+        field.field_id: field.dtype for field in setup.spec.memory_plan.fields
     }
+    assert plan_dtypes["layer.0.conv"] == "bfloat16"
+    assert plan_dtypes["layer.0.ssm"] == "float32"
     assert not hasattr(attn_config, "lcm_memory_plan")
-    pool = create_cache_pool(
-        setup.spec,
-        attn_config,
-        num_layers=2,
-        rank=0,
-        enable_memory_saver=False,
-    )
+    pool = _pool_over_new_arena(setup.spec, attn_config, num_layers=2)
     assert type(pool) is HybridMHATokenToKVPool
-    assert pool.buffer is not None
+    assert pool.arena.buffer is not None
 
 
 def test_ordinary_mha_reserves_null_parent_within_cache_budget() -> None:
@@ -289,22 +333,14 @@ def test_ordinary_mha_reserves_null_parent_within_cache_budget() -> None:
     assert setup.spec.memory_plan.arena_bytes <= 16_384
     assert setup.spec.token_capacity == 960
     assert setup.num_draft_layers == 0
-    pool = create_cache_pool(
-        setup.spec,
-        attn_config,
-        num_layers=2,
-        rank=0,
-        enable_memory_saver=False,
-    )
+    pool = _pool_over_new_arena(setup.spec, attn_config, num_layers=2)
     assert type(pool) is MHATokenToKVPool
-    assert pool.runtime_contract.token_capacity == setup.spec.token_capacity
+    assert pool.arena.runtime_contract.token_capacity == setup.spec.token_capacity
     with pytest.raises(TypeError, match="incompatible with MHAConfig"):
-        create_cache_pool(
+        _pool_over_new_arena(
             replace(setup.spec, family="kimi_k3"),
             attn_config,
             num_layers=2,
-            rank=0,
-            enable_memory_saver=False,
         )
 
 
@@ -334,15 +370,9 @@ def test_ordinary_mla_reserves_null_parent_within_cache_budget() -> None:
     assert setup.spec.memory_plan.arena_bytes <= 24_576
     assert setup.spec.token_capacity == 960
     assert setup.num_draft_layers == 0
-    pool = create_cache_pool(
-        setup.spec,
-        attn_config,
-        num_layers=2,
-        rank=0,
-        enable_memory_saver=False,
-    )
+    pool = _pool_over_new_arena(setup.spec, attn_config, num_layers=2)
     assert type(pool) is MLATokenToKVPool
-    assert pool.runtime_contract.token_capacity == setup.spec.token_capacity
+    assert pool.arena.runtime_contract.token_capacity == setup.spec.token_capacity
 
 
 @pytest.mark.parametrize(
@@ -354,7 +384,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
     target_config,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tokenspeed.runtime.pd.cache_protocol import build_pool_cache_transfer_contract
+    from tokenspeed.runtime.pd.cache_protocol import build_arena_cache_transfer_contract
 
     model_config = SimpleNamespace(num_attention_layers=2, hf_config=SimpleNamespace())
     draft_model_config = SimpleNamespace(
@@ -396,69 +426,34 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
         first_layer=2,
         num_layers=1,
         family="mha",
-        publish_runtime_contract=False,
+    )
+    # One arena, two compute views: the target's window and the draft's
+    # continuation window, with no owner/view asymmetry to encode.
+    arena = create_cache_arena(
+        setup.spec, device=target_attn_config.device, enable_memory_saver=False
     )
     target_pool = create_cache_pool(
         target_spec,
         target_attn_config,
+        arena,
         num_layers=2,
         rank=0,
-        enable_memory_saver=False,
     )
-    unbound_pool = CachePool(
-        setup.spec.pool_size,
-        target_pool.dtype,
-        "cpu",
-        setup.spec.memory_plan.prefix_granularity,
-        0,
-        setup.spec.memory_plan,
-    )
-    with pytest.raises(ValueError, match="must bind its fields before a view"):
-        CachePool(
-            setup.spec.pool_size,
-            target_pool.dtype,
-            "cpu",
-            setup.spec.memory_plan.prefix_granularity,
-            0,
-            setup.spec.memory_plan,
-            backing_pool=unbound_pool,
-        )
-    with pytest.raises(ValueError, match="must inherit, not republish"):
-        CachePool(
-            setup.spec.pool_size,
-            target_pool.dtype,
-            "cpu",
-            setup.spec.memory_plan.prefix_granularity,
-            0,
-            setup.spec.memory_plan,
-            paged_cache_group_specs=target_spec.paged_cache_group_specs,
-            backing_pool=target_pool,
-        )
-    with pytest.raises(ValueError, match="only supported by ordinary MHA or MLA pools"):
-        create_cache_pool(
-            target_spec,
-            _msa_config(),
-            num_layers=2,
-            rank=0,
-            enable_memory_saver=False,
-            backing_pool=target_pool,
-        )
     draft_pool = create_cache_pool(
         draft_spec,
         draft_attn_config,
+        arena,
         num_layers=1,
         rank=0,
-        enable_memory_saver=False,
         field_layer_offset=2,
-        backing_pool=target_pool,
     )
 
     assert type(draft_pool) is MHATokenToKVPool
-    assert draft_pool.buffer is target_pool.buffer
-    assert draft_pool._fields is target_pool._fields
-    assert draft_pool.runtime_contract is target_pool.runtime_contract
+    assert draft_pool.arena is target_pool.arena
+    assert draft_pool.arena.buffer is target_pool.arena.buffer
+    assert draft_pool.arena.runtime_contract is target_pool.arena.runtime_contract
     assert draft_pool.layerwise_load_tracker is None
-    assert set(target_pool._fields) == {
+    assert arena.field_ids() == {
         field.field_id for field in setup.spec.memory_plan.fields
     }
     target_layout = target_pool.cache_transfer_layout()
@@ -469,22 +464,22 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
     draft_transfer_fields = {
         field_id for consumer in draft_layout.consumers for field_id in consumer
     }
-    assert target_transfer_fields == set(target_pool._fields) - draft_field_ids
+    assert target_transfer_fields == arena.field_ids() - draft_field_ids
     assert draft_transfer_fields == draft_field_ids
     combined_layout = combine_cache_transfer_layouts(
         target_layout,
         draft_layout,
-        group_ids=tuple(spec.group_id for spec in target_pool.paged_cache_group_specs),
+        group_ids=tuple(spec.group_id for spec in target_pool.arena.cache_group_specs),
     )
     assert len(combined_layout.consumers) == 3
-    assert combined_layout.buffers == (target_pool.buffer,)
+    assert combined_layout.buffers == (target_pool.arena.buffer,)
     assert {
         field.field_id for group in combined_layout.groups for field in group.fields
-    } == set(target_pool._fields)
-    contract, base_addr = build_pool_cache_transfer_contract(target_pool)
-    assert contract.plan is target_pool.plan
-    assert base_addr == target_pool.buffer.data_ptr()
-    assert len(contract.field_dtypes) == len(target_pool._fields)
+    } == arena.field_ids()
+    contract, base_addr = build_arena_cache_transfer_contract(target_pool.arena)
+    assert contract.plan is target_pool.arena.plan
+    assert base_addr == target_pool.arena.buffer.data_ptr()
+    assert {field.field_id for field in contract.plan.fields} == arena.field_ids()
 
     target_last_layer = target_pool.get_key_buffer(1).clone()
 
@@ -506,11 +501,11 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
     assert torch.equal(draft_pool.get_value_buffer(0)[0], cache_v[0])
     assert torch.equal(target_pool.get_key_buffer(1), target_last_layer)
 
-    # Sleep/wake repair visits both objects; only the allocation owner clears.
+    # Sleep/wake repair visits both views; both name the one arena, so a
+    # clear through either zeros the shared allocation exactly as well.
     draft_pool.clear_kv_buffers()
-    assert torch.equal(draft_pool.get_key_buffer(0)[0], cache_k[0])
-    target_pool.clear_kv_buffers()
     assert not torch.count_nonzero(draft_pool.get_key_buffer(0))
+    assert not torch.count_nonzero(target_pool.get_key_buffer(1))
 
 
 def test_heterogeneous_draft_guards_fail_fast() -> None:
@@ -532,6 +527,7 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
             cache_spec=object(),
             num_target_layers=1,
             full_attn_backend_name=None,
+            is_heterogeneous=True,
             is_hybrid_linear=True,
             is_kda=False,
             is_inkling=False,
@@ -598,66 +594,13 @@ def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:
     plan) participates in the draft solve with its own byte-ratio packing;
     shared groups keep the target's pinned packing.
     """
-    (
-        fields,
-        layer_types,
-        group_ids,
-        _,
-        num_draft_layers,
-    ) = merge_continuation_layers(
-        fields=(
-            CacheFieldSpec(
-                "full_attention",
-                "layer.0.kv",
-                "slot.0",
-                (256,),
-                1,
-            ),
-        ),
-        layer_types=("full_attention",),
-        group_ids=("full_attention",),
-        draft_fields=(
-            CacheFieldSpec(
-                "full_attention",
-                "layer.0.kv",
-                "slot.0",
-                (256,),
-                1,
-            ),
-            # Draft-only sliding-window layers: not present in the target plan.
-            CacheFieldSpec(
-                "draft_swa",
-                "layer.1.kv",
-                "slot.1",
-                (256,),
-                1,
-            ),
-        ),
-        draft_layer_types=("full_attention", "sliding_attention"),
-        draft_group_ids=("full_attention", "draft_swa"),
-    )
-    # ONE spec derivation over the merged layers, per-layer windows.
-    group_specs = build_paged_cache_group_specs(
-        layer_types=layer_types,
-        group_ids=group_ids,
-        sliding_window_tokens=(None, None, 8),
-        prefix_granularity=4,
-    )
-    setup = build_hybrid_cache_setup(
-        family="inkling",
-        server_args=SimpleNamespace(max_total_tokens=None),
-        fields=fields,
-        layer_types=layer_types,
-        group_ids=group_ids,
-        group_specs=group_specs,
-        state_dtypes={},
-        layer_kv_head_counts=None,
-        num_draft_layers=num_draft_layers,
+    setup = _SyntheticHybridRecipe(
+        layer_types=("full_attention", "full_attention", "sliding_attention"),
+        group_ids=("full_attention", "full_attention", "draft_swa"),
+        num_draft_layers=2,
+        windows=(None, None, 8),
         cache_budget_bytes=4_096,
-        fixed_workspace_bytes=0,
-        prefix_granularity=4,
-        max_padding_fraction=1.0,
-    )
+    ).setup()
 
     # One big model: both draft layers are continuation layers (global
     # layers 1 and 2) of the one merged plan. The full_attention group is
@@ -673,7 +616,7 @@ def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:
         "full_attention",
         "draft_swa",
     )
-    published = {spec.group_id for spec in setup.spec.paged_cache_group_specs}
+    published = {spec.group_id for spec in setup.spec.cache_group_specs}
     assert published == {"full_attention", "draft_swa"}
 
 
@@ -684,122 +627,133 @@ def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
     instantiates its existing SwaManager for them, no draft concept
     anywhere."""
     import torch
+    from cache_pool_test_utils import MinimalCacheView
 
-    from tokenspeed.runtime.engine.scheduler_utils import pool_to_paged_cache_groups
-    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+    from tokenspeed.runtime.engine.scheduler_utils import pool_to_cache_groups
 
-    (
-        fields,
-        layer_types,
-        group_ids,
-        _,
-        num_draft_layers,
-    ) = merge_continuation_layers(
-        fields=(CacheFieldSpec("full_attention", "layer.0.kv", "slot.0", (256,), 1),),
-        layer_types=("full_attention",),
-        group_ids=("full_attention",),
-        draft_fields=(
-            CacheFieldSpec("full_attention", "layer.0.kv", "slot.0", (256,), 1),
-            CacheFieldSpec("draft_swa", "layer.1.kv", "slot.1", (256,), 1),
-        ),
-        draft_layer_types=("full_attention", "sliding_attention"),
-        draft_group_ids=("full_attention", "draft_swa"),
-    )
-    group_specs = build_paged_cache_group_specs(
-        layer_types=layer_types,
-        group_ids=group_ids,
-        sliding_window_tokens=(None, None, 8),
-        prefix_granularity=4,
-    )
-    setup = build_hybrid_cache_setup(
-        family="inkling",
-        server_args=SimpleNamespace(max_total_tokens=None),
-        fields=fields,
-        layer_types=layer_types,
-        group_ids=group_ids,
-        group_specs=group_specs,
-        state_dtypes={},
-        layer_kv_head_counts=None,
-        num_draft_layers=num_draft_layers,
+    setup = _SyntheticHybridRecipe(
+        layer_types=("full_attention", "full_attention", "sliding_attention"),
+        group_ids=("full_attention", "full_attention", "draft_swa"),
+        num_draft_layers=2,
+        windows=(None, None, 8),
         cache_budget_bytes=4_096,
-        fixed_workspace_bytes=0,
-        prefix_granularity=4,
-        max_padding_fraction=1.0,
-    )
-    pool = CachePool(
-        size=setup.spec.pool_size,
-        dtype=torch.uint8,
-        device="cpu",
-        prefix_granularity=4,
+    ).setup()
+    pool = MinimalCacheView(
+        CacheArena(
+            setup.spec.memory_plan,
+            "cpu",
+            cache_group_specs=setup.spec.cache_group_specs,
+            token_capacity=setup.spec.token_capacity,
+        ),
+        torch.uint8,
         rank=0,
-        memory_plan=setup.spec.memory_plan,
-        paged_cache_group_specs=setup.spec.paged_cache_group_specs,
-        token_capacity=setup.spec.token_capacity,
     )
-    groups = {g.group_id: g for g in pool_to_paged_cache_groups(pool)}
+    groups = {g.group_id: g for g in pool_to_cache_groups(pool)}
     assert set(groups) == {"full_attention", "draft_swa"}
     swa = groups["draft_swa"]
     assert swa.sliding_window_tokens == 8
-    # Packing and page counts come from the ONE merged plan.
+    # Packing and page counts come from the ONE merged plan, carried across
+    # the bridge by the contract rather than stamped onto the group specs.
     plan_group = setup.spec.memory_plan.group("draft_swa")
+    contract = pool.arena.runtime_contract
+    assert contract.group_packing["draft_swa"] == plan_group.cache_blocks_per_lcm_block
     assert swa.cache_blocks_per_lcm_block == plan_group.cache_blocks_per_lcm_block
     assert swa.total_pages == plan_group.page_count
 
 
 def test_draft_view_maps_local_layer_ids_to_continuation_planes() -> None:
-    """Tripwire for the draft layer-map DIRECTION: a draft model's local
-    layer 0 must resolve to the merged pool's continuation plane
-    (num_target_layers), never to the target's layer 0. The inverse map
-    (the hybrid {global: pool_idx} convention) silently corrupts the
-    target's first layers with every draft KV write."""
-    from tokenspeed.runtime.layers.attention.kv_cache.base import LayerMappedKVPool
+    """Tripwire for the draft window's DIRECTION and its bounds.
 
-    class _FakePool:
-        page_size = 4
+    A draft model numbers its layers locally, so local layer 0 must resolve to
+    the merged plan's continuation plane (num_target_layers), never to the
+    target's layer 0. And an id already carrying a global number must be
+    REJECTED rather than offset a second time -- silently addressing another
+    model's planes is how the KV of two models gets crossed.
+    """
+    from cache_pool_test_utils import MinimalCacheView
 
-        def get_key_buffer(self, layer_id: int) -> int:
-            return layer_id
+    class _Window(MinimalCacheView):
+        """Just a layer window: the subject is _field_layer_id's arithmetic."""
+
+        def __init__(self, *, first_layer: int, num_layers: int) -> None:
+            self._field_layer_offset = first_layer
+            self.layer_num = num_layers
 
     num_target_layers = 61
-    draft_pool = LayerMappedKVPool(
-        _FakePool(),
-        [num_target_layers + local for local in range(1)],
-        layer_map={local: num_target_layers + local for local in range(1)},
+    draft = _Window(first_layer=num_target_layers, num_layers=3)
+
+    assert draft._field_layer_id(0) == num_target_layers
+    assert draft._field_layer_id(2) == num_target_layers + 2
+    for outside in (num_target_layers, 3, -1):
+        with pytest.raises(ValueError, match="outside this cache view"):
+            draft._field_layer_id(outside)
+
+    # The target view starts at 0, so its own ids pass through unchanged.
+    target = _Window(first_layer=0, num_layers=num_target_layers)
+    assert target._field_layer_id(7) == 7
+
+
+# --- recipe seams that used to be standalone functions ---
+
+
+def test_qwen_mtp_padding_allowance_tracks_draft_planes() -> None:
+    """The Qwen bound grows with the draft's mirrored K/V planes.
+
+    p = 1 + 2 * draft_layers / full_attention_layers: no draft keeps the
+    original 1.0, and each MTP layer buys headroom for the planes it adds.
+    """
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
+        QwenGDNRecipe,
     )
-    # Local draft layer 0 -> global continuation plane 61.
-    assert draft_pool.get_key_buffer(0) == num_target_layers
-    # A layer already carrying its global id (V4 MTP convention) passes through.
-    assert draft_pool.get_key_buffer(num_target_layers) == num_target_layers
 
-    # The hybrid default stays the inverse: global sparse ids -> compact slots.
-    hybrid_pool = LayerMappedKVPool(_FakePool(), [3, 7, 11])
-    assert hybrid_pool.get_key_buffer(7) == 1
+    def bound(*, full_attention_layers, draft_layers):
+        recipe = QwenGDNRecipe.__new__(QwenGDNRecipe)
+        recipe.__dict__["target_layer_types"] = (
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ) * full_attention_layers
+        recipe.draft_attn_config = object() if draft_layers else None
+        recipe.draft_model_config = SimpleNamespace(num_attention_layers=draft_layers)
+        return QwenGDNRecipe.max_padding_fraction.fget(recipe)
+
+    for full_attention_layers in (6, 12):
+        assert bound(full_attention_layers=full_attention_layers, draft_layers=0) == 1.0
+        assert (
+            abs(
+                bound(full_attention_layers=full_attention_layers, draft_layers=1)
+                - (1.0 + 2.0 / full_attention_layers)
+            )
+            < 1e-9
+        )
 
 
-def test_draft_view_maps_inkling_conv_checkpoint_accessors() -> None:
-    """Same tripwire for the Inkling conv-checkpoint accessors: the
-    __getattr__ pass-through would resolve them against the target's
-    layers 0..n, silently restoring/publishing the wrong planes."""
-    from tokenspeed.runtime.layers.attention.kv_cache.base import LayerMappedKVPool
+def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
+    """Profiled capacity keeps the null page inside the budget.
 
-    class _FakePool:
-        page_size = 4
-
-        def kvconv_checkpoint_buffers(self, layer_id: int):
-            return ("kv", layer_id)
-
-        def hiddenconv_checkpoint_buffer(self, layer_id: int, component: str):
-            return ("hidden", layer_id, component)
-
-    num_target_layers = 66
-    draft_pool = LayerMappedKVPool(
-        _FakePool(),
-        [num_target_layers + local for local in range(3)],
-        layer_map={local: num_target_layers + local for local in range(3)},
+    16_384 bytes at 16 bytes/token and P=64 buys 16 pages; one is the reserved
+    null page, so 15 are schedulable.
+    """
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
+        OrdinaryRecipe,
     )
-    assert draft_pool.kvconv_checkpoint_buffers(0) == ("kv", 66)
-    assert draft_pool.hiddenconv_checkpoint_buffer(2, "mlpconv") == (
-        "hidden",
-        68,
-        "mlpconv",
+
+    recipe = OrdinaryRecipe.__new__(OrdinaryRecipe)
+    recipe.cache_budget_bytes = 16_384
+    recipe.server_args = SimpleNamespace(max_total_tokens=None)
+    recipe.attn_config = SimpleNamespace(
+        prefix_granularity=64,
+        cache_cell_size=lambda: 16,
+        layer_types=(),
+        sliding_window_tokens=None,
     )
+    recipe.draft_attn_config = None
+    recipe.model_config = SimpleNamespace(num_attention_layers=1)
+
+    usable_pages = recipe.num_lcm_blocks(
+        SimpleNamespace(lcm_block_bytes=1, prefix_granularity=64, group_packing=())
+    )
+
+    assert usable_pages == 15
+    assert (usable_pages + 1) * 64 * 16 <= 16_384

@@ -1,7 +1,7 @@
 """aligned_max_scheduled_tokens (engine/scheduler_utils, applied in
 engine/event_loop before make_config).
 
-Recurrent-state paged-cache groups (family=State, retention=FullHistory; the
+Recurrent-state cache groups (family=State, retention=FullHistory; the
 C++ ``final_state_manager`` criterion) register their snapshot only when a
 prefill chunk ends page-aligned (RegistersAlignedFinalPageOnly). The helper
 floors the scheduler's max_scheduled_tokens to the LCM of those groups' page
@@ -24,9 +24,9 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed_scheduler import (
-    PagedCacheGroupConfig,
-    PagedCacheGroupFamily,
-    PagedCacheRetention,
+    CacheGroupConfig,
+    CacheGroupFamily,
+    CacheRetention,
 )
 
 from tokenspeed.runtime.engine.scheduler_utils import aligned_max_scheduled_tokens
@@ -34,11 +34,11 @@ from tokenspeed.runtime.engine.scheduler_utils import aligned_max_scheduled_toke
 
 def _group(
     group_id: str,
-    family: PagedCacheGroupFamily,
-    retention: PagedCacheRetention,
+    family: CacheGroupFamily,
+    retention: CacheRetention,
     page_size: int = 64,
     sliding_window_tokens: int | None = None,
-) -> PagedCacheGroupConfig:
+) -> CacheGroupConfig:
     kwargs = dict(
         group_id=group_id,
         rows_per_page=page_size,
@@ -49,23 +49,23 @@ def _group(
     )
     if sliding_window_tokens is not None:
         kwargs["sliding_window_tokens"] = sliding_window_tokens
-    return PagedCacheGroupConfig(**kwargs)
+    return CacheGroupConfig(**kwargs)
 
 
-def _kimi_k3_groups(page_size: int = 1536) -> list[PagedCacheGroupConfig]:
+def _kimi_k3_groups(page_size: int = 1536) -> list[CacheGroupConfig]:
     groups = [
         _group(
             "full_attention",
-            PagedCacheGroupFamily.History,
-            PagedCacheRetention.FullHistory,
+            CacheGroupFamily.History,
+            CacheRetention.FullHistory,
             page_size=page_size,
         )
     ]
     groups.extend(
         _group(
             f"linear_attention_{i}",
-            PagedCacheGroupFamily.State,
-            PagedCacheRetention.FullHistory,
+            CacheGroupFamily.State,
+            CacheRetention.FullHistory,
             page_size=page_size,
         )
         for i in range(3)
@@ -85,8 +85,8 @@ class AlignedMaxScheduledTokensTest(unittest.TestCase):
         groups = [
             _group(
                 "full_attention",
-                PagedCacheGroupFamily.History,
-                PagedCacheRetention.FullHistory,
+                CacheGroupFamily.History,
+                CacheRetention.FullHistory,
                 page_size=1536,
             )
         ]
@@ -102,8 +102,8 @@ class AlignedMaxScheduledTokensTest(unittest.TestCase):
         groups = [
             _group(
                 "v4.swa_kv",
-                PagedCacheGroupFamily.State,
-                PagedCacheRetention.SlidingWindow,
+                CacheGroupFamily.State,
+                CacheRetention.SlidingWindow,
                 page_size=1536,
                 sliding_window_tokens=1536,
             )
@@ -120,8 +120,8 @@ class AlignedMaxScheduledTokensTest(unittest.TestCase):
         groups = [
             _group(
                 "state",
-                PagedCacheGroupFamily.State,
-                PagedCacheRetention.FullHistory,
+                CacheGroupFamily.State,
+                CacheRetention.FullHistory,
                 page_size=96,
             )
         ]
@@ -131,14 +131,14 @@ class AlignedMaxScheduledTokensTest(unittest.TestCase):
         groups = [
             _group(
                 "state_a",
-                PagedCacheGroupFamily.State,
-                PagedCacheRetention.FullHistory,
+                CacheGroupFamily.State,
+                CacheRetention.FullHistory,
                 page_size=64,
             ),
             _group(
                 "state_b",
-                PagedCacheGroupFamily.State,
-                PagedCacheRetention.FullHistory,
+                CacheGroupFamily.State,
+                CacheRetention.FullHistory,
                 page_size=96,
             ),
         ]

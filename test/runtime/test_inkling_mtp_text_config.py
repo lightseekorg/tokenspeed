@@ -3,7 +3,7 @@
 Checkpoints since 4d71c3ea mix SWA and full-attention MTP depths
 (``mtp_config.local_layer_ids``); ``inkling_mtp_text_config`` turns the base
 text config into the draft worker's depth config: depth-local ids become the
-``local_layer_ids`` that drive attention geometry and paged-cache labels,
+``local_layer_ids`` that drive attention geometry and cache-group labels,
 and depths beyond ``--speculative-num-steps`` are pruned (an MTP chain only
 runs depths 0..steps-1).
 """
@@ -69,10 +69,10 @@ class TestInklingMTPTextConfig(unittest.TestCase):
                 cfg.swa_num_key_value_heads,
             ],
         )
-        # Every depth gets its own paged-cache group so the shared slab has
+        # Every depth gets its own cache group so the shared slab has
         # no dead rows (1 full + 2 sliding sub-groups of one layer each).
         self.assertEqual(
-            cfg.paged_cache_layer_types,
+            cfg.cache_layer_types,
             ["sliding_attention_0", "full_attention", "sliding_attention_1"],
         )
         # The base config is untouched (deepcopy).
@@ -96,7 +96,7 @@ class TestInklingMTPTextConfig(unittest.TestCase):
         cfg = inkling_mtp_text_config(text)
         self.assertEqual(cfg.num_hidden_layers, 4)
         self.assertEqual(cfg.local_layer_ids, [])
-        self.assertEqual(cfg.paged_cache_layer_types, ["full_attention"] * 4)
+        self.assertEqual(cfg.cache_layer_types, ["full_attention"] * 4)
 
     def test_steps_beyond_depths_keeps_all_depths(self):
         # The registry raises for steps > depths; the config transform must

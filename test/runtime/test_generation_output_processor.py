@@ -65,6 +65,9 @@ class _ForwardOp:
     request_ids = ["prefill", "decode"]
     request_pool_indices = [0, 1]
     input_lengths = [4, 1]
+    # Total prefill size per extend slot, as C++ Request::PrefillSize() reports
+    # it: for a fresh request this equals prefix + input.
+    prefill_lengths = [4]
     extend_prefix_lens = [0]
 
     def num_extends(self):
@@ -196,6 +199,7 @@ def test_nan_flag_keeps_single_sanitized_token():
         request_ids = ["decode"]
         request_pool_indices = [0]
         input_lengths = [1]
+        prefill_lengths = []
         extend_prefix_lens = []
 
         def num_extends(self):
@@ -271,6 +275,7 @@ def test_log_request_stats_disabled_by_default():
             request_ids = ["d"]
             request_pool_indices = [0]
             input_lengths = [1]
+            prefill_lengths = []
             extend_prefix_lens = []
 
             def num_extends(self):
@@ -438,6 +443,7 @@ def test_log_request_stats_records_timestamps_through_forward():
             request_ids = ["d"]
             request_pool_indices = [0]
             input_lengths = [1]
+            prefill_lengths = []
             extend_prefix_lens = []
 
             def num_extends(self):

@@ -109,9 +109,12 @@ class CacheGroupIdsTest(_TorchCase):
         )
 
     def _pool(self, group_ids):
+        # A cache view names its arena; the arena publishes the specs.
         return SimpleNamespace(
-            paged_cache_group_specs=tuple(
-                SimpleNamespace(group_id=gid) for gid in group_ids
+            arena=SimpleNamespace(
+                cache_group_specs=tuple(
+                    SimpleNamespace(group_id=gid) for gid in group_ids
+                )
             )
         )
 
@@ -159,9 +162,11 @@ class DraftCacheGroupIdsTest(_TorchCase):
                 cache_consumer_families=frozenset(families),
             ),
             draft_token_to_kv_pool=SimpleNamespace(
-                paged_cache_group_specs=(
-                    SimpleNamespace(group_id="full_attention", family="history"),
-                    SimpleNamespace(group_id="state", family="state"),
+                arena=SimpleNamespace(
+                    cache_group_specs=(
+                        SimpleNamespace(group_id="full_attention", family="history"),
+                        SimpleNamespace(group_id="state", family="state"),
+                    )
                 )
             ),
         )
@@ -222,7 +227,7 @@ class WrapperReplayGroupedTest(_TorchCase):
         mock = SimpleNamespace(
             attn_backend=SimpleNamespace(
                 uses_cache_groups=True,
-                uses_paged_cache_groups=False,
+                needs_group_block_tables=False,
                 uses_padded_decode_token_mask=False,
                 init_forward_metadata_replay_cuda_graph=record,
             ),
@@ -284,13 +289,13 @@ class WrapperReplayGroupedTest(_TorchCase):
         mock = SimpleNamespace(
             attn_backend=SimpleNamespace(
                 uses_cache_groups=False,
-                uses_paged_cache_groups=False,
+                needs_group_block_tables=False,
                 uses_padded_decode_token_mask=False,
                 init_forward_metadata_replay_cuda_graph=lambda *args, **kwargs: None,
             ),
             draft_attn_backend=SimpleNamespace(
                 uses_cache_groups=True,
-                uses_paged_cache_groups=False,
+                needs_group_block_tables=False,
                 uses_padded_decode_token_mask=False,
                 init_forward_metadata_replay_cuda_graph=record_draft,
             ),
@@ -343,7 +348,7 @@ class WrapperReplayGroupedTest(_TorchCase):
 
         backend_contract = {
             "uses_cache_groups": True,
-            "uses_paged_cache_groups": False,
+            "needs_group_block_tables": False,
             "uses_padded_decode_token_mask": True,
         }
         mock = SimpleNamespace(
@@ -421,13 +426,15 @@ class WrapperCaptureGroupIdsTest(_TorchCase):
                 seq_lens_buf=torch.ones(MAX_BS, dtype=torch.int32),
             ),
             attn_backend=SimpleNamespace(
-                uses_paged_cache_groups=False,
+                needs_group_block_tables=False,
                 uses_cache_groups=uses_cache_groups,
                 init_forward_metadata_capture_cuda_graph=record,
             ),
             token_to_kv_pool=SimpleNamespace(
-                paged_cache_group_specs=tuple(
-                    SimpleNamespace(group_id=gid) for gid in group_ids
+                arena=SimpleNamespace(
+                    cache_group_specs=tuple(
+                        SimpleNamespace(group_id=gid) for gid in group_ids
+                    )
                 )
             ),
             drafter=None,
@@ -481,11 +488,13 @@ class WrapperEagerGroupGuardTest(_TorchCase):
             config=SimpleNamespace(),
             attn_backend=SimpleNamespace(
                 uses_cache_groups=True,
-                uses_paged_cache_groups=False,
+                needs_group_block_tables=False,
             ),
             token_to_kv_pool=SimpleNamespace(
-                paged_cache_group_specs=tuple(
-                    SimpleNamespace(group_id=gid) for gid in group_ids
+                arena=SimpleNamespace(
+                    cache_group_specs=tuple(
+                        SimpleNamespace(group_id=gid) for gid in group_ids
+                    )
                 )
             ),
             drafter=None,
@@ -548,8 +557,10 @@ class IdleBlockTablesTest(_TorchCase):
     def _wrapper(self, group_ids):
         return SimpleNamespace(
             token_to_kv_pool=SimpleNamespace(
-                paged_cache_group_specs=tuple(
-                    SimpleNamespace(group_id=gid) for gid in group_ids
+                arena=SimpleNamespace(
+                    cache_group_specs=tuple(
+                        SimpleNamespace(group_id=gid) for gid in group_ids
+                    )
                 )
             ),
             device="cpu",

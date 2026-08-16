@@ -50,7 +50,6 @@ def _layout(
                 "layer.0.kv",
                 dtype="bfloat16",
                 shape=(8,),
-                element_size=2,
                 offset=history_offset,
                 stride=page_stride_bytes,
             ),
@@ -61,7 +60,6 @@ def _layout(
                 "layer.1.state",
                 dtype="bfloat16",
                 shape=(8,),
-                element_size=2,
                 offset=state_offset,
                 stride=page_stride_bytes,
             ),
@@ -85,7 +83,6 @@ def _typed_layout(
                 "layer.0.k",
                 dtype="bfloat16",
                 shape=(2, local_heads, 2),
-                element_size=2,
                 axis=1,
                 extent=global_heads,
             ),
@@ -488,17 +485,11 @@ def test_cache_factory_exposes_only_typed_arena() -> None:
     layout = _layout()
     buffer = torch.zeros(layout.plan.arena_bytes, dtype=torch.uint8)
     pool = SimpleNamespace(
-        supports_disaggregation=True,
-        plan=layout.plan,
-        paged_cache_group_specs=layout.group_specs,
-        cache_contract_binding=lambda: (
-            buffer,
-            {
-                field.field_id: dtype
-                for field, dtype in zip(
-                    layout.plan.fields, layout.field_dtypes, strict=True
-                )
-            },
+        arena=SimpleNamespace(
+            supports_disaggregation=True,
+            plan=layout.plan,
+            cache_group_specs=layout.group_specs,
+            contract_binding=lambda: buffer,
         ),
     )
 
@@ -729,12 +720,11 @@ def test_layerwise_final_preserves_speculative_candidates() -> None:
     assert executor._layerwise_token_published == set()
 
 
-def test_shared_manager_executes_strided_paged_cache_tp_fragment() -> None:
+def test_shared_manager_executes_strided_cache_tp_fragment() -> None:
     source_segment = make_segment(
         "layer.0.k",
         dtype="bfloat16",
         shape=(2, 2, 2),
-        element_size=2,
         stride=32,
         axis=1,
         extent=4,
@@ -743,7 +733,6 @@ def test_shared_manager_executes_strided_paged_cache_tp_fragment() -> None:
         "layer.0.k",
         dtype="bfloat16",
         shape=(2, 4, 2),
-        element_size=2,
         stride=64,
         axis=1,
         extent=4,
