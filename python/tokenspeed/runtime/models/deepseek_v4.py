@@ -88,6 +88,15 @@ from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4IndexerPrefillMetadata,
     DeepseekV4SparseIndexerMetadata,
 )
+from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
+    DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+    V4_KERNEL_BLOCK_ROWS,
+    deepseek_v4_indexer_mxfp4_layout_from_row_bytes,
+    deepseek_v4_indexer_mxfp4_scale_dim,
+    deepseek_v4_indexer_mxfp4_value_bytes,
+    deepseek_v4_nope_dim,
+    v4_compressed_kv_group_id,
+)
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_csa_compress_kv_cache_insert,
     deepseek_v4_csa_indexer_cache_insert,
@@ -102,15 +111,6 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     _group_slot_mapping_from_raw,
     _mask_invalid_graph_tokens,
-)
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec import (
-    DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
-    V4_KERNEL_BLOCK_ROWS,
-    deepseek_v4_indexer_mxfp4_layout_from_row_bytes,
-    deepseek_v4_indexer_mxfp4_scale_dim,
-    deepseek_v4_indexer_mxfp4_value_bytes,
-    deepseek_v4_nope_dim,
-    v4_compressed_kv_group_id,
 )
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_post as fast_mhc_post
