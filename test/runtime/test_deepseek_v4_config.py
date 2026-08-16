@@ -3168,6 +3168,21 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_extends=1,
             )
 
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "prefill metadata requires complete CPU sequence and query length mirrors",
+        ):
+            backend.init_forward_metadata(
+                bs=1,
+                num_tokens=3,
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([131], dtype=torch.int32),
+                forward_mode=ForwardMode.EXTEND,
+                page_table=torch.zeros((1, 3), dtype=torch.int32),
+                extend_seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
+                num_extends=1,
+            )
+
     def test_deepseek_v4_prefill_workspace_bounds_use_cpu_mirrors(self):
         self.assertEqual(
             DeepseekV4AttentionBackend._prefill_workspace_bounds(
@@ -5175,6 +5190,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             forward_mode=ForwardMode.EXTEND,
             page_table=page_table,
             extend_seq_lens_cpu=seq_lens.cpu(),
+            extend_prefix_lens_cpu=torch.zeros(1, dtype=torch.int32),
         )
         backend.init_forward_metadata(
             bs=1,

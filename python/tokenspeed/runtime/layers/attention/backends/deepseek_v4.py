@@ -986,14 +986,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     )
                     + query_lens_cpu[:prefix_count]
                 )
-        elif extend_seq_lens_cpu is not None and forward_mode is not None:
-            if forward_mode.is_extend():
-                seq_lens_cpu = extend_seq_lens_cpu[:bs].to(
-                    dtype=torch.int32,
-                    device="cpu",
-                )
-            elif forward_mode.is_mixed():
-                seq_lens_cpu = seq_lens[:bs].to(dtype=torch.int32, device="cpu")
+        elif (
+            extend_seq_lens_cpu is not None
+            and forward_mode is not None
+            and forward_mode.is_mixed()
+        ):
+            seq_lens_cpu = seq_lens[:bs].to(dtype=torch.int32, device="cpu")
         prefill_seq_lens: list[int] = []
         prefill_query_lens: list[int] = []
         if num_prefill_reqs:
