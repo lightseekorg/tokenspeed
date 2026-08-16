@@ -73,6 +73,25 @@ def _build_mock_smg() -> FastAPI:
     return mock
 
 
+def _build_mock_rl_control() -> FastAPI:
+    """Mock of the in-engine RL-control app (``vllm_compat_http``).
+
+    Only the status routes the sidecar proxies are needed; they return canned
+    booleans so the proxy-parity tests can assert byte-faithful relay.
+    """
+    mock = FastAPI()
+
+    @mock.get("/is_paused")
+    async def is_paused():
+        return JSONResponse({"is_paused": False})
+
+    @mock.get("/is_sleeping")
+    async def is_sleeping():
+        return JSONResponse({"is_sleeping": True})
+
+    return mock
+
+
 def _wait(port, path, timeout=15):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -220,6 +239,73 @@ class TestProxyPassthrough(unittest.TestCase):
         """A non-200 from smg must be relayed, not masked as 200."""
         r = requests.get(self._url("/v1/models"), timeout=10)  # mock has no such route
         self.assertEqual(r.status_code, 404)
+
+
+class TestRlControlProxy(unittest.TestCase):
+    """Proxy parity for the RL-control status routes (``/is_paused``,
+    ``/is_sleeping``).
+
+    The sidecar mounts these as thin proxies to the in-engine RL-control app
+    (``vllm_compat_http``); they must relay the upstream ``{is_<state>: bool}``
+    body byte-faithfully, the same contract as the smg passthrough routes above.
+    """
+
+    RL_PORT = 28340
+    SIDECAR_PORT = 28341
+
+    @classmethod
+    def setUpClass(cls):
+        from tokenspeed.runtime.entrypoints import control_server as hs
+
+        cls.hs = hs
+        # Point the RL-control proxy at our mock; save/restore to keep the
+        # module global clean for the other test classes in this module.
+        cls._orig_rl_control_url = hs._rl_control_url
+        hs._rl_control_url = f"http://127.0.0.1:{cls.RL_PORT}"
+        hs._gateway_url = "http://127.0.0.1:1"  # dead — no smg route hit here
+        hs._engine_grpc_addr = "127.0.0.1:1"
+
+        cls._rl_server = uvicorn.Server(
+            uvicorn.Config(
+                _build_mock_rl_control(),
+                host="127.0.0.1",
+                port=cls.RL_PORT,
+                log_level="error",
+            )
+        )
+        cls._sidecar_server = uvicorn.Server(
+            uvicorn.Config(
+                hs.app, host="127.0.0.1", port=cls.SIDECAR_PORT, log_level="error"
+            )
+        )
+        cls._t_rl = threading.Thread(target=cls._rl_server.run, daemon=True)
+        cls._t_side = threading.Thread(target=cls._sidecar_server.run, daemon=True)
+        cls._t_rl.start()
+        cls._t_side.start()
+        assert _wait(cls.RL_PORT, "/is_paused"), "mock RL control failed to start"
+        assert _wait(cls.SIDECAR_PORT, "/is_paused"), "sidecar failed to start"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._rl_server.should_exit = True
+        cls._sidecar_server.should_exit = True
+        cls.hs._rl_control_url = cls._orig_rl_control_url
+
+    def _url(self, path):
+        return f"http://127.0.0.1:{self.SIDECAR_PORT}{path}"
+
+    def test_is_paused_proxies_faithfully(self):
+        r = requests.get(self._url("/is_paused"), timeout=10)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json(), {"is_paused": False})
+
+    def test_is_sleeping_proxies_faithfully(self):
+        """``/is_sleeping`` must be mounted on the sidecar and relay the
+        upstream ``{is_sleeping: bool}`` body unchanged — parity with
+        ``/is_paused``."""
+        r = requests.get(self._url("/is_sleeping"), timeout=10)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json(), {"is_sleeping": True})
 
 
 class TestGrpcDirect(unittest.TestCase):

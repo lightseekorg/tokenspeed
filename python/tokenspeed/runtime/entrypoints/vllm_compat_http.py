@@ -230,6 +230,21 @@ async def is_paused(raw_request: Request) -> JSONResponse:
     return JSONResponse(content={"is_paused": paused})
 
 
+@router.get("/is_sleeping")
+async def is_sleeping(raw_request: Request) -> JSONResponse:
+    try:
+        sleeping = await _manager(raw_request).is_sleeping()
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001 - defensive
+        logger.exception("Failed to fetch sleep status")
+        return JSONResponse(
+            {"error": f"Failed to fetch sleep status: {e}"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
+    return JSONResponse(content={"is_sleeping": sleeping})
+
+
 @router.get("/get_world_size")
 async def get_world_size(
     raw_request: Request,

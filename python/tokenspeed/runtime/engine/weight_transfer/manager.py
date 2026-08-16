@@ -95,6 +95,14 @@ class WeightTransferManager:
         """Whether generation admission is currently paused."""
         return self._async_llm.weight_transfer_admission_paused()
 
+    async def is_sleeping(self) -> bool:
+        """Whether the engine is in the sleep/wake-up suspended state.
+
+        Mirrors :meth:`is_paused`; delegates to ``AsyncLLM.is_sleeping`` so the
+        sleep/wake-up state is queryable through the same RL-control surface.
+        """
+        return await self._async_llm.is_sleeping()
+
     def get_world_size(self, include_dp: bool = True) -> int:
         """Return the inference world size used to size the NCCL group.
 
