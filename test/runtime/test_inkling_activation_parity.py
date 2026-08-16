@@ -200,20 +200,12 @@ class _Harness:
             kv_cache_quant_method="none",
         )
         inner = MHAAttnBackend(config)
-        from cache_pool_test_utils import make_mha_memory_plan
+        from cache_pool_test_utils import make_mha_memory_plan, make_pool
 
-        self.kv_pool = MHATokenToKVPool(
-            size=1024,
-            dtype=torch.bfloat16,
-            head_num=text.num_key_value_heads,
-            head_dim=text.head_dim,
-            layer_num=text.num_hidden_layers,
-            device=device,
-            enable_memory_saver=False,
-            prefix_granularity=PAGE_SIZE,
-            rank=0,
-            layer_group_ids=("full_attention",) * text.num_hidden_layers,
-            memory_plan=make_mha_memory_plan(
+        # One arena, one view over it: the pool owns no memory or geometry.
+        _arena, self.kv_pool = make_pool(
+            MHATokenToKVPool,
+            make_mha_memory_plan(
                 size=1024,
                 prefix_granularity=PAGE_SIZE,
                 layer_num=text.num_hidden_layers,
@@ -221,6 +213,13 @@ class _Harness:
                 head_dim=text.head_dim,
                 dtype=torch.bfloat16,
             ),
+            device=device,
+            dtype=torch.bfloat16,
+            head_num=text.num_key_value_heads,
+            head_dim=text.head_dim,
+            layer_num=text.num_hidden_layers,
+            rank=0,
+            layer_group_ids=("full_attention",) * text.num_hidden_layers,
         )
         conv_pool = InklingConvStatePool(
             num_layers=text.num_hidden_layers,
