@@ -154,13 +154,6 @@ class KimiK3Recipe(CacheRecipe):
     def num_target_layers(self) -> int:
         return len(self.target_group_ids)
 
-    @property
-    @override
-    def num_draft_layers(self) -> int:
-        if self.draft_attn_config is None:
-            return 0
-        return self.draft_model_config.num_attention_layers
-
     @cached_property
     def group_ids(self) -> tuple[str, ...]:
         return self.target_group_ids + (FULL_ATTENTION,) * self.num_draft_layers

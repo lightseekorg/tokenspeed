@@ -581,11 +581,6 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
     def get_compressor_state_buffer(self, layer_id: int) -> torch.Tensor:
         return self._require(self.compressor_state_buffer, layer_id, "compressor state")
 
-    def get_compressor_state_view(self, layer_id: int) -> torch.Tensor:
-        buf = self.get_compressor_state_buffer(layer_id)
-        block_size = self.get_compressor_state_block_size(layer_id)
-        return buf.view(-1, block_size, buf.shape[-1])
-
     def get_indexer_kv_buffer_2d(self, layer_id: int) -> torch.Tensor:
         return self._require(self.indexer_kv_buffer, layer_id, "indexer KV")
 
@@ -597,11 +592,6 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
 
     def get_indexer_state_buffer(self, layer_id: int) -> torch.Tensor:
         return self._require(self.indexer_state_buffer, layer_id, "indexer state")
-
-    def get_indexer_state_view(self, layer_id: int) -> torch.Tensor:
-        buf = self.get_indexer_state_buffer(layer_id)
-        block_size = self.get_indexer_state_block_size(layer_id)
-        return buf.view(-1, block_size, buf.shape[-1])
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         return self.get_swa_kv_buffer(layer_id)

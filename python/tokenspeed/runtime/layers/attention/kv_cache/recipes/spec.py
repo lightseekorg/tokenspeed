@@ -20,6 +20,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from tokenspeed.runtime.layers.attention.kv_cache.recipes import plan
+
 Retention = Literal["full_history", "sliding_window"]
 Family = Literal["history", "state"]
 TransferPolicy = Literal["full_suffix", "latest_snapshot"]
@@ -111,10 +113,10 @@ class CacheGroupSpec:
 
 _CACHE_GROUP_DUMMY_PAGES = 1
 
-# Token span of one interleaved mxfp8 KV-scale tile. The fused FP8 attention
-# kernels store k_scale/v_scale in tiles of this many tokens, which changes
-# both the scale field shape and its head-partition axis.
-MXFP8_KV_SCALE_TILE_TOKENS = 128
+# The scale-tile span lives with the field geometry it defines (plan.py); it is
+# re-exported here because scheduler-side callers reason about the tile as a
+# token span, not as a shape.
+MXFP8_KV_SCALE_TILE_TOKENS = plan.MXFP8_KV_SCALE_TILE_TOKENS
 
 
 def _ceil_div(dividend: int, divisor: int) -> int:

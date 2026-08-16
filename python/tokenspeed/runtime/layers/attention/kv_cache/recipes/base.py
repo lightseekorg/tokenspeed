@@ -154,8 +154,15 @@ class CacheRecipe(ABC):
 
     @property
     def num_draft_layers(self) -> int:
-        """Trailing layers that belong to the draft model."""
-        return 0
+        """Trailing layers that belong to the draft model, zero without one.
+
+        A draft's layers are continuation layers of the merged plan, so their
+        count is a fact of the draft config -- override this only to constrain
+        it further, never to restate it.
+        """
+        if self.draft_attn_config is None:
+            return 0
+        return self.draft_model_config.num_attention_layers
 
     @property
     def layer_kv_head_counts(self) -> tuple[int, ...] | None:

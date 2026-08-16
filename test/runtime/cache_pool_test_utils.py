@@ -8,6 +8,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes import spec
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     cache_dtype_name,
+    mxfp8_kv_scale_fields,
     pack,
     scatter_stored_dtype_name,
 )
@@ -214,30 +215,14 @@ def make_mha_memory_plan(
         )
         if not mxfp8:
             return fields
-        scale_dim = head_dim // 32
-        # The same shape OrdinaryRecipe declares: the interleaved paged scale
-        # layout, one tile group per MXFP8_KV_SCALE_TILE_TOKENS of the page.
-        scale_shape = (
-            kv_heads,
-            prefix_granularity // spec.MXFP8_KV_SCALE_TILE_TOKENS,
-            32,
-            scale_dim,
-            scale_dim,
-        )
-        scale_dtype = cache_dtype_name(torch.float8_e8m0fnu)
-        return fields + (
-            CacheFieldSpec(
-                f"layer.{layer_id}.k_scale",
-                f"unit.{occurrence}.k_scale",
-                scale_shape,
-                scale_dtype,
-            ),
-            CacheFieldSpec(
-                f"layer.{layer_id}.v_scale",
-                f"unit.{occurrence}.v_scale",
-                scale_shape,
-                scale_dtype,
-            ),
+        # The production builder, so a test plan cannot declare a scale shape
+        # the recipes would never emit.
+        return fields + mxfp8_kv_scale_fields(
+            layer_id=layer_id,
+            occurrence=occurrence,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            prefix_granularity=prefix_granularity,
         )
 
     groups = spec.group(

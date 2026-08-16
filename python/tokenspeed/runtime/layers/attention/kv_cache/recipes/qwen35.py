@@ -11,12 +11,12 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecip
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     cache_dtype_name,
+    mxfp8_kv_scale_fields,
     scatter_stored_dtype_name,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
-    MXFP8_KV_SCALE_TILE_TOKENS,
     split_recurrent_state_groups,
 )
 
@@ -48,13 +48,6 @@ class QwenGDNRecipe(CacheRecipe):
     @cached_property
     def target_layer_types(self) -> tuple[str, ...]:
         return tuple(self.attn_config.layer_types)
-
-    @property
-    @override
-    def num_draft_layers(self) -> int:
-        if self.draft_attn_config is None:
-            return 0
-        return self.draft_model_config.num_attention_layers
 
     @cached_property
     def layer_types(self) -> tuple[str, ...]:
@@ -190,29 +183,12 @@ class QwenGDNRecipe(CacheRecipe):
         )
         if not mxfp8:
             return fields
-        kv_heads = self._draft_kv_shape[1]
-        scale_dim = config.head_dim // 32
-        scale_shape = (
-            kv_heads,
-            self.prefix_granularity // MXFP8_KV_SCALE_TILE_TOKENS,
-            32,
-            scale_dim,
-            scale_dim,
-        )
-        scale_dtype = cache_dtype_name(torch.float8_e8m0fnu)
-        return fields + (
-            CacheFieldSpec(
-                f"layer.{layer_id}.k_scale",
-                f"unit.{occurrence}.k_scale",
-                scale_shape,
-                scale_dtype,
-            ),
-            CacheFieldSpec(
-                f"layer.{layer_id}.v_scale",
-                f"unit.{occurrence}.v_scale",
-                scale_shape,
-                scale_dtype,
-            ),
+        return fields + mxfp8_kv_scale_fields(
+            layer_id=layer_id,
+            occurrence=occurrence,
+            kv_heads=self._draft_kv_shape[1],
+            head_dim=config.head_dim,
+            prefix_granularity=self.prefix_granularity,
         )
 
     # ---- extras ----

@@ -41,6 +41,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     CacheLayout,
     cache_dtype_name,
+    mxfp8_kv_scale_fields,
     scatter_stored_dtype_name,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -64,13 +65,6 @@ class OrdinaryRecipe(CacheRecipe):
         self.family = family
 
     # ---- layer vocabulary ----
-
-    @property
-    @override
-    def num_draft_layers(self) -> int:
-        if self.draft_attn_config is None:
-            return 0
-        return self.draft_model_config.num_attention_layers
 
     @cached_property
     def group_ids(self) -> tuple[str, ...]:
@@ -240,22 +234,12 @@ def _mha_layer_fields(config, layer_id: int, occurrence: int):
     )
     if not mxfp8:
         return fields
-    scale_dim = head_dim // 32
-    scale_shape = (kv_heads, 32, scale_dim, scale_dim)
-    scale_dtype = cache_dtype_name(torch.float8_e8m0fnu)
-    return fields + (
-        CacheFieldSpec(
-            f"layer.{layer_id}.k_scale",
-            f"unit.{occurrence}.k_scale",
-            scale_shape,
-            scale_dtype,
-        ),
-        CacheFieldSpec(
-            f"layer.{layer_id}.v_scale",
-            f"unit.{occurrence}.v_scale",
-            scale_shape,
-            scale_dtype,
-        ),
+    return fields + mxfp8_kv_scale_fields(
+        layer_id=layer_id,
+        occurrence=occurrence,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        prefix_granularity=config.prefix_granularity,
     )
 
 

@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from itertools import pairwise
 from typing import TYPE_CHECKING
 
+import torch
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
         CacheGroupSpec,
@@ -113,6 +115,13 @@ def cache_dtype_bytes(dtype_name: str) -> int:
         return _CACHE_DTYPE_BYTES[dtype_name]
     except KeyError:
         raise ValueError(f"unsupported cache dtype {dtype_name!r}") from None
+
+
+# Token span of one interleaved mxfp8 KV-scale tile, and the head-dim block a
+# single e8m0 scale covers. Both are properties of the fused FP8 attention
+# kernels, so the shape they imply is built here once.
+MXFP8_KV_SCALE_TILE_TOKENS = 128
+MXFP8_SCALE_BLOCK_SIZE = 32
 
 
 def cache_field_layer_id(field_id: str) -> int:
@@ -355,6 +364,53 @@ class CacheFieldSpec:
     @property
     def payload_bytes(self) -> int:
         return math.prod(self.shape) * self.element_size
+
+
+def mxfp8_kv_scale_fields(
+    *,
+    layer_id: int,
+    occurrence: int,
+    kv_heads: int,
+    head_dim: int,
+    prefix_granularity: int,
+) -> tuple[CacheFieldSpec, ...]:
+    """The k_scale/v_scale planes of one mxfp8 KV layer.
+
+    One kernel layout, one definition: the fused FP8 attention kernels read
+    scales as ``(num_ids, heads, tiles, 32, sf, sf)`` where a tile spans
+    ``MXFP8_KV_SCALE_TILE_TOKENS`` tokens, so the per-page shape a recipe
+    declares is fixed by the page's token span and the head count. Recipes
+    differ in how they arrive at those two numbers, never in the shape.
+    """
+    if prefix_granularity % MXFP8_KV_SCALE_TILE_TOKENS or kv_heads <= 0:
+        raise ValueError(
+            "mxfp8 KV scales need a page span that is a positive multiple of "
+            f"{MXFP8_KV_SCALE_TILE_TOKENS} and at least one KV head, got "
+            f"{prefix_granularity} and {kv_heads}"
+        )
+    if head_dim % MXFP8_SCALE_BLOCK_SIZE:
+        raise ValueError(
+            f"mxfp8 head_dim must be a multiple of {MXFP8_SCALE_BLOCK_SIZE}, "
+            f"got {head_dim}"
+        )
+    scale_dim = head_dim // MXFP8_SCALE_BLOCK_SIZE
+    shape = (
+        kv_heads,
+        prefix_granularity // MXFP8_KV_SCALE_TILE_TOKENS,
+        32,
+        scale_dim,
+        scale_dim,
+    )
+    dtype = cache_dtype_name(torch.float8_e8m0fnu)
+    return tuple(
+        CacheFieldSpec(
+            f"layer.{layer_id}.{plane}_scale",
+            f"unit.{occurrence}.{plane}_scale",
+            shape,
+            dtype,
+        )
+        for plane in ("k", "v")
+    )
 
 
 @dataclass(frozen=True)

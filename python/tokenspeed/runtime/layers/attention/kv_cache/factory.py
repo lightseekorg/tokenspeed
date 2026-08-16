@@ -26,6 +26,39 @@ def create_cache_arena(
     )
 
 
+def _mha_pool_class(family: str, *, mxfp8: bool) -> type[CachePool]:
+    """The MHA-shaped pool for one family, in its plain or mxfp8 variant.
+
+    All three take the same arguments; only the recurrent-state aliasing (and
+    the scale planes) differ, which is the class's business, not the caller's.
+    """
+    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_inkling import (
+        HybridInklingTokenToKVPool,
+        HybridInklingTokenToKVPoolMXFP8,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
+        HybridMHATokenToKVPool,
+        HybridMHATokenToKVPoolMXFP8,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.mha import (
+        MHATokenToKVPool,
+        MHATokenToKVPoolMXFP8,
+    )
+
+    by_family = {
+        "mha": (MHATokenToKVPool, MHATokenToKVPoolMXFP8),
+        "inkling": (HybridInklingTokenToKVPool, HybridInklingTokenToKVPoolMXFP8),
+        "qwen_gdn": (HybridMHATokenToKVPool, HybridMHATokenToKVPoolMXFP8),
+    }
+    try:
+        plain, scaled = by_family[family]
+    except KeyError:
+        raise TypeError(
+            f"cache family {family!r} is incompatible with MHAConfig"
+        ) from None
+    return scaled if mxfp8 else plain
+
+
 def create_cache_pool(
     spec: CachePoolSpec,
     config: BaseAttnConfig,
@@ -98,52 +131,7 @@ def create_cache_pool(
             field_layer_offset=field_layer_offset,
         )
     if isinstance(config, MHAConfig):
-        if spec.family == "mha":
-            from tokenspeed.runtime.layers.attention.kv_cache.mha import (
-                MHATokenToKVPool,
-                MHATokenToKVPoolMXFP8,
-            )
-
-            pool_cls = (
-                MHATokenToKVPoolMXFP8 if config.kv_cache_mxfp8 else MHATokenToKVPool
-            )
-            return pool_cls(
-                arena,
-                dtype=config.kv_cache_dtype,
-                head_num=max(config.num_kv_heads // config.attn_tp_size, 1),
-                head_dim=config.head_dim,
-                layer_num=num_layers,
-                rank=rank,
-                layer_types=spec.layer_types,
-                layer_group_ids=spec.layer_group_ids,
-                field_layer_offset=field_layer_offset,
-            )
-        if spec.family == "inkling":
-            from tokenspeed.runtime.layers.attention.kv_cache.hybrid_inkling import (
-                HybridInklingTokenToKVPool,
-                HybridInklingTokenToKVPoolMXFP8,
-            )
-
-            pool_cls = (
-                HybridInklingTokenToKVPoolMXFP8
-                if config.kv_cache_mxfp8
-                else HybridInklingTokenToKVPool
-            )
-        elif spec.family == "qwen_gdn":
-            from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
-                HybridMHATokenToKVPool,
-                HybridMHATokenToKVPoolMXFP8,
-            )
-
-            pool_cls = (
-                HybridMHATokenToKVPoolMXFP8
-                if config.kv_cache_mxfp8
-                else HybridMHATokenToKVPool
-            )
-        else:
-            raise TypeError(
-                f"cache family {spec.family!r} is incompatible with MHAConfig"
-            )
+        pool_cls = _mha_pool_class(spec.family, mxfp8=bool(config.kv_cache_mxfp8))
         return pool_cls(
             arena=arena,
             dtype=config.kv_cache_dtype,

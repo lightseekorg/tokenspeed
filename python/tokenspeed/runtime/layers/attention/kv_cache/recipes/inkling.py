@@ -41,10 +41,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     cache_dtype_bytes,
     cache_dtype_name,
+    mxfp8_kv_scale_fields,
     scatter_stored_dtype_name,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    MXFP8_KV_SCALE_TILE_TOKENS,
     CacheGroupSpec,
     apply_pd_transfer_policies,
 )
@@ -72,11 +72,10 @@ class InklingRecipe(CacheRecipe):
     @property
     @override
     def num_draft_layers(self) -> int:
-        if self.draft_attn_config is None:
-            return 0
-        num_layers = self.draft_model_config.num_attention_layers
+        """The base count, plus the one constraint Inkling's depths impose."""
+        num_layers = super().num_draft_layers
         num_steps = self.server_args.speculative_num_steps
-        if num_steps > num_layers:
+        if num_layers and num_steps > num_layers:
             raise ValueError(
                 f"Inkling MTP has {num_layers} depth layers; "
                 f"--speculative-num-steps {num_steps} would wrap depths "
@@ -150,12 +149,9 @@ class InklingRecipe(CacheRecipe):
     ) -> tuple[CacheFieldSpec, ...]:
         """This layer's attention pages. Its conv checkpoints are columns."""
         config = self._layer_config(layer_id)
+        # mxfp8_kv_scale_fields owns the page-span and head-dim constraints the
+        # interleaved scale layout imposes.
         mxfp8 = bool(config.kv_cache_mxfp8)
-        if mxfp8 and (self.prefix_granularity % 128 or config.head_dim != 128):
-            raise ValueError(
-                "Inkling MXFP8 scale fields require P divisible by 128 and "
-                "head_dim 128"
-            )
         kv_heads = self._layer_kv_heads(layer_id)
         kv_shape = (self.prefix_granularity, kv_heads, config.head_dim)
         kv_dtype = (
@@ -179,28 +175,12 @@ class InklingRecipe(CacheRecipe):
         )
         if not mxfp8:
             return fields
-        scale_dim = config.head_dim // 32
-        scale_shape = (
-            kv_heads,
-            self.prefix_granularity // MXFP8_KV_SCALE_TILE_TOKENS,
-            32,
-            scale_dim,
-            scale_dim,
-        )
-        scale_dtype = cache_dtype_name(torch.float8_e8m0fnu)
-        return fields + (
-            CacheFieldSpec(
-                f"layer.{layer_id}.k_scale",
-                f"unit.{occurrence}.k_scale",
-                scale_shape,
-                scale_dtype,
-            ),
-            CacheFieldSpec(
-                f"layer.{layer_id}.v_scale",
-                f"unit.{occurrence}.v_scale",
-                scale_shape,
-                scale_dtype,
-            ),
+        return fields + mxfp8_kv_scale_fields(
+            layer_id=layer_id,
+            occurrence=occurrence,
+            kv_heads=kv_heads,
+            head_dim=config.head_dim,
+            prefix_granularity=self.prefix_granularity,
         )
 
     def _conv_columns(self) -> dict[str, tuple[CacheFieldSpec, ...]]:
