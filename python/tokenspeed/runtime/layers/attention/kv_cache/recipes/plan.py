@@ -116,6 +116,20 @@ def cache_dtype_bytes(dtype_name: str) -> int:
         raise ValueError(f"unsupported cache dtype {dtype_name!r}") from None
 
 
+def cache_field_layer_id(field_id: str) -> int:
+    """Return the owning model layer encoded in a cache field ID."""
+    parts = field_id.split(".", 2)
+    if len(parts) != 3 or parts[0] != "layer":
+        raise ValueError(f"cache field {field_id!r} is not owned by a model layer")
+    try:
+        layer_id = int(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"cache field {field_id!r} has an invalid layer id") from exc
+    if layer_id < 0:
+        raise ValueError(f"cache field {field_id!r} has an invalid layer id")
+    return layer_id
+
+
 @dataclass(frozen=True)
 class CacheGroupLayout:
     group_id: str

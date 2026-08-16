@@ -77,11 +77,6 @@ class CacheGroupsMixin:
     # Wrapper-owned (Inkling conv) groups: mixin skips their write-loc math and capture buffers
     engine_owned_group_ids: frozenset[str] = frozenset()
 
-    # Draft decode-window lookback rows (Inkling MTP): armed by the conv
-    # wrapper's configure_draft_lookback BEFORE graph init, so the lookback
-    # loc stack below is sized alongside the main one.
-    draft_lookback: int = 0
-
     # Value for CUDA-graph buffer column tails past this replay's table
     # width. -1 is a debug tripwire (never read past cache_seqlens by the
     # MHA kernels); backends whose kernels assume a full-width table
@@ -153,12 +148,18 @@ class CacheGroupsMixin:
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
         """Per-group write locations for out-of-backend KV writers (fused
         RoPE prewrite): the write must land in the pages this layer's group
-        reads, never the scheduler's single-table locations.
+        reads, never the scheduler's single-table locations. Draft chains own
+        their per-step locations, so they must keep the caller-provided tensor.
         """
         metadata = self._prewrite_metadata(forward_mode)
         if metadata is None or metadata.out_cache_locs is None:
             return out_cache_loc
-        return self._select_out_cache_loc(layer, metadata, out_cache_loc)
+        return self._select_out_cache_loc(
+            layer,
+            metadata,
+            out_cache_loc,
+            prefer_caller=self.is_draft,
+        )
 
     def _shed_state_groups(self, tables):
         """Drop family="state" groups (GDN/mamba state blocks, consumed by the
@@ -319,44 +320,22 @@ class CacheGroupsMixin:
             for gid, chunks in out.items()
         }
 
-    def enter_draft_lookback(self, bs: int) -> bool:
-        """Drafter hook (via the Inkling conv wrapper): swap the decode
-        metadata's write locs to the lookback-window variant — N + D tokens
-        per request at positions ``seq-(N+D)..seq-1`` — so the lookback
-        pass's KV writes cover its extra leading rows.
-
-        Metadata without grouped locations needs no swap: the drafter's caller
-        locations are live there. Returns False when grouped locations cannot be
-        provided (lookback disarmed, or a captured metadata without the
-        lookback loc stack), so the caller falls back to the plain window
-        pass. The next round's metadata init restores the plain locs.
-        """
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        """Re-anchor the k-row decode metadata to the committed frontier:
+        seq_lens becomes ``frontier`` and the grouped write locs cover
+        positions ``frontier-k..frontier-1``. Accept-dependent, so pure
+        tensor ops recomputed per graph replay; the next metadata init
+        resets."""
         md = self.forward_decode_metadata
-        if md is None or md.out_cache_locs is None:
-            return True
-        lookback = int(getattr(self, "draft_lookback", 0) or 0)
-        if lookback <= 0:
-            return False
-        spec_n = max(int(getattr(self, "spec_num_tokens", 1) or 1), 1)
-        total = spec_n + lookback
-        captured = getattr(self, "cuda_graph_decode_metadata", None) or {}
-        if md is captured.get(bs):
-            if not self.cuda_graph_lookback_locs:
-                return False
-            locs = {
-                gid: buf[: bs * total]
-                for gid, buf in self.cuda_graph_lookback_locs.items()
-                if gid in md.out_cache_locs
-            }
-        else:
-            locs = self._compute_decode_group_out_cache_locs(
+        fields = {"seq_lens": frontier}
+        if md.out_cache_locs is not None:
+            fields["out_cache_locs"] = self._compute_decode_group_out_cache_locs(
                 md.page_tables,
-                md.seq_lens,
+                frontier,
                 self.kernel_page_size,
-                total,
+                self.spec_num_tokens,
             )
-        self.forward_decode_metadata = replace(md, out_cache_locs=locs)
-        return True
+        self.forward_decode_metadata = replace(md, **fields)
 
     def _maybe_check_group_write_locs(self, page_tables, out_cache_locs, page_size):
         """TOKENSPEED_CACHE_DEBUG=1 (eager only, GPU sync): write pages must
@@ -394,10 +373,8 @@ class CacheGroupsMixin:
         are gone, on the spec-verify path too."""
         self.cuda_graph_page_tables: dict[str, torch.Tensor] = {}
         self.cuda_graph_out_cache_locs: dict[str, torch.Tensor] = {}
-        self.cuda_graph_lookback_locs: dict[str, torch.Tensor] = {}
         self._cuda_graph_max_bs = max_bs
         self._group_locs_stack = None
-        self._group_lookback_locs_stack = None
         self._group_tables_stack = None
         self._group_source_widths = {}
         self._group_grain_ratios = ()
@@ -464,18 +441,6 @@ class CacheGroupsMixin:
         self._group_locs_stack = torch.zeros(
             (len(att_gids), max_bs * spec_n), dtype=torch.int32, device=self.device
         )
-        lookback = int(getattr(self, "draft_lookback", 0) or 0)
-        if lookback > 0:
-            # Draft lookback window passes write N + D rows per request
-            # (positions seq-(N+D)..seq-1); their captured kernels read this
-            # second stack, refilled alongside the main one at replay.
-            self._group_lookback_locs_stack = torch.zeros(
-                (len(att_gids), max_bs * (spec_n + lookback)),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            for i, gid in enumerate(att_gids):
-                self.cuda_graph_lookback_locs[gid] = self._group_lookback_locs_stack[i]
         self._group_source_widths = source_widths
         self._group_grain_ratios = tuple(ratios[gid] for gid in gids)
         self._group_block_granularities_tensor = torch.tensor(
@@ -680,14 +645,3 @@ class CacheGroupsMixin:
             bs,
             tokens_per_req,
         )
-        if self._group_lookback_locs_stack is not None:
-            # Second variant for the draft's lookback window passes: N + D
-            # rows per request ending at the same frontier.
-            compute_group_decode_locs(
-                self._group_tables_stack[: self._attention_group_count],
-                self._group_block_granularities_tensor,
-                seq_lens[:bs],
-                self._group_lookback_locs_stack,
-                bs,
-                tokens_per_req + self.draft_lookback,
-            )

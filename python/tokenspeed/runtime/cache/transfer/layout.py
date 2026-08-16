@@ -25,6 +25,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    cache_field_layer_id,
+)
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
         CacheMemoryPlan,
@@ -59,17 +63,7 @@ def select_layer_fields(
     selected = set()
     consumers = [[] for _ in range(num_layers)]
     for field in fields:
-        parts = field.field_id.split(".", 2)
-        if len(parts) != 3 or parts[0] != "layer":
-            raise ValueError(
-                f"cache field {field.field_id!r} is not owned by a model layer"
-            )
-        try:
-            layer_id = int(parts[1])
-        except ValueError as exc:
-            raise ValueError(
-                f"cache field {field.field_id!r} has an invalid layer id"
-            ) from exc
+        layer_id = cache_field_layer_id(field.field_id)
         if first_layer <= layer_id < last_layer:
             selected.add(field.field_id)
             consumers[layer_id - first_layer].append(field.field_id)

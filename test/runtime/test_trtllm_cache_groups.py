@@ -233,6 +233,21 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             full_loc,
         )
 
+    def test_public_prewrite_preserves_draft_chain_locations(self):
+        b = self._bare_backend(spec_num_tokens=4)
+        metadata_loc = self.torch.tensor([64], dtype=self.torch.int32)
+        caller_loc = self.torch.tensor([7, 8, 9, 10], dtype=self.torch.int32)
+        b.is_draft = True
+        b.forward_decode_metadata = self.Metadata(
+            out_cache_locs={"full_attention": metadata_loc}
+        )
+
+        got = b.select_out_cache_loc(
+            self._layer("full_attention"), caller_loc, _DecodeMode()
+        )
+
+        self.assertIs(got, caller_loc)
+
     def test_decode_metadata_grouped_drops_single_table(self):
         b = self._bare_backend()
         bs = 2

@@ -35,6 +35,9 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 @dataclass
 class MHAConfig(BaseAttnConfig):
+    # Resolved by the Qwen GDN cache recipe after checking the engine option,
+    # verify width, device, and registered kernel support.
+    replay_ssm: bool = False
     # Per-layer attention-type labels + window, forwarded to the KV pool for
     # cache_group_specs publication (empty -> single full-history group).
     layer_types: tuple[str, ...] = ()

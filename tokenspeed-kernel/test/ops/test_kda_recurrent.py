@@ -6,12 +6,15 @@ import pytest
 import torch
 from kimi3_reference import kda_gate
 from kimi3_reference import kda_recurrent as reference_kda_recurrent
+from tokenspeed_kernel.ops import attention as attention_ops
 from tokenspeed_kernel.ops.attention import (
     _attention_format_signature,
     kda_paged_decode,
     kda_paged_prefill,
+    try_kda_fused_paged_decode,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 
 
@@ -232,6 +235,227 @@ def test_kda_paged_decode_graph_padding_and_page_stride() -> None:
         captured[:, active:],
         torch.zeros_like(captured[:, active:]),
     )
+
+
+def test_kda_fused_paged_decode_matches_reference() -> None:
+    """The K3 megafusion preserves state paging and its fused norm epilogue."""
+    if not current_platform().is_cdna4:
+        pytest.skip("gfx950 KDA fusion test")
+
+    torch.manual_seed(31)
+    batch, active, heads, head_dim, pages = 4, 2, 12, 128, 6
+    projection_width = heads * head_dim
+    mixed_qkv = torch.randn(
+        batch,
+        3 * projection_width,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    conv_weights = 0.1 * torch.randn(
+        3 * projection_width,
+        4,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    conv_states = 0.1 * torch.randn(
+        pages,
+        3 * projection_width,
+        3,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    initial_conv_states = conv_states.clone()
+    expected_conv_states = conv_states.clone()
+    f_a_out = torch.randn(
+        batch,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    f_b_weight = 0.1 * torch.randn(
+        projection_width,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    beta_logits = torch.randn(
+        batch,
+        heads,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    a_log = torch.randn(heads, device="cuda", dtype=torch.float32)
+    dt_bias = torch.randn(projection_width, device="cuda", dtype=torch.float32)
+    output_gate = torch.randn(
+        batch,
+        projection_width,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    norm_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
+    norm_eps = 1e-6
+    state_pool = 0.01 * torch.randn(
+        pages,
+        heads,
+        head_dim,
+        head_dim,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    initial_state_pool = state_pool.clone()
+    expected_state_pool = state_pool.clone()
+    read_indices = torch.tensor([0, 1, -1, -1], device="cuda", dtype=torch.int32)
+    write_indices = torch.tensor([2, 3, -1, -1], device="cuda", dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 1, 2, 2, 2], device="cuda", dtype=torch.int32)
+
+    raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
+    expected_out = torch.zeros(
+        batch,
+        heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    for row in range(active):
+        read_idx = read_indices[row].item()
+        write_idx = write_indices[row].item()
+        current = mixed_qkv[row].view(3, heads, head_dim).float()
+        history = initial_conv_states[read_idx].view(3, heads, head_dim, 3).float()
+        weights = conv_weights.view(3, heads, head_dim, 4).float()
+        convolved = torch.nn.functional.silu(
+            (history * weights[..., :3]).sum(dim=-1) + current * weights[..., 3]
+        )
+        q, k, v = convolved.unbind(dim=0)
+        core_out, final_state = reference_kda_recurrent(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            raw_g[row].view(1, heads, head_dim),
+            beta_logits[row].unsqueeze(0),
+            initial_state_pool[read_idx].transpose(-1, -2),
+            a_log,
+            dt_bias.view(heads, head_dim),
+        )
+        core_out = core_out[0].float()
+        inverse_rms = torch.rsqrt(core_out.square().mean(dim=-1) + norm_eps)
+        expected_out[row] = (
+            core_out
+            * inverse_rms[:, None]
+            * norm_weight.float()[None, :]
+            * torch.sigmoid(output_gate[row].view(heads, head_dim).float())
+        ).to(torch.bfloat16)
+        expected_state_pool[write_idx] = final_state.transpose(-1, -2)
+        expected_conv_states[write_idx] = torch.stack(
+            (history[..., 1], history[..., 2], current), dim=-1
+        ).reshape(3 * projection_width, 3)
+
+    result = try_kda_fused_paged_decode(
+        mixed_qkv,
+        conv_weights,
+        conv_states,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        a_log,
+        dt_bias,
+        state_pool=state_pool,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        num_heads=heads,
+        head_dim=head_dim,
+        cu_seqlens=cu_seqlens,
+        output_gate=output_gate,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
+
+    assert result is not None
+    assert result.output_norm_applied
+    torch.testing.assert_close(
+        result.out[0].float(), expected_out.float(), atol=5e-2, rtol=5e-2
+    )
+    torch.testing.assert_close(state_pool, expected_state_pool, atol=2e-4, rtol=2e-4)
+    torch.testing.assert_close(conv_states, expected_conv_states)
+
+
+def test_kda_fused_decode_override_preserves_external_output_norm(monkeypatch) -> None:
+    """A core-only override must not claim that it applied output normalization."""
+    kernel_name = "triton_nvidia_kda_fused_paged_decode"
+    spec = KernelRegistry.get().get_by_name(kernel_name)
+    assert spec is not None
+    assert spec.traits["fused_output_norm"] == frozenset({False})
+
+    captured_kwargs = {}
+
+    class CoreOnlyKernel:
+        name = kernel_name
+
+        def __call__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return kwargs["mixed_qkv"]
+
+    monkeypatch.setattr(
+        attention_ops,
+        "select_kernel",
+        lambda *_args, **_kwargs: CoreOnlyKernel(),
+    )
+    tensor = torch.empty(1, dtype=torch.bfloat16)
+    result = try_kda_fused_paged_decode(
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        state_pool=tensor,
+        read_indices=tensor,
+        write_indices=tensor,
+        num_heads=12,
+        head_dim=128,
+        cu_seqlens=tensor,
+        output_gate=tensor,
+        norm_weight=tensor,
+        norm_eps=1e-6,
+        override=kernel_name,
+    )
+
+    assert result is not None
+    assert not result.output_norm_applied
+    assert captured_kwargs["output_gate"] is None
+    assert captured_kwargs["norm_weight"] is None
+    assert captured_kwargs["norm_eps"] is None
+
+
+def test_kda_fused_decode_rejects_unsupported_conv_width() -> None:
+    """Unsupported convolution widths must fall back before kernel execution."""
+    if not current_platform().is_cdna4:
+        pytest.skip("gfx950 KDA fusion dispatch test")
+
+    tensor = torch.empty(1, dtype=torch.bfloat16)
+    conv_weights = torch.empty(1, 5, dtype=torch.bfloat16)
+    result = try_kda_fused_paged_decode(
+        tensor,
+        conv_weights,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        state_pool=tensor,
+        read_indices=tensor,
+        write_indices=tensor,
+        num_heads=12,
+        head_dim=128,
+        cu_seqlens=tensor,
+        output_gate=tensor,
+        norm_weight=tensor,
+        norm_eps=1e-6,
+    )
+
+    assert result is None
 
 
 def test_kda_paged_decode_does_not_select_nvidia_kernel_on_amd() -> None:

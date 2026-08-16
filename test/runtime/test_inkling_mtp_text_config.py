@@ -12,9 +12,9 @@ import os
 import sys
 import unittest
 
-from tokenspeed.runtime.configs.inkling_config import (
-    inkling_kv_heads_for_layer,
-    inkling_mtp_text_config,
+from tokenspeed.runtime.configs.inkling_config import inkling_mtp_text_config
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
+    inkling_layer_kv_head_counts,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -34,6 +34,18 @@ def _mm_config(mtp_config):
     return InklingMMConfig(
         **{k: v for k, v in base.items() if k not in ("model_type", "architectures")}
     )
+
+
+class _ModelConfigOver:
+    """The two-level shape inkling_layer_kv_head_counts reads: a model config
+    whose hf_config resolves to this text config."""
+
+    def __init__(self, text_config):
+        self._text = text_config
+        self.hf_config = self
+
+    def get_text_config(self):
+        return self._text
 
 
 class TestInklingMTPTextConfig(unittest.TestCase):
@@ -59,10 +71,9 @@ class TestInklingMTPTextConfig(unittest.TestCase):
         self.assertEqual(cfg.local_layer_ids, [0, 2])
         self.assertEqual(cfg.dense_mlp_idx, 3)
         # Depth 1 is full attention at the ckpt head count; depths 0/2 are
-        # SWA at the swa count — the target model's byte-uniform pairing.
-        heads = [inkling_kv_heads_for_layer(cfg, i, True) for i in range(3)]
+        # SWA at the swa count -- the target model's byte-uniform pairing.
         self.assertEqual(
-            heads,
+            list(inkling_layer_kv_head_counts(_ModelConfigOver(cfg))),
             [
                 cfg.swa_num_key_value_heads,
                 cfg.ckpt_num_key_value_heads,

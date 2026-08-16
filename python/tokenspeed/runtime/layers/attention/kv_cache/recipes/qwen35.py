@@ -39,6 +39,9 @@ class QwenGDNRecipe(CacheRecipe):
                 "Qwen cache buffer does not yet support the MXFP8 interleaved "
                 "scale layout"
             )
+        # The GDN backend reads the same decision, so publish it once here
+        # rather than as a side effect of sizing the workspace.
+        self.attn_config.replay_ssm = self.replay_ssm
 
     # ---- layer vocabulary ----
 
@@ -214,6 +217,26 @@ class QwenGDNRecipe(CacheRecipe):
 
     # ---- extras ----
 
+    @cached_property
+    def replay_ssm(self) -> bool:
+        """Whether the GDN backend replays the SSM state instead of staging it.
+
+        Replay recomputes the recurrent state from the conv checkpoint, so the
+        verify window needs no ssm staging -- which is what makes this a cache
+        fact and not just a backend flag.
+        """
+        if not self.num_draft_layers:
+            return False
+        if not (
+            getattr(self.server_args, "enable_replay_ssm", False)
+            and int(self.server_args.speculative_num_draft_tokens) > 1
+            and torch.device(self.attn_config.device).type == "cuda"
+        ):
+            return False
+        from tokenspeed_kernel.ops.attention import gdn_replay_commit_supported
+
+        return bool(gdn_replay_commit_supported(self.attn_config.dtype))
+
     @override
     def workspace_bytes(self) -> int:
         """Verify-window staging for the recurrent state, when drafting."""
@@ -222,9 +245,12 @@ class QwenGDNRecipe(CacheRecipe):
         verify_rows = self.attn_config.max_bs * (
             int(self.server_args.speculative_num_draft_tokens) + 1
         )
+        # Replay reconstructs the ssm state, so only the conv checkpoint is
+        # staged; the backend reads the same decision off attn_config.
+        suffixes = (".conv",) if self.replay_ssm else (".conv", ".ssm")
         return verify_rows * sum(
             field.payload_bytes
             for _, fields in self.groups()
             for field in fields
-            if field.field_id.endswith((".conv", ".ssm"))
+            if field.field_id.endswith(suffixes)
         )

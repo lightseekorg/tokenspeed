@@ -211,50 +211,24 @@ class TestInklingLoadWeights(unittest.TestCase):
         missing = sorted(set(params) - self.loaded)
         self.assertEqual(missing, [], f"params never loaded: {missing}")
 
-    def test_qkvr_fusion_and_kv_replication(self):
-        from tokenspeed.runtime.configs.inkling_config import (
-            inkling_kv_heads_for_layer,
-        )
-
-        text = self.text
-        hd = text.head_dim
-        hetero = True  # gate retired 2026-07-15; hetero KV is unconditional
-        local = set(text.local_layer_ids)
-        for i in range(text.num_hidden_layers):
+    def test_qkvr_fusion(self):
+        # Hetero KV serves every layer's native checkpoint head count, so the
+        # fused qkvr and sconv taps carry the checkpoint tensors verbatim.
+        for i in range(self.text.num_hidden_layers):
             p = f"model.llm.layers.{i}"
-            kv = (
-                text.swa_num_key_value_heads
-                if i in local
-                else text.ckpt_num_key_value_heads
-            )
-            # Hetero (default): full layers serve their native ckpt heads
-            # (factor 1, no replication); uniform mode replicates to the max.
-            served = inkling_kv_heads_for_layer(text, i, hetero)
-            factor = served // kv
-            wk = self.ckpt[f"{p}.attn.wk_dv.weight"]
-            wv = self.ckpt[f"{p}.attn.wv_dv.weight"]
-            # Served head j must carry checkpoint head j // factor.
-            rep_k = torch.cat(
-                [wk[(j // factor) * hd : (j // factor + 1) * hd] for j in range(served)]
-            )
-            rep_v = torch.cat(
-                [wv[(j // factor) * hd : (j // factor + 1) * hd] for j in range(served)]
-            )
             expected = torch.cat(
                 [
                     self.ckpt[f"{p}.attn.wq_du.weight"],
-                    rep_k,
-                    rep_v,
+                    self.ckpt[f"{p}.attn.wk_dv.weight"],
+                    self.ckpt[f"{p}.attn.wv_dv.weight"],
                     self.ckpt[f"{p}.attn.wr_du.weight"],
                 ]
             )
             self._assert_eq(f"model.layers.{i}.attn.qkvr.weight", expected)
-            # K/V sconv taps replicate the same way.
-            ks = self.ckpt[f"{p}.attn.k_sconv.weight"]
-            rep_ks = torch.cat(
-                [ks[(j // factor) * hd : (j // factor + 1) * hd] for j in range(served)]
+            self._assert_eq(
+                f"model.layers.{i}.attn.k_sconv.weight",
+                self.ckpt[f"{p}.attn.k_sconv.weight"],
             )
-            self._assert_eq(f"model.layers.{i}.attn.k_sconv.weight", rep_ks)
 
     def test_dense_mlp_deinterleave_and_scale(self):
         for i in range(self.text.dense_mlp_idx):
@@ -458,24 +432,18 @@ class TestInklingLoadWeightsParallel(unittest.TestCase):
         return dict(model.named_parameters())[name].data.cpu()
 
     def test_attention_tp2_and_moe_tp2(self):
-        from tokenspeed.runtime.configs.inkling_config import (
-            inkling_kv_heads_for_layer,
-        )
-
-        hetero = True  # gate retired 2026-07-15; hetero KV is unconditional
         for rank in range(2):
             model, text = self._load_rank(rank, 2)
             hd = text.head_dim
             tp = 2
             q_heads = text.num_attention_heads // tp
-            # Layer 4 is local (ckpt KV == served). Layer 5 is full: hetero
-            # (default) serves its native 8 heads (4 per rank, factor 1);
-            # uniform mode replicates 8 -> 16.
+            # Each layer serves its native head count, replicated up to one
+            # head per rank when tp exceeds it.
             for layer, ckpt_kv in (
                 (4, text.swa_num_key_value_heads),
                 (5, text.ckpt_num_key_value_heads),
             ):
-                served = max(inkling_kv_heads_for_layer(text, layer, hetero), tp)
+                served = max(ckpt_kv, tp)
                 p = f"model.llm.layers.{layer}.attn"
                 qkvr = self._param(model, f"model.layers.{layer}.attn.qkvr.weight")
                 wq = self.ckpt[f"{p}.wq_du.weight"]

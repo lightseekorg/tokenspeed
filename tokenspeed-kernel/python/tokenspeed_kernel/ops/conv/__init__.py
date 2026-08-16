@@ -25,7 +25,7 @@ an optional residual connection, ``y = x + conv(window)``, as used by TML
 hybrid layers. One entry point, :func:`inkling_ring_sconv`, dispatching on
 ``num_extends`` to two kernels with hard-coded state sources: extend
 batches (``num_extends > 0``) tap the paged checkpoint and never read the
-ring; decode/verify/lookback batches tap the ring and never read the paged
+ring; decode/verify batches tap the ring and never read the paged
 cache. Both publish covered boundary checkpoints unconditionally. The per-request convolution state lives in a slot-indexed ring
 of the last ``R`` input rows, shape ``[num_slots, R, D]`` with D-contiguous
 rows: the ring row of absolute position ``p`` is ``p % R``, positions derive
@@ -112,7 +112,7 @@ def inkling_ring_sconv(
     ``min(chunk_len + W - 1, R)`` positions persist to the ring in place —
     chunk rows plus the checkpoint window itself.
 
-    ``num_extends == 0`` (decode/verify/lookback batches): chunks are
+    ``num_extends == 0`` (decode/verify batches): chunks are
     uniform per request and must fit ``R - (W - 1)`` (asserted) so every
     chunk row persists without aliasing any request's tap reads; pre-chunk
     taps read the request's ring rows; the paged cache is never read.
@@ -122,7 +122,8 @@ def inkling_ring_sconv(
     later round covering the same boundary.
 
     Args:
-        x: Varlen-packed input ``[T, D]`` (e.g. bf16), D-contiguous.
+        x: Varlen-packed input ``[T, D]`` (e.g. bf16). May be a strided
+            slice of a wider buffer.
         weight: Per-channel FIR taps ``[D, W]``; tap ``W - 1`` multiplies
             the current token.
         conv_cache: Conv state ring ``[num_slots, R, D]`` with

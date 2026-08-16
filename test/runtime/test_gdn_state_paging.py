@@ -370,6 +370,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
     def setUp(self):
         try:
             import torch
+            from tokenspeed_kernel.ops.attention import gdn_replay_commit_supported
             from tokenspeed_kernel.ops.attention.flashinfer import (
                 gated_delta_rule as gdn,
             )
@@ -388,9 +389,12 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         self.gdn = gdn
         self.ForwardMode = ForwardMode
         self.MambaAttnBackend = MambaAttnBackend
+        self.gdn_replay_commit_supported = gdn_replay_commit_supported
         torch.manual_seed(0)
 
-    def _make_backend(self, conv_slab, ssm_slab, spec_num_tokens=1):
+    def _make_backend(
+        self, conv_slab, ssm_slab, spec_num_tokens=1, *, replay_ssm=False
+    ):
         torch = self.torch
         config = SimpleNamespace(
             device="cuda",
@@ -401,6 +405,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             head_dim=self.D,
             is_draft=False,
             speculative_num_draft_tokens=spec_num_tokens,
+            replay_ssm=replay_ssm,
         )
         backend = self.MambaAttnBackend(config)
         stub_pool = _ContractPool(
@@ -411,9 +416,9 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         self.assertTrue(backend.state_paging_active)
         return backend
 
-    def test_verify_scratch_starts_from_committed_conv_and_ssm_state(self):
+    def test_verify_scratch_seeds_conv_but_omits_replayed_ssm_state(self):
         torch = self.torch
-        conv_dim = 8
+        conv_dim = 3 * self.H * self.D
         conv_slab = torch.zeros(
             7, conv_dim, self.WIDTH - 1, device="cuda", dtype=torch.bfloat16
         )
@@ -424,7 +429,11 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         conv_slab[5].fill_(5)
         ssm_slab[3].fill_(3)
         ssm_slab[5].fill_(5)
-        backend = self._make_backend(conv_slab, ssm_slab, spec_num_tokens=4)
+        if not self.gdn_replay_commit_supported(torch.bfloat16):
+            self.skipTest("GDN ReplaySSM kernel unavailable")
+        backend = self._make_backend(
+            conv_slab, ssm_slab, spec_num_tokens=4, replay_ssm=True
+        )
         backend.init_forward_metadata(
             bs=2,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
@@ -446,8 +455,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(conv_scratch[0], conv_slab[3]))
         self.assertTrue(torch.equal(conv_scratch[5], conv_slab[5]))
-        self.assertTrue(torch.equal(ssm_scratch[0], ssm_slab[3]))
-        self.assertTrue(torch.equal(ssm_scratch[5], ssm_slab[5]))
+        self.assertIsNone(ssm_scratch)
 
     def test_paged_states_match_fla_oracle(self):
         if not self.gdn.is_available():

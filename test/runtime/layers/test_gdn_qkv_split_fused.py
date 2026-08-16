@@ -115,3 +115,55 @@ def test_strided_input(nq, nv, hq, hv, T):
     assert torch.max(torch.abs(q.float() - q_ref.float())) < 1e-5
     assert torch.max(torch.abs(k.float() - k_ref.float())) < 1e-5
     assert torch.max(torch.abs(v.float() - v_ref.float())) < 1e-5
+
+
+@pytest.mark.parametrize("fuse_l2norm", [False, True])
+def test_split_packs_replay_payload(fuse_l2norm):
+    """The split launch also stores raw K/V and both replay gate inputs."""
+    nq, nk, nv = 2, 2, 4
+    hq, hk, hv, T = 32, 32, 24, 17
+    dtype = torch.bfloat16
+    torch.manual_seed(113)
+    mixed_qkv = torch.randn(
+        T,
+        nq * hq + nk * hk + nv * hv,
+        dtype=dtype,
+        device="cuda",
+    )
+    replay_a = torch.randn(T, nv, dtype=dtype, device="cuda")
+    replay_b = torch.randn(T, nv, dtype=dtype, device="cuda")
+    replay_payload = torch.empty(
+        T,
+        nk * hk + nv * hv + 2 * nv,
+        dtype=dtype,
+        device="cuda",
+    )
+
+    _, key_ref, value_ref = _ref_split(mixed_qkv, nq, nk, nv, hq, hk, hv)
+    q, key, value = fused_qkv_split_gdn_prefill(
+        mixed_qkv,
+        nq,
+        nk,
+        nv,
+        hq,
+        hk,
+        hv,
+        fuse_l2norm=fuse_l2norm,
+        replay=(replay_payload, replay_a, replay_b),
+    )
+    expected_payload = torch.cat(
+        (
+            key_ref.reshape(T, -1),
+            value_ref.reshape(T, -1),
+            replay_a,
+            replay_b,
+        ),
+        dim=-1,
+    )
+
+    torch.testing.assert_close(replay_payload, expected_payload, atol=0, rtol=0)
+    torch.testing.assert_close(value, value_ref, atol=0, rtol=0)
+    if fuse_l2norm:
+        query_ref, _, _ = _ref_split(mixed_qkv, nq, nk, nv, hq, hk, hv)
+        torch.testing.assert_close(q, l2norm_fwd(query_ref), atol=2e-3, rtol=0)
+        torch.testing.assert_close(key, l2norm_fwd(key_ref), atol=2e-3, rtol=0)

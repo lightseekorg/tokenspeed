@@ -53,6 +53,9 @@ if current_platform().is_amd:
         gluon_dsa_prefill_topk_fp8_gfx950 as _dsa_prefill_topk_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
+        gluon_kda_fused_decode_gfx950 as _kda_fused_decode_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
         gluon_kda_recurrent_decode_gfx950 as _kda_decode_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.prefill import (
@@ -220,6 +223,76 @@ if current_platform().is_amd:
     def gluon_kda_paged_decode_gfx950(**kwargs):
         """Run specialized gfx950 KDA decode against the canonical K-major pool."""
         return _kda_decode_impl(**kwargs)
+
+    @register_kernel(
+        "attention",
+        "kda_fused_paged_decode",
+        name="gluon_kda_fused_paged_decode_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k", "v"),
+            "dense",
+            {torch.bfloat16},
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "paged_state": frozenset({True}),
+            "fused_output_norm": frozenset({True}),
+            "num_heads": frozenset({12}),
+            "head_dim": frozenset({128}),
+            "conv_kernel_size": frozenset({4}),
+        },
+        tags={"amd", "gfx950", "paged_cache", "cuda_graph", "fusion"},
+    )
+    def gluon_kda_fused_paged_decode_gfx950(
+        mixed_qkv: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_states: torch.Tensor,
+        f_a_out: torch.Tensor,
+        f_b_weight: torch.Tensor,
+        beta_logits: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        *,
+        state_pool: torch.Tensor,
+        read_indices: torch.Tensor,
+        write_indices: torch.Tensor,
+        num_heads: int,
+        head_dim: int,
+        cu_seqlens: torch.Tensor,
+        lower_bound: float | None,
+        output_gate: torch.Tensor | None,
+        norm_weight: torch.Tensor | None,
+        norm_eps: float | None,
+    ):
+        """Run the decay projection and fused gfx950 KDA decode epilogue."""
+        if output_gate is None or norm_weight is None or norm_eps is None:
+            raise ValueError("gfx950 fused KDA decode requires output normalization")
+        raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
+        return _kda_fused_decode_impl(
+            mixed_qkv=mixed_qkv,
+            conv_weights=conv_weights,
+            conv_states=conv_states,
+            raw_g=raw_g,
+            beta_logits=beta_logits,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            output_gate=output_gate,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            state_pool=state_pool,
+            read_indices=read_indices,
+            write_indices=write_indices,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            cu_seqlens=cu_seqlens,
+            lower_bound=lower_bound,
+        )
 
     @register_kernel(
         "attention",
@@ -1320,6 +1393,14 @@ if current_platform().is_amd:
     )
     def gluon_rel_mha_prefill_gfx950(*args, **kwargs):
         kwargs.pop("enable_pdl", None)
+        tau = kwargs.pop("tau", None)
+        if tau is not None:
+            # No fused per-row logit scale in the gluon backend; fold tau
+            # into q and the rel bias: tau*(scale*qk + rel).
+            kwargs["q"] = kwargs["q"] * tau[:, None, None].to(kwargs["q"].dtype)
+            kwargs["rel_logits"] = kwargs["rel_logits"] * tau[:, None, None].to(
+                kwargs["rel_logits"].dtype
+            )
         return _rel_prefill_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1345,6 +1426,14 @@ if current_platform().is_amd:
     )
     def gluon_rel_mha_extend_gfx950(*args, **kwargs):
         kwargs.pop("enable_pdl", None)
+        tau = kwargs.pop("tau", None)
+        if tau is not None:
+            # No fused per-row logit scale in the gluon backend; fold tau
+            # into q and the rel bias: tau*(scale*qk + rel).
+            kwargs["q"] = kwargs["q"] * tau[:, None, None].to(kwargs["q"].dtype)
+            kwargs["rel_logits"] = kwargs["rel_logits"] * tau[:, None, None].to(
+                kwargs["rel_logits"].dtype
+            )
         return _rel_extend_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1370,4 +1459,12 @@ if current_platform().is_amd:
     )
     def gluon_rel_mha_decode_gfx950(*args, **kwargs):
         kwargs.pop("enable_pdl", None)
+        tau = kwargs.pop("tau", None)
+        if tau is not None:
+            # No fused per-row logit scale in the gluon backend; fold tau
+            # into q and the rel bias: tau*(scale*qk + rel).
+            kwargs["q"] = kwargs["q"] * tau[:, None, None].to(kwargs["q"].dtype)
+            kwargs["rel_logits"] = kwargs["rel_logits"] * tau[:, None, None].to(
+                kwargs["rel_logits"].dtype
+            )
         return _rel_decode_impl(*args, **kwargs)

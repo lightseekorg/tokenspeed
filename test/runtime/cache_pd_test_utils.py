@@ -37,8 +37,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 from tokenspeed.runtime.pd.cache_protocol import (
     CacheFieldPartition,
     CacheFieldTransferSpec,
-    CachePDGroupPages,
-    CachePDPageManifest,
+    CachePDBlockManifest,
+    CachePDGroupBlocks,
     CacheProducerSchedule,
     CacheTransferContract,
     CacheTransferSchema,
@@ -221,13 +221,13 @@ def producer_schedule(
     )
 
 
-def manifest(
+def block_manifest(
     *groups: tuple[str, tuple[int, ...]],
     prefix: int = 0,
     prompt: int = 2,
-) -> CachePDPageManifest:
-    return CachePDPageManifest(
-        groups=tuple(CachePDGroupPages(*entry) for entry in groups),
+) -> CachePDBlockManifest:
+    return CachePDBlockManifest(
+        groups=tuple(CachePDGroupBlocks(*entry) for entry in groups),
         prefix_len=prefix,
         prompt_len=prompt,
     )

@@ -320,6 +320,7 @@ class SelectOutCacheLocTest(_MHACase):
     def setUp(self):
         super().setUp()
         backend = self.MHAAttnBackend.__new__(self.MHAAttnBackend)
+        backend.is_draft = False
         backend.forward_decode_metadata = None
         backend.forward_extend_metadata = None
         self.backend = backend
@@ -389,6 +390,21 @@ class SelectOutCacheLocTest(_MHACase):
             )
             is fb
         )
+
+    def test_public_select_preserves_draft_chain_locations(self):
+        torch = self.torch
+        metadata_loc = torch.tensor([6], dtype=torch.int32)
+        caller_loc = torch.tensor([99, 100, 101], dtype=torch.int32)
+        self.backend.is_draft = True
+        self.backend.forward_decode_metadata = SimpleNamespace(
+            out_cache_locs={"full_attention": metadata_loc}
+        )
+
+        got = self.backend.select_out_cache_loc(
+            SimpleNamespace(group_id="full_attention"), caller_loc
+        )
+
+        assert got is caller_loc
 
 
 _GROUP_IDS = ("sliding_attention", "full_attention")

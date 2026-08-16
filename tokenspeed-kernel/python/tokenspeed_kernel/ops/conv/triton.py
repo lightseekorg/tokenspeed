@@ -32,7 +32,7 @@ carries the other's paths:
   the checkpoint window itself, one writer per row via the
   ``pos >= through - R`` gate — and publishes the conv window at every
   covered boundary.
-- ``_inkling_ring_sconv_decode_kernel``: fixed-shape decode/verify/lookback
+- ``_inkling_ring_sconv_decode_kernel``: fixed-shape decode/verify
   chunks (uniform tokens per request). Pre-chunk taps read the RING; the
   paged cache is never read. Persists every chunk row (the wrapper asserts
   the uniform chunk fits ``R - (W - 1)``, so writes never alias another
@@ -143,9 +143,9 @@ def _inkling_ring_sconv_decode_kernel(
     W: tl.constexpr,
     W_POW2: tl.constexpr,
 ):
-    """Decode/verify/lookback sconv: ring taps, write-all, one boundary.
+    """Decode/verify sconv: ring taps, write-all, one boundary.
 
-    Chunks are uniform per request (1 / K / K + D tokens) and fit
+    Chunks are uniform per request (1 / K tokens) and fit
     ``R - (W - 1)``, so every chunk row persists at its position's ring row
     with no aliasing (the wrapper asserts the bound). Pre-chunk taps read
     the request's ring; the paged cache is never read. A token whose

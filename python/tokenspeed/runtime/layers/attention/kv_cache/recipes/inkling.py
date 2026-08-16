@@ -311,15 +311,20 @@ def _fp8_sconv() -> bool:
 
 
 def inkling_layer_kv_head_counts(model_config) -> tuple[int, ...]:
-    """Per-layer global KV head count, before TP sharding.
+    """Served KV heads per layer, before TP sharding.
 
-    Also read by the PD field-partition logic, which needs the global width.
+    Each kind's native checkpoint count (hetero byte-uniform slots, #647), so
+    page sizes derive from these. Also read by the PD field-partition logic,
+    which needs the global width.
     """
-    from tokenspeed.runtime.configs.inkling_config import inkling_kv_heads_for_layer
-
     text_config = model_config.hf_config.get_text_config()
+    local = set(text_config.local_layer_ids)
     return tuple(
-        inkling_kv_heads_for_layer(text_config, layer_id, True)
+        (
+            text_config.swa_num_key_value_heads
+            if layer_id in local
+            else text_config.ckpt_num_key_value_heads
+        )
         for layer_id in range(text_config.num_hidden_layers)
     )
 
@@ -328,12 +333,9 @@ def _conv_ring_bytes(*, text_config, attn_config, num_layers: int, spec_tokens: 
     from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
 
     rows = int(attn_config.max_bs) + 2
-    # Must match _wrap_inkling_backend's ring sizing:
-    # (W-1) taps + K chunk rows + draft lookback depth (K-2).
+    # Must match _wrap_inkling_backend's ring sizing: (W-1) taps + K chunk rows.
     spec_tokens = max(1, int(spec_tokens))
-    ring_rows = (
-        int(text_config.sconv_kernel_size) - 1 + spec_tokens + max(spec_tokens - 2, 0)
-    )
+    ring_rows = int(text_config.sconv_kernel_size) - 1 + spec_tokens
     conv_dim = inkling_conv_total_dim(text_config, attn_config.attn_tp_size)
     pending_bytes = rows * torch.bool.itemsize
     return (

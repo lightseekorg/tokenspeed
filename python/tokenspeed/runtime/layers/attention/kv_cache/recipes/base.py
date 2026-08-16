@@ -23,8 +23,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from functools import cached_property
 from collections.abc import Mapping, Sequence
+from functools import cached_property
 from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import (

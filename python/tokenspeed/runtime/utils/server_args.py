@@ -277,6 +277,7 @@ class ServerArgs:
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
+    enable_replay_ssm: bool = False
     eagle3_layers_to_capture: str | None = None
     # Logprob support flags — all OFF by default. Enabling extends the
     # captured CUDA-graph footprint; requests asking for logprobs on a
@@ -1708,6 +1709,12 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--enable-replay-ssm",
+            action="store_true",
+            default=ServerArgs.enable_replay_ssm,
+            help="Enable ReplaySSM for supported Qwen GDN target verification.",
         )
         parser.add_argument(
             "--enable-output-logprobs",

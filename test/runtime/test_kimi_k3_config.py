@@ -412,8 +412,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
             layer = kimi_k3.KimiLinearMoE(
                 config,
                 mapping,
-                quant_config=None,
                 layer_index=1,
+                model_scope="model.layers",
+                quant_config=None,
                 prefix="model.layers.1.block_sparse_moe",
             )
 

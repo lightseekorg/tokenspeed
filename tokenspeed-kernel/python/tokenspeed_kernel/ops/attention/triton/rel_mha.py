@@ -862,10 +862,16 @@ def triton_rel_mha_prefill(
     window_left: int = -1,
     return_lse: bool = False,
     softmax_scale: float | None = None,
+    tau: torch.Tensor | None = None,
     enable_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+    if tau is not None:
+        # No fused per-row logit scale in this backend; fold tau into q and
+        # the rel bias: tau*(scale*qk + rel).
+        q = q * tau[:, None, None].to(q.dtype)
+        rel_logits = rel_logits * tau[:, None, None].to(rel_logits.dtype)
     out = torch.empty_like(q)
     lse = (
         torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
@@ -926,6 +932,7 @@ def triton_rel_mha_extend_with_kvcache(
     window_left: int = -1,
     return_lse: bool = False,
     softmax_scale: float | None = None,
+    tau: torch.Tensor | None = None,
     enable_pdl: bool = False,
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
@@ -933,6 +940,11 @@ def triton_rel_mha_extend_with_kvcache(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+    if tau is not None:
+        # No fused per-row logit scale in this backend; fold tau into q and
+        # the rel bias: tau*(scale*qk + rel).
+        q = q * tau[:, None, None].to(q.dtype)
+        rel_logits = rel_logits * tau[:, None, None].to(rel_logits.dtype)
     k = torch.empty(
         (0, k_cache.shape[2], k_cache.shape[3]),
         dtype=k_cache.dtype,
@@ -1001,6 +1013,7 @@ def triton_rel_mha_decode_with_kvcache(
     max_seqlen_q: int = 1,
     window_left: int = -1,
     softmax_scale: float | None = None,
+    tau: torch.Tensor | None = None,
     enable_pdl: bool = False,
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
@@ -1008,6 +1021,11 @@ def triton_rel_mha_decode_with_kvcache(
 ) -> torch.Tensor:
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+    if tau is not None:
+        # No fused per-row logit scale in this backend; fold tau into q and
+        # the rel bias: tau*(scale*qk + rel).
+        q = q * tau[:, None, None].to(q.dtype)
+        rel_logits = rel_logits * tau[:, None, None].to(rel_logits.dtype)
     out = torch.empty_like(q)
     max_kv_splits = _decode_split_count(max_seqlen_k, window_left)
     attn_logits = torch.empty(

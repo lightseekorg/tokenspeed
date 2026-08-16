@@ -739,6 +739,9 @@ class FlashAttentionForwardSm100:
         mLSE: Optional[cute.Tensor],
         mRowMax: Optional[cute.Tensor],
         softmax_scale: Float32,
+        # (total_q,) varlen / (b, s_q) batch fp32 per-query-row multiplier on
+        # the total pre-softmax logits, tau * (scale * q@k^T + bias); > 0.
+        mTau: Optional[cute.Tensor] = None,
         mSFQ: Optional[cute.Tensor] = None,
         mSFK: Optional[cute.Tensor] = None,
         mSFV: Optional[cute.Tensor] = None,
@@ -1697,6 +1700,9 @@ class FlashAttentionForwardSm100:
             smem_size_bytes <= 227 * 1024
         ), f"insufficient smem, requested {smem_size_bytes}"
         # Launch the kernel synchronously
+        if const_expr(mTau is not None):
+            assert mTau.dtype == Float32
+            assert cute.rank(mTau) == (1 if mCuSeqlensQ is not None else 2)
         self.kernel(
             mQ,
             mK,
@@ -1725,6 +1731,7 @@ class FlashAttentionForwardSm100:
             softmax_scale,
             softmax_scale_true,
             inv_softmax_scale,
+            mTau,
             window_size_left,
             window_size_right,
             learnable_sink,
@@ -1799,6 +1806,7 @@ class FlashAttentionForwardSm100:
         softmax_scale: Float32 | None,
         softmax_scale_true: Float32,
         inv_softmax_scale: Float32,
+        mTau: Optional[cute.Tensor],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         learnable_sink: Optional[cute.Tensor],
@@ -2464,6 +2472,7 @@ class FlashAttentionForwardSm100:
                 softmax_scale=softmax_scale,
                 softmax_scale_true=softmax_scale_true,
                 inv_softmax_scale=inv_softmax_scale,
+                mTau=mTau,
                 thr_mma_qk=thr_mma_qk,
                 sScale=sScale,
                 mLSE=mLSE,
@@ -3693,6 +3702,7 @@ class FlashAttentionForwardSm100:
         softmax_scale: Float32,
         softmax_scale_true: Float32,
         inv_softmax_scale: Float32,
+        mTau: Optional[cute.Tensor],
         thr_mma_qk: cute.core.ThrMma,
         tStS: cute.Tensor,  # ((TILE_M, TILE_N), 1, 1, q_stage)
         sScale: cute.Tensor,
@@ -3920,6 +3930,7 @@ class FlashAttentionForwardSm100:
                 head_idx=head_idx,
                 m_block=(self.q_stage * m_block + stage) * self.cta_group_size,
                 inv_softmax_scale=inv_softmax_scale,
+                mTau=mTau,
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
@@ -4260,6 +4271,7 @@ class FlashAttentionForwardSm100:
         head_idx: Int32,
         m_block: Int32,
         inv_softmax_scale: Float32,
+        mTau: Optional[cute.Tensor],
         seqlen,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
@@ -4365,6 +4377,24 @@ class FlashAttentionForwardSm100:
                 head_divmod,
             )
 
+        if const_expr(mTau is not None):
+            # Per-query-row scale on the raw (qk + bias/scale) tile; the later
+            # scale_log2 multiply distributes it over the total logits. Must
+            # precede masking (-inf rows) and the online row-max.
+            cTau = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
+            cTau = cute.domain_offset((m_block * self.m_block_size, 0), cTau)
+            tScTau = thr_mma_qk.partition_C(cTau)
+            tau_row = thr_tmem_load.partition_D(tScTau[(None, None), 0, 0])[0][0]
+            if const_expr(self.pack_gqa):
+                tau_row, _ = divmod(tau_row, head_divmod)
+            tau = Float32(1.0)
+            if tau_row < seqlen.seqlen_q:
+                if const_expr(seqlen.has_cu_seqlens_q):
+                    tau = mTau[seqlen.offset_q + tau_row]
+                else:
+                    tau = mTau[batch_idx, tau_row]
+            tSrS_t2r.store(tSrS_t2r.load() * tau)
+
         # may need to mask out dummy bias add
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
@@ -4401,7 +4431,7 @@ class FlashAttentionForwardSm100:
             tSrP_r2t,
             ex2_emu_freq=(
                 self.ex2_emu_freq
-                if const_expr(mask_fn is None and not apply_bias)
+                if const_expr(mask_fn is None and not apply_bias and mTau is None)
                 else 0
             ),
             ex2_emu_start_frg=self.ex2_emu_start_frg,
@@ -6466,6 +6496,7 @@ def _flash_attn_fwd_standalone(
         m_lse,
         m_logits_max,
         softmax_scale,
+        None,  # mTau
         m_sfq,
         m_sfk,
         m_sfv,
@@ -6523,7 +6554,7 @@ def _flash_attn_fwd_standalone(
     if compiled is None:
         compiled = cute.compile(kernel, *compile_args)
         _STANDALONE_FORWARD_CACHE[cache_key] = compiled
-    runtime_args = compile_args[:10] + compile_args[12:]
+    runtime_args = compile_args[:11] + compile_args[13:]
     compiled(*runtime_args)
     return out, lse, logits_max
 

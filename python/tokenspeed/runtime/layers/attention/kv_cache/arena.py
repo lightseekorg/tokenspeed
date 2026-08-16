@@ -77,9 +77,7 @@ class CacheArena:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
-        with self.memory_saver_adapter.region(
-            tag="kv_cache", enable_cpu_backup=False
-        ):
+        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
             self.buffer = torch.zeros(
                 plan.arena_bytes,
                 dtype=torch.uint8,
@@ -157,7 +155,9 @@ class CacheArena:
         The plan's parent count times the tightest packing. One definition
         here, so compute views no longer re-derive it and disagree.
         """
-        max_packing = max(group.cache_blocks_per_lcm_block for group in self.plan.groups)
+        max_packing = max(
+            group.cache_blocks_per_lcm_block for group in self.plan.groups
+        )
         return self.plan.num_lcm_blocks * max_packing * self.plan.prefix_granularity
 
     def _bind(self, field) -> torch.Tensor:
@@ -245,9 +245,7 @@ class CacheArena:
     @property
     def supports_disaggregation(self) -> bool:
         """Whether the arena exposes complete inputs for cache transfer."""
-        return all(
-            spec.transfer_policy is not None for spec in self.cache_group_specs
-        )
+        return all(spec.transfer_policy is not None for spec in self.cache_group_specs)
 
     def contract_binding(self) -> torch.Tensor:
         """Return the arena buffer the cache contract is bound to.

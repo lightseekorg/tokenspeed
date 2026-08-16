@@ -26,6 +26,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import warnings
 from collections.abc import Callable
 from typing import Any
@@ -62,6 +63,9 @@ from tokenspeed.runtime.configs import (
 )
 from tokenspeed.runtime.utils import lru_cache_frozenset
 
+_HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
+logger = logging.getLogger(__name__)
+
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     Qwen2Config.model_type: Qwen2Config,
     Qwen3Config.model_type: Qwen3Config,
@@ -80,6 +84,21 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     InklingModelConfig.model_type: InklingModelConfig,
     InklingMMConfig.model_type: InklingMMConfig,
 }
+
+
+def _snapshot_commit_hash(snapshot_path: str) -> str | None:
+    """Extract an immutable commit from a standard HF snapshot path.
+
+    Args:
+        snapshot_path: Local snapshot directory returned by ``snapshot_download``.
+
+    Returns:
+        The 40-character lowercase commit hash, or ``None`` for a nonstandard
+        cache layout.
+    """
+    candidate = os.path.basename(os.path.normpath(snapshot_path))
+    return candidate if _HF_COMMIT_HASH_RE.fullmatch(candidate) else None
+
 
 _DEEPSEEK_V4_ENCODING_MODULE_NAME = "_tokenspeed_deepseek_v4_encoding"
 
@@ -221,37 +240,90 @@ def get_config(
     speculative_algorithm: str | None = None,
     **kwargs,
 ):
-    if os.path.isdir(model):
-        model_path = model
-    else:
+    """Load one config from one revision-pinned metadata snapshot.
+
+    Remote repositories are resolved under the TokenSpeed cross-process lock.
+    Ordinary configs parse from that immutable local snapshot. Custom config
+    code parses from the original repo at the snapshot's immutable commit,
+    still under the lock. This avoids an unlocked second Hub/cache lookup
+    racing across tensor-parallel worker processes.
+    """
+
+    def load_raw_config(model_path: str) -> dict[str, Any]:
+        try:
+            with open(os.path.join(model_path, "config.json")) as file:
+                return json.load(file)
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"Config file not found in {model}. Please check the path."
+            )
+        except json.JSONDecodeError:
+            raise RuntimeError(
+                f"Failed to decode JSON from config file in {model}. "
+                "Please ensure the file is valid JSON."
+            )
+
+    config = None
+    raw_config = None
+    is_remote_model = not os.path.isdir(model)
+    if is_remote_model:
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
         with get_lock(model):
             model_path = snapshot_download(
-                model, ignore_patterns=["*.pt", "*.safetensors", "*.bin"]
+                model,
+                revision=revision,
+                ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
             )
+            raw_config = load_raw_config(model_path)
 
-    try:
-        with open(os.path.join(model_path, "config.json")) as file:
-            raw_config = json.load(file)
-    except FileNotFoundError:
-        raise RuntimeError(f"Config file not found in {model}. Please check the path.")
-    except json.JSONDecodeError:
-        raise RuntimeError(
-            f"Failed to decode JSON from config file in {model}. Please ensure the file is valid JSON."
-        )
-
-    if raw_config.get("model_type", "llama") in _CONFIG_REGISTRY:
-        config_class = _CONFIG_REGISTRY[raw_config["model_type"]]
-        config = config_class.from_pretrained(model, revision=revision)
-        setattr(config, "_name_or_path", model)
+            # Local snapshot parsing is mandatory for ordinary configs: a
+            # second remote config lookup can silently construct defaults (as
+            # in GB200 run 31909404825). Custom AutoConfig code is the sole
+            # exception because Transformers 5.12 resolves its relative
+            # imports incorrectly from symlink-backed local snapshots. Keep
+            # that remote-code load revision-pinned and inside the same lock.
+            if (
+                raw_config.get("model_type", "llama") not in _CONFIG_REGISTRY
+                and trust_remote_code
+            ):
+                snapshot_revision = _snapshot_commit_hash(model_path)
+                if snapshot_revision is not None:
+                    # Keep the lock while Transformers copies executable code
+                    # into transformers_modules. Remote code must not call
+                    # get_config/get_tokenizer recursively for this repo: the
+                    # host-local FileLock is intentionally non-reentrant.
+                    config = AutoConfig.from_pretrained(
+                        model,
+                        trust_remote_code=True,
+                        revision=snapshot_revision,
+                        **kwargs,
+                    )
+                else:
+                    logger.warning(
+                        "Cannot derive an immutable Hugging Face commit from %s; "
+                        "parsing custom config code from the local snapshot. "
+                        "Remote-code sibling imports may fail in this layout.",
+                        model_path,
+                    )
     else:
-        try:
+        model_path = model
+
+    if raw_config is None:
+        raw_config = load_raw_config(model_path)
+
+    if config is None:
+        if raw_config.get("model_type", "llama") in _CONFIG_REGISTRY:
+            config_class = _CONFIG_REGISTRY[raw_config["model_type"]]
+            config = config_class.from_pretrained(model_path)
+        else:
             config = AutoConfig.from_pretrained(
-                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+                model_path, trust_remote_code=trust_remote_code, **kwargs
             )
-        except ValueError as e:
-            raise e
+
+    # Keep user-facing diagnostics and downstream cache keys stable even though
+    # parsing is deliberately pinned to the immutable local snapshot.
+    config._name_or_path = model
 
     _materialize_architectures(config, raw_config)
     _restore_raw_glm_dsa_fields(config, raw_config)
@@ -338,9 +410,20 @@ def get_generation_config(
     revision: str | None = None,
     **kwargs,
 ):
+    """Load generation metadata from one revision-pinned local snapshot."""
     try:
+        model_path = model
+        if not os.path.isdir(model):
+            from tokenspeed.runtime.model_loader.weight_utils import get_lock
+
+            with get_lock(model):
+                model_path = snapshot_download(
+                    model,
+                    revision=revision,
+                    ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                )
         return GenerationConfig.from_pretrained(
-            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            model_path, trust_remote_code=trust_remote_code, **kwargs
         )
     except OSError:
         logging.debug("model doesn't have generation_config.json")
@@ -424,6 +507,10 @@ def _find_deepseek_v4_encoding_file(
         encoding_path = os.path.join(tokenizer_name, "encoding", "encoding_dsv4.py")
         if os.path.exists(encoding_path):
             return encoding_path
+        raise RuntimeError(
+            "DeepSeek V4 tokenizer mode requires "
+            f"`encoding/encoding_dsv4.py` in {tokenizer_name}."
+        )
 
     try:
         encoding_path = cached_file(
@@ -549,10 +636,16 @@ def get_tokenizer(
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     tokenizer_revision: str | None = None,
+    revision: str | None = None,
     architectures: list[str] | None = None,
     **kwargs,
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
     """Gets a tokenizer for the given model name via Huggingface.
+
+    Remote tokenizers are downloaded once under the TokenSpeed cross-process
+    lock. Ordinary tokenizers parse from that local snapshot. Custom tokenizer
+    code parses from the original repo at the snapshot's immutable commit,
+    while still holding the lock, so Transformers can resolve sibling imports.
 
     ``architectures`` is the model's ``config.architectures`` list (caller
     should pass it when available). It gates whether we bypass AutoTokenizer
@@ -562,93 +655,130 @@ def get_tokenizer(
     loaded via ``trust_remote_code`` (e.g. Kimi-K2.5's ``TikTokenTokenizer``)
     must NOT go through the verbatim path; leaving ``architectures`` as None
     (the default) keeps the safe AutoTokenizer-only behavior.
+
+    ``revision`` is the production-facing alias for ``tokenizer_revision``.
+    When both are provided they must name the same snapshot.
     """
+    if tokenizer_revision is not None and revision is not None:
+        if tokenizer_revision != revision:
+            raise ValueError(
+                f"tokenizer_revision ({tokenizer_revision!r}) and revision "
+                f"({revision!r}) must match when both are set."
+            )
+    elif tokenizer_revision is None:
+        tokenizer_revision = revision
+
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
 
+    tokenizer_path = tokenizer_name
+    tokenizer = None
+
+    def load_tokenizer(
+        auto_tokenizer_target: str,
+        auto_tokenizer_revision: str | None = None,
+    ) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
+        fast_tokenizer = None
+        if (
+            tokenizer_mode != "slow"
+            and kwargs.get("use_fast", True)
+            and prefers_verbatim_fast_tokenizer(architectures)
+        ):
+            try:
+                fast_tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                    tokenizer_path,
+                    *args,
+                    clean_up_tokenization_spaces=False,
+                )
+            except Exception:
+                fast_tokenizer = None
+
+        auto_tokenizer_kwargs = dict(kwargs)
+        if auto_tokenizer_revision is not None:
+            auto_tokenizer_kwargs["revision"] = auto_tokenizer_revision
+
+        try:
+            loaded_tokenizer = AutoTokenizer.from_pretrained(
+                auto_tokenizer_target,
+                *args,
+                trust_remote_code=trust_remote_code,
+                clean_up_tokenization_spaces=False,
+                **auto_tokenizer_kwargs,
+            )
+        except TypeError as e:
+            # The LLaMA tokenizer causes a protobuf error in some environments.
+            err_msg = (
+                "Failed to load the tokenizer. If you are using a LLaMA V1 model "
+                f"consider using '{_FAST_LLAMA_TOKENIZER}' instead of the "
+                "original tokenizer."
+            )
+            raise RuntimeError(err_msg) from e
+        except ValueError as e:
+            # If the error pertains to the tokenizer class not existing or not
+            # currently being imported, suggest using --trust-remote-code.
+            if not trust_remote_code and (
+                "does not exist or is not currently imported." in str(e)
+                or "requires you to execute the tokenizer file" in str(e)
+            ):
+                err_msg = (
+                    "Failed to load the tokenizer. If the tokenizer is a custom "
+                    "tokenizer not yet available in the HuggingFace transformers "
+                    "library, consider setting `trust_remote_code=True` in LLM "
+                    "or using the `--trust-remote-code` flag in the CLI."
+                )
+                raise RuntimeError(err_msg) from e
+            raise
+
+        # Swap in the fast tokenizer, carrying over chat_template from
+        # tokenizer_config.json if tokenizer.json doesn't have one.
+        if fast_tokenizer is not None and fast_tokenizer is not loaded_tokenizer:
+            if getattr(loaded_tokenizer, "chat_template", None) and not getattr(
+                fast_tokenizer, "chat_template", None
+            ):
+                fast_tokenizer.chat_template = loaded_tokenizer.chat_template
+            loaded_tokenizer = fast_tokenizer
+
+        if not isinstance(loaded_tokenizer, PreTrainedTokenizerFast):
+            warnings.warn(
+                "Using a slow tokenizer. This might cause a significant "
+                "slowdown. Consider using a fast tokenizer instead."
+            )
+
+        if tokenizer_mode == "auto" and prefers_deepseek_v4_tokenizer(architectures):
+            loaded_tokenizer = _wrap_deepseek_v4_tokenizer(
+                loaded_tokenizer,
+                _load_deepseek_v4_encode_messages(tokenizer_path, tokenizer_revision),
+            )
+        return loaded_tokenizer
+
     if not os.path.isdir(tokenizer_name):
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
         with get_lock(tokenizer_name):
-            snapshot_download(
+            tokenizer_path = snapshot_download(
                 tokenizer_name,
                 revision=tokenizer_revision,
                 ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
             )
+            snapshot_revision = _snapshot_commit_hash(tokenizer_path)
+            if trust_remote_code and snapshot_revision is not None:
+                tokenizer = load_tokenizer(tokenizer_name, snapshot_revision)
+            elif trust_remote_code:
+                logger.warning(
+                    "Cannot derive an immutable Hugging Face commit from %s; "
+                    "parsing custom tokenizer code from the local snapshot. "
+                    "Remote-code sibling imports may fail in this layout.",
+                    tokenizer_path,
+                )
 
-    fast_tokenizer = None
-    if (
-        tokenizer_mode != "slow"
-        and kwargs.get("use_fast", True)
-        and prefers_verbatim_fast_tokenizer(architectures)
-    ):
-        try:
-            fast_tokenizer = PreTrainedTokenizerFast.from_pretrained(
-                tokenizer_name,
-                *args,
-                revision=tokenizer_revision,
-                clean_up_tokenization_spaces=False,
-            )
-        except Exception:
-            fast_tokenizer = None
+    if tokenizer is None:
+        tokenizer = load_tokenizer(tokenizer_path)
 
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_name,
-            *args,
-            trust_remote_code=trust_remote_code,
-            tokenizer_revision=tokenizer_revision,
-            clean_up_tokenization_spaces=False,
-            **kwargs,
-        )
-    except TypeError as e:
-        # The LLaMA tokenizer causes a protobuf error in some environments.
-        err_msg = (
-            "Failed to load the tokenizer. If you are using a LLaMA V1 model "
-            f"consider using '{_FAST_LLAMA_TOKENIZER}' instead of the "
-            "original tokenizer."
-        )
-        raise RuntimeError(err_msg) from e
-    except ValueError as e:
-        # If the error pertains to the tokenizer class not existing or not
-        # currently being imported, suggest using the --trust-remote-code flag.
-        if not trust_remote_code and (
-            "does not exist or is not currently imported." in str(e)
-            or "requires you to execute the tokenizer file" in str(e)
-        ):
-            err_msg = (
-                "Failed to load the tokenizer. If the tokenizer is a custom "
-                "tokenizer not yet available in the HuggingFace transformers "
-                "library, consider setting `trust_remote_code=True` in LLM "
-                "or using the `--trust-remote-code` flag in the CLI."
-            )
-            raise RuntimeError(err_msg) from e
-        else:
-            raise e
-
-    # Swap in the fast tokenizer, carrying over chat_template from
-    # tokenizer_config.json if tokenizer.json doesn't have one.
-    if fast_tokenizer is not None and fast_tokenizer is not tokenizer:
-        if getattr(tokenizer, "chat_template", None) and not getattr(
-            fast_tokenizer, "chat_template", None
-        ):
-            fast_tokenizer.chat_template = tokenizer.chat_template
-        tokenizer = fast_tokenizer
-
-    if not isinstance(tokenizer, PreTrainedTokenizerFast):
-        warnings.warn(
-            "Using a slow tokenizer. This might cause a significant "
-            "slowdown. Consider using a fast tokenizer instead."
-        )
-
-    if tokenizer_mode == "auto" and prefers_deepseek_v4_tokenizer(architectures):
-        tokenizer = _wrap_deepseek_v4_tokenizer(
-            tokenizer,
-            _load_deepseek_v4_encode_messages(tokenizer_name, tokenizer_revision),
-        )
-
+    tokenizer.name_or_path = tokenizer_name
+    if isinstance(getattr(tokenizer, "init_kwargs", None), dict):
+        tokenizer.init_kwargs["name_or_path"] = tokenizer_name
     attach_additional_stop_token_ids(tokenizer)
     return tokenizer
 

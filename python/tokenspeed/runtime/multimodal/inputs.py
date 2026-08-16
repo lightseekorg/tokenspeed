@@ -72,27 +72,20 @@ def is_mm_pad_value_for(token_ids: torch.Tensor, modality: "Modality") -> torch.
     )
 
 
-def maybe_substitute_mm_pad(
-    input_ids: torch.Tensor,
-    substitute_ids: int | Mapping["Modality", int] | None,
+def substitute_mm_pad_(
+    token_ids: torch.Tensor,
+    substitute_ids: Mapping["Modality", int],
 ) -> torch.Tensor:
-    """Replace hash MM-pad positions with in-vocab draft token IDs.
+    """Replace hash MM-pad positions with in-vocab draft token IDs, in place.
 
-    A scalar keeps the legacy behavior and substitutes every modality with one
-    token. A mapping preserves modality-specific semantics, which is required
-    by mixed image+audio prompts such as TML/Inkling.
+    Rewrites every hash-derived multimodal pad id to its modality's in-vocab
+    substitute token, directly in ``token_ids``. Returns ``token_ids``.
+    Modality-specific substitutes are required by mixed image+audio prompts
+    such as TML/Inkling.
     """
-    if substitute_ids is None:
-        return input_ids
-    if isinstance(substitute_ids, int):
-        return input_ids.masked_fill(is_mm_pad_value(input_ids), substitute_ids)
-
-    output = input_ids
     for modality, substitute_id in substitute_ids.items():
-        if output is input_ids:
-            output = input_ids.clone()
-        output.masked_fill_(is_mm_pad_value_for(input_ids, modality), substitute_id)
-    return output
+        token_ids.masked_fill_(is_mm_pad_value_for(token_ids, modality), substitute_id)
+    return token_ids
 
 
 class Modality(Enum):

@@ -918,6 +918,7 @@ class KimiLinearKDA(nn.Module):
         # plain GEMV on the prefill path.
         # Fused [3*proj, k] conv kernel bank, built once in post_load_weights.
         conv_weights = self.conv_weights
+        fuse_decode_output_norm = ctx.forward_mode.is_decode() and num_tokens == ctx.bs
 
         core_out = ctx.attn_backend.forward(
             q=None,
@@ -943,19 +944,25 @@ class KimiLinearKDA(nn.Module):
             A_log=self.A_log,
             dt_bias=self.dt_bias,
             lower_bound=self.gate_lower_bound,
+            output_gate=out_gate if fuse_decode_output_norm else None,
+            norm_weight=self.o_norm.weight if fuse_decode_output_norm else None,
+            norm_eps=self.o_norm.variance_epsilon if fuse_decode_output_norm else None,
             layer_id=self.layer_id,
             seq_len=num_tokens,
         )
 
-        # Per-head gated RMSNorm + sigmoid output gate in one kernel.
-        core_out = rmsnorm_gated_sigmoid(
-            core_out.reshape(num_tokens, hn * hd).contiguous(),
-            out_gate.contiguous(),
-            self.o_norm.weight,
-            self.o_norm.variance_epsilon,
-            hn,
-            hd,
-        )
+        core_out = core_out.reshape(num_tokens, hn * hd)
+        if not fuse_decode_output_norm:
+            # Decode kernels may fuse this epilogue; prefill retains the shared
+            # per-head norm implementation.
+            core_out = rmsnorm_gated_sigmoid(
+                core_out.contiguous(),
+                out_gate.contiguous(),
+                self.o_norm.weight,
+                self.o_norm.variance_epsilon,
+                hn,
+                hd,
+            )
         output, _ = self.o_proj(core_out)
         return output
 
@@ -1055,8 +1062,9 @@ class KimiLinearMoE(nn.Module):
         self,
         config: KimiLinearConfig,
         mapping: Mapping,
+        layer_index: int,
+        model_scope: str,
         quant_config: QuantizationConfig | None = None,
-        layer_index: int = -1,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
@@ -1279,13 +1287,17 @@ class KimiLinearMoE(nn.Module):
             )
         )
 
-        self._initialize_tail_capabilities(config, mapping, prefix)
+        self._initialize_tail_capabilities(
+            config, mapping, prefix, layer_index, model_scope
+        )
 
     def _initialize_tail_capabilities(
         self,
         config: KimiLinearConfig,
         mapping: Mapping,
         prefix: str,
+        layer_index: int,
+        model_scope: str,
     ) -> None:
         """Probe locally, cast one collective vote, then allocate collectively."""
         # All ranks must agree on eligibility before either collective allocator runs.
@@ -1355,7 +1367,8 @@ class KimiLinearMoE(nn.Module):
                     latent_size=self.routed_hidden,
                     rms_eps=self.routed_expert_norm.variance_epsilon,
                     device=_device,
-                    owner=prefix,
+                    layer_index=layer_index,
+                    model_scope=model_scope,
                     # Staging may alias the workspace pool; each barrier-free mailbox must remain private.
                     scratch_allocator=workspace_pool(_device).allocate,
                 )
@@ -1734,12 +1747,9 @@ class KimiLinearMoE(nn.Module):
             else routed_reduced
         )
         start, width = self.routed_expert_up_proj.shard_slice
-        routed_projected_shard = self.routed_expert_up_proj.project_shard(
-            routed_reduced
-        )
-        shared_stage[:, start : start + width] += routed_projected_shard + (
-            prefix_sum.view(num_tokens, hidden_size).narrow(-1, start, width)
-        )
+        target = shared_stage[:, start : start + width]
+        target += prefix_sum.view(num_tokens, hidden_size).narrow(-1, start, width)
+        target.addmm_(routed_reduced, self.routed_expert_up_proj.weight.t())
         shared_reduced = multimem_all_reduce_staged(shared_stage, group_name)
         # Clone: the staging buffer is recycled by the next layer's stage copy.
         return shared_reduced.view(num_tokens, hidden_size).clone()
@@ -1796,16 +1806,12 @@ class KimiLinearMoE(nn.Module):
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
-        routed_projected_shard = self.routed_expert_up_proj.project_shard(
-            routed_reduced
-        )
-        return self._inject_local_block(
-            routed_projected_shard,
-            shared_partial,
-            prefix_sum,
-            num_tokens,
-            hidden_size,
-        )
+        start, width = self.routed_expert_up_proj.shard_slice
+        shared_partial = shared_partial.view(num_tokens, hidden_size)
+        target = shared_partial[:, start : start + width]
+        target += prefix_sum.view(num_tokens, hidden_size)[:, start : start + width]
+        target.addmm_(routed_reduced, self.routed_expert_up_proj.weight.t())
+        return shared_partial
 
     def _inject_local_block(
         self,
@@ -1982,6 +1988,7 @@ class KimiLinearDecoderLayer(nn.Module):
         config: KimiLinearConfig,
         mapping: Mapping,
         layer_id: int,
+        model_scope: str,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
@@ -2027,11 +2034,12 @@ class KimiLinearDecoderLayer(nn.Module):
             # Named for the checkpoint index; not aliased as self.mlp (double
             # registration would duplicate every MoE param in state_dict).
             self.block_sparse_moe = KimiLinearMoE(
-                config,
-                mapping,
-                quant_config,
-                layer_id,
-                add_prefix("block_sparse_moe", prefix),
+                config=config,
+                mapping=mapping,
+                layer_index=layer_id,
+                model_scope=model_scope,
+                quant_config=quant_config,
+                prefix=add_prefix("block_sparse_moe", prefix),
                 alt_stream=alt_stream,
             )
         else:
@@ -2592,11 +2600,14 @@ class KimiLinearModel(nn.Module):
             tp_group=mapping.attn.tp_group,
         )
 
+        layers_scope = add_prefix("layers", prefix)
+
         def get_layer(idx: int, prefix: str):
             return KimiLinearDecoderLayer(
                 config=config,
                 mapping=mapping,
                 layer_id=idx,
+                model_scope=layers_scope,
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=alt_stream,
@@ -2605,7 +2616,7 @@ class KimiLinearModel(nn.Module):
         self.layers = make_layers(
             config.num_hidden_layers,
             get_layer,
-            prefix=add_prefix("layers", prefix),
+            prefix=layers_scope,
         )
         # Cross-layer attn-side mix precompute: a layer's aux stream computes
         # the NEXT layer's block partial alongside its own mlp-side partial

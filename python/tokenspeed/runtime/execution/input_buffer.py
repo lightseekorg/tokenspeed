@@ -29,6 +29,7 @@ from tokenspeed.runtime.execution.cache_loc_kernel import (
     fused_decode_input_prep,
 )
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
+from tokenspeed.runtime.multimodal.inputs import Modality, substitute_mm_pad_
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
@@ -63,6 +64,10 @@ class InputBuffers:
         self.state_write_padding_pool_index = state_write_padding_pool_index
         self.max_bs = max_bs
         self.all_extends_mid_chunk = False
+        # Per-modality in-vocab draft tokens; when set, fill rewrites the
+        # drafter-only shift-1 buffer's media pad ids in place so drafters
+        # only ever see embeddable input ids.
+        self.mm_pad_substitute_ids: dict[Modality, int] = {}
 
         with torch.device(device):
             # Initialise buffers to the *padding* values the captured graph
@@ -118,6 +123,27 @@ class InputBuffers:
             off += (nbytes + align - 1) // align * align
         bulk = torch.empty(off, dtype=torch.int8, pin_memory=True)
         return [bulk[o : o + n * dt.itemsize].view(dt) for o, n, dt in offsets]
+
+    def set_mm_pad_substitute_ids(
+        self, substitute_ids: dict[Modality, int], vocab_size: int
+    ) -> None:
+        """Install the per-modality draft substitutes applied at fill time.
+
+        Args:
+            substitute_ids: in-vocab token id per media modality.
+            vocab_size: target vocabulary size, for validation.
+        """
+        invalid = {
+            modality: token_id
+            for modality, token_id in substitute_ids.items()
+            if token_id < 0 or token_id >= vocab_size
+        }
+        if invalid:
+            raise ValueError(
+                "MM draft substitute token IDs must be inside the target "
+                f"vocabulary: {invalid} (vocab_size={vocab_size})"
+            )
+        self.mm_pad_substitute_ids = dict(substitute_ids)
 
     @nvtx_range("input_prep_fill", color="cyan")
     def fill_input_buffers(
@@ -314,6 +340,13 @@ class InputBuffers:
                 shifted_ids_cpu,
                 non_blocking=True,
             )
+            if self.mm_pad_substitute_ids:
+                # Media positions carry content-hash ids (prefix-cache keying);
+                # the draft embedding needs the modality's in-vocab token.
+                substitute_mm_pad_(
+                    self.shifted_prefill_ids_buf[:prefill_token_count],
+                    self.mm_pad_substitute_ids,
+                )
             if num_extends < batch_size:
                 decode_req_pool_indices = req_pool_indices_device[
                     num_extends:batch_size
@@ -357,15 +390,13 @@ class InputBuffers:
         # Defensive clamp of the target-model IDs into the valid vocab range.
         # Decode IDs come from future_input_map, written by the previous
         # sampler/drafter; a stale/corrupt value must not reach the captured
-        # graph's embedding gather. The shifted draft buffer is deliberately
-        # handled separately below because valid content-derived MM pads are
-        # out-of-vocab until Eagle/MTP restores their modality token.
+        # graph's embedding gather. The shift-1 draft buffer is not clamped:
+        # its prefill segment legitimately carries a -1 placeholder in each
+        # final chunk's last row (patched by the drafter with the round's
+        # sampled token), and every id the drafters consume is sampled or
+        # substituted in-vocab by construction.
         vocab_size = runtime_states.vocab_size
         self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
-        # Do not clamp shifted_prefill_ids_buf here. Content-derived MM pad IDs
-        # intentionally exceed the vocabulary and retain a modality tag until
-        # Eagle/MTP replaces them with model-specific in-vocab tokens. The draft
-        # path performs its own defensive clamp immediately after substitution.
 
         if valid_cache_lengths is not None:
             torch.add(

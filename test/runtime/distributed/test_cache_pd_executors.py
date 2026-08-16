@@ -17,14 +17,14 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from runtime.cache_pd_test_utils import block_manifest as make_block_manifest
 from runtime.cache_pd_test_utils import group as make_group  # noqa: E402
 from runtime.cache_pd_test_utils import layout as make_layout
-from runtime.cache_pd_test_utils import manifest as make_manifest
 from runtime.cache_pd_test_utils import operation as make_operation
 from runtime.cache_pd_test_utils import segment as make_segment
 
 from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
-    CachePDPageManifest,
+    CachePDBlockManifest,
     CacheTransferContract,
 )
 from tokenspeed.runtime.pd.mooncake.entities import (  # noqa: E402
@@ -32,7 +32,29 @@ from tokenspeed.runtime.pd.mooncake.entities import (  # noqa: E402
     TransferInfo,
     TransferKVChunk,
 )
+from tokenspeed.runtime.pd.topology import PDParallelTopology  # noqa: E402
 from tokenspeed.runtime.pd.transfer_plan import CacheTransferFragment  # noqa: E402
+
+
+def _topology(
+    *,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    dp_size: int = 1,
+    dp_rank: int = 0,
+    world_size: int | None = None,
+    global_rank: int = 0,
+) -> PDParallelTopology:
+    return PDParallelTopology(
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        cp_size=1,
+        cp_rank=0,
+        dp_size=dp_size,
+        dp_rank=dp_rank,
+        world_size=world_size or tp_size * dp_size,
+        global_rank=global_rank,
+    )
 
 
 def _layout(
@@ -107,21 +129,23 @@ def _op(*, state_page: int = 6):
     )
 
 
-def _destination_manifest() -> CachePDPageManifest:
-    return make_manifest(("history", (10, 11)), ("state", (12,)), prefix=2, prompt=5)
+def _destination_block_manifest() -> CachePDBlockManifest:
+    return make_block_manifest(
+        ("history", (10, 11)), ("state", (12,)), prefix=2, prompt=5
+    )
 
 
-def _single_group_manifest(
-    group_id: str, page_ids: tuple[int, ...]
-) -> CachePDPageManifest:
-    return make_manifest((group_id, page_ids))
+def _single_group_block_manifest(
+    group_id: str, block_ids: tuple[int, ...]
+) -> CachePDBlockManifest:
+    return make_block_manifest((group_id, block_ids))
 
 
 def _destination_transfer_frames() -> list[bytes]:
     return [
         b"9",
         b"session",
-        _destination_manifest().to_wire_bytes(),
+        _destination_block_manifest().to_wire_bytes(),
     ]
 
 
@@ -176,16 +200,16 @@ def _transfer_cache(
     dst_ptr: int,
     transfer_fragments: tuple[CacheTransferFragment, ...],
     *,
-    src_page_manifest: CachePDPageManifest,
-    dst_page_manifest: CachePDPageManifest,
+    src_block_manifest: CachePDBlockManifest,
+    dst_block_manifest: CachePDBlockManifest,
     dst_cache_layout,
 ) -> int:
     return manager._transfer_data(
         session,
         manager._cache_transfer_blocks(
             dst_ptr=dst_ptr,
-            src_manifest=src_page_manifest,
-            dst_manifest=dst_page_manifest,
+            src_block_manifest=src_block_manifest,
+            dst_block_manifest=dst_block_manifest,
             transfer_fragments=transfer_fragments,
             dst_cache_layout=dst_cache_layout,
         ),
@@ -214,12 +238,11 @@ def _route_manager():
         cache_layout=_typed_layout(local_heads=4, global_heads=4),
         kv_data_ptr=0x1000,
     )
-    manager.world_size = manager.dp_size = 1
-    manager.attn_tp_rank = 0
+    manager.topology = _topology()
     return manager
 
 
-def _real_destinations(manager, page_manifest=None):
+def _real_destinations(manager, block_manifest=None):
     destination_layout = _typed_layout(local_heads=2, global_heads=4)
     registrations = tuple(
         manager._prepare_decode_registration(
@@ -230,9 +253,9 @@ def _real_destinations(manager, page_manifest=None):
     manager.decode_kv_args_table = {
         registration.mooncake_session_id: registration for registration in registrations
     }
-    page_manifest = page_manifest or _single_group_manifest("history", (2,))
+    block_manifest = block_manifest or _single_group_block_manifest("history", (2,))
     requests = tuple(
-        TransferInfo(9, registration.mooncake_session_id, page_manifest)
+        TransferInfo(9, registration.mooncake_session_id, block_manifest)
         for registration in registrations
     )
     return destination_layout, registrations, requests
@@ -288,10 +311,9 @@ def test_decode_receiver_sends_static_registration_then_three_frame_request() ->
         kv_args=SimpleNamespace(
             kv_data_ptr=0x1000,
             cache_layout=layout,
-            engine_rank=1,
+            engine_rank=0,
         ),
-        world_size=2,
-        dp_size=1,
+        topology=_topology(tp_size=2, tp_rank=1, global_rank=1),
         rank_port=9000,
         update_status=lambda room, status: statuses.append((room, status)),
     )
@@ -304,7 +326,7 @@ def test_decode_receiver_sends_static_registration_then_three_frame_request() ->
     receiver._connect = lambda _endpoint: (_Socket(), nullcontext())
 
     receiver._register_kv_args()
-    receiver.prefill(page_manifest=_destination_manifest())
+    receiver.prefill(block_manifest=_destination_block_manifest())
 
     assert len(messages[0]) == 8
     registration = KVArgsRegisterInfo.from_zmq(messages[0])
@@ -313,7 +335,7 @@ def test_decode_receiver_sends_static_registration_then_three_frame_request() ->
     assert len(messages[1]) == 3
     transfer = TransferInfo.from_zmq(messages[1])
     assert transfer.room == room
-    assert transfer.page_manifest == _destination_manifest()
+    assert transfer.block_manifest == _destination_block_manifest()
     assert receiver.init_time is not None
     assert statuses == [(room, TransferPoll.WaitingForInput)]
 
@@ -340,11 +362,11 @@ def test_rejected_registration_fails_later_request_without_stopping_handler() ->
             (endpoint, port, room, status, rank)
         )
     )
-    manager.attn_tp_rank = 0
+    manager.topology = _topology(tp_size=2, tp_rank=1, global_rank=1)
 
     manager._handle_bootstrap_message(registration_frames)
     manager._handle_bootstrap_message(
-        [b"9", b"session", _destination_manifest().to_wire_bytes()]
+        [b"9", b"session", _destination_block_manifest().to_wire_bytes()]
     )
     manager._handle_bootstrap_message([b"9"])
 
@@ -353,7 +375,7 @@ def test_rejected_registration_fails_later_request_without_stopping_handler() ->
         9000,
     )
     assert aborts and aborts[0][0] == 9
-    assert notifications == [("127.0.0.1", 9000, 9, TransferPoll.Failed, 0)]
+    assert notifications == [("127.0.0.1", 9000, 9, TransferPoll.Failed, 1)]
 
 
 @pytest.mark.parametrize(
@@ -382,7 +404,7 @@ def test_failed_room_fanout_never_restores_state(
     manager.request_status = {
         9: (TransferPoll.WaitingForInput if fail_during_commit else TransferPoll.Failed)
     }
-    manager.attn_tp_rank = 0
+    manager.topology = _topology()
     if fail_during_commit:
         manager._validate_cache_room_fanout = lambda _requests: (
             manager.request_status.__setitem__(9, TransferPoll.Failed)
@@ -395,7 +417,7 @@ def test_failed_room_fanout_never_restores_state(
     )
 
     manager._handle_bootstrap_message(
-        [b"9", b"session", _destination_manifest().to_wire_bytes()]
+        [b"9", b"session", _destination_block_manifest().to_wire_bytes()]
     )
 
     assert manager.transfer_infos == {}
@@ -606,7 +628,7 @@ def test_decode_publishes_manifest_through_contract_receiver() -> None:
     assert len(calls) == 1
     args, kwargs = calls[0]
     assert args == ()
-    assert kwargs["page_manifest"].groups[0].page_ids == (2, 3)
+    assert kwargs["block_manifest"].groups[0].block_ids == (2, 3)
     assert executor._request_pool_indices == {"request-0": 7}
 
 
@@ -636,7 +658,7 @@ def test_prefill_submits_manifest_through_contract_sender() -> None:
     args, kwargs = calls[0]
     assert args == (True,)
     assert kwargs["bootstrap_token"] == 42
-    assert kwargs["page_manifest"].prompt_len == 5
+    assert kwargs["block_manifest"].prompt_len == 5
     assert executor._request_token == {}
 
 
@@ -662,7 +684,7 @@ def test_idle_prefill_rank_submits_final_dummy_rendezvous() -> None:
     assert kwargs == {
         "bootstrap_token": 42,
         "spec_candidate_ids": None,
-        "page_manifest": None,
+        "block_manifest": None,
     }
     assert executor._request_token == {}
 
@@ -690,7 +712,7 @@ def test_idle_layerwise_prefill_rank_submits_final_dummy_rendezvous() -> None:
     assert kwargs == {
         "bootstrap_token": 42,
         "spec_candidate_ids": [7, 8],
-        "page_manifest": None,
+        "block_manifest": None,
     }
     assert executor._request_token == {}
     assert executor._request_spec_candidate_ids == {}
@@ -743,8 +765,8 @@ def test_shared_manager_executes_strided_cache_tp_fragment() -> None:
 
     source_layout = one_field_layout(source_segment)
     destination_layout = one_field_layout(destination_segment)
-    source_manifest = _single_group_manifest("history", (1,))
-    destination_manifest = _single_group_manifest("history", (2,))
+    source_manifest = _single_group_block_manifest("history", (1,))
+    destination_manifest = _single_group_block_manifest("history", (2,))
     fragment = CacheTransferFragment(
         group_id="history",
         field_id="layer.0.k",
@@ -763,8 +785,8 @@ def test_shared_manager_executes_strided_cache_tp_fragment() -> None:
             "session",
             0x2000,
             (fragment,),
-            src_page_manifest=source_manifest,
-            dst_page_manifest=destination_manifest,
+            src_block_manifest=source_manifest,
+            dst_block_manifest=destination_manifest,
             dst_cache_layout=destination_layout,
         )
         == 0
@@ -782,12 +804,12 @@ def test_shared_manager_executes_strided_cache_tp_fragment() -> None:
 def test_transfer_worker_completes_real_heterogeneous_fanout_before_status() -> None:
     from tokenspeed.runtime.pd.base.status import TransferPoll
 
-    source_manifest = _single_group_manifest("history", (1,))
+    source_manifest = _single_group_block_manifest("history", (1,))
     chunk = TransferKVChunk(
         room=9,
         is_last=True,
         bootstrap_token=42,
-        page_manifest=source_manifest,
+        block_manifest=source_manifest,
     )
 
     manager = _route_manager()
@@ -811,7 +833,7 @@ def test_transfer_worker_completes_real_heterogeneous_fanout_before_status() -> 
         )
     )
     manager.kv_transfer_metrics = None
-    manager.attn_tp_rank = 0
+    manager.topology = _topology()
 
     with pytest.raises(_StopWorker):
         manager.transfer_worker(_OneChunkQueue(chunk), None)
@@ -864,8 +886,12 @@ def test_shared_manager_uses_destination_page_zero_offsets() -> None:
         history_offset=8,
         state_offset=40,
     )
-    source_manifest = make_manifest(("history", (1, 2)), ("state", (4,)), prompt=4)
-    destination_manifest = make_manifest(("history", (5, 6)), ("state", (3,)), prompt=4)
+    source_manifest = make_block_manifest(
+        ("history", (1, 2)), ("state", (4,)), prompt=4
+    )
+    destination_manifest = make_block_manifest(
+        ("history", (5, 6)), ("state", (3,)), prompt=4
+    )
     manager, calls = _recording_transfer_manager(source_layout, 0x10000)
 
     assert (
@@ -874,8 +900,8 @@ def test_shared_manager_uses_destination_page_zero_offsets() -> None:
             "session",
             0x20000,
             (),
-            src_page_manifest=source_manifest,
-            dst_page_manifest=destination_manifest,
+            src_block_manifest=source_manifest,
+            dst_block_manifest=destination_manifest,
             dst_cache_layout=destination_layout,
         )
         == 0
@@ -897,8 +923,7 @@ def test_cache_heterogeneous_gqa_route_rendezvous_idle_prefill_ranks() -> None:
     decode_layout = _typed_layout(local_heads=2, global_heads=2)
     prefill_layout = _typed_layout(local_heads=1, global_heads=2)
     manager = SimpleNamespace(
-        world_size=1,
-        dp_size=1,
+        topology=_topology(),
         kv_args=SimpleNamespace(
             engine_rank=0,
             cache_layout=decode_layout,

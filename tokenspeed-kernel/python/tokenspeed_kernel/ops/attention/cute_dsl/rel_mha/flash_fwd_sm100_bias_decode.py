@@ -1044,6 +1044,7 @@ class FlashAttentionDecodeSm100Bias:
         m_partial_bsh: Optional[cute.Tensor],  # partial colmax_s per kv split
         l_partial_bsh: Optional[cute.Tensor],  # partial colsum_p per kv split
         scale_s: Float32,
+        mTau: Optional[cute.Tensor] = None,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
@@ -1057,6 +1058,10 @@ class FlashAttentionDecodeSm100Bias:
         """Launch fixed-length, native packed-varlen, or paged-KV Decode.
 
         ``bias_bshr=None`` selects static no-relative-bias codegen.
+        ``mTau`` is an optional fp32 per-query-row multiplier on the total
+        pre-softmax logits, ``tau * (scale_s * q@k^T + bias)`` — (B, Sq) for
+        fixed/paged launches, flat (total_q,) for packed varlen. Values must
+        be positive (masked -inf lanes must stay -inf).
         ``rel_bias_layout="compact"`` consumes (B, Sq, Hq, R).
         ``rel_bias_layout="sheared"`` consumes the corresponding Prefill
         ShearingBias allocation (B, round_up(Sq, 128), Hq, R + 256). The layout
@@ -1110,6 +1115,9 @@ class FlashAttentionDecodeSm100Bias:
         assert k_bshd.dtype == qk_dtype
         if cutlass.const_expr(bias_bshr is not None):
             assert bias_bshr.dtype == v_mma_dtype
+        if cutlass.const_expr(mTau is not None):
+            assert mTau.dtype == Float32
+            assert cute.rank(mTau) == (1 if is_varlen_q else 2)
         if cutlass.const_expr(is_paged_kv):
             assert mPageTable is not None and mPageTableOffsets is not None
             assert mSeqUsedK is not None
@@ -1798,6 +1806,7 @@ class FlashAttentionDecodeSm100Bias:
             mM_partial_nl,
             mL_partial_nl,
             scale_s_log2_e,
+            mTau,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -2171,6 +2180,8 @@ class FlashAttentionDecodeSm100Bias:
         mM_partial: Optional[cute.Tensor],
         mL_partial: Optional[cute.Tensor],
         scale_s_log2_e: Float32,
+        # Optional fp32 per-query-row scale on the total pre-softmax logits
+        mTau: Optional[cute.Tensor] = None,
     ):
         ##############################
         # Static variables
@@ -3572,6 +3583,21 @@ class FlashAttentionDecodeSm100Bias:
                                                     )
                                                     score_log2 += bias_log2
                                     scores_log2_rmem[h, p, sm] = score_log2
+                if cutlass.const_expr(mTau is not None):
+                    # Per-query-row scale on the total logits. log2 space is
+                    # linear, so this composes with scale_s and the bias; it
+                    # must sit outside the bias window skip above.
+                    for p in cutlass.range_constexpr(blk_tile_p):
+                        query_idx = coord_p * blk_tile_p + p
+                        tau = Float32(1.0)
+                        if query_idx < prediction:
+                            if cutlass.const_expr(is_varlen_q):
+                                tau = mTau[offset_q + query_idx]
+                            else:
+                                tau = mTau[coord_b, query_idx]
+                        for sm in cutlass.range_constexpr(tiles_sm):
+                            row_scores = scores_log2_rmem[None, p, sm]
+                            row_scores.store(row_scores.load() * tau)
                 scores_log2 = scores_log2_rmem.load().reshape((blk_tile_n, tiles_sm))
 
                 # Reduce colmax in thread RF
@@ -4823,6 +4849,7 @@ def run(
         m_partial_cute,
         l_partial_cute,
         scale_s,
+        None,  # mTau
         None,  # mCuSeqlensQ
         None,  # mCuSeqlensK
         None,  # mSeqUsedQ
@@ -4885,6 +4912,7 @@ def run(
             m_partial_cute,
             l_partial_cute,
             scale_s,
+            None,  # mTau
             None,
             None,
             None,

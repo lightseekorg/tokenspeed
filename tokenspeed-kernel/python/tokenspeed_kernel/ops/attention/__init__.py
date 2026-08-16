@@ -38,7 +38,10 @@ from tokenspeed_kernel.ops.attention.gdn_utils import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
 )
-from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
+from tokenspeed_kernel.ops.attention.kda_utils import (
+    KdaFusedDecodeResult,
+    KdaPrefillResult,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
@@ -128,10 +131,13 @@ __all__ = [
     "gdn_chunk_prefill",
     "gdn_decode_step",
     "gdn_decode_mtp",
+    "gdn_replay_commit",
+    "gdn_replay_commit_supported",
     "kda_paged_prefill",
     "kda_paged_decode",
     "try_kda_fused_paged_decode",
     "try_kda_fused_paged_verify",
+    "KdaFusedDecodeResult",
     "KdaPrefillResult",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
@@ -1167,6 +1173,185 @@ def gdn_decode_mtp(
         )
 
 
+def gdn_replay_commit(
+    payload: torch.Tensor,
+    parameters: torch.Tensor,
+    *,
+    state_addresses: torch.Tensor,
+    state_row_strides: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    draft_token_num: int,
+    geometry: tuple[int, int, int, int],
+    state_dtype: torch.dtype,
+    override: str | None = None,
+    solution: str | None = None,
+) -> None:
+    """Replay every GDN layer's accepted prefix in one kernel launch.
+
+    K/V/a/b share one layer-major allocation. Recurrent slabs may remain
+    physically disjoint: ``state_addresses`` and ``state_row_strides`` expose
+    them as a layer-indexed table to the kernel. Each program decodes its
+    layer, request, and value-head coordinates and writes only the final
+    accepted state.
+
+    Args:
+        payload: Contiguous packed K/V/a/b storage shaped
+            ``[L, token_capacity, H*K + HV*V + 2*HV]``. The first ``B*T``
+            rows of each layer hold the current request-major verify window.
+        parameters: FP32 A_log/dt_bias table shaped ``[L, 2, HV]``.
+        state_addresses: uint64 base-address table shaped ``[L]`` for the
+            K-last recurrent-state pools.
+        state_row_strides: int64 row strides in elements, shaped ``[L]``.
+        read_indices: Committed-state pages shaped ``[L, B]``.
+        write_indices: Accepted-state destination pages shaped ``[L, B]``.
+        accepted_length: Accepted verified-token count per request, shaped ``[B]``.
+        draft_token_num: Number of verify positions per request (``T``).
+        geometry: ``(num_k_heads, num_v_heads, head_k_dim, head_v_dim)``.
+        state_dtype: Element dtype shared by all recurrent-state pools.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution name.
+    """
+    if payload.dim() != 3 or not payload.is_contiguous():
+        raise ValueError("GDN layer replay payload must be contiguous [L, rows, width]")
+    num_layers = payload.shape[0]
+    batch_size = accepted_length.numel()
+    if num_layers == 0 or batch_size == 0:
+        return
+    num_k_heads, num_v_heads, head_k_dim, head_v_dim = geometry
+    if draft_token_num <= 0:
+        raise ValueError("draft_token_num must be positive")
+    if num_v_heads <= 0 or num_k_heads <= 0 or num_v_heads % num_k_heads:
+        raise ValueError("num_v_heads must be divisible by num_k_heads")
+    if head_k_dim <= 0 or head_v_dim <= 0:
+        raise ValueError("GDN replay head dimensions must be positive")
+    payload_width = (
+        num_k_heads * head_k_dim + num_v_heads * head_v_dim + 2 * num_v_heads
+    )
+    if payload.shape[1] < batch_size * draft_token_num:
+        raise ValueError("GDN replay payload has insufficient token capacity")
+    if payload.shape[2] != payload_width:
+        raise ValueError(
+            f"GDN replay payload width must be {payload_width}, got {payload.shape[2]}"
+        )
+    if parameters.shape != (num_layers, 2, num_v_heads):
+        raise ValueError(
+            "GDN replay parameters must have shape "
+            f"{(num_layers, 2, num_v_heads)}, got {tuple(parameters.shape)}"
+        )
+    if parameters.dtype != torch.float32 or not parameters.is_contiguous():
+        raise ValueError("GDN replay parameters must be contiguous torch.float32")
+    if state_addresses.shape != (num_layers,) or state_addresses.dtype != torch.uint64:
+        raise ValueError(
+            "state_addresses must be torch.uint64 with one entry per layer"
+        )
+    if (
+        state_row_strides.shape != (num_layers,)
+        or state_row_strides.dtype != torch.int64
+    ):
+        raise ValueError(
+            "state_row_strides must be torch.int64 with one entry per layer"
+        )
+    if read_indices.shape != (num_layers, batch_size):
+        raise ValueError(
+            "read_indices must have shape "
+            f"{(num_layers, batch_size)}, got {tuple(read_indices.shape)}"
+        )
+    if write_indices.shape != (num_layers, batch_size):
+        raise ValueError(
+            "write_indices must have shape "
+            f"{(num_layers, batch_size)}, got {tuple(write_indices.shape)}"
+        )
+    if read_indices.dtype != torch.int32 or write_indices.dtype != torch.int32:
+        raise ValueError("GDN replay page tables must have dtype torch.int32")
+    if accepted_length.shape != (batch_size,) or accepted_length.dtype != torch.int32:
+        raise ValueError("accepted_length must be a one-dimensional torch.int32 tensor")
+    if state_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(f"unsupported GDN replay state dtype: {state_dtype}")
+    tensors = (
+        parameters,
+        state_addresses,
+        state_row_strides,
+        read_indices,
+        write_indices,
+        accepted_length,
+    )
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError(
+            "GDN replay address, stride, index, and parameter tables must be contiguous"
+        )
+    if any(tensor.device != payload.device for tensor in tensors):
+        raise ValueError("all GDN replay tensors must reside on the payload device")
+
+    signature = _attention_format_signature(q=payload, k=payload, v=payload)
+    kernel = select_kernel(
+        "attention",
+        "gdn_replay_commit",
+        signature,
+        traits={"flat_state": True},
+        solution=solution,
+        override=override,
+    )
+    with kernel_scope(
+        "attention",
+        "gdn_replay_commit",
+        payload.dtype,
+        kernel_name=kernel.name,
+        batch_size=batch_size,
+        seq_len=draft_token_num,
+        num_layers=num_layers,
+        num_v_heads=num_v_heads,
+        head_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+    ):
+        kernel(
+            payload=payload,
+            parameters=parameters,
+            state_addresses=state_addresses,
+            state_row_strides=state_row_strides,
+            read_indices=read_indices,
+            write_indices=write_indices,
+            accepted_length=accepted_length,
+            draft_token_num=draft_token_num,
+            num_k_heads=num_k_heads,
+            num_v_heads=num_v_heads,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+            state_dtype=state_dtype,
+        )
+
+
+def gdn_replay_commit_supported(
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    solution: str | None = None,
+) -> bool:
+    """Whether ReplaySSM can replace per-draft GDN recurrent-state scratch.
+
+    Args:
+        dtype: Activation dtype used by the target verify pass.
+        solution: Optional registered solution restriction.
+
+    Returns:
+        ``True`` when a compatible GDN replay kernel is registered for the
+        current platform.
+    """
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    try:
+        select_kernel(
+            "attention",
+            "gdn_replay_commit",
+            signature,
+            traits={"flat_state": True},
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return False
+    return True
+
+
 def kda_paged_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1326,14 +1511,28 @@ def try_kda_fused_paged_decode(
     head_dim: int,
     cu_seqlens: torch.Tensor,
     lower_bound: float | None = -5.0,
+    output_gate: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
     override: str | None = None,
     solution: str | None = None,
-) -> torch.Tensor | None:
+) -> KdaFusedDecodeResult | None:
     """Try a registered pre-convolution KDA decode fusion.
 
+    ``output_gate``, ``norm_weight``, and ``norm_eps`` request a fused gated
+    RMSNorm epilogue. If the selected backend only supports the original core
+    fusion, the returned result reports that the caller must apply the
+    epilogue.
+
     Returns ``None`` only when no implementation supports the current
-    platform. Invalid inputs and execution failures remain visible.
+    platform. Otherwise, returns the output and whether output normalization
+    was applied. Invalid inputs and execution failures remain visible.
     """
+    if (output_gate is None) != (norm_weight is None):
+        raise ValueError("output_gate and norm_weight must be provided together")
+    if output_gate is not None and norm_eps is None:
+        raise ValueError("norm_eps is required with fused KDA output normalization")
+
     signature = _attention_format_signature(
         q=mixed_qkv,
         k=mixed_qkv,
@@ -1344,13 +1543,49 @@ def try_kda_fused_paged_decode(
             "attention",
             "kda_fused_paged_decode",
             signature,
-            traits={"paged_state": True},
+            traits={
+                "paged_state": True,
+                "fused_output_norm": output_gate is not None,
+                "num_heads": num_heads,
+                "head_dim": head_dim,
+                "conv_kernel_size": conv_weights.shape[-1],
+            },
             solution=solution,
             override=override,
         )
     except NoKernelFoundError:
-        return None
-    return kernel(
+        if output_gate is None:
+            return None
+        try:
+            kernel = select_kernel(
+                "attention",
+                "kda_fused_paged_decode",
+                signature,
+                traits={
+                    "paged_state": True,
+                    "fused_output_norm": False,
+                    "num_heads": num_heads,
+                    "head_dim": head_dim,
+                    "conv_kernel_size": conv_weights.shape[-1],
+                },
+                solution=solution,
+                override=override,
+            )
+        except NoKernelFoundError:
+            return None
+
+    selected_spec = KernelRegistry.get().get_by_name(kernel.name)
+    output_norm_applied = (
+        output_gate is not None
+        and selected_spec is not None
+        and spec_matches_traits(
+            selected_spec,
+            {"fused_output_norm": True},
+            require_all_traits=True,
+        )
+    )
+
+    out = kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
         conv_states=conv_states,
@@ -1366,7 +1601,11 @@ def try_kda_fused_paged_decode(
         head_dim=head_dim,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
+        output_gate=output_gate if output_norm_applied else None,
+        norm_weight=norm_weight if output_norm_applied else None,
+        norm_eps=norm_eps if output_norm_applied else None,
     )
+    return KdaFusedDecodeResult(out=out, output_norm_applied=output_norm_applied)
 
 
 def try_kda_fused_paged_verify(
@@ -1809,6 +2048,7 @@ def rel_mha_prefill(
     window_left: int = -1,
     return_lse: bool = False,
     softmax_scale: float | None = None,
+    tau: torch.Tensor | None = None,
     enable_pdl: bool = False,
     # dispatch options
     override: str | None = None,
@@ -1835,6 +2075,9 @@ def rel_mha_prefill(
             shape [total_q, num_q_heads].
         softmax_scale: Scale applied to QK logits before softmax. None uses the
             backend default 1/sqrt(head_dim).
+        tau: Optional fp32 per-query-row multiplier on the total pre-softmax
+            logits, ``tau * (softmax_scale * q@k^T + rel)``; shape matches
+            q's row count and values must be positive.
         enable_pdl: Launch eligible kernels with Programmatic Dependent
             Launch (Hopper+).
         override: Optional kernel override name.
@@ -1895,6 +2138,7 @@ def rel_mha_prefill(
             window_left=window_left,
             return_lse=return_lse,
             softmax_scale=softmax_scale,
+            tau=tau,
             enable_pdl=enable_pdl,
         )
 
@@ -1915,6 +2159,7 @@ def rel_mha_extend_with_kvcache(
     window_left: int = -1,
     return_lse: bool = False,
     softmax_scale: float | None = None,
+    tau: torch.Tensor | None = None,
     enable_pdl: bool = False,
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
@@ -1946,6 +2191,9 @@ def rel_mha_extend_with_kvcache(
             shape [total_q, num_q_heads].
         softmax_scale: Scale applied to QK logits before softmax. None uses the
             backend default 1/sqrt(head_dim).
+        tau: Optional fp32 per-query-row multiplier on the total pre-softmax
+            logits, ``tau * (softmax_scale * q@k^T + rel)``; shape matches
+            q's row count and values must be positive.
         enable_pdl: Launch eligible kernels with Programmatic Dependent
             Launch (Hopper+).
         override: Optional kernel override name.
@@ -2019,6 +2267,7 @@ def rel_mha_extend_with_kvcache(
             window_left=window_left,
             return_lse=return_lse,
             softmax_scale=softmax_scale,
+            tau=tau,
             enable_pdl=enable_pdl,
             **scale_kwargs,
         )
@@ -2038,6 +2287,7 @@ def rel_mha_decode_with_kvcache(
     # attention options
     window_left: int = -1,
     softmax_scale: float | None = None,
+    tau: torch.Tensor | None = None,
     enable_pdl: bool = False,
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
@@ -2069,6 +2319,9 @@ def rel_mha_decode_with_kvcache(
         window_left: Exclusive left sliding-window size. -1 means full attention.
         softmax_scale: Scale applied to QK logits before softmax. None uses the
             backend default 1/sqrt(head_dim).
+        tau: Optional fp32 per-query-row multiplier on the total pre-softmax
+            logits, ``tau * (softmax_scale * q@k^T + rel)``; shape matches
+            q's row count and values must be positive.
         enable_pdl: Launch eligible kernels with Programmatic Dependent
             Launch (Hopper+).
         override: Optional kernel override name.
@@ -2143,6 +2396,7 @@ def rel_mha_decode_with_kvcache(
             max_seqlen_q=max_seqlen_q,
             window_left=window_left,
             softmax_scale=softmax_scale,
+            tau=tau,
             enable_pdl=enable_pdl,
             **scale_kwargs,
         )

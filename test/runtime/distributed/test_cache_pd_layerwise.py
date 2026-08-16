@@ -38,18 +38,18 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from runtime.cache_pd_test_utils import block_manifest as make_block_manifest
 from runtime.cache_pd_test_utils import group as make_group  # noqa: E402
 from runtime.cache_pd_test_utils import layout as make_layout
-from runtime.cache_pd_test_utils import manifest as make_manifest
 from runtime.cache_pd_test_utils import producer_schedule as make_producer_schedule
 from runtime.cache_pd_test_utils import segment as make_segment
 
 from tokenspeed.runtime.pd.base.status import TransferPoll  # noqa: E402
 from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
+    CachePDLayerwiseBlockSelection,
     CachePDLayerwiseGroupSelection,
-    CachePDLayerwisePageSelection,
     CacheTransferContract,
-    build_cache_layerwise_page_selection,
+    build_cache_layerwise_block_selection,
 )
 from tokenspeed.runtime.pd.mooncake.entities import (  # noqa: E402
     TransferInfo,
@@ -144,7 +144,7 @@ def test_group_aware_two_chunk_history_and_state_selection() -> None:
         "state-b": np.asarray([[9, 10, 11, 12]], dtype=np.int32),
     }
     operation = SimpleNamespace(block_tables_arrays=lambda: tables)
-    first = build_cache_layerwise_page_selection(
+    first = build_cache_layerwise_block_selection(
         operation,
         layout=layout,
         request_row=0,
@@ -158,7 +158,7 @@ def test_group_aware_two_chunk_history_and_state_selection() -> None:
         CachePDLayerwiseGroupSelection((), ()),
         CachePDLayerwiseGroupSelection((), ()),
     )
-    final = build_cache_layerwise_page_selection(
+    final = build_cache_layerwise_block_selection(
         operation,
         layout=layout,
         request_row=0,
@@ -178,7 +178,7 @@ def test_prepare_cache_prefill_preflights_batch_and_reserves_once() -> None:
     from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 
     layout = _grouped_layout()
-    destination_manifest = make_manifest(
+    destination_block_manifest = make_block_manifest(
         ("history", (20, 21)),
         ("state-a", (22,)),
         ("state-b", (23,)),
@@ -186,7 +186,7 @@ def test_prepare_cache_prefill_preflights_batch_and_reserves_once() -> None:
     )
     destination = SimpleNamespace(
         is_dummy=False,
-        page_manifest=destination_manifest,
+        block_manifest=destination_block_manifest,
     )
     calls = []
 
@@ -244,7 +244,7 @@ def test_prepare_cache_prefill_preflights_batch_and_reserves_once() -> None:
     calls.clear()
     reserves.clear()
     tables["history"][1, 0] = 0
-    with pytest.raises(ValueError, match="invalid page ID"):
+    with pytest.raises(ValueError, match="invalid block ID"):
         executor._prepare_cache_prefill(operation)
     assert reserves == []
     assert calls == []
@@ -257,7 +257,7 @@ def test_first_layerwise_chunk_includes_deeper_prefill_cache_hit() -> None:
     layout = _grouped_layout()
     destination = SimpleNamespace(
         is_dummy=False,
-        page_manifest=make_manifest(
+        block_manifest=make_block_manifest(
             ("history", (20, 21, 22, 23)),
             ("state-a", (24,)),
             ("state-b", (25,)),
@@ -301,11 +301,11 @@ def test_first_layerwise_chunk_includes_deeper_prefill_cache_hit() -> None:
     executor._prepare_cache_prefill(operation(7, 2))
     assert sender.layerwise_final_chunk_submitted()
 
-    first_history = calls[0][1]["cache_page_selection"].groups[0]
-    assert first_history.source_page_ids == (2, 3)
+    first_history = calls[0][1]["cache_block_selection"].groups[0]
+    assert first_history.source_block_ids == (2, 3)
     assert first_history.destination_positions == (0, 1)
-    second_history = calls[1][1]["cache_page_selection"].groups[0]
-    assert second_history.source_page_ids == (4, 5)
+    second_history = calls[1][1]["cache_block_selection"].groups[0]
+    assert second_history.source_block_ids == (4, 5)
     assert second_history.destination_positions == (2, 3)
 
 
@@ -409,8 +409,8 @@ def test_draft_final_reservation_stays_aligned_across_forwards() -> None:
     assert counter.reserved == counter.ready == 6
 
 
-def _single_history_selection() -> CachePDLayerwisePageSelection:
-    return CachePDLayerwisePageSelection(
+def _single_history_selection() -> CachePDLayerwiseBlockSelection:
+    return CachePDLayerwiseBlockSelection(
         groups=(CachePDLayerwiseGroupSelection((2,), (0,)),),
     )
 
@@ -462,19 +462,19 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
         (fragment.group_id, fragment.field_id) for fragment in rank_one_fragments
     ) == (("state", "layer.2.state"),)
 
-    selection = CachePDLayerwisePageSelection(
+    selection = CachePDLayerwiseBlockSelection(
         groups=(
             CachePDLayerwiseGroupSelection((1,), (0,)),
             CachePDLayerwiseGroupSelection((2,), (0,)),
         ),
     )
-    destination_manifest = make_manifest(("history", (3,)), ("state", (4,)))
+    destination_block_manifest = make_block_manifest(("history", (3,)), ("state", (4,)))
     manager = object.__new__(MooncakeKVManagerPrefill)
     manager.kv_args = SimpleNamespace(
         cache_layout=source_layout,
         kv_data_ptr=0x10000,
     )
-    manager.attn_tp_rank = 1
+    manager.topology = SimpleNamespace(tp_rank=1)
 
     # Rank 1 has no edge for the replicated latent field in layer 0. An empty
     # fragment set for this interval is a no-op, never a raw-page identity copy.
@@ -486,11 +486,11 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
         return list(
             manager._cache_transfer_blocks(
                 dst_ptr=0x20000,
-                src_manifest=None,
-                dst_manifest=destination_manifest,
+                src_block_manifest=None,
+                dst_block_manifest=destination_block_manifest,
                 transfer_fragments=rank_one_fragments,
                 dst_cache_layout=destination_layout,
-                page_selection=selection,
+                block_selection=selection,
                 field_ids=schedule.fields_in_range(begin, end),
             )
         )
@@ -503,12 +503,12 @@ def _layerwise_fanout_context():
     from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
 
     layout = _ordinary_layerwise_layout()
-    manifest = make_manifest(("history", (3,)))
+    block_manifest = make_block_manifest(("history", (3,)))
     requests = tuple(
         TransferInfo(
             room=9,
             mooncake_session_id=f"session-{rank}",
-            page_manifest=manifest,
+            block_manifest=block_manifest,
         )
         for rank in range(2)
     )
@@ -545,7 +545,7 @@ def test_layerwise_fanout_is_layer_major_and_completes_once() -> None:
         begin_cache_step=100,
         layerwise_interval=2,
         wait_for_bootstrap_token=True,
-        cache_page_selection=_single_history_selection(),
+        cache_block_selection=_single_history_selection(),
     )
     events = []
     status_updates = []
@@ -575,7 +575,7 @@ def test_layerwise_fanout_is_layer_major_and_completes_once() -> None:
             (endpoint, port, room, status, rank, kwargs)
         )
     )
-    manager.attn_tp_rank = 0
+    manager.topology = SimpleNamespace(tp_rank=0)
     manager.abort_room = lambda *_args: pytest.fail("successful fanout must not abort")
 
     assert manager._send_cache_layerwise_fanout(chunk, requests)
@@ -622,7 +622,7 @@ def test_layerwise_fanout_failure_aborts_before_later_intervals() -> None:
         is_last=True,
         begin_cache_step=100,
         layerwise_interval=2,
-        cache_page_selection=_single_history_selection(),
+        cache_block_selection=_single_history_selection(),
     )
     events = []
     aborts = []

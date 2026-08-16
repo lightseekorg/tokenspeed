@@ -44,13 +44,12 @@ class MooncakeKVManagerBase(DisaggManagerBase):
         disaggregation_mode: DisaggregationMode,
     ):
         self.kv_args = kv_args
-        self.attn_tp_rank = args.attn_tp_rank
+        self.topology = args.topology
+        self.topology.require_cache_pd_supported()
         self.disaggregation_mode = disaggregation_mode
         self.bootstrap_port = args.bootstrap_port
         self.dist_init_addr = args.dist_init_addr
-        self.world_size = args.world_size
-        self.dp_size = args.dp_size
-        if not args.enable_dp_attention and args.dp_size != 1:
+        if not args.enable_dp_attention and self.topology.dp_size != 1:
             raise ValueError(
                 "If dp_attention is not enabled, dp size must be 1 in disaggregation mode."
             )

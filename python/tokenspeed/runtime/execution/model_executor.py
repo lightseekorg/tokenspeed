@@ -437,7 +437,7 @@ class ModelExecutor:
             )
             self.drafter.wire_target(self.model_runner.model)
             MultimodalRuntime.wire_drafter(
-                self.drafter, self.model_runner.model_config.hf_config
+                self.input_buffers, self.model_runner.model_config
             )
         else:
             self.drafter = None

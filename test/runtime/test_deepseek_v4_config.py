@@ -3136,6 +3136,272 @@ class TestDeepseekV4Config(unittest.TestCase):
                 num_extends=1,
             )
 
+    def test_deepseek_v4_prefill_metadata_uses_complete_cpu_mirrors(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                prefix_granularity=64,
+                kernel_page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+
+        backend.init_forward_metadata(
+            bs=2,
+            num_tokens=14,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            seq_lens=torch.tensor([17, 65], dtype=torch.int32),
+            forward_mode=ForwardMode.EXTEND,
+            page_table=torch.zeros((2, 2), dtype=torch.int32),
+            extend_seq_lens_cpu=torch.tensor([5, 9], dtype=torch.int32),
+            extend_prefix_lens_cpu=torch.tensor([12, 56], dtype=torch.int32),
+            num_extends=2,
+        )
+
+        metadata = backend.forward_metadata
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(metadata.seq_lens_cpu.tolist(), [17, 65])
+        self.assertEqual(metadata.query_lens_cpu.tolist(), [5, 9])
+        self.assertEqual(metadata.num_prefill_reqs, 2)
+        self.assertEqual(metadata.num_prefill_tokens, 14)
+        self.assertEqual(metadata.token_to_req_indices.tolist(), [0] * 5 + [1] * 9)
+
+    def test_deepseek_v4_prefill_metadata_requires_complete_cpu_mirrors(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                prefix_granularity=64,
+                kernel_page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "prefill metadata requires complete CPU sequence and query length mirrors",
+        ):
+            backend.init_forward_metadata(
+                bs=1,
+                num_tokens=3,
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([5], dtype=torch.int32),
+                forward_mode=ForwardMode.EXTEND,
+                page_table=torch.zeros((1, 1), dtype=torch.int32),
+                extend_prefix_lens_cpu=torch.tensor([2], dtype=torch.int32),
+                num_extends=1,
+            )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "prefill metadata requires complete CPU sequence and query length mirrors",
+        ):
+            backend.init_forward_metadata(
+                bs=1,
+                num_tokens=3,
+                req_pool_indices=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([131], dtype=torch.int32),
+                forward_mode=ForwardMode.EXTEND,
+                page_table=torch.zeros((1, 3), dtype=torch.int32),
+                extend_seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
+                num_extends=1,
+            )
+
+    def test_deepseek_v4_prefill_workspace_bounds_use_cpu_mirrors(self):
+        self.assertEqual(
+            DeepseekV4AttentionBackend._prefill_workspace_bounds(
+                torch.tensor([17, 65], dtype=torch.int32),
+                torch.tensor([5, 9], dtype=torch.int32),
+                num_reqs=2,
+                window_size=16,
+                compress_ratio=4,
+            ),
+            (24, 16),
+        )
+        self.assertEqual(
+            DeepseekV4AttentionBackend._prefill_workspace_bounds(
+                torch.tensor([17], dtype=torch.int32),
+                torch.tensor([5], dtype=torch.int32),
+                num_reqs=1,
+                window_size=16,
+                compress_ratio=1,
+            ),
+            (17, 0),
+        )
+        self.assertEqual(
+            DeepseekV4AttentionBackend._prefill_workspace_bounds(
+                None,
+                None,
+                num_reqs=0,
+                window_size=16,
+                compress_ratio=4,
+            ),
+            (1, 0),
+        )
+
+    def test_deepseek_v4_prefill_workspace_bounds_fail_closed(self):
+        invalid_cases = (
+            (
+                torch.tensor([17, 65], dtype=torch.int32),
+                torch.tensor([5], dtype=torch.int32),
+            ),
+            (
+                torch.tensor([4], dtype=torch.int32),
+                torch.tensor([5], dtype=torch.int32),
+            ),
+        )
+        for seq_lens_cpu, query_lens_cpu in invalid_cases:
+            with (
+                self.subTest(
+                    seq_lens=seq_lens_cpu.tolist(),
+                    query_lens=query_lens_cpu.tolist(),
+                ),
+                self.assertRaises(RuntimeError),
+            ):
+                DeepseekV4AttentionBackend._prefill_workspace_bounds(
+                    seq_lens_cpu,
+                    query_lens_cpu,
+                    num_reqs=2 if seq_lens_cpu.numel() == 2 else 1,
+                    window_size=16,
+                    compress_ratio=4,
+                )
+
+        for seq_lens_cpu, query_lens_cpu in (
+            (None, torch.tensor([5], dtype=torch.int32)),
+            (torch.tensor([17], dtype=torch.int32), None),
+            (
+                torch.tensor([17, 65], dtype=torch.int32),
+                torch.tensor([5, 9], dtype=torch.int32),
+            ),
+        ):
+            with (
+                self.subTest(
+                    seq_lens_missing=seq_lens_cpu is None,
+                    query_lens_missing=query_lens_cpu is None,
+                    seq_lens_count=(
+                        None if seq_lens_cpu is None else seq_lens_cpu.numel()
+                    ),
+                ),
+                self.assertRaises(RuntimeError),
+            ):
+                DeepseekV4AttentionBackend._prefill_workspace_bounds(
+                    seq_lens_cpu,
+                    query_lens_cpu,
+                    num_reqs=1,
+                    window_size=16,
+                    compress_ratio=4,
+                )
+
+        with self.assertRaisesRegex(ValueError, "num_reqs must be non-negative"):
+            DeepseekV4AttentionBackend._prefill_workspace_bounds(
+                None,
+                None,
+                num_reqs=-1,
+                window_size=16,
+                compress_ratio=4,
+            )
+
+    def test_deepseek_v4_chunked_prefill_uses_cpu_query_offsets(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                prefix_granularity=64,
+                kernel_page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+        backend.prefill_chunk_size = 2
+        backend.init_forward_metadata(
+            bs=3,
+            num_tokens=6,
+            req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
+            seq_lens=torch.tensor([4, 7, 9], dtype=torch.int32),
+            forward_mode=ForwardMode.EXTEND,
+            page_table=torch.zeros((3, 1), dtype=torch.int32),
+            extend_seq_lens_cpu=torch.tensor([2, 1, 3], dtype=torch.int32),
+            extend_prefix_lens_cpu=torch.tensor([2, 6, 6], dtype=torch.int32),
+            num_extends=3,
+        )
+        metadata = backend.forward_metadata
+        assert metadata is not None
+        calls = []
+
+        def fake_prefill_chunk(**kwargs):
+            chunk_metadata = backend.forward_metadata
+            calls.append(
+                (
+                    kwargs["q"].shape[0],
+                    kwargs["positions"].tolist(),
+                    chunk_metadata.req_pool_indices.tolist(),
+                    chunk_metadata.query_lens_cpu.tolist(),
+                )
+            )
+            q = kwargs["q"]
+            return q.new_zeros((q.shape[0], 1, 2))
+
+        backend._forward_deepseek_v4_prefill_chunk = fake_prefill_chunk
+        q = torch.zeros((6, 1, 2), dtype=torch.float32)
+        common = {
+            "q": q,
+            "positions": torch.arange(6, dtype=torch.int32),
+            "token_to_kv_pool": SimpleNamespace(),
+            "layer_id": 0,
+            "kind": "mla",
+            "compress_ratio": 4,
+            "num_local_heads": 1,
+            "padded_heads": 1,
+            "head_dim": 2,
+            "window_size": 4,
+            "softmax_scale": 1.0,
+            "attn_sink": torch.zeros(1),
+            "topk_indices": None,
+        }
+        out = backend.forward_deepseek_v4_prefill(**common)
+
+        self.assertEqual(out.shape, (6, 1, 2))
+        self.assertEqual(
+            calls,
+            [
+                (3, [0, 1, 2], [0, 1], [2, 1]),
+                (3, [3, 4, 5], [2], [3]),
+            ],
+        )
+
+        metadata.query_lens_cpu = None
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "chunked prefill requires CPU query-length metadata",
+        ):
+            backend.forward_deepseek_v4_prefill(**common)
+
+        metadata.query_lens_cpu = torch.tensor([2, 1, 2], dtype=torch.int32)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "chunked prefill query lengths do not match token count",
+        ):
+            backend.forward_deepseek_v4_prefill(**common)
+
     def test_deepseek_v4_draft_keeps_mixed_step0_and_decode_step_metadata(self):
         verify_width = 4
         backend = DeepseekV4AttentionBackend(
@@ -4955,6 +5221,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=seq_lens,
             forward_mode=ForwardMode.EXTEND,
             page_table=page_table,
+            extend_seq_lens_cpu=seq_lens.cpu(),
+            extend_prefix_lens_cpu=torch.zeros(1, dtype=torch.int32),
         )
         backend.init_forward_metadata(
             bs=1,

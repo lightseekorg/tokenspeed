@@ -293,11 +293,24 @@ class MultimodalRuntime:
         return active_wrappers
 
     @staticmethod
-    def wire_drafter(drafter, target_hf_config) -> None:
-        """Hand the drafter the pad-substitute token IDs for mm placeholders."""
-        mm_pad_substitute_ids = resolve_mm_pad_substitute_ids(target_hf_config)
-        if mm_pad_substitute_ids and hasattr(drafter, "set_mm_pad_substitute_ids"):
-            drafter.set_mm_pad_substitute_ids(mm_pad_substitute_ids)
+    def wire_drafter(input_buffers, target_model_config) -> None:
+        """Wire mm pad substitution for the draft path.
+
+        Substitution runs once at fill time on the drafter-only shift-1
+        buffer, so drafters only ever see in-vocab input ids. A multimodal
+        target with no resolvable substitutes must fail here, loudly —
+        otherwise the fill clamp would silently rewrite media positions.
+        """
+        substitute_ids = resolve_mm_pad_substitute_ids(target_model_config.hf_config)
+        if substitute_ids:
+            input_buffers.set_mm_pad_substitute_ids(
+                substitute_ids, target_model_config.vocab_size
+            )
+        elif target_model_config.is_multimodal_active:
+            raise ValueError(
+                "Speculative decoding on a multimodal target requires draft "
+                "substitute tokens, but none could be resolved from the HF config."
+            )
 
     # ------------------------------------------------------------------
     # Diagnostics

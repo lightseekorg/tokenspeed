@@ -38,3 +38,17 @@ class KdaPrefillResult:
 
     out: torch.Tensor
     final_state: torch.Tensor
+
+
+@dataclass(frozen=True)
+class KdaFusedDecodeResult:
+    """Result from an optional pre-convolution KDA decode fusion.
+
+    Attributes:
+        out: Packed decode output ``[1, batch, heads, value_dim]``.
+        output_norm_applied: Whether the selected kernel applied the output
+            gate and RMSNorm, so the caller must not apply them again.
+    """
+
+    out: torch.Tensor
+    output_norm_applied: bool
