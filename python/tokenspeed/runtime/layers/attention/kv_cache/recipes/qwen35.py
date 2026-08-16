@@ -1,234 +1,230 @@
-"""Qwen3.5 cache field recipe."""
+"""Qwen3.5 cache recipe: full-attention KV plus GDN recurrent checkpoints."""
 
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
-    build_hybrid_cache_setup,
-    draft_cache_fields,
-)
+from __future__ import annotations
+
+from functools import cached_property
+
+import torch
+from typing_extensions import override
+
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
-    merge_continuation_layers,
+    cache_dtype_name,
+    scatter_stored_dtype_name,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+    LINEAR_ATTENTION,
+    MXFP8_KV_SCALE_TILE_TOKENS,
+    split_recurrent_state_groups,
 )
 
+_QWEN_GDN_PREFIX_GRANULARITY = 128
 
-def qwen_gdn_max_padding_fraction(*, layer_types, num_draft_layers: int) -> float:
-    """Allow the structural K/V planes added by a Qwen MTP draft.
 
-    Args:
-        layer_types: Target-only attention labels, before merging draft layers.
-        num_draft_layers: Number of full-attention MTP layers being merged.
+class QwenGDNRecipe(CacheRecipe):
+    """Qwen3.5: MHA full-attention layers interleaved with GDN state layers.
 
-    Returns:
-        The Qwen-specific upper bound on unified-arena padding.
-
-    Raises:
-        ValueError: If the target has no full-attention layers.
+    Draft (MTP) layers are full-attention continuation layers of the one big
+    model, so they join the target's full-attention group.
     """
-    num_full_attention_layers = sum(
-        layer_type == "full_attention" for layer_type in layer_types
-    )
-    if num_full_attention_layers == 0:
-        raise ValueError("Qwen3.5 cache requires at least one full-attention layer")
 
-    # If target-only recurrent padding is p <= 1, each mirrored draft layer's
-    # K/V planes increase it by (1 + p) / num_full_attention_layers.  Bound
-    # that increase by 2 without relaxing the original limit when no draft is
-    # present.  The derivation margin is intentionally the only headroom: if
-    # future cache geometry trips the guard, re-derive this bound rather than
-    # adding an epsilon or silently accepting an unbounded binding hole.
-    return 1.0 + 2.0 * num_draft_layers / num_full_attention_layers
+    family = "qwen_gdn"
 
-
-def qwen_gdn_cache_fields(
-    *,
-    layer_types,
-    layer_group_ids,
-    prefix_granularity,
-    kv_shape,
-    kv_element_size,
-    conv_shape,
-    conv_element_size,
-    ssm_shape,
-    ssm_element_size,
-) -> tuple[CacheFieldSpec, ...]:
-    """Describe Qwen3.5 full-attention KV and recurrent checkpoints."""
-    if len(layer_types) != len(layer_group_ids):
-        raise ValueError(
-            f"layer_types has {len(layer_types)} entries but layer_group_ids "
-            f"has {len(layer_group_ids)}"
-        )
-    if next(iter(kv_shape)) != prefix_granularity:
-        raise ValueError("kv_shape must start with prefix_granularity")
-    occurrences: dict[str, int] = {}
-    fields = []
-    for layer_id, (label, group_id) in enumerate(zip(layer_types, layer_group_ids)):
-        unit = occurrences.get(group_id, 0)
-        occurrences[group_id] = unit + 1
-        if label == "linear_attention":
-            fields.extend(
-                (
-                    CacheFieldSpec(
-                        group_id,
-                        f"layer.{layer_id}.ssm",
-                        f"unit.{unit}.a",
-                        tuple(ssm_shape),
-                        ssm_element_size,
-                    ),
-                    CacheFieldSpec(
-                        group_id,
-                        f"layer.{layer_id}.conv",
-                        f"unit.{unit}.b",
-                        tuple(conv_shape),
-                        conv_element_size,
-                        exact_page_stride=False,
-                    ),
-                )
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        if self.attn_config.kv_cache_mxfp8:
+            raise RuntimeError(
+                "Qwen cache buffer does not yet support the MXFP8 interleaved "
+                "scale layout"
             )
-        else:
-            fields.extend(
-                (
-                    CacheFieldSpec(
-                        group_id,
-                        f"layer.{layer_id}.k",
-                        f"unit.{unit}.a",
-                        tuple(kv_shape),
-                        kv_element_size,
-                    ),
-                    CacheFieldSpec(
-                        group_id,
-                        f"layer.{layer_id}.v",
-                        f"unit.{unit}.b",
-                        tuple(kv_shape),
-                        kv_element_size,
-                    ),
-                )
-            )
-    return tuple(fields)
 
+    # ---- layer vocabulary ----
 
-def prepare_qwen35_cache(
-    *,
-    server_args,
-    model_config,
-    attn_config,
-    draft_model_config,
-    draft_attn_config,
-    cache_budget_bytes: int,
-    decode_input_tokens: int,
-    overlap_schedule_depth: int,
-):
-    """Build target and optional draft cache specs for Qwen3.5."""
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-        FULL_ATTENTION,
-        LINEAR_ATTENTION,
-        build_paged_cache_group_specs,
-        split_recurrent_state_groups,
-    )
+    @cached_property
+    def target_layer_types(self) -> tuple[str, ...]:
+        return tuple(self.attn_config.layer_types)
 
-    if attn_config.kv_cache_mxfp8:
-        raise RuntimeError(
-            "Qwen cache buffer does not yet support the MXFP8 interleaved scale layout"
+    @property
+    @override
+    def num_draft_layers(self) -> int:
+        if self.draft_attn_config is None:
+            return 0
+        return self.draft_model_config.num_attention_layers
+
+    @cached_property
+    def layer_types(self) -> tuple[str, ...]:
+        return self.target_layer_types + (FULL_ATTENTION,) * self.num_draft_layers
+
+    @cached_property
+    def group_ids(self) -> tuple[str, ...]:
+        # Recurrent state splits into its own groups; draft layers land in the
+        # target's full-attention group.
+        return (
+            tuple(split_recurrent_state_groups(self.target_layer_types))
+            + (FULL_ATTENTION,) * self.num_draft_layers
         )
-    prefix_granularity = 128
-    text_config = getattr(model_config.hf_config, "text_config", model_config.hf_config)
-    conv_shape, ssm_shape, conv_dtype, ssm_dtype, _ = text_config.mamba2_cache_params
-    layer_types = tuple(attn_config.layer_types)
-    group_ids = tuple(split_recurrent_state_groups(layer_types))
-    fields = qwen_gdn_cache_fields(
-        layer_types=layer_types,
-        layer_group_ids=group_ids,
-        prefix_granularity=prefix_granularity,
-        kv_shape=(
-            prefix_granularity,
-            max(attn_config.num_kv_heads // attn_config.attn_tp_size, 1),
-            attn_config.head_dim,
-        ),
-        kv_element_size=attn_config.kv_cache_dtype.itemsize,
-        conv_shape=conv_shape,
-        conv_element_size=conv_dtype.itemsize,
-        ssm_shape=ssm_shape,
-        ssm_element_size=ssm_dtype.itemsize,
-    )
-    state_dtypes = {
-        f"layer.{layer_id}.conv": conv_dtype
-        for layer_id, layer_type in enumerate(layer_types)
-        if layer_type == LINEAR_ATTENTION
-    } | {
-        f"layer.{layer_id}.ssm": ssm_dtype
-        for layer_id, layer_type in enumerate(layer_types)
-        if layer_type == LINEAR_ATTENTION
-    }
 
-    draft_fields = None
-    draft_layer_types = ()
-    draft_group_ids = ()
-    fixed_workspace_bytes = 0
-    if draft_attn_config is not None:
-        draft_num_layers = draft_model_config.num_attention_layers
-        draft_layer_types = (FULL_ATTENTION,) * draft_num_layers
-        draft_group_ids = draft_layer_types
-        per_rank_heads = (
-            max(
-                draft_attn_config.num_kv_heads // draft_attn_config.attn_tp_size,
-                1,
+    # ---- geometry ----
+
+    @property
+    @override
+    def prefix_granularity(self) -> int:
+        return _QWEN_GDN_PREFIX_GRANULARITY
+
+    @property
+    @override
+    def max_padding_fraction(self) -> float:
+        """Allow the structural K/V planes added by a Qwen MTP draft.
+
+        If target-only recurrent padding is p <= 1, each mirrored draft
+        layer's K/V planes increase it by (1 + p) / num_full_attention_layers.
+        Bound that increase by 2 without relaxing the original limit when no
+        draft is present. The derivation margin is intentionally the only
+        headroom: if future cache geometry trips the guard, re-derive this
+        bound rather than adding an epsilon or silently accepting an unbounded
+        binding hole.
+        """
+        num_full_attention = sum(
+            layer_type == FULL_ATTENTION for layer_type in self.target_layer_types
+        )
+        if num_full_attention == 0:
+            raise ValueError("Qwen3.5 cache requires at least one full-attention layer")
+        return 1.0 + 2.0 * self.num_draft_layers / num_full_attention
+
+    # ---- fields ----
+
+    @cached_property
+    def _state_shapes(self):
+        text_config = getattr(
+            self.model_config.hf_config, "text_config", self.model_config.hf_config
+        )
+        conv_shape, ssm_shape, conv_dtype, ssm_dtype, _ = (
+            text_config.mamba2_cache_params
+        )
+        return (
+            tuple(conv_shape),
+            cache_dtype_name(conv_dtype),
+            tuple(ssm_shape),
+            cache_dtype_name(ssm_dtype),
+        )
+
+    @cached_property
+    def _kv_shape(self) -> tuple[int, ...]:
+        return (
+            self.prefix_granularity,
+            max(self.attn_config.num_kv_heads // self.attn_config.attn_tp_size, 1),
+            self.attn_config.head_dim,
+        )
+
+    @cached_property
+    def _draft_kv_shape(self) -> tuple[int, ...]:
+        config = self.draft_attn_config
+        return (
+            self.prefix_granularity,
+            max(config.num_kv_heads // config.attn_tp_size, 1),
+            config.head_dim,
+        )
+
+    @override
+    def fields_for_layer(
+        self, layer_id: int, group_id: str, occurrence: int
+    ) -> tuple[CacheFieldSpec, ...]:
+        if layer_id >= len(self.target_layer_types):
+            return self._draft_fields(layer_id, occurrence)
+        conv_shape, conv_dtype, ssm_shape, ssm_dtype = self._state_shapes
+        if self.layer_types[layer_id] == LINEAR_ATTENTION:
+            return (
+                CacheFieldSpec(
+                    f"layer.{layer_id}.ssm",
+                    f"unit.{occurrence}.a",
+                    ssm_shape,
+                    ssm_dtype,
+                ),
+                CacheFieldSpec(
+                    f"layer.{layer_id}.conv",
+                    f"unit.{occurrence}.b",
+                    conv_shape,
+                    conv_dtype,
+                    exact_page_stride=False,
+                ),
+            )
+        kv_dtype = scatter_stored_dtype_name(self.attn_config.kv_cache_dtype)
+        return (
+            CacheFieldSpec(
+                f"layer.{layer_id}.k", f"unit.{occurrence}.a", self._kv_shape, kv_dtype
             ),
-        ) * draft_num_layers
-        draft_fields = draft_cache_fields(
-            layer_group_ids=draft_group_ids,
-            enabled_layer_ids=range(draft_num_layers),
-            prefix_granularity=prefix_granularity,
-            layer_kv_heads=per_rank_heads,
-            head_dim=draft_attn_config.head_dim,
-            kv_element_size=draft_attn_config.kv_cache_dtype.itemsize,
-            kv_scale_block_size=32 if draft_attn_config.kv_cache_mxfp8 else 0,
-            kv_scale_element_size=1 if draft_attn_config.kv_cache_mxfp8 else 0,
+            CacheFieldSpec(
+                f"layer.{layer_id}.v", f"unit.{occurrence}.b", self._kv_shape, kv_dtype
+            ),
         )
-        verify_rows = attn_config.max_bs * (
-            int(server_args.speculative_num_draft_tokens) + 1
+
+    def _draft_fields(
+        self, layer_id: int, occurrence: int
+    ) -> tuple[CacheFieldSpec, ...]:
+        """One MTP draft layer's full-attention KV, mxfp8 scales included."""
+        config = self.draft_attn_config
+        mxfp8 = bool(config.kv_cache_mxfp8)
+        kv_dtype = (
+            cache_dtype_name(torch.float8_e4m3fn)
+            if mxfp8
+            else scatter_stored_dtype_name(config.kv_cache_dtype)
         )
-        fixed_workspace_bytes = verify_rows * sum(
+        fields = (
+            CacheFieldSpec(
+                f"layer.{layer_id}.k",
+                f"unit.{occurrence}.a",
+                self._draft_kv_shape,
+                kv_dtype,
+            ),
+            CacheFieldSpec(
+                f"layer.{layer_id}.v",
+                f"unit.{occurrence}.b",
+                self._draft_kv_shape,
+                kv_dtype,
+            ),
+        )
+        if not mxfp8:
+            return fields
+        kv_heads = self._draft_kv_shape[1]
+        scale_dim = config.head_dim // 32
+        scale_shape = (
+            kv_heads,
+            self.prefix_granularity // MXFP8_KV_SCALE_TILE_TOKENS,
+            32,
+            scale_dim,
+            scale_dim,
+        )
+        scale_dtype = cache_dtype_name(torch.float8_e8m0fnu)
+        return fields + (
+            CacheFieldSpec(
+                f"layer.{layer_id}.k_scale",
+                f"unit.{occurrence}.k_scale",
+                scale_shape,
+                scale_dtype,
+            ),
+            CacheFieldSpec(
+                f"layer.{layer_id}.v_scale",
+                f"unit.{occurrence}.v_scale",
+                scale_shape,
+                scale_dtype,
+            ),
+        )
+
+    # ---- extras ----
+
+    @override
+    def workspace_bytes(self) -> int:
+        """Verify-window staging for the recurrent state, when drafting."""
+        if not self.num_draft_layers:
+            return 0
+        verify_rows = self.attn_config.max_bs * (
+            int(self.server_args.speculative_num_draft_tokens) + 1
+        )
+        return verify_rows * sum(
             field.payload_bytes
+            for _, fields in self.groups()
             for field in fields
             if field.field_id.endswith((".conv", ".ssm"))
         )
-
-    (
-        merged_fields,
-        merged_layer_types,
-        merged_group_ids,
-        _,
-        num_draft_layers,
-    ) = merge_continuation_layers(
-        fields=fields,
-        layer_types=layer_types,
-        group_ids=group_ids,
-        draft_fields=draft_fields,
-        draft_layer_types=draft_layer_types,
-        draft_group_ids=draft_group_ids,
-    )
-    # ONE spec derivation over the merged layers: shared groups validate
-    # for consistent policy instead of the draft's being silently dropped.
-    group_specs = build_paged_cache_group_specs(
-        layer_types=merged_layer_types,
-        group_ids=merged_group_ids,
-        sliding_window_tokens=None,
-        prefix_granularity=prefix_granularity,
-        pd_disaggregation_enabled=attn_config.pd_disaggregation_enabled,
-    )
-    return build_hybrid_cache_setup(
-        family="qwen_gdn",
-        server_args=server_args,
-        fields=merged_fields,
-        layer_types=merged_layer_types,
-        group_ids=merged_group_ids,
-        group_specs=group_specs,
-        state_dtypes=state_dtypes,
-        layer_kv_head_counts=None,
-        num_draft_layers=num_draft_layers,
-        cache_budget_bytes=cache_budget_bytes,
-        fixed_workspace_bytes=fixed_workspace_bytes,
-        prefix_granularity=prefix_granularity,
-        max_padding_fraction=qwen_gdn_max_padding_fraction(
-            layer_types=layer_types,
-            num_draft_layers=num_draft_layers,
-        ),
-    )

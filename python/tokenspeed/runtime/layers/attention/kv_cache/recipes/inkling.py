@@ -1,153 +1,320 @@
-"""Inkling cache recipe."""
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Inkling cache recipe: attention pages plus paged ShortConv checkpoints.
+
+Every attention layer costs bytes in three groups -- its own attention group
+and the two conv checkpoint columns -- so the conv groups are declared whole
+(spec and fields together) rather than derived from a layer label.
+"""
+
+from __future__ import annotations
 
 import os
+from functools import cached_property
 
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
-    build_hybrid_cache_setup,
+import torch
+from typing_extensions import override
+
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
+    CacheGroupDeclaration,
+    CacheRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
-    merge_continuation_layers,
+    cache_dtype_bytes,
+    cache_dtype_name,
+    scatter_stored_dtype_name,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     MXFP8_KV_SCALE_TILE_TOKENS,
+    CacheGroupSpec,
+    apply_pd_transfer_policies,
 )
 
+_INKLING_PREFIX_GRANULARITY = 128
 
-def inkling_cache_fields(
-    *,
-    layer_group_ids,
-    prefix_granularity,
-    layer_kv_heads,
-    head_dim,
-    kv_element_size,
-    hidden_size,
-    checkpoint_rows,
-    kvconv_element_size,
-    hiddenconv_element_size,
-    kv_scale_block_size=0,
-    kv_scale_element_size=0,
-) -> tuple[CacheFieldSpec, ...]:
-    """Describe Inkling attention pages and ShortConv checkpoints."""
-    if len(layer_group_ids) != len(layer_kv_heads):
-        raise ValueError(
-            f"layer_group_ids has {len(layer_group_ids)} entries but "
-            f"layer_kv_heads has {len(layer_kv_heads)}"
-        )
-    if bool(kv_scale_block_size) != bool(kv_scale_element_size):
-        raise ValueError(
-            "kv_scale_block_size and kv_scale_element_size must both be zero "
-            "or both be positive"
-        )
-    if kv_scale_block_size and head_dim % kv_scale_block_size:
-        raise ValueError("head_dim must be divisible by kv_scale_block_size")
-    if kv_scale_block_size and (
-        prefix_granularity % 128 or head_dim != 128 or kv_scale_block_size != 32
-    ):
-        raise ValueError(
-            "Inkling MXFP8 scale fields require P divisible by 128, "
-            "head_dim 128 and scale block size 32"
-        )
+# The ShortConv checkpoint groups. Named once: the field builder and the
+# whole-group declaration below both reference these.
+KVCONV_GROUP_ID = "kvconv"
+HIDDENCONV_GROUP_ID = "hiddenconv"
 
-    occurrences: dict[str, int] = {}
-    fields = []
-    for layer_id, (group_id, kv_heads) in enumerate(
-        zip(layer_group_ids, layer_kv_heads)
-    ):
-        unit = occurrences.get(group_id, 0)
-        occurrences[group_id] = unit + 1
-        k_plane = f"unit.{unit}.k"
-        v_plane = f"unit.{unit}.v"
-        if hiddenconv_element_size > 1:
-            hidden_k_plane = f"unit.{unit}.hidden_k"
-            hidden_v_plane = f"unit.{unit}.hidden_v"
-        else:
-            hidden_k_plane = k_plane
-            hidden_v_plane = v_plane
-        kv_shape = (prefix_granularity, kv_heads, head_dim)
-        kvconv_shape = (checkpoint_rows, kv_heads * head_dim)
-        hiddenconv_shape = (checkpoint_rows, hidden_size)
-        fields.extend(
+
+class InklingRecipe(CacheRecipe):
+    """Inkling: MHA pages plus per-layer ShortConv state checkpoints."""
+
+    family = "inkling"
+
+    # ---- layer vocabulary ----
+
+    @property
+    @override
+    def num_target_layers(self) -> int:
+        return len(self.attn_config.layer_types)
+
+    @property
+    @override
+    def num_draft_layers(self) -> int:
+        if self.draft_attn_config is None:
+            return 0
+        num_layers = self.draft_model_config.num_attention_layers
+        num_steps = self.server_args.speculative_num_steps
+        if num_steps > num_layers:
+            raise ValueError(
+                f"Inkling MTP has {num_layers} depth layers; "
+                f"--speculative-num-steps {num_steps} would wrap depths "
+                "with no trained meaning."
+            )
+        return num_layers
+
+    @cached_property
+    def layer_types(self) -> tuple[str, ...]:
+        target = tuple(self.attn_config.layer_types)
+        if self.draft_attn_config is None:
+            return target
+        return target + tuple(self.draft_attn_config.layer_types)
+
+    @property
+    def group_ids(self) -> tuple[str, ...]:
+        """Inkling groups by label: the label *is* the attention group."""
+        return self.layer_types
+
+    @cached_property
+    @override
+    def layer_kv_head_counts(self) -> tuple[int, ...]:
+        counts = inkling_layer_kv_head_counts(self.model_config)
+        if self.draft_attn_config is None:
+            return counts
+        return counts + inkling_layer_kv_head_counts(self.draft_model_config)
+
+    # ---- geometry ----
+
+    @property
+    @override
+    def prefix_granularity(self) -> int:
+        return _INKLING_PREFIX_GRANULARITY
+
+    @property
+    @override
+    def max_padding_fraction(self) -> float:
+        # The bf16 conv columns are narrow next to the KV pages they alias;
+        # the fp8 variant tightens the binding enough to bound it.
+        return float("inf") if not _fp8_sconv() else 1.0
+
+    # ---- groups: the layer walk, plus the two conv columns ----
+
+    @override
+    def groups(self) -> tuple[CacheGroupDeclaration, ...]:
+        """The attention groups from the layer walk, plus both conv columns."""
+        conv = tuple(
             (
-                CacheFieldSpec(
-                    group_id,
-                    f"layer.{layer_id}.k",
-                    k_plane,
-                    kv_shape,
-                    kv_element_size,
+                CacheGroupSpec(
+                    group_id=group_id,
+                    retention="full_history",
+                    sliding_window_tokens=None,
+                    family="state",
+                    checkpoint_granularity=self.prefix_granularity,
                 ),
+                fields,
+            )
+            for group_id, fields in self._conv_columns().items()
+        )
+        if self.pd_disaggregation_enabled:
+            # The layer walk already stamped the attention groups.
+            policies = apply_pd_transfer_policies(tuple(spec for spec, _ in conv))
+            conv = tuple(
+                (spec, fields) for spec, (_, fields) in zip(policies, conv, strict=True)
+            )
+        return super().groups() + conv
+
+    @override
+    def fields_for_layer(
+        self, layer_id: int, group_id: str, occurrence: int
+    ) -> tuple[CacheFieldSpec, ...]:
+        """This layer's attention pages. Its conv checkpoints are columns."""
+        config = self._layer_config(layer_id)
+        mxfp8 = bool(config.kv_cache_mxfp8)
+        if mxfp8 and (self.prefix_granularity % 128 or config.head_dim != 128):
+            raise ValueError(
+                "Inkling MXFP8 scale fields require P divisible by 128 and "
+                "head_dim 128"
+            )
+        kv_heads = self._layer_kv_heads(layer_id)
+        kv_shape = (self.prefix_granularity, kv_heads, config.head_dim)
+        kv_dtype = (
+            cache_dtype_name(torch.float8_e4m3fn)
+            if mxfp8
+            else scatter_stored_dtype_name(config.kv_cache_dtype)
+        )
+        fields = (
+            CacheFieldSpec(
+                f"layer.{layer_id}.k",
+                f"unit.{occurrence}.k",
+                kv_shape,
+                kv_dtype,
+            ),
+            CacheFieldSpec(
+                f"layer.{layer_id}.v",
+                f"unit.{occurrence}.v",
+                kv_shape,
+                kv_dtype,
+            ),
+        )
+        if not mxfp8:
+            return fields
+        scale_dim = config.head_dim // 32
+        scale_shape = (
+            kv_heads,
+            self.prefix_granularity // MXFP8_KV_SCALE_TILE_TOKENS,
+            32,
+            scale_dim,
+            scale_dim,
+        )
+        scale_dtype = cache_dtype_name(torch.float8_e8m0fnu)
+        return fields + (
+            CacheFieldSpec(
+                f"layer.{layer_id}.k_scale",
+                f"unit.{occurrence}.k_scale",
+                scale_shape,
+                scale_dtype,
+            ),
+            CacheFieldSpec(
+                f"layer.{layer_id}.v_scale",
+                f"unit.{occurrence}.v_scale",
+                scale_shape,
+                scale_dtype,
+            ),
+        )
+
+    def _conv_columns(self) -> dict[str, tuple[CacheFieldSpec, ...]]:
+        """Both ShortConv checkpoint columns, one entry per attention layer.
+
+        The checkpoints alias their layer's KV planes, so they reuse the plane
+        ids -- which means reproducing the group's plane numbering here. It is
+        the same rule the layer walk applies (a group's Nth layer takes plane
+        N) and Inkling's layers all declare fields, so the two agree.
+        """
+        columns = {KVCONV_GROUP_ID: (), HIDDENCONV_GROUP_ID: ()}
+        occurrences: dict[str, int] = {}
+        hiddenconv_dtype = cache_dtype_name(
+            torch.float8_e5m2 if _fp8_sconv() else torch.bfloat16
+        )
+        wide_hidden = cache_dtype_bytes(hiddenconv_dtype) > 1
+        for layer_id, group_id in enumerate(self.group_ids):
+            occurrence = occurrences.get(group_id, 0)
+            occurrences[group_id] = occurrence + 1
+            text_config = self._layer_model_config(layer_id).hf_config.get_text_config()
+            checkpoint_rows = text_config.sconv_kernel_size - 1
+            kv_row = (
+                self._layer_kv_heads(layer_id) * self._layer_config(layer_id).head_dim
+            )
+            k_plane = f"unit.{occurrence}.k"
+            v_plane = f"unit.{occurrence}.v"
+            columns[KVCONV_GROUP_ID] += (
                 CacheFieldSpec(
-                    group_id,
-                    f"layer.{layer_id}.v",
-                    v_plane,
-                    kv_shape,
-                    kv_element_size,
-                ),
-                CacheFieldSpec(
-                    "kvconv",
                     f"layer.{layer_id}.kvconv_k",
                     k_plane,
-                    kvconv_shape,
-                    kvconv_element_size,
+                    (checkpoint_rows, kv_row),
+                    cache_dtype_name(torch.bfloat16),
                     exact_page_stride=False,
                 ),
                 CacheFieldSpec(
-                    "kvconv",
                     f"layer.{layer_id}.kvconv_v",
                     v_plane,
-                    kvconv_shape,
-                    kvconv_element_size,
+                    (checkpoint_rows, kv_row),
+                    cache_dtype_name(torch.bfloat16),
                     exact_page_stride=False,
                 ),
+            )
+            columns[HIDDENCONV_GROUP_ID] += (
                 CacheFieldSpec(
-                    "hiddenconv",
                     f"layer.{layer_id}.attnconv",
-                    hidden_k_plane,
-                    hiddenconv_shape,
-                    hiddenconv_element_size,
+                    f"unit.{occurrence}.hidden_k" if wide_hidden else k_plane,
+                    (checkpoint_rows, text_config.hidden_size),
+                    hiddenconv_dtype,
                     exact_page_stride=False,
                 ),
                 CacheFieldSpec(
-                    "hiddenconv",
                     f"layer.{layer_id}.mlpconv",
-                    hidden_v_plane,
-                    hiddenconv_shape,
-                    hiddenconv_element_size,
+                    f"unit.{occurrence}.hidden_v" if wide_hidden else v_plane,
+                    (checkpoint_rows, text_config.hidden_size),
+                    hiddenconv_dtype,
                     exact_page_stride=False,
                 ),
             )
+        return columns
+
+    def _layer_config(self, layer_id: int):
+        return (
+            self.attn_config
+            if layer_id < self.num_target_layers
+            else self.draft_attn_config
         )
-        if kv_scale_block_size:
-            scale_dim = head_dim // kv_scale_block_size
-            scale_shape = (
-                kv_heads,
-                prefix_granularity // MXFP8_KV_SCALE_TILE_TOKENS,
-                32,
-                scale_dim,
-                scale_dim,
+
+    def _layer_model_config(self, layer_id: int):
+        return (
+            self.model_config
+            if layer_id < self.num_target_layers
+            else self.draft_model_config
+        )
+
+    def _layer_kv_heads(self, layer_id: int) -> int:
+        config = self._layer_config(layer_id)
+        return max(1, self.layer_kv_head_counts[layer_id] // config.attn_tp_size)
+
+    # ---- extras ----
+
+    @override
+    def workspace_bytes(self) -> int:
+        """The conv ring both models stage their checkpoints through."""
+        draft_tokens = (
+            int(self.server_args.speculative_num_draft_tokens)
+            if self.draft_attn_config is not None
+            else 0
+        )
+        text_config = self.model_config.hf_config.get_text_config()
+        total = _conv_ring_bytes(
+            text_config=text_config,
+            attn_config=self.attn_config,
+            num_layers=text_config.num_hidden_layers,
+            spec_tokens=draft_tokens,
+        )
+        if self.draft_attn_config is not None:
+            total += _conv_ring_bytes(
+                text_config=self.draft_model_config.hf_config.get_text_config(),
+                attn_config=self.draft_attn_config,
+                num_layers=self.num_draft_layers,
+                spec_tokens=draft_tokens,
             )
-            fields.extend(
-                (
-                    CacheFieldSpec(
-                        group_id,
-                        f"layer.{layer_id}.k_scale",
-                        f"unit.{unit}.k_scale",
-                        scale_shape,
-                        kv_scale_element_size,
-                    ),
-                    CacheFieldSpec(
-                        group_id,
-                        f"layer.{layer_id}.v_scale",
-                        f"unit.{unit}.v_scale",
-                        scale_shape,
-                        kv_scale_element_size,
-                    ),
-                )
-            )
-    return tuple(fields)
+        return total
+
+
+def _fp8_sconv() -> bool:
+    return os.environ.get("INKLING_FP8_SCONV", "0") != "0"
 
 
 def inkling_layer_kv_head_counts(model_config) -> tuple[int, ...]:
+    """Per-layer global KV head count, before TP sharding.
+
+    Also read by the PD field-partition logic, which needs the global width.
+    """
     from tokenspeed.runtime.configs.inkling_config import inkling_kv_heads_for_layer
 
     text_config = model_config.hf_config.get_text_config()
@@ -157,59 +324,7 @@ def inkling_layer_kv_head_counts(model_config) -> tuple[int, ...]:
     )
 
 
-def _inkling_fields(attn_config, model_config, prefix_granularity: int):
-    text_config = model_config.hf_config.get_text_config()
-    layer_kv_head_counts = inkling_layer_kv_head_counts(model_config)
-    per_rank_heads = tuple(
-        max(1, heads // attn_config.attn_tp_size) for heads in layer_kv_head_counts
-    )
-    hiddenconv_element_size = (
-        2 if os.environ.get("INKLING_FP8_SCONV", "0") == "0" else 1
-    )
-    fields = inkling_cache_fields(
-        layer_group_ids=attn_config.layer_types,
-        prefix_granularity=prefix_granularity,
-        layer_kv_heads=per_rank_heads,
-        head_dim=attn_config.head_dim,
-        kv_element_size=attn_config.kv_cache_dtype.itemsize,
-        hidden_size=text_config.hidden_size,
-        checkpoint_rows=text_config.sconv_kernel_size - 1,
-        kvconv_element_size=2,
-        hiddenconv_element_size=hiddenconv_element_size,
-        kv_scale_block_size=32 if attn_config.kv_cache_mxfp8 else 0,
-        kv_scale_element_size=1 if attn_config.kv_cache_mxfp8 else 0,
-    )
-    return fields, layer_kv_head_counts
-
-
-def _checkpoint_groups(prefix_granularity: int):
-    # Physical packing is aligned with the memory plan by the pool at
-    # construction; the recipe only declares the scheduler semantics.
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-        PagedCacheGroupSpec,
-    )
-
-    return tuple(
-        PagedCacheGroupSpec(
-            group_id=group_id,
-            retention="full_history",
-            sliding_window_tokens=None,
-            family="state",
-            checkpoint_granularity=prefix_granularity,
-        )
-        for group_id in ("kvconv", "hiddenconv")
-    )
-
-
-def _workspace_bytes(
-    *,
-    text_config,
-    attn_config,
-    num_layers: int,
-    spec_tokens: int = 1,
-) -> int:
-    import torch
-
+def _conv_ring_bytes(*, text_config, attn_config, num_layers: int, spec_tokens: int):
     from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
 
     rows = int(attn_config.max_bs) + 2
@@ -220,121 +335,8 @@ def _workspace_bytes(
         int(text_config.sconv_kernel_size) - 1 + spec_tokens + max(spec_tokens - 2, 0)
     )
     conv_dim = inkling_conv_total_dim(text_config, attn_config.attn_tp_size)
-    element_size = torch.bfloat16.itemsize
     pending_bytes = rows * torch.bool.itemsize
-    return num_layers * rows * ring_rows * conv_dim * element_size + pending_bytes
-
-
-def prepare_inkling_cache(
-    *,
-    server_args,
-    model_config,
-    attn_config,
-    draft_model_config,
-    draft_attn_config,
-    cache_budget_bytes: int,
-    decode_input_tokens: int,
-    overlap_schedule_depth: int,
-):
-    """Build target and optional draft cache specs for Inkling."""
-    prefix_granularity = 128
-    fields, layer_kv_head_counts = _inkling_fields(
-        attn_config, model_config, prefix_granularity
-    )
-    layer_types = tuple(attn_config.layer_types)
-    text_config = model_config.hf_config.get_text_config()
-    draft_tokens = (
-        int(server_args.speculative_num_draft_tokens)
-        if draft_attn_config is not None
-        else 0
-    )
-    fixed_workspace_bytes = _workspace_bytes(
-        text_config=text_config,
-        attn_config=attn_config,
-        num_layers=text_config.num_hidden_layers,
-        spec_tokens=draft_tokens,
-    )
-
-    draft_fields = None
-    draft_layer_types = ()
-    draft_group_ids = ()
-    draft_layer_kv_head_counts = None
-    if draft_attn_config is not None:
-        draft_num_layers = draft_model_config.num_attention_layers
-        num_steps = server_args.speculative_num_steps
-        if num_steps > draft_num_layers:
-            raise ValueError(
-                f"Inkling MTP has {draft_num_layers} depth layers; "
-                f"--speculative-num-steps {num_steps} would wrap depths "
-                "with no trained meaning."
-            )
-        draft_layer_types = tuple(draft_attn_config.layer_types)
-        draft_group_ids = draft_layer_types
-        # Same recipe as the target: the depth layers get kvconv/hiddenconv
-        # checkpoint fields as continuation tenants of the existing groups,
-        # so the draft conv ring gains the same publish/restore bridges.
-        draft_fields, draft_layer_kv_head_counts = _inkling_fields(
-            draft_attn_config, draft_model_config, prefix_granularity
-        )
-        fixed_workspace_bytes += _workspace_bytes(
-            text_config=draft_model_config.hf_config.get_text_config(),
-            attn_config=draft_attn_config,
-            num_layers=draft_num_layers,
-            spec_tokens=draft_tokens,
-        )
-
-    max_padding_fraction = (
-        float("inf") if os.environ.get("INKLING_FP8_SCONV", "0") == "0" else 1.0
-    )
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-        apply_pd_transfer_policies,
-        build_paged_cache_group_specs,
-    )
-
-    (
-        merged_fields,
-        merged_layer_types,
-        merged_group_ids,
-        merged_head_counts,
-        num_draft_layers,
-    ) = merge_continuation_layers(
-        fields=fields,
-        layer_types=layer_types,
-        group_ids=layer_types,
-        layer_kv_head_counts=layer_kv_head_counts,
-        draft_fields=draft_fields,
-        draft_layer_types=draft_layer_types,
-        draft_group_ids=draft_group_ids,
-        draft_layer_kv_head_counts=draft_layer_kv_head_counts,
-    )
-    # ONE spec derivation over the merged layers (shared groups validate
-    # for consistent policy), plus the paged sconv checkpoint groups
-    # (per-layer state columns outside the layer-type vocabulary); PD
-    # policies stamp the complete tuple. Target and draft share the
-    # sliding window width by construction (same architecture family).
-    group_specs = (
-        *build_paged_cache_group_specs(
-            layer_types=merged_layer_types,
-            group_ids=merged_group_ids,
-            sliding_window_tokens=attn_config.sliding_window_tokens,
-            prefix_granularity=prefix_granularity,
-        ),
-        *_checkpoint_groups(prefix_granularity),
-    )
-    if attn_config.pd_disaggregation_enabled:
-        group_specs = tuple(apply_pd_transfer_policies(group_specs))
-    return build_hybrid_cache_setup(
-        family="inkling",
-        server_args=server_args,
-        fields=merged_fields,
-        layer_types=merged_layer_types,
-        group_ids=merged_group_ids,
-        group_specs=group_specs,
-        state_dtypes={},
-        layer_kv_head_counts=merged_head_counts,
-        num_draft_layers=num_draft_layers,
-        cache_budget_bytes=cache_budget_bytes,
-        fixed_workspace_bytes=fixed_workspace_bytes,
-        prefix_granularity=prefix_granularity,
-        max_padding_fraction=max_padding_fraction,
+    return (
+        num_layers * rows * ring_rows * conv_dim * torch.bfloat16.itemsize
+        + pending_bytes
     )
