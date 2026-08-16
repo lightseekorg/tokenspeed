@@ -69,9 +69,8 @@ class CachePoolSpec:
     memory_plan: CacheMemoryPlan
     layer_types: tuple[str, ...]
     layer_group_ids: tuple[str, ...]
-    # Scheduler group specs. The recipe declared these next to the fields the
-    # plan was packed from (CacheRecipe.groups), so the plan and the specs name
-    # the same groups by construction -- there is nothing to cross-check.
+    # Scheduler group specs, declared next to the fields the plan was packed
+    # from (CacheRecipe.groups), so the plan and the specs name one group set.
     cache_group_specs: tuple[CacheGroupSpec, ...]
     token_capacity: int
     layer_kv_head_counts: tuple[int, ...] | None = None

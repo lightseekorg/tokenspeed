@@ -765,7 +765,7 @@ def test_draft_view_maps_local_layer_ids_to_continuation_planes() -> None:
     assert target._field_layer_id(7) == 7
 
 
-# --- recipe seams that used to be standalone functions ---
+# --- individual recipe seams ---
 
 
 def test_qwen_mtp_padding_allowance_tracks_draft_planes() -> None:

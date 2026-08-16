@@ -2473,7 +2473,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
     def test_deepseek_v4_plan_rejects_nonpositive_capacity(self):
-        # Capacity is a plan quantity now (the pool derives its size from the
+        # Capacity is a plan quantity (the pool derives its size from the
         # arena), so the planner owns this guard.
         config = SimpleNamespace(
             compress_ratios=[1],

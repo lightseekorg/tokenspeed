@@ -88,13 +88,12 @@ class CacheArena:
         self._fields: dict[str, torch.Tensor] = {
             field.field_id: self._bind(field) for field in plan.fields
         }
-        # Publish the contract: the recipe's logical specs joined with the
-        # plan's physical facts for the same groups. Nothing is copied into
-        # the specs -- the plan owns page counts and LCM packing, the contract
-        # carries them beside the specs, so the two never need reconciling.
-        # That the two name the same groups needs no assertion here: the
-        # recipe packs the plan from the very (spec, fields) pairs it publishes
-        # these specs from, so one group id cannot reach only one of them.
+        # The contract joins the recipe's logical specs with the plan's
+        # physical facts for the same groups. The plan owns page counts and
+        # packing; the contract carries them beside the specs rather than
+        # copying them in, and the recipe packs the plan from the same
+        # (spec, fields) pairs these specs come from, so both name one group
+        # set by construction.
         plan_groups = {group.group_id: group for group in plan.groups}
         self.runtime_contract = CacheRuntimeContract(
             # The identity axis comes from the plan, never read back out of

@@ -504,9 +504,8 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         )
 
     # A ratio-1 layer plans no compressed/state planes and only ratio-4 plans
-    # indexer planes, so the plan's field list decides per layer -- the
-    # ratio branches this used to re-derive are the plan's own shape.
-    # Every V4 plane is read with the shape the plan gives it.
+    # indexer planes, so the plan's field list decides which planes a layer
+    # has, and each is read with the shape the plan gives it.
     layer_plane_bindings: ClassVar[dict[str, str]] = {
         "swa": "swa_kv_buffer",
         "compressed_kv": "compressed_kv_buffer",

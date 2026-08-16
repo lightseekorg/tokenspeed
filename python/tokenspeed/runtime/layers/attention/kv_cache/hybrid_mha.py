@@ -64,11 +64,9 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
         )
 
     # A state layer has no k/v field planned and an attention layer has no
-    # conv/ssm, so the plan's field list decides per layer -- no layer_types
-    # branch here. Contiguity is a plan invariant (exact_page_stride), already
-    # enforced by pack.
-    # State planes keep their planned shape: the GDN decode ABI reads them
-    # as the plan lays them out.
+    # conv/ssm, so the plan's field list decides which planes a layer has.
+    # State planes keep their planned shape: the GDN decode ABI reads them as
+    # the plan lays them out.
     layer_plane_bindings: ClassVar[dict[str, str]] = {
         **MHATokenToKVPool.layer_plane_bindings,
         "conv": "_conv_state",

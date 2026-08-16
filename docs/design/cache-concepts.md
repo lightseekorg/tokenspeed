@@ -371,8 +371,8 @@ are not per-layer (Inkling appends conv columns; V4 declares each group
 whole). No family restates the order of the stages, and `_RECIPES`
 (`recipes/setup.py`) is the single family → recipe map.
 
-**No round-trip reconciliation.** The pipeline is arranged so that the pairs
-that used to be cross-checked cannot differ:
+**No round-trip reconciliation.** The pipeline is arranged so that pairs which
+would otherwise need cross-checking cannot differ:
 
 * the group set in the plan equals the declared one because `pack` consumes
   the `(spec, fields)` pairs and `setup()` publishes the specs from those
@@ -542,24 +542,21 @@ do it as its own milestone.
 * Field dtypes come from the memory plan. `CacheFieldSpec`/`CacheFieldLayout`
   carry `dtype` (a name; `plan.py` stays torch-free because the plan travels
   the PD wire) and `element_size` derives from it, so byte geometry and dtype
-  can no longer disagree. Recipes name each field's dtype where they already
-  know it, via `cache_dtype_name` or `scatter_stored_dtype_name` — the latter
-  encodes the one substitution rule that used to live in the pools: fp8
-  collapses to `uint8` for fields written by elementwise scatter, because
-  `index_put` has no fp8 kernel. Fields written through dtype-aware kernels
-  (MXFP8) keep their fp8 view. The PD wire string is unchanged by this move,
-  and `CacheTransferContract` no longer carries a parallel `field_dtypes`
-  tuple. ✓
+  cannot disagree. Recipes name each field's dtype where they already know it,
+  via `cache_dtype_name` or `scatter_stored_dtype_name`; the latter holds the
+  one substitution rule — fp8 collapses to `uint8` for fields written by
+  elementwise scatter, because `index_put` has no fp8 kernel, while fields
+  written through dtype-aware kernels (MXFP8) keep their fp8 view. The
+  contract carries no parallel `field_dtypes` tuple. ✓
 * The arena owns the allocation and materializes every planned field view in
   its constructor, so `field(field_id)` is a lookup with no dtype argument and
-  no lazy-bind state. `CachePool.store_dtype` narrowed to what it always
-  should have been: how a pool reinterprets *input* tensors before a write.
-  A pool binds nothing — `_bind_layer_planes` walks `plan.fields` once and
-  arranges this view's layer window into the per-layer buffers its kernels
-  read, with each subclass declaring only its `layer_plane_bindings`. Which
-  planes a layer has is a fact of the plan (a state layer plans no `k`/`v`),
-  so pools no longer re-derive it from `layer_types` or V4 compression ratios,
-  and page contiguity stays a plan invariant (`exact_page_stride`). ✓
+  no lazy-bind state. `CachePool.store_dtype` means one thing: how a pool
+  reinterprets *input* tensors before a write. A pool allocates nothing —
+  `_bind_layer_planes` walks `plan.fields` once and arranges this view's layer
+  window into the per-layer buffers its kernels read, with each subclass
+  declaring only its `layer_plane_bindings`. Which planes a layer has is a
+  fact of the plan (a state layer plans no `k`/`v`), and page contiguity is a
+  plan invariant (`exact_page_stride`). ✓
 * Every backend's `kernel_page_size` is registry- or config-sourced
   (`kernel_page_sizes.py`); the registry LCM validator checks explicitly
   configured values, and a backend that resolves its own registry default
@@ -568,12 +565,11 @@ do it as its own milestone.
   build from `DEEPSEEK_V4_PAGE_SIZE`, and V4 accepts any P that is a
   positive multiple of it (e2e-verified against the `bt_v4` baseline;
   GSM8K 1319-question sweep: nospec 0.9651, DSpark 0.9629). ✓
-* The former pool-scalar naming debt is paid by a role split:
+* Two arena scalars, two roles, both derived from the plan:
   `CacheArena.prefix_granularity` (identity grain; contract publication and
   plan checks only) and `CacheArena.kv_page_size` (KV arena geometry, read by
-  row/slot/tile math in the paged pools and their consumers), both derived
-  from the plan. Prefix-hit computation is the only computational consumer of
-  `prefix_granularity`.
+  row/slot/tile math in the paged pools and their consumers). Prefix-hit
+  computation is the only computational consumer of `prefix_granularity`. ✓
 * Cache geometry has one owner and no mirrors. `CacheArena` holds the
   allocation, the field views, the plan, the contract and the geometry
   scalars; `CachePool` is a typed layer window that forwards nothing, so
@@ -582,45 +578,30 @@ do it as its own milestone.
   bytes are read as (a bf16 draft head over an fp8 target is two views of
   one arena), the layer-window offset, and the per-layer kernel buffers. ✓
 
-### Principle 7 — one pipeline, declared once (round of 2026-08-16)
+### Principle 7 — one pipeline, declared once: fixed
 
-The recipe layer used to be ~26 family-prefixed free functions
-(`prepare_kimi_k3_cache`, `kimi_k3_token_capacity_for_cache_pool`,
-`build_v4_cache_specs`, …) whose call order each family restated. It is now
-one template method with uniformly named seams (see *The cache pipeline*
-above). What changed, and why each change is structural rather than a check:
+* Every family's cache is built by `CacheRecipe.setup()`, the single place the
+  four stages appear in order (see *The cache pipeline* above). A family fills
+  in uniformly named seams and marks each with `@override`, so a renamed seam
+  fails type checking rather than silently taking the base default. ✓
+* The stage names and the function names are the same words: `group`, `pack`,
+  `bind`. `pack` is capacity-independent — it describes one physical parent —
+  and `bind` is the only place a parent count enters. ✓
+* A group id is written once, in its spec, next to the fields that deposit
+  bytes in it. `CacheFieldSpec` carries no `group_id` and `CacheGroupSpec` no
+  packing: the declaring group is positional, and packing is the layout's
+  answer, so neither can be stated twice and disagree. ✓
+* Capacity has two shapes and no more, and one place to read the scheduler's
+  concurrency (see *The cache pipeline* above). ✓
+* Kernel geometry does not live under the recipes package. DeepSeek V4's byte
+  formulas, cache layout and group-id vocabulary sit in
+  `attention/deepseek_v4_geometry.py`, which the backends, ops, model and pool
+  read directly; the recipe depends on it, not the reverse. ✓
+* One kernel layout has one definition. The interleaved mxfp8 KV-scale planes
+  come from `plan.mxfp8_kv_scale_fields`, which also owns the page-span and
+  head-dim constraints that layout imposes, so no recipe restates the shape or
+  re-checks the constraint. ✓
 
-* `layers → group → pack → bind` is written once, in `CacheRecipe.setup()`.
-  `solve_cache_layout` → `pack` (it solves nothing when the recipe pins every
-  group) and `CacheLayout.with_num_lcm_blocks` → `bind`, so the stage names
-  and the function names are the same words.
-* `group` walks the layers once and returns `(spec, fields)` pairs. The
-  previous two-walk shape (`group_specs_from_layer_types` plus a separate
-  field builder, reconciled afterwards by `group_fields`) is gone, along with
-  its reconciliation: the group id exists in exactly one place per group.
-* `CacheGroupSpec` lost `cache_blocks_per_lcm_block` and `CacheFieldSpec` lost
-  `group_id` — packing is the layout's answer and the declaring group is
-  positional, so neither can be stated twice and disagree.
-* `CachePoolSpec.pool_size` is deleted: it was a fourth copy of
-  `num_lcm_blocks × max_packing × P`. The registry reads `arena.size` for
-  physical slots and the contract for admitted capacity, and the tautological
-  `pool_size <= 0` guard went with it. `create_attn_components` no longer
-  returns a token count at all — the caller overwrote it with
-  `geometry.token_capacity` on the next line.
-* Capacity is two shapes, not five: the flat product on the base class, and
-  `parents_needed` + one shared binary search for the families whose per-group
-  demand differs. `deepseek_v4_lcm_blocks_needed` and
-  `deepseek_v4_token_capacity_for_cache_pool` are gone; K3's own binary search
-  is gone.
-* `paged` is out of the group-type names on both sides of the bridge
-  (`CacheGroupSpec`, `CacheRuntimeContract`, `pool_to_cache_groups`,
-  `cache_group_page_counts`) — see the boundary section above for why. Names
-  are kept only where the consumer is genuinely paged KV.
-* `recipes/deepseek_v4_cache_spec.py` is split by dependency direction, not
-  merged: kernel byte geometry and the group-id vocabulary moved *up* to
-  `attention/deepseek_v4_geometry.py`, where the backends, ops, model and pool
-  already lived; only the recipe-side spec constructors moved *into*
-  `recipes/deepseek_v4.py`. The recipes package no longer sits underneath
-  kernel-facing code. Dead constants (`DEEPSEEK_V4_PREFIX_GRANULARITY`,
-  `DEEPSEEK_V4_FP8_BLOCK_SIZE`) and the duplicated compressor-state tables
-  went with the move.
+Verified end to end for this round: DeepSeek V3.2, R1 and V4-Flash, each
+× {CUDA graph, eager} × {spec, no spec}, against pre-refactor baselines
+(accuracy equal or better; speculative accept length within noise).

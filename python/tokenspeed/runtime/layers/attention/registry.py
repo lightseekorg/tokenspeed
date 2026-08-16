@@ -121,8 +121,7 @@ def _cache_storage_report(
     packing = {
         group.group_id: int(group.cache_blocks_per_lcm_block) for group in plan.groups
     }
-    # The arena is the one definition of child-token capacity; re-deriving it
-    # here only to compare against itself is what this report used to do.
+    # The arena is the one definition of child-token capacity.
     physical_token_capacity = int(arena.size)
     geometry = {
         "prefix_granularity": int(plan.prefix_granularity),
@@ -137,8 +136,8 @@ def _cache_storage_report(
         },
     }
 
-    # One pool: the draft "pool" is a layer-mapped view of the same buffer,
-    # so the one allocation already covers both models' layers.
+    # One arena: the draft view shares this allocation, so it already covers
+    # both models' layers.
     arena_bytes = _arena_allocated_bytes(arena)
     allocated_cache_bytes = arena_bytes + fixed_workspace_bytes
     if allocated_cache_bytes > configured_cache_bytes:
