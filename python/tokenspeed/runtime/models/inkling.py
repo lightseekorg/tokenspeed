@@ -563,8 +563,8 @@ class InklingAttention(nn.Module):
             num_kv_heads=self.num_tp_kv_heads,
             layer_id=layer_id,
             sliding_window_size=(config.sliding_window_size - 1) if is_local else -1,
-            # Group ids == config.paged_cache_layer_types labels (sliding sub-groups included).
-            group_id=config.paged_cache_layer_types[layer_id],
+            # Group ids == config.cache_layer_types labels (sliding sub-groups included).
+            group_id=config.cache_layer_types[layer_id],
         )
 
         self.q_size = self.head_dim * self.num_tp_heads

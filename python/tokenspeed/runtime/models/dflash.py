@@ -176,7 +176,7 @@ class DFlashAttention(nn.Module):
                 cache_loc=out_cache_loc,
                 k_scale=self.attn.k_scale,
                 v_scale=self.attn.v_scale,
-                page_size=ctx.token_to_kv_pool.kv_page_size,
+                page_size=ctx.token_to_kv_pool.arena.kv_page_size,
             )
         else:
             ctx.token_to_kv_pool.set_kv_buffer(

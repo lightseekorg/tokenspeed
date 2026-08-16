@@ -35,11 +35,14 @@ from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import (
     MSAConfig,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import (
     CachePool,
-    LayerMappedKVPool,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.factory import create_cache_pool
+from tokenspeed.runtime.layers.attention.kv_cache.factory import (
+    create_cache_arena,
+    create_cache_pool,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     CacheModelFamily,
     CachePoolSpec,
@@ -96,14 +99,13 @@ def _resolve_heterogeneous_draft_family(
     return draft_family
 
 
-def _pool_allocated_bytes(pool) -> int:
-    buffer = getattr(pool, "buffer", None)
-    if buffer is not None:
-        return int(buffer.nbytes)
-    sizes = pool.get_kv_size_bytes()
-    if isinstance(sizes, tuple):
-        return sum(int(size) for size in sizes)
-    return int(sizes)
+def _arena_allocated_bytes(arena) -> int:
+    """Bytes this model's cache actually occupies: the one arena allocation.
+
+    Summing a pool's per-layer view sizes would answer a different question
+    (and double-count aliased views), so read the owner directly.
+    """
+    return int(arena.buffer.nbytes)
 
 
 def _cache_storage_report(
@@ -113,19 +115,16 @@ def _cache_storage_report(
     fixed_workspace_bytes: int = 0,
 ) -> dict:
     """Describe cache storage from allocated tensors, not scheduler counts."""
-    plan = getattr(pool, "plan", None)
+    arena = getattr(pool, "arena", None)
+    plan = getattr(arena, "plan", None)
     if plan is None:
         raise RuntimeError("cache pool has no memory plan; every pool is LCM-planned")
     packing = {
         group.group_id: int(group.cache_blocks_per_lcm_block) for group in plan.groups
     }
-    physical_token_capacity = (
-        int(plan.num_lcm_blocks) * max(packing.values()) * int(plan.prefix_granularity)
-    )
-    if physical_token_capacity != int(pool.size):
-        raise RuntimeError(
-            "LCM geometry capacity does not match the allocated pool size"
-        )
+    # The arena is the one definition of child-token capacity; re-deriving it
+    # here only to compare against itself is what this report used to do.
+    physical_token_capacity = int(arena.size)
     geometry = {
         "prefix_granularity": int(plan.prefix_granularity),
         "num_lcm_blocks": int(plan.num_lcm_blocks),
@@ -141,7 +140,7 @@ def _cache_storage_report(
 
     # One pool: the draft "pool" is a layer-mapped view of the same buffer,
     # so the one allocation already covers both models' layers.
-    arena_bytes = _pool_allocated_bytes(pool)
+    arena_bytes = _arena_allocated_bytes(arena)
     allocated_cache_bytes = arena_bytes + fixed_workspace_bytes
     if allocated_cache_bytes > configured_cache_bytes:
         raise RuntimeError(
@@ -263,26 +262,6 @@ def _validate_lcm_page_size(
             "prefix granularity must be a positive multiple of kernel page "
             f"size, got {prefix_granularity} and {kernel_page_size}"
         )
-
-
-def _set_cache_group_block_granularities(
-    config: BaseAttnConfig, spec: CachePoolSpec
-) -> None:
-    """Publish each group's scheduler table grain to group-aware backends.
-
-    This seed must be per-group: under --enforce-eager the backend never runs
-    _learn_cache_groups (a CUDA-graph hook), so whatever is published here is
-    what group-table expansion uses.
-    """
-    if not hasattr(config, "group_block_granularities"):
-        return
-    grain_by_group = {
-        group_spec.group_id: group_spec.block_granularity
-        for group_spec in spec.paged_cache_group_specs
-    }
-    config.group_block_granularities = {
-        group_id: grain_by_group[group_id] for group_id in spec.layer_group_ids
-    }
 
 
 # ---------- arch -> config class ----------
@@ -416,7 +395,7 @@ def _create_hybrid_linear_attn_backend(
     )
 
     if is_kda:
-        # Paged cache contract: see CuteDSLMLABackend.mark_cache_contract.
+        # Cache contract: see CuteDSLMLABackend.mark_cache_contract.
         mark_cache_contract = getattr(full_attn_backend, "mark_cache_contract", None)
         if mark_cache_contract is not None:
             mark_cache_contract()
@@ -527,11 +506,11 @@ def _wrap_inkling_backend(
 
 def _inkling_conv_columns(pool, text_config):
     """Return the ShortConv checkpoint groups backed by the cache plan."""
-    layer_labels = text_config.paged_cache_layer_types
-    prefix_granularity = pool.plan.prefix_granularity
+    layer_labels = text_config.cache_layer_types
+    prefix_granularity = pool.arena.plan.prefix_granularity
     # The checkpoint grain belongs to the conv groups' own specs; P is only
     # the fallback when a group is absent from the plan.
-    specs_by_id = {spec.group_id: spec for spec in pool.paged_cache_group_specs}
+    specs_by_id = {spec.group_id: spec for spec in pool.arena.cache_group_specs}
 
     def conv_grain(group_id):
         spec = specs_by_id.get(group_id)
@@ -547,12 +526,12 @@ def _inkling_conv_columns(pool, text_config):
         },
         "pd_endpoint_snapshots": all(
             spec.transfer_policy == "latest_snapshot"
-            for spec in pool.paged_cache_group_specs
+            for spec in pool.arena.cache_group_specs
             if spec.group_id in ("kvconv", "hiddenconv")
         )
         and any(
             spec.group_id in ("kvconv", "hiddenconv")
-            for spec in pool.paged_cache_group_specs
+            for spec in pool.arena.cache_group_specs
         ),
     }
     logger.info(
@@ -616,39 +595,33 @@ def _create_target_components(
     model_config,
     config,
     cache_spec: CachePoolSpec,
+    arena: CacheArena,
     rank: int,
-    enable_memory_saver: bool,
     full_attn_backend_name: str | None,
     is_hybrid_linear: bool,
     is_kda: bool,
     is_inkling: bool,
 ):
-    """The ONE cache pool (target + draft continuation layers) + target backend."""
-    # The merged spec includes the draft's continuation layers; the pool
-    # binds every planned field regardless of which model consumes it.
+    """The target's compute view onto the shared arena + target backend."""
+    # The merged spec includes the draft's continuation layers; the target
+    # view binds every planned field regardless of which model consumes it.
     pool = create_cache_pool(
         cache_spec,
         config,
+        arena,
         num_layers=len(cache_spec.layer_group_ids),
         rank=rank,
-        enable_memory_saver=enable_memory_saver,
     )
     if is_hybrid_linear:
-        # Identity map, NOT a no-op: the wrapper is the per-view carrier of
-        # the MLA-write sanitize contract (LayerMappedKVPool.set_mla_kv_buffer
-        # forces sanitize=True for the hybrid chunked-prefill path). Target
-        # and draft share the ONE pool, so a pool-level flag could not
-        # express per-view sanitize semantics.
-        mapped = LayerMappedKVPool(pool, list(range(len(cache_spec.layer_group_ids))))
         backend = _create_hybrid_linear_attn_backend(
             server_args,
             model_config,
             config,
-            pool=mapped,
+            pool=pool,
             full_attn_backend_name=full_attn_backend_name,
             is_kda=is_kda,
         )
-        return backend, mapped
+        return backend, pool
 
     backend = _create_attn_backend(model_config.attention_arch, config)
     if not is_inkling:
@@ -679,54 +652,39 @@ def _create_draft_components(
     model_config,
     config,
     pool,
-    cache_spec: CachePoolSpec | None,
+    cache_spec: CachePoolSpec,
     num_target_layers: int,
     full_attn_backend_name: str | None,
+    is_heterogeneous: bool,
     is_hybrid_linear: bool,
     is_kda: bool,
     is_inkling: bool,
 ):
-    """Draft backend + the ONE pool viewed through the draft's layer window.
+    """Draft backend + the ONE arena viewed through the draft's layer window.
 
-    One big model, one pool: draft layers are continuation layers
-    (global ids ``num_target_layers..``) of the merged plan the target
-    pool already binds. The draft side needs no pool of its own — only a
-    LayerMappedKVPool translating its local layer ids onto the global
-    continuation range, exactly the mapping hybrid models already use.
+    One big model, one arena: draft layers are continuation layers of the
+    merged plan, so the draft pool is a second compute view whose
+    ``field_layer_offset`` places its LOCAL layer ids (a NextN draft's one
+    layer is layer 0) onto the continuation range. Nothing remaps ids on the
+    way through -- the view *is* the mapping, and an id outside the window is
+    rejected rather than silently offset onto another model's planes.
     """
     if config is None:
         return None, None
-    num_layers = model_config.num_attention_layers
-    if cache_spec is not None:
-        if is_hybrid_linear or is_inkling:
-            raise RuntimeError(
-                "heterogeneous cache views currently support ordinary drafts only"
-            )
-        # The draft pool is a compute view, not an allocation: it binds local
-        # layer 0..N to the merged plan's continuation fields while sharing
-        # the target's buffer and global field registry. Its transfer counter
-        # stays local/None; heterogeneous PD is rejected before construction.
-        draft_pool = create_cache_pool(
-            cache_spec,
-            config,
-            num_layers=num_layers,
-            rank=pool.rank,
-            enable_memory_saver=False,
-            field_layer_offset=num_target_layers,
-            backing_pool=pool,
+    if is_heterogeneous and (is_hybrid_linear or is_inkling):
+        raise RuntimeError(
+            "heterogeneous cache views currently support ordinary drafts only"
         )
-        backend = _create_attn_backend(model_config.attention_arch, config)
-        return backend, draft_pool
-    # Draft layers carry LOCAL ids (a NextN draft's one layer is layer 0);
-    # their planes are the merged plan's continuation range. The map must be
-    # {local: global} — the wrapper's default ({global: pool_idx}, the hybrid
-    # convention) is this map's INVERSE and would route every draft write to
-    # the target's first layers. Global ids (V4 MTP layers carry them) pass
-    # through _map's identity default unharmed.
-    draft_pool = LayerMappedKVPool(
-        pool,
-        [num_target_layers + local for local in range(num_layers)],
-        layer_map={local: num_target_layers + local for local in range(num_layers)},
+    num_layers = model_config.num_attention_layers
+    # The draft view's transfer counter stays local/None; heterogeneous PD is
+    # rejected before construction.
+    draft_pool = create_cache_pool(
+        cache_spec,
+        config,
+        pool.arena,
+        num_layers=num_layers,
+        rank=pool.rank,
+        field_layer_offset=num_target_layers,
     )
     if is_hybrid_linear:
         backend = _create_hybrid_linear_attn_backend(
@@ -811,7 +769,6 @@ def create_attn_components(
     CachePool,
     AttentionBackend | None,
     CachePool | None,
-    int,
     dict | None,
 ]:
     architectures = getattr(model_config.hf_config, "architectures", None) or []
@@ -977,34 +934,34 @@ def create_attn_components(
         overlap_schedule_depth=overlap_schedule_depth,
     )
     spec = cache_setup.spec
+    # The target view binds every planned field, draft continuation layers
+    # included, so the merged plan has one owner. The draft is a second view
+    # over the same arena, offset onto its own layer window.
     target_spec = spec
     draft_view_spec = None
-    if heterogeneous_draft_family is not None:
-        target_spec = spec.layer_view(
-            first_layer=0,
-            num_layers=cache_setup.num_target_layers,
-        )
+    if cache_setup.num_draft_layers:
         draft_view_spec = spec.layer_view(
             first_layer=cache_setup.num_target_layers,
             num_layers=cache_setup.num_draft_layers,
             family=heterogeneous_draft_family,
-            publish_runtime_contract=False,
+        )
+    if heterogeneous_draft_family is not None:
+        target_spec = spec.layer_view(
+            first_layer=0,
+            num_layers=cache_setup.num_target_layers,
         )
     prefix_granularity = spec.memory_plan.prefix_granularity
     _validate_lcm_page_size(
         config,
         prefix_granularity=prefix_granularity,
     )
-    _set_cache_group_block_granularities(config, spec)
     if draft_attn_config is not None:
         _validate_lcm_page_size(
             draft_attn_config,
             prefix_granularity=prefix_granularity,
         )
-        _set_cache_group_block_granularities(draft_attn_config, spec)
     cache_budget_bytes = cache_setup.cache_budget_bytes
     fixed_workspace_bytes = cache_setup.fixed_workspace_bytes
-    max_num_tokens = spec.pool_size
     logger.info(
         "Cache profile: parent_bytes=%d, P=%d, parents=%d, token_capacity=%d, "
         "layers=%d (draft %d), groups=%s",
@@ -1020,18 +977,20 @@ def create_attn_components(
         },
     )
 
-    if max_num_tokens <= 0:
-        raise ValueError(
-            f"KV cache token pool size must be positive, got {max_num_tokens}"
-        )
-
+    # One model, one arena: the merged plan's single allocation, which every
+    # compute view below (target, draft) is a layer window onto.
+    arena = create_cache_arena(
+        spec,
+        device=config.device,
+        enable_memory_saver=enable_memory_saver,
+    )
     backend, pool = _create_target_components(
         server_args=server_args,
         model_config=model_config,
         config=config,
         cache_spec=target_spec,
+        arena=arena,
         rank=rank,
-        enable_memory_saver=enable_memory_saver,
         full_attn_backend_name=target_full_attn_backend_name,
         is_hybrid_linear=is_hybrid_linear,
         is_kda=is_hybrid_mla_kda,
@@ -1045,6 +1004,7 @@ def create_attn_components(
         cache_spec=draft_view_spec,
         num_target_layers=cache_setup.num_target_layers,
         full_attn_backend_name=draft_full_attn_backend_name,
+        is_heterogeneous=heterogeneous_draft_family is not None,
         is_hybrid_linear=draft_is_hybrid_gdn or draft_is_hybrid_mla_kda,
         is_kda=draft_is_hybrid_mla_kda,
         is_inkling=any(a in _INKLING_ARCHITECTURES for a in draft_architectures),
@@ -1057,7 +1017,8 @@ def create_attn_components(
         if side_backend is None or side_pool is None:
             continue
         side_backend.set_cache_pool(side_pool)
-        if getattr(side_pool, "runtime_contract", None) is None:
+        side_arena = getattr(side_pool, "arena", None)
+        if getattr(side_arena, "runtime_contract", None) is None:
             continue
         mark_cache_contract = getattr(side_backend, "mark_cache_contract", None)
         if mark_cache_contract is None:
@@ -1085,6 +1046,5 @@ def create_attn_components(
         pool,
         draft_attn_backend,
         draft_pool,
-        max_num_tokens,
         cache_storage,
     )

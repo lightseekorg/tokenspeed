@@ -51,7 +51,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_sync_debug_enabled,
     log_gpu_memory_summary,
     make_config,
-    pool_to_paged_cache_groups,
+    pool_to_cache_groups,
     pop_common_cache_event_payloads,
     resolve_dspark_prefix_replay_tokens,
     scheduler_cache_geometry_from_pool,
@@ -242,7 +242,6 @@ class EventLoop:
             token_to_kv_pool,
             draft_attn_backend,
             draft_token_to_kv_pool,
-            self.max_total_num_tokens,
             self.cache_storage,
         ) = create_attn_components(
             server_args,
@@ -257,14 +256,13 @@ class EventLoop:
         )
 
         self._scheduler_cache_geometry = scheduler_cache_geometry_from_pool(
-            token_to_kv_pool,
-            fallback_token_capacity=self.max_total_num_tokens,
-            fallback_prefix_granularity=server_args.prefix_granularity,
+            token_to_kv_pool
         )
         geometry = self._scheduler_cache_geometry
+        # The contract is the one source of admitted capacity.
         self.max_total_num_tokens = geometry.token_capacity
         num_total_pages = geometry.num_device_pages
-        paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
+        cache_groups = pool_to_cache_groups(token_to_kv_pool)
         # Resolve the scheduler limit before ModelExecutorConfig sizes input
         # buffers. Lowering the limit is safe; a configured chunk smaller than
         # one state checkpoint block is rejected by aligned_max_scheduled_tokens instead of
@@ -273,7 +271,7 @@ class EventLoop:
         if server_args.enable_prefix_caching:
             max_scheduled_tokens = aligned_max_scheduled_tokens(
                 server_args.chunked_prefill_size,
-                paged_cache_groups,
+                cache_groups,
             )
             if max_scheduled_tokens != server_args.chunked_prefill_size:
                 logger.warning(
@@ -379,7 +377,7 @@ class EventLoop:
             "decode",
         )
         if self._pd_cache_enabled:
-            if not token_to_kv_pool.supports_disaggregation:
+            if not token_to_kv_pool.arena.supports_disaggregation:
                 raise RuntimeError(
                     "PD disaggregation requires a unified cache contract"
                 )
@@ -418,7 +416,7 @@ class EventLoop:
                 )
         # Backend/pool compatibility is validated inside ModelExecutor
         # (validate_scheduler_config), before CUDA-graph capture.
-        self._paged_cache_groups = paged_cache_groups
+        self._cache_groups = cache_groups
         scheduler_cfg = make_config(
             num_device_pages=geometry.num_device_pages,
             max_scheduled_tokens=max_scheduled_tokens,
@@ -433,7 +431,7 @@ class EventLoop:
             overlap_schedule_depth=self.overlap_schedule_depth,
             disable_prefix_cache=not server_args.enable_prefix_caching,
             prefix_replay_tokens=prefix_replay_tokens,
-            paged_cache_groups=paged_cache_groups,
+            cache_groups=cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         )
         scheduler_cfg.enable_pd_cache = self._pd_cache_enabled
@@ -443,7 +441,7 @@ class EventLoop:
             "overlap_schedule_depth=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
             "disable_prefix_cache=%s prefix_replay_tokens=%s "
-            "paged_cache_groups=%s",
+            "cache_groups=%s",
             scheduler_cfg.prefix_granularity,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
@@ -455,7 +453,7 @@ class EventLoop:
             self.dp_size,
             scheduler_cfg.disable_prefix_cache,
             scheduler_cfg.prefix_replay_tokens,
-            [group.group_id for group in paged_cache_groups],
+            [group.group_id for group in cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
         self.max_single_request_tokens = self.scheduler.max_single_request_tokens()
@@ -481,7 +479,7 @@ class EventLoop:
             self.max_model_len,
             self.max_req_input_len,
         )
-        token_to_kv_pool.bind_paged_cache_scheduler(self.scheduler)
+        token_to_kv_pool.bind_cache_scheduler(self.scheduler)
         if attn_tp_rank == 0:
             self.kv_event_publisher = EventPublisherFactory.create(
                 server_args.kv_events_config,
