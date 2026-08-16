@@ -36,16 +36,13 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 @dataclass
 class MHAConfig(BaseAttnConfig):
     # Per-layer attention-type labels + window, forwarded to the KV pool for
-    # paged_cache_group_specs publication (empty -> single full-history group).
+    # cache_group_specs publication (empty -> single full-history group).
     layer_types: tuple[str, ...] = ()
     sliding_window_tokens: int | tuple[int | None, ...] | None = None
     max_scheduled_tokens: int = 0
     # True iff server_args.disaggregation_mode != "null"; cache recipes use
-    # it to stamp transfer policies onto the paged-cache group specs.
+    # it to stamp transfer policies onto the cache group specs.
     pd_disaggregation_enabled: bool = False
-    # Per-group scheduler page sizes, published by the registry for
-    # group-aware backends (backends/cache_groups.py).
-    group_block_granularities: dict[str, int] | None = None
     layer_kv_head_counts: tuple[int, ...] | None = None
 
     @classmethod
@@ -68,9 +65,9 @@ class MHAConfig(BaseAttnConfig):
             kv_cache_dtype = "bfloat16"
 
         hf_config = getattr(model_config, "hf_config", None)
-        # paged_cache_layer_types wins: it can carry labels outside transformers' ALLOWED_LAYER_TYPES
+        # cache_layer_types wins: it can carry labels outside transformers' ALLOWED_LAYER_TYPES
         layer_types = tuple(
-            getattr(hf_config, "paged_cache_layer_types", None)
+            getattr(hf_config, "cache_layer_types", None)
             or getattr(hf_config, "layer_types", None)
             or ()
         )

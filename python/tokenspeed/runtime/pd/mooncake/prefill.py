@@ -49,7 +49,7 @@ from tokenspeed.runtime.pd.mooncake.entities import (
 )
 from tokenspeed.runtime.pd.transfer_plan import (
     CacheTransferFragment,
-    PagedCacheTransferPlanner,
+    CacheTransferPlanner,
 )
 from tokenspeed.runtime.pd.utils import (
     DisaggregationMode,
@@ -290,7 +290,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         peer_layout = registration.peer_cache_layout
         prefill_tp_size = self.world_size // self.dp_size
         local_tp_rank = self.attn_tp_rank % prefill_tp_size
-        planner = PagedCacheTransferPlanner(
+        planner = CacheTransferPlanner(
             prefill_tp_size=prefill_tp_size,
             decode_tp_size=registration.decode_tp_size,
             prefill_layout=layout,

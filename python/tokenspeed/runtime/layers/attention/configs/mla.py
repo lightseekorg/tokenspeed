@@ -80,7 +80,7 @@ class MLAConfig(BaseAttnConfig):
             )
         hf_config = getattr(model_config, "hf_config", None)
         layer_types = tuple(
-            getattr(hf_config, "paged_cache_layer_types", None)
+            getattr(hf_config, "cache_layer_types", None)
             or getattr(hf_config, "layer_types", None)
             or ()
         )

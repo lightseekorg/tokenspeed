@@ -37,6 +37,13 @@ from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4ForwardMetadata,
 )
+from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
+    DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
+    V4_KERNEL_BLOCK_ROWS,
+    deepseek_v4_swa_row_bytes,
+    first_v4_compressed_kv_group_id,
+    v4_compressed_kv_group_id,
+)
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_build_dense_prefill_local_compressed_indices,
     deepseek_v4_combine_dense_swa_indices,
@@ -52,15 +59,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
     _split_block_tables_into_v4_metadata,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec import (
-    DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
-    V4_KERNEL_BLOCK_ROWS,
-    deepseek_v4_swa_row_bytes,
-    first_v4_compressed_kv_group_id,
-    v4_compressed_kv_group_id,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    PagedCacheGroupSpec,
+    CacheGroupSpec,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -245,7 +245,7 @@ def _refresh_decode_indexer_schedule_metadata(
 class DeepseekV4AttentionBackend(AttentionBackend):
     """Metadata owner for the model-local DeepSeek V4 attention path."""
 
-    uses_paged_cache_groups = True
+    needs_group_block_tables = True
     uses_cache_groups = True
     cache_group_tables_replace_draft_page_table = True
     cache_active_pages_must_be_real = True
@@ -338,10 +338,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
 
     def _configure_cache_group_contract(
         self,
-        paged_cache_group_specs=(),
-        paged_cache_group_page_counts=None,
+        cache_group_specs=(),
+        cache_group_page_counts=None,
     ) -> tuple[tuple[object, ...], dict[str, int]]:
-        specs = tuple(paged_cache_group_specs or ())
+        specs = tuple(cache_group_specs or ())
         group_ids = tuple(getattr(spec, "group_id", None) for spec in specs)
         if any(not isinstance(group_id, str) or not group_id for group_id in group_ids):
             raise RuntimeError(
@@ -349,7 +349,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
         if len(group_ids) != len(set(group_ids)):
             raise RuntimeError("DeepSeek V4 cache group specs contain duplicate IDs")
-        page_counts = dict(paged_cache_group_page_counts or {})
+        page_counts = dict(cache_group_page_counts or {})
         if not group_ids:
             if page_counts:
                 raise RuntimeError(
@@ -406,8 +406,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
 
     def configure_runtime(self, **kwargs) -> None:
         self._configure_cache_group_contract(
-            kwargs.pop("paged_cache_group_specs", ()),
-            kwargs.pop("paged_cache_group_page_counts", None),
+            kwargs.pop("cache_group_specs", ()),
+            kwargs.pop("cache_group_page_counts", None),
         )
 
     def _prepare_cache_group_tables(
@@ -592,7 +592,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
 
     def _cuda_graph_group_table_width(
         self,
-        spec: PagedCacheGroupSpec,
+        spec: CacheGroupSpec,
         *,
         max_tokens_per_req: int,
         overlap_schedule_depth: int,
@@ -1144,7 +1144,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
 
         cache_metadata = metadata.cache
         if cache_metadata.swa_page_table is None:
-            raise RuntimeError("DeepSeek V4 missing paged-cache block table for SWA KV")
+            raise RuntimeError("DeepSeek V4 missing cache-group block table for SWA KV")
         swa_page_table = cache_metadata.swa_page_table
         indices, lens = deepseek_v4_decode_swa_indices_and_lens(
             query_start_loc=metadata.query_start_loc,
@@ -1588,7 +1588,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             torch.full_like(prefix_lens, max(window_size - 1, 0)),
         )
         if cache_metadata.swa_page_table is None:
-            raise RuntimeError("DeepSeek V4 missing paged-cache block table for SWA KV")
+            raise RuntimeError("DeepSeek V4 missing cache-group block table for SWA KV")
         swa_page_table = cache_metadata.swa_page_table
         max_gather_len = int(gather_lens.max().item()) if num_reqs else 1
         compressed_lens = (
@@ -1977,8 +1977,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
-        paged_cache_group_specs=(),
-        paged_cache_group_page_counts=None,
+        cache_group_specs=(),
+        cache_group_page_counts=None,
         max_tokens_per_req: int = 1,
         overlap_schedule_depth: int = 0,
     ):
@@ -2041,8 +2041,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._cuda_graph_max_bs = max_bs
         self._cuda_graph_block_tables = {}
         specs, _ = self._configure_cache_group_contract(
-            paged_cache_group_specs,
-            paged_cache_group_page_counts,
+            cache_group_specs,
+            cache_group_page_counts,
         )
         group_ids = self._expected_cache_group_ids
         assert group_ids is not None
@@ -2097,14 +2097,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             if table is not None:
                 if int(table.shape[0]) < active_rows:
                     raise RuntimeError(
-                        "DeepSeek V4 CUDA graph paged cache table row count "
+                        "DeepSeek V4 CUDA graph cache-group table row count "
                         f"mismatch for {group_id!r}: got {int(table.shape[0])}, "
                         f"expected at least actual_bs {active_rows}"
                     )
                 cols = int(table.shape[1])
                 if cols > int(buf.shape[1]):
                     raise RuntimeError(
-                        "DeepSeek V4 CUDA graph paged cache table width "
+                        "DeepSeek V4 CUDA graph cache-group table width "
                         f"mismatch for {group_id!r}: got {cols}, capture "
                         f"buffer has {int(buf.shape[1])}"
                     )

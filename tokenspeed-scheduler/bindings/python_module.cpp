@@ -91,53 +91,53 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("D", tokenspeed::Role::kD)
         .value("Fused", tokenspeed::Role::kFused);
 
-    nb::enum_<tokenspeed::PagedCacheGroupConfig::Retention>(m, "PagedCacheRetention")
-        .value("FullHistory", tokenspeed::PagedCacheGroupConfig::Retention::FullHistory)
-        .value("SlidingWindow", tokenspeed::PagedCacheGroupConfig::Retention::SlidingWindow);
+    nb::enum_<tokenspeed::CacheGroupConfig::Retention>(m, "CacheRetention")
+        .value("FullHistory", tokenspeed::CacheGroupConfig::Retention::FullHistory)
+        .value("SlidingWindow", tokenspeed::CacheGroupConfig::Retention::SlidingWindow);
 
-    nb::enum_<tokenspeed::PagedCacheGroupFamily>(m, "PagedCacheGroupFamily")
-        .value("History", tokenspeed::PagedCacheGroupFamily::History)
-        .value("State", tokenspeed::PagedCacheGroupFamily::State);
+    nb::enum_<tokenspeed::CacheGroupFamily>(m, "CacheGroupFamily")
+        .value("History", tokenspeed::CacheGroupFamily::History)
+        .value("State", tokenspeed::CacheGroupFamily::State);
 
-    nb::enum_<tokenspeed::PagedCacheTransferPolicy>(m, "PagedCacheTransferPolicy")
-        .value("Unspecified", tokenspeed::PagedCacheTransferPolicy::Unspecified)
-        .value("FullSuffix", tokenspeed::PagedCacheTransferPolicy::FullSuffix)
-        .value("LatestSnapshot", tokenspeed::PagedCacheTransferPolicy::LatestSnapshot);
+    nb::enum_<tokenspeed::CacheTransferPolicy>(m, "CacheTransferPolicy")
+        .value("Unspecified", tokenspeed::CacheTransferPolicy::Unspecified)
+        .value("FullSuffix", tokenspeed::CacheTransferPolicy::FullSuffix)
+        .value("LatestSnapshot", tokenspeed::CacheTransferPolicy::LatestSnapshot);
 
-    nb::class_<tokenspeed::PagedCacheGroupConfig>(m, "PagedCacheGroupConfig")
+    nb::class_<tokenspeed::CacheGroupConfig>(m, "CacheGroupConfig")
         .def(nb::init<>())
         .def(
             "__init__",
-            [](tokenspeed::PagedCacheGroupConfig* self, std::string group_id, std::int32_t rows_per_page,
+            [](tokenspeed::CacheGroupConfig* self, std::string group_id, std::int32_t rows_per_page,
                std::int32_t entry_stride_tokens, std::int32_t total_pages,
-               tokenspeed::PagedCacheGroupConfig::Retention retention,
-               std::optional<std::int32_t> sliding_window_tokens, tokenspeed::PagedCacheGroupFamily family,
-               std::int32_t cache_blocks_per_lcm_block, tokenspeed::PagedCacheTransferPolicy transfer_policy) {
-                new (self) tokenspeed::PagedCacheGroupConfig{std::move(group_id),
-                                                             rows_per_page,
-                                                             entry_stride_tokens,
-                                                             total_pages,
-                                                             cache_blocks_per_lcm_block,
-                                                             retention,
-                                                             sliding_window_tokens,
-                                                             family,
-                                                             transfer_policy};
+               tokenspeed::CacheGroupConfig::Retention retention, std::optional<std::int32_t> sliding_window_tokens,
+               tokenspeed::CacheGroupFamily family, std::int32_t cache_blocks_per_lcm_block,
+               tokenspeed::CacheTransferPolicy transfer_policy) {
+                new (self) tokenspeed::CacheGroupConfig{std::move(group_id),
+                                                        rows_per_page,
+                                                        entry_stride_tokens,
+                                                        total_pages,
+                                                        cache_blocks_per_lcm_block,
+                                                        retention,
+                                                        sliding_window_tokens,
+                                                        family,
+                                                        transfer_policy};
             },
             nb::arg("group_id"), nb::arg("rows_per_page"), nb::arg("entry_stride_tokens"), nb::arg("total_pages"),
-            nb::arg("retention") = tokenspeed::PagedCacheGroupConfig::Retention::FullHistory,
-            nb::arg("sliding_window_tokens") = std::nullopt,
-            nb::arg("family") = tokenspeed::PagedCacheGroupFamily::History, nb::arg("cache_blocks_per_lcm_block") = 1,
-            nb::arg("transfer_policy") = tokenspeed::PagedCacheTransferPolicy::Unspecified)
-        .def_rw("group_id", &tokenspeed::PagedCacheGroupConfig::group_id)
-        .def_rw("rows_per_page", &tokenspeed::PagedCacheGroupConfig::rows_per_page)
-        .def_rw("entry_stride_tokens", &tokenspeed::PagedCacheGroupConfig::entry_stride_tokens)
-        .def_rw("total_pages", &tokenspeed::PagedCacheGroupConfig::total_pages)
-        .def_rw("cache_blocks_per_lcm_block", &tokenspeed::PagedCacheGroupConfig::cache_blocks_per_lcm_block)
-        .def_rw("retention", &tokenspeed::PagedCacheGroupConfig::retention)
-        .def_rw("sliding_window_tokens", &tokenspeed::PagedCacheGroupConfig::sliding_window_tokens)
-        .def_rw("family", &tokenspeed::PagedCacheGroupConfig::family)
-        .def_rw("transfer_policy", &tokenspeed::PagedCacheGroupConfig::transfer_policy)
-        .def("validate", &tokenspeed::PagedCacheGroupConfig::Validate);
+            nb::arg("retention") = tokenspeed::CacheGroupConfig::Retention::FullHistory,
+            nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("family") = tokenspeed::CacheGroupFamily::History,
+            nb::arg("cache_blocks_per_lcm_block") = 1,
+            nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified)
+        .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
+        .def_rw("rows_per_page", &tokenspeed::CacheGroupConfig::rows_per_page)
+        .def_rw("entry_stride_tokens", &tokenspeed::CacheGroupConfig::entry_stride_tokens)
+        .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
+        .def_rw("cache_blocks_per_lcm_block", &tokenspeed::CacheGroupConfig::cache_blocks_per_lcm_block)
+        .def_rw("retention", &tokenspeed::CacheGroupConfig::retention)
+        .def_rw("sliding_window_tokens", &tokenspeed::CacheGroupConfig::sliding_window_tokens)
+        .def_rw("family", &tokenspeed::CacheGroupConfig::family)
+        .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
+        .def("validate", &tokenspeed::CacheGroupConfig::Validate);
 
     scheduler_config.def(nb::init<>())
         .def_rw("prefix_granularity", &tokenspeed::SchedulerConfig::prefix_granularity)
@@ -153,7 +153,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_prop_rw(
             "num_host_pages", [](const tokenspeed::SchedulerConfig& c) { return c.host_allocator.total_pages; },
             [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.host_allocator.total_pages = v; })
-        .def_rw("paged_cache_groups", &tokenspeed::SchedulerConfig::paged_cache_groups)
+        .def_rw("cache_groups", &tokenspeed::SchedulerConfig::cache_groups)
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
@@ -326,7 +326,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
         .def("clear_cache", &tokenspeed::Scheduler::ClearCache)
-        .def("paged_cache_group_total_pages", &tokenspeed::Scheduler::PagedCacheGroupTotalPages, nb::arg("group_id"))
-        .def("paged_cache_group_available_pages", &tokenspeed::Scheduler::PagedCacheGroupAvailablePages,
-             nb::arg("group_id"));
+        .def("cache_group_total_pages", &tokenspeed::Scheduler::CacheGroupTotalPages, nb::arg("group_id"))
+        .def("cache_group_available_pages", &tokenspeed::Scheduler::CacheGroupAvailablePages, nb::arg("group_id"));
 }

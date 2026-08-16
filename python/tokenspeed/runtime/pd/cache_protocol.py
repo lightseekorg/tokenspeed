@@ -42,7 +42,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     MXFP8_KV_SCALE_TILE_TOKENS,
-    PagedCacheGroupSpec,
+    CacheGroupSpec,
     Retention,
     TransferPolicy,
 )
@@ -303,9 +303,7 @@ class CacheTransferContract:
     """Thin PD wire envelope around the cache-owned plan and group specs."""
 
     plan: CacheMemoryPlan
-    group_specs: tuple[PagedCacheGroupSpec, ...]
-    # Dtypes align positionally with plan.fields; field IDs stay plan-owned.
-    field_dtypes: tuple[str, ...]
+    group_specs: tuple[CacheGroupSpec, ...]
     transfer_schema: CacheTransferSchema = CacheTransferSchema()
 
     def __post_init__(self) -> None:
@@ -320,10 +318,7 @@ class CacheTransferContract:
         )
 
     def field_dtype(self, field_id: str) -> str:
-        for field, dtype in zip(self.plan.fields, self.field_dtypes, strict=True):
-            if field.field_id == field_id:
-                return dtype
-        raise KeyError(field_id)
+        return self.plan.field(field_id).dtype
 
     def to_wire_bytes(self) -> bytes:
         return _dump_wire_json(
@@ -365,9 +360,8 @@ class CacheTransferContract:
             return cls(
                 plan=plan,
                 group_specs=tuple(
-                    PagedCacheGroupSpec(**spec) for spec in payload["group_specs"]
+                    CacheGroupSpec(**spec) for spec in payload["group_specs"]
                 ),
-                field_dtypes=tuple(payload["field_dtypes"]),
                 transfer_schema=CacheTransferSchema(
                     tuple(
                         CacheFieldTransferSpec(
@@ -390,11 +384,10 @@ def build_cache_transfer_contract(
     *,
     plan: CacheMemoryPlan,
     buffer: object,
-    group_specs: Sequence[PagedCacheGroupSpec],
-    field_dtypes: Mapping[str, str],
+    group_specs: Sequence[CacheGroupSpec],
     transfer_schema: CacheTransferSchema = CacheTransferSchema(),
 ) -> tuple[CacheTransferContract, int]:
-    """Bind one cache memory plan to its semantics, dtypes, and raw slab."""
+    """Bind one cache memory plan to its semantics and raw slab."""
     specs = tuple(group_specs)
     plan_group_ids = tuple(group.group_id for group in plan.groups)
     spec_group_ids = tuple(spec.group_id for spec in specs)
@@ -404,15 +397,9 @@ def build_cache_transfer_contract(
             f"missing={sorted(set(plan_group_ids) - set(spec_group_ids))}, "
             f"extra={sorted(set(spec_group_ids) - set(plan_group_ids))}"
         )
-    expected_field_ids = {field.field_id for field in plan.fields}
-    if set(field_dtypes) != expected_field_ids:
-        raise CacheContractError(
-            "cache field dtype map must contain exactly the planned fields"
-        )
     contract = CacheTransferContract(
         plan=plan,
         group_specs=specs,
-        field_dtypes=tuple(field_dtypes[field.field_id] for field in plan.fields),
         transfer_schema=transfer_schema,
     )
     if (
@@ -428,18 +415,16 @@ def build_cache_transfer_contract(
     return contract, buffer.data_ptr()
 
 
-def build_pool_cache_transfer_contract(
-    pool: object,
+def build_arena_cache_transfer_contract(
+    arena: object,
     *,
     transfer_schema: CacheTransferSchema = CacheTransferSchema(),
 ) -> tuple[CacheTransferContract, int]:
-    """Build the PD wire envelope from the cache-owned arena binding."""
-    buffer, field_dtypes = pool.cache_contract_binding()
+    """Build the PD wire envelope from the cache arena it transfers."""
     return build_cache_transfer_contract(
-        plan=pool.plan,
-        buffer=buffer,
-        group_specs=pool.paged_cache_group_specs,
-        field_dtypes=field_dtypes,
+        plan=arena.plan,
+        buffer=arena.contract_binding(),
+        group_specs=arena.cache_group_specs,
         transfer_schema=transfer_schema,
     )
 
@@ -641,9 +626,8 @@ def validate_cache_peer_layout(
             if peer_partition is not None:
                 peer_global_shape[peer_partition.axis] = peer_partition.global_extent
             if (
-                layout.field_dtype(local_field.field_id)
-                != peer_layout.field_dtype(peer_field.field_id)
-                or local_field.element_size != peer_field.element_size
+                # element_size derives from dtype, so one comparison covers both.
+                local_field.dtype != peer_field.dtype
                 or local_partition != peer_partition
                 or tuple(local_global_shape) != tuple(peer_global_shape)
             ):
@@ -863,7 +847,7 @@ __all__ = [
     "build_cache_page_manifest",
     "build_cache_transfer_schema",
     "build_cache_transfer_contract",
-    "build_pool_cache_transfer_contract",
+    "build_arena_cache_transfer_contract",
     "validate_cache_manifest",
     "validate_cache_peer_layout",
 ]

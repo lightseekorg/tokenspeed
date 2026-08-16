@@ -30,12 +30,12 @@ import numpy as np
 import torch
 from tokenspeed_scheduler import (
     Cache,
+    CacheGroupConfig,
+    CacheGroupFamily,
+    CacheRetention,
+    CacheTransferPolicy,
     ExecutionEvent,
     ForwardEvent,
-    PagedCacheGroupConfig,
-    PagedCacheGroupFamily,
-    PagedCacheRetention,
-    PagedCacheTransferPolicy,
     RequestSpec,
     SchedulerConfig,
 )
@@ -53,18 +53,18 @@ if hasattr(Cache, "LoadBackDoneEvent"):
     _CACHE_EVENT_TYPES["LoadBackDoneEvent"] = Cache.LoadBackDoneEvent
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
-# Pool-spec string -> scheduler enum (pool_to_paged_cache_groups).
+# Pool-spec string -> scheduler enum (pool_to_cache_groups).
 _RETENTION_MAP = {
-    "full_history": PagedCacheRetention.FullHistory,
-    "sliding_window": PagedCacheRetention.SlidingWindow,
+    "full_history": CacheRetention.FullHistory,
+    "sliding_window": CacheRetention.SlidingWindow,
 }
 _FAMILY_MAP = {
-    "history": PagedCacheGroupFamily.History,
-    "state": PagedCacheGroupFamily.State,
+    "history": CacheGroupFamily.History,
+    "state": CacheGroupFamily.State,
 }
 _TRANSFER_POLICY_MAP = {
-    "full_suffix": PagedCacheTransferPolicy.FullSuffix,
-    "latest_snapshot": PagedCacheTransferPolicy.LatestSnapshot,
+    "full_suffix": CacheTransferPolicy.FullSuffix,
+    "latest_snapshot": CacheTransferPolicy.LatestSnapshot,
 }
 
 
@@ -76,77 +76,29 @@ class SchedulerCacheGeometry:
     token_capacity: int
 
 
-def scheduler_cache_geometry_from_pool(
-    pool: Any,
-    *,
-    fallback_token_capacity: int,
-    fallback_prefix_granularity: int,
-) -> SchedulerCacheGeometry:
-    contract = getattr(pool, "runtime_contract", None)
-    num_lcm_blocks = getattr(pool, "num_lcm_blocks", None)
-    if num_lcm_blocks is not None:
-        num_lcm_blocks = require_positive_int("num_lcm_blocks", num_lcm_blocks)
-        if contract is not None and contract.num_lcm_blocks != num_lcm_blocks:
-            raise ValueError("pool and runtime contract disagree on num_lcm_blocks")
-        return SchedulerCacheGeometry(
-            prefix_granularity=require_positive_int(
-                (
-                    "contract.prefix_granularity"
-                    if contract is not None
-                    else "fallback_prefix_granularity"
-                ),
-                (
-                    contract.prefix_granularity
-                    if contract is not None
-                    else fallback_prefix_granularity
-                ),
-            ),
-            # Parent 0 is reserved as the null LCM block.
-            num_device_pages=num_lcm_blocks + 1,
-            num_usable_pages=num_lcm_blocks,
-            token_capacity=require_positive_int(
-                (
-                    "contract.token_capacity"
-                    if contract is not None
-                    else "fallback_token_capacity"
-                ),
-                (
-                    contract.token_capacity
-                    if contract is not None
-                    else fallback_token_capacity
-                ),
-            ),
-        )
-    if contract is not None:
-        num_lcm_blocks = require_positive_int(
-            "contract.num_lcm_blocks", contract.num_lcm_blocks
-        )
-        return SchedulerCacheGeometry(
-            prefix_granularity=contract.prefix_granularity,
-            num_device_pages=num_lcm_blocks + 1,
-            num_usable_pages=num_lcm_blocks,
-            token_capacity=contract.token_capacity,
-        )
-    if fallback_prefix_granularity <= 0 or fallback_token_capacity <= 0:
-        raise ValueError("fallback scheduler cache geometry must be positive")
-    if fallback_token_capacity % fallback_prefix_granularity:
-        raise ValueError(
-            "fallback token capacity must be divisible by the fallback prefix granularity"
-        )
-    pages = fallback_token_capacity // fallback_prefix_granularity
+def scheduler_cache_geometry_from_pool(pool: Any) -> SchedulerCacheGeometry:
+    """Project the arena's published contract onto scheduler page counts.
+
+    The contract is the only source: the arena publishes it for every pool,
+    so there is no pool-side copy to prefer and no server-args fallback to
+    reconcile against.
+    """
+    contract = pool.arena.runtime_contract
+    num_lcm_blocks = require_positive_int(
+        "contract.num_lcm_blocks", contract.num_lcm_blocks
+    )
     return SchedulerCacheGeometry(
-        prefix_granularity=fallback_prefix_granularity,
-        # Ordinary pools allocate page 0 separately from their profiled,
-        # usable token capacity, just like LCM pools reserve parent 0.
-        num_device_pages=pages + 1,
-        num_usable_pages=pages,
-        token_capacity=fallback_token_capacity,
+        prefix_granularity=contract.prefix_granularity,
+        # Parent 0 is reserved as the null LCM block.
+        num_device_pages=num_lcm_blocks + 1,
+        num_usable_pages=num_lcm_blocks,
+        token_capacity=contract.token_capacity,
     )
 
 
 def aligned_max_scheduled_tokens(
     max_scheduled_tokens: int,
-    paged_cache_groups,
+    cache_groups,
 ) -> int:
     """Floor ``max_scheduled_tokens`` to the state-snapshot grain, if any.
 
@@ -162,8 +114,8 @@ def aligned_max_scheduled_tokens(
     Args:
         max_scheduled_tokens: Requested per-step token budget
             (``--chunked-prefill-size``).
-        paged_cache_groups: Scheduler ``PagedCacheGroupConfig`` sequence, or
-            None/empty when the model declares no paged cache groups.
+        cache_groups: Scheduler ``CacheGroupConfig`` sequence, or
+            None/empty when the model declares no cache groups.
     Returns:
         ``max_scheduled_tokens`` floored to the LCM of the state groups'
         CacheBlock token spans. Returned unchanged when no such group exists
@@ -176,10 +128,10 @@ def aligned_max_scheduled_tokens(
     """
     require_positive_int("max_scheduled_tokens", max_scheduled_tokens)
     grain = 1
-    for group in paged_cache_groups or ():
-        if group.family != PagedCacheGroupFamily.State:
+    for group in cache_groups or ():
+        if group.family != CacheGroupFamily.State:
             continue
-        if group.retention == PagedCacheRetention.SlidingWindow:
+        if group.retention == CacheRetention.SlidingWindow:
             continue
         grain = math.lcm(
             grain,
@@ -216,7 +168,7 @@ def make_config(
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
     disable_prefix_cache: bool = False,
-    paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
+    cache_groups: Sequence["CacheGroupConfig"] | None = None,
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
 ) -> SchedulerConfig:
@@ -248,34 +200,31 @@ def make_config(
     cfg.disable_l2_cache = disable_l2_cache
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
-    if paged_cache_groups:
-        cfg.paged_cache_groups = list(paged_cache_groups)
+    if cache_groups:
+        cfg.cache_groups = list(cache_groups)
     return cfg
 
 
-def pool_to_paged_cache_groups(pool: Any) -> list:
-    """Convert authoritative contract specs, or legacy pool properties."""
-    contract = getattr(pool, "runtime_contract", None)
-    if contract is not None:
-        specs = contract.group_specs
-        counts = contract.group_page_counts
-    else:
-        specs = pool.paged_cache_group_specs
-        counts = pool.paged_cache_group_page_counts
-    if not specs:
-        return []
+def pool_to_cache_groups(pool: Any) -> list:
+    """Convert a cache's published contract into scheduler group configs."""
+    # The arena is the sole publisher, so there is exactly one source here --
+    # no fallback to pool-side copies of the same specs.
+    contract = pool.arena.runtime_contract
+    specs = contract.group_specs
+    counts = contract.group_page_counts
+    packing = contract.group_packing
     out = []
     for spec in specs:
         retention = _RETENTION_MAP.get(spec.retention)
         if retention is None:
             raise ValueError(
-                f"pool_to_paged_cache_groups: unsupported retention "
+                f"pool_to_cache_groups: unsupported retention "
                 f"{spec.retention!r} for group {spec.group_id!r}"
             )
         family = _FAMILY_MAP.get(spec.family)
         if family is None:
             raise ValueError(
-                f"pool_to_paged_cache_groups: unsupported family "
+                f"pool_to_cache_groups: unsupported family "
                 f"{spec.family!r} for group {spec.group_id!r}"
             )
         # The C++ scheduler config only carries row geometry. A snapshot-state
@@ -294,22 +243,20 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
             total_pages=int(counts[spec.group_id]),
             retention=retention,
             family=family,
-            cache_blocks_per_lcm_block=int(
-                getattr(spec, "cache_blocks_per_lcm_block", 1)
-            ),
+            cache_blocks_per_lcm_block=int(packing[spec.group_id]),
         )
-        transfer_policy = getattr(spec, "transfer_policy", None)
+        transfer_policy = spec.transfer_policy
         if transfer_policy is not None:
             mapped_policy = _TRANSFER_POLICY_MAP.get(transfer_policy)
             if mapped_policy is None:
                 raise ValueError(
-                    "pool_to_paged_cache_groups: unsupported transfer policy "
+                    "pool_to_cache_groups: unsupported transfer policy "
                     f"{transfer_policy!r} for group {spec.group_id!r}"
                 )
             kwargs["transfer_policy"] = mapped_policy
         if spec.retention == "sliding_window":
             kwargs["sliding_window_tokens"] = int(spec.sliding_window_tokens)
-        out.append(PagedCacheGroupConfig(**kwargs))
+        out.append(CacheGroupConfig(**kwargs))
     return out
 
 
@@ -640,10 +587,9 @@ def _classify_param(name: str) -> str:
 def _kv_pool_bytes(*pools) -> int:
     """Best-effort total KV-buffer bytes across the given pools, deduped.
 
-    A draft pool is a ``LayerMappedKVPool`` view of the target's merged pool
-    (draft KV lives in the target arena), and its ``get_kv_size_bytes`` forwards
-    to that same inner pool -- so counting target + draft naively would double
-    the KV. Dedupe by the underlying (unwrapped) pool identity first.
+    Target and draft are two compute views of the ONE arena (draft KV lives
+    in the target's arena), so counting both naively would double the KV.
+    Dedupe by arena identity -- the allocation each view reports on.
 
     Return types differ (int, or a tuple like MSA's (kv, index); a hybrid pool
     may nest several) -- sum any numeric leaves.
@@ -653,10 +599,10 @@ def _kv_pool_bytes(*pools) -> int:
     for pool in pools:
         if pool is None:
             continue
-        underlying = getattr(pool, "inner", pool)
-        if id(underlying) in seen:
+        arena = getattr(pool, "arena", pool)
+        if id(arena) in seen:
             continue
-        seen.add(id(underlying))
+        seen.add(id(arena))
         getter = getattr(pool, "get_kv_size_bytes", None)
         if getter is None:
             continue

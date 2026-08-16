@@ -71,7 +71,7 @@ class CacheGroupsMixin:
     cache_consumer_families = frozenset({"history"})
 
     # family="state" group ids (GDN/mamba state blocks); learned from the
-    # pool's specs in init_cuda_graph_state, shed from every table here.
+    # pool's specs in set_cache_pool, shed from every table here.
     state_group_ids: frozenset[str] = frozenset()
 
     # Wrapper-owned (Inkling conv) groups: mixin skips their write-loc math and capture buffers
@@ -175,26 +175,39 @@ class CacheGroupsMixin:
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Learned from the pool by _learn_cache_groups / set_cache_pool;
-        # init_cuda_graph_state is never reached under --enforce-eager, so
-        # establish the empty state at construction.
+        # Empty until the pool arrives; set_cache_pool runs before any
+        # metadata init, on both the eager and the CUDA-graph path.
         self.state_group_ids: frozenset[str] = frozenset()
         self.group_block_granularities: dict[str, int] = {}
         self.cache_pool: CachePool | None = None
 
-    def _learn_cache_groups(self, paged_cache_group_specs) -> None:
-        """Record the pool's family="state" group ids (see
-        state_group_ids) and per-group page sizes (heterogeneous block
-        sizes); called from init_cuda_graph_state, the one place the pool's
-        specs reach every backend."""
+    def set_cache_pool(self, cache_pool: CachePool) -> None:
+        """Bind the pool and learn its groups in one step.
+
+        The arena's published specs are the only source of group geometry, so
+        binding is also when learning happens -- no second seeding path that
+        could answer differently on the eager arm.
+        """
+        super().set_cache_pool(cache_pool)
+        self._learn_cache_groups(cache_pool.arena.cache_group_specs)
+
+    def _learn_cache_groups(self, cache_group_specs) -> None:
+        """Record the pool's family="state" group ids (see state_group_ids)
+        and per-group CacheBlock spans (heterogeneous block sizes).
+
+        Spans are read as ``block_granularity``, the shape-agnostic name: for
+        the row-geometry groups kept here it equals ``page_size`` by
+        definition, and asking a snapshot-state group for ``page_size`` is a
+        TypeError. State groups carry no span because they are shed before any
+        page-table or write-location math (_shed_state_groups); their blocks
+        hold state snapshots, not kernel pages.
+        """
         self.state_group_ids = frozenset(
-            str(spec.group_id)
-            for spec in paged_cache_group_specs
-            if spec.family == "state"
+            str(spec.group_id) for spec in cache_group_specs if spec.family == "state"
         )
         self.group_block_granularities = {
-            str(spec.group_id): spec.page_size
-            for spec in paged_cache_group_specs
+            str(spec.group_id): spec.block_granularity
+            for spec in cache_group_specs
             if spec.family != "state"
         }
 
@@ -504,8 +517,8 @@ class CacheGroupsMixin:
             if buf is None:
                 # Replay write locs are ALWAYS the fused triton launch over
                 # the stacked buffers; a group outside the stack could never
-                # get its locs filled. Groups must be declared (via
-                # group_block_granularities) before init_cuda_graph_state.
+                # get its locs filled. Every capture-visible group must be
+                # known (set_cache_pool) before init_cuda_graph_state.
                 raise RuntimeError(
                     f"cache group {gid!r} is not in the stacked CUDA-graph "
                     f"buffers (stack: {self._graph_group_ids}); declare every "

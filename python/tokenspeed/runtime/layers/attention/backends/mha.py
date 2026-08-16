@@ -173,11 +173,6 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
 
-        # family="state" ids (GDN/mamba) learned in init_cuda_graph_state; this backend sheds them
-        self.state_group_ids: frozenset[str] = frozenset()
-        # Group geometry is available to eager metadata before graph setup.
-        self.group_block_granularities = dict(config.group_block_granularities or {})
-
     # ------------------------------------------------------------------
     # Metadata initialization
     # ------------------------------------------------------------------
@@ -210,7 +205,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             # Verify keeps [bs]-row tables; only DFLASH expands rows.
             assert not (
                 self.draft_block_decode and self.spec_num_tokens > 1
-            ), "paged cache groups are unsupported with DFLASH block decode"
+            ), "cache groups are unsupported with DFLASH block decode"
             # The cache path routes every read/write through the per-group
             # tables; a shared single page_table would be dead work.
             page_table = None
@@ -337,13 +332,13 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
-        paged_cache_group_specs: Sequence = (),
+        cache_group_specs: Sequence = (),
         **kwargs,
     ):
         # State-family groups (GDN/mamba pages) belong to the mamba backend;
         # learn their ids from the pool's specs so every table/location path
         # here (eager, capture, replay) sheds them.
-        self._learn_cache_groups(paged_cache_group_specs)
+        self._learn_cache_groups(cache_group_specs)
 
         self.cuda_graph_decode_metadata = {}
         # Per-group persistent buffers. parallels

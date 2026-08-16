@@ -38,7 +38,7 @@ struct SchedulerConfig {
     AllocatorConfig host_allocator;
     AllocatorConfig device_allocator;
 
-    std::vector<PagedCacheGroupConfig> paged_cache_groups{};
+    std::vector<CacheGroupConfig> cache_groups{};
 
     bool HasHostCache() const { return !disable_l2_cache && host_allocator.total_pages > 1; }
 
@@ -66,6 +66,15 @@ struct SchedulerConfig {
     // Zero preserves the default logits contract, which already recomputes at
     // least the final prompt token. The effective hit is page-aligned down.
     std::int32_t prefix_replay_tokens{0};
+
+    // The single validation entry point for a scheduler configuration: every
+    // scheduler scalar, every group's own invariants, and the cross-checks
+    // between them. Throws std::invalid_argument on the first violation.
+    //
+    // The Scheduler runs this before constructing any member, because the pools
+    // and the cache coordinator assert on the same fields and their assertions
+    // would otherwise preempt these diagnostics.
+    void Validate() const;
 };
 
 }  // namespace tokenspeed

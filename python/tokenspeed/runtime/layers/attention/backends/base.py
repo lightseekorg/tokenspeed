@@ -45,7 +45,7 @@ def init_backend_cuda_graph_state(
     """Call ``backend.init_cuda_graph_state`` with only the kwargs its
     signature accepts (VAR_KEYWORD accepts all of them).
 
-    Signature-probe instead of try/except TypeError: paged_cache_group_specs
+    Signature-probe instead of try/except TypeError: cache_group_specs
     is load-bearing for the state shed, so a TypeError raised from inside the
     backend's body must propagate rather than silently retry without specs.
 
@@ -61,11 +61,15 @@ def init_backend_cuda_graph_state(
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
-    uses_paged_cache_groups: bool = False
-    # paged cache per-group block tables (absolute index, null hole = 0). A
-    # separate flag from uses_paged_cache_groups because the two mechanisms have
-    # different hole/index semantics; a group-aware backend sets
-    # this True. Default False keeps every existing backend on today's path.
+    # The graph capture/replay helpers must hand this backend per-group
+    # ``block_tables`` as a metadata kwarg; a backend that builds its own
+    # tables from the pool leaves this False.
+    needs_group_block_tables: bool = False
+    # This backend reads per-group cache block tables (absolute index, null
+    # hole = 0). A separate flag from needs_group_block_tables because that
+    # one is about who supplies the tables and this one about the index
+    # semantics the backend reads them with; a group-aware backend sets this
+    # True. Default False keeps every existing backend on today's path.
     uses_cache_groups: bool = False
     # True when authoritative per-group tables also replace the shared
     # full-history draft table for this backend. Keep this separate from

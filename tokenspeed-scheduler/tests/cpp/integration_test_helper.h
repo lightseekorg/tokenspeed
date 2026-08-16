@@ -49,13 +49,13 @@ protected:
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
-        cfg.paged_cache_groups.push_back(PagedCacheGroupConfig{
+        cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full_attention",
             .rows_per_page = cfg.prefix_granularity,
             .entry_stride_tokens = 1,
             .total_pages = cfg.device_allocator.total_pages,
-            .retention = PagedCacheGroupConfig::Retention::FullHistory,
-            .family = PagedCacheGroupFamily::History,
+            .retention = CacheGroupConfig::Retention::FullHistory,
+            .family = CacheGroupFamily::History,
         });
         return cfg;
     }
@@ -209,14 +209,14 @@ protected:
         cfg.disable_prefix_cache = false;
 
         for (std::size_t i = 0; i < GroupIds().size(); ++i) {
-            PagedCacheGroupConfig group;
+            CacheGroupConfig group;
             group.group_id = GroupIds()[i];
             group.rows_per_page = cfg.prefix_granularity;
             group.entry_stride_tokens = 1;
             group.total_pages = cfg.device_allocator.total_pages;
-            group.retention = PagedCacheGroupConfig::Retention::FullHistory;
-            group.family = i == 0 ? PagedCacheGroupFamily::History : PagedCacheGroupFamily::State;
-            cfg.paged_cache_groups.push_back(std::move(group));
+            group.retention = CacheGroupConfig::Retention::FullHistory;
+            group.family = i == 0 ? CacheGroupFamily::History : CacheGroupFamily::State;
+            cfg.cache_groups.push_back(std::move(group));
         }
         return cfg;
     }

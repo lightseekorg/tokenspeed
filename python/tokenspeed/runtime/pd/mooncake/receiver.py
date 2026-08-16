@@ -36,7 +36,7 @@ from tokenspeed.runtime.pd.cache_protocol import (
 )
 from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
 from tokenspeed.runtime.pd.transfer_plan import (
-    PagedCacheTransferPlanner,
+    CacheTransferPlanner,
     RankTransferPlan,
 )
 from tokenspeed.runtime.utils import (
@@ -128,7 +128,7 @@ def _calc(kv_mgr, prefill_parallel_info: PrefillParallelInfo) -> ReceiverRoutePl
     if prefill_cache_layout is None:
         raise RuntimeError("Paged cache decode connected to a non-Paged cache prefill")
     decode_tp_rank = kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
-    planner = PagedCacheTransferPlanner(
+    planner = CacheTransferPlanner(
         prefill_tp_size=prefill_tp_size_per_dp_rank,
         decode_tp_size=local_tp_size_per_dp_rank,
         prefill_layout=prefill_cache_layout,

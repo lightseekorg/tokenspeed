@@ -2974,7 +2974,7 @@ TEST(CacheCoordinatorHostExtension, MultiWindowCascadeConvergesToZeroExtension) 
 
 // ---------------------------------------------------------------------------
 // Mamba-analog semantics: vLLM reduces a mamba/linear-attention group to the
-// paged machinery via (a) hit = ONE aligned state snapshot found right-to-left,
+// cache machinery via (a) hit = ONE aligned state snapshot found right-to-left,
 // padded with nulls ([null]*i + [state]); (b) retention = only the last token's
 // state lives (skipped = n-1, exactly our W=2 slide rule); (c) L2 = sliding
 // window of one block. These tests pin that our SwaManager with a one-page

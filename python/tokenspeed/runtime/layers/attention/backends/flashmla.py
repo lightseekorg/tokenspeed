@@ -532,7 +532,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         self.cuda_graph_seq_lens_k = torch.zeros(
             max_bs, dtype=torch.int32, device="cuda"
         )
-        # Paged cache contract: persistent write-location buffer whose address
+        # Cache contract: persistent write-location buffer whose address
         # the captured graph records; replay refreshes it in place from the
         # live full-history table. Only allocated when the backend is a cache
         # contract sub-backend.

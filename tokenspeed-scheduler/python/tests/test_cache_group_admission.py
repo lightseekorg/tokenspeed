@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import pytest
 from tokenspeed_scheduler import (
+    CacheGroupConfig,
+    CacheGroupFamily,
+    CacheRetention,
     ExecutionEvent,
     ForwardEvent,
-    PagedCacheGroupConfig,
-    PagedCacheGroupFamily,
-    PagedCacheRetention,
     RequestSpec,
     Scheduler,
     SchedulerConfig,
@@ -66,15 +66,15 @@ def _overlap_admission_scheduler(verify_width: int) -> Scheduler:
     cfg.prefix_granularity = 1
     cfg.decode_input_tokens = verify_width
     cfg.overlap_schedule_depth = 1
-    # Paged-cache group page 0 is reserved by the allocator.
-    cfg.paged_cache_groups = [
-        PagedCacheGroupConfig(
+    # Cache group page 0 is reserved by the allocator.
+    cfg.cache_groups = [
+        CacheGroupConfig(
             group_id="overlap.history",
             rows_per_page=1,
             entry_stride_tokens=1,
             total_pages=total_pages,
-            retention=PagedCacheRetention.FullHistory,
-            family=PagedCacheGroupFamily.History,
+            retention=CacheRetention.FullHistory,
+            family=CacheGroupFamily.History,
         )
     ]
     scheduler = Scheduler(cfg)
@@ -88,16 +88,14 @@ def _overlap_admission_scheduler(verify_width: int) -> Scheduler:
 def test_overlap_decode_admission_uses_runtime_verify_width(verify_width: int):
     scheduler = _overlap_admission_scheduler(verify_width)
     assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
-    assert (
-        scheduler.paged_cache_group_available_pages("overlap.history") == verify_width
-    )
+    assert scheduler.cache_group_available_pages("overlap.history") == verify_width
 
 
 def test_overlap_schedule_depth_defaults_to_zero_and_rejects_deeper_pipeline():
     assert SchedulerConfig().overlap_schedule_depth == 0
     cfg = _base_config()
-    cfg.paged_cache_groups = [
-        PagedCacheGroupConfig(
+    cfg.cache_groups = [
+        CacheGroupConfig(
             group_id="history",
             rows_per_page=cfg.prefix_granularity,
             entry_stride_tokens=1,
@@ -124,13 +122,13 @@ def test_sliding_release_before_admit_prevents_oom():
     cfg = _base_config(num_device_pages=8)
     cfg.prefix_granularity = 2
     cfg.max_scheduled_tokens = 1024
-    cfg.paged_cache_groups = [
-        PagedCacheGroupConfig(
+    cfg.cache_groups = [
+        CacheGroupConfig(
             group_id="swa.test",
             rows_per_page=2,
             entry_stride_tokens=1,
             total_pages=8,
-            retention=PagedCacheRetention.SlidingWindow,
+            retention=CacheRetention.SlidingWindow,
             sliding_window_tokens=4,
         )
     ]
@@ -152,13 +150,13 @@ def test_batch_admission_debits_simulated_free_pages():
     cfg.prefix_granularity = 2
     cfg.max_batch_size = 4
     cfg.max_scheduled_tokens = 512
-    cfg.paged_cache_groups = [
-        PagedCacheGroupConfig(
+    cfg.cache_groups = [
+        CacheGroupConfig(
             group_id=f"swa.g{i}",
             rows_per_page=2,
             entry_stride_tokens=1,
             total_pages=12,
-            retention=PagedCacheRetention.SlidingWindow,
+            retention=CacheRetention.SlidingWindow,
             sliding_window_tokens=4,
         )
         for i in range(2)
@@ -177,24 +175,24 @@ def test_batch_admission_debits_simulated_free_pages():
 def test_group_tables_use_each_groups_block_granularity():
     cfg = _base_config(num_device_pages=17)
     cfg.prefix_granularity = 8
-    cfg.paged_cache_groups = [
-        PagedCacheGroupConfig(
+    cfg.cache_groups = [
+        CacheGroupConfig(
             group_id="history",
             rows_per_page=8,
             entry_stride_tokens=1,
             total_pages=17,
-            retention=PagedCacheRetention.FullHistory,
-            family=PagedCacheGroupFamily.History,
+            retention=CacheRetention.FullHistory,
+            family=CacheGroupFamily.History,
         ),
-        PagedCacheGroupConfig(
+        CacheGroupConfig(
             group_id="state",
             rows_per_page=2,
             entry_stride_tokens=1,
             total_pages=65,
             cache_blocks_per_lcm_block=4,
-            retention=PagedCacheRetention.SlidingWindow,
+            retention=CacheRetention.SlidingWindow,
             sliding_window_tokens=4,
-            family=PagedCacheGroupFamily.State,
+            family=CacheGroupFamily.State,
         ),
     ]
     scheduler = Scheduler(cfg)

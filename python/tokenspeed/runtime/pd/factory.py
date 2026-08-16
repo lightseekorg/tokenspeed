@@ -21,9 +21,9 @@
 """Factories for PD KV transfer helpers."""
 
 from tokenspeed.runtime.pd.cache_protocol import (
+    build_arena_cache_transfer_contract,
     build_cache_fields_by_producer_step,
     build_cache_transfer_schema,
-    build_pool_cache_transfer_contract,
 )
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
@@ -44,16 +44,16 @@ def get_kv_args(
     # the target pool's merged plan, so exactly one typed slab registration is
     # published for both target and draft caches.
     transfer_schema = build_cache_transfer_schema(
-        token_to_kv_pool.plan,
+        token_to_kv_pool.arena.plan,
         model_config=model_config,
         draft_model_config=draft_model_config,
     )
     producer_schedule = build_cache_fields_by_producer_step(
-        token_to_kv_pool.plan,
+        token_to_kv_pool.arena.plan,
         num_target_layers=model_config.num_attention_layers,
     )
-    layout, base_addr = build_pool_cache_transfer_contract(
-        token_to_kv_pool,
+    layout, base_addr = build_arena_cache_transfer_contract(
+        token_to_kv_pool.arena,
         transfer_schema=transfer_schema,
     )
     return KVArgs(
