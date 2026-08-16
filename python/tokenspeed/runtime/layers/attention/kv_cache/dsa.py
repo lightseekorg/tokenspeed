@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
@@ -45,13 +47,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_k_row_bytes = dsa_index_k_row_bytes(self.index_head_dim)
         super().__init__(*args, **kwargs)
 
-        with self.memory_saver_adapter.region():
-            self.index_k_buffer = [
-                self.field(f"layer.{layer_id}.index_k", torch.uint8).view(
-                    -1, self.index_k_row_bytes
-                )
-                for layer_id in range(self.layer_num)
-            ]
+    layer_plane_bindings: ClassVar[dict[str, str]] = {
+        **MLATokenToKVPool.layer_plane_bindings,
+        "index_k": "index_k_buffer",
+    }
 
     def get_kv_size_bytes(self):
         return super().get_kv_size_bytes() + _get_tensor_size_bytes(self.index_k_buffer)
@@ -100,7 +99,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         """
         # DSA requires kv_page_size == DSA_SPARSE_PAGE_SIZE (64), the only
         # implemented sparse layout.
-        ps = self.kv_page_size
+        ps = self.arena.kv_page_size
         hd = self.index_head_dim
         ng = hd // _INDEX_K_FP8_GROUP_SIZE
         row = hd + ng * _INDEX_K_SCALE_BYTES
@@ -143,8 +142,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         buf = self.get_index_k_buffer(layer_id)
         fp8_view, scale_view = self._index_k_block_views(buf)
         slots = slots.to(torch.long)
-        page = slots // self.kv_page_size
-        slot_in_page = slots % self.kv_page_size
+        page = slots // self.arena.kv_page_size
+        slot_in_page = slots % self.arena.kv_page_size
         k_fp8 = fp8_view[page, slot_in_page]
         k_scale = scale_view[page, slot_in_page]
         return k_fp8, k_scale
@@ -169,7 +168,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             index_k_fp8,
             index_k_scale,
             loc,
-            page_size=self.kv_page_size,
+            page_size=self.arena.kv_page_size,
             head_dim=self.index_head_dim,
             group_size=_INDEX_K_FP8_GROUP_SIZE,
         )

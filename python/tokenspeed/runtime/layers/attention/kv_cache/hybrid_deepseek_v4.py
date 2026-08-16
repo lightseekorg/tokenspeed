@@ -15,14 +15,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 import torch
 
-from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
-    deepseek_v4_compressed_slot_mapping,
-)
-from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec import (
+from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
     V4_KERNEL_BLOCK_ROWS,
     V4_SWA_KV_GROUP_ID,
@@ -31,12 +28,16 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec
     v4_compressed_kv_group_id,
     v4_compressor_state_group_id,
 )
+from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
+    deepseek_v4_compressed_slot_mapping,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    PagedCacheGroupSpec,
+    CacheGroupSpec,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
 
@@ -409,8 +410,8 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
     """DeepSeek V4 fp8_ds_mla cache pool.
 
     TokenSpeed keeps SWA, compressed, compressor-state, and CSA indexer caches
-    in dedicated per-group paged pools (see PagedCacheGroup* on the scheduler
-    side and ``build_v4_cache_specs`` here), keeping ordinary MLA models on
+    in dedicated per-group paged pools (see CacheGroup* on the scheduler
+    side and the V4 recipe here), keeping ordinary MLA models on
     their existing single-pool contract. The ``indexer_kv_buffer`` shares its
     page table and page-count budget with the ``v4.c{ratio}a.compressed_kv``
     group rather than owning a separate group of its own.
@@ -418,56 +419,44 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
 
     def __init__(
         self,
-        size: int,
+        arena: CacheArena,
         model_dtype: torch.dtype,
         layout: DeepseekV4CacheLayout,
         layer_num: int,
-        device: str,
-        enable_memory_saver: bool,
         rank: int,
-        memory_plan: CacheMemoryPlan,
-        paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...],
-        token_capacity: int,
+        field_layer_offset: int = 0,
     ) -> None:
-        if size <= 0:
-            raise ValueError(f"DeepSeek V4 KV pool size must be positive, got {size}")
+        # The layout is this view's own window (a draft view carries only its
+        # continuation layers' ratios), so it is indexed by local layer id.
         if layer_num != len(layout.layer_ratio):
             raise ValueError(
                 "DeepSeek V4 KV pool layer_num must match cache layout ratios: "
                 f"layer_num={layer_num}, ratios={len(layout.layer_ratio)}"
             )
-        prefix_granularity = memory_plan.prefix_granularity
         super().__init__(
-            size=size,
-            dtype=torch.uint8,
-            device=device,
-            prefix_granularity=prefix_granularity,
-            rank=rank,
-            memory_plan=memory_plan,
-            paged_cache_group_specs=paged_cache_group_specs,
-            token_capacity=token_capacity,
+            arena,
+            torch.uint8,
+            rank,
+            field_layer_offset=field_layer_offset,
         )
-        # Tag KV allocations as "kv_cache" (no CPU backup: discarded on sleep)
-        # so release/resume_memory_occupation frees them. See memory_occupation.py.
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
-        )
+        plan = self.arena.plan
+        prefix_granularity = self.arena.prefix_granularity
         self.model_dtype = model_dtype
         self.layout = layout
         self.layer_num = layer_num
-        self._paged_cache_group_specs_by_id = {
-            spec.group_id: spec for spec in self.paged_cache_group_specs
+        self._cache_group_specs_by_id = {
+            spec.group_id: spec for spec in self.arena.cache_group_specs
         }
-        self._paged_cache_scheduler: object | None = None
-        self._paged_cache_state_group_ids = tuple(
+        self._cache_scheduler: object | None = None
+        self._cache_state_group_ids = tuple(
             str(spec.group_id)
-            for spec in self.paged_cache_group_specs
+            for spec in self.arena.cache_group_specs
             if spec.family == "state"
         )
-        self.paged_cache_requires_page_zeroing = True
+        self.requires_page_zeroing = True
 
         def _group_rows(group_id: str, default: int) -> int:
-            spec = self._paged_cache_group_specs_by_id.get(group_id)
+            spec = self._cache_group_specs_by_id.get(group_id)
             return int(spec.rows_per_page) if spec is not None else int(default)
 
         self.swa_block_size = _group_rows(
@@ -506,72 +495,44 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
             )
             for ratio in layout.layer_ratio
         )
-        expected_size = (
-            memory_plan.num_lcm_blocks
-            * max(group.cache_blocks_per_lcm_block for group in memory_plan.groups)
-            * memory_plan.prefix_granularity
-        )
-        if size != expected_size:
-            raise ValueError(
-                f"DeepSeek V4 cache pool size {size} does not match {expected_size}"
-            )
-        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
-            self._bind_planned_buffers()
+        self._bind_layer_planes()
 
         logger.info(
             "Initialized DeepSeek V4 cache pool: %d parents, P=%d, %d layers, "
             "fp4 indexer=%s, compressed block sizes=%s",
-            memory_plan.num_lcm_blocks,
-            memory_plan.prefix_granularity,
+            plan.num_lcm_blocks,
+            prefix_granularity,
             layer_num,
             layout.use_fp4_indexer_cache,
             self.compressed_block_sizes,
         )
 
-    def _bind_planned_buffers(self) -> None:
-        self.swa_kv_buffer = []
-        self.compressed_kv_buffer = []
-        self.compressor_state_buffer = []
-        self.indexer_kv_buffer = []
-        self.indexer_state_buffer = []
-        for layer_id, ratio in enumerate(self.layout.layer_ratio):
-            self.swa_kv_buffer.append(self.field(f"layer.{layer_id}.swa", torch.uint8))
-            if ratio <= 1:
-                self.compressed_kv_buffer.append(None)
-                self.compressor_state_buffer.append(None)
-                self.indexer_kv_buffer.append(None)
-                self.indexer_state_buffer.append(None)
-                continue
-            self.compressed_kv_buffer.append(
-                self.field(f"layer.{layer_id}.compressed_kv", torch.uint8)
-            )
-            self.compressor_state_buffer.append(
-                self.field(f"layer.{layer_id}.compressor_state", torch.float32)
-            )
-            if ratio == 4:
-                indexer_kv = self.field(f"layer.{layer_id}.indexer_kv", torch.uint8)
-                self.indexer_kv_buffer.append(indexer_kv.view(indexer_kv.shape[0], -1))
-                self.indexer_state_buffer.append(
-                    self.field(f"layer.{layer_id}.indexer_state", torch.float32)
-                )
-            else:
-                self.indexer_kv_buffer.append(None)
-                self.indexer_state_buffer.append(None)
+    # A ratio-1 layer plans no compressed/state planes and only ratio-4 plans
+    # indexer planes, so the plan's field list decides per layer -- the
+    # ratio branches this used to re-derive are the plan's own shape.
+    # Every V4 plane is read with the shape the plan gives it.
+    layer_plane_bindings: ClassVar[dict[str, str]] = {
+        "swa": "swa_kv_buffer",
+        "compressed_kv": "compressed_kv_buffer",
+        "compressor_state": "compressor_state_buffer",
+        "indexer_kv": "indexer_kv_buffer",
+        "indexer_state": "indexer_state_buffer",
+    }
 
-    def bind_paged_cache_scheduler(self, scheduler: object) -> None:
-        self._paged_cache_scheduler = scheduler
+    def bind_cache_scheduler(self, scheduler: object) -> None:
+        self._cache_scheduler = scheduler
 
-    def maybe_log_paged_cache_group_pages(self) -> None:
-        scheduler = self._paged_cache_scheduler
-        if self.rank != 0 or scheduler is None or not self._paged_cache_state_group_ids:
+    def maybe_log_cache_group_pages(self) -> None:
+        scheduler = self._cache_scheduler
+        if self.rank != 0 or scheduler is None or not self._cache_state_group_ids:
             return
         if not logger.isEnabledFor(logging.DEBUG):
             return
 
         parts = []
-        for group_id in self._paged_cache_state_group_ids:
-            total = scheduler.paged_cache_group_total_pages(group_id)
-            available = scheduler.paged_cache_group_available_pages(group_id)
+        for group_id in self._cache_state_group_ids:
+            total = scheduler.cache_group_total_pages(group_id)
+            available = scheduler.cache_group_available_pages(group_id)
             parts.append(
                 f"{group_id}: used={total - available}/{total}, available={available}"
             )
@@ -662,8 +623,7 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         )
 
     def get_kv_size_bytes(self) -> int:
-        assert self.buffer is not None
-        return int(self.buffer.nbytes)
+        return int(self.arena.buffer.nbytes)
 
     def zero_new_blocks(self, new_page_ids: dict[str, list[int]]) -> None:
-        self.zero_blocks(new_page_ids)
+        self.arena.zero_blocks(new_page_ids)
