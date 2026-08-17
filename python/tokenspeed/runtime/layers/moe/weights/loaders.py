@@ -68,7 +68,7 @@ def _narrow_block_scale(
     scale: torch.Tensor | None,
     block_shape: tuple[int, int] | None,
     shard_dim: int,
-    start: int,
+    block_start: int,
     length: int,
 ) -> torch.Tensor | None:
     """Narrow a per-expert block-scale view alongside its weight shard."""
@@ -76,10 +76,8 @@ def _narrow_block_scale(
     if scale is None or block_shape is None or shard_dim not in (0, 1):
         return None
     block = block_shape[shard_dim]
-    if start % block != 0:
-        return None
     num_blocks = (length + block - 1) // block
-    return scale.narrow(shard_dim, start // block, num_blocks)
+    return scale.narrow(shard_dim, block_start, num_blocks)
 
 
 def load_w13(
@@ -132,11 +130,15 @@ def load_w13(
     dst = expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
     scale_dst = None
     if not is_bias:
+        block_start = 0
+        if start and block_shape is not None and shard_dim in (0, 1):
+            block = block_shape[shard_dim]
+            block_start = round_up(shard_size, block) // block
         scale_dst = _narrow_block_scale(
             expert_scale,
             block_shape,
             shard_dim,
-            start,
+            block_start,
             loaded_weight.shape[shard_dim],
         )
     copy_expert_shard(dst, loaded_weight, scale_dst, block_shape)
