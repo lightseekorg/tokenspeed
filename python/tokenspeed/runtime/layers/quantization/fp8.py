@@ -40,7 +40,7 @@ class Fp8Config(QuantizationConfig):
     weight_scale_dtype = torch.float32
 
     # Linear-attention (GDN/mamba) projections are excluded from online
-    # quantization    
+    # quantization
     ONLINE_IGNORED_LAYERS = [
         "re:.*linear_attn.*",
         "re:.*conv1d.*",
