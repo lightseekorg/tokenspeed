@@ -32,9 +32,8 @@ with the wrapper entry points stubbed out.
 from __future__ import annotations
 
 import pytest
-import torch
-
 import tokenspeed_kernel.ops.attention.cutedsl_kda as cutedsl_op
+import torch
 from tokenspeed_kernel.ops.attention.triton.kda_dispatch import _nvidia_kda_prefill
 
 H, HV, K, V, T = 2, 2, 128, 128, 32
@@ -80,7 +79,13 @@ def test_hint_reaches_wrapper_calls(stubbed_wrapper):
     hint = (0, 10, T)
 
     cutedsl_op.cutedsl_kda_chunk_prefill(
-        q, k, v, g, beta, a_log, dt_bias,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        a_log,
+        dt_bias,
         initial_state=None,
         cu_seqlens=cu,
         cu_seqlens_cpu=hint,
@@ -98,7 +103,13 @@ def test_hint_length_mismatch_raises(stubbed_wrapper):
 
     with pytest.raises(ValueError, match="cu_seqlens_cpu"):
         cutedsl_op.cutedsl_kda_chunk_prefill(
-            q, k, v, g, beta, a_log, dt_bias,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            a_log,
+            dt_bias,
             initial_state=None,
             cu_seqlens=cu,
             cu_seqlens_cpu=(0, T),
@@ -110,7 +121,13 @@ def test_batch_fallback_synthesizes_hint(stubbed_wrapper):
     q, k, v, g, beta, a_log, dt_bias = _inputs(tokens=16, batch=2)
 
     cutedsl_op.cutedsl_kda_chunk_prefill(
-        q, k, v, g, beta, a_log, dt_bias,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        a_log,
+        dt_bias,
         initial_state=None,
         cu_seqlens=None,
         lower_bound=-5.0,
@@ -130,14 +147,23 @@ def test_dispatch_forwards_hint_only_when_set():
 
     q, k, v, g, beta, a_log, dt_bias = _inputs()
     cu = torch.tensor([0, T], dtype=torch.int32)
-    common = dict(initial_state=torch.zeros(1, HV, K, V), cu_seqlens=cu,
-                  lower_bound=-5.0)
+    common = dict(
+        initial_state=torch.zeros(1, HV, K, V), cu_seqlens=cu, lower_bound=-5.0
+    )
 
     _nvidia_kda_prefill(impl, q, k, v, g, beta, a_log, dt_bias, **common)
     assert "cu_seqlens_cpu" not in calls[-1]
 
     _nvidia_kda_prefill(
-        impl, q, k, v, g, beta, a_log, dt_bias,
-        cu_seqlens_cpu=(0, T), **common,
+        impl,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        a_log,
+        dt_bias,
+        cu_seqlens_cpu=(0, T),
+        **common,
     )
     assert calls[-1]["cu_seqlens_cpu"] == (0, T)
