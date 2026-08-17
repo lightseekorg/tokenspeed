@@ -34,7 +34,10 @@ from __future__ import annotations
 import pytest
 import tokenspeed_kernel.ops.attention.cutedsl_kda as cutedsl_op
 import torch
-from tokenspeed_kernel.ops.attention.triton.kda_dispatch import _nvidia_kda_prefill
+from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
+    KdaPrefillResult,
+    _nvidia_kda_prefill,
+)
 
 H, HV, K, V, T = 2, 2, 128, 128, 32
 
@@ -70,6 +73,9 @@ def stubbed_wrapper(monkeypatch):
     monkeypatch.setattr(cutedsl_op, "cutedsl_kda_check_config", fake_check_config)
     monkeypatch.setattr(cutedsl_op, "cutedsl_kda_workspace_size", fake_workspace_size)
     monkeypatch.setattr(cutedsl_op, "cutedsl_kda_forward", fake_forward)
+    # The real probe needs an installed hint-capable package; environments
+    # without the wheel would silently drop the hint and starve the test.
+    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_supports_host_hint", lambda: True)
     return seen
 
 
@@ -167,3 +173,67 @@ def test_dispatch_forwards_hint_only_when_set():
         **common,
     )
     assert calls[-1]["cu_seqlens_cpu"] == (0, T)
+
+
+def test_facade_forwards_hint_only_when_set(monkeypatch):
+    import tokenspeed_kernel.ops.attention as attn
+
+    calls = []
+
+    def fake_kernel(**kwargs):
+        calls.append(kwargs)
+        return KdaPrefillResult(
+            out=torch.zeros(1, T, HV, V), final_state=torch.zeros(1, HV, K, V)
+        )
+
+    monkeypatch.setattr(attn, "select_kernel", lambda *a, **kw: fake_kernel)
+
+    q, k, v, g, beta, a_log, dt_bias = _inputs()
+    cu = torch.tensor([0, T], dtype=torch.int32)
+    common = dict(
+        initial_state=torch.zeros(1, HV, K, V), cu_seqlens=cu, lower_bound=-5.0
+    )
+
+    attn.kda_paged_prefill(q, k, v, g, beta, a_log, dt_bias, **common)
+    assert "cu_seqlens_cpu" not in calls[-1]
+
+    attn.kda_paged_prefill(
+        q, k, v, g, beta, a_log, dt_bias, cu_seqlens_cpu=(0, T), **common
+    )
+    assert calls[-1]["cu_seqlens_cpu"] == (0, T)
+
+
+def test_device_planning_wrappers_strip_hint(monkeypatch):
+    import tokenspeed_kernel.ops.attention.triton.kda_dispatch as kd
+
+    received = []
+
+    def fake_prefill(implementation, *args, **kwargs):
+        received.append(kwargs)
+        return KdaPrefillResult(
+            out=torch.zeros(1, T, HV, V), final_state=torch.zeros(1, HV, K, V)
+        )
+
+    monkeypatch.setattr(kd, "_nvidia_kda_prefill", fake_prefill)
+
+    q, k, v, g, beta, a_log, dt_bias = _inputs()
+    cu = torch.tensor([0, T], dtype=torch.int32)
+    kwargs = dict(
+        q=q,
+        k=k,
+        v=v,
+        g_raw=g,
+        beta_logits=beta,
+        A_log=a_log,
+        dt_bias=dt_bias,
+        initial_state=torch.zeros(1, HV, K, V),
+        cu_seqlens=cu,
+        lower_bound=-5.0,
+        cu_seqlens_cpu=(0, T),
+    )
+
+    kd.triton_nvidia_kda_paged_prefill(**dict(kwargs))
+    assert "cu_seqlens_cpu" not in received[-1]
+
+    kd.flashkda_nvidia_kda_paged_prefill(**dict(kwargs))
+    assert "cu_seqlens_cpu" not in received[-1]

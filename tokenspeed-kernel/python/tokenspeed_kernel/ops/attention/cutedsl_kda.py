@@ -38,6 +38,7 @@ from tokenspeed_kernel.thirdparty.cutedsl_kda import (
     DEFAULT_SCALE,
     cutedsl_kda_check_config,
     cutedsl_kda_forward,
+    cutedsl_kda_supports_host_hint,
     cutedsl_kda_workspace_size,
     is_cutedsl_kda_installed,
 )
@@ -100,6 +101,9 @@ def cutedsl_kda_chunk_prefill(
     # The bound is a compile-time CUBIN constant; mismatches must fail
     # loudly rather than silently mis-gate.
     cutedsl_kda_check_config(float(lower_bound))
+    if cu_seqlens_cpu is not None and not cutedsl_kda_supports_host_hint():
+        # Hint-unaware package build: fall back to its own D2H read.
+        cu_seqlens_cpu = None
     batch, tokens, num_heads, key_dim = q.shape
     num_value_heads, value_dim = v.shape[2], v.shape[-1]
     if cu_seqlens is not None:
@@ -154,6 +158,9 @@ def cutedsl_kda_chunk_prefill(
     workspace = (
         torch.empty(ws_bytes, dtype=torch.uint8, device=q.device) if ws_bytes else None
     )
+    # Forwarded only when set: the shim's forward is a passthrough, so an
+    # explicit kwarg would reach hint-unaware package builds and TypeError.
+    hint = {} if cu_seqlens_cpu is None else {"cu_seqlens_cpu": cu_seqlens_cpu}
     out, final_state = cutedsl_kda_forward(
         q,
         k,
@@ -166,7 +173,7 @@ def cutedsl_kda_chunk_prefill(
         state_in,
         scale=DEFAULT_SCALE,
         workspace=workspace,
-        cu_seqlens_cpu=cu_seqlens_cpu,
+        **hint,
     )
     # out is token-major [1, T, HV, V] already; state VK -> FLA-native KV.
     return out.view(batch, tokens, num_value_heads, value_dim), final_state.transpose(
