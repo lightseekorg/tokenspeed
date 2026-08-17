@@ -31,6 +31,7 @@ from enum import Enum, auto
 import psutil
 import setproctitle
 import zmq
+
 from tokenspeed.runtime.engine.event_loop import run_event_loop
 from tokenspeed.runtime.engine.io_struct import (
     BlockReqInput,
