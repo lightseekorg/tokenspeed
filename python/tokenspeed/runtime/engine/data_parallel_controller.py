@@ -31,7 +31,6 @@ from enum import Enum, auto
 import psutil
 import setproctitle
 import zmq
-
 from tokenspeed.runtime.engine.event_loop import run_event_loop
 from tokenspeed.runtime.engine.io_struct import (
     BlockReqInput,
@@ -166,13 +165,9 @@ class DataParallelController:
 
         self.launch_dp_schedulers(server_args, port_args)
 
-        # Workers are already created in launch_dp_schedulers before starting scheduler threads
-
-        if server_args.mapping.has_attn_dp:
-            self.control_message_step = server_args.mapping.attn.tp_size
-        else:
-            self.control_message_step = 1
-
+        # Each worker represents one attention-DP shard. Its local TP rank 0
+        # receives messages from this controller and broadcasts them to the
+        # remaining ranks in that TP group.
         self.init_dispatcher()
 
     def send_to_all_workers(self, obj):
@@ -180,8 +175,13 @@ class DataParallelController:
             worker.send_pyobj(obj)
 
     def send_control_message(self, obj):
-        # Send control messages to first worker of tp group
-        for worker in self.workers[:: self.control_message_step]:
+        """Broadcast a control request to every attention-DP worker.
+
+        ``self.workers`` is indexed by attention-DP rank, not tensor-parallel
+        rank. Each worker endpoint is consumed by TP rank 0 of that DP shard,
+        which broadcasts the request within its local TP group.
+        """
+        for worker in self.workers:
             worker.send_pyobj(obj)
 
     def handle_load_update_req(self, obj):
