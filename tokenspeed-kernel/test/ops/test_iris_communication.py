@@ -67,6 +67,39 @@ def _spawn_and_collect(worker_fn, args, world_size: int) -> None:
         raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
 
 
+@pytest.mark.parametrize(
+    ("max_numel", "max_bytes", "expected_numel"),
+    [(16, 64, 32), (16, 0, 16)],
+)
+def test_iris_state_uses_backing_capacity(
+    monkeypatch, max_numel, max_bytes, expected_numel
+):
+    from tokenspeed_kernel.ops.communication import iris as iris_ops
+    from tokenspeed_kernel.ops.communication import triton as triton_ops
+
+    created = []
+
+    def create_iris_state(**kwargs):
+        created.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(iris_ops, "IRIS_AR_STATES", {})
+    monkeypatch.setattr(iris_ops, "create_iris_state", create_iris_state)
+    state = SimpleNamespace(
+        group=object(),
+        rank_in_group=0,
+        max_numel=max_numel,
+        max_bytes=max_bytes,
+        device=torch.device("cpu"),
+    )
+
+    iris_state = triton_ops._get_or_create_iris_state(state, torch.bfloat16)
+
+    assert iris_state.max_numel == expected_numel
+    assert triton_ops._get_or_create_iris_state(state, torch.bfloat16) is iris_state
+    assert len(created) == 1
+
+
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_producer_direct_admission_supported_world_sizes(
