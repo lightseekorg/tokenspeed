@@ -239,12 +239,8 @@ class CudaGraphWrapper:
         init_backend_cuda_graph_state(
             attn_backend,
             self.max_bs,
-            paged_cache_group_specs=tuple(token_to_kv_pool.paged_cache_group_specs),
-            paged_cache_group_page_counts=getattr(
-                token_to_kv_pool,
-                "paged_cache_group_page_counts",
-                None,
-            ),
+            cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
+            cache_group_page_counts=(token_to_kv_pool.arena.cache_group_page_counts),
             max_tokens_per_req=self.max_tokens_per_req,
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
@@ -252,13 +248,9 @@ class CudaGraphWrapper:
             init_backend_cuda_graph_state(
                 draft_attn_backend,
                 self.max_bs,
-                paged_cache_group_specs=tuple(
-                    draft_token_to_kv_pool.paged_cache_group_specs
-                ),
-                paged_cache_group_page_counts=getattr(
-                    draft_token_to_kv_pool,
-                    "paged_cache_group_page_counts",
-                    None,
+                cache_group_specs=tuple(draft_token_to_kv_pool.arena.cache_group_specs),
+                cache_group_page_counts=(
+                    draft_token_to_kv_pool.arena.cache_group_page_counts
                 ),
                 max_tokens_per_req=self.max_tokens_per_req,
                 overlap_schedule_depth=self.overlap_schedule_depth,
@@ -614,7 +606,7 @@ class CudaGraphWrapper:
             _is_cuda_graph_phase = old_cuda_graph_phase
 
     def _capture_group_block_tables(self, bs: int, pool) -> dict | None:
-        specs = tuple(pool.paged_cache_group_specs)
+        specs = tuple(pool.arena.cache_group_specs)
         if not specs:
             return None
         out = {}
@@ -648,7 +640,7 @@ class CudaGraphWrapper:
         persistent per-group buffers."""
         if not getattr(self.attn_backend, "uses_cache_groups", False):
             return ()
-        return tuple(str(spec.group_id) for spec in pool.paged_cache_group_specs)
+        return tuple(str(spec.group_id) for spec in pool.arena.cache_group_specs)
 
     def _draft_cache_group_ids(self) -> tuple[str, ...]:
         """Per-group page tables consumed by the drafter.
@@ -680,17 +672,15 @@ class CudaGraphWrapper:
                 ("history",),
             )
         )
-        if self.draft_token_to_kv_pool is not None and getattr(
-            self.draft_token_to_kv_pool, "paged_cache_group_specs", ()
-        ):
+        draft_arena = getattr(self.draft_token_to_kv_pool, "arena", None)
+        draft_specs = getattr(draft_arena, "cache_group_specs", ())
+        if draft_specs:
             return tuple(
-                str(spec.group_id)
-                for spec in self.draft_token_to_kv_pool.paged_cache_group_specs
-                if spec.family in families
+                str(spec.group_id) for spec in draft_specs if spec.family in families
             )
         return tuple(
             str(spec.group_id)
-            for spec in self.token_to_kv_pool.paged_cache_group_specs
+            for spec in self.token_to_kv_pool.arena.cache_group_specs
             if spec.family in families
         )
 
@@ -704,7 +694,7 @@ class CudaGraphWrapper:
 
     def _init_capture_metadata(self, bs: int):
         capture_kwargs = {}
-        if self.attn_backend.uses_paged_cache_groups:
+        if self.attn_backend.needs_group_block_tables:
             group_block_tables = self._capture_group_block_tables(
                 bs,
                 self.token_to_kv_pool,
@@ -727,7 +717,7 @@ class CudaGraphWrapper:
             draft_kwargs = {}
             if (
                 self.draft_token_to_kv_pool is not None
-                and self.draft_attn_backend.uses_paged_cache_groups
+                and self.draft_attn_backend.needs_group_block_tables
             ):
                 draft_group_block_tables = self._capture_group_block_tables(
                     bs,
@@ -752,7 +742,7 @@ class CudaGraphWrapper:
         """Minimal per-group tables for the bs==0 idle replay: all rows are
         dummy rows, so one column of page-0 entries per group is valid.
         None when the pool publishes no groups."""
-        specs = tuple(self.token_to_kv_pool.paged_cache_group_specs)
+        specs = tuple(self.token_to_kv_pool.arena.cache_group_specs)
         if not specs:
             return None
         table = torch.zeros((padded_bs, 1), dtype=torch.int32, device=self.device)
@@ -842,13 +832,13 @@ class CudaGraphWrapper:
         group_placeholder_tables = kwargs.pop("group_placeholder_tables", None)
         block_table_base_offsets = kwargs.pop("block_table_base_offsets", None)
         block_tables = kwargs.pop("block_tables", None)
-        target_uses_paged_groups = getattr(
+        target_needs_group_tables = getattr(
             self.attn_backend,
-            "uses_paged_cache_groups",
+            "needs_group_block_tables",
             False,
         )
-        draft_uses_paged_groups = self.draft_attn_backend is not None and getattr(
-            self.draft_attn_backend, "uses_paged_cache_groups", False
+        draft_needs_group_tables = self.draft_attn_backend is not None and getattr(
+            self.draft_attn_backend, "needs_group_block_tables", False
         )
         target_uses_cache_groups = getattr(
             self.attn_backend,
@@ -861,7 +851,7 @@ class CudaGraphWrapper:
             False,
         )
         if group_placeholder_tables is not None and (
-            target_uses_paged_groups or draft_uses_paged_groups
+            target_needs_group_tables or draft_needs_group_tables
         ):
             table_bs = next(
                 (
@@ -882,7 +872,7 @@ class CudaGraphWrapper:
                     actual_bs=actual_bs,
                     padded_bs=padded_bs,
                 )
-            if target_uses_paged_groups:
+            if target_needs_group_tables:
                 kwargs["block_tables"] = group_placeholder_tables
                 if block_table_base_offsets is not None:
                     kwargs["block_table_base_offsets"] = block_table_base_offsets
@@ -918,7 +908,7 @@ class CudaGraphWrapper:
                 kwargs["block_tables"] = padded_block_tables
         if self.attn_backend.uses_padded_decode_token_mask:
             kwargs["actual_bs"] = actual_bs
-        if target_uses_paged_groups and getattr(self, "drafter", None) is not None:
+        if target_needs_group_tables and getattr(self, "drafter", None) is not None:
             kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
         self.attn_backend.init_forward_metadata_replay_cuda_graph(
             padded_bs,
@@ -930,7 +920,7 @@ class CudaGraphWrapper:
         )
         if self.draft_attn_backend is not None:
             draft_attn_kwargs = {}
-            if draft_uses_paged_groups and group_placeholder_tables is not None:
+            if draft_needs_group_tables and group_placeholder_tables is not None:
                 draft_attn_kwargs["block_tables"] = group_placeholder_tables
                 if block_table_base_offsets is not None:
                     draft_attn_kwargs["block_table_base_offsets"] = (
@@ -951,7 +941,7 @@ class CudaGraphWrapper:
             if draft_group_tables is not None:
                 draft_attn_kwargs["block_tables"] = draft_group_tables
             draft_forward_mode = ForwardMode.DECODE
-            if draft_uses_paged_groups:
+            if draft_needs_group_tables:
                 draft_attn_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
             draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
             draft_seq_lens.copy_(seq_lens[:padded_bs])
@@ -977,7 +967,7 @@ class CudaGraphWrapper:
     ):
         """Eager path — allocate/refresh metadata for the upcoming forward."""
         if (
-            getattr(self.attn_backend, "uses_paged_cache_groups", False)
+            getattr(self.attn_backend, "needs_group_block_tables", False)
             and self.drafter is not None
             and forward_mode.is_decode()
         ):
@@ -993,7 +983,7 @@ class CudaGraphWrapper:
         )
         if self.draft_attn_backend is not None:
             draft_kwargs = {}
-            if getattr(self.draft_attn_backend, "uses_paged_cache_groups", False):
+            if getattr(self.draft_attn_backend, "needs_group_block_tables", False):
                 value = kwargs.get("block_table_base_offsets")
                 if value is not None:
                     draft_kwargs["block_table_base_offsets"] = value
@@ -1059,7 +1049,7 @@ class CudaGraphWrapper:
                     seq_lens if self.use_v4_mtp_paged_metadata else draft_seq_lens
                 )
                 draft_forward_mode = ForwardMode.DECODE
-                if getattr(self.draft_attn_backend, "uses_paged_cache_groups", False):
+                if getattr(self.draft_attn_backend, "needs_group_block_tables", False):
                     draft_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
                 self.draft_attn_backend.init_forward_metadata(
                     bs=padded_bs,
@@ -1202,7 +1192,7 @@ class CudaGraphWrapper:
 
         if use_graph:
             group_placeholder_tables = None
-            if bs == 0 and self.attn_backend.uses_paged_cache_groups:
+            if bs == 0 and self.attn_backend.needs_group_block_tables:
                 group_placeholder_tables = self._capture_group_block_tables(
                     padded_bs,
                     self.token_to_kv_pool,
@@ -1261,19 +1251,19 @@ class CudaGraphWrapper:
                 and not ctx.forward_mode.is_idle()
                 and not block_tables
                 and getattr(self.attn_backend, "uses_cache_groups", False)
-                and len(self.token_to_kv_pool.paged_cache_group_specs) > 1
+                and len(self.token_to_kv_pool.arena.cache_group_specs) > 1
             ):
                 raise RuntimeError(
                     "CudaGraphWrapper eager forward: pool publishes "
-                    f"{len(self.token_to_kv_pool.paged_cache_group_specs)} "
-                    "paged cache groups and the backend consumes group tables, "
+                    f"{len(self.token_to_kv_pool.arena.cache_group_specs)} "
+                    "cache groups and the backend consumes group tables, "
                     f"but block_tables is missing/empty at bs={bs} "
                     f"({ctx.forward_mode.name}); the single-table fallback "
                     "would use one group's pages for all layers."
                 )
             metadata_num_tokens = (
                 {"num_tokens": ctx.input_num_tokens}
-                if self.attn_backend.uses_paged_cache_groups
+                if self.attn_backend.needs_group_block_tables
                 else {}
             )
             self._init_forward_metadata(
@@ -1299,7 +1289,7 @@ class CudaGraphWrapper:
                 ),
                 block_table_base_offsets=(
                     block_table_base_offsets
-                    if self.attn_backend.uses_paged_cache_groups
+                    if self.attn_backend.needs_group_block_tables
                     else None
                 ),
                 **cache_kwargs,

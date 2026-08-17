@@ -68,7 +68,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
-    validate_paged_cache_group_ids,
+    validate_cache_group_ids,
 )
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
@@ -124,6 +124,14 @@ def _resolve_prefill_graph_max_tokens(server_args) -> int:
     if server_args.max_total_tokens:
         cap = min(cap, int(server_args.max_total_tokens))
     return cap
+
+
+def _cache_arena_attr(pool, name: str, default):
+    """Read one arena attribute off a cache view, tolerating fakes.
+
+    Every production pool is a view onto an arena; test doubles need not be.
+    """
+    return getattr(getattr(pool, "arena", None), name, default)
 
 
 @dataclass
@@ -317,7 +325,7 @@ class ModelExecutor:
             attn_backend=attn_backend,
             kv_pool=token_to_kv_pool,
         )
-        self._cache_runtime_contract = token_to_kv_pool.runtime_contract
+        self._cache_runtime_contract = token_to_kv_pool.arena.runtime_contract
 
         # The batch-ordered full-history table backs out_cache_loc and the
         # draft page table. First contract group with family=history and
@@ -335,8 +343,10 @@ class ModelExecutor:
         self._draft_final_step_counter = None
 
         # fill_input_buffers indexes the scheduler table in its own table pages; the drafter indexes draft_page_table in its backend's kernel pages.
+        # The grain comes off the draft view's arena (the plan's P), never from
+        # the view itself -- a recipe may pin a P the config never saw.
         self._block_granularity = int(
-            getattr(draft_token_to_kv_pool, "prefix_granularity", 0)
+            _cache_arena_attr(draft_token_to_kv_pool, "prefix_granularity", 0)
             or config.prefix_granularity
         )
         draft_kernel_page_size = getattr(draft_attn_backend, "kernel_page_size", None)
@@ -390,8 +400,8 @@ class ModelExecutor:
             max_num_tokens=config.chunked_prefill_size,
             # Indexes the scheduler's full-history table: scheduler-table page ids.
             page_size=self._block_granularity,
-            # token_to_kv_pool allocates size+page_size slots; index `size` is
-            # the reserved dummy slot (see MHATokenToKVPool._create_buffers).
+            # The cache arena reserves parent 0 as the null page, so slot 0
+            # is the dummy slot padded tokens write into.
             dummy_kv_slot=0,
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
@@ -444,34 +454,30 @@ class ModelExecutor:
 
         attn_backend.configure_runtime(
             sliding_window_size=model_runner.sliding_window_size,
-            paged_cache_group_specs=tuple(token_to_kv_pool.paged_cache_group_specs),
-            paged_cache_group_page_counts=getattr(
-                token_to_kv_pool,
-                "paged_cache_group_page_counts",
-                None,
+            cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
+            cache_group_page_counts=_cache_arena_attr(
+                token_to_kv_pool, "cache_group_page_counts", None
             ),
         )
         if draft_attn_backend is not None:
             draft_attn_backend.configure_runtime(
                 sliding_window_size=model_runner.sliding_window_size,
-                paged_cache_group_specs=tuple(
-                    getattr(draft_token_to_kv_pool, "paged_cache_group_specs", ())
+                cache_group_specs=tuple(
+                    _cache_arena_attr(draft_token_to_kv_pool, "cache_group_specs", ())
                 ),
-                paged_cache_group_page_counts=getattr(
-                    draft_token_to_kv_pool,
-                    "paged_cache_group_page_counts",
-                    None,
+                cache_group_page_counts=_cache_arena_attr(
+                    draft_token_to_kv_pool, "cache_group_page_counts", None
                 ),
             )
 
-        validate_paged_cache_group_ids(
+        validate_cache_group_ids(
             model_runner.model,
-            token_to_kv_pool.paged_cache_group_specs,
+            token_to_kv_pool.arena.cache_group_specs,
         )
         if draft_model_runner is not None and draft_token_to_kv_pool is not None:
-            validate_paged_cache_group_ids(
+            validate_cache_group_ids(
                 draft_model_runner.model,
-                draft_token_to_kv_pool.paged_cache_group_specs,
+                draft_token_to_kv_pool.arena.cache_group_specs,
             )
 
         self.dp_sampling_runtime_config = setup_dp_sampling(
@@ -1072,7 +1078,7 @@ class ModelExecutor:
                     gen_throughput,
                     num_queue_reqs,
                 )
-            self.token_to_kv_pool.maybe_log_paged_cache_group_pages()
+            self.token_to_kv_pool.maybe_log_cache_group_pages()
             self.num_generated_tokens = 0
             self.num_decode_steps = 0
             self.last_decode_stats_tic = now
@@ -1210,7 +1216,7 @@ class ModelExecutor:
                 )
                 zero_pages(page_ids)
                 return True
-            if getattr(pool, "paged_cache_requires_page_zeroing", False):
+            if getattr(pool, "requires_page_zeroing", False):
                 raise RuntimeError(
                     "scheduler emitted pages to zero but an active KV "
                     "pool does not implement physical-page sanitization"
@@ -1222,14 +1228,16 @@ class ModelExecutor:
             draft_pool = getattr(self, "draft_token_to_kv_pool", None)
             if draft_pool is not None and getattr(
                 draft_pool,
-                "paged_cache_requires_page_zeroing",
+                "requires_page_zeroing",
                 False,
             ):
                 draft_pages = pages
                 if isinstance(pages, Mapping):
                     draft_group_ids = {
                         str(spec.group_id)
-                        for spec in draft_pool.paged_cache_group_specs
+                        for spec in _cache_arena_attr(
+                            draft_pool, "cache_group_specs", ()
+                        )
                     }
                     draft_pages = {
                         group_id: page_ids

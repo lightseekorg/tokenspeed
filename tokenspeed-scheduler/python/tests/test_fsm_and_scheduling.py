@@ -33,13 +33,13 @@ Covers:
 import pytest
 from tokenspeed_scheduler import (
     PD,
+    CacheGroupConfig,
+    CacheGroupFamily,
+    CacheRetention,
+    CacheTransferPolicy,
     ExecutionEvent,
     ExecutionPlan,
     ForwardEvent,
-    PagedCacheGroupConfig,
-    PagedCacheGroupFamily,
-    PagedCacheRetention,
-    PagedCacheTransferPolicy,
     RequestSpec,
     Scheduler,
     SchedulerConfig,
@@ -61,14 +61,14 @@ def make_config(
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
     cfg.num_device_pages = num_device_pages
-    cfg.paged_cache_groups = [
-        PagedCacheGroupConfig(
+    cfg.cache_groups = [
+        CacheGroupConfig(
             group_id="full_attention",
             rows_per_page=prefix_granularity,
             entry_stride_tokens=1,
             total_pages=num_device_pages,
-            retention=PagedCacheRetention.FullHistory,
-            family=PagedCacheGroupFamily.History,
+            retention=CacheRetention.FullHistory,
+            family=CacheGroupFamily.History,
         )
     ]
     return cfg
@@ -292,7 +292,7 @@ class TestPrefillFirst:
         cfg.role = SchedulerConfig.Role.P
         cfg.decode_input_tokens = 0
         cfg.enable_pd_cache = True
-        cfg.paged_cache_groups[0].transfer_policy = PagedCacheTransferPolicy.FullSuffix
+        cfg.cache_groups[0].transfer_policy = CacheTransferPolicy.FullSuffix
         s = Scheduler(cfg)
         s.submit_requests(
             [

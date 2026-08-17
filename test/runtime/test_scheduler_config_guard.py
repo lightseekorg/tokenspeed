@@ -6,6 +6,7 @@ import importlib.util
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,7 +15,7 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 
-def _load_paged_cache_spec():
+def _load_cache_spec():
     try:
         from tokenspeed.runtime.layers.attention.kv_cache.recipes import spec
 
@@ -36,14 +37,14 @@ def _load_paged_cache_spec():
             "recipes",
             "spec.py",
         )
-        spec = importlib.util.spec_from_file_location("_paged_cache_spec_guard", path)
+        spec = importlib.util.spec_from_file_location("_cache_spec_guard", path)
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         return module
 
 
-_pcs = _load_paged_cache_spec()
+_pcs = _load_cache_spec()
 
 
 class FakeGroupSpec:
@@ -58,7 +59,8 @@ class FakeContract:
 
 class FakePool:
     def __init__(self, contract: FakeContract | None):
-        self.runtime_contract = contract
+        # The arena publishes the contract; a view only names its arena.
+        self.arena = SimpleNamespace(runtime_contract=contract)
 
 
 class HistoryBackend:
@@ -74,7 +76,7 @@ class ValidateSchedulerConfigTest(unittest.TestCase):
         self.assertNotIn("scheduler_ext_flat_kvcache", _pcs.__dict__)
 
     def test_contractless_pool_rejected(self):
-        with self.assertRaisesRegex(RuntimeError, "PagedCacheRuntimeContract"):
+        with self.assertRaisesRegex(RuntimeError, "CacheRuntimeContract"):
             _pcs.validate_scheduler_config(
                 attn_backend=HistoryBackend(),
                 kv_pool=FakePool(None),

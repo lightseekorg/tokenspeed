@@ -64,10 +64,10 @@ std::pair<bool, std::string> ClearL1CacheWithCapturedLog(Scheduler* scheduler) {
     return {cleared, output.str()};
 }
 
-PagedCacheGroupConfig MakeGroup(const std::string& id, std::int32_t block_granularity, std::int32_t total_pages,
-                                PagedCacheGroupConfig::Retention retention, PagedCacheGroupFamily family,
-                                std::int32_t sliding_window_tokens = 0) {
-    PagedCacheGroupConfig g;
+CacheGroupConfig MakeGroup(const std::string& id, std::int32_t block_granularity, std::int32_t total_pages,
+                           CacheGroupConfig::Retention retention, CacheGroupFamily family,
+                           std::int32_t sliding_window_tokens = 0) {
+    CacheGroupConfig g;
     g.group_id = id;
     g.rows_per_page = block_granularity;
     g.entry_stride_tokens = 1;
@@ -109,11 +109,11 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
 
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
                       /*sliding_window_tokens=*/4),
         };
         return cfg;
@@ -168,11 +168,11 @@ protected:
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::State),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
         };
         return cfg;
     }
@@ -252,11 +252,11 @@ TEST(MambaChunkAlignmentConfigTest, RejectsBudgetSmallerThanStatePage) {
     cfg.max_batch_size = 8;
     cfg.disable_l2_cache = true;
     cfg.disable_prefix_cache = true;
-    cfg.paged_cache_groups = {
+    cfg.cache_groups = {
         MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                  PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                  CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
         MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                  PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::State),
+                  CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
     };
 
     EXPECT_THROW((void)Scheduler(std::move(cfg)), std::invalid_argument);
@@ -279,14 +279,14 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
 
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa_small", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
                       /*sliding_window_tokens=*/4),
             MakeGroup("swa_big", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
                       /*sliding_window_tokens=*/8),
         };
         return cfg;
@@ -340,14 +340,14 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
 
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa_w3", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
                       /*sliding_window_tokens=*/3),
             MakeGroup("swa_w5", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
                       /*sliding_window_tokens=*/5),
         };
         return cfg;
@@ -421,11 +421,11 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
 
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
         };
         return cfg;
     }
@@ -475,11 +475,11 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
 
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
                       /*sliding_window_tokens=*/4),
         };
         return cfg;
@@ -655,11 +655,11 @@ protected:
         cfg.disable_prefix_cache = true;
         cfg.enable_mixed_prefill_decode = true;  // decode + prefill in one plan
 
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
                       /*sliding_window_tokens=*/4),
         };
         return cfg;
@@ -769,11 +769,11 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
 
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
                       /*sliding_window_tokens=*/2),
         };
         return cfg;
@@ -841,11 +841,11 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
 
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
                       /*sliding_window_tokens=*/4),
         };
         return cfg;
@@ -907,11 +907,11 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
 
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
                       /*sliding_window_tokens=*/4),
         };
         return cfg;
@@ -1088,11 +1088,11 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
 
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
         };
         return cfg;
     }
@@ -1233,11 +1233,11 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
 
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
         };
         return cfg;
     }
@@ -1478,7 +1478,7 @@ protected:
         cfg.device_allocator.total_pages = 19;
         cfg.host_allocator.total_pages = 20;
         cfg.max_scheduled_tokens = 8;
-        for (auto& group : cfg.paged_cache_groups) {
+        for (auto& group : cfg.cache_groups) {
             group.total_pages = cfg.device_allocator.total_pages;
         }
         return cfg;
@@ -1517,7 +1517,7 @@ protected:
         // 9 physical pages -> 8 usable: one 3-page prompt charges exactly the pool.
         cfg.device_allocator.total_pages = 9;
         cfg.host_allocator.total_pages = 10;
-        for (auto& g : cfg.paged_cache_groups) {
+        for (auto& g : cfg.cache_groups) {
             g.total_pages = cfg.device_allocator.total_pages;
         }
         return cfg;
@@ -1532,7 +1532,7 @@ TEST_F(RetractExactFitSuite, ReportsSingleRequestTokenCapacity) {
 
 TEST_F(RetractExactFitSuite, ReportsCapacityUsingEachGroupsBlockGranularity) {
     SchedulerConfig config = MakeConfig();
-    config.paged_cache_groups[1].rows_per_page = 1;
+    config.cache_groups[1].rows_per_page = 1;
     Scheduler scheduler{std::move(config)};
 
     // Eight parents fit ceil(tokens / 2) pages for the first group and one
@@ -1561,17 +1561,17 @@ TEST(PdSlidingCapacityTest, CountsPrefixIslandPhasePageAndGroupPacking) {
     cfg.enable_pd_cache = true;
     cfg.disable_l2_cache = true;
 
-    PagedCacheGroupConfig sliding;
+    CacheGroupConfig sliding;
     sliding.group_id = "sliding";
     sliding.rows_per_page = 2;  // group q=2 while scheduler P=4
     sliding.entry_stride_tokens = 1;
     sliding.total_pages = 5;  // null + two parents packing two children each
     sliding.cache_blocks_per_lcm_block = 2;
-    sliding.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+    sliding.retention = CacheGroupConfig::Retention::SlidingWindow;
     sliding.sliding_window_tokens = 4;
-    sliding.family = PagedCacheGroupFamily::State;
-    sliding.transfer_policy = PagedCacheTransferPolicy::FullSuffix;
-    cfg.paged_cache_groups = {sliding};
+    sliding.family = CacheGroupFamily::State;
+    sliding.transfer_policy = CacheTransferPolicy::FullSuffix;
+    cfg.cache_groups = {sliding};
 
     Scheduler scheduler{std::move(cfg)};
 
@@ -1625,7 +1625,7 @@ protected:
         // 25 physical pages -> 24 usable: r1 charges 10, r2 8, r3 6 = the pool.
         cfg.device_allocator.total_pages = 25;
         cfg.host_allocator.total_pages = 26;
-        for (auto& g : cfg.paged_cache_groups) {
+        for (auto& g : cfg.cache_groups) {
             g.total_pages = cfg.device_allocator.total_pages;
         }
         return cfg;
@@ -1713,11 +1713,11 @@ protected:
         SchedulerConfig cfg = RetractSuite::MakeConfig();
         cfg.device_allocator.total_pages = 9;  // 8 usable
         cfg.host_allocator.total_pages = 10;
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::State),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
         };
         return cfg;
     }
@@ -1809,11 +1809,11 @@ protected:
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = false;
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::State),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
         };
         return cfg;
     }
@@ -2124,11 +2124,11 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
 
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
         };
         return cfg;
     }
@@ -2224,12 +2224,11 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = DisablePrefixCache();
 
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
-                      SlidingWindowTokens()),
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State, SlidingWindowTokens()),
         };
         return cfg;
     }
@@ -2549,15 +2548,13 @@ protected:
         cfg.disable_prefix_cache = false;
         cfg.prefix_replay_tokens = 8;
 
-        PagedCacheGroupConfig history =
-            MakeGroup("history", /*block_granularity=*/8, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History);
-        PagedCacheGroupConfig state =
-            MakeGroup("state", /*block_granularity=*/2, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
-                      /*sliding_window_tokens=*/32);
+        CacheGroupConfig history = MakeGroup("history", /*block_granularity=*/8, cfg.device_allocator.total_pages,
+                                             CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History);
+        CacheGroupConfig state = MakeGroup("state", /*block_granularity=*/2, cfg.device_allocator.total_pages,
+                                           CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
+                                           /*sliding_window_tokens=*/32);
         state.cache_blocks_per_lcm_block = 4;
-        cfg.paged_cache_groups = {history, state};
+        cfg.cache_groups = {history, state};
         return cfg;
     }
 };
@@ -2600,9 +2597,9 @@ TEST(PrefixReplayConfigTest, RejectsNegativeReplayTokens) {
     cfg.max_scheduled_tokens = 8;
     cfg.max_batch_size = 1;
     cfg.prefix_replay_tokens = -1;
-    cfg.paged_cache_groups = {
+    cfg.cache_groups = {
         MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                  PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                  CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
     };
     EXPECT_THROW((void)Scheduler(std::move(cfg)), std::invalid_argument);
 }
@@ -3110,11 +3107,11 @@ protected:
         cfg.disable_l2_cache = false;
         cfg.disable_prefix_cache = true;
 
-        cfg.paged_cache_groups = {
+        cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::State,
                       /*sliding_window_tokens=*/4),
         };
         return cfg;
@@ -3311,7 +3308,7 @@ protected:
         // (10 prefill + 2 reserve) spans the whole free list, recycling r1's 6 cached pages.
         cfg.device_allocator.total_pages = 13;
         cfg.host_allocator.total_pages = 33;  // ample (+null page 0): r1's 6 + the churn's 7 entries fit un-evicted
-        for (auto& g : cfg.paged_cache_groups) {
+        for (auto& g : cfg.cache_groups) {
             g.total_pages = cfg.device_allocator.total_pages;
         }
         return cfg;
@@ -3571,7 +3568,7 @@ protected:
         // 21 -> 20 free: r2's first chunk holds 10 (6 ext + 4 fresh) and its second
         // chunk charges 6 with zero slide credit (ticket-held punches don't count).
         cfg.device_allocator.total_pages = 21;
-        for (auto& g : cfg.paged_cache_groups) {
+        for (auto& g : cfg.cache_groups) {
             g.total_pages = cfg.device_allocator.total_pages;
         }
         return cfg;

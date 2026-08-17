@@ -139,15 +139,15 @@ protected:
         cfg.disable_l2_cache = false;
         cfg.disable_prefix_cache = true;
 
-        PagedCacheGroupConfig full;
+        CacheGroupConfig full;
         full.group_id = "full";
         full.rows_per_page = cfg.prefix_granularity;
         full.entry_stride_tokens = 1;
         full.total_pages = cfg.device_allocator.total_pages;
-        full.retention = PagedCacheGroupConfig::Retention::FullHistory;
-        full.family = PagedCacheGroupFamily::History;
-        full.transfer_policy = PagedCacheTransferPolicy::FullSuffix;
-        cfg.paged_cache_groups = {full};
+        full.retention = CacheGroupConfig::Retention::FullHistory;
+        full.family = CacheGroupFamily::History;
+        full.transfer_policy = CacheTransferPolicy::FullSuffix;
+        cfg.cache_groups = {full};
         return cfg;
     }
 
@@ -194,7 +194,7 @@ protected:
         SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 5;
         cfg.max_batch_size = 2;
-        cfg.paged_cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         return cfg;
     }
 };
@@ -232,7 +232,7 @@ protected:
         cfg.disable_l2_cache = false;
         cfg.disable_prefix_cache = false;
         cfg.device_allocator.total_pages = 5;  // null parent + one four-page recovery working set
-        cfg.paged_cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         return cfg;
     }
 };
@@ -244,7 +244,7 @@ protected:
         cfg.device_allocator.total_pages = 16;
         cfg.host_allocator.total_pages = 6;  // null parent + five retraction parents
         cfg.max_batch_size = 3;
-        cfg.paged_cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         return cfg;
     }
 };
@@ -254,7 +254,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = DecodeRetractionL2TestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 6;
-        cfg.paged_cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         cfg.max_batch_size = 2;
         return cfg;
     }
@@ -609,19 +609,19 @@ protected:
         cfg.enable_pd_cache = true;
         cfg.disable_prefix_cache = false;
 
-        PagedCacheGroupConfig full = cfg.paged_cache_groups.front();
+        CacheGroupConfig full = cfg.cache_groups.front();
         full.group_id = "full";
         full.total_pages = 13;
         full.cache_blocks_per_lcm_block = 2;
-        full.transfer_policy = PagedCacheTransferPolicy::FullSuffix;
+        full.transfer_policy = CacheTransferPolicy::FullSuffix;
 
-        PagedCacheGroupConfig state = full;
+        CacheGroupConfig state = full;
         state.group_id = "state";
         state.total_pages = 7;
         state.cache_blocks_per_lcm_block = 1;
-        state.family = PagedCacheGroupFamily::State;
-        state.transfer_policy = PagedCacheTransferPolicy::LatestSnapshot;
-        cfg.paged_cache_groups = {full, state};
+        state.family = CacheGroupFamily::State;
+        state.transfer_policy = CacheTransferPolicy::LatestSnapshot;
+        cfg.cache_groups = {full, state};
         return cfg;
     }
 };
@@ -631,8 +631,8 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = PdSparseDecodeAdmissionTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 8;
-        cfg.paged_cache_groups[0].total_pages = 15;
-        cfg.paged_cache_groups[1].total_pages = 8;
+        cfg.cache_groups[0].total_pages = 15;
+        cfg.cache_groups[1].total_pages = 8;
         cfg.disable_prefix_cache = true;
         return cfg;
     }
@@ -642,7 +642,7 @@ class PdSmallStatePagesTestSuite : public PdSparseDecodeAdmissionTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = PdSparseDecodeAdmissionTestSuite::MakeConfig();
-        auto& state = cfg.paged_cache_groups[1];
+        auto& state = cfg.cache_groups[1];
         state.rows_per_page = 1;
         state.total_pages = 13;
         state.cache_blocks_per_lcm_block = 2;
@@ -656,8 +656,8 @@ protected:
         SchedulerConfig cfg = PdSparseDecodeAdmissionTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 9;  // null parent + eight usable parents
         cfg.max_scheduled_tokens = 8;
-        cfg.paged_cache_groups[0].total_pages = 17;
-        cfg.paged_cache_groups[1].total_pages = 9;
+        cfg.cache_groups[0].total_pages = 17;
+        cfg.cache_groups[1].total_pages = 9;
         return cfg;
     }
 };
@@ -673,16 +673,16 @@ protected:
         cfg.enable_pd_cache = true;
         cfg.disable_prefix_cache = false;
 
-        PagedCacheGroupConfig sliding;
+        CacheGroupConfig sliding;
         sliding.group_id = "sliding";
         sliding.rows_per_page = 2;
         sliding.entry_stride_tokens = 1;
         sliding.total_pages = cfg.device_allocator.total_pages;
-        sliding.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+        sliding.retention = CacheGroupConfig::Retention::SlidingWindow;
         sliding.sliding_window_tokens = 4;
-        sliding.family = PagedCacheGroupFamily::State;
-        sliding.transfer_policy = PagedCacheTransferPolicy::FullSuffix;
-        cfg.paged_cache_groups = {sliding};
+        sliding.family = CacheGroupFamily::State;
+        sliding.transfer_policy = CacheTransferPolicy::FullSuffix;
+        cfg.cache_groups = {sliding};
         return cfg;
     }
 };

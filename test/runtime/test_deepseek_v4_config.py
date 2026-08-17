@@ -63,6 +63,18 @@ from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4IndexerDecodePlan,
     DeepseekV4IndexerPrefillMetadata,
 )
+from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
+    V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+    V4_SWA_KV_GROUP_ID,
+    deepseek_v4_cache_layout_from_config,
+    deepseek_v4_indexer_fp8_row_bytes,
+    deepseek_v4_indexer_mxfp4_row_bytes,
+    deepseek_v4_nope_dim,
+    deepseek_v4_swa_row_bytes,
+    deepseek_v4_swa_token_stride,
+    v4_compressed_kv_group_id,
+    v4_compressor_state_group_id,
+)
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_compute_global_topk_indices_and_lens,
     fused_qnorm_rope_kv_insert,
@@ -75,25 +87,15 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     _split_block_tables_into_v4_metadata,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
-    build_deepseek_v4_cache_fields,
-    prepare_deepseek_v4_cache,
-    solve_deepseek_v4_memory_layout,
-)
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec import (
-    V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
-    V4_SWA_KV_GROUP_ID,
-    build_v4_cache_specs,
-    deepseek_v4_cache_layout_from_config,
-    deepseek_v4_indexer_fp8_row_bytes,
-    deepseek_v4_indexer_mxfp4_row_bytes,
-    deepseek_v4_nope_dim,
-    deepseek_v4_swa_row_bytes,
-    deepseek_v4_swa_token_stride,
-    v4_compressed_kv_group_id,
-    v4_compressor_state_group_id,
+    DeepseekV4Recipe,
+    v4_c4_state_window,
+    v4_compressed_kv_spec,
+    v4_compressor_state_spec,
+    v4_indexer_state_spec,
+    v4_swa_kv_spec,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    PagedCacheGroupSpec,
+    CacheGroupSpec,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.quantization import (
@@ -162,36 +164,98 @@ from tokenspeed.runtime.utils.hf_transformers_utils import (
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
+def _v4_spec_set(hf_config, *, layer_ratio, decode_input_tokens: int = 1):
+    """The spec set a ratio vector declares, in the recipe's own order."""
+    ratios = {int(ratio) for ratio in layer_ratio}
+    window = v4_c4_state_window(decode_input_tokens)
+    specs = [v4_swa_kv_spec(hf_config)]
+    for ratio in sorted(r for r in ratios if r > 1):
+        specs.append(v4_compressor_state_spec(ratio, c4_state_window=window))
+        specs.append(v4_compressed_kv_spec(ratio))
+    if 4 in ratios:
+        specs.append(v4_indexer_state_spec(c4_state_window=window))
+    return tuple(specs)
+
+
+def _v4_recipe(
+    hf_config, *, prefix_granularity: int = 256, decode_input_tokens: int = 1
+):
+    """A V4 recipe over one hf_config, with tiny scheduler limits."""
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
+        DeepseekV4Recipe,
+    )
+
+    num_layers = len(hf_config.compress_ratios)
+    return DeepseekV4Recipe(
+        server_args=SimpleNamespace(
+            max_total_tokens=None,
+            chunked_prefill_size=prefix_granularity,
+            attention_use_fp4_indexer_cache=True,
+            speculative_algorithm=None,
+        ),
+        model_config=SimpleNamespace(
+            hf_config=hf_config, num_attention_layers=num_layers
+        ),
+        attn_config=SimpleNamespace(
+            prefix_granularity=prefix_granularity,
+            max_bs=1,
+            context_len=4096,
+            pd_disaggregation_enabled=False,
+        ),
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=1 << 34,
+        decode_input_tokens=decode_input_tokens,
+        overlap_schedule_depth=0,
+    )
+
+
+def _v4_layout(hf_config, **kwargs):
+    """``(recipe, groups, packed layout)`` -- group then pack, as setup does."""
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
+
+    recipe = _v4_recipe(hf_config, **kwargs)
+    groups = recipe.groups()
+    layout = pack(
+        groups,
+        prefix_granularity=recipe.prefix_granularity,
+        cache_blocks_per_lcm_block=recipe.packing(groups),
+        alignment=recipe.alignment,
+        max_padding_fraction=recipe.max_padding_fraction,
+    )
+    recipe.check_layout(layout)
+    return recipe, groups, layout
+
+
+def _fake_pool(*group_specs, **arena_attrs) -> SimpleNamespace:
+    """A cache-view double: the arena publishes, the view just names it."""
+    return SimpleNamespace(
+        arena=SimpleNamespace(cache_group_specs=tuple(group_specs), **arena_attrs)
+    )
+
+
 def _make_planned_deepseek_v4_pool(
     layout,
     hf_config,
     *,
     num_lcm_blocks: int = 2,
 ):
-    fields = build_deepseek_v4_cache_fields(
-        layout,
-        sliding_window=int(hf_config.sliding_window),
-        prefix_granularity=256,
-    )
-    plan = solve_deepseek_v4_memory_layout(fields).with_num_lcm_blocks(num_lcm_blocks)
+    _, groups, packed = _v4_layout(hf_config)
+    plan = packed.bind(num_lcm_blocks)
     max_packing = max(group.cache_blocks_per_lcm_block for group in plan.groups)
     pool_size = num_lcm_blocks * max_packing * plan.prefix_granularity
-    specs = tuple(
-        build_v4_cache_specs(
-            hf_config,
-            layer_ratio=layout.layer_ratio,
-        )
-    )
-    pool = HybridDeepseekV4TokenToKVPool(
-        size=pool_size,
+    specs = tuple(spec for spec, _ in groups)
+    from cache_pool_test_utils import make_pool
+
+    _, pool = make_pool(
+        HybridDeepseekV4TokenToKVPool,
+        plan,
+        device="cpu",
         model_dtype=torch.bfloat16,
         layout=layout,
         layer_num=len(layout.layer_ratio),
-        device="cpu",
-        enable_memory_saver=False,
         rank=0,
-        memory_plan=plan,
-        paged_cache_group_specs=specs,
+        cache_group_specs=specs,
         token_capacity=pool_size,
     )
     return pool, plan
@@ -803,7 +867,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         captured = {}
 
         class FakeBackend:
-            uses_paged_cache_groups = True
+            needs_group_block_tables = True
             uses_padded_decode_token_mask = True
 
             def init_forward_metadata_replay_cuda_graph(self, *args, **kwargs):
@@ -839,7 +903,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         captured = {"target": {}, "draft": {}}
 
         class FakeBackend:
-            uses_paged_cache_groups = True
+            needs_group_block_tables = True
             uses_padded_decode_token_mask = False
 
             def __init__(self, key):
@@ -922,7 +986,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         captured = {"target": [], "draft": []}
 
         class FakeBackend:
-            uses_paged_cache_groups = False
+            needs_group_block_tables = False
 
             def __init__(self, key):
                 self.key = key
@@ -964,7 +1028,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         captured = {"target": [], "draft": []}
 
         class FakeBackend:
-            uses_paged_cache_groups = True
+            needs_group_block_tables = True
             uses_cache_groups = True
 
             def __init__(self, key):
@@ -987,16 +1051,12 @@ class TestDeepseekV4Config(unittest.TestCase):
             draft_seq_lens_buf=torch.zeros(1, dtype=torch.int32),
         )
         wrapper.use_v4_mtp_paged_metadata = True
-        wrapper.token_to_kv_pool = SimpleNamespace(
-            paged_cache_group_specs=(
-                SimpleNamespace(group_id="v4.swa_kv", family="history"),
-                SimpleNamespace(group_id="v4.state", family="state"),
-            )
+        wrapper.token_to_kv_pool = _fake_pool(
+            SimpleNamespace(group_id="v4.swa_kv", family="history"),
+            SimpleNamespace(group_id="v4.state", family="state"),
         )
-        wrapper.draft_token_to_kv_pool = SimpleNamespace(
-            paged_cache_group_specs=(
-                SimpleNamespace(group_id="v4.swa_kv", family="history"),
-            )
+        wrapper.draft_token_to_kv_pool = _fake_pool(
+            SimpleNamespace(group_id="v4.swa_kv", family="history"),
         )
 
         wrapper._init_forward_metadata(
@@ -1024,7 +1084,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         captured = {"target": [], "draft": []}
 
         class FakeBackend:
-            uses_paged_cache_groups = False
+            needs_group_block_tables = False
 
             def __init__(self, key):
                 self.key = key
@@ -2412,7 +2472,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             (plan.group("v4.c4a.compressed_kv").page_count, 64 * 68),
         )
 
-    def test_deepseek_v4_kv_pool_rejects_nonpositive_size(self):
+    def test_deepseek_v4_plan_rejects_nonpositive_capacity(self):
+        # Capacity is a plan quantity (the pool derives its size from the
+        # arena), so the planner owns this guard.
         config = SimpleNamespace(
             compress_ratios=[1],
             head_dim=512,
@@ -2425,26 +2487,11 @@ class TestDeepseekV4Config(unittest.TestCase):
             page_size=64,
             use_fp4_indexer_cache=True,
         )
+        cache_layout = _v4_layout(config)[2]
 
-        with self.assertRaisesRegex(ValueError, "must be positive"):
-            HybridDeepseekV4TokenToKVPool(
-                size=0,
-                model_dtype=torch.bfloat16,
-                layout=layout,
-                layer_num=1,
-                device="cpu",
-                enable_memory_saver=False,
-                rank=0,
-                memory_plan=solve_deepseek_v4_memory_layout(
-                    build_deepseek_v4_cache_fields(
-                        layout,
-                        sliding_window=128,
-                        prefix_granularity=256,
-                    ),
-                ).with_num_lcm_blocks(1),
-                paged_cache_group_specs=(),
-                token_capacity=256,
-            )
+        for capacity in (0, -1):
+            with self.assertRaisesRegex(ValueError, "must be a positive integer"):
+                cache_layout.bind(capacity)
 
     def test_deepseek_v4_group_slot_mapping_consumes_compact_base_offsets(self):
         slots = _group_slot_mapping_from_raw(
@@ -2470,7 +2517,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.equal(slots, torch.tensor([640, 641, 642, 1280, 1281, 1282]))
         )
 
-    def test_deepseek_v4_backend_preserves_compact_paged_cache_contract(self):
+    def test_deepseek_v4_backend_preserves_compact_cache_contract(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
                 prefix_granularity=64,
@@ -2523,18 +2570,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
         backend.prefix_granularity = 256
-        group_ids = {
-            V4_SWA_KV_GROUP_ID,
-            v4_compressor_state_group_id(4),
-            v4_compressed_kv_group_id(4),
-            v4_compressor_state_group_id(128),
-            v4_compressed_kv_group_id(128),
-            V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
-        }
-        specs = build_v4_cache_specs(
+        specs = _v4_spec_set(
             SimpleNamespace(sliding_window=128),
             layer_ratio=(4, 128),
-            cache_blocks_per_lcm_block={group_id: 1 for group_id in group_ids},
         )
         widths = {
             spec.group_id: backend._cuda_graph_group_table_width(
@@ -2612,14 +2650,14 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
         specs = (
-            PagedCacheGroupSpec(
+            CacheGroupSpec(
                 group_id="fine",
                 retention="full_history",
                 rows_per_page=4,
                 entry_stride_tokens=1,
                 sliding_window_tokens=None,
             ),
-            PagedCacheGroupSpec(
+            CacheGroupSpec(
                 group_id="coarse",
                 retention="full_history",
                 rows_per_page=256,
@@ -2630,8 +2668,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         counts = {"fine": 20001, "coarse": 1025}
 
         backend.configure_runtime(
-            paged_cache_group_specs=specs,
-            paged_cache_group_page_counts=counts,
+            cache_group_specs=specs,
+            cache_group_page_counts=counts,
         )
         tables = {
             "fine": torch.ones((1, 1), dtype=torch.int32),
@@ -2650,8 +2688,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         # Graph setup may repeat the same contract but must not replace it.
         backend.init_cuda_graph_state(
             max_bs=1,
-            paged_cache_group_specs=specs,
-            paged_cache_group_page_counts=counts,
+            cache_group_specs=specs,
+            cache_group_page_counts=counts,
         )
         changed = {"fine": 20002, "coarse": 1025}
         with self.assertRaisesRegex(RuntimeError, "changed after initialization"):
@@ -2810,13 +2848,13 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_target_mtp_graph_replay_refreshes_flat_tables(self):
         device = torch.device("cuda")
         target_specs = tuple(
-            build_v4_cache_specs(
+            _v4_spec_set(
                 SimpleNamespace(sliding_window=128),
                 layer_ratio=(1, 4, 128),
             )
         )
         draft_specs = tuple(
-            build_v4_cache_specs(
+            _v4_spec_set(
                 SimpleNamespace(sliding_window=128),
                 layer_ratio=(1,),
             )
@@ -2847,14 +2885,14 @@ class TestDeepseekV4Config(unittest.TestCase):
         draft = make_backend(is_draft=True)
         target.init_cuda_graph_state(
             max_bs=2,
-            paged_cache_group_specs=target_specs,
-            paged_cache_group_page_counts=target_counts,
+            cache_group_specs=target_specs,
+            cache_group_page_counts=target_counts,
             max_tokens_per_req=4,
         )
         draft.init_cuda_graph_state(
             max_bs=2,
-            paged_cache_group_specs=draft_specs,
-            paged_cache_group_page_counts=draft_counts,
+            cache_group_specs=draft_specs,
+            cache_group_page_counts=draft_counts,
             max_tokens_per_req=4,
         )
 
@@ -3441,8 +3479,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         backend.init_cuda_graph_state(
             2,
-            paged_cache_group_specs=(
-                PagedCacheGroupSpec(
+            cache_group_specs=(
+                CacheGroupSpec(
                     group_id="v4.swa_kv",
                     retention="sliding_window",
                     rows_per_page=64,
@@ -3450,7 +3488,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     sliding_window_tokens=128,
                 ),
             ),
-            paged_cache_group_page_counts={"v4.swa_kv": 1024},
+            cache_group_page_counts={"v4.swa_kv": 1024},
             max_tokens_per_req=1,
         )
         compact = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
@@ -3657,6 +3695,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             head_dim=512,
             qk_rope_head_dim=64,
             index_head_dim=128,
+            sliding_window=128,
         )
         layout = deepseek_v4_cache_layout_from_config(
             config,
@@ -3664,24 +3703,17 @@ class TestDeepseekV4Config(unittest.TestCase):
             use_fp4_indexer_cache=True,
         )
 
+        from cache_pool_test_utils import make_pool
+
         with self.assertRaisesRegex(ValueError, "layer_num"):
-            HybridDeepseekV4TokenToKVPool(
-                size=128,
+            make_pool(
+                HybridDeepseekV4TokenToKVPool,
+                _v4_layout(config)[2].bind(1),
+                device="cpu",
                 model_dtype=torch.bfloat16,
                 layout=layout,
                 layer_num=2,
-                device="cpu",
-                enable_memory_saver=False,
                 rank=0,
-                memory_plan=solve_deepseek_v4_memory_layout(
-                    build_deepseek_v4_cache_fields(
-                        layout,
-                        sliding_window=128,
-                        prefix_granularity=256,
-                    ),
-                ).with_num_lcm_blocks(1),
-                paged_cache_group_specs=(),
-                token_capacity=256,
             )
 
     def test_deepseek_v4_metadata_maps_compressed_slots(self):
@@ -3837,7 +3869,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
         backend.configure_runtime(
-            paged_cache_group_specs=(
+            cache_group_specs=(
                 SimpleNamespace(
                     group_id=V4_SWA_KV_GROUP_ID,
                     retention="sliding_window",
@@ -3845,7 +3877,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     entry_stride_tokens=1,
                 ),
             ),
-            paged_cache_group_page_counts={V4_SWA_KV_GROUP_ID: 128},
+            cache_group_page_counts={V4_SWA_KV_GROUP_ID: 128},
         )
         backend.init_forward_metadata(
             bs=3,
@@ -4193,11 +4225,11 @@ class TestDeepseekV4Config(unittest.TestCase):
                     build(granularity)
 
     def test_deepseek_v4_spec_geometry_is_prefix_granularity_free(self):
-        """build_v4_cache_specs takes no P; block spans come from the kernel
+        """The spec constructors take no P; block spans come from the kernel
         page registry (256 // ratio rows x ratio-token stride)."""
         specs = {
             spec.group_id: spec
-            for spec in build_v4_cache_specs(
+            for spec in _v4_spec_set(
                 SimpleNamespace(sliding_window=128),
                 layer_ratio=(1, 4, 128),
                 decode_input_tokens=1,
@@ -4791,8 +4823,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         group_id = v4_compressed_kv_group_id(4)
         backend.init_cuda_graph_state(
             max_bs=4,
-            paged_cache_group_specs=(
-                PagedCacheGroupSpec(
+            cache_group_specs=(
+                CacheGroupSpec(
                     group_id=group_id,
                     retention="full_history",
                     rows_per_page=64,
@@ -4800,7 +4832,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     sliding_window_tokens=None,
                 ),
             ),
-            paged_cache_group_page_counts={group_id: 128},
+            cache_group_page_counts={group_id: 128},
         )
         backend.init_forward_metadata_capture_cuda_graph(
             bs=4,
@@ -6214,13 +6246,8 @@ def test_v4_merged_solve_draft_is_a_continuation_layer():
     layout = deepseek_v4_cache_layout_from_config(
         hf_config, page_size=64, use_fp4_indexer_cache=False
     )
-    fields = build_deepseek_v4_cache_fields(
-        layout,
-        sliding_window=int(hf_config.sliding_window),
-        prefix_granularity=256,
-    )
-    merged = solve_deepseek_v4_memory_layout(fields)
-    plan = merged.with_num_lcm_blocks(2)
+    merged = _v4_layout(hf_config)[2]
+    plan = merged.bind(2)
     # Every layer's swa field (all 6 layers incl. the MTP continuation
     # layer) shares the one v4.swa_kv group — one packing, one page-id
     # space for target and draft alike.
@@ -6232,11 +6259,11 @@ def test_v4_merged_solve_draft_is_a_continuation_layer():
 
 
 def test_v4_pd_recipe_and_readiness_follow_cache_producers():
-    setup = prepare_deepseek_v4_cache(
+    setup = DeepseekV4Recipe(
         server_args=SimpleNamespace(
             speculative_algorithm=None,
             attention_use_fp4_indexer_cache=False,
-            max_total_tokens=512,
+            max_total_tokens=64 * 1024,
             chunked_prefill_size=256,
         ),
         model_config=SimpleNamespace(
@@ -6261,7 +6288,7 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
         cache_budget_bytes=1 << 30,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
-    )
+    ).setup()
     schedule = build_cache_fields_by_producer_step(
         setup.spec.memory_plan, num_target_layers=3
     )

@@ -56,7 +56,7 @@ from tokenspeed.runtime.pd.mooncake.entities import (  # noqa: E402
     TransferKVChunk,
 )
 from tokenspeed.runtime.pd.transfer_plan import (  # noqa: E402
-    PagedCacheTransferPlanner,
+    CacheTransferPlanner,
 )
 from tokenspeed.runtime.pd.utils import StepCounter  # noqa: E402
 
@@ -83,7 +83,6 @@ def _segment(
         field_id,
         dtype="bfloat16",
         shape=shape,
-        element_size=2,
         offset=page_zero_offset,
         stride=page_stride_bytes,
         axis=partition_axis,
@@ -452,7 +451,7 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
 
     source_layout = _heterogeneous_layout(destination=False)
     destination_layout = _heterogeneous_layout(destination=True)
-    planner = PagedCacheTransferPlanner(
+    planner = CacheTransferPlanner(
         prefill_tp_size=2,
         decode_tp_size=1,
         prefill_layout=source_layout,

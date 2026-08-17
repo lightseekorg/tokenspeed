@@ -94,7 +94,7 @@ def test_bridge_exposes_full_attention_group_and_block_size() -> None:
     metadata, forward_op = _metadata_for(pool, table, "cpu")
 
     assert metadata.full_attention_group_id == "full_attention"
-    assert metadata.block_granularity == pool.prefix_granularity
+    assert metadata.block_granularity == pool.arena.prefix_granularity
     resolved = metadata.require_full_attention_table(active_forward_op=forward_op)
     assert torch.equal(resolved, torch.tensor(table, dtype=torch.int32))
 
@@ -110,15 +110,16 @@ def test_bridge_exposes_full_attention_group_and_block_size() -> None:
 def test_pool_mla_views_are_no_copy_and_layer_gated() -> None:
     pool = _make_pool("cpu", usable_pages=2)
     layer_id = _mla_layer_id(pool)
-    page_size = pool.prefix_granularity
+    page_size = pool.arena.prefix_granularity
 
     key = pool.get_key_buffer(layer_id)
-    component = pool.get_component(layer_id, "latent_kv")
 
     assert key.shape == ((2 * 12 + 1) * page_size, 1, _LATENT_DIM)
     assert key.dtype == torch.float8_e4m3fn
-    assert key.data_ptr() == component.data_ptr()
-    assert key.untyped_storage().data_ptr() == pool.buffer.untyped_storage().data_ptr()
+    assert (
+        key.untyped_storage().data_ptr()
+        == pool.arena.buffer.untyped_storage().data_ptr()
+    )
 
     value = pool.get_value_buffer(layer_id)
     assert value.shape[-1] == _KV_LORA_RANK
@@ -127,8 +128,12 @@ def test_pool_mla_views_are_no_copy_and_layer_gated() -> None:
     assert key2.data_ptr() == key.data_ptr()
     assert value2.shape == value.shape
 
+    # The two surfaces are layer-gated in both directions: latent KV is read
+    # through the kv buffers, KDA state only through get_component.
     with pytest.raises(ValueError, match="state layer"):
         pool.get_key_buffer(_kda_layer_id(pool))
+    with pytest.raises(ValueError, match="no KDA state"):
+        pool.get_component(layer_id, "latent_kv")
 
 
 @requires_cuda
@@ -138,8 +143,14 @@ def test_pool_write_location_oracle_page_id_times_p_plus_offset() -> None:
     pool = _make_pool("cuda", usable_pages=3)
     layer_id = _mla_layer_id(pool)
     layer = _fake_layer(layer_id)
-    page_size = pool.prefix_granularity
-    component = pool.get_component(layer_id, "latent_kv")
+    page_size = pool.arena.prefix_granularity
+    # Page contiguity is a plan invariant (exact_page_stride), so the flat slot
+    # view folds into pages -- which is the oracle under test.
+    paged_latent = (
+        pool.get_key_buffer(layer_id)
+        .view(torch.uint8)
+        .view(-1, page_size, 1, _LATENT_DIM)
+    )
 
     # Page-boundary coverage: last slot of page 1, first slot of page 2,
     # interior of page 3.
@@ -156,11 +167,11 @@ def test_pool_write_location_oracle_page_id_times_p_plus_offset() -> None:
 
     expected = latent.to(torch.float8_e4m3fn).view(torch.uint8)
     for row, (page, off) in enumerate([(1, page_size - 1), (2, 0), (3, 7)]):
-        got_bytes = component[page, off, 0]
+        got_bytes = paged_latent[page, off, 0]
         assert torch.equal(got_bytes, expected[row, 0]), (page, off)
 
     # Null page 0 must stay untouched.
-    assert torch.count_nonzero(component[0]).item() == 0
+    assert torch.count_nonzero(paged_latent[0]).item() == 0
 
     # Round-trip through the read adapter.
     nope, rope = pool.get_mla_kv_buffer(layer, locs, torch.bfloat16)
@@ -224,7 +235,7 @@ def backend_factory(cuda_env, gpu_pool):
             kv_cache_dtype=torch.float8_e4m3fn,
             prefix_granularity=_KERNEL_PAGE,
             kernel_page_size=_KERNEL_PAGE,
-            context_len=4 * gpu_pool.prefix_granularity,
+            context_len=4 * gpu_pool.arena.prefix_granularity,
             max_bs=8,
             max_graph_bs=8,
             kv_cache_quant_method="",
@@ -244,7 +255,7 @@ def backend_factory(cuda_env, gpu_pool):
 
 def _write_history(pool, layer, logical_rows, lengths, seed=0):
     torch.manual_seed(seed)
-    page_size = pool.prefix_granularity
+    page_size = pool.arena.prefix_granularity
     for pages, length in zip(logical_rows, lengths):
         positions = torch.arange(length, device="cuda", dtype=torch.int64)
         locs = _token_locs(pages, positions, page_size)
@@ -283,7 +294,7 @@ def test_decode_grouped_matches_single_table_and_reference(
     backend_factory, gpu_pool
 ) -> None:
     pool = gpu_pool
-    page_size = pool.prefix_granularity
+    page_size = pool.arena.prefix_granularity
     layer = _fake_layer(_mla_layer_id(pool), scaling=_LATENT_DIM**-0.5)
     # req0 crosses a logical page boundary; req1 ends exactly at one.
     logical_rows = [[2, 4], [1, -1]]
@@ -354,7 +365,7 @@ def test_decode_grouped_writes_land_at_group_locations(
     """forward_decode(save_kv_cache=True) writes via grouped locationations, not the
     caller's page_table-derived out_cache_loc."""
     pool = gpu_pool
-    page_size = pool.prefix_granularity
+    page_size = pool.arena.prefix_granularity
     layer = _fake_layer(_mla_layer_id(pool))
     logical_rows = [[3, 5]]
     seq_lens_cpu = [page_size + 41]
@@ -410,7 +421,7 @@ def _init_prefill(backend, pool, logical_rows, prefix, extend, *, grouped: bool)
         backend.init_forward_metadata(
             req_pool_indices=torch.arange(bs, device="cuda", dtype=torch.int64),
             page_table=_kernel_page_table(
-                logical_rows, pool.prefix_granularity, "cuda"
+                logical_rows, pool.arena.prefix_granularity, "cuda"
             ),
             **kwargs,
         )
@@ -426,7 +437,7 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
     from tokenspeed.runtime.utils.pdl import pdl_enabled
 
     pool = gpu_pool
-    page_size = pool.prefix_granularity
+    page_size = pool.arena.prefix_granularity
     layer = _fake_layer(_mla_layer_id(pool), scaling=192**-0.5)
     # req0's prefix crosses a page boundary mid-page; req1's prefix ends
     # exactly on one, and its extend tokens cross into a fresh page.
@@ -561,7 +572,7 @@ def test_path_never_reads_page_table(backend_factory, gpu_pool) -> None:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
     pool = gpu_pool
-    page_size = pool.prefix_granularity
+    page_size = pool.arena.prefix_granularity
     logical_rows = [[2, 5], [4, -1]]
     seq_lens_cpu = [page_size + 3, 9]
     backend = backend_factory()

@@ -156,17 +156,17 @@ class _StubFullAttnMeta:
         return self._table
 
     def kernel_table(
-        self, group_id=None, *, page_size, max_pages=None, active_forward_op
+        self, group_id=None, *, kernel_page_size, max_pages=None, active_forward_op
     ):
         if active_forward_op is not self._forward_op:
             raise RuntimeError("stale forward op")
-        key = (group_id, page_size, max_pages)
+        key = (group_id, kernel_page_size, max_pages)
         cached = self._kernel_tables.get(key)
         if cached is None:
             cached = expand_page_table(
                 self._table,
                 block_granularity=self.prefix_granularity,
-                kernel_page_size=page_size,
+                kernel_page_size=kernel_page_size,
                 max_kernel_pages=max_pages,
             )
             self._kernel_tables[key] = cached

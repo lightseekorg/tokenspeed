@@ -338,8 +338,8 @@ class InklingModelConfig(PretrainedConfig):
         return [i for i in range(self.num_hidden_layers) if i not in local]
 
     @property
-    def paged_cache_layer_types(self) -> list[str]:
-        """Per-layer paged-cache labels derived from ``local_layer_ids``.
+    def cache_layer_types(self) -> list[str]:
+        """Per-layer cache-group labels derived from ``local_layer_ids``.
 
         Deliberately NOT named ``layer_types``: transformers strictly
         validates that attribute against its own vocabulary
@@ -518,8 +518,8 @@ class InklingMMConfig(PretrainedConfig):
         return self.text_config
 
     @property
-    def paged_cache_layer_types(self) -> list[str]:
-        return self.text_config.paged_cache_layer_types
+    def cache_layer_types(self) -> list[str]:
+        return self.text_config.cache_layer_types
 
     @property
     def sliding_window(self) -> int:

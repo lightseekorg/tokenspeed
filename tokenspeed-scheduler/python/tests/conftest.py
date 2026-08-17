@@ -30,17 +30,17 @@ def _make_k3_config() -> "ts.SchedulerConfig":
     cfg.enable_l3_storage = False
     cfg.disable_l2_cache = True
     cfg.disable_prefix_cache = False
-    cfg.paged_cache_groups = [
-        ts.PagedCacheGroupConfig(
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
             group_id=group_id,
             rows_per_page=cfg.prefix_granularity,
             entry_stride_tokens=1,
             total_pages=cfg.num_device_pages,
-            retention=ts.PagedCacheRetention.FullHistory,
+            retention=ts.CacheRetention.FullHistory,
             family=(
-                ts.PagedCacheGroupFamily.History
+                ts.CacheGroupFamily.History
                 if group_id == K3_HISTORY_GROUP
-                else ts.PagedCacheGroupFamily.State
+                else ts.CacheGroupFamily.State
             ),
         )
         for group_id in K3_GROUP_IDS

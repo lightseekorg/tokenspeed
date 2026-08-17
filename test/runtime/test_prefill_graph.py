@@ -22,6 +22,19 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
+def _spec(group_id: str, *, family: str = "history", **fields) -> SimpleNamespace:
+    """A published group-spec double. ``family`` decides state vs history, so
+    it is never inferred from the group id."""
+    return SimpleNamespace(group_id=group_id, family=family, **fields)
+
+
+def _fake_pool(*, specs=(), **arena_attrs) -> SimpleNamespace:
+    """A cache-view double: the arena publishes, the view just names it."""
+    return SimpleNamespace(
+        arena=SimpleNamespace(cache_group_specs=tuple(specs), **arena_attrs)
+    )
+
+
 class SliceMhaExtendInputsTest(unittest.TestCase):
     """MHA kernels see exactly the rows covered by live cu-seqlens."""
 
@@ -115,11 +128,11 @@ class DummyGroupTablesTest(unittest.TestCase):
             max_num_pages=0,  # fall back to bucket-derived width
             state_group_ids=frozenset({"linear_attention"}),
         )
-        pool = SimpleNamespace(
-            paged_cache_group_specs=(
-                SimpleNamespace(group_id="full_attention"),
-                SimpleNamespace(group_id="sliding_attention"),
-                SimpleNamespace(group_id="linear_attention"),  # state: included
+        pool = _fake_pool(
+            specs=(
+                _spec("full_attention"),
+                _spec("sliding_attention"),
+                _spec("linear_attention", family="state"),  # state: included
             )
         )
         tables = self._bare(backend, pool)._dummy_group_tables(100, 1)
@@ -145,9 +158,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             max_num_pages=2500,
             state_group_ids=frozenset(),
         )
-        pool = SimpleNamespace(
-            paged_cache_group_specs=(SimpleNamespace(group_id="full_attention"),)
-        )
+        pool = _fake_pool(specs=(_spec("full_attention"),))
         tables = self._bare(backend, pool)._dummy_group_tables(100, 1)
         self.assertEqual(tables["full_attention"].shape, (1, 2500))
 
@@ -159,16 +170,10 @@ class DummyGroupTablesTest(unittest.TestCase):
             max_num_pages=257,
             state_group_ids=frozenset(),
         )
-        pool = SimpleNamespace(
-            paged_cache_group_specs=(
-                SimpleNamespace(
-                    group_id="fine",
-                    block_granularity=4,
-                ),
-                SimpleNamespace(
-                    group_id="coarse",
-                    block_granularity=256,
-                ),
+        pool = _fake_pool(
+            specs=(
+                _spec("fine", block_granularity=4),
+                _spec("coarse", block_granularity=256),
             )
         )
 
@@ -187,10 +192,10 @@ class DummyGroupTablesTest(unittest.TestCase):
             kernel_page_size=32, max_num_pages=0, state_group_ids=frozenset()
         )
         wrapper = SimpleNamespace(uses_cache_groups=True, full_attn_backend=child)
-        pool = SimpleNamespace(
-            paged_cache_group_specs=(
-                SimpleNamespace(group_id="full_attention"),
-                SimpleNamespace(group_id="linear_attention"),
+        pool = _fake_pool(
+            specs=(
+                _spec("full_attention"),
+                _spec("linear_attention", family="state"),
             )
         )
         tables = self._bare(wrapper, pool)._dummy_group_tables(64, 1)
@@ -199,7 +204,7 @@ class DummyGroupTablesTest(unittest.TestCase):
 
     def test_backend_without_cache_groups_is_empty(self):
         backend = SimpleNamespace(uses_cache_groups=False)
-        pool = SimpleNamespace(paged_cache_group_specs=())
+        pool = _fake_pool(specs=())
         self.assertEqual(self._bare(backend, pool)._dummy_group_tables(64, 1), {})
 
     def test_runtime_contract_pool_is_eligible_for_capture(self):
@@ -216,7 +221,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             disable_prefill_graph=False,
             data_parallel_size=1,
         )
-        pool = SimpleNamespace(runtime_contract=object())
+        pool = _fake_pool(runtime_contract=object())
         with (
             mock.patch(
                 "tokenspeed.runtime.execution.prefill_graph.get_prefill_token_buckets",

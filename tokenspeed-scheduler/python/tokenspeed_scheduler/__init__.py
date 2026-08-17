@@ -22,12 +22,12 @@
 
 import tokenspeed_scheduler.tokenspeed_scheduler_ext as _ext
 from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution plan; Events
+    CacheGroupConfig,
+    CacheGroupFamily,
+    CacheRetention,
+    CacheTransferPolicy,
     ExecutionEvent,
     ExecutionPlan,
-    PagedCacheGroupConfig,
-    PagedCacheGroupFamily,
-    PagedCacheRetention,
-    PagedCacheTransferPolicy,
     RequestSpec,
     Scheduler,
     SchedulerConfig,
@@ -61,10 +61,10 @@ __all__ = [
     "Scheduler",
     "SchedulerConfig",
     "RequestSpec",
-    "PagedCacheRetention",
-    "PagedCacheGroupConfig",
-    "PagedCacheGroupFamily",
-    "PagedCacheTransferPolicy",
+    "CacheRetention",
+    "CacheGroupConfig",
+    "CacheGroupFamily",
+    "CacheTransferPolicy",
     # Execution plan & operations
     "ExecutionPlan",
     "Forward",

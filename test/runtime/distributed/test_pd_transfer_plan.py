@@ -17,7 +17,7 @@ from runtime.cache_pd_test_utils import segment  # noqa: E402
 from runtime.cache_pd_test_utils import layout as make_layout  # noqa: E402
 
 from tokenspeed.runtime.pd.transfer_plan import (
-    PagedCacheTransferPlanner,
+    CacheTransferPlanner,
 )
 
 
@@ -33,7 +33,6 @@ def _paged_layout(
             "layer.0.k",
             dtype="bfloat16",
             shape=(2, local_heads, 2),
-            element_size=2,
             offset=page_zero_offset,
             stride=page_stride,
             axis=1,
@@ -45,7 +44,6 @@ def _paged_layout(
             "layer.1.latent",
             dtype="bfloat16",
             shape=(2, 1),
-            element_size=2,
             offset=page_zero_offset + 1024,
             stride=16,
         )
@@ -67,7 +65,6 @@ def _composite_paged_layout(
                 "layer.0.conv",
                 dtype="bfloat16",
                 shape=shape,
-                element_size=2,
                 stride=page_stride,
                 axis=partition_axis,
                 extent=sum(global_parts),
@@ -80,7 +77,7 @@ def _composite_paged_layout(
 
 
 def _planner(prefill_tp, decode_tp, prefill_layout, decode_layout):
-    return PagedCacheTransferPlanner(
+    return CacheTransferPlanner(
         prefill_tp_size=prefill_tp,
         decode_tp_size=decode_tp,
         prefill_layout=prefill_layout,
@@ -144,7 +141,7 @@ def _composite_planner(
     )
 
 
-def test_paged_cache_planner_splits_token_major_rows_from_tp1_to_tp2():
+def test_cache_planner_splits_token_major_rows_from_tp1_to_tp2():
     planner = _paged_planner(1, 2, 4, 2, 64, 32)
 
     first = planner.plan_for_decode_rank(0)
@@ -165,7 +162,7 @@ def test_paged_cache_planner_splits_token_major_rows_from_tp1_to_tp2():
     assert second_k.bytes_per_row == 8
 
 
-def test_paged_cache_planner_merges_tp2_to_tp1():
+def test_cache_planner_merges_tp2_to_tp1():
     planner = _paged_planner(2, 1, 2, 4, 32, 64)
 
     plan = planner.plan_for_decode_rank(0)
@@ -185,7 +182,7 @@ def test_paged_cache_planner_merges_tp2_to_tp1():
     )
 
 
-def test_paged_cache_planner_handles_gqa_replicas_and_idle_prefill_ranks() -> None:
+def test_cache_planner_handles_gqa_replicas_and_idle_prefill_ranks() -> None:
     planner = _paged_planner(4, 1, 1, 2, 32, 64, global_heads=2)
 
     plan = planner.plan_for_decode_rank(0)
@@ -193,7 +190,7 @@ def test_paged_cache_planner_handles_gqa_replicas_and_idle_prefill_ranks() -> No
     assert plan.target_prefill_ranks == (0, 2)
 
 
-def test_paged_cache_planner_maps_non_multiple_tp_sizes() -> None:
+def test_cache_planner_maps_non_multiple_tp_sizes() -> None:
     planner = _paged_planner(2, 3, 3, 2, 96, 64, global_heads=6)
 
     plans = tuple(planner.plan_for_decode_rank(rank) for rank in range(3))
@@ -201,7 +198,7 @@ def test_paged_cache_planner_maps_non_multiple_tp_sizes() -> None:
     assert [plan.target_prefill_ranks for plan in plans] == [(0,), (0, 1), (1,)]
 
 
-def test_paged_cache_planner_splits_each_qkv_part_from_tp1_to_tp2():
+def test_cache_planner_splits_each_qkv_part_from_tp1_to_tp2():
     planner = _composite_planner(1, 2, (16, 2), (8, 2), 0, (4, 4, 8), 64, 32)
 
     plan = planner.plan_for_decode_rank(1)

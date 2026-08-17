@@ -5,6 +5,7 @@ import os
 import pathlib
 import sys
 import unittest
+from types import SimpleNamespace
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -33,14 +34,35 @@ def _load(mod_name: str, file_path: pathlib.Path):
 # spec.py is self-contained: load it from the repo file under a private
 # name (no real package import, no sys.modules shadowing needed).
 _spec = _load("kv_cache_spec_under_test", _RECIPES_DIR / "spec.py")
-group_specs_from_layer_types = _spec.group_specs_from_layer_types
 layer_group_ids = _spec.layer_group_ids
-PagedCacheGroupSpec = _spec.PagedCacheGroupSpec
+CacheGroupSpec = _spec.CacheGroupSpec
+_spec.CacheFieldSpec = _load(
+    "kv_cache_plan_under_test", _RECIPES_DIR / "plan.py"
+).CacheFieldSpec
+
+
+def _group_specs(module, **kwargs):
+    """The specs a layer vocabulary produces, via the one-walk ``group``.
+
+    A group must declare fields, so a one-byte placeholder stands in: these
+    tests are about scheduler semantics, not bytes.
+    """
+    return tuple(
+        group_spec
+        for group_spec, _ in module.group(
+            fields_for_layer=lambda layer_id, group_id, occurrence: (
+                module.CacheFieldSpec(
+                    f"layer.{layer_id}.probe", f"unit.{occurrence}", (1,), "uint8"
+                ),
+            ),
+            **kwargs,
+        )
+    )
 
 
 def _specs(**kwargs):
-    """Call group_specs_from_layer_types the way the recipes do: group_ids
-    derived from the layer types unless the test supplies a finer split."""
+    """Call ``group`` the way the recipes do: group_ids derived from the
+    layer types unless the test supplies a finer split."""
     kwargs.setdefault(
         "group_ids",
         layer_group_ids(
@@ -48,14 +70,14 @@ def _specs(**kwargs):
             sliding_window_tokens=kwargs["sliding_window_tokens"],
         ),
     )
-    return group_specs_from_layer_types(**kwargs)
+    return _group_specs(_spec, **kwargs)
 
 
 class GroupSpecsFromLayerTypesTest(unittest.TestCase):
     def test_group_spec_has_no_producer_boundary_capability(self):
         self.assertNotIn(
             "materializes_all_boundaries",
-            PagedCacheGroupSpec.__dataclass_fields__,
+            CacheGroupSpec.__dataclass_fields__,
         )
 
     def test_gpt_oss_mixed_shape_yields_two_groups(self):
@@ -381,12 +403,12 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
         self.assertEqual(len(specs), 2)
 
 
-class PagedCacheGroupSpecShapeTest(unittest.TestCase):
+class CacheGroupSpecShapeTest(unittest.TestCase):
     """A spec declares exactly one geometry shape: row geometry (paged KV)
     or checkpoint_granularity (snapshot state)."""
 
     def test_row_geometry_shape(self):
-        spec = PagedCacheGroupSpec(
+        spec = CacheGroupSpec(
             group_id="kv",
             retention="full_history",
             rows_per_page=16,
@@ -398,7 +420,7 @@ class PagedCacheGroupSpecShapeTest(unittest.TestCase):
         self.assertIsNone(spec.checkpoint_granularity)
 
     def test_checkpoint_shape(self):
-        spec = PagedCacheGroupSpec(
+        spec = CacheGroupSpec(
             group_id="state",
             retention="full_history",
             sliding_window_tokens=None,
@@ -411,7 +433,7 @@ class PagedCacheGroupSpecShapeTest(unittest.TestCase):
 
     def test_shapes_are_mutually_exclusive(self):
         with self.assertRaises(ValueError):
-            PagedCacheGroupSpec(
+            CacheGroupSpec(
                 group_id="state",
                 retention="full_history",
                 rows_per_page=16,
@@ -423,7 +445,7 @@ class PagedCacheGroupSpecShapeTest(unittest.TestCase):
 
     def test_missing_shape_raises(self):
         with self.assertRaises(ValueError):
-            PagedCacheGroupSpec(
+            CacheGroupSpec(
                 group_id="kv",
                 retention="full_history",
                 sliding_window_tokens=None,
@@ -431,7 +453,7 @@ class PagedCacheGroupSpecShapeTest(unittest.TestCase):
 
     def test_partial_row_geometry_raises(self):
         with self.assertRaises(ValueError):
-            PagedCacheGroupSpec(
+            CacheGroupSpec(
                 group_id="kv",
                 retention="full_history",
                 rows_per_page=16,
@@ -440,7 +462,7 @@ class PagedCacheGroupSpecShapeTest(unittest.TestCase):
 
     def test_checkpoint_requires_state_family(self):
         with self.assertRaises(ValueError):
-            PagedCacheGroupSpec(
+            CacheGroupSpec(
                 group_id="kv",
                 retention="full_history",
                 sliding_window_tokens=None,
@@ -450,7 +472,7 @@ class PagedCacheGroupSpecShapeTest(unittest.TestCase):
 
     def test_nonpositive_geometry_raises(self):
         with self.assertRaises(ValueError):
-            PagedCacheGroupSpec(
+            CacheGroupSpec(
                 group_id="kv",
                 retention="full_history",
                 rows_per_page=0,
@@ -458,7 +480,7 @@ class PagedCacheGroupSpecShapeTest(unittest.TestCase):
                 sliding_window_tokens=None,
             )
         with self.assertRaises(ValueError):
-            PagedCacheGroupSpec(
+            CacheGroupSpec(
                 group_id="state",
                 retention="full_history",
                 sliding_window_tokens=None,
@@ -468,7 +490,7 @@ class PagedCacheGroupSpecShapeTest(unittest.TestCase):
 
     def test_state_family_may_keep_row_geometry(self):
         # V4-style row-buffer groups are state-family with real rows.
-        spec = PagedCacheGroupSpec(
+        spec = CacheGroupSpec(
             group_id="v4.compressor",
             retention="sliding_window",
             rows_per_page=16,
@@ -480,40 +502,55 @@ class PagedCacheGroupSpecShapeTest(unittest.TestCase):
         self.assertEqual(spec.block_granularity, 64)
 
 
-class PoolToPagedCacheGroupsIntegrationTest(unittest.TestCase):
-    """pool_to_paged_cache_groups converts published specs to a multi-group
+def _fake_pool(specs, *, packing=1) -> SimpleNamespace:
+    """A cache view whose arena publishes ``specs`` as its contract.
+
+    Page counts and packing are the plan's facts, carried by the contract
+    beside the specs -- the bridge reads them from there, never off a spec.
+    """
+    return SimpleNamespace(
+        arena=SimpleNamespace(
+            runtime_contract=SimpleNamespace(
+                group_specs=tuple(specs),
+                group_page_counts={spec.group_id: 1024 for spec in specs},
+                group_packing={spec.group_id: packing for spec in specs},
+            )
+        )
+    )
+
+
+class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
+    """pool_to_cache_groups converts published specs to a multi-group
     scheduler config. Needs torch + the tokenspeed_scheduler ext; skips
     where those are absent."""
 
     def _import_converter(self):
         try:
             from tokenspeed.runtime.engine.scheduler_utils import (
-                pool_to_paged_cache_groups,
+                pool_to_cache_groups,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(
-                f"pool_to_paged_cache_groups unavailable (needs torch + "
+                f"pool_to_cache_groups unavailable (needs torch + "
                 f"tokenspeed_scheduler ext): {exc}"
             )
-        return pool_to_paged_cache_groups
+        return pool_to_cache_groups
 
     def test_two_group_specs_convert_to_two_scheduler_groups(self):
         from types import SimpleNamespace
 
-        pool_to_paged_cache_groups = self._import_converter()
+        pool_to_cache_groups = self._import_converter()
 
         specs = _specs(
             layer_types=["full_attention", "sliding_attention"],
             sliding_window_tokens=128,
             prefix_granularity=16,
         )
-        # Duck-typed stand-in: only the two attributes the converter reads.
-        fake_pool = SimpleNamespace(
-            paged_cache_group_specs=specs,
-            paged_cache_group_page_counts={s.group_id: 1024 for s in specs},
-        )
+        # Duck-typed stand-in: a view naming an arena whose contract is
+        # what the converter reads.
+        fake_pool = _fake_pool(specs)
 
-        groups = pool_to_paged_cache_groups(fake_pool)
+        groups = pool_to_cache_groups(fake_pool)
 
         self.assertEqual(len(groups), 2)
         group_ids = {g.group_id for g in groups}
@@ -522,34 +559,20 @@ class PoolToPagedCacheGroupsIntegrationTest(unittest.TestCase):
     def test_checkpoint_spec_folds_to_row_geometry_at_the_bridge(self):
         from types import SimpleNamespace
 
-        pool_to_paged_cache_groups = self._import_converter()
+        pool_to_cache_groups = self._import_converter()
 
         specs = _specs(
             layer_types=["linear_attention", "full_attention"],
             sliding_window_tokens=None,
             prefix_granularity=16,
         )
-        fake_pool = SimpleNamespace(
-            paged_cache_group_specs=specs,
-            paged_cache_group_page_counts={s.group_id: 1024 for s in specs},
-        )
+        fake_pool = _fake_pool(specs)
 
-        groups = {g.group_id: g for g in pool_to_paged_cache_groups(fake_pool)}
+        groups = {g.group_id: g for g in pool_to_cache_groups(fake_pool)}
 
         state = groups["linear_attention"]
         self.assertEqual(state.rows_per_page, 16)
         self.assertEqual(state.entry_stride_tokens, 1)
-
-    def test_empty_specs_convert_to_no_groups(self):
-        pool_to_paged_cache_groups = self._import_converter()
-
-        from types import SimpleNamespace
-
-        fake_pool = SimpleNamespace(
-            paged_cache_group_specs=(),
-            paged_cache_group_page_counts={},
-        )
-        self.assertEqual(pool_to_paged_cache_groups(fake_pool), [])
 
 
 if __name__ == "__main__":

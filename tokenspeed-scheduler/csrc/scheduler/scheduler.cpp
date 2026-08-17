@@ -53,6 +53,13 @@ std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
     return config.HasHostCache() ? config.host_allocator.NumUsableBlocks() : 0;
 }
 
+// config_ is the first member, so routing it through this helper validates the
+// configuration before any pool or the coordinator is built off it.
+SchedulerConfig validated(SchedulerConfig config) {
+    config.Validate();
+    return config;
+}
+
 CacheKey eventKey(const CacheKey& key) {
     // External events describe one scheduler-level boundary. Fold every
     // group/child offset behind that boundary into the same accounting key.
@@ -66,7 +73,7 @@ CacheKey eventKey(const CacheKey& key) {
 }  // namespace
 
 Scheduler::Scheduler(SchedulerConfig config)
-    : config_{std::move(config)},
+    : config_{validated(std::move(config))},
       req_pool_allocator_{config_.max_batch_size},
       block_pool_{config_.device_allocator.NumUsableBlocks()},
       host_pool_{hostPoolBlocks(config_)},
@@ -74,40 +81,9 @@ Scheduler::Scheduler(SchedulerConfig config)
                                    hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
                                    config_.StreamsDeviceCacheToHost())},
       tier_transfers_{coordinator_} {
-    if (config_.prefix_granularity <= 0) {
-        throw std::invalid_argument("Scheduler: prefix_granularity must be > 0");
-    }
-    if (config_.device_allocator.total_pages <= 1) {
-        throw std::invalid_argument("Scheduler: device cache must contain a null page and usable capacity");
-    }
-    if (config_.paged_cache_groups.empty()) {
-        throw std::invalid_argument("Scheduler: at least one cache group is required");
-    }
-    if (config_.decode_input_tokens < 0) {
-        throw std::invalid_argument("Scheduler: decode_input_tokens must be >= 0");
-    }
-    if (config_.max_scheduled_tokens <= 0) {
-        throw std::invalid_argument("Scheduler: max_scheduled_tokens must be > 0");
-    }
-    if (config_.overlap_schedule_depth < 0 || config_.overlap_schedule_depth > 1) {
-        throw std::invalid_argument("Scheduler: overlap_schedule_depth must be 0 or 1");
-    }
-    if (config_.overlap_schedule_depth > 0 && config_.decode_input_tokens == 0) {
-        throw std::invalid_argument("Scheduler: overlapped decode requires decode_input_tokens > 0");
-    }
-    if (config_.prefix_replay_tokens < 0) {
-        throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
-    }
-    if (config_.enable_l3_storage) {
-        throw std::invalid_argument("Scheduler: L3 storage is not supported by the cache coordinator");
-    }
-    if (coordinator_.HasMambaStateGroup() && config_.max_scheduled_tokens < coordinator_.PrefixGranularity()) {
-        throw std::invalid_argument("Scheduler: Mamba max_scheduled_tokens must cover one cache block");
-    }
-
-    cache_group_ids_.reserve(config_.paged_cache_groups.size());
-    for (const PagedCacheGroupConfig& group : config_.paged_cache_groups) {
-        group.Validate();
+    // config_.Validate() already ran; the body only derives state from it.
+    cache_group_ids_.reserve(config_.cache_groups.size());
+    for (const CacheGroupConfig& group : config_.cache_groups) {
         cache_group_ids_.push_back(group.group_id);
         const std::int32_t child_entries = config_.prefix_granularity / group.BlockGranularity();
         if (cache_entries_per_event_boundary_ > std::numeric_limits<std::int32_t>::max() - child_entries) {
@@ -161,9 +137,9 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
         if (coordinator_.GroupIsPrefixClosed(i)) {
             child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
         } else if (config_.role == Role::kD) {
-            const PagedCacheGroupConfig& group = config_.paged_cache_groups[static_cast<std::size_t>(i)];
+            const CacheGroupConfig& group = config_.cache_groups[static_cast<std::size_t>(i)];
             const bool latest_snapshot =
-                config_.enable_pd_cache && group.transfer_policy == PagedCacheTransferPolicy::LatestSnapshot;
+                config_.enable_pd_cache && group.transfer_policy == CacheTransferPolicy::LatestSnapshot;
             if (latest_snapshot) {
                 // The final prompt page may be full, so a non-zero decode
                 // reservation can span one more page than its own page count.
@@ -174,7 +150,7 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
                 // recomputing its suffix. Old State checkpoints are
                 // evictable, but one recovery chunk and its lookback must fit.
                 child_pages = std::max(snapshot_pages, local_prefill_peak());
-            } else if (config_.enable_pd_cache && group.retention == PagedCacheGroupConfig::Retention::SlidingWindow) {
+            } else if (config_.enable_pd_cache && group.retention == CacheGroupConfig::Retention::SlidingWindow) {
                 const std::int64_t dense_pages =
                     ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
                 const std::int64_t window_pages = ceilDiv(static_cast<std::int64_t>(*group.sliding_window_tokens - 1) +
@@ -355,7 +331,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
             throw std::invalid_argument("Scheduler: request token limit exceeds int32 range");
         }
         if (token_limit > max_single_request_tokens_) {
-            throw std::invalid_argument("Scheduler: request token limit exceeds paged-cache capacity");
+            throw std::invalid_argument("Scheduler: request token limit exceeds cache capacity");
         }
         pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, config_.role));
     }
@@ -399,11 +375,11 @@ std::size_t Scheduler::ActiveKvPages() const {
     return coordinator_.NumActiveLcmBlocks(request_tables);
 }
 
-std::int32_t Scheduler::PagedCacheGroupTotalPages(const std::string& group_id) const {
-    return config_.paged_cache_groups[groupIndex(group_id)].total_pages;
+std::int32_t Scheduler::CacheGroupTotalPages(const std::string& group_id) const {
+    return config_.cache_groups[groupIndex(group_id)].total_pages;
 }
 
-std::int32_t Scheduler::PagedCacheGroupAvailablePages(const std::string& group_id) const {
+std::int32_t Scheduler::CacheGroupAvailablePages(const std::string& group_id) const {
     return coordinator_.GroupAvailablePages(static_cast<std::int32_t>(groupIndex(group_id)));
 }
 

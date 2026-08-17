@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
     quantize_store_kv_mxfp8,
@@ -27,16 +29,14 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     store_sf_interleaved,
 )
 
+from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     MXFP8_KV_SCALE_TILE_TOKENS,
-    PagedCacheGroupSpec,
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.pdl import pdl_enabled
-from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
 
@@ -47,41 +47,24 @@ GB = 1024 * 1024 * 1024
 class MHATokenToKVPool(CachePool):
     def __init__(
         self,
-        size: int,
+        arena: CacheArena,
         dtype: torch.dtype,
         head_num: int,
         head_dim: int,
         layer_num: int,
-        device: str,
-        enable_memory_saver: bool,
-        prefix_granularity: int,
         rank: int,
         *,
-        memory_plan: CacheMemoryPlan,
-        paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = (),
-        token_capacity: int | None = None,
         layer_types: tuple[str, ...] = (),
         layer_group_ids: tuple[str, ...] = (),
         layer_kv_head_counts: tuple[int, ...] | None = None,
         kv_alloc_head_count: int | None = None,
         field_layer_offset: int = 0,
-        backing_pool: CachePool | None = None,
     ):
         super().__init__(
-            size,
+            arena,
             dtype,
-            device,
-            prefix_granularity,
             rank,
-            memory_plan,
-            paged_cache_group_specs=paged_cache_group_specs,
-            token_capacity=token_capacity,
-            backing_pool=backing_pool,
             field_layer_offset=field_layer_offset,
-        )
-
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
         )
 
         self.head_num = head_num
@@ -115,7 +98,7 @@ class MHATokenToKVPool(CachePool):
                 "recipe must supply one group id per layer "
                 "(CachePoolSpec.layer_group_ids)"
             )
-        self._create_buffers()
+        self._bind_layer_planes()
 
         k_size, v_size = self.get_kv_size_bytes()
         logger.info(
@@ -124,33 +107,10 @@ class MHATokenToKVPool(CachePool):
             v_size / GB,
         )
 
-    def _field_layer_id(self, layer_id: int) -> int:
-        """Map this compute view's local layer id into the merged plan."""
-        return self._field_layer_offset + layer_id
-
-    def _create_kv_buffers(self):
-        self.k_buffer = [
-            self.field(
-                f"layer.{self._field_layer_id(layer_id)}.k", self.store_dtype
-            ).view(-1, self.head_num, self.head_dim)
-            for layer_id in range(self.layer_num)
-        ]
-        self.v_buffer = [
-            self.field(
-                f"layer.{self._field_layer_id(layer_id)}.v", self.store_dtype
-            ).view(-1, self.head_num, self.head_dim)
-            for layer_id in range(self.layer_num)
-        ]
-        logger.info(
-            "KV layout: one buffer with %d per-layer K/V views",
-            self.layer_num,
-        )
-
-    def _create_buffers(self):
-        # Tag as "kv_cache", no CPU backup: KV is discarded on sleep and rebuilt
-        # after wake (paging overwrites; clear_kv_buffers zeros the remapped pages).
-        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
-            self._create_kv_buffers()
+    layer_plane_bindings: ClassVar[dict[str, str]] = {
+        "k": "k_buffer",
+        "v": "v_buffer",
+    }
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -276,31 +236,27 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
 
     MXFP8_SCALE_BLOCK_SIZE = 32
 
-    def _create_buffers(self):
-        assert self.head_dim % self.MXFP8_SCALE_BLOCK_SIZE == 0
+    # Scale planes stay page-major: the blockscaled kernels read them in the
+    # interleaved layout the plan already gives them.
+    layer_plane_bindings: ClassVar[dict[str, str]] = {
+        **MHATokenToKVPool.layer_plane_bindings,
+        "k_scale": "k_scale_buffer",
+        "v_scale": "v_scale_buffer",
+    }
+
+    def _bind_layer_planes(self) -> None:
+        if self.head_dim % self.MXFP8_SCALE_BLOCK_SIZE:
+            raise ValueError("MXFP8 head_dim must be divisible by 32")
+        # These writes go through dtype-aware kernels, so the fp8 view the
+        # plan hands out is the one to keep for input reinterpretation too.
         self.store_dtype = torch.float8_e4m3fn
-        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
-            self._create_kv_buffers()
-            self.k_scale_buffer = [
-                self.field(
-                    f"layer.{self._field_layer_id(layer_id)}.k_scale",
-                    torch.float8_e8m0fnu,
-                )
-                for layer_id in range(self.layer_num)
-            ]
-            self.v_scale_buffer = [
-                self.field(
-                    f"layer.{self._field_layer_id(layer_id)}.v_scale",
-                    torch.float8_e8m0fnu,
-                )
-                for layer_id in range(self.layer_num)
-            ]
+        super()._bind_layer_planes()
 
     def _layer_page_tokens(self, layer_id: int) -> int:
         """Tokens represented by one page id for this layer."""
         # Byte-uniform slots factor one id through the layer's head count.
         heads_l = self._layer_heads_per_rank(layer_id)
-        return self.kv_page_size * self.head_num // heads_l
+        return self.arena.kv_page_size * self.head_num // heads_l
 
     def _layer_scale_view(self, buf: torch.Tensor, layer_id: int) -> torch.Tensor:
         """(num_ids, heads_l, k_l, 32, 4, 4) view over a layer's SF slots
@@ -368,7 +324,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
                 page_size=page_tokens,
                 enable_pdl=pdl_enabled(),
             )
-        elif self.kv_page_size == MXFP8_KV_SCALE_TILE_TOKENS:
+        elif self.arena.kv_page_size == MXFP8_KV_SCALE_TILE_TOKENS:
             store_sf_interleaved(
                 k_scale, self.k_scale_buffer[layer_id], loc, enable_pdl=pdl_enabled()
             )
@@ -399,7 +355,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         )
         if self._layer_kv_head_counts is not None:
             page_tokens = self._layer_page_tokens(layer_id)
-        elif self.kv_page_size == MXFP8_KV_SCALE_TILE_TOKENS:
+        elif self.arena.kv_page_size == MXFP8_KV_SCALE_TILE_TOKENS:
             page_tokens = MXFP8_KV_SCALE_TILE_TOKENS
         else:
             return False

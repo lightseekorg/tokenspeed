@@ -74,8 +74,8 @@ public:
     // before submitting requests.
     std::int32_t MaxSingleRequestTokens() const { return max_single_request_tokens_; }
 
-    std::int32_t PagedCacheGroupTotalPages(const std::string& group_id) const;
-    std::int32_t PagedCacheGroupAvailablePages(const std::string& group_id) const;
+    std::int32_t CacheGroupTotalPages(const std::string& group_id) const;
+    std::int32_t CacheGroupAvailablePages(const std::string& group_id) const;
 
     bool PdTransferPinned(const std::string& request_id) const { return pd_transfer_pins_.contains(request_id); }
     std::int32_t PoolFreeBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }

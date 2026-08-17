@@ -32,6 +32,9 @@ import torch
 import yaml
 from transformers import PretrainedConfig
 
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    DEEPSEEK_V4_PAGE_SIZE,
+)
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
@@ -234,7 +237,9 @@ _ATTENTION_FAMILY_SPECS = (
         architectures=_DEEPSEEK_V4_ARCHITECTURES,
         configure=configure_deepseek_v4_attention,
         supports_target_verify_forward_mode=True,
-        default_prefix_granularity=256,
+        # V4 kernels need P to be a multiple of their fixed page; default to
+        # exactly one page rather than restating the number.
+        default_prefix_granularity=DEEPSEEK_V4_PAGE_SIZE,
     ),
     _AttentionFamilySpec(
         name="GLM",

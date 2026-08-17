@@ -108,7 +108,7 @@ class CuteDSLMLABackend(AttentionBackend):
     _logged_decode = False
     _logged_prefill = False
 
-    # Paged cache contract capability: this backend consumes only history-family
+    # Cache contract capability: this backend consumes only history-family
     # (full-attention) tables; state groups belong to the linear sub-backend.
     cache_consumer_families = frozenset({"history"})
     draft_seq_lens_attr: str = "cuda_graph_seq_lens_buf"
@@ -117,7 +117,7 @@ class CuteDSLMLABackend(AttentionBackend):
         super().__init__(config)
 
         # Latched the first time paged cache metadata arrives. Once bound, a
-        # forward without cache metadata is a hard error: the paged-cache contract
+        # forward without cache metadata is a hard error: the cache contract
         # forbids falling back to legacy page_table metadata.
         self._cache_groups_bound = False
         # Set by the registry before graph capture; see mark_cache_contract.
@@ -191,7 +191,7 @@ class CuteDSLMLABackend(AttentionBackend):
         self.forward_prefill_metadata: CuteDSLMLAPrefillMetadata | None = None
         self.decode_cuda_graph_metadata: dict[int, CuteDSLMLADecodeMetadata] = {}
         self.decode_cuda_graph_kv_indices = None
-        # Paged cache contract decode graph: persistent write-location buffer whose
+        # Cache contract decode graph: persistent write-location buffer whose
         # address the captured graph records; replay refreshes it in place.
         # Allocated in init_cuda_graph_state only when _cache_contract_bound.
         self.decode_cuda_graph_group_out_cache_loc: torch.Tensor | None = None
@@ -210,7 +210,7 @@ class CuteDSLMLABackend(AttentionBackend):
         return buf
 
     def mark_cache_contract(self) -> None:
-        """Mark this MLA backend as a Kimi-K3 Paged cache contract sub-backend.
+        """Mark this MLA backend as a Kimi-K3 Cache contract sub-backend.
 
         Called by the registry when the backend is constructed for the
         Kimi-K3 LCM contract path. Enables grouped CUDA-graph
@@ -399,7 +399,7 @@ class CuteDSLMLABackend(AttentionBackend):
             # Missing Paged cache metadata must never select the legacy page_table
             # path after the backend is bound to the contract.
             raise RuntimeError(
-                "tokenspeed_mla is bound to the Paged cache contract but received "
+                "tokenspeed_mla is bound to the Cache contract but received "
                 "no paged cache metadata; refusing the legacy page_table path"
             )
 
@@ -680,7 +680,7 @@ class CuteDSLMLABackend(AttentionBackend):
                 raise RuntimeError(
                     "tokenspeed_mla Paged cache graph capture: the cache write-location "
                     "buffer is not allocated; init_cuda_graph_state ran before "
-                    "the backend was marked as the Paged cache contract sub-backend"
+                    "the backend was marked as the Cache contract sub-backend"
                 )
             # Placeholders resolve to the null page 0 until the first replay.
             block_kv_indices.zero_()

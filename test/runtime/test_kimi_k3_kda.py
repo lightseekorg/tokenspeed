@@ -1,4 +1,4 @@
-"""Kimi-K3 KDA recurrent state on the paged-cache contract path.
+"""Kimi-K3 KDA recurrent state on the cache contract path.
 
 Coverage:
 
@@ -59,10 +59,10 @@ from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
     compute_state_block_indices,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
-    PagedCacheRuntimeContract,
+    CacheRuntimeContract,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    PagedCacheGroupSpec,
+    CacheGroupSpec,
 )
 
 register_cuda_ci(est_time=240, suite="runtime-1gpu")
@@ -98,7 +98,7 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
     group_ids = ("full_attention", *_STATE_GROUPS)
     specs = tuple(
         (
-            PagedCacheGroupSpec(
+            CacheGroupSpec(
                 group_id=group_id,
                 retention="full_history",
                 rows_per_page=prefix_granularity,
@@ -106,7 +106,7 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
                 sliding_window_tokens=None,
             )
             if group_id == "full_attention"
-            else PagedCacheGroupSpec(
+            else CacheGroupSpec(
                 group_id=group_id,
                 retention="full_history",
                 sliding_window_tokens=None,
@@ -116,12 +116,13 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
         )
         for group_id in group_ids
     )
-    return PagedCacheRuntimeContract(
+    return CacheRuntimeContract(
         prefix_granularity=prefix_granularity,
         num_lcm_blocks=usable_pages,
         token_capacity=usable_pages * prefix_granularity,
         group_specs=specs,
         group_page_counts={spec.group_id: usable_pages + 1 for spec in specs},
+        group_packing={spec.group_id: 1 for spec in specs},
     )
 
 
@@ -130,7 +131,8 @@ class _StubContractPool:
     conv/recurrent component slabs indexed by page id (page 0 = null)."""
 
     def __init__(self, contract, device, conv_dim, width, num_heads, head_dim):
-        self.runtime_contract = contract
+        # The arena publishes the contract; a view only names its arena.
+        self.arena = SimpleNamespace(runtime_contract=contract)
         num_pages = contract.group_page_counts[_STATE_GROUPS[0]]
         self._groups = {i: _STATE_GROUPS[i] for i in range(3)}
         self._components = {
@@ -197,7 +199,7 @@ def test_set_kv_pool_binds_contract_state_groups() -> None:
     backend = _backend("cpu", contract_pool=pool)
     assert backend.state_paging_active
     assert backend._state_group_ids == _STATE_GROUPS
-    assert backend._checkpoint_granularity == pool.prefix_granularity
+    assert backend._checkpoint_granularity == pool.arena.prefix_granularity
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +226,7 @@ def test_dual_index_reuses_one_slot_plan_and_groups_are_independent(
 ) -> None:
     pool = _make_kimi_pool("cpu", usable_pages=24)
     backend = _backend("cpu", contract_pool=pool)
-    page_size = pool.prefix_granularity
+    page_size = pool.arena.prefix_granularity
 
     plan_calls = 0
     real = hybrid_linear_attn._compute_state_block_index_plan
@@ -238,7 +240,7 @@ def test_dual_index_reuses_one_slot_plan_and_groups_are_independent(
 
     bs = 2
     tables = _kimi_tables(bs, width=2)
-    metadata, forward_op = _metadata_for(pool.runtime_contract, tables, "cpu")
+    metadata, forward_op = _metadata_for(pool.arena.runtime_contract, tables, "cpu")
     # Decode: request 0 crosses into its second page, request 1 stays inside
     # its first page.
     seq_lens = torch.tensor([page_size + 1, 5], dtype=torch.int32)
@@ -295,7 +297,7 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
     }
     # Distinct per-group tables so the refresh is provably group-specific.
     tables = _kimi_tables(bs=2, width=4, base=1)
-    metadata, forward_op = _metadata_for(pool.runtime_contract, tables, "cpu")
+    metadata, forward_op = _metadata_for(pool.arena.runtime_contract, tables, "cpu")
     # bs 2 requests, one padding row (real_bs 1). Decode: before = seq-1.
     backend.init_forward_metadata_replay_cuda_graph(
         bs=2,
@@ -315,7 +317,7 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
         # Real row 0 refreshed from this group's table; padded row 1 -> pad.
         expected_in, _ = compute_state_block_indices(
             torch.as_tensor(tables[gid][:1]),
-            pool.runtime_contract.prefix_granularity,
+            pool.arena.runtime_contract.prefix_granularity,
             torch.tensor([4]),  # before = seq_len 5 - 1
             torch.tensor([5]),
             validate=False,
@@ -788,7 +790,7 @@ def test_kda_cache_pool_component_views_end_to_end(
     through the conv + KDA kernels: prefill + decodes on one KDA layer of
     each of the three groups, vs naive + FLA."""
     pool = _make_kimi_pool("cuda", usable_pages=4)
-    contract = pool.runtime_contract
+    contract = pool.arena.runtime_contract
     layer_ids = [_kda_layer_for_group(pool, gid) for gid in _STATE_GROUPS]
 
     # Kimi TP8 geometry: 12 heads, D=128, conv_dim 4608.

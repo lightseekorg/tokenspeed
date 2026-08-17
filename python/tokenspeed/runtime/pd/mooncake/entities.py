@@ -29,7 +29,7 @@ from tokenspeed.runtime.pd.cache_protocol import (
 )
 from tokenspeed.runtime.pd.topology import PDParallelTopology
 from tokenspeed.runtime.pd.transfer_plan import (
-    MAX_PAGED_CACHE_TP_SIZE,
+    MAX_CACHE_TP_SIZE,
     CacheTransferFragment,
 )
 
@@ -172,7 +172,7 @@ class KVArgsRegisterInfo:
             msg[6],
             name="CachePD decode_tp_size",
             minimum=1,
-            maximum=MAX_PAGED_CACHE_TP_SIZE,
+            maximum=MAX_CACHE_TP_SIZE,
         )
         decode_tp_rank = _bounded_ascii_uint(
             msg[7],

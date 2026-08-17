@@ -227,8 +227,8 @@ class InklingAttnBackend(AttentionBackend):
 
     # Class-level flags on AttentionBackend would shadow __getattr__; mirror inner's explicitly.
     @property
-    def uses_paged_cache_groups(self):
-        return self.inner.uses_paged_cache_groups
+    def needs_group_block_tables(self):
+        return self.inner.needs_group_block_tables
 
     @property
     def uses_cache_groups(self):

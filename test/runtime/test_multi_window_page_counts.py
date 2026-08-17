@@ -44,7 +44,7 @@ _RUNTIME_DIR = (
 _KV_CACHE_DIR = _RUNTIME_DIR / "layers" / "attention" / "kv_cache"
 _RECIPES_DIR = _KV_CACHE_DIR / "recipes"
 
-# compute_paged_cache_group_page_counts lazily imports ceil_div from
+# compute_cache_group_page_counts lazily imports ceil_div from
 # tokenspeed.runtime.utils.common, whose package pulls torch/psutil. Prefer the
 # real module (container runs); register a minimal equivalent only where the
 # runtime deps are absent, so the pure math stays testable everywhere.
@@ -69,14 +69,41 @@ def _load(mod_name: str, file_path: pathlib.Path):
 # spec.py is self-contained: load it from the repo file under a private
 # name (no real package import, no sys.modules shadowing needed).
 _pcs = _load("kv_cache_spec_for_page_counts", _RECIPES_DIR / "spec.py")
-compute_paged_cache_group_page_counts = _pcs.compute_paged_cache_group_page_counts
-group_specs_from_layer_types = _pcs.group_specs_from_layer_types
-PagedCacheGroupSpec = _pcs.PagedCacheGroupSpec
-DUMMY = _pcs._PAGED_CACHE_GROUP_DUMMY_PAGES
+compute_cache_group_page_counts = _pcs.compute_cache_group_page_counts
+CacheGroupSpec = _pcs.CacheGroupSpec
+_pcs.CacheFieldSpec = _load(
+    "kv_cache_plan_for_page_counts", _RECIPES_DIR / "plan.py"
+).CacheFieldSpec
+
+
+def _group_specs(module, **kwargs):
+    """The specs a layer vocabulary produces, via the one-walk ``group``.
+
+    A group must declare fields, so a one-byte placeholder stands in: these
+    tests are about scheduler semantics, not bytes.
+    """
+    return tuple(
+        group_spec
+        for group_spec, _ in module.group(
+            fields_for_layer=lambda layer_id, group_id, occurrence: (
+                module.CacheFieldSpec(
+                    f"layer.{layer_id}.probe", f"unit.{occurrence}", (1,), "uint8"
+                ),
+            ),
+            **kwargs,
+        )
+    )
+
+
+def group_specs_from_layer_types(**kwargs):
+    return _group_specs(_pcs, **kwargs)
+
+
+DUMMY = _pcs._CACHE_GROUP_DUMMY_PAGES
 
 
 def _spec(group_id, retention, window=None, rows_per_page=64):
-    return PagedCacheGroupSpec(
+    return CacheGroupSpec(
         group_id=group_id,
         retention=retention,
         rows_per_page=rows_per_page,
@@ -96,7 +123,7 @@ class MultiWindowPageCountsTest(unittest.TestCase):
             max_context_len=4096,
         )
         defaults.update(kw)
-        return compute_paged_cache_group_page_counts(specs, **defaults)
+        return compute_cache_group_page_counts(specs, **defaults)
 
     def test_each_window_budgets_independently(self):
         counts = self.counts(
@@ -170,7 +197,7 @@ class SuffixedGroupIdFlowTest(unittest.TestCase):
             [s.group_id for s in specs],
             ["full_attention", "sliding_attention_128", "sliding_attention_4"],
         )
-        counts = compute_paged_cache_group_page_counts(
+        counts = compute_cache_group_page_counts(
             specs,
             max_live_requests=4,
             max_scheduled_tokens=512,

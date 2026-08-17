@@ -17,7 +17,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTEN
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.paged_attention import (
     PagedAttention,
-    validate_paged_cache_group_ids,
+    validate_cache_group_ids,
 )
 from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -126,7 +126,7 @@ def test_eagle3_attention_routes_to_full_attention_cache_group(
 
     assert paged_layers
     assert {layer.group_id for layer in paged_layers} == {FULL_ATTENTION}
-    validate_paged_cache_group_ids(
+    validate_cache_group_ids(
         model,
         (
             SimpleNamespace(group_id=FULL_ATTENTION),

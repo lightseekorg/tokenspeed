@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import numpy as np
 import torch
 
@@ -27,15 +29,11 @@ from tokenspeed.runtime.cache.utils import (
     get_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    PagedCacheGroupSpec,
-)
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.pdl import pdl_enabled
-from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
 
@@ -51,35 +49,22 @@ def _get_tensor_size_bytes(t: torch.Tensor | list[torch.Tensor]):
 class MLATokenToKVPool(CachePool):
     def __init__(
         self,
-        size: int,
+        arena: CacheArena,
         model_dtype: torch.dtype,
         dtype: torch.dtype,
         quant_method: str,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
         layer_num: int,
-        device: str,
-        enable_memory_saver: bool,
-        prefix_granularity: int,
         rank: int,
         *,
-        memory_plan: CacheMemoryPlan,
-        paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = (),
-        token_capacity: int | None = None,
         layer_group_ids: tuple[str, ...] = (),
         field_layer_offset: int = 0,
-        backing_pool: CachePool | None = None,
     ):
         super().__init__(
-            size,
+            arena,
             dtype,
-            device,
-            prefix_granularity,
             rank,
-            memory_plan,
-            paged_cache_group_specs=paged_cache_group_specs,
-            token_capacity=token_capacity,
-            backing_pool=backing_pool,
             field_layer_offset=field_layer_offset,
         )
         self.model_dtype = model_dtype
@@ -100,45 +85,26 @@ class MLATokenToKVPool(CachePool):
                 "recipe must supply one group id per layer "
                 "(CachePoolSpec.layer_group_ids)"
             )
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
-        )
+        self._bind_layer_planes()
 
-        self._create_buffers()
+    # Quantized MLA splits one logical cache into three planes, so its
+    # per-layer entry is a tuple; the plain path is a single latent plane.
+    # Either way each plane is reshaped into the token rows its kernel reads.
+    layer_plane_bindings: ClassVar[dict[str, str]] = {
+        "latent_kv": "_latent_kv",
+        "latent_scale": "_latent_scale",
+        "rope_k": "_rope_k",
+    }
 
-    def _field_layer_id(self, layer_id: int) -> int:
-        """Map this compute view's local layer id into the merged plan."""
-        return self._field_layer_offset + layer_id
-
-    def _create_buffers(self) -> None:
-        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
-            # The padded page 0 is used for writing dummy outputs from padded tokens.
-            if self.quant_method == "per_token_head":
-                self.kv_buffer = [
-                    (
-                        self.field(
-                            f"layer.{self._field_layer_id(layer_id)}.latent_kv",
-                            self.store_dtype,
-                        ).view(-1, 1, self.kv_lora_rank),
-                        self.field(
-                            f"layer.{self._field_layer_id(layer_id)}.latent_scale",
-                            torch.float32,
-                        ).view(-1, 1, 1),
-                        self.field(
-                            f"layer.{self._field_layer_id(layer_id)}.rope_k",
-                            self.model_dtype,
-                        ).view(-1, 1, self.qk_rope_head_dim),
-                    )
-                    for layer_id in range(self.layer_num)
-                ]
-            else:
-                self.kv_buffer = [
-                    self.field(
-                        f"layer.{self._field_layer_id(layer_id)}.latent_kv",
-                        self.store_dtype,
-                    ).view(-1, 1, self.kv_cache_dim)
-                    for layer_id in range(self.layer_num)
-                ]
+    def _bind_layer_planes(self) -> None:
+        super()._bind_layer_planes()
+        # The padded page 0 is used for writing dummy outputs from padded tokens.
+        if self.quant_method == "per_token_head":
+            self.kv_buffer = list(
+                zip(self._latent_kv, self._latent_scale, self._rope_k, strict=True)
+            )
+        else:
+            self.kv_buffer = self._latent_kv
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
