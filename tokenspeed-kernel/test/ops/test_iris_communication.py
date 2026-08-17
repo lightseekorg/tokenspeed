@@ -20,6 +20,7 @@
 
 
 import socket
+import sys
 import traceback
 from types import SimpleNamespace
 from typing import List, Tuple
@@ -74,7 +75,6 @@ def _spawn_and_collect(worker_fn, args, world_size: int) -> None:
 def test_iris_state_uses_backing_capacity(
     monkeypatch, max_numel, max_bytes, expected_numel
 ):
-    from tokenspeed_kernel.ops.communication import iris as iris_ops
     from tokenspeed_kernel.ops.communication import triton as triton_ops
 
     created = []
@@ -83,8 +83,10 @@ def test_iris_state_uses_backing_capacity(
         created.append(kwargs)
         return SimpleNamespace(**kwargs)
 
-    monkeypatch.setattr(iris_ops, "IRIS_AR_STATES", {})
-    monkeypatch.setattr(iris_ops, "create_iris_state", create_iris_state)
+    iris_ops = SimpleNamespace(IRIS_AR_STATES={}, create_iris_state=create_iris_state)
+    monkeypatch.setitem(
+        sys.modules, "tokenspeed_kernel.ops.communication.iris", iris_ops
+    )
     state = SimpleNamespace(
         group=object(),
         rank_in_group=0,
