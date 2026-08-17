@@ -145,6 +145,10 @@ class _Contract:
     hidden_size: int
     latent_size: int
     rms_eps: float
+    # Non-None arms the deferred-finalize input mode (the collective kernel
+    # inlines the MoE finalize); part of the pool identity because it selects
+    # which kernel variants the pooled slot compiles.
+    finalize_top_k: int | None = None
 
 
 @dataclass
@@ -165,7 +169,7 @@ class KimiK3LatentTailOp:
     """
 
     _symmetric_pools: dict[
-        tuple[str, int, torch.device, int, int, float, str, int],
+        tuple[str, int, torch.device, int, int, float, int | None, str, int],
         _SymmetricPoolSlot,
     ] = {}
 
@@ -181,6 +185,7 @@ class KimiK3LatentTailOp:
         layer_index: int,
         model_scope: str,
         scratch_allocator: _ScratchAllocator | None = None,
+        finalize_top_k: int | None = None,
     ) -> "KimiK3LatentTailOp":
         """Construct this caller's tail op with a statically bound pool slot.
 
@@ -197,6 +202,12 @@ class KimiK3LatentTailOp:
                 per-call staging views from a shared block (the runtime's
                 workspace pool). The views are re-fetched on every collective
                 call per that pool's contract; None keeps private buffers.
+            finalize_top_k: When set (rank-uniform), additionally compiles the
+                deferred-finalize input mode so :meth:`call_deferred` can
+                consume the MoE kernel's ``(gemm2 permuted rows, expert
+                weights, expanded->permuted index)`` triple directly, skipping
+                the standalone finalize kernel and its ``[M, latent]``
+                intermediate. The standard mode stays available.
         """
         contract = _Contract(
             group_name=group.group_name,
@@ -205,6 +216,7 @@ class KimiK3LatentTailOp:
             hidden_size=hidden_size,
             latent_size=latent_size,
             rms_eps=float(rms_eps),
+            finalize_top_k=finalize_top_k,
         )
         return cls(
             contract,
@@ -238,6 +250,7 @@ class KimiK3LatentTailOp:
             contract.hidden_size,
             contract.latent_size,
             contract.rms_eps,
+            contract.finalize_top_k,
             model_scope,
             slot_index,
         )
@@ -259,6 +272,7 @@ class KimiK3LatentTailOp:
                         rms_eps=contract.rms_eps,
                         fp32_internal=True,
                         scratch_allocator=scratch_allocator,
+                        finalize_top_k=contract.finalize_top_k,
                     ),
                     up_projection=AdaptiveUpProjectionKernel(
                         group=group,
@@ -293,6 +307,11 @@ class KimiK3LatentTailOp:
     def max_num_tokens(self) -> int:
         return _MAX_NUM_TOKENS
 
+    @property
+    def supports_deferred_finalize(self) -> bool:
+        """Whether :meth:`call_deferred` may consume the deferred triple."""
+        return self.contract.finalize_top_k is not None
+
     def __call__(
         self,
         routed_partial: torch.Tensor,
@@ -323,17 +342,127 @@ class KimiK3LatentTailOp:
         """
         # Same-slot calls are stream-ordered, preserving Lamport buffer rotation.
         m = routed_partial.shape[0]
+        self._assert_capture_compiled(m)
+        latent, shared_shard = self._collective(
+            routed_partial,
+            shared_partial,
+            rms_weight,
+        )
+        return self._project_and_gather(latent, shared_shard, m, up_weight, prefix)
+
+    def call_deferred(
+        self,
+        gemm2_output: torch.Tensor,
+        expert_weights: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+        shared_partial: torch.Tensor,
+        rms_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        *,
+        num_tokens: int,
+        prefix: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Fused tail consuming the MoE kernel's deferred-finalize triple.
+
+        The collective kernel inlines the finalize (FP32 accumulate over the
+        fixed top-k order, semantically equivalent to the standalone finalize
+        kernel; bitwise identity is not guaranteed across compilers) into its
+        publish phase, so no ``[M, latent]`` routed partial is materialized.
+
+        Args:
+            gemm2_output: Permuted expert rows ``[total_padded_rows, >=3584]``
+                BF16 from the MoE kernel's ``do_finalize=False`` path; extra
+                padded width is sliced off.
+            expert_weights: Per-slot scales, ``[M, top_k]`` or flat
+                ``[M * top_k]`` (coerced to contiguous BF16).
+            expanded_idx_to_permuted_idx: Expanded->permuted row map,
+                ``[M, top_k]`` or flat ``[M * top_k]`` (coerced to contiguous
+                int32); ``-1`` drops the slot (EP non-local expert / padding).
+            shared_partial: This rank's shared-expert partial ``[M, 7168]``.
+            rms_weight: Latent RMSNorm weight ``[3584]``.
+            up_weight: Up-projection weight, as in :meth:`__call__`.
+            num_tokens: Token count M for this step.
+            prefix: Optional residual stream ``[M, 7168]``, as in
+                :meth:`__call__`.
+
+        Returns:
+            ``[M, 7168]`` post-communication hidden, as in :meth:`__call__`.
+        """
+        if not self.supports_deferred_finalize:
+            raise RuntimeError(
+                "KimiK3LatentTailOp was initialized without finalize_top_k; "
+                "the deferred-finalize mode is unavailable"
+            )
+        m = int(num_tokens)
+        top_k = self.contract.finalize_top_k
+        self._assert_capture_compiled(m)
+        # The deferred trtllm MoE returns scale/index tensors as either
+        # [m, top_k] or flat [m * top_k]; both are memory-identical when
+        # contiguous, and the fused kernel indexes the flat form. Reshape is
+        # a view and contiguous() a no-op on the K3 SiTU path.
+        if expert_weights.dtype != torch.bfloat16:
+            # No silent cast: the collective kernel scalar-loads raw BF16
+            # bits, so a .to(bfloat16) here would quietly halve the scale
+            # precision of a producer emitting fp32 weights (e.g. a routing
+            # path with _routing_logits_dtype=float32). Refuse instead.
+            raise ValueError(
+                "deferred-finalize expert_weights must be BF16 (the trtllm "
+                "SiTU path echoes the caller's bf16 topk weights); got "
+                f"{expert_weights.dtype}. An fp32-scale producer needs an "
+                "fp32 weight-load variant of the latent-tail kernel first."
+            )
+        if expert_weights.shape != (m * top_k,) or not expert_weights.is_contiguous():
+            expert_weights = expert_weights.reshape(m * top_k).contiguous()
+        if (
+            expanded_idx_to_permuted_idx.dtype != torch.int32
+            or expanded_idx_to_permuted_idx.shape != (m * top_k,)
+            or not expanded_idx_to_permuted_idx.is_contiguous()
+        ):
+            expanded_idx_to_permuted_idx = (
+                expanded_idx_to_permuted_idx.reshape(m * top_k)
+                .to(torch.int32)
+                .contiguous()
+            )
+        if gemm2_output.shape[-1] != self.contract.latent_size:
+            gemm2_output = gemm2_output[:, : self.contract.latent_size].contiguous()
+        if gemm2_output.shape[0] == 0:
+            # EP corner: every slot routed away from this rank (idx all -1).
+            # This rank must still publish zeros and join the collective, so
+            # substitute a one-row zero placeholder rather than early-return
+            # (which would strand peers in the AR poll). The kernel only
+            # dereferences rows named by non-negative indices, and a zero row
+            # contributes nothing even if a contract-violating index reads it.
+            gemm2_output = torch.zeros(
+                (1, self.contract.latent_size),
+                dtype=torch.bfloat16,
+                device=gemm2_output.device,
+            )
+        latent, shared_shard = self._collective.call_deferred(
+            gemm2_output,
+            expert_weights,
+            expanded_idx_to_permuted_idx,
+            shared_partial,
+            rms_weight,
+            num_tokens=m,
+        )
+        return self._project_and_gather(latent, shared_shard, m, up_weight, prefix)
+
+    def _assert_capture_compiled(self, m: int) -> None:
         # JIT compilation launches kernels; under capture they would be
         # recorded into the graph. Warmup must have compiled this m already.
         assert not torch.cuda.is_current_stream_capturing() or (
             self._up_projection.is_compiled(m)
         ), f"latent-tail up-projection for M={m} must compile in warmup, not capture"
         self._up_projection.ensure_compiled(m)
-        latent, shared_shard = self._collective(
-            routed_partial,
-            shared_partial,
-            rms_weight,
-        )
+
+    def _project_and_gather(
+        self,
+        latent: torch.Tensor,
+        shared_shard: torch.Tensor,
+        m: int,
+        up_weight: torch.Tensor,
+        prefix: torch.Tensor | None,
+    ) -> torch.Tensor:
         local_hidden = self.contract.hidden_size // self.contract.tp_size
         if up_weight.shape[0] == local_hidden:
             local_up_weight = up_weight

@@ -22,7 +22,7 @@
 
 import pytest
 
-from tokenspeed.runtime.layers.moe.latent import (
+from tokenspeed.runtime.models.kimi_k3_comm import (
     K3MoETailTier,
     select_k3_moe_tail_tier,
 )
