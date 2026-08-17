@@ -158,16 +158,20 @@ class _Harness:
             beta_raw=rnd(bs * T, H),
         )
 
-    def verify_round(self, rpis, pages, seq_lens, window):
-        """One target-verify forward over all three KDA layers."""
+    def verify_round(self, rpis, pages, seq_lens, window, identity=True):
+        """One target-verify forward over all three KDA layers.
+
+        ``identity=False`` strips the batch's request identity, modelling a
+        forward op that carries no ``request_pool_indices``.
+        """
         bs = len(rpis)
         tables = {
             gid: np.asarray([[p] for p in pages[gid]], dtype=np.int32)
             for gid in _STATE_GROUPS
         }
         metadata, op = _metadata_for(self.contract, tables, DEV)
-        op.request_pool_indices = list(rpis)
-        op.request_ids = [f"req{r}" for r in rpis]
+        op.request_pool_indices = list(rpis) if identity else []
+        op.request_ids = [f"req{r}" for r in rpis] if identity else []
         self.backend.init_forward_metadata(
             bs=bs,
             req_pool_indices=torch.tensor(rpis, dtype=torch.int32, device=DEV),
@@ -1089,6 +1093,7 @@ def _one_token_round(h, rpis, pages, seq_lens, seed):
     op.request_pool_indices = list(rpis)
     op.request_ids = [f"req{r}" for r in rpis]
     h.backend.speculative_num_draft_tokens = 1
+    outs = {}
     try:
         h.backend.init_forward_metadata(
             bs=bs,
@@ -1101,7 +1106,7 @@ def _one_token_round(h, rpis, pages, seq_lens, seed):
         )
         for layer_id in h.layer_ids:
             p = h.params[layer_id]
-            h.backend.forward_decode(
+            outs[layer_id] = h.backend.forward_decode(
                 None,
                 None,
                 None,
@@ -1132,6 +1137,49 @@ def _one_token_round(h, rpis, pages, seq_lens, seed):
             )
     finally:
         h.backend.speculative_num_draft_tokens = T
+    return outs
+
+
+def test_guard_flush_round_still_reads_committed_state():
+    """A round whose pending dies in staging must verify from committed pages.
+
+    The stage neutral-fills every control row to -1 before it decides the
+    pending's fate, and the fused kernel reads each request's initial state
+    and conv tail through the anchor row -- where -1 means "no history", a
+    zero state. A guard exit (here: a verify batch carrying no request
+    identity) that flushes the pending must still anchor the plain verify to
+    this round's committed pages, or the whole batch runs from zero state
+    and the round's outputs are silently wrong while the later standalone
+    commit keeps the pools looking healthy.
+    """
+    rpis = [0, 1]
+    h_lazy = _Harness(seed=47)
+    h_eager = _Harness(seed=47)
+    pages = _pages_for(h_lazy, rpis)
+    for h in (h_lazy, h_eager):
+        h.verify_round(rpis, pages, [6, 6], h.window(2, 211))
+        h.accept([2, 1])
+    h_eager.flush()  # the eager control has no pending to strand
+
+    # Round 2 arrives without request identity: ownership cannot be checked,
+    # so the lazy arm's stage flushes mid-staging -- the exact class of exit
+    # that used to leave the anchors at -1.
+    outs_lazy = h_lazy.verify_round(
+        rpis, pages, [8, 7], h_lazy.window(2, 212), identity=False
+    )
+    outs_eager = h_eager.verify_round(
+        rpis, pages, [8, 7], h_eager.window(2, 212), identity=False
+    )
+    assert (
+        h_lazy.pending() is None
+    ), "the no-identity guard should have flushed the T=2 window"
+    for layer_id in h_lazy.layer_ids:
+        torch.testing.assert_close(
+            outs_lazy[layer_id],
+            outs_eager[layer_id],
+            msg=f"layer {layer_id}: guard-flush round diverged from the eager "
+            "control -- the plain verify is not anchored to committed pages",
+        )
 
 
 def test_empty_forward_round_keeps_a_resident_owners_window():

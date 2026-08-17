@@ -90,6 +90,23 @@ class KdaAttnBackend(MambaAttnBackend):
     def __init__(self, config: BaseAttnConfig, kda_backend: str = "auto") -> None:
         super().__init__(config)
         self.max_bs = config.max_bs
+        # Lazy-commit lifecycle. ``_kda_pending`` holds at most ONE verify
+        # window's deferred commit; every transition below names its caller:
+        #
+        #   (none) --commit_verified_state--> pending      accept recorded, write deferred
+        #   pending --_stage_pending_replay--> staged       next verify prep composed the fusion
+        #                                                   (guards may instead flush/drop, below)
+        #   staged --forward issued--> release_deferred_state   via settle_deferred_state,
+        #                                                   after EVERY forward; clears
+        #                                                   ``_kda_replay_staged`` so an
+        #                                                   abandoned prep still owes a flush
+        #   pending --_flush_kda_pending--> (none)          written out standalone: pause fence
+        #                                                   (flush_deferred_state), a non-verify
+        #                                                   batch carrying the owner
+        #                                                   (_resolve_pending_before_forward),
+        #                                                   or a staging guard
+        #   pending --_drop_kda_pending--> (none)           owner departed or its pool index was
+        #                                                   recycled: pages reclaimed, NEVER write
         self._kda_pending: dict | None = None
         self._kda_replay_staged = False
         self._kda_overflow_round = False
@@ -706,53 +723,16 @@ class KdaAttnBackend(MambaAttnBackend):
         from tokenspeed_kernel.ops.metadata import kda_stage_replay
 
         assert rpis_dev is not None and rpis_dev.shape[0] >= real_bs
-        pending = self._kda_pending
+        pending = self._pending_survives_staging(kwargs, real_bs)
         if pending is None:
-            # No window to fuse, so the anchors are this round's pages verbatim.
+            # Plain verify. The fused kernel still reads each request's
+            # initial state and conv tail through the anchor rows, so they
+            # must hold this round's committed pages on EVERY no-pending
+            # exit: the neutral fill above left them at -1, which the kernel
+            # reads as "no history" and would run real requests from a zero
+            # state.
             if state_in is not anchor_rows:
                 anchor_rows[:, :real_bs].copy_(state_in)
-            return
-        batch = kwargs.get("forward_batch")
-        if batch is None or not batch.request_pool_indices:
-            # No request identity: cannot fuse safely; commit eagerly, run plain.
-            self._flush_kda_pending()
-            return
-        # Screen corpses and departures BEFORE any flush: a growth flush that
-        # still holds a departed request would write its reclaimed pages.
-        rpis = list(batch.request_pool_indices)[:real_bs]
-        staged_req_ids = list(batch.request_ids)[:real_bs]
-        _, corpses = self._kda_pending_owner_mask(rpis, staged_req_ids)
-        if corpses:
-            self._drop_kda_pending(corpses)
-            pending = self._kda_pending
-            if pending is None:
-                return
-        current = set(rpis)
-        departed = [r for r in pending["slot_by_rpi"] if r not in current]
-        if departed:
-            self._drop_kda_pending(departed)
-            pending = self._kda_pending
-            if pending is None:
-                return
-        cache = self._replay_payload_cache
-        needed_rows = max(len(self.query_start_loc_list), real_bs) * int(
-            self.speculative_num_draft_tokens
-        )
-        if cache is not None and cache["rows"] < needed_rows:
-            # The pending's ring and this round's ring diverge here -- eager
-            # growth rebuilds the buffers the replay reads, and an overflow
-            # round writes a different set entirely. Commit before staging.
-            self._flush_kda_pending()
-            return
-        t_prev = pending["draft_token_num"]
-        t_now = int(
-            kwargs.get("tokens_per_req", 0)
-            or self.speculative_num_draft_tokens
-            or t_prev
-        )
-        if t_prev != t_now:
-            # Payload is in t_prev units: a different window size would mis-replay.
-            self._flush_kda_pending()
             return
         # One launch for every control row. Ownership comes from the device
         # slot table; a row failing the identity or causal gate is condemned
@@ -770,7 +750,7 @@ class KdaAttnBackend(MambaAttnBackend):
             state_in,
             state_in_stride,
             base_offset=pending["parity"] * self._payload_half_rows,
-            draft_token_num=t_prev,
+            draft_token_num=pending["draft_token_num"],
             num_groups=n_groups,
         )
         # The record stays live until the forward it was staged for is issued:
@@ -778,6 +758,66 @@ class KdaAttnBackend(MambaAttnBackend):
         # releases it -- NOT the next round's record, which never arrives when
         # the round dies between the KDA layers and the accept sampling.
         self._kda_replay_staged = True
+
+    def _pending_survives_staging(self, kwargs: dict, real_bs: int) -> dict | None:
+        """Return the pending record iff it is safe to fuse into this round.
+
+        Every ``None`` exit has already dropped or flushed the record; the
+        caller then anchors a plain verify. The reasons a pending does not
+        survive, in screening order:
+
+        1. No request identity on the batch: ownership cannot be checked, so
+           commit eagerly rather than fuse blindly.
+        2. Corpses -- a slot whose request id changed: the pool index was
+           recycled, so the window belongs to a departed request. Dropped,
+           never flushed; its pages may already belong to the new request.
+        3. Departures -- owners absent from this batch entirely. Dropped for
+           the same reason. Corpses and departures are screened BEFORE any
+           flush so a later flush cannot write reclaimed pages.
+        4. Payload-ring divergence: eager growth rebuilds the buffers the
+           replay reads, and an overflow round writes a different set
+           entirely. Committed standalone before staging.
+        5. Window-size change: the payload is addressed in previous-window
+           units, so a different size would mis-replay. Committed standalone.
+        """
+        pending = self._kda_pending
+        if pending is None:
+            return None
+        batch = kwargs.get("forward_batch")
+        if batch is None or not batch.request_pool_indices:
+            self._flush_kda_pending()
+            return None
+        rpis = list(batch.request_pool_indices)[:real_bs]
+        staged_req_ids = list(batch.request_ids)[:real_bs]
+        _, corpses = self._kda_pending_owner_mask(rpis, staged_req_ids)
+        if corpses:
+            self._drop_kda_pending(corpses)
+            pending = self._kda_pending
+            if pending is None:
+                return None
+        current = set(rpis)
+        departed = [r for r in pending["slot_by_rpi"] if r not in current]
+        if departed:
+            self._drop_kda_pending(departed)
+            pending = self._kda_pending
+            if pending is None:
+                return None
+        cache = self._replay_payload_cache
+        needed_rows = max(len(self.query_start_loc_list), real_bs) * int(
+            self.speculative_num_draft_tokens
+        )
+        if cache is not None and cache["rows"] < needed_rows:
+            self._flush_kda_pending()
+            return None
+        t_now = int(
+            kwargs.get("tokens_per_req", 0)
+            or self.speculative_num_draft_tokens
+            or pending["draft_token_num"]
+        )
+        if pending["draft_token_num"] != t_now:
+            self._flush_kda_pending()
+            return None
+        return pending
 
     @override
     def _resolve_pending_before_forward(
@@ -1039,6 +1079,7 @@ class KdaAttnBackend(MambaAttnBackend):
         else:
             self._kda_pending = None
 
+    @override
     def release_deferred_state(self) -> None:
         """Drop the record whose window the just-issued forward already applied.
 
@@ -1059,6 +1100,10 @@ class KdaAttnBackend(MambaAttnBackend):
             self._kda_replay_staged = False
             self._kda_pending = None
             self._kda_table_release()
+
+    @override
+    def has_deferred_state(self) -> bool:
+        return self._kda_pending is not None
 
     @override
     def flush_deferred_state(self, resident_request_ids: set[str]) -> None:
@@ -1587,6 +1632,10 @@ class HybridKDABackend(HybridLinearAttnBackend):
     """
 
     @override
+    def has_deferred_state(self) -> bool:
+        return self.linear_attn_backend.has_deferred_state()
+
+    @override
     def flush_deferred_state(self, resident_request_ids: set[str]) -> None:
         self.linear_attn_backend.flush_deferred_state(resident_request_ids)
 
@@ -1594,5 +1643,4 @@ class HybridKDABackend(HybridLinearAttnBackend):
     def settle_deferred_state(self, accepted_length):
         """Release issued replay work, then record a verified state window."""
         self.linear_attn_backend.release_deferred_state()
-        if accepted_length is not None:
-            self.linear_attn_backend.commit_verified_state(accepted_length)
+        super().settle_deferred_state(accepted_length)

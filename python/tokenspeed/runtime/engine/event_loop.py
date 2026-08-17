@@ -1028,6 +1028,9 @@ class EventLoop:
         resident, so an empty round says nothing about who is still here.
         """
         backend = self.model_executor.attn_backend
+        if not backend.has_deferred_state():
+            # Most backends never defer; skip the stream fencing entirely.
+            return
         resident = set(self.output_processor.rid_to_state)
         stream = self.model_executor.execution_stream
         stream.wait_stream(torch.cuda.current_stream())
@@ -1577,16 +1580,22 @@ class EventLoop:
             if hasattr(pool, "clear_kv_buffers"):
                 pool.clear_kv_buffers()
 
-    def _paused_idle_step(self, prev_forward_op=None, prev_results=None) -> None:
+    def _commit_paused_inflight(self, prev_forward_op, prev_results) -> None:
+        """Commit an overlapped step caught in flight by a pause.
+
+        A forward already on the GPU can't be un-launched; its results are
+        committed here so the pause path sees post-step request state.
+        """
+        if prev_results is None:
+            return
+        request_changes = self._commit_forward_results(prev_forward_op, prev_results)
+        advance_forward(self.scheduler, request_changes)
+        self._publish_scheduler_kv_events()
+
+    def _paused_idle_step(self) -> None:
         """Run one iteration under ``PAUSED_ALL`` (keep mode): no new forward
         work, but keep DP ranks in lockstep, service the drain check, and yield
         the CPU so the freeze does not busy-spin a core."""
-        if prev_results is not None:
-            request_changes = self._commit_forward_results(
-                prev_forward_op, prev_results
-            )
-            advance_forward(self.scheduler, request_changes)
-            self._publish_scheduler_kv_events()
 
         if self.has_dp:
             dp_metadata = self._dp_sync_and_check(None)
@@ -1772,11 +1781,18 @@ class EventLoop:
             self._process_new_requests()
             self._commit_cache_results()
             if self._pause.forward_blocked:
-                # Freeze: commit the in-flight overlapped step, flush deferred state under its own weights, then idle.
-                self._flush_deferred_state()
-                self._paused_idle_step(prev_forward_op, prev_results)
+                # Freeze. Order matters twice over: the in-flight overlapped
+                # step commits FIRST, so its completions leave rid_to_state
+                # and the flush sees true residency (a request finishing in
+                # that very step must be dropped, not flushed); the flush runs
+                # BEFORE the idle step, whose drain-finish can release a
+                # weight update -- deferred state must be settled under the
+                # weights that produced it.
+                self._commit_paused_inflight(prev_forward_op, prev_results)
                 prev_results = None
                 prev_forward_op = None
+                self._flush_deferred_state()
+                self._paused_idle_step()
                 continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
