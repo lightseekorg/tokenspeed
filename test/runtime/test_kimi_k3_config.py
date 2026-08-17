@@ -329,6 +329,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             def __init__(self, *args, **kwargs):
                 super().__init__()
                 self.weight = torch.empty(0)
+                self.shard_group = kwargs.get("shard_group")
 
         class FakeExperts(torch.nn.Module):
             def __init__(self, *args, **kwargs):
@@ -386,11 +387,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         with (
             mock.patch.object(kimi_k3, "ReplicatedLinear", FakeLinear),
-            mock.patch.object(
-                kimi_k3,
-                "Kimi3LatentProjection",
-                side_effect=lambda *args, **kwargs: FakeLinear(),
-            ),
+            mock.patch.object(kimi_k3, "Kimi3LatentProjection", FakeLinear),
             mock.patch.object(kimi_k3, "MoELayer", FakeExperts),
             mock.patch.object(kimi_k3, "KimiLinearMLP", FakeSharedExperts),
             mock.patch.object(kimi_k3, "LatentMoELayer", FakeLatentMoE),
