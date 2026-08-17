@@ -231,7 +231,7 @@ class AttentionBackend(ABC):
         ``settle_deferred_state`` for the per-forward settlement point.
         """
 
-    def settle_deferred_state(self, accept_lengths) -> None:
+    def settle_deferred_state(self, accept_lengths: torch.Tensor | None) -> None:
         """Settle deferred work at the per-forward settlement point.
 
         Called by the graph wrapper after every forward. ``accept_lengths`` is

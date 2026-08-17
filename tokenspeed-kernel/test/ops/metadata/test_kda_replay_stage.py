@@ -43,7 +43,6 @@ DEV = "cuda"
 
 def _reference(flat, table, rpis, steps, expect, anchor, commit, committed, G, base, t):
     """The eager chain: identity + causal gates, then per-group selects."""
-    cap = flat.shape[1]
     bs = rpis.shape[0]
     state_in = flat[2 : 2 + G, :bs].clone()
     slot = table.to(torch.int64).gather(0, rpis.to(torch.int64))

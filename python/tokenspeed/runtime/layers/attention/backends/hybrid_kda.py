@@ -90,23 +90,8 @@ class KdaAttnBackend(MambaAttnBackend):
     def __init__(self, config: BaseAttnConfig, kda_backend: str = "auto") -> None:
         super().__init__(config)
         self.max_bs = config.max_bs
-        # Lazy-commit lifecycle. ``_kda_pending`` holds at most ONE verify
-        # window's deferred commit; every transition below names its caller:
-        #
-        #   (none) --commit_verified_state--> pending      accept recorded, write deferred
-        #   pending --_stage_pending_replay--> staged       next verify prep composed the fusion
-        #                                                   (guards may instead flush/drop, below)
-        #   staged --forward issued--> release_deferred_state   via settle_deferred_state,
-        #                                                   after EVERY forward; clears
-        #                                                   ``_kda_replay_staged`` so an
-        #                                                   abandoned prep still owes a flush
-        #   pending --_flush_kda_pending--> (none)          written out standalone: pause fence
-        #                                                   (flush_deferred_state), a non-verify
-        #                                                   batch carrying the owner
-        #                                                   (_resolve_pending_before_forward),
-        #                                                   or a staging guard
-        #   pending --_drop_kda_pending--> (none)           owner departed or its pool index was
-        #                                                   recycled: pages reclaimed, NEVER write
+        # One deferred window: record -> stage -> release after every forward;
+        # guards flush resident owners and drop departed/recycled owners.
         self._kda_pending: dict | None = None
         self._kda_replay_staged = False
         self._kda_overflow_round = False
@@ -665,7 +650,7 @@ class KdaAttnBackend(MambaAttnBackend):
         LEAVES the pending: an empty batch is no evidence about residency.
         """
         bufs = self._kda_lazy_buffers(min_slots=padded_bs)
-        pend = self._kda_pending
+        pending = self._kda_pending
         # A round whose token rows exceed the frozen graph ring runs eagerly
         # on the free-growing overflow payload. The fused launch selects by
         # max(ceiling, batch)*T > ring rows as well (its batch equals
@@ -694,7 +679,7 @@ class KdaAttnBackend(MambaAttnBackend):
             # stage, so capture_base is still its zero init -- half 0 it is.
             self._staged_parity = 0
         else:
-            par = pend["parity"] if pend is not None else self._payload_parity
+            par = pending["parity"] if pending is not None else self._payload_parity
             self._staged_parity = 1 - par
             bufs["capture_base"].fill_(self._staged_parity * self._payload_half_rows)
         n = padded_bs
@@ -1286,9 +1271,7 @@ class KdaAttnBackend(MambaAttnBackend):
         """
         max_rows = max(len(self.query_start_loc_list), batch_size) * draft_token_num
         widths = (mixed_qkv.shape[-1], f_a_out.shape[-1], beta_raw.shape[-1])
-        qkv_buf, f_a_buf, beta_buf = self._replay_payload(
-            layer_id, max_rows, widths, mixed_qkv.dtype
-        )
+        self._replay_payload(layer_id, max_rows, widths, mixed_qkv.dtype)
         # Staged in-kernel by the conv-window commit (CAPTURE mode).
         state = self._replay_layer_weights
         if state is None:
@@ -1640,7 +1623,7 @@ class HybridKDABackend(HybridLinearAttnBackend):
         self.linear_attn_backend.flush_deferred_state(resident_request_ids)
 
     @override
-    def settle_deferred_state(self, accepted_length):
+    def settle_deferred_state(self, accepted_length: torch.Tensor | None) -> None:
         """Release issued replay work, then record a verified state window."""
         self.linear_attn_backend.release_deferred_state()
         super().settle_deferred_state(accepted_length)

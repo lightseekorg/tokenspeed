@@ -490,7 +490,7 @@ def test_capture_payload_fa_wider_than_the_qkv_grid_is_loud_or_lossless():
     ride. That must either copy correctly or fail loudly -- a silent
     truncation would feed stale gate inputs into the next round's replay."""
     try:
-        (q, f, b), (dq, df, db) = _capture_case(512, 1100, 8, rows=3)
+        (_, f, _), (_, df, _) = _capture_case(512, 1100, 8, rows=3)
     except AssertionError:
         return  # loud: the driver refused the shape, which the contract allows
     assert torch.equal(df[:3], f[:3]), (

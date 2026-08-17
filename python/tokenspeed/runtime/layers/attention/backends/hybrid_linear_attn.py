@@ -2355,6 +2355,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
 
     @override
-    def settle_deferred_state(self, accepted_length):
+    def settle_deferred_state(self, accepted_length: torch.Tensor | None) -> None:
         if accepted_length is not None:
             self.linear_attn_backend.commit_verified_state(accepted_length)
