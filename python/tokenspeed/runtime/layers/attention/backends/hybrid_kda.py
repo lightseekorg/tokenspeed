@@ -372,6 +372,7 @@ class KdaAttnBackend(MambaAttnBackend):
         seq_len: int,
         num_real_tokens: int,
         lower_bound: float | None,
+        extend_seq_lens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run only the real-token prefix through the KDA prefill kernel.
 
@@ -379,6 +380,15 @@ class KdaAttnBackend(MambaAttnBackend):
         ``cu_seqlens``: bucket-padded inputs would leave the output tail
         unwritten and feed padding into its final full-tile loads. The graph
         handoff clears and restores the bucket tail afterward.
+
+        ``extend_seq_lens_cpu`` is the scheduler's host-side per-sequence
+        extend lengths; its prefix sum equals the contents of
+        ``query_start_loc``. Forwarding it as ``cu_seqlens_cpu`` lets the
+        CuteDSL wrapper plan on the host without a stream-synchronizing D2H
+        read of the boundaries — otherwise that read recurs on every KDA
+        layer of every prefill chunk (the wrapper's identity memo cannot hit
+        across layers because the op casts ``cu_seqlens`` to a fresh int64
+        tensor per call).
         """
         head_k_dim = query.shape[3]
         num_value_heads = value.shape[2]
@@ -393,6 +403,14 @@ class KdaAttnBackend(MambaAttnBackend):
             num_real_tokens, query, key, value, g_kda, beta_kda
         )
 
+        cu_seqlens_cpu = None
+        if extend_seq_lens_cpu is not None:
+            bounds = [0]
+            for n in extend_seq_lens_cpu.tolist():
+                bounds.append(bounds[-1] + int(n))
+            if len(bounds) == query_start_loc.numel():
+                cu_seqlens_cpu = tuple(bounds)
+
         kda_result = kda_paged_prefill(
             query,
             key,
@@ -403,6 +421,7 @@ class KdaAttnBackend(MambaAttnBackend):
             dt_bias,
             initial_state=recurrent_state,
             cu_seqlens=query_start_loc,
+            cu_seqlens_cpu=cu_seqlens_cpu,
             lower_bound=lower_bound,
             solution=None if self.kda_backend == "auto" else self.kda_backend,
         )
