@@ -39,13 +39,15 @@ class Fp8Config(QuantizationConfig):
 
     weight_scale_dtype = torch.float32
 
-    # Linear-attention (GDN/mamba) projections are excluded from online
-    # quantization
+    # Excluded from online quantization: linear-attention (GDN/mamba)
+    # projections, plus wo_a, whose is_bmm runtime path only accepts the
+    # deep_gemm ue8m0 block-scale layout that online quantization never emits.
     ONLINE_IGNORED_LAYERS = [
         "re:.*linear_attn.*",
         "re:.*conv1d.*",
         "re:.*in_proj.*",
         "re:.*out_proj.*",
+        "re:.*wo_a.*",
     ]
 
     def __init__(
