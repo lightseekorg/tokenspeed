@@ -313,6 +313,18 @@ Its responsibilities:
   stream to the Host tier (`stream_device_cache_to_host_`); a
   `pending_stores_` queue drives D2H transfers, alongside Host-side
   acquire/contains/pin queries.
+* **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
+  CacheBlock IDs. Optional L3 (Mooncake Store) sits *below* that buffer, not
+  beside GPU pages: after D2H, the runtime `batch_put_from`s each packed
+  Host CacheBlock; a later Host miss that is known to exist in L3 allocates
+  a Host page, `batch_get_into`s it, then runs the ordinary H2D load.
+  Object keys are `{model}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}`.
+  The scheduler's `storage_keys_` set treats those keys as Host hits that
+  require prefetch; Host eviction does **not** drop the L3 key. Cross-instance
+  reuse probes `batch_exists` before `submit_requests` and
+  `register_storage_keys`. This is the TokenSpeed equivalent of SGLang HiCache
+  / vLLM `MooncakeStoreConnector`, keyed on packed CacheBlocks rather than
+  split K/V pages.
 * **Reclamation and lifecycle.** `ReclaimExpired`, `Free`,
   `ClearDeviceCache`/`ClearCache`, and `NumNewlyReleasableLcmBlocks` for
   ranking retraction (preemption) victims.

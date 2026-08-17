@@ -250,3 +250,36 @@ features directly:
 - `--disaggregation-*`
 - `--comm-fusion-max-num-tokens`
 - `--enable-allreduce-fusion`
+
+### Host L2 and Mooncake Store L3
+
+Host KVStore (`--kvstore-ratio` / `--kvstore-size`) is a compact pinned
+buffer under GPU cache (flat KV). `--kvstore-storage-backend mooncake`
+adds Mooncake Store as L3 under that buffer, following SGLang HiCache /
+vLLM `MooncakeStoreConnector`:
+
+```
+GPU Device KV (L1)
+  ↕ D2H / H2D
+Host pinned buffer (L2 / flat KV)
+  ↕ batch_put_from / batch_get_into
+Mooncake Store (L3)
+```
+
+Each packed Host CacheBlock is one Mooncake object. L3 requires Host L2
+(do not pass `--disable-kvstore`). Pass Mooncake client settings as JSON
+in `--kvstore-storage-backend-extra-config`, for example:
+
+```json
+{
+  "master_server_address": "10.0.0.1:50051",
+  "local_hostname": "localhost",
+  "metadata_server": "P2PHANDSHAKE",
+  "global_segment_size": "16gb",
+  "protocol": "tcp"
+}
+```
+
+`--kvstore-storage-backend memory` is an in-process dict for tests only.
+Mooncake Store is the offload backend; PD KV transfer still uses the
+separate Mooncake TransferEngine (`--disaggregation-transfer-backend`).

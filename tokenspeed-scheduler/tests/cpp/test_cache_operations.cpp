@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdlib>
+#include <stdexcept>
 #include <type_traits>
 
 #include "cache/core/block_pool.h"
@@ -273,6 +274,106 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
     };
 
     EXPECT_NO_THROW(scheduler.SubmitRequests({spec}));
+}
+
+TEST(CacheOperationTest, L3StorageRequiresHostCache) {
+    SchedulerConfig config;
+    config.prefix_granularity = 2;
+    config.device_allocator.total_pages = 4;
+    config.host_allocator.total_pages = 1;
+    config.max_scheduled_tokens = 2;
+    config.max_batch_size = 1;
+    config.enable_l3_storage = true;
+    config.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "full",
+        .rows_per_page = 2,
+        .entry_stride_tokens = 1,
+        .total_pages = 4,
+        .retention = CacheGroupConfig::Retention::FullHistory,
+        .family = CacheGroupFamily::History,
+    });
+    EXPECT_THROW(Scheduler{std::move(config)}, std::invalid_argument);
+}
+
+TEST(CacheOperationTest, L3StorageAcceptsHostCache) {
+    SchedulerConfig config;
+    config.prefix_granularity = 2;
+    config.device_allocator.total_pages = 4;
+    config.host_allocator.total_pages = 8;
+    config.max_scheduled_tokens = 2;
+    config.max_batch_size = 1;
+    config.enable_l3_storage = true;
+    config.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "full",
+        .rows_per_page = 2,
+        .entry_stride_tokens = 1,
+        .total_pages = 4,
+        .retention = CacheGroupConfig::Retention::FullHistory,
+        .family = CacheGroupFamily::History,
+    });
+    EXPECT_NO_THROW(Scheduler{std::move(config)});
+}
+
+TEST(CacheOperationTest, L3StorageHitsAllocateHostPrefetch) {
+    BlockPool device_pool{4};
+    BlockPool host_pool{4};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
+                                                   /*stream_device_cache_to_host=*/true, /*enable_l3_storage=*/true);
+    ASSERT_TRUE(coordinator.EnablesL3Storage());
+
+    const CacheKey key{.group_id = 0, .content_hash = "h0"};
+    coordinator.RegisterStorageKeys(std::array{key});
+    EXPECT_TRUE(coordinator.ContainsStorageKey(key));
+
+    auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
+    EXPECT_EQ(probe.host.num_common_tokens, 2);
+
+    std::vector<BlockTable> tables(1);
+    std::vector<GroupDemand> demands{{.table = &tables[0], .num_tokens = 2}};
+    auto admission = coordinator.Admit(std::move(probe), demands);
+    ASSERT_TRUE(admission);
+    ASSERT_EQ(admission->load_pairs.size(), 1u);
+    EXPECT_TRUE(admission->load_pairs[0].prefetch_from_storage);
+    EXPECT_EQ(admission->load_pairs[0].key.content_hash, "h0");
+}
+
+TEST(CacheOperationTest, ExpandPrefixKeysCoversGroupsAndOffsets) {
+    BlockPool device_pool{4};
+    BlockPool host_pool{4};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, device_pool, &host_pool,
+                                                   /*stream_device_cache_to_host=*/true, /*enable_l3_storage=*/true);
+    const std::vector<CacheKey> keys = coordinator.ExpandPrefixKeys(std::array<std::string, 1>{"h0"});
+    ASSERT_EQ(keys.size(), 2u);
+    EXPECT_EQ(keys[0].content_hash, "h0");
+    EXPECT_EQ(keys[0].page_offset, 0);
+    EXPECT_EQ(keys[1].page_offset, 1);
+}
+
+TEST(CacheOperationTest, WriteBackBatchCarriesStorageKeys) {
+    WriteBackOperation op;
+    op.op_id = 3;
+    op.transfers = {CacheTransfer{
+        .group_id = 0,
+        .source_page = 1,
+        .destination_page = 11,
+        .content_hash = "h0",
+        .page_offset = 0,
+    }};
+
+    WriteBackBatch batch({op});
+
+    ASSERT_EQ(batch.content_hashes[0], std::vector<std::string>({"h0"}));
+    ASSERT_EQ(batch.page_offsets[0], std::vector<std::int32_t>({0}));
 }
 
 }  // namespace tokenspeed::test

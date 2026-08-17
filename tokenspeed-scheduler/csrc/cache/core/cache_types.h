@@ -125,6 +125,10 @@ struct BlockTransfer {
     std::uint32_t group_id{0};
     CacheBlockRef source;
     CacheBlockRef destination;
+    CacheKey key{};
+    // True when source is a freshly allocated Host block that L3 must fill
+    // before the Host→Device copy.
+    bool prefetch_from_storage{false};
 };
 
 }  // namespace tokenspeed

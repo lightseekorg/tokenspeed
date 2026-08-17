@@ -809,6 +809,12 @@ class ServerArgs:
                     "Mooncake storage backend uses page_first layout, which requires kernel io backend"
                 )
 
+        if self.kvstore_storage_backend is not None and not self.enable_kvstore:
+            raise ValueError(
+                "L3 storage (--kvstore-storage-backend) requires Host L2; "
+                "unset --disable-kvstore"
+            )
+
     def validate_cache_options(self):
         speculative_algorithm = getattr(self, "speculative_algorithm", None)
         draft_model_path_use_base = getattr(self, "draft_model_path_use_base", False)
@@ -1169,18 +1175,20 @@ class ServerArgs:
         parser.add_argument(
             "--kvstore-storage-backend",
             type=str,
-            choices=["mooncake"],
+            choices=["mooncake", "memory"],
             default=ServerArgs.kvstore_storage_backend,
-            help="The storage backend for KVStore. "
-            "Built-in backends: mooncake. "
-            "For dynamic backend, use --kvstore-storage-backend-extra-config to specify: "
-            "backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="L3 store under compact Host (flat) KV. "
+            "'mooncake' is Mooncake Store (SGLang/vLLM HiCache equivalent). "
+            "'memory' is an in-process dict for tests. Requires Host L2 "
+            "(do not pass --disable-kvstore).",
         )
         parser.add_argument(
             "--kvstore-storage-backend-extra-config",
             type=str,
             default=ServerArgs.kvstore_storage_backend_extra_config,
-            help="A dictionary in JSON string format containing extra configuration for the storage backend.",
+            help="JSON object of extra L3 backend settings. For mooncake: "
+            "master_server_address, local_hostname, metadata_server, "
+            "global_segment_size, protocol, device_name, tenant_id.",
         )
         # Mamba Cache
         parser.add_argument(

@@ -255,6 +255,61 @@ class GroupAwareWireTest(unittest.TestCase):
         )
 
 
+class L3FlatKvExecutorTest(unittest.TestCase):
+    def test_storage_pages_skip_non_prefetch_sources(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        operation = SimpleNamespace(
+            content_hashes=[["h0", "h1"]],
+            page_offsets=[[0, 1]],
+            group_ids=[[0, 1]],
+            src_pages=[[3, 4]],
+            dst_pages=[[7, 8]],
+            prefetch_from_storage=[[1, 0]],
+        )
+        pages = L2CacheExecutor._storage_pages(
+            operation, host_is_destination=False, prefetch_only=True
+        )
+        self.assertEqual(pages, [(0, 3, "h0", 0)])
+        write_pages = L2CacheExecutor._storage_pages(
+            operation, host_is_destination=True
+        )
+        self.assertEqual(write_pages, [(0, 7, "h0", 0), (1, 8, "h1", 1)])
+
+    def test_drain_writes_backs_up_host_pages_after_d2h(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor, _Ack
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor.l3_store = Mock()
+        finish = Mock()
+        finish.query.return_value = True
+        results = []
+        pending = executor._drain_writes(
+            [_Ack(finish, [7], [(0, 1, "h0", 0)])], results
+        )
+        self.assertEqual(pending, [])
+        executor.l3_store.backup.assert_called_once_with([(0, 1, "h0", 0)])
+        self.assertEqual(len(results), 1)
+
+    def test_prefetch_failure_raises(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor.l3_store = Mock()
+        executor.l3_store.prefetch.return_value = [True, False]
+        with self.assertRaisesRegex(RuntimeError, "L3 prefetch failed"):
+            executor._prefetch_from_storage([(0, 1, "h0", 0), (0, 2, "h1", 0)])
+
+
 class CompactLayoutRoundTripTest(unittest.TestCase):
     def setUp(self):
         try:

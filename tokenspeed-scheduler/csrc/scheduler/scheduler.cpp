@@ -34,6 +34,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "core/token_container.h"
 #include "cache/tier/transfer.h"
 #include "fsm/forward_states.h"
 #include "scheduler/operations/forward.h"
@@ -79,7 +80,7 @@ Scheduler::Scheduler(SchedulerConfig config)
       host_pool_{hostPoolBlocks(config_)},
       coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.prefix_granularity, block_pool_,
                                    hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
-                                   config_.StreamsDeviceCacheToHost())},
+                                   config_.StreamsDeviceCacheToHost(), config_.enable_l3_storage)},
       tier_transfers_{coordinator_} {
     // config_.Validate() already ran; the body only derives state from it.
     cache_group_ids_.reserve(config_.cache_groups.size());
@@ -381,6 +382,16 @@ std::int32_t Scheduler::CacheGroupTotalPages(const std::string& group_id) const 
 
 std::int32_t Scheduler::CacheGroupAvailablePages(const std::string& group_id) const {
     return coordinator_.GroupAvailablePages(static_cast<std::int32_t>(groupIndex(group_id)));
+}
+
+std::vector<std::string> Scheduler::PrefixHashesForTokens(const std::vector<std::int32_t>& tokens) const {
+    TokenContainer container(tokens);
+    std::vector<std::span<const std::int32_t>> prefix_pages =
+        container.FullPrefixPages(config_.prefix_granularity, false);
+    const std::int32_t candidate_prefix_pages =
+        std::max((static_cast<std::int32_t>(tokens.size()) - 1) / config_.prefix_granularity, 0);
+    prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
+    return ComputePrefixHashes(prefix_pages, "");
 }
 
 std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {
