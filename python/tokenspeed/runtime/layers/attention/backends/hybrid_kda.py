@@ -332,7 +332,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 conv_scratch,
                 ssm_comp,
                 ssm_scratch,
-                state_in_pages,
+                state_in_blocks,
                 output_indices,
                 layer_id=layer_id,
                 bias=bias,
@@ -456,7 +456,7 @@ class KdaAttnBackend(MambaAttnBackend):
         key: torch.Tensor,
         value: torch.Tensor,
         ssm_comp: torch.Tensor,
-        ssm_scratch: torch.Tensor,
+        ssm_scratch: torch.Tensor | None,
         state_in_blocks: torch.Tensor,
         output_indices: torch.Tensor,
         *,
@@ -1570,12 +1570,11 @@ class KdaAttnBackend(MambaAttnBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
-        page_table: torch.Tensor = None,
         **kwargs,
     ):
         self._kda_replay_staged = False
         return super().init_forward_metadata_replay_cuda_graph(
-            bs, req_pool_indices, seq_lens, forward_mode, page_table, **kwargs
+            bs, req_pool_indices, seq_lens, forward_mode, **kwargs
         )
 
 

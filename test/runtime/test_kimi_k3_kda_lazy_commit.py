@@ -128,7 +128,7 @@ class _Harness:
     def __init__(self, seed=0, usable_pages=16):
         torch.manual_seed(seed)
         self.pool = _make_kimi_pool(DEV, usable_pages=usable_pages)
-        self.contract = self.pool.runtime_contract
+        self.contract = self.pool.arena.runtime_contract
         self.backend = _backend(self.pool)
         # Drive EVERY KDA layer, as a real verify forward would.
         self.layer_ids = list(self.backend._state_layer_ids())

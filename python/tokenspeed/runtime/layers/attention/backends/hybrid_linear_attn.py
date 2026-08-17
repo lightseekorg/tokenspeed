@@ -1750,8 +1750,6 @@ class MambaAttnBackend(AttentionBackend):
             )
             if fused_out is not None:
                 return fused_out
-            if conv_scratch is None or ssm_scratch is None:
-                raise RuntimeError("verify scratch is unavailable after fused fallback")
             # Read the committed window and write per-position states into the
             # verify scratch. The accepted position is committed afterward.
             if layer_id == self._state_layer_ids()[0]:
