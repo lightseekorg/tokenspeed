@@ -1397,6 +1397,9 @@ class MambaAttnBackend(AttentionBackend):
         if fused_out is not None:
             return fused_out
 
+        # Stride-aware fused decoders consume packed projection views directly.
+        # Preserve the shared fallback's established compact input layout.
+        mixed_qkv = mixed_qkv.contiguous()
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,

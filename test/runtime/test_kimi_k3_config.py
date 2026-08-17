@@ -317,7 +317,77 @@ class KimiK3RegistrationTests(unittest.TestCase):
             beta,
             torch.nn.functional.linear(hidden_states, beta_weight),
         )
-        self.assertTrue(mixed_qkv.is_contiguous())
+        self.assertFalse(mixed_qkv.is_contiguous())
+        self.assertEqual(
+            mixed_qkv.untyped_storage().data_ptr(),
+            gate.untyped_storage().data_ptr(),
+        )
+
+    def test_kda_compacts_prefill_qkv_before_backend_break(self):
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA
+
+        config = KimiLinearConfig(
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            linear_attn_config={
+                "kda_layers": [1],
+                "full_attn_layers": [],
+                "num_heads": 4,
+                "head_dim": 16,
+                "short_conv_kernel_size": 4,
+                "gate_lower_bound": -5.0,
+                "use_full_rank_gate": True,
+            },
+        )
+        mapping = SimpleNamespace(
+            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,))
+        )
+        layer = KimiLinearKDA(config, mapping, layer_id=0)
+        rows, projection_width = 4, 64
+        packed = torch.randn(rows, 288, dtype=torch.bfloat16)
+        projection_outputs = (
+            packed[:, : 3 * projection_width],
+            packed[:, 3 * projection_width : 4 * projection_width],
+            packed[:, 4 * projection_width : 4 * projection_width + 16],
+            packed[:, 4 * projection_width + 16 : 4 * projection_width + 20],
+        )
+
+        class BackendCalled(Exception):
+            pass
+
+        for mode, expect_contiguous in (
+            (ForwardMode.EXTEND, True),
+            (ForwardMode.DECODE, False),
+        ):
+            with self.subTest(mode=mode):
+                captured = []
+
+                def capture_backend(**kwargs):
+                    captured.append(kwargs["mixed_qkv"])
+                    raise BackendCalled
+
+                ctx = SimpleNamespace(
+                    forward_mode=mode,
+                    bs=rows,
+                    attn_backend=SimpleNamespace(forward=capture_backend),
+                    token_to_kv_pool=None,
+                )
+                with mock.patch.object(
+                    layer, "_project_qkvfab", return_value=projection_outputs
+                ):
+                    with self.assertRaises(BackendCalled):
+                        layer(
+                            positions=torch.empty(rows, dtype=torch.int64),
+                            hidden_states=torch.empty(rows, 64, dtype=torch.bfloat16),
+                            ctx=ctx,
+                            out_cache_loc=torch.empty(0, dtype=torch.int64),
+                            comm_manager=None,
+                        )
+
+                self.assertEqual(captured[0].is_contiguous(), expect_contiguous)
 
     def test_ep_kimi_moe_combines_shared_and_routed_reductions(self):
         import tokenspeed.runtime.models.kimi_k3 as kimi_k3

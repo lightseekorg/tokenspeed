@@ -694,9 +694,6 @@ class KimiKDAMergedProj(nn.Module):
         out = decode_gemv(x, self.weight)
         p = self.proj_local
         mixed_qkv = out[:, : 3 * p]
-        # No-op at decode (single row); prefill pays a small copy for the conv.
-        if not mixed_qkv.is_contiguous():
-            mixed_qkv = mixed_qkv.contiguous()
         f_a_end = 4 * p + self.head_dim
         return (
             mixed_qkv,
@@ -858,8 +855,6 @@ class KimiLinearKDA(nn.Module):
             )
         f_a_end = 4 * proj_local + self.head_dim
         mixed_qkv = output[:, : 3 * proj_local]
-        if not mixed_qkv.is_contiguous():
-            mixed_qkv = mixed_qkv.contiguous()
         return (
             mixed_qkv,
             output[:, 3 * proj_local : 4 * proj_local],
@@ -914,6 +909,10 @@ class KimiLinearKDA(nn.Module):
         mixed_qkv, out_gate, f_a_out, beta = self._project_qkvfab(
             h, attnres_partial_args
         )
+        # Prefill consumes compact QKV; perform this copy in the captured
+        # projection segment rather than inside the eager attention break.
+        if not ctx.forward_mode.is_decode():
+            mixed_qkv = mixed_qkv.contiguous()
         # f_b runs inside the backend: fused into the decode scan kernel, a
         # plain GEMV on the prefill path.
         # Fused [3*proj, k] conv kernel bank, built once in post_load_weights.
