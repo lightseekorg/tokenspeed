@@ -466,6 +466,10 @@ class TailPlan:
 
     Attributes:
         tier: The negotiated tail tier for this token count.
+        defer_finalize: The experts kernel must run with
+            ``do_finalize=False`` (the tail owns finalize). Set for
+            TAIL_FUSION when the multicast tail was armed to inline
+            finalize (trtllm fused-AR deployments).
         lane: Pre-materialized fused-lane buffer, or None; when set the
             experts kernel writes its routed partial into
             ``lane[:, :routed_hidden]`` and the shared experts into the rest.
@@ -474,6 +478,7 @@ class TailPlan:
     """
 
     tier: "K3MoETailTier"
+    defer_finalize: bool = False
     lane: torch.Tensor | None = None
     routed_in_fork: bool = False
 
@@ -521,6 +526,27 @@ class K3MoeTailComm:
         self._shard_up_projection = up_proj.shard_group is not None
         self.latent_tail = None
         if self.state.latent_tail_ok:
+            # Deferred-finalize arming (rank-uniform: execution_plan and the
+            # negotiated state agree on every rank). fused_moe_ar already
+            # implies use_trtllm at construction, and only the trtllm SiTU
+            # kernel emits the deferred triple; the explicit use_trtllm check
+            # keeps that assumption visible.
+            # NOTE: use_trtllm is a *proxy* for "the producer echoes bf16
+            # expert scales" — this comm layer never sees the experts module,
+            # so it cannot assert the kernel's supports_deferred_finalize
+            # trait or weight dtype here. The backstops are explicit: the
+            # experts layer raises on do_finalize=False without the trait,
+            # and KimiK3LatentTailOp.call_deferred raises on non-BF16 scales
+            # (no silent down-cast), so a future fp32-scale producer fails
+            # loudly instead of silently degrading precision.
+            tail_finalize_top_k = (
+                top_k
+                if (
+                    execution_plan.fused_moe_ar
+                    and getattr(execution_plan, "use_trtllm", False)
+                )
+                else None
+            )
             # Per-module mailbox. Constructor failures must propagate because
             # peers are already rendezvousing: a rank that failed mid-way has
             # stranded them, and killing the whole job is the good outcome.
@@ -536,8 +562,13 @@ class K3MoeTailComm:
                 # Staging may alias the workspace pool; each barrier-free
                 # mailbox must remain private.
                 scratch_allocator=workspace_pool(_device).allocate,
+                finalize_top_k=tail_finalize_top_k,
             )
-            logger.info("multicast latent tail engaged (%s)", prefix)
+            logger.info(
+                "multicast latent tail engaged (%s, deferred_finalize=%s)",
+                prefix,
+                tail_finalize_top_k is not None,
+            )
 
     # ------------------------------------------------------------------
     # Routing
@@ -558,6 +589,20 @@ class K3MoeTailComm:
             fused_moe_ar=self.execution_plan.fused_moe_ar,
             multimem_ok=self.state.multimem_ar_ok,
         )
+        if tier is K3MoETailTier.TAIL_FUSION:
+            # Full fusion: with the trtllm fused-AR plan armed and a
+            # deferred-capable tail op, the multicast tail consumes the
+            # experts kernel's deferred-finalize triple directly — no
+            # standalone finalize kernel, no [M, latent] intermediate.
+            # Otherwise the materialized-input mode remains.
+            return TailPlan(
+                tier=tier,
+                defer_finalize=(
+                    self.execution_plan.fused_moe_ar
+                    and self.latent_tail is not None
+                    and self.latent_tail.supports_deferred_finalize
+                ),
+            )
         # Shard mode splits the joined reduction, so it cannot use the packed lane.
         lane = allreduce_fusion_lane(
             hidden_states,
@@ -614,10 +659,22 @@ class K3MoeTailComm:
         """Dispatch the selected tier over the partials.
 
         Raw partials everywhere except SEPARATE_REDUCE, whose routed side
-        already ran inside the fork scope to overlap the shared branch.
+        already ran inside the fork scope to overlap the shared branch, and
+        deferred-finalize TAIL_FUSION (``plan.defer_finalize``), whose
+        ``routed_out`` is the experts kernel's deferred-finalize triple.
         """
         tier = plan.tier
         if tier is K3MoETailTier.TAIL_FUSION:
+            if plan.defer_finalize:
+                gemm2_out, expert_weights, expanded_idx = routed_out
+                return self._tail_fusion_deferred(
+                    gemm2_out,
+                    expert_weights,
+                    expanded_idx,
+                    shared_partial,
+                    prefix_sum,
+                    num_tokens,
+                )
             return self._tail_fusion(routed_out, shared_partial, prefix_sum)
         if tier is K3MoETailTier.MULTIMEM_AR:
             return self._tail_multimem_ar(
@@ -647,6 +704,27 @@ class K3MoeTailComm:
             shared_partial,
             self.routed_norm.weight,
             self.up_proj.weight,
+            prefix=prefix_sum,
+        )
+
+    def _tail_fusion_deferred(
+        self,
+        gemm2_out: torch.Tensor,
+        expert_weights: torch.Tensor,
+        expanded_idx: torch.Tensor,
+        shared_partial: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """TAIL_FUSION over the deferred-finalize triple (finalize in-kernel)."""
+        return self.latent_tail.call_deferred(
+            gemm2_out,
+            expert_weights,
+            expanded_idx,
+            shared_partial,
+            self.routed_norm.weight,
+            self.up_proj.weight,
+            num_tokens=num_tokens,
             prefix=prefix_sum,
         )
 

@@ -216,6 +216,50 @@ def red_async_release_gpu_add_u32(
 
 
 @dsl_user_op
+def load_global_bf16_as_f32(pointer: cute.Pointer, *, loc=None, ip=None) -> Float32:
+    """Load one BF16 scalar and widen it exactly to FP32.
+
+    BF16 is the high half of FP32, so the widen is a zero-extended 16-bit
+    load shifted into the high halfword and reinterpreted — no rounding.
+    Used by the deferred-finalize publish phase to read expert scales.
+    """
+
+    address = pointer.toint(loc=loc, ip=ip)
+    widened = llvm.inline_asm(
+        T.i32(),
+        [address.ir_value(loc=loc, ip=ip)],
+        "ld.global.u16 $0, [$1]; shl.b32 $0, $0, 16;",
+        "=r,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Float32(llvm.bitcast(T.f32(), widened, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def load_global_s32(pointer: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    """Load one signed 32-bit scalar from global memory."""
+
+    address = pointer.toint(loc=loc, ip=ip)
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [address.ir_value(loc=loc, ip=ip)],
+            "ld.global.s32 $0, [$1];",
+            "=r,l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def load_volatile_u32(pointer: cute.Pointer, *, loc=None, ip=None) -> Uint32:
     address = pointer.toint(loc=loc, ip=ip)
     return Uint32(

@@ -24,6 +24,8 @@ from .primitives import (
     bf16x8_to_packed_u32x4,
     block_sum_specialized,
     fragment_is_dirty,
+    load_global_bf16_as_f32,
+    load_global_s32,
     load_global_u32x4,
     load_volatile_u32,
     map_shared_to_peer,
@@ -106,6 +108,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         include_reduce_scatter: bool = True,
         include_routed: bool = True,
         use_pdl: bool | None = None,
+        finalize_top_k: int | None = None,
     ):
         # Bind in host Python; the JIT resolves names from self, not module globals.
         if use_pdl is None:
@@ -121,6 +124,17 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             raise ValueError(f"rank must be in [0,{tp_size}), got {rank}")
         if not include_routed and not include_reduce_scatter:
             raise ValueError("at least one collective role must be enabled")
+        if finalize_top_k is not None and not 1 <= finalize_top_k <= 64:
+            raise ValueError(f"finalize_top_k must be in [1, 64], got {finalize_top_k}")
+        # Deferred-finalize input mode: the routed publish phase consumes the
+        # MoE kernel's (gemm2 permuted rows, expert weights, expanded->permuted
+        # index) triple instead of a materialized [M, latent] partial. The
+        # finalize math is semantically equivalent to moe_finalize_fuse_shared
+        # (FP32 accumulate in ascending fixed k order — rank-deterministic —
+        # skip idx == -1 slots for EP non-local / padding, one final round to
+        # BF16); bitwise identity is not guaranteed across compilers.
+        self.finalize_input = finalize_top_k is not None
+        self.finalize_top_k = finalize_top_k if finalize_top_k is not None else 0
         self.rank = rank
         self.tp_size = tp_size
         self.latent_dim = latent_dim
@@ -170,10 +184,16 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         shared_workspace: cute.Tensor,
         shared_flags: cute.Tensor,
         shared_peer_ptrs: cute.Tensor,
+        finalize_weights: cute.Tensor,
+        finalize_idx: cute.Tensor,
         m: Int32,
         epsilon: Float32,
         stream: cuda.CUstream,
     ):
+        # In finalize-input mode ``latent_source`` carries the gemm2 permuted
+        # rows [total_padded_rows, latent_dim]; ``finalize_weights`` /
+        # ``finalize_idx`` are the flat [m * top_k] expert scales and
+        # expanded->permuted map. Otherwise the last two are unused dummies.
         self.kernel(
             latent_source,
             gamma,
@@ -186,6 +206,8 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             shared_workspace,
             shared_flags,
             shared_peer_ptrs,
+            finalize_weights,
+            finalize_idx,
             m,
             epsilon,
         ).launch(
@@ -211,6 +233,8 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         shared_workspace: cute.Tensor,
         shared_flags: cute.Tensor,
         shared_peer_ptrs: cute.Tensor,
+        finalize_weights: cute.Tensor,
+        finalize_idx: cute.Tensor,
         m: Int32,
         epsilon: Float32,
     ):
@@ -237,6 +261,8 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 shared_workspace,
                 shared_flags,
                 shared_peer_ptrs,
+                finalize_weights,
+                finalize_idx,
                 m,
                 epsilon,
                 token,
@@ -264,6 +290,8 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         shared_workspace: cute.Tensor,
         shared_flags: cute.Tensor,
         shared_peer_ptrs: cute.Tensor,
+        finalize_weights: cute.Tensor,
+        finalize_idx: cute.Tensor,
         m: Int32,
         epsilon: Float32,
         token: Int32,
@@ -294,15 +322,56 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             )
             dirty_elements = Int64(dirty_index) * (Int64(bytes_per_buffer) // Int64(2))
 
-            local_ptr = cute.make_ptr(
-                BFloat16,
-                (latent_source.iterator + element_offset).llvm_ptr,
-                cute.AddressSpace.gmem,
-                assumed_align=16,
-            )
-            local_packed = sanitize_negative_zero(
-                load_global_u32x4(local_ptr, volatile=False)
-            )
+            if cutlass.const_expr(self.finalize_input):
+                # Inline MoE finalize: gather this fragment from every routed
+                # expert's gemm2 row and combine with the expert scales.
+                # Semantically equivalent to the standalone finalize kernel
+                # (FP32 ascending-k accumulate, single BF16 round); bitwise
+                # identity is not guaranteed across compilers. idx == -1
+                # slots are EP non-local / padded entries: they contribute
+                # nothing.
+                finalize_accum = cute.make_rmem_tensor(
+                    cute.make_layout((VEC_BF16,)), Float32
+                )
+                for element in cutlass.range_constexpr(VEC_BF16):
+                    finalize_accum[element] = Float32(0.0)
+                for k in cutlass.range_constexpr(self.finalize_top_k):
+                    slot = Int64(token) * self.finalize_top_k + k
+                    permuted_row = load_global_s32(finalize_idx.iterator + slot)
+                    if permuted_row >= Int32(0):
+                        scale = load_global_bf16_as_f32(
+                            finalize_weights.iterator + slot
+                        )
+                        row_ptr = cute.make_ptr(
+                            BFloat16,
+                            (
+                                latent_source.iterator
+                                + Int64(permuted_row) * self.latent_dim
+                                + Int64(packed_idx) * VEC_BF16
+                            ).llvm_ptr,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        expert_values = packed_u32x4_to_bf16x8(
+                            load_global_u32x4(row_ptr, volatile=False)
+                        ).to(Float32)
+                        for element in cutlass.range_constexpr(VEC_BF16):
+                            finalize_accum[element] = (
+                                finalize_accum[element] + scale * expert_values[element]
+                            )
+                local_packed = sanitize_negative_zero(
+                    bf16x8_to_packed_u32x4(finalize_accum.load().to(BFloat16))
+                )
+            else:
+                local_ptr = cute.make_ptr(
+                    BFloat16,
+                    (latent_source.iterator + element_offset).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                local_packed = sanitize_negative_zero(
+                    load_global_u32x4(local_ptr, volatile=False)
+                )
             multicast_offset = (
                 Int64(current_index) * Int64(bytes_per_buffer)
                 + (
@@ -636,6 +705,7 @@ def _compile_key(
     fp32_internal: bool,
     include_reduce_scatter: bool,
     include_routed: bool,
+    finalize_top_k: int | None = None,
 ):
     return (
         torch.accelerator.current_device_index(),
@@ -648,6 +718,7 @@ def _compile_key(
         fp32_internal,
         include_reduce_scatter,
         include_routed,
+        finalize_top_k,
     )
 
 
@@ -663,8 +734,16 @@ def _runtime_args(
     shared_workspace: torch.Tensor,
     shared_flags: torch.Tensor,
     shared_peer_ptrs: torch.Tensor,
+    finalize_weights: torch.Tensor,
+    finalize_idx: torch.Tensor,
+    num_tokens: int,
     rms_eps: float,
 ):
+    # ``latent_source`` is [M, latent] in the standard mode and the gemm2
+    # permuted rows [P, latent] in finalize-input mode; both are dynamic in
+    # mode 0 so one compiled kernel serves every token count. The finalize
+    # scale/index tensors are flat [M * top_k] (dummies otherwise) and only
+    # ever scalar-loaded, so 4-byte alignment suffices.
     return (
         to_cute_dynamic_m(latent_source, mode=0, assumed_align=16),
         to_cute(gamma, 16),
@@ -677,7 +756,9 @@ def _runtime_args(
         to_cute(shared_workspace, 16),
         to_cute(shared_flags, 16),
         to_cute(shared_peer_ptrs, 16),
-        Int32(latent_source.shape[0]),
+        to_cute_dynamic_m(finalize_weights, mode=0, assumed_align=4),
+        to_cute_dynamic_m(finalize_idx, mode=0, assumed_align=4),
+        Int32(num_tokens),
         Float32(rms_eps),
         cuda.CUstream(torch.cuda.current_stream(latent_source.device).cuda_stream),
     )
@@ -703,6 +784,7 @@ def compile_kernel(
     fp32_internal: bool,
     include_reduce_scatter: bool = True,
     include_routed: bool = True,
+    finalize_top_k: int | None = None,
 ) -> None:
     """Compile the rank/M specialization without retaining caller tensors."""
 
@@ -716,13 +798,20 @@ def compile_kernel(
         fp32_internal,
         include_reduce_scatter,
         include_routed,
+        finalize_top_k,
     )
     if key in _COMPILED:
         return
     device = latent_output.device
-    latent = torch.empty((max_m, latent_dim), dtype=torch.bfloat16, device=device)
+    latent_rows = max_m if finalize_top_k is None else max_m * finalize_top_k
+    finalize_slots = 8 if finalize_top_k is None else max_m * finalize_top_k
+    latent = torch.empty((latent_rows, latent_dim), dtype=torch.bfloat16, device=device)
     gamma = torch.empty((latent_dim,), dtype=torch.bfloat16, device=device)
     shared = torch.empty((max_m, hidden_dim), dtype=torch.bfloat16, device=device)
+    finalize_weights = torch.zeros(
+        (finalize_slots,), dtype=torch.bfloat16, device=device
+    )
+    finalize_idx = torch.full((finalize_slots,), -1, dtype=torch.int32, device=device)
     kernel = AllReduceRMSNormWithReduceScatterEarlyExit(
         rank=rank,
         tp_size=tp_size,
@@ -733,6 +822,7 @@ def compile_kernel(
         fp32_internal=fp32_internal,
         include_reduce_scatter=include_reduce_scatter,
         include_routed=include_routed,
+        finalize_top_k=finalize_top_k,
     )
     _COMPILED[key] = cute.compile(
         kernel,
@@ -748,6 +838,9 @@ def compile_kernel(
             shared_workspace,
             shared_flags,
             shared_peer_ptrs,
+            finalize_weights,
+            finalize_idx,
+            max_m,
             rms_eps,
         ),
     )
@@ -765,6 +858,9 @@ def launch(
     shared_workspace: torch.Tensor,
     shared_flags: torch.Tensor,
     shared_peer_ptrs: torch.Tensor,
+    finalize_weights: torch.Tensor,
+    finalize_idx: torch.Tensor,
+    num_tokens: int,
     rms_eps: float,
     *,
     rank: int,
@@ -776,6 +872,7 @@ def launch(
     fp32_internal: bool,
     include_reduce_scatter: bool = True,
     include_routed: bool = True,
+    finalize_top_k: int | None = None,
 ) -> None:
     compile_kernel(
         rank=rank,
@@ -796,6 +893,7 @@ def launch(
         fp32_internal=fp32_internal,
         include_reduce_scatter=include_reduce_scatter,
         include_routed=include_routed,
+        finalize_top_k=finalize_top_k,
     )
     _COMPILED[
         _compile_key(
@@ -808,6 +906,7 @@ def launch(
             fp32_internal,
             include_reduce_scatter,
             include_routed,
+            finalize_top_k,
         )
     ](
         *_runtime_args(
@@ -822,6 +921,9 @@ def launch(
             shared_workspace,
             shared_flags,
             shared_peer_ptrs,
+            finalize_weights,
+            finalize_idx,
+            num_tokens,
             rms_eps,
         )
     )
@@ -843,12 +945,15 @@ class CollectiveKernel:
         rms_eps: float,
         fp32_internal: bool,
         scratch_allocator=None,
+        finalize_top_k: int | None = None,
     ) -> None:
         validate_shape(
             tp_size=tp_size,
             latent_dim=latent_dim,
             hidden_dim=hidden_dim,
         )
+        if finalize_top_k is not None and not 1 <= finalize_top_k <= 64:
+            raise ValueError(f"finalize_top_k must be in [1, 64], got {finalize_top_k}")
         self.rank = rank
         self.tp_size = tp_size
         self.latent_dim = latent_dim
@@ -858,7 +963,19 @@ class CollectiveKernel:
         self.max_token_ctas = max_token_ctas
         self.rms_eps = float(rms_eps)
         self.fp32_internal = fp32_internal
+        # When set, ``call_deferred`` additionally accepts the MoE kernel's
+        # deferred-finalize triple; the standard materialized-input mode
+        # stays available on the same instance.
+        self.finalize_top_k = finalize_top_k
         device = torch.device("cuda", torch.accelerator.current_device_index())
+        # Placeholders for the finalize operand slots of the standard-mode
+        # kernel signature (never dereferenced when finalize is compiled out).
+        self._finalize_dummy_weights = torch.zeros(
+            (8,), dtype=torch.bfloat16, device=device
+        )
+        self._finalize_dummy_idx = torch.full(
+            (8,), -1, dtype=torch.int32, device=device
+        )
 
         bytes_per_routed_buffer = max_m * tp_size * latent_dim * 2
         routed_bytes = NUM_LAMPORT_BUFFERS * bytes_per_routed_buffer
@@ -934,24 +1051,30 @@ class CollectiveKernel:
         dist.barrier(group=group, device_ids=[device.index])
         for owner in range(tp_size):
             if rank == owner:
-                compile_kernel(
-                    rank=rank,
-                    tp_size=tp_size,
-                    latent_dim=latent_dim,
-                    hidden_dim=hidden_dim,
-                    max_m=max_m,
-                    max_token_ctas=max_token_ctas,
-                    latent_output=self._latent_output,
-                    routed_workspace=self._routed_workspace,
-                    routed_flags=self._routed_flags,
-                    routed_multicast_ptr=self._routed_multicast_ptr,
-                    shared_output=self._shared_output,
-                    shared_workspace=self._shared_workspace,
-                    shared_flags=self._shared_flags,
-                    shared_peer_ptrs=self._shared_peer_ptrs,
-                    rms_eps=self.rms_eps,
-                    fp32_internal=fp32_internal,
-                )
+                # Compile the standard variant always and the deferred-input
+                # variant when armed; both must exist before graph capture.
+                for variant_top_k in (
+                    (None,) if finalize_top_k is None else (None, finalize_top_k)
+                ):
+                    compile_kernel(
+                        rank=rank,
+                        tp_size=tp_size,
+                        latent_dim=latent_dim,
+                        hidden_dim=hidden_dim,
+                        max_m=max_m,
+                        max_token_ctas=max_token_ctas,
+                        latent_output=self._latent_output,
+                        routed_workspace=self._routed_workspace,
+                        routed_flags=self._routed_flags,
+                        routed_multicast_ptr=self._routed_multicast_ptr,
+                        shared_output=self._shared_output,
+                        shared_workspace=self._shared_workspace,
+                        shared_flags=self._shared_flags,
+                        shared_peer_ptrs=self._shared_peer_ptrs,
+                        rms_eps=self.rms_eps,
+                        fp32_internal=fp32_internal,
+                        finalize_top_k=variant_top_k,
+                    )
             dist.barrier(group=group, device_ids=[device.index])
 
     def __call__(
@@ -979,7 +1102,112 @@ class CollectiveKernel:
                 raise ValueError(f"{name} must be contiguous CUDA BF16 {list(shape)}")
         if not 1 <= m <= self.max_m:
             raise ValueError(f"runtime M={m} must be in [1, {self.max_m}]")
+        return self._dispatch(
+            latent_source,
+            shared_source,
+            gamma,
+            m,
+            finalize_weights=self._finalize_dummy_weights,
+            finalize_idx=self._finalize_dummy_idx,
+            finalize_top_k=None,
+        )
 
+    def call_deferred(
+        self,
+        gemm2_output: torch.Tensor,
+        expert_weights: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+        shared_source: torch.Tensor,
+        gamma: torch.Tensor,
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused collective over the MoE kernel's deferred-finalize triple.
+
+        Args:
+            gemm2_output: Permuted expert rows ``[total_padded_rows,
+                latent_dim]`` (contiguous BF16); rows not referenced by the
+                index map are never read.
+            expert_weights: Flat per-slot scales ``[num_tokens * top_k]``
+                (contiguous BF16).
+            expanded_idx_to_permuted_idx: Flat expanded->permuted map
+                ``[num_tokens * top_k]`` (contiguous int32); ``-1`` drops the
+                slot (EP non-local expert or padding).
+            shared_source: This rank's shared partial ``[num_tokens, hidden]``.
+            gamma: Latent RMSNorm weight ``[latent_dim]``.
+            num_tokens: Token count M for this launch.
+
+        Returns:
+            ``(latent_output[:M], shared_shard)`` exactly like ``__call__``.
+        """
+        if self.finalize_top_k is None:
+            raise RuntimeError(
+                "CollectiveKernel was constructed without finalize_top_k; "
+                "the deferred-finalize variant is not compiled"
+            )
+        m = int(num_tokens)
+        if not 1 <= m <= self.max_m:
+            raise ValueError(f"runtime M={m} must be in [1, {self.max_m}]")
+        device = self._routed_workspace.device
+        slots = m * self.finalize_top_k
+        if (
+            gemm2_output.ndim != 2
+            or gemm2_output.shape[1] != self.latent_dim
+            or gemm2_output.dtype != torch.bfloat16
+            or gemm2_output.device != device
+            or not gemm2_output.is_contiguous()
+        ):
+            raise ValueError(
+                f"gemm2_output must be contiguous CUDA BF16 [*, {self.latent_dim}]"
+            )
+        for tensor, dtype, name in (
+            (expert_weights, torch.bfloat16, "expert_weights"),
+            (expanded_idx_to_permuted_idx, torch.int32, "expanded_idx_to_permuted_idx"),
+        ):
+            if (
+                tensor.shape != (slots,)
+                or tensor.dtype != dtype
+                or tensor.device != device
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(f"{name} must be contiguous CUDA {dtype} [{slots}]")
+        if (
+            shared_source.shape != (m, self.hidden_dim)
+            or shared_source.dtype != torch.bfloat16
+            or shared_source.device != device
+            or not shared_source.is_contiguous()
+        ):
+            raise ValueError(
+                f"shared_source must be contiguous CUDA BF16 [{m}, {self.hidden_dim}]"
+            )
+        if (
+            gamma.shape != (self.latent_dim,)
+            or gamma.dtype != torch.bfloat16
+            or gamma.device != device
+            or not gamma.is_contiguous()
+        ):
+            raise ValueError(f"gamma must be contiguous CUDA BF16 [{self.latent_dim}]")
+        return self._dispatch(
+            gemm2_output,
+            shared_source,
+            gamma,
+            m,
+            finalize_weights=expert_weights,
+            finalize_idx=expanded_idx_to_permuted_idx,
+            finalize_top_k=self.finalize_top_k,
+        )
+
+    def _dispatch(
+        self,
+        latent_source: torch.Tensor,
+        shared_source: torch.Tensor,
+        gamma: torch.Tensor,
+        m: int,
+        *,
+        finalize_weights: torch.Tensor,
+        finalize_idx: torch.Tensor,
+        finalize_top_k: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = self._routed_workspace.device
         if self._scratch_allocator is not None:
             # Pool views cannot survive another allocation, which may move the block.
             self._latent_output, self._shared_output = self._scratch_allocator(
@@ -1003,6 +1231,9 @@ class CollectiveKernel:
                 self._shared_workspace,
                 self._shared_flags,
                 self._shared_peer_ptrs,
+                finalize_weights,
+                finalize_idx,
+                m,
                 self.rms_eps,
                 rank=self.rank,
                 tp_size=self.tp_size,
@@ -1011,6 +1242,7 @@ class CollectiveKernel:
                 max_m=self.max_m,
                 max_token_ctas=self.max_token_ctas,
                 fp32_internal=self.fp32_internal,
+                finalize_top_k=finalize_top_k,
             )
         return (
             self._latent_output[:m],

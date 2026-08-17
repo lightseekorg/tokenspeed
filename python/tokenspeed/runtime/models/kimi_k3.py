@@ -1354,6 +1354,7 @@ class KimiLinearMoE(nn.Module):
         topk_output: TopKOutput,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
+        do_finalize: bool = True,
     ) -> torch.Tensor:
         """Run the precomputed-TopK SiTU MoE (TRT-LLM cubin or Hopper Marlin)."""
         plan = self.execution_plan
@@ -1367,6 +1368,7 @@ class KimiLinearMoE(nn.Module):
             topk_output=topk_output,
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            do_finalize=do_finalize,
         )
         # The kernel returns this rank's pre-reduce partial; the selected
         # tail tier owns the combining reduction.
@@ -1536,6 +1538,7 @@ class KimiLinearMoE(nn.Module):
                 topk_output,
                 num_global_tokens,
                 max_num_tokens_per_gpu,
+                do_finalize=not plan.defer_finalize,
             )
             if plan.routed_in_fork:
                 # No fused collective to hide behind: reduce and project here

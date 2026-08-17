@@ -193,6 +193,130 @@ def _run_separate_reduce(comm, routed, shared, prefix, m):
     return comm._tail_separate_reduce(routed_proj, shared, prefix, m, H)
 
 
+TOP_K = 8  # K3's num_experts_per_token; any value in [1, 64] compiles.
+
+
+def _deferred_triple(rank: int, device: torch.device, m: int, seed: int):
+    """Synthesize a per-rank deferred-finalize triple with EP-style -1 slots.
+
+    Mirrors the trtllm ``do_finalize=False`` contract: permuted gemm2 rows
+    (with a few never-referenced padded rows poisoned with NaN, so any
+    out-of-contract read turns the output NaN and fails the tolerance
+    assertions), bf16 expert scales, and an int32 expanded->permuted map
+    where ``-1`` marks slots whose expert lives on another rank.
+    """
+    g = torch.Generator(device="cpu").manual_seed(seed * 1009 + rank)
+    slots = m * TOP_K
+    # ~30% of slots dropped, mimicking EP routing away from this rank.
+    keep = torch.rand(slots, generator=g) < 0.7
+    kept = int(keep.sum().item())
+    num_rows = kept + 3  # padded rows must never leak into the output
+    idx = torch.full((slots,), -1, dtype=torch.int32)
+    idx[keep] = torch.randperm(num_rows, generator=g)[:kept].to(torch.int32)
+    gemm2 = (torch.randn(num_rows, L, generator=g) * 0.1).to(device, torch.bfloat16)
+    referenced = torch.zeros(num_rows, dtype=torch.bool, device=device)
+    referenced[idx[keep].to(device).long()] = True
+    gemm2[~referenced] = float("nan")
+    weights = (torch.rand(m, TOP_K, generator=g) * 0.5).to(device, torch.bfloat16)
+    return gemm2, weights, idx.to(device)
+
+
+def _manual_finalize(gemm2, weights, idx, m):
+    """Torch reference finalize: fp32 accumulate in k order, one bf16 round.
+
+    Semantically equivalent to the standalone finalize kernel
+    (moe_finalize_fuse_shared.cu) that the deferred TAIL_FUSION mode inlines;
+    bitwise identity is not expected (FMA contraction differs).
+    """
+    acc = torch.zeros(m, L, dtype=torch.float32, device=gemm2.device)
+    idx2 = idx.view(m, TOP_K).long()
+    w2 = weights.view(m, TOP_K).float()
+    for k in range(TOP_K):
+        rows = idx2[:, k]
+        valid = rows >= 0
+        if valid.any():
+            acc[valid] += w2[valid, k, None] * gemm2[rows[valid]].float()
+    return acc.to(torch.bfloat16)
+
+
+def test_call_deferred_shape_hardening():
+    """Host-op contract checks that need no collective (F1/F2 hardening).
+
+    A stubbed collective records what the launch would receive: a zero-row
+    gemm2 (EP routed everything away) must take the safe one-row placeholder
+    path — never an early return, which would strand peers — and fp32 expert
+    scales must be refused rather than silently down-cast to bf16.
+    """
+    from tokenspeed_kernel.ops.moe import latent_tail as lt
+
+    m = 2
+    op = object.__new__(lt.KimiK3LatentTailOp)
+    op.contract = lt._Contract(
+        group_name="test-group",
+        tp_size=8,
+        device=torch.device("cpu"),
+        hidden_size=H,
+        latent_size=L,
+        rms_eps=EPS,
+        finalize_top_k=TOP_K,
+    )
+    op.rank = 0
+    seen = {}
+
+    class FakeCollective:
+        def call_deferred(self, gemm2, weights, idx, shared, gamma, num_tokens):
+            seen.update(gemm2=gemm2, weights=weights, idx=idx, m=num_tokens)
+            return "LATENT", "SHARD"
+
+    class FakeUpProj:
+        # Special methods resolve on the type, so a class (not a namespace)
+        # stands in for the callable up-projection kernel.
+        def is_compiled(self, m):
+            return True
+
+        def ensure_compiled(self, m):
+            return None
+
+        def __call__(self, latent, weight, shard):
+            return "MAILBOX"
+
+    op._collective = FakeCollective()
+    op._up_projection = FakeUpProj()
+    op._lamport_copy = lambda mailbox, m, residual: torch.zeros(1, m, H)
+
+    weights = torch.zeros(m, TOP_K, dtype=torch.bfloat16)
+    idx = torch.full((m * TOP_K,), -1, dtype=torch.int32)
+    shared = torch.zeros(m, H, dtype=torch.bfloat16)
+    rms_w = torch.zeros(L, dtype=torch.bfloat16)
+    up_w = torch.zeros(H, L, dtype=torch.bfloat16)
+
+    out = op.call_deferred(
+        torch.empty(0, L, dtype=torch.bfloat16),
+        weights,
+        idx,
+        shared,
+        rms_w,
+        up_w,
+        num_tokens=m,
+    )
+    assert out.shape == (m, H)
+    # The zero-row input was replaced by the never-read one-row placeholder.
+    assert seen["gemm2"].shape == (1, L)
+    assert (seen["gemm2"] == 0).all()
+    assert seen["weights"].shape == (m * TOP_K,) and seen["m"] == m
+
+    with pytest.raises(ValueError, match="BF16"):
+        op.call_deferred(
+            torch.zeros(4, L, dtype=torch.bfloat16),
+            weights.float(),  # fp32 scales must be refused, not down-cast
+            idx,
+            shared,
+            rms_w,
+            up_w,
+            num_tokens=m,
+        )
+
+
 def test_selector_boundaries():
     """The tier map itself, with no GPU or collective involved."""
     from tokenspeed.runtime.models.kimi_k3_comm import (
@@ -227,6 +351,52 @@ def test_selector_boundaries():
     assert pick(1, fused_ar=False) is K3MoETailTier.TAIL_FUSION
     for n in (17, 64, 256, 100_000):
         assert pick(n, fused_ar=False) is K3MoETailTier.SEPARATE_REDUCE
+
+
+def test_tail_fusion_plan_defer_decision(monkeypatch):
+    """TAIL_FUSION defers finalize iff the tail op and the fused-AR plan agree.
+
+    Pure Python: the plan() early return for TAIL_FUSION never touches the
+    lane machinery or hidden_states, so stubs carry the whole decision.
+    """
+    from tokenspeed.runtime.models import kimi_k3_comm as mod
+
+    monkeypatch.setattr(mod, "get_is_cuda_graph_phase", lambda: True)
+
+    def build(*, supports_deferred, fused_ar):
+        comm = object.__new__(mod.K3MoeTailComm)
+        comm.latent_tail = SimpleNamespace(
+            max_num_tokens=16,
+            supports_deferred_finalize=supports_deferred,
+        )
+        comm.execution_plan = SimpleNamespace(fused_moe_ar=fused_ar)
+        comm.state = SimpleNamespace(multimem_ar_ok=False)
+        comm._shard_up_projection = False
+        comm.routed_hidden, comm.hidden_size = L, H
+        return comm
+
+    plan = build(supports_deferred=True, fused_ar=True).plan(1, None)
+    assert plan.tier is mod.K3MoETailTier.TAIL_FUSION
+    assert plan.defer_finalize
+    assert plan.lane is None and not plan.routed_in_fork
+
+    # A tail op without the deferred variant must keep the materialized mode.
+    plan = build(supports_deferred=False, fused_ar=True).plan(16, None)
+    assert plan.tier is mod.K3MoETailTier.TAIL_FUSION
+    assert not plan.defer_finalize
+
+    # Without the fused-AR (trtllm) plan the experts kernel cannot defer.
+    plan = build(supports_deferred=True, fused_ar=False).plan(1, None)
+    assert plan.tier is mod.K3MoETailTier.TAIL_FUSION
+    assert not plan.defer_finalize
+
+    # No tail op at all: the tier is unreachable, nothing defers.
+    comm = build(supports_deferred=True, fused_ar=True)
+    comm.latent_tail = None
+    hidden = torch.zeros(17, H)
+    plan = comm.plan(17, hidden)
+    assert plan.tier is not mod.K3MoETailTier.TAIL_FUSION
+    assert not plan.defer_finalize
 
 
 # 4 is included so a single node can cover the tiers; the fused tail itself
@@ -269,6 +439,60 @@ def test_fused_tail_matches_reference(m):
     out = comm._tail_fusion(routed, shared, prefix)
     torch.cuda.synchronize()
     assert _rel_err(out, ref) < 0.05
+
+
+@collective
+@pytest.mark.parametrize("m", [1, 4, 16])
+def test_fused_tail_deferred_finalize_matches_reference(m):
+    """TAIL_FUSION with the MoE finalize inlined into the publish phase.
+
+    The triple is synthetic (random permuted rows, scales, and an index map
+    with EP-style ``-1`` holes); the reference materializes the finalize with
+    the torch mirror of the standalone kernel's math and then runs the same
+    fp32 tail reference as every other tier. A second assertion pins the
+    deferred output to the materialized TAIL_FUSION path on identical inputs,
+    which isolates the in-kernel finalize from the rest of the tail.
+    """
+    from tokenspeed_kernel.ops.moe.latent_tail import (
+        KimiK3LatentTailOp,
+        latent_tail_supported,
+    )
+
+    rank, dev = _setup()
+    if not _agreed(
+        latent_tail_supported(
+            tp_size=_world_size(), hidden_size=H, latent_size=L, dtype=torch.bfloat16
+        )
+    ):
+        pytest.skip("fused latent tail unsupported here")
+
+    tail = KimiK3LatentTailOp.initialize(
+        group=dist.group.WORLD,
+        hidden_size=H,
+        latent_size=L,
+        rms_eps=EPS,
+        device=dev,
+        layer_index=0,
+        model_scope="test-deferred",
+        finalize_top_k=TOP_K,
+    )
+    assert tail.supports_deferred_finalize
+    comm = _build_comm(dev, latent_tail=tail)
+    gemm2, weights, idx = _deferred_triple(rank, dev, m, seed=66)
+    routed_manual = _manual_finalize(gemm2, weights, idx, m)
+    _, shared, prefix = _inputs(rank, dev, m, seed=66)
+    ref = _reference(comm, routed_manual, shared, prefix)
+
+    out = comm._tail_fusion_deferred(gemm2, weights, idx, shared, prefix, m)
+    torch.cuda.synchronize()
+    assert _rel_err(out, ref) < 0.05
+
+    # Same tail, materialized finalize: only the in-kernel finalize differs.
+    out_materialized = comm._tail_fusion(routed_manual, shared, prefix)
+    torch.cuda.synchronize()
+    scale = out_materialized.float().abs().max().item()
+    diff = (out.float() - out_materialized.float()).abs().max().item()
+    assert diff / max(scale, 1e-6) < 0.02
 
 
 @collective
