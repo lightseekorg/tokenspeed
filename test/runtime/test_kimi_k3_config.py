@@ -622,17 +622,9 @@ class KimiK3LcmPlanTests(unittest.TestCase):
 
     @staticmethod
     def _plan(cfg, tp):
-        from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
-            solve_kimi_k3_cache_layout,
-        )
+        from test.runtime.conftest import kimi_tp8_layout
 
-        layout = solve_kimi_k3_cache_layout(
-            cfg,
-            tp_size=tp,
-            mla_cache_dtype=torch.float8_e4m3fn,
-            mla_quant_method=None,
-        )
-        return layout.with_num_lcm_blocks(64)
+        return kimi_tp8_layout(text_config=cfg, tp_size=tp)[2].bind(64)
 
     def test_linear_packing_scales_with_attn_tp(self):
         """KDA pages pack into an MLA-sized plane, so tp=16 -- where the KDA
@@ -682,9 +674,9 @@ class KimiK3LcmPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "69 KDA and 24 MLA"):
             self._plan(cfg, 8)
 
-    def test_kda_group_split_must_divide(self):
-        """A KDA layer count that does not split into the fixed state groups
-        is rejected loudly."""
+    def test_reduced_layer_split_must_ride_inside_the_mla_planes(self):
+        """A reduced-layer variant whose KDA groups need a plane of their own
+        is rejected loudly: 5 MLA layers cannot host 6 KDA slots."""
         base = KimiLinearConfig()
         linear = dict(base.linear_attn_config)
         num_layers = 23  # 17 KDA layers: not divisible by 3

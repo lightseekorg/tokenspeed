@@ -43,7 +43,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     LINEAR_ATTENTION,
 )
 
-# "linear_attention" comes from paged_cache_spec (the KV-cache label vocabulary
+# "linear_attention" comes from cache_spec (the KV-cache label vocabulary
 # the hybrid allocator keys on). "attention" is the value of
 # ``HybridLayerType.full_attention`` (configs/qwen3_5_text_base_config.py);
 # kept as a literal to avoid a cross-config import in the model-loading path.
@@ -278,7 +278,7 @@ class KimiLinearConfig(PretrainedConfig):
 
     @property
     def layer_types(self) -> list[str]:
-        """``layers_block_type`` translated to paged-cache labels."""
+        """``layers_block_type`` translated to cache-group labels."""
         return [
             FULL_ATTENTION if layer_type == _ATTENTION_LAYER else layer_type
             for layer_type in self.layers_block_type

@@ -95,13 +95,13 @@ TEST(CacheOperationTest, DecodeCanStartWithoutHostL2) {
         config.max_scheduled_tokens = 2;
         config.max_batch_size = 1;
         config.role = Role::kD;
-        config.paged_cache_groups.push_back(PagedCacheGroupConfig{
+        config.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full",
             .rows_per_page = 2,
             .entry_stride_tokens = 1,
             .total_pages = 4,
-            .retention = PagedCacheGroupConfig::Retention::FullHistory,
-            .family = PagedCacheGroupFamily::History,
+            .retention = CacheGroupConfig::Retention::FullHistory,
+            .family = CacheGroupFamily::History,
         });
         return config;
     };
@@ -124,13 +124,13 @@ TEST(CacheOperationTest, DeviceRequestLimitDoesNotDependOnHostCapacity) {
         config.max_scheduled_tokens = 8;
         config.max_batch_size = 2;
         config.role = Role::kD;
-        config.paged_cache_groups.push_back(PagedCacheGroupConfig{
+        config.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full",
             .rows_per_page = 2,
             .entry_stride_tokens = 1,
             .total_pages = 9,
-            .retention = PagedCacheGroupConfig::Retention::FullHistory,
-            .family = PagedCacheGroupFamily::History,
+            .retention = CacheGroupConfig::Retention::FullHistory,
+            .family = CacheGroupFamily::History,
         });
         return config;
     };
@@ -229,13 +229,13 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) 
     config.max_scheduled_tokens = 8;
     config.max_batch_size = 2;
     config.role = Role::kD;
-    config.paged_cache_groups.push_back(PagedCacheGroupConfig{
+    config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",
         .rows_per_page = 2,
         .entry_stride_tokens = 1,
         .total_pages = 4,
-        .retention = PagedCacheGroupConfig::Retention::FullHistory,
-        .family = PagedCacheGroupFamily::History,
+        .retention = CacheGroupConfig::Retention::FullHistory,
+        .family = CacheGroupFamily::History,
     });
     Scheduler scheduler{std::move(config)};
     ASSERT_EQ(scheduler.MaxSingleRequestTokens(), 6);
@@ -256,13 +256,13 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
     config.max_scheduled_tokens = 8;
     config.max_batch_size = 2;
     config.role = Role::kP;
-    config.paged_cache_groups.push_back(PagedCacheGroupConfig{
+    config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",
         .rows_per_page = 2,
         .entry_stride_tokens = 1,
         .total_pages = 4,
-        .retention = PagedCacheGroupConfig::Retention::FullHistory,
-        .family = PagedCacheGroupFamily::History,
+        .retention = CacheGroupConfig::Retention::FullHistory,
+        .family = CacheGroupFamily::History,
     });
     Scheduler scheduler{std::move(config)};
     ASSERT_EQ(scheduler.MaxSingleRequestTokens(), 6);

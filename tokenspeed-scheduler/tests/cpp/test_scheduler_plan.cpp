@@ -20,6 +20,8 @@
 
 #include "integration_test_helper.h"
 
+#include <stdexcept>
+#include <string>
 #include <unordered_set>
 
 namespace tokenspeed::test {
@@ -254,9 +256,9 @@ protected:
         cfg.device_allocator.total_pages = 8;
         cfg.disable_l2_cache = true;
         cfg.enable_kv_cache_events = true;
-        PagedCacheGroupConfig second = cfg.paged_cache_groups.front();
+        CacheGroupConfig second = cfg.cache_groups.front();
         second.group_id = "full_attention_1";
-        cfg.paged_cache_groups.push_back(std::move(second));
+        cfg.cache_groups.push_back(std::move(second));
         return cfg;
     }
 };
@@ -278,7 +280,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = SchedulerKvCacheEventTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 4;
-        auto& group = cfg.paged_cache_groups.front();
+        auto& group = cfg.cache_groups.front();
         group.rows_per_page = 1;
         group.total_pages = 2 * cfg.device_allocator.total_pages;
         group.cache_blocks_per_lcm_block = 2;
@@ -347,10 +349,10 @@ protected:
         cfg.device_allocator.total_pages = 128;
         cfg.disable_l2_cache = true;
         for (std::int32_t i = 0; i < 3; ++i) {
-            PagedCacheGroupConfig state = cfg.paged_cache_groups.front();
+            CacheGroupConfig state = cfg.cache_groups.front();
             state.group_id = "linear_attention_" + std::to_string(i);
-            state.family = PagedCacheGroupFamily::State;
-            cfg.paged_cache_groups.push_back(std::move(state));
+            state.family = CacheGroupFamily::State;
+            cfg.cache_groups.push_back(std::move(state));
         }
         return cfg;
     }
@@ -390,6 +392,27 @@ TEST_F(HybridPrefixPromotionTestSuite, ThirdRequestReusesPromotedStateBoundary) 
     ASSERT_NE(reuse, nullptr);
     ASSERT_EQ(reuse->request_ids, std::vector<std::string>{"reuse"});
     EXPECT_EQ(reuse->extend_prefix_lens, std::vector<std::int32_t>{8});
+}
+
+TEST(SchedulerConstructionTest, ValidatesConfigBeforeBuildingPools) {
+    SchedulerConfig cfg{};
+    cfg.prefix_granularity = 2;
+    cfg.max_scheduled_tokens = 64;
+    cfg.max_batch_size = 8;
+    cfg.cache_groups.push_back(CacheGroupConfig{
+        .group_id = "full_attention",
+        .rows_per_page = cfg.prefix_granularity,
+        .entry_stride_tokens = 1,
+        .total_pages = 32,
+    });
+    // device_allocator.total_pages stays 0, so the block pool would be built
+    // with a negative usable count and assert before the config diagnostic.
+    try {
+        Scheduler scheduler{cfg};
+        FAIL() << "a device cache without usable capacity was accepted";
+    } catch (const std::invalid_argument& error) {
+        EXPECT_NE(std::string{error.what()}.find("device cache"), std::string::npos) << error.what();
+    }
 }
 
 }  // namespace tokenspeed::test

@@ -12,7 +12,7 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.layers.paged_attention import (  # noqa: E402
     PagedAttention,
-    validate_paged_cache_group_ids,
+    validate_cache_group_ids,
 )
 
 
@@ -51,9 +51,9 @@ class TestMlaCacheGroupId(unittest.TestCase):
         specs = (_Spec(FULL_ATTENTION), _Spec("linear_attention"))
         model = _Model()
         with self.assertRaises(ValueError):
-            validate_paged_cache_group_ids(model, specs)
+            validate_cache_group_ids(model, specs)
         model.attn.group_id = FULL_ATTENTION
-        validate_paged_cache_group_ids(model, specs)  # must not raise
+        validate_cache_group_ids(model, specs)  # must not raise
 
 
 if __name__ == "__main__":

@@ -22,13 +22,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from typing import ClassVar
 
-import numpy as np
 import torch
+from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     STATE_LAYER_TYPES,
 )
@@ -40,18 +39,15 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
     def __init__(
         self,
         *,
-        memory_plan: CacheMemoryPlan,
         layer_group_ids: tuple[str, ...],
         layer_types: tuple[str, ...],
-        state_field_dtypes: Mapping[str, torch.dtype] | None = None,
         **kwargs,
     ):
         self._layer_types = tuple(layer_types)
         group_ids = tuple(layer_group_ids)
         self._group_ids_by_layer = dict(enumerate(group_ids))
-        self._state_field_dtypes = dict(state_field_dtypes or {})
         self._state_buffers_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        self.paged_cache_requires_page_zeroing = True
+        self.requires_page_zeroing = True
 
         layer_num = kwargs["layer_num"]
         if len(self._layer_types) != layer_num:
@@ -60,65 +56,34 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
             raise ValueError("cache group ids must cover every model layer")
 
         super().__init__(
-            memory_plan=memory_plan,
             layer_group_ids=group_ids,
             **kwargs,
         )
 
-    def _create_buffers(self) -> None:
-        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
-            self._bind_buffers()
+    # A KDA layer has conv/recurrent planes planned and an MLA layer has a
+    # latent plane; the plan's field list decides per layer. Latent-page
+    # contiguity is a plan invariant (exact_page_stride).
+    # State planes keep their planned shape: the KDA decode ABI reads them
+    # as the plan lays them out.
+    layer_plane_bindings: ClassVar[dict[str, str]] = {
+        **MLATokenToKVPool.layer_plane_bindings,
+        "conv_state": "_conv_state",
+        "recurrent_state": "_recurrent_state",
+    }
 
-    def _bind_buffers(self) -> None:
+    def _bind_layer_planes(self) -> None:
         if self.quant_method == "per_token_head":
             raise ValueError("KDA cache does not support per-token-head KV")
-        if self.plan.prefix_granularity != self.prefix_granularity:
-            raise ValueError(
-                f"cache plan P={self.plan.prefix_granularity} does not match "
-                f"pool prefix_granularity={self.prefix_granularity}"
-            )
-        max_packing = max(
-            group.cache_blocks_per_lcm_block for group in self.plan.groups
-        )
-        expected_size = self.plan.num_lcm_blocks * max_packing * self.prefix_granularity
-        if self.size != expected_size:
-            raise ValueError(
-                f"cache pool size {self.size} does not match child capacity "
-                f"{expected_size}"
-            )
-        self.kv_buffer = [None] * self.layer_num
-        for layer_id, label in enumerate(self._layer_types):
-            if label in STATE_LAYER_TYPES:
-                conv_id = f"layer.{layer_id}.conv_state"
-                recurrent_id = f"layer.{layer_id}.recurrent_state"
-                try:
-                    conv_dtype = self._state_field_dtypes[conv_id]
-                    recurrent_dtype = self._state_field_dtypes[recurrent_id]
-                except KeyError as exc:
-                    raise ValueError(
-                        f"cache state field {exc.args[0]!r} has no dtype"
-                    ) from exc
-                conv = self.field(
-                    conv_id,
-                    conv_dtype,
-                )
-                recurrent = self.field(
-                    recurrent_id,
-                    recurrent_dtype,
-                )
-                self._state_buffers_by_layer[layer_id] = (conv, recurrent)
-                continue
-            latent = self.field(f"layer.{layer_id}.latent_kv", self.store_dtype)
-            page_elements = int(np.prod(latent.shape[1:]))
-            if latent.stride(0) != page_elements:
-                raise ValueError(
-                    f"layer {layer_id} latent pages have padding between pages"
-                )
-            self.kv_buffer[layer_id] = latent.view(-1, 1, self.kv_cache_dim)
+        super()._bind_layer_planes()
+        self._state_buffers_by_layer = {
+            layer_id: (self._conv_state[layer_id], self._recurrent_state[layer_id])
+            for layer_id, label in enumerate(self._layer_types)
+            if label in STATE_LAYER_TYPES
+        }
 
     @property
     def num_lcm_blocks(self) -> int:
-        return self.plan.num_lcm_blocks
+        return self.arena.plan.num_lcm_blocks
 
     @property
     def state_slabs(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -130,14 +95,36 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         except KeyError as exc:
             raise ValueError(f"layer {layer_id} has no cache group") from exc
 
+    @override
+    def set_mla_kv_buffer(
+        self,
+        layer,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+        sanitize: bool = True,
+    ):
+        """Latent write that sanitizes by default -- a fact of this cache.
+
+        Prefill breakable-graph padding contract: the dummy-batch capture (and
+        bucket-padding rows) whose ``out_cache_loc`` is the reserved
+        ``dummy_kv_slot`` can carry NaN into this fp8 KV write. The paged MLA
+        decode kernel reads that shared dummy slot through the zero-padded
+        block-table entries and computes ``q·k`` BEFORE applying the causal
+        mask, so the NaN survives it (``NaN + -inf = NaN``) and poisons a live
+        row's softmax -> NaN logits -> token 0. Eager prefill leaves the dummy
+        slot finite (``q·0`` masks cleanly), which is why the bug only appears
+        with the prefill graph on. Sanitizing in-kernel keeps real rows bitwise
+        unchanged without allocating two temporary tensors.
+        """
+        super().set_mla_kv_buffer(
+            layer, loc, cache_k_nope, cache_k_rope, sanitize=sanitize
+        )
+
     def get_component(self, layer_id: int, component_name: str) -> torch.Tensor:
+        """Return one KDA state plane. Latent KV is read via ``kv_buffer``."""
         if self.layerwise_load_tracker is not None:
             self.layerwise_load_tracker.wait_for_layer(layer_id)
-        if component_name == "latent_kv":
-            buffer = self.kv_buffer[layer_id]
-            if buffer is None:
-                raise ValueError(f"layer {layer_id} has no MLA latent cache")
-            return self.field(f"layer.{layer_id}.latent_kv", self.store_dtype)
         try:
             conv, recurrent = self._state_buffers_by_layer[layer_id]
         except KeyError as exc:
@@ -156,13 +143,7 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
 
     def zero_new_blocks(self, new_page_ids: dict[str, list[int]]) -> None:
         if new_page_ids:
-            self.zero_blocks(new_page_ids)
-
-    @torch.no_grad()
-    def clear_kv_buffers(self) -> None:
-        assert self.buffer is not None
-        self.buffer.zero_()
+            self.arena.zero_blocks(new_page_ids)
 
     def get_kv_size_bytes(self):
-        assert self.buffer is not None
-        return self.buffer.nbytes
+        return self.arena.buffer.nbytes

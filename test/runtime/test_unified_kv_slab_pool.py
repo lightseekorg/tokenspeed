@@ -39,6 +39,12 @@ _pcs = _load("kv_cache_spec_slab_under_test", _RECIPES_DIR / "spec.py")
 hybrid_slab_group_size = _pcs.hybrid_slab_group_size
 
 
+def _specs_for_layers(**kwargs):
+    from cache_pool_test_utils import specs_for_layers
+
+    return specs_for_layers(**kwargs)
+
+
 def _real_spec():
     # The REAL package module (not the file-loaded shadow above): pool
     # constructions need specs whose class passes the contract's
@@ -95,7 +101,7 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
 
     def test_none_when_unknown_label(self):
         # Unknown input degrades to None (safe legacy layout), never raises;
-        # loud rejection is group_specs_from_layer_types' job.
+        # loud rejection is spec.group's job.
         lt = GPT_OSS_LAYER_TYPES + ("banana_attention",)
         self.assertIsNone(hybrid_slab_group_size(lt))
 
@@ -174,7 +180,11 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         self.MHATokenToKVPool = MHATokenToKVPool
 
     def _pool(self, **overrides):
-        from cache_pool_test_utils import make_layer_group_ids, make_mha_memory_plan
+        from cache_pool_test_utils import (
+            make_layer_group_ids,
+            make_mha_memory_plan,
+            make_pool,
+        )
 
         kwargs = {
             "size": 32,
@@ -190,7 +200,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             "sliding_window_tokens": 128,
         }
         kwargs.update(overrides)
-        kwargs["memory_plan"] = make_mha_memory_plan(
+        plan = make_mha_memory_plan(
             size=kwargs["size"],
             prefix_granularity=kwargs["prefix_granularity"],
             layer_num=kwargs["layer_num"],
@@ -209,7 +219,15 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             ),
         )
         kwargs.pop("sliding_window_tokens", None)
-        return self.MHATokenToKVPool(**kwargs)
+        # The arena owns the allocation; ``size`` and the plan geometry are
+        # its properties, not the view's.
+        device = kwargs.pop("device")
+        kwargs.pop("size")
+        kwargs.pop("prefix_granularity")
+        kwargs.pop("enable_memory_saver")
+        arena, pool = make_pool(self.MHATokenToKVPool, plan, device=device, **kwargs)
+        self.arena = arena
+        return pool
 
     def test_plan_aliases_distinct_layer_views(self):
         pool = self._pool()
@@ -299,7 +317,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         from cache_pool_test_utils import make_layer_group_ids
 
         from tokenspeed.runtime.pd.cache_protocol import (
-            build_pool_cache_transfer_contract,
+            build_arena_cache_transfer_contract,
         )
 
         group_ids = make_layer_group_ids(
@@ -307,7 +325,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             layer_types=GPT_OSS_LAYER_TYPES,
             sliding_window_tokens=128,
         )
-        specs = _real_spec().build_paged_cache_group_specs(
+        specs = _specs_for_layers(
             layer_types=GPT_OSS_LAYER_TYPES,
             group_ids=group_ids,
             sliding_window_tokens=128,
@@ -316,97 +334,76 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         )
         pool = self._pool(
             layer_group_ids=group_ids,
-            paged_cache_group_specs=specs,
+            cache_group_specs=specs,
         )
 
-        layout, base_addr = build_pool_cache_transfer_contract(pool)
+        layout, base_addr = build_arena_cache_transfer_contract(pool.arena)
 
-        self.assertTrue(pool.supports_disaggregation)
-        self.assertEqual(base_addr, pool.buffer.data_ptr())
-        self.assertEqual(layout.plan, pool.plan)
+        self.assertTrue(pool.arena.supports_disaggregation)
+        self.assertEqual(base_addr, pool.arena.buffer.data_ptr())
+        self.assertEqual(layout.plan, pool.arena.plan)
         groups = {spec.retention: spec for spec in layout.group_specs}
         self.assertEqual(set(groups), {"full_history", "sliding_window"})
         self.assertIsNone(groups["full_history"].sliding_window_tokens)
         self.assertEqual(groups["sliding_window"].sliding_window_tokens, 128)
 
-    def test_constructor_without_specs_publishes_no_contract(self):
-        # The recipe is the single source of group specs; a pool constructed
-        # without them (tests, partial harnesses) publishes no contract.
-        kwargs = {
-            "size": 32,
-            "dtype": self.torch.bfloat16,
-            "head_num": 1,
-            "head_dim": 8,
-            "layer_num": 1,
-            "device": "cpu",
-            "enable_memory_saver": False,
-            "prefix_granularity": 16,
-            "rank": 0,
-            "layer_types": ("full_attention",),
-            "layer_group_ids": ("full_attention",),
-        }
+    def test_arena_rejects_an_empty_group_spec_set(self):
+        # Publication is unconditional: an arena with no groups is one no
+        # scheduler can address, so it is rejected at construction rather
+        # than left in a contract-less mode for callers to discover.
         from cache_pool_test_utils import make_mha_memory_plan
 
-        kwargs["memory_plan"] = make_mha_memory_plan(
-            size=kwargs["size"],
-            prefix_granularity=kwargs["prefix_granularity"],
-            layer_num=kwargs["layer_num"],
-            kv_heads=kwargs["head_num"],
-            head_dim=kwargs["head_dim"],
-            dtype=kwargs["dtype"],
-            layer_types=kwargs["layer_types"],
+        from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+
+        plan = make_mha_memory_plan(
+            size=32,
+            prefix_granularity=16,
+            layer_num=1,
+            kv_heads=1,
+            head_dim=8,
+            dtype=self.torch.bfloat16,
+            layer_types=("full_attention",),
         )
-        pool = self.MHATokenToKVPool(**kwargs)
 
-        self.assertEqual(pool.paged_cache_group_specs, ())
-        self.assertIsNone(pool.runtime_contract)
+        with self.assertRaisesRegex(ValueError, "at least one cache group spec"):
+            CacheArena(plan, "cpu", cache_group_specs=())
 
-    def test_constructor_aligns_recipe_specs_with_plan(self):
-        # Recipe specs carry default packing; the pool overwrites it (and the
+    def test_arena_aligns_recipe_specs_with_plan(self):
+        # Recipe specs carry default packing; the arena overwrites it (and the
         # page counts) from the memory plan before publishing the contract.
-        kwargs = {
-            "size": 32,
-            "dtype": self.torch.bfloat16,
-            "head_num": 1,
-            "head_dim": 8,
-            "layer_num": 1,
-            "device": "cpu",
-            "enable_memory_saver": False,
-            "prefix_granularity": 16,
-            "rank": 0,
-            "layer_types": ("full_attention",),
-            "layer_group_ids": ("full_attention",),
-        }
-        from cache_pool_test_utils import make_mha_memory_plan
+        from cache_pool_test_utils import make_arena, make_mha_memory_plan
 
-        kwargs["memory_plan"] = make_mha_memory_plan(
-            size=kwargs["size"],
-            prefix_granularity=kwargs["prefix_granularity"],
-            layer_num=kwargs["layer_num"],
-            kv_heads=kwargs["head_num"],
-            head_dim=kwargs["head_dim"],
-            dtype=kwargs["dtype"],
-            layer_types=kwargs["layer_types"],
+        plan = make_mha_memory_plan(
+            size=32,
+            prefix_granularity=16,
+            layer_num=1,
+            kv_heads=1,
+            head_dim=8,
+            dtype=self.torch.bfloat16,
+            layer_types=("full_attention",),
         )
-        kwargs["paged_cache_group_specs"] = _real_spec().build_paged_cache_group_specs(
-            layer_types=kwargs["layer_types"],
-            group_ids=kwargs["layer_group_ids"],
-            sliding_window_tokens=None,
-            prefix_granularity=kwargs["prefix_granularity"],
+        arena = make_arena(
+            plan,
+            device="cpu",
+            cache_group_specs=_specs_for_layers(
+                layer_types=("full_attention",),
+                group_ids=("full_attention",),
+                sliding_window_tokens=None,
+                prefix_granularity=16,
+            ),
         )
-        pool = self.MHATokenToKVPool(**kwargs)
 
-        self.assertIsNotNone(pool.runtime_contract)
+        self.assertIsNotNone(arena.runtime_contract)
         self.assertEqual(
-            [spec.group_id for spec in pool.paged_cache_group_specs],
+            [spec.group_id for spec in arena.cache_group_specs],
             ["full_attention"],
         )
-        plan_group = kwargs["memory_plan"].group("full_attention")
         self.assertEqual(
-            pool.paged_cache_group_page_counts["full_attention"],
-            plan_group.page_count,
+            arena.cache_group_page_counts["full_attention"],
+            plan.group("full_attention").page_count,
         )
-        self.assertEqual(pool.runtime_contract.token_capacity, kwargs["size"])
+        # No explicit token capacity: the arena falls back to child capacity.
+        self.assertEqual(arena.runtime_contract.token_capacity, 32)
 
 
 class MLAPoolAllocationHookTest(unittest.TestCase):
@@ -422,43 +419,28 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
         self.torch = torch
         self.MLATokenToKVPool = MLATokenToKVPool
 
-    def test_constructor_uses_overridable_buffer_allocation(self):
+    def test_pool_arranges_arena_views_without_allocating(self):
         torch = self.torch
-        from cache_pool_test_utils import make_mla_memory_plan
+        from cache_pool_test_utils import make_mla_memory_plan, make_pool
 
-        class PoolWithCustomAllocation(self.MLATokenToKVPool):
-            def _create_buffers(self):
-                self.allocation_hook_called = True
-                self.kv_buffer = [
-                    torch.zeros(
-                        (self.size + self.prefix_granularity, 1, self.kv_cache_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-
-        pool = PoolWithCustomAllocation(
-            size=8,
-            model_dtype=torch.bfloat16,
-            dtype=torch.bfloat16,
-            quant_method=None,
-            kv_lora_rank=4,
-            qk_rope_head_dim=2,
-            layer_num=1,
-            device="cpu",
-            enable_memory_saver=False,
-            prefix_granularity=4,
-            rank=0,
-            memory_plan=make_mla_memory_plan(
+        arena, pool = make_pool(
+            self.MLATokenToKVPool,
+            make_mla_memory_plan(
                 size=8,
                 prefix_granularity=4,
                 layer_num=1,
                 latent_width=6,
                 dtype=torch.bfloat16,
             ),
+            model_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
+            quant_method=None,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            layer_num=1,
+            rank=0,
             layer_group_ids=("full_attention",),
-            paged_cache_group_specs=_real_spec().build_paged_cache_group_specs(
+            cache_group_specs=_specs_for_layers(
                 layer_types=(),
                 group_ids=("full_attention",),
                 sliding_window_tokens=None,
@@ -466,20 +448,25 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
             ),
         )
 
-        self.assertTrue(pool.allocation_hook_called)
-        self.assertEqual(tuple(pool.kv_buffer[0].shape), (12, 1, 6))
+        # The pool allocates nothing: each per-layer buffer is a reshape of
+        # the arena view the plan already materialized.
         self.assertEqual(
-            [spec.group_id for spec in pool.paged_cache_group_specs],
+            pool.kv_buffer[0].untyped_storage().data_ptr(),
+            arena.buffer.untyped_storage().data_ptr(),
+        )
+        self.assertEqual(tuple(pool.kv_buffer[0].shape[1:]), (1, 6))
+        self.assertEqual(
+            [spec.group_id for spec in pool.arena.cache_group_specs],
             ["full_attention"],
         )
         self.assertGreater(
-            pool.paged_cache_group_page_counts["full_attention"],
+            pool.arena.cache_group_page_counts["full_attention"],
             1,
         )
 
 
-class StatePagedCacheGroupPageCountTest(unittest.TestCase):
-    """compute_paged_cache_group_page_counts: the family="state" branch is
+class StateCacheGroupPageCountTest(unittest.TestCase):
+    """compute_cache_group_page_counts: the family="state" branch is
     positive and bounded by the full-history formula for the same inputs
     (state rows keep <= 2 live pages per request -- the W=2 write window --
     and snapshots are bounded by the shared page-id space).
@@ -494,7 +481,7 @@ class StatePagedCacheGroupPageCountTest(unittest.TestCase):
             self.skipTest(f"page-count math needs the real package: {exc}")
 
     def _counts(self, **overrides):
-        specs = _pcs.group_specs_from_layer_types(
+        specs = _specs_for_layers(
             layer_types=("linear_attention", "full_attention"),
             group_ids=("linear_attention", "full_attention"),
             sliding_window_tokens=None,
@@ -507,7 +494,7 @@ class StatePagedCacheGroupPageCountTest(unittest.TestCase):
             "max_context_len": 4096,
         }
         params.update(overrides)
-        return _pcs.compute_paged_cache_group_page_counts(specs, **params)
+        return _pcs.compute_cache_group_page_counts(specs, **params)
 
     def test_state_count_positive_and_bounded_by_full_history(self):
         counts = self._counts()
@@ -534,25 +521,32 @@ class CachePoolFieldBindingTest(unittest.TestCase):
             from tokenspeed.runtime.layers.attention.kv_cache.mha import (
                 MHATokenToKVPool,
             )
-            from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
-                qwen_gdn_cache_fields,
+            from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+                CacheFieldSpec,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.pool_cls = HybridMHATokenToKVPool
         self.mha_pool_cls = MHATokenToKVPool
-        fields = qwen_gdn_cache_fields(
-            layer_types=("linear_attention", "full_attention"),
-            layer_group_ids=("linear_attention_0", "full_attention"),
-            prefix_granularity=4,
-            kv_shape=(4, 1, 2),
-            kv_element_size=2,
-            conv_shape=(2, 2),
-            conv_element_size=2,
-            ssm_shape=(1, 2, 2),
-            ssm_element_size=2,
-        )
+        # Qwen-shaped: one GDN state layer (ssm + conv) and one KV layer, the
+        # state fields aliasing the KV planes.
+        fields = {
+            "linear_attention_0": (
+                CacheFieldSpec("layer.0.ssm", "unit.0.a", (1, 2, 2), "bfloat16"),
+                CacheFieldSpec(
+                    "layer.0.conv",
+                    "unit.0.b",
+                    (2, 2),
+                    "bfloat16",
+                    exact_page_stride=False,
+                ),
+            ),
+            "full_attention": (
+                CacheFieldSpec("layer.1.k", "unit.0.a", (4, 1, 2), "bfloat16"),
+                CacheFieldSpec("layer.1.v", "unit.0.b", (4, 1, 2), "bfloat16"),
+            ),
+        }
         self.plan = plan_fields(
             fields,
             prefix_granularity=4,
@@ -561,47 +555,33 @@ class CachePoolFieldBindingTest(unittest.TestCase):
         )
 
     def _pool(self):
-        return self.pool_cls(
-            size=8,
+        from cache_pool_test_utils import make_pool
+
+        _, pool = make_pool(
+            self.pool_cls,
+            self.plan,
             dtype=self.torch.bfloat16,
             head_num=1,
             head_dim=2,
             layer_num=2,
-            device="cpu",
-            enable_memory_saver=False,
-            prefix_granularity=4,
             rank=0,
             layer_types=("linear_attention", "full_attention"),
-            state_field_dtypes={
-                "layer.0.conv": self.torch.bfloat16,
-                "layer.0.ssm": self.torch.bfloat16,
-            },
-            memory_plan=self.plan,
             layer_group_ids=("linear_attention_0", "full_attention"),
-            paged_cache_group_specs=_real_spec().build_paged_cache_group_specs(
+            cache_group_specs=_specs_for_layers(
                 layer_types=("linear_attention", "full_attention"),
                 group_ids=("linear_attention_0", "full_attention"),
                 sliding_window_tokens=None,
                 prefix_granularity=4,
             ),
         )
+        return pool
 
     def _ordinary_pool(self):
-        from cache_pool_test_utils import make_mha_memory_plan
+        from cache_pool_test_utils import make_mha_memory_plan, make_pool
 
-        return self.mha_pool_cls(
-            size=8,
-            dtype=self.torch.bfloat16,
-            head_num=1,
-            head_dim=2,
-            layer_num=2,
-            device="cpu",
-            enable_memory_saver=False,
-            prefix_granularity=4,
-            rank=0,
-            layer_types=("linear_attention", "full_attention"),
-            layer_group_ids=("linear_attention", "full_attention"),
-            memory_plan=make_mha_memory_plan(
+        _, pool = make_pool(
+            self.mha_pool_cls,
+            make_mha_memory_plan(
                 size=8,
                 prefix_granularity=4,
                 layer_num=2,
@@ -610,7 +590,15 @@ class CachePoolFieldBindingTest(unittest.TestCase):
                 dtype=self.torch.bfloat16,
                 layer_types=("linear_attention", "full_attention"),
             ),
+            dtype=self.torch.bfloat16,
+            head_num=1,
+            head_dim=2,
+            layer_num=2,
+            rank=0,
+            layer_types=("linear_attention", "full_attention"),
+            layer_group_ids=("linear_attention", "full_attention"),
         )
+        return pool
 
     def test_pool_binds_history_and_state_views_from_one_arena(self):
         pool = self._pool()
@@ -622,22 +610,20 @@ class CachePoolFieldBindingTest(unittest.TestCase):
         self.assertIsNotNone(pool.v_buffer[1])
         self.assertEqual(
             conv.untyped_storage().data_ptr(),
-            pool.field("layer.0.conv", self.torch.bfloat16)
-            .untyped_storage()
-            .data_ptr(),
+            pool.arena.field("layer.0.conv").untyped_storage().data_ptr(),
         )
         self.assertEqual(
             ssm.untyped_storage().data_ptr(),
-            pool.field("layer.0.ssm", self.torch.bfloat16).untyped_storage().data_ptr(),
+            pool.arena.field("layer.0.ssm").untyped_storage().data_ptr(),
         )
 
     def test_pool_publishes_runtime_contract_and_component_mapping(self):
         pool = self._pool()
 
-        self.assertEqual(pool.runtime_contract.prefix_granularity, 4)
-        self.assertEqual(pool.runtime_contract.num_lcm_blocks, 1)
+        self.assertEqual(pool.arena.runtime_contract.prefix_granularity, 4)
+        self.assertEqual(pool.arena.runtime_contract.num_lcm_blocks, 1)
         self.assertEqual(
-            pool.runtime_contract.group_page_counts,
+            pool.arena.runtime_contract.group_page_counts,
             {"linear_attention_0": 3, "full_attention": 2},
         )
         self.assertEqual(pool.group_id_for_layer(0), "linear_attention_0")
@@ -651,7 +637,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a state layer"):
             pool.get_state_buffers(1)
         with self.assertRaisesRegex(ValueError, "not planned"):
-            pool.field("missing", self.torch.bfloat16)
+            pool.arena.field("missing")
 
     def test_ordinary_pool_keeps_ordinary_per_layer_kv(self):
         pool = self._ordinary_pool()

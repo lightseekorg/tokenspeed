@@ -31,32 +31,89 @@ def _poison(shape, device="cuda", dtype=torch.int32):
     return torch.full(shape, 987_654, device=device, dtype=dtype)
 
 
-def kimi_tp8_plan(*, num_lcm_blocks: int = 7):
+def kimi_recipe(
+    *,
+    text_config=None,
+    tp_size: int = 8,
+    draft_layers: int = 0,
+    pd_enabled: bool = False,
+    max_bs: int = 1,
+    max_scheduled_tokens: int = 128,
+    context_len: int = 4096,
+    decode_input_tokens: int = 1,
+    overlap_schedule_depth: int = 0,
+):
+    """A Kimi-K3 recipe over the reference config, with tiny scheduler limits."""
+    from types import SimpleNamespace
+
     from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
-        solve_kimi_k3_cache_layout,
+        KimiK3Recipe,
     )
 
-    layout = solve_kimi_k3_cache_layout(
-        KimiLinearConfig(),
-        tp_size=8,
-        mla_cache_dtype=torch.float8_e4m3fn,
-        mla_quant_method=None,
+    text_config = text_config if text_config is not None else KimiLinearConfig()
+    attn_config = SimpleNamespace(
+        attn_tp_size=tp_size,
+        kv_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_quant_method=None,
+        kv_lora_rank=text_config.kv_lora_rank,
+        qk_rope_head_dim=text_config.qk_rope_head_dim,
+        prefix_granularity=128,
+        max_bs=max_bs,
+        # K3's per-group demand reads the scheduler's concurrency through
+        # CacheRecipe.scheduler_limits, context length included.
+        context_len=context_len,
+        pd_disaggregation_enabled=pd_enabled,
     )
-    return layout.with_num_lcm_blocks(num_lcm_blocks)
+    # The real K3 draft is BF16 MLA over the FP8 target arena.
+    draft_attn_config = (
+        SimpleNamespace(**{**vars(attn_config), "kv_cache_dtype": torch.bfloat16})
+        if draft_layers
+        else None
+    )
+    return KimiK3Recipe(
+        server_args=SimpleNamespace(
+            max_total_tokens=None, chunked_prefill_size=max_scheduled_tokens
+        ),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(text_config=text_config)
+        ),
+        attn_config=attn_config,
+        draft_model_config=(
+            SimpleNamespace(num_attention_layers=draft_layers) if draft_layers else None
+        ),
+        draft_attn_config=draft_attn_config,
+        cache_budget_bytes=1 << 34,
+        decode_input_tokens=decode_input_tokens,
+        overlap_schedule_depth=overlap_schedule_depth,
+    )
+
+
+def kimi_tp8_layout(**recipe_kwargs):
+    """The capacity-independent K3 layout: group, then pack."""
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
+
+    recipe = kimi_recipe(**recipe_kwargs)
+    groups = recipe.groups()
+    layout = pack(
+        groups,
+        prefix_granularity=recipe.prefix_granularity,
+        cache_blocks_per_lcm_block=recipe.packing(groups),
+        alignment=recipe.alignment,
+        max_padding_fraction=recipe.max_padding_fraction,
+    )
+    # Same order as CacheRecipe.setup: group, pack, check, then bind.
+    recipe.check_layout(layout)
+    return recipe, groups, layout
+
+
+def kimi_tp8_plan(*, num_lcm_blocks: int = 7):
+    return kimi_tp8_layout()[2].bind(num_lcm_blocks)
 
 
 def _kimi_group_specs(group_ids, layer_types, plan):
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-        build_paged_cache_group_specs,
-    )
-
-    return build_paged_cache_group_specs(
-        layer_types=layer_types,
-        group_ids=group_ids,
-        sliding_window_tokens=None,
-        prefix_granularity=plan.prefix_granularity,
-    )
+    del group_ids, layer_types, plan
+    return tuple(spec for spec, _ in kimi_recipe().groups())
 
 
 def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True):
@@ -64,48 +121,31 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
         HybridKDATokenToKVPool,
     )
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
-        kimi_k3_layer_group_ids,
-    )
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-        FULL_ATTENTION,
-        LINEAR_ATTENTION,
-    )
 
     del with_mla_dims
     text_config = KimiLinearConfig()
     plan = kimi_tp8_plan(num_lcm_blocks=usable_pages)
-    group_ids = kimi_k3_layer_group_ids(text_config)
-    layer_types = tuple(
-        FULL_ATTENTION if group_id == FULL_ATTENTION else LINEAR_ATTENTION
-        for group_id in group_ids
-    )
-    return HybridKDATokenToKVPool(
-        size=usable_pages * 12 * plan.prefix_granularity,
+    recipe = kimi_recipe()
+    group_ids = recipe.target_group_ids
+    layer_types = recipe.layer_types
+    from cache_pool_test_utils import make_pool
+
+    _, pool = make_pool(
+        HybridKDATokenToKVPool,
+        plan,
+        device=device,
         model_dtype=torch.bfloat16,
         dtype=torch.float8_e4m3fn,
         quant_method=None,
         kv_lora_rank=MLA_KV_LORA_RANK,
         qk_rope_head_dim=MLA_QK_ROPE_DIM,
         layer_num=text_config.num_hidden_layers,
-        device=device,
-        enable_memory_saver=False,
-        prefix_granularity=plan.prefix_granularity,
         rank=0,
         layer_types=layer_types,
         layer_group_ids=group_ids,
-        paged_cache_group_specs=_kimi_group_specs(group_ids, layer_types, plan),
-        state_field_dtypes={
-            field_id: dtype
-            for layer_id, layer_type in enumerate(layer_types)
-            if layer_type == LINEAR_ATTENTION
-            for field_id, dtype in (
-                (f"layer.{layer_id}.conv_state", torch.bfloat16),
-                (f"layer.{layer_id}.recurrent_state", torch.float32),
-            )
-        },
-        memory_plan=plan,
+        cache_group_specs=_kimi_group_specs(group_ids, layer_types, plan),
     )
+    return pool
 
 
 @pytest.fixture(scope="module")
@@ -154,7 +194,7 @@ def cache_metadata_for(contract, tables, device, *, filler_page: int = 1):
 
 def full_attention_metadata_for(pool, full_table_np, device):
     return cache_metadata_for(
-        pool.runtime_contract,
+        pool.arena.runtime_contract,
         {"full_attention": np.asarray(full_table_np, dtype=np.int32)},
         device,
     )

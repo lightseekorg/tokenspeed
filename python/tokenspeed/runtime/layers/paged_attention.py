@@ -56,7 +56,7 @@ class PagedAttention(nn.Module):
         self.layer_id = layer_id
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
-        # paged cache group ("" -> single-table fallback in the backend).
+        # cache group ("" -> single-table fallback in the backend).
         # make group_id mandatory once flat is the only path.
         self.group_id = group_id
         self.k_scale = None
@@ -97,15 +97,15 @@ class PagedAttention(nn.Module):
         )
 
 
-def validate_paged_cache_group_ids(
+def validate_cache_group_ids(
     model: nn.Module,
-    paged_cache_group_specs: Sequence,
+    cache_group_specs: Sequence,
 ) -> None:
     """Fail fast (ValueError) when a pool publishing more than one paged-cache
     group meets a PagedAttention layer whose group_id is empty or unknown --
     instead of a KeyError deep in the backend, possibly during graph capture.
     """
-    group_ids = {str(spec.group_id) for spec in paged_cache_group_specs}
+    group_ids = {str(spec.group_id) for spec in cache_group_specs}
     if len(group_ids) <= 1:
         return
     model_name = type(model).__name__
@@ -116,7 +116,7 @@ def validate_paged_cache_group_ids(
             raise ValueError(
                 f"{model_name}: attention layer {name!r} (layer_id="
                 f"{module.layer_id}) has empty group_id but the KV pool "
-                f"publishes {len(group_ids)} paged-cache groups "
+                f"publishes {len(group_ids)} cache groups "
                 f"{sorted(group_ids)}; pass group_id=<layer_type> to "
                 "PagedAttention (see gpt_oss.py)."
             )
@@ -124,6 +124,6 @@ def validate_paged_cache_group_ids(
             raise ValueError(
                 f"{model_name}: attention layer {name!r} (layer_id="
                 f"{module.layer_id}) has group_id={module.group_id!r} which "
-                "is not among the KV pool's paged-cache groups "
+                "is not among the KV pool's cache groups "
                 f"{sorted(group_ids)}."
             )

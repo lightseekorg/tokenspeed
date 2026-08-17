@@ -13,63 +13,67 @@
 
 from __future__ import annotations
 
-import importlib.util
 import math
-import pathlib
-import sys
 import unittest
 from types import SimpleNamespace
 
-_CONFIGS_DIR = (
-    pathlib.Path(__file__).resolve().parents[2]
-    / "python"
-    / "tokenspeed"
-    / "runtime"
-    / "layers"
-    / "attention"
-    / "kv_cache"
-    / "recipes"
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
+    v4_c4_state_window,
+    v4_compressed_kv_spec,
+    v4_compressor_state_spec,
+    v4_indexer_state_spec,
+    v4_swa_kv_spec,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    CacheGroupSpec,
+    compute_cache_group_page_counts,
+    compute_max_logical_pages_for_capture,
 )
 
 
-def _load(mod_name: str, file_name: str):
-    spec = importlib.util.spec_from_file_location(mod_name, _CONFIGS_DIR / file_name)
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+def build_v4_cache_specs(hf_config, *, layer_ratio, decode_input_tokens=1):
+    """The spec set a ratio vector declares, in the recipe's own order.
+
+    The recipe reaches for these constructors one group at a time as it walks
+    layers; here the whole set is what is under test.
+    """
+    ratios = {int(ratio) for ratio in layer_ratio}
+    window = v4_c4_state_window(decode_input_tokens)
+    specs = [v4_swa_kv_spec(hf_config)]
+    for ratio in sorted(r for r in ratios if r > 1):
+        specs.append(v4_compressor_state_spec(ratio, c4_state_window=window))
+        specs.append(v4_compressed_kv_spec(ratio))
+    if 4 in ratios:
+        specs.append(v4_indexer_state_spec(c4_state_window=window))
+    return tuple(specs)
 
 
-# Shadow the real module only while the v4 spec module binds its imports,
-# then restore: leaving it would fork PagedCacheGroupSpec into two classes
-# and fail the contract's isinstance check in later test files.
-_orig_generic = sys.modules.get(
-    "tokenspeed.runtime.layers.attention.kv_cache.recipes.spec"
-)
-_generic = _load(
-    "tokenspeed.runtime.layers.attention.kv_cache.recipes.spec",
-    "spec.py",
-)
-_v4 = _load(
-    "tokenspeed_runtime_configs_deepseek_v4_cache_spec_smoke",
-    "deepseek_v4_cache_spec.py",
-)
-if _orig_generic is not None:
-    sys.modules["tokenspeed.runtime.layers.attention.kv_cache.recipes.spec"] = (
-        _orig_generic
-    )
-else:
-    del sys.modules["tokenspeed.runtime.layers.attention.kv_cache.recipes.spec"]
+class _CapacityProbe(CacheRecipe):
+    """A recipe that is nothing but its group specs and scheduler limits.
 
-build_v4_cache_specs = _v4.build_v4_cache_specs
-deepseek_v4_lcm_blocks_needed = _v4.deepseek_v4_lcm_blocks_needed
-deepseek_v4_token_capacity_for_cache_pool = (
-    _v4.deepseek_v4_token_capacity_for_cache_pool
-)
-compute_max_logical_pages_for_capture = _generic.compute_max_logical_pages_for_capture
-compute_paged_cache_group_page_counts = _generic.compute_paged_cache_group_page_counts
-PagedCacheGroupSpec = _generic.PagedCacheGroupSpec
+    ``parents_needed`` and ``_capacity_from_parents`` read only those two plus
+    the layout's per-group packing, so the inverse property can be probed
+    without a model config or a packed arena -- and this states which inputs
+    the capacity math is allowed to read.
+    """
+
+    family = "deepseek_v4"
+    layer_types = ()
+    group_ids = ()
+
+    def __init__(self, specs, limits) -> None:
+        self._specs = tuple(specs)
+        self._limits = dict(limits)
+
+    @property
+    def _group_specs(self):
+        return self._specs
+
+    @property
+    def scheduler_limits(self):
+        return self._limits
+
 
 _PAGE_SHAPES = ((4, 1), (4, 2), (16, 4), (2, 128))
 
@@ -80,14 +84,14 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         for rows_per_page, entry_stride_tokens in _PAGE_SHAPES:
             raw_per_page = rows_per_page * entry_stride_tokens
             specs = [
-                PagedCacheGroupSpec(
+                CacheGroupSpec(
                     group_id="full",
                     retention="full_history",
                     rows_per_page=rows_per_page,
                     entry_stride_tokens=entry_stride_tokens,
                     sliding_window_tokens=None,
                 ),
-                PagedCacheGroupSpec(
+                CacheGroupSpec(
                     group_id="sliding",
                     retention="sliding_window",
                     rows_per_page=rows_per_page,
@@ -102,7 +106,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 "max_context_len": 4096,
             }
             for verify_width in (1, 2, 4, 8):
-                baseline = compute_paged_cache_group_page_counts(
+                baseline = compute_cache_group_page_counts(
                     specs,
                     **common,
                     decode_input_tokens=verify_width,
@@ -114,7 +118,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                         verify_width=verify_width,
                         overlap_depth=overlap_depth,
                     ):
-                        actual = compute_paged_cache_group_page_counts(
+                        actual = compute_cache_group_page_counts(
                             specs,
                             **common,
                             decode_input_tokens=verify_width,
@@ -132,7 +136,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
     def test_capture_table_width_is_parameterized_by_verify_width_and_depth(self):
         for rows_per_page, entry_stride_tokens in _PAGE_SHAPES:
             raw_per_page = rows_per_page * entry_stride_tokens
-            full = PagedCacheGroupSpec(
+            full = CacheGroupSpec(
                 group_id="full",
                 retention="full_history",
                 rows_per_page=rows_per_page,
@@ -140,7 +144,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 sliding_window_tokens=None,
             )
             window = 3 * raw_per_page + 1
-            sliding = PagedCacheGroupSpec(
+            sliding = CacheGroupSpec(
                 group_id="sliding",
                 retention="sliding_window",
                 rows_per_page=rows_per_page,
@@ -191,7 +195,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             # not, exercising both page-alignment relationships between the
             # window and the physical page stride.
             for window in (3 * raw_per_page, 3 * raw_per_page + 1):
-                spec = PagedCacheGroupSpec(
+                spec = CacheGroupSpec(
                     group_id="sliding",
                     retention="sliding_window",
                     rows_per_page=rows_per_page,
@@ -228,7 +232,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                                 )
 
     def test_overlap_sizing_rejects_invalid_runtime_parameters(self):
-        spec = PagedCacheGroupSpec(
+        spec = CacheGroupSpec(
             group_id="full",
             retention="full_history",
             rows_per_page=4,
@@ -253,7 +257,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 self.subTest(function="page_counts", overrides=overrides),
                 self.assertRaisesRegex(ValueError, message),
             ):
-                compute_paged_cache_group_page_counts([spec], **count_args, **overrides)
+                compute_cache_group_page_counts([spec], **count_args, **overrides)
 
         for overrides, message in (
             ({"max_context_len": -1}, "max_context_len"),
@@ -278,15 +282,15 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             self.subTest(group="bad-rows"),
             self.assertRaisesRegex(ValueError, "rows_per_page"),
         ):
-            PagedCacheGroupSpec("bad-rows", "full_history", 0, 1, None)
+            CacheGroupSpec("bad-rows", "full_history", 0, 1, None)
 
         invalid_specs = (
             (
-                PagedCacheGroupSpec("bad-window", "sliding_window", 4, 1, 0),
+                CacheGroupSpec("bad-window", "sliding_window", 4, 1, 0),
                 "sliding_window_tokens",
             ),
             (
-                PagedCacheGroupSpec("bad-retention", "unknown", 4, 1, None),
+                CacheGroupSpec("bad-retention", "unknown", 4, 1, None),
                 "unsupported retention",
             ),
         )
@@ -324,7 +328,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
 
     def test_sliding_window_scheduled_tokens_are_global_and_capped(self):
         specs = [
-            PagedCacheGroupSpec(
+            CacheGroupSpec(
                 group_id="sliding",
                 retention="sliding_window",
                 rows_per_page=4,
@@ -333,7 +337,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             )
         ]
 
-        counts = compute_paged_cache_group_page_counts(
+        counts = compute_cache_group_page_counts(
             specs,
             max_live_requests=10,
             max_scheduled_tokens=100,
@@ -361,7 +365,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             SimpleNamespace(sliding_window=128),
             layer_ratio=(1, 4, 128),
         )
-        counts = compute_paged_cache_group_page_counts(specs, **inputs)
+        counts = compute_cache_group_page_counts(specs, **inputs)
         bound = inputs["max_total_tokens"] * inputs["max_live_requests"]
         for spec in specs:
             n = counts[spec.group_id]
@@ -370,25 +374,15 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             self.assertTrue(math.isfinite(n), spec.group_id)
             self.assertLess(n, bound, spec.group_id)
 
-    def test_lcm_specs_preserve_group_block_granularities_and_publish_packing(self):
-        packing = {
-            "v4.swa_kv": 1,
-            "v4.c4a.compressor_state": 16,
-            "v4.c4a.compressed_kv": 2,
-            "v4.c128a.compressor_state": 32,
-            "v4.c128a.compressed_kv": 8,
-            "v4.c4a.indexer_compressor_state": 16,
-        }
-
+    def test_lcm_specs_own_row_geometry_and_declare_no_packing(self):
         specs = build_v4_cache_specs(
             SimpleNamespace(sliding_window=128),
             layer_ratio=(1, 4, 128),
-            cache_blocks_per_lcm_block=packing,
         )
 
-        self.assertEqual(
-            {spec.group_id: spec.cache_blocks_per_lcm_block for spec in specs},
-            packing,
+        # Packing is the memory plan's answer, so a spec cannot declare it.
+        self.assertFalse(
+            any(hasattr(spec, "cache_blocks_per_lcm_block") for spec in specs)
         )
         rows = {spec.group_id: spec.rows_per_page for spec in specs}
         self.assertEqual(rows["v4.swa_kv"], 64)
@@ -416,49 +410,37 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             self.assertEqual(wide_windows[group_id], 10)
 
     def test_lcm_capacity_is_the_inverse_of_parent_demand(self):
-        packing = {
-            "v4.swa_kv": 1,
-            "v4.c4a.compressor_state": 4,
-            "v4.c4a.compressed_kv": 2,
-            "v4.c128a.compressor_state": 1,
-            "v4.c128a.compressed_kv": 8,
-            "v4.c4a.indexer_compressor_state": 4,
-        }
-        specs = build_v4_cache_specs(
-            SimpleNamespace(sliding_window=128),
-            layer_ratio=(1, 4, 128),
-            cache_blocks_per_lcm_block=packing,
+        layout = SimpleNamespace(
+            prefix_granularity=256,
+            group_packing=(
+                ("v4.swa_kv", 1),
+                ("v4.c4a.compressor_state", 4),
+                ("v4.c4a.compressed_kv", 2),
+                ("v4.c128a.compressor_state", 1),
+                ("v4.c128a.compressed_kv", 8),
+                ("v4.c4a.indexer_compressor_state", 4),
+            ),
         )
-        sizing = {
-            "prefix_granularity": 256,
-            "max_live_requests": 1,
-            "max_scheduled_tokens": 256,
-            "max_context_len": 4096,
-        }
+        probe = _CapacityProbe(
+            build_v4_cache_specs(
+                SimpleNamespace(sliding_window=128),
+                layer_ratio=(1, 4, 128),
+            ),
+            {
+                "max_live_requests": 1,
+                "max_scheduled_tokens": 256,
+                "max_context_len": 4096,
+                "decode_input_tokens": 1,
+                "overlap_schedule_depth": 0,
+            },
+        )
         num_lcm_blocks = 100
-        capacity = deepseek_v4_token_capacity_for_cache_pool(
-            specs,
-            num_lcm_blocks=num_lcm_blocks,
-            upper_bound_tokens=4096,
-            **sizing,
+        capacity = probe._capacity_from_parents(
+            layout, num_lcm_blocks, upper_bound=4096
         )
 
-        self.assertLessEqual(
-            deepseek_v4_lcm_blocks_needed(
-                specs,
-                token_capacity=capacity,
-                **sizing,
-            ),
-            num_lcm_blocks,
-        )
-        self.assertGreater(
-            deepseek_v4_lcm_blocks_needed(
-                specs,
-                token_capacity=capacity + 1,
-                **sizing,
-            ),
-            num_lcm_blocks,
-        )
+        self.assertLessEqual(probe.parents_needed(layout, capacity), num_lcm_blocks)
+        self.assertGreater(probe.parents_needed(layout, capacity + 1), num_lcm_blocks)
 
 
 if __name__ == "__main__":

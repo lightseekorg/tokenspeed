@@ -187,7 +187,7 @@ class PrefillGraph:
     A pure graph object -- :meth:`can_run` / :meth:`replay` -- holding no
     reference to any other component. The executor calls :meth:`capture` once
     kernel tuning has run, passing the decode wrapper transiently for its
-    capture stream and dummy paged-cache tables; it is not kept. The dispatch
+    capture stream and dummy cache-group tables; it is not kept. The dispatch
     checks :meth:`can_run` and calls :meth:`replay`; the eager path stays a
     direct ``model_runner.forward`` call at that call site. Capture failure
     degrades to eager -- world-agreed, so DP/TP ranks stay in lockstep.
@@ -272,7 +272,7 @@ class PrefillGraph:
         """Capture one breakable graph per token bucket (no-op when disabled).
 
         ``decode_wrapper`` supplies the shared capture stream and dummy
-        paged-cache block tables (used here only, not stored). Buckets share
+        cache-group block tables (used here only, not stored). Buckets share
         one PRIVATE mempool (first capture
         allocates it), so graph memory stays ~the largest bucket's peak --
         but never the decode graphs' pool: eager ops cache raw pointers to
@@ -425,14 +425,13 @@ class PrefillGraph:
         backend = self.attn_backend
         if not getattr(backend, "uses_cache_groups", False):
             return {}
-        specs = tuple(getattr(self.token_to_kv_pool, "paged_cache_group_specs", ()))
+        # The arena's specs are the source; the backend's state_group_ids is
+        # learned from these same specs, so consulting it as a second opinion
+        # could only ever return the same set.
+        specs = self.token_to_kv_pool.arena.cache_group_specs
         state_group_ids = {
-            str(spec.group_id)
-            for spec in specs
-            if getattr(spec, "family", "history") == "state"
+            str(spec.group_id) for spec in specs if spec.family == "state"
         }
-        if not state_group_ids:
-            state_group_ids = set(getattr(backend, "state_group_ids", frozenset()))
         # Composite wrappers hold the cache-group consumer as a child.
         if not hasattr(backend, "kernel_page_size") and hasattr(
             backend, "full_attn_backend"
@@ -534,7 +533,7 @@ class PrefillGraph:
             ctx.global_bs = [bs] * self.config.world_size
         extra_metadata_kwargs: dict = {}
         if (
-            getattr(self.attn_backend, "uses_paged_cache_groups", False)
+            getattr(self.attn_backend, "needs_group_block_tables", False)
             and decode_wrapper is not None
         ):
             tables = decode_wrapper._capture_group_block_tables(
@@ -546,24 +545,22 @@ class PrefillGraph:
             extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
         group_tables = self._dummy_group_tables(max(seq_lens), bs)
         if group_tables:
-            contract = getattr(self.token_to_kv_pool, "runtime_contract", None)
-            if contract is not None:
-                arrays = {
-                    group_id: table.cpu().numpy()
-                    for group_id, table in group_tables.items()
-                }
-                dummy_forward_op = SimpleNamespace(block_tables_arrays=lambda: arrays)
-                cache_metadata = CacheBatchMetadata.from_forward_op(
-                    dummy_forward_op,
-                    device=self.config.device,
-                    contract=contract,
-                    num_requests=bs,
-                )
-                group_tables = dict(
-                    cache_metadata.tables(active_forward_op=dummy_forward_op)
-                )
-                extra_metadata_kwargs["cache_metadata"] = cache_metadata
-                extra_metadata_kwargs["forward_batch"] = dummy_forward_op
+            arrays = {
+                group_id: table.cpu().numpy()
+                for group_id, table in group_tables.items()
+            }
+            dummy_forward_op = SimpleNamespace(block_tables_arrays=lambda: arrays)
+            cache_metadata = CacheBatchMetadata.from_forward_op(
+                dummy_forward_op,
+                device=self.config.device,
+                contract=self.token_to_kv_pool.arena.runtime_contract,
+                num_requests=bs,
+            )
+            group_tables = dict(
+                cache_metadata.tables(active_forward_op=dummy_forward_op)
+            )
+            extra_metadata_kwargs["cache_metadata"] = cache_metadata
+            extra_metadata_kwargs["forward_batch"] = dummy_forward_op
             extra_metadata_kwargs["block_tables"] = group_tables
         self.attn_backend.init_forward_metadata(
             bs=bs,

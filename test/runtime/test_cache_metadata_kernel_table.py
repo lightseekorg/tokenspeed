@@ -57,7 +57,7 @@ def _metadata(pool, rows):
 @requires_cuda
 def test_kernel_table_expansion_preserves_token_locations() -> None:
     pool = _make_pool("cuda", usable_pages=6)
-    P = pool.prefix_granularity
+    P = pool.arena.prefix_granularity
     metadata, op = _metadata(pool, [[3, 5], [1, 4]])
 
     logical = metadata.require_full_attention_table(active_forward_op=op)
@@ -102,7 +102,9 @@ def test_kernel_table_identity_when_sizes_match() -> None:
     metadata, op = _metadata(pool, [[3, 5]])
 
     table = metadata.kernel_table(
-        kernel_page_size=pool.prefix_granularity, max_pages=None, active_forward_op=op
+        kernel_page_size=pool.arena.prefix_granularity,
+        max_pages=None,
+        active_forward_op=op,
     )
     logical = metadata.require_full_attention_table(active_forward_op=op)
     assert table.data_ptr() == logical.data_ptr()
@@ -111,7 +113,7 @@ def test_kernel_table_identity_when_sizes_match() -> None:
 @requires_cuda
 def test_kernel_table_max_pages_pads_with_null_page() -> None:
     pool = _make_pool("cuda", usable_pages=6)
-    P = pool.prefix_granularity
+    P = pool.arena.prefix_granularity
     ratio = P // _KERNEL_PAGE
     metadata, op = _metadata(pool, [[3, 5]])
 
@@ -144,7 +146,7 @@ def test_kernel_table_rejects_stale_forward_op() -> None:
 @requires_cuda
 def test_validate_live_pages_flags_null_page_in_live_range() -> None:
     pool = _make_pool("cuda", usable_pages=6)
-    P = pool.prefix_granularity
+    P = pool.arena.prefix_granularity
     # Row 0 is fine; row 1 has the null page 0 inside its live range.
     metadata, op = _metadata(pool, [[3, 5], [0, 4]])
     seq_lens = torch.tensor([2 * P, P], device="cuda", dtype=torch.int32)
@@ -155,7 +157,7 @@ def test_validate_live_pages_flags_null_page_in_live_range() -> None:
 @requires_cuda
 def test_validate_live_pages_ignores_pages_past_seq_len() -> None:
     pool = _make_pool("cuda", usable_pages=6)
-    P = pool.prefix_granularity
+    P = pool.arena.prefix_granularity
     # -1 hole in the tail column is legal padding while seq stays on page 0.
     metadata, op = _metadata(pool, [[3, -1]])
     seq_lens = torch.tensor([P], device="cuda", dtype=torch.int32)

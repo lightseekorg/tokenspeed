@@ -32,7 +32,10 @@ namespace tokenspeed {
 
 struct SchedulerConfig;
 
-// One CacheGroupSpec per config paged_cache_group (group_id = index); all groups share config.prefix_granularity.
+// One CacheGroupSpec per config cache_group (group_id = index); all groups share config.prefix_granularity.
+// Pure translation: the caller must have accepted `config` through
+// SchedulerConfig::Validate() first, which is what makes every field read here
+// (packing, block granularity, a sliding group's window) well-formed.
 std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
 
 std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,

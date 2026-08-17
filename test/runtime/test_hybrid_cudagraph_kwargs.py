@@ -52,8 +52,8 @@ class _NamedExtraBackend:
     def __init__(self):
         self.calls = []
 
-    def init_cuda_graph_state(self, max_bs, paged_cache_group_specs=None):
-        self.calls.append((max_bs, paged_cache_group_specs))
+    def init_cuda_graph_state(self, max_bs, cache_group_specs=None):
+        self.calls.append((max_bs, cache_group_specs))
 
 
 class _RaisingBackend:
@@ -67,7 +67,7 @@ class _RaisingBackend:
 
 
 _EXTRAS = {
-    "paged_cache_group_specs": ("full_attention", "linear_attention"),
+    "cache_group_specs": ("full_attention", "linear_attention"),
     "max_tokens_per_req": 2,
     "overlap_schedule_depth": 1,
 }
@@ -100,7 +100,7 @@ class InitBackendCudaGraphStateHelperTest(unittest.TestCase):
         self.helper(backend, 4, **_EXTRAS)
         self.assertEqual(
             backend.calls,
-            [(4, _EXTRAS["paged_cache_group_specs"])],
+            [(4, _EXTRAS["cache_group_specs"])],
         )
 
     def test_type_error_from_backend_body_propagates(self):

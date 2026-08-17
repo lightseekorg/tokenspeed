@@ -432,7 +432,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         self.decode_cuda_graph_kv_indices = torch.zeros(
             (max_bs, max_blocks), dtype=torch.int32, device=self.device
         )
-        # Paged cache contract: persistent write-location buffer whose address
+        # Cache contract: persistent write-location buffer whose address
         # the captured graph records; replay refreshes it in place. Target
         # verify records spec_num_tokens locations per request.
         if self._cache_contract_bound:

@@ -20,8 +20,6 @@
 
 #include "scheduler/operations/cache.h"
 
-#include <stdexcept>
-
 #include "scheduler/types.h"
 
 namespace tokenspeed {
@@ -47,51 +45,26 @@ std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled,
 }
 
 std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
-    _assert(config.prefix_granularity > 0, "scheduler prefix_granularity must be > 0");
     std::vector<CacheGroupSpec> specs;
-    specs.reserve(config.paged_cache_groups.size());
-    for (const PagedCacheGroupConfig& group : config.paged_cache_groups) {
-        _assert(group.cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
-        const std::int32_t block_granularity = group.BlockGranularity();
-        _assert(block_granularity > 0, "cache group must have a positive block_granularity");
-        _assert(config.prefix_granularity % block_granularity == 0,
-                "group block_granularity must divide the scheduler prefix granularity");
-        // family=State marks trailing-window prefix reuse and covers both SWA and
-        // linear-attention groups; only a State group WITHOUT SlidingWindow
-        // retention is a mamba-style state group.
-        const bool final_state_manager = group.family == PagedCacheGroupFamily::State &&
-                                         group.retention != PagedCacheGroupConfig::Retention::SlidingWindow;
-        if (config.enable_pd_cache) {
-            const PagedCacheTransferPolicy expected =
-                final_state_manager ? PagedCacheTransferPolicy::LatestSnapshot : PagedCacheTransferPolicy::FullSuffix;
-            if (group.transfer_policy == PagedCacheTransferPolicy::Unspecified) {
-                throw std::invalid_argument("PD cache group '" + group.group_id +
-                                            "' requires an explicit transfer_policy");
-            }
-            if (group.transfer_policy != expected) {
-                throw std::invalid_argument("PD cache group '" + group.group_id +
-                                            "' transfer_policy does not match its scheduler "
-                                            "destination layout");
-            }
-        }
-        if (final_state_manager) {
+    specs.reserve(config.cache_groups.size());
+    for (const CacheGroupConfig& group : config.cache_groups) {
+        if (group.IsSnapshotStateGroup()) {
             specs.push_back(CacheGroupSpec{
                 .kind = AttnKind::kMambaState,
                 .sliding_window = 0,
                 .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
-                .block_granularity = block_granularity,
+                .block_granularity = group.BlockGranularity(),
             });
             continue;
         }
-        const bool is_swa = group.retention == PagedCacheGroupConfig::Retention::SlidingWindow;
-        if (is_swa && (!group.sliding_window_tokens || *group.sliding_window_tokens <= 0)) {
-            throw std::invalid_argument("Cache group '" + group.group_id + "' requires positive sliding_window_tokens");
-        }
+        // family=State also covers linear-attention groups with a trailing
+        // window; those translate like any other sliding group.
+        const bool is_swa = group.retention == CacheGroupConfig::Retention::SlidingWindow;
         specs.push_back(CacheGroupSpec{
             .kind = is_swa ? AttnKind::kSlidingWindow : AttnKind::kFull,
             .sliding_window = is_swa ? *group.sliding_window_tokens : 0,
             .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
-            .block_granularity = block_granularity,
+            .block_granularity = group.BlockGranularity(),
         });
     }
     return specs;

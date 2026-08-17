@@ -31,7 +31,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     block_tables_from_forward_op,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
-    PagedCacheRuntimeContract,
+    CacheRuntimeContract,
     require_positive_int,
 )
 from tokenspeed.runtime.layers.attention.page_table import expand_page_table
@@ -74,7 +74,7 @@ class CacheBatchMetadata:
         forward_op: Any,
         *,
         device: torch.device | str,
-        contract: PagedCacheRuntimeContract,
+        contract: CacheRuntimeContract,
         num_requests: int,
     ) -> CacheBatchMetadata:
         """Validate CPU exports, pack once, and retain operation provenance."""
@@ -201,7 +201,7 @@ class CacheBatchMetadata:
         try:
             return self._group_tables[group_id]
         except KeyError:
-            raise KeyError(f"missing paged cache group {group_id!r}") from None
+            raise KeyError(f"missing cache group {group_id!r}") from None
 
     def require_full_attention_table(self, *, active_forward_op: Any) -> torch.Tensor:
         """Return the unique full-history history-group table.

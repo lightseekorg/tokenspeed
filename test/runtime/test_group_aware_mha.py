@@ -91,7 +91,7 @@ class SelectPageTableTest(unittest.TestCase):
             self.backend._select_page_table(self._layer(""), self._multi_group_meta())
 
 
-class ValidatePagedCacheGroupIdsTest(unittest.TestCase):
+class ValidateCacheGroupIdsTest(unittest.TestCase):
     """Init-time fail-fast: multi-group pool requires labeled layers."""
 
     def setUp(self):
@@ -101,13 +101,13 @@ class ValidatePagedCacheGroupIdsTest(unittest.TestCase):
 
             from tokenspeed.runtime.layers.paged_attention import (
                 PagedAttention,
-                validate_paged_cache_group_ids,
+                validate_cache_group_ids,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch: {exc}")
         self.nn = nn
         self.PagedAttention = PagedAttention
-        self.validate = validate_paged_cache_group_ids
+        self.validate = validate_cache_group_ids
 
     def _model(self, group_ids):
         nn, PagedAttention = self.nn, self.PagedAttention

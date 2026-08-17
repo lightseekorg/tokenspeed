@@ -60,7 +60,7 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
 )
 from tokenspeed_kernel.ops.transform import hadamard_transform
 
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec import (
+from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     DEEPSEEK_V4_FP8_MAX,
     DEEPSEEK_V4_FP8_QUANT_BLOCK,
     DEEPSEEK_V4_MXFP4_BLOCK_SIZE,

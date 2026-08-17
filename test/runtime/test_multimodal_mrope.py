@@ -23,19 +23,22 @@ class _Qwen35Config:
 
 @pytest.mark.parametrize("num_extends", [0, 1])
 def test_text_only_mrope_positions_copy_linear_positions_directly(num_extends):
-    model_executor = pytest.importorskip(
-        "tokenspeed.runtime.execution.model_executor", exc_type=ImportError
+    """With no multimodal inputs, all three M-RoPE axes are the linear
+    positions -- and the override is a view of the graph-stable buffer, so a
+    captured forward reads the values this write produced."""
+    runtime = pytest.importorskip(
+        "tokenspeed.runtime.execution.multimodal_runtime", exc_type=ImportError
     )
-    executor = object.__new__(model_executor.ModelExecutor)
-    executor.config = SimpleNamespace(model_is_mrope=True)
-    executor.input_buffers = SimpleNamespace(
+    mm_runtime = object.__new__(runtime.MultimodalRuntime)
+    mm_runtime.model_is_mrope = True
+    mm_runtime.input_buffers = SimpleNamespace(
         positions_buf=torch.arange(4, dtype=torch.int64),
         mrope_positions_buf=torch.empty((3, 4), dtype=torch.int64),
     )
     forward_op = SimpleNamespace(num_extends=lambda: num_extends)
 
-    positions = executor._build_mrope_positions_override(
-        forward_op,
+    positions = mm_runtime.build_positions_override(
+        forward_op=forward_op,
         multimodal_context=None,
         total_tokens=4,
     )
@@ -43,6 +46,9 @@ def test_text_only_mrope_positions_copy_linear_positions_directly(num_extends):
     assert torch.equal(
         positions,
         torch.arange(4, dtype=torch.int64).unsqueeze(0).expand(3, -1),
+    )
+    assert (
+        positions.data_ptr() == mm_runtime.input_buffers.mrope_positions_buf.data_ptr()
     )
 
 

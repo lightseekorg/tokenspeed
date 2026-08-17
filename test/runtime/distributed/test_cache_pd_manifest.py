@@ -25,7 +25,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CachePlaneLayout,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    PagedCacheGroupSpec,
+    CacheGroupSpec,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
     CacheFieldPartition,
@@ -60,16 +60,14 @@ def _group_spec(
     prefix_granularity: int = 4,
     retention: str = "full_history",
     sliding_window_tokens: int | None = None,
-    packing: int = 1,
-) -> PagedCacheGroupSpec:
-    return PagedCacheGroupSpec(
+) -> CacheGroupSpec:
+    return CacheGroupSpec(
         group_id=group_id,
         retention=retention,
         rows_per_page=prefix_granularity,
         entry_stride_tokens=1,
         sliding_window_tokens=sliding_window_tokens,
         family=family,
-        cache_blocks_per_lcm_block=packing,
         transfer_policy=policy,
     )
 
@@ -80,7 +78,7 @@ def _field(
     *,
     plane_id: str = "cache",
     shape: tuple[int, ...] = (1,),
-    element_size: int = 1,
+    dtype: str = "uint8",
     offset: int = 0,
     stride: int = 128,
 ) -> CacheFieldLayout:
@@ -89,22 +87,22 @@ def _field(
         field_id=field_id,
         plane_id=plane_id,
         shape=shape,
-        element_size=element_size,
+        dtype=dtype,
         field_offset_bytes=offset,
         page_stride_bytes=stride,
     )
 
 
 def _contract(
-    specs: tuple[PagedCacheGroupSpec, ...],
+    specs: tuple[CacheGroupSpec, ...],
     fields: tuple[CacheFieldLayout, ...],
     *,
     block_size: int = 4,
     capacity: int = 64,
     page_bytes: int = 128,
     planes: tuple[CachePlaneLayout, ...] | None = None,
-    dtypes: tuple[str, ...] | None = None,
     transfer_schema: CacheTransferSchema = CacheTransferSchema(),
+    packing: int = 1,
 ) -> CacheTransferContract:
     plan = CacheMemoryPlan(
         prefix_granularity=block_size,
@@ -113,8 +111,8 @@ def _contract(
         groups=tuple(
             CacheGroupLayout(
                 group_id=spec.group_id,
-                cache_blocks_per_lcm_block=spec.cache_blocks_per_lcm_block,
-                page_count=(1 + (capacity - 1) * spec.cache_blocks_per_lcm_block),
+                cache_blocks_per_lcm_block=packing,
+                page_count=(1 + (capacity - 1) * packing),
             )
             for spec in specs
         ),
@@ -131,7 +129,6 @@ def _contract(
     return CacheTransferContract(
         plan=plan,
         group_specs=specs,
-        field_dtypes=dtypes or tuple("uint8" for _ in fields),
         transfer_schema=transfer_schema,
     )
 
@@ -323,7 +320,7 @@ def test_contract_and_manifest_wire_round_trip_has_no_version_field() -> None:
 
 
 def test_lcm_group_capacity_uses_its_cache_blocks_per_parent() -> None:
-    spec = _group_spec("history", "history", "full_suffix", packing=2)
+    spec = _group_spec("history", "history", "full_suffix")
     # Null parent plus three usable parents, each packing two child pages.
     layout = _contract(
         (spec,),
@@ -332,13 +329,13 @@ def test_lcm_group_capacity_uses_its_cache_blocks_per_parent() -> None:
                 "history",
                 "layer.0.k",
                 shape=(64,),
-                element_size=2,
+                dtype="bfloat16",
                 stride=128,
             ),
         ),
         capacity=4,
         page_bytes=1024,
-        dtypes=("bfloat16",),
+        packing=2,
     )
     tables = {"history": np.array([[5, 6]], dtype=np.int32)}
     operation = SimpleNamespace(block_tables_arrays=lambda: tables)
@@ -368,7 +365,6 @@ def test_destination_manifest_uses_peer_local_group_packing() -> None:
             "history",
             "full_suffix",
             prefix_granularity=2,
-            packing=packing,
         )
         return _contract(
             (spec,),
@@ -377,14 +373,14 @@ def test_destination_manifest_uses_peer_local_group_packing() -> None:
                     "history",
                     "layer.0.k",
                     shape=(4,),
-                    element_size=2,
+                    dtype="bfloat16",
                     stride=8,
                 ),
             ),
             block_size=2,
             capacity=4,
             page_bytes=physical_page_bytes,
-            dtypes=("bfloat16",),
+            packing=packing,
         )
 
     source_layout = layout(packing=1, physical_page_bytes=8)
@@ -486,7 +482,7 @@ def _two_plane_lcm_plan(num_lcm_blocks: int) -> CacheMemoryPlan:
                 field_id="layer.0.k",
                 plane_id="k",
                 shape=(4, 8),
-                element_size=2,
+                dtype="bfloat16",
                 field_offset_bytes=0,
                 page_stride_bytes=256,
             ),
@@ -495,7 +491,7 @@ def _two_plane_lcm_plan(num_lcm_blocks: int) -> CacheMemoryPlan:
                 field_id="layer.0.v",
                 plane_id="v",
                 shape=(4, 8),
-                element_size=2,
+                dtype="bfloat16",
                 field_offset_bytes=0,
                 page_stride_bytes=256,
             ),
@@ -504,53 +500,39 @@ def _two_plane_lcm_plan(num_lcm_blocks: int) -> CacheMemoryPlan:
 
 
 _LCM_SPECS = (
-    PagedCacheGroupSpec(
+    CacheGroupSpec(
         group_id="history",
         retention="full_history",
         rows_per_page=4,
         entry_stride_tokens=1,
         sliding_window_tokens=None,
         family="history",
-        cache_blocks_per_lcm_block=2,
         transfer_policy="full_suffix",
     ),
 )
 
 
 def _recipe_contract(
-    fields,
-    specs,
-    dtypes,
+    groups,
     *,
     ptr=0x10000,
     q=128,
     transfer_schema=CacheTransferSchema(),
     **solve,
 ):
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
-        solve_cache_layout,
-    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
 
-    plan = solve_cache_layout(
-        fields,
+    specs = tuple(spec for spec, _ in groups)
+    plan = pack(
+        groups,
         prefix_granularity=q,
         max_padding_fraction=1.0,
         **solve,
-    ).with_num_lcm_blocks(3)
-    aligned_specs = tuple(
-        replace(
-            spec,
-            cache_blocks_per_lcm_block=(
-                plan.group(spec.group_id).cache_blocks_per_lcm_block
-            ),
-        )
-        for spec in specs
-    )
+    ).bind(3)
     return build_cache_transfer_contract(
         plan=plan,
         buffer=_cache_buffer(plan.arena_bytes, data_ptr=ptr),
-        group_specs=aligned_specs,
-        field_dtypes=dtypes,
+        group_specs=specs,
         transfer_schema=transfer_schema,
     )[0]
 
@@ -561,7 +543,6 @@ def test_lcm_contract_registers_one_arena_and_preserves_group_geometry() -> None
         plan=plan,
         buffer=_cache_buffer(plan.arena_bytes),
         group_specs=_LCM_SPECS,
-        field_dtypes={"layer.0.k": "bfloat16", "layer.0.v": "bfloat16"},
     )
 
     assert layout.plan.num_lcm_blocks + 1 == 4
@@ -580,13 +561,11 @@ def test_peer_layout_allows_capacity_and_offsets_to_differ() -> None:
         plan=_two_plane_lcm_plan(3),
         buffer=_cache_buffer(4096),
         group_specs=_LCM_SPECS,
-        field_dtypes={"layer.0.k": "bfloat16", "layer.0.v": "bfloat16"},
     )
     large, _ = build_cache_transfer_contract(
         plan=_two_plane_lcm_plan(5),
         buffer=_cache_buffer(6144, data_ptr=0x20000),
         group_specs=_LCM_SPECS,
-        field_dtypes={"layer.0.k": "bfloat16", "layer.0.v": "bfloat16"},
     )
 
     assert small.plan.num_lcm_blocks != large.plan.num_lcm_blocks
@@ -620,10 +599,7 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
     from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
-        _ordinary_fields,
-    )
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-        build_paged_cache_group_specs,
+        OrdinaryRecipe,
     )
 
     common = {
@@ -661,30 +637,22 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
         pd_disaggregation_enabled=True,
     )
 
-    fields, group_ids = _ordinary_fields(config, 2)
-    packing = {group_id: 1 for group_id in group_ids}
-    specs = build_paged_cache_group_specs(
-        layer_types=(),
-        group_ids=group_ids,
-        sliding_window_tokens=None,
-        prefix_granularity=config.prefix_granularity,
-        cache_blocks_per_lcm_block=packing,
-        pd_disaggregation_enabled=True,
+    recipe = OrdinaryRecipe(
+        family=family,
+        server_args=SimpleNamespace(max_total_tokens=None),
+        model_config=SimpleNamespace(num_attention_layers=2),
+        attn_config=config,
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=1 << 24,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
     )
-    field_dtypes = {
-        field.field_id: (
-            "uint8"
-            if family == "dsa" and field.field_id.endswith(".index_k")
-            else "bfloat16"
-        )
-        for field in fields
-    }
+    groups = recipe.groups()
     layout = _recipe_contract(
-        fields,
-        specs,
-        field_dtypes,
+        groups,
         q=config.prefix_granularity,
-        cache_blocks_per_lcm_block=packing,
+        cache_blocks_per_lcm_block=recipe.packing(groups),
         alignment=1,
     )
     model_config = SimpleNamespace(
@@ -703,15 +671,9 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
     assert layout.plan.prefix_granularity == 16
     assert len(layout.group_specs) == 1
     group = layout.group_specs[0]
-    assert (
-        group.group_id,
-        group.family,
-        group.cache_blocks_per_lcm_block,
-    ) == (
-        "full_attention",
-        "history",
-        1,
-    )
+    assert (group.group_id, group.family) == ("full_attention", "history")
+    # Packing lives on the plan, not on the group spec.
+    assert layout.plan.group("full_attention").cache_blocks_per_lcm_block == 1
 
     fields_by_id = {
         field.field_id: field for field in layout.fields_for_group(group.group_id)
@@ -732,10 +694,11 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
             if family == "dsa" and is_index
             else (16, 1, 8) if field_id.endswith(".latent_kv") else (16, 2, 8)
         )
-        expected_element_size = 1 if family == "dsa" and is_index else 2
-        assert layout.field_dtype(field_id) == field_dtypes[field_id]
+        # The recipe put the dtype in the plan; the contract reads it back.
+        expected_dtype = "uint8" if family == "dsa" and is_index else "bfloat16"
+        assert layout.field_dtype(field_id) == expected_dtype
         assert field.shape == expected_shape
-        assert field.element_size == expected_element_size
+        assert field.element_size == (1 if expected_dtype == "uint8" else 2)
         partition = layout.transfer_schema.partition_for(field_id)
         if field_id.endswith((".k", ".v")):
             assert partition is not None

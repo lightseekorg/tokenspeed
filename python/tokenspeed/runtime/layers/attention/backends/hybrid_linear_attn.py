@@ -326,7 +326,7 @@ class MambaAttnBackend(AttentionBackend):
     def set_kv_pool(self, kv_pool) -> None:
         """Bind a unified pool that publishes state groups and component views."""
         self.kv_pool = kv_pool
-        contract = kv_pool.runtime_contract
+        contract = kv_pool.arena.runtime_contract
         if contract is None:
             raise RuntimeError(
                 "MambaAttnBackend requires a KV pool with a runtime cache contract"
@@ -2127,7 +2127,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.linear_attn_backend.init_forward_metadata(*args, **kwargs)
 
     def init_cuda_graph_state(self, max_bs: int, **kwargs):
-        # kwargs (e.g. paged_cache_group_specs, so the full backend sheds
+        # kwargs (e.g. cache_group_specs, so the full backend sheds
         # state-family groups) are forwarded through the shared signature
         # filter: the full backend is user-selectable and may have a narrow
         # signature (e.g. TRTLLM MHA takes only (max_bs,)), and the mamba

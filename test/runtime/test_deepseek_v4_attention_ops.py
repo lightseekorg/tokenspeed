@@ -39,6 +39,10 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
 )
 from tokenspeed_kernel.ops.transform import hadamard_transform
 
+from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
+    deepseek_v4_swa_scale_dim,
+    deepseek_v4_swa_token_stride,
+)
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_combine_dense_swa_indices,
     deepseek_v4_combine_topk_swa_indices,
@@ -60,10 +64,6 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     _mask_invalid_graph_tokens,
-)
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec import (
-    deepseek_v4_swa_scale_dim,
-    deepseek_v4_swa_token_stride,
 )
 from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_sanitize_swa_slot_mapping,

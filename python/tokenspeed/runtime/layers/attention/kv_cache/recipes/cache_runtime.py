@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    PagedCacheGroupSpec,
+    CacheGroupSpec,
 )
 
 
@@ -54,12 +54,15 @@ def require_positive_int(name: str, value: object) -> int:
 
 
 @dataclass(frozen=True)
-class PagedCacheRuntimeContract:
+class CacheRuntimeContract:
     prefix_granularity: int
     num_lcm_blocks: int
     token_capacity: int
-    group_specs: tuple[PagedCacheGroupSpec, ...]
+    group_specs: tuple[CacheGroupSpec, ...]
+    # Both projected from the memory plan, which owns physical geometry: how
+    # many CacheBlocks each group has, and how many share one LCM parent.
     group_page_counts: Mapping[str, int]
+    group_packing: Mapping[str, int]
 
     def __post_init__(self) -> None:
         prefix_granularity = require_positive_int(
@@ -69,8 +72,8 @@ class PagedCacheRuntimeContract:
         token_capacity = require_positive_int("token_capacity", self.token_capacity)
         if not isinstance(self.group_specs, tuple) or not self.group_specs:
             raise ValueError("group_specs must be a non-empty tuple")
-        if any(not isinstance(spec, PagedCacheGroupSpec) for spec in self.group_specs):
-            raise ValueError("group_specs must contain PagedCacheGroupSpec values")
+        if any(not isinstance(spec, CacheGroupSpec) for spec in self.group_specs):
+            raise ValueError("group_specs must contain CacheGroupSpec values")
         group_ids = tuple(spec.group_id for spec in self.group_specs)
         if len(group_ids) != len(set(group_ids)):
             raise ValueError("group_specs contain duplicate group IDs")
@@ -89,14 +92,24 @@ class PagedCacheRuntimeContract:
             )
             for group_id in group_ids
         }
-        expected_counts = {
-            spec.group_id: num_lcm_blocks
-            * require_positive_int(
-                f"cache_blocks_per_lcm_block for {spec.group_id!r}",
-                spec.cache_blocks_per_lcm_block,
+        packing = dict(self.group_packing)
+        if set(packing) != expected_group_ids:
+            raise ValueError(
+                "group_packing keys must match group_specs: "
+                f"missing={sorted(expected_group_ids - set(packing))} "
+                f"extra={sorted(set(packing) - expected_group_ids)}"
             )
-            + 1
-            for spec in self.group_specs
+        packing = {
+            group_id: require_positive_int(
+                f"cache_blocks_per_lcm_block for {group_id!r}", packing[group_id]
+            )
+            for group_id in group_ids
+        }
+        # Both sides come from the plan, so this checks the plan's own
+        # arithmetic: every group's blocks are its packing per parent times
+        # the parent count, plus the reserved null block.
+        expected_counts = {
+            group_id: num_lcm_blocks * packing[group_id] + 1 for group_id in group_ids
         }
         if counts != expected_counts:
             raise ValueError(
@@ -110,3 +123,4 @@ class PagedCacheRuntimeContract:
                 "token_capacity exceeds the largest group's child-page capacity"
             )
         object.__setattr__(self, "group_page_counts", MappingProxyType(counts))
+        object.__setattr__(self, "group_packing", MappingProxyType(packing))

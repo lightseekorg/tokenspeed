@@ -582,7 +582,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             weights,
             seq_lens,
             page_table,
-            page_size=ctx.token_to_kv_pool.kv_page_size,
+            page_size=ctx.token_to_kv_pool.arena.kv_page_size,
             topk=topk,
             softmax_scale=self.indexer.weights_softmax_scale,
             q_len_per_req=q_len_per_req,
@@ -621,7 +621,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             )
 
         topk = self.index_topk
-        page_size = ctx.token_to_kv_pool.kv_page_size
+        page_size = ctx.token_to_kv_pool.arena.kv_page_size
         max_seq_len = int(seq_lens.max().item())
         max_pages = (max_seq_len + page_size - 1) // page_size
         page_table = chunk_meta.page_table[:, :max_pages].to(
@@ -708,7 +708,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             topk=topk,
             softmax_scale=self.indexer.weights_softmax_scale,
             index_k_cache=index_k_cache,
-            page_size=ctx.token_to_kv_pool.kv_page_size,
+            page_size=ctx.token_to_kv_pool.arena.kv_page_size,
             max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
         )
         return GlmDsaPrefillTopK(
