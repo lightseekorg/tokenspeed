@@ -218,8 +218,6 @@ def _kda_fused_decode_kernel(
     sequence_idx = sequence_head // H
     head_idx = sequence_head % H
 
-    # Eight Wave32 warps preserve the 64 FP32 state elements per thread used
-    # by the gfx950 fusion while covering the complete 128x128 state matrix.
     state_layout: gl.constexpr = gl.BlockedLayout(
         [8, 8],
         [8, 4],
