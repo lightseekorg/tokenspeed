@@ -436,6 +436,7 @@ def test_nvfp4_situ_deferred_triple_matches_finalized() -> None:
     torch.cuda.synchronize()
 
     # Triple contract, as consumed by KimiK3LatentTailOp.call_deferred.
+    assert gemm2_out.dtype == torch.bfloat16
     assert expert_weights.dtype == torch.bfloat16
     assert torch.equal(expert_weights, topk_weights)  # routed variant echoes
     assert expanded_idx.dtype == torch.int32

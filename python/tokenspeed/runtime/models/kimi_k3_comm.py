@@ -550,8 +550,8 @@ class K3MoeTailComm:
             # experts kernel plan's own supports_deferred_finalize bit,
             # passed in by the model (this comm layer never sees the experts
             # module itself) — NOT a use_trtllm proxy: the trtllm solution
-            # spans kernels with either capability (mxfp4 SwiGLU emits the
-            # deferred triple, the SiTU variants do not). The backstops stay
+            # spans kernels with either capability (the SiTU variants emit
+            # the deferred triple, mxfp4 SwiGLU does not). The backstops stay
             # explicit: the experts layer raises on do_finalize=False without
             # the trait, and KimiK3LatentTailOp.call_deferred raises on
             # non-BF16 scales (no silent down-cast), so a mis-armed or

@@ -1609,8 +1609,9 @@ class KimiLinearMoE(nn.Module):
             up_proj=self.routed_expert_up_proj,
             execution_plan=self.execution_plan,
             # The experts kernel plan's capability bit (rank-uniform):
-            # nvfp4-SiTU registers supports_deferred_finalize=False, so the
-            # latent tail must arm the materialized-input mode there.
+            # both SiTU variants register the deferred capability, while a
+            # kernel without it (e.g. mxfp4 SwiGLU) arms the
+            # materialized-input tail instead.
             # self.experts is constructed above, before this comm object.
             experts_supports_deferred_finalize=(
                 self.experts.supports_deferred_finalize
