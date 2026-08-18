@@ -7,12 +7,9 @@ from tokenspeed.runtime.engine.request_handler import RequestHandler
 
 class TestRequestHandlerWeightUpdate(unittest.TestCase):
     def test_deferred_state_settles_before_the_weights_load(self):
-        """A pause(keep) reply is immediate, so a weight update can arrive in
-        the same socket drain as the pause -- before the event loop's
-        pause-fence flush runs. The handler must settle deferred backend state
-        BEFORE loading the new weights: a deferred KDA window replayed through
-        freshly loaded weights would commit state the old model never
-        produced."""
+        """A weight update can share a socket drain with a pause(keep),
+        ahead of the loop's pause-fence flush; deferred state must settle
+        before the new weights load."""
         order = []
         handler = RequestHandler.__new__(RequestHandler)
         handler.send_func = mock.Mock()
@@ -20,8 +17,13 @@ class TestRequestHandlerWeightUpdate(unittest.TestCase):
             side_effect=lambda: order.append("settle")
         )
         handler.model_runner = mock.Mock()
+
+        def load(req):
+            order.append("load")
+            return True, "ok"
+
         handler.model_runner.update_weights_from_distributed = mock.Mock(
-            side_effect=lambda req: (order.append("load"), (True, "ok"))[1]
+            side_effect=load
         )
 
         handler.process_requests(

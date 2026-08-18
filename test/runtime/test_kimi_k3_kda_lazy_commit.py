@@ -1205,15 +1205,9 @@ def _guard_window_change(h, rpis, pages):
     ids=["no_identity", "corpse", "departed", "ring_growth", "window_change"],
 )
 def test_every_staging_guard_anchors_to_committed_pages(trigger):
-    """Whichever guard retires the pending, the round still verifies from its
-    committed pages.
-
-    The stage neutral-fills every control row to -1 before deciding the
-    pending's fate. The five guard exits and the no-pending exit share one
-    anchor copy; this pins that property per guard, with an absolute oracle
-    on the control rows so a defect that breaks every exit at once -- the
-    likely shape of a future refactor regression -- cannot hide behind two
-    harnesses failing identically.
+    """Whichever guard retires the pending, the round still verifies from
+    its committed pages -- pinned per guard with an absolute oracle, so a
+    defect breaking every exit at once cannot hide.
     """
     rpis = [0, 1]
     h = _Harness(seed=61)
@@ -1224,8 +1218,7 @@ def test_every_staging_guard_anchors_to_committed_pages(trigger):
 
     trigger(h, rpis, pages)
 
-    bs = len(h.backend._kda_lazy_bufs["base"][:2].tolist())
-    _assert_anchored_to_committed(h, pages, bs, why=trigger.__name__)
+    _assert_anchored_to_committed(h, pages, len(rpis), why=trigger.__name__)
 
 
 def test_guard_flush_round_still_reads_committed_state():
@@ -1336,12 +1329,9 @@ def test_forward_without_a_record_does_not_double_apply_next_round():
 def test_zeroed_pages_condemn_a_retracted_owners_pending():
     """A retracted-but-resident owner's window dies when its pages recycle.
 
-    Capacity retraction leaves the owner in the engine's residency set (it
-    will rebase and re-prefill), so the pause fence's residency screen would
-    FLUSH its pending -- onto pages the pool already handed to a new
-    admission. The plan's pages_to_zero names exactly those pages; the drop
-    hook must condemn the matching rows so the later fence flush self-masks,
-    while an untouched co-owner still commits normally.
+    Retraction keeps the owner in the residency set, so the pause fence
+    would flush its pending onto pages already handed to a new admission;
+    the drop hook must condemn those rows while a co-owner still commits.
     """
     h = _Harness(seed=73, usable_pages=32)
     rpis = [0, 1]

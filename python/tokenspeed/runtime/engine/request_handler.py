@@ -249,12 +249,10 @@ class RequestHandler:
                     InitWeightsUpdateGroupReqOutput(success=ok, message=msg)
                 )
             elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
-                # RL weight sync: receive broadcast weights + load into the model.
-                # Settle deferred backend state FIRST. A pause(keep) reply is
-                # immediate, so this update can land in the same socket drain,
-                # before the loop's pause-fence flush runs -- and a deferred
-                # KDA window replayed through freshly loaded weights would
-                # commit state the old model never produced.
+                # RL weight sync. Settle deferred state first: the update can
+                # share a socket drain with a pause(keep), and a deferred window
+                # replayed through new weights would commit state the old model
+                # never produced.
                 if self.settle_deferred_fn is not None:
                     self.settle_deferred_fn()
                 ok, msg = self.model_runner.update_weights_from_distributed(recv_req)

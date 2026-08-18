@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
@@ -240,13 +241,13 @@ class AttentionBackend(ABC):
         teardown.
         """
 
-    def drop_deferred_on_pages(self, pages_by_group) -> None:
+    def drop_deferred_on_pages(
+        self, pages_by_group: Mapping[str, Sequence[int]]
+    ) -> None:
         """Condemn deferred work targeting pages being handed to new owners.
 
-        The engine calls this with the execution plan's ``pages_to_zero`` --
-        the freshly admitted pages, keyed by cache group -- before zeroing
-        them. A deferred write to such a page would land in a page that now
-        belongs to a different request.
+        Called with the plan's ``pages_to_zero`` before the zeroing; a
+        deferred write to such a page would land in another request's state.
         """
 
     def has_deferred_state(self) -> bool:

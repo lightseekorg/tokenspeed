@@ -24,6 +24,7 @@ See ``KdaAttnBackend`` for what separates the family from GDN."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -1110,25 +1111,24 @@ class KdaAttnBackend(MambaAttnBackend):
         return self._kda_pending is not None
 
     @override
-    def drop_deferred_on_pages(self, pages_by_group) -> None:
+    def drop_deferred_on_pages(
+        self, pages_by_group: Mapping[str, Sequence[int]]
+    ) -> None:
         """Condemn pending rows whose pages are being handed to new owners.
 
-        The plan's ``pages_to_zero`` names every freshly admitted page per
-        cache group. A pending row anchored on -- or committing into -- such a
-        page belongs to a retracted owner whose pages were reassigned; a later
-        flush would write a stale window into another request's state. Device-
-        side condemnation, the same idiom the compose uses: clear the slot
-        table row, and every later write (flush, fuse) self-masks on it. The
-        host dict entries linger harmlessly. No host-device sync: the page
-        lists ride an async H2D copy and the compare stays on the stream.
+        ``pages_to_zero`` names freshly admitted pages; a pending row
+        anchored on or committing into one belongs to a retracted owner,
+        and flushing it would write into the new owner's state. Clearing
+        the slot-table row self-masks every later write; everything stays
+        on the stream.
         """
         pending = self._kda_pending
-        if pending is None or not hasattr(pages_by_group, "get"):
+        if pending is None:
             return
         gids = self._state_group_ids
         table = self._kda_slot_table
         for i, gid in enumerate(gids):
-            zeroed = pages_by_group.get(gid) or pages_by_group.get(str(gid))
+            zeroed = pages_by_group.get(gid)
             if not zeroed:
                 continue
             zset = torch.as_tensor(
@@ -1136,12 +1136,9 @@ class KdaAttnBackend(MambaAttnBackend):
                 dtype=torch.int64,
                 device=self.device,
             )
-            # One broadcast compare per stack instead of isin's sort chain,
-            # and a FIXED-SHAPE scatter: boolean indexing would call nonzero
-            # and sync the host on the output size -- here, right after the
-            # loop's default-waits-execution fence, that would stall the CPU
-            # until the in-flight forward completes. Misses route to the
-            # table's sentinel row, which is documented to hold -1 forever.
+            # Fixed-shape update: boolean indexing would nonzero-sync the
+            # host mid-overlap. Misses scatter -1 onto the sentinel row,
+            # which holds -1 forever anyway.
             hit = (pending["commit_stack"][i].unsqueeze(1) == zset).any(1) | (
                 pending["anchor_stack"][i].unsqueeze(1) == zset
             ).any(1)
@@ -1595,10 +1592,8 @@ class KdaAttnBackend(MambaAttnBackend):
         if not self._graphs_captured and self._replay_active:
             self._graphs_captured = True
         self._kda_replay_staged = False
-        # Capture is the one verify-shaped prep that does not run the stage,
-        # so nothing else neutralizes the control rows. Today they are still
-        # at their -1 init (capture is startup-only, before any pending
-        # exists); clearing them keeps that true if capture ever moves.
+        # Capture skips the stage, so neutralize the control rows here in
+        # case capture ever moves past startup.
         bufs = self._kda_lazy_bufs
         if bufs is not None:
             bufs["flat"].fill_(-1)
@@ -1633,7 +1628,9 @@ class HybridKDABackend(HybridLinearAttnBackend):
         return self.linear_attn_backend.has_deferred_state()
 
     @override
-    def drop_deferred_on_pages(self, pages_by_group) -> None:
+    def drop_deferred_on_pages(
+        self, pages_by_group: Mapping[str, Sequence[int]]
+    ) -> None:
         self.linear_attn_backend.drop_deferred_on_pages(pages_by_group)
 
     @override

@@ -1022,23 +1022,15 @@ class EventLoop:
     def _flush_deferred_state(self) -> None:
         """Settle deferred backend state on the execution stream (pause fence).
 
-        The stream hop is the loop's job: an overlap-scheduled forward still
-        in flight must finish writing the backend's buffers first. A round
-        with no forward is deliberately NOT such a point: capacity
-        retraction schedules nothing precisely while the other decoders stay
-        resident, so an empty round says nothing about who is still here.
+        An empty round is deliberately not such a point: capacity retraction
+        schedules no forward exactly while other decoders stay resident.
 
-        This is NOT a pre-release fence, despite running under a pause. A
-        release drain sits at ``PAUSED_NEW``, so ``forward_blocked`` stays
-        false for its whole duration and ``PAUSED_ALL`` is only reached from
-        ``_finish_release`` -- after the adapter has unmapped the weights.
-        Settling deferred work under the weights that produced it has to
-        happen at the release itself; here the weights may already be gone.
+        Not a pre-release fence: a release drain sits at ``PAUSED_NEW``
+        until ``_finish_release`` has already unmapped the weights, so
+        deferred work must settle at the release itself, not here.
         """
         if self._pause.released:
-            # Weights and KV are unmapped. A backend flush replays through
-            # live weight tensors, so a launch here is an illegal access,
-            # not a stale result. Mirrors the guard on the idle forward below.
+            # Weights are unmapped; a replay here is an illegal access.
             return
         backend = self.model_executor.attn_backend
         if not backend.has_deferred_state():
@@ -1650,9 +1642,7 @@ class EventLoop:
                 continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
-            # Freshly admitted pages may recycle a retracted owner's; any
-            # deferred backend window targeting them must die before a later
-            # flush can write into the new owner's state.
+            # Condemn deferred windows on recycled pages before new owners land.
             self.model_executor.attn_backend.drop_deferred_on_pages(
                 execution_plan.pages_to_zero
             )
@@ -1815,9 +1805,7 @@ class EventLoop:
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
 
-            # Freshly admitted pages may recycle a retracted owner's; any
-            # deferred backend window targeting them must die before a later
-            # flush can write into the new owner's state.
+            # Condemn deferred windows on recycled pages before new owners land.
             self.model_executor.attn_backend.drop_deferred_on_pages(
                 execution_plan.pages_to_zero
             )
