@@ -341,6 +341,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.w2_weight = torch.empty(0)
                 self.w2_weight_scale = torch.empty(0)
                 self.plan = {}
+                # Consumed by K3MoeTailComm arming (real MoELayer exposes it
+                # from the selected kernel's plan trait).
+                self.supports_deferred_finalize = False
 
         class FakeSharedExperts(torch.nn.Module):
             def __init__(self, *args, **kwargs):
