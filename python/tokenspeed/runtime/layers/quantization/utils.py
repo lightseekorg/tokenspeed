@@ -417,3 +417,16 @@ def block_dequant(
             x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
 
     return x_dq_block
+
+
+def modelopt_block_scale_to_2d(scale: torch.Tensor) -> torch.Tensor:
+    """Normalize ModelOpt's 4-D block-scale layout to the 2-D block grid.
+
+    ModelOpt MIXED_PRECISION checkpoints store per-block FP8 dequant scales as
+    ``[ceil(N/block_n), 1, ceil(K/block_k), 1]``; runtime consumers use the
+    plain 2-D ``[ceil(N/block_n), ceil(K/block_k)]`` grid. 2-D inputs pass
+    through unchanged.
+    """
+    if scale.dim() == 4 and scale.shape[1] == 1 and scale.shape[3] == 1:
+        return scale.reshape(scale.shape[0], scale.shape[2])
+    return scale

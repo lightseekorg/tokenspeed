@@ -33,6 +33,7 @@ from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platf
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
+    dense_tensor_format,
     format_signature,
     format_signatures,
     tensor_format,
@@ -813,6 +814,218 @@ def triton_mm_fp8_blockscale(
         A,
         B,
         A_scales,
+        B_scales,
+        block_size=block_size,
+        output_dtype=out_dtype,
+        out=out,
+    )
+
+
+# ---- Triton weight-only per-block FP8 (W8A16) ------------------------------
+
+_WO_BLOCK_FP8_FORMAT_SIGNATURES = frozenset(
+    format_signature(
+        a=dense_tensor_format(act_dtype),
+        b=tensor_format("mxfp8", _fp8_dtype, scale=_MXFP8_BLOCK_SCALE),
+    )
+    for act_dtype in (torch.bfloat16, torch.float16)
+)
+
+
+@triton.jit
+def _wo_block_fp8_matmul(
+    A,
+    B,
+    C,
+    Bs,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_cm,
+    stride_cn,
+    stride_bsn,
+    stride_bsk,
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Weight-only block-FP8 GEMM tile: ``C = A @ dequant(B).T``.
+
+    ``A`` stays in its 16-bit dtype (never quantized). Each FP8 weight tile is
+    dequantized in registers to the activation dtype before the MMA, so the
+    math matches a 16-bit GEMM over the 16-bit-dequantized weight. ``BLOCK_N``
+    must divide ``group_n`` and ``BLOCK_K`` must divide ``group_k`` so every
+    tile maps to exactly one scale cell per k-step.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    scale_row_ptr = Bs + (pid_n * BLOCK_N // group_n) * stride_bsn
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+        a = tl.load(
+            A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+        b = tl.load(
+            B + offs_n[:, None] * stride_bn + offs_k[None, :] * stride_bk,
+            mask=mask_n[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+        scale = tl.load(scale_row_ptr + (k_start // group_k) * stride_bsk)
+        b = (b.to(tl.float32) * scale).to(a.dtype)
+        acc = tl.dot(a, b.trans(), acc)
+    tl.store(
+        C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        acc.to(C.dtype.element_ty),
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+def _largest_pow2_divisor(value: int, cap: int, floor: int) -> int:
+    """Largest power of two <= cap that divides value; at least floor."""
+    tile = cap
+    while tile > floor:
+        if value % tile == 0:
+            return tile
+        tile //= 2
+    if value % floor != 0:
+        raise ValueError(f"{value} has no power-of-two divisor >= {floor}")
+    return floor
+
+
+def wo_block_fp8_matmul_triton(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: List[int],
+    output_dtype: torch.dtype = torch.bfloat16,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Weight-only per-block FP8 GEMM (W8A16): ``A @ dequant(B).T``.
+
+    The activations are consumed as-is (bf16/fp16, never quantized) and the
+    FP8 weight blocks are dequantized in-kernel, preserving weight-only
+    quantization semantics (e.g. ModelOpt ``FP8_PB_WO``): the result matches a
+    16-bit GEMM over ``(B.float() * scale).to(A.dtype)`` up to fp32-accumulator
+    tiling order.
+
+    Args:
+        A: Activations ``[..., K]``, bf16 or fp16.
+        B: FP8 (e4m3) weight ``[N, K]``.
+        Bs: float32 dequant scales ``[ceil(N/block_n), ceil(K/block_k)]`` with
+            ``dequant(B)[n, k] = float(B[n, k]) * Bs[n // block_n, k // block_k]``.
+        block_size: ``[block_n, block_k]`` weight quantization block shape.
+        output_dtype: Dtype of the returned tensor.
+        out: Optional preallocated output ``[..., N]``.
+
+    Returns:
+        ``A @ dequant(B).T`` shaped ``[..., N]`` in ``output_dtype``.
+    """
+    assert len(block_size) == 2
+    block_n, block_k = int(block_size[0]), int(block_size[1])
+    assert A.dtype in (
+        torch.bfloat16,
+        torch.float16,
+    ), f"weight-only FP8 GEMM keeps activations 16-bit, got {A.dtype}"
+    assert B.dtype == _fp8_dtype, f"expected {_fp8_dtype} weight, got {B.dtype}"
+    assert Bs.dtype == torch.float32, f"expected float32 scales, got {Bs.dtype}"
+    assert A.shape[-1] == B.shape[-1], f"K mismatch: {A.shape=} {B.shape=}"
+    assert A.is_contiguous()
+    assert B.ndim == 2 and B.is_contiguous()
+    N, K = B.shape
+    assert Bs.ndim == 2 and Bs.shape == (
+        triton.cdiv(N, block_n),
+        triton.cdiv(K, block_k),
+    ), f"{Bs.shape=} does not match {B.shape=} with {block_size=}"
+
+    M = A.numel() // A.shape[-1]
+    C_shape = A.shape[:-1] + (N,)
+    C = out if out is not None else A.new_empty(C_shape, dtype=output_dtype)
+    assert tuple(C.shape) == tuple(C_shape) and C.is_contiguous()
+    if M == 0:
+        return C
+
+    A_2d = A.view(M, K)
+    C_2d = C.view(M, N)
+    BLOCK_M = 16 if M <= 16 else 64
+    BLOCK_N = _largest_pow2_divisor(block_n, cap=64, floor=16)
+    BLOCK_K = _largest_pow2_divisor(block_k, cap=128, floor=16)
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    _wo_block_fp8_matmul[grid](
+        A_2d,
+        B,
+        C_2d,
+        Bs,
+        M,
+        N,
+        K,
+        A_2d.stride(0),
+        A_2d.stride(1),
+        B.stride(0),
+        B.stride(1),
+        C_2d.stride(0),
+        C_2d.stride(1),
+        Bs.stride(0),
+        Bs.stride(1),
+        group_n=block_n,
+        group_k=block_k,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+        num_stages=3,
+    )
+    return C
+
+
+@register_kernel(
+    "gemm",
+    "mm",
+    name="triton_mm_fp8_weight_only_blockscale",
+    solution="triton",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 0),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=_WO_BLOCK_FP8_FORMAT_SIGNATURES,
+    traits={},
+    priority=Priority.PERFORMANT,
+    tags={"portability"},
+)
+def triton_mm_fp8_weight_only_blockscale(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    block_size: List[int] | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    del alpha
+    assert (
+        A_scales is None
+    ), "weight-only FP8 GEMM takes unquantized activations (no A_scales)"
+    assert block_size is not None, "block_size is required for weight-only FP8 GEMM"
+    if B_scales is None:
+        raise ValueError("B_scales is required for weight-only FP8 GEMM")
+    return wo_block_fp8_matmul_triton(
+        A,
+        B,
         B_scales,
         block_size=block_size,
         output_dtype=out_dtype,

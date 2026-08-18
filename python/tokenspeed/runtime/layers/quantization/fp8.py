@@ -135,3 +135,59 @@ class Mxfp8Config(Fp8Config):
 
     def moe_weight_dtype(self, prefix: str = "") -> str:
         return "fp8"
+
+
+class Fp8BlockWeightOnlyConfig(QuantizationConfig):
+    """Config for per-block FP8 weight-only linear layers (ModelOpt FP8_PB_WO).
+
+    Weight-only semantics: FP8 (e4m3) weights stay FP8-resident with float32
+    per-``[block_n, block_k]`` dequant scales, activations are never quantized
+    (bf16/fp16 pass through as-is), and the GEMM dequantizes weight blocks
+    in-kernel (W8A16). This intentionally does NOT inherit from
+    :class:`Fp8Config`, whose block-quant path dynamically quantizes
+    activations (w8a8) and would change the checkpoint's export semantics.
+
+    ModelOpt exports the dequant scale as ``weight_scale`` shaped
+    ``[ceil(N/block_n), 1, ceil(K/block_k), 1]``; the linear method accepts
+    that layout (and plain 2-D) at load time.
+    """
+
+    def __init__(
+        self,
+        weight_block_size: list[int] | None = None,
+        exclude_modules: list[str] | None = None,
+    ) -> None:
+        super().__init__(exclude_modules=exclude_modules)
+        weight_block_size = list(weight_block_size or [128, 128])
+        if len(weight_block_size) != 2:
+            raise ValueError(
+                "FP8 weight-only block quantization requires a 2-dim block "
+                f"size, got {weight_block_size}."
+            )
+        self.weight_block_size = weight_block_size
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "fp8_pb_wo"
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        return [torch.bfloat16, torch.half]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 90
+
+    @classmethod
+    def get_config_filenames(cls) -> list[str]:
+        return []
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> Fp8BlockWeightOnlyConfig:
+        return cls(
+            weight_block_size=cls.get_from_keys_or(config, ["weight_block_size"], None),
+            exclude_modules=cls.get_from_keys_or(config, ["exclude_modules"], None),
+        )
+
+    def get_scaled_act_names(self) -> list[str]:
+        return []

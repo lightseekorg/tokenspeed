@@ -124,6 +124,10 @@ from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.topk import TopK, TopKOutput, TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
+    preprocess_fp8_pb_wo_weights,
+)
+from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
@@ -2313,7 +2317,15 @@ class KimiLinearForCausalLM(BaseCausalLM):
         KDA layers' remaining ``self_attn.*`` weights (conv + A_log / dt_bias /
         f_b / o_norm / o_proj) load directly through the default path — their
         names match ``KimiLinearKDA``'s modules 1:1 (no fusion).
+
+        ModelOpt FP8_PB_WO checkpoints (nvidia/Kimi-K3-NVFP4) are adapted by
+        ``preprocess_fp8_pb_wo_weights`` before any of the above: raw-consumed
+        attention weights (KDA merged q/k/v/g/f_a/b, f_b, MLA q_a/kv_a/g/q_b)
+        arrive block-dequantized to bf16 so the existing stacking/fusing paths
+        work unchanged, while o_proj / kv_b_proj keep FP8 weights with their
+        scales renamed to ``weight_scale_inv`` for the w8a8 blockwise method.
         """
+        weights = preprocess_fp8_pb_wo_weights(weights, self.quant_config)
         config = self.config
         stacked_params_mapping = [
             # KDA q/k/v/g/f_a/b stack into qkvgb_proj; MLA's g_proj falls
@@ -2429,15 +2441,34 @@ class KimiLinearForCausalLM(BaseCausalLM):
     def post_load_weights(self) -> None:
         """Prepare the absorbed MLA weights (``w_kc``/``w_vc``) per MLA layer.
 
-        Kimi-K3's attention is unquantized (MXFP4 ignores ``self_attn.*``), so
-        ``kv_b_proj.weight`` is bf16 and no block dequant is needed. KDA layers
-        have no ``kv_b_proj`` (not ``KimiLinearMLAAttention``) and are skipped.
+        With FP8_PB_WO checkpoints ``kv_b_proj.weight`` stays FP8 for the
+        w8a8 prefill GEMM; the absorbed ``w_kc``/``w_vc`` copies follow the
+        DeepSeek R1 precedent and block-dequantize to the activation dtype
+        (``DeepseekV3ForCausalLM.post_load_weights``). bf16 checkpoints (e.g.
+        moonshotai/Kimi-K3, whose MXFP4 config ignores ``self_attn.*``) skip
+        the dequant. KDA layers have no ``kv_b_proj`` (not
+        ``KimiLinearMLAAttention``) and are skipped.
         """
         for layer in self.model.layers:
             self_attn = layer.self_attn
             if isinstance(self_attn, KimiLinearMLAAttention):
+                w = self_attn.kv_b_proj.weight
+                if w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+                    if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
+                        raise RuntimeError(
+                            "kv_b_proj.weight_scale_inv is required for block "
+                            "FP8 dequant of the absorbed MLA weights."
+                        )
+                    weight_block_size = (
+                        self_attn.kv_b_proj.quant_method.quant_config.weight_block_size
+                    )
+                    w = block_dequant(
+                        w,
+                        self_attn.kv_b_proj.weight_scale_inv,
+                        weight_block_size,
+                    ).to(torch.get_default_dtype())
                 self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
-                    self_attn.kv_b_proj.weight, self_attn
+                    w, self_attn
                 )
             elif isinstance(self_attn, KimiLinearKDA):
                 self_attn.fuse_conv_weights()
