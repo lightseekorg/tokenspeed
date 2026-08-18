@@ -476,6 +476,19 @@ srun "${{srun_args[@]}}" "${{container_command[@]}}"
         "--unbuffered",
         "--kill-on-bad-exit=1",
     ]
+    image_prepare_args = [
+        "--overlap",
+        "--nodes=1",
+        "--ntasks=1",
+        "--gres=none",
+        "--unbuffered",
+        "--kill-on-bad-exit=1",
+        "--export=ALL",
+        f"--container-image={image}",
+        "--no-container-entrypoint",
+        "--no-container-mount-home",
+        "--container-remap-root",
+    ]
     server_srun = [
         "--overlap",
         "--label",
@@ -519,6 +532,7 @@ srun "${{srun_args[@]}}" "${{container_command[@]}}"
     return common + f"""
 {shell_array("prepare_args", prepare_args)}
 {shell_array("client_prepare_args", client_prepare_args)}
+{shell_array("image_prepare_args", image_prepare_args)}
 {shell_array("cleanup_args", cleanup_args)}
 
 server_src="$scratch/server-src"
@@ -532,6 +546,7 @@ server_container_mounts="$(IFS=,; printf '%s' "${{server_mounts[*]}}")"
 client_container_mounts="$(IFS=,; printf '%s' "${{client_mounts[*]}}")"
 head_node="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n '1p')"
 client_prepare_args+=(--nodelist="$head_node")
+image_prepare_args+=(--nodelist="$head_node")
 
 server_step_pid=""
 client_step_pid=""
@@ -551,6 +566,10 @@ cleanup() {{
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# Import a new image digest once before every node opens the shared Enroot
+# cache. Concurrent first-use imports race on the cache's final rename.
+srun "${{image_prepare_args[@]}}" true
 
 srun "${{prepare_args[@]}}" \
   bash -c 'set -euo pipefail; mkdir -p "$1/.ci-artifacts" "$2"; tar -xf "$3" -C "$1"' \

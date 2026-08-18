@@ -445,6 +445,9 @@ def test_render_script_orchestrates_multi_node_server_and_head_client():
         in script
     )
     assert 'client_prepare_args+=(--nodelist="$head_node")' in script
+    assert 'image_prepare_args+=(--nodelist="$head_node")' in script
+    image_prepare_block = script.split("image_prepare_args=(", 1)[1].split(")", 1)[0]
+    assert "--container-image=" in image_prepare_block
     assert 'client_srun_args+=(--nodelist="$head_node")' in script
     assert "--serve-only" in script
     assert "--external-server" in script
@@ -455,6 +458,10 @@ def test_render_script_orchestrates_multi_node_server_and_head_client():
     assert 'client_src="$scratch/client-src"' in script
     assert "tokenspeed-cleanup" in script
     assert "trap cleanup EXIT" in script
+    assert 'srun "${image_prepare_args[@]}" true' in script
+    assert script.index('srun "${image_prepare_args[@]}" true') < script.index(
+        'srun "${server_srun_args[@]}"'
+    )
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
 
