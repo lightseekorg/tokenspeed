@@ -376,4 +376,50 @@ TEST(CacheOperationTest, WriteBackBatchCarriesStorageKeys) {
     ASSERT_EQ(batch.page_offsets[0], std::vector<std::int32_t>({0}));
 }
 
+TEST(CacheOperationTest, L3KeySurvivesHostEvictionAndPrefetches) {
+    BlockPool device_pool{8};
+    BlockPool host_pool{2};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, &host_pool,
+                                                   /*stream_device_cache_to_host=*/true, /*enable_l3_storage=*/true);
+
+    const CacheKey key_h0{.group_id = 0, .content_hash = "h0"};
+    const CacheKey key_h1{.group_id = 0, .content_hash = "h1"};
+    CacheBlockRef first = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef second = host_pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    coordinator.CacheHostBlock(first, key_h0);
+    coordinator.CacheHostBlock(second, key_h1);
+    first.reset();
+    second.reset();
+    ASSERT_TRUE(coordinator.ContainsHostCachedBlock(key_h0));
+    ASSERT_TRUE(coordinator.ContainsStorageKey(key_h0));
+
+    CacheBlockRef replacement = coordinator.AcquireHostBlock(/*group_id=*/0);
+    ASSERT_TRUE(replacement);
+    replacement.reset();
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(key_h0)) << "Host eviction must drop the L2 index entry";
+    EXPECT_TRUE(coordinator.ContainsStorageKey(key_h0)) << "Mooncake L3 keys survive Host eviction";
+
+    auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
+    EXPECT_EQ(probe.host.num_common_tokens, 2);
+
+    std::vector<BlockTable> tables(1);
+    std::vector<GroupDemand> demands{{.table = &tables[0], .num_tokens = 2}};
+    auto admission = coordinator.Admit(std::move(probe), demands);
+    ASSERT_TRUE(admission);
+    ASSERT_EQ(admission->load_pairs.size(), 1u);
+    EXPECT_TRUE(admission->load_pairs[0].prefetch_from_storage);
+    EXPECT_EQ(admission->load_pairs[0].key.content_hash, "h0");
+
+    admission.reset();
+    coordinator.Free(tables);
+    EXPECT_TRUE(coordinator.ClearCache());
+}
+
 }  // namespace tokenspeed::test

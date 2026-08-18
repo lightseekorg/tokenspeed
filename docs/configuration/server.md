@@ -281,5 +281,9 @@ in `--kvstore-storage-backend-extra-config`, for example:
 ```
 
 `--kvstore-storage-backend memory` is an in-process dict for tests only.
+CI exercises that Mooncake-compatible contract end-to-end (scheduler
+prefetch after `register_storage_keys` / Host eviction, and a CUDA
+D2H → store → Host wipe → prefetch → H2D round trip) without running a
+Mooncake master.
 Mooncake Store is the offload backend; PD KV transfer still uses the
 separate Mooncake TransferEngine (`--disaggregation-transfer-backend`).

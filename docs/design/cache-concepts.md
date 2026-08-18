@@ -322,7 +322,10 @@ Its responsibilities:
   The scheduler's `storage_keys_` set treats those keys as Host hits that
   require prefetch; Host eviction does **not** drop the L3 key. Cross-instance
   reuse probes `batch_exists` before `submit_requests` and
-  `register_storage_keys`. This is the TokenSpeed equivalent of SGLang HiCache
+  `register_storage_keys`. CI covers this path with the in-process `memory`
+  backend (no Mooncake master): scheduler tests register keys / evict Host
+  then assert `prefetch_from_storage`, and the CUDA runtime suite round-trips
+  packed Host bytes through `batch_put_from` / Host wipe / `batch_get_into`.
   / vLLM `MooncakeStoreConnector`, keyed on packed CacheBlocks rather than
   split K/V pages.
 * **Reclamation and lifecycle.** `ReclaimExpired`, `Free`,
