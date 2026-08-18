@@ -22,6 +22,7 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (  # noqa: 
 
 if is_cdna4():
     from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4 import (
+        gluon_deepseek_v4_paged_selected_attention_split_gfx950,
         gluon_deepseek_v4_selected_attention_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import (  # noqa: E402
@@ -88,6 +89,52 @@ def test_deepseek_v4_selected_attention_matches_reference() -> None:
     reference = torch.einsum("hs,sd->hd", probabilities, selected).to(torch.bfloat16)
 
     torch.testing.assert_close(output[0], reference, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="DeepSeek V4 Gluon kernel targets gfx950")
+def test_deepseek_v4_paged_split_attention_applies_sink_once() -> None:
+    tokens = 2
+
+    def constant_cache(pages: int) -> torch.Tensor:
+        cache = torch.empty((pages, 64 * 584), device="cuda", dtype=torch.uint8)
+        rows = cache[:, : 64 * 576].view(pages, 64, 576)
+        rows[:, :, :448].copy_(
+            torch.ones((pages, 64, 448), device="cuda")
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+        )
+        rows[:, :, 448:].view(torch.bfloat16).fill_(1.0)
+        cache[:, 64 * 576 :].fill_(127)
+        return cache
+
+    q = torch.zeros((tokens, 16, 512), device="cuda", dtype=torch.bfloat16)
+    swa_cache = constant_cache(2)
+    extra_cache = constant_cache(16)
+    swa_slots = torch.arange(128, device="cuda", dtype=torch.int32).repeat(tokens, 1)
+    extra_slots = torch.arange(1024, device="cuda", dtype=torch.int32).repeat(tokens, 1)
+    swa_lens = torch.full((tokens,), 128, device="cuda", dtype=torch.int32)
+    extra_lens = torch.full((tokens,), 1024, device="cuda", dtype=torch.int32)
+    sink = torch.zeros((16,), device="cuda", dtype=torch.float32)
+    out = torch.empty_like(q)
+
+    actual = gluon_deepseek_v4_paged_selected_attention_split_gfx950(
+        q,
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        64,
+        sink,
+        512**-0.5,
+        extra_cache,
+        extra_slots,
+        extra_lens,
+        64,
+        out,
+    )
+
+    expected = torch.full_like(q, 1152.0 / 1153.0)
+    assert actual is out
+    torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)
 
 
 @pytest.mark.parametrize(

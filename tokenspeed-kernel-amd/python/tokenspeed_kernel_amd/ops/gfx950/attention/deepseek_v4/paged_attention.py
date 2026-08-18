@@ -27,7 +27,10 @@ import math
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
-__all__ = ["gluon_deepseek_v4_paged_selected_attention_gfx950"]
+__all__ = [
+    "gluon_deepseek_v4_paged_selected_attention_gfx950",
+    "gluon_deepseek_v4_paged_selected_attention_split_gfx950",
+]
 
 
 @gluon.jit
@@ -372,6 +375,355 @@ def _deepseek_v4_paged_selected_attention_kernel(
     )
 
 
+@gluon.jit
+def _deepseek_v4_paged_split_stage_kernel(
+    q,
+    swa_cache_u8,
+    swa_cache_fp8,
+    swa_cache_bf16,
+    swa_slots,
+    swa_lens,
+    extra_cache_u8,
+    extra_cache_fp8,
+    extra_cache_bf16,
+    extra_slots,
+    extra_lens,
+    partial_out,
+    partial_lse,
+    stride_q_t: tl.int64,
+    stride_q_h: tl.int64,
+    swa_page_stride_bytes: tl.int64,
+    extra_page_stride_bytes: tl.int64,
+    stride_po_t: tl.int64,
+    stride_po_h: tl.int64,
+    stride_po_s: tl.int64,
+    stride_lse_t: tl.int64,
+    stride_lse_h: tl.int64,
+    stride_lse_s: tl.int64,
+    softmax_scale: tl.float32,
+    swa_page_size: gl.constexpr,
+    extra_page_size: gl.constexpr,
+    swa_capacity: tl.int64,
+    extra_capacity: tl.int64,
+    SWA_WIDTH: gl.constexpr,
+    EXTRA_WIDTH: gl.constexpr,
+    NUM_KV_SPLITS: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    TILE_K: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+):
+    mfma_score: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 16],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    mfma_value: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 16],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    q_load_layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 8],
+        threads_per_warp=[1, 64],
+        warps_per_cta=[4, 1],
+        order=[1, 0],
+    )
+    kv_load_layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[8, 1],
+        threads_per_warp=[64, 1],
+        warps_per_cta=[1, 4],
+        order=[0, 1],
+    )
+    q_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[512, 16]],
+        [BLOCK_H, HEAD_DIM],
+        [1, 0],
+    )
+    kv_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[512, 16]],
+        [HEAD_DIM, TILE_K],
+        [0, 1],
+    )
+    q_dot_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0,
+        parent=mfma_score,
+        k_width=8,
+    )
+    k_dot_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1,
+        parent=mfma_score,
+        k_width=8,
+    )
+    p_dot_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0,
+        parent=mfma_value,
+        k_width=4,
+    )
+    v_dot_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1,
+        parent=mfma_value,
+        k_width=4,
+    )
+
+    token_idx = gl.program_id(axis=0)
+    split_idx = gl.program_id(axis=2)
+    raw_swa_len = gl.load(swa_lens + token_idx).to(gl.int32)
+    raw_extra_len = gl.load(extra_lens + token_idx).to(gl.int32)
+    swa_len = gl.minimum(gl.maximum(raw_swa_len, 0), SWA_WIDTH)
+    extra_len = gl.minimum(gl.maximum(raw_extra_len, 0), EXTRA_WIDTH)
+
+    q_heads = gl.arange(
+        0,
+        BLOCK_H,
+        layout=gl.SliceLayout(1, q_load_layout),
+    )
+    q_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, q_load_layout))
+    q_offsets = (
+        token_idx.to(tl.int64) * stride_q_t
+        + q_heads[:, None].to(tl.int64) * stride_q_h
+        + q_dims[None, :].to(tl.int64)
+    )
+    q_values = gl.load(q + q_offsets)
+    q_shared = gl.allocate_shared_memory(
+        q.dtype.element_ty,
+        [BLOCK_H, HEAD_DIM],
+        layout=q_shared_layout,
+    )
+    q_shared.store(q_values)
+    kv_shared = gl.allocate_shared_memory(
+        q.dtype.element_ty,
+        [HEAD_DIM, TILE_K],
+        layout=kv_shared_layout,
+    )
+
+    gl.barrier()
+    q_dot = q_shared.load(q_dot_layout)
+    score_heads = gl.arange(
+        0,
+        BLOCK_H,
+        layout=gl.SliceLayout(1, mfma_score),
+    )
+    max_value = gl.full(
+        [BLOCK_H],
+        -float("inf"),
+        dtype=gl.float32,
+        layout=gl.SliceLayout(1, mfma_score),
+    )
+    denominator = gl.zeros(
+        [BLOCK_H],
+        dtype=gl.float32,
+        layout=gl.SliceLayout(1, mfma_score),
+    )
+    accumulator = gl.zeros(
+        [BLOCK_H, HEAD_DIM],
+        dtype=gl.float32,
+        layout=mfma_value,
+    )
+
+    local_k_load = gl.arange(
+        0,
+        TILE_K,
+        layout=gl.SliceLayout(0, kv_load_layout),
+    )
+    kv_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, kv_load_layout))
+    swa_tiles = gl.cdiv(swa_len, TILE_K)
+    extra_tiles = gl.cdiv(extra_len, TILE_K)
+    total_tiles = swa_tiles + extra_tiles
+    tile_start = (split_idx * total_tiles) // NUM_KV_SPLITS
+    tile_end = ((split_idx + 1) * total_tiles) // NUM_KV_SPLITS
+    split_has_tiles = tile_start < tile_end
+    num_tiles = gl.maximum(tile_end - tile_start, 1)
+
+    for local_tile_idx in range(num_tiles):
+        tile_idx = tile_start + local_tile_idx
+        if tile_idx < swa_tiles:
+            positions = tile_idx * TILE_K + local_k_load
+            slots_load, valid_load = _load_segment_slot(
+                swa_slots,
+                token_idx,
+                positions,
+                swa_len,
+                swa_capacity,
+                SWA_WIDTH,
+            )
+            valid_load &= split_has_tiles
+            kv_values = _load_page_planar_tile(
+                swa_cache_u8,
+                swa_cache_fp8,
+                swa_cache_bf16,
+                slots_load,
+                valid_load,
+                kv_dims,
+                swa_page_stride_bytes,
+                swa_page_size,
+            )
+        else:
+            positions = (tile_idx - swa_tiles) * TILE_K + local_k_load
+            slots_load, valid_load = _load_segment_slot(
+                extra_slots,
+                token_idx,
+                positions,
+                extra_len,
+                extra_capacity,
+                EXTRA_WIDTH,
+            )
+            valid_load &= split_has_tiles
+            kv_values = _load_page_planar_tile(
+                extra_cache_u8,
+                extra_cache_fp8,
+                extra_cache_bf16,
+                slots_load,
+                valid_load,
+                kv_dims,
+                extra_page_stride_bytes,
+                extra_page_size,
+            )
+
+        valid_mfma = gl.convert_layout(
+            valid_load,
+            gl.SliceLayout(0, mfma_score),
+        )
+        kv_shared.store(kv_values)
+        gl.barrier()
+
+        k_dot = kv_shared.load(k_dot_layout)
+        v_dot = kv_shared.permute([1, 0]).load(v_dot_layout)
+        scores = gl.zeros(
+            [BLOCK_H, TILE_K],
+            dtype=gl.float32,
+            layout=mfma_score,
+        )
+        scores = gl.amd.cdna4.mfma(q_dot, k_dot, scores) * softmax_scale
+        scores = gl.where(valid_mfma[None, :], scores, -float("inf"))
+
+        tile_max = gl.max(scores, axis=1)
+        next_max = gl.maximum(max_value, tile_max)
+        safe_next_max = gl.where(next_max > -float("inf"), next_max, 0.0)
+        previous_scale = gl.exp(max_value - safe_next_max)
+        probabilities = gl.exp(scores - safe_next_max[:, None])
+        denominator = previous_scale * denominator + gl.sum(probabilities, axis=1)
+        accumulator_scale = gl.convert_layout(
+            previous_scale,
+            gl.SliceLayout(1, mfma_value),
+        )
+        accumulator *= accumulator_scale[:, None]
+        p_dot = gl.convert_layout(
+            probabilities.to(q.dtype.element_ty),
+            p_dot_layout,
+        )
+        accumulator = gl.amd.cdna4.mfma(p_dot, v_dot, accumulator)
+        max_value = next_max
+        gl.barrier()
+
+    denominator_value = gl.convert_layout(
+        denominator,
+        gl.SliceLayout(1, mfma_value),
+    )
+    safe_denominator = gl.where(denominator_value > 0.0, denominator_value, 1.0)
+    accumulator /= safe_denominator[:, None]
+    accumulator = gl.where(
+        denominator_value[:, None] > 0.0,
+        accumulator,
+        0.0,
+    )
+
+    out_heads = gl.arange(
+        0,
+        BLOCK_H,
+        layout=gl.SliceLayout(1, q_load_layout),
+    )
+    out_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, q_load_layout))
+    out_offsets = (
+        token_idx.to(tl.int64) * stride_po_t
+        + out_heads[:, None].to(tl.int64) * stride_po_h
+        + split_idx.to(tl.int64) * stride_po_s
+        + out_dims[None, :].to(tl.int64)
+    )
+    output = gl.convert_layout(
+        accumulator.to(partial_out.dtype.element_ty),
+        q_load_layout,
+    )
+    gl.store(partial_out + out_offsets, output)
+
+    lse = gl.where(
+        denominator > 0.0,
+        max_value + gl.log(denominator),
+        -float("inf"),
+    )
+    lse_offsets = (
+        token_idx.to(tl.int64) * stride_lse_t
+        + score_heads.to(tl.int64) * stride_lse_h
+        + split_idx.to(tl.int64) * stride_lse_s
+    )
+    gl.store(partial_lse + lse_offsets, lse)
+
+
+@gluon.jit
+def _deepseek_v4_paged_split_reduce_kernel(
+    partial_out,
+    partial_lse,
+    attn_sink,
+    out,
+    stride_po_t: tl.int64,
+    stride_po_h: tl.int64,
+    stride_po_s: tl.int64,
+    stride_lse_t: tl.int64,
+    stride_lse_h: tl.int64,
+    stride_lse_s: tl.int64,
+    stride_o_t: tl.int64,
+    stride_o_h: tl.int64,
+    NUM_KV_SPLITS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+):
+    token_idx = gl.program_id(axis=0)
+    head_idx = gl.program_id(axis=1)
+    split_tile: gl.constexpr = 1 << (NUM_KV_SPLITS - 1).bit_length()
+    reduce_layout: gl.constexpr = gl.BlockedLayout(
+        [1, HEAD_DIM // 64],
+        [1, 64],
+        [1, 1],
+        [1, 0],
+    )
+    split_offsets = gl.arange(
+        0,
+        split_tile,
+        layout=gl.SliceLayout(1, reduce_layout),
+    )
+    dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, reduce_layout))
+    valid_split = split_offsets < NUM_KV_SPLITS
+    lse_base = (
+        token_idx.to(tl.int64) * stride_lse_t + head_idx.to(tl.int64) * stride_lse_h
+    )
+    split_lse = gl.load(
+        partial_lse + lse_base + split_offsets * stride_lse_s,
+        mask=valid_split,
+        other=-float("inf"),
+    )
+    max_lse = gl.max(split_lse, axis=0)
+    sink = gl.load(attn_sink + head_idx).to(gl.float32)
+    max_lse = gl.maximum(max_lse, sink)
+    weights = gl.exp(split_lse - max_lse)
+    denominator = gl.sum(weights, axis=0) + gl.exp(sink - max_lse)
+
+    partial_base = (
+        token_idx.to(tl.int64) * stride_po_t + head_idx.to(tl.int64) * stride_po_h
+    )
+    partial = gl.load(
+        partial_out
+        + partial_base
+        + split_offsets[:, None] * stride_po_s
+        + dims[None, :],
+        mask=valid_split[:, None],
+        other=0.0,
+    ).to(gl.float32)
+    accumulator = gl.sum(partial * weights[:, None], axis=0)
+    output = (accumulator / denominator).to(out.dtype.element_ty)
+    out_base = token_idx.to(tl.int64) * stride_o_t + head_idx.to(tl.int64) * stride_o_h
+    gl.store(out + out_base + dims, output)
+
+
 def _check_tensor(name: str, value: object) -> torch.Tensor:
     if not isinstance(value, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
@@ -440,7 +792,7 @@ def _shares_storage(tensor: torch.Tensor, other: torch.Tensor) -> bool:
     return tensor.untyped_storage().data_ptr() == other.untyped_storage().data_ptr()
 
 
-def gluon_deepseek_v4_paged_selected_attention_gfx950(
+def _validate_paged_attention_inputs(
     q: torch.Tensor,
     swa_kv_cache: torch.Tensor,
     swa_slots: torch.Tensor,
@@ -448,35 +800,12 @@ def gluon_deepseek_v4_paged_selected_attention_gfx950(
     swa_page_size: int,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-    extra_kv_cache: torch.Tensor | None = None,
-    extra_slots: torch.Tensor | None = None,
-    extra_lens: torch.Tensor | None = None,
-    extra_page_size: int | None = None,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Run direct page-planar DeepSeek V4 selected attention on GFX950.
-
-    Args:
-        q: Contiguous BF16 queries shaped `[tokens, heads, 512]`.
-        swa_kv_cache: Contiguous uint8 SWA cache shaped
-            `[pages, swa_page_size * 584]`. Each page stores all 576-byte
-            token rows followed by eight exponent bytes per row.
-        swa_slots: Contiguous int32 global SWA slots with one row per token.
-        swa_lens: Contiguous int32 valid SWA widths shaped `[tokens]`.
-        swa_page_size: Number of independently addressed rows per SWA page.
-        attn_sink: Contiguous FP32 or BF16 sink logits, one per query head.
-        softmax_scale: Finite scale applied to query-key dot products.
-        extra_kv_cache: Optional page-planar cache for a second segment.
-        extra_slots: Optional contiguous int32 global slots for that segment.
-        extra_lens: Optional contiguous int32 valid widths for that segment.
-        extra_page_size: Optional independently addressed rows per extra page.
-        out: Optional exact contiguous BF16 destination shaped like `q`.
-
-    Returns:
-        The BF16 attention result shaped exactly like `q`. SWA and extra
-        selections share one sink-seeded online-softmax state.
-    """
-
+    extra_kv_cache: torch.Tensor | None,
+    extra_slots: torch.Tensor | None,
+    extra_lens: torch.Tensor | None,
+    extra_page_size: int | None,
+    out: torch.Tensor | None,
+) -> tuple[torch.Tensor, bool, float]:
     q = _check_tensor("q", q)
     swa_kv_cache = _check_tensor("swa_kv_cache", swa_kv_cache)
     swa_slots = _check_tensor("swa_slots", swa_slots)
@@ -516,21 +845,21 @@ def gluon_deepseek_v4_paged_selected_attention_gfx950(
             "must be provided together"
         )
     if has_extra:
-        extra_kv_cache = _check_tensor("extra_kv_cache", extra_kv_cache)
-        extra_slots = _check_tensor("extra_slots", extra_slots)
-        extra_lens = _check_tensor("extra_lens", extra_lens)
-        extra_page_size = _check_page_size("extra_page_size", extra_page_size)
+        checked_extra_cache = _check_tensor("extra_kv_cache", extra_kv_cache)
+        checked_extra_slots = _check_tensor("extra_slots", extra_slots)
+        checked_extra_lens = _check_tensor("extra_lens", extra_lens)
+        checked_extra_page_size = _check_page_size("extra_page_size", extra_page_size)
         _check_cache(
             "extra_kv_cache",
-            extra_kv_cache,
+            checked_extra_cache,
             device,
-            extra_page_size,
+            checked_extra_page_size,
         )
         _check_metadata(
             "extra_slots",
-            extra_slots,
+            checked_extra_slots,
             "extra_lens",
-            extra_lens,
+            checked_extra_lens,
             tokens,
             device,
         )
@@ -579,6 +908,61 @@ def gluon_deepseek_v4_paged_selected_attention_gfx950(
                 raise ValueError(f"out must not alias {name}")
 
     output = out if out is not None else torch.empty_like(q)
+    return output, has_extra, scale
+
+
+def gluon_deepseek_v4_paged_selected_attention_gfx950(
+    q: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    swa_slots: torch.Tensor,
+    swa_lens: torch.Tensor,
+    swa_page_size: int,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    extra_kv_cache: torch.Tensor | None = None,
+    extra_slots: torch.Tensor | None = None,
+    extra_lens: torch.Tensor | None = None,
+    extra_page_size: int | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run direct page-planar DeepSeek V4 selected attention on GFX950.
+
+    Args:
+        q: Contiguous BF16 queries shaped `[tokens, heads, 512]`.
+        swa_kv_cache: Contiguous uint8 SWA cache shaped
+            `[pages, swa_page_size * 584]`. Each page stores all 576-byte
+            token rows followed by eight exponent bytes per row.
+        swa_slots: Contiguous int32 global SWA slots with one row per token.
+        swa_lens: Contiguous int32 valid SWA widths shaped `[tokens]`.
+        swa_page_size: Number of independently addressed rows per SWA page.
+        attn_sink: Contiguous FP32 or BF16 sink logits, one per query head.
+        softmax_scale: Finite scale applied to query-key dot products.
+        extra_kv_cache: Optional page-planar cache for a second segment.
+        extra_slots: Optional contiguous int32 global slots for that segment.
+        extra_lens: Optional contiguous int32 valid widths for that segment.
+        extra_page_size: Optional independently addressed rows per extra page.
+        out: Optional exact contiguous BF16 destination shaped like `q`.
+
+    Returns:
+        The BF16 attention result shaped exactly like `q`. SWA and extra
+        selections share one sink-seeded online-softmax state.
+    """
+
+    output, has_extra, scale = _validate_paged_attention_inputs(
+        q,
+        swa_kv_cache,
+        swa_slots,
+        swa_lens,
+        swa_page_size,
+        attn_sink,
+        softmax_scale,
+        extra_kv_cache,
+        extra_slots,
+        extra_lens,
+        extra_page_size,
+        out,
+    )
+    tokens = q.shape[0]
     if q.shape[1] == 0:
         return output
 
@@ -634,6 +1018,150 @@ def gluon_deepseek_v4_paged_selected_attention_gfx950(
         HEAD_DIM=512,
         num_warps=4,
         num_stages=1,
+        waves_per_eu=1,
+    )
+    return output
+
+
+def gluon_deepseek_v4_paged_selected_attention_split_gfx950(
+    q: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    swa_slots: torch.Tensor,
+    swa_lens: torch.Tensor,
+    swa_page_size: int,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    extra_kv_cache: torch.Tensor | None = None,
+    extra_slots: torch.Tensor | None = None,
+    extra_lens: torch.Tensor | None = None,
+    extra_page_size: int | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run split-KV DeepSeek V4 Pro TP8 selected attention on GFX950.
+
+    Args:
+        q: Contiguous BF16 queries shaped `[tokens, 16, 512]`, where tokens
+            is between 1 and 6 inclusive.
+        swa_kv_cache: Uint8 page-planar SWA cache with 64 rows per page.
+        swa_slots: Contiguous int32 global SWA slots shaped `[tokens, 128]`.
+        swa_lens: Contiguous int32 valid SWA widths shaped `[tokens]`.
+        swa_page_size: Number of rows per SWA page, which must be 64.
+        attn_sink: Contiguous FP32 or BF16 sink logits, one per query head.
+        softmax_scale: Finite scale applied to query-key dot products.
+        extra_kv_cache: Uint8 page-planar extra cache with 64 rows per page.
+        extra_slots: Contiguous int32 global extra slots shaped
+            `[tokens, 1024]`.
+        extra_lens: Contiguous int32 valid extra widths shaped `[tokens]`.
+        extra_page_size: Number of rows per extra page, which must be 64.
+        out: Optional exact contiguous BF16 destination shaped like `q`.
+
+    Returns:
+        The BF16 attention result shaped exactly like `q`. Eighteen KV
+        partitions are combined before the attention sink is applied once.
+    """
+
+    output, has_extra, scale = _validate_paged_attention_inputs(
+        q,
+        swa_kv_cache,
+        swa_slots,
+        swa_lens,
+        swa_page_size,
+        attn_sink,
+        softmax_scale,
+        extra_kv_cache,
+        extra_slots,
+        extra_lens,
+        extra_page_size,
+        out,
+    )
+    tokens = q.shape[0]
+    swa_width = swa_slots.numel() // tokens
+    extra_width = extra_slots.numel() // tokens if extra_slots is not None else 0
+    if not (
+        tokens <= 6
+        and q.shape[1] == 16
+        and swa_width == 128
+        and swa_page_size == 64
+        and has_extra
+        and extra_width == 1024
+        and extra_page_size == 64
+    ):
+        raise ValueError(
+            "split GFX950 attention requires tokens 1..6, 16 heads, SWA width "
+            "128, extra width 1024, 64-row pages, and an extra segment"
+        )
+
+    assert extra_kv_cache is not None
+    assert extra_slots is not None
+    assert extra_lens is not None
+    assert extra_page_size is not None
+    swa_slots_2d = swa_slots.view(tokens, 128)
+    extra_slots_2d = extra_slots.view(tokens, 1024)
+    partial_out = torch.empty(
+        (tokens, 16, 18, 512),
+        dtype=torch.bfloat16,
+        device=q.device,
+    )
+    partial_lse = torch.empty(
+        (tokens, 16, 18),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    _deepseek_v4_paged_split_stage_kernel[(tokens, 1, 18)](
+        q,
+        swa_kv_cache,
+        swa_kv_cache.view(torch.float8_e4m3fn),
+        swa_kv_cache.view(torch.bfloat16),
+        swa_slots_2d,
+        swa_lens,
+        extra_kv_cache,
+        extra_kv_cache.view(torch.float8_e4m3fn),
+        extra_kv_cache.view(torch.bfloat16),
+        extra_slots_2d,
+        extra_lens,
+        partial_out,
+        partial_lse,
+        q.stride(0),
+        q.stride(1),
+        swa_kv_cache.stride(0),
+        extra_kv_cache.stride(0),
+        partial_out.stride(0),
+        partial_out.stride(1),
+        partial_out.stride(2),
+        partial_lse.stride(0),
+        partial_lse.stride(1),
+        partial_lse.stride(2),
+        scale,
+        swa_page_size,
+        extra_page_size,
+        swa_kv_cache.shape[0] * swa_page_size,
+        extra_kv_cache.shape[0] * extra_page_size,
+        SWA_WIDTH=128,
+        EXTRA_WIDTH=1024,
+        NUM_KV_SPLITS=18,
+        BLOCK_H=16,
+        TILE_K=32,
+        HEAD_DIM=512,
+        num_warps=4,
+        num_stages=1,
+        waves_per_eu=1,
+    )
+    _deepseek_v4_paged_split_reduce_kernel[(tokens, 16)](
+        partial_out,
+        partial_lse,
+        attn_sink,
+        output,
+        partial_out.stride(0),
+        partial_out.stride(1),
+        partial_out.stride(2),
+        partial_lse.stride(0),
+        partial_lse.stride(1),
+        partial_lse.stride(2),
+        output.stride(0),
+        output.stride(1),
+        NUM_KV_SPLITS=18,
+        HEAD_DIM=512,
+        num_warps=1,
         waves_per_eu=1,
     )
     return output

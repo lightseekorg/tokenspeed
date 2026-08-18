@@ -47,6 +47,9 @@ if current_platform().is_amd:
         gluon_deepseek_v4_paged_selected_attention_gfx950 as _deepseek_v4_paged_selected_attention_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4 import (
+        gluon_deepseek_v4_paged_selected_attention_split_gfx950 as _deepseek_v4_paged_selected_attention_split_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4 import (
         gluon_deepseek_v4_selected_attention_gfx950 as _deepseek_v4_selected_attention_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
@@ -227,6 +230,44 @@ if current_platform().is_amd:
     )
     def gluon_deepseek_v4_paged_selected_attention_gfx950(*args, **kwargs):
         return _deepseek_v4_paged_selected_attention_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "deepseek_v4_paged_selected_attention",
+        name="gluon_deepseek_v4_paged_selected_attention_split_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    swa_kv_cache=dense_tensor_format(torch.uint8),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "tokens": frozenset({1, 2, 3, 4, 5, 6}),
+            "head_dim": frozenset({512}),
+            "num_heads": frozenset({16}),
+            "cache_layout": frozenset({"fp8_swa_page_planar"}),
+            "topk_layout": frozenset({"global_slots"}),
+            "support_sink": frozenset({True}),
+            "has_extra": frozenset({True}),
+            "has_extra_segment": frozenset({True}),
+            "swa_selected_width": frozenset({128}),
+            "extra_selected_width": frozenset({1024}),
+            "swa_page_size": frozenset({64}),
+            "extra_page_size": frozenset({64}),
+        },
+        tags={"amd", "gfx950", "paged_cache", "selected_attention"},
+    )
+    def gluon_deepseek_v4_paged_selected_attention_split_gfx950(*args, **kwargs):
+        return _deepseek_v4_paged_selected_attention_split_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",

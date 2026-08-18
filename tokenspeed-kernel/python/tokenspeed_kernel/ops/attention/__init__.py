@@ -156,6 +156,7 @@ __all__ = [
     "dsa_plan",
     "deepseek_v4_csa_indexer_fp8_cache_insert",
     "deepseek_v4_indexer_cache_format",
+    "deepseek_v4_padded_heads",
     "deepseek_v4_paged_selected_attention",
     "deepseek_v4_selected_attention",
     "deepseek_v4_supports_deep_gemm",
@@ -187,6 +188,29 @@ def deepseek_v4_indexer_cache_format(use_fp4: bool | None = None) -> str:
         "mxfp4"
         if platform.is_nvidia and platform.arch_version.major >= 10
         else "fp8_scaled"
+    )
+
+
+def deepseek_v4_padded_heads(num_local_heads: int) -> int:
+    """Return the local head extent required by DeepSeek V4 kernels.
+
+    Args:
+        num_local_heads: Number of attention heads assigned to this rank.
+
+    Returns:
+        A kernel-compatible local head extent. GFX950 accepts the native
+        16-head Pro TP8 shape; other platform behavior retains the 64/128-head
+        padding policy.
+    """
+
+    if current_platform().is_cdna4 and num_local_heads == 16:
+        return 16
+    if num_local_heads <= 64:
+        return 64
+    if num_local_heads <= 128:
+        return 128
+    raise ValueError(
+        f"DeepSeek V4 attention supports at most 128 local heads, got {num_local_heads}"
     )
 
 
@@ -3343,14 +3367,18 @@ def deepseek_v4_paged_selected_attention(
     extra_width = int(extra_slots.numel() // tokens) if extra_slots is not None else 0
     signature = _attention_format_signature(q=q, swa_kv_cache=swa_kv_cache)
     traits = {
+        "tokens": tokens,
         "head_dim": int(q.shape[-1]),
         "num_heads": int(q.shape[1]),
         "cache_layout": "fp8_swa_page_planar",
         "topk_layout": "global_slots",
         "support_sink": True,
+        "has_extra": has_extra_segment,
         "has_extra_segment": has_extra_segment,
         "swa_selected_width": swa_width,
         "extra_selected_width": extra_width,
+        "swa_page_size": int(swa_page_size),
+        "extra_page_size": int(extra_page_size or 0),
     }
     kernel = select_kernel(
         "attention",

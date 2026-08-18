@@ -206,6 +206,22 @@ def test_builtin_moe_preprocessor_links_are_callables():
     assert errors == []
 
 
+def test_deepseek_v4_padded_heads_platform_policy(
+    mi350_platform: PlatformInfo,
+    h100_platform: PlatformInfo,
+) -> None:
+    host_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        assert tokenspeed_kernel.deepseek_v4_padded_heads(16) == 16
+        assert tokenspeed_kernel.deepseek_v4_padded_heads(32) == 64
+        Platform.override(h100_platform)
+        assert tokenspeed_kernel.deepseek_v4_padded_heads(16) == 64
+        assert tokenspeed_kernel.deepseek_v4_padded_heads(65) == 128
+    finally:
+        Platform.override(host_platform)
+
+
 def test_moe_process_weights_returns_for_no_preprocessing_plan():
     module = torch.nn.Module()
 
@@ -1231,6 +1247,31 @@ def _attention_deepseek_v4_paged_selected(with_extra: bool = True) -> object:
 
 def _attention_deepseek_v4_paged_selected_swa_only() -> object:
     return _attention_deepseek_v4_paged_selected(with_extra=False)
+
+
+def _attention_deepseek_v4_paged_selected_pro_tp8() -> object:
+    tokens = 6
+    q = torch.empty((tokens, 16, 512), dtype=torch.bfloat16)
+    swa_cache = torch.empty((2, 64 * 584), dtype=torch.uint8)
+    swa_slots = torch.empty((tokens, 128), dtype=torch.int32)
+    swa_lens = torch.empty((tokens,), dtype=torch.int32)
+    extra_cache = torch.empty((16, 64 * 584), dtype=torch.uint8)
+    extra_slots = torch.empty((tokens, 1024), dtype=torch.int32)
+    extra_lens = torch.empty((tokens,), dtype=torch.int32)
+    attn_sink = torch.empty((16,), dtype=torch.float32)
+    return tokenspeed_kernel.deepseek_v4_paged_selected_attention(
+        q=q,
+        swa_kv_cache=swa_cache,
+        swa_slots=swa_slots,
+        swa_lens=swa_lens,
+        swa_page_size=64,
+        attn_sink=attn_sink,
+        softmax_scale=512**-0.5,
+        extra_kv_cache=extra_cache,
+        extra_slots=extra_slots,
+        extra_lens=extra_lens,
+        extra_page_size=64,
+    )
 
 
 def _attention_deepseek_v4_swa_cache_insert() -> object:
@@ -2664,6 +2705,15 @@ _CASES = [
         "rel_mha_decode_with_kvcache",
         "fa4_rel_mha_decode_with_kvcache",
         _attention_rel_decode_multiquery_sliding,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "deepseek_v4_paged_selected_attention",
+        "gluon_deepseek_v4_paged_selected_attention_split_gfx950",
+        _attention_deepseek_v4_paged_selected_pro_tp8,
+        id_suffix="pro-tp8",
     ),
     _case(
         _is_cdna4,

@@ -38,6 +38,7 @@ from tokenspeed_kernel import (
     bmm,
     deepseek_v4_indexer_cache_format,
     deepseek_v4_linear_fp32,
+    deepseek_v4_padded_heads,
 )
 from tokenspeed_kernel import (
     deepseek_v4_select_experts as fast_deepseek_v4_select_experts,
@@ -1911,16 +1912,6 @@ class _DeepseekV4TopKBuffer:
         return self.buffer[:num_tokens]
 
 
-def _deepseek_v4_padded_heads(num_local_heads: int) -> int:
-    if num_local_heads <= 64:
-        return 64
-    if num_local_heads <= 128:
-        return 128
-    raise ValueError(
-        f"DeepSeek V4 attention supports at most 128 local heads, got {num_local_heads}"
-    )
-
-
 def _deepseek_v4_sanitize_swa_slot_mapping(
     slot_mapping: torch.Tensor,
     capacity: int,
@@ -3473,7 +3464,7 @@ class DeepseekV4Attention(nn.Module):
                 f"by attn_tp_size={tp_size}"
             )
         self.num_local_heads = self.num_heads // tp_size
-        self.padded_heads = _deepseek_v4_padded_heads(self.num_local_heads)
+        self.padded_heads = deepseek_v4_padded_heads(self.num_local_heads)
         self.head_dim = int(config.head_dim)
         self.qk_rope_head_dim = int(config.qk_rope_head_dim)
         self.nope_head_dim = deepseek_v4_nope_dim(
