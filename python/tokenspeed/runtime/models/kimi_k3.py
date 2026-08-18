@@ -399,14 +399,23 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         bf16/mxfp4 keep the canonical [q_a | kv_a | gate].
         """
         if self._fused_qkv_a_fp8_layout:
-            gate, q_a, latent_cache = qkv_gate.split(
-                [
-                    self._gate_width,
-                    self.q_lora_rank,
-                    self.kv_lora_rank + self.qk_rope_head_dim,
-                ],
-                dim=-1,
+            widths = {
+                "g_proj": self._gate_width,
+                "q_a_proj": self.q_lora_rank,
+                "kv_a_proj_with_mqa": self.kv_lora_rank + self.qk_rope_head_dim,
+            }
+            parts = dict(
+                zip(
+                    _FP8_FUSED_QKV_A_ORDER,
+                    qkv_gate.split(
+                        [widths[leaf] for leaf in _FP8_FUSED_QKV_A_ORDER],
+                        dim=-1,
+                    ),
+                )
             )
+            gate = parts["g_proj"]
+            q_a = parts["q_a_proj"]
+            latent_cache = parts["kv_a_proj_with_mqa"]
         else:
             q_a, latent_cache, gate = qkv_gate.split(
                 [
@@ -816,13 +825,14 @@ class KimiKDAMergedProj(nn.Module):
     13us at 6284 vs 6288 x 7168) and the GEMM is plain bf16 — unchanged.
 
     FP8_PB_WO checkpoints (``fp8_block_quant=True``): the buffer stays
-    FP8-resident with a per-[128, 128]-block f32 dequant scale grid and rows
-    pad to the 128 grid (3216 -> 3328 @tp16, 6288 -> 6400 @tp8) so the w8a8
-    blockscale GEMM keeps the flashinfer kernel (N % 128 == 0). Every
+    FP8-resident with a per-[128, 128]-block f32 dequant scale grid, and the
+    used rows pad straight to the 128 grid (3206 -> 3328 @tp16,
+    6284 -> 6400 @tp8; the bf16 16-row alignment does not apply here) so the
+    w8a8 blockscale GEMM keeps the flashinfer kernel (N % 128 == 0). Every
     segment offset (0/p/2p/3p/4p/4p+head_dim) is 128-aligned, so the
     checkpoint's per-segment scale grids concatenate directly with no
     requantization; the zero pad rows share ``b``'s trailing block scale and
-    quantize to exact zeros (pad-first lemma).
+    dequantize to exact zeros (pad lemma).
     """
 
     _ROW_ALIGN = 16
@@ -2669,7 +2679,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
         # requantization. KDA g_proj (FP8 too, but stacked into the merged
         # qkvgb buffer) and bf16 checkpoints skip this path entirely.
         fp8_fused_pending: dict[str, dict[str, torch.Tensor]] = {}
-        fp8_fused_segments = ("q_a_proj", "kv_a_proj_with_mqa", "g_proj")
+        fp8_fused_segments = frozenset(_FP8_FUSED_QKV_A_ORDER)
 
         def _try_fp8_fused_assembly(name: str, loaded_weight: torch.Tensor) -> bool:
             is_scale = name.endswith(".weight_scale_inv")
@@ -2706,22 +2716,24 @@ class KimiLinearForCausalLM(BaseCausalLM):
             blocks_per_shard = gate_rows // 128
             block_start = self.mapping.attn.tp_rank * blocks_per_shard
             weight_param = params_dict[fused_weight_name]
-            # Verbatim stack in the private [gate | q_a | kv_a | pad] order
-            # (_FP8_FUSED_QKV_A_ORDER): every boundary is 128-aligned, so
-            # codes and scale rows copy bit-identically — zero
-            # requantization; consumers split via _split_fused_qkv_a.
+            # Verbatim stack in the private [gate | q_a | kv_a | pad] order:
+            # every boundary is 128-aligned, so codes and scale rows copy
+            # bit-identically — zero requantization; consumers split via
+            # _split_fused_qkv_a. The segment order is derived from
+            # _FP8_FUSED_QKV_A_ORDER so loader and consumers cannot drift.
+            ordered = {
+                "g_proj": (
+                    gate_w[gate_start : gate_start + gate_rows],
+                    gate_s[block_start : block_start + blocks_per_shard],
+                ),
+                "q_a_proj": (pieces["q_a_proj.weight"], pieces["q_a_proj.scale"]),
+                "kv_a_proj_with_mqa": (
+                    pieces["kv_a_proj_with_mqa.weight"],
+                    pieces["kv_a_proj_with_mqa.scale"],
+                ),
+            }
             fused_w, fused_s = _assemble_fp8_fused_qkv_a(
-                [
-                    (
-                        gate_w[gate_start : gate_start + gate_rows],
-                        gate_s[block_start : block_start + blocks_per_shard],
-                    ),
-                    (pieces["q_a_proj.weight"], pieces["q_a_proj.scale"]),
-                    (
-                        pieces["kv_a_proj_with_mqa.weight"],
-                        pieces["kv_a_proj_with_mqa.scale"],
-                    ),
-                ],
+                [ordered[leaf] for leaf in _FP8_FUSED_QKV_A_ORDER],
                 total_rows=weight_param.shape[0],
             )
             weight_param.weight_loader(weight_param, fused_w)
@@ -2835,11 +2847,11 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 f"stream: { {k: sorted(v) for k, v in fp8_fused_pending.items()} }"
             )
         self.post_load_weights()
-        # Return the loader's transient allocator blocks (FP8 dequant / fused
-        # splice fp32 workspaces) to the device before the KV pool sizes
-        # itself from free memory: boot accounting showed ~1 GiB of
-        # reserved-but-free slack otherwise shrinking the pool (boot3 vs
-        # boot6: torch allocated -1.11 GB, torch reserved +0.03 GB).
+        # Return the loader's transient allocator blocks (block-dequant
+        # intermediates for the dequant-routed weights, fused-assembly
+        # segment buffers) to the device before the KV pool sizes itself
+        # from free memory; otherwise the reserved-but-free slack shrinks
+        # the pool by up to ~1 GiB per rank.
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

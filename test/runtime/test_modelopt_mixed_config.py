@@ -82,8 +82,8 @@ def test_from_config_rejects_unknown_algo():
         )
 
 
-# Layer 4 mimics a Kimi-K3 MLA layer (q_a_proj sibling present), layer 6 a
-# KDA layer (merged-projection siblings).
+# Layer 4 mimics a Kimi-K3 MLA layer, layer 6 a KDA layer (realistic
+# checkpoint entry names; routing itself is purely per-leaf).
 _FP8_PB_WO_LAYERS = {
     # MLA layer: everything is FP8-resident (w8a8 / verbatim fused reorder)
     "language_model.model.layers.4.self_attn.o_proj": {"quant_algo": "FP8_PB_WO"},
@@ -120,7 +120,7 @@ def test_fp8_pb_wo_route_classification():
     config = _renamed_config(_FP8_PB_WO_LAYERS)
     mla = "model.layers.4.self_attn"
     kda = "model.layers.6.self_attn"
-    # MLA-side projections stay FP8-resident (w8a8 / fused-splice at load).
+    # MLA-side projections stay FP8-resident (w8a8 / verbatim fused reorder).
     for leaf in (
         "o_proj",
         "kv_b_proj",
@@ -128,7 +128,8 @@ def test_fp8_pb_wo_route_classification():
         "q_a_proj",
         "kv_a_proj_with_mqa",
         "fused_qkv_a_proj_with_mqa",
-        "g_proj",  # MLA g_proj: identified by the q_a_proj sibling
+        "g_proj",  # w8a8 by leaf name; KDA/MLA are told apart by the
+        # model loader (which runtime module exists), not by routing
     ):
         assert config.fp8_pb_wo_route(f"{mla}.{leaf}") == "w8a8", leaf
     # KDA merged-projection segments are FP8-resident too (w8a8 blockscale

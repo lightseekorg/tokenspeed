@@ -25,7 +25,10 @@ modules keep FP8 weights and run the DeepSeek-style w8a8 blockwise
 Fp8LinearMethod (dynamic per-token-128-group activation quantization), with
 the ModelOpt ``weight_scale`` renamed/squeezed to ``weight_scale_inv`` by
 ``preprocess_fp8_pb_wo_weights``. Raw-consumed modules arrive from the same
-preprocessor block-dequantized to bf16.
+preprocessor block-dequantized to bf16. Also covers the fused_qkv_a verbatim
+assembly (``_assemble_fp8_fused_qkv_a``): bitwise segment/scale stacking in
+the private [gate | q_a | kv_a | pad] order and the 128-padded rows keeping
+the flashinfer blockscale GEMM selected.
 """
 
 from __future__ import annotations

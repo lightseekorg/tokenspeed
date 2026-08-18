@@ -30,12 +30,15 @@ FP8_PB_WO).
 ``FP8_PB_WO`` is ModelOpt's per-block FP8 format (128x128 blocks, float32
 dequant scales; ``weight_scale`` is numerically identical to DeepSeek's
 ``weight_scale_inv`` — both are ``amax / 448``). Following TRT-LLM, which
-aliases FP8_PB_WO to FP8_BLOCK_SCALES, layers whose weight naturally flows
-through ``quant_method.apply`` run the existing DeepSeek-style w8a8 blockwise
-path (:class:`Fp8LinearMethod`: dynamic per-token-128-group activation
-quantization + block-scale GEMM). Layers whose raw weight is consumed by
-fused/custom bf16 kernels are instead block-dequantized to bf16 at load time
-(see :data:`_FP8_PB_WO_DEQUANT_LEAVES` and
+aliases FP8_PB_WO to FP8_BLOCK_SCALES, nearly every layer stays FP8-resident
+on the DeepSeek-style w8a8 blockwise path (:class:`Fp8LinearMethod` or the
+model's own w8a8 fallbacks: dynamic per-token-128-group activation
+quantization + block-scale GEMM); fused consumers reassemble the FP8
+segments verbatim (Kimi-K3: the merged KDA buffer concatenates scale grids,
+the MLA fused_qkv_a reorders segments onto its private 128-aligned layout).
+Only the few weights consumed raw by bf16-only kernels with no fallback
+(Kimi-K3: ``f_b_proj`` plus two checkpoint-alias names) are block-dequantized
+to bf16 at load time (see :data:`_FP8_PB_WO_DEQUANT_LEAVES` and
 :func:`preprocess_fp8_pb_wo_weights`).
 """
 
@@ -78,8 +81,9 @@ _SUPPORTED_QUANT_ALGOS = frozenset({"NVFP4", "MXFP8", "FP8_PB_WO"})
 #                           grids concatenated) consumed by the w8a8
 #                           blockscale GEMM branch of kimi3_qkvfab_projection
 #   q_a/kv_a/g (MLA) /
-#   fused_qkv_a aliases  -> spliced onto the fused_qkv_a layer's clean
-#                           128-block grid at load, quantized module call
+#   fused_qkv_a aliases  -> reassembled VERBATIM onto the fused_qkv_a
+#                           layer's private 128-aligned row order at load,
+#                           quantized module call
 #   q_b_proj             -> gated MLA falls back to fused norms + the
 #                           quantized q_b GEMM for FP8 weights
 #   o_proj / kv_b_proj   -> plain LinearBase w8a8
@@ -421,7 +425,9 @@ def _block_dequant_fp8_to_bf16(
 
     Ragged trailing blocks are handled by clipping the expanded scale grid.
     Runs on CUDA when available (load-time throughput; the quantization utils
-    ``block_dequant`` loops per tile and is too slow for ~600 large tensors).
+    ``block_dequant`` loops per tile — tolerable for today's few small
+    dequant-routed tensors such as Kimi-K3's per-layer f_b_proj, but this
+    vectorized form keeps the path shape-agnostic).
     """
     if weight.dtype not in _FP8_WEIGHT_DTYPES:
         raise TypeError(f"expected an FP8 weight to dequantize, got {weight.dtype}")
@@ -443,9 +449,8 @@ def preprocess_fp8_pb_wo_weights(
       :data:`_FP8_PB_WO_DEQUANT_LEAVES`): the FP8 weight is paired with its
       ``weight_scale``, block-dequantized to bf16, and yielded under the
       original ``.weight`` name; the scale tensor is consumed and never
-      surfaces (the runtime parameter is plain bf16). Fusing dequantized
-      segments downstream (KDA merged / fused_qkv_a) is therefore exact and
-      free of block-alignment constraints.
+      surfaces (the runtime parameter is plain bf16, e.g. Kimi-K3's
+      f_b_proj, whose raw weight feeds the KDA attention backend's GEMV).
     * ``"w8a8"`` modules: the FP8 weight passes through unchanged;
       ``weight_scale`` is renamed to ``weight_scale_inv`` (the parameter
       :class:`Fp8LinearMethod` registers — ModelOpt's ``weight_scale`` is the

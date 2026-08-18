@@ -18,6 +18,10 @@ import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.platform import Platform
 
+# FP8 storage dtypes served by the w8a8 projection branch (matches the
+# runtime quantization layers' width: e4m3fn on NVIDIA, e4m3fnuz on ROCm).
+_FP8_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
 KIMI3_HIDDEN_SIZE = 7168
 KIMI3_LATENT_SIZE = 3584
 KIMI3_QKVFAB_SIZE = 6288
@@ -753,7 +757,7 @@ def kimi3_qkvfab_projection(
         out,
         name="Kimi K3 QKVFAB projection",
     )
-    if weight.dtype == torch.float8_e4m3fn:
+    if weight.dtype in _FP8_WEIGHT_DTYPES:
         if weight_scale is None:
             raise ValueError("FP8 Kimi K3 QKVFAB projection requires weight_scale")
         # Lazy import: ops.gemm.__init__ imports this module at load time.
@@ -780,7 +784,9 @@ def kimi3_qkvfab_projection(
         out.copy_(result)
         return out
     if weight_scale is not None or prepacked_scales is not None:
-        raise ValueError("weight_scale is only valid with FP8 weights")
+        raise ValueError(
+            "weight_scale / prepacked_scales are only valid with FP8 weights"
+        )
     if solution not in {"auto", "decode_gemv", "triton_gemv", "torch"}:
         raise ValueError(f"unknown Kimi K3 QKVFAB solution {solution!r}")
     specialized = (
