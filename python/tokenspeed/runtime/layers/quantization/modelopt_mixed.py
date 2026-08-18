@@ -70,42 +70,41 @@ _FP8_PB_WO_BLOCK_SIZE = [128, 128]
 _SUPPORTED_QUANT_ALGOS = frozenset({"NVFP4", "MXFP8", "FP8_PB_WO"})
 
 # FP8_PB_WO runtime routing. A module keeps FP8 weights (w8a8 blockwise
-# Fp8LinearMethod) only if its weight naturally flows through
-# ``quant_method.apply()`` as a plain LinearBase call. Modules whose raw
-# ``.weight`` is consumed by fused/custom bf16 kernels are block-dequantized
-# to bf16 at load and dispatched UnquantizedLinearMethod instead (no model
-# forward-path surgery). Kimi-K3 leaf names and the raw consumers:
+# Fp8LinearMethod) if its weight either flows through ``quant_method.apply()``
+# as a plain LinearBase call or has an fp8-aware fallback in the model
+# (Kimi-K3's gated MLA fast paths divert to the quantized module call when
+# the weight dtype is FP8). Modules whose raw ``.weight`` is consumed by
+# bf16-only fused kernels with no fallback are block-dequantized to bf16 at
+# load and dispatched UnquantizedLinearMethod instead. Kimi-K3 leaf names:
 #   q/k/v/g/f_a/b_proj   -> KimiKDAMergedProj bf16 merged buffer
 #                           (decode_gemv / kimi3_qkvfab_projection /
-#                           linear_attnres_partials)
+#                           linear_attnres_partials): dequant
 #   f_b_proj             -> raw ``f_b_weight`` GEMV inside the KDA attention
-#                           backend (fused into the decode scan kernel)
-#   g_proj (MLA)         -> fused into the fused_qkv_a tail (gate offset 2112
-#                           is not 128-aligned, so a fused block-scale grid
-#                           cannot represent it anyway)
+#                           backend (fused into the decode scan kernel):
+#                           dequant
+#   fused_qkvg_proj /
+#   in_proj_qkvgfab      -> checkpoint aliases of the KDA merged buffer:
+#                           dequant
 #   q_a_proj /
-#   kv_a_proj_with_mqa   -> fused into fused_qkv_a_proj_with_mqa, whose weight
-#                           the gated MLA fast paths consume raw
-#                           (kimi3_mla_qkv_gate_projection /
-#                           linear_attnres_partials)
-#   q_b_proj             -> mla_normalize_project_query consumes the raw
-#                           weight unconditionally on the gated MLA path
-#   fused_* / in_proj_*  -> checkpoint aliases for the fused modules above
-# Everything else (Kimi-K3: o_proj, kv_b_proj) goes w8a8.
+#   kv_a_proj_with_mqa /
+#   g_proj (MLA only) /
+#   fused_qkv_a aliases  -> w8a8: spliced onto the fused_qkv_a layer's clean
+#                           128-block grid at load (the [q_a|kv_a|gate]
+#                           boundaries are not block-aligned), consumed by
+#                           the quantized module call fallback
+#   q_b_proj             -> w8a8: the gated MLA path falls back to fused
+#                           norms + quantized q_b GEMM for FP8 weights
+# Everything else (Kimi-K3: o_proj, kv_b_proj) goes w8a8. ``g_proj`` is
+# shared between KDA (dequant) and MLA (w8a8) layers and is routed by its
+# checkpoint siblings, see ``_fp8_pb_wo_leaf_route``.
 _FP8_PB_WO_DEQUANT_LEAVES = frozenset(
     {
         "q_proj",
         "k_proj",
         "v_proj",
-        "g_proj",
         "f_a_proj",
         "b_proj",
         "f_b_proj",
-        "q_a_proj",
-        "kv_a_proj_with_mqa",
-        "q_b_proj",
-        "fused_qkv_a_proj",
-        "fused_qkv_a_proj_with_mqa",
         "fused_qkvg_proj",
         "in_proj_qkvgfab",
     }
@@ -300,10 +299,19 @@ class ModelOptMixedConfig(QuantizationConfig):
 
         return None
 
-    @staticmethod
-    def _fp8_pb_wo_leaf_route(module_name: str) -> str:
+    def _fp8_pb_wo_leaf_route(self, module_name: str) -> str:
         """Route an FP8_PB_WO module: ``"dequant"`` (bf16 at load) or ``"w8a8"``."""
         leaf = module_name.rsplit(".", 1)[-1]
+        if leaf == "g_proj":
+            # Kimi-K3 shares the g_proj name across two sublayer kinds: KDA
+            # folds it into the bf16 merged qkvgb projection (dequant), MLA
+            # rides it on the FP8 fused_qkv_a projection (w8a8, spliced onto
+            # the fused grid at load). MLA layers are identified by their
+            # q_a_proj sibling in the checkpoint's quantized_layers.
+            base = module_name.rsplit(".", 1)[0]
+            if f"{base}.q_a_proj" in self.quantized_layers:
+                return "w8a8"
+            return "dequant"
         return "dequant" if leaf in _FP8_PB_WO_DEQUANT_LEAVES else "w8a8"
 
     def fp8_pb_wo_route(self, module_name: str) -> str | None:
@@ -397,6 +405,17 @@ def _assert_routed_or_known(
     )
 
 
+def _expand_block_scale(
+    scale: torch.Tensor, n: int, k: int, block_n: int, block_k: int
+) -> torch.Tensor:
+    """Expand a 2-D block-scale grid to per-element [n, k] (ragged-clipped)."""
+    return (
+        scale.to(torch.float32)
+        .repeat_interleave(block_n, dim=0)[:n]
+        .repeat_interleave(block_k, dim=1)[:, :k]
+    )
+
+
 def _block_dequant_fp8_to_bf16(
     weight: torch.Tensor, scale: torch.Tensor, block_n: int, block_k: int
 ) -> torch.Tensor:
@@ -406,18 +425,97 @@ def _block_dequant_fp8_to_bf16(
     Runs on CUDA when available (load-time throughput; the quantization utils
     ``block_dequant`` loops per tile and is too slow for ~600 large tensors).
     """
-    if weight.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+    if weight.dtype not in _FP8_WEIGHT_DTYPES:
         raise TypeError(f"expected an FP8 weight to dequantize, got {weight.dtype}")
     if weight.device.type != "cuda" and torch.cuda.is_available():
         weight = weight.cuda()
         scale = scale.cuda()
     n, k = weight.shape
-    s_full = (
-        scale.to(torch.float32)
-        .repeat_interleave(block_n, dim=0)[:n]
-        .repeat_interleave(block_k, dim=1)[:, :k]
-    )
+    s_full = _expand_block_scale(scale, n, k, block_n, block_k)
     return (weight.to(torch.float32) * s_full).to(torch.bfloat16)
+
+
+def splice_requant_fp8_block_rows(
+    segments: list[tuple[torch.Tensor, torch.Tensor]],
+    block_n: int = 128,
+    block_k: int = 128,
+    pad_rows_to_multiple: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Row-concatenate per-block-quantized FP8 segments onto a clean grid.
+
+    Fused projections can concatenate segments at row offsets that are not
+    multiples of ``block_n`` (Kimi-K3 ``fused_qkv_a``: ``[q_a 1536 | kv_a 576
+    | gate]`` puts the gate at row 2112), so the per-segment scale grids
+    cannot be stitched together directly. Each segment is exactly
+    dequantized to fp32 with its own grid, the concatenation is requantized
+    on a fresh grid anchored at row 0, and the result stays FP8-resident.
+
+    Numerics: a fused block whose span coincides with exactly one source
+    scale cell reproduces that cell's scale (the cell's amax element
+    requantizes to the same ±448 code), so its codes are bit-identical and
+    its scale matches within 1 float32 ulp. Blocks that straddle several
+    source cells (segment boundaries, or segments whose offset is misaligned
+    with the fused grid) take the merged amax scale and re-round values
+    within the FP8 quantization band.
+
+    Args:
+        segments: ``(weight_fp8 [n_i, K], scale_f32 2-D block grid)`` per
+            segment, all with the same ``K``.
+        block_n: Fused-grid block rows.
+        block_k: Fused-grid block columns.
+        pad_rows_to_multiple: When set, append zero rows after the last
+            segment until the total row count is a multiple of this value
+            (e.g. 128 keeps a w8a8 blockscale GEMM on kernel paths requiring
+            ``N % 128 == 0``). Zero rows cannot change any block's amax, so
+            every scale — and therefore every real row's quantized code — is
+            bit-identical to the unpadded result, and the pad rows themselves
+            quantize to exact zeros. Segment offsets are unaffected (padding
+            is appended at the tail only).
+
+    Returns:
+        ``(weight_fp8 [n_padded, K], scale_f32 [ceil(n_padded/block_n),
+        ceil(K/block_k)])`` where ``n_padded`` is ``sum(n_i)`` rounded up to
+        ``pad_rows_to_multiple`` (or exactly ``sum(n_i)`` when unset).
+    """
+    if not segments:
+        raise ValueError("splice_requant_fp8_block_rows needs at least one segment")
+    parts = []
+    for weight, scale in segments:
+        if weight.dtype not in _FP8_WEIGHT_DTYPES:
+            raise TypeError(
+                f"expected FP8 segment weights, got {weight.dtype}; bf16 "
+                "segments belong on the plain fused loading path"
+            )
+        if weight.device.type != "cuda" and torch.cuda.is_available():
+            weight = weight.cuda()
+            scale = scale.cuda()
+        n, k = weight.shape
+        parts.append(
+            weight.to(torch.float32)
+            * _expand_block_scale(scale, n, k, block_n, block_k)
+        )
+    full = torch.cat(parts, dim=0)
+    n, k = full.shape
+    if pad_rows_to_multiple is not None and n % pad_rows_to_multiple:
+        n += pad_rows_to_multiple - n % pad_rows_to_multiple
+    nb = (n + block_n - 1) // block_n
+    kb = (k + block_k - 1) // block_k
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    padded = full.new_zeros(nb * block_n, kb * block_k)
+    padded[: full.shape[0], :k] = full
+    blocks = padded.view(nb, block_n, kb, block_k)
+    amax = blocks.abs().amax(dim=(1, 3))
+    # All-zero blocks (zeroed weight regions, or full pad blocks) quantize to
+    # exact zeros under any scale; pick 1.0 so downstream kernels never see a
+    # subnormal scale or a zero divisor in the grid.
+    scale = torch.where(amax > 0, amax / fp8_max, torch.ones_like(amax))
+    quant = (blocks / scale[:, None, :, None]).clamp(-fp8_max, fp8_max)
+    quant = (
+        quant.view(nb * block_n, kb * block_k)[:n, :k]
+        .to(torch.float8_e4m3fn)
+        .contiguous()
+    )
+    return quant, scale.contiguous()
 
 
 def preprocess_fp8_pb_wo_weights(

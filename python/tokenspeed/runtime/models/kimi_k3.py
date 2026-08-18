@@ -126,6 +126,7 @@ from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backe
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
     preprocess_fp8_pb_wo_weights,
+    splice_requant_fp8_block_rows,
 )
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -362,12 +363,28 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             # effective bandwidth here anyway.)
             self._qkv_a_width = q_lora_rank + kv_lora_rank + qk_rope_head_dim
             self._gate_width = num_heads * v_head_dim // mapping.attn.tp_size
+            fused_prefix = add_prefix("fused_qkv_a_proj_with_mqa", prefix)
+            fused_out = self._qkv_a_width + self._gate_width
+            # FP8_PB_WO (w8a8) fused projection: pad the output rows to the
+            # 128-block grid so Fp8LinearMethod keeps the flashinfer
+            # blockscale GEMM (which requires N % 128 == 0) instead of the
+            # Triton fallback. The pad rows are loaded as exact zeros
+            # (splice_requant_fp8_block_rows pads before requantization,
+            # which provably changes no scale or real-row code) and are
+            # sliced off right after the GEMM. bf16/mxfp4 checkpoints take
+            # pad 0 and are constructed exactly as before.
+            self._fused_qkv_a_pad_rows = 0
+            fp8_pb_wo_route = getattr(quant_config, "fp8_pb_wo_route", None)
+            if fp8_pb_wo_route is not None and fp8_pb_wo_route(fused_prefix) == "w8a8":
+                padded_out = ceil_div(fused_out, 128) * 128
+                self._fused_qkv_a_pad_rows = padded_out - fused_out
+                fused_out = padded_out
             self.fused_qkv_a_proj_with_mqa = DeepseekV3FusedQkvAProjWithMqa(
                 hidden_size,
-                self._qkv_a_width + self._gate_width,
+                fused_out,
                 bias=False,
                 quant_config=quant_config,
-                prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
+                prefix=fused_prefix,
             )
 
     def _project_q_latent_gated(
@@ -392,6 +409,37 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             )
             if attnres_partial_args is not None:
                 attnres_partial_dual(*attnres_partial_args)
+            if self._fused_qkv_a_pad_rows:
+                # Drop the zero pad rows of the 128-aligned FP8 projection
+                # before anything consumes the output.
+                qkv_gate = qkv_gate[
+                    ..., : self._qkv_a_width + self._gate_width
+                ].contiguous()
+            qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
+            q_a, latent_cache, gate = qkv_gate.split(
+                [
+                    self.q_lora_rank,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    self._gate_width,
+                ],
+                dim=-1,
+            )
+        elif self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.float8_e4m3fn:
+            # FP8-resident fused projection (FP8_PB_WO w8a8): the bf16 fast
+            # kernels below cannot consume the quantized weight, so run the
+            # quantized module GEMM and keep any hoisted dual-partials as a
+            # standalone kernel — the same recipe as the block_scale branch.
+            # (can_fuse_attnres_partials already returns False for FP8
+            # weights, so args are normally None here.)
+            if attnres_partial_args is not None:
+                attnres_partial_dual(*attnres_partial_args)
+            qkv_gate = self.fused_qkv_a_proj_with_mqa(hidden_states)
+            if self._fused_qkv_a_pad_rows:
+                # Drop the zero pad rows of the 128-aligned FP8 projection
+                # before anything consumes the output.
+                qkv_gate = qkv_gate[
+                    ..., : self._qkv_a_width + self._gate_width
+                ].contiguous()
             qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
             q_a, latent_cache, gate = qkv_gate.split(
                 [
@@ -446,6 +494,19 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 )
                 gate = projection.gate
         kv_a = latent_cache[..., : self.kv_lora_rank]
+        if self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
+            # FP8-resident q_b (FP8_PB_WO w8a8): mla_normalize_project_query
+            # consumes a raw bf16 weight, so fall back to the unfused parent
+            # recipe — fused q_a/kv_a norms, then the quantized q_b GEMM.
+            # No absorbed-query preparation on this path; forward_absorb
+            # projects the query itself when absorbed_query is None.
+            q_norm = torch.empty_like(q_a)
+            if q_a.size(0) > 0:
+                self.fused_qk_layernorm(
+                    input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm
+                )
+            q = self.q_b_proj(q_norm)[0]
+            return q, latent_cache, gate, None
         projection = mla_normalize_project_query(
             q_a,
             kv_a,
@@ -2363,6 +2424,77 @@ class KimiLinearForCausalLM(BaseCausalLM):
         fuse_qkv_a_proj = config.q_lora_rank is not None
 
         params_dict = dict(self.named_parameters())
+
+        # ModelOpt FP8_PB_WO fused_qkv_a assembly: MLA q_a / kv_a / g_proj
+        # arrive FP8-resident with per-segment block scales, but the fused
+        # [q_a | kv_a | gate] concatenation is not aligned to the 128-block
+        # grid (the gate starts at row q_lora+kv_lora+rope = 2112). Collect
+        # the six tensors per MLA layer, splice them onto the fused layer's
+        # clean grid, and load the result directly into the fused FP8
+        # parameters. KDA g_proj (dequant route, bf16 by now) and bf16
+        # checkpoints skip this path entirely.
+        fp8_fused_pending: dict[str, dict[str, torch.Tensor]] = {}
+        fp8_fused_segments = ("q_a_proj", "kv_a_proj_with_mqa", "g_proj")
+
+        def _try_fp8_fused_assembly(name: str, loaded_weight: torch.Tensor) -> bool:
+            is_scale = name.endswith(".weight_scale_inv")
+            if not (is_scale or name.endswith(".weight")):
+                return False
+            module_name = name.rsplit(".", 1)[0]
+            leaf = module_name.rsplit(".", 1)[-1]
+            if leaf not in fp8_fused_segments:
+                return False
+            base = module_name.rsplit(".", 1)[0]
+            fused_weight_name = f"{base}.fused_qkv_a_proj_with_mqa.weight"
+            if fused_weight_name not in params_dict:
+                return False  # KDA layers (g_proj) or unfused configs
+            if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
+                return False  # bf16 checkpoints keep the existing fused path
+            entry = fp8_fused_pending.setdefault(base, {})
+            entry[f"{leaf}.{'scale' if is_scale else 'weight'}"] = loaded_weight
+            if len(entry) < 2 * len(fp8_fused_segments):
+                return True
+            pieces = fp8_fused_pending.pop(base)
+            # The checkpoint gate is globally head-sharded; splice this
+            # attention rank's rows (its scale grid slices with it as long
+            # as the shard is block-aligned).
+            gate_w = pieces["g_proj.weight"]
+            gate_s = pieces["g_proj.scale"]
+            gate_rows = gate_w.shape[0] // self.mapping.attn.tp_size
+            if gate_rows % 128 != 0:
+                raise ValueError(
+                    f"FP8 fused_qkv_a gate shard ({gate_rows} rows) must "
+                    "align to the 128-row scale-block grid; adjust the "
+                    "attention TP size."
+                )
+            gate_start = self.mapping.attn.tp_rank * gate_rows
+            blocks_per_shard = gate_rows // 128
+            block_start = self.mapping.attn.tp_rank * blocks_per_shard
+            fused_w, fused_s = splice_requant_fp8_block_rows(
+                [
+                    (pieces["q_a_proj.weight"], pieces["q_a_proj.scale"]),
+                    (
+                        pieces["kv_a_proj_with_mqa.weight"],
+                        pieces["kv_a_proj_with_mqa.scale"],
+                    ),
+                    (
+                        gate_w[gate_start : gate_start + gate_rows],
+                        gate_s[block_start : block_start + blocks_per_shard],
+                    ),
+                ],
+                # Match the constructor's 128-aligned padded output rows so
+                # the flashinfer blockscale GEMM stays selected; the pad rows
+                # load as exact zeros.
+                pad_rows_to_multiple=128,
+            )
+            weight_param = params_dict[fused_weight_name]
+            weight_param.weight_loader(weight_param, fused_w)
+            scale_param = params_dict[
+                f"{base}.fused_qkv_a_proj_with_mqa.weight_scale_inv"
+            ]
+            scale_param.weight_loader(scale_param, fused_s)
+            return True
+
         moe_loader = build_moe_checkpoint_loader(
             params_dict=params_dict,
             expert_schema=ExpertCheckpointSchema(
@@ -2391,6 +2523,10 @@ class KimiLinearForCausalLM(BaseCausalLM):
             # KDA conv weights are plain params named ``<qkv>_conv1d_weight``.
             if "_conv1d.weight" in name:
                 name = name.replace("_conv1d.weight", "_conv1d_weight")
+
+            # FP8-resident fused_qkv_a segments (splice + requant), see above.
+            if _try_fp8_fused_assembly(name, loaded_weight):
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -2457,6 +2593,11 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
+        if fp8_fused_pending:
+            raise RuntimeError(
+                "FP8 fused_qkv_a layers missing segments at end of checkpoint "
+                f"stream: { {k: sorted(v) for k, v in fp8_fused_pending.items()} }"
+            )
         self.post_load_weights()
 
     def post_load_weights(self) -> None:

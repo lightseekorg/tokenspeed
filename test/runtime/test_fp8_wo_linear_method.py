@@ -232,6 +232,10 @@ def test_modelopt_mixed_dispatches_fp8_pb_wo() -> None:
                 "model.layers.0.self_attn.o_proj": {"quant_algo": "FP8_PB_WO"},
                 "model.layers.0.self_attn.kv_b_proj": {"quant_algo": "FP8_PB_WO"},
                 "model.layers.0.self_attn.q_b_proj": {"quant_algo": "FP8_PB_WO"},
+                "model.layers.0.self_attn.q_a_proj": {"quant_algo": "FP8_PB_WO"},
+                "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa": {
+                    "quant_algo": "FP8_PB_WO"
+                },
                 "model.layers.0.self_attn.f_b_proj": {"quant_algo": "FP8_PB_WO"},
                 "model.layers.0.mlp.experts.0.w1": {
                     "quant_algo": "NVFP4",
@@ -242,12 +246,15 @@ def test_modelopt_mixed_dispatches_fp8_pb_wo() -> None:
         }
     )
     layer = torch.nn.Module()
-    for leaf in ("o_proj", "kv_b_proj"):
+    # MLA-side projections (incl. q_b and the fused a-projection) stay
+    # FP8-resident: the gated MLA fast paths fall back to the quantized
+    # module call for FP8 weights.
+    for leaf in ("o_proj", "kv_b_proj", "q_b_proj", "fused_qkv_a_proj_with_mqa"):
         method = config.get_quant_method(layer, f"model.layers.0.self_attn.{leaf}")
-        assert isinstance(method, Fp8LinearMethod)
+        assert isinstance(method, Fp8LinearMethod), leaf
         assert method.block_quant
         assert method.quant_config.weight_block_size == [128, 128]
         assert method.quant_config.scale_fmt is None
-    for leaf in ("q_b_proj", "f_b_proj"):
-        method = config.get_quant_method(layer, f"model.layers.0.self_attn.{leaf}")
-        assert isinstance(method, UnquantizedLinearMethod)
+    # KDA f_b stays dequant (raw GEMV inside the attention backend).
+    method = config.get_quant_method(layer, "model.layers.0.self_attn.f_b_proj")
+    assert isinstance(method, UnquantizedLinearMethod)

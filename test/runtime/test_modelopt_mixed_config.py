@@ -82,17 +82,26 @@ def test_from_config_rejects_unknown_algo():
         )
 
 
+# Layer 4 mimics a Kimi-K3 MLA layer (q_a_proj sibling present), layer 6 a
+# KDA layer (merged-projection siblings).
 _FP8_PB_WO_LAYERS = {
-    # w8a8 (weights flow through quant_method.apply as plain LinearBase calls)
+    # MLA layer: everything is FP8-resident (w8a8 / fused-splice at load)
     "language_model.model.layers.4.self_attn.o_proj": {"quant_algo": "FP8_PB_WO"},
     "language_model.model.layers.4.self_attn.kv_b_proj": {"quant_algo": "FP8_PB_WO"},
-    # dequant (raw weights consumed by fused/custom bf16 kernels)
     "language_model.model.layers.4.self_attn.q_b_proj": {"quant_algo": "FP8_PB_WO"},
-    "language_model.model.layers.4.self_attn.q_proj": {"quant_algo": "FP8_PB_WO"},
-    "language_model.model.layers.4.self_attn.f_b_proj": {"quant_algo": "FP8_PB_WO"},
+    "language_model.model.layers.4.self_attn.q_a_proj": {"quant_algo": "FP8_PB_WO"},
+    "language_model.model.layers.4.self_attn.kv_a_proj_with_mqa": {
+        "quant_algo": "FP8_PB_WO"
+    },
+    "language_model.model.layers.4.self_attn.g_proj": {"quant_algo": "FP8_PB_WO"},
     "language_model.model.layers.4.self_attn.fused_qkv_a_proj_with_mqa": {
         "quant_algo": "FP8_PB_WO"
     },
+    # KDA layer: raw-consumed merged projections dequant, o_proj w8a8
+    "language_model.model.layers.6.self_attn.q_proj": {"quant_algo": "FP8_PB_WO"},
+    "language_model.model.layers.6.self_attn.f_b_proj": {"quant_algo": "FP8_PB_WO"},
+    "language_model.model.layers.6.self_attn.g_proj": {"quant_algo": "FP8_PB_WO"},
+    "language_model.model.layers.6.self_attn.o_proj": {"quant_algo": "FP8_PB_WO"},
 }
 
 
@@ -109,11 +118,24 @@ def test_from_config_accepts_fp8_pb_wo():
 
 def test_fp8_pb_wo_route_classification():
     config = _renamed_config(_FP8_PB_WO_LAYERS)
-    base = "model.layers.4.self_attn"
-    assert config.fp8_pb_wo_route(f"{base}.o_proj") == "w8a8"
-    assert config.fp8_pb_wo_route(f"{base}.kv_b_proj") == "w8a8"
-    for leaf in ("q_b_proj", "q_proj", "f_b_proj", "fused_qkv_a_proj_with_mqa"):
-        assert config.fp8_pb_wo_route(f"{base}.{leaf}") == "dequant"
+    mla = "model.layers.4.self_attn"
+    kda = "model.layers.6.self_attn"
+    # MLA-side projections stay FP8-resident (w8a8 / fused-splice at load).
+    for leaf in (
+        "o_proj",
+        "kv_b_proj",
+        "q_b_proj",
+        "q_a_proj",
+        "kv_a_proj_with_mqa",
+        "fused_qkv_a_proj_with_mqa",
+        "g_proj",  # MLA g_proj: identified by the q_a_proj sibling
+    ):
+        assert config.fp8_pb_wo_route(f"{mla}.{leaf}") == "w8a8", leaf
+    # KDA-side merged/raw-consumed projections dequantize at load; the KDA
+    # g_proj shares its name with the MLA one but has no q_a_proj sibling.
+    for leaf in ("q_proj", "f_b_proj", "g_proj"):
+        assert config.fp8_pb_wo_route(f"{kda}.{leaf}") == "dequant", leaf
+    assert config.fp8_pb_wo_route(f"{kda}.o_proj") == "w8a8"
     # Non-FP8_PB_WO modules never route.
     assert config.fp8_pb_wo_route("model.layers.3.self_attn.o_proj") is None
     assert config.fp8_pb_wo_route("model.layers.99.self_attn.o_proj") is None
@@ -141,7 +163,8 @@ def test_preprocess_fp8_pb_wo_weights_stream():
 
     torch.manual_seed(0)
     config = _renamed_config(_FP8_PB_WO_LAYERS)
-    base = "model.layers.4.self_attn"
+    kda = "model.layers.6.self_attn"
+    mla = "model.layers.4.self_attn"
     n, k = 96, 200  # ragged on both axes
     q_deq, s_deq = _quantize_per_block_cpu(torch.randn(n, k))
     q_w8a8, s_w8a8 = _quantize_per_block_cpu(torch.randn(256, 128))
@@ -150,13 +173,13 @@ def test_preprocess_fp8_pb_wo_weights_stream():
     nvfp4_scale = torch.randn(4)
 
     stream = [
-        # dequant module: scale arrives BEFORE the weight
-        (f"{base}.q_proj.weight_scale", scale_4d),
-        (f"{base}.q_proj.weight", q_deq),
+        # dequant module (KDA): scale arrives BEFORE the weight
+        (f"{kda}.q_proj.weight_scale", scale_4d),
+        (f"{kda}.q_proj.weight", q_deq),
         # w8a8 module: fp8 weight passes through, scale renamed + squeezed
-        (f"{base}.o_proj.weight", q_w8a8),
+        (f"{mla}.o_proj.weight", q_w8a8),
         (
-            f"{base}.o_proj.weight_scale",
+            f"{mla}.o_proj.weight_scale",
             s_w8a8.reshape(s_w8a8.shape[0], 1, s_w8a8.shape[1], 1),
         ),
         # untouched tensors: norms and NVFP4 expert scales keep their names
@@ -166,17 +189,17 @@ def test_preprocess_fp8_pb_wo_weights_stream():
     out = dict(preprocess_fp8_pb_wo_weights(iter(stream), config))
 
     # Dequant path: bitwise-identical to the manual block dequant.
-    dq = out[f"{base}.q_proj.weight"].cpu()
+    dq = out[f"{kda}.q_proj.weight"].cpu()
     assert dq.dtype == torch.bfloat16
     s_full = s_deq.repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)[:, :k]
     expected = (q_deq.float() * s_full).to(torch.bfloat16)
     assert torch.equal(dq, expected)
-    assert f"{base}.q_proj.weight_scale" not in out  # scale is consumed
+    assert f"{kda}.q_proj.weight_scale" not in out  # scale is consumed
 
     # w8a8 path: weight untouched, scale renamed to weight_scale_inv (2-D).
-    assert out[f"{base}.o_proj.weight"].dtype == torch.float8_e4m3fn
-    assert f"{base}.o_proj.weight_scale" not in out
-    assert torch.equal(out[f"{base}.o_proj.weight_scale_inv"], s_w8a8)
+    assert out[f"{mla}.o_proj.weight"].dtype == torch.float8_e4m3fn
+    assert f"{mla}.o_proj.weight_scale" not in out
+    assert torch.equal(out[f"{mla}.o_proj.weight_scale_inv"], s_w8a8)
 
     # Everything else passes through untouched.
     assert out["model.layers.4.input_layernorm.weight"] is other
@@ -192,7 +215,7 @@ def test_preprocess_fp8_pb_wo_weights_missing_scale_raises():
 
     config = _renamed_config(_FP8_PB_WO_LAYERS)
     q, _ = _quantize_per_block_cpu(torch.randn(128, 128))
-    stream = [("model.layers.4.self_attn.q_proj.weight", q)]
+    stream = [("model.layers.6.self_attn.q_proj.weight", q)]
     with pytest.raises(RuntimeError, match="missing their weight/weight_scale"):
         list(preprocess_fp8_pb_wo_weights(iter(stream), config))
 
@@ -245,12 +268,125 @@ def test_preprocess_dequant_route_passes_bf16_refit_weights():
     refit = torch.randn(96, 200, dtype=torch.bfloat16)
     out = list(
         preprocess_fp8_pb_wo_weights(
-            iter([("model.layers.4.self_attn.q_proj.weight", refit)]), config
+            iter([("model.layers.6.self_attn.q_proj.weight", refit)]), config
         )
     )
     # Passed through unchanged, not buffered waiting for a scale.
-    assert out == [("model.layers.4.self_attn.q_proj.weight", refit)]
+    assert out == [("model.layers.6.self_attn.q_proj.weight", refit)]
     assert out[0][1] is refit
+
+
+def test_splice_requant_fp8_block_rows_bounds():
+    """Fused-grid requant: coincident blocks near-bitexact, straddlers in band.
+
+    Mimics Kimi-K3 fused_qkv_a: segments [256 | 192 | 256] put the third
+    segment at row 448 (not a multiple of 128), like the gate at 2112.
+    """
+    from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
+        splice_requant_fp8_block_rows,
+    )
+
+    torch.manual_seed(0)
+    k = 256
+    seg_rows = [256, 192, 256]
+    segments, dequant_ref = [], []
+    for rows in seg_rows:
+        w = torch.randn(rows, k) * torch.logspace(-1, 1, rows).unsqueeze(1)
+        q, s = _quantize_per_block_cpu(w)
+        segments.append((q, s))
+        sf = s.repeat_interleave(128, 0)[:rows].repeat_interleave(128, 1)[:, :k]
+        dequant_ref.append(q.float() * sf)
+    ref = torch.cat(dequant_ref)
+
+    q_new, s_new = splice_requant_fp8_block_rows(segments)
+    q_new, s_new = q_new.cpu(), s_new.cpu()
+    assert q_new.dtype == torch.float8_e4m3fn  # stays FP8-resident
+    n = ref.shape[0]
+    assert q_new.shape == (n, k) and s_new.shape == ((n + 127) // 128, k // 128)
+    sf_new = s_new.repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)[:, :k]
+    dq_new = q_new.float() * sf_new
+
+    # Fused row-blocks 0,1 coincide with segment-0 cells and block 2 with
+    # segment-1 cell 0 -> near-bitexact (scale within 1 f32 ulp, same codes).
+    # Blocks 3+ straddle segment boundaries or the misaligned third segment's
+    # cells -> merged-amax scale, error within the FP8 re-rounding band.
+    for block_index in range((n + 127) // 128):
+        r0, r1 = block_index * 128, min((block_index + 1) * 128, n)
+        diff = (dq_new[r0:r1] - ref[r0:r1]).abs()
+        if block_index <= 2:
+            assert torch.allclose(
+                dq_new[r0:r1], ref[r0:r1], rtol=1e-5, atol=0.0
+            ), f"coincident block {block_index} should be near-bitexact"
+        else:
+            for col_block in range(k // 128):
+                c0, c1 = col_block * 128, (col_block + 1) * 128
+                block_amax = ref[r0:r1, c0:c1].abs().amax()
+                bound = 0.05 * block_amax  # 0.5 ulp of e4m3 at amax = 3.6%
+                assert diff[:, c0:c1].max() <= bound, (
+                    f"straddling block ({block_index},{col_block}): "
+                    f"{diff[:, c0:c1].max():.5f} > {bound:.5f}"
+                )
+
+
+def test_splice_requant_pad_rows_bitwise_equivalent():
+    """Tail zero-padding changes no scale and no real-row code.
+
+    Zero rows cannot change any block's amax, so the padded requantization
+    must be bit-identical to the unpadded one on all real rows, and the pad
+    rows themselves must quantize to exact zeros (Kimi-K3 fused_qkv_a:
+    2880 -> 2944 to keep the flashinfer blockscale GEMM's N % 128 == 0).
+    """
+    from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
+        splice_requant_fp8_block_rows,
+    )
+
+    torch.manual_seed(1)
+    k = 256
+    segments = []
+    for rows in (256, 192, 256):  # 704 total -> pads to 768
+        w = torch.randn(rows, k) * torch.logspace(-1, 1, rows).unsqueeze(1)
+        segments.append(_quantize_per_block_cpu(w))
+
+    q_ref, s_ref = splice_requant_fp8_block_rows(segments)
+    q_pad, s_pad = splice_requant_fp8_block_rows(segments, pad_rows_to_multiple=128)
+    q_ref, s_ref, q_pad, s_pad = (
+        q_ref.cpu(),
+        s_ref.cpu(),
+        q_pad.cpu(),
+        s_pad.cpu(),
+    )
+
+    n_real = q_ref.shape[0]
+    assert n_real == 704 and q_pad.shape[0] == 768
+    assert s_pad.shape == s_ref.shape  # same block grid (ceil(704/128) == 6)
+    # Scales bit-identical, real-row codes bit-identical, pad rows exact zero.
+    assert torch.equal(s_pad, s_ref)
+    assert torch.equal(q_pad[:n_real].view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(
+        q_pad[n_real:].view(torch.uint8),
+        torch.zeros(768 - n_real, k, dtype=torch.uint8),
+    )
+
+
+def test_splice_requant_all_zero_block_guard():
+    """A fully-zero block takes scale 1.0 and exact-zero codes."""
+    from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
+        splice_requant_fp8_block_rows,
+    )
+
+    torch.manual_seed(2)
+    k = 256
+    w = torch.randn(256, k)
+    w[:128] = 0.0  # first 128-row block entirely zero
+    q_seg, s_seg = _quantize_per_block_cpu(w)
+    q_new, s_new = splice_requant_fp8_block_rows([(q_seg, s_seg)])
+    q_new, s_new = q_new.cpu(), s_new.cpu()
+    assert torch.all(s_new[0] == 1.0)  # all-zero blocks -> scale 1.0
+    assert torch.equal(
+        q_new[:128].view(torch.uint8), torch.zeros(128, k, dtype=torch.uint8)
+    )
+    # Non-zero blocks keep amax/448 scales and roundtrip within band.
+    assert torch.all(s_new[1] > 0) and torch.all(s_new[1] != 1.0)
 
 
 def test_preprocess_passthrough_without_fp8_pb_wo():
