@@ -18,6 +18,13 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from tokenspeed_kernel.platform import current_platform
+
+# PDL is an NVIDIA launch attribute: ROCm Triton rejects the launch_pdl
+# kwarg outright, and the kernels' gdc_wait/gdc_launch_dependents intrinsics
+# are CUDA-only. Degrade enable_pdl to False off-NVIDIA so the flag is inert
+# there, matching ops/kvcache/triton.py.
+_IS_NVIDIA = current_platform().is_nvidia
 
 
 @triton.jit
@@ -1264,6 +1271,7 @@ def kda_gate_precompute(
     Returns:
         None. ``gk_out`` is written in place.
     """
+    enable_pdl = bool(enable_pdl and _IS_NVIDIA)
     rows = gk_out.shape[0]
     if rows == 0:
         return
@@ -1365,6 +1373,7 @@ def _launch_kda_window(
     ``gate_scratch`` is caller-provided fp32 scratch for the hoisted gate
     (rows x ``num_heads*head_dim``, transient within this launch pair);
     ``None`` falls back to the module-local buffer."""
+    enable_pdl = bool(enable_pdl and _IS_NVIDIA)
     total = qkv_raw.shape[0]
     T = draft_token_num
     N = total // T
@@ -1829,6 +1838,7 @@ def kda_commit_conv_window(
     Returns:
         None. The destination windows are written in place.
     """
+    enable_pdl = bool(enable_pdl and _IS_NVIDIA)
     n = write_indices.numel()
     if row_base is None:
         row_base = (
@@ -2042,6 +2052,7 @@ def kda_capture_payload(
     Returns:
         None. Destinations are written in place.
     """
+    enable_pdl = bool(enable_pdl and _IS_NVIDIA)
     W_QKV, W_FA, W_BETA = qkv_raw.shape[-1], f_a.shape[-1], beta.shape[-1]
     BLOCK = 1024
     assert W_BETA <= BLOCK, "beta rides block 0 and must fit one block"
