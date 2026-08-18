@@ -368,6 +368,13 @@ class LayerMappedKVPool:
       (0..n-1) while their planes are the continuation range
       ``num_target_layers..``; the map is ``{local: global}`` (pass
       ``layer_map`` explicitly).
+
+    Deliberately not an ``MLATokenToKVPool`` subclass: ``models/utils.py``'s
+    fused MLA write gate uses ``isinstance`` to keep off this wrapper,
+    because ``set_mla_kv_buffer`` here defaults to ``sanitize=True`` (see that
+    method) and the fused write has no sanitize path. Losing this property --
+    by subclassing, or by the gate switching to duck-typing -- reopens the
+    padded-row NaN hazard that default exists to close.
     """
 
     def __init__(

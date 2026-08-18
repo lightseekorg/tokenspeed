@@ -100,22 +100,60 @@ def create_fused_set_kv_buffer_arg(
     )
 
 
+# Grid CTA count (tokens * (heads + 1), the fused kernel's own launch shape)
+# at which the fused write stops being measured no-slower than the split path
+# it replaces. 2048 tokens at H=16 (measured, see the perf table in the
+# commit that added this) is the calibration point; scaling by heads matters
+# because the grid's CTA count -- and so the fused kernel's own wall time --
+# grows with heads at a fixed token count, while the split path's does not
+# the same way. Confirmed at H=32 (safe to 1024 tokens, 18.9% regression at
+# 2048) and H=64 (safe to 512 tokens, 4.9% regression at 768).
+_FUSED_MLA_KV_MAX_TOKEN_HEADS = 2048 * 16
+
+
 def create_fused_mla_set_kv_buffer_arg(
     k_nope: torch.Tensor,
     rope_dim: int,
-    rotary_head_size: int,
-    is_neox_style: bool,
+    rotary_emb: object | None,
     out_cache_loc: torch.Tensor,
     token_to_kv_pool: object,
     layer_id: int,
+    num_q_heads: int,
+    q_nope: torch.Tensor | None = None,
 ) -> FusedMLASetKVBufferArg | None:
-    """Build fused MLA RoPE+KV write arguments when the cache layout matches."""
+    """Arguments for the fused MLA RoPE + quantize + KV write, or ``None``.
+
+    ``None`` is the single place this configuration is judged to have no fused
+    form, so callers fall back rather than branch. Every reason lives here:
+    ``token_to_kv_pool`` is not a plain ``MLATokenToKVPool`` (a
+    ``LayerMappedKVPool`` view over a merged pool -- Kimi-K3's own MLA layers,
+    and an ordinary model's same-family draft view -- fails this on purpose,
+    see below); the token*head count is past the validated range; the pool's
+    latent rows are not one dense ``[tokens, 1, nope+rope]`` tensor (the
+    per-token-head quantized pool keeps three); or no registered RoPE solution
+    advertises the fused traits.
+
+    ``rotary_emb=None`` is the NoPE form and IS fused when every other check
+    passes -- the tables are simply absent from the returned argument. Kimi-K3
+    is NoPE, but its own MLA layers read through a ``LayerMappedKVPool`` and
+    so never reach this form; a K3 draft (a heterogeneous MLA cache view) gets
+    a plain pool and does.
+
+    The ``MLATokenToKVPool`` check is also what keeps this write off a
+    ``LayerMappedKVPool``'s ``sanitize=True`` contract (its ``set_mla_kv_buffer``
+    default -- see the comment there): this write does not sanitize, so it
+    must never reach a pool that requires it. That coupling is deliberate,
+    not incidental to the isinstance check happening to be here for other
+    reasons -- keep it if this gate is ever loosened to duck-type instead.
+    """
 
     from tokenspeed_kernel.ops.embedding import supports_fused_mla_kv_write
 
     from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 
     if not isinstance(token_to_kv_pool, MLATokenToKVPool):
+        return None
+    if out_cache_loc.numel() * num_q_heads > _FUSED_MLA_KV_MAX_TOKEN_HEADS:
         return None
 
     kv_buffer = token_to_kv_pool.get_key_buffer(layer_id)
@@ -124,13 +162,12 @@ def create_fused_mla_set_kv_buffer_arg(
     if not supports_fused_mla_kv_write(
         q_dtype=k_nope.dtype,
         k_dtype=k_nope.dtype,
-        head_size=rotary_head_size,
-        rotary_dim=rope_dim,
-        is_neox=is_neox_style,
+        has_rope=rotary_emb is not None,
+        is_neox=True if rotary_emb is None else rotary_emb.is_neox_style,
+        has_q_nope=q_nope is not None,
     ):
         return None
-    if kv_buffer.dtype != k_nope.dtype:
-        return None
+    # The kernel converts BF16 inputs to the FP8 cache dtype on store.
     if kv_buffer.ndim != 3 or kv_buffer.shape[1] != 1:
         return None
     if kv_buffer.shape[2] != k_nope.shape[-1] + rope_dim:
@@ -140,4 +177,7 @@ def create_fused_mla_set_kv_buffer_arg(
         k_nope=k_nope,
         kv_buffer=kv_buffer.view(kv_buffer.shape[0], -1),
         cache_loc=out_cache_loc,
+        q_nope=q_nope,
+        cos_sin_cache=None if rotary_emb is None else rotary_emb.cos_sin_cache,
+        is_neox=True if rotary_emb is None else rotary_emb.is_neox_style,
     )
