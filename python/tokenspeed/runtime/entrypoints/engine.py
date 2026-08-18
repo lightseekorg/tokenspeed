@@ -483,9 +483,27 @@ def _set_socket_interface(server_args: ServerArgs):
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
-    if not server_args.enable_symm_mem:
-        os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
+    # NCCL's NVLS and cuMem paths are worth 2.7x on a 112 MiB all-reduce at
+    # world 16 (506us vs 1350us) and 19% of K3 prefill TTFT, so only turn them
+    # off when asked, and never overwrite an operator's own setting. The probe
+    # checks NVLS multicast and, for a world wider than one host, a real fabric
+    # allocation: hosts without the IMEX stack advertise multicast and then hang
+    # in rendezvous. Without a capable fabric, set nothing -- NCCL's own default
+    # beats a guess of ours.
+    if server_args.disable_symm_mem:
+        os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    if server_args.disable_nccl_nvls:
+        os.environ["NCCL_NVLS_ENABLE"] = "0"
+    if not (server_args.disable_symm_mem and server_args.disable_nccl_nvls):
+        from tokenspeed_kernel.ops.communication.trtllm import (
+            _mnnvl_locally_available,
+        )
+
+        if _mnnvl_locally_available(server_args.mapping.world_size):
+            if not server_args.disable_symm_mem:
+                os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
+            if not server_args.disable_nccl_nvls:
+                os.environ.setdefault("NCCL_NVLS_ENABLE", "1")
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
     if not server_args.disable_tf32:

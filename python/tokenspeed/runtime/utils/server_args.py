@@ -292,8 +292,8 @@ class ServerArgs:
     disable_cuda_graph_padding: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
-    enable_nccl_nvls: bool = False
-    enable_symm_mem: bool = False
+    disable_nccl_nvls: bool = False
+    disable_symm_mem: bool = False
     disable_overlap_schedule: bool = False
     disable_tf32: bool = False
     force_deterministic_rsag: bool = False
@@ -1772,14 +1772,14 @@ class ServerArgs:
             help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
         )
         parser.add_argument(
-            "--enable-nccl-nvls",
+            "--disable-nccl-nvls",
             action="store_true",
-            help="Enable NCCL NVLS for prefill heavy requests when available.",
+            help="Disable NCCL NVLS even when an MNNVL-capable fabric is detected.",
         )
         parser.add_argument(
-            "--enable-symm-mem",
+            "--disable-symm-mem",
             action="store_true",
-            help="Enable NCCL symmetric memory for fast collectives.",
+            help="Disable NCCL cuMem support even when an MNNVL-capable fabric is detected.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
