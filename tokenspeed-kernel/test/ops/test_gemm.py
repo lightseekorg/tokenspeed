@@ -279,17 +279,21 @@ def test_linear_attnres_partials_cpu_skips_device_kernel_selection(
     or "gfx950" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""),
     reason="gfx950 is required",
 )
-def test_linear_attnres_partials_gfx950_matches_composition() -> None:
+@pytest.mark.parametrize("tokens", [1, 2, 4])
+@pytest.mark.parametrize("output_size", [3648, 6288])
+def test_linear_attnres_partials_gfx950_matches_composition(
+    tokens: int, output_size: int
+) -> None:
     generator = torch.Generator(device="cuda").manual_seed(29)
-    hidden = (torch.randn(1, 7168, device="cuda", generator=generator) * 0.1).to(
+    hidden = (torch.randn(tokens, 7168, device="cuda", generator=generator) * 0.1).to(
         torch.bfloat16
     )
-    weight = (torch.randn(3648, 7168, device="cuda", generator=generator) * 0.01).to(
-        torch.bfloat16
-    )
-    blocks = (torch.randn(4, 1, 7168, device="cuda", generator=generator) * 0.1).to(
-        torch.bfloat16
-    )
+    weight = (
+        torch.randn(output_size, 7168, device="cuda", generator=generator) * 0.01
+    ).to(torch.bfloat16)
+    blocks = (
+        torch.randn(4, tokens, 7168, device="cuda", generator=generator) * 0.1
+    ).to(torch.bfloat16)
     scores = tuple(
         (torch.randn(7168, device="cuda", generator=generator) * 0.02).to(
             torch.bfloat16
@@ -298,9 +302,9 @@ def test_linear_attnres_partials_gfx950_matches_composition() -> None:
     )
     scratch = tuple(
         (
-            torch.empty(1, device="cuda", dtype=torch.float32),
-            torch.empty(1, device="cuda", dtype=torch.float32),
-            torch.empty(1, 7168, device="cuda", dtype=torch.float32),
+            torch.empty(tokens, device="cuda", dtype=torch.float32),
+            torch.empty(tokens, device="cuda", dtype=torch.float32),
+            torch.empty(tokens, 7168, device="cuda", dtype=torch.float32),
         )
         for _ in range(2)
     )
