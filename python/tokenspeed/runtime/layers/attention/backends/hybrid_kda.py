@@ -1110,6 +1110,45 @@ class KdaAttnBackend(MambaAttnBackend):
         return self._kda_pending is not None
 
     @override
+    def drop_deferred_on_pages(self, pages_by_group) -> None:
+        """Condemn pending rows whose pages are being handed to new owners.
+
+        The plan's ``pages_to_zero`` names every freshly admitted page per
+        cache group. A pending row anchored on -- or committing into -- such a
+        page belongs to a retracted owner whose pages were reassigned; a later
+        flush would write a stale window into another request's state. Device-
+        side condemnation, the same idiom the compose uses: clear the slot
+        table row, and every later write (flush, fuse) self-masks on it. The
+        host dict entries linger harmlessly. No host-device sync: the page
+        lists ride an async H2D copy and the compare stays on the stream.
+        """
+        pending = self._kda_pending
+        if pending is None or not hasattr(pages_by_group, "get"):
+            return
+        gids = self._state_group_ids
+        table = self._kda_slot_table
+        for i, gid in enumerate(gids):
+            zeroed = pages_by_group.get(gid) or pages_by_group.get(str(gid))
+            if not zeroed:
+                continue
+            zset = torch.as_tensor(
+                sorted(set(int(p) for p in zeroed)),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            hit = torch.isin(pending["commit_stack"][i], zset) | torch.isin(
+                pending["anchor_stack"][i], zset
+            )
+            # No host readback: an empty-hit scatter is an async no-op, so
+            # the whole condemnation stays on the stream.
+            rpis = pending["rpi_by_slot"][: hit.shape[0]][hit]
+            table.scatter_(
+                0,
+                rpis.clamp(0, table.shape[0] - 1),
+                torch.full_like(rpis, -1).to(torch.int32),
+            )
+
+    @override
     def flush_deferred_state(self, resident_request_ids: set[str]) -> None:
         """Resolve every pending KDA window now (lifecycle escape hatch).
 
@@ -1590,6 +1629,10 @@ class HybridKDABackend(HybridLinearAttnBackend):
     @override
     def has_deferred_state(self) -> bool:
         return self.linear_attn_backend.has_deferred_state()
+
+    @override
+    def drop_deferred_on_pages(self, pages_by_group) -> None:
+        self.linear_attn_backend.drop_deferred_on_pages(pages_by_group)
 
     @override
     def flush_deferred_state(self, resident_request_ids: set[str]) -> None:

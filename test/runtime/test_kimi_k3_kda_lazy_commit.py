@@ -1333,6 +1333,50 @@ def test_forward_without_a_record_does_not_double_apply_next_round():
     _accept_flush_and_assert(h_lazy, h_eager, pages, rpis, [8, 7], 133, [1, 2])
 
 
+def test_zeroed_pages_condemn_a_retracted_owners_pending():
+    """A retracted-but-resident owner's window dies when its pages recycle.
+
+    Capacity retraction leaves the owner in the engine's residency set (it
+    will rebase and re-prefill), so the pause fence's residency screen would
+    FLUSH its pending -- onto pages the pool already handed to a new
+    admission. The plan's pages_to_zero names exactly those pages; the drop
+    hook must condemn the matching rows so the later fence flush self-masks,
+    while an untouched co-owner still commits normally.
+    """
+    h = _Harness(seed=73, usable_pages=32)
+    rpis = [0, 1]
+    pages = _pages_for(h, rpis)
+    h.verify_round(rpis, pages, [6, 6], h.window(2, 151))
+    h.accept([2, 1])
+    assert h.pending() is not None
+
+    # rpi 1 is capacity-retracted; its pages recycle to a new admission whose
+    # prefill will own them. The sentinel stands in for the new content.
+    reassigned = {}
+    for layer_id in h.layer_ids:
+        gid = h.pool.group_id_for_layer(layer_id)
+        p = pages[gid][1]
+        reassigned.setdefault(gid, p)
+        h.pool.get_component(layer_id, "conv_state")[p].fill_(9.0)
+        h.pool.get_component(layer_id, "recurrent_state")[p].fill_(9.0)
+
+    # The plan hands those pages to the newcomer: pages_to_zero carries them.
+    h.backend.drop_deferred_on_pages({g: [p] for g, p in reassigned.items()})
+
+    # Pause fence: rpi 1 is retracted, NOT departed -- it stays resident, so
+    # the residency screen alone would have flushed it.
+    h.backend.flush_deferred_state({"req0", "req1"})
+
+    for layer_id in h.layer_ids:
+        gid = h.pool.group_id_for_layer(layer_id)
+        p1 = pages[gid][1]
+        conv, ssm = h.state_of(layer_id, p1)
+        assert bool((conv == 9.0).all()) and bool(
+            (ssm == 9.0).all()
+        ), "the fence flushed a condemned window onto a reassigned page"
+    assert h.pending() is None, "the fence must still settle the survivors"
+
+
 def test_pause_flush_does_not_write_a_departed_owners_reclaimed_pages():
     """The pause fence must screen departed owners by engine residency.
 

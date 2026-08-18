@@ -240,6 +240,15 @@ class AttentionBackend(ABC):
         teardown.
         """
 
+    def drop_deferred_on_pages(self, pages_by_group) -> None:
+        """Condemn deferred work targeting pages being handed to new owners.
+
+        The engine calls this with the execution plan's ``pages_to_zero`` --
+        the freshly admitted pages, keyed by cache group -- before zeroing
+        them. A deferred write to such a page would land in a page that now
+        belongs to a different request.
+        """
+
     def has_deferred_state(self) -> bool:
         """Whether any deferred work is pending settlement.
 

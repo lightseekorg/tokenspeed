@@ -1650,6 +1650,12 @@ class EventLoop:
                 continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
+            # Freshly admitted pages may recycle a retracted owner's; any
+            # deferred backend window targeting them must die before a later
+            # flush can write into the new owner's state.
+            self.model_executor.attn_backend.drop_deferred_on_pages(
+                execution_plan.pages_to_zero
+            )
             cache_zero_event = self.model_executor.zero_cache_pages(
                 execution_plan.pages_to_zero
             )
@@ -1809,6 +1815,12 @@ class EventLoop:
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
 
+            # Freshly admitted pages may recycle a retracted owner's; any
+            # deferred backend window targeting them must die before a later
+            # flush can write into the new owner's state.
+            self.model_executor.attn_backend.drop_deferred_on_pages(
+                execution_plan.pages_to_zero
+            )
             cache_zero_event = self.model_executor.zero_cache_pages(
                 execution_plan.pages_to_zero
             )
