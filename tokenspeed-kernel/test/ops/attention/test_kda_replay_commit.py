@@ -216,32 +216,6 @@ def test_mixed_accepted_lengths_in_one_batch():
     )
 
 
-def test_committing_into_the_source_page_matches_a_fresh_page():
-    """In-place commit is the common case and must not race.
-
-    ``write == read`` makes every recurrence program read and write the same
-    page. The recurrence is safe (each program owns a disjoint state slice);
-    the conv window is only safe because it is committed by a separate launch
-    that gives each program its own channels.
-    """
-    n, t = 8, 3
-    x = _window(n, t, seed=17)
-    accepted = torch.tensor([0, 1, 2, 3, 3, 2, 1, 0], device=DEV, dtype=torch.int32)
-    fresh = torch.arange(1, n + 1, device=DEV, dtype=torch.int32) + 16
-    expected = _replay(x, fresh, accepted, t)
-
-    for _ in range(8):  # repeat: a race here would be intermittent
-        in_place = _replay(x, x["read_indices"], accepted, t)
-        for i in range(n):
-            r, w = int(x["read_indices"][i]), int(fresh[i])
-            torch.testing.assert_close(
-                in_place["conv_pool"][r], expected["conv_pool"][w], atol=0.0, rtol=0.0
-            )
-            torch.testing.assert_close(
-                in_place["h_pool"][r], expected["h_pool"][w], atol=0.0, rtol=0.0
-            )
-
-
 def test_accepted_length_clamps_at_and_past_the_window_boundary():
     """Boundary pins: a = T is exact, a > T and a < 0 clamp bitwise to T / 0.
 

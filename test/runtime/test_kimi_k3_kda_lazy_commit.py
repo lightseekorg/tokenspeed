@@ -165,13 +165,9 @@ class _Harness:
         forward op that carries no ``request_pool_indices``.
         """
         bs = len(rpis)
-        tables = {
-            gid: np.asarray([[p] for p in pages[gid]], dtype=np.int32)
-            for gid in _STATE_GROUPS
-        }
-        metadata, op = _metadata_for(self.contract, tables, DEV)
-        op.request_pool_indices = list(rpis) if identity else []
-        op.request_ids = [f"req{r}" for r in rpis] if identity else []
+        metadata, op = _metadata_op(
+            self.contract, _tables_for(pages), rpis if identity else []
+        )
         self.backend.init_forward_metadata(
             bs=bs,
             req_pool_indices=torch.tensor(rpis, dtype=torch.int32, device=DEV),
@@ -264,15 +260,46 @@ def _run_rounds(h, rounds, accepts, rpis, eager):
     return outs, pages
 
 
+def _assert_page_match(h_a, h_b, layer_id, page):
+    """One page, both harnesses: conv bitwise, ssm at the shared tolerance."""
+    conv_a, ssm_a = h_a.state_of(layer_id, page)
+    conv_b, ssm_b = h_b.state_of(layer_id, page)
+    torch.testing.assert_close(conv_a, conv_b, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(ssm_a, ssm_b, atol=1e-6, rtol=1e-4)
+
+
+def _tables_for(pages):
+    """One checkpoint column per request, the harness's standard layout."""
+    return {
+        gid: np.asarray([[p] for p in pages[gid]], dtype=np.int32)
+        for gid in _STATE_GROUPS
+    }
+
+
+def _metadata_op(contract, tables, rpis, req_ids=None):
+    """Cache metadata plus a forward op carrying the batch identity."""
+    metadata, op = _metadata_for(contract, tables, DEV)
+    op.request_pool_indices = list(rpis)
+    op.request_ids = (
+        list(req_ids) if req_ids is not None else [f"req{r}" for r in rpis]
+    )
+    return metadata, op
+
+
+def _accept_flush_and_assert(h_lazy, h_eager, pages, rpis, seq_lens, seed, accepted):
+    """One verify+accept+flush round on both arms, then the pool comparison."""
+    for h in (h_lazy, h_eager):
+        h.verify_round(rpis, pages, list(seq_lens), h.window(len(rpis), seed))
+        h.accept(list(accepted))
+        h.flush()
+    _assert_pools_match(h_lazy, h_eager, pages, rpis)
+
+
 def _assert_pools_match(h_lazy, h_eager, pages, rpis):
     for layer_id in h_lazy.layer_ids:
         gid = h_lazy.pool.group_id_for_layer(layer_id)
         for i, _ in enumerate(rpis):
-            page = pages[gid][i]
-            conv_l, ssm_l = h_lazy.state_of(layer_id, page)
-            conv_e, ssm_e = h_eager.state_of(layer_id, page)
-            torch.testing.assert_close(conv_l, conv_e, atol=0.0, rtol=0.0)
-            torch.testing.assert_close(ssm_l, ssm_e, atol=1e-6, rtol=1e-4)
+            _assert_page_match(h_lazy, h_eager, layer_id, pages[gid][i])
 
 
 def test_lazy_rounds_match_eager_flush_every_round():
@@ -354,11 +381,7 @@ def test_departed_request_is_dropped_and_survivors_fuse():
     for layer_id in h_lazy.layer_ids:
         gid = h_lazy.pool.group_id_for_layer(layer_id)
         for i in (0, 2):
-            page = pages3[gid][i]
-            conv_l, ssm_l = h_lazy.state_of(layer_id, page)
-            conv_e, ssm_e = h_eager.state_of(layer_id, page)
-            torch.testing.assert_close(conv_l, conv_e, atol=0.0, rtol=0.0)
-            torch.testing.assert_close(ssm_l, ssm_e, atol=1e-6, rtol=1e-4)
+            _assert_page_match(h_lazy, h_eager, layer_id, pages3[gid][i])
     # The departed request's page still holds the new owner's sentinel:
     # nothing replayed the dead window onto it.
     for layer_id in h_lazy.layer_ids:
@@ -383,9 +406,7 @@ def test_non_verify_forward_flushes_the_pending():
         gid: np.asarray([[p] for p in pages[gid]], dtype=np.int32)
         for gid in _STATE_GROUPS
     }
-    metadata, op = _metadata_for(h.contract, tables, DEV)
-    op.request_pool_indices = rpis
-    op.request_ids = [f"req{r}" for r in rpis]
+    metadata, op = _metadata_op(h.contract, tables, rpis)
     h.backend.spec_num_tokens = 1  # plain-decode shape for this metadata call
     try:
         h.backend.init_forward_metadata(
@@ -420,16 +441,9 @@ def _prep_verify(h, rpis, pages, seq_lens, identity=True, req_ids=None):
     batch, then retracted it before launching the model. ``identity=False``
     strips the batch's request identity; ``req_ids`` overrides the derived
     ids so a caller can recycle a pool index under a new request."""
-    tables = {
-        gid: np.asarray([[p] for p in pages[gid]], dtype=np.int32)
-        for gid in _STATE_GROUPS
-    }
-    metadata, op = _metadata_for(h.contract, tables, DEV)
-    op.request_pool_indices = list(rpis) if identity else []
-    if not identity:
-        op.request_ids = []
-    else:
-        op.request_ids = req_ids or [f"req{r}" for r in rpis]
+    metadata, op = _metadata_op(
+        h.contract, _tables_for(pages), rpis if identity else [], req_ids=req_ids if identity else None
+    )
     h.backend.init_forward_metadata(
         bs=len(rpis),
         req_pool_indices=torch.tensor(rpis, dtype=torch.int32, device=DEV),
@@ -502,11 +516,7 @@ def test_abandoned_verify_prep_keeps_pending_for_retract_flush():
             _, ssm_0 = pre[(layer_id, i)]
             assert not torch.equal(ssm_n, ssm_0), f"no write: {layer_id}/{i}"
 
-    for h in (h_lazy, h_eager):
-        h.verify_round(rpis, pages, [8, 7], h.window(2, 52))
-        h.accept([1, 2])
-        h.flush()
-    _assert_pools_match(h_lazy, h_eager, pages, rpis)
+    _accept_flush_and_assert(h_lazy, h_eager, pages, rpis, [8, 7], 52, [1, 2])
 
 
 def test_rearm_after_abandoned_prep_commits_exactly_once():
@@ -610,10 +620,7 @@ def test_recycled_rpi_pending_is_dropped_not_replayed():
     for layer_id in h_lazy.layer_ids:
         gid = h_lazy.pool.group_id_for_layer(layer_id)
         for page in (pages3[gid][0], pages3[gid][1], fresh[gid]):
-            conv_l, ssm_l = h_lazy.state_of(layer_id, page)
-            conv_e, ssm_e = h_eager.state_of(layer_id, page)
-            torch.testing.assert_close(conv_l, conv_e, atol=0.0, rtol=0.0)
-            torch.testing.assert_close(ssm_l, ssm_e, atol=1e-6, rtol=1e-4)
+            _assert_page_match(h_lazy, h_eager, layer_id, page)
 
     # The dead request's old pages keep their pre-accept content bitwise:
     # the DROP semantic (eager, by contrast, flushed that window there).
@@ -632,13 +639,7 @@ def _prepped_round(h, rpis, pages, seq_lens):
     parked on a ``torch.cuda._sleep``: any pageable H2D (``torch.tensor(...,
     device=cuda)``) inside the round would synchronize the stream and drain
     the sleep, silently voiding the race window it is trying to create."""
-    tables = {
-        gid: np.asarray([[p] for p in pages[gid]], dtype=np.int32)
-        for gid in _STATE_GROUPS
-    }
-    metadata, op = _metadata_for(h.contract, tables, DEV)
-    op.request_pool_indices = list(rpis)
-    op.request_ids = [f"req{r}" for r in rpis]
+    metadata, op = _metadata_op(h.contract, _tables_for(pages), rpis)
     # Materialize the device tables now, not lazily mid-round.
     for gid in _STATE_GROUPS:
         metadata.require_table(gid, active_forward_op=op)
@@ -890,11 +891,7 @@ def test_growth_flush_drops_departed_windows():
     for layer_id in h_lazy.layer_ids:
         gid = h_lazy.pool.group_id_for_layer(layer_id)
         for i in range(3):
-            page = pages_r2[gid][i]
-            conv_l, ssm_l = h_lazy.state_of(layer_id, page)
-            conv_e, ssm_e = h_eager.state_of(layer_id, page)
-            torch.testing.assert_close(conv_l, conv_e, atol=0.0, rtol=0.0)
-            torch.testing.assert_close(ssm_l, ssm_e, atol=1e-6, rtol=1e-4)
+            _assert_page_match(h_lazy, h_eager, layer_id, pages_r2[gid][i])
     # The departed request's reclaimed pages keep the new owner's sentinel.
     for layer_id in h_lazy.layer_ids:
         conv_l, ssm_l = h_lazy.state_of(layer_id, sentinel[layer_id])
@@ -971,9 +968,7 @@ def test_resumed_owner_with_moved_pages_is_dropped_not_flushed():
         gid: np.asarray([[pages[gid][0]], [fresh[gid]]], dtype=np.int32)
         for gid in _STATE_GROUPS
     }
-    metadata, op = _metadata_for(h.contract, tables, DEV)
-    op.request_pool_indices = rpis
-    op.request_ids = [f"req{r}" for r in rpis]
+    metadata, op = _metadata_op(h.contract, tables, rpis)
     h.backend.spec_num_tokens = 1
     try:
         h.backend.init_forward_metadata(
@@ -1115,13 +1110,7 @@ def _one_token_round(h, rpis, pages, seq_lens, seed):
     window = dict(
         mixed_qkv=rnd(bs, CONV_DIM), f_a_out=rnd(bs, D_FA), beta_raw=rnd(bs, H)
     )
-    tables = {
-        gid: np.asarray([[p] for p in pages[gid]], dtype=np.int32)
-        for gid in _STATE_GROUPS
-    }
-    metadata, op = _metadata_for(h.contract, tables, DEV)
-    op.request_pool_indices = list(rpis)
-    op.request_ids = [f"req{r}" for r in rpis]
+    metadata, op = _metadata_op(h.contract, _tables_for(pages), rpis)
     h.backend.speculative_num_draft_tokens = 1
     outs = {}
     try:
@@ -1307,11 +1296,7 @@ def test_empty_forward_round_keeps_a_resident_owners_window():
     h_lazy.backend._stage_pending_replay(0, len(rpis), {}, None)
     assert h_lazy.pending() is not None, "empty round dropped a live window"
 
-    for h in (h_lazy, h_eager):
-        h.verify_round(rpis, pages, [8, 7], h.window(2, 122))
-        h.accept([1, 1])
-        h.flush()
-    _assert_pools_match(h_lazy, h_eager, pages, rpis)
+    _accept_flush_and_assert(h_lazy, h_eager, pages, rpis, [8, 7], 122, [1, 1])
 
 
 def test_forward_without_a_record_does_not_double_apply_next_round():
@@ -1344,11 +1329,7 @@ def test_forward_without_a_record_does_not_double_apply_next_round():
     assert h_lazy.pending() is None, "issued forward left its record live"
 
     # Round 2 is retried at the same seq_lens and this time it records.
-    for h in (h_lazy, h_eager):
-        h.verify_round(rpis, pages, [8, 7], h.window(2, 133))
-        h.accept([1, 2])
-        h.flush()
-    _assert_pools_match(h_lazy, h_eager, pages, rpis)
+    _accept_flush_and_assert(h_lazy, h_eager, pages, rpis, [8, 7], 133, [1, 2])
 
 
 def test_pause_flush_does_not_write_a_departed_owners_reclaimed_pages():
@@ -1380,9 +1361,7 @@ def test_pause_flush_does_not_write_a_departed_owners_reclaimed_pages():
     tables = {
         gid: np.asarray([[pages[gid][1]]], dtype=np.int32) for gid in _STATE_GROUPS
     }
-    metadata, op = _metadata_for(h.contract, tables, DEV)
-    op.request_pool_indices = [5]
-    op.request_ids = ["req5"]
+    metadata, op = _metadata_op(h.contract, tables, [5])
     h.backend.init_forward_metadata(
         bs=1,
         req_pool_indices=torch.tensor([5], dtype=torch.int32, device=DEV),
@@ -1434,9 +1413,7 @@ def test_extend_row_owner_is_dropped_not_flushed():
         gid: np.asarray([[pages[gid][1]], [pages[gid][0]]], dtype=np.int32)
         for gid in _STATE_GROUPS
     }
-    metadata, op = _metadata_for(h.contract, tables, DEV)
-    op.request_pool_indices = [1, 0]
-    op.request_ids = ["req1", "req0"]
+    metadata, op = _metadata_op(h.contract, tables, [1, 0])
     h.backend.init_forward_metadata(
         bs=2,
         req_pool_indices=torch.tensor([1, 0], dtype=torch.int32, device=DEV),

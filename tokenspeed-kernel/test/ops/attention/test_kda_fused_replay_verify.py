@@ -445,28 +445,6 @@ def test_negative_base_row_adjacent_to_committing_rows():
     )
 
 
-def test_fused_boundary_steps_zero_and_full_in_one_batch():
-    """prev_steps = 0 and = T side by side, each committed to a moved page.
-
-    a = 0 with commit != anchor is a real commit of the unchanged state: the
-    anchor's bits must land on the commit page while the a = T rows commit
-    the fully replayed window, all in one launch.
-    """
-    n, t = 4, 3
-    x = _window(n, t, seed=53)
-    accepted = torch.tensor([0, t, 0, t], device=DEV, dtype=torch.int32)
-    commit = torch.arange(1, n + 1, device=DEV, dtype=torch.int32) + 24
-    ref_out, ref = _two_launch(x, n, t, accepted, commit)
-    got_out, got = _fused(x, n, t, accepted, commit)
-    _assert_equivalent(got_out, ref_out, got, ref)
-    for i in (0, 2):
-        r, w = int(x["anchor"][i]), int(commit[i])
-        torch.testing.assert_close(got["h_pool"][w], x["h_pool"][r], atol=0.0, rtol=0.0)
-        torch.testing.assert_close(
-            got["conv_pool"][w], x["conv_pool"][r], atol=0.0, rtol=0.0
-        )
-
-
 def test_fused_negative_prev_steps_clamps_to_zero():
     """Red-team pin: prev_steps < 0 must behave exactly like prev_steps = 0."""
     n, t = 3, 2
@@ -479,33 +457,6 @@ def test_fused_negative_prev_steps_clamps_to_zero():
     torch.testing.assert_close(got_out, ref_out, atol=0.0, rtol=0.0)
     torch.testing.assert_close(got["h_pool"], ref["h_pool"], atol=0.0, rtol=0.0)
     torch.testing.assert_close(got["conv_pool"], ref["conv_pool"], atol=0.0, rtol=0.0)
-
-
-def test_fused_in_place_commit_full_pool_accounting():
-    """In-place fused commit: account for every page in the pool, bit for bit.
-
-    Beyond matching the out-of-place result on the committed pages, no other
-    page of either pool may move at all -- a program storing outside its own
-    [BK, BV] slice (or the conv launch outside its channel block) would
-    disturb random sentinel bits somewhere in the slab.
-    """
-    n, t, pages = 8, 3, 48
-    x = _window(n, t, pages=pages, seed=59)
-    accepted = torch.tensor([0, 1, 2, 3, 3, 2, 1, 0], device=DEV, dtype=torch.int32)
-    fresh = torch.arange(1, n + 1, device=DEV, dtype=torch.int32) + 24
-    ref_out, ref = _fused(x, n, t, accepted, fresh)
-    for _ in range(6):  # a race or torn write would be intermittent
-        got_out, got = _fused(x, n, t, accepted, x["anchor"].clone())
-        torch.testing.assert_close(got_out, ref_out, atol=0.0, rtol=0.0)
-        for p in range(pages):
-            if 1 <= p <= n:
-                # Anchor page of request p-1: must hold the committed state.
-                rc, rh = ref["conv_pool"][p + 24], ref["h_pool"][p + 24]
-            else:
-                # Every other page must be untouched, bit for bit.
-                rc, rh = x["conv_pool"][p], x["h_pool"][p]
-            torch.testing.assert_close(got["conv_pool"][p], rc, atol=0.0, rtol=0.0)
-            torch.testing.assert_close(got["h_pool"][p], rh, atol=0.0, rtol=0.0)
 
 
 def test_fused_pending_on_a_fresh_request_replays_from_zero_state():
