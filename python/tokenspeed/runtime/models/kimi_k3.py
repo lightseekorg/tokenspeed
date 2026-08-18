@@ -399,23 +399,22 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         bf16/mxfp4 keep the canonical [q_a | kv_a | gate].
         """
         if self._fused_qkv_a_fp8_layout:
-            widths = {
-                "g_proj": self._gate_width,
-                "q_a_proj": self.q_lora_rank,
-                "kv_a_proj_with_mqa": self.kv_lora_rank + self.qk_rope_head_dim,
-            }
-            parts = dict(
-                zip(
-                    _FP8_FUSED_QKV_A_ORDER,
-                    qkv_gate.split(
-                        [widths[leaf] for leaf in _FP8_FUSED_QKV_A_ORDER],
-                        dim=-1,
-                    ),
-                )
+            # Locked to the assembly order: a layout change edits the
+            # constant, and this assertion turns any drift into a loud
+            # failure instead of silently mis-splitting the projections.
+            assert _FP8_FUSED_QKV_A_ORDER == (
+                "g_proj",
+                "q_a_proj",
+                "kv_a_proj_with_mqa",
             )
-            gate = parts["g_proj"]
-            q_a = parts["q_a_proj"]
-            latent_cache = parts["kv_a_proj_with_mqa"]
+            gate, q_a, latent_cache = qkv_gate.split(
+                [
+                    self._gate_width,
+                    self.q_lora_rank,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ],
+                dim=-1,
+            )
         else:
             q_a, latent_cache, gate = qkv_gate.split(
                 [
