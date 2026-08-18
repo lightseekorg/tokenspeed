@@ -139,7 +139,9 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         torch.cuda.synchronize()
         self.assertFalse(bool(executor.host_storage.host_buffer.any().item()))
 
-        executor._prefetch_from_storage(backup_pages)  # pylint: disable=protected-access
+        executor._prefetch_from_storage(
+            backup_pages
+        )  # pylint: disable=protected-access
         self.assertTrue(bool(executor.host_storage.host_buffer.any().item()))
 
         load_index = executor._start_loading(  # pylint: disable=protected-access
