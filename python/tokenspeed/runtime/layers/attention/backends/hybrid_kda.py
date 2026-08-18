@@ -96,7 +96,7 @@ class KdaAttnBackend(MambaAttnBackend):
         self._kda_pending: dict | None = None
         self._kda_replay_staged = False
         self._kda_lazy_bufs: dict | None = None
-        self._replay_active: bool = kda_replay_commit_supported()
+        self._replay_active: bool = kda_replay_commit_supported(self.dtype)
         self._replay_payload_cache: dict | None = None
         self._replay_layer_weights: dict | None = None
         self._verify_scratch: dict | None = None
@@ -1131,10 +1131,12 @@ class KdaAttnBackend(MambaAttnBackend):
             zeroed = pages_by_group.get(gid)
             if not zeroed:
                 continue
-            zset = torch.as_tensor(
-                sorted(set(int(p) for p in zeroed)),
-                dtype=torch.int64,
-                device=self.device,
+            # Pinned staging: a pageable H2D copy blocks the host until the
+            # stream drains, just like the nonzero sync below would.
+            zset = (
+                torch.tensor(sorted(set(int(p) for p in zeroed)), dtype=torch.int64)
+                .pin_memory()
+                .to(self.device, non_blocking=True)
             )
             # Fixed-shape update: boolean indexing would nonzero-sync the
             # host mid-overlap. Misses scatter -1 onto the sentinel row,

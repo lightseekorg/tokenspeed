@@ -584,3 +584,12 @@ def test_merged_capture_handles_a_gate_wider_than_one_column_block():
     torch.cuda.synchronize()
     assert torch.equal(dst_fa[: n * t], src_fa), "wide gate columns were dropped"
     assert torch.equal(dst_beta[: n * t], src_beta)
+
+
+def test_replay_commit_probe_tracks_dtype():
+    """Only half-precision replay-commit kernels are registered, so a probe
+    with the run's real dtype must decline fp32 instead of defaulting to
+    bf16 and enabling a replay path the verify batch cannot dispatch."""
+    from tokenspeed_kernel.ops.attention import kda_replay_commit_supported
+
+    assert not kda_replay_commit_supported(torch.float32)
