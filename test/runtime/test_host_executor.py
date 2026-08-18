@@ -287,6 +287,7 @@ class L3FlatKvExecutorTest(unittest.TestCase):
 
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
         executor.l3_store = Mock()
+        executor.l3_store.backup.return_value = [True]
         finish = Mock()
         finish.query.return_value = True
         results = []
@@ -296,6 +297,22 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         self.assertEqual(pending, [])
         executor.l3_store.backup.assert_called_once_with([(0, 1, "h0", 0)])
         self.assertEqual(len(results), 1)
+
+    def test_backup_failure_does_not_ack_writeback(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor, _Ack
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor.l3_store = Mock()
+        executor.l3_store.backup.return_value = [False]
+        finish = Mock()
+        finish.query.return_value = True
+        results = []
+        with self.assertRaisesRegex(RuntimeError, "L3 backup failed"):
+            executor._drain_writes([_Ack(finish, [7], [(0, 1, "h0", 0)])], results)
+        self.assertEqual(results, [])
 
     def test_prefetch_failure_raises(self):
         try:

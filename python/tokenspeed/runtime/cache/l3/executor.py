@@ -24,12 +24,15 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from typing import Any
 
 from tokenspeed.runtime.cache.l3.backend import KvStoreStorage, storage_object_key
 
 logger = logging.getLogger(__name__)
 
-StoragePage = tuple[int, int, str, int]  # group_index, host_block_id, content_hash, page_offset
+StoragePage = tuple[
+    int, int, str, int
+]  # group_index, host_block_id, content_hash, page_offset
 
 
 class L3HostStore:
@@ -38,7 +41,7 @@ class L3HostStore:
     def __init__(
         self,
         backend: KvStoreStorage,
-        host_storage: HostCacheStorage,
+        host_storage: Any,
         *,
         key_prefix: str = "",
         rank: int = 0,
@@ -104,12 +107,16 @@ class L3HostStore:
             hit_offsets.append(int(page_offset))
         return hit_groups, hit_hashes, hit_offsets
 
-    def _ranges(self, pages: Sequence[StoragePage]) -> tuple[list[str], list[int], list[int]]:
+    def _ranges(
+        self, pages: Sequence[StoragePage]
+    ) -> tuple[list[str], list[int], list[int]]:
         keys = []
         offsets = []
         sizes = []
         for group_id, host_block_id, content_hash, page_offset in pages:
-            offset, size = self.host_storage.host_block_range(int(group_id), int(host_block_id))
+            offset, size = self.host_storage.host_block_range(
+                int(group_id), int(host_block_id)
+            )
             keys.append(self.object_key(content_hash, int(group_id), int(page_offset)))
             offsets.append(offset)
             sizes.append(size)
@@ -122,7 +129,9 @@ class L3HostStore:
         results = self.backend.batch_put_from(
             keys, self.host_storage.host_buffer, offsets, sizes
         )
-        logger.info("[L3] backup pages=%d ok=%d", len(pages), sum(1 for ok in results if ok))
+        logger.info(
+            "[L3] backup pages=%d ok=%d", len(pages), sum(1 for ok in results if ok)
+        )
         return results
 
     def prefetch(self, pages: Sequence[StoragePage]) -> list[bool]:
@@ -132,7 +141,9 @@ class L3HostStore:
         results = self.backend.batch_get_into(
             keys, self.host_storage.host_buffer, offsets, sizes
         )
-        logger.info("[L3] prefetch pages=%d ok=%d", len(pages), sum(1 for ok in results if ok))
+        logger.info(
+            "[L3] prefetch pages=%d ok=%d", len(pages), sum(1 for ok in results if ok)
+        )
         return results
 
     def close(self) -> None:

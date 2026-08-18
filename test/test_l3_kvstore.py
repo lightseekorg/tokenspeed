@@ -89,7 +89,9 @@ class L3HostStoreTest(unittest.TestCase):
         self.assertEqual(groups, [0])
         self.assertEqual(hashes, ["h0"])
         self.assertEqual(offsets, [0])
-        self.assertEqual(l3.present_keys([0], ["h0"], [0], exists=[False]), ([], [], []))
+        self.assertEqual(
+            l3.present_keys([0], ["h0"], [0], exists=[False]), ([], [], [])
+        )
         l3.close()
 
 

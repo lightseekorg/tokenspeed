@@ -447,7 +447,12 @@ class L2CacheExecutor:
         l3_store = getattr(self, "l3_store", None)
         if not pages or l3_store is None:
             return
-        l3_store.backup(pages)
+        results = l3_store.backup(pages)
+        if len(results) != len(pages) or not all(results):
+            ok = sum(1 for flag in results if flag)
+            raise RuntimeError(
+                f"L3 backup failed for Host page(s): ok={ok}/{len(pages)}"
+            )
 
     def _drain_writes(self, queue, results):
         pending = []

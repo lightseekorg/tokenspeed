@@ -52,12 +52,16 @@ def _parse_global_segment_size(value: Any) -> int:
         if text.endswith("gb"):
             number = text[:-2].strip()
             if not number:
-                raise ValueError("Invalid global_segment_size: missing number before 'gb'")
+                raise ValueError(
+                    "Invalid global_segment_size: missing number before 'gb'"
+                )
             return int(number) * 1024 * 1024 * 1024
         if text.endswith("mb"):
             number = text[:-2].strip()
             if not number:
-                raise ValueError("Invalid global_segment_size: missing number before 'mb'")
+                raise ValueError(
+                    "Invalid global_segment_size: missing number before 'mb'"
+                )
             return int(number) * 1024 * 1024
         return int(text)
     return int(value)
@@ -183,7 +187,11 @@ class MooncakeKvStore:
     def _register_host_buffer(self, host_buffer: Any) -> None:
         ptr = host_buffer_ptr(host_buffer)
         numel = int(host_buffer.numel())
-        itemsize = int(host_buffer.element_size()) if hasattr(host_buffer, "element_size") else 1
+        itemsize = (
+            int(host_buffer.element_size())
+            if hasattr(host_buffer, "element_size")
+            else 1
+        )
         size = numel * itemsize
         if size <= 0:
             return
@@ -210,7 +218,9 @@ class MooncakeKvStore:
             return []
         base = host_buffer_ptr(host_buffer)
         ptrs = [base + int(offset) for offset in offsets]
-        results = self.store.batch_get_into(list(keys), ptrs, [int(size) for size in sizes])
+        results = self.store.batch_get_into(
+            list(keys), ptrs, [int(size) for size in sizes]
+        )
         return [int(result) > 0 for result in results]
 
     def batch_put_from(
@@ -240,7 +250,9 @@ class MooncakeKvStore:
             missing_index.append(index)
             results[index] = False
         if missing_keys:
-            put_results = self.store.batch_put_from(missing_keys, missing_ptrs, missing_sizes)
+            put_results = self.store.batch_put_from(
+                missing_keys, missing_ptrs, missing_sizes
+            )
             for index, ret in zip(missing_index, put_results):
                 results[index] = int(ret) == 0
         return results
