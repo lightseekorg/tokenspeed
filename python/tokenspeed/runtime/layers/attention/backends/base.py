@@ -240,15 +240,6 @@ class AttentionBackend(ABC):
         teardown.
         """
 
-    def release_deferred_state(self) -> None:
-        """Release work staged for a forward that has now been issued.
-
-        The first half of ``settle_deferred_state``: the composed inputs of a
-        staged round are on the device once the forward launches, so the CPU
-        record no longer owes a standalone flush. Split out so a composite
-        backend can release before it records a verify's result.
-        """
-
     def has_deferred_state(self) -> bool:
         """Whether any deferred work is pending settlement.
 

@@ -1064,9 +1064,12 @@ class KdaAttnBackend(MambaAttnBackend):
         else:
             self._kda_pending = None
 
-    @override
     def release_deferred_state(self) -> None:
         """Drop the record whose window the just-issued forward already applied.
+
+        KDA-internal, not part of the engine-facing deferred-state contract:
+        only ``HybridKDABackend.settle_deferred_state`` calls it, to retire the
+        staged record before recording the verify's result.
 
         The counterpart to ``flush_deferred_state``, which writes a window out:
         here the device work is already on its way, so only the bookkeeping is
