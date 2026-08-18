@@ -95,9 +95,7 @@ def _build_fp8_merged(rank: int):
 def _load(module, ckpt) -> None:
     for name, (codes, scales) in ckpt.items():
         module.weight.weight_loader(module.weight, codes, name)
-        module.weight_scale_inv.weight_loader(
-            module.weight_scale_inv, scales, name
-        )
+        module.weight_scale_inv.weight_loader(module.weight_scale_inv, scales, name)
 
 
 def _dequant(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -120,11 +118,7 @@ def test_fp8_merged_loading_codes_scales_and_pad() -> None:
         for name, rows in module._rows.items():
             codes, scales = ckpt[name]
             start = module._offsets[name]
-            src = (
-                codes
-                if name == "f_a"
-                else codes.narrow(0, rank * rows, rows)
-            )
+            src = codes if name == "f_a" else codes.narrow(0, rank * rows, rows)
             assert torch.equal(
                 module.weight.data[start : start + rows].view(torch.uint8),
                 src.view(torch.uint8),
@@ -142,26 +136,23 @@ def test_fp8_merged_loading_codes_scales_and_pad() -> None:
                 expected_scale,
             ), name
         # Pad rows carry zero codes -> exact-zero dequant under b's scale.
-        assert torch.all(
-            module.weight.data[module.used_rows :].view(torch.uint8) == 0
-        )
+        assert torch.all(module.weight.data[module.used_rows :].view(torch.uint8) == 0)
         # Full-buffer dequant matches the per-segment manual dequant.
         dq = _dequant(module.weight.data, module.weight_scale_inv.data)
         for name, rows in module._rows.items():
             codes, scales = ckpt[name]
             start = module._offsets[name]
-            src_codes = (
-                codes if name == "f_a" else codes.narrow(0, rank * rows, rows)
-            )
+            src_codes = codes if name == "f_a" else codes.narrow(0, rank * rows, rows)
             if name in ("f_a", "b"):
-                seg_ref = src_codes.float() * scales[:1].repeat_interleave(
-                    128, 0
-                )[:rows].repeat_interleave(128, 1)[:, :HIDDEN]
+                seg_ref = (
+                    src_codes.float()
+                    * scales[:1]
+                    .repeat_interleave(128, 0)[:rows]
+                    .repeat_interleave(128, 1)[:, :HIDDEN]
+                )
             else:
                 nblocks = rows // 128
-                seg_ref = _dequant(
-                    src_codes, scales.narrow(0, rank * nblocks, nblocks)
-                )
+                seg_ref = _dequant(src_codes, scales.narrow(0, rank * nblocks, nblocks))
             assert torch.equal(dq[start : start + rows], seg_ref), name
 
 
@@ -173,6 +164,13 @@ def test_fp8_merged_rejects_bf16_refit_shard() -> None:
             torch.zeros(PROJ, HIDDEN, dtype=torch.bfloat16, device="cuda"),
             "q",
         )
+
+
+def test_fp8_merged_forward_fails_fast() -> None:
+    """The legacy bf16 GEMV forward must not consume FP8 codes silently."""
+    module = _build_fp8_merged(rank=0)
+    with pytest.raises(RuntimeError, match="kimi3_qkvfab_projection"):
+        module(torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device="cuda"))
 
 
 def test_bf16_mode_unchanged() -> None:

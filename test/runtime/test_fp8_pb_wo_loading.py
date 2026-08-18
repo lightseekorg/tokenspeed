@@ -172,19 +172,60 @@ def test_w8a8_scale_shards_with_column_parallel_narrow() -> None:
         )
 
 
-def test_padded_fused_splice_selects_flashinfer_blockscale() -> None:
-    """The 128-padded fused_qkv_a splice must keep the flashinfer GEMM.
+def test_fp8_fused_assembly_verbatim_and_pad() -> None:
+    """Reordered fused assembly copies codes/scales bit-identically.
 
-    Kimi-K3's fused_qkv_a has 2880 output rows per rank at tp16; without tail
+    The private [gate | q_a | kv_a | pad] order puts every boundary on the
+    128 grid, so segment codes and scale rows stack verbatim (zero
+    requantization); the ragged last segment's trailing scale block is
+    completed by the zero pad rows, which dequantize to exact zeros under it
+    (pad lemma).
+    """
+    from tokenspeed.runtime.models.kimi_k3 import _assemble_fp8_fused_qkv_a
+
+    torch.manual_seed(4)
+    k = 256
+    seg_rows = [256, 256, 192]  # [gate | q_a | kv_a]-style, ragged last
+    segments = [
+        _quantize_per_block(torch.randn(rows, k, device="cuda")) for rows in seg_rows
+    ]
+    fused_w, fused_s = _assemble_fp8_fused_qkv_a(segments, total_rows=768)
+    assert fused_w.dtype == torch.float8_e4m3fn
+    assert fused_w.shape == (768, k) and fused_s.shape == (6, k // 128)
+
+    row = block = 0
+    for codes, scales in segments:
+        rows, nblocks = codes.shape[0], scales.shape[0]
+        assert torch.equal(
+            fused_w[row : row + rows].view(torch.uint8), codes.view(torch.uint8)
+        )
+        assert torch.equal(fused_s[block : block + nblocks], scales)
+        row += rows
+        block += nblocks
+    # Tail pad rows are exact-zero codes; the last (ragged) segment's final
+    # scale row covers them, so their dequant is exactly zero.
+    assert torch.all(fused_w[row:].view(torch.uint8) == 0)
+    assert block == fused_s.shape[0]
+
+    # Interior segments must be 128-row multiples (only the tail may be
+    # ragged) -- the layout invariant that makes verbatim stacking valid.
+    with pytest.raises(ValueError, match="only the last segment"):
+        _assemble_fp8_fused_qkv_a(
+            [segments[2], segments[0], segments[1]], total_rows=768
+        )
+
+
+def test_padded_fused_assembly_selects_flashinfer_blockscale() -> None:
+    """The 128-padded fused_qkv_a assembly must keep the flashinfer GEMM.
+
+    Kimi-K3's fused_qkv_a has 2880 real rows per rank at tp16; without tail
     padding (N % 128 == 64) Fp8LinearMethod falls back to the Triton
-    blockscale GEMM. Assert the padded assembly flips the layer onto the
-    flashinfer path (asserted via the method's own selection flag) and that
-    the pad rows produce exact-zero GEMM outputs.
+    blockscale GEMM. Assert the padded verbatim assembly flips the layer onto
+    the flashinfer path (the method's own selection flag) and that the pad
+    rows produce exact-zero GEMM outputs.
     """
     from tokenspeed.runtime.layers.dense.fp8 import has_flashinfer_fp8_blockscale
-    from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
-        splice_requant_fp8_block_rows,
-    )
+    from tokenspeed.runtime.models.kimi_k3 import _assemble_fp8_fused_qkv_a
 
     if has_flashinfer_fp8_blockscale is None or not has_flashinfer_fp8_blockscale():
         pytest.skip("requires the flashinfer fp8 blockscale GEMM")
@@ -206,18 +247,13 @@ def test_padded_fused_splice_selects_flashinfer_blockscale() -> None:
         }
     )
     k = 256
-    seg_rows = [256, 192, 256]  # 704 rows: % 128 == 64, like K3's 2880
-    segments = []
-    for rows in seg_rows:
-        w = torch.randn(rows, k, device="cuda")
-        segments.append(_quantize_per_block(w))
+    seg_rows = [256, 256, 192]  # 704 real rows: % 128 == 64, like K3's 2880
+    segments = [
+        _quantize_per_block(torch.randn(rows, k, device="cuda")) for rows in seg_rows
+    ]
     n_real = sum(seg_rows)
 
-    def _build(pad: bool):
-        fused_w, fused_s = splice_requant_fp8_block_rows(
-            segments, pad_rows_to_multiple=128 if pad else None
-        )
-        n_out = fused_w.shape[0]
+    def _build(n_out: int, fused_w: torch.Tensor, fused_s: torch.Tensor):
         method = config.get_quant_method(
             torch.nn.Module(), "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa"
         )
@@ -237,12 +273,16 @@ def test_padded_fused_splice_selects_flashinfer_blockscale() -> None:
         method.process_weights_after_loading(layer)
         return method, layer
 
-    # Unpadded control: 704 % 128 != 0 lands on the Triton fallback.
-    _, layer_ctrl = _build(pad=False)
+    # Unpadded control: 704 % 128 != 0 lands on the Triton fallback. (Single
+    # ragged tensor: the verbatim assembly itself only emits padded rows.)
+    ctrl_w = torch.cat([w for w, _ in segments])
+    ctrl_s = torch.cat([segments[0][1], segments[1][1], segments[2][1]])
+    _, layer_ctrl = _build(n_real, ctrl_w, ctrl_s)
     assert layer_ctrl._use_flashinfer_fp8_blockscale is False
 
-    # Padded: 768 % 128 == 0 selects the flashinfer blockscale GEMM.
-    method, layer = _build(pad=True)
+    # Padded assembly: 768 % 128 == 0 selects the flashinfer blockscale GEMM.
+    fused_w, fused_s = _assemble_fp8_fused_qkv_a(segments, total_rows=768)
+    method, layer = _build(768, fused_w, fused_s)
     assert layer._use_flashinfer_fp8_blockscale is True
     assert layer._use_deep_gemm_fp8 is False
 
