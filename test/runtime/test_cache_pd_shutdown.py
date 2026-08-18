@@ -44,15 +44,9 @@ class _SchedulerHarness:
         return SimpleNamespace(pages_to_zero=())
 
 
-class _AttnBackendHarness:
-    def drop_deferred_on_pages(self, pages_by_group) -> None:
-        assert not pages_by_group
-
-
 class _ModelExecutorHarness:
     def __init__(self, trace: list[str]) -> None:
         self._trace = trace
-        self.attn_backend = _AttnBackendHarness()
 
     def zero_cache_pages(self, page_ids) -> None:
         assert tuple(page_ids) == ()

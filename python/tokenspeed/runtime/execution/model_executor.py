@@ -1195,6 +1195,9 @@ class ModelExecutor:
         """Clear newly owned pages and return a CUDA completion event when needed."""
         if not pages:
             return None
+        if isinstance(pages, Mapping):
+            # Zeroed pages are changing owners; condemn deferred work first.
+            self.attn_backend.drop_deferred_on_pages(pages)
 
         def sanitize(pool, pool_pages) -> bool:
             zero_new_blocks = getattr(pool, "zero_new_blocks", None)

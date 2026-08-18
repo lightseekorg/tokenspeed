@@ -21,12 +21,14 @@ register_cuda_ci(est_time=15, suite="runtime-1gpu")
 
 class ZeroCachePagesContractTest(unittest.TestCase):
     @staticmethod
-    def _call(pool, page_ids, draft_pool=None):
+    def _call(pool, page_ids, draft_pool=None, attn_backend=None):
         from tokenspeed.runtime.execution.model_executor import ModelExecutor
 
         fake = types.SimpleNamespace(
             token_to_kv_pool=pool,
             draft_token_to_kv_pool=draft_pool,
+            attn_backend=attn_backend
+            or types.SimpleNamespace(drop_deferred_on_pages=lambda pages: None),
             device="cpu",
         )
         return ModelExecutor.zero_cache_pages(fake, page_ids)
@@ -96,3 +98,15 @@ class ZeroCachePagesContractTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_mapping_pages_condemn_deferred_work_before_zeroing(self):
+        order = []
+        pool = types.SimpleNamespace(
+            requires_page_zeroing=True,
+            zero_new_blocks=lambda pages: order.append("zero"),
+        )
+        backend = types.SimpleNamespace(
+            drop_deferred_on_pages=lambda pages: order.append("drop"),
+        )
+        self.assertIsNone(self._call(pool, {"g": [1]}, attn_backend=backend))
+        self.assertEqual(order, ["drop", "zero"])
