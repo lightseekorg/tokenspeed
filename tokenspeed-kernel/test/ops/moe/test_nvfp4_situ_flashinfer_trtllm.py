@@ -359,3 +359,17 @@ def test_situ_preprocessor_rejects_mismatched_gate_up_global_scales() -> None:
     w = _MoEWeights(raw).cuda()
     with pytest.raises(RuntimeError, match="equal gate/up weight_scale_2"):
         flashinfer_trtllm_nvfp4_situ_moe_weights({}, w)
+
+
+def test_registry_deferred_finalize_bit_stays_false() -> None:
+    """K3's latent-tail arming reads this bit; a silent flip to True would
+    re-arm TAIL_FUSION and crash the experts layer on do_finalize=False."""
+    import tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4  # noqa: F401
+    from tokenspeed_kernel.registry import KernelRegistry
+
+    spec = KernelRegistry.get().get_by_name(
+        "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"
+    )
+    if spec is None:
+        pytest.skip("nvfp4 SiTU kernel not registered on this platform")
+    assert spec.traits["supports_deferred_finalize"] == frozenset({False})

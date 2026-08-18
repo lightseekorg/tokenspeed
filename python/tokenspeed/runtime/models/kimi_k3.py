@@ -1599,6 +1599,13 @@ class KimiLinearMoE(nn.Module):
             routed_norm=self.routed_expert_norm,
             up_proj=self.routed_expert_up_proj,
             execution_plan=self.execution_plan,
+            # The experts kernel plan's capability bit (rank-uniform):
+            # nvfp4-SiTU registers supports_deferred_finalize=False, so the
+            # latent tail must arm the materialized-input mode there.
+            # self.experts is constructed above, before this comm object.
+            experts_supports_deferred_finalize=(
+                self.experts.supports_deferred_finalize
+            ),
         )
 
     def pack_input_projection_weights(self) -> None:
