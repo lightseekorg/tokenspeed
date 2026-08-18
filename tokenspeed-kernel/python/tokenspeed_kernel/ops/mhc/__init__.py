@@ -205,4 +205,5 @@ def mhc_fused_hc(
 
 # Registration side effects must run after the public API is defined.
 import tokenspeed_kernel.ops.mhc.deep_gemm  # noqa: E402,F401
+import tokenspeed_kernel.ops.mhc.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.mhc.triton  # noqa: E402,F401
