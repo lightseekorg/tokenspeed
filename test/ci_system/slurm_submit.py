@@ -681,10 +681,11 @@ def print_progress(
 ) -> None:
     print(f"\nSlurm progress ({time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())})")
     for submission in submissions:
-        state = states.get(
-            submission.job_id,
-            {"state": "UNKNOWN", "elapsed": "", "reason": ""},
-        )
+        state = states.get(submission.job_id) or {
+            "state": "UNKNOWN",
+            "elapsed": "",
+            "reason": "",
+        }
         status = {
             "COMPLETED": "PASS",
             "FAILED": "FAIL",

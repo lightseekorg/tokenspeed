@@ -494,3 +494,17 @@ def test_print_progress_omits_running_node(capsys, tmp_path):
     assert "123" in output
     assert "example" in output
     assert "node" not in output
+
+
+def test_print_progress_handles_accounting_delay(capsys, tmp_path):
+    submission = Submission(
+        Task("test/ci/ut/example.yaml", "example", "ut", "gb300-1gpu", 1),
+        "123",
+        tmp_path / "job.log",
+    )
+
+    print_progress([submission], {"123": {}})
+
+    output = capsys.readouterr().out
+    assert "UNKNOWN" in output
+    assert "123" in output
