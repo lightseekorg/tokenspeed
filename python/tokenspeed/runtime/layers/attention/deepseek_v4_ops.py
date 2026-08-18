@@ -50,6 +50,9 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_fused_inv_rope_fp8_quant,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    deepseek_v4_fused_qnorm_rope_kv_insert as _triton_fused_qnorm_rope_kv_insert,
+)
+from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_fused_sparse_compress_cache_insert as _triton_fused_sparse_compress_cache_insert,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
@@ -87,6 +90,7 @@ __all__ = (
     "deepseek_v4_csa_compress_kv_cache_insert",
     "deepseek_v4_csa_indexer_cache_insert",
     "deepseek_v4_hca_compress_kv_cache_insert",
+    "deepseek_v4_prepare_indexer_q",
     "deepseek_v4_prepare_indexer_q_fp8",
     "deepseek_v4_prepare_indexer_q_mxfp4",
     "dequantize_deepseek_v4_fp8_ds_mla_cache",
@@ -150,20 +154,31 @@ def fused_qnorm_rope_kv_insert(
     - positions: absolute token positions
     """
 
-    if not _cuda_has_fused_qnorm_rope_kv_insert():
+    if _cuda_has_fused_qnorm_rope_kv_insert():
+        _cuda_fused_qnorm_rope_kv_insert(
+            q,
+            kv,
+            swa_kv_cache_2d,
+            slot_mapping,
+            positions.to(torch.int64),
+            cos_sin_cache,
+            rms_norm_eps,
+            block_size,
+        )
+        return
+
+    if not q.is_cuda:
         raise RuntimeError(
             "DeepSeek V4 fused SWA cache insert op "
-            "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert is unavailable. "
-            "Build `tokenspeed-kernel/python` so the deepseek_v4_attention CUDA "
-            "library is present before running this path."
+            "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert is unavailable "
+            "for CPU tensors."
         )
-
-    _cuda_fused_qnorm_rope_kv_insert(
+    _triton_fused_qnorm_rope_kv_insert(
         q,
         kv,
         swa_kv_cache_2d,
         slot_mapping,
-        positions.to(torch.int64),
+        positions,
         cos_sin_cache,
         rms_norm_eps,
         block_size,
@@ -317,6 +332,32 @@ def deepseek_v4_prepare_indexer_q_mxfp4(
         softmax_scale=softmax_scale,
         head_scale=head_scale,
     )
+
+
+def deepseek_v4_prepare_indexer_q(
+    index_q: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weights: torch.Tensor,
+    head_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare BF16 index queries and FP32 weights for public DSA top-k."""
+
+    if index_q.dim() != 3:
+        raise ValueError(f"index_q must be [tokens, heads, dim], got {index_q.shape}")
+    if weights.dim() == 3:
+        weights = weights.squeeze(-1)
+    if weights.shape != index_q.shape[:2]:
+        raise ValueError(f"weights must be [tokens, heads], got {tuple(weights.shape)}")
+    rope_dim = int(cos_sin_cache.shape[-1])
+    rotated = _apply_gptj_rope_tail_rows(
+        index_q,
+        positions,
+        cos_sin_cache,
+        rope_dim,
+    )
+    query = _deepseek_v4_hadamard_rotate(rotated).to(torch.bfloat16).contiguous()
+    return query, (weights.float() * float(head_scale)).contiguous()
 
 
 def deepseek_v4_prepare_indexer_q_fp8(
@@ -663,8 +704,7 @@ def write_deepseek_v4_indexer_fp8_cache(
     min_stride = block_size * row_bytes
     if cache_2d.dim() != 2 or cache_2d.shape[1] < min_stride:
         raise ValueError(
-            f"cache_2d must be [pages, >= {min_stride}], "
-            f"got {tuple(cache_2d.shape)}"
+            f"cache_2d must be [pages, >= {min_stride}], got {tuple(cache_2d.shape)}"
         )
 
     num_actual = min(slot_mapping.numel(), index_k.shape[0])

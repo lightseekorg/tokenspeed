@@ -22,13 +22,19 @@ from tokenspeed_kernel.ops.attention.flash_mla import (
     get_mla_metadata,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    deepseek_v4_dequantize_selected_cache_rows,
     deepseek_v4_indexer_decode_metadata_compute,
+    deepseek_v4_sparse_attention,
 )
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import error_fn
 
 try:
     from tokenspeed_kernel.thirdparty import deep_gemm
 except Exception:
+    deep_gemm = None  # type: ignore[assignment]
+
+if not current_platform().is_nvidia:
     deep_gemm = None  # type: ignore[assignment]
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -438,7 +444,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         expected = self._expected_cache_group_ids
         if expected is None:
             raise RuntimeError(
-                "DeepSeek V4 cache group specs were not initialized before " f"{phase}"
+                f"DeepSeek V4 cache group specs were not initialized before {phase}"
             )
         items = list(block_tables.items())
         delivered: list[str] = []
@@ -549,8 +555,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             max_page_id = self._cache_group_max_page_ids.get(group_id)
             if raw_tokens_per_page is None or max_page_id is None:
                 raise RuntimeError(
-                    "DeepSeek V4 cache group contract is incomplete for "
-                    f"{group_id!r}"
+                    f"DeepSeek V4 cache group contract is incomplete for {group_id!r}"
                 )
             live = table[:actual_bs]
             required_page = torch.div(
@@ -1439,12 +1444,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 f"metadata_tokens={metadata.token_to_req_indices.numel()}, "
                 f"q_tokens={q.shape[0]}"
             )
-        if flash_mla_with_kvcache is error_fn:
-            raise RuntimeError(
-                "DeepSeek V4 decode requires FlashMLA latent attention. "
-                "Build/install `tokenspeed-kernel/python` with FlashMLA."
-            )
-
         if q.shape[1] == padded_heads:
             q_padded = q.contiguous()
         else:
@@ -1490,27 +1489,111 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compressed_block_size,
             )
 
-        out, _ = flash_mla_with_kvcache(
-            q=q_padded.unsqueeze(1),
-            k_cache=swa_cache,
-            block_table=None,
-            cache_seqlens=None,
-            head_dim_v=head_dim,
-            tile_scheduler_metadata=self._get_decode_tile_metadata(
-                kind,
-                q_padded.shape[0],
-            ),
-            softmax_scale=softmax_scale,
-            is_fp8_kvcache=True,
-            indices=swa_indices.unsqueeze(1),
-            attn_sink=attn_sink,
-            extra_k_cache=compressed_cache,
-            extra_indices_in_kvcache=extra_indices,
-            topk_length=swa_lens,
-            extra_topk_length=extra_lens,
+        if flash_mla_with_kvcache is not error_fn:
+            out, _ = flash_mla_with_kvcache(
+                q=q_padded.unsqueeze(1),
+                k_cache=swa_cache,
+                block_table=None,
+                cache_seqlens=None,
+                head_dim_v=head_dim,
+                tile_scheduler_metadata=self._get_decode_tile_metadata(
+                    kind,
+                    q_padded.shape[0],
+                ),
+                softmax_scale=softmax_scale,
+                is_fp8_kvcache=True,
+                indices=swa_indices.unsqueeze(1),
+                attn_sink=attn_sink,
+                extra_k_cache=compressed_cache,
+                extra_indices_in_kvcache=extra_indices,
+                topk_length=swa_lens,
+                extra_topk_length=extra_lens,
+            )
+            if out.dim() == 4:
+                out = out.squeeze(1)
+            return out[:, :num_local_heads]
+
+        swa_offsets = torch.arange(
+            swa_indices.shape[-1],
+            dtype=torch.int32,
+            device=swa_indices.device,
+        )[None, :]
+        swa_valid = (swa_indices >= 0) & (swa_offsets < swa_lens[:, None])
+        swa_slots = torch.where(
+            swa_valid, swa_indices, torch.full_like(swa_indices, -1)
         )
-        if out.dim() == 4:
-            out = out.squeeze(1)
+        swa_dense = deepseek_v4_dequantize_selected_cache_rows(
+            token_to_kv_pool.get_swa_kv_buffer(layer_id),
+            swa_slots,
+            swa_block_size,
+        )
+        workspace_parts = [swa_dense]
+        index_parts = [
+            torch.where(
+                swa_valid,
+                swa_offsets,
+                torch.full_like(swa_indices, -1),
+            )
+        ]
+        if extra_indices is not None and compressed_cache is not None:
+            extra_slots = extra_indices.reshape(extra_indices.shape[0], -1)
+            extra_offsets = torch.arange(
+                extra_slots.shape[-1],
+                dtype=torch.int32,
+                device=extra_slots.device,
+            )[None, :]
+            extra_valid = extra_slots >= 0
+            if extra_lens is not None:
+                extra_valid = extra_valid & (extra_offsets < extra_lens[:, None])
+            extra_slots = torch.where(
+                extra_valid,
+                extra_slots,
+                torch.full_like(extra_slots, -1),
+            )
+            extra_dense = deepseek_v4_dequantize_selected_cache_rows(
+                token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id),
+                extra_slots,
+                compressed_block_size,
+            )
+            extra_base = swa_indices.shape[-1]
+            workspace_parts.append(extra_dense)
+            index_parts.append(
+                torch.where(
+                    extra_valid,
+                    extra_base + extra_offsets,
+                    torch.full_like(extra_slots, -1),
+                )
+            )
+        kv_workspace = torch.cat(workspace_parts, dim=1)
+        selected_indices = torch.cat(index_parts, dim=1)
+        workspace_width = selected_indices.shape[1]
+        row_bases = (
+            torch.arange(
+                selected_indices.shape[0],
+                dtype=torch.int32,
+                device=selected_indices.device,
+            )[:, None]
+            * workspace_width
+        )
+        selected_indices = torch.where(
+            selected_indices >= 0,
+            selected_indices + row_bases,
+            selected_indices,
+        )
+        selected_lens = torch.full(
+            (q_padded.shape[0],),
+            workspace_width,
+            dtype=torch.int32,
+            device=q_padded.device,
+        )
+        out = deepseek_v4_sparse_attention(
+            q=q_padded,
+            kv=kv_workspace,
+            indices=selected_indices,
+            lens=selected_lens,
+            attn_sink=attn_sink,
+            softmax_scale=softmax_scale,
+        )
         return out[:, :num_local_heads]
 
     def forward_deepseek_v4_mixed(
@@ -1934,12 +2017,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
-        if flash_mla_sparse_fwd is error_fn:
-            raise RuntimeError(
-                "DeepSeek V4 prefill requires FlashMLA sparse attention. "
-                "Build/install `tokenspeed-kernel/python` with FlashMLA."
-            )
-
         with nvtx_range(f"attn_{kind}_prefill_pad_q"):
             if q.shape[1] == padded_heads:
                 q_padded = q.contiguous()
@@ -1960,15 +2037,25 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 head_dim=head_dim,
                 topk_indices=topk_indices,
             )
-        with nvtx_range(f"attn_{kind}_prefill_flashmla"):
-            out, _, _ = flash_mla_sparse_fwd(
-                q=q_padded,
-                kv=kv_workspace.view(-1, 1, head_dim),
-                indices=indices.unsqueeze(1),
-                sm_scale=softmax_scale,
-                attn_sink=attn_sink,
-                topk_length=lens,
-            )
+        with nvtx_range(f"attn_{kind}_prefill_selected_attention"):
+            if flash_mla_sparse_fwd is not error_fn:
+                out, _, _ = flash_mla_sparse_fwd(
+                    q=q_padded,
+                    kv=kv_workspace.view(-1, 1, head_dim),
+                    indices=indices.unsqueeze(1),
+                    sm_scale=softmax_scale,
+                    attn_sink=attn_sink,
+                    topk_length=lens,
+                )
+            else:
+                out = deepseek_v4_sparse_attention(
+                    q=q_padded,
+                    kv=kv_workspace,
+                    indices=indices,
+                    lens=lens,
+                    attn_sink=attn_sink,
+                    softmax_scale=softmax_scale,
+                )
         return out[:, :num_local_heads]
 
     def forward_deepseek_v4_prefill(

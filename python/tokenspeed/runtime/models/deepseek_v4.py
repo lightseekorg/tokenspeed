@@ -34,6 +34,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel import bmm, dsa_decode_topk, dsa_prefill_topk
 
 try:
     # Optional dependency; the module-level wrapper imports the external
@@ -91,6 +92,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
     V4_KERNEL_BLOCK_ROWS,
+    deepseek_v4_indexer_fp8_scale_bytes,
     deepseek_v4_indexer_mxfp4_layout_from_row_bytes,
     deepseek_v4_indexer_mxfp4_scale_dim,
     deepseek_v4_indexer_mxfp4_value_bytes,
@@ -102,6 +104,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_csa_indexer_cache_insert,
     deepseek_v4_fused_inv_rope_fp8_quant,
     deepseek_v4_hca_compress_kv_cache_insert,
+    deepseek_v4_prepare_indexer_q,
     deepseek_v4_prepare_indexer_q_fp8,
     deepseek_v4_prepare_indexer_q_mxfp4,
     fused_qnorm_rope_kv_insert,
@@ -151,6 +154,8 @@ from tokenspeed.runtime.utils.env import global_server_args_dict, pdl_enabled
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 _platform = current_platform()
+if not _platform.is_nvidia:
+    deep_gemm = None  # type: ignore[assignment]
 
 
 logger = get_colorful_logger(__name__)
@@ -174,6 +179,18 @@ def _deepseek_v4_indexer_token_split(
     if forward_mode is not None and forward_mode.is_decode():
         return 0, int(total_tokens)
     return int(total_tokens), 0
+
+
+def _deepseek_v4_pack_fp8_indexer_cache(
+    cache_2d: torch.Tensor,
+    block_size: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Copy strided V4 pages while preserving their value/scale plane order."""
+
+    row_bytes = head_dim + deepseek_v4_indexer_fp8_scale_bytes(head_dim)
+    page_bytes = block_size * row_bytes
+    return cache_2d[:, :page_bytes].contiguous().view(-1, row_bytes)
 
 
 def _deepseek_v4_forward_metadata(ctx: ForwardContext):
@@ -678,8 +695,7 @@ def _deepseek_v4_indexer_topk_from_logits(
         )
     if topk_tokens not in (512, 1024, 2048):
         raise RuntimeError(
-            "DeepSeek V4 decode indexer top-k supports topk_tokens in "
-            "{512, 1024, 2048}"
+            "DeepSeek V4 decode indexer top-k supports topk_tokens in {512, 1024, 2048}"
         )
 
     if (
@@ -1079,7 +1095,7 @@ def _deepseek_v4_indexer_prefill_metadata(
                 req_end=chunk.req_end,
                 query_start=chunk.query_start,
                 query_end=chunk.query_end,
-                build_slots=False,
+                build_slots=True,
             )
         )
         slot_count = _deepseek_v4_indexer_prefill_chunk_total_rows(
@@ -3157,6 +3173,94 @@ class DeepseekV4Indexer(nn.Module):
             context_lens=decode_plan.context_lens,
         )
 
+    def _forward_sparse_indexer_portable(
+        self,
+        query: torch.Tensor,
+        weights: torch.Tensor,
+        indexer_cache: torch.Tensor,
+        indexer_page_table: torch.Tensor,
+        indexer_block_size: int,
+        prefill_metadata: DeepseekV4IndexerPrefillMetadata,
+        decode_plan: DeepseekV4IndexerDecodePlan | None,
+        num_prefill_tokens: int,
+        num_decode_tokens: int,
+        topk_out: torch.Tensor,
+    ) -> torch.Tensor:
+        topk_out.fill_(-1)
+        packed_indexer_cache = _deepseek_v4_pack_fp8_indexer_cache(
+            indexer_cache,
+            indexer_block_size,
+            self.head_dim,
+        )
+        max_logits_mb = int(
+            global_server_args_dict.get(
+                "deepseek_v4_indexer_prefill_max_logits_mb", 512
+            )
+            or 512
+        )
+        for chunk in prefill_metadata.chunks:
+            token_slice = slice(chunk.token_start, chunk.token_end)
+            row_slice = slice(chunk.gather_row_start, chunk.gather_row_end)
+            slots = prefill_metadata.slots[chunk.slot_start : chunk.slot_end]
+            row_starts = prefill_metadata.cu_seqlen_k_start[row_slice]
+            row_ends = prefill_metadata.cu_seqlen_k_end[row_slice]
+            selected, _ = dsa_prefill_topk(
+                query[token_slice],
+                weights[token_slice],
+                slots,
+                row_starts,
+                row_ends,
+                topk=self.topk_tokens,
+                softmax_scale=self.softmax_scale,
+                index_k_cache=packed_indexer_cache,
+                page_size=indexer_block_size,
+                max_logits_bytes=max_logits_mb * 1024 * 1024,
+                out=topk_out[token_slice],
+            )
+            local = selected.to(torch.int64) - row_starts.to(torch.int64)[:, None]
+            valid = (selected >= 0) & (selected < row_ends[:, None])
+            topk_out[token_slice].copy_(
+                torch.where(valid, local, torch.full_like(local, -1)).to(torch.int32)
+            )
+
+        if num_decode_tokens <= 0:
+            return topk_out
+        if decode_plan is None:
+            raise RuntimeError("DeepSeek V4 decode indexer plan is missing")
+        decode_start = num_prefill_tokens
+        decode_end = decode_start + num_decode_tokens
+        decode_slice = slice(decode_start, decode_end)
+        seq_lens = decode_plan.context_lens[:, -1].to(torch.int32).contiguous()
+        selected, _ = dsa_decode_topk(
+            query[decode_slice],
+            weights[decode_slice],
+            seq_lens,
+            decode_plan.page_table,
+            page_size=indexer_block_size,
+            topk=self.topk_tokens,
+            softmax_scale=self.softmax_scale,
+            index_k_cache=packed_indexer_cache,
+            out=topk_out[decode_slice],
+        )
+        selected_i64 = selected.to(torch.int64)
+        selected_pages = torch.div(
+            selected_i64.clamp_min(0),
+            indexer_block_size,
+            rounding_mode="floor",
+        )
+        page_table = decode_plan.page_table.to(torch.int64)
+        page_matches = page_table[:, None, :] == selected_pages[:, :, None]
+        has_page = page_matches.any(dim=-1)
+        logical_pages = page_matches.to(torch.int32).argmax(dim=-1).to(torch.int64)
+        local = logical_pages * indexer_block_size + torch.remainder(
+            selected_i64.clamp_min(0), indexer_block_size
+        )
+        valid = (selected_i64 >= 0) & has_page & (local < seq_lens[:, None])
+        topk_out[decode_slice].copy_(
+            torch.where(valid, local, torch.full_like(local, -1)).to(torch.int32)
+        )
+        return topk_out
+
     def _forward_sparse_indexer_custom_op(
         self,
         *,
@@ -3169,8 +3273,6 @@ class DeepseekV4Indexer(nn.Module):
         indexer_block_size: int,
         cos_sin_cache: torch.Tensor,
     ) -> torch.Tensor:
-        if deep_gemm is None:
-            raise RuntimeError("DeepSeek V4 sparse indexer requires DeepGEMM")
         if not positions.is_cuda:
             raise RuntimeError("DeepSeek V4 sparse indexer requires CUDA tensors")
 
@@ -3193,7 +3295,25 @@ class DeepseekV4Indexer(nn.Module):
             index_q = index_q.view(-1, self.n_head, self.head_dim)
         with nvtx_range("indexer_weights_proj"):
             weights, _ = self.weights_proj(hidden_states)
-        if self.use_fp4_cache:
+        if deep_gemm is None:
+            if self.use_fp4_cache:
+                raise RuntimeError(
+                    "DeepSeek V4 MXFP4 indexer cache requires DeepGEMM; "
+                    "set --attention-use-fp4-indexer-cache false"
+                )
+            with nvtx_range("indexer_prepare_portable"):
+                q_values, packed_weights = deepseek_v4_prepare_indexer_q(
+                    index_q=index_q,
+                    positions=positions,
+                    cos_sin_cache=cos_sin_cache,
+                    weights=weights,
+                    head_scale=self.n_head**-0.5,
+                )
+            packed_index_q = (
+                q_values,
+                q_values.new_empty((q_values.shape[0], 0), dtype=torch.float32),
+            )
+        elif self.use_fp4_cache:
             with nvtx_range("indexer_prepare_mxfp4"):
                 packed_index_q, packed_weights = deepseek_v4_prepare_indexer_q_mxfp4(
                     index_q=index_q,
@@ -3307,6 +3427,19 @@ class DeepseekV4Indexer(nn.Module):
                 dtype=torch.int32,
             )
         )[:total_tokens]
+        if deep_gemm is None:
+            return self._forward_sparse_indexer_portable(
+                query=packed_index_q[0],
+                weights=packed_weights,
+                indexer_cache=indexer_cache,
+                indexer_page_table=indexer_page_table,
+                indexer_block_size=indexer_block_size,
+                prefill_metadata=prefill_metadata,
+                decode_plan=decode_plan,
+                num_prefill_tokens=num_prefill_tokens,
+                num_decode_tokens=num_decode_tokens,
+                topk_out=topk_out,
+            )
         return _deepseek_v4_sparse_attn_indexer(
             indexer_metadata=indexer_metadata,
             indexer_cache=indexer_cache,
@@ -3660,11 +3793,11 @@ class DeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
     ) -> torch.Tensor:
-        # Inverse RoPE + grouped block-scaled FP8 quant in one Triton kernel,
-        # then a single native FP8 GEMM via deep_gemm.fp8_einsum -- replaces the
-        # inv-rope + per-group online-quant + GEMM chain. wo_a's block scale was
-        # transformed into the deep_gemm MN-major layout at load time.
+        # Inverse RoPE + grouped block-scaled FP8 quant in one Triton kernel.
+        # DeepGEMM consumes its transformed scale layout when available; the
+        # public BMM path consumes canonical checkpoint scales on other devices.
         heads_per_group = self.num_local_heads // self.num_local_groups
+        use_deep_gemm = getattr(self.wo_a, "_use_deep_gemm_fp8", False)
         o_fp8, o_scale = deepseek_v4_fused_inv_rope_fp8_quant(
             attn_output,
             positions,
@@ -3673,24 +3806,41 @@ class DeepseekV4Attention(nn.Module):
             heads_per_group=heads_per_group,
             nope_dim=self.nope_head_dim,
             rope_dim=self.qk_rope_head_dim,
-            tma_aligned_scales=self._o_tma_aligned,
+            tma_aligned_scales=self._o_tma_aligned and use_deep_gemm,
         )
         in_dim = self.num_heads * self.head_dim // self.o_groups
         weight = self.wo_a.weight.view(self.num_local_groups, self.o_lora_rank, in_dim)
-        block_n, block_k = self.wo_a._deep_gemm_block_size
-        recipe = (1, 1, block_n) if self._o_tma_aligned else (1, block_n, block_k)
+        block_n, block_k = self.wo_a.quant_config.weight_block_size
         z = torch.empty(
             (attn_output.shape[0], self.num_local_groups, self.o_lora_rank),
             device=attn_output.device,
             dtype=torch.bfloat16,
         )
-        deep_gemm.fp8_einsum(
-            "bhr,hdr->bhd",
-            (o_fp8, o_scale),
-            (weight, self.wo_a.weight_scale_inv),
-            z,
-            recipe=recipe,
-        )
+        if use_deep_gemm:
+            recipe = (1, 1, block_n) if self._o_tma_aligned else (1, block_n, block_k)
+            deep_gemm.fp8_einsum(
+                "bhr,hdr->bhd",
+                (o_fp8, o_scale),
+                (weight, self.wo_a.weight_scale_inv),
+                z,
+                recipe=recipe,
+            )
+        else:
+            weight_scale = self.wo_a.weight_scale_inv.view(
+                self.num_local_groups,
+                self.o_lora_rank // block_n,
+                in_dim // block_k,
+            )
+            bmm(
+                o_fp8.transpose(0, 1),
+                weight,
+                A_scales=o_scale.transpose(0, 1),
+                B_scales=weight_scale,
+                out=z.transpose(0, 1),
+                out_dtype=z.dtype,
+                block_size=[block_n, block_k],
+                quant="mxfp8",
+            )
         out, _ = self.wo_b(z.flatten(1))
         return out
 

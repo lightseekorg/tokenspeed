@@ -56,14 +56,436 @@ __all__ = [
     "deepseek_v4_compute_global_topk_indices_and_lens",
     "deepseek_v4_decode_swa_indices_and_lens",
     "deepseek_v4_dequantize_and_gather_k_cache",
+    "deepseek_v4_dequantize_selected_cache_rows",
     "deepseek_v4_fused_csa_indexer_mxfp4_cache_insert",
     "deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4",
+    "deepseek_v4_fused_qnorm_rope_kv_insert",
     "deepseek_v4_fused_sparse_compress_cache_insert",
     "deepseek_v4_gather_indexer_mxfp4_cache",
     "deepseek_v4_indexer_decode_metadata_compute",
     "deepseek_v4_save_compressor_state",
+    "deepseek_v4_sparse_attention",
     "write_deepseek_v4_indexer_mxfp4_cache_cuda",
 ]
+
+
+@triton.jit
+def _deepseek_v4_qnorm_rope_kernel(
+    q_ptr,
+    positions_ptr,
+    cos_sin_cache_ptr,
+    q_stride_token,
+    q_stride_head,
+    cos_sin_stride,
+    rms_norm_eps,
+    HEAD_DIM: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK_DIM)
+    mask = offsets < HEAD_DIM
+    q_base = q_ptr + token_idx * q_stride_token + head_idx * q_stride_head
+    q = tl.load(q_base + offsets, mask=mask, other=0.0).to(tl.float32)
+    q *= tl.rsqrt(tl.sum(q * q, axis=0) / HEAD_DIM + rms_norm_eps)
+
+    NUM_PAIRS: tl.constexpr = BLOCK_DIM // 2
+    NOPE_PAIRS: tl.constexpr = NOPE_DIM // 2
+    pair_2d = tl.reshape(q, (NUM_PAIRS, 2))
+    even, odd = tl.split(pair_2d)
+    pair_idx = tl.arange(0, NUM_PAIRS)
+    rope_pair = pair_idx - NOPE_PAIRS
+    is_rope = (rope_pair >= 0) & (rope_pair < ROPE_DIM // 2)
+    cs_idx = tl.maximum(rope_pair, 0)
+    position = tl.load(positions_ptr + token_idx)
+    cs_base = cos_sin_cache_ptr + position * cos_sin_stride
+    cos_v = tl.load(cs_base + cs_idx, mask=is_rope, other=1.0).to(tl.float32)
+    sin_v = tl.load(cs_base + ROPE_DIM // 2 + cs_idx, mask=is_rope, other=0.0).to(
+        tl.float32
+    )
+    rotated = tl.interleave(even * cos_v - odd * sin_v, even * sin_v + odd * cos_v)
+    tl.store(q_base + offsets, rotated, mask=mask)
+
+
+@triton.jit
+def _deepseek_v4_k_rope_quant_insert_kernel(
+    kv_ptr,
+    cache_ptr,
+    slot_mapping_ptr,
+    positions_ptr,
+    cos_sin_cache_ptr,
+    kv_stride_token,
+    cache_block_stride,
+    cos_sin_stride,
+    block_size,
+    HEAD_DIM: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    SCALE_DIM: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    slot = tl.load(slot_mapping_ptr + token_idx)
+    if slot < 0:
+        return
+
+    offsets = tl.arange(0, BLOCK_DIM)
+    mask = offsets < HEAD_DIM
+    kv = tl.load(
+        kv_ptr + token_idx * kv_stride_token + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    NUM_PAIRS: tl.constexpr = BLOCK_DIM // 2
+    NOPE_PAIRS: tl.constexpr = NOPE_DIM // 2
+    pair_2d = tl.reshape(kv, (NUM_PAIRS, 2))
+    even, odd = tl.split(pair_2d)
+    pair_idx = tl.arange(0, NUM_PAIRS)
+    rope_pair = pair_idx - NOPE_PAIRS
+    is_rope = (rope_pair >= 0) & (rope_pair < ROPE_DIM // 2)
+    cs_idx = tl.maximum(rope_pair, 0)
+    position = tl.load(positions_ptr + token_idx)
+    cs_base = cos_sin_cache_ptr + position * cos_sin_stride
+    cos_v = tl.load(cs_base + cs_idx, mask=is_rope, other=1.0).to(tl.float32)
+    sin_v = tl.load(cs_base + ROPE_DIM // 2 + cs_idx, mask=is_rope, other=0.0).to(
+        tl.float32
+    )
+    rotated = tl.interleave(even * cos_v - odd * sin_v, even * sin_v + odd * cos_v)
+
+    cache_block = slot // block_size
+    cache_position = slot % block_size
+    block_base = cache_ptr + cache_block.to(tl.int64) * cache_block_stride
+    token_base = block_base + cache_position * TOKEN_STRIDE
+    scale_base = block_base + block_size * TOKEN_STRIDE + cache_position * SCALE_DIM
+
+    N_QUANT_BLOCKS: tl.constexpr = BLOCK_DIM // QUANT_BLOCK
+    N_NOPE_BLOCKS: tl.constexpr = NOPE_DIM // QUANT_BLOCK
+    values_2d = tl.reshape(
+        rotated.to(tl.bfloat16).to(tl.float32),
+        (N_QUANT_BLOCKS, QUANT_BLOCK),
+    )
+    block_absmax = tl.maximum(tl.max(tl.abs(values_2d), axis=1), 1.0e-4)
+    exponents = tl.ceil(tl.log2(block_absmax / FP8_MAX))
+    inv_scales = tl.exp2(-exponents)
+    quantized = tl.clamp(
+        values_2d * tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1)),
+        -FP8_MAX,
+        FP8_MAX,
+    ).to(tl.float8e4nv)
+    quantized_u8 = tl.reshape(quantized.to(tl.uint8, bitcast=True), (BLOCK_DIM,))
+    tl.store(token_base + offsets, quantized_u8, mask=offsets < NOPE_DIM)
+
+    scale_offsets = tl.arange(0, N_QUANT_BLOCKS)
+    encoded_scales = tl.maximum(tl.minimum(exponents + 127.0, 255.0), 0.0)
+    tl.store(
+        scale_base + scale_offsets,
+        encoded_scales.to(tl.uint8),
+        mask=scale_offsets < N_NOPE_BLOCKS,
+    )
+    tl.store(scale_base + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
+
+    rope_offsets = tl.arange(0, ROPE_DIM)
+    rope_values = tl.load(
+        kv_ptr + token_idx * kv_stride_token + NOPE_DIM + rope_offsets
+    ).to(tl.float32)
+    rope_pairs = tl.reshape(rope_values, (ROPE_DIM // 2, 2))
+    rope_even, rope_odd = tl.split(rope_pairs)
+    rope_idx = tl.arange(0, ROPE_DIM // 2)
+    rope_cos = tl.load(cs_base + rope_idx).to(tl.float32)
+    rope_sin = tl.load(cs_base + ROPE_DIM // 2 + rope_idx).to(tl.float32)
+    rope_rotated = tl.interleave(
+        rope_even * rope_cos - rope_odd * rope_sin,
+        rope_even * rope_sin + rope_odd * rope_cos,
+    )
+    rope_ptr = (token_base + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+    tl.store(rope_ptr + rope_offsets, rope_rotated.to(tl.bfloat16))
+
+
+def deepseek_v4_fused_qnorm_rope_kv_insert(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    swa_kv_cache_2d: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    rms_norm_eps: float,
+    block_size: int,
+) -> None:
+    """Normalize/rotate Q and insert rotated K into the V4 SWA cache."""
+
+    num_q_tokens, num_heads, head_dim = q.shape
+    if head_dim != DEEPSEEK_V4_HEAD_DIM:
+        raise ValueError(f"DeepSeek V4 Q head dimension must be 512, got {head_dim}")
+    if num_q_tokens > 0:
+        _deepseek_v4_qnorm_rope_kernel[(num_q_tokens, num_heads)](
+            q,
+            positions,
+            cos_sin_cache,
+            q.stride(0),
+            q.stride(1),
+            cos_sin_cache.stride(0),
+            rms_norm_eps,
+            HEAD_DIM=DEEPSEEK_V4_HEAD_DIM,
+            NOPE_DIM=DEEPSEEK_V4_NOPE_DIM,
+            ROPE_DIM=DEEPSEEK_V4_ROPE_DIM,
+            BLOCK_DIM=triton.next_power_of_2(DEEPSEEK_V4_HEAD_DIM),
+            num_warps=4,
+        )
+
+    num_insert = min(kv.shape[0], slot_mapping.numel(), positions.numel())
+    if num_insert == 0:
+        return
+    _deepseek_v4_k_rope_quant_insert_kernel[(num_insert,)](
+        kv,
+        swa_kv_cache_2d,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        kv.stride(0),
+        swa_kv_cache_2d.stride(0),
+        cos_sin_cache.stride(0),
+        block_size,
+        HEAD_DIM=DEEPSEEK_V4_HEAD_DIM,
+        NOPE_DIM=DEEPSEEK_V4_NOPE_DIM,
+        ROPE_DIM=DEEPSEEK_V4_ROPE_DIM,
+        QUANT_BLOCK=DEEPSEEK_V4_FP8_QUANT_BLOCK,
+        TOKEN_STRIDE=DEEPSEEK_V4_SWA_TOKEN_STRIDE,
+        SCALE_DIM=DEEPSEEK_V4_SWA_SCALE_DIM,
+        FP8_MAX=DEEPSEEK_V4_FP8_MAX,
+        BLOCK_DIM=triton.next_power_of_2(DEEPSEEK_V4_HEAD_DIM),
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _deepseek_v4_sparse_attention_kernel(
+    q_ptr,
+    kv_ptr,
+    indices_ptr,
+    lens_ptr,
+    sink_ptr,
+    out_ptr,
+    q_stride_token,
+    q_stride_head,
+    kv_stride_row,
+    indices_stride_token,
+    out_stride_token,
+    out_stride_head,
+    softmax_scale,
+    TOPK: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    dim = tl.arange(0, BLOCK_DIM)
+    dim_mask = dim < HEAD_DIM
+    q = tl.load(
+        q_ptr + token_idx * q_stride_token + head_idx * q_stride_head + dim,
+        mask=dim_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    max_logit = tl.load(sink_ptr + head_idx).to(tl.float32)
+    denominator = tl.full((), 1.0, tl.float32)
+    accumulator = tl.zeros((BLOCK_DIM,), tl.float32)
+    valid_len = tl.load(lens_ptr + token_idx).to(tl.int32)
+    topk_offsets = tl.arange(0, BLOCK_TOPK)
+
+    for start in range(0, TOPK, BLOCK_TOPK):
+        cols = start + topk_offsets
+        valid = cols < valid_len
+        rows = tl.load(
+            indices_ptr + token_idx * indices_stride_token + cols,
+            mask=valid,
+            other=-1,
+        ).to(tl.int64)
+        valid = valid & (rows >= 0)
+        kv = tl.load(
+            kv_ptr + rows[:, None] * kv_stride_row + dim[None, :],
+            mask=valid[:, None] & dim_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        logits = tl.sum(kv * q[None, :], axis=1) * softmax_scale
+        logits = tl.where(valid, logits, -float("inf"))
+        block_max = tl.max(logits, axis=0)
+        next_max = tl.maximum(max_logit, block_max)
+        previous_scale = tl.exp(max_logit - next_max)
+        probabilities = tl.exp(logits - next_max)
+        probabilities = tl.where(valid, probabilities, 0.0)
+        accumulator = accumulator * previous_scale + tl.sum(
+            probabilities[:, None] * kv,
+            axis=0,
+        )
+        denominator = denominator * previous_scale + tl.sum(probabilities, axis=0)
+        max_logit = next_max
+
+    output = tl.where(denominator > 0.0, accumulator / denominator, 0.0)
+    tl.store(
+        out_ptr + token_idx * out_stride_token + head_idx * out_stride_head + dim,
+        output,
+        mask=dim_mask,
+    )
+
+
+def deepseek_v4_sparse_attention(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    lens: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run selected shared-KV attention for DeepSeek V4 geometry."""
+
+    if q.dim() != 3 or q.shape[-1] != DEEPSEEK_V4_HEAD_DIM:
+        raise ValueError(f"expected q [tokens, heads, 512], got {tuple(q.shape)}")
+    kv_2d = kv.reshape(-1, kv.shape[-1])
+    if kv_2d.shape[-1] != DEEPSEEK_V4_HEAD_DIM:
+        raise ValueError(f"expected kv rows of width 512, got {tuple(kv.shape)}")
+    indices_2d = indices.reshape(indices.shape[0], -1).contiguous()
+    lens = lens.reshape(-1).contiguous()
+    if indices_2d.shape[0] != q.shape[0] or lens.shape[0] != q.shape[0]:
+        raise ValueError("selected-attention metadata must have one row per query")
+    if attn_sink.numel() < q.shape[1]:
+        raise ValueError("attention sink must provide one value per query head")
+
+    output = out if out is not None else torch.empty_like(q)
+    _deepseek_v4_sparse_attention_kernel[(q.shape[0], q.shape[1])](
+        q,
+        kv_2d,
+        indices_2d,
+        lens,
+        attn_sink,
+        output,
+        q.stride(0),
+        q.stride(1),
+        kv_2d.stride(0),
+        indices_2d.stride(0),
+        output.stride(0),
+        output.stride(1),
+        softmax_scale,
+        TOPK=indices_2d.shape[1],
+        HEAD_DIM=DEEPSEEK_V4_HEAD_DIM,
+        BLOCK_TOPK=8,
+        BLOCK_DIM=triton.next_power_of_2(DEEPSEEK_V4_HEAD_DIM),
+        num_warps=8,
+        num_stages=1,
+    )
+    return output
+
+
+@triton.jit
+def _deepseek_v4_dequantize_selected_cache_rows_kernel(
+    cache_ptr,
+    slots_ptr,
+    out_ptr,
+    cache_block_stride,
+    slots_stride_token,
+    out_stride_token,
+    out_stride_row,
+    block_size,
+    HEAD_DIM: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    SCALE_DIM: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    row_idx = tl.program_id(1)
+    slot = tl.load(slots_ptr + token_idx * slots_stride_token + row_idx).to(tl.int64)
+    valid = slot >= 0
+    safe_slot = tl.maximum(slot, 0)
+    cache_block = safe_slot // block_size
+    cache_position = safe_slot % block_size
+    block_base = cache_ptr + cache_block * cache_block_stride
+    token_base = block_base + cache_position * TOKEN_STRIDE
+    scale_base = block_base + block_size * TOKEN_STRIDE + cache_position * SCALE_DIM
+    out_base = out_ptr + token_idx * out_stride_token + row_idx * out_stride_row
+
+    dim = tl.arange(0, BLOCK_DIM)
+    nope_mask = dim < NOPE_DIM
+    values_u8 = tl.load(token_base + dim, mask=valid & nope_mask, other=0)
+    values_fp8 = values_u8.to(tl.float8e4nv, bitcast=True)
+    scale_idx = dim // QUANT_BLOCK
+    exponent = (
+        tl.load(
+            scale_base + scale_idx,
+            mask=valid & nope_mask,
+            other=127,
+        ).to(tl.float32)
+        - 127.0
+    )
+    nope = values_fp8.to(tl.float32) * tl.exp2(exponent)
+    tl.store(out_base + dim, nope, mask=nope_mask)
+
+    rope_offsets = tl.arange(0, ROPE_DIM)
+    rope_ptr = (token_base + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+    rope = tl.load(rope_ptr + rope_offsets, mask=valid, other=0.0)
+    tl.store(out_base + NOPE_DIM + rope_offsets, rope)
+
+
+def deepseek_v4_dequantize_selected_cache_rows(
+    cache_2d: torch.Tensor,
+    slots: torch.Tensor,
+    block_size: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Materialize arbitrary selected V4 cache rows as dense BF16 K/V."""
+
+    slots_2d = slots.reshape(slots.shape[0], -1).to(torch.int32).contiguous()
+    expected_shape = (
+        slots_2d.shape[0],
+        slots_2d.shape[1],
+        DEEPSEEK_V4_HEAD_DIM,
+    )
+    output = (
+        out
+        if out is not None
+        else torch.empty(
+            expected_shape,
+            dtype=torch.bfloat16,
+            device=cache_2d.device,
+        )
+    )
+    if output.shape != expected_shape or output.dtype != torch.bfloat16:
+        raise ValueError(
+            f"selected cache output must be BF16 {expected_shape}, got "
+            f"{output.dtype} {tuple(output.shape)}"
+        )
+    if slots_2d.numel() == 0:
+        return output
+    _deepseek_v4_dequantize_selected_cache_rows_kernel[
+        (slots_2d.shape[0], slots_2d.shape[1])
+    ](
+        cache_2d,
+        slots_2d,
+        output,
+        cache_2d.stride(0),
+        slots_2d.stride(0),
+        output.stride(0),
+        output.stride(1),
+        block_size,
+        HEAD_DIM=DEEPSEEK_V4_HEAD_DIM,
+        NOPE_DIM=DEEPSEEK_V4_NOPE_DIM,
+        ROPE_DIM=DEEPSEEK_V4_ROPE_DIM,
+        QUANT_BLOCK=DEEPSEEK_V4_FP8_QUANT_BLOCK,
+        TOKEN_STRIDE=DEEPSEEK_V4_SWA_TOKEN_STRIDE,
+        SCALE_DIM=DEEPSEEK_V4_SWA_SCALE_DIM,
+        BLOCK_DIM=triton.next_power_of_2(DEEPSEEK_V4_HEAD_DIM),
+        num_warps=4,
+    )
+    return output
 
 
 def _as_int32_block_table(block_table: torch.Tensor) -> torch.Tensor:

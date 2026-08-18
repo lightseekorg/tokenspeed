@@ -33,9 +33,11 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
     static_quant_fp8,
     swizzle_mxfp8_scale,
 )
+from tokenspeed_kernel.platform import current_platform
 from torch.nn.parameter import Parameter
 
 logger = logging.getLogger(__name__)
+_platform = current_platform()
 
 try:
     from tokenspeed_kernel.thirdparty.deep_gemm import ceil_to_ue8m0 as _ceil_to_ue8m0
@@ -221,6 +223,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 _transform_sf is not None
                 and _ceil_to_ue8m0 is not None
                 and scale_requires_transform
+                and _platform.is_nvidia
             ):
                 N, K = layer.weight.shape
                 block_n, block_k = self.quant_config.weight_block_size
@@ -258,17 +261,6 @@ class Fp8LinearMethod(LinearMethodBase):
                         is_sfa=False,
                     )
                     layer._use_deep_gemm_fp8 = True
-            if is_bmm and not layer._use_deep_gemm_fp8:
-                # The is_bmm runtime path (DeepSeek-V4 o_proj) has no FP32
-                # fallback, so fail fast at load with a clear message instead of
-                # a cryptic AttributeError on the first forward.
-                raise RuntimeError(
-                    "is_bmm weight requires the deep_gemm FP8 block-scale path "
-                    "but it could not be prepared (deep_gemm_available="
-                    f"{_transform_sf is not None}, ue8m0={is_ue8m0}, "
-                    f"weight={tuple(layer.weight.shape)}); ensure FP8 block-quant "
-                    "ue8m0 weights with block-aligned dims and deep_gemm installed."
-                )
             layer._use_flashinfer_mxfp8 = False
             if (
                 not layer._use_deep_gemm_fp8

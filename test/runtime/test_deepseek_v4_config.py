@@ -5856,7 +5856,9 @@ class TestDeepseekV4Config(unittest.TestCase):
                 torch.tensor([[0, 6, 0, 6, 4, 0, 3]], dtype=torch.int64),
             )
         )
-        self.assertEqual(actual.slots.numel(), 0)
+        self.assertTrue(
+            torch.equal(actual.slots, torch.tensor([40, 41, 42, 43, 80, 81]))
+        )
         self.assertTrue(
             torch.equal(actual.cu_seq_lens, torch.tensor([0, 4, 6], dtype=torch.int32))
         )

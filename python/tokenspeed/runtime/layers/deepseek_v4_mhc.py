@@ -9,12 +9,16 @@ from functools import cache
 import torch
 import triton
 import triton.language as tl
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.utils import ceil_div
 
 try:
     from tokenspeed_kernel.thirdparty import deep_gemm
 except Exception:
+    deep_gemm = None  # type: ignore[assignment]
+
+if not current_platform().is_nvidia:
     deep_gemm = None  # type: ignore[assignment]
 
 
@@ -26,6 +30,89 @@ def _compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
         num_block_k = ceil_div(k, block_k)
         split_k = min(split_k, num_block_k // 4)
     return max(split_k, 1)
+
+
+@triton.jit
+def _mhc_prenorm_gemm_triton_kernel(
+    x,
+    fn,
+    out_mul,
+    out_sqrsum,
+    num_tokens,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    split_id = tl.program_id(0)
+    token_block = tl.program_id(1)
+    offs_m = token_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    split_start = split_id * SPLIT_K
+    dot_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    square_acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    for k_start in range(0, SPLIT_K, BLOCK_K):
+        offs_k = split_start + k_start + tl.arange(0, BLOCK_K)
+        x_values = tl.load(
+            x + offs_m[:, None] * K + offs_k[None, :],
+            mask=(offs_m[:, None] < num_tokens) & (offs_k[None, :] < K),
+            other=0.0,
+        )
+        fn_values = tl.load(
+            fn + offs_k[:, None] + offs_n[None, :] * K,
+            mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        dot_acc = tl.dot(
+            x_values.to(tl.float32),
+            fn_values,
+            dot_acc,
+            input_precision="ieee",
+        )
+        x_fp32 = x_values.to(tl.float32)
+        square_acc += tl.sum(x_fp32 * x_fp32, axis=1)
+
+    tl.store(
+        out_mul + split_id * num_tokens * N + offs_m[:, None] * N + offs_n[None, :],
+        dot_acc,
+        mask=(offs_m[:, None] < num_tokens) & (offs_n[None, :] < N),
+    )
+    tl.store(
+        out_sqrsum + split_id * num_tokens + offs_m,
+        square_acc,
+        mask=offs_m < num_tokens,
+    )
+
+
+def _mhc_prenorm_gemm_triton(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out_mul: torch.Tensor,
+    out_sqrsum: torch.Tensor,
+    n_splits: int,
+) -> None:
+    num_tokens, k = x.shape
+    n = fn.shape[0]
+    block_k = 64
+    split_k = triton.cdiv(triton.cdiv(k, n_splits), block_k) * block_k
+    _mhc_prenorm_gemm_triton_kernel[(n_splits, triton.cdiv(num_tokens, 16))](
+        x,
+        fn,
+        out_mul,
+        out_sqrsum,
+        num_tokens,
+        K=k,
+        N=n,
+        SPLIT_K=split_k,
+        BLOCK_M=16,
+        BLOCK_N=32,
+        BLOCK_K=block_k,
+        num_warps=4,
+        num_stages=1,
+    )
 
 
 @triton.jit
@@ -348,9 +435,6 @@ def mhc_pre(
     if not residual.is_cuda:
         raise RuntimeError("fast mHC requires CUDA tensors")
 
-    if deep_gemm is None:
-        raise RuntimeError("deep_gemm.tf32_hc_prenorm_gemm is unavailable")
-
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
     hc_mult2 = hc_mult * hc_mult
@@ -403,13 +487,23 @@ def mhc_pre(
         n_splits, num_tokens, dtype=torch.float32, device=residual.device
     )
 
-    deep_gemm.tf32_hc_prenorm_gemm(
-        residual_flat.view(num_tokens, hc_hidden_size),
-        fn,
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        n_splits,
-    )
+    residual_2d = residual_flat.view(num_tokens, hc_hidden_size)
+    if deep_gemm is not None:
+        deep_gemm.tf32_hc_prenorm_gemm(
+            residual_2d,
+            fn,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            n_splits,
+        )
+    else:
+        _mhc_prenorm_gemm_triton(
+            residual_2d,
+            fn,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            n_splits,
+        )
     block_h = 1024
     block_comb = triton.next_power_of_2(hc_mult2)
     _mhc_pre_mix_triton_kernel[(num_tokens,)](
