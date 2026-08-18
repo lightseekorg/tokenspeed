@@ -20,7 +20,12 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
+from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
+    situ_moe_unavailable_reason,
+)
 from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -29,6 +34,8 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+
+logger = logging.getLogger(__name__)
 
 platform = current_platform()
 
@@ -47,7 +54,18 @@ if platform.is_nvidia:
         get_w2_permute_indices_with_cache,
     )
 
-    def flashinfer_trtllm_nvfp4_moe_weights(plan: dict, w: torch.nn.Module):
+    # SiTU availability (flashinfer > 0.6.15, PR #4180) and the per-expert
+    # SiTU constant lookup are shared with the MXFP4 TRT-LLM integration.
+    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
+        _SITU_ACTIVATION_TYPE,
+        _positive_situ_value,
+    )
+
+    def _flashinfer_trtllm_nvfp4_moe_weights(
+        plan: dict, w: torch.nn.Module, *, situ: bool
+    ):
+        if situ and (reason := situ_moe_unavailable_reason()) is not None:
+            raise RuntimeError(reason)
         _group_size = 16
         _correction_bias = getattr(w, "_correction_bias", None)
         _routing_logits_dtype = getattr(w, "_routing_logits_dtype", torch.bfloat16)
@@ -195,39 +213,70 @@ if platform.is_nvidia:
             (w2_input_scale * w.w2_weight_scale_2).to(torch.float32),
             requires_grad=False,
         )
-        # up (W3) dequant alpha folded with the GEMM2-input requant -> output1_scale_scalar
-        w.g1_scale_c = torch.nn.Parameter(
-            w2_input_scale_quant * (w13_input_scale * up_ws2).to(torch.float32),
-            requires_grad=False,
-        )
-
-        swiglu_arg = getattr(w, "swiglu_arg", None)
-        if swiglu_arg is not None:
-            # The fused gated activation runs on pre-dequant accumulators
-            # (actual = raw * g1_alphas), so beta and the clamp limit must be
-            # expressed in the raw domain; alpha passes through unchanged.
-            # Folding the gate dequant scale is only exact when the gate and
-            # up halves share one global scale.
+        if situ:
+            # SiTU is nonlinear in BOTH GEMM1 halves: the kernel dequantizes
+            # the raw accumulators with output1_scale_gate_scalar inside the
+            # activation, so (a) gate and up must share one per-expert global
+            # scale and (b) output1_scale_scalar must carry ONLY the
+            # GEMM2-input requant factor -- the SwiGLU recipe below folds the
+            # up-half dequant into it, which for SiTU would move that factor
+            # inside tanh and change the activation.
             if not torch.equal(gate_ws2, up_ws2):
                 raise RuntimeError(
-                    "NVFP4 swiglu alpha/limit requires equal gate/up "
-                    "weight_scale_2 per expert."
+                    "NVFP4 SiTU requires equal gate/up weight_scale_2 per expert."
                 )
-            alpha = swiglu_arg.alpha if swiglu_arg.alpha is not None else 1.0
-            beta = getattr(w, "swiglu_beta", None)
-            w.gemm1_alpha = torch.nn.Parameter(
-                torch.full_like(w.g1_alphas.data, float(alpha)),
+            w.g1_scale_c = torch.nn.Parameter(
+                (w2_input_scale_quant * torch.ones_like(up_ws2)).to(torch.float32),
                 requires_grad=False,
             )
-            if beta is not None:
-                w.gemm1_beta = torch.nn.Parameter(
-                    float(beta) / w.g1_alphas.data, requires_grad=False
-                )
-            if swiglu_arg.limit is not None:
-                w.gemm1_clamp_limit = torch.nn.Parameter(
-                    float(swiglu_arg.limit) / w.g1_alphas.data,
+            # Actual-domain per-expert SiTU constants: dequant happens before
+            # the activation, so alpha/beta pass through unchanged (no
+            # raw-domain folding as in SwiGLU).
+            alpha = _positive_situ_value(w, "activation_situ_beta", "situ_beta")
+            beta = _positive_situ_value(
+                w, "activation_situ_linear_beta", "situ_linear_beta"
+            )
+            w.gemm1_alpha = torch.nn.Parameter(
+                torch.full_like(w.g1_alphas.data, alpha), requires_grad=False
+            )
+            w.gemm1_beta = torch.nn.Parameter(
+                torch.full_like(w.g1_alphas.data, beta), requires_grad=False
+            )
+        else:
+            # up (W3) dequant alpha folded with the GEMM2-input requant
+            # -> output1_scale_scalar
+            w.g1_scale_c = torch.nn.Parameter(
+                w2_input_scale_quant * (w13_input_scale * up_ws2).to(torch.float32),
+                requires_grad=False,
+            )
+
+            swiglu_arg = getattr(w, "swiglu_arg", None)
+            if swiglu_arg is not None:
+                # The fused gated activation runs on pre-dequant accumulators
+                # (actual = raw * g1_alphas), so beta and the clamp limit must be
+                # expressed in the raw domain; alpha passes through unchanged.
+                # Folding the gate dequant scale is only exact when the gate and
+                # up halves share one global scale.
+                if not torch.equal(gate_ws2, up_ws2):
+                    raise RuntimeError(
+                        "NVFP4 swiglu alpha/limit requires equal gate/up "
+                        "weight_scale_2 per expert."
+                    )
+                alpha = swiglu_arg.alpha if swiglu_arg.alpha is not None else 1.0
+                beta = getattr(w, "swiglu_beta", None)
+                w.gemm1_alpha = torch.nn.Parameter(
+                    torch.full_like(w.g1_alphas.data, float(alpha)),
                     requires_grad=False,
                 )
+                if beta is not None:
+                    w.gemm1_beta = torch.nn.Parameter(
+                        float(beta) / w.g1_alphas.data, requires_grad=False
+                    )
+                if swiglu_arg.limit is not None:
+                    w.gemm1_clamp_limit = torch.nn.Parameter(
+                        float(swiglu_arg.limit) / w.g1_alphas.data,
+                        requires_grad=False,
+                    )
 
         # Store intermediate_size_per_partition for the executor
         w.intermediate_size_per_partition = intermediate_size
@@ -244,6 +293,14 @@ if platform.is_nvidia:
         if _correction_bias is not None:
             _correction_bias = _correction_bias.to(_routing_logits_dtype)
 
+    def flashinfer_trtllm_nvfp4_moe_weights(plan: dict, w: torch.nn.Module):
+        return _flashinfer_trtllm_nvfp4_moe_weights(plan, w, situ=False)
+
+    def flashinfer_trtllm_nvfp4_situ_moe_weights(plan: dict, w: torch.nn.Module):
+        # SiTU shares the standard TRT-LLM [up|gate] shuffled layout with
+        # SwiGLU; only the GEMM1 output scales and act constants differ.
+        return _flashinfer_trtllm_nvfp4_moe_weights(plan, w, situ=True)
+
     def _flashinfer_trtllm_nvfp4_moe_apply(
         x: torch.Tensor,
         w: torch.nn.Module,
@@ -253,6 +310,8 @@ if platform.is_nvidia:
         do_finalize: bool,
         enable_pdl: bool,
         routed: bool,
+        activation_type: int | None = None,
+        output: torch.Tensor | None = None,
     ):
         """Shared body for the in-kernel-routing and precomputed-topk variants.
 
@@ -311,6 +370,13 @@ if platform.is_nvidia:
             do_finalize=do_finalize,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
         )
+
+        if activation_type is not None:
+            common_kwargs["activation_type"] = activation_type
+        if output is not None:
+            # Caller-owned destination (e.g. a fused all-reduce lane slice);
+            # the kernel writes the finalized rows in place.
+            common_kwargs["output"] = output
 
         if routed:
             # UnpackedPrecomputed route weights pass at their native dtype
@@ -462,4 +528,89 @@ if platform.is_nvidia:
             do_finalize,
             enable_pdl,
             routed=True,
+        )
+
+    def _register_nvfp4_situ_kernel(function):
+        reason = situ_moe_unavailable_reason()
+        if reason is not None:
+            # Skipping is normal for deployments that don't serve Kimi-K3, so
+            # log at INFO -- but keep the reason (e.g. a flashinfer build
+            # without SiTU), which otherwise vanishes and makes "kernel not
+            # found" failures hard to trace back here.
+            logger.info("Kimi-K3 NVFP4 SiTU MoE kernel not registered: %s", reason)
+            return function
+        return register_kernel(
+            "moe",
+            "apply",
+            name="flashinfer_trtllm_nvfp4_situ_routed_moe_apply",
+            solution="flashinfer_trtllm",
+            weight_preprocessor=flashinfer_trtllm_nvfp4_situ_moe_weights,
+            capability=CapabilityRequirement(
+                vendors=frozenset({"nvidia"}),
+                min_arch_version=ArchVersion(10, 0),
+                max_arch_version=ArchVersion(10, 3),
+            ),
+            signatures=format_signatures(
+                "x",
+                "dense",
+                {torch.bfloat16},
+            ),
+            traits={
+                "weight_dtype": frozenset({"nvfp4"}),
+                "activation": frozenset({"situ"}),
+                "routing_mode": frozenset({"precomputed_topk"}),
+                "supports_deferred_finalize": frozenset({False}),
+                "supports_ep": frozenset({True}),
+                "supports_all_to_all_ep": frozenset({False}),
+                "ispp_alignment": frozenset({1}),
+                # NVFP4 SiTU runs w4a4: the wrapper quantizes the bf16 input
+                # to NVFP4 itself, which the registry models as "input"
+                # (unlike the MXFP4 SiTU cubins, which are w4a8/MXFP8).
+                "internal_activation_dtype": frozenset({"input"}),
+                "supports_bias": frozenset({False}),
+            },
+            priority=Priority.SPECIALIZED,
+        )(function)
+
+    @_register_nvfp4_situ_kernel
+    def flashinfer_trtllm_nvfp4_situ_routed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ):
+        if topk_weights is None or topk_ids is None:
+            raise ValueError("precomputed_topk plan requires topk_weights and topk_ids")
+        if not do_finalize:
+            raise NotImplementedError("FlashInfer NVFP4 SiTU requires finalization")
+        if x.dtype != torch.bfloat16:
+            raise TypeError("FlashInfer NVFP4 SiTU requires bf16 input")
+        # Caller-owned destination (e.g. K3's fused all-reduce lane slice):
+        # writing the finalized rows in place keeps the join zero-copy, same
+        # contract as the MXFP4 SiTU kernel. Used only when present and
+        # exactly matching; otherwise the kernel allocates its own output.
+        out_buf = getattr(w, "_situ_output_buffer", None)
+        if not (
+            out_buf is not None
+            and out_buf.shape == (x.shape[0], x.shape[-1])
+            and out_buf.is_contiguous()
+        ):
+            out_buf = None
+        return _flashinfer_trtllm_nvfp4_moe_apply(
+            x,
+            w,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            do_finalize,
+            enable_pdl,
+            routed=True,
+            activation_type=_SITU_ACTIVATION_TYPE,
+            output=out_buf,
         )

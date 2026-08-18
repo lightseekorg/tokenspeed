@@ -603,6 +603,20 @@ def _shard_k3_up_projection(mapping: Mapping, hidden_size: int) -> bool:
     )
 
 
+def _k3_trtllm_situ_internal_activation_dtype(
+    quant_config: QuantizationConfig | None, prefix: str
+) -> str:
+    """Activation trait for FlashInfer TRT-LLM SiTU MoE by expert weight dtype.
+
+    MXFP4 SiTU cubins are w4a8 (activations quantized to MXFP8 -> ``"fp8"``);
+    NVFP4 SiTU runs w4a4 with the kernel wrapper quantizing the bf16 input to
+    NVFP4 itself, which the kernel registry models as ``"input"``.
+    """
+    if quant_config is not None and quant_config.moe_weight_dtype(prefix) == "nvfp4":
+        return "input"
+    return "fp8"
+
+
 # ===----------------------------------------------------------------------=== #
 # Text decoder layers
 # ===----------------------------------------------------------------------=== #
@@ -1175,12 +1189,19 @@ class KimiLinearMoE(nn.Module):
                 "activation_situ_linear_beta": situ_linear_beta,
             },
             routing_mode="precomputed_topk",
-            # Native gfx950 and Hopper Marlin both run A16W4 (bf16 activations);
-            # FlashInfer's SiTU cubins require MXFP4 weights with MXFP8 acts.
+            # Native gfx950 and Hopper Marlin both run A16W4 (bf16 activations).
+            # FlashInfer TRT-LLM SiTU depends on the expert weight dtype:
+            # MXFP4 cubins are w4a8 (MXFP8 activations -> "fp8"), NVFP4 SiTU
+            # runs w4a4 with the kernel wrapper quantizing the bf16 input
+            # itself, which the registry models as "input".
             internal_activation_dtype_override=(
                 "input"
                 if self.execution_plan.use_native or self.execution_plan.use_marlin
-                else "fp8" if self.execution_plan.use_trtllm else None
+                else (
+                    _k3_trtllm_situ_internal_activation_dtype(quant_config, prefix)
+                    if self.execution_plan.use_trtllm
+                    else None
+                )
             ),
         )
         if self.experts.support_routing:
