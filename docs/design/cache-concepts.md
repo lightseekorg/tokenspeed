@@ -323,11 +323,12 @@ Its responsibilities:
   require prefetch; Host eviction does **not** drop the L3 key. Cross-instance
   reuse probes `batch_exists` before `submit_requests` and
   `register_storage_keys`. CI covers this path with the in-process `memory`
-  backend (no Mooncake master): scheduler tests register keys / evict Host
-  then assert `prefetch_from_storage`, and the CUDA runtime suite round-trips
-  packed Host bytes through `batch_put_from` / Host wipe / `batch_get_into`.
-  / vLLM `MooncakeStoreConnector`, keyed on packed CacheBlocks rather than
-  split K/V pages.
+  backend (scheduler tests register keys / evict Host then assert
+  `prefetch_from_storage`, and the CUDA runtime suite round-trips packed Host
+  bytes through `batch_put_from` / Host wipe / `batch_get_into`) plus a live
+  `mooncake_master` job that drives `MooncakeKvStore` over TCP /
+  `P2PHANDSHAKE`, matching SGLang HiCache / vLLM `MooncakeStoreConnector` on
+  packed CacheBlocks rather than split K/V pages.
 * **Reclamation and lifecycle.** `ReclaimExpired`, `Free`,
   `ClearDeviceCache`/`ClearCache`, and `NumNewlyReleasableLcmBlocks` for
   ranking retraction (preemption) victims.
