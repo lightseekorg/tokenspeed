@@ -52,7 +52,7 @@ def _config() -> ModelOptMixedConfig:
             "quantized_layers": {
                 "model.layers.0.self_attn.o_proj": {"quant_algo": "FP8_PB_WO"},
                 "model.layers.0.self_attn.kv_b_proj": {"quant_algo": "FP8_PB_WO"},
-                "model.layers.0.self_attn.q_proj": {"quant_algo": "FP8_PB_WO"},
+                "model.layers.0.self_attn.f_b_proj": {"quant_algo": "FP8_PB_WO"},
             },
             "exclude_modules": ["lm_head"],
         }
@@ -268,11 +268,11 @@ def test_dequant_route_bitwise_on_gpu() -> None:
     q, scales = _quantize_per_block(torch.randn(n, k, device="cuda"))
     scale_4d = scales.reshape(scales.shape[0], 1, scales.shape[1], 1)
     stream = [
-        ("model.layers.0.self_attn.q_proj.weight", q),
-        ("model.layers.0.self_attn.q_proj.weight_scale", scale_4d),
+        ("model.layers.0.self_attn.f_b_proj.weight", q),
+        ("model.layers.0.self_attn.f_b_proj.weight_scale", scale_4d),
     ]
     out = dict(preprocess_fp8_pb_wo_weights(iter(stream), config))
-    got = out["model.layers.0.self_attn.q_proj.weight"]
+    got = out["model.layers.0.self_attn.f_b_proj.weight"]
     assert got.dtype == torch.bfloat16
     assert torch.equal(got, _dequant_f32(q, scales).to(torch.bfloat16))
-    assert "model.layers.0.self_attn.q_proj.weight_scale" not in out
+    assert "model.layers.0.self_attn.f_b_proj.weight_scale" not in out

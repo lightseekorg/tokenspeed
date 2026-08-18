@@ -684,17 +684,28 @@ def _k3_trtllm_situ_internal_activation_dtype(
 
 
 class KimiKDAMergedProj(nn.Module):
-    """Merged bf16 KDA input projections: ``[q | k | v | g | f_a | b]``, one GEMM.
+    """Merged KDA input projections: ``[q | k | v | g | f_a | b]``, one GEMM.
 
-    All six consume the post-norm hidden states (``self_attn`` is on the
-    quantization ignore list, so everything is plain bf16). q/k/v/g/b shard
-    per-head over the attention TP group; ``f_a`` (low-rank decay-gate down
+    All six consume the post-norm hidden states. q/k/v/g/b shard per-head
+    over the attention TP group; ``f_a`` (low-rank decay-gate down
     projection) is replicated, so each rank carries a full copy. The ``q|k|v``
     slice reproduces the layout the hybrid backend's conv expects; ``g``,
     ``f_a`` and ``b`` (beta logits) ride along as strided slices, replacing two
-    extra latency-bound GEMVs per layer. Rows are padded to a multiple of 16:
-    off-multiple row counts fall off cublasLt's fast M=1 tactic (30us vs 13us
-    at 6284 vs 6288 x 7168). Loader ``shard_id`` in {"q","k","v","g","f_a","b"}.
+    extra latency-bound GEMVs per layer. Loader ``shard_id`` in
+    {"q","k","v","g","f_a","b"}.
+
+    bf16 checkpoints (mxfp4 recipe): rows pad to a multiple of 16
+    (off-multiple row counts fall off cublasLt's fast M=1 tactic, 30us vs
+    13us at 6284 vs 6288 x 7168) and the GEMM is plain bf16 — unchanged.
+
+    FP8_PB_WO checkpoints (``fp8_block_quant=True``): the buffer stays
+    FP8-resident with a per-[128, 128]-block f32 dequant scale grid and rows
+    pad to the 128 grid (3216 -> 3328 @tp16, 6288 -> 6400 @tp8) so the w8a8
+    blockscale GEMM keeps the flashinfer kernel (N % 128 == 0). Every
+    segment offset (0/p/2p/3p/4p/4p+head_dim) is 128-aligned, so the
+    checkpoint's per-segment scale grids concatenate directly with no
+    requantization; the zero pad rows share ``b``'s trailing block scale and
+    quantize to exact zeros (pad-first lemma).
     """
 
     _ROW_ALIGN = 16
@@ -707,12 +718,14 @@ class KimiKDAMergedProj(nn.Module):
         head_dim: int,
         tp_rank: int,
         tp_size: int,
+        fp8_block_quant: bool = False,
     ) -> None:
         super().__init__()
         self.proj_local = proj // tp_size
         self.local_num_heads = num_heads // tp_size
         self.head_dim = head_dim
         self.tp_rank = tp_rank
+        self.fp8_block_quant = fp8_block_quant
         p = self.proj_local
         self._offsets = {
             "q": 0,
@@ -731,19 +744,47 @@ class KimiKDAMergedProj(nn.Module):
             "b": self.local_num_heads,
         }
         used = 4 * p + head_dim + self.local_num_heads
-        total = ceil_div(used, self._ROW_ALIGN) * self._ROW_ALIGN
         self.used_rows = used
-        # Explicit bf16: default-dtype fp32 would cost +6 GiB/rank and starve the KV budget.
-        self.weight = nn.Parameter(
-            torch.empty(total, hidden_size, dtype=torch.bfloat16)
-        )
-        # Padding rows are never read back, but keep them finite.
-        self.weight.data[used:].zero_()
+        if fp8_block_quant:
+            if p % 128 or head_dim % 128 or hidden_size % 128:
+                raise ValueError(
+                    "FP8 merged KDA projection requires 128-aligned segment "
+                    f"offsets, got proj_local={p} head_dim={head_dim} "
+                    f"hidden_size={hidden_size}"
+                )
+            total = ceil_div(used, 128) * 128
+            # Zero codes: the pad rows (and any unwritten row) dequantize to
+            # exact zeros under any scale.
+            self.weight = nn.Parameter(
+                torch.zeros(total, hidden_size, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.weight_scale_inv = nn.Parameter(
+                torch.ones(total // 128, hidden_size // 128, dtype=torch.float32),
+                requires_grad=False,
+            )
+            self.weight_scale_inv.weight_loader = self._load_scale
+            # flashinfer MN-major prepacked scales, prepared post-load.
+            self._flashinfer_scales_mn: torch.Tensor | None = None
+        else:
+            total = ceil_div(used, self._ROW_ALIGN) * self._ROW_ALIGN
+            # Explicit bf16: default-dtype fp32 would cost +6 GiB/rank and starve the KV budget.
+            self.weight = nn.Parameter(
+                torch.empty(total, hidden_size, dtype=torch.bfloat16)
+            )
+            # Padding rows are never read back, but keep them finite.
+            self.weight.data[used:].zero_()
         self.weight.weight_loader = self._load_weight
 
     def _load_weight(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: str
     ) -> None:
+        if self.fp8_block_quant and loaded_weight.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                "FP8-resident merged KDA projection cannot load a "
+                f"{loaded_weight.dtype} shard (bf16 refit of FP8 KDA weights "
+                "is unsupported)."
+            )
         rows = self._rows[shard_id]
         # f_a is replicated (full copy per rank); the rest are row-sharded.
         src = (
@@ -753,6 +794,26 @@ class KimiKDAMergedProj(nn.Module):
         )
         start = self._offsets[shard_id]
         param.data[start : start + rows].copy_(src)
+
+    def _load_scale(
+        self, param: nn.Parameter, loaded_scale: torch.Tensor, shard_id: str
+    ) -> None:
+        """Concatenate the checkpoint's per-segment scale grids in place.
+
+        Segment offsets are all 128-aligned, so each shard's scale rows map
+        1:1 onto the merged grid. ``f_a`` is replicated; ``b``'s <=96-row
+        shard lives inside the checkpoint's single scale block regardless of
+        rank, and the zero pad rows in the trailing block dequantize to
+        exact zeros under it.
+        """
+        block_start = self._offsets[shard_id] // 128
+        if shard_id in ("f_a", "b"):
+            src = loaded_scale[:1]
+            nblocks = 1
+        else:
+            nblocks = self._rows[shard_id] // 128
+            src = loaded_scale.narrow(0, self.tp_rank * nblocks, nblocks)
+        param.data[block_start : block_start + nblocks].copy_(src)
 
     def forward(
         self, x: torch.Tensor
@@ -838,6 +899,13 @@ class KimiLinearKDA(nn.Module):
             )
 
         # One merged GEMM replaces four per-head-sharded projections + the qkv concat.
+        # FP8_PB_WO checkpoints keep the merged buffer FP8-resident (w8a8
+        # blockscale GEMM); everything else stays bf16 exactly as before.
+        fp8_pb_wo_route = getattr(quant_config, "fp8_pb_wo_route", None)
+        merged_fp8 = (
+            fp8_pb_wo_route is not None
+            and fp8_pb_wo_route(add_prefix("q_proj", prefix)) == "w8a8"
+        )
         self.qkvgb_proj = KimiKDAMergedProj(
             hidden_size=hidden,
             proj=proj,
@@ -845,6 +913,7 @@ class KimiLinearKDA(nn.Module):
             head_dim=self.head_dim,
             tp_rank=tp_rank,
             tp_size=tp_size,
+            fp8_block_quant=merged_fp8,
         )
         # Decay-gate up projection (f_a and beta ride in the merged GEMM).
         self.f_b_proj = _col(self.head_dim, proj, "f_b_proj")
@@ -910,6 +979,11 @@ class KimiLinearKDA(nn.Module):
             output = kimi3_qkvfab_projection(
                 hidden_states,
                 self.qkvgb_proj.weight,
+                weight_scale=getattr(self.qkvgb_proj, "weight_scale_inv", None),
+                prepacked_scales=getattr(
+                    self.qkvgb_proj, "_flashinfer_scales_mn", None
+                ),
+                enable_pdl=pdl_enabled(),
             )
         else:
             blocks, weight_a, weight_b, eps, scratch_a, scratch_b = attnres_partial_args
@@ -2599,6 +2673,13 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 f"stream: { {k: sorted(v) for k, v in fp8_fused_pending.items()} }"
             )
         self.post_load_weights()
+        # Return the loader's transient allocator blocks (FP8 dequant / fused
+        # splice fp32 workspaces) to the device before the KV pool sizes
+        # itself from free memory: boot accounting showed ~1 GiB of
+        # reserved-but-free slack otherwise shrinking the pool (boot3 vs
+        # boot6: torch allocated -1.11 GB, torch reserved +0.03 GB).
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def post_load_weights(self) -> None:
         """Prepare the absorbed MLA weights (``w_kc``/``w_vc``) per MLA layer.
@@ -2634,6 +2715,29 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 )
             elif isinstance(self_attn, KimiLinearKDA):
                 self_attn.fuse_conv_weights()
+                merged = self_attn.qkvgb_proj
+                if getattr(merged, "fp8_block_quant", False):
+                    # Prepack the block scales for the flashinfer w8a8 GEMM
+                    # (the same preparation Fp8LinearMethod does for
+                    # LinearBase layers); rows are 128-padded at construction
+                    # so the shape gate always holds on this path.
+                    from tokenspeed.runtime.layers.dense.fp8 import (
+                        has_flashinfer_fp8_blockscale,
+                        prepare_flashinfer_fp8_blockscale_weight_scales,
+                    )
+
+                    n_rows, n_cols = merged.weight.shape
+                    if (
+                        has_flashinfer_fp8_blockscale is not None
+                        and has_flashinfer_fp8_blockscale()
+                        and n_rows % 128 == 0
+                        and n_cols % 128 == 0
+                    ):
+                        merged._flashinfer_scales_mn = (
+                            prepare_flashinfer_fp8_blockscale_weight_scales(
+                                merged.weight_scale_inv.data
+                            )
+                        )
 
         # Fold the AttnRes rms_w * res_w products once; the split kernels take a single wp pointer.
         for layer in self.model.layers:

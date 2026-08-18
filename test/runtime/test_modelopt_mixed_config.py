@@ -131,11 +131,12 @@ def test_fp8_pb_wo_route_classification():
         "g_proj",  # MLA g_proj: identified by the q_a_proj sibling
     ):
         assert config.fp8_pb_wo_route(f"{mla}.{leaf}") == "w8a8", leaf
-    # KDA-side merged/raw-consumed projections dequantize at load; the KDA
-    # g_proj shares its name with the MLA one but has no q_a_proj sibling.
-    for leaf in ("q_proj", "f_b_proj", "g_proj"):
-        assert config.fp8_pb_wo_route(f"{kda}.{leaf}") == "dequant", leaf
-    assert config.fp8_pb_wo_route(f"{kda}.o_proj") == "w8a8"
+    # KDA merged-projection segments are FP8-resident too (w8a8 blockscale
+    # GEMM in kimi3_qkvfab_projection); only f_b stays dequant (raw GEMV
+    # inside the KDA-NaN-sensitive megafuse kernels, kept bf16 by decision).
+    for leaf in ("q_proj", "g_proj", "o_proj"):
+        assert config.fp8_pb_wo_route(f"{kda}.{leaf}") == "w8a8", leaf
+    assert config.fp8_pb_wo_route(f"{kda}.f_b_proj") == "dequant"
     # Non-FP8_PB_WO modules never route.
     assert config.fp8_pb_wo_route("model.layers.3.self_attn.o_proj") is None
     assert config.fp8_pb_wo_route("model.layers.99.self_attn.o_proj") is None
@@ -173,9 +174,9 @@ def test_preprocess_fp8_pb_wo_weights_stream():
     nvfp4_scale = torch.randn(4)
 
     stream = [
-        # dequant module (KDA): scale arrives BEFORE the weight
-        (f"{kda}.q_proj.weight_scale", scale_4d),
-        (f"{kda}.q_proj.weight", q_deq),
+        # dequant module (KDA f_b): scale arrives BEFORE the weight
+        (f"{kda}.f_b_proj.weight_scale", scale_4d),
+        (f"{kda}.f_b_proj.weight", q_deq),
         # w8a8 module: fp8 weight passes through, scale renamed + squeezed
         (f"{mla}.o_proj.weight", q_w8a8),
         (
@@ -189,12 +190,12 @@ def test_preprocess_fp8_pb_wo_weights_stream():
     out = dict(preprocess_fp8_pb_wo_weights(iter(stream), config))
 
     # Dequant path: bitwise-identical to the manual block dequant.
-    dq = out[f"{kda}.q_proj.weight"].cpu()
+    dq = out[f"{kda}.f_b_proj.weight"].cpu()
     assert dq.dtype == torch.bfloat16
     s_full = s_deq.repeat_interleave(128, 0)[:n].repeat_interleave(128, 1)[:, :k]
     expected = (q_deq.float() * s_full).to(torch.bfloat16)
     assert torch.equal(dq, expected)
-    assert f"{kda}.q_proj.weight_scale" not in out  # scale is consumed
+    assert f"{kda}.f_b_proj.weight_scale" not in out  # scale is consumed
 
     # w8a8 path: weight untouched, scale renamed to weight_scale_inv (2-D).
     assert out[f"{mla}.o_proj.weight"].dtype == torch.float8_e4m3fn
@@ -215,7 +216,7 @@ def test_preprocess_fp8_pb_wo_weights_missing_scale_raises():
 
     config = _renamed_config(_FP8_PB_WO_LAYERS)
     q, _ = _quantize_per_block_cpu(torch.randn(128, 128))
-    stream = [("model.layers.6.self_attn.q_proj.weight", q)]
+    stream = [("model.layers.6.self_attn.f_b_proj.weight", q)]
     with pytest.raises(RuntimeError, match="missing their weight/weight_scale"):
         list(preprocess_fp8_pb_wo_weights(iter(stream), config))
 
@@ -258,6 +259,53 @@ def test_preprocess_route_miss_fp8_raises():
     assert [name for name, _ in out] == [name for name, _ in ok_stream]
 
 
+def test_guard_passes_real_ckpt_expert_subtree_names():
+    """NVFP4 experts are declared as PARENT subtree entries in real exports.
+
+    nvidia/Kimi-K3-NVFP4's hf_quant_config.json has no per-expert entries;
+    it declares e.g. ``language_model.model.layers.49.block_sparse_moe
+    .experts`` (entry names sampled verbatim from the checkpoint), which
+    owns every ``...experts.<i>.w{1,2,3}`` tensor. The unrouted-tensor guard
+    must honor such subtree entries — regression for a boot crash where the
+    guard raised on ``model.layers.49.block_sparse_moe.experts.0.w1
+    .weight_scale`` because the test fixture's unrealistic per-expert entry
+    naming masked the missing ancestor resolution.
+    """
+    from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
+        preprocess_fp8_pb_wo_weights,
+    )
+
+    layers = dict(_FP8_PB_WO_LAYERS)  # keeps has_fp8_pb_wo True
+    layers.update(
+        {
+            "language_model.model.layers.49.block_sparse_moe.experts": {
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+            },
+            "language_model.model.layers.49.mlp.experts": {
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+            },
+        }
+    )
+    config = _renamed_config(layers)
+    packed_uint8 = torch.zeros(4, 4, dtype=torch.uint8)
+    fp8_scales = torch.zeros(4, 4, dtype=torch.uint8).view(torch.float8_e4m3fn)
+    stream = [
+        (
+            "model.layers.49.block_sparse_moe.experts.0.w1.weight_scale",
+            fp8_scales,
+        ),
+        (
+            "model.layers.49.block_sparse_moe.experts.383.w2.weight_scale",
+            fp8_scales,
+        ),
+        ("model.layers.49.block_sparse_moe.experts.0.w1.weight", packed_uint8),
+    ]
+    out = list(preprocess_fp8_pb_wo_weights(iter(stream), config))
+    assert [name for name, _ in out] == [name for name, _ in stream]
+
+
 def test_preprocess_dequant_route_passes_bf16_refit_weights():
     """bf16 refit streams re-send dequantized weights without scale sidecars."""
     from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
@@ -268,11 +316,11 @@ def test_preprocess_dequant_route_passes_bf16_refit_weights():
     refit = torch.randn(96, 200, dtype=torch.bfloat16)
     out = list(
         preprocess_fp8_pb_wo_weights(
-            iter([("model.layers.6.self_attn.q_proj.weight", refit)]), config
+            iter([("model.layers.6.self_attn.f_b_proj.weight", refit)]), config
         )
     )
     # Passed through unchanged, not buffered waiting for a scale.
-    assert out == [("model.layers.6.self_attn.q_proj.weight", refit)]
+    assert out == [("model.layers.6.self_attn.f_b_proj.weight", refit)]
     assert out[0][1] is refit
 
 

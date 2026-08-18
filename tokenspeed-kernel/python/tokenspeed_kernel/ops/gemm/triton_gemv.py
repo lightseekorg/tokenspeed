@@ -38,7 +38,12 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["decode_gemv", "rowcta_gemv"]
+__all__ = [
+    "blockscale_dequant_bf16",
+    "blockscale_w8a16_gemv",
+    "decode_gemv",
+    "rowcta_gemv",
+]
 
 
 @triton.jit
@@ -205,6 +210,164 @@ def decode_gemv(
     return _select(x.shape[0], weight.shape[0], weight.shape[1], x.is_cuda)(
         x, weight, out
     )
+
+
+@triton.jit
+def _blockscale_w8a16_gemv_kernel(
+    x_ptr,
+    w_ptr,
+    s_ptr,
+    out_ptr,
+    M,
+    N,
+    KB,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+    IS_FP8: tl.constexpr,
+):
+    """Row-per-CTA W8A16 GEMV for small-M decode batches.
+
+    One CTA owns output row ``n`` and dots it against up to ``BM`` activation
+    rows. With ``IS_FP8`` the weight row is FP8 with per-[128, BK]-block f32
+    dequant scales and is dequantized in registers through bf16 — the exact
+    load-time-dequant rounding sequence — before the fp32 accumulation. The
+    ``IS_FP8=False`` flavor consumes a bf16 weight through the identical
+    accumulation structure, so the two flavors are bitwise-comparable.
+    """
+    n = tl.program_id(0)
+    offs_m = tl.arange(0, BM)
+    mask_m = offs_m < M
+    acc = tl.zeros([BM], tl.float32)
+    s_row = s_ptr + (n // 128) * KB
+    for kb in tl.static_range(0, K, BK):
+        offs = kb + tl.arange(0, BK)
+        wv_raw = tl.load(w_ptr + n * K + offs)
+        if IS_FP8:
+            s = tl.load(s_row + kb // 128)
+            wv = (wv_raw.to(tl.float32) * s).to(tl.bfloat16).to(tl.float32)
+        else:
+            wv = wv_raw.to(tl.float32)
+        xv = tl.load(
+            x_ptr + offs_m[:, None] * K + offs[None, :],
+            mask=mask_m[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(xv * wv[None, :], axis=1)
+    tl.store(
+        out_ptr + offs_m * N + n,
+        acc.to(out_ptr.dtype.element_ty),
+        mask=mask_m,
+    )
+
+
+def blockscale_w8a16_gemv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``x @ dequant(weight).T`` for small-M (<= 32) decode batches (W8A16).
+
+    Activations stay bf16 (never quantized); FP8 weight rows are dequantized
+    in registers per [128, 128] scale block through bf16 — bit-identical to a
+    load-time ``(w.float() * scale).to(bf16)`` dequant feeding the same
+    accumulation. Weight-bandwidth-bound: the FP8 read halves the dominant
+    traffic vs the bf16 GEMV.
+
+    Args:
+        x: ``[M <= 32, K]`` contiguous bf16 activations.
+        weight: ``[N, K]`` contiguous weight, FP8 (e4m3) with ``weight_scale``
+            or bf16 (test/reference flavor, ``weight_scale`` must be None).
+        weight_scale: f32 ``[ceil(N/128), K/128]`` block dequant multipliers.
+        out: optional ``[M, N]`` contiguous destination.
+
+    Returns:
+        ``[M, N]`` output in ``x``'s dtype.
+    """
+    m, k = x.shape
+    n, wk = weight.shape
+    assert m <= 32, f"blockscale_w8a16_gemv covers decode M <= 32, got {m}"
+    assert wk == k and k % 128 == 0, f"K must match and be 128-aligned: {k=} {wk=}"
+    assert x.dtype == torch.bfloat16 and x.is_contiguous() and weight.is_contiguous()
+    is_fp8 = weight.dtype == torch.float8_e4m3fn
+    if is_fp8:
+        assert weight_scale is not None and weight_scale.dtype == torch.float32
+        assert weight_scale.shape == (
+            (n + 127) // 128,
+            k // 128,
+        ), f"{weight_scale.shape=} does not match {weight.shape=}"
+        assert weight_scale.is_contiguous()
+    else:
+        assert weight.dtype == torch.bfloat16 and weight_scale is None
+    if out is None:
+        out = torch.empty(m, n, dtype=x.dtype, device=x.device)
+    bm = max(1, triton.next_power_of_2(m))
+    _blockscale_w8a16_gemv_kernel[(n,)](
+        x,
+        weight,
+        weight_scale if is_fp8 else weight,  # unused pointer in bf16 flavor
+        out,
+        m,
+        n,
+        k // 128,
+        K=k,
+        BM=bm,
+        BK=128,
+        IS_FP8=is_fp8,
+        num_warps=4,
+    )
+    return out
+
+
+@triton.jit
+def _blockscale_dequant_bf16_kernel(
+    w_ptr,
+    s_ptr,
+    out_ptr,
+    KB,
+    K: tl.constexpr,
+    BK: tl.constexpr,
+):
+    n = tl.program_id(0)
+    kb = tl.program_id(1) * BK
+    offs = kb + tl.arange(0, BK)
+    wv = tl.load(w_ptr + n * K + offs).to(tl.float32)
+    s = tl.load(s_ptr + (n // 128) * KB + kb // 128)
+    tl.store(out_ptr + n * K + offs, (wv * s).to(tl.bfloat16))
+
+
+def blockscale_dequant_bf16(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Dequantize a block-scaled FP8 weight into a bf16 scratch buffer.
+
+    Elementwise ``(w.float() * scale).to(bf16)`` — bit-identical to the
+    load-time dequant recipe — so large-M callers can keep the FP8 weight
+    resident and feed the vendor BLAS from a transient scratch.
+
+    Args:
+        weight: ``[N, K]`` contiguous FP8 (e4m3), ``K % 128 == 0``.
+        weight_scale: f32 ``[ceil(N/128), K/128]`` dequant multipliers.
+        out: ``[N, K]`` contiguous bf16 destination (reused across layers).
+    """
+    n, k = weight.shape
+    assert weight.dtype == torch.float8_e4m3fn and weight.is_contiguous()
+    assert k % 128 == 0 and weight_scale.shape == ((n + 127) // 128, k // 128)
+    assert out.shape == (n, k) and out.dtype == torch.bfloat16
+    assert out.is_contiguous() and weight_scale.is_contiguous()
+    _blockscale_dequant_bf16_kernel[(n, k // 128)](
+        weight,
+        weight_scale,
+        out,
+        k // 128,
+        K=k,
+        BK=128,
+        num_warps=1,
+    )
+    return out
 
 
 def rowcta_gemv_add3(
