@@ -1912,6 +1912,37 @@ class _DeepseekV4TopKBuffer:
         return self.buffer[:num_tokens]
 
 
+def _deepseek_v4_index_topk_refreshes(config: PretrainedConfig, layer_id: int) -> bool:
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None:
+        return not (0 <= layer_id < len(pattern) and pattern[layer_id] == "S")
+
+    frequency_value = getattr(config, "index_topk_freq", 1)
+    frequency = int(1 if frequency_value is None else frequency_value)
+    if frequency <= 0:
+        raise ValueError("index_topk_freq must be a positive integer")
+    csa_ordinal = (
+        sum(1 for ratio in config.compress_ratios[: layer_id + 1] if ratio == 4) - 1
+    )
+    return csa_ordinal >= 0 and csa_ordinal % frequency == 0
+
+
+def _deepseek_v4_should_reuse_index_topk(
+    config: PretrainedConfig, layer_id: int
+) -> bool:
+    if not getattr(config, "use_index_cache", False):
+        return False
+    if config.compress_ratios[layer_id] != 4:
+        return False
+    if _deepseek_v4_index_topk_refreshes(config, layer_id):
+        return False
+    return any(
+        config.compress_ratios[previous] == 4
+        and _deepseek_v4_index_topk_refreshes(config, previous)
+        for previous in range(layer_id - 1, -1, -1)
+    )
+
+
 def _deepseek_v4_sanitize_swa_slot_mapping(
     slot_mapping: torch.Tensor,
     capacity: int,
@@ -2892,6 +2923,7 @@ class DeepseekV4Indexer(nn.Module):
         prefix: str,
         compress_ratio: int,
         topk_buffer: _DeepseekV4TopKBuffer | None = None,
+        reuse_topk: bool = False,
     ) -> None:
         super().__init__()
         self.wq_b = ReplicatedLinear(
@@ -2921,6 +2953,7 @@ class DeepseekV4Indexer(nn.Module):
         self.head_dim = int(config.index_head_dim)
         self.topk_tokens = int(config.index_topk)
         self.topk_buffer = topk_buffer
+        self.reuse_topk = reuse_topk
         self.softmax_scale = self.head_dim**-0.5
         value_bytes = deepseek_v4_indexer_mxfp4_value_bytes(self.head_dim)
         scale_bytes = deepseek_v4_indexer_mxfp4_scale_dim(self.head_dim)
@@ -3410,6 +3443,10 @@ class DeepseekV4Indexer(nn.Module):
                 use_fp4_cache=self.use_fp4_cache,
                 compress_ratio=self.compress_ratio,
             )
+        if getattr(self, "reuse_topk", False):
+            if self.topk_buffer is None:
+                raise RuntimeError("DeepSeek V4 index sharing requires a top-k buffer")
+            return self.topk_buffer.get(positions.numel(), positions.device)
         return self._forward_sparse_indexer_custom_op(
             hidden_states=hidden_states,
             qr=qr,
@@ -3567,6 +3604,7 @@ class DeepseekV4Attention(nn.Module):
                 add_prefix("indexer", prefix),
                 self.compress_ratio,
                 topk_buffer=topk_buffer,
+                reuse_topk=_deepseek_v4_should_reuse_index_topk(config, layer_index),
             )
         else:
             self.indexer = None

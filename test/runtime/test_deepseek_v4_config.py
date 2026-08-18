@@ -123,6 +123,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_mega_moe_max_num_tokens,
     _deepseek_v4_reorder_c4_ape_2604,
     _deepseek_v4_routed_expert_quant_config,
+    _deepseek_v4_should_reuse_index_topk,
     _DeepseekV4TopKBuffer,
     deepseek_v4_rope_config,
     deepseek_v4_select_experts,
@@ -5503,6 +5504,47 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(first.data_ptr(), second.data_ptr())
         self.assertEqual(third.shape, (4, 3))
         self.assertGreaterEqual(buffer.buffer.shape[0], 4)
+
+    def test_deepseek_v4_index_topk_frequency_reuses_after_refresh(self):
+        config = SimpleNamespace(
+            use_index_cache=True,
+            index_topk_freq=4,
+            index_topk_pattern=None,
+            compress_ratios=[128, 4, 1, 4, 128, 4, 4, 4],
+        )
+
+        actual = [
+            _deepseek_v4_should_reuse_index_topk(config, layer_id)
+            for layer_id in range(len(config.compress_ratios))
+        ]
+
+        self.assertEqual(actual, [False, False, False, True, False, True, True, False])
+
+    def test_deepseek_v4_index_topk_pattern_overrides_frequency(self):
+        config = SimpleNamespace(
+            use_index_cache=True,
+            index_topk_freq=1,
+            index_topk_pattern="RSSR",
+            compress_ratios=[4, 4, 4, 4],
+        )
+
+        actual = [
+            _deepseek_v4_should_reuse_index_topk(config, layer_id)
+            for layer_id in range(len(config.compress_ratios))
+        ]
+
+        self.assertEqual(actual, [False, True, True, False])
+
+    def test_deepseek_v4_index_topk_rejects_nonpositive_frequency(self):
+        config = SimpleNamespace(
+            use_index_cache=True,
+            index_topk_freq=0,
+            index_topk_pattern=None,
+            compress_ratios=[4, 4],
+        )
+
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            _deepseek_v4_should_reuse_index_topk(config, 0)
 
     def test_deepseek_v4_sparse_indexer_custom_op_registered(self):
         self.assertTrue(
