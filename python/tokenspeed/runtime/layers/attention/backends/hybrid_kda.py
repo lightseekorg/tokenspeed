@@ -1136,17 +1136,19 @@ class KdaAttnBackend(MambaAttnBackend):
                 dtype=torch.int64,
                 device=self.device,
             )
-            hit = torch.isin(pending["commit_stack"][i], zset) | torch.isin(
-                pending["anchor_stack"][i], zset
-            )
-            # No host readback: an empty-hit scatter is an async no-op, so
-            # the whole condemnation stays on the stream.
-            rpis = pending["rpi_by_slot"][: hit.shape[0]][hit]
-            table.scatter_(
-                0,
-                rpis.clamp(0, table.shape[0] - 1),
-                torch.full_like(rpis, -1).to(torch.int32),
-            )
+            # One broadcast compare per stack instead of isin's sort chain,
+            # and a FIXED-SHAPE scatter: boolean indexing would call nonzero
+            # and sync the host on the output size -- here, right after the
+            # loop's default-waits-execution fence, that would stall the CPU
+            # until the in-flight forward completes. Misses route to the
+            # table's sentinel row, which is documented to hold -1 forever.
+            hit = (pending["commit_stack"][i].unsqueeze(1) == zset).any(1) | (
+                pending["anchor_stack"][i].unsqueeze(1) == zset
+            ).any(1)
+            sentinel = table.shape[0] - 1
+            rpis = pending["rpi_by_slot"][: hit.shape[0]]
+            slots = torch.where(hit, rpis.clamp(0, sentinel), sentinel)
+            table.scatter_(0, slots, torch.full_like(slots, -1).to(torch.int32))
 
     @override
     def flush_deferred_state(self, resident_request_ids: set[str]) -> None:
