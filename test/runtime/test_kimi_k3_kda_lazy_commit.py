@@ -413,18 +413,23 @@ def test_all_rejected_window_still_commits():
     _assert_pools_match(h_lazy, h_eager, pages, rpis)
 
 
-def _prep_verify(h, rpis, pages, seq_lens):
+def _prep_verify(h, rpis, pages, seq_lens, identity=True, req_ids=None):
     """Verify-shaped metadata prep WITHOUT the forward that should follow.
 
     This is the stage half of an abandoned round: the event loop prepared the
-    batch, then retracted it before launching the model."""
+    batch, then retracted it before launching the model. ``identity=False``
+    strips the batch's request identity; ``req_ids`` overrides the derived
+    ids so a caller can recycle a pool index under a new request."""
     tables = {
         gid: np.asarray([[p] for p in pages[gid]], dtype=np.int32)
         for gid in _STATE_GROUPS
     }
     metadata, op = _metadata_for(h.contract, tables, DEV)
-    op.request_pool_indices = list(rpis)
-    op.request_ids = [f"req{r}" for r in rpis]
+    op.request_pool_indices = list(rpis) if identity else []
+    if not identity:
+        op.request_ids = []
+    else:
+        op.request_ids = req_ids or [f"req{r}" for r in rpis]
     h.backend.init_forward_metadata(
         bs=len(rpis),
         req_pool_indices=torch.tensor(rpis, dtype=torch.int32, device=DEV),
@@ -433,6 +438,26 @@ def _prep_verify(h, rpis, pages, seq_lens):
         cache_metadata=metadata,
         forward_batch=op,
     )
+
+
+def _assert_anchored_to_committed(h, pages, bs, why):
+    """Absolute oracle: the anchor rows carry THIS round's committed pages.
+
+    The fused verify reads every request's initial recurrent state and conv
+    tail through these rows, and -1 reads as a zero state. Asserting the rows
+    directly -- rather than comparing two harnesses -- is what makes this
+    catch a defect that breaks both arms the same way, and it holds for every
+    staging exit rather than only the one a given test happens to trigger.
+    """
+    bufs = h.backend._kda_lazy_bufs
+    assert bufs is not None, f"{why}: no control buffers were composed"
+    for gid in _STATE_GROUPS:
+        got = bufs["anchor"][gid][:bs].tolist()
+        want = list(pages[gid][:bs])
+        assert got == want, (
+            f"{why}: group {gid} anchored to {got}, expected this round's "
+            f"committed pages {want}; -1 would verify from a zero state"
+        )
 
 
 def test_abandoned_verify_prep_keeps_pending_for_retract_flush():
@@ -1138,6 +1163,74 @@ def _one_token_round(h, rpis, pages, seq_lens, seed):
     finally:
         h.backend.speculative_num_draft_tokens = T
     return outs
+
+
+def _guard_no_identity(h, rpis, pages):
+    """Guard 1: a verify batch with no request identity at all."""
+    _prep_verify(h, rpis, pages, [8, 7], identity=False)
+
+
+def _guard_corpse(h, rpis, pages):
+    """Guard 2: the pool index is recycled under a different request id."""
+    _prep_verify(h, rpis, pages, [8, 7], req_ids=[f"other{r}" for r in rpis])
+
+
+def _guard_departed(h, rpis, pages):
+    """Guard 3: the pending's owner is absent from this batch."""
+    survivors = rpis[:1]
+    _prep_verify(h, survivors, {g: p[:1] for g, p in pages.items()}, [8])
+
+
+def _guard_ring_growth(h, rpis, pages):
+    """Guard 4: the round needs more payload rows than the ring holds."""
+    cache = h.backend._replay_payload_cache
+    if cache is not None:
+        cache["rows"] = 1  # any round now out-grows the ring
+    _prep_verify(h, rpis, pages, [8, 7])
+
+
+def _guard_window_change(h, rpis, pages):
+    """Guard 5: the draft window changed, so the payload units mismatch."""
+    h.backend.speculative_num_draft_tokens = T + 1
+    try:
+        _prep_verify(h, rpis, pages, [8, 7])
+    finally:
+        h.backend.speculative_num_draft_tokens = T
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        _guard_no_identity,
+        _guard_corpse,
+        _guard_departed,
+        _guard_ring_growth,
+        _guard_window_change,
+    ],
+    ids=["no_identity", "corpse", "departed", "ring_growth", "window_change"],
+)
+def test_every_staging_guard_anchors_to_committed_pages(trigger):
+    """Whichever guard retires the pending, the round still verifies from its
+    committed pages.
+
+    The stage neutral-fills every control row to -1 before deciding the
+    pending's fate. The five guard exits and the no-pending exit share one
+    anchor copy; this pins that property per guard, with an absolute oracle
+    on the control rows so a defect that breaks every exit at once -- the
+    likely shape of a future refactor regression -- cannot hide behind two
+    harnesses failing identically.
+    """
+    rpis = [0, 1]
+    h = _Harness(seed=61)
+    pages = _pages_for(h, rpis)
+    h.verify_round(rpis, pages, [6, 6], h.window(2, 301))
+    h.accept([2, 1])
+    assert h.pending() is not None, "round 1 must leave a window to retire"
+
+    trigger(h, rpis, pages)
+
+    bs = len(h.backend._kda_lazy_bufs["base"][:2].tolist())
+    _assert_anchored_to_committed(h, pages, bs, why=trigger.__name__)
 
 
 def test_guard_flush_round_still_reads_committed_state():
