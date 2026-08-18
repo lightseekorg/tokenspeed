@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pipeline import build_matrix
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 K8S_RUNNER_PREFIXES = ("b200-", "amd-", "gb200-", "b300-")
@@ -325,9 +326,11 @@ def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
         "github.event.pull_request.head.repo.full_name == github.repository"
         in gate["env"]["ALLOWED"]
     )
-    assert matrix_step["env"]["TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"] == (
-        "${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}"
+    assert gate["env"]["ENABLED"] == (
+        "${{ vars.TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED == 'true' }}"
     )
+    assert "needs.scan.outputs.enabled == 'true'" in submit["if"]
+    assert "TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS" not in matrix_step.get("env", {})
     assert "--multi-node only" in matrix_step["run"]
 
     cancel_workflow = load_yaml(
@@ -338,6 +341,34 @@ def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
         for item in cancel_workflow["jobs"]["cancel"]["strategy"]["matrix"]["include"]
     }
     assert "gb300-slurm-per-commit" in cancel_groups
+
+
+def test_gb300_slurm_per_commit_matrix_selects_kimi_k3(monkeypatch):
+    monkeypatch.delenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", raising=False)
+
+    matrix = build_matrix(
+        REPO_ROOT / "test/ci",
+        REPO_ROOT,
+        trigger="per-commit",
+        runner_group="nvidia-arm",
+        workflow_stage="model-test",
+        multi_node="only",
+    )
+
+    assert matrix["include"] == [
+        {
+            "name": "eval-kimi-k3-mxfp4-tp8-two-node-aime26-gb300-slurm",
+            "type": "eval",
+            "config": (
+                "test/ci/eval/"
+                "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
+            ),
+            "runner": "slurm-b300-4gpu",
+            "priority": "normal",
+            "optional": False,
+            "workflow_stage": "model-test",
+        }
+    ]
 
 
 def test_nvidia_arm_workflow_excludes_multi_node_tasks():

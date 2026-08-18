@@ -258,6 +258,15 @@ the shared Slurm cluster; use the manual `Slurm Dispatch` workflow after
 review. New pull-request commits cancel the older run, while `main` runs keep
 the in-flight evaluation and retain the latest pending commit.
 
+Submission is fail-closed and requires the repository variable
+`TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED` to equal `true`. The dedicated
+switch is separate from `TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS`: this workflow
+does not pass that variable to its matrix scan, so entries such as `b300`,
+which would otherwise also substring-match the `slurm-b300-4gpu` topology
+label, cannot filter the multi-node matrix here. During this workflow's
+bootstrap only, leave the switch unset; after dispatcher support reaches
+`main`, set it to `true` and re-run the merge commit's workflow.
+
 The two-node Kimi K3 task declares `slurm-b300-4gpu`, `slurm.nodes: 2`, and
 `slurm.gpus_per_node: 4`. Dispatch maps that label to
 `slurm-gb300-4gpu`; the runner label describes GPUs per node, while the Slurm

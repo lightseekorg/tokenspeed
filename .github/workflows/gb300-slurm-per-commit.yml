@@ -39,15 +39,20 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       has_tasks: ${{ steps.matrix.outputs.has_tasks }}
       allowed: ${{ steps.gate.outputs.allowed }}
+      enabled: ${{ steps.gate.outputs.enabled }}
     steps:
       - name: Check trusted source
         id: gate
         env:
           ALLOWED: ${{ (github.repository == 'lightseekorg/tokenspeed' || github.repository == vars.TOKENSPEED_CI_REPOSITORY) && (github.event_name != 'pull_request' || (github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository)) }}
+          ENABLED: ${{ vars.TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED == 'true' }}
         run: |
           echo "allowed=$ALLOWED" >> "$GITHUB_OUTPUT"
+          echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
           if [ "$ALLOWED" != true ]; then
             echo "GB300 Slurm per-commit CI skips draft and fork pull requests; use Slurm Dispatch after review." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$ENABLED" != true ]; then
+            echo "GB300 Slurm per-commit submission is disabled; set TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED=true to enable it." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Checkout code
@@ -97,8 +102,6 @@ jobs:
       - name: Build multi-node task matrix
         if: steps.changes.outputs.should_run == 'true'
         id: matrix
-        env:
-          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: ${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
         run: |
           matrix=$(python3 test/ci_system/pipeline.py scan \
             --root test/ci \
@@ -115,6 +118,7 @@ jobs:
     needs: scan
     if: |
       needs.scan.outputs.allowed == 'true' &&
+      needs.scan.outputs.enabled == 'true' &&
       needs.scan.outputs.should_run == 'true' &&
       needs.scan.outputs.has_tasks == 'true'
     runs-on: slurm-dispatch-gb300-auto
