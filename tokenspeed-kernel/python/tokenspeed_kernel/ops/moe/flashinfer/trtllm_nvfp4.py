@@ -559,7 +559,7 @@ if platform.is_nvidia:
                 "weight_dtype": frozenset({"nvfp4"}),
                 "activation": frozenset({"situ"}),
                 "routing_mode": frozenset({"precomputed_topk"}),
-                "supports_deferred_finalize": frozenset({False}),
+                "supports_deferred_finalize": frozenset({True, False}),
                 "supports_ep": frozenset({True}),
                 "supports_all_to_all_ep": frozenset({False}),
                 "ispp_alignment": frozenset({1}),
@@ -587,15 +587,15 @@ if platform.is_nvidia:
     ):
         if topk_weights is None or topk_ids is None:
             raise ValueError("precomputed_topk plan requires topk_weights and topk_ids")
-        if not do_finalize:
-            raise NotImplementedError("FlashInfer NVFP4 SiTU requires finalization")
         if x.dtype != torch.bfloat16:
             raise TypeError("FlashInfer NVFP4 SiTU requires bf16 input")
         # Caller-owned destination (e.g. K3's fused all-reduce lane slice):
         # writing the finalized rows in place keeps the join zero-copy, same
-        # contract as the MXFP4 SiTU kernel. Used only when present and
-        # exactly matching; otherwise the kernel allocates its own output.
-        out_buf = getattr(w, "_situ_output_buffer", None)
+        # contract as the MXFP4 SiTU kernel. Only meaningful when finalizing;
+        # deferred mode returns the permuted triple (gemm2 rows, the caller's
+        # bf16 expert weights echoed back, expanded_idx) instead of finalized
+        # rows, so no destination exists to write into.
+        out_buf = getattr(w, "_situ_output_buffer", None) if do_finalize else None
         if not (
             out_buf is not None
             and out_buf.shape == (x.shape[0], x.shape[-1])

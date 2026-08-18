@@ -40,7 +40,7 @@ import pytest
 import torch
 
 NUM_EXPERTS = 16
-TOP_K = 10  # Kimi-K3 top-k
+TOP_K = 10  # scaled-down test shape (real Kimi-K3 num_experts_per_token=16)
 HIDDEN = 256
 ISPP = 192  # Kimi-K3 intermediate size per partition
 SITU_BETA = 4.0  # K3 activation_situ_beta (gate branch)
@@ -361,9 +361,11 @@ def test_situ_preprocessor_rejects_mismatched_gate_up_global_scales() -> None:
         flashinfer_trtllm_nvfp4_situ_moe_weights({}, w)
 
 
-def test_registry_deferred_finalize_bit_stays_false() -> None:
-    """K3's latent-tail arming reads this bit; a silent flip to True would
-    re-arm TAIL_FUSION and crash the experts layer on do_finalize=False."""
+def test_registry_deferred_finalize_bit_matches_wiring() -> None:
+    """K3's latent-tail arming reads this bit. It must only include True
+    while the situ apply actually serves do_finalize=False (the deferred
+    triple); a bit/behavior mismatch crashes the experts layer at the first
+    MoE forward of a TAIL_FUSION deployment."""
     import tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4  # noqa: F401
     from tokenspeed_kernel.registry import KernelRegistry
 
@@ -372,4 +374,87 @@ def test_registry_deferred_finalize_bit_stays_false() -> None:
     )
     if spec is None:
         pytest.skip("nvfp4 SiTU kernel not registered on this platform")
-    assert spec.traits["supports_deferred_finalize"] == frozenset({False})
+    assert spec.traits["supports_deferred_finalize"] == frozenset({True, False})
+
+
+@requires_flashinfer_situ
+def test_nvfp4_situ_deferred_triple_matches_finalized() -> None:
+    """do_finalize=False must hand back the exact raw materials of the
+    finalized result: manually finalizing the (permuted rows, echoed bf16
+    expert weights, expanded_idx) triple with the latent tail's recipe
+    (fp32 ascending-k accumulate, single bf16 round) reproduces the
+    do_finalize=True output."""
+    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
+        flashinfer_trtllm_nvfp4_situ_moe_weights,
+        flashinfer_trtllm_nvfp4_situ_routed_moe_apply,
+    )
+
+    generator = torch.Generator().manual_seed(20260818)
+    num_tokens = 16
+    raw = _make_nvfp4_moe_weights(generator)
+    hidden_states = (
+        (torch.randn(num_tokens, HIDDEN, generator=generator) * 0.2).bfloat16().cuda()
+    )
+    topk_ids = (
+        torch.stack(
+            [
+                torch.randperm(NUM_EXPERTS, generator=generator)[:TOP_K]
+                for _ in range(num_tokens)
+            ]
+        )
+        .to(dtype=torch.int32)
+        .cuda()
+    )
+    topk_weights = (
+        torch.rand(num_tokens, TOP_K, generator=generator)
+        .softmax(dim=-1)
+        .bfloat16()
+        .cuda()
+    )
+    w = _MoEWeights({k: v.clone() for k, v in raw.items()}).cuda()
+    flashinfer_trtllm_nvfp4_situ_moe_weights({}, w)
+
+    finalized = flashinfer_trtllm_nvfp4_situ_routed_moe_apply(
+        {},
+        hidden_states,
+        w,
+        router_logits=None,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+    gemm2_out, expert_weights, expanded_idx = (
+        flashinfer_trtllm_nvfp4_situ_routed_moe_apply(
+            {},
+            hidden_states,
+            w,
+            router_logits=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            do_finalize=False,
+        )
+    )
+    torch.cuda.synchronize()
+
+    # Triple contract, as consumed by KimiK3LatentTailOp.call_deferred.
+    assert expert_weights.dtype == torch.bfloat16
+    assert torch.equal(expert_weights, topk_weights)  # routed variant echoes
+    assert expanded_idx.dtype == torch.int32
+    assert expanded_idx.shape == (num_tokens * TOP_K,)
+    assert int(expanded_idx.max()) < gemm2_out.shape[0]
+    assert int(expanded_idx.min()) >= -1
+
+    # The tail's finalize recipe: fp32 ascending-k accumulate per token,
+    # one bf16 round at the end. -1 entries are padding and contribute 0.
+    idx = expanded_idx.view(num_tokens, TOP_K).long()
+    acc = torch.zeros(num_tokens, HIDDEN, dtype=torch.float32, device="cuda")
+    for k in range(TOP_K):
+        valid = idx[:, k] >= 0
+        rows = gemm2_out[idx[:, k].clamp(min=0)].float()
+        acc += torch.where(
+            valid[:, None],
+            expert_weights[:, k].float()[:, None] * rows,
+            torch.zeros_like(rows),
+        )
+    manual = acc.to(torch.bfloat16)
+
+    assert _rel_l2(manual, finalized) < 5e-3, f"{_rel_l2(manual, finalized)=}"
