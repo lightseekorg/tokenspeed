@@ -43,6 +43,7 @@ class Task:
     runner: str
     gpus: int
     nodes: int = 1
+    declared_runner: str | None = None
 
 
 @dataclass(frozen=True)
@@ -59,7 +60,12 @@ def gpu_count(runner: str) -> int:
     return int(matches[0])
 
 
-def load_task(repo: Path, config: str, runner: str | None = None) -> Task:
+def load_task(
+    repo: Path,
+    config: str,
+    runner: str | None = None,
+    effective_runner: str | None = None,
+) -> Task:
     path = (repo / config).resolve()
     try:
         relative = path.relative_to(repo).as_posix()
@@ -75,6 +81,21 @@ def load_task(repo: Path, config: str, runner: str | None = None) -> Task:
         runner = labels[0]
     if runner not in labels:
         raise ValueError(f"{runner!r} is not declared by {relative}")
+    declared_runner = runner
+    if effective_runner is not None:
+        if data["type"] == "perf":
+            raise ValueError("runner aliases are not supported for perf tasks")
+        if not declared_runner.startswith("b300-") or not effective_runner.startswith(
+            "gb300-"
+        ):
+            raise ValueError("runner aliases must map b300-* to gb300-*")
+        if gpu_count(declared_runner) != gpu_count(effective_runner):
+            raise ValueError("runner alias GPU counts must match")
+        if declared_runner.removeprefix("b300-") != effective_runner.removeprefix(
+            "gb300-"
+        ):
+            raise ValueError("runner alias suffixes must match")
+        runner = effective_runner
     gpus = gpu_count(runner)
     slurm = data.get("slurm", {})
     nodes = int(slurm.get("nodes", 1))
@@ -84,7 +105,22 @@ def load_task(repo: Path, config: str, runner: str | None = None) -> Task:
             f"{relative}: slurm.gpus_per_node={gpus_per_node} does not match "
             f"runner {runner!r} ({gpus} GPUs)"
         )
-    return Task(relative, str(data["name"]), str(data["type"]), runner, gpus, nodes)
+    return Task(
+        relative,
+        str(data["name"]),
+        str(data["type"]),
+        runner,
+        gpus,
+        nodes,
+        declared_runner if effective_runner is not None else None,
+    )
+
+
+def parse_runner_alias(value: str) -> tuple[str, str]:
+    declared, separator, effective = value.partition("=")
+    if not separator or not declared or not effective:
+        raise ValueError("--runner-alias must be DECLARED=EFFECTIVE")
+    return declared, effective
 
 
 def task_matches(repo: Path, task: Task, patterns: list[str]) -> bool:
@@ -101,6 +137,7 @@ def task_matches(repo: Path, task: Task, patterns: list[str]) -> bool:
 
 def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
     runners = args.runner or []
+    runner_aliases = getattr(args, "runner_alias", None) or []
     task_types = set(args.task_types or DEFAULT_TASK_TYPES)
     patterns = args.match or []
     excluded_patterns = getattr(args, "exclude_match", None) or []
@@ -111,11 +148,19 @@ def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
         )
 
     if args.config:
-        tasks = (
-            [load_task(repo, args.config, runner) for runner in runners]
-            if runners
-            else [load_task(repo, args.config)]
-        )
+        if runners and runner_aliases:
+            raise ValueError("--runner and --runner-alias cannot be combined")
+        if runner_aliases:
+            tasks = [
+                load_task(repo, args.config, *parse_runner_alias(value))
+                for value in runner_aliases
+            ]
+        else:
+            tasks = (
+                [load_task(repo, args.config, runner) for runner in runners]
+                if runners
+                else [load_task(repo, args.config)]
+            )
         tasks = [
             task
             for task in tasks
@@ -124,6 +169,8 @@ def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
         if not tasks:
             raise ValueError("the selected config does not match the task filters")
         return tasks
+    if runner_aliases:
+        raise ValueError("--runner-alias requires --config")
     if not runners:
         raise ValueError("--all requires --runner")
     matrix = build_matrix(repo / "test/ci", repo, args.trigger)
@@ -281,11 +328,13 @@ def render_script(
         "test/ci_system/pipeline.py",
         "execute",
         f"--config={task.config}",
-        f"--runner={task.runner}",
+        f"--runner={task.declared_runner or task.runner}",
         "--work-dir=/workspace",
         "--setup-mode=slurm",
         "--print-plan",
     ]
+    if task.declared_runner is not None:
+        pipeline.append(f"--runner-override={task.runner}")
     bootstrap = (
         'export LD_LIBRARY_PATH="/opt/tokenspeed-cuda-runtime'
         '${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"; '
@@ -796,7 +845,16 @@ def write_report(
         detail = result_detail(result_path)
         row = {
             "job_id": submission.job_id,
-            "task": submission.task.__dict__,
+            "task": {
+                # Keep the public report schema stable; declared_runner is
+                # internal selection metadata for an effective alias.
+                "config": submission.task.config,
+                "name": submission.task.name,
+                "task_type": submission.task.task_type,
+                "runner": submission.task.runner,
+                "gpus": submission.task.gpus,
+                "nodes": submission.task.nodes,
+            },
             "log": str(submission.log),
             "result": str(result_path),
             **state,
@@ -893,6 +951,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     source.add_argument("--config")
     source.add_argument("--all", action="store_true")
     parser.add_argument("--runner", action="append")
+    parser.add_argument(
+        "--runner-alias",
+        action="append",
+        help="Slurm-only declared/effective runner pair: b300-Ngpu=gb300-Ngpu.",
+    )
     parser.add_argument(
         "--type", dest="task_types", action="append", choices=sorted(TASK_TYPES)
     )

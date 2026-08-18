@@ -1,4 +1,5 @@
 import argparse
+import json
 import subprocess
 import textwrap
 from pathlib import Path
@@ -111,6 +112,56 @@ def test_load_task_checks_runner(tmp_path):
         load_task(tmp_path, config, "gb200-4gpu")
 
 
+def test_load_task_supports_optional_gb300_alias(tmp_path):
+    config = write_task(tmp_path, runner="b300-1gpu", task_type="ut")
+
+    assert load_task(tmp_path, config, "b300-1gpu", "gb300-1gpu") == Task(
+        config, "example", "ut", "gb300-1gpu", 1, 1, "b300-1gpu"
+    )
+
+
+def test_render_script_passes_declared_and_effective_gb300_runners():
+    script = render_script(
+        Task(
+            "test/ci/ut/example.yaml",
+            "example",
+            "ut",
+            "gb300-1gpu",
+            1,
+            declared_runner="b300-1gpu",
+        ),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    assert "--runner=b300-1gpu" in script
+    assert "--runner-override=gb300-1gpu" in script
+    assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in script
+
+
+@pytest.mark.parametrize(
+    ("declared", "effective", "message"),
+    [
+        ("b300-4gpu", "gb300-1gpu", "GPU counts"),
+        ("b200-1gpu", "gb300-1gpu", "b300"),
+    ],
+)
+def test_load_task_rejects_invalid_gb300_alias(tmp_path, declared, effective, message):
+    config = write_task(tmp_path, runner=declared, task_type="ut")
+
+    with pytest.raises(ValueError, match=message):
+        load_task(tmp_path, config, declared, effective)
+
+
+def test_load_task_rejects_gb300_perf_alias(tmp_path):
+    config = write_task(tmp_path, runner="b300-4gpu", task_type="perf")
+
+    with pytest.raises(ValueError, match="perf"):
+        load_task(tmp_path, config, "b300-4gpu", "gb300-4gpu")
+
+
 def test_select_all_filters_exact_runner(monkeypatch, tmp_path):
     config = write_task(tmp_path)
     monkeypatch.setattr(
@@ -135,6 +186,20 @@ def test_select_all_filters_exact_runner(monkeypatch, tmp_path):
     assert select_tasks(args, tmp_path) == [
         Task(config, "example", "eval", "gb200-1gpu", 1)
     ]
+
+
+def test_select_all_rejects_runner_alias_even_with_runner(tmp_path):
+    args = argparse.Namespace(
+        config=None,
+        runner=["gb200-1gpu"],
+        runner_alias=["b300-1gpu=gb300-1gpu"],
+        task_types=None,
+        match=None,
+        trigger="manual",
+    )
+
+    with pytest.raises(ValueError, match="requires --config"):
+        select_tasks(args, tmp_path)
 
 
 def test_select_all_supports_multiple_runners_types_and_model_match(
@@ -431,6 +496,15 @@ def test_write_report_collects_logs_and_results(tmp_path):
 
     assert (report / "123.log").read_text() == "task output\n"
     assert (report / "123-result.json").exists()
+    manifest_task = json.loads((report / "manifest.json").read_text())[0]["task"]
+    assert manifest_task == {
+        "config": "test/ci/eval/example.yaml",
+        "name": "example",
+        "task_type": "eval",
+        "runner": "gb200-1gpu",
+        "gpus": 1,
+        "nodes": 1,
+    }
     assert (
         "| 123 | eval | gb200-1gpu | example | ✅ |"
         in (report / "summary.md").read_text()

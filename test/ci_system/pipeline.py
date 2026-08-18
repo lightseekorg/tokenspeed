@@ -454,6 +454,32 @@ def get_runner_specific_env(task: Dict[str, Any], runner: str) -> Dict[str, str]
     return {}
 
 
+def apply_slurm_runner_override(
+    declared_runner: str,
+    runner_override: str | None,
+    setup_mode: str,
+    task_type: str,
+) -> str:
+    if runner_override is None:
+        return declared_runner
+    if setup_mode != "slurm":
+        raise ValueError("--runner-override requires --setup-mode=slurm")
+    if task_type == "perf":
+        raise ValueError("--runner-override is not supported for perf tasks")
+    if not declared_runner.startswith("b300-") or not runner_override.startswith(
+        "gb300-"
+    ):
+        raise ValueError("runner override must map b300-* to gb300-*")
+    gpu_pattern = re.compile(r"(?:^|-)([1-9]\d*)gpu(?:-|$)")
+    declared_gpus = gpu_pattern.findall(declared_runner)
+    override_gpus = gpu_pattern.findall(runner_override)
+    if len(declared_gpus) != 1 or declared_gpus != override_gpus:
+        raise ValueError("runner override GPU counts must match")
+    if declared_runner.removeprefix("b300-") != runner_override.removeprefix("gb300-"):
+        raise ValueError("runner override suffixes must match")
+    return runner_override
+
+
 def create_ci_venv_name(runner_name: str | None = None) -> str:
     if runner_name:
         # Fixed path per runner so flashinfer JIT cache (which embeds the
@@ -1611,6 +1637,7 @@ def execute_task(
     *,
     config: str,
     runner: str,
+    runner_override: str | None = None,
     work_dir: str,
     dry_run: bool,
     print_plan: bool,
@@ -1643,6 +1670,10 @@ def execute_task(
         raise ValueError(
             f"{config}: runner {runner!r} is not declared in runner.labels"
         )
+    declared_runner = runner
+    runner = apply_slurm_runner_override(
+        declared_runner, runner_override, setup_mode, str(task["type"])
+    )
     targets = summarize_task_targets(task, repo_root)
 
     env = merge_env(task.get("env", {}))
@@ -1650,7 +1681,7 @@ def execute_task(
     env["CI_TASK_TYPE"] = str(task["type"])
     env["CI_RUNNER_LABEL"] = runner
     env.update(get_default_runner_env(runner))
-    env.update(get_runner_specific_env(task, runner))
+    env.update(get_runner_specific_env(task, declared_runner))
 
     jit_cache_env = get_jit_cache_env(env) if is_gb200_runner(runner) else {}
     env.update(jit_cache_env)
@@ -1828,7 +1859,7 @@ def execute_task(
             task, command_results, stages_run, server_log_path
         )
         eval_score_check = check_eval_score_threshold(
-            task, command_results, stages_run, runner
+            task, command_results, stages_run, declared_runner
         )
         if eval_score_check is not None and not eval_score_check["passed"]:
             raise RuntimeError(
@@ -1931,6 +1962,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--runner", required=True, help="Runner label selected by the matrix"
     )
     execute_parser.add_argument(
+        "--runner-override",
+        help="Slurm-only effective GB300 runner for a declared B300 runner.",
+    )
+    execute_parser.add_argument(
         "--work-dir", default=".", help="Repository work directory"
     )
     execute_parser.add_argument(
@@ -2002,6 +2037,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         return execute_task(
             config=args.config,
             runner=args.runner,
+            runner_override=args.runner_override,
             work_dir=args.work_dir,
             dry_run=args.dry_run,
             print_plan=args.print_plan,

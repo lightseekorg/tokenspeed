@@ -106,19 +106,17 @@ repositories. `pull_request` runs keep their existing behavior. The configured
 repository must also provide the matching self-hosted runner labels and any
 required secrets; this variable only controls the repository gate.
 
-The NVIDIA x86 PR workflow excludes `h100` and `b300` runners by default, and
-the NVIDIA ARM workflow excludes `gb300` runners until a matching GitHub runner
-pool is available. These defaults also apply to fork PRs where repository
-variables are unavailable. To temporarily remove additional unavailable GPU
-runners from PR test matrices, set the
+The NVIDIA PR workflow excludes `h100` and `b300` runners by default, including
+for fork PRs where repository variables are unavailable. To temporarily remove
+additional unavailable GPU runners from PR test matrices, set the
 `TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS` repository variable to comma-separated,
 case-insensitive substrings such as `gb200, mi355`. Matching uses the resolved
 runner label after applying `TOKENSPEED_B200_RUNNER_LABEL`; `mi355` therefore
 matches `amd-mi355-*`. Empty entries are ignored. If every runner in a workflow
 group is excluded, its matrix job is skipped while the workflow still
 finishes. This variable applies only to the three PR test workflows. Clear or
-unset it to restore all runner labels except the built-in NVIDIA x86 `h100` and
-`b300` baselines and NVIDIA ARM `gb300` baseline.
+unset it to restore all runner labels except the NVIDIA workflow's `h100` and
+`b300` baselines.
 
 The CI system derives `SM` from common runner label prefixes by default:
 `h100`/`h200` use `sm90`, `b200`/`gb200` use `sm100`, and `b300`/`gb300` use
@@ -127,7 +125,8 @@ override or extend the defaults for a single runner label.
 
 PR workflows split runner labels by vendor and host architecture. `PR Test
 NVIDIA` uses the `nvidia-x86` runner group, while `PR Test NVIDIA ARM` uses
-the `nvidia-arm` runner group for `gb200` and `gb300` labels.
+the `nvidia-arm` runner group. GB300 is classified as NVIDIA ARM, but is not
+declared in task YAMLs and therefore does not enter default CI matrices.
 
 ## Slurm with Pyxis/Enroot
 
@@ -235,17 +234,19 @@ TS_CI_ARTIFACT_ROOT=/data/home/$USER/tokenspeed-slurm \
 TS_CI_CACHE_DIR=/data/home/$USER/tokenspeed-cache \
 test/ci/run_slurm.sh \
   test/ci/ut/ut-tokenspeed-kernel.yaml \
-  --runner gb300-1gpu \
+  --runner-alias b300-1gpu=gb300-1gpu \
   --type ut \
   --wait
 ```
 
 The `Slurm Dispatch` workflow exposes a `cluster` input. `gb200` keeps the
-existing `slurm-dispatch` coordinator and runner defaults. `gb300` uses the
-separate `slurm-dispatch-gb300` coordinator, maps an unchanged runner default
-to `gb300-4gpu`, and rejects labels for another cluster. Registering that
-coordinator is an infrastructure prerequisite. GB300 perf tasks are not
-enabled until GB300-specific reference values are measured.
+existing `slurm-dispatch` coordinator and runner defaults. `gb300` is an
+explicit opt-in: select one YAML, then the workflow maps its single declared
+`b300-Ngpu` label to `gb300-Ngpu` (or validates one explicit `gb300-*` runner).
+GB300 labels are not added to task YAMLs or default CI matrices. Registering
+the separate `slurm-dispatch-gb300` coordinator is an infrastructure
+prerequisite. GB300 perf tasks are disabled until GB300-specific reference
+values are measured.
 
 GB200 examples:
 
