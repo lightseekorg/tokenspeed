@@ -744,6 +744,29 @@ class KdaAttnBackend(MambaAttnBackend):
         # the round dies between the KDA layers and the accept sampling.
         self._kda_replay_staged = True
 
+    def _anchor_rows_to_committed(self, bufs: dict) -> None:
+        """Point the anchor rows at this round's committed pages.
+
+        The same repair every no-pending exit of ``_stage_pending_replay``
+        performs, reachable from outside the stage: the caller has retired a
+        pending mid-forward, so the round is now a plain verify and must not
+        keep the pre-window pages the compose left behind.
+        """
+        ctx = self._verify_commit_ctx
+        if ctx is None:
+            return
+        state_in_by_group = ctx[3]
+        if not state_in_by_group:
+            return
+        gids = self._state_group_ids
+        real_bs = int(state_in_by_group[gids[0]].shape[0])
+        if real_bs <= 0:
+            return
+        anchor_rows = bufs["flat"][2 : 2 + len(gids)]
+        anchor_rows[:, :real_bs].copy_(
+            torch.stack([state_in_by_group[gid][:real_bs] for gid in gids])
+        )
+
     def _pending_survives_staging(self, kwargs: dict, real_bs: int) -> dict | None:
         """Return the pending record iff it is safe to fuse into this round.
 
@@ -1194,6 +1217,12 @@ class KdaAttnBackend(MambaAttnBackend):
                 # this round's capture and next round's replay agree on rows.
                 bufs["capture_base"].fill_(self._staged_parity * rows)
                 bufs["base"].fill_(-1)
+                # Retiring the pending here turns this into a plain verify, so
+                # it owes the same re-anchor every no-pending exit of the stage
+                # does: the anchor rows still name the pre-window pages, and a
+                # window that crossed a checkpoint boundary would run the whole
+                # round one window behind.
+                self._anchor_rows_to_committed(bufs)
             # The startup overflow preallocation guessed its widths from the
             # pool geometry; this rebuild carries the model's true widths, so
             # re-drive it here (still pre-capture) or the guess would be
@@ -1523,9 +1552,12 @@ class KdaAttnBackend(MambaAttnBackend):
         and any chance of a first touch landing inside a capture mempool.
 
         The f_a payload width is not in the pool geometry; KDA's low-rank
-        gate uses the state head dim (K3: 128 == K). If a model ever
-        disagrees, the width check in ``_replay_payload`` rebuilds the
-        buffers during the eager warmup forward, before anything captures.
+        gate uses the state head dim (K3: 128 == K). A model whose gate rank
+        disagrees does NOT recover: ``_graphs_captured`` latches in the
+        capture metadata hook, which runs before the first warmup forward, so
+        ``_replay_payload``'s rebuild hits its post-capture assert instead --
+        an all-rank startup abort whose message names ring growth rather than
+        the width. Widen this guess, or move the latch, before adding one.
         """
         rows = max(max_bs, 1) * int(self.speculative_num_draft_tokens)
         hv = k = None
@@ -1591,6 +1623,13 @@ class KdaAttnBackend(MambaAttnBackend):
         if not self._graphs_captured and self._replay_active:
             self._graphs_captured = True
         self._kda_replay_staged = False
+        # Capture is the one verify-shaped prep that does not run the stage,
+        # so nothing else neutralizes the control rows. Today they are still
+        # at their -1 init (capture is startup-only, before any pending
+        # exists); clearing them keeps that true if capture ever moves.
+        bufs = self._kda_lazy_bufs
+        if bufs is not None:
+            bufs["flat"].fill_(-1)
         return super().init_forward_metadata_capture_cuda_graph(
             bs, req_pool_indices, seq_lens, forward_mode, **kwargs
         )

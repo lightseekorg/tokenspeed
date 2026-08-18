@@ -1026,7 +1026,19 @@ class EventLoop:
         with no forward is deliberately NOT such a point: capacity
         retraction schedules nothing precisely while the other decoders stay
         resident, so an empty round says nothing about who is still here.
+
+        This is NOT a pre-release fence, despite running under a pause. A
+        release drain sits at ``PAUSED_NEW``, so ``forward_blocked`` stays
+        false for its whole duration and ``PAUSED_ALL`` is only reached from
+        ``_finish_release`` -- after the adapter has unmapped the weights.
+        Settling deferred work under the weights that produced it has to
+        happen at the release itself; here the weights may already be gone.
         """
+        if self._pause.released:
+            # Weights and KV are unmapped. A backend flush replays through
+            # live weight tensors, so a launch here is an illegal access,
+            # not a stale result. Mirrors the guard on the idle forward below.
+            return
         backend = self.model_executor.attn_backend
         if not backend.has_deferred_state():
             # Most backends never defer; skip the stream fencing entirely.
@@ -1631,7 +1643,7 @@ class EventLoop:
             self._drain_ready_epd_embeddings()
             self._commit_cache_results()
             if self._pause.forward_blocked:
-                # A pause may precede a weight update: flush deferred state under the weights that produced it.
+                # Retire deferred backend windows while the loop is idle.
                 self._flush_deferred_state()
                 self._paused_idle_step()
                 continue
@@ -1781,13 +1793,12 @@ class EventLoop:
             self._process_new_requests()
             self._commit_cache_results()
             if self._pause.forward_blocked:
-                # Freeze. Order matters twice over: the in-flight overlapped
-                # step commits FIRST, so its completions leave rid_to_state
-                # and the flush sees true residency (a request finishing in
-                # that very step must be dropped, not flushed); the flush runs
-                # BEFORE the idle step, whose drain-finish can release a
-                # weight update -- deferred state must be settled under the
-                # weights that produced it.
+                # Freeze. The in-flight overlapped step commits FIRST, so its
+                # completions leave rid_to_state and the flush sees true
+                # residency: a request finishing in that very step is dropped
+                # rather than flushed. The flush itself is opportunistic --
+                # it retires windows while the loop is idle, and self-guards
+                # against a release having already unmapped the weights.
                 self._commit_paused_inflight(prev_forward_op, prev_results)
                 prev_results = None
                 prev_forward_op = None

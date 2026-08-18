@@ -1055,6 +1055,11 @@ def test_payload_ring_rebuild_neutralizes_the_staged_replay_base():
     assert bool(
         (bufs["base"][: len(rpis)] == -1).all()
     ), "ring rebuilt under a live replay base: the rest of this round re-commits"
+    # Retiring the pending makes this a plain verify, so the same anchor
+    # invariant the staging guards obey applies here: the compose left the
+    # anchor rows on the PRE-window pages, and a window crossing a checkpoint
+    # boundary would run the whole round one window behind.
+    _assert_anchored_to_committed(h, pages, len(rpis), why="payload_ring_rebuild")
 
 
 def test_window_size_change_flushes_the_pending():
