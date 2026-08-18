@@ -242,11 +242,26 @@ test/ci/run_slurm.sh \
 The `Slurm Dispatch` workflow exposes a `cluster` input. `gb200` keeps the
 existing `slurm-dispatch` coordinator and runner defaults. `gb300` is an
 explicit opt-in: select one YAML, then the workflow maps its single declared
-`b300-Ngpu` label to `gb300-Ngpu` (or validates one explicit `gb300-*` runner).
-GB300 labels are not added to task YAMLs or default CI matrices. Registering
-the separate `slurm-dispatch-gb300` coordinator is an infrastructure
-prerequisite. GB300 perf tasks are disabled until GB300-specific reference
-values are measured.
+`b300-Ngpu` label to `gb300-Ngpu`, preserving an optional `slurm-` prefix for
+multi-node tasks (or validates one matching explicit runner). Effective GB300
+labels are not added to task YAMLs or default CI matrices. Registering the
+separate `slurm-dispatch-gb300` coordinator is an infrastructure prerequisite.
+GB300 perf tasks are disabled until GB300-specific reference values are
+measured.
+
+The `GB300 Slurm Per Commit` workflow selects only multi-node model tasks with
+the `per-commit` trigger and submits them through the dedicated
+`slurm-dispatch-gb300-auto` coordinator. It runs for pushes to `main` and for
+non-draft pull requests whose head branch belongs to this repository. Fork
+pull requests are skipped because their code must not execute automatically on
+the shared Slurm cluster; use the manual `Slurm Dispatch` workflow after
+review. New pull-request commits cancel the older run, while `main` runs keep
+the in-flight evaluation and retain the latest pending commit.
+
+The two-node Kimi K3 task declares `slurm-b300-4gpu`, `slurm.nodes: 2`, and
+`slurm.gpus_per_node: 4`. Dispatch maps that label to
+`slurm-gb300-4gpu`; the runner label describes GPUs per node, while the Slurm
+topology fields describe the allocation.
 
 GB200 examples:
 

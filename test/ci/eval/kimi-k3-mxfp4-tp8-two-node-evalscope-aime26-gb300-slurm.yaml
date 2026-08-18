@@ -1,0 +1,54 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-kimi-k3-mxfp4-tp8-two-node-aime26-gb300-slurm
+type: eval
+workflow_stage: model-test
+triggers:
+  - per-commit
+runner:
+  labels:
+    - slurm-b300-4gpu
+slurm:
+  nodes: 2
+  gpus_per_node: 4
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+  - python3 -m pip install flash-linear-attention
+server:
+  command: >-
+    ts serve moonshotai/Kimi-K3
+    --served-model-name kimi-k3
+    --trust-remote-code
+    --max-model-len 65536
+    --kv-cache-dtype fp8
+    --tensor-parallel-size 8
+    --mm-encoder-tp-mode data
+    --moe-backend flashinfer_trtllm
+    --gpu-memory-utilization 0.94
+    --max-num-seqs 16
+    --disable-kvstore
+    --host 0.0.0.0
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 7200
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model kimi-k3
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets aime26
+    --dataset-hub huggingface
+    --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
+    --eval-batch-size 16
+    --stream
+    --generation-config '{"do_sample":true,"temperature":1.0,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'
+report:
+  github_step_summary: true
+score_threshold: 0.90

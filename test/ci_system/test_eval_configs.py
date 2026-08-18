@@ -34,7 +34,7 @@ DATASETS = {
         "dataset_args": {"dataset_id": "math-ai/aime25"},
     },
     "aime26": {
-        "count": 4,
+        "count": 5,
         "dataset_args": {"dataset_id": "math-ai/aime26"},
     },
     "gpqa_diamond": {

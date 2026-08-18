@@ -44,6 +44,7 @@ SUPPORTED_SETUP_MODES = ("ci", "slurm")
 SUPPORTED_PRIORITIES = ("high", "normal", "low")
 DEFAULT_PRIORITY = "normal"
 SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
+SUPPORTED_MULTI_NODE_FILTERS = ("all", "only", "exclude")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
 EXCLUDED_RUNNER_LABELS_ENV = "TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"
@@ -66,12 +67,23 @@ JIT_CACHE_ENV_SUBDIRS = {
 RUNNER_SM_PREFIXES = (
     (("h100", "h200"), "sm90"),
     (("b200", "gb200", "slurm-gb200"), "sm100"),
-    (("b300", "gb300"), "sm103"),
+    (("b300", "gb300", "slurm-b300", "slurm-gb300"), "sm103"),
 )
 
 AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-")
-NVIDIA_ARM_RUNNER_PREFIXES = ("gb200", "gb300")
+NVIDIA_ARM_RUNNER_PREFIXES = (
+    "gb200",
+    "gb300",
+    "slurm-b300",
+    "slurm-gb200",
+    "slurm-gb300",
+)
 GB200_RUNNER_PREFIXES = ("gb200", "slurm-gb200")
+ISOLATED_JIT_CACHE_RUNNER_PREFIXES = (
+    *GB200_RUNNER_PREFIXES,
+    "slurm-b300",
+    "slurm-gb300",
+)
 NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES = ("gb200", "b300")
 PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
 
@@ -100,6 +112,10 @@ def runner_matches_group(runner: str, runner_group: str) -> bool:
 
 def is_gb200_runner(runner: str) -> bool:
     return runner.startswith(GB200_RUNNER_PREFIXES)
+
+
+def uses_isolated_jit_cache(runner: str) -> bool:
+    return runner.startswith(ISOLATED_JIT_CACHE_RUNNER_PREFIXES)
 
 
 def should_run_nvidia_gpu_cleanup(runner: str) -> bool:
@@ -246,9 +262,13 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 raise ValueError(
                     f"{path}: multi-node Slurm tasks must have type 'eval' or 'perf'"
                 )
-            if data["triggers"] != ["slurm"]:
+            if len(data["triggers"]) != 1 or data["triggers"][0] not in {
+                "per-commit",
+                "slurm",
+            }:
                 raise ValueError(
-                    f"{path}: multi-node Slurm tasks must use only the 'slurm' trigger"
+                    f"{path}: multi-node Slurm tasks must use exactly one of the "
+                    "'per-commit' or 'slurm' triggers"
                 )
             if not all(label.startswith("slurm-") for label in labels):
                 raise ValueError(
@@ -344,12 +364,20 @@ def build_matrix(
     trigger: str | None,
     runner_group: str = "all",
     workflow_stage: str | None = None,
+    multi_node: str = "exclude",
 ) -> Dict[str, Any]:
+    if multi_node not in SUPPORTED_MULTI_NODE_FILTERS:
+        raise ValueError(f"unsupported multi-node filter: {multi_node!r}")
     include = []
     excluded_runner_labels = get_excluded_runner_labels()
     for path in find_task_files(root):
         task = normalize_task(path, repo_root)
         if trigger and trigger not in task["triggers"]:
+            continue
+        is_multi_node = task.get("slurm", {}).get("nodes", 1) > 1
+        if multi_node == "only" and not is_multi_node:
+            continue
+        if multi_node == "exclude" and is_multi_node:
             continue
         task_workflow_stage = task.get("workflow_stage")
         if workflow_stage:
@@ -454,6 +482,28 @@ def get_runner_specific_env(task: Dict[str, Any], runner: str) -> Dict[str, str]
     return {}
 
 
+def validate_gb300_runner_alias(declared_runner: str, effective_runner: str) -> str:
+    """Validate a B300-to-GB300 alias, preserving an optional Slurm prefix."""
+    declared_slurm = declared_runner.startswith("slurm-")
+    effective_slurm = effective_runner.startswith("slurm-")
+    declared_base = declared_runner.removeprefix("slurm-")
+    effective_base = effective_runner.removeprefix("slurm-")
+    if (
+        declared_slurm != effective_slurm
+        or not declared_base.startswith("b300-")
+        or not effective_base.startswith("gb300-")
+    ):
+        raise ValueError("runner alias must map [slurm-]b300-* to [slurm-]gb300-*")
+    gpu_pattern = re.compile(r"(?:^|-)([1-9]\d*)gpu(?:-|$)")
+    declared_gpus = gpu_pattern.findall(declared_runner)
+    effective_gpus = gpu_pattern.findall(effective_runner)
+    if len(declared_gpus) != 1 or declared_gpus != effective_gpus:
+        raise ValueError("runner alias GPU counts must match")
+    if declared_base.removeprefix("b300-") != effective_base.removeprefix("gb300-"):
+        raise ValueError("runner alias suffixes must match")
+    return effective_runner
+
+
 def apply_slurm_runner_override(
     declared_runner: str,
     runner_override: str | None,
@@ -466,18 +516,10 @@ def apply_slurm_runner_override(
         raise ValueError("--runner-override requires --setup-mode=slurm")
     if task_type == "perf":
         raise ValueError("--runner-override is not supported for perf tasks")
-    if not declared_runner.startswith("b300-") or not runner_override.startswith(
-        "gb300-"
-    ):
-        raise ValueError("runner override must map b300-* to gb300-*")
-    gpu_pattern = re.compile(r"(?:^|-)([1-9]\d*)gpu(?:-|$)")
-    declared_gpus = gpu_pattern.findall(declared_runner)
-    override_gpus = gpu_pattern.findall(runner_override)
-    if len(declared_gpus) != 1 or declared_gpus != override_gpus:
-        raise ValueError("runner override GPU counts must match")
-    if declared_runner.removeprefix("b300-") != runner_override.removeprefix("gb300-"):
-        raise ValueError("runner override suffixes must match")
-    return runner_override
+    try:
+        return validate_gb300_runner_alias(declared_runner, runner_override)
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("runner alias", "runner override")) from exc
 
 
 def create_ci_venv_name(runner_name: str | None = None) -> str:
@@ -1683,7 +1725,7 @@ def execute_task(
     env.update(get_default_runner_env(runner))
     env.update(get_runner_specific_env(task, declared_runner))
 
-    jit_cache_env = get_jit_cache_env(env) if is_gb200_runner(runner) else {}
+    jit_cache_env = get_jit_cache_env(env) if uses_isolated_jit_cache(runner) else {}
     env.update(jit_cache_env)
     if not dry_run:
         for cache_dir in jit_cache_env.values():
@@ -1953,6 +1995,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional workflow stage filter",
     )
+    scan_parser.add_argument(
+        "--multi-node",
+        choices=SUPPORTED_MULTI_NODE_FILTERS,
+        default="exclude",
+        help="Optionally select only or exclude multi-node Slurm tasks",
+    )
 
     execute_parser = subparsers.add_parser("execute", help="Execute one CI task")
     execute_parser.add_argument(
@@ -2029,6 +2077,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.trigger,
             args.runner_group,
             args.workflow_stage,
+            args.multi_node,
         )
         print(json.dumps(matrix, separators=(",", ":")))
         return 0

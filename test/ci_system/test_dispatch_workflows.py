@@ -7,7 +7,13 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 K8S_RUNNER_PREFIXES = ("b200-", "amd-", "gb200-", "b300-")
-SLURM_RUNNER_PREFIXES = ("b200-", "gb200-", "slurm-gb200-")
+SLURM_RUNNER_PREFIXES = (
+    "b200-",
+    "gb200-",
+    "slurm-b200-",
+    "slurm-gb200-",
+    "slurm-b300-",
+)
 
 
 def workflow_dispatch_inputs(name: str) -> dict:
@@ -204,6 +210,22 @@ def test_slurm_dispatch_accepts_one_explicit_matching_gb300_runner(tmp_path):
     assert "arg=--runner-alias\narg=b300-1gpu=gb300-1gpu\n" in result.stdout
 
 
+def test_slurm_dispatch_maps_multi_node_b300_runner(tmp_path):
+    result = run_slurm_dispatch_script(
+        tmp_path,
+        CLUSTER="gb300",
+        YAML_SELECTION=(
+            "test/ci/eval/"
+            "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        "arg=--runner-alias\n" "arg=slurm-b300-4gpu=slurm-gb300-4gpu\n" in result.stdout
+    )
+
+
 @pytest.mark.parametrize(
     ("runners", "message"),
     [
@@ -246,7 +268,7 @@ def test_slurm_dispatch_rejects_ambiguous_b300_runner(tmp_path):
     )
 
     assert result.returncode == 2
-    assert "exactly one declared b300-* runner" in result.stderr
+    assert "exactly one declared [slurm-]b300-* runner" in result.stderr
 
 
 def test_default_task_matrices_do_not_declare_gb300():
@@ -255,6 +277,78 @@ def test_default_task_matrices_do_not_declare_gb300():
         labels.extend(load_yaml(path)["runner"]["labels"])
 
     assert not any(label.startswith("gb300-") for label in labels)
+
+
+def test_kimi_k3_gb300_is_two_node_per_commit_tp8():
+    task = load_yaml(
+        REPO_ROOT / "test/ci/eval/"
+        "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
+    )
+
+    assert task["triggers"] == ["per-commit"]
+    assert task["runner"]["labels"] == ["slurm-b300-4gpu"]
+    assert task["slurm"] == {"nodes": 2, "gpus_per_node": 4}
+    assert "--tensor-parallel-size 8" in task["server"]["command"]
+
+
+def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/gb300-slurm-per-commit.yml")
+    triggers = workflow.get("on") or workflow.get(True)
+    submit = workflow["jobs"]["submit"]
+    scan_steps = workflow["jobs"]["scan"]["steps"]
+    gate = next(
+        step for step in scan_steps if step.get("name") == "Check trusted source"
+    )
+    matrix_step = next(
+        step
+        for step in scan_steps
+        if step.get("name") == "Build multi-node task matrix"
+    )
+    submit_script = next(
+        step["run"]
+        for step in submit["steps"]
+        if step.get("name") == "Submit and wait for GB300 Slurm task"
+    )
+
+    assert set(triggers) == {"push", "pull_request"}
+    assert submit["runs-on"] == "slurm-dispatch-gb300-auto"
+    assert workflow["concurrency"]["cancel-in-progress"] == (
+        "${{ github.event_name == 'pull_request' }}"
+    )
+    assert "--runner-alias" in submit_script
+    assert "--pr" in submit_script
+    assert "secrets.HF_TOKEN" not in str(submit)
+    assert "unset HF_TOKEN HUGGING_FACE_HUB_TOKEN" in submit_script
+    assert "github.repository == 'lightseekorg/tokenspeed'" in gate["env"]["ALLOWED"]
+    assert "github.event.pull_request.draft == false" in gate["env"]["ALLOWED"]
+    assert (
+        "github.event.pull_request.head.repo.full_name == github.repository"
+        in gate["env"]["ALLOWED"]
+    )
+    assert matrix_step["env"]["TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"] == (
+        "${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}"
+    )
+    assert "--multi-node only" in matrix_step["run"]
+
+    cancel_workflow = load_yaml(
+        REPO_ROOT / ".github/workflows/cancel-pr-tests-on-close.yml"
+    )
+    cancel_groups = {
+        item["group"]
+        for item in cancel_workflow["jobs"]["cancel"]["strategy"]["matrix"]["include"]
+    }
+    assert "gb300-slurm-per-commit" in cancel_groups
+
+
+def test_nvidia_arm_workflow_excludes_multi_node_tasks():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/pr-test-nvidia-arm.yml")
+    scan_script = next(
+        step["run"]
+        for step in workflow["jobs"]["scan"]["steps"]
+        if step.get("name") == "Build task matrix"
+    )
+
+    assert "--multi-node exclude" in scan_script
 
 
 def test_qwen35_agentic_allows_declared_80k_context():

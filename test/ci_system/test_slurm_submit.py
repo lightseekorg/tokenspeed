@@ -120,6 +120,25 @@ def test_load_task_supports_optional_gb300_alias(tmp_path):
     )
 
 
+def test_load_task_supports_multi_node_gb300_alias(tmp_path):
+    config = write_task(
+        tmp_path,
+        runner="slurm-b300-4gpu",
+        nodes=2,
+        gpus_per_node=4,
+    )
+
+    assert load_task(tmp_path, config, "slurm-b300-4gpu", "slurm-gb300-4gpu") == Task(
+        config,
+        "example",
+        "eval",
+        "slurm-gb300-4gpu",
+        4,
+        2,
+        "slurm-b300-4gpu",
+    )
+
+
 def test_render_script_passes_declared_and_effective_gb300_runners():
     script = render_script(
         Task(
@@ -146,6 +165,7 @@ def test_render_script_passes_declared_and_effective_gb300_runners():
     [
         ("b300-4gpu", "gb300-1gpu", "GPU counts"),
         ("b200-1gpu", "gb300-1gpu", "b300"),
+        ("slurm-b300-1gpu", "gb300-1gpu", "b300"),
     ],
 )
 def test_load_task_rejects_invalid_gb300_alias(tmp_path, declared, effective, message):

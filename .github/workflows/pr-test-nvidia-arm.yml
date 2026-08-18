@@ -133,7 +133,8 @@ jobs:
               --root test/ci \
               --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
               --runner-group "nvidia-arm" \
-              --workflow-stage "$workflow_stage")
+              --workflow-stage "$workflow_stage" \
+              --multi-node exclude)
             echo "${output}_matrix=${matrix}" >> "$GITHUB_OUTPUT"
             printf '%s' "$matrix" | python3 -c "import json, sys; print('${output}_has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" >> "$GITHUB_OUTPUT"
           done

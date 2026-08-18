@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from pipeline import build_matrix, normalize_task
+from pipeline import build_matrix, normalize_task, validate_gb300_runner_alias
 
 GPU_RE = re.compile(r"(?:^|-)([1-9]\d*)gpu(?:-|$)")
 TASK_TYPES = {"ut", "server_smoke", "eval", "perf"}
@@ -85,17 +85,7 @@ def load_task(
     if effective_runner is not None:
         if data["type"] == "perf":
             raise ValueError("runner aliases are not supported for perf tasks")
-        if not declared_runner.startswith("b300-") or not effective_runner.startswith(
-            "gb300-"
-        ):
-            raise ValueError("runner aliases must map b300-* to gb300-*")
-        if gpu_count(declared_runner) != gpu_count(effective_runner):
-            raise ValueError("runner alias GPU counts must match")
-        if declared_runner.removeprefix("b300-") != effective_runner.removeprefix(
-            "gb300-"
-        ):
-            raise ValueError("runner alias suffixes must match")
-        runner = effective_runner
+        runner = validate_gb300_runner_alias(declared_runner, effective_runner)
     gpus = gpu_count(runner)
     slurm = data.get("slurm", {})
     nodes = int(slurm.get("nodes", 1))
@@ -173,7 +163,7 @@ def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
         raise ValueError("--runner-alias requires --config")
     if not runners:
         raise ValueError("--all requires --runner")
-    matrix = build_matrix(repo / "test/ci", repo, args.trigger)
+    matrix = build_matrix(repo / "test/ci", repo, args.trigger, "all", None, "all")
     tasks = [
         load_task(repo, item["config"], item["runner"])
         for item in matrix["include"]
@@ -954,7 +944,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--runner-alias",
         action="append",
-        help="Slurm-only declared/effective runner pair: b300-Ngpu=gb300-Ngpu.",
+        help=(
+            "Slurm-only declared/effective runner pair: "
+            "[slurm-]b300-Ngpu=[slurm-]gb300-Ngpu."
+        ),
     )
     parser.add_argument(
         "--type", dest="task_types", action="append", choices=sorted(TASK_TYPES)
