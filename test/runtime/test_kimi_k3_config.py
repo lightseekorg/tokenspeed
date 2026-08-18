@@ -317,7 +317,13 @@ class KimiK3RegistrationTests(unittest.TestCase):
             beta,
             torch.nn.functional.linear(hidden_states, beta_weight),
         )
-        self.assertTrue(mixed_qkv.is_contiguous())
+        # The fused projection hands every consumer a strided row-slice of one
+        # output rather than four packed tensors, so mixed_qkv is a view and is
+        # NOT contiguous. What the KDA kernels actually require is a unit last
+        # stride -- `assert qkv_raw.stride(-1) == 1` in the recurrent kernels --
+        # which the slice satisfies. Pin that contract, not the old packed one.
+        self.assertEqual(mixed_qkv.stride(-1), 1)
+        self.assertFalse(mixed_qkv.is_contiguous())
 
     def test_ep_kimi_moe_combines_shared_and_routed_reductions(self):
         import tokenspeed.runtime.models.kimi_k3 as kimi_k3
