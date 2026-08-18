@@ -116,19 +116,23 @@ def triton_nvidia_kda_fused_paged_verify(
     prev_steps: torch.Tensor | None = None,
     commit_indices: torch.Tensor | None = None,
     enable_pdl: bool = False,
+    capture: tuple | None = None,
     gate_scratch: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Adapt the NVIDIA conv/GEMV/recurrent megafusion to target verify.
 
-    Writes no state of its own; with the ``prev_*`` args staged it also
-    replays and commits the previous round's accepted prefix on the way in
-    (the deferred lazy commit -- see the kernel docstring).
+    With the ``prev_*`` args staged it also replays and commits the previous
+    round's accepted prefix on the way in (the deferred lazy commit -- see
+    the kernel docstring). The commit's conv half is this implementation's
+    own responsibility: any registered solution that replays a pending
+    window must commit it, so the registry stays the only dispatch seam.
     """
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
         fused_recurrent_kda_verify_megafuse,
+        kda_commit_conv_window,
     )
 
-    return fused_recurrent_kda_verify_megafuse(
+    out = fused_recurrent_kda_verify_megafuse(
         mixed_qkv,
         conv_weights,
         conv_states,
@@ -152,6 +156,28 @@ def triton_nvidia_kda_fused_paged_verify(
         enable_pdl=enable_pdl,
         gate_scratch=gate_scratch,
     ).view(1, -1, num_heads, head_dim)
+    if prev_qkv is not None:
+        # A replay round without capture destinations would silently skip the
+        # conv commit and lose this round's payload; say so instead.
+        assert capture is not None, "a replay verify round must supply capture"
+        # The conv half commits in its own launch: the recurrence splits V
+        # across programs that share this request's q/k conv slots, so an
+        # in-place roll there would race its own reads.
+        f_a_dst, beta_dst, capture_base = capture
+        kda_commit_conv_window(
+            prev_qkv,
+            conv_states,
+            conv_states,
+            read_indices,
+            commit_indices,
+            prev_steps,
+            conv_dim=mixed_qkv.shape[-1],
+            draft_token_num=draft_token_num,
+            row_base=prev_base,
+            enable_pdl=enable_pdl,
+            capture=(mixed_qkv, f_a_out, beta_logits, f_a_dst, beta_dst, capture_base),
+        )
+    return out
 
 
 @register_kernel(

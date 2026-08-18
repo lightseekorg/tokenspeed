@@ -115,6 +115,7 @@ class RequestHandler:
         pause_controller=None,
         memory_controller=None,
         model_runner=None,
+        settle_deferred_fn=None,
     ) -> None:
 
         self.forward_ct = 0
@@ -143,6 +144,7 @@ class RequestHandler:
         self.vocab_size = vocab_size
         self.get_load_fn = get_load_fn
         self.clear_cache_fn = clear_cache_fn
+        self.settle_deferred_fn = settle_deferred_fn
 
         self.tokenizer = get_tokenizer(
             server_args.tokenizer,
@@ -248,6 +250,13 @@ class RequestHandler:
                 )
             elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
                 # RL weight sync: receive broadcast weights + load into the model.
+                # Settle deferred backend state FIRST. A pause(keep) reply is
+                # immediate, so this update can land in the same socket drain,
+                # before the loop's pause-fence flush runs -- and a deferred
+                # KDA window replayed through freshly loaded weights would
+                # commit state the old model never produced.
+                if self.settle_deferred_fn is not None:
+                    self.settle_deferred_fn()
                 ok, msg = self.model_runner.update_weights_from_distributed(recv_req)
                 self.send_func.send_pyobj(
                     UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)

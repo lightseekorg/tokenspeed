@@ -1704,33 +1704,9 @@ def try_kda_fused_paged_verify(
         prev_steps=prev_steps,
         enable_pdl=enable_pdl,
         commit_indices=commit_indices,
+        capture=capture,
         gate_scratch=gate_scratch,
     )
-    if out is not None and prev_qkv is not None:
-        # A replay round without capture destinations would silently skip the
-        # conv commit and lose this round's payload; say so instead.
-        assert capture is not None, "a replay verify round must supply capture"
-        from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
-            kda_commit_conv_window,
-        )
-
-        # The conv half commits in its own launch: the recurrence splits V
-        # across programs that share this request's q/k conv slots, so an
-        # in-place roll there would race its own reads.
-        f_a_dst, beta_dst, capture_base = capture
-        kda_commit_conv_window(
-            prev_qkv,
-            conv_states,
-            conv_states,
-            read_indices,
-            commit_indices,
-            prev_steps,
-            conv_dim=mixed_qkv.shape[-1],
-            draft_token_num=draft_token_num,
-            row_base=prev_base,
-            enable_pdl=enable_pdl,
-            capture=(mixed_qkv, f_a_out, beta_logits, f_a_dst, beta_dst, capture_base),
-        )
     return out
 
 

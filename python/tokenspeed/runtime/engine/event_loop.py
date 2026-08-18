@@ -547,6 +547,7 @@ class EventLoop:
             pause_controller=self._pause,
             memory_controller=self._memory,
             model_runner=target,
+            settle_deferred_fn=self._flush_deferred_state,
         )
 
         self.output_processor = OutputProcesser(
