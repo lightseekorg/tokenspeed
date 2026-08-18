@@ -94,8 +94,6 @@ class KdaAttnBackend(MambaAttnBackend):
         # guards flush resident owners and drop departed/recycled owners.
         self._kda_pending: dict | None = None
         self._kda_replay_staged = False
-        self._kda_overflow_round = False
-        self._kda_overflow_payload: dict = {}
         self._kda_lazy_bufs: dict | None = None
         self._replay_active: bool = kda_replay_commit_supported()
         self._replay_payload_cache: dict | None = None
@@ -633,8 +631,8 @@ class KdaAttnBackend(MambaAttnBackend):
         padded_bs: int,
         kwargs: dict,
         state_in_by_group: dict[str, torch.Tensor] | None,
-        committed: torch.Tensor | None = None,
-        rpis_dev: torch.Tensor | None = None,
+        committed: torch.Tensor | None,
+        rpis_dev: torch.Tensor | None,
     ) -> None:
         """Compose this verify round's lazy-commit inputs from the pending
         record, flushing any pending request that left the verify batch.
@@ -651,30 +649,23 @@ class KdaAttnBackend(MambaAttnBackend):
         """
         bufs = self._kda_lazy_buffers(min_slots=padded_bs)
         pending = self._kda_pending
-        # A round whose token rows exceed the frozen graph ring runs eagerly
-        # on the free-growing overflow payload. The fused launch selects by
-        # max(ceiling, batch)*T > ring rows as well (its batch equals
-        # padded_bs on every call path), so control values and payload
-        # always travel together.
+        # The scheduler caps every batch at max_bs and the ring is pre-sized
+        # to max_bs * T in set_kv_pool, so a round can never out-grow it; the
+        # explicit guard lives in _replay_payload.
         cache = self._replay_payload_cache
-        overflow = (
-            self._graphs_captured
-            and cache is not None
-            and max(len(self.query_start_loc_list), padded_bs)
-            * int(self.speculative_num_draft_tokens)
-            > cache["rows"]
+        payload_rows = max(len(self.query_start_loc_list), padded_bs) * int(
+            self.speculative_num_draft_tokens
         )
-        self._kda_overflow_round = overflow
-        if overflow:
-            # Single-half overflow ring: capture at row 0, and the graph
-            # ring's parity chain stays untouched -- no pending will be
-            # recorded against this round (the commit runs standalone the
-            # moment acceptance is known).
-            bufs["capture_base"].fill_(0)
+        if self._graphs_captured and cache is not None and payload_rows > cache["rows"]:
+            raise RuntimeError(
+                f"KDA verify round needs {payload_rows} payload rows but the "
+                f"captured ring holds {cache['rows']}; the scheduler no longer "
+                "bounds the batch at the ring's max_bs"
+            )
         # Payload-ring parity: this round's capture must write the half the
         # pending's replay does NOT read. Derived, not toggled -- an abandoned
         # prep (staged, forward never ran) must not flip the target half.
-        elif self._payload_half_rows is None:
+        if self._payload_half_rows is None:
             # First round: the ring is allocated inside the forward, after this
             # stage, so capture_base is still its zero init -- half 0 it is.
             self._staged_parity = 0
@@ -783,8 +774,7 @@ class KdaAttnBackend(MambaAttnBackend):
            the same reason. Corpses and departures are screened BEFORE any
            flush so a later flush cannot write reclaimed pages.
         4. Payload-ring divergence: eager growth rebuilds the buffers the
-           replay reads, and an overflow round writes a different set
-           entirely. Committed standalone before staging.
+           replay reads. Committed standalone before staging.
         5. Window-size change: the payload is addressed in previous-window
            units, so a different size would mis-replay. Committed standalone.
         """
@@ -967,7 +957,11 @@ class KdaAttnBackend(MambaAttnBackend):
         gate_by_group = {}
         for gid in self._state_group_ids:
             rows = cache_metadata.require_table(gid, active_forward_op=batch)
-            commit = pending["commit_by_group"][gid].to(torch.int64).gather(0, slots)
+            commit = (
+                pending["commit_stack"][self._state_group_ids.index(gid)]
+                .to(torch.int64)
+                .gather(0, slots)
+            )
             present = (rows[pos].to(torch.int64) == commit[:, None]).any(dim=1)
             gate = torch.zeros(old_bs, dtype=torch.bool, device=dev)
             gate[slots] = present
@@ -1035,14 +1029,9 @@ class KdaAttnBackend(MambaAttnBackend):
                 head_dim,
                 lower_bound,
             ) = weights[layer_id]
-            if pending["overflow"]:
-                qkv_buf, f_a_buf, beta_buf = self._kda_overflow_payload[layer_id]
-            else:
-                qkv_buf, f_a_buf, beta_buf = self._replay_payload_cache["buffers"][
-                    layer_id
-                ]
-                po = pending["parity"] * self._payload_half_rows
-                qkv_buf, f_a_buf, beta_buf = qkv_buf[po:], f_a_buf[po:], beta_buf[po:]
+            qkv_buf, f_a_buf, beta_buf = self._replay_payload_cache["buffers"][layer_id]
+            po = pending["parity"] * self._payload_half_rows
+            qkv_buf, f_a_buf, beta_buf = qkv_buf[po:], f_a_buf[po:], beta_buf[po:]
             conv_comp = self.kv_pool.get_component(layer_id, "conv_state")
             ssm_comp = self.kv_pool.get_component(layer_id, "recurrent_state")
             row_mask = mask
@@ -1050,7 +1039,9 @@ class KdaAttnBackend(MambaAttnBackend):
                 row_mask = mask & commit_gate_by_group[gid]
             write = torch.where(
                 row_mask,
-                pending["commit_by_group"][gid].to(torch.int64),
+                pending["commit_stack"][self._state_group_ids.index(gid)].to(
+                    torch.int64
+                ),
                 torch.full((old_bs,), -1, dtype=torch.int64, device=self.device),
             ).to(torch.int32)
             ok = try_kda_replay_commit(
@@ -1065,7 +1056,9 @@ class KdaAttnBackend(MambaAttnBackend):
                 dt_bias,
                 state_pool=ssm_comp,
                 state_out=ssm_comp,
-                read_indices=pending["anchor_by_group"][gid][:old_bs],
+                read_indices=pending["anchor_stack"][self._state_group_ids.index(gid)][
+                    :old_bs
+                ],
                 write_indices=write,
                 accepted_length=pending["steps"],
                 num_heads=num_heads,
@@ -1183,19 +1176,22 @@ class KdaAttnBackend(MambaAttnBackend):
         if (
             self._graphs_captured
             and cache is not None
-            and rows > cache["rows"]
-            and widths == cache["widths"]
+            and (rows > cache["rows"] or cache["widths"] != widths)
         ):
-            # Eager round above the graph ceiling: the graph ring is frozen,
-            # so the payload lands in the free-growing overflow set. Its
-            # window never crosses a round (committed standalone at record),
-            # so a single half suffices and no graph ever reads it.
-            return self._kda_overflow_payload_buffers(layer_id, rows, widths, dtype)
-        if cache is None or cache["rows"] < rows or cache["widths"] != widths:
-            assert not self._graphs_captured, (
-                f"KDA payload ring grew to {rows} rows after graph capture; "
+            # The ring is pre-sized to max_bs * T before capture and the
+            # scheduler bounds every batch at max_bs, so this cannot happen
+            # unless that invariant breaks. Before capture the ring may still
+            # grow (the rebuild below); after capture its addresses are baked
+            # into the graphs, so growth is a contract violation, not a resize.
+            raise RuntimeError(
+                f"KDA payload ring holds {cache['rows']} rows of widths "
+                f"{cache['widths']} but the round needs {rows} of {tuple(widths)}; "
                 "captured graphs still hold the old address"
             )
+        if cache is None or cache["rows"] < rows or cache["widths"] != widths:
+            # Width equality matters beyond capacity: the kernels take the row
+            # stride as a constexpr, so a differently-wide buffer would compile
+            # (and module-load) fresh kernel variants mid-decode.
             # A graphed forward can never rebuild: warmup pre-sizes the ring.
             assert (
                 not torch.cuda.is_current_stream_capturing()
@@ -1223,21 +1219,6 @@ class KdaAttnBackend(MambaAttnBackend):
                 # window that crossed a checkpoint boundary would run the whole
                 # round one window behind.
                 self._anchor_rows_to_committed(bufs)
-            # The startup overflow preallocation guessed its widths from the
-            # pool geometry; this rebuild carries the model's true widths, so
-            # re-drive it here (still pre-capture) or the guess would be
-            # discarded by the width check during an overflow round -- the
-            # mid-serving cudaMalloc the preallocation exists to avoid.
-            for stale_id in [
-                lid
-                for lid, entry in self._kda_overflow_payload.items()
-                if tuple(t.shape[1] for t in entry) != tuple(widths)
-            ]:
-                overflow_rows = self._kda_overflow_payload[stale_id][0].shape[0]
-                del self._kda_overflow_payload[stale_id]
-                self._kda_overflow_payload_buffers(
-                    stale_id, overflow_rows, widths, dtype
-                )
         buffers = cache["buffers"]
         entry = buffers.get(layer_id)
         if entry is None:
@@ -1251,33 +1232,6 @@ class KdaAttnBackend(MambaAttnBackend):
                     torch.zeros(
                         (2 * cache["rows"], width), dtype=dtype, device=self.device
                     )
-                    for width in widths
-                )
-        return entry
-
-    def _kda_overflow_payload_buffers(
-        self,
-        layer_id: int,
-        rows: int,
-        widths: tuple[int, int, int],
-        dtype: torch.dtype,
-    ):
-        """Per-layer payload buffers for an eager round above the graph
-        ceiling; see ``_replay_payload`` for the buffers' role."""
-        assert not torch.cuda.is_current_stream_capturing()
-        store = self._kda_overflow_payload
-        entry = store.get(layer_id)
-        # Width equality matters beyond capacity: the kernels take the row
-        # stride as a constexpr, so a differently-wide buffer would compile
-        # (and module-load) fresh variants mid-decode.
-        if (
-            entry is None
-            or entry[0].shape[0] < rows
-            or tuple(t.shape[1] for t in entry) != tuple(widths)
-        ):
-            with torch.inference_mode(False):
-                entry = store[layer_id] = tuple(
-                    torch.zeros((rows, width), dtype=dtype, device=self.device)
                     for width in widths
                 )
         return entry
@@ -1395,9 +1349,7 @@ class KdaAttnBackend(MambaAttnBackend):
             # Record what a replay needs; the NEXT verify's fused kernel commits it.
             rpis = ctx[4] if len(ctx) > 4 else []
             req_ids = ctx[5] if len(ctx) > 5 else []
-            overflow = self._kda_overflow_round
-            if not overflow:
-                self._payload_parity = self._staged_parity
+            self._payload_parity = self._staged_parity
             # Group-major stacks: the next stage's compose reads all groups in
             # one launch, and the per-group views below share their storage.
             gids = self._state_group_ids
@@ -1431,8 +1383,7 @@ class KdaAttnBackend(MambaAttnBackend):
             )
             rpi_by_slot[:real] = safe_rpis
             self._kda_pending = dict(
-                parity=0 if overflow else self._staged_parity,
-                overflow=overflow,
+                parity=self._staged_parity,
                 rpi_by_slot=rpi_by_slot,
                 slot_by_rpi={r: i for i, r in enumerate(rpis[:bs])},
                 steps=k.to(torch.int32),
@@ -1443,8 +1394,6 @@ class KdaAttnBackend(MambaAttnBackend):
                 },
                 anchor_stack=anchor_stack,
                 commit_stack=commit_stack,
-                anchor_by_group={g: anchor_stack[i] for i, g in enumerate(gids)},
-                commit_by_group={g: commit_stack[i] for i, g in enumerate(gids)},
                 draft_token_num=draft_token_num,
             )
             self._verify_commit_ctx = None
@@ -1454,13 +1403,6 @@ class KdaAttnBackend(MambaAttnBackend):
                 raise RuntimeError(
                     "KDA replay commit needs request identities on the batch"
                 )
-            if overflow:
-                # An overflow window never crosses a round: no captured graph
-                # can read its ring, so the next verify could not fuse it and
-                # a later flush might find the buffers regrown. Acceptance is
-                # known right here (device-side), so commit standalone now.
-                self._kda_overflow_round = False
-                self._flush_kda_pending()
             return
         # Batched commit: scratch row -> committed page, one launch per state kind.
         from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
@@ -1577,17 +1519,6 @@ class KdaAttnBackend(MambaAttnBackend):
             # the ceiling run eagerly against the same frozen pool. Two
             # halves -- this round's tokens and the pending window's.
             self._kda_gate_scratch(2 * self.max_bs * self.spec_num_tokens, hv * k)
-            overflow_rows = self.max_bs * int(self.speculative_num_draft_tokens)
-            if overflow_rows > rows:
-                # The engine can schedule eager batches above the graph ring:
-                # claim their payload at startup, inside the memory budget,
-                # instead of cudaMalloc-ing (a device sync) mid-serving under
-                # the very load spike that triggers the overflow.
-                for layer_id in self._state_layer_ids():
-                    conv = self.kv_pool.get_component(layer_id, "conv_state")
-                    self._kda_overflow_payload_buffers(
-                        layer_id, overflow_rows, (conv.shape[1], k, hv), self.dtype
-                    )
         self._kda_lazy_buffers(min_slots=max_bs)
 
     def _kda_gate_scratch(self, rows: int, width: int) -> torch.Tensor:

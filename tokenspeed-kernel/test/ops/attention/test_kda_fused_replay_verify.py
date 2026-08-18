@@ -684,18 +684,3 @@ def test_strided_projection_slices_are_bitwise_contiguous():
     torch.testing.assert_close(got_out, ref_out, atol=0.0, rtol=0.0)
     torch.testing.assert_close(got["h_pool"], ref["h_pool"], atol=0.0, rtol=0.0)
     torch.testing.assert_close(got["conv_pool"], ref["conv_pool"], atol=0.0, rtol=0.0)
-
-
-def test_window_tile_is_a_single_shipped_choice():
-    """One tile for every launch. BV decides how the [BK, BV] state tile is
-    spread across threads, and with it the order of the reduction along K, so
-    a batch-size-dependent tile would make a request's committed state depend
-    on the batch it happened to verify in."""
-    from tokenspeed_kernel.thirdparty.triton import fla_kda_recurrent as fk
-
-    assert fk._window_tile() == fk._WINDOW_TILE
-    try:
-        fk._WINDOW_TILE_OVERRIDE = (32, 4, 2)
-        assert fk._window_tile() == (32, 4, 2), "override ignored"
-    finally:
-        fk._WINDOW_TILE_OVERRIDE = None

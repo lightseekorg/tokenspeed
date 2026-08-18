@@ -280,9 +280,7 @@ def _metadata_op(contract, tables, rpis, req_ids=None):
     """Cache metadata plus a forward op carrying the batch identity."""
     metadata, op = _metadata_for(contract, tables, DEV)
     op.request_pool_indices = list(rpis)
-    op.request_ids = (
-        list(req_ids) if req_ids is not None else [f"req{r}" for r in rpis]
-    )
+    op.request_ids = list(req_ids) if req_ids is not None else [f"req{r}" for r in rpis]
     return metadata, op
 
 
@@ -442,7 +440,10 @@ def _prep_verify(h, rpis, pages, seq_lens, identity=True, req_ids=None):
     strips the batch's request identity; ``req_ids`` overrides the derived
     ids so a caller can recycle a pool index under a new request."""
     metadata, op = _metadata_op(
-        h.contract, _tables_for(pages), rpis if identity else [], req_ids=req_ids if identity else None
+        h.contract,
+        _tables_for(pages),
+        rpis if identity else [],
+        req_ids=req_ids if identity else None,
     )
     h.backend.init_forward_metadata(
         bs=len(rpis),
@@ -1293,7 +1294,7 @@ def test_empty_forward_round_keeps_a_resident_owners_window():
     # The engine hook is gone entirely; a re-added call must fail loudly.
     assert not hasattr(h_lazy.backend, "drop_pending")
     # The graph-padded flavor of the same round: an stage with zero real rows.
-    h_lazy.backend._stage_pending_replay(0, len(rpis), {}, None)
+    h_lazy.backend._stage_pending_replay(0, len(rpis), {}, None, None, None)
     assert h_lazy.pending() is not None, "empty round dropped a live window"
 
     _accept_flush_and_assert(h_lazy, h_eager, pages, rpis, [8, 7], 122, [1, 1])
@@ -1470,108 +1471,6 @@ def test_gate_scratch_rides_the_frozen_workspace_pool():
         _assert_pools_match(h_lazy, h_eager, pages, rpis)
     finally:
         reset_workspace_pools()
-
-
-def test_eager_batch_above_the_graph_ceiling_commits_standalone():
-    """A legal eager batch above the graph ceiling must run, not crash.
-
-    Graph capture freezes the payload ring and control buffers at the
-    capture ceiling, while max_num_seqs can schedule a bigger batch that
-    runs eagerly. Such a round uses the free-growing overflow set: the
-    pending it inherits is flushed standalone at stage (its ring and this
-    round's ring diverge), its own window is committed standalone the
-    moment acceptance is known, and the graph ring's parity chain is left
-    untouched -- so the graph-sized round that follows fuses normally.
-    """
-    rpis4 = [0, 1, 2, 3]
-    rpis2 = [0, 1]
-    h_lazy = _Harness(seed=97, usable_pages=32)
-    h_eager = _Harness(seed=97, usable_pages=32)
-    pages4 = _pages_for(h_lazy, rpis4)
-    pages2 = {gid: rows[:2] for gid, rows in pages4.items()}
-
-    # Ceiling of 2; round 1 doubles as the pre-capture warmup (it sizes the
-    # ring at the model's widths), then capture freezes everything -- the
-    # production ordering.
-    h_lazy.backend.init_cuda_graph_state(2)
-
-    # Round 1 at the ceiling: records a pending in the graph ring.
-    for h in (h_lazy, h_eager):
-        h.verify_round(rpis2, pages2, [6, 6], h.window(2, 171))
-        h.accept([2, 1])
-    h_eager.flush()
-    assert h_lazy.pending() is not None
-    h_lazy.backend._graphs_captured = True
-
-    # Round 2 above the ceiling: inherits the pending, runs on overflow.
-    for h in (h_lazy, h_eager):
-        h.verify_round(rpis4, pages4, [8, 7, 5, 5], h.window(4, 172))
-        h.accept([1, 2, 2, 1])
-    h_eager.flush()
-    # Overflow commits standalone at record: nothing left pending.
-    assert h_lazy.pending() is None
-
-    # Round 3 back at the ceiling: the graph set fuses normally again.
-    for h in (h_lazy, h_eager):
-        h.verify_round(rpis2, pages2, [9, 9], h.window(2, 173))
-        h.accept([2, 2])
-        h.flush()
-    _assert_pools_match(h_lazy, h_eager, pages4, rpis4)
-
-
-def _kernel_variants():
-    """Compiled specializations of the hot verify kernels on this device."""
-    from tokenspeed_kernel.thirdparty.triton import fla_kda_recurrent as fk
-
-    def count(kern):
-        fn = getattr(kern, "fn", kern)
-        total = 0
-        for dc in getattr(fn, "device_caches", {}).values():
-            for part in dc:
-                if isinstance(part, dict):
-                    total += len(part)
-        return total
-
-    return {
-        "window": count(fk.fused_recurrent_kda_window_fwd_kernel),
-        "gate": count(fk.kda_gate_precompute_kernel),
-    }
-
-
-def test_overflow_round_compiles_no_fresh_kernel_variants():
-    """An above-ceiling round must reuse the warm kernels bit for bit.
-
-    Triton keys compiled variants on pointer alignment; a control or
-    payload row whose byte offset differs from the graph set's would
-    compile a fresh variant mid-decode, and the module load behind it
-    implicitly synchronizes the device (found by adversarial review as a
-    2.9s-class stall: the old per-batch overflow control set carried
-    unaligned rows). The control rows are one fixed aligned allocation
-    now; this pins that no round shape can re-specialize.
-    """
-    rpis6 = [0, 1, 2, 3, 4, 5]
-    h = _Harness(seed=61, usable_pages=32)
-    pages6 = _pages_for(h, rpis6)
-
-    def leg(rpis, wseed, seqs):
-        pages = {gid: rows[: len(rpis)] for gid, rows in pages6.items()}
-        h.verify_round(rpis, pages, seqs, h.window(len(rpis), wseed))
-        h.accept([1] * len(rpis))
-
-    h.backend.init_cuda_graph_state(4)
-    # Warm every graph-set batch shape first.
-    for i, bs in enumerate((4, 3, 2, 4, 3)):
-        leg(rpis6[:bs], 800 + i, [6 + i] * bs)
-    h.flush()
-    h.backend._graphs_captured = True
-    base = _kernel_variants()
-
-    leg(rpis6, 850, [12] * 6)  # overflow: bs=6 above the ceiling of 4
-    h.flush()
-    assert _kernel_variants() == base, (
-        f"the overflow round compiled new kernel variants {base} -> "
-        f"{_kernel_variants()}"
-    )
 
 
 def test_condemned_row_survives_an_abandoned_prep_without_flushing():
