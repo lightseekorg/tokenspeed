@@ -243,8 +243,8 @@ def test_kda_paged_decode_graph_padding_and_page_stride() -> None:
 )
 def test_kda_fused_paged_decode_matches_reference(batch: int, active: int) -> None:
     """The K3 megafusion preserves state paging and its fused norm epilogue."""
-    if not current_platform().is_cdna4:
-        pytest.skip("gfx950 KDA fusion test")
+    if not (current_platform().is_cdna4 or current_platform().is_cdna5):
+        pytest.skip("gfx950/gfx1250 KDA fusion test")
 
     torch.manual_seed(31)
     heads, head_dim, pages = 12, 128, 2 * active
@@ -434,8 +434,8 @@ def test_kda_fused_decode_override_preserves_external_output_norm(monkeypatch) -
 
 def test_kda_fused_decode_rejects_unsupported_conv_width() -> None:
     """Unsupported convolution widths must fall back before kernel execution."""
-    if not current_platform().is_cdna4:
-        pytest.skip("gfx950 KDA fusion dispatch test")
+    if not (current_platform().is_cdna4 or current_platform().is_cdna5):
+        pytest.skip("gfx950/gfx1250 KDA fusion dispatch test")
 
     tensor = torch.empty(1, dtype=torch.bfloat16)
     conv_weights = torch.empty(1, 5, dtype=torch.bfloat16)

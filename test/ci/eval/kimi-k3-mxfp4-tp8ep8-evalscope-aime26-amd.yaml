@@ -1,9 +1,10 @@
 api_version: ci.tokenspeed.io/v1
+# Keep the pure target as a manual control; the matching DSpark configuration
+# is the per-commit Kimi-K3 AIME26 gate.
 name: eval-kimi-k3-mxfp4-tp8ep8-aime26-amd
 type: eval
 workflow_stage: model-test
 triggers:
-  - per-commit
   - manual
 runner:
   labels:

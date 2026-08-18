@@ -1947,23 +1947,31 @@ def all_reduce_can_run(state: TritonCommState, tensor: torch.Tensor, op=None) ->
     )
 
 
+def _get_or_create_iris_state(state: TritonCommState, dtype: torch.dtype):
+    """Return the Iris state sized for this communication backing buffer."""
+    import tokenspeed_kernel.ops.communication.iris as _iris_mod
+
+    key = (id(state.group), state.max_bytes, dtype)
+    iris_state = _iris_mod.IRIS_AR_STATES.get(key)
+    if iris_state is None:
+        iris_state = _iris_mod.create_iris_state(
+            group=state.group,
+            rank_in_group=state.rank_in_group,
+            max_numel=max(state.max_numel, state.max_bytes // dtype.itemsize),
+            dtype=dtype,
+            device=state.device,
+        )
+        _iris_mod.IRIS_AR_STATES[key] = iris_state
+    return iris_state
+
+
 def all_reduce(state: TritonCommState, tensor: torch.Tensor, op=None) -> torch.Tensor:
     assert all_reduce_can_run(state, tensor, op=op)
     platform = current_platform()
     if platform.is_amd:
         import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
-        key = (id(state.group), state.max_bytes, tensor.dtype)
-        iris_state = _iris_mod.IRIS_AR_STATES.get(key)
-        if iris_state is None:
-            iris_state = _iris_mod.create_iris_state(
-                group=state.group,
-                rank_in_group=state.rank_in_group,
-                max_numel=state.max_numel,
-                dtype=tensor.dtype,
-                device=state.device,
-            )
-            _iris_mod.IRIS_AR_STATES[key] = iris_state
+        iris_state = _get_or_create_iris_state(state, tensor.dtype)
         return _iris_mod.iris_all_reduce(iris_state, tensor, op=op, safe=False)
 
     raise AssertionError(f"Unsupported platform: {platform}")
@@ -2015,18 +2023,7 @@ def acquire_symm_outputs(
         raise RuntimeError("unsupported symmetric all-reduce output request")
     import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
-    max_numel = state.max_bytes // dtype.itemsize
-    key = (id(state.group), state.max_bytes, dtype)
-    iris_state = _iris_mod.IRIS_AR_STATES.get(key)
-    if iris_state is None:
-        iris_state = _iris_mod.create_iris_state(
-            group=state.group,
-            rank_in_group=state.rank_in_group,
-            max_numel=max_numel,
-            dtype=dtype,
-            device=state.device,
-        )
-        _iris_mod.IRIS_AR_STATES[key] = iris_state
+    iris_state = _get_or_create_iris_state(state, dtype)
     return _iris_mod.iris_acquire_outputs(iris_state, shapes)
 
 
@@ -2153,17 +2150,7 @@ def _all_reduce_residual_attnres(
     )
     from . import iris as _iris_mod
 
-    key = (id(state.group), state.max_bytes, partial.dtype)
-    iris_state = _iris_mod.IRIS_AR_STATES.get(key)
-    if iris_state is None:
-        iris_state = _iris_mod.create_iris_state(
-            group=state.group,
-            rank_in_group=state.rank_in_group,
-            max_numel=state.max_numel,
-            dtype=partial.dtype,
-            device=state.device,
-        )
-        _iris_mod.IRIS_AR_STATES[key] = iris_state
+    iris_state = _get_or_create_iris_state(state, partial.dtype)
     return _iris_mod.iris_all_reduce_residual_attnres(
         iris_state,
         partial,

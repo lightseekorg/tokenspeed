@@ -439,6 +439,7 @@ if platform.is_nvidia:
         output: torch.Tensor,
         enable_pdl: bool,
         hidden_states_scale: torch.Tensor | None = None,
+        do_finalize: bool = True,
     ) -> torch.Tensor:
         local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
         if local_experts != w.w13_weight.shape[0]:
@@ -461,7 +462,7 @@ if platform.is_nvidia:
         # format; expert IDs stay global and the kernel filters to the local
         # range. routing_method_type=1 (Renormalize) matches K3's
         # pre-normalized topk weights, which the kernel consumes as-is.
-        _fi_fp4_routed_moe(
+        result = _fi_fp4_routed_moe(
             topk_ids=topk,
             routing_bias=None,
             hidden_states=x,
@@ -487,12 +488,15 @@ if platform.is_nvidia:
             local_num_experts=local_experts,
             routed_scaling_factor=None,
             routing_method_type=1,
-            do_finalize=True,
+            do_finalize=do_finalize,
             enable_pdl=enable_pdl,
             activation_type=_SITU_ACTIVATION_TYPE,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
-            output=output,
+            output=output if do_finalize else None,
         )
+        if not do_finalize:
+            # [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]
+            return result
         return output
 
     @register_kernel(
@@ -611,7 +615,7 @@ if platform.is_nvidia:
                 "weight_dtype": frozenset({"mxfp4"}),
                 "activation": frozenset({"situ"}),
                 "routing_mode": frozenset({"precomputed_topk"}),
-                "supports_deferred_finalize": frozenset({False}),
+                "supports_deferred_finalize": frozenset({True, False}),
                 "supports_ep": frozenset({True}),
                 "supports_all_to_all_ep": frozenset({False}),
                 "ispp_alignment": frozenset({1}),
@@ -637,8 +641,6 @@ if platform.is_nvidia:
     ):
         if topk_weights is None or topk_ids is None:
             raise ValueError("precomputed_topk plan requires topk_weights and topk_ids")
-        if not do_finalize:
-            raise NotImplementedError("FlashInfer MXFP4 SiTU requires finalization")
         if x.dtype != torch.bfloat16:
             raise TypeError("FlashInfer MXFP4 SiTU requires bf16 input")
 
@@ -666,18 +668,22 @@ if platform.is_nvidia:
         )
         hidden_states_scale = x_scale.view(torch.float8_e4m3fn).reshape(x.shape[0], -1)
 
-        out_buf = getattr(w, "_situ_output_buffer", None)
-        if (
-            out_buf is not None
-            and out_buf.shape == (x.shape[0], hidden_padded)
-            and out_buf.is_contiguous()
-        ):
-            # Caller-owned destination (e.g. a fused all-reduce lane slice).
-            output = out_buf
-        else:
-            output = torch.empty(
-                x.shape[0], hidden_padded, dtype=torch.bfloat16, device=x.device
-            )
+        # Deferred finalize returns the raw triple, so it needs no
+        # [tokens, hidden] destination at all — skip the allocation.
+        output = None
+        if do_finalize:
+            out_buf = getattr(w, "_situ_output_buffer", None)
+            if (
+                out_buf is not None
+                and out_buf.shape == (x.shape[0], hidden_padded)
+                and out_buf.is_contiguous()
+            ):
+                # Caller-owned destination (e.g. a fused all-reduce lane slice).
+                output = out_buf
+            else:
+                output = torch.empty(
+                    x.shape[0], hidden_padded, dtype=torch.bfloat16, device=x.device
+                )
         # Tactics come from the autotuner cache, seeded by a pre-swept table
         # and/or the runtime's startup autotune window (which exercises this
         # op via the dummy prefill); uncovered shapes take the heuristic
@@ -690,7 +696,13 @@ if platform.is_nvidia:
             output,
             enable_pdl,
             hidden_states_scale=hidden_states_scale,
+            do_finalize=do_finalize,
         )
+        if not do_finalize:
+            # Deferred: [gemm2_output(permuted), expert_weights,
+            # expanded_idx_to_permuted_idx]; padded width is the caller's
+            # concern (K3 latent 3584 needs no pad on this path).
+            return result
         if hidden_original != hidden_padded:
             result = result[:, :hidden_original].contiguous()
         return result

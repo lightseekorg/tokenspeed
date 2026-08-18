@@ -10,11 +10,15 @@ recurrent KDA state still gets committed after a DSpark verify.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     _should_update_mamba_state_after_mtp_verify,
 )
+from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import DeepseekV4DSpark
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.models.dspark import VanillaMarkov
@@ -22,6 +26,53 @@ from tokenspeed.runtime.models.dspark import VanillaMarkov
 VOCAB = 32
 RANK = 4
 HIDDEN = 6
+
+
+class _DeviceLengthReadBomb:
+    def __getitem__(self, key):
+        raise AssertionError(f"device length buffer was read with {key!r}")
+
+
+class _RecordingV4DSparkModel:
+    window_size = 2
+
+    def __init__(self) -> None:
+        self.writes = []
+
+    def write_context_windows_batched(
+        self,
+        hidden,
+        positions,
+        slots,
+        valid,
+        kv_windows,
+        first_padding_slot,
+    ) -> None:
+        self.writes.append(
+            (
+                hidden.clone(),
+                positions.clone(),
+                slots.clone(),
+                valid.clone(),
+                kv_windows,
+                first_padding_slot,
+            )
+        )
+
+
+def _v4_dspark_window_shell(lengths: torch.Tensor) -> DeepseekV4DSpark:
+    drafter = DeepseekV4DSpark.__new__(DeepseekV4DSpark)
+    drafter.input_buffers = SimpleNamespace(
+        extend_seq_lens_cpu=lengths,
+        input_lengths_buf=_DeviceLengthReadBomb(),
+        positions_buf=torch.arange(32, dtype=torch.int64),
+    )
+    drafter.model = _RecordingV4DSparkModel()
+    drafter.slot_indices_buf = torch.tensor([2, 4, 6, 8], dtype=torch.int64)
+    drafter.kv_windows = object()
+    drafter.first_padding_slot = 10
+    drafter.context_lengths = torch.zeros(12, dtype=torch.int64)
+    return drafter
 
 
 def _drafter(spec_num_tokens: int = 8, vocab: int = VOCAB) -> DSpark:
@@ -32,6 +83,78 @@ def _drafter(spec_num_tokens: int = 8, vocab: int = VOCAB) -> DSpark:
     head = VanillaMarkov(vocab_size=vocab, markov_rank=RANK)
     drafter.markov_head = head
     return drafter
+
+
+# --------------------------------------------------------------------------
+# DeepSeek V4 prefill window seeding
+# --------------------------------------------------------------------------
+
+
+def test_v4_prefill_window_seeding_uses_the_cpu_length_mirror() -> None:
+    drafter = _v4_dspark_window_shell(torch.tensor([2, 3, 0], dtype=torch.int32))
+    hidden = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+
+    consumed = drafter._seed_prefill_windows(hidden, num_extends=3)
+
+    assert consumed == 5
+    assert len(drafter.model.writes) == 2
+    first, second = drafter.model.writes
+    torch.testing.assert_close(first[0], hidden[:2].unsqueeze(0))
+    torch.testing.assert_close(second[0], hidden[3:5].unsqueeze(0))
+    assert first[1].tolist() == [[0, 1]]
+    assert second[1].tolist() == [[3, 4]]
+    assert first[2].tolist() == [2]
+    assert second[2].tolist() == [4]
+    assert drafter.context_lengths[[2, 4, 6]].tolist() == [2, 5, 0]
+
+
+def test_v4_mixed_window_seeding_reads_only_prefill_rows() -> None:
+    drafter = _v4_dspark_window_shell(torch.tensor([2, 3, 99], dtype=torch.int32))
+    hidden = torch.arange(22, dtype=torch.float32).reshape(11, 2)
+
+    consumed = drafter._seed_prefill_windows(hidden, num_extends=2)
+
+    assert consumed == 5
+    assert len(drafter.model.writes) == 2
+
+
+def test_v4_decode_window_seeding_does_not_read_any_length_buffer() -> None:
+    drafter = _v4_dspark_window_shell(torch.empty(0, device="meta"))
+    drafter.input_buffers.extend_seq_lens_cpu = _DeviceLengthReadBomb()
+
+    assert drafter._seed_prefill_windows(torch.empty(0, 2), num_extends=0) == 0
+    assert drafter.model.writes == []
+
+
+@pytest.mark.parametrize(
+    ("lengths", "num_extends", "hidden_rows", "message"),
+    (
+        (torch.tensor([1], dtype=torch.int64), 1, 1, "int32 CPU"),
+        (torch.empty(1, dtype=torch.int32, device="meta"), 1, 1, "int32 CPU"),
+        (torch.tensor([1], dtype=torch.int32), 2, 2, "int32 CPU"),
+        (torch.tensor([-1], dtype=torch.int32), 1, 1, "non-negative"),
+        (torch.tensor([3], dtype=torch.int32), 1, 2, "exceed"),
+    ),
+)
+def test_v4_prefill_window_seeding_rejects_invalid_cpu_mirrors(
+    lengths: torch.Tensor,
+    num_extends: int,
+    hidden_rows: int,
+    message: str,
+) -> None:
+    drafter = _v4_dspark_window_shell(lengths)
+
+    with pytest.raises(RuntimeError, match=message):
+        drafter._seed_prefill_windows(
+            torch.empty(hidden_rows, 2), num_extends=num_extends
+        )
+
+
+def test_v4_prefill_window_seeding_rejects_negative_num_extends() -> None:
+    drafter = _v4_dspark_window_shell(torch.empty(0, dtype=torch.int32))
+
+    with pytest.raises(ValueError, match="non-negative"):
+        drafter._seed_prefill_windows(torch.empty(0, 2), num_extends=-1)
 
 
 # --------------------------------------------------------------------------

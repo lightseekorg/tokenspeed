@@ -58,6 +58,24 @@ def create_fp8_block_scale_inverses(
     layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
     layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
 
+    if (
+        not layer.quant_config.is_checkpoint_fp8_serialized
+        and scale_dtype == torch.float32
+    ):
+        for weight_name, scale in (
+            ("w13_weight", w13_weight_scale),
+            ("w2_weight", w2_weight_scale),
+        ):
+            weight = getattr(layer, weight_name, None)
+            if weight is not None:
+                set_weight_attrs(
+                    weight,
+                    {
+                        "block_scale_inv": scale,
+                        "block_scale_shape": (block_n, block_k),
+                    },
+                )
+
     weight_loader = make_weight_loader(spec)
     set_weight_attrs(w13_weight_scale, {"weight_loader": weight_loader})
     set_weight_attrs(w2_weight_scale, {"weight_loader": weight_loader})
