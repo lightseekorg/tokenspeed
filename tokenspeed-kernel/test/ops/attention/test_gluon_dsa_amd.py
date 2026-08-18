@@ -21,6 +21,9 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (  # noqa: 
 )
 
 if is_cdna4():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4 import (
+        gluon_deepseek_v4_selected_attention_gfx950,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import (  # noqa: E402
         sparse_mla as dsa_topk_backend,
     )
@@ -54,6 +57,37 @@ else:
     )
 
 torch.manual_seed(42)
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="DeepSeek V4 Gluon kernel targets gfx950")
+def test_deepseek_v4_selected_attention_matches_reference() -> None:
+    selected_width = 640
+    q = torch.randn((1, 16, 512), device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn((selected_width, 512), device="cuda", dtype=torch.bfloat16)
+    indices = torch.arange(selected_width, device="cuda", dtype=torch.int32)[None]
+    indices[:, 3] = -1
+    lens = torch.tensor([selected_width - 2], device="cuda", dtype=torch.int32)
+    attn_sink = torch.randn((16,), device="cuda", dtype=torch.float32)
+    scale = 512**-0.5
+
+    output = gluon_deepseek_v4_selected_attention_gfx950(
+        q,
+        kv,
+        indices,
+        lens,
+        attn_sink,
+        scale,
+    )
+
+    valid_indices = indices[0, : lens.item()].long()
+    valid_indices = valid_indices[valid_indices >= 0]
+    selected = kv[valid_indices].float()
+    logits = torch.einsum("hd,sd->hs", q[0].float(), selected) * scale
+    logits = torch.cat((attn_sink[:, None], logits), dim=1)
+    probabilities = torch.softmax(logits, dim=1)[:, 1:]
+    reference = torch.einsum("hs,sd->hd", probabilities, selected).to(torch.bfloat16)
+
+    torch.testing.assert_close(output[0], reference, rtol=3e-2, atol=3e-2)
 
 
 @pytest.mark.parametrize(

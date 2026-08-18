@@ -33,6 +33,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from functools import cached_property
 
+from tokenspeed_kernel import deepseek_v4_indexer_cache_format
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
@@ -416,8 +417,7 @@ class DeepseekV4Recipe(CacheRecipe):
         budgeted = self.cache_budget_bytes // layout.lcm_block_bytes - 1
         if budgeted < 1:
             raise ValueError(
-                "DeepSeek V4 cache budget must hold a null parent and one "
-                "usable parent"
+                "DeepSeek V4 cache budget must hold a null parent and one usable parent"
             )
         return self.parents_needed(layout, self.token_capacity(layout, budgeted))
 
@@ -443,17 +443,10 @@ class DeepseekV4Recipe(CacheRecipe):
 
     def _use_fp4_indexer(self, hf_config) -> bool:
         forced = getattr(self.server_args, "attention_use_fp4_indexer_cache", None)
-        if forced is not None:
-            return bool(forced)
         attention_config = getattr(hf_config, "attention_config", None)
         if isinstance(attention_config, dict):
             configured = attention_config.get("use_fp4_indexer_cache", None)
         else:
             configured = getattr(attention_config, "use_fp4_indexer_cache", None)
-        if configured is not None:
-            return bool(configured)
-        # FP4 indexer tensor cores are Blackwell-only (SM100+); default to the
-        # FP8 indexer cache layout on Hopper (SM90) and earlier.
-        from tokenspeed_kernel.platform import current_platform
-
-        return current_platform().arch_version.major >= 10
+        requested = forced if forced is not None else configured
+        return deepseek_v4_indexer_cache_format(requested) == "mxfp4"

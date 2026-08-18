@@ -40,6 +40,15 @@ if current_platform().is_amd:
     _DSA_FULL_TOPK_WIDTHS = frozenset({512, 1024, 2048})
     _DSA_PREFILL_TOPK_WIDTHS = _DSA_FULL_TOPK_WIDTHS
 
+    from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4 import (
+        gluon_deepseek_v4_fused_csa_indexer_fp8_cache_insert_gfx950 as _deepseek_v4_csa_indexer_fp8_cache_insert_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4 import (
+        gluon_deepseek_v4_paged_selected_attention_gfx950 as _deepseek_v4_paged_selected_attention_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4 import (
+        gluon_deepseek_v4_selected_attention_gfx950 as _deepseek_v4_selected_attention_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
         gluon_dsa_decode_gfx950 as _dsa_decode_impl,
     )
@@ -151,6 +160,103 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.project_value import (
         gluon_mla_project_value_gfx1250 as _mla_project_value_gfx1250_impl,
     )
+
+    @register_kernel(
+        "attention",
+        "deepseek_v4_csa_indexer_fp8_cache_insert",
+        name="gluon_deepseek_v4_csa_indexer_fp8_cache_insert_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    state_cache=dense_tensor_format(torch.float32),
+                    kv_cache=dense_tensor_format(torch.uint8),
+                )
+            }
+        ),
+        # The first fused Gluon implementation is correct but currently loses
+        # to portable Triton because its explicit Hadamard raises VGPR pressure.
+        priority=Priority.REFERENCE,
+        traits={
+            "index_head_dim": frozenset({128}),
+            "compress_ratio": frozenset({4}),
+            "page_size": frozenset({64}),
+            "cache_format": frozenset({"fp8_scaled_page_planar"}),
+        },
+        tags={"amd", "gfx950", "cache_insert"},
+    )
+    def gluon_deepseek_v4_csa_indexer_fp8_cache_insert_gfx950(*args, **kwargs):
+        return _deepseek_v4_csa_indexer_fp8_cache_insert_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "deepseek_v4_paged_selected_attention",
+        name="gluon_deepseek_v4_paged_selected_attention_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    swa_kv_cache=dense_tensor_format(torch.uint8),
+                )
+            }
+        ),
+        # The direct kernel wins isolated latency but loses full-model Flash
+        # throughput; retain it for explicit experiments until occupancy drops.
+        priority=Priority.REFERENCE,
+        traits={
+            "head_dim": frozenset({512}),
+            "num_heads": frozenset({64}),
+            "cache_layout": frozenset({"fp8_swa_page_planar"}),
+            "topk_layout": frozenset({"global_slots"}),
+            "support_sink": frozenset({True}),
+            "has_extra_segment": frozenset({False, True}),
+            "swa_selected_width": frozenset({128}),
+        },
+        tags={"amd", "gfx950", "paged_cache", "selected_attention"},
+    )
+    def gluon_deepseek_v4_paged_selected_attention_gfx950(*args, **kwargs):
+        return _deepseek_v4_paged_selected_attention_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "deepseek_v4_selected_attention",
+        name="gluon_deepseek_v4_selected_attention_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    kv=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": frozenset({512}),
+            "cache_layout": frozenset({"dense_workspace"}),
+            "support_sink": frozenset({True}),
+            "selected_width": frozenset({384, 512, 640, 768, 1024, 1152}),
+        },
+        tags={"amd", "gfx950", "selected_attention"},
+    )
+    def gluon_deepseek_v4_selected_attention_gfx950(*args, **kwargs):
+        return _deepseek_v4_selected_attention_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",

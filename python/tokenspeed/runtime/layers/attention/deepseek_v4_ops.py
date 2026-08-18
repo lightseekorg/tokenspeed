@@ -25,11 +25,9 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
-    fused_qnorm_rope_kv_insert as _cuda_fused_qnorm_rope_kv_insert,
-)
-from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
-    has_fused_qnorm_rope_kv_insert as _cuda_has_fused_qnorm_rope_kv_insert,
+from tokenspeed_kernel import (
+    deepseek_v4_csa_indexer_fp8_cache_insert,
+    deepseek_v4_swa_cache_insert,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_build_dense_prefill_local_compressed_indices,
@@ -48,9 +46,6 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_fused_inv_rope_fp8_quant,
-)
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
-    deepseek_v4_fused_qnorm_rope_kv_insert as _triton_fused_qnorm_rope_kv_insert,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_fused_sparse_compress_cache_insert as _triton_fused_sparse_compress_cache_insert,
@@ -143,45 +138,94 @@ def fused_qnorm_rope_kv_insert(
     cos_sin_cache: torch.Tensor,
     rms_norm_eps: float,
     block_size: int,
+    q_out: torch.Tensor | None = None,
 ) -> None:
     """Run the DeepSeek V4 fused SWA cache insert op.
 
     Expected contract:
-    - q: [tokens, local_heads, 512], mutated in place by RMSNorm/RoPE
+    - q: [tokens, local_heads, 512], mutated in place by RMSNorm/RoPE unless
+      q_out is provided
     - kv: [tokens, 512], source KV latent before RoPE/quant insert
     - swa_kv_cache_2d: uint8 cache blocks flattened as [num_blocks, block_bytes]
     - slot_mapping: output token slots in the paged SWA cache
     - positions: absolute token positions
     """
 
-    if _cuda_has_fused_qnorm_rope_kv_insert():
-        _cuda_fused_qnorm_rope_kv_insert(
-            q,
-            kv,
-            swa_kv_cache_2d,
-            slot_mapping,
-            positions.to(torch.int64),
-            cos_sin_cache,
-            rms_norm_eps,
-            block_size,
+    if q.dim() != 3 or q.shape[-1] != 512:
+        raise ValueError(f"q must be [tokens, heads, 512], got {tuple(q.shape)}")
+    if kv.shape != (q.shape[0], 512):
+        raise ValueError(f"kv must be [tokens, 512], got {tuple(kv.shape)}")
+    if q.dtype not in (torch.float16, torch.bfloat16) or kv.dtype != q.dtype:
+        raise TypeError("q and kv must have matching float16 or bfloat16 dtypes")
+    if not q.is_contiguous() or not kv.is_contiguous():
+        raise ValueError("q and kv must be contiguous")
+    if positions.dim() != 1 or positions.numel() != q.shape[0]:
+        raise ValueError(
+            f"positions must have one entry per token, got {tuple(positions.shape)}"
         )
-        return
-
-    if not q.is_cuda:
-        raise RuntimeError(
-            "DeepSeek V4 fused SWA cache insert op "
-            "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert is unavailable "
-            "for CPU tensors."
+    if slot_mapping.dim() != 1 or slot_mapping.numel() > q.shape[0]:
+        raise ValueError(
+            "slot_mapping must be one-dimensional and no longer than q, got "
+            f"{tuple(slot_mapping.shape)}"
         )
-    _triton_fused_qnorm_rope_kv_insert(
-        q,
+    if positions.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"positions must be int32 or int64, got {positions.dtype}")
+    if slot_mapping.dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            f"slot_mapping must be int32 or int64, got {slot_mapping.dtype}"
+        )
+    if not positions.is_contiguous() or not slot_mapping.is_contiguous():
+        raise ValueError("positions and slot_mapping must be contiguous")
+    if cos_sin_cache.dim() != 2 or cos_sin_cache.shape[-1] != 64:
+        raise ValueError(
+            f"cos_sin_cache must be [max_position, 64], got {tuple(cos_sin_cache.shape)}"
+        )
+    if cos_sin_cache.dtype != torch.float32 or not cos_sin_cache.is_contiguous():
+        raise TypeError("cos_sin_cache must be contiguous float32")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    if rms_norm_eps <= 0.0:
+        raise ValueError(f"rms_norm_eps must be positive, got {rms_norm_eps}")
+    min_block_bytes = block_size * deepseek_v4_swa_row_bytes(512, 64)
+    if (
+        swa_kv_cache_2d.dtype != torch.uint8
+        or swa_kv_cache_2d.dim() != 2
+        or swa_kv_cache_2d.shape[1] < min_block_bytes
+        or swa_kv_cache_2d.stride(1) != 1
+    ):
+        raise ValueError(
+            "swa_kv_cache_2d must be an inner-contiguous uint8 tensor shaped "
+            f"[pages, >= {min_block_bytes}], got {tuple(swa_kv_cache_2d.shape)}"
+        )
+    if q_out is not None and (
+        q_out.shape != q.shape
+        or q_out.dtype != q.dtype
+        or q_out.device != q.device
+        or not q_out.is_contiguous()
+    ):
+        raise ValueError(
+            "q_out must be contiguous and match q shape, dtype, and device"
+        )
+    tensors = (
         kv,
         swa_kv_cache_2d,
         slot_mapping,
         positions,
         cos_sin_cache,
-        rms_norm_eps,
-        block_size,
+    )
+    if any(tensor.device != q.device for tensor in tensors):
+        raise ValueError("all DeepSeek V4 SWA cache insert tensors must share a device")
+
+    deepseek_v4_swa_cache_insert(
+        q=q,
+        kv=kv,
+        swa_kv_cache=swa_kv_cache_2d,
+        slot_mapping=slot_mapping,
+        positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        rms_norm_eps=rms_norm_eps,
+        page_size=block_size,
+        q_out=q_out,
     )
 
 
@@ -1238,39 +1282,19 @@ def deepseek_v4_csa_indexer_cache_insert(
         )
         return
 
-    normed, valid = _compress_v4_state_windows_capturable(
+    deepseek_v4_csa_indexer_fp8_cache_insert(
         state_cache=state_cache,
         token_to_req_indices=token_to_req_indices,
         positions=positions,
         compressor_slot_mapping=compressor_slot_mapping,
         block_table=block_table,
-        block_table_base_offsets=block_table_base_offsets,
         compressor_block_size=compressor_block_size,
         rms_norm_weight=rms_norm_weight,
         rms_norm_eps=rms_norm_eps,
+        cos_sin_cache=cos_sin_cache,
+        kv_cache_2d=kv_cache_2d,
+        kv_slot_mapping=kv_slot_mapping,
+        kv_cache_block_size=kv_cache_block_size,
         compress_ratio=compress_ratio,
-        head_dim=index_head_dim,
-        overlap=True,
-    )
-    compressed_positions = (
-        torch.div(
-            positions[:num_actual].to(torch.int64),
-            compress_ratio,
-            rounding_mode="floor",
-        )
-        * compress_ratio
-    )
-    rotated = _apply_gptj_rope_tail_rows(
-        normed,
-        compressed_positions,
-        cos_sin_cache,
-        int(cos_sin_cache.shape[-1]),
-    )
-    rotated = _deepseek_v4_hadamard_rotate(rotated).float()
-    _write_deepseek_v4_indexer_fp8_cache_capturable(
-        rotated,
-        kv_cache_2d,
-        kv_slot_mapping[:num_actual],
-        valid,
-        block_size=kv_cache_block_size,
+        block_table_base_offsets=block_table_base_offsets,
     )

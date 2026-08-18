@@ -30,6 +30,7 @@ import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.gemm.deepseek_v4 import deepseek_v4_linear_fp32
 from tokenspeed_kernel.ops.gemm.kimi3 import (
     kimi3_latent_projection,
     kimi3_latent_projection_add3,
@@ -58,6 +59,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "bmm",
+    "deepseek_v4_linear_fp32",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
     "kimi3_latent_projection",

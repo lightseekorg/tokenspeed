@@ -23,6 +23,7 @@ from types import SimpleNamespace
 
 import torch
 
+from tokenspeed.runtime.execution import model_executor as model_executor_module
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 
 
@@ -123,3 +124,25 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         "future-input",
         "draft-final",
     ]
+
+
+def test_autotune_dummy_prefill_fits_request_capacity(monkeypatch):
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.config = SimpleNamespace(
+        chunked_prefill_size=8192,
+        context_len=1024,
+        max_num_seqs=1,
+        data_parallel_size=1,
+        disable_autotune=True,
+    )
+    executor.model_runner = object()
+    captured = []
+    monkeypatch.setattr(
+        model_executor_module,
+        "set_autotune_max_num_tokens",
+        captured.append,
+    )
+
+    executor._autotune()
+
+    assert captured == [1024]

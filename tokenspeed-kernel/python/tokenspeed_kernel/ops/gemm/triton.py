@@ -483,7 +483,7 @@ def w8a8_block_fp8_matmul_triton(
         # Each K tile consumes one scale, so its width must equal the scale group.
         if Platform.get().is_amd:
             config = {
-                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_M": 16 if M <= 128 else 32,
                 "BLOCK_SIZE_N": 64,
                 "BLOCK_SIZE_K": block_size[1],
                 "GROUP_SIZE_M": 8,
@@ -962,7 +962,7 @@ def triton_bmm_fp8_blockscale(
         else torch.empty((batch, m, n), device=A.device, dtype=out_dtype)
     )
     config = {
-        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_M": 16 if Platform.get().is_amd and m <= 128 else 32,
         "BLOCK_SIZE_N": 64,
         "BLOCK_SIZE_K": block_k,
         "num_warps": 4,

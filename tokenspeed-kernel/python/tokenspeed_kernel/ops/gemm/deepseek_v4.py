@@ -1,0 +1,182 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""DeepSeek V4 FP32-output linear projection."""
+
+from __future__ import annotations
+
+from math import prod
+
+import torch
+import torch.nn.functional as F
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.thirdparty.cuda.dsv3_gemm import dsv3_router_gemm
+
+
+def deepseek_v4_linear_fp32(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    enable_pdl: bool = False,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Project DeepSeek V4 hidden states and return FP32 output.
+
+    Args:
+        hidden_states: Floating-point activations with trailing dimension K.
+        weight: Floating-point row-major weight shaped [N, K].
+        enable_pdl: Request Programmatic Dependent Launch when supported.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        FP32 projected activations with trailing dimension N.
+    """
+    if hidden_states.ndim == 0:
+        raise ValueError("hidden_states must have at least one dimension")
+    if weight.ndim != 2:
+        raise ValueError(f"weight must have shape [N, K], got {tuple(weight.shape)}")
+    if hidden_states.shape[-1] != weight.shape[1]:
+        raise ValueError(
+            "DeepSeek V4 linear K mismatch: "
+            f"hidden_states K={hidden_states.shape[-1]}, weight K={weight.shape[1]}"
+        )
+    if not hidden_states.is_floating_point() or not weight.is_floating_point():
+        raise ValueError("hidden_states and weight must be floating-point tensors")
+
+    traits = {
+        "hidden_rank": hidden_states.ndim,
+        "weight_rank": weight.ndim,
+        "has_tokens": hidden_states.numel() > 0,
+        "k_match": True,
+    }
+    signature = format_signature(
+        hidden_states=dense_tensor_format(hidden_states.dtype),
+        weight=dense_tensor_format(weight.dtype),
+    )
+    kernel = select_kernel(
+        "gemm",
+        "deepseek_v4_linear_fp32",
+        signature,
+        traits=traits,
+        override=override,
+        solution=solution,
+    )
+    k = int(weight.shape[1])
+    shape_params = {
+        "M": int(prod(hidden_states.shape[:-1])),
+        "N": int(weight.shape[0]),
+        "K": k,
+        "enable_pdl": bool(enable_pdl),
+    }
+    ShapeCapture.get().record(
+        "gemm",
+        "deepseek_v4_linear_fp32",
+        kernel.name,
+        hidden_states.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "gemm",
+        "deepseek_v4_linear_fp32",
+        hidden_states.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(hidden_states, weight, enable_pdl=enable_pdl)
+
+
+@register_kernel(
+    "gemm",
+    "deepseek_v4_linear_fp32",
+    name="cuda_dsv3_deepseek_v4_linear_fp32",
+    solution="cuda",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 0),
+        max_arch_version=ArchVersion(10, 9),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=frozenset(
+        {
+            format_signature(
+                hidden_states=dense_tensor_format(torch.bfloat16),
+                weight=dense_tensor_format(weight_dtype),
+            )
+            for weight_dtype in (torch.bfloat16, torch.float32)
+        }
+    ),
+    traits={
+        "hidden_rank": frozenset({2}),
+        "weight_rank": frozenset({2}),
+        "has_tokens": frozenset({True}),
+        "k_match": frozenset({True}),
+    },
+    priority=Priority.SPECIALIZED,
+    tags={"nvidia", "latency"},
+)
+def cuda_dsv3_deepseek_v4_linear_fp32(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Run the DSV3 router GEMM specialization."""
+    return dsv3_router_gemm(
+        hidden_states,
+        weight,
+        out_dtype=torch.float32,
+        enable_pdl=enable_pdl,
+    )
+
+
+@register_kernel(
+    "gemm",
+    "deepseek_v4_linear_fp32",
+    name="torch_deepseek_v4_linear_fp32",
+    solution="torch",
+    signatures=frozenset(
+        format_signature(
+            hidden_states=dense_tensor_format(hidden_dtype),
+            weight=dense_tensor_format(weight_dtype),
+        )
+        for hidden_dtype in (torch.float16, torch.bfloat16, torch.float32)
+        for weight_dtype in (torch.float16, torch.bfloat16, torch.float32)
+    ),
+    priority=Priority.PORTABLE,
+    tags={"portability", "reference"},
+)
+def torch_deepseek_v4_linear_fp32(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Run the projection with matching operand dtypes and return FP32."""
+    activations = (
+        hidden_states
+        if hidden_states.dtype == weight.dtype
+        else hidden_states.to(weight.dtype)
+    )
+    return F.linear(activations, weight).to(torch.float32)
+
+
+__all__ = ["deepseek_v4_linear_fp32"]

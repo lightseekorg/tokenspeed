@@ -18,8 +18,20 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import tokenspeed_kernel.ops.moe.gluon.bf16  # noqa: F401
-import tokenspeed_kernel.ops.moe.gluon.deepseek_v4  # noqa: F401
-import tokenspeed_kernel.ops.moe.gluon.latent_decode  # noqa: F401
-import tokenspeed_kernel.ops.moe.gluon.latent_input  # noqa: F401
-import tokenspeed_kernel.ops.moe.gluon.mxfp4  # noqa: F401
+"""DeepSeek V4 attention kernels for AMD GFX950."""
+
+from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4.attention import (
+    gluon_deepseek_v4_selected_attention_gfx950,
+)
+from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4.cache_insert import (
+    gluon_deepseek_v4_fused_csa_indexer_fp8_cache_insert_gfx950,
+)
+from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4.paged_attention import (
+    gluon_deepseek_v4_paged_selected_attention_gfx950,
+)
+
+__all__ = [
+    "gluon_deepseek_v4_fused_csa_indexer_fp8_cache_insert_gfx950",
+    "gluon_deepseek_v4_paged_selected_attention_gfx950",
+    "gluon_deepseek_v4_selected_attention_gfx950",
+]

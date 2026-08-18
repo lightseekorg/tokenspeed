@@ -154,6 +154,12 @@ __all__ = [
     "dsa_prefill_topk",
     "dsa_decode_topk",
     "dsa_plan",
+    "deepseek_v4_csa_indexer_fp8_cache_insert",
+    "deepseek_v4_indexer_cache_format",
+    "deepseek_v4_paged_selected_attention",
+    "deepseek_v4_selected_attention",
+    "deepseek_v4_supports_deep_gemm",
+    "deepseek_v4_swa_cache_insert",
     "msa_decode_with_kvcache",
     "msa_extend_with_kvcache",
     "attn_merge_state",
@@ -161,6 +167,33 @@ __all__ = [
 ]
 
 LSE_LN = math.log2(math.e)
+
+
+def deepseek_v4_indexer_cache_format(use_fp4: bool | None = None) -> str:
+    """Resolve the DeepSeek V4 indexer cache format for this kernel platform.
+
+    Args:
+        use_fp4: Explicit format request. ``True`` selects MXFP4, ``False``
+            selects scaled FP8, and ``None`` selects the platform default.
+
+    Returns:
+        ``"mxfp4"`` or ``"fp8_scaled"``.
+    """
+
+    if use_fp4 is not None:
+        return "mxfp4" if use_fp4 else "fp8_scaled"
+    platform = current_platform()
+    return (
+        "mxfp4"
+        if platform.is_nvidia and platform.arch_version.major >= 10
+        else "fp8_scaled"
+    )
+
+
+def deepseek_v4_supports_deep_gemm() -> bool:
+    """Return whether V4 may select its optional DeepGEMM implementations."""
+
+    return current_platform().is_nvidia
 
 
 def mla_project_value_prefers_contiguous_weight(
@@ -2953,6 +2986,418 @@ def mla_decode_with_kvcache(
 # ===-----------------------------------------------------------------------===#
 # DSA Kernels
 # ===-----------------------------------------------------------------------===#
+
+
+def deepseek_v4_swa_cache_insert(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    rms_norm_eps: float,
+    page_size: int,
+    q_out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> None:
+    """Normalize/rotate Q and rotate/quantize/insert DeepSeek V4 SWA K/V.
+
+    Args:
+        q: Query latents shaped ``[tokens, heads, 512]``. Updated in place when
+            ``q_out`` is not provided.
+        kv: Shared K/V latents shaped ``[tokens, 512]``.
+        swa_kv_cache: Uint8 page-planar V4 FP8 SWA cache.
+        slot_mapping: Destination cache slot for each inserted token. Negative
+            slots suppress insertion.
+        positions: Absolute positions for all query/KV tokens.
+        cos_sin_cache: FP32 GPT-J-style fused cosine/sine cache of width 64.
+        rms_norm_eps: Positive epsilon used to normalize Q.
+        page_size: Number of cache entries in each page.
+        q_out: Optional contiguous destination for normalized and rotated Q.
+            When provided, ``q`` is left unchanged.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        None. Q and the selected cache rows are written in place.
+    """
+
+    signature = format_signature(
+        q=dense_tensor_format(q.dtype),
+        kv=dense_tensor_format(kv.dtype),
+        swa_kv_cache=dense_tensor_format(swa_kv_cache.dtype),
+    )
+    traits = {
+        "head_dim": int(q.shape[-1]),
+        "rope_dim": int(cos_sin_cache.shape[-1]),
+        "quant_block_size": 64,
+        "cache_layout": "fp8_swa_page_planar",
+        "has_q_out": q_out is not None,
+    }
+    kernel = select_kernel(
+        "attention",
+        "deepseek_v4_swa_cache_insert",
+        signature,
+        traits=traits,
+        override=override,
+        solution=solution,
+    )
+    shape_params = {
+        "tokens": int(q.shape[0]),
+        "insert_tokens": min(int(kv.shape[0]), int(slot_mapping.numel())),
+        "num_heads": int(q.shape[1]),
+        "head_dim": int(q.shape[2]),
+        "rope_dim": int(cos_sin_cache.shape[-1]),
+        "page_size": int(page_size),
+        "num_pages": int(swa_kv_cache.shape[0]),
+        "has_q_out": q_out is not None,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "deepseek_v4_swa_cache_insert",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "deepseek_v4_swa_cache_insert",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        kernel(
+            q=q,
+            kv=kv,
+            swa_kv_cache=swa_kv_cache,
+            slot_mapping=slot_mapping,
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            rms_norm_eps=rms_norm_eps,
+            page_size=page_size,
+            q_out=q_out,
+        )
+
+
+def deepseek_v4_csa_indexer_fp8_cache_insert(
+    state_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    compressor_slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    compressor_block_size: int,
+    rms_norm_weight: torch.Tensor,
+    rms_norm_eps: float,
+    cos_sin_cache: torch.Tensor,
+    kv_cache_2d: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    kv_cache_block_size: int,
+    compress_ratio: int = 4,
+    block_table_base_offsets: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> None:
+    """Compress and insert DeepSeek V4 FP8 CSA indexer-cache rows.
+
+    Args:
+        state_cache: FP32 paged compressor values and scores.
+        token_to_req_indices: Request index for each input token.
+        positions: Absolute token positions.
+        compressor_slot_mapping: Compressor-state slots for input tokens.
+        block_table: Logical-to-physical compressor-state page table.
+        compressor_block_size: Number of compressor-state rows per page.
+        rms_norm_weight: Width-128 RMSNorm weight.
+        rms_norm_eps: RMSNorm epsilon.
+        cos_sin_cache: Width-64 fused cosine and sine cache.
+        kv_cache_2d: Uint8 page-planar FP8 indexer cache.
+        kv_slot_mapping: Destination indexer-cache slots.
+        kv_cache_block_size: Number of destination rows per page.
+        compress_ratio: CSA compression ratio, currently four.
+        block_table_base_offsets: Optional logical page base per request.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        None. Valid rows are written in place.
+    """
+
+    signature = _attention_format_signature(
+        state_cache=state_cache,
+        kv_cache=kv_cache_2d,
+    )
+    traits = {
+        "index_head_dim": int(rms_norm_weight.numel()),
+        "compress_ratio": int(compress_ratio),
+        "page_size": int(kv_cache_block_size),
+        "cache_format": "fp8_scaled_page_planar",
+    }
+    kernel = select_kernel(
+        "attention",
+        "deepseek_v4_csa_indexer_fp8_cache_insert",
+        signature,
+        traits=traits,
+        override=override,
+        solution=solution,
+    )
+    shape_params = {
+        "tokens": min(
+            int(positions.numel()),
+            int(compressor_slot_mapping.numel()),
+            int(kv_slot_mapping.numel()),
+        ),
+        **traits,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "deepseek_v4_csa_indexer_fp8_cache_insert",
+        kernel.name,
+        state_cache.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "deepseek_v4_csa_indexer_fp8_cache_insert",
+        state_cache.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        kernel(
+            state_cache=state_cache,
+            token_to_req_indices=token_to_req_indices,
+            positions=positions,
+            compressor_slot_mapping=compressor_slot_mapping,
+            block_table=block_table,
+            compressor_block_size=compressor_block_size,
+            rms_norm_weight=rms_norm_weight,
+            rms_norm_eps=rms_norm_eps,
+            cos_sin_cache=cos_sin_cache,
+            kv_cache_2d=kv_cache_2d,
+            kv_slot_mapping=kv_slot_mapping,
+            kv_cache_block_size=kv_cache_block_size,
+            compress_ratio=compress_ratio,
+            block_table_base_offsets=block_table_base_offsets,
+        )
+
+
+def deepseek_v4_selected_attention(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    lens: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run DeepSeek V4 selected attention over a dense K/V workspace.
+
+    Args:
+        q: BF16 queries shaped ``[tokens, heads, 512]``.
+        kv: BF16 selected K/V workspace with rows of width 512.
+        indices: Selected workspace row indices shaped ``[tokens, width]``.
+        lens: Valid selected width for each query token.
+        attn_sink: One attention sink logit per query head.
+        softmax_scale: Scale applied to query-key dot products.
+        out: Optional output shaped like ``q``.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        BF16 attention output shaped like ``q``.
+    """
+
+    signature = _attention_format_signature(q=q, kv=kv)
+    traits = {
+        "head_dim": int(q.shape[-1]),
+        "cache_layout": "dense_workspace",
+        "support_sink": True,
+        "selected_width": int(indices.shape[-1]),
+    }
+    kernel = select_kernel(
+        "attention",
+        "deepseek_v4_selected_attention",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": int(q.shape[0]),
+        "num_heads": int(q.shape[1]),
+        "head_dim": int(q.shape[2]),
+        "selected_width": int(indices.shape[-1]),
+        "kv_rows": int(kv.numel() // q.shape[-1]),
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "deepseek_v4_selected_attention",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "deepseek_v4_selected_attention",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            kv=kv,
+            indices=indices,
+            lens=lens,
+            attn_sink=attn_sink,
+            softmax_scale=softmax_scale,
+            out=out,
+        )
+
+
+def deepseek_v4_paged_selected_attention(
+    q: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    swa_slots: torch.Tensor,
+    swa_lens: torch.Tensor,
+    swa_page_size: int,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    extra_kv_cache: torch.Tensor | None = None,
+    extra_slots: torch.Tensor | None = None,
+    extra_lens: torch.Tensor | None = None,
+    extra_page_size: int | None = None,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run DeepSeek V4 selected attention over page-planar FP8 caches.
+
+    SWA and optional extra compressed rows form independent selected segments.
+    Invalid negative slots and entries beyond each segment's per-token length
+    do not contribute to attention.
+
+    Args:
+        q: BF16 queries shaped ``[tokens, heads, 512]``.
+        swa_kv_cache: Uint8 page-planar SWA cache shaped
+            ``[pages, page_size * row_bytes]``.
+        swa_slots: Selected global SWA slots with one row per query token.
+        swa_lens: Valid SWA selection length for each query token.
+        swa_page_size: Number of SWA rows in each cache page.
+        attn_sink: One attention sink logit per query head.
+        softmax_scale: Scale applied to query-key dot products.
+        extra_kv_cache: Optional uint8 page-planar compressed cache.
+        extra_slots: Selected global slots in ``extra_kv_cache``.
+        extra_lens: Valid extra selection length for each query token.
+        extra_page_size: Number of rows in each extra cache page.
+        out: Optional output shaped like ``q``.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        BF16 attention output shaped like ``q``.
+    """
+    if q.dim() != 3 or q.shape[0] < 1 or q.shape[-1] != 512:
+        raise ValueError(
+            f"q must have shape [tokens, heads, 512], got {tuple(q.shape)}"
+        )
+    if swa_kv_cache.dim() != 2 or swa_kv_cache.dtype != torch.uint8:
+        raise ValueError("swa_kv_cache must be a 2D uint8 page-planar cache")
+    if swa_page_size <= 0 or swa_kv_cache.shape[1] % swa_page_size:
+        raise ValueError("swa_kv_cache width must be divisible by swa_page_size")
+    tokens = int(q.shape[0])
+    if swa_slots.dim() < 2 or int(swa_slots.shape[0]) != tokens:
+        raise ValueError("swa_slots must have one row per query token")
+    if swa_lens.numel() != tokens:
+        raise ValueError("swa_lens must have one entry per query token")
+    if attn_sink.numel() < q.shape[1]:
+        raise ValueError("attn_sink must provide one value per query head")
+
+    extra_values = (extra_kv_cache, extra_slots, extra_lens, extra_page_size)
+    has_extra_segment = any(value is not None for value in extra_values)
+    if has_extra_segment and not all(value is not None for value in extra_values):
+        raise ValueError(
+            "extra_kv_cache, extra_slots, extra_lens, and extra_page_size "
+            "must be provided together"
+        )
+    if extra_kv_cache is not None:
+        assert extra_slots is not None
+        assert extra_lens is not None
+        assert extra_page_size is not None
+        if extra_kv_cache.dim() != 2 or extra_kv_cache.dtype != torch.uint8:
+            raise ValueError("extra_kv_cache must be a 2D uint8 page-planar cache")
+        if extra_page_size <= 0 or extra_kv_cache.shape[1] % extra_page_size:
+            raise ValueError(
+                "extra_kv_cache width must be divisible by extra_page_size"
+            )
+        if extra_slots.dim() < 2 or int(extra_slots.shape[0]) != tokens:
+            raise ValueError("extra_slots must have one row per query token")
+        if extra_lens.numel() != tokens:
+            raise ValueError("extra_lens must have one entry per query token")
+    if out is not None and (
+        out.shape != q.shape or out.dtype != q.dtype or out.device != q.device
+    ):
+        raise ValueError("out must match q shape, dtype, and device")
+
+    swa_width = int(swa_slots.numel() // tokens)
+    extra_width = int(extra_slots.numel() // tokens) if extra_slots is not None else 0
+    signature = _attention_format_signature(q=q, swa_kv_cache=swa_kv_cache)
+    traits = {
+        "head_dim": int(q.shape[-1]),
+        "num_heads": int(q.shape[1]),
+        "cache_layout": "fp8_swa_page_planar",
+        "topk_layout": "global_slots",
+        "support_sink": True,
+        "has_extra_segment": has_extra_segment,
+        "swa_selected_width": swa_width,
+        "extra_selected_width": extra_width,
+    }
+    kernel = select_kernel(
+        "attention",
+        "deepseek_v4_paged_selected_attention",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": tokens,
+        "num_heads": int(q.shape[1]),
+        "head_dim": int(q.shape[2]),
+        "swa_selected_width": swa_width,
+        "extra_selected_width": extra_width,
+        "swa_page_size": int(swa_page_size),
+        "extra_page_size": int(extra_page_size or 0),
+        "has_extra_segment": has_extra_segment,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "deepseek_v4_paged_selected_attention",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "deepseek_v4_paged_selected_attention",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            swa_kv_cache=swa_kv_cache,
+            swa_slots=swa_slots,
+            swa_lens=swa_lens,
+            swa_page_size=swa_page_size,
+            attn_sink=attn_sink,
+            softmax_scale=softmax_scale,
+            extra_kv_cache=extra_kv_cache,
+            extra_slots=extra_slots,
+            extra_lens=extra_lens,
+            extra_page_size=extra_page_size,
+            out=out,
+        )
 
 
 def dsa_decode(

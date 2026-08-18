@@ -29,7 +29,9 @@ import logging
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,7 @@ __all__ = [
     "deepseek_v4_decode_swa_indices_and_lens",
     "deepseek_v4_dequantize_and_gather_k_cache",
     "deepseek_v4_dequantize_selected_cache_rows",
+    "deepseek_v4_fused_csa_indexer_fp8_cache_insert",
     "deepseek_v4_fused_csa_indexer_mxfp4_cache_insert",
     "deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4",
     "deepseek_v4_fused_qnorm_rope_kv_insert",
@@ -207,28 +210,58 @@ def _deepseek_v4_k_rope_quant_insert_kernel(
     tl.store(rope_ptr + rope_offsets, rope_rotated.to(tl.bfloat16))
 
 
+@register_kernel(
+    "attention",
+    "deepseek_v4_swa_cache_insert",
+    name="triton_deepseek_v4_swa_cache_insert",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        format_signature(
+            q=dense_tensor_format(dtype),
+            kv=dense_tensor_format(dtype),
+            swa_kv_cache=dense_tensor_format(torch.uint8),
+        )
+        for dtype in (torch.float16, torch.bfloat16)
+    ),
+    traits={
+        "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
+        "rope_dim": frozenset({DEEPSEEK_V4_ROPE_DIM}),
+        "quant_block_size": frozenset({DEEPSEEK_V4_FP8_QUANT_BLOCK}),
+        "cache_layout": frozenset({"fp8_swa_page_planar"}),
+        "has_q_out": frozenset({True, False}),
+    },
+    priority=Priority.PORTABLE,
+    tags={"portability", "cache_insert"},
+)
 def deepseek_v4_fused_qnorm_rope_kv_insert(
     q: torch.Tensor,
     kv: torch.Tensor,
-    swa_kv_cache_2d: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     rms_norm_eps: float,
-    block_size: int,
+    page_size: int,
+    q_out: torch.Tensor | None = None,
 ) -> None:
     """Normalize/rotate Q and insert rotated K into the V4 SWA cache."""
 
-    num_q_tokens, num_heads, head_dim = q.shape
+    q_destination = q
+    if q_out is not None:
+        q_out.copy_(q)
+        q_destination = q_out
+
+    num_q_tokens, num_heads, head_dim = q_destination.shape
     if head_dim != DEEPSEEK_V4_HEAD_DIM:
         raise ValueError(f"DeepSeek V4 Q head dimension must be 512, got {head_dim}")
     if num_q_tokens > 0:
         _deepseek_v4_qnorm_rope_kernel[(num_q_tokens, num_heads)](
-            q,
+            q_destination,
             positions,
             cos_sin_cache,
-            q.stride(0),
-            q.stride(1),
+            q_destination.stride(0),
+            q_destination.stride(1),
             cos_sin_cache.stride(0),
             rms_norm_eps,
             HEAD_DIM=DEEPSEEK_V4_HEAD_DIM,
@@ -243,14 +276,14 @@ def deepseek_v4_fused_qnorm_rope_kv_insert(
         return
     _deepseek_v4_k_rope_quant_insert_kernel[(num_insert,)](
         kv,
-        swa_kv_cache_2d,
+        swa_kv_cache,
         slot_mapping,
         positions,
         cos_sin_cache,
         kv.stride(0),
-        swa_kv_cache_2d.stride(0),
+        swa_kv_cache.stride(0),
         cos_sin_cache.stride(0),
-        block_size,
+        page_size,
         HEAD_DIM=DEEPSEEK_V4_HEAD_DIM,
         NOPE_DIM=DEEPSEEK_V4_NOPE_DIM,
         ROPE_DIM=DEEPSEEK_V4_ROPE_DIM,
@@ -335,6 +368,28 @@ def _deepseek_v4_sparse_attention_kernel(
     )
 
 
+@register_kernel(
+    "attention",
+    "deepseek_v4_selected_attention",
+    name="triton_deepseek_v4_selected_attention",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                kv=dense_tensor_format(torch.bfloat16),
+            )
+        }
+    ),
+    traits={
+        "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
+        "cache_layout": frozenset({"dense_workspace"}),
+        "support_sink": frozenset({True}),
+    },
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
 def deepseek_v4_sparse_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -375,9 +430,9 @@ def deepseek_v4_sparse_attention(
         softmax_scale,
         TOPK=indices_2d.shape[1],
         HEAD_DIM=DEEPSEEK_V4_HEAD_DIM,
-        BLOCK_TOPK=8,
+        BLOCK_TOPK=16,
         BLOCK_DIM=triton.next_power_of_2(DEEPSEEK_V4_HEAD_DIM),
-        num_warps=8,
+        num_warps=4,
         num_stages=1,
     )
     return output
@@ -486,6 +541,137 @@ def deepseek_v4_dequantize_selected_cache_rows(
         num_warps=4,
     )
     return output
+
+
+@register_kernel(
+    "attention",
+    "deepseek_v4_paged_selected_attention",
+    name="triton_deepseek_v4_paged_selected_attention",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                swa_kv_cache=dense_tensor_format(torch.uint8),
+            )
+        }
+    ),
+    traits={
+        "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
+        "cache_layout": frozenset({"fp8_swa_page_planar"}),
+        "topk_layout": frozenset({"global_slots"}),
+        "support_sink": frozenset({True}),
+        "has_extra_segment": frozenset({False, True}),
+    },
+    priority=Priority.PORTABLE,
+    tags={"portability", "paged_cache", "selected_attention"},
+)
+def triton_deepseek_v4_paged_selected_attention(
+    q: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    swa_slots: torch.Tensor,
+    swa_lens: torch.Tensor,
+    swa_page_size: int,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    extra_kv_cache: torch.Tensor | None = None,
+    extra_slots: torch.Tensor | None = None,
+    extra_lens: torch.Tensor | None = None,
+    extra_page_size: int | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compose page-planar dequantization with registered dense attention."""
+    from tokenspeed_kernel.ops.attention import deepseek_v4_selected_attention
+
+    tokens = q.shape[0]
+    swa_slots_2d = swa_slots.reshape(tokens, -1)
+    swa_offsets = torch.arange(
+        swa_slots_2d.shape[1],
+        dtype=torch.int32,
+        device=swa_slots.device,
+    )[None, :]
+    swa_valid = (swa_slots_2d >= 0) & (swa_offsets < swa_lens.reshape(-1, 1))
+    masked_swa_slots = torch.where(
+        swa_valid,
+        swa_slots_2d,
+        torch.full_like(swa_slots_2d, -1),
+    )
+    workspace_parts = [
+        deepseek_v4_dequantize_selected_cache_rows(
+            swa_kv_cache,
+            masked_swa_slots,
+            swa_page_size,
+        )
+    ]
+    index_parts = [
+        torch.where(
+            swa_valid,
+            swa_offsets,
+            torch.full_like(swa_offsets, -1),
+        )
+    ]
+
+    if extra_kv_cache is not None:
+        assert extra_slots is not None
+        assert extra_lens is not None
+        assert extra_page_size is not None
+        extra_slots_2d = extra_slots.reshape(tokens, -1)
+        extra_offsets = torch.arange(
+            extra_slots_2d.shape[1],
+            dtype=torch.int32,
+            device=extra_slots.device,
+        )[None, :]
+        extra_valid = (extra_slots_2d >= 0) & (
+            extra_offsets < extra_lens.reshape(-1, 1)
+        )
+        masked_extra_slots = torch.where(
+            extra_valid,
+            extra_slots_2d,
+            torch.full_like(extra_slots_2d, -1),
+        )
+        workspace_parts.append(
+            deepseek_v4_dequantize_selected_cache_rows(
+                extra_kv_cache,
+                masked_extra_slots,
+                extra_page_size,
+            )
+        )
+        index_parts.append(
+            torch.where(
+                extra_valid,
+                swa_slots_2d.shape[1] + extra_offsets,
+                torch.full_like(extra_offsets, -1),
+            )
+        )
+
+    kv_workspace = torch.cat(workspace_parts, dim=1)
+    selected_indices = torch.cat(index_parts, dim=1)
+    workspace_width = selected_indices.shape[1]
+    row_bases = (
+        torch.arange(tokens, dtype=torch.int32, device=selected_indices.device)[:, None]
+        * workspace_width
+    )
+    selected_indices = torch.where(
+        selected_indices >= 0,
+        selected_indices + row_bases,
+        selected_indices,
+    )
+    selected_lens = torch.full(
+        (tokens,),
+        workspace_width,
+        dtype=torch.int32,
+        device=q.device,
+    )
+    return deepseek_v4_selected_attention(
+        q=q,
+        kv=kv_workspace,
+        indices=selected_indices,
+        lens=selected_lens,
+        attn_sink=attn_sink,
+        softmax_scale=softmax_scale,
+        out=out,
+    )
 
 
 def _as_int32_block_table(block_table: torch.Tensor) -> torch.Tensor:
@@ -924,6 +1110,263 @@ def deepseek_v4_fused_sparse_compress_cache_insert(
             and _wide_compress_launch_supported(state_cache.device)
             else 4
         ),
+    )
+
+
+@triton.jit(do_not_specialize=["block_table_stride", "block_table_width"])
+def _deepseek_v4_fused_csa_indexer_fp8_cache_kernel(
+    state_cache_ptr,
+    state_cache_stride0,
+    state_cache_stride1,
+    token_to_req_indices_ptr,
+    positions_ptr,
+    slot_mapping_ptr,
+    block_table_ptr,
+    block_table_base_offsets_ptr,
+    block_table_stride,
+    block_table_width,
+    state_block_size,
+    rms_norm_weight_ptr,
+    rms_norm_eps,
+    cos_sin_cache_ptr,
+    cos_sin_stride,
+    k_cache_ptr,
+    kv_slot_mapping_ptr,
+    kv_cache_block_size,
+    HEAD_SIZE: tl.constexpr,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+    STATE_WIDTH: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    ROPE_HEAD_DIM: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    SCALE_DIM: tl.constexpr,
+    KV_BLOCK_STRIDE: tl.constexpr,
+    HADAMARD_SCALE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+
+    state_slot = tl.load(slot_mapping_ptr + token_idx)
+    if state_slot < 0:
+        return
+
+    position = tl.load(positions_ptr + token_idx)
+    if (position + 1) % COMPRESS_RATIO != 0:
+        return
+
+    kv_slot = tl.load(kv_slot_mapping_ptr + token_idx)
+    if kv_slot < 0:
+        return
+
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    if block_table_base_offsets_ptr is not None:
+        base_logical_page = tl.load(block_table_base_offsets_ptr + req_idx)
+    else:
+        base_logical_page = tl.full((), 0, tl.int32)
+    window: tl.constexpr = 2 * COMPRESS_RATIO
+    window_offsets = tl.arange(0, window)
+    pos = position - window + 1 + window_offsets
+    valid_pos = pos >= 0
+
+    table_idx = pos // state_block_size - base_logical_page
+    valid_pos = valid_pos & (table_idx >= 0) & (table_idx < block_table_width)
+    block_numbers = tl.load(
+        block_table_ptr + req_idx * block_table_stride + table_idx,
+        mask=valid_pos,
+        other=-1,
+    ).to(tl.int64)
+    pos_in_block = pos % state_block_size
+    head_offset = (window_offsets >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
+
+    dim = tl.arange(0, TRITON_BLOCK_SIZE)
+    row_base = (
+        state_cache_ptr
+        + block_numbers[:, None] * state_cache_stride0
+        + pos_in_block[:, None] * state_cache_stride1
+        + head_offset[:, None]
+    )
+    valid_rows = valid_pos[:, None] & (block_numbers[:, None] >= 0)
+    score = tl.load(
+        row_base + STATE_WIDTH + dim[None, :],
+        mask=valid_rows,
+        other=-1.0e30,
+    )
+    score = tl.softmax(score, dim=0)
+    kv = tl.load(row_base + dim[None, :], mask=valid_rows, other=0.0)
+    compressed = tl.sum(kv * score, axis=0)
+
+    rms_w = tl.load(rms_norm_weight_ptr + dim)
+    variance = tl.sum(compressed * compressed, axis=0) / HEAD_SIZE
+    normed = compressed * tl.rsqrt(variance + rms_norm_eps) * rms_w
+
+    NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM
+    HALF_ROPE: tl.constexpr = ROPE_HEAD_DIM // 2
+    NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
+    NOPE_PAIRS: tl.constexpr = NOPE_HEAD_DIM // 2
+    pair_2d = tl.reshape(normed, (NUM_PAIRS, 2))
+    even, odd = tl.split(pair_2d)
+    pair_idx = tl.arange(0, NUM_PAIRS)
+    rope_pair = pair_idx - NOPE_PAIRS
+    is_rope = rope_pair >= 0
+    cs_idx = tl.maximum(rope_pair, 0)
+
+    compressed_pos = (position // COMPRESS_RATIO) * COMPRESS_RATIO
+    cs_base = cos_sin_cache_ptr + compressed_pos * cos_sin_stride
+    cos_v = tl.load(cs_base + cs_idx, mask=is_rope, other=1.0)
+    sin_v = tl.load(cs_base + HALF_ROPE + cs_idx, mask=is_rope, other=0.0)
+    new_even = even * cos_v - odd * sin_v
+    new_odd = odd * cos_v + even * sin_v
+    rotated = tl.interleave(new_even, new_odd)
+    rotated = rotated.to(tl.bfloat16).to(tl.float32)
+
+    in_idx = tl.arange(0, TRITON_BLOCK_SIZE)
+    out_idx = tl.arange(0, TRITON_BLOCK_SIZE)
+    bits = (in_idx[:, None] & out_idx[None, :]).to(tl.int32)
+    parity = bits ^ (bits >> 4)
+    parity = parity ^ (parity >> 2)
+    parity = parity ^ (parity >> 1)
+    parity = parity & 1
+    signs = tl.where(parity == 0, 1.0, -1.0)
+    hadamard = tl.sum(rotated[:, None] * signs, axis=0) * HADAMARD_SCALE
+    hadamard = hadamard.to(tl.bfloat16).to(tl.float32)
+
+    scale_input = tl.maximum(
+        tl.max(tl.abs(hadamard), axis=0) / FP8_MAX,
+        1.0e-10,
+    )
+    scale = tl.exp2(tl.ceil(tl.log2(scale_input)))
+    quantized = tl.clamp(hadamard / scale, -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
+    value_bytes = quantized.to(tl.uint8, bitcast=True)
+
+    kv_block = kv_slot // kv_cache_block_size
+    kv_pos = kv_slot % kv_cache_block_size
+    cache_block_ptr = k_cache_ptr + kv_block.to(tl.int64) * KV_BLOCK_STRIDE
+    value_ptr = cache_block_ptr + kv_pos * TOKEN_STRIDE
+    scale_ptr = (
+        cache_block_ptr + kv_cache_block_size * TOKEN_STRIDE + kv_pos * SCALE_DIM
+    ).to(tl.pointer_type(tl.float32))
+    tl.store(value_ptr + out_idx, value_bytes)
+    tl.store(scale_ptr, scale)
+
+
+@register_kernel(
+    "attention",
+    "deepseek_v4_csa_indexer_fp8_cache_insert",
+    name="triton_deepseek_v4_csa_indexer_fp8_cache_insert",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                state_cache=dense_tensor_format(torch.float32),
+                kv_cache=dense_tensor_format(torch.uint8),
+            )
+        }
+    ),
+    traits={
+        "index_head_dim": frozenset({DEEPSEEK_V4_INDEXER_DIM}),
+        "compress_ratio": frozenset({4}),
+        "page_size": frozenset({64}),
+        "cache_format": frozenset({"fp8_scaled_page_planar"}),
+    },
+    priority=Priority.PORTABLE,
+    tags={"portability", "cache_insert"},
+)
+def deepseek_v4_fused_csa_indexer_fp8_cache_insert(
+    *,
+    state_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    compressor_slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    compressor_block_size: int,
+    rms_norm_weight: torch.Tensor,
+    rms_norm_eps: float,
+    cos_sin_cache: torch.Tensor,
+    kv_cache_2d: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    kv_cache_block_size: int,
+    compress_ratio: int,
+    block_table_base_offsets: torch.Tensor | None = None,
+) -> None:
+    """Compress CSA indexer state and insert page-planar FP8 cache rows.
+
+    The input state is FP32 `[pages, state_block, 512]` and the output pages
+    contain `[64, 128]` E4M3 value bytes followed by `[64, 4]` FP32 scale
+    bytes. Rows are written only at the end of each four-token CSA group.
+
+    Args:
+        state_cache: Paged compressor values and scores.
+        token_to_req_indices: Request index for each input token.
+        positions: Absolute input token positions.
+        compressor_slot_mapping: State slots; negative slots suppress writes.
+        block_table: Logical-to-physical state page table.
+        compressor_block_size: Number of state rows per page.
+        rms_norm_weight: Width-128 RMSNorm weight.
+        rms_norm_eps: RMSNorm epsilon.
+        cos_sin_cache: Width-64 fused cosine and sine cache.
+        kv_cache_2d: Uint8 page-planar FP8 indexer cache.
+        kv_slot_mapping: Output cache slots; negative slots suppress writes.
+        kv_cache_block_size: Output page size, which must be 64.
+        compress_ratio: CSA compression ratio, which must be 4.
+        block_table_base_offsets: Optional logical page base per request.
+
+    Returns:
+        None.
+    """
+
+    if kv_cache_block_size != 64:
+        raise ValueError(
+            "DeepSeek V4 FP8 indexer insertion requires "
+            f"kv_cache_block_size=64, got {kv_cache_block_size}"
+        )
+    if compress_ratio != 4:
+        raise ValueError(
+            "DeepSeek V4 CSA indexer insertion requires "
+            f"compress_ratio=4, got {compress_ratio}"
+        )
+    num_actual = min(
+        compressor_slot_mapping.numel(),
+        positions.numel(),
+        kv_slot_mapping.numel(),
+    )
+    if num_actual == 0:
+        return
+    block_table_i32 = _as_int32_block_table(block_table)
+    _deepseek_v4_fused_csa_indexer_fp8_cache_kernel[(num_actual,)](
+        state_cache,
+        state_cache.stride(0),
+        state_cache.stride(1),
+        token_to_req_indices[:num_actual],
+        positions[:num_actual],
+        compressor_slot_mapping[:num_actual],
+        block_table_i32,
+        (
+            block_table_base_offsets.to(torch.int32)
+            if block_table_base_offsets is not None
+            else None
+        ),
+        block_table_i32.stride(0),
+        block_table_i32.shape[-1],
+        compressor_block_size,
+        rms_norm_weight,
+        rms_norm_eps,
+        cos_sin_cache,
+        cos_sin_cache.stride(0),
+        kv_cache_2d,
+        kv_slot_mapping[:num_actual],
+        kv_cache_block_size,
+        HEAD_SIZE=DEEPSEEK_V4_INDEXER_DIM,
+        TRITON_BLOCK_SIZE=triton.next_power_of_2(DEEPSEEK_V4_INDEXER_DIM),
+        STATE_WIDTH=state_cache.shape[-1] // 2,
+        COMPRESS_RATIO=compress_ratio,
+        ROPE_HEAD_DIM=DEEPSEEK_V4_ROPE_DIM,
+        FP8_MAX=DEEPSEEK_V4_FP8_MAX,
+        TOKEN_STRIDE=DEEPSEEK_V4_INDEXER_DIM,
+        SCALE_DIM=4,
+        KV_BLOCK_STRIDE=kv_cache_2d.stride(0),
+        HADAMARD_SCALE=DEEPSEEK_V4_INDEXER_DIM**-0.5,
+        num_warps=4,
     )
 
 

@@ -28,6 +28,12 @@ from tokenspeed_kernel.ops.attention import (
     GdnChunkPrefillResult,
     MLAQueryProjection,
     attn_merge_state,
+    deepseek_v4_csa_indexer_fp8_cache_insert,
+    deepseek_v4_indexer_cache_format,
+    deepseek_v4_paged_selected_attention,
+    deepseek_v4_selected_attention,
+    deepseek_v4_supports_deep_gemm,
+    deepseek_v4_swa_cache_insert,
     dsa_decode,
     dsa_decode_topk,
     dsa_plan,
@@ -55,6 +61,7 @@ from tokenspeed_kernel.ops.attention import (
 )
 from tokenspeed_kernel.ops.gemm import (
     bmm,
+    deepseek_v4_linear_fp32,
     kimi3_latent_projection,
     kimi3_latent_projection_add3,
     kimi3_mla_qkv_gate_projection,
@@ -64,7 +71,9 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_situ_projection,
     mm,
 )
+from tokenspeed_kernel.ops.mhc import mhc_fused_hc, mhc_post, mhc_pre
 from tokenspeed_kernel.ops.moe import (
+    deepseek_v4_select_experts,
     moe_apply,
     moe_plan,
     moe_process_weights,
@@ -88,6 +97,7 @@ __all__ = [
     "NoKernelFoundError",
     # gemm
     "bmm",
+    "deepseek_v4_linear_fp32",
     "kimi3_latent_projection",
     "kimi3_mla_qkv_gate_projection",
     "kimi3_latent_projection_add3",
@@ -120,6 +130,12 @@ __all__ = [
     "msa_decode_with_kvcache",
     "msa_extend_with_kvcache",
     "attn_merge_state",
+    "deepseek_v4_csa_indexer_fp8_cache_insert",
+    "deepseek_v4_indexer_cache_format",
+    "deepseek_v4_paged_selected_attention",
+    "deepseek_v4_selected_attention",
+    "deepseek_v4_supports_deep_gemm",
+    "deepseek_v4_swa_cache_insert",
     "gdn_chunk_prefill",
     "gdn_decode_step",
     "gdn_decode_mtp",
@@ -129,12 +145,17 @@ __all__ = [
     "add3",
     "situ_and_mul",
     # moe
+    "deepseek_v4_select_experts",
     "native_latent_moe_available",
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
     "moe_sigmoid_bias_topk",
     "moe_softmax_topk",
+    # mhc
+    "mhc_fused_hc",
+    "mhc_post",
+    "mhc_pre",
     # quantization
     "quantize_fp8",
     "quantize_fp8_with_scale",

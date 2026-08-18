@@ -34,7 +34,22 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel import bmm, dsa_decode_topk, dsa_prefill_topk
+from tokenspeed_kernel import (
+    bmm,
+    deepseek_v4_indexer_cache_format,
+    deepseek_v4_linear_fp32,
+)
+from tokenspeed_kernel import (
+    deepseek_v4_select_experts as fast_deepseek_v4_select_experts,
+)
+from tokenspeed_kernel import (
+    deepseek_v4_supports_deep_gemm,
+    dsa_decode_topk,
+    dsa_prefill_topk,
+)
+from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
+from tokenspeed_kernel import mhc_post as fast_mhc_post
+from tokenspeed_kernel import mhc_pre as fast_mhc_pre
 
 try:
     # Optional dependency; the module-level wrapper imports the external
@@ -52,12 +67,6 @@ from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_indexer_decode_metadata_compute,
-)
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cuda import (
-    dsv3_router_gemm,
-    hash_softplus_sqrt_topk_flash,
-    softplus_sqrt_topk_flash,
 )
 from tokenspeed_kernel.thirdparty.triton import (
     stage_deepseek_v4_mega_moe_inputs as _stage_deepseek_v4_mega_moe_inputs,
@@ -105,7 +114,6 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_fused_inv_rope_fp8_quant,
     deepseek_v4_hca_compress_kv_cache_insert,
     deepseek_v4_prepare_indexer_q,
-    deepseek_v4_prepare_indexer_q_fp8,
     deepseek_v4_prepare_indexer_q_mxfp4,
     fused_qnorm_rope_kv_insert,
     gather_paged_indexer_fp8_cache,
@@ -115,9 +123,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     _group_slot_mapping_from_raw,
     _mask_invalid_graph_tokens,
 )
-from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_fused_hc as fast_mhc_fused_hc
-from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_post as fast_mhc_post
-from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_pre as fast_mhc_pre
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -153,8 +158,7 @@ from tokenspeed.runtime.utils.custom_ops import direct_register_custom_op
 from tokenspeed.runtime.utils.env import global_server_args_dict, pdl_enabled
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
-_platform = current_platform()
-if not _platform.is_nvidia:
+if not deepseek_v4_supports_deep_gemm():
     deep_gemm = None  # type: ignore[assignment]
 
 
@@ -250,57 +254,6 @@ def _dequant_fp8_weight(layer: nn.Module, shape: tuple[int, ...]) -> torch.Tenso
     return weight.float() * expanded_scale[:, :out_dim, :in_dim]
 
 
-def _deepseek_v4_router_gemm(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-) -> torch.Tensor:
-    if (
-        hidden_states.dim() == 2
-        and hidden_states.shape[0] > 0
-        and hidden_states.is_cuda
-        and hidden_states.dtype == torch.bfloat16
-        and weight.dtype in (torch.bfloat16, torch.float32)
-        and (_platform.is_hopper or _platform.is_blackwell)
-    ):
-        return dsv3_router_gemm(
-            hidden_states,
-            weight,
-            out_dtype=torch.float32,
-            enable_pdl=pdl_enabled(),
-        )
-
-    x = (
-        hidden_states
-        if hidden_states.dtype == weight.dtype
-        else hidden_states.to(weight.dtype)
-    )
-    return F.linear(x, weight, None).to(torch.float32)
-
-
-def _deepseek_v4_bf16_linear_fp32(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-) -> torch.Tensor | None:
-    if (
-        hidden_states.dim() == 2
-        and hidden_states.shape[0] > 0
-        and hidden_states.is_cuda
-        and hidden_states.dtype == torch.bfloat16
-        and weight.is_cuda
-        and weight.dtype == torch.bfloat16
-        and weight.dim() == 2
-        and hidden_states.shape[1] == weight.shape[1]
-        and (_platform.is_hopper or _platform.is_blackwell)
-    ):
-        return dsv3_router_gemm(
-            hidden_states,
-            weight,
-            out_dtype=torch.float32,
-            enable_pdl=False,
-        )
-    return None
-
-
 def _deepseek_v4_fused_select_experts(
     router_logits: torch.Tensor,
     top_k: int,
@@ -309,67 +262,17 @@ def _deepseek_v4_fused_select_experts(
     correction_bias: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if (
-        not router_logits.is_cuda
-        or router_logits.dim() != 2
-        or top_k <= 0
-        or top_k > 32
-        or router_logits.dtype not in (torch.float32, torch.float16, torch.bfloat16)
-    ):
-        return None
-
-    num_experts = router_logits.shape[1]
-
-    topk_weights = torch.empty(
-        router_logits.shape[0],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compatibility wrapper returning only selected weights and ids."""
+    topk_weights, topk_ids, _ = fast_deepseek_v4_select_experts(
+        router_logits,
         top_k,
-        dtype=torch.float32,
-        device=router_logits.device,
+        renormalize,
+        correction_bias=correction_bias,
+        hash_indices_table=hash_indices_table,
+        input_ids=input_ids,
+        need_scores=False,
     )
-    topk_ids = torch.empty(
-        router_logits.shape[0],
-        top_k,
-        dtype=torch.int32,
-        device=router_logits.device,
-    )
-
-    if num_experts not in (256, 384) or top_k != 6 or not renormalize:
-        return None
-
-    logits_f32 = router_logits.float().contiguous()
-
-    try:
-        if hash_indices_table is not None:
-            if input_ids is None:
-                raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
-            hash_softplus_sqrt_topk_flash(
-                logits_f32,
-                input_ids.reshape(-1).to(device=router_logits.device).contiguous(),
-                hash_indices_table.to(
-                    device=router_logits.device, dtype=torch.int32
-                ).contiguous(),
-                topk_ids,
-                topk_weights,
-                1.0,
-                renormalize,
-            )
-        elif correction_bias is not None:
-            softplus_sqrt_topk_flash(
-                logits_f32,
-                correction_bias.to(
-                    device=router_logits.device, dtype=torch.float32
-                ).contiguous(),
-                topk_ids,
-                topk_weights,
-                1.0,
-                renormalize,
-            )
-        else:
-            return None
-    except (AttributeError, RuntimeError):
-        return None
-
     return topk_weights, topk_ids
 
 
@@ -475,45 +378,15 @@ def deepseek_v4_select_experts(
     (e.g. mega_moe) to skip the redundant sqrt(softplus(logits)) computation.
     """
 
-    fused_topk = _deepseek_v4_fused_select_experts(
+    return fast_deepseek_v4_select_experts(
         router_logits,
         top_k,
         renormalize,
         correction_bias=correction_bias,
         hash_indices_table=hash_indices_table,
         input_ids=input_ids,
+        need_scores=need_scores,
     )
-    if fused_topk is not None:
-        topk_weights, topk_ids = fused_topk
-        if need_scores:
-            scores = torch.sqrt(F.softplus(router_logits.float()))
-        else:
-            scores = router_logits
-        return topk_weights, topk_ids, scores
-
-    scores = torch.sqrt(F.softplus(router_logits.float()))
-    if hash_indices_table is not None:
-        if input_ids is None:
-            raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
-        topk_ids = hash_indices_table[input_ids.reshape(-1)].to(
-            device=scores.device,
-            dtype=torch.long,
-        )
-    else:
-        scores_for_choice = scores
-        if correction_bias is not None:
-            scores_for_choice = scores_for_choice + correction_bias.to(
-                device=scores.device,
-                dtype=scores.dtype,
-            ).unsqueeze(0)
-        topk_ids = torch.topk(scores_for_choice, k=top_k, dim=-1, sorted=True)[1]
-
-    topk_weights = scores.gather(1, topk_ids)
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
-            torch.finfo(topk_weights.dtype).tiny
-        )
-    return topk_weights.to(torch.float32), topk_ids.to(torch.int32), scores
 
 
 def pack_topk_as_router_logits(
@@ -2116,18 +1989,13 @@ def _deepseek_v4_swa_slot_mapping(
 
 def _attention_use_fp4_indexer_cache(config: PretrainedConfig) -> bool:
     override = global_server_args_dict.get("attention_use_fp4_indexer_cache", None)
-    if override is not None:
-        return bool(override)
     attention_config = getattr(config, "attention_config", None)
     if isinstance(attention_config, dict):
         configured = attention_config.get("use_fp4_indexer_cache", None)
     else:
         configured = getattr(attention_config, "use_fp4_indexer_cache", None)
-    if configured is not None:
-        return bool(configured)
-    # FP4 indexer tensor cores are Blackwell-only (SM100+). On Hopper (SM90)
-    # and earlier, default to the FP8 indexer cache/kernels.
-    return _platform.arch_version.major >= 10
+    requested = override if override is not None else configured
+    return deepseek_v4_indexer_cache_format(requested) == "mxfp4"
 
 
 def deepseek_v4_rope_config(
@@ -2273,7 +2141,11 @@ class DeepseekV4MoEGate(nn.Module):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return _deepseek_v4_router_gemm(hidden_states, self.weight)
+        return deepseek_v4_linear_fp32(
+            hidden_states,
+            self.weight,
+            enable_pdl=pdl_enabled(),
+        )
 
 
 class DeepseekV4MegaMoEExperts(nn.Module):
@@ -2861,10 +2733,7 @@ class DeepseekV4Compressor(nn.Module):
         weight = self.fused_wkv_wgate.weight.view(*weight_shape)
         if weight.dtype == torch.float8_e4m3fn:
             weight = _dequant_fp8_weight(self.fused_wkv_wgate, weight_shape)
-        kv_score = _deepseek_v4_bf16_linear_fp32(hidden_states, weight)
-        if kv_score is None:
-            kv_score = torch.matmul(hidden_states.float(), weight.float().T)
-        return kv_score
+        return deepseek_v4_linear_fp32(hidden_states, weight)
 
     def forward(
         self,
@@ -2903,9 +2772,7 @@ class DeepseekV4Compressor(nn.Module):
                 if weight.dtype == torch.float8_e4m3fn:
                     weight = _dequant_fp8_weight(self.fused_wkv_wgate, weight_shape)
             with nvtx_range(f"{profile_prefix}_matmul"):
-                kv_score = _deepseek_v4_bf16_linear_fp32(hidden_states, weight)
-                if kv_score is None:
-                    kv_score = torch.matmul(hidden_states.float(), weight.float().T)
+                kv_score = deepseek_v4_linear_fp32(hidden_states, weight)
         kv, score = kv_score.split([self.coff * self.head_dim] * 2, dim=-1)
         if state_cache is None:
             state_cache = pool.get_compressor_state_buffer(layer_index)
@@ -3122,7 +2989,7 @@ class DeepseekV4Indexer(nn.Module):
         ctx: ForwardContext,
         indexer_block_size: int,
     ) -> None:
-        if deep_gemm is None or not positions.is_cuda:
+        if not self.use_fp4_cache or deep_gemm is None or not positions.is_cuda:
             return
         forward_mode = ctx.forward_mode
         if forward_mode is not None and forward_mode.is_mixed():
@@ -3295,12 +3162,7 @@ class DeepseekV4Indexer(nn.Module):
             index_q = index_q.view(-1, self.n_head, self.head_dim)
         with nvtx_range("indexer_weights_proj"):
             weights, _ = self.weights_proj(hidden_states)
-        if deep_gemm is None:
-            if self.use_fp4_cache:
-                raise RuntimeError(
-                    "DeepSeek V4 MXFP4 indexer cache requires DeepGEMM; "
-                    "set --attention-use-fp4-indexer-cache false"
-                )
+        if not self.use_fp4_cache:
             with nvtx_range("indexer_prepare_portable"):
                 q_values, packed_weights = deepseek_v4_prepare_indexer_q(
                     index_q=index_q,
@@ -3313,7 +3175,12 @@ class DeepseekV4Indexer(nn.Module):
                 q_values,
                 q_values.new_empty((q_values.shape[0], 0), dtype=torch.float32),
             )
-        elif self.use_fp4_cache:
+        else:
+            if deep_gemm is None:
+                raise RuntimeError(
+                    "DeepSeek V4 MXFP4 indexer cache requires DeepGEMM; "
+                    "set --attention-use-fp4-indexer-cache false"
+                )
             with nvtx_range("indexer_prepare_mxfp4"):
                 packed_index_q, packed_weights = deepseek_v4_prepare_indexer_q_mxfp4(
                     index_q=index_q,
@@ -3327,26 +3194,6 @@ class DeepseekV4Indexer(nn.Module):
                 raise RuntimeError(
                     "DeepSeek V4 sparse indexer requires DeepGEMM FP4 support"
                 )
-        else:
-            # FP8 (SM90) path: q is a plain fp8 tensor with the softmax/head
-            # scales folded into the weights, so there is no per-token query
-            # scale. Pair it with a zero-width scales tensor -- it keeps the
-            # leading token dimension (so the custom op's per-request slicing
-            # stays coherent) while making it explicit that the fp8 kernels
-            # read no query scales.
-            with nvtx_range("indexer_prepare_fp8"):
-                q_fp8, packed_weights = deepseek_v4_prepare_indexer_q_fp8(
-                    index_q=index_q,
-                    positions=positions,
-                    cos_sin_cache=cos_sin_cache,
-                    weights=weights,
-                    softmax_scale=self.softmax_scale,
-                    head_scale=self.n_head**-0.5,
-                )
-            q_scales_placeholder = q_fp8.new_empty(
-                (q_fp8.shape[0], 0), dtype=torch.float32
-            )
-            packed_index_q = (q_fp8, q_scales_placeholder)
 
         empty_cpu = torch.empty(0, dtype=torch.int32, device="cpu")
         seq_lens_cpu = (
@@ -3393,13 +3240,16 @@ class DeepseekV4Indexer(nn.Module):
                 metadata=metadata,
                 is_valid_token=decode_valid_token,
             )
-            decode_schedule_metadata = _deepseek_v4_indexer_decode_schedule_metadata(
-                positions=decode_positions,
-                cache_block_size=indexer_block_size,
-                compress_ratio=self.compress_ratio,
-                metadata=metadata,
-                context_lens=decode_plan.context_lens,
-            )
+            if self.use_fp4_cache:
+                decode_schedule_metadata = (
+                    _deepseek_v4_indexer_decode_schedule_metadata(
+                        positions=decode_positions,
+                        cache_block_size=indexer_block_size,
+                        compress_ratio=self.compress_ratio,
+                        metadata=metadata,
+                        context_lens=decode_plan.context_lens,
+                    )
+                )
         indexer_metadata = DeepseekV4SparseIndexerMetadata(
             batch_metadata=DeepseekV4IndexerBatchMetadata(
                 positions=positions,
@@ -3427,7 +3277,7 @@ class DeepseekV4Indexer(nn.Module):
                 dtype=torch.int32,
             )
         )[:total_tokens]
-        if deep_gemm is None:
+        if not self.use_fp4_cache:
             return self._forward_sparse_indexer_portable(
                 query=packed_index_q[0],
                 weights=packed_weights,

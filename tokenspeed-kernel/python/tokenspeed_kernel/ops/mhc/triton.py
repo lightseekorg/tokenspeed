@@ -1,33 +1,42 @@
 # Copyright (c) 2026 LightSeek Foundation
 #
-# Portions copyright the vLLM project contributors under Apache-2.0.
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 from __future__ import annotations
 
 from functools import cache
 
 import torch
-import triton
-import triton.language as tl
-from tokenspeed_kernel.platform import current_platform
-
-from tokenspeed.runtime.utils import ceil_div
-
-try:
-    from tokenspeed_kernel.thirdparty import deep_gemm
-except Exception:
-    deep_gemm = None  # type: ignore[assignment]
-
-if not current_platform().is_nvidia:
-    deep_gemm = None  # type: ignore[assignment]
+from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 @cache
-def _compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
-    device_props = torch.cuda.get_device_properties(0)
+def _compute_num_split(
+    device: torch.device, block_k: int, k: int | None, grid_size: int
+) -> int:
+    device_props = torch.cuda.get_device_properties(device)
     split_k = device_props.multi_processor_count // grid_size
     if k is not None:
-        num_block_k = ceil_div(k, block_k)
+        num_block_k = triton.cdiv(k, block_k)
         split_k = min(split_k, num_block_k // 4)
     return max(split_k, 1)
 
@@ -352,7 +361,7 @@ def _mhc_post_hc4_triton_kernel(
     ).to(tl.float32)
 
     post_base = token_id * 4
-    acc0 = tl.load(post + post_base + 0).to(tl.float32) * hidden_values
+    acc0 = tl.load(post + post_base).to(tl.float32) * hidden_values
     acc1 = tl.load(post + post_base + 1).to(tl.float32) * hidden_values
     acc2 = tl.load(post + post_base + 2).to(tl.float32) * hidden_values
     acc3 = tl.load(post + post_base + 3).to(tl.float32) * hidden_values
@@ -365,16 +374,12 @@ def _mhc_post_hc4_triton_kernel(
             other=0.0,
         ).to(tl.float32)
         comb_row = comb_base + in_hc * 4
-        acc0 += tl.load(comb + comb_row + 0).to(tl.float32) * residual_values
+        acc0 += tl.load(comb + comb_row).to(tl.float32) * residual_values
         acc1 += tl.load(comb + comb_row + 1).to(tl.float32) * residual_values
         acc2 += tl.load(comb + comb_row + 2).to(tl.float32) * residual_values
         acc3 += tl.load(comb + comb_row + 3).to(tl.float32) * residual_values
 
-    tl.store(
-        out + token_residual_offset + hidden_offsets,
-        acc0,
-        mask=hidden_mask,
-    )
+    tl.store(out + token_residual_offset + hidden_offsets, acc0, mask=hidden_mask)
     tl.store(
         out + token_residual_offset + hidden_size + hidden_offsets,
         acc1,
@@ -392,36 +397,7 @@ def _mhc_post_hc4_triton_kernel(
     )
 
 
-def mhc_fused_hc(
-    x_prev: torch.Tensor,
-    residual_prev: torch.Tensor,
-    post_prev: torch.Tensor,
-    comb_prev: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused post_mapping(prev) + pre_mapping(curr).
-
-    Returns (residual_cur, layer_input, post_cur, comb_cur).
-    """
-    residual_cur = mhc_post(x_prev, residual_prev, post_prev, comb_prev)
-    layer_input, post_cur, comb_cur = mhc_pre(
-        residual_cur,
-        fn,
-        hc_scale,
-        hc_base,
-        rms_eps,
-        hc_eps,
-        sinkhorn_iters,
-    )
-    return residual_cur, layer_input, post_cur, comb_cur
-
-
-def mhc_pre(
+def _mhc_pre_impl(
     residual: torch.Tensor,
     fn: torch.Tensor,
     hc_scale: torch.Tensor,
@@ -429,6 +405,7 @@ def mhc_pre(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    prenorm_gemm,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if residual.dtype != torch.bfloat16 or fn.dtype != torch.float32:
         raise RuntimeError("fast mHC requires bf16 residual and fp32 weights")
@@ -462,12 +439,12 @@ def mhc_pre(
             ),
         )
 
-    block_k = 64
-    block_m = 64
     n_splits = _compute_num_split(
-        block_k, hc_hidden_size, ceil_div(num_tokens, block_m)
+        residual.device,
+        64,
+        hc_hidden_size,
+        triton.cdiv(num_tokens, 64),
     )
-
     post_mix = torch.empty(
         num_tokens, hc_mult, dtype=torch.float32, device=residual.device
     )
@@ -488,24 +465,14 @@ def mhc_pre(
     )
 
     residual_2d = residual_flat.view(num_tokens, hc_hidden_size)
-    if deep_gemm is not None:
-        deep_gemm.tf32_hc_prenorm_gemm(
-            residual_2d,
-            fn,
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            n_splits,
-        )
-    else:
-        _mhc_prenorm_gemm_triton(
-            residual_2d,
-            fn,
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            n_splits,
-        )
+    prenorm_gemm(
+        residual_2d,
+        fn,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        n_splits,
+    )
     block_h = 1024
-    block_comb = triton.next_power_of_2(hc_mult2)
     _mhc_pre_mix_triton_kernel[(num_tokens,)](
         gemm_out_mul,
         gemm_out_sqrsum,
@@ -522,7 +489,7 @@ def mhc_pre(
         hc_mult=hc_mult,
         hc_mult2=hc_mult2,
         hc_mult3=hc_mult3,
-        block_comb=block_comb,
+        block_comb=triton.next_power_of_2(hc_mult2),
         num_tokens=num_tokens,
         num_warps=1,
     )
@@ -543,16 +510,78 @@ def mhc_pre(
     )
 
 
-def mhc_post(
+@register_kernel(
+    "mhc",
+    "pre",
+    name="triton_mhc_pre",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                residual=dense_tensor_format(torch.bfloat16),
+                fn=dense_tensor_format(torch.float32),
+                hc_scale=dense_tensor_format(torch.float32),
+                hc_base=dense_tensor_format(torch.float32),
+            )
+        }
+    ),
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
+def triton_mhc_pre(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the portable Triton mHC pre-mapping."""
+    return _mhc_pre_impl(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+        _mhc_prenorm_gemm_triton,
+    )
+
+
+@register_kernel(
+    "mhc",
+    "post",
+    name="triton_mhc_post",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                hidden_states=dense_tensor_format(torch.bfloat16),
+                residual=dense_tensor_format(torch.bfloat16),
+                post=dense_tensor_format(torch.float32),
+                comb=dense_tensor_format(torch.float32),
+            )
+        }
+    ),
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
+def triton_mhc_post(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     post: torch.Tensor,
     comb: torch.Tensor,
 ) -> torch.Tensor:
+    """Run the portable Triton mHC post-mapping."""
     if not hidden_states.is_cuda:
         raise RuntimeError("fast mHC requires CUDA tensors")
     if residual.numel() == 0:
         return torch.empty_like(residual)
+
     out = torch.empty_like(residual)
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]

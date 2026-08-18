@@ -19,7 +19,6 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
-    has_fused_qnorm_rope_kv_insert,
     has_indexer_topk_prefill,
     indexer_topk_prefill,
 )
@@ -77,7 +76,6 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
 )
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_compute_global_topk_indices_and_lens,
-    fused_qnorm_rope_kv_insert,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
@@ -1476,24 +1474,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not match"):
             model_config._verify_quantization()
 
-    def test_deepseek_v4_attention_op_boundary_fails_loudly_when_missing(self):
-        if has_fused_qnorm_rope_kv_insert():
-            self.skipTest("DeepSeek V4 fused attention op is available in this build")
-
-        q = torch.empty(1, 1, 512)
-        kv = torch.empty(1, 512)
-        cache = torch.empty(1, 584, dtype=torch.uint8)
-        slots = torch.zeros(1, dtype=torch.int32)
-        positions = torch.zeros(1, dtype=torch.int32)
-        cos_sin = torch.empty(1, 128)
-
-        with self.assertRaisesRegex(
-            RuntimeError, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"
-        ):
-            fused_qnorm_rope_kv_insert(
-                q, kv, cache, slots, positions, cos_sin, 1e-6, 256
-            )
-
     def test_deepseek_v4_flashmla_wrapper_exposes_required_api(self):
         try:
             from tokenspeed_kernel.ops.attention.flash_mla import (
@@ -1514,6 +1494,81 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(callable(flash_mla_with_kvcache))
         self.assertTrue(callable(flash_mla_sparse_fwd))
         self.assertTrue(callable(get_mla_metadata))
+
+    def test_decode_forwards_page_planar_segments_to_shared_kernel_api(self):
+        backend = object.__new__(DeepseekV4AttentionBackend)
+        swa_cache = torch.empty((2, 4 * 584), dtype=torch.uint8)
+        extra_cache = torch.empty((1, 2 * 584), dtype=torch.uint8)
+        swa_slots = torch.tensor([[0, 1, -1], [4, 5, 6]], dtype=torch.int32)
+        swa_lens = torch.tensor([2, 3], dtype=torch.int32)
+        extra_slots = torch.tensor([[[0, -1]], [[1, 0]]], dtype=torch.int32)
+        extra_lens = torch.tensor([1, 2], dtype=torch.int32)
+        metadata = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            token_to_req_indices=torch.arange(2, dtype=torch.int32),
+            attention=SimpleNamespace(
+                decode_swa_indices=swa_slots,
+                decode_swa_lens=swa_lens,
+                decode_swa_window_size=3,
+                decode_swa_block_size=4,
+            ),
+        )
+        backend._select_decode_metadata = MethodType(
+            lambda _self, _tokens: metadata,
+            backend,
+        )
+        backend._decode_compressed_attention_indices_and_lens = MethodType(
+            lambda _self, _positions, **_kwargs: (extra_slots, extra_lens),
+            backend,
+        )
+        pool = SimpleNamespace(
+            swa_block_size=4,
+            get_compressed_block_size=lambda _layer_id: 2,
+            get_swa_kv_buffer=lambda _layer_id: swa_cache,
+            get_compressed_kv_buffer_2d=lambda _layer_id: extra_cache,
+        )
+        q = torch.randn(2, 2, 512, dtype=torch.bfloat16)
+        sink = torch.randn(4, dtype=torch.float32)
+        calls = []
+
+        def fake_paged_attention(**kwargs):
+            calls.append(kwargs)
+            return torch.empty_like(kwargs["q"])
+
+        with patch.object(
+            deepseek_v4_backend,
+            "deepseek_v4_paged_selected_attention",
+            side_effect=fake_paged_attention,
+        ):
+            result = backend.forward_deepseek_v4_decode(
+                q=q,
+                positions=torch.tensor([7, 8], dtype=torch.int64),
+                token_to_kv_pool=pool,
+                layer_id=0,
+                kind="csa",
+                compress_ratio=4,
+                num_local_heads=2,
+                padded_heads=4,
+                head_dim=512,
+                window_size=3,
+                softmax_scale=0.125,
+                attn_sink=sink,
+                topk_indices=torch.zeros((2, 2), dtype=torch.int32),
+            )
+
+        self.assertEqual(result.shape, (2, 2, 512))
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertIs(call["swa_kv_cache"], swa_cache)
+        self.assertIs(call["swa_slots"], swa_slots)
+        self.assertIs(call["swa_lens"], swa_lens)
+        self.assertEqual(call["swa_page_size"], 4)
+        self.assertIs(call["extra_kv_cache"], extra_cache)
+        self.assertIs(call["extra_slots"], extra_slots)
+        self.assertIs(call["extra_lens"], extra_lens)
+        self.assertEqual(call["extra_page_size"], 2)
+        self.assertIs(call["attn_sink"], sink)
+        self.assertEqual(call["q"].shape, (2, 4, 512))
 
     def test_deepseek_v4_model_config_uses_mla_runtime_metadata(self):
         model_config = object.__new__(ModelConfig)

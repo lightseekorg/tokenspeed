@@ -578,7 +578,15 @@ class ModelExecutor:
         cannot change a replay. On distributed boots, per-tactic timings are
         averaged over the world so every rank picks the same tactic.
         """
-        num_tokens = int(self.config.chunked_prefill_size)
+        per_rank_max_batch = max(
+            1,
+            int(self.config.max_num_seqs)
+            // max(int(self.config.data_parallel_size), 1),
+        )
+        num_tokens = min(
+            int(self.config.chunked_prefill_size),
+            int(self.config.context_len) * per_rank_max_batch,
+        )
         if num_tokens <= 0 or self.model_runner is None:
             return
 
