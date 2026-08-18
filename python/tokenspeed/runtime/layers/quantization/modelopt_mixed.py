@@ -382,9 +382,13 @@ def _assert_routed_or_known(
     # "...experts.<i>.w{1,2,3}" tensor (the same parent-first semantics
     # moe_weight_dtype uses). _resolve_quant_algo only scans downward
     # (direct hit / fused shards / children), so walk the ancestors here.
+    # Only non-FP8_PB_WO subtrees are legitimate owners (NVFP4/MXFP8 fused
+    # experts): FP8_PB_WO entries name leaf projections, so an FP8_PB_WO
+    # ancestor over an unrouted child is itself name drift and must raise.
     parts = module.split(".")
     for depth in range(len(parts) - 1, 0, -1):
-        if ".".join(parts[:depth]) in quant_config.quantized_layers:
+        algo = quant_config.quantized_layers.get(".".join(parts[:depth]))
+        if algo is not None and algo != "FP8_PB_WO":
             return  # a subtree entry (e.g. NVFP4 fused experts) owns it
     if should_exclude_quant_module(module, quant_config.exclude_modules):
         return
@@ -477,6 +481,16 @@ def preprocess_fp8_pb_wo_weights(
                 yield (
                     module + ".weight_scale_inv",
                     modelopt_block_scale_to_2d(weight),
+                )
+            elif weight.dtype not in _FP8_WEIGHT_DTYPES:
+                # A 16-bit weight for an FP8-resident module can only be a
+                # runtime refit stream; copying it into the FP8 parameter (or
+                # the fused buffer at checkpoint-canonical offsets) would
+                # silently corrupt the weights.
+                raise TypeError(
+                    f"FP8-resident module {module!r} cannot load a "
+                    f"{weight.dtype} weight (bf16 refit of FP8_PB_WO w8a8 "
+                    "layers is unsupported)."
                 )
             else:
                 yield name, weight

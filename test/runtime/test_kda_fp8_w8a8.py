@@ -110,6 +110,7 @@ def test_fp8_merged_loading_codes_scales_and_pad() -> None:
     for rank in range(TP_SIZE):
         module = _build_fp8_merged(rank)
         _load(module, ckpt)
+        module.verify_fp8_load_complete()  # full load passes the bitmap check
         p = module.proj_local
         assert module.weight.dtype == torch.float8_e4m3fn  # FP8-resident
         assert module.weight.shape[0] % 128 == 0  # padded to the block grid
@@ -164,6 +165,18 @@ def test_fp8_merged_rejects_bf16_refit_shard() -> None:
             torch.zeros(PROJ, HIDDEN, dtype=torch.bfloat16, device="cuda"),
             "q",
         )
+
+
+def test_fp8_merged_incomplete_load_raises() -> None:
+    """Zero-init buffers must not mask a dropped shard (explicit bitmap)."""
+    ckpt = _make_ckpt_segments(torch.Generator().manual_seed(7))
+    module = _build_fp8_merged(rank=0)
+    for name, (codes, scales) in ckpt.items():
+        module.weight.weight_loader(module.weight, codes, name)
+        if name != "b":  # drop one scale shard
+            module.weight_scale_inv.weight_loader(module.weight_scale_inv, scales, name)
+    with pytest.raises(RuntimeError, match="scale shards \\['b'\\]"):
+        module.verify_fp8_load_complete()
 
 
 def test_fp8_merged_forward_fails_fast() -> None:

@@ -85,7 +85,7 @@ def test_from_config_rejects_unknown_algo():
 # Layer 4 mimics a Kimi-K3 MLA layer (q_a_proj sibling present), layer 6 a
 # KDA layer (merged-projection siblings).
 _FP8_PB_WO_LAYERS = {
-    # MLA layer: everything is FP8-resident (w8a8 / fused-splice at load)
+    # MLA layer: everything is FP8-resident (w8a8 / verbatim fused reorder)
     "language_model.model.layers.4.self_attn.o_proj": {"quant_algo": "FP8_PB_WO"},
     "language_model.model.layers.4.self_attn.kv_b_proj": {"quant_algo": "FP8_PB_WO"},
     "language_model.model.layers.4.self_attn.q_b_proj": {"quant_algo": "FP8_PB_WO"},
@@ -97,7 +97,7 @@ _FP8_PB_WO_LAYERS = {
     "language_model.model.layers.4.self_attn.fused_qkv_a_proj_with_mqa": {
         "quant_algo": "FP8_PB_WO"
     },
-    # KDA layer: raw-consumed merged projections dequant, o_proj w8a8
+    # KDA layer: FP8-resident except f_b (raw backend GEMV keeps dequant)
     "language_model.model.layers.6.self_attn.q_proj": {"quant_algo": "FP8_PB_WO"},
     "language_model.model.layers.6.self_attn.f_b_proj": {"quant_algo": "FP8_PB_WO"},
     "language_model.model.layers.6.self_attn.g_proj": {"quant_algo": "FP8_PB_WO"},
@@ -304,6 +304,83 @@ def test_guard_passes_real_ckpt_expert_subtree_names():
     ]
     out = list(preprocess_fp8_pb_wo_weights(iter(stream), config))
     assert [name for name, _ in out] == [name for name, _ in stream]
+
+
+def test_preprocess_w8a8_route_rejects_bf16_refit_weights():
+    """16-bit weights for FP8-resident modules must fail fast, not corrupt.
+
+    A bf16 refit stream hitting a w8a8-routed module would otherwise be
+    raw-copied into the FP8 parameter (or the fused buffer at
+    checkpoint-canonical offsets) with silently wrong values.
+    """
+    from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
+        preprocess_fp8_pb_wo_weights,
+    )
+
+    config = _renamed_config(_FP8_PB_WO_LAYERS)
+    refit = torch.randn(96, 200, dtype=torch.bfloat16)
+    for module in (
+        "model.layers.4.self_attn.q_a_proj",  # fused segment
+        "model.layers.4.self_attn.q_b_proj",  # plain LinearBase w8a8
+        "model.layers.6.self_attn.q_proj",  # KDA merged segment
+    ):
+        with pytest.raises(TypeError, match="bf16 refit"):
+            list(
+                preprocess_fp8_pb_wo_weights(
+                    iter([(f"{module}.weight", refit)]), config
+                )
+            )
+
+
+def test_guard_fp8_pb_wo_ancestor_does_not_own_children():
+    """Only NVFP4/MXFP8 subtree entries legitimize unrouted descendants.
+
+    FP8_PB_WO entries name leaf projections; an unrouted FP8 tensor under an
+    FP8_PB_WO ancestor is itself checkpoint/runtime name drift and must keep
+    raising.
+    """
+    from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
+        preprocess_fp8_pb_wo_weights,
+    )
+
+    config = _renamed_config(_FP8_PB_WO_LAYERS)
+    q, _ = _quantize_per_block_cpu(torch.randn(128, 128))
+    with pytest.raises(RuntimeError, match="module-name drift"):
+        list(
+            preprocess_fp8_pb_wo_weights(
+                iter([("model.layers.4.self_attn.o_proj.child.weight", q)]),
+                config,
+            )
+        )
+
+
+def test_fused_qkv_a_fp8_decision():
+    """FP8 layout engages from the alias OR the segments; partial raises."""
+    from tokenspeed.runtime.models.kimi_k3 import _fused_qkv_a_uses_fp8
+
+    fp8 = {"quant_algo": "FP8_PB_WO"}
+    layer = "language_model.model.layers.7.self_attn"
+    prefix = "model.layers.7.self_attn"
+    # Segment-only config (no fused alias) -> FP8 layout.
+    seg_only = _renamed_config(
+        {
+            f"{layer}.q_a_proj": fp8,
+            f"{layer}.kv_a_proj_with_mqa": fp8,
+            f"{layer}.g_proj": fp8,
+        }
+    )
+    assert _fused_qkv_a_uses_fp8(seg_only, prefix) is True
+    # Alias-only config -> FP8 layout (checkpoint aliases without segments).
+    alias_only = _renamed_config({f"{layer}.fused_qkv_a_proj_with_mqa": fp8})
+    assert _fused_qkv_a_uses_fp8(alias_only, prefix) is True
+    # Partially quantized segments -> loud error, not a later alignment trap.
+    partial = _renamed_config({f"{layer}.q_a_proj": fp8})
+    with pytest.raises(ValueError, match="partially"):
+        _fused_qkv_a_uses_fp8(partial, prefix)
+    # Non-mixed configs (bf16/mxfp4) -> bf16 layout.
+    assert _fused_qkv_a_uses_fp8(None, prefix) is False
+    # Mixed config without any FP8_PB_WO entry for this layer -> bf16 layout.
+    assert _fused_qkv_a_uses_fp8(_renamed_config(), prefix) is False
 
 
 def test_preprocess_dequant_route_passes_bf16_refit_weights():
