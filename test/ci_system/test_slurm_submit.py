@@ -255,6 +255,7 @@ def test_render_script_contains_cluster_requirements():
     )
     assert "--setup-mode=slurm" in script
     assert "--container-remap-root" in script
+    assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' not in script
     assert "libcuda.so.1" in script
     assert "libcudart.so.13" in script
     assert "/usr/bin/nvidia-smi" in script
@@ -265,6 +266,72 @@ def test_render_script_contains_cluster_requirements():
     )
     assert unset in script
     assert script.index(unset) < script.index('srun "${srun_args[@]}"')
+    subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def test_render_script_mounts_only_allocated_gb300_devices():
+    script = render_script(
+        Task("test/ci/ut/example.yaml", "example", "ut", "gb300-1gpu", 1),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in script
+    assert 'device="/dev/nvidia$gpu"' in script
+    assert 'elif [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]' in script
+    assert "No NVIDIA device nodes matched Slurm GPU allocation" in script
+    assert "\n  /dev/nvidiactl \\\n" in script
+    assert "\n  /dev/nvidia-uvm \\\n" in script
+    assert "\n  /dev/nvidia-uvm-tools \\\n" in script
+    assert "\n  /dev/nvidia-nvswitchctl \\\n" in script
+    assert "\n  /dev/nvidia-caps \\\n" in script
+    assert "\n  /dev/nvidia-caps-imex-channels; do\n" in script
+    assert '"${gpu_mounts[@]}" "${mounts[@]}"' in script
+    subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+    multinode_script = render_script(
+        Task(
+            "test/ci/eval/example.yaml",
+            "example",
+            "eval",
+            "slurm-gb300-4node-4gpu",
+            16,
+            nodes=4,
+        ),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+    assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in multinode_script
+
+
+def test_render_multinode_gb300_keeps_devices_out_of_client_step():
+    script = render_script(
+        Task(
+            "test/ci/eval/example.yaml",
+            "example",
+            "eval",
+            "gb300-4gpu",
+            4,
+            nodes=2,
+        ),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    assert (
+        'server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" '
+        '"${gpu_mounts[@]}" "${mounts[@]}")' in script
+    )
+    assert (
+        'client_mounts=("$client_src:/workspace" "$client_tmp:/tmp" '
+        '"${mounts[@]}")' in script
+    )
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
 

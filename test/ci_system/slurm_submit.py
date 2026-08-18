@@ -310,6 +310,45 @@ def render_script(
         "SLURM_STEP_ID,SLURM_STEP_NUM_NODES,SLURM_STEP_NODELIST,SLURM_NODEID,"
         "SLURM_PROCID,SLURM_LOCALID",
     ]
+    gpu_device_mounts = ""
+    if task.runner.startswith(("gb300-", "slurm-gb300-")):
+        gpu_device_mounts = r"""
+# The GB300 Pyxis hook does not expose allocated device nodes.
+gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"
+IFS=',' read -ra visible_gpus <<< "$gpu_ids"
+mounted_gpu_count=0
+for token in "${visible_gpus[@]}"; do
+  if [[ "$token" =~ ^[0-9]+$ ]]; then
+    first_gpu=$((10#$token))
+    last_gpu=$first_gpu
+  elif [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+    first_gpu=$((10#${BASH_REMATCH[1]}))
+    last_gpu=$((10#${BASH_REMATCH[2]}))
+  else
+    continue
+  fi
+  for ((gpu = first_gpu; gpu <= last_gpu; gpu++)); do
+    device="/dev/nvidia$gpu"
+    if [ -e "$device" ]; then
+      gpu_mounts+=("$device:$device")
+      mounted_gpu_count=$((mounted_gpu_count + 1))
+    fi
+  done
+done
+if ((mounted_gpu_count == 0)); then
+  echo "No NVIDIA device nodes matched Slurm GPU allocation: ${gpu_ids:-<unset>}" >&2
+  exit 2
+fi
+for device in \
+  /dev/nvidiactl \
+  /dev/nvidia-uvm \
+  /dev/nvidia-uvm-tools \
+  /dev/nvidia-nvswitchctl \
+  /dev/nvidia-caps \
+  /dev/nvidia-caps-imex-channels; do
+  [ ! -e "$device" ] || gpu_mounts+=("$device:$device")
+done
+"""
     common = f"""#!/usr/bin/env bash
 set -euo pipefail
 
@@ -330,8 +369,11 @@ mounts=(
   "$run:/workspace/.ci-artifacts"
   {shlex.quote(str(cache) + ":/home/runner/.cache")}
 )
+gpu_mounts=()
 
-# This cluster's Pyxis hook exposes devices but omits driver libraries/tools.
+{gpu_device_mounts}
+
+# The cluster Pyxis hooks omit driver libraries and tools.
 driver_dir=""
 for lib in libcuda.so.1 libnvidia-ml.so.1 libnvidia-ptxjitcompiler.so.1 libnvidia-nvvm.so.4; do
   link="$(ldconfig -p 2>/dev/null | awk -v name="$lib" \
@@ -370,7 +412,7 @@ nvidia_smi="$(command -v nvidia-smi 2>/dev/null || true)"
 trap 'rm -rf -- "$scratch"' EXIT
 mkdir -p "$src/.ci-artifacts" "$tmp"
 tar -xf "$source_archive" -C "$src"
-mounts=("$src:/workspace" "$tmp:/tmp" "${{mounts[@]}}")
+mounts=("$src:/workspace" "$tmp:/tmp" "${{gpu_mounts[@]}}" "${{mounts[@]}}")
 container_mounts="$(IFS=,; printf '%s' "${{mounts[*]}}")"
 {shell_array("srun_args", srun)}
 srun_args+=(--container-mounts="$container_mounts")
@@ -444,7 +486,8 @@ server_src="$scratch/server-src"
 client_src="$scratch/client-src"
 server_tmp="$scratch/server-tmp"
 client_tmp="$scratch/client-tmp"
-server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" "${{mounts[@]}}")
+# Full-node server allocations use the same GPU device IDs on every node.
+server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" "${{gpu_mounts[@]}}" "${{mounts[@]}}")
 client_mounts=("$client_src:/workspace" "$client_tmp:/tmp" "${{mounts[@]}}")
 server_container_mounts="$(IFS=,; printf '%s' "${{server_mounts[*]}}")"
 client_container_mounts="$(IFS=,; printf '%s' "${{client_mounts[*]}}")"
