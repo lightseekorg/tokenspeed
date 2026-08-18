@@ -9,6 +9,7 @@ runner:
   labels:
     - b200-4gpu
     - b300-4gpu
+    - gb300-4gpu
 env:
   CI: "true"
   TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN: "1"

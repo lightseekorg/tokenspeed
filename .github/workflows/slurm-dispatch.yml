@@ -8,8 +8,16 @@ on:
         required: false
         default: ""
         type: string
+      cluster:
+        description: "Slurm cluster"
+        required: true
+        default: gb200
+        type: choice
+        options:
+          - gb200
+          - gb300
       yaml:
-        description: "Optional single B200/GB200 or multi-node Slurm CI YAML"
+        description: "Optional single B200/GB200/GB300 or multi-node Slurm CI YAML"
         required: true
         default: "off"
         type: choice
@@ -44,7 +52,7 @@ on:
           - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
           - test/ci/ut/ut-tokenspeed-kernel.yaml
       runners:
-        description: "Comma-separated exact runner labels"
+        description: "Comma-separated exact runner labels; unchanged default maps to the selected cluster"
         required: true
         default: "b200-4gpu,gb200-4gpu"
         type: string
@@ -76,12 +84,12 @@ on:
           - slurm
 
 concurrency:
-  group: slurm-dispatch-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}
+  group: slurm-dispatch-${{ inputs.cluster }}-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}
   cancel-in-progress: false
 
 jobs:
   dispatch:
-    runs-on: slurm-dispatch
+    runs-on: ${{ inputs.cluster == 'gb300' && 'slurm-dispatch-gb300' || 'slurm-dispatch' }}
     timeout-minutes: 720
     permissions:
       contents: read
@@ -99,6 +107,7 @@ jobs:
       - name: Submit and wait for Slurm tasks
         env:
           PR: ${{ inputs.pr }}
+          CLUSTER: ${{ inputs.cluster }}
           YAML_SELECTION: ${{ inputs.yaml }}
           RUNNERS: ${{ inputs.runners }}
           TASK_TYPES: ${{ inputs.task_types }}
@@ -110,10 +119,37 @@ jobs:
           args=(--wait --report-dir "$RUNNER_TEMP/slurm-report")
           [ -z "$PR" ] || args+=(--pr "$PR")
 
+          case "$CLUSTER" in
+            gb200)
+              runner_prefixes=(b200- gb200- slurm-gb200-)
+              ;;
+            gb300)
+              runner_prefixes=(gb300-)
+              coordinator_user=${USER:-$(id -un)}
+              export TS_CI_ARTIFACT_ROOT="/data/home/$coordinator_user/tokenspeed-slurm"
+              export TS_CI_CACHE_DIR="/data/home/$coordinator_user/tokenspeed-cache"
+              if [ "$RUNNERS" = "b200-4gpu,gb200-4gpu" ]; then
+                RUNNERS=gb300-4gpu
+              fi
+              ;;
+            *)
+              echo "Unsupported Slurm cluster: $CLUSTER" >&2
+              exit 2
+              ;;
+          esac
+
+          runner_is_supported() {
+            local runner=$1 prefix
+            for prefix in "${runner_prefixes[@]}"; do
+              [[ "$runner" == "$prefix"* ]] && return 0
+            done
+            return 1
+          }
+
           if [ "$YAML_SELECTION" != off ]; then
             args+=(--config "$YAML_SELECTION")
             mapfile -t yaml_metadata < <(
-              python3 - "$YAML_SELECTION" <<'PY'
+              python3 - "$YAML_SELECTION" "$CLUSTER" <<'PY'
           import sys
           from pathlib import Path
 
@@ -122,9 +158,13 @@ jobs:
 
           repo = Path.cwd()
           task = normalize_task(repo / sys.argv[1], repo)
+          prefixes = {
+              "gb200": ("b200-", "gb200-", "slurm-gb200-"),
+              "gb300": ("gb300-",),
+          }[sys.argv[2]]
           print(f"type:{task['type']}")
           for label in task["runner"]["labels"]:
-              if label.startswith(("b200-", "gb200-", "slurm-")):
+              if label.startswith(prefixes):
                   print(label)
           PY
             )
@@ -143,7 +183,12 @@ jobs:
             IFS=',' read -ra values <<< "$RUNNERS"
             for value in "${values[@]}"; do
               value="${value//[[:space:]]/}"
-              [ -z "$value" ] || args+=(--runner "$value")
+              [ -z "$value" ] && continue
+              runner_is_supported "$value" || {
+                echo "Runner $value is not supported by the $CLUSTER cluster" >&2
+                exit 2
+              }
+              args+=(--runner "$value")
             done
 
             IFS=',' read -ra values <<< "$TASK_TYPES"

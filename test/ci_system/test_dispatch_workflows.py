@@ -1,10 +1,12 @@
+import os
+import subprocess
 from pathlib import Path
 
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 K8S_RUNNER_PREFIXES = ("b200-", "amd-", "gb200-", "b300-")
-SLURM_RUNNER_PREFIXES = ("b200-", "gb200-", "slurm-")
+SLURM_RUNNER_PREFIXES = ("b200-", "gb200-", "slurm-gb200-", "gb300-")
 
 
 def workflow_dispatch_inputs(name: str) -> dict:
@@ -16,6 +18,50 @@ def workflow_dispatch_inputs(name: str) -> dict:
 
 def load_yaml(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def run_slurm_dispatch_script(
+    tmp_path: Path, **overrides: str
+) -> subprocess.CompletedProcess[str]:
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/slurm-dispatch.yml")
+    step = next(
+        step
+        for step in workflow["jobs"]["dispatch"]["steps"]
+        if step.get("name") == "Submit and wait for Slurm tasks"
+    )
+    original_script = step["run"]
+    script = original_script.replace(
+        'exec test/ci/run_slurm.sh "${args[@]}"',
+        """printf 'arg=%s\\n' "${args[@]}"
+printf 'artifact=%s\\n' "${TS_CI_ARTIFACT_ROOT-}"
+printf 'cache=%s\\n' "${TS_CI_CACHE_DIR-}"
+""",
+    )
+    assert script != original_script
+    env = {
+        **os.environ,
+        "PR": "",
+        "CLUSTER": "gb200",
+        "YAML_SELECTION": "off",
+        "RUNNERS": "b200-4gpu,gb200-4gpu",
+        "TASK_TYPES": "eval,perf",
+        "MATCH": "",
+        "INCLUDE_MMLU": "false",
+        "TRIGGER": "all",
+        "RUNNER_TEMP": str(tmp_path),
+        "USER": "test-coordinator",
+        **overrides,
+    }
+    env.pop("TS_CI_ARTIFACT_ROOT", None)
+    env.pop("TS_CI_CACHE_DIR", None)
+    return subprocess.run(
+        ["bash", "-c", script],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 def eligible_config_paths(runner_prefixes: tuple[str, ...]) -> set[str]:
@@ -39,7 +85,7 @@ def test_k8s_dispatch_lists_every_supported_ci_yaml():
     )
 
 
-def test_slurm_dispatch_lists_every_b200_and_gb200_ci_yaml():
+def test_slurm_dispatch_lists_every_supported_ci_yaml():
     assert configured_yaml_choices("slurm-dispatch.yml") == eligible_config_paths(
         SLURM_RUNNER_PREFIXES
     )
@@ -55,6 +101,78 @@ def test_slurm_dispatch_lists_every_supported_trigger():
         "debug",
         "slurm",
     }
+
+
+def test_slurm_dispatch_lists_every_supported_cluster():
+    cluster = workflow_dispatch_inputs("slurm-dispatch.yml")["cluster"]
+
+    assert cluster["default"] == "gb200"
+    assert set(cluster["options"]) == {"gb200", "gb300"}
+
+
+def test_slurm_dispatch_routes_gb300_to_its_coordinator():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/slurm-dispatch.yml")
+
+    assert workflow["jobs"]["dispatch"]["runs-on"] == (
+        "${{ inputs.cluster == 'gb300' && "
+        "'slurm-dispatch-gb300' || 'slurm-dispatch' }}"
+    )
+    assert "${{ inputs.cluster }}" in workflow["concurrency"]["group"]
+
+
+def test_slurm_dispatch_uses_gb300_defaults_and_shared_paths(tmp_path):
+    result = run_slurm_dispatch_script(tmp_path, CLUSTER="gb300")
+
+    assert result.returncode == 0, result.stderr
+    assert "arg=--runner\narg=gb300-4gpu\n" in result.stdout
+    assert "arg=b200-4gpu" not in result.stdout
+    assert "arg=gb200-4gpu" not in result.stdout
+    assert "artifact=/data/home/test-coordinator/tokenspeed-slurm" in result.stdout
+    assert "cache=/data/home/test-coordinator/tokenspeed-cache" in result.stdout
+
+
+def test_slurm_dispatch_preserves_gb200_defaults(tmp_path):
+    result = run_slurm_dispatch_script(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "arg=--runner\narg=b200-4gpu\n" in result.stdout
+    assert "arg=--runner\narg=gb200-4gpu\n" in result.stdout
+    assert "artifact=\n" in result.stdout
+    assert "cache=\n" in result.stdout
+
+
+def test_slurm_dispatch_resolves_missing_coordinator_user(tmp_path):
+    result = run_slurm_dispatch_script(tmp_path, CLUSTER="gb300", USER="")
+    coordinator_user = subprocess.run(
+        ["id", "-un"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+    assert result.returncode == 0, result.stderr
+    assert f"artifact=/data/home/{coordinator_user}/tokenspeed-slurm" in result.stdout
+    assert f"cache=/data/home/{coordinator_user}/tokenspeed-cache" in result.stdout
+
+
+def test_slurm_dispatch_rejects_runner_for_another_cluster(tmp_path):
+    result = run_slurm_dispatch_script(
+        tmp_path,
+        CLUSTER="gb300",
+        RUNNERS="b200-4gpu",
+    )
+
+    assert result.returncode == 2
+    assert "Runner b200-4gpu is not supported by the gb300 cluster" in result.stderr
+
+
+def test_nvidia_arm_dispatch_excludes_gb300_without_a_runner_pool():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/pr-test-nvidia-arm.yml")
+    scan_step = next(
+        step
+        for step in workflow["jobs"]["scan"]["steps"]
+        if step.get("name") == "Build task matrix"
+    )
+    excluded = scan_step["env"]["TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"]
+
+    assert excluded.startswith("gb300,")
 
 
 def test_qwen35_agentic_allows_declared_80k_context():
