@@ -1224,6 +1224,9 @@ class DeepseekV3AttentionMLA(nn.Module):
             kv_a_normed, k_pe = token_to_kv_pool.get_mla_kv_buffer(
                 self.attn_mha, chunk_kv_indices, read_dtype
             )
+            reconstruct_prefix_kv = getattr(attn_backend, "reconstruct_prefix_kv", None)
+            if reconstruct_prefix_kv is not None:
+                kv_a_normed, k_pe = reconstruct_prefix_kv(kv_a_normed, k_pe)
 
             kv_a_normed = kv_a_normed.squeeze(1)
             kv = self.kv_b_proj(kv_a_normed)[0]

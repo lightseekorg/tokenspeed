@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from functools import cached_property
@@ -97,6 +98,7 @@ class CacheRecipe(ABC):
     def setup(self) -> CacheSetup:
         """Run the pipeline for this family and bind it to the budget."""
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+            CachePlacementContract,
             CachePoolSpec,
             CacheSetup,
         )
@@ -123,6 +125,22 @@ class CacheRecipe(ABC):
                 token_capacity=self.token_capacity(layout, num_lcm_blocks),
                 layer_kv_head_counts=self.layer_kv_head_counts,
                 pool_options=self.pool_options(),
+                placement_contract=CachePlacementContract(
+                    dcp_size=int(getattr(self.attn_config, "dcp_size", 1)),
+                    dcp_rank=int(getattr(self.attn_config, "dcp_rank", 0)),
+                    layer_placements=tuple(
+                        (
+                            "cyclic_history"
+                            if (
+                                layer_id < self.num_target_layers
+                                and int(getattr(self.attn_config, "dcp_size", 1)) > 1
+                                and group_id == "full_attention"
+                            )
+                            else "replicated"
+                        )
+                        for layer_id, group_id in enumerate(self.group_ids)
+                    ),
+                ),
             ),
             num_draft_layers=self.num_draft_layers,
             cache_budget_bytes=self.cache_budget_bytes,
@@ -186,7 +204,14 @@ class CacheRecipe(ABC):
     @property
     def prefix_granularity(self) -> int:
         """Scheduler-wide identity grain in tokens."""
-        return int(self.attn_config.prefix_granularity)
+        configured = int(self.attn_config.prefix_granularity)
+        dcp_size = int(getattr(self.attn_config, "dcp_size", 1))
+        if dcp_size == 1:
+            return configured
+        kernel_page_size = int(
+            getattr(self.attn_config, "kernel_page_size", None) or 64
+        )
+        return math.lcm(configured, kernel_page_size * dcp_size)
 
     @property
     def alignment(self) -> int:

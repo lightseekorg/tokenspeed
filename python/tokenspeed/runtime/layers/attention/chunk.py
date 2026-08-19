@@ -41,6 +41,8 @@ def create_chunked_cache_kv_indices_paged(
     chunk_kv_indices_ptr,  # (num_chunk_tokens,)
     page_table_ptr_stride: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
@@ -56,12 +58,16 @@ def create_chunked_cache_kv_indices_paged(
         offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
         mask = offset < chunk_seq_len
         token_pos = chunk_start_pos + offset
-        page_idx = token_pos // PAGE_SIZE
+        owned = token_pos % DCP_SIZE == DCP_RANK
+        local_pos = token_pos // DCP_SIZE
+        page_idx = local_pos // PAGE_SIZE
         page_id = tl.load(
             page_table_ptr + req_pool_index * page_table_ptr_stride + page_idx,
-            mask=mask,
+            mask=mask & owned,
+            other=0,
         )
-        kv_slot = page_id * PAGE_SIZE + token_pos % PAGE_SIZE
+        kv_slot = page_id * PAGE_SIZE + local_pos % PAGE_SIZE
+        kv_slot = tl.where(owned, kv_slot, 0)
         tl.store(
             chunk_kv_indices_ptr + chunk_kv_indices_offset + offset,
             kv_slot,
@@ -127,7 +133,14 @@ def chunking(prefix_lens: torch.Tensor, num_chunks, batch_size, chunk_len):
 
 
 def get_chunks_paged(
-    prefix_lens, prefix_lens_cpu, page_table, req_pool_indices, page_size
+    prefix_lens,
+    prefix_lens_cpu,
+    page_table,
+    req_pool_indices,
+    page_size,
+    *,
+    dcp_size=1,
+    dcp_rank=0,
 ):
     """Page-table aware version of get_chunks."""
     device: torch.device = prefix_lens.device
@@ -157,6 +170,8 @@ def get_chunks_paged(
             chunk_kv_indices,
             page_table.shape[1],
             page_size,
+            DCP_SIZE=dcp_size,
+            DCP_RANK=dcp_rank,
         )
         chunk_kv_indices_list.append(chunk_kv_indices)
 
@@ -169,6 +184,9 @@ def build_chunked_prefill_metadata_arrays(
     page_table,
     req_pool_indices,
     page_size,
+    *,
+    dcp_size=1,
+    dcp_rank=0,
 ):
     """Build the per-prefix-loop arrays for chunked-prefill MLA.
 
@@ -195,6 +213,8 @@ def build_chunked_prefill_metadata_arrays(
         page_table,
         req_pool_indices,
         page_size,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
     )
     chunked_loop_num = chunks.starts.shape[0]
     max_chunk_len_per_loop = [

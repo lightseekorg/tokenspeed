@@ -2154,6 +2154,12 @@ class HybridLinearAttnBackend(AttentionBackend):
     def forward_extend_chunked(self, *args, **kwargs):
         return self.full_attn_backend.forward_extend_chunked(*args, **kwargs)
 
+    def reconstruct_prefix_kv(self, *args, **kwargs):
+        reconstruct = getattr(self.full_attn_backend, "reconstruct_prefix_kv", None)
+        if reconstruct is None:
+            return args
+        return reconstruct(*args, **kwargs)
+
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         # Composite: the full-attention child owns the seq_lens the draft reads.
         self.full_attn_backend.advance_draft_forward_metadata(seq_lens)

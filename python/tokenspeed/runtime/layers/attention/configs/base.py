@@ -90,6 +90,11 @@ class BaseAttnConfig:
     # per request) instead of Eagle/MTP's per-step single-token decode. Backends
     # use this to expand decode metadata to spec_num_tokens rows per request.
     draft_block_decode: bool = False
+    # Decode context parallelism is nested inside attention TP. Non-MLA and
+    # replicated draft configurations retain the identity defaults.
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    dcp_group: tuple[int, ...] = (0,)
 
     @classmethod
     def generate(
