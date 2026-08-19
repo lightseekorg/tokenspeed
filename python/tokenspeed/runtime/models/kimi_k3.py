@@ -2316,10 +2316,11 @@ class KimiLinearDecoderLayer(nn.Module):
             else None
         )
         attnres_partial_args = None
-        if next_mix is not None and self._hoist_next_mlp and num_tokens == 1:
+        if next_mix is not None and self._hoist_next_mlp:
             next_layer, _ = next_mix
             # This layer's attention projection writes both block partials
             # hoisted for the next layer, which consumes their scratch slots.
+            # Kernel availability below is the token-count capability gate.
             candidate_args = (
                 block_residual[:mlp_valid_blocks],
                 next_layer._mlp_wp,
@@ -2340,6 +2341,12 @@ class KimiLinearDecoderLayer(nn.Module):
                     self.k3_comm.state.attn_ar_fusion_ok
                     and num_tokens
                     <= global_server_args_dict["comm_fusion_max_num_tokens"]
+                )
+                or (
+                    # The gfx950 fused reducer consumes the AttnRes scratch
+                    # through M=16, so its producer stream must join first.
+                    current_platform().is_cdna4
+                    and num_tokens <= ATTNRES_STREAM_FORK_THRESHOLD
                 )
             )
         )
