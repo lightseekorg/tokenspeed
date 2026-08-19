@@ -53,7 +53,7 @@ WARP_DECODE_STAGE1_NUM_WARPS = 4
 WARP_DECODE_STAGE2_BLOCK_N = 8
 WARP_DECODE_STAGE2_BLOCK_KB = 512
 WARP_DECODE_STAGE2_NUM_WARPS = 8
-WARP_DECODE_STAGE2_M4_NUM_WARPS = 4
+WARP_DECODE_STAGE2_BATCHED_NUM_WARPS = 4
 _MIN_WARP_DECODE_BLOCK_KB = 128
 _KIMI3_SHARED_K = gl.constexpr(768)
 _KIMI3_SHARED_BLOCK_K = gl.constexpr(512)
@@ -290,6 +290,10 @@ def _stage2_a16w4_warp_gemv_combine(
     stride_ids,
     stride_twm,
     stride_tws,
+    stride_sim,
+    stride_sik,
+    stride_som,
+    stride_son,
     FUSE_SHARED_DOWN: gl.constexpr,
     NUM_ROUTED_PROGRAMS: gl.constexpr,
     TOP_K: gl.constexpr,
@@ -297,13 +301,16 @@ def _stage2_a16w4_warp_gemv_combine(
     NUM_LOCAL_EXPERTS: gl.constexpr,
     LINEAR_WEIGHTS: gl.constexpr,
     NUM_PID_N: gl.constexpr,
+    NUM_SHARED_PID_N: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_KB: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
     pid = gl.program_id(0)
     if FUSE_SHARED_DOWN and pid >= NUM_ROUTED_PROGRAMS:
-        shared_pid_n = pid - NUM_ROUTED_PROGRAMS
+        shared_pid = pid - NUM_ROUTED_PROGRAMS
+        shared_token = shared_pid // NUM_SHARED_PID_N
+        shared_pid_n = shared_pid % NUM_SHARED_PID_N
         shared_layout: gl.constexpr = gl.BlockedLayout(
             [1, _KIMI3_SHARED_BLOCK_K // _LANES],
             [1, _LANES],
@@ -323,7 +330,9 @@ def _stage2_a16w4_warp_gemv_combine(
             shared_k_valid = shared_offs_k < _KIMI3_SHARED_K
             shared_input = gl.amd.cdna4.buffer_load(
                 ptr=shared_input_ptr,
-                offsets=shared_offs_k.to(gl.int32),
+                offsets=(shared_token * stride_sim + shared_offs_k * stride_sik).to(
+                    gl.int32
+                ),
                 mask=shared_k_valid,
                 other=0.0,
             ).to(gl.float32)
@@ -345,7 +354,7 @@ def _stage2_a16w4_warp_gemv_combine(
                 axis=1,
             )
         gl.store(
-            shared_out_ptr + shared_offs_n,
+            shared_out_ptr + shared_token * stride_som + shared_offs_n * stride_son,
             shared_acc.to(shared_out_ptr.dtype.element_ty),
         )
         return
@@ -486,12 +495,11 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
             raise ValueError(
                 "Kimi K3 shared input and weight must be provided together"
             )
-        if tuple(shared_input.shape) != (1, 768) or tuple(shared_weight.shape) != (
-            7168,
-            768,
-        ):
+        if tuple(shared_input.shape) != (hidden_states.shape[0], 768) or tuple(
+            shared_weight.shape
+        ) != (7168, 768):
             raise ValueError(
-                "Kimi K3 shared down fusion requires [1, 768] input and "
+                "Kimi K3 shared down fusion requires [M, 768] input and "
                 "[7168, 768] weight"
             )
         if (
@@ -642,10 +650,10 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         packed_intermediate,
         WARP_DECODE_STAGE2_BLOCK_KB,
     )
-    # Smaller shapes and the M=1 joint path remain faster with eight waves.
+    # The M=1 joint path remains faster with eight waves.
     stage2_warps = (
-        WARP_DECODE_STAGE2_M4_NUM_WARPS
-        if num_tokens == 4 and not fuse_shared_down
+        WARP_DECODE_STAGE2_BATCHED_NUM_WARPS
+        if num_tokens in (2, 4)
         else WARP_DECODE_STAGE2_NUM_WARPS
     )
     if hidden_dim % stage2_block_n or packed_intermediate % stage2_block_kb:
@@ -654,21 +662,23 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
     if fuse_shared_down:
         if shared_out is None:
             shared_out = torch.empty(
-                (1, 7168), dtype=torch.bfloat16, device=hidden_states.device
+                (num_tokens, 7168),
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
             )
         if (
-            shared_out.shape != (1, 7168)
+            shared_out.shape != (num_tokens, 7168)
             or shared_out.dtype != torch.bfloat16
             or not shared_out.is_contiguous()
             or shared_out.device != hidden_states.device
         ):
-            raise ValueError("shared output must be contiguous BF16 [1, 7168]")
+            raise ValueError("shared output must be contiguous BF16 [M, 7168]")
     else:
         if shared_out is not None:
             raise ValueError("shared output requires fused shared down")
         shared_out = out
     total_stage2_grid = stage2_grid + (
-        triton.cdiv(7168, stage2_block_n) if fuse_shared_down else 0
+        num_tokens * triton.cdiv(7168, stage2_block_n) if fuse_shared_down else 0
     )
     _stage2_a16w4_warp_gemv_combine[(total_stage2_grid,)](
         inter,
@@ -696,6 +706,10 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         local_topk_ids.stride(1),
         topk_weights.stride(0),
         topk_weights.stride(1),
+        shared_input.stride(0) if shared_input is not None else out.stride(0),
+        shared_input.stride(1) if shared_input is not None else out.stride(1),
+        shared_out.stride(0),
+        shared_out.stride(1),
         FUSE_SHARED_DOWN=fuse_shared_down,
         NUM_ROUTED_PROGRAMS=stage2_grid,
         TOP_K=top_k,
@@ -703,6 +717,7 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         NUM_LOCAL_EXPERTS=num_experts,
         LINEAR_WEIGHTS=linear_weights,
         NUM_PID_N=hidden_dim // stage2_block_n,
+        NUM_SHARED_PID_N=7168 // stage2_block_n,
         BLOCK_N=stage2_block_n,
         BLOCK_KB=stage2_block_kb,
         NUM_WARPS=stage2_warps,
