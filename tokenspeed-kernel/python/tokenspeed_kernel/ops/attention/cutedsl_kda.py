@@ -101,9 +101,6 @@ def cutedsl_kda_chunk_prefill(
     # The bound is a compile-time CUBIN constant; mismatches must fail
     # loudly rather than silently mis-gate.
     cutedsl_kda_check_config(float(lower_bound))
-    if cu_seqlens_cpu is not None and not cutedsl_kda_supports_host_hint():
-        # Hint-unaware package build: fall back to its own D2H read.
-        cu_seqlens_cpu = None
     batch, tokens, num_heads, key_dim = q.shape
     num_value_heads, value_dim = v.shape[2], v.shape[-1]
     if cu_seqlens is not None:
@@ -150,6 +147,11 @@ def cutedsl_kda_chunk_prefill(
             dtype=torch.float32,
             device=q.device,
         )
+    # The gate runs AFTER the batch fallback above so it also covers the
+    # synthesized hint: hint-unaware package builds fall back to their own
+    # D2H read instead of receiving an unknown kwarg.
+    if cu_seqlens_cpu is not None and not cutedsl_kda_supports_host_hint():
+        cu_seqlens_cpu = None
     # Decomposition-route scratch (0 bytes on the engine route); preallocated
     # here so the wrapper does not allocate on the hot path.
     ws_bytes = cutedsl_kda_workspace_size(

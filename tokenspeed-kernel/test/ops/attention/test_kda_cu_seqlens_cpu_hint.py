@@ -175,6 +175,47 @@ def test_dispatch_forwards_hint_only_when_set():
     assert calls[-1]["cu_seqlens_cpu"] == (0, T)
 
 
+def test_hint_dropped_on_hint_unaware_package(stubbed_wrapper, monkeypatch):
+    """Probe=False must suppress BOTH caller-provided and synthesized hints."""
+    monkeypatch.setattr(cutedsl_op, "cutedsl_kda_supports_host_hint", lambda: False)
+
+    # varlen path with an explicit hint
+    q, k, v, g, beta, a_log, dt_bias = _inputs()
+    cu = torch.tensor([0, 10, T], dtype=torch.int32)
+    cutedsl_op.cutedsl_kda_chunk_prefill(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        a_log,
+        dt_bias,
+        initial_state=None,
+        cu_seqlens=cu,
+        cu_seqlens_cpu=(0, 10, T),
+        lower_bound=-5.0,
+    )
+    assert stubbed_wrapper["ws_cu_seqlens_cpu"] is None
+    assert stubbed_wrapper["fwd_cu_seqlens_cpu"] is None
+
+    # batch fallback path (synthesizes its own hint internally)
+    q, k, v, g, beta, a_log, dt_bias = _inputs(tokens=16, batch=2)
+    cutedsl_op.cutedsl_kda_chunk_prefill(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        a_log,
+        dt_bias,
+        initial_state=None,
+        cu_seqlens=None,
+        lower_bound=-5.0,
+    )
+    assert stubbed_wrapper["ws_cu_seqlens_cpu"] is None
+    assert stubbed_wrapper["fwd_cu_seqlens_cpu"] is None
+
+
 def test_facade_forwards_hint_only_when_set(monkeypatch):
     import tokenspeed_kernel.ops.attention as attn
 
