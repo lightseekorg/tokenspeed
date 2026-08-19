@@ -256,6 +256,8 @@ def test_dynamic_mxfp4_activation_moe(
         w2_mx_scale=module.w2_precision_config.b_mx_scale,
         out=output,
     )
+    torch.cuda.synchronize()
+    assert stages == [1, 2, 1, 2]
     assert direct.data_ptr() == output.data_ptr()
     torch.testing.assert_close(direct, actual, atol=0, rtol=0)
     hidden = _dequantize_dynamic_mxfp4(hidden_states)
