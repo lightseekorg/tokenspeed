@@ -32,6 +32,7 @@ import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import torch
 from tokenspeed_kernel.ops.gemm.kimi3 import (
     kimi3_latent_projection,
+    kimi3_latent_projection_add,
     kimi3_latent_projection_add3,
     kimi3_mla_qkv_gate_projection,
     kimi3_qkvfab_projection,
@@ -61,6 +62,7 @@ __all__ = [
     "linear_attnres_partials",
     "linear_attnres_partials_available",
     "kimi3_latent_projection",
+    "kimi3_latent_projection_add",
     "kimi3_mla_qkv_gate_projection",
     "kimi3_latent_projection_add3",
     "kimi3_qkvfab_projection",

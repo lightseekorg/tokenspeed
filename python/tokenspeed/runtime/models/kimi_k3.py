@@ -781,11 +781,18 @@ def _assemble_fp8_fused_qkv_a(
 
 
 def _shard_k3_up_projection(mapping: Mapping, hidden_size: int) -> bool:
-    """Whether to column-shard K3's routed up projection on NVIDIA."""
+    """Whether the active K3 tail can consume a column-sharded projection."""
     return (
-        torch.version.hip is None
-        and mapping.moe.tp_ep_size > 1
+        mapping.moe.tp_ep_size > 1
         and hidden_size % mapping.moe.tp_ep_size == 0
+        and (
+            torch.version.hip is None
+            or (
+                current_platform().is_cdna4
+                and mapping.moe.tp_size == 8
+                and mapping.moe.ep_size == 1
+            )
+        )
     )
 
 
@@ -1597,6 +1604,11 @@ class KimiLinearMoE(nn.Module):
                 ),
                 joint_expert_shared_max_tokens=(
                     JOINT_EXPERT_SHARED_MAX_TOKENS if joint_expert_shared else 0
+                ),
+                sharded_output_min_tokens=(
+                    8
+                    if current_platform().is_cdna4 and self._shard_up_projection
+                    else 0
                 ),
             )
             if self.execution_plan.use_native

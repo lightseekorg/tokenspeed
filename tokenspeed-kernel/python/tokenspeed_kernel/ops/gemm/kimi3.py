@@ -578,6 +578,98 @@ def kimi3_latent_projection_add3(
     return add3(prefix, projected, shared_output)
 
 
+def kimi3_latent_projection_add(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    addend: torch.Tensor,
+    *,
+    norm_weight: torch.Tensor | None = None,
+    eps: float | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Project K3 latent rows and add one possibly strided output slice.
+
+    Args:
+        hidden_states: Contiguous latent rows shaped ``[M, K]``.
+        weight: Contiguous projection weight shaped ``[N, K]``.
+        addend: Output addend shaped ``[M, N]`` with unit inner stride.
+        norm_weight: Optional contiguous RMSNorm weight shaped ``[K]``.
+        eps: Positive RMSNorm epsilon required with ``norm_weight``.
+        out: Optional output shaped like ``addend``; it may alias ``addend``.
+
+    Returns:
+        ``hidden_states @ weight.T + addend``, optionally written to ``out``.
+    """
+
+    m, n, k = _validate_fallback_projection(
+        hidden_states,
+        weight,
+        None,
+        name="Kimi K3 latent projection-add",
+    )
+    expected_shape = (m, n)
+    for name, tensor in (("addend", addend), ("out", out)):
+        if tensor is None:
+            continue
+        if (
+            tensor.shape != expected_shape
+            or tensor.dtype != hidden_states.dtype
+            or tensor.device != hidden_states.device
+            or tensor.stride(1) != 1
+        ):
+            raise ValueError(
+                f"Kimi K3 latent projection {name} must match the input and "
+                f"have shape {expected_shape} with unit inner stride"
+            )
+    if norm_weight is not None:
+        if (
+            norm_weight.shape != (k,)
+            or norm_weight.dtype != hidden_states.dtype
+            or norm_weight.device != hidden_states.device
+            or not norm_weight.is_contiguous()
+        ):
+            raise ValueError("Kimi K3 norm weight must match the latent input")
+        if eps is None or eps <= 0:
+            raise ValueError("Kimi K3 RMSNorm epsilon must be positive")
+        if (
+            Platform.get().is_cdna4
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and weight.is_contiguous()
+            and k == KIMI3_LATENT_SIZE
+            and n % 32 == 0
+        ):
+            from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.rmsnorm_linear_add import (
+                gluon_rmsnorm_linear_add_gfx950,
+            )
+
+            return gluon_rmsnorm_linear_add_gfx950(
+                hidden_states,
+                norm_weight,
+                weight,
+                None,
+                addend,
+                eps=eps,
+                out=out,
+            )
+        source = hidden_states.float()
+        hidden_states = (
+            source
+            * torch.rsqrt(source.square().mean(dim=-1, keepdim=True) + eps)
+            * norm_weight.float()
+        ).to(hidden_states.dtype)
+    elif eps is not None:
+        raise ValueError("Kimi K3 RMSNorm epsilon requires a norm weight")
+    if out is None:
+        return torch.addmm(addend, hidden_states, weight.T)
+    if out.data_ptr() != addend.data_ptr():
+        out.copy_(addend)
+    out.addmm_(hidden_states, weight.T)
+    return out
+
+
 def kimi3_shared_situ_projection(
     hidden_states: torch.Tensor,
     gate_up_weight: torch.Tensor,
@@ -1009,6 +1101,7 @@ __all__ = [
     "KIMI3_SHARED_LOCAL_SIZE",
     "Kimi3MLAQKVGateProjection",
     "kimi3_latent_projection",
+    "kimi3_latent_projection_add",
     "kimi3_latent_projection_add3",
     "kimi3_mla_qkv_gate_projection",
     "kimi3_qkvfab_projection",

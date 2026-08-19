@@ -75,6 +75,25 @@ class _Add3Up(nn.Module):
         return prefix_sum + routed_output + shared_output
 
 
+class _ShardUp(_Add3Up):
+    shard_group = (0, 1)
+
+    def project_shard_add_(
+        self,
+        routed_latent: torch.Tensor,
+        shared_output: torch.Tensor,
+        *,
+        norm_weight: torch.Tensor | None = None,
+        eps: float | None = None,
+    ) -> torch.Tensor:
+        if norm_weight is not None:
+            assert eps == 1e-6
+            routed_latent = routed_latent + 3
+        output = shared_output[:, :2]
+        output.add_(routed_latent)
+        return output
+
+
 class _WeightedNorm(_Norm):
     def __init__(self) -> None:
         super().__init__()
@@ -621,6 +640,44 @@ def test_latent_moe_acquires_shared_and_routed_outputs(
     expected = routed + hidden_states * 4 + 5
     torch.testing.assert_close(actual, expected)
     assert len(acquisitions) == 1
+
+
+def test_latent_moe_shards_projection_before_final_reduce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def reduce_output(value, group):
+        assert group == (0, 1)
+        calls.append(tuple(value.shape))
+        return value * 2
+
+    monkeypatch.setattr(latent_module, "all_reduce", reduce_output)
+    monkeypatch.setattr(
+        latent_module,
+        "acquire_all_reduce_outputs",
+        lambda *_args, **_kwargs: pytest.fail("sharded tail uses ordered reductions"),
+    )
+    layer = _layer(
+        routed_norm=_WeightedNorm(),
+        routed_up_proj=_ShardUp(),
+        shared_experts=_Shared(),
+        joint_reduce=True,
+        expert_parallel_group=(0,),
+        joint_reduce_group=(0, 1),
+        sharded_output_min_tokens=2,
+    )
+    hidden_states = torch.arange(8, dtype=torch.float32).view(2, 4)
+    prefix_sum = torch.full_like(hidden_states, 7)
+
+    actual = layer(hidden_states, prefix_sum=prefix_sum)
+
+    routed = (hidden_states[:, :2] + 1) * 2 + 3
+    shared = hidden_states * 4
+    shared[:, :2] += routed
+    expected = prefix_sum + shared * 2
+    torch.testing.assert_close(actual, expected)
+    assert calls == [(2, 2), (2, 4)]
 
 
 def test_latent_moe_can_return_separate_residual_components() -> None:

@@ -188,6 +188,43 @@ def test_kimi3_rmsnorm_linear_add_matches_composed_and_captures(
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.parametrize("num_tokens", [8, 16])
+def test_kimi3_rmsnorm_linear_add_shard_updates_strided_slice(
+    num_tokens: int,
+) -> None:
+    torch.manual_seed(41)
+    latent = torch.randn(num_tokens, 3584, device="cuda", dtype=torch.bfloat16)
+    norm_weight = torch.randn(3584, device="cuda", dtype=torch.bfloat16)
+    projection_weight = torch.randn(896, 3584, device="cuda", dtype=torch.bfloat16)
+    shared = torch.randn(num_tokens, 7168, device="cuda", dtype=torch.bfloat16)
+    output = shared[:, 896:1792]
+    addend = output.clone()
+    source = latent.float()
+    normalized = (
+        source
+        * torch.rsqrt(source.square().mean(dim=-1, keepdim=True) + 1e-6)
+        * norm_weight.float()
+    ).to(latent.dtype)
+    projected = torch.nn.functional.linear(normalized, projection_weight)
+    expected = (projected.float() + addend.float()).to(latent.dtype)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = tokenspeed_kernel.kimi3_latent_projection_add(
+            latent,
+            projection_weight,
+            output,
+            norm_weight=norm_weight,
+            eps=1e-6,
+            out=output,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert actual.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
 def test_kimi3_latent_projection_rejects_forced_kernel_for_non_k3_shape() -> None:
     hidden_states = torch.empty(1, 128, device="cuda", dtype=torch.bfloat16)
     weight = torch.empty(64, 128, device="cuda", dtype=torch.bfloat16)

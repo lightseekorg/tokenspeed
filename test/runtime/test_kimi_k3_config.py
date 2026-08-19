@@ -495,6 +495,40 @@ class KimiK3RegistrationTests(unittest.TestCase):
             layer.native_latent_moe.components["expert_parallel_group"], ep_group
         )
 
+    def test_kimi_moe_shards_amd_up_projection_only_for_tp8(self):
+        import tokenspeed.runtime.models.kimi_k3 as kimi_k3
+
+        def mapping(tp_size, ep_size):
+            return SimpleNamespace(
+                moe=SimpleNamespace(
+                    tp_size=tp_size,
+                    ep_size=ep_size,
+                    tp_ep_size=tp_size * ep_size,
+                )
+            )
+
+        with (
+            mock.patch.object(kimi_k3.torch.version, "hip", "6.4"),
+            mock.patch.object(
+                kimi_k3,
+                "current_platform",
+                return_value=SimpleNamespace(is_cdna4=True),
+            ),
+        ):
+            self.assertTrue(kimi_k3._shard_k3_up_projection(mapping(8, 1), 64))
+            self.assertFalse(kimi_k3._shard_k3_up_projection(mapping(4, 1), 64))
+            self.assertFalse(kimi_k3._shard_k3_up_projection(mapping(1, 8), 64))
+
+        with (
+            mock.patch.object(kimi_k3.torch.version, "hip", None),
+            mock.patch.object(
+                kimi_k3,
+                "current_platform",
+                return_value=SimpleNamespace(is_cdna4=False),
+            ),
+        ):
+            self.assertTrue(kimi_k3._shard_k3_up_projection(mapping(1, 8), 64))
+
     def test_cross_dp_ep_gather_uses_dp_group_and_returns_local_offset(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
 
