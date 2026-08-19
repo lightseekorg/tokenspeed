@@ -1046,9 +1046,14 @@ class KdaAttnBackend(MambaAttnBackend):
         if not weights:
             raise RuntimeError("KDA pending flush has no captured verify projections")
         mask = torch.zeros(old_bs, dtype=torch.bool, device=self.device)
-        flush_slots = torch.tensor(
-            [slot_by_rpi[r] for r in targets], dtype=torch.int64, device=self.device
-        )
+        # Pinned staging for the same reason as the record path above: building
+        # a CUDA tensor from a Python list is a pageable copy, which blocks the
+        # host until this stream drains -- here that is the overlapped previous
+        # forward, on every verify-to-extend transition.
+        host_slots = torch.empty(len(targets), dtype=torch.int64, pin_memory=True)
+        host_slots.copy_(torch.tensor([slot_by_rpi[r] for r in targets]))
+        flush_slots = torch.empty_like(host_slots, device=self.device)
+        flush_slots.copy_(host_slots, non_blocking=True)
         mask[flush_slots] = True
         # The slot table gates every write: a row the compose condemned (or
         # a drop cleared) since this pending was recorded self-masks here,

@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+    CudaGraphWrapper,
     _should_settle_with_accept_lengths,
 )
 from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import DeepseekV4DSpark
@@ -379,3 +380,86 @@ def test_kda_commit_is_skipped_outside_decode() -> None:
 
 
 # Every attention backend now inherits the settlement hook.
+
+
+class _SettleRecordingBackend:
+    needs_group_block_tables = False
+    uses_cache_groups = False
+
+    def __init__(self) -> None:
+        self.settled = []
+
+    def settle_deferred_state(self, accepted_length) -> None:
+        self.settled.append(accepted_length)
+
+
+class _WrapperHarness:
+    """Only the state ``CudaGraphWrapper.__call__`` reads on its eager path."""
+
+    def __init__(self, backend, result) -> None:
+        self.attn_backend = backend
+        self._result = result
+        self.metadata_calls = 0
+        self.input_buffers = SimpleNamespace(
+            seq_lens_buf=torch.ones(4, dtype=torch.int32),
+            req_pool_indices_buf=torch.arange(4, dtype=torch.int32),
+        )
+        self.token_to_kv_pool = SimpleNamespace(
+            arena=SimpleNamespace(cache_group_specs=())
+        )
+
+    def _can_use_graph(self, bs, ctx) -> bool:
+        return False
+
+    def _any_backend_uses_cache_groups(self) -> bool:
+        return False
+
+    def _init_forward_metadata(self, *args, **kwargs) -> None:
+        self.metadata_calls += 1
+
+    def _forward_func(self, *, bs, ctx, sampling_info):
+        return self._result
+
+
+def _drive_wrapper(forward_mode, drafter, result):
+    backend = _SettleRecordingBackend()
+    harness = _WrapperHarness(backend, result)
+    harness.drafter = drafter
+    ctx = SimpleNamespace(
+        bs=1,
+        forward_mode=forward_mode,
+        num_extends=0,
+        input_num_tokens=1,
+        global_num_tokens=None,
+        all_decode_or_idle=True,
+        capture_hidden_mode=None,
+    )
+    got = CudaGraphWrapper.__call__(
+        harness,
+        bs=1,
+        ctx=ctx,
+        sampling_info=None,
+        page_table=torch.zeros(1, 1, dtype=torch.int32),
+    )
+    assert got is result
+    assert harness.metadata_calls == 1
+    return backend
+
+
+def test_every_forward_settles_deferred_state_through_the_wrapper():
+    """The engine, not the test harness, owes the backend its settlement.
+
+    A backend that enqueued work inside the forward is told it landed on
+    EVERY forward -- with the accept lengths when a speculative verify ran,
+    with None otherwise. Without this call a KDA pending record stays live
+    and the next verify replays the accepted prefix a second time.
+    """
+    accept_lengths = torch.tensor([2, 1], dtype=torch.int32)
+    result = ("logits", accept_lengths)
+
+    verify = _drive_wrapper(ForwardMode.DECODE, object(), result)
+    assert len(verify.settled) == 1
+    assert verify.settled[0] is accept_lengths
+
+    plain = _drive_wrapper(ForwardMode.EXTEND, None, result)
+    assert plain.settled == [None]

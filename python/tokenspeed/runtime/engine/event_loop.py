@@ -519,6 +519,7 @@ class EventLoop:
             reset_caches_fn=self._reset_caches_for_release,
             kv_repair_fn=self._kv_repair_after_wake,
             kv_cache_release_allowed=kv_cache_release_allowed,
+            settle_deferred_fn=self._flush_deferred_state,
         )
 
         self.metrics = EngineMetrics(

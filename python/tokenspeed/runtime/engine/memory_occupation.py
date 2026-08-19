@@ -73,6 +73,7 @@ class MemoryOccupationController:
         reset_caches_fn: Callable[[], bool],
         kv_repair_fn: Callable[[], None],
         kv_cache_release_allowed: bool = True,
+        settle_deferred_fn: Callable[[], None] | None = None,
     ) -> None:
         self._send = send_func
         self._pause = pause_controller
@@ -80,6 +81,9 @@ class MemoryOccupationController:
         self._enabled = enabled
         self._reset_caches = reset_caches_fn
         self._kv_repair = kv_repair_fn
+        # Resolves deferred backend state; see ``_finish_release``. Engines
+        # whose backends never defer wire nothing.
+        self._settle_deferred = settle_deferred_fn
         # Whether releasing the ``kv_cache`` region is safe in this engine. False
         # when prefix caching is on but the scheduler exposes no prefix-cache
         # reset: discarded KV would leave stale cache entries that survive wake
@@ -130,6 +134,12 @@ class MemoryOccupationController:
         )
 
     def _finish_release(self, tags: list[str]) -> None:
+        # Deferred backend work replays through the weights and writes into
+        # the state pages this is about to unmap, so it settles first. The
+        # pause fence cannot cover this: a release stays at PAUSED_NEW until
+        # the line below moves it on.
+        if self._settle_deferred is not None:
+            self._settle_deferred()
         for tag in tags:
             self._adapter.pause(tag=tag)
             self.released_tags.add(tag)

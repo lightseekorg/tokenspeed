@@ -1565,3 +1565,83 @@ def test_slot_table_holds_every_index_the_scheduler_can_deliver():
     assert KDA_SLOT_TABLE_PADDING >= 2
     assert graph_padding_index < table.shape[0], "graph padding lands out of range"
     assert table.shape[0] - 1 > max_bs, "sentinel row can hold a live slot"
+
+
+def test_graph_padded_lanes_never_alias_a_live_owner():
+    """Padding rides on rows the scheduler can also hand to a real request.
+
+    A recorded batch inverts its slot map into ``rpi_by_slot``. The lanes a
+    CUDA-graph bucket padded past the real batch have no owner, so they must
+    address the sentinel row -- permanently -1, self-masking every later flush
+    and fuse. Pointing them at any addressable pool index instead lets a padded
+    lane inherit whichever request lands there, which is why the batch here
+    holds the highest live index the scheduler can deliver.
+    """
+    h = _Harness(seed=41)
+    max_bs = h.backend.max_bs
+    rpis = [0, max_bs]  # the top live index the scheduler can deliver
+    pages = _pages_for(h, rpis)
+    padded_bs = len(rpis) + 2
+
+    # verify_round's batch is exactly its real rows; a graph bucket pads past
+    # them, which is the case the sentinel exists for. The bucket's table is
+    # sized to the padded batch -- only the real rows carry an owner.
+    padded_pages = {
+        gid: pages[gid] + [pages[gid][-1]] * (padded_bs - len(rpis)) for gid in pages
+    }
+    metadata, op = _metadata_op(h.contract, _tables_for(padded_pages), rpis)
+    h.backend.init_forward_metadata(
+        bs=padded_bs,
+        req_pool_indices=torch.tensor(
+            rpis + [max_bs + 1] * 2, dtype=torch.int32, device=DEV
+        ),
+        seq_lens=torch.full((padded_bs,), 6, dtype=torch.int32, device=DEV),
+        forward_mode=ForwardMode.DECODE,
+        cache_metadata=metadata,
+        forward_batch=op,
+    )
+    window = h.window(padded_bs, 211)
+    for layer_id in h.layer_ids:
+        p = h.params[layer_id]
+        h.backend.forward_decode(
+            None,
+            None,
+            None,
+            layer=None,
+            out_cache_loc=None,
+            token_to_kv_pool=h.pool,
+            bs=padded_bs,
+            mixed_qkv=window["mixed_qkv"].clone(),
+            f_a_out=window["f_a_out"],
+            beta_raw=window["beta_raw"],
+            g_raw=None,
+            conv_weights=p["conv_weights"],
+            bias=None,
+            activation="silu",
+            key_dim=KEY_DIM,
+            value_dim=KEY_DIM,
+            attention_tp_size=1,
+            head_k_dim=D,
+            head_v_dim=D,
+            A_log=p["A_log"],
+            dt_bias=p["dt_bias"],
+            f_b_weight=p["f_b_weight"],
+            lower_bound=_LOWER_BOUND,
+            layer_id=layer_id,
+            seq_len=padded_bs * T,
+            a=None,
+            b=None,
+        )
+    h.backend.release_deferred_state()
+    h.accept([2, 1, 0, 0])
+
+    pending = h.pending()
+    assert pending is not None, "the verify must leave a window to inspect"
+    sentinel = h.backend._kda_slot_table.shape[0] - 1
+    padded = pending["rpi_by_slot"][len(rpis) :]
+
+    assert padded.numel() == padded_bs - len(rpis), "no padded lane was recorded"
+    assert torch.equal(padded, torch.full_like(padded, sentinel)), padded.tolist()
+    # The sentinel row is the one place no live slot can be scattered into.
+    assert int(h.backend._kda_slot_table[sentinel].item()) == -1
+    assert sentinel > max_bs
