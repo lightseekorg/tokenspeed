@@ -50,7 +50,7 @@ if invoke_sigmoid_bias_topk_route_prefill_gluon is not None:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         route = (
             invoke_sigmoid_bias_topk_route_gluon
-            if router_logits.shape[0] * topk <= 128
+            if router_logits.shape[0] == 1 or router_logits.dtype != torch.float32
             else invoke_sigmoid_bias_topk_route_prefill_gluon
         )
         topk_ids, topk_weights = route(

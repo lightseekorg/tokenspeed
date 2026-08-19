@@ -152,13 +152,17 @@ def test_kimi3_latent_projection_add3_matches_torch_and_captures(
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-def test_kimi3_rmsnorm_linear_add_matches_composed_and_captures() -> None:
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4])
+def test_kimi3_rmsnorm_linear_add_matches_composed_and_captures(
+    num_tokens: int,
+) -> None:
     torch.manual_seed(37)
-    latent = torch.randn(1, 3584, device="cuda", dtype=torch.bfloat16)
+    latent = torch.randn(num_tokens, 3584, device="cuda", dtype=torch.bfloat16)
     norm_weight = torch.randn(3584, device="cuda", dtype=torch.bfloat16)
     projection_weight = torch.randn(7168, 3584, device="cuda", dtype=torch.bfloat16)
-    prefix = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
-    shared = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
+    prefix = torch.randn(num_tokens, 7168, device="cuda", dtype=torch.bfloat16)
+    shared_lane = torch.randn(num_tokens, 10752, device="cuda", dtype=torch.bfloat16)
+    shared = shared_lane[:, 3584:]
     source = latent.float()
     normalized = (
         source

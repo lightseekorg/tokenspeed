@@ -46,7 +46,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "tokens": frozenset({1}),
+            "tokens": frozenset({1, 2, 3, 4}),
             "latent_size": frozenset({3584}),
             "topk": frozenset({16}),
             "num_local_experts": frozenset({112}),

@@ -101,6 +101,37 @@ def test_public_sigmoid_bias_topk_dispatch_uses_gluon_kernel(
     assert actual_ids is sentinel_ids
 
 
+def test_public_sigmoid_bias_topk_uses_per_token_float32_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logits = torch.zeros((2, 896), device="cuda", dtype=torch.float32)
+    correction_bias = torch.zeros(896, device="cuda", dtype=torch.float32)
+    sentinel_ids = torch.empty((2, 16), device="cuda", dtype=torch.int32)
+    sentinel_weights = torch.empty((2, 16), device="cuda", dtype=torch.float32)
+
+    def launch(route_input, bias, topk, **kwargs):
+        assert route_input is logits
+        assert bias is correction_bias
+        assert topk == 16
+        return sentinel_ids, sentinel_weights
+
+    monkeypatch.setattr(
+        gluon_sigmoid_topk,
+        "invoke_sigmoid_bias_topk_route_prefill_gluon",
+        launch,
+    )
+    actual_weights, actual_ids = moe_sigmoid_bias_topk(
+        logits,
+        correction_bias,
+        16,
+        routed_scaling_factor=2.827,
+        normalize_topk_weights=True,
+    )
+
+    assert actual_weights is sentinel_weights
+    assert actual_ids is sentinel_ids
+
+
 @pytest.mark.parametrize("dtype", _ROUTE_DTYPES)
 def test_sigmoid_bias_topk_route_gluon_fuses_sigmoid(
     monkeypatch: pytest.MonkeyPatch,
