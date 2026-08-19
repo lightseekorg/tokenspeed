@@ -2072,14 +2072,16 @@ def _all_reduce_residual_attnres_can_run(
         op = torch.distributed.ReduceOp.SUM
     m, s_, acc = scratch
     platform = current_platform()
+    num_tokens = partial.shape[0] if partial.ndim == 2 else 0
     return (
         platform.is_cdna4
         and state.world_size == 8
         and op == torch.distributed.ReduceOp.SUM
-        and partial.shape == residual.shape == (1, 7168)
+        and 0 < num_tokens <= 16
+        and partial.shape == residual.shape == (num_tokens, 7168)
         and score_weight.shape == output_weight.shape == (7168,)
-        and m.shape == s_.shape == (1,)
-        and acc.shape == (1, 7168)
+        and m.shape == s_.shape == (num_tokens,)
+        and acc.shape == (num_tokens, 7168)
         and partial.dtype
         == residual.dtype
         == score_weight.dtype
@@ -2124,20 +2126,20 @@ def _all_reduce_residual_attnres(
 
     Args:
         state: Initialized communication state for the tensor-parallel group.
-        partial: Contiguous local BF16 attention partial shaped ``[1, 7168]``.
-        residual: Contiguous BF16 residual stream shaped ``[1, 7168]``.
+        partial: Contiguous local BF16 attention partial shaped ``[M, 7168]``.
+        residual: Contiguous BF16 residual stream shaped ``[M, 7168]``.
         score_weight: Contiguous BF16 AttnRes score weight shaped ``[7168]``.
         output_weight: Contiguous BF16 output RMSNorm weight shaped ``[7168]``.
         scratch: Contiguous FP32 ``(max_logit, exp_sum, weighted_sum)`` tensors
-            for the historical AttnRes candidates, shaped ``[1]``, ``[1]``,
-            and ``[1, 7168]``.
+            for the historical AttnRes candidates, shaped ``[M]``, ``[M]``,
+            and ``[M, 7168]``.
         eps: Positive epsilon used for AttnRes scoring and output RMSNorm.
         op: Reduction operation; only ``SUM`` is supported.
 
     Returns:
         A pair containing the normalized AttnRes mixture and the BF16 sum of
         ``residual`` with the all-reduced attention partial, both shaped
-        ``[1, 7168]``.
+        ``[M, 7168]``.
     """
     assert _all_reduce_residual_attnres_can_run(
         state,
@@ -2168,12 +2170,14 @@ def _attnres_comm_state(
     rank: int,
     group: dist.ProcessGroup,
 ) -> TritonCommState:
+    max_numel = input_tensor.numel()
     return TritonCommState(
         group=group,
         rank_in_group=rank,
         world_size=group.size(),
         device=input_tensor.device,
-        max_numel=input_tensor.numel(),
+        max_numel=max_numel,
+        max_bytes=max_numel * input_tensor.dtype.itemsize,
     )
 
 
@@ -2227,8 +2231,8 @@ def allreduce_residual_attnres_combine(
     """Run the fused Kimi-K3 Iris all-reduce and AttnRes epilogue.
 
     Args:
-        input_tensor: Per-rank BF16 attention partial shaped ``[1, 7168]``.
-        residual: Running BF16 residual stream shaped ``[1, 7168]``.
+        input_tensor: Per-rank BF16 attention partial shaped ``[M, 7168]``.
+        residual: Running BF16 residual stream shaped ``[M, 7168]``.
         score_weight: Precomputed AttnRes score weight shaped ``[7168]``.
         output_weight: Output RMSNorm weight shaped ``[7168]``.
         scratch: FP32 ``(max_logit, exp_sum, weighted_sum)`` partials.
