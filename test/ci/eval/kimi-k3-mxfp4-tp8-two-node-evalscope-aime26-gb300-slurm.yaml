@@ -1,48 +1,38 @@
 api_version: ci.tokenspeed.io/v1
-# Keep the pure target as a manual control; the matching DSpark configuration
-# is the per-commit Kimi-K3 AIME26 gate.
-name: eval-kimi-k3-mxfp4-tp8ep8-aime26-amd
+name: eval-kimi-k3-mxfp4-tp8-two-node-aime26-gb300-slurm
 type: eval
 workflow_stage: model-test
 triggers:
-  - manual
+  - per-commit
 runner:
   labels:
-    - amd-mi35x-8gpu-test
+    - slurm-b300-4gpu
+slurm:
+  nodes: 2
+  gpus_per_node: 4
 env:
   CI: "true"
 install:
-  - bash test/ci_system/install_deps_rocm.sh
+  - bash test/ci_system/install_deps.sh
+  - python3 -m pip install flash-linear-attention
 server:
   command: >-
-    ts serve
-    --model moonshotai/Kimi-K3
+    ts serve moonshotai/Kimi-K3
     --served-model-name kimi-k3
-    --tp 8
-    --ep-size 8
-    --attention-backend mla
-    --moe-backend auto
-    --kv-cache-dtype fp8
-    --mm-encoder-tp-mode data
-    --max-model-len 65536
-    --max-num-seqs 16
-    --max-cudagraph-capture-size 16
-    --cudagraph-capture-sizes 1 2 4 8 16
-    --disable-prefill-graph
-    --gpu-memory-utilization 0.92
     --trust-remote-code
-    --sampling-backend greedy
+    --max-model-len 65536
+    --kv-cache-dtype fp8
+    --tensor-parallel-size 8
+    --mm-encoder-tp-mode data
+    --moe-backend flashinfer_trtllm
+    --gpu-memory-utilization 0.94
+    --max-num-seqs 16
     --disable-kvstore
-    --kvstore-ratio 0.0
-    --enable-cache-report
-    --host 127.0.0.1
+    --host 0.0.0.0
     --port 8000
-    --policy round_robin
-    --engine-startup-timeout 3000
-    --gateway-startup-timeout 600
   ready:
     url: http://127.0.0.1:8000/readiness
-    timeout: 3600
+    timeout: 7200
     interval: 10
 eval:
   install:
@@ -61,5 +51,4 @@ eval:
     --generation-config '{"do_sample":true,"temperature":1.0,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'
 report:
   github_step_summary: true
-# Measured 0.933 (28/30) on 8x MI350X with high reasoning effort.
 score_threshold: 0.90

@@ -1,4 +1,5 @@
 import argparse
+import json
 import subprocess
 import textwrap
 from pathlib import Path
@@ -111,6 +112,76 @@ def test_load_task_checks_runner(tmp_path):
         load_task(tmp_path, config, "gb200-4gpu")
 
 
+def test_load_task_supports_optional_gb300_alias(tmp_path):
+    config = write_task(tmp_path, runner="b300-1gpu", task_type="ut")
+
+    assert load_task(tmp_path, config, "b300-1gpu", "gb300-1gpu") == Task(
+        config, "example", "ut", "gb300-1gpu", 1, 1, "b300-1gpu"
+    )
+
+
+def test_load_task_supports_multi_node_gb300_alias(tmp_path):
+    config = write_task(
+        tmp_path,
+        runner="slurm-b300-4gpu",
+        nodes=2,
+        gpus_per_node=4,
+    )
+
+    assert load_task(tmp_path, config, "slurm-b300-4gpu", "slurm-gb300-4gpu") == Task(
+        config,
+        "example",
+        "eval",
+        "slurm-gb300-4gpu",
+        4,
+        2,
+        "slurm-b300-4gpu",
+    )
+
+
+def test_render_script_passes_declared_and_effective_gb300_runners():
+    script = render_script(
+        Task(
+            "test/ci/ut/example.yaml",
+            "example",
+            "ut",
+            "gb300-1gpu",
+            1,
+            declared_runner="b300-1gpu",
+        ),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    assert "--runner=b300-1gpu" in script
+    assert "--runner-override=gb300-1gpu" in script
+    assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in script
+
+
+@pytest.mark.parametrize(
+    ("declared", "effective", "message"),
+    [
+        ("b300-4gpu", "gb300-1gpu", "GPU counts"),
+        ("b200-1gpu", "gb300-1gpu", "b300"),
+        ("slurm-b300-1gpu", "gb300-1gpu", "b300"),
+    ],
+)
+def test_load_task_rejects_invalid_gb300_alias(tmp_path, declared, effective, message):
+    config = write_task(tmp_path, runner=declared, task_type="ut")
+
+    with pytest.raises(ValueError, match=message):
+        load_task(tmp_path, config, declared, effective)
+
+
+def test_load_task_rejects_gb300_perf_alias(tmp_path):
+    config = write_task(tmp_path, runner="b300-4gpu", task_type="perf")
+
+    with pytest.raises(ValueError, match="perf"):
+        load_task(tmp_path, config, "b300-4gpu", "gb300-4gpu")
+
+
 def test_select_all_filters_exact_runner(monkeypatch, tmp_path):
     config = write_task(tmp_path)
     monkeypatch.setattr(
@@ -135,6 +206,20 @@ def test_select_all_filters_exact_runner(monkeypatch, tmp_path):
     assert select_tasks(args, tmp_path) == [
         Task(config, "example", "eval", "gb200-1gpu", 1)
     ]
+
+
+def test_select_all_rejects_runner_alias_even_with_runner(tmp_path):
+    args = argparse.Namespace(
+        config=None,
+        runner=["gb200-1gpu"],
+        runner_alias=["b300-1gpu=gb300-1gpu"],
+        task_types=None,
+        match=None,
+        trigger="manual",
+    )
+
+    with pytest.raises(ValueError, match="requires --config"):
+        select_tasks(args, tmp_path)
 
 
 def test_select_all_supports_multiple_runners_types_and_model_match(
@@ -255,6 +340,7 @@ def test_render_script_contains_cluster_requirements():
     )
     assert "--setup-mode=slurm" in script
     assert "--container-remap-root" in script
+    assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' not in script
     assert "libcuda.so.1" in script
     assert "libcudart.so.13" in script
     assert "/usr/bin/nvidia-smi" in script
@@ -265,6 +351,72 @@ def test_render_script_contains_cluster_requirements():
     )
     assert unset in script
     assert script.index(unset) < script.index('srun "${srun_args[@]}"')
+    subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def test_render_script_mounts_only_allocated_gb300_devices():
+    script = render_script(
+        Task("test/ci/ut/example.yaml", "example", "ut", "gb300-1gpu", 1),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in script
+    assert 'device="/dev/nvidia$gpu"' in script
+    assert 'elif [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]' in script
+    assert "No NVIDIA device nodes matched Slurm GPU allocation" in script
+    assert "\n  /dev/nvidiactl \\\n" in script
+    assert "\n  /dev/nvidia-uvm \\\n" in script
+    assert "\n  /dev/nvidia-uvm-tools \\\n" in script
+    assert "\n  /dev/nvidia-nvswitchctl \\\n" in script
+    assert "\n  /dev/nvidia-caps \\\n" in script
+    assert "\n  /dev/nvidia-caps-imex-channels; do\n" in script
+    assert '"${gpu_mounts[@]}" "${mounts[@]}"' in script
+    subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+    multinode_script = render_script(
+        Task(
+            "test/ci/eval/example.yaml",
+            "example",
+            "eval",
+            "slurm-gb300-4node-4gpu",
+            16,
+            nodes=4,
+        ),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+    assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in multinode_script
+
+
+def test_render_multinode_gb300_keeps_devices_out_of_client_step():
+    script = render_script(
+        Task(
+            "test/ci/eval/example.yaml",
+            "example",
+            "eval",
+            "gb300-4gpu",
+            4,
+            nodes=2,
+        ),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    assert (
+        'server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" '
+        '"${gpu_mounts[@]}" "${mounts[@]}")' in script
+    )
+    assert (
+        'client_mounts=("$client_src:/workspace" "$client_tmp:/tmp" '
+        '"${mounts[@]}")' in script
+    )
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
 
@@ -293,6 +445,9 @@ def test_render_script_orchestrates_multi_node_server_and_head_client():
         in script
     )
     assert 'client_prepare_args+=(--nodelist="$head_node")' in script
+    assert 'image_prepare_args+=(--nodelist="$head_node")' in script
+    image_prepare_block = script.split("image_prepare_args=(", 1)[1].split(")", 1)[0]
+    assert "--container-image=" in image_prepare_block
     assert 'client_srun_args+=(--nodelist="$head_node")' in script
     assert "--serve-only" in script
     assert "--external-server" in script
@@ -303,6 +458,10 @@ def test_render_script_orchestrates_multi_node_server_and_head_client():
     assert 'client_src="$scratch/client-src"' in script
     assert "tokenspeed-cleanup" in script
     assert "trap cleanup EXIT" in script
+    assert 'srun "${image_prepare_args[@]}" true' in script
+    assert script.index('srun "${image_prepare_args[@]}" true') < script.index(
+        'srun "${server_srun_args[@]}"'
+    )
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
 
@@ -364,6 +523,15 @@ def test_write_report_collects_logs_and_results(tmp_path):
 
     assert (report / "123.log").read_text() == "task output\n"
     assert (report / "123-result.json").exists()
+    manifest_task = json.loads((report / "manifest.json").read_text())[0]["task"]
+    assert manifest_task == {
+        "config": "test/ci/eval/example.yaml",
+        "name": "example",
+        "task_type": "eval",
+        "runner": "gb200-1gpu",
+        "gpus": 1,
+        "nodes": 1,
+    }
     assert (
         "| 123 | eval | gb200-1gpu | example | ✅ |"
         in (report / "summary.md").read_text()
@@ -427,3 +595,17 @@ def test_print_progress_omits_running_node(capsys, tmp_path):
     assert "123" in output
     assert "example" in output
     assert "node" not in output
+
+
+def test_print_progress_handles_accounting_delay(capsys, tmp_path):
+    submission = Submission(
+        Task("test/ci/ut/example.yaml", "example", "ut", "gb300-1gpu", 1),
+        "123",
+        tmp_path / "job.log",
+    )
+
+    print_progress([submission], {"123": {}})
+
+    output = capsys.readouterr().out
+    assert "UNKNOWN" in output
+    assert "123" in output

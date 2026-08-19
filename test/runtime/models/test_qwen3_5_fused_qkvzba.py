@@ -164,6 +164,19 @@ def _make_inputs(batch, nk, nv, device="cuda"):
     return mixed_qkvz, mixed_ba
 
 
+def _bench_interleaved(fn_a, fn_b, rounds=5):
+    """Time two candidates fairly and return their fastest observations."""
+    best_a = best_b = float("inf")
+    for _ in range(rounds):
+        best_a = min(
+            best_a, triton.testing.do_bench(fn_a, warmup=25, rep=50, return_mode="min")
+        )
+        best_b = min(
+            best_b, triton.testing.do_bench(fn_b, warmup=25, rep=50, return_mode="min")
+        )
+    return best_a, best_b
+
+
 @unittest.skipUnless(HAS_CUDA, "needs CUDA + triton")
 class FusedQkvzbaTest(unittest.TestCase):
     def _fused(self):
@@ -233,14 +246,9 @@ class FusedQkvzbaTest(unittest.TestCase):
         for nk, nv in [(4, 4), (4, 8), (4, 16)]:  # legacy-supported ratios
             mixed_qkvz, mixed_ba = _make_inputs(8192, nk, nv)  # prefill-sized
             args = (mixed_qkvz, mixed_ba, nk, nv, HEAD_QK, HEAD_V)
-            t_new = triton.testing.do_bench(
-                lambda a=args: fused(*a), warmup=50, rep=200, return_mode="median"
-            )
-            t_old = triton.testing.do_bench(
+            t_old, t_new = _bench_interleaved(
                 lambda a=args: _legacy_launch(*a),
-                warmup=50,
-                rep=200,
-                return_mode="median",
+                lambda a=args: fused(*a),
             )
             results[nv // nk] = (t_old, t_new)
 
@@ -271,11 +279,9 @@ class FusedQkvzbaTest(unittest.TestCase):
             return torch.cat((q, k, v), dim=-1), z, b, a
 
         args = (mixed_qkvz, mixed_ba, nk, nv, HEAD_QK, HEAD_V)
-        t_fused = triton.testing.do_bench(
-            lambda: fused(*args), warmup=50, rep=200, return_mode="median"
-        )
-        t_torch = triton.testing.do_bench(
-            torch_fallback, warmup=50, rep=200, return_mode="median"
+        t_fused, t_torch = _bench_interleaved(
+            lambda: fused(*args),
+            torch_fallback,
         )
         self.assertLessEqual(
             t_fused,
