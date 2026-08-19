@@ -727,6 +727,7 @@ def apply_pd_transfer_policies(
 
 def cyclic_history_spec(spec: CacheGroupSpec, *, dcp_size: int) -> CacheGroupSpec:
     """Return rank-neutral scheduler geometry for cyclic DCP history."""
+    import math
     from dataclasses import replace
 
     if dcp_size <= 0:
@@ -735,15 +736,17 @@ def cyclic_history_spec(spec: CacheGroupSpec, *, dcp_size: int) -> CacheGroupSpe
         return spec
     if spec.family != "history" or spec.retention != "full_history":
         return spec
-    if spec.block_granularity % dcp_size:
-        raise ValueError(
-            f"group {spec.group_id!r} block granularity "
-            f"{spec.block_granularity} is not divisible by DCP size {dcp_size}"
-        )
+    assert spec.rows_per_page is not None
+    assert spec.entry_stride_tokens is not None
+    # Preserve any pre-existing compression stride.  Ordinary MLA has stride
+    # one, while DeepSeek-V4 history already represents one stored row per
+    # 4/128 source tokens.  Widen a logical page only when its stored-row count
+    # is not divisible by DCP (notably V4's ratio-128 one-row pages).
+    global_rows = math.lcm(int(spec.rows_per_page), dcp_size)
     return replace(
         spec,
-        rows_per_page=spec.block_granularity // dcp_size,
-        entry_stride_tokens=dcp_size,
+        rows_per_page=global_rows // dcp_size,
+        entry_stride_tokens=int(spec.entry_stride_tokens) * dcp_size,
     )
 
 

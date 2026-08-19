@@ -28,6 +28,7 @@ written once, in its spec, next to the fields the layers deposit in it.
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -61,6 +62,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
     apply_pd_transfer_policies,
+    cyclic_history_spec,
 )
 
 _MAX_PADDING_FRACTION = 2.0
@@ -224,6 +226,23 @@ class DeepseekV4Recipe(CacheRecipe):
 
     @property
     @override
+    def prefix_granularity(self) -> int:
+        configured = super().prefix_granularity
+        dcp_size = int(getattr(self.attn_config, "dcp_size", 1))
+        if dcp_size == 1:
+            return configured
+        spans = [configured]
+        for ratio in set(self._cache_layout.layer_ratio):
+            if ratio > 1:
+                spans.append(
+                    cyclic_history_spec(
+                        v4_compressed_kv_spec(int(ratio)), dcp_size=dcp_size
+                    ).block_granularity
+                )
+        return math.lcm(*spans)
+
+    @property
+    @override
     def max_padding_fraction(self) -> float:
         return _MAX_PADDING_FRACTION
 
@@ -232,6 +251,7 @@ class DeepseekV4Recipe(CacheRecipe):
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
         layout = self._cache_layout
+        dcp_size = int(getattr(self.attn_config, "dcp_size", 1))
         sliding_window = int(
             (
                 self.draft_model_config.hf_config
@@ -289,7 +309,9 @@ class DeepseekV4Recipe(CacheRecipe):
             if ratio == 1:
                 continue
 
-            compressed_spec = v4_compressed_kv_spec(ratio)
+            compressed_spec = cyclic_history_spec(
+                v4_compressed_kv_spec(ratio), dcp_size=dcp_size
+            )
             state_spec = v4_compressor_state_spec(ratio, c4_state_window=c4_window)
             compressed_slot = occurrences[compressed_spec.group_id]
             occurrences[compressed_spec.group_id] += 1
@@ -300,7 +322,7 @@ class DeepseekV4Recipe(CacheRecipe):
                 CacheFieldSpec(
                     f"layer.{layer_id}.compressed_kv",
                     f"unit.{compressed_slot}",
-                    (layout.swa_block_bytes(layout.storage_block_size(ratio)),),
+                    (layout.swa_block_bytes(int(compressed_spec.rows_per_page)),),
                     "uint8",
                     exact_page_stride=False,
                     page_stride_alignment_bytes=stride_alignment,
@@ -404,8 +426,7 @@ class DeepseekV4Recipe(CacheRecipe):
         budgeted = self.cache_budget_bytes // layout.lcm_block_bytes - 1
         if budgeted < 1:
             raise ValueError(
-                "DeepSeek V4 cache budget must hold a null parent and one "
-                "usable parent"
+                "DeepSeek V4 cache budget must hold a null parent and one usable parent"
             )
         return self.parents_needed(layout, self.token_capacity(layout, budgeted))
 

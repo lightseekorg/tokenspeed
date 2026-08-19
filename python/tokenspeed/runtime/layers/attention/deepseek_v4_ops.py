@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_combine_dense_swa_indices,
     deepseek_v4_combine_topk_swa_indices,
     deepseek_v4_compressed_slot_mapping,
+    deepseek_v4_compact_dcp_topk_indices,
     deepseek_v4_compute_global_topk_indices_and_lens,
     deepseek_v4_decode_swa_indices_and_lens,
     deepseek_v4_dequantize_and_gather_k_cache,
@@ -80,6 +81,7 @@ __all__ = (
     "deepseek_v4_combine_dense_swa_indices",
     "deepseek_v4_combine_topk_swa_indices",
     "deepseek_v4_compressed_slot_mapping",
+    "deepseek_v4_compact_dcp_topk_indices",
     "deepseek_v4_compute_global_topk_indices_and_lens",
     "deepseek_v4_decode_swa_indices_and_lens",
     "deepseek_v4_dequantize_and_gather_k_cache",
@@ -663,8 +665,7 @@ def write_deepseek_v4_indexer_fp8_cache(
     min_stride = block_size * row_bytes
     if cache_2d.dim() != 2 or cache_2d.shape[1] < min_stride:
         raise ValueError(
-            f"cache_2d must be [pages, >= {min_stride}], "
-            f"got {tuple(cache_2d.shape)}"
+            f"cache_2d must be [pages, >= {min_stride}], got {tuple(cache_2d.shape)}"
         )
 
     num_actual = min(slot_mapping.numel(), index_k.shape[0])

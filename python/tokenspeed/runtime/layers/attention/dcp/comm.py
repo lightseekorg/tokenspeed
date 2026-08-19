@@ -48,6 +48,16 @@ def gather_fp8_query_heads(query: torch.Tensor, group: Group) -> torch.Tensor:
     return gathered_bytes.view(query.dtype).movedim(0, -2)
 
 
+def gather_query_heads(query: torch.Tensor, group: Group) -> torch.Tensor:
+    """All-gather the head axis for ordinary NCCL-supported query dtypes."""
+    if len(group) == 1:
+        return query
+    from tokenspeed.runtime.distributed.comm_ops import all_gather
+
+    head_major = query.movedim(-2, 0).contiguous()
+    return all_gather(head_major, group, dim=0).movedim(0, -2)
+
+
 def merge_partial_outputs(
     partial_outputs: torch.Tensor,
     partial_lse2: torch.Tensor,
@@ -95,6 +105,7 @@ def reconstruct_and_reduce_scatter(
     dcp_rank: int,
     group: Group,
     local_nonempty: torch.Tensor | None = None,
+    lse_base: float = 2.0,
 ) -> torch.Tensor:
     """Weight one local partial and reduce-scatter original TP head slices."""
     if len(group) == 1:
@@ -126,7 +137,12 @@ def reconstruct_and_reduce_scatter(
         sanitized - maximum.unsqueeze(0),
         torch.full_like(sanitized, -torch.inf),
     )
-    masses = torch.exp2(shifted)
+    if lse_base == 2.0:
+        masses = torch.exp2(shifted)
+    elif lse_base == 2.718281828459045:
+        masses = torch.exp(shifted)
+    else:
+        masses = torch.pow(torch.as_tensor(lse_base, device=shifted.device), shifted)
     denominator = masses.sum(dim=0)
     local_weight = torch.where(
         denominator > 0,
@@ -147,6 +163,7 @@ def reconstruct_and_reduce_scatter(
 
 __all__ = [
     "gather_fp8_query_heads",
+    "gather_query_heads",
     "merge_partial_outputs",
     "reconstruct_and_reduce_scatter",
 ]

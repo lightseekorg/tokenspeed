@@ -678,8 +678,7 @@ def _deepseek_v4_indexer_topk_from_logits(
         )
     if topk_tokens not in (512, 1024, 2048):
         raise RuntimeError(
-            "DeepSeek V4 decode indexer top-k supports topk_tokens in "
-            "{512, 1024, 2048}"
+            "DeepSeek V4 decode indexer top-k supports topk_tokens in {512, 1024, 2048}"
         )
 
     if (
@@ -2981,6 +2980,8 @@ class DeepseekV4Compressor(nn.Module):
                         ctx.forward_mode is not None and ctx.forward_mode.is_decode()
                     ),
                     is_valid_token=valid_token,
+                    dcp_size=pool.dcp_size,
+                    dcp_rank=pool.dcp_rank,
                 )
             if memo is not None:
                 memo[("compressed", self.compress_ratio)] = compressed_slots

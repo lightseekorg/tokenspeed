@@ -829,10 +829,13 @@ def create_attn_components(
                 "decode context parallelism is implemented only for dense MLA "
                 f"targets, got {type(config).__name__}"
             )
-        if target_full_attn_backend_name != "tokenspeed_mla":
+        supported_dcp_backend = (
+            "deepseek_v4" if is_deepseek_v4_model else "tokenspeed_mla"
+        )
+        if target_full_attn_backend_name != supported_dcp_backend:
             raise ValueError(
                 "decode context parallelism requires the resolved full-attention "
-                "backend to be 'tokenspeed_mla', got "
+                f"backend to be {supported_dcp_backend!r}, got "
                 f"{target_full_attn_backend_name!r}"
             )
     draft_attn_config = (

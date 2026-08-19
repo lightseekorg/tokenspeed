@@ -53,6 +53,7 @@ __all__ = [
     "deepseek_v4_combine_dense_swa_indices",
     "deepseek_v4_combine_topk_swa_indices",
     "deepseek_v4_compressed_slot_mapping",
+    "deepseek_v4_compact_dcp_topk_indices",
     "deepseek_v4_compute_global_topk_indices_and_lens",
     "deepseek_v4_decode_swa_indices_and_lens",
     "deepseek_v4_dequantize_and_gather_k_cache",
@@ -64,6 +65,79 @@ __all__ = [
     "deepseek_v4_save_compressor_state",
     "write_deepseek_v4_indexer_mxfp4_cache_cuda",
 ]
+
+
+@triton.jit
+def _deepseek_v4_compact_dcp_topk_indices_kernel(
+    out_ptr,
+    out_stride,
+    lens_ptr,
+    indices_ptr,
+    indices_stride,
+    topk: tl.constexpr,
+    dcp_size: tl.constexpr,
+    dcp_rank: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < topk
+    values = tl.load(
+        indices_ptr + token_idx * indices_stride + offsets,
+        mask=mask,
+        other=-1,
+    ).to(tl.int64)
+    owned = mask & (values >= 0) & ((values % dcp_size) == dcp_rank)
+    destinations = tl.cumsum(owned.to(tl.int32), axis=0) - 1
+    local_values = values // dcp_size
+    tl.store(
+        out_ptr + token_idx * out_stride + destinations,
+        local_values,
+        mask=owned,
+    )
+    tl.store(lens_ptr + token_idx, tl.sum(owned.to(tl.int32), axis=0))
+
+
+def deepseek_v4_compact_dcp_topk_indices(
+    indices: torch.Tensor,
+    *,
+    dcp_size: int,
+    dcp_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stable fixed-shape compaction of one DCP rank's compressed indices."""
+    if indices.dtype != torch.int32 or indices.ndim != 2:
+        raise ValueError("DCP top-k indices must be a 2-D int32 tensor")
+    if dcp_size <= 0 or not 0 <= dcp_rank < dcp_size:
+        raise ValueError(f"invalid DCP rank/size {dcp_rank}/{dcp_size}")
+    if dcp_size == 1:
+        return indices, (indices >= 0).sum(dim=-1, dtype=torch.int32)
+    out = torch.full_like(indices, -1)
+    lens = torch.empty(indices.shape[0], dtype=torch.int32, device=indices.device)
+    if indices.numel() == 0:
+        lens.zero_()
+        return out, lens
+    if not indices.is_cuda:
+        for row in range(indices.shape[0]):
+            values = indices[row]
+            owned = (values >= 0) & ((values % dcp_size) == dcp_rank)
+            local = torch.div(values[owned], dcp_size, rounding_mode="floor")
+            out[row, : local.numel()] = local
+            lens[row] = local.numel()
+        return out, lens
+    block = triton.next_power_of_2(indices.shape[-1])
+    _deepseek_v4_compact_dcp_topk_indices_kernel[(indices.shape[0],)](
+        out,
+        out.stride(0),
+        lens,
+        indices,
+        indices.stride(0),
+        topk=indices.shape[-1],
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        BLOCK=block,
+        num_warps=8,
+    )
+    return out, lens
 
 
 def _as_int32_block_table(block_table: torch.Tensor) -> torch.Tensor:
