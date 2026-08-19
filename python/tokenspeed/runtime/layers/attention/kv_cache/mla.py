@@ -164,14 +164,21 @@ class MLATokenToKVPool(CachePool):
         else:
             self.kv_buffer[layer_id][loc] = cache_k
 
+    #: Default for ``set_mla_kv_buffer``'s ``sanitize``. Declared rather than
+    #: overridden so a pool needing only this keeps the base method identity
+    #: the fused MLA write gate checks (see ``models/utils.py``).
+    latent_write_sanitizes: ClassVar[bool] = False
+
     def set_mla_kv_buffer(
         self,
         layer: PagedAttention,
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
-        sanitize: bool = False,
+        sanitize: bool | None = None,
     ):
+        if sanitize is None:
+            sanitize = self.latent_write_sanitizes
         layer_id = layer.layer_id
         if self.quant_method == "per_token_head":
             # Preserve the writer's sanitization contract for the quantized

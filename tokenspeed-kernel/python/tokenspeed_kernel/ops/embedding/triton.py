@@ -203,6 +203,15 @@ def _rope_apply_kernel(
 
 
 @triton.jit
+def _sanitize_for_store(x, MAX_FINITE: tl.constexpr):
+    """NaN -> 0, +-inf -> +-MAX_FINITE, matching set_mla_kv_buffer_triton."""
+    x = x.to(tl.float32)
+    x = tl.where(x != x, 0.0, x)
+    x = tl.where(x == float("inf"), MAX_FINITE, x)
+    return tl.where(x == -float("inf"), -MAX_FINITE, x)
+
+
+@triton.jit
 def _mla_rope_set_kv_buffer_kernel(
     q_rope_ptr,
     k_nope_ptr,
@@ -236,6 +245,8 @@ def _mla_rope_set_kv_buffer_kernel(
     APPLY_ROPE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     INDEX_INT64: tl.constexpr,
+    SANITIZE: tl.constexpr,
+    MAX_FINITE: tl.constexpr,
 ):
     """One launch for the MLA query assembly and the latent KV write.
 
@@ -243,6 +254,8 @@ def _mla_rope_set_kv_buffer_kernel(
     program per token writes that token's latent row into the cache. Stores
     convert, so an FP8 destination needs no pre-cast. ``APPLY_ROPE=False``
     serves NoPE models, where the same halves are copied without rotation.
+    ``SANITIZE`` folds the split path's NaN/inf clamp into the latent store --
+    the query is never sanitized, matching ``set_mla_kv_buffer_triton``.
     """
     block_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -338,6 +351,8 @@ def _mla_rope_set_kv_buffer_kernel(
                     mask=nope_mask,
                     other=0.0,
                 )
+                if SANITIZE:
+                    k_nope = _sanitize_for_store(k_nope, MAX_FINITE)
                 tl.store(kv_base + nope_offsets, k_nope, mask=nope_mask)
 
                 k_base = k_rope_ptr + token_idx * k_rope_stride_t
@@ -346,19 +361,18 @@ def _mla_rope_set_kv_buffer_kernel(
                 if APPLY_ROPE:
                     k1_f = k1.to(tl.float32)
                     k2_f = k2.to(tl.float32)
-                    tl.store(
-                        kv_base + nope_dim + pair_lo,
-                        k1_f * cos - k2_f * sin,
-                        mask=half_mask,
-                    )
-                    tl.store(
-                        kv_base + nope_dim + pair_hi,
-                        k2_f * cos + k1_f * sin,
-                        mask=half_mask,
-                    )
+                    k1_out = k1_f * cos - k2_f * sin
+                    k2_out = k2_f * cos + k1_f * sin
                 else:
-                    tl.store(kv_base + nope_dim + pair_lo, k1, mask=half_mask)
-                    tl.store(kv_base + nope_dim + pair_hi, k2, mask=half_mask)
+                    k1_out = k1
+                    k2_out = k2
+                if SANITIZE:
+                    # After the rotation: it mixes the halves, so a NaN cleared
+                    # on input returns through its partner, and inf becomes one.
+                    k1_out = _sanitize_for_store(k1_out, MAX_FINITE)
+                    k2_out = _sanitize_for_store(k2_out, MAX_FINITE)
+                tl.store(kv_base + nope_dim + pair_lo, k1_out, mask=half_mask)
+                tl.store(kv_base + nope_dim + pair_hi, k2_out, mask=half_mask)
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -456,6 +470,16 @@ def apply_rope_mla_set_kv_buffer_triton(
     )
     index_int64 = max_token_offset >= 2**31
 
+    # Bound both source and destination: a bf16-only bound would overflow back
+    # to a non-finite fp8 encoding on store. As set_mla_kv_buffer_triton does.
+    sanitize = fused_mla_set_kv_buffer_arg.sanitize
+    float_maxes = [
+        torch.finfo(t.dtype).max
+        for t in (k_nope, kv_buffer)
+        if t.dtype.is_floating_point
+    ]
+    max_finite = min(float_maxes) if float_maxes else float("inf")
+
     half_block = max(_next_power_of_2(rope_dim // 2), 16)
     nope_block = max(_next_power_of_2(nope_dim), 16)
     block_n = select_mla_kv_block_n(num_tokens, num_q_heads)
@@ -493,6 +517,8 @@ def apply_rope_mla_set_kv_buffer_triton(
         APPLY_ROPE=apply_rope,
         BLOCK_N=block_n,
         INDEX_INT64=index_int64,
+        SANITIZE=sanitize,
+        MAX_FINITE=max_finite,
         num_warps=4,
         **({"launch_pdl": True} if enable_pdl else {}),
     )

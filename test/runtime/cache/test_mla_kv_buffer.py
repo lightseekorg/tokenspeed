@@ -447,6 +447,89 @@ def test_mla_set_kv_nope_matches_two_kernel_path(n_loc: int, enable_pdl: bool) -
     assert _bitwise_equal(kv[loc], key_ref[:, 0])
 
 
+@pytest.mark.parametrize("n_loc", [4, 600])
+@pytest.mark.parametrize("has_rope", [False, True])
+def test_fused_sanitize_matches_the_split_path_bytes(
+    n_loc: int, has_rope: bool
+) -> None:
+    """A sanitizing fused write lands the same latent bytes as the split path.
+
+    This is the property that lets Kimi-K3's pool declare
+    ``latent_write_sanitizes`` instead of overriding the latent write: the
+    hazard the override closed (a padded row's NaN reaching a live row's
+    softmax through the shared dummy slot) stays closed on the fused path.
+    Both RoPE forms are covered because the rotation mixes the two halves, so
+    where the clamp lands relative to it is observable.
+    """
+    torch.manual_seed(0)
+    num_heads = 3
+    dtype = torch.bfloat16
+
+    q_rope = torch.randn(n_loc, num_heads, ROPE_DIM, device="cuda", dtype=dtype)
+    k_rope = torch.randn(n_loc, 1, ROPE_DIM, device="cuda", dtype=dtype)
+    q_nope = torch.randn(n_loc, num_heads, NOPE_DIM, device="cuda", dtype=dtype)
+    k_nope = torch.randn(n_loc, 1, NOPE_DIM, device="cuda", dtype=dtype)
+    # Every non-finite the padded rows can carry, in both halves.
+    k_nope[0, 0, 0] = float("nan")
+    k_nope[0, 0, 1] = float("inf")
+    k_nope[0, 0, 2] = float("-inf")
+    k_rope[0, 0, 0] = float("nan")
+    k_rope[0, 0, 1] = float("inf")
+    k_rope[0, 0, ROPE_DIM // 2] = float("-inf")
+
+    positions = torch.zeros(n_loc, device="cuda", dtype=torch.int64)
+    loc = torch.randperm(NUM_PAGES, device="cuda")[:n_loc]
+    cos_sin_cache = (
+        torch.randn(2048, ROPE_DIM, device="cuda", dtype=torch.float32)
+        if has_rope
+        else None
+    )
+
+    # Split path: rope+quantize, then the sanitizing scatter.
+    _, key_ref = apply_rope_mla(
+        positions=positions,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        q_nope=q_nope,
+        k_nope=k_nope,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=False,
+    )
+    kv_ref = _empty_kv(torch.float8_e4m3fn)
+    set_mla_kv_buffer_triton(
+        kv_ref,
+        loc,
+        key_ref[:, :, :NOPE_DIM],
+        key_ref[:, :, NOPE_DIM:],
+        sanitize=True,
+    )
+
+    kv = _empty_kv(torch.float8_e4m3fn)
+    query = torch.empty(
+        n_loc, num_heads, NOPE_DIM + ROPE_DIM, device="cuda", dtype=dtype
+    )
+    apply_rope_mla_set_kv(
+        positions=positions,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        fused_mla_set_kv_buffer_arg=FusedMLASetKVBufferArg(
+            k_nope=k_nope,
+            kv_buffer=kv,
+            cache_loc=loc,
+            q_nope=q_nope,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=False,
+            sanitize=True,
+        ),
+        q_rope_out=query,
+    )
+    torch.cuda.synchronize()
+
+    assert not torch.isnan(kv[loc.cpu()].float()).any()
+    assert torch.isfinite(kv[loc.cpu()].float()).all()
+    assert _bitwise_equal(kv, kv_ref)
+
+
 def _fake_mla_pool(dtype: torch.dtype = torch.float8_e4m3fn) -> MLATokenToKVPool:
     """A minimal MLATokenToKVPool that isinstance-checks true, for gate tests
     that need no real cache -- construction takes eight unrelated args."""
@@ -496,25 +579,9 @@ def test_fused_gate_token_head_budget(num_q_heads, num_tokens, expect_fused):
     assert (arg is not None) == expect_fused
 
 
-def test_fused_gate_declines_a_pool_that_overrides_the_latent_write():
-    """A pool that customizes set_mla_kv_buffer must not be fused past.
-
-    The hybrid KDA pool (Kimi-K3) overrides it to force sanitize=True, whose
-    docstring describes a padded row's NaN reaching a live row's softmax
-    through the shared dummy slot. The fused write does not sanitize, so
-    bypassing that override would reopen the hazard silently. It is an
-    MLATokenToKVPool subclass, so isinstance alone does not exclude it.
-    """
-    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
-        HybridKDATokenToKVPool,
-    )
-
-    assert issubclass(HybridKDATokenToKVPool, MLATokenToKVPool)
-
-    pool = _fake_mla_pool()
-    pool.__class__ = HybridKDATokenToKVPool
-    n_loc, num_q_heads = 8, 16
-    arg = create_fused_mla_set_kv_buffer_arg(
+def _gate_arg_for_pool(pool, n_loc: int = 8, num_q_heads: int = 16):
+    """Run the fused-write gate against ``pool`` with an otherwise valid shape."""
+    return create_fused_mla_set_kv_buffer_arg(
         k_nope=torch.zeros(n_loc, 1, NOPE_DIM, device="cuda", dtype=torch.bfloat16),
         rope_dim=ROPE_DIM,
         rotary_emb=None,
@@ -526,4 +593,53 @@ def test_fused_gate_declines_a_pool_that_overrides_the_latent_write():
             n_loc, num_q_heads, NOPE_DIM, device="cuda", dtype=torch.bfloat16
         ),
     )
-    assert arg is None
+
+
+def test_fused_gate_declines_a_pool_that_overrides_the_latent_write():
+    """A pool that customizes set_mla_kv_buffer must not be fused past.
+
+    An override adds something the fused write does not have, and fusing would
+    bypass it silently. isinstance alone does not exclude such a pool, since it
+    is an MLATokenToKVPool subclass -- the gate compares method identity.
+    """
+
+    class _OverridingPool(MLATokenToKVPool):
+        def set_mla_kv_buffer(self, *args, **kwargs):  # pragma: no cover
+            raise AssertionError("must not be reached")
+
+    pool = _fake_mla_pool()
+    pool.__class__ = _OverridingPool
+
+    assert issubclass(_OverridingPool, MLATokenToKVPool)
+    assert _gate_arg_for_pool(pool) is None
+
+
+def test_fused_gate_admits_the_hybrid_kda_pool_and_carries_its_sanitize():
+    """Kimi-K3's pool reaches the fused write, sanitizing.
+
+    It needs a sanitizing latent write -- a padded row's NaN otherwise reaches
+    a live row's softmax through the shared dummy slot -- but declares that
+    through ``latent_write_sanitizes`` instead of overriding the method, so the
+    identity check above still holds and the flag rides into the kernel.
+    """
+    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
+        HybridKDATokenToKVPool,
+    )
+
+    assert issubclass(HybridKDATokenToKVPool, MLATokenToKVPool)
+    assert (
+        HybridKDATokenToKVPool.set_mla_kv_buffer is MLATokenToKVPool.set_mla_kv_buffer
+    )
+    assert HybridKDATokenToKVPool.latent_write_sanitizes is True
+    assert MLATokenToKVPool.latent_write_sanitizes is False
+
+    pool = _fake_mla_pool()
+    pool.__class__ = HybridKDATokenToKVPool
+    arg = _gate_arg_for_pool(pool)
+    assert arg is not None
+    assert arg.sanitize is True
+
+    plain = _fake_mla_pool()
+    plain_arg = _gate_arg_for_pool(plain)
+    assert plain_arg is not None
+    assert plain_arg.sanitize is False

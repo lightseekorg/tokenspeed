@@ -25,7 +25,6 @@ from __future__ import annotations
 from typing import ClassVar
 
 import torch
-from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -95,31 +94,20 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         except KeyError as exc:
             raise ValueError(f"layer {layer_id} has no cache group") from exc
 
-    @override
-    def set_mla_kv_buffer(
-        self,
-        layer,
-        loc: torch.Tensor,
-        cache_k_nope: torch.Tensor,
-        cache_k_rope: torch.Tensor,
-        sanitize: bool = True,
-    ):
-        """Latent write that sanitizes by default -- a fact of this cache.
-
-        Prefill breakable-graph padding contract: the dummy-batch capture (and
-        bucket-padding rows) whose ``out_cache_loc`` is the reserved
-        ``dummy_kv_slot`` can carry NaN into this fp8 KV write. The paged MLA
-        decode kernel reads that shared dummy slot through the zero-padded
-        block-table entries and computes ``q·k`` BEFORE applying the causal
-        mask, so the NaN survives it (``NaN + -inf = NaN``) and poisons a live
-        row's softmax -> NaN logits -> token 0. Eager prefill leaves the dummy
-        slot finite (``q·0`` masks cleanly), which is why the bug only appears
-        with the prefill graph on. Sanitizing in-kernel keeps real rows bitwise
-        unchanged without allocating two temporary tensors.
-        """
-        super().set_mla_kv_buffer(
-            layer, loc, cache_k_nope, cache_k_rope, sanitize=sanitize
-        )
+    #: Latent write that sanitizes by default -- a fact of this cache.
+    #:
+    #: Prefill breakable-graph padding contract: the dummy-batch capture (and
+    #: bucket-padding rows) whose ``out_cache_loc`` is the reserved
+    #: ``dummy_kv_slot`` can carry NaN into this fp8 KV write. The paged MLA
+    #: decode kernel reads that shared dummy slot through the zero-padded
+    #: block-table entries and computes ``q·k`` BEFORE applying the causal
+    #: mask, so the NaN survives it (``NaN + -inf = NaN``) and poisons a live
+    #: row's softmax -> NaN logits -> token 0. Eager prefill leaves the dummy
+    #: slot finite (``q·0`` masks cleanly), which is why the bug only appears
+    #: with the prefill graph on. Sanitizing in-kernel keeps real rows bitwise
+    #: unchanged without allocating two temporary tensors. Declared, not
+    #: overridden, so the fused MLA write gate still admits this pool.
+    latent_write_sanitizes: ClassVar[bool] = True
 
     def get_component(self, layer_id: int, component_name: str) -> torch.Tensor:
         """Return one KDA state plane. Latent KV is read via ``kv_buffer``."""

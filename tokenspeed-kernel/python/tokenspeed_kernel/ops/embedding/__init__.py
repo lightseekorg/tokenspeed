@@ -55,6 +55,8 @@ class FusedMLASetKVBufferArg:
     # rotary module then needs no separate path.
     cos_sin_cache: torch.Tensor | None = None
     is_neox: bool = True
+    # Clamp NaN/inf on the latent store only, as set_mla_kv_buffer_triton does.
+    sanitize: bool = False
 
 
 @functools.lru_cache(maxsize=64)

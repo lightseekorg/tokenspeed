@@ -126,17 +126,15 @@ def create_fused_mla_set_kv_buffer_arg(
     ``None`` is the single place this configuration is judged to have no fused
     form, so callers fall back rather than branch. Every reason lives here:
     ``token_to_kv_pool`` is not an ``MLATokenToKVPool``, or it overrides the
-    latent write (Kimi-K3's hybrid KDA pool overrides it to force sanitize --
-    see below); the token*head count is past the validated range; the pool's
-    latent rows are not one dense ``[tokens, 1, nope+rope]`` tensor (the
-    per-token-head quantized pool keeps three); or no registered RoPE solution
-    advertises the fused traits.
+    latent write (see below); the token*head count is past the validated range;
+    the pool's latent rows are not one dense ``[tokens, 1, nope+rope]`` tensor
+    (the per-token-head quantized pool keeps three); or no registered RoPE
+    solution advertises the fused traits.
 
     ``rotary_emb=None`` is the NoPE form and IS fused when every other check
     passes -- the tables are simply absent from the returned argument. Kimi-K3
-    is NoPE, but its hybrid KDA pool overrides the latent write and so never
-    reaches this form; a K3 draft (a heterogeneous MLA cache view) gets a
-    plain pool and does.
+    is NoPE and reaches it, carrying its pool's ``latent_write_sanitizes`` into
+    the kernel.
     """
 
     from tokenspeed_kernel.ops.embedding import supports_fused_mla_kv_write
@@ -145,11 +143,9 @@ def create_fused_mla_set_kv_buffer_arg(
 
     if not isinstance(token_to_kv_pool, MLATokenToKVPool):
         return None
-    # A pool that overrides the latent write does so to add something this
-    # fused write does not have -- the hybrid KDA pool overrides it to force
-    # sanitize=True, whose comment describes a padded-row NaN reaching a live
-    # row's softmax through the shared dummy slot. Fusing would bypass the
-    # override silently, so decline whenever one exists.
+    # An override adds something this fused write does not have, and fusing
+    # would bypass it silently. Sanitize is the one addition it can reproduce,
+    # which a pool declares through latent_write_sanitizes instead.
     if type(token_to_kv_pool).set_mla_kv_buffer is not (
         MLATokenToKVPool.set_mla_kv_buffer
     ):
@@ -181,4 +177,5 @@ def create_fused_mla_set_kv_buffer_arg(
         q_nope=q_nope,
         cos_sin_cache=None if rotary_emb is None else rotary_emb.cos_sin_cache,
         is_neox=True if rotary_emb is None else rotary_emb.is_neox_style,
+        sanitize=token_to_kv_pool.latent_write_sanitizes,
     )
