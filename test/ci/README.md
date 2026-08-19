@@ -232,12 +232,18 @@ The defaults target GB200; on GB300 set the shared paths under
 ```bash
 TS_CI_ARTIFACT_ROOT=/data/home/$USER/tokenspeed-slurm \
 TS_CI_CACHE_DIR=/data/home/$USER/tokenspeed-cache \
+TS_CI_LOCAL_MODEL_ROOT=/scratch/$USER-models \
 test/ci/run_slurm.sh \
   test/ci/ut/ut-tokenspeed-kernel.yaml \
   --runner-alias b300-1gpu=gb300-1gpu \
   --type ut \
   --wait
 ```
+
+GB300 server containers mount `TS_CI_LOCAL_MODEL_ROOT` read-only at `/models`.
+It defaults to `/scratch/$USER-models`, the node-local RAID path. The Kimi-K3
+GB300 task uses its pinned snapshot below that mount so weight loading does not
+read the shared Hugging Face cache.
 
 The `Slurm Dispatch` workflow exposes a `cluster` input. `gb200` keeps the
 existing `slurm-dispatch` coordinator and runner defaults. `gb300` is an
