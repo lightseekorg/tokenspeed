@@ -674,3 +674,58 @@ def test_every_fused_call_site_uses_the_probed_entry_point():
     for call in carriers:
         assert isinstance(call.func, ast.Name), ast.dump(call.func)
         assert call.func.id == "apply_rope_mla_set_kv", call.func.id
+
+
+@pytest.mark.parametrize("n_loc", [1, 4, 600])
+def test_fused_write_follows_a_strided_cache_loc(n_loc: int) -> None:
+    """A strided ``cache_loc`` lands the same rows as a packed one.
+
+    A column of a per-step location table arrives with a stride of
+    ``num_draft_tokens``; indexing it as ``ptr + token_idx`` would read a
+    different row per token and write the latent to the wrong pages. n_loc=1
+    is the shape that matters most: a one-element column reports that stride
+    while ``is_contiguous()`` is True, so it is legitimate input that a
+    stride-1 assertion rejects.
+    """
+    torch.manual_seed(0)
+    num_heads = 3
+    num_draft_tokens = 4
+    dtype = torch.bfloat16
+
+    q_rope = torch.randn(n_loc, num_heads, ROPE_DIM, device="cuda", dtype=dtype)
+    k_rope = torch.randn(n_loc, 1, ROPE_DIM, device="cuda", dtype=dtype)
+    q_nope = torch.randn(n_loc, num_heads, NOPE_DIM, device="cuda", dtype=dtype)
+    k_nope = torch.randn(n_loc, 1, NOPE_DIM, device="cuda", dtype=dtype)
+    positions = torch.zeros(n_loc, device="cuda", dtype=torch.int64)
+
+    table = torch.randperm(NUM_PAGES, device="cuda")[: n_loc * num_draft_tokens]
+    strided_loc = table.view(n_loc, num_draft_tokens)[:, 1]
+    assert strided_loc.stride(-1) == num_draft_tokens
+    packed_loc = strided_loc.contiguous()
+
+    def run(loc):
+        query = torch.empty(
+            n_loc, num_heads, NOPE_DIM + ROPE_DIM, device="cuda", dtype=dtype
+        )
+        kv = _empty_kv(torch.float8_e4m3fn)
+        apply_rope_mla_set_kv(
+            positions=positions,
+            q_rope=q_rope,
+            k_rope=k_rope,
+            fused_mla_set_kv_buffer_arg=FusedMLASetKVBufferArg(
+                k_nope=k_nope,
+                kv_buffer=kv,
+                cache_loc=loc,
+                q_nope=q_nope,
+                cos_sin_cache=None,
+            ),
+            q_rope_out=query,
+        )
+        torch.cuda.synchronize()
+        return query, kv
+
+    query_strided, kv_strided = run(strided_loc)
+    query_packed, kv_packed = run(packed_loc)
+
+    assert _bitwise_equal(query_strided, query_packed)
+    assert _bitwise_equal(kv_strided[packed_loc], kv_packed[packed_loc])

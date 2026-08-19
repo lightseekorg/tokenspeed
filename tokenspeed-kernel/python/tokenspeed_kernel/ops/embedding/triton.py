@@ -223,6 +223,7 @@ def _mla_rope_set_kv_buffer_kernel(
     positions_ptr,
     q_nope_ptr,
     num_tokens,
+    loc_stride: tl.constexpr,
     q_rope_stride_t: tl.constexpr,
     q_rope_stride_h: tl.constexpr,
     k_nope_stride_t: tl.constexpr,
@@ -344,7 +345,7 @@ def _mla_rope_set_kv_buffer_kernel(
                     tl.store(q_out_base + pair_lo, q1, mask=half_mask)
                     tl.store(q_out_base + pair_hi, q2, mask=half_mask)
             else:
-                loc = tl.load(loc_ptr + token_idx).to(tl.int64)
+                loc = tl.load(loc_ptr + token_idx * loc_stride).to(tl.int64)
                 kv_base = kv_buffer_ptr + loc * kv_buffer_stride_t
                 k_nope = tl.load(
                     k_nope_ptr + token_idx * k_nope_stride_t + nope_offsets,
@@ -449,10 +450,8 @@ def apply_rope_mla_set_kv_buffer_triton(
     assert kv_buffer.shape[1] == nope_dim + rope_dim
     assert rope_dim % 2 == 0
     assert loc.dtype in (torch.int32, torch.int64)
-    # Indexed as ``ptr + token_idx``, so a strided view would silently read
-    # or write the wrong rows -- flatten() would not catch it, it returns a
-    # 1-D input unchanged however it is strided.
-    assert loc.stride(-1) == 1
+    # Spec-decode passes one draft step's column of a per-step table.
+    assert loc.ndim == 1
     apply_rope = cos_sin_cache is not None
     if apply_rope:
         assert cos_sin_cache.shape[-1] == rope_dim
@@ -495,6 +494,7 @@ def apply_rope_mla_set_kv_buffer_triton(
         positions,
         q_nope,
         num_tokens,
+        loc.stride(0),
         q_rope.stride(0),
         q_rope.stride(1),
         k_nope.stride(0),
