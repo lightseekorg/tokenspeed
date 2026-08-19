@@ -689,7 +689,9 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
                 name = "midlayer." + name[len("layers.0.") :]
 
             if "d2t" in name:
-                self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
+                self.hot_token_id = loaded_weight + torch.arange(
+                    loaded_weight.shape[0], device=loaded_weight.device
+                )
                 continue
 
             if "t2d" in name:
