@@ -216,24 +216,7 @@ def compute_cache_group_page_counts(
         # (the C++ side keys it the same way); V4's sliding-window state tail
         # buffers keep the sliding-window formula below.
         if spec.family == "state" and spec.retention == "full_history":
-            # State group: 2 live pages/request (the W=2 write window) +
-            # floor(T/P) snapshot pages (snapshots are bounded by the shared
-            # page-id space), capped at the full-history count.
-            full_history_total = (
-                _ceil_div(max_total_tokens, block_granularity)
-                + max_live_requests
-                + protected_pages
-                + _CACHE_GROUP_DUMMY_PAGES
-                + safety_margin
-            )
-            state_total = (
-                max_live_requests * 2
-                + max_total_tokens // block_granularity
-                + protected_pages
-                + _CACHE_GROUP_DUMMY_PAGES
-                + safety_margin
-            )
-            total = min(state_total, full_history_total)
+            total = max_live_requests * 2 + _CACHE_GROUP_DUMMY_PAGES + safety_margin
         elif spec.retention == "full_history":
             full_pages = _ceil_div(max_total_tokens, block_granularity)
             total = (

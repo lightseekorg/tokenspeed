@@ -291,6 +291,23 @@ class KimiK3Recipe(CacheRecipe):
                 f"{len(layout.plane_bytes)}"
             )
 
+    # ---- extras ----
+
+    @override
+    def workspace_bytes(self) -> int:
+        """Dense KDA state rows staged by speculative target verification."""
+        if getattr(self.server_args, "speculative_algorithm", None) is None:
+            return 0
+        verify_rows = self.attn_config.max_bs * (
+            int(self.server_args.speculative_num_draft_tokens) + 1
+        )
+        return verify_rows * sum(
+            field.payload_bytes
+            for spec, fields in self.groups()
+            if spec.group_id != FULL_ATTENTION
+            for field in fields
+        )
+
     # ---- capacity: the scheduler's concurrency decides, then a search ----
 
     @override
@@ -328,9 +345,6 @@ class KimiK3Recipe(CacheRecipe):
         protected_pages = max_live_requests * math.ceil(
             depth * limits["decode_input_tokens"] / page_tokens
         )
-        scheduled_pages = math.ceil(
-            min(limits["max_scheduled_tokens"], token_capacity) / page_tokens
-        )
         parents = 0
         for group_id, packing in layout.group_packing:
             if group_id == FULL_ATTENTION:
@@ -341,6 +355,7 @@ class KimiK3Recipe(CacheRecipe):
                     + protected_pages
                 )
             else:
-                child_pages = 2 * max_live_requests + scheduled_pages + protected_pages
+                # Snapshot state rolls between two pages per live request.
+                child_pages = 2 * max_live_requests
             parents += math.ceil(child_pages / packing)
         return parents
