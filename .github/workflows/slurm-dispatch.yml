@@ -8,8 +8,16 @@ on:
         required: false
         default: ""
         type: string
+      cluster:
+        description: "Slurm cluster"
+        required: true
+        default: gb200
+        type: choice
+        options:
+          - gb200
+          - gb300
       yaml:
-        description: "Optional single B200/GB200 or multi-node Slurm CI YAML"
+        description: "Single B200/GB200 or multi-node Slurm CI YAML; required for cluster=gb300"
         required: true
         default: "off"
         type: choice
@@ -27,6 +35,7 @@ on:
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-mmlu.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-ocr-bench.yaml
           - test/ci/eval/kimi-k3-mxfp4-tp16-four-node-evalscope-aime26-slurm.yaml
+          - test/ci/eval/kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
           - test/ci/eval/minimax-m3-nvfp4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d-evalscope-ocr-bench.yaml
           - test/ci/eval/qwen3.5-122b-a10b-nvfp4-evalscope-ocr-bench.yaml
@@ -44,7 +53,7 @@ on:
           - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
           - test/ci/ut/ut-tokenspeed-kernel.yaml
       runners:
-        description: "Comma-separated exact runner labels"
+        description: "GB200 bulk runners, or one explicit [slurm-]gb300-* runner with a selected YAML"
         required: true
         default: "b200-4gpu,gb200-4gpu"
         type: string
@@ -76,12 +85,12 @@ on:
           - slurm
 
 concurrency:
-  group: slurm-dispatch-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}
+  group: slurm-dispatch-${{ inputs.cluster }}-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}
   cancel-in-progress: false
 
 jobs:
   dispatch:
-    runs-on: slurm-dispatch
+    runs-on: ${{ inputs.cluster == 'gb300' && 'slurm-dispatch-gb300' || 'slurm-dispatch' }}
     timeout-minutes: 720
     permissions:
       contents: read
@@ -99,6 +108,7 @@ jobs:
       - name: Submit and wait for Slurm tasks
         env:
           PR: ${{ inputs.pr }}
+          CLUSTER: ${{ inputs.cluster }}
           YAML_SELECTION: ${{ inputs.yaml }}
           RUNNERS: ${{ inputs.runners }}
           TASK_TYPES: ${{ inputs.task_types }}
@@ -110,10 +120,38 @@ jobs:
           args=(--wait --report-dir "$RUNNER_TEMP/slurm-report")
           [ -z "$PR" ] || args+=(--pr "$PR")
 
+          case "$CLUSTER" in
+            gb200)
+              runner_prefixes=(b200- gb200- slurm-gb200-)
+              ;;
+            gb300)
+              runner_prefixes=(gb300- slurm-gb300-)
+              coordinator_user=${USER:-$(id -un)}
+              export TS_CI_ARTIFACT_ROOT="/data/home/$coordinator_user/tokenspeed-slurm"
+              export TS_CI_CACHE_DIR="/data/home/$coordinator_user/tokenspeed-cache"
+              [ "$YAML_SELECTION" != off ] || {
+                echo "GB300 requires an explicit YAML selection" >&2
+                exit 2
+              }
+              ;;
+            *)
+              echo "Unsupported Slurm cluster: $CLUSTER" >&2
+              exit 2
+              ;;
+          esac
+
+          runner_is_supported() {
+            local runner=$1 prefix
+            for prefix in "${runner_prefixes[@]}"; do
+              [[ "$runner" == "$prefix"* ]] && return 0
+            done
+            return 1
+          }
+
           if [ "$YAML_SELECTION" != off ]; then
             args+=(--config "$YAML_SELECTION")
             mapfile -t yaml_metadata < <(
-              python3 - "$YAML_SELECTION" <<'PY'
+              python3 - "$YAML_SELECTION" "$CLUSTER" <<'PY'
           import sys
           from pathlib import Path
 
@@ -122,9 +160,13 @@ jobs:
 
           repo = Path.cwd()
           task = normalize_task(repo / sys.argv[1], repo)
+          prefixes = {
+              "gb200": ("b200-", "gb200-", "slurm-gb200-"),
+              "gb300": ("b300-", "slurm-b300-"),
+          }[sys.argv[2]]
           print(f"type:{task['type']}")
           for label in task["runner"]["labels"]:
-              if label.startswith(("b200-", "gb200-", "slurm-")):
+              if label.startswith(prefixes):
                   print(label)
           PY
             )
@@ -135,15 +177,68 @@ jobs:
               exit 2
             }
             args+=(--type "$yaml_task_type")
-            for value in "${yaml_runners[@]}"; do
-              args+=(--runner "$value")
-            done
+            if [ "$CLUSTER" = gb300 ]; then
+              [ "$yaml_task_type" != perf ] || {
+                echo "GB300 perf tasks require calibrated references" >&2
+                exit 2
+              }
+              ((${#yaml_runners[@]} == 1)) || {
+                echo "GB300 requires exactly one declared [slurm-]b300-* runner" >&2
+                exit 2
+              }
+              declared_runner=${yaml_runners[0]}
+              if [ "${RUNNERS//[[:space:]]/}" = "b200-4gpu,gb200-4gpu" ]; then
+                case "$declared_runner" in
+                  b300-*) effective_runner="gb300-${declared_runner#b300-}" ;;
+                  slurm-b300-*) effective_runner="slurm-gb300-${declared_runner#slurm-b300-}" ;;
+                  *) echo "Unsupported GB300 runner: $declared_runner" >&2; exit 2 ;;
+                esac
+              else
+                IFS=',' read -ra values <<< "$RUNNERS"
+                effective_runners=()
+                for value in "${values[@]}"; do
+                  value="${value//[[:space:]]/}"
+                  [ -z "$value" ] || effective_runners+=("$value")
+                done
+                ((${#effective_runners[@]} == 1)) || {
+                  echo "GB300 accepts exactly one explicit runner" >&2
+                  exit 2
+                }
+                effective_runner=${effective_runners[0]}
+              fi
+              runner_is_supported "$effective_runner" || {
+                echo "Runner $effective_runner is not supported by the GB300 cluster" >&2
+                exit 2
+              }
+              case "$declared_runner=$effective_runner" in
+                b300-*=gb300-*)
+                  [ "${declared_runner#b300-}" = "${effective_runner#gb300-}" ]
+                  ;;
+                slurm-b300-*=slurm-gb300-*)
+                  [ "${declared_runner#slurm-b300-}" = "${effective_runner#slurm-gb300-}" ]
+                  ;;
+                *) false ;;
+              esac || {
+                echo "Runner $effective_runner does not match $declared_runner" >&2
+                exit 2
+              }
+              args+=(--runner-alias "$declared_runner=$effective_runner")
+            else
+              for value in "${yaml_runners[@]}"; do
+                args+=(--runner "$value")
+              done
+            fi
           else
             args+=(--all)
             IFS=',' read -ra values <<< "$RUNNERS"
             for value in "${values[@]}"; do
               value="${value//[[:space:]]/}"
-              [ -z "$value" ] || args+=(--runner "$value")
+              [ -z "$value" ] && continue
+              runner_is_supported "$value" || {
+                echo "Runner $value is not supported by the $CLUSTER cluster" >&2
+                exit 2
+              }
+              args+=(--runner "$value")
             done
 
             IFS=',' read -ra values <<< "$TASK_TYPES"
