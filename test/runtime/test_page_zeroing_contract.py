@@ -95,11 +95,8 @@ class ZeroCachePagesContractTest(unittest.TestCase):
         self.assertEqual(target_seen, [pages])
         self.assertEqual(draft_seen, [{"history": [4], "state": [9]}])
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_mapping_pages_condemn_deferred_work_before_zeroing(self):
+        """A page is never zeroed while deferred work still targets it."""
         order = []
         pool = types.SimpleNamespace(
             requires_page_zeroing=True,
@@ -110,3 +107,7 @@ if __name__ == "__main__":
         )
         self.assertIsNone(self._call(pool, {"g": [1]}, attn_backend=backend))
         self.assertEqual(order, ["drop", "zero"])
+
+
+if __name__ == "__main__":
+    unittest.main()
