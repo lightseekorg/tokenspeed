@@ -129,6 +129,30 @@ class _Experts(nn.Module):
         return result
 
 
+class _JointExperts(_Experts):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: StandardTopKOutput,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+        shared_input: torch.Tensor | None = None,
+        shared_weight: torch.Tensor | None = None,
+        shared_out: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        routed = super().forward(
+            hidden_states,
+            topk_output,
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+        )
+        if shared_input is None:
+            return routed
+        assert shared_weight is not None and shared_out is not None
+        shared_out.copy_(shared_input)
+        return routed, shared_out
+
+
 def test_kimi3_join_reduce_moe_selects_lane_norm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -318,6 +342,37 @@ def test_kimi3_moe_execution_policy_is_selected_outside_model() -> None:
     assert plan.joint_moe_reduce
 
 
+def test_kimi3_tp_moe_joins_tensor_parallel_reductions() -> None:
+    group = tuple(range(8))
+    mapping = SimpleNamespace(
+        moe=SimpleNamespace(
+            tp_size=8,
+            ep_size=1,
+            ep_group=(0,),
+            tp_ep_size=8,
+            tp_ep_group=group,
+        )
+    )
+    backend = SimpleNamespace(
+        is_auto=lambda: True,
+        is_flashinfer_trtllm=lambda: False,
+    )
+
+    with mock.patch.object(
+        latent_module,
+        "native_latent_moe_available",
+        return_value=True,
+    ):
+        plan = Kimi3MoEExecutionPlan.build(
+            mapping,
+            backend,
+            alt_stream=None,
+            enforce_eager=False,
+        )
+
+    assert plan.joint_moe_reduce
+
+
 def test_kimi3_moe_execution_policy_preserves_nvidia_trtllm() -> None:
     mapping = SimpleNamespace(
         moe=SimpleNamespace(
@@ -474,6 +529,58 @@ def test_latent_moe_falls_back_when_input_projections_declines() -> None:
     input_projections.assert_called_once_with(hidden_states, None)
 
 
+@pytest.mark.parametrize(
+    ("tokens", "uses_joint"),
+    [(1, True), (2, True), (3, True), (4, True), (8, False)],
+)
+def test_latent_moe_applies_joint_projection_through_tuned_token_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tokens: int,
+    uses_joint: bool,
+) -> None:
+    monkeypatch.setattr(
+        latent_module,
+        "acquire_all_reduce_outputs",
+        lambda shapes, like, _group: tuple(like.new_empty(shape) for shape in shapes),
+    )
+    monkeypatch.setattr(
+        latent_module,
+        "all_reduce",
+        lambda outputs, _group: outputs,
+    )
+    hidden_states = torch.arange(tokens * 4, dtype=torch.float32).view(tokens, 4)
+    joint_projector = mock.Mock(
+        return_value=(
+            hidden_states[:, :2].float(),
+            hidden_states[:, :2] + 10,
+            hidden_states * 6,
+        )
+    )
+    layer = _layer(
+        experts=_JointExperts(),
+        routed_norm=_Norm(),
+        shared_experts=_Shared(),
+        joint_reduce=True,
+        joint_reduce_group=(0,),
+        joint_input_projections=joint_projector,
+        joint_shared_weight=torch.ones(1),
+        joint_expert_shared_max_tokens=4,
+    )
+
+    actual = layer(hidden_states)
+
+    if uses_joint:
+        latent = hidden_states[:, :2] + 14
+        shared = hidden_states * 6
+        joint_projector.assert_called_once()
+    else:
+        latent = hidden_states[:, :2] + 4
+        shared = hidden_states * 4
+        joint_projector.assert_not_called()
+    expected = torch.cat((latent, torch.zeros_like(latent)), dim=-1) + shared
+    torch.testing.assert_close(actual, expected)
+
+
 def test_latent_moe_rejects_input_projections_without_shared_experts() -> None:
     with pytest.raises(ValueError, match="input_projections requires shared_experts"):
         _layer(input_projections=lambda hidden_states, shared_out: None)
@@ -485,14 +592,14 @@ def test_latent_moe_acquires_shared_and_routed_outputs(
     acquisitions = []
 
     def acquire_outputs(shapes, like, group):
-        assert group == (0,)
+        assert group == (0, 1)
         outputs = tuple(like.new_empty(shape) for shape in shapes)
         acquisitions.append(outputs)
         return outputs
 
     def reduce_outputs(outputs, group):
         assert outputs is acquisitions[0]
-        assert group == (0,)
+        assert group == (0, 1)
         return outputs[0] + 5, outputs[1] * 2
 
     monkeypatch.setattr(latent_module, "acquire_all_reduce_outputs", acquire_outputs)
@@ -503,6 +610,7 @@ def test_latent_moe_acquires_shared_and_routed_outputs(
         shared_experts=_Shared(),
         joint_reduce=True,
         expert_parallel_group=(0,),
+        joint_reduce_group=(0, 1),
     )
     hidden_states = torch.arange(12, dtype=torch.float32).view(3, 4)
 
