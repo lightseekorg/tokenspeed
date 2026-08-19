@@ -17,9 +17,11 @@ from slurm_submit import (
     queued_states,
     render_script,
     result_detail,
+    scontrol_states,
     select_tasks,
     source_pr_url,
     submit,
+    wait_all,
     write_report,
 )
 
@@ -112,34 +114,25 @@ def test_load_task_checks_runner(tmp_path):
         load_task(tmp_path, config, "gb200-4gpu")
 
 
-def test_load_task_supports_optional_gb300_alias(tmp_path):
-    config = write_task(tmp_path, runner="b300-1gpu", task_type="ut")
-
-    assert load_task(tmp_path, config, "b300-1gpu", "gb300-1gpu") == Task(
-        config, "example", "ut", "gb300-1gpu", 1, 1, "b300-1gpu"
-    )
-
-
-def test_load_task_supports_multi_node_gb300_alias(tmp_path):
+def test_load_task_supports_multi_node_gb300_runner(tmp_path):
     config = write_task(
         tmp_path,
-        runner="slurm-b300-4gpu",
+        runner="slurm-gb300-4gpu",
         nodes=2,
         gpus_per_node=4,
     )
 
-    assert load_task(tmp_path, config, "slurm-b300-4gpu", "slurm-gb300-4gpu") == Task(
+    assert load_task(tmp_path, config, "slurm-gb300-4gpu") == Task(
         config,
         "example",
         "eval",
         "slurm-gb300-4gpu",
         4,
         2,
-        "slurm-b300-4gpu",
     )
 
 
-def test_render_script_passes_declared_and_effective_gb300_runners():
+def test_render_script_passes_declared_gb300_runner_unchanged():
     script = render_script(
         Task(
             "test/ci/ut/example.yaml",
@@ -147,7 +140,6 @@ def test_render_script_passes_declared_and_effective_gb300_runners():
             "ut",
             "gb300-1gpu",
             1,
-            declared_runner="b300-1gpu",
         ),
         Path("/shared/source.tar"),
         Path("/shared/runs"),
@@ -155,31 +147,9 @@ def test_render_script_passes_declared_and_effective_gb300_runners():
         "ghcr.io/example/image@sha256:abc",
     )
 
-    assert "--runner=b300-1gpu" in script
-    assert "--runner-override=gb300-1gpu" in script
+    assert "--runner=gb300-1gpu" in script
+    assert "--runner-override" not in script
     assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in script
-
-
-@pytest.mark.parametrize(
-    ("declared", "effective", "message"),
-    [
-        ("b300-4gpu", "gb300-1gpu", "GPU counts"),
-        ("b200-1gpu", "gb300-1gpu", "b300"),
-        ("slurm-b300-1gpu", "gb300-1gpu", "b300"),
-    ],
-)
-def test_load_task_rejects_invalid_gb300_alias(tmp_path, declared, effective, message):
-    config = write_task(tmp_path, runner=declared, task_type="ut")
-
-    with pytest.raises(ValueError, match=message):
-        load_task(tmp_path, config, declared, effective)
-
-
-def test_load_task_rejects_gb300_perf_alias(tmp_path):
-    config = write_task(tmp_path, runner="b300-4gpu", task_type="perf")
-
-    with pytest.raises(ValueError, match="perf"):
-        load_task(tmp_path, config, "b300-4gpu", "gb300-4gpu")
 
 
 def test_select_all_filters_exact_runner(monkeypatch, tmp_path):
@@ -206,20 +176,6 @@ def test_select_all_filters_exact_runner(monkeypatch, tmp_path):
     assert select_tasks(args, tmp_path) == [
         Task(config, "example", "eval", "gb200-1gpu", 1)
     ]
-
-
-def test_select_all_rejects_runner_alias_even_with_runner(tmp_path):
-    args = argparse.Namespace(
-        config=None,
-        runner=["gb200-1gpu"],
-        runner_alias=["b300-1gpu=gb300-1gpu"],
-        task_types=None,
-        match=None,
-        trigger="manual",
-    )
-
-    with pytest.raises(ValueError, match="requires --config"):
-        select_tasks(args, tmp_path)
 
 
 def test_select_all_supports_multiple_runners_types_and_model_match(
@@ -572,6 +528,58 @@ def test_queued_states_queries_only_requested_jobs(monkeypatch):
             "reason": "Resources",
         },
     }
+
+
+def test_scontrol_states_parses_terminal_job(monkeypatch):
+    outputs = iter(
+        [
+            "JobId=123 JobState=COMPLETED RunTime=00:37:01 "
+            "DerivedExitCode=9:0 ExitCode=0:0\n",
+            "JobId=123 JobState=COMPLETING RunTime=00:37:01 ExitCode=0:0\n",
+        ]
+    )
+
+    def fake_run(command, **kwargs):
+        assert command == ["scontrol", "show", "job", "-o", "123"]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=next(outputs),
+            stderr="",
+        )
+
+    monkeypatch.setattr("slurm_submit.subprocess.run", fake_run)
+
+    assert scontrol_states(["123"]) == {
+        "123": {
+            "state": "COMPLETED",
+            "elapsed": "00:37:01",
+            "exit_code": "0:0",
+        }
+    }
+    assert scontrol_states(["123"]) == {}
+
+
+def test_wait_all_uses_scontrol_when_accounting_is_empty(monkeypatch, tmp_path):
+    monkeypatch.setattr("slurm_submit.queued_states", lambda _ids: {})
+    monkeypatch.setattr("slurm_submit.slurm_states", lambda _ids: {})
+    monkeypatch.setattr(
+        "slurm_submit.scontrol_states",
+        lambda _ids: {
+            "123": {
+                "state": "COMPLETED",
+                "elapsed": "00:01:00",
+                "exit_code": "0:0",
+            }
+        },
+    )
+
+    submission = Submission(
+        Task("test/ci/eval/example.yaml", "example", "eval", "gb300-4gpu", 4),
+        "123",
+        tmp_path / "123.log",
+    )
+    assert wait_all([submission], tmp_path / "runs", tmp_path / "report")
 
 
 def test_print_progress_omits_running_node(capsys, tmp_path):

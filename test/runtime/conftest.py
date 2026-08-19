@@ -42,6 +42,8 @@ def kimi_recipe(
     context_len: int = 4096,
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
+    speculative_algorithm: str | None = None,
+    speculative_num_draft_tokens: int = 1,
 ):
     """A Kimi-K3 recipe over the reference config, with tiny scheduler limits."""
     from types import SimpleNamespace
@@ -73,7 +75,10 @@ def kimi_recipe(
     )
     return KimiK3Recipe(
         server_args=SimpleNamespace(
-            max_total_tokens=None, chunked_prefill_size=max_scheduled_tokens
+            max_total_tokens=None,
+            chunked_prefill_size=max_scheduled_tokens,
+            speculative_algorithm=speculative_algorithm,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(text_config=text_config)

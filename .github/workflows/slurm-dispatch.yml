@@ -27,7 +27,7 @@ on:
           - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k.yaml
           - test/ci/eval/glm-5.2-nvfp4-mtp-evalscope-aime26.yaml
           - test/ci/eval/gpt-oss-120b-mxfp4-evalscope-gpqa-diamond.yaml
-          - test/ci/eval/inkling-nvfp4-mtp-evalscope-gsm8k.yaml
+          - test/ci/eval/inkling-nvfp4-mtp-evalscope-aime25.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-dflash-evalscope-aime25.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-aime25.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-gpqa-diamond.yaml
@@ -53,7 +53,7 @@ on:
           - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
           - test/ci/ut/ut-tokenspeed-kernel.yaml
       runners:
-        description: "GB200 bulk runners, or one explicit [slurm-]gb300-* runner with a selected YAML"
+        description: "GB200 bulk runners, or one declared [slurm-]gb300-* runner with a selected YAML"
         required: true
         default: "b200-4gpu,gb200-4gpu"
         type: string
@@ -162,7 +162,7 @@ jobs:
           task = normalize_task(repo / sys.argv[1], repo)
           prefixes = {
               "gb200": ("b200-", "gb200-", "slurm-gb200-"),
-              "gb300": ("b300-", "slurm-b300-"),
+              "gb300": ("gb300-", "slurm-gb300-"),
           }[sys.argv[2]]
           print(f"type:{task['type']}")
           for label in task["runner"]["labels"]:
@@ -183,46 +183,34 @@ jobs:
                 exit 2
               }
               ((${#yaml_runners[@]} == 1)) || {
-                echo "GB300 requires exactly one declared [slurm-]b300-* runner" >&2
+                echo "GB300 requires exactly one declared [slurm-]gb300-* runner" >&2
                 exit 2
               }
-              declared_runner=${yaml_runners[0]}
+              yaml_runner=${yaml_runners[0]}
               if [ "${RUNNERS//[[:space:]]/}" = "b200-4gpu,gb200-4gpu" ]; then
-                case "$declared_runner" in
-                  b300-*) effective_runner="gb300-${declared_runner#b300-}" ;;
-                  slurm-b300-*) effective_runner="slurm-gb300-${declared_runner#slurm-b300-}" ;;
-                  *) echo "Unsupported GB300 runner: $declared_runner" >&2; exit 2 ;;
-                esac
+                selected_runner=$yaml_runner
               else
                 IFS=',' read -ra values <<< "$RUNNERS"
-                effective_runners=()
+                selected_runners=()
                 for value in "${values[@]}"; do
                   value="${value//[[:space:]]/}"
-                  [ -z "$value" ] || effective_runners+=("$value")
+                  [ -z "$value" ] || selected_runners+=("$value")
                 done
-                ((${#effective_runners[@]} == 1)) || {
+                ((${#selected_runners[@]} == 1)) || {
                   echo "GB300 accepts exactly one explicit runner" >&2
                   exit 2
                 }
-                effective_runner=${effective_runners[0]}
+                selected_runner=${selected_runners[0]}
               fi
-              runner_is_supported "$effective_runner" || {
-                echo "Runner $effective_runner is not supported by the GB300 cluster" >&2
+              runner_is_supported "$selected_runner" || {
+                echo "Runner $selected_runner is not supported by the GB300 cluster" >&2
                 exit 2
               }
-              case "$declared_runner=$effective_runner" in
-                b300-*=gb300-*)
-                  [ "${declared_runner#b300-}" = "${effective_runner#gb300-}" ]
-                  ;;
-                slurm-b300-*=slurm-gb300-*)
-                  [ "${declared_runner#slurm-b300-}" = "${effective_runner#slurm-gb300-}" ]
-                  ;;
-                *) false ;;
-              esac || {
-                echo "Runner $effective_runner does not match $declared_runner" >&2
+              [ "$selected_runner" = "$yaml_runner" ] || {
+                echo "Runner $selected_runner is not declared by $YAML_SELECTION" >&2
                 exit 2
               }
-              args+=(--runner-alias "$declared_runner=$effective_runner")
+              args+=(--runner "$yaml_runner")
             else
               for value in "${yaml_runners[@]}"; do
                 args+=(--runner "$value")
