@@ -312,7 +312,7 @@ def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
     )
 
     assert set(triggers) == {"push", "pull_request"}
-    assert submit["runs-on"] == "slurm-dispatch-gb300-auto"
+    assert submit["runs-on"] == "slurm-dispatch-gb300"
     assert workflow["concurrency"]["cancel-in-progress"] == (
         "${{ github.event_name == 'pull_request' }}"
     )
