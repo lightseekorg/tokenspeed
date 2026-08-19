@@ -55,6 +55,12 @@ WARP_DECODE_STAGE2_BATCHED_BLOCK_N = 4
 WARP_DECODE_STAGE2_BLOCK_KB = 512
 WARP_DECODE_STAGE2_NUM_WARPS = 8
 WARP_DECODE_STAGE2_BATCHED_NUM_WARPS = 4
+WARP_DECODE_TP_STAGE1_BLOCK_N = 2
+WARP_DECODE_TP_STAGE1_NUM_WARPS = 1
+WARP_DECODE_TP_STAGE2_BLOCK_N = 8
+WARP_DECODE_TP_STAGE2_BLOCK_KB = 256
+WARP_DECODE_TP_STAGE2_NUM_WARPS = 1
+WARP_DECODE_TP_TOPK_PER_CTA = 1
 _MIN_WARP_DECODE_BLOCK_KB = 128
 _KIMI3_SHARED_K = gl.constexpr(768)
 _KIMI3_SHARED_BLOCK_K = gl.constexpr(512)
@@ -302,6 +308,7 @@ def _stage2_a16w4_warp_gemv_combine(
     NUM_LOCAL_EXPERTS: gl.constexpr,
     LINEAR_WEIGHTS: gl.constexpr,
     NUM_PID_N: gl.constexpr,
+    NUM_TOPK_GROUPS: gl.constexpr,
     NUM_SHARED_PID_N: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_KB: gl.constexpr,
@@ -361,8 +368,10 @@ def _stage2_a16w4_warp_gemv_combine(
         )
         return
 
-    token = pid // NUM_PID_N
-    pid_n = pid % NUM_PID_N
+    token = pid // (NUM_TOPK_GROUPS * NUM_PID_N)
+    token_pid = pid % (NUM_TOPK_GROUPS * NUM_PID_N)
+    topk_group = token_pid // NUM_PID_N
+    pid_n = token_pid % NUM_PID_N
     layout: gl.constexpr = gl.BlockedLayout(
         [(BLOCK_N + NUM_WARPS - 1) // NUM_WARPS, BLOCK_KB // _LANES],
         [1, _LANES],
@@ -384,7 +393,12 @@ def _stage2_a16w4_warp_gemv_combine(
     packed_k = intermediate_dim // 2
     acc = gl.zeros([BLOCK_N], gl.float32, expanded_n_layout)
 
-    for slot in gl.static_range(0, TOP_K):
+    for group_slot in gl.static_range(
+        0, (TOP_K + NUM_TOPK_GROUPS - 1) // NUM_TOPK_GROUPS
+    ):
+        slot = (
+            topk_group * ((TOP_K + NUM_TOPK_GROUPS - 1) // NUM_TOPK_GROUPS) + group_slot
+        )
         expert = (
             gl.load(local_ids_ptr + token * stride_idm + slot * stride_ids)
             - EXPERT_START
@@ -457,9 +471,42 @@ def _stage2_a16w4_warp_gemv_combine(
             # Match the reference's BF16 W2 result before route weighting.
             acc += route_weight * route_acc.to(gl.bfloat16).to(gl.float32)
 
+    out_row = token * NUM_TOPK_GROUPS + topk_group
     gl.store(
-        out_ptr + token * stride_om + expanded_offs_n * stride_on,
+        out_ptr + out_row * stride_om + expanded_offs_n * stride_on,
         acc.to(out_ptr.dtype.element_ty),
+    )
+
+
+@gluon.jit
+def _reduce_topk_groups(
+    partial_ptr,
+    out_ptr,
+    hidden_dim,
+    stride_pm,
+    stride_pn,
+    stride_om,
+    stride_on,
+    NUM_GROUPS: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    pid = gl.program_id(0)
+    num_pid_n = gl.cdiv(hidden_dim, BLOCK_N)
+    token = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    layout: gl.constexpr = gl.BlockedLayout([4], [64], [1], [0])
+    offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=layout)
+    acc = gl.zeros([BLOCK_N], gl.float32, layout=layout)
+    for group in gl.static_range(0, NUM_GROUPS):
+        acc += gl.load(
+            partial_ptr + (token * NUM_GROUPS + group) * stride_pm + offs_n * stride_pn,
+            mask=offs_n < hidden_dim,
+            other=0.0,
+        ).to(gl.float32)
+    gl.store(
+        out_ptr + token * stride_om + offs_n * stride_on,
+        acc.to(out_ptr.dtype.element_ty),
+        mask=offs_n < hidden_dim,
     )
 
 
@@ -607,9 +654,14 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    stage1_block_n = WARP_DECODE_STAGE1_BLOCK_N
+    tp_local = num_experts == 896 and intermediate_dim == 384 and top_k == 16
+    stage1_block_n = (
+        WARP_DECODE_TP_STAGE1_BLOCK_N if tp_local else WARP_DECODE_STAGE1_BLOCK_N
+    )
     stage1_block_kb = WARP_DECODE_STAGE1_BLOCK_KB
-    stage1_warps = WARP_DECODE_STAGE1_NUM_WARPS
+    stage1_warps = (
+        WARP_DECODE_TP_STAGE1_NUM_WARPS if tp_local else WARP_DECODE_STAGE1_NUM_WARPS
+    )
     if (
         intermediate_dim % stage1_block_n
         or stage1_block_kb < _MIN_WARP_DECODE_BLOCK_KB
@@ -662,24 +714,44 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         raise ValueError("routed output must be contiguous and colocated")
     # Finer output tiles keep work balanced when local route counts differ.
     stage2_block_n = (
-        WARP_DECODE_STAGE2_BATCHED_BLOCK_N
-        if num_tokens in (2, 4)
-        else WARP_DECODE_STAGE2_BLOCK_N
+        WARP_DECODE_TP_STAGE2_BLOCK_N
+        if tp_local
+        else (
+            WARP_DECODE_STAGE2_BATCHED_BLOCK_N
+            if num_tokens in (2, 4)
+            else WARP_DECODE_STAGE2_BLOCK_N
+        )
     )
     packed_intermediate = intermediate_dim // 2
-    stage2_block_kb = _largest_exact_block_kb(
-        packed_intermediate,
-        WARP_DECODE_STAGE2_BLOCK_KB,
+    stage2_block_kb = (
+        WARP_DECODE_TP_STAGE2_BLOCK_KB
+        if tp_local
+        else _largest_exact_block_kb(
+            packed_intermediate,
+            WARP_DECODE_STAGE2_BLOCK_KB,
+        )
     )
     # The M=1 joint path remains faster with eight waves.
     stage2_warps = (
-        WARP_DECODE_STAGE2_BATCHED_NUM_WARPS
-        if num_tokens in (2, 4)
-        else WARP_DECODE_STAGE2_NUM_WARPS
+        WARP_DECODE_TP_STAGE2_NUM_WARPS
+        if tp_local
+        else (
+            WARP_DECODE_STAGE2_BATCHED_NUM_WARPS
+            if num_tokens in (2, 4)
+            else WARP_DECODE_STAGE2_NUM_WARPS
+        )
     )
     if hidden_dim % stage2_block_n:
         raise ValueError("stage2 requires exact output-column tiles")
-    stage2_grid = num_tokens * triton.cdiv(hidden_dim, stage2_block_n)
+    num_topk_groups = triton.cdiv(top_k, WARP_DECODE_TP_TOPK_PER_CTA) if tp_local else 1
+    stage2_grid = num_tokens * num_topk_groups * triton.cdiv(hidden_dim, stage2_block_n)
+    stage2_out = out
+    if num_topk_groups > 1:
+        stage2_out = torch.empty(
+            (num_tokens * num_topk_groups, hidden_dim),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
     if fuse_shared_down:
         if shared_out is None:
             shared_out = torch.empty(
@@ -705,7 +777,7 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         inter,
         w2_weight,
         w2_scale,
-        out,
+        stage2_out,
         local_topk_ids,
         topk_weights,
         out if shared_input is None else shared_input,
@@ -721,8 +793,8 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         w2_scale.stride(0),
         w2_scale.stride(1),
         w2_scale.stride(2),
-        out.stride(0),
-        out.stride(1),
+        stage2_out.stride(0),
+        stage2_out.stride(1),
         local_topk_ids.stride(0),
         local_topk_ids.stride(1),
         topk_weights.stride(0),
@@ -738,6 +810,7 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         NUM_LOCAL_EXPERTS=num_experts,
         LINEAR_WEIGHTS=linear_weights,
         NUM_PID_N=hidden_dim // stage2_block_n,
+        NUM_TOPK_GROUPS=num_topk_groups,
         NUM_SHARED_PID_N=7168 // stage2_block_n,
         BLOCK_N=stage2_block_n,
         BLOCK_KB=stage2_block_kb,
@@ -745,6 +818,19 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         MASK_K_TAIL=packed_intermediate % stage2_block_kb != 0,
         num_warps=stage2_warps,
     )
+    if num_topk_groups > 1:
+        _reduce_topk_groups[(num_tokens * triton.cdiv(hidden_dim, 256),)](
+            stage2_out,
+            out,
+            hidden_dim,
+            stage2_out.stride(0),
+            stage2_out.stride(1),
+            out.stride(0),
+            out.stride(1),
+            NUM_GROUPS=num_topk_groups,
+            BLOCK_N=256,
+            num_warps=1,
+        )
     if fuse_shared_down:
         return out, shared_out
     return out
