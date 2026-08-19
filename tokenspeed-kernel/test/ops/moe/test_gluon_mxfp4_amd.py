@@ -265,11 +265,11 @@ def test_dynamic_mxfp4_activation_moe(
     torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
 
 
-def test_bf16_activation_situ_moe() -> None:
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4])
+def test_bf16_activation_situ_moe(num_tokens: int) -> None:
     if not is_cdna4():
         pytest.skip("BF16 SiTU activation is unavailable on this GPU")
 
-    num_tokens = 1
     num_experts = 2
     hidden_size = 3584
     intermediate_size = 3072
@@ -306,7 +306,9 @@ def test_bf16_activation_situ_moe() -> None:
     topk_weights = torch.full(
         (num_tokens, top_k), 1.0 / top_k, dtype=torch.float32, device="cuda"
     )
-    topk_ids = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
+    topk_ids = torch.tensor([[0, 1]] * num_tokens, dtype=torch.int32, device="cuda")
+    shared_input = torch.randn(num_tokens, 768, dtype=torch.bfloat16, device="cuda")
+    shared_weight = torch.randn(7168, 768, dtype=torch.bfloat16, device="cuda")
 
     actual = gluon_a16w4_situ_warp_decode_ep_gfx950(
         hidden_states,
@@ -320,11 +322,21 @@ def test_bf16_activation_situ_moe() -> None:
         situ_linear_beta=25.0,
         linear_weights=True,
         w13_interleaved=True,
+        shared_input=shared_input,
+        shared_weight=shared_weight,
     )
 
     torch.cuda.synchronize()
-    assert actual.shape == hidden_states.shape
-    torch.testing.assert_close(actual, torch.zeros_like(actual), atol=0, rtol=0)
+    assert isinstance(actual, tuple)
+    routed, shared = actual
+    assert routed.shape == hidden_states.shape
+    torch.testing.assert_close(routed, torch.zeros_like(routed), atol=0, rtol=0)
+    torch.testing.assert_close(
+        shared,
+        torch.nn.functional.linear(shared_input, shared_weight),
+        atol=2e-2,
+        rtol=2e-2,
+    )
 
 
 def test_static_fp8_activation_moe_gfx950_smoke() -> None:
