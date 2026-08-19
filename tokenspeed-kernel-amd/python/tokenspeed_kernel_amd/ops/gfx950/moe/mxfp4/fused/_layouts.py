@@ -132,6 +132,25 @@ def _swiglu_reduce(
     return s * (linear + beta)
 
 
+@gluon.jit
+def _situ_reduce(
+    acc,
+    beta: gl.constexpr,
+    linear_beta: gl.constexpr,
+    OUT_BLOCK_N: gl.constexpr,
+):
+    block_m: gl.constexpr = acc.shape[0]
+    block_n_full: gl.constexpr = acc.shape[1]
+    split_layout: gl.constexpr = _swiglu_split_layout(
+        block_m, block_n_full, gl.num_warps()
+    )
+    acc = gl.convert_layout(acc, split_layout).to(gl.bfloat16).to(gl.float32)
+    gate, linear = gl.split(acc.reshape((block_m, OUT_BLOCK_N, 2)))
+    gate = beta * gl.extra.libdevice.tanh(gate / beta) / (1.0 + gl.exp(-gate))
+    linear = linear_beta * gl.extra.libdevice.tanh(linear / linear_beta)
+    return gate * linear
+
+
 # ---------------------------------------------------------------------------
 # Scaled MFMA MoE kernel (mxfp4 / fp8 + e8m0 block scales)
 # ---------------------------------------------------------------------------
@@ -343,3 +362,96 @@ def _moe_partial_reduce(
         acc.to(Out.dtype.element_ty),
         mask=bound,
     )
+
+
+@gluon.jit
+def _moe_partial_reduce_shared(
+    Partial,
+    Out,
+    SharedInput,
+    SharedWeight,
+    SharedOut,
+    M,
+    N,
+    stride_pk,
+    stride_pm,
+    stride_pn,
+    stride_om,
+    stride_on,
+    stride_sim,
+    stride_sik,
+    stride_som,
+    stride_son,
+    SPLIT_K: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_REDUCE_PROGRAMS: gl.constexpr,
+    NUM_SHARED_PID_N: gl.constexpr,
+    SHARED_BLOCK_N: gl.constexpr,
+):
+    """Combine routed experts and compute K3's shared down projection."""
+    pid = gl.program_id(axis=0)
+    if pid < NUM_REDUCE_PROGRAMS:
+        num_n = gl.cdiv(N, BLOCK_N)
+        pid_m = pid // num_n
+        pid_n = pid % num_n
+        layout: gl.constexpr = gl.BlockedLayout([4], [64], [1], [0])
+        n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=layout)
+        bound = (pid_m < M) & (n < N)
+        acc = gl.zeros([BLOCK_N], gl.float32, layout=layout)
+        for k in gl.static_range(SPLIT_K):
+            acc += gl.load(
+                Partial
+                + k * stride_pk
+                + pid_m.to(gl.int64) * stride_pm
+                + n.to(gl.int64) * stride_pn,
+                mask=bound,
+                other=0.0,
+            ).to(gl.float32)
+        gl.store(
+            Out + pid_m.to(gl.int64) * stride_om + n.to(gl.int64) * stride_on,
+            acc.to(Out.dtype.element_ty),
+            mask=bound,
+        )
+    else:
+        shared_pid = pid - NUM_REDUCE_PROGRAMS
+        shared_token = shared_pid // NUM_SHARED_PID_N
+        shared_pid_n = shared_pid % NUM_SHARED_PID_N
+        shared_layout: gl.constexpr = gl.BlockedLayout(
+            [SHARED_BLOCK_N, 8], [1, 64], [1, 1], [1, 0]
+        )
+        shared_n_layout: gl.constexpr = gl.SliceLayout(1, shared_layout)
+        shared_k_layout: gl.constexpr = gl.SliceLayout(0, shared_layout)
+        shared_n = shared_pid_n * SHARED_BLOCK_N + gl.arange(
+            0, SHARED_BLOCK_N, layout=shared_n_layout
+        )
+        shared_acc = gl.zeros([SHARED_BLOCK_N], gl.float32, shared_n_layout)
+        for k0 in range(0, 768, 512):
+            shared_k = k0 + gl.arange(0, 512, layout=shared_k_layout)
+            valid_k = shared_k < 768
+            shared_input = gl.amd.cdna4.buffer_load(
+                SharedInput,
+                (shared_token * stride_sim + shared_k * stride_sik).to(gl.int32),
+                mask=valid_k,
+                other=0.0,
+            ).to(gl.float32)
+            shared_weight = gl.amd.cdna4.buffer_load(
+                SharedWeight,
+                (
+                    shared_n[:, None].to(gl.int64) * 768
+                    + shared_k[None, :].to(gl.int64)
+                ).to(gl.int32),
+                mask=valid_k[None, :],
+                other=0.0,
+            ).to(gl.float32)
+            shared_input = gl.convert_layout(shared_input[None, :], shared_layout)
+            shared_acc += gl.sum(shared_weight * shared_input, axis=1)
+        gl.store(
+            SharedOut + shared_token * stride_som + shared_n * stride_son,
+            shared_acc.to(SharedOut.dtype.element_ty),
+        )
+
+
+def _route_small_m(logits, topk, dtype):
+    """1-kernel stable-order fused route for bounded M and G=M*topk."""
+    M, E = logits.shape
+    G = M * topk
