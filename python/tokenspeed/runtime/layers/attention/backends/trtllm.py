@@ -149,9 +149,6 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             if config.kernel_page_size is not None
             else TRTLLM_MHA_PAGE_SIZE
         )
-        self.group_block_granularities = dict(
-            getattr(config, "group_block_granularities", None) or {}
-        )
         self.max_context_len = config.context_len
         self.kv_cache_dtype = config.kv_cache_dtype
         max_bs = config.max_bs
@@ -436,7 +433,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             # Verify keeps [bs]-row tables; only DFLASH expands rows.
             assert not (
                 self.draft_block_decode and self.spec_num_tokens > 1
-            ), "paged cache groups are unsupported with DFLASH block decode"
+            ), "cache groups are unsupported with DFLASH block decode"
             if forward_mode.is_extend_or_mixed():
                 assert extend_prefix_lens_cpu is not None
                 assert extend_seq_lens_cpu is not None
@@ -747,14 +744,14 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
-        paged_cache_group_specs: Sequence = (),
+        cache_group_specs: Sequence = (),
         **kwargs,
     ):
         self.cuda_graph_prefill_metadata = {}
         self.cuda_graph_decode_metadata = {}
         # Per-group persistent buffers + state-group shed; before the
         # DFLASH early return (replay reads the dict for the stale guard).
-        self._learn_cache_groups(paged_cache_group_specs)
+        self._learn_cache_groups(cache_group_specs)
         self._init_group_graph_buffers(max_bs)
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: spec_num_tokens decode rows per request. Unlike

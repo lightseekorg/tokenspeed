@@ -277,10 +277,10 @@ class Qwen3_5BaseTextConfig(PretrainedConfig):
 
     @property
     def layer_types(self):
-        """Per-layer paged-cache labels: "full_attention" / "linear_attention".
+        """Per-layer cache-group labels: "full_attention" / "linear_attention".
 
         Same interleaving as ``layers_block_type``, translated to the label
-        vocabulary of ``paged_cache_spec`` (``HybridLayerType.full_attention``
+        vocabulary of ``cache_spec`` (``HybridLayerType.full_attention``
         serializes as the checkpoint's "attention", which the KV-cache layer
         has no retention entry for). A property rather than an ``__init__``
         attribute because NextN drafts overwrite ``full_attention_interval``

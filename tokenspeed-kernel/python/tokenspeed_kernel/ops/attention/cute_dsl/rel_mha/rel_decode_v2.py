@@ -106,6 +106,7 @@ def _compile_decode(
     page_size: int,
     use_pdl: bool,
     prediction: int = 1,
+    has_tau: bool = False,
 ):
     from cutlass import cute
     from flash_attn.cute.cute_dsl_utils import to_cute_tensor
@@ -143,6 +144,7 @@ def _compile_decode(
     pt = torch.empty(FB * 4, device=dev, dtype=torch.int32)
     po = torch.empty(FB, device=dev, dtype=torch.int32)
     su = torch.empty(FB, device=dev, dtype=torch.int32)
+    tau = torch.empty(FB, P, device=dev, dtype=torch.float32) if has_tau else None
     return cute.compile(
         kernel,
         kv_splits,
@@ -158,6 +160,7 @@ def _compile_decode(
         to_cute_tensor(mp, assumed_align=4),
         to_cute_tensor(lp, assumed_align=4),
         1.0 / math.sqrt(head_dim),
+        to_cute_tensor(tau, assumed_align=4) if has_tau else None,
         None,  # mCuSeqlensQ
         None,  # mCuSeqlensK
         None,  # mSeqUsedQ
@@ -227,7 +230,13 @@ def v2_buffers_ready(q, window_left, page_table, prediction: int = 1) -> bool:
 
 
 def is_compiled_for_v2(
-    q, k_cache, rel_logits, window_left, enable_pdl: bool = True, prediction: int = 1
+    q,
+    k_cache,
+    rel_logits,
+    window_left,
+    enable_pdl: bool = True,
+    prediction: int = 1,
+    has_tau: bool = False,
 ) -> bool:
     """Whether the config's kernel is already compiled (graph-capture guard)."""
     kv_splits = 1 if window_left >= 0 else _V2_FULL_SPLITS
@@ -243,6 +252,7 @@ def is_compiled_for_v2(
         k_cache.shape[1],
         enable_pdl,
         prediction,
+        has_tau,
     )
     return key in _DECODE._cache
 
@@ -270,6 +280,7 @@ def rel_mha_decode_tsmha_v2(
     rel_logits: torch.Tensor,  # (B * prediction, num_q_heads, extent)
     window_left: int,
     softmax_scale: float | None = None,
+    tau: torch.Tensor | None = None,  # (B * prediction,) fp32
     enable_pdl: bool = True,
     prediction: int = 1,
 ) -> torch.Tensor:
@@ -287,7 +298,9 @@ def rel_mha_decode_tsmha_v2(
     256 tokens — the kernel's sub-page TMA boxes cover all three). It must
     be (a view of) the engine's address-stable per-step table with a dense
     innermost dim (column-sliced row strides are fine) and ``-1`` holes
-    only outside the sliding window. Returns
+    only outside the sliding window. ``tau`` is an optional fp32 per-query-row
+    multiplier fused onto the total pre-softmax logits,
+    ``tau * (softmax_scale * q@k^T + rel)``; values must be positive. Returns
     ``(B * prediction, num_q_heads * head_dim)`` in the query dtype.
     """
     P = max(prediction, 1)
@@ -317,6 +330,7 @@ def rel_mha_decode_tsmha_v2(
         page_tokens,
         enable_pdl,
         P,
+        tau is not None,
     )
 
     row_stride = page_table.stride(0)
@@ -348,6 +362,7 @@ def rel_mha_decode_tsmha_v2(
         mp_w,
         lp_w,
         softmax_scale,
+        tau.view(B, P) if tau is not None else None,
         None,
         None,
         None,

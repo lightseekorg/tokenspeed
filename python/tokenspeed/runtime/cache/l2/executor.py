@@ -109,7 +109,7 @@ class L2CacheExecutor:
             draft_pool.cache_transfer_layout() if draft_pool is not None else None
         )
         scheduler_group_ids = tuple(
-            spec.group_id for spec in device_pool.paged_cache_group_specs
+            spec.group_id for spec in device_pool.arena.cache_group_specs
         )
         self.layout = combine_cache_transfer_layouts(
             target_layout,

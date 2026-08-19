@@ -1275,6 +1275,11 @@ def test_dsa_dense_kvcache(
             id="single-row-full-width",
         ),
         pytest.param(
+            (2048, 2048),
+            2112,
+            id="multi-row-full-width",
+        ),
+        pytest.param(
             (1024,),
             1024,
             id="registered-width-1024",

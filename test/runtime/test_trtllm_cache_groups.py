@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -45,9 +46,10 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         device="cpu",
         groups=None,
     ):
-        from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+        from cache_pool_test_utils import MinimalCacheView
+
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-            PagedCacheGroupSpec,
+            CacheGroupSpec,
         )
 
         # Bypass __init__: the paths under test read only these attributes.
@@ -58,9 +60,11 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         b.group_block_granularities = dict(groups or {})
         b.cache_pool = None
         if groups:
-            b.cache_pool = CachePool.__new__(CachePool)
-            b.cache_pool.paged_cache_group_specs = tuple(
-                PagedCacheGroupSpec(
+            b.cache_pool = MinimalCacheView.__new__(MinimalCacheView)
+            # The arena publishes the specs; the pool answers for them.
+            b.cache_pool.arena = SimpleNamespace()
+            b.cache_pool.arena.cache_group_specs = tuple(
+                CacheGroupSpec(
                     group_id=group_id,
                     retention="full_history",
                     rows_per_page=group_page_size,
@@ -115,9 +119,11 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             [[6, 7, 10, 11, 0, 1]],
         )
 
-    def test_constructor_keeps_group_geometry_for_eager_metadata(self):
+    def test_binding_the_pool_learns_group_geometry_for_eager_metadata(self):
+        # One learner, one source: set_cache_pool runs on every path, so eager
+        # metadata sees the same geometry a captured graph would, and state
+        # groups land in state_group_ids rather than the span map.
         from tokenspeed.runtime.execution import workspace
-        from tokenspeed.runtime.layers.attention.backends import trtllm
         from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
         from tokenspeed.runtime.utils.env import envs
 
@@ -136,7 +142,6 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             max_bs=1,
             max_graph_bs=1,
             kv_cache_quant_method="none",
-            group_block_granularities={"full_attention": 128},
         )
         with (
             envs.TOKENSPEED_WORKSPACE_TRTLLM_MHA_MB.override(1),
@@ -144,37 +149,31 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         ):
             backend = self.Backend(config)
 
-        self.assertEqual(backend.group_block_granularities, {"full_attention": 128})
-
-    def test_constructor_accepts_config_without_group_geometry(self):
-        from tokenspeed.runtime.execution import workspace
-        from tokenspeed.runtime.layers.attention.backends import trtllm
-        from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
-        from tokenspeed.runtime.utils.env import envs
-
-        config = MSAConfig(
-            device="cpu",
-            backend_name="msa",
-            num_attention_heads=4,
-            num_kv_heads=1,
-            head_dim=64,
-            attn_tp_size=1,
-            dtype=self.torch.bfloat16,
-            kv_cache_dtype=self.torch.bfloat16,
-            prefix_granularity=64,
-            kernel_page_size=64,
-            context_len=256,
-            max_bs=1,
-            max_graph_bs=1,
-            kv_cache_quant_method="none",
-        )
-        with (
-            envs.TOKENSPEED_WORKSPACE_TRTLLM_MHA_MB.override(1),
-            mock.patch.object(workspace, "_pools", {}),
-        ):
-            backend = self.Backend(config)
-
+        # Nothing is known before the pool arrives.
         self.assertEqual(backend.group_block_granularities, {})
+        self.assertEqual(backend.state_group_ids, frozenset())
+
+        pool = SimpleNamespace(
+            arena=SimpleNamespace(
+                cache_group_specs=(
+                    SimpleNamespace(
+                        group_id="full_attention",
+                        family="history",
+                        block_granularity=128,
+                    ),
+                    SimpleNamespace(
+                        group_id="linear_attention_0",
+                        family="state",
+                        block_granularity=64,
+                    ),
+                )
+            )
+        )
+        backend.set_cache_pool(pool)
+
+        self.assertIs(backend.cache_pool, pool)
+        self.assertEqual(backend.group_block_granularities, {"full_attention": 128})
+        self.assertEqual(backend.state_group_ids, frozenset({"linear_attention_0"}))
 
     def test_build_page_table_keeps_single_table_direct_copy_path(self):
         b = self._bare_backend(page_size=64, max_num_pages=4)
@@ -233,6 +232,21 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             b._select_out_cache_loc(self._layer("full_attention"), meta, caller_loc),
             full_loc,
         )
+
+    def test_public_prewrite_preserves_draft_chain_locations(self):
+        b = self._bare_backend(spec_num_tokens=4)
+        metadata_loc = self.torch.tensor([64], dtype=self.torch.int32)
+        caller_loc = self.torch.tensor([7, 8, 9, 10], dtype=self.torch.int32)
+        b.is_draft = True
+        b.forward_decode_metadata = self.Metadata(
+            out_cache_locs={"full_attention": metadata_loc}
+        )
+
+        got = b.select_out_cache_loc(
+            self._layer("full_attention"), caller_loc, _DecodeMode()
+        )
+
+        self.assertIs(got, caller_loc)
 
     def test_decode_metadata_grouped_drops_single_table(self):
         b = self._bare_backend()

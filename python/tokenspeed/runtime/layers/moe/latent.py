@@ -24,7 +24,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from enum import IntEnum
 from functools import partial
 
 import tokenspeed_kernel
@@ -61,49 +60,6 @@ InputProjector = Callable[
     tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
 ]
 _SUPPORTED_EP_SIZES = {1, 2, 4, 8}
-
-
-class K3MoETailTier(IntEnum):
-    """How the K3 MoE tail combines routed/shared partials, best first."""
-
-    TAIL_FUSION = 0  # fused decode kernel (aka the multicast latent tail)
-    MULTIMEM_AR = 1  # in-switch (ld_reduce) reduces, then the replicated tail
-    FUSED_LANE_AR = 2  # join tier: lane one-shot / cat+one-shot / grouped NCCL
-    SEPARATE_REDUCE = 3  # portable: reduce each partial on its own
-
-
-# Speculative decode may enter this prefill-tuned multimem window.
-MULTIMEM_AR_MIN_TOKENS = 256
-MULTIMEM_AR_MAX_TOKENS = 8192
-
-
-def select_k3_moe_tail_tier(
-    *,
-    num_tokens: int,
-    graph_phase: bool,
-    tail_fusion_max_tokens: int,
-    fused_moe_ar: bool,
-    multimem_ok: bool,
-) -> K3MoETailTier:
-    """Pick the tail tier; every input must be rank-uniform.
-
-    Args:
-        num_tokens: Tokens in this forward (identical on every rank).
-        graph_phase: Whether the forward runs under the CUDA-graph phase.
-        tail_fusion_max_tokens: Fused decode kernel capacity, 0 when absent.
-        fused_moe_ar: Whether the fused-AR execution plan is armed.
-        multimem_ok: Collectively-agreed multimem availability.
-
-    Returns:
-        The best applicable ``K3MoETailTier``.
-    """
-    if graph_phase and 1 <= num_tokens <= tail_fusion_max_tokens:
-        return K3MoETailTier.TAIL_FUSION
-    if not fused_moe_ar:
-        return K3MoETailTier.SEPARATE_REDUCE
-    if multimem_ok and MULTIMEM_AR_MIN_TOKENS <= num_tokens <= MULTIMEM_AR_MAX_TOKENS:
-        return K3MoETailTier.MULTIMEM_AR
-    return K3MoETailTier.FUSED_LANE_AR
 
 
 def _marlin_moe_available() -> bool:
@@ -792,11 +748,9 @@ class LatentMoELayer(nn.Module):
 
 
 __all__ = [
-    "K3MoETailTier",
     "Kimi3LatentProjection",
     "Kimi3MoEExecutionPlan",
     "LatentMoELayer",
     "kimi3_join_reduce_moe",
     "latent_moe_expert_shared_all_reduce",
-    "select_k3_moe_tail_tier",
 ]

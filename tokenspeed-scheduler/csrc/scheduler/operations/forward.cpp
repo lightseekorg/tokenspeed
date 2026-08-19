@@ -284,12 +284,12 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
                                           : fsm::PrefillSource::kLocal;
     if (config_.enable_pd_cache && source == fsm::PrefillSource::kRemote) {
         for (std::size_t i = 0; i < demands.size(); ++i) {
-            const PagedCacheGroupConfig& group = config_.paged_cache_groups[i];
+            const CacheGroupConfig& group = config_.cache_groups[i];
             const std::int32_t block_granularity = coordinator_.GroupBlockGranularity(i);
-            if (group.transfer_policy == PagedCacheTransferPolicy::LatestSnapshot) {
+            if (group.transfer_policy == CacheTransferPolicy::LatestSnapshot) {
                 demands[i].num_tokens = request->PrefillSize();
                 demands[i].materialized_suffix_start = (request->PrefillSize() - 1) / block_granularity;
-            } else if (group.retention == PagedCacheGroupConfig::Retention::SlidingWindow) {
+            } else if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
                 const std::int32_t retained_begin =
                     std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
                 demands[i].num_tokens = request->PrefillSize();
@@ -536,6 +536,12 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         const bool recovery_front = !recovery_queue_.empty() && request->Id() == recovery_queue_.front();
         const bool local_decode_prefill =
             request->Is<fsm::Prefilling>() && request->PrefillSource() == fsm::PrefillSource::kLocal;
+        if (config_.role == Role::kP && request->Is<fsm::PrefillDone>()) {
+            // Completed P-side prefills hold their KV pages until the remote
+            // transfer finishes, so start their handoffs before admitting
+            // more prompt tokens.
+            return 0;
+        }
         if (config_.role == Role::kD && (local_decode_prefill || request->Is<fsm::PrefillDone>() ||
                                          (recovery_front && request->Is<fsm::Decoding>()))) {
             // Keep the oldest retracted request at the head of line through
@@ -566,15 +572,23 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         return lhs_priority != rhs_priority ? lhs_priority < rhs_priority : lhs->Id() < rhs->Id();
     });
 
+    // EventLoop selects the P-side KV-transfer path only for an all-zero-extend
+    // ForwardBatch.  Once the highest-priority candidate selects that batch
+    // kind, collect every consecutive PrefillDone candidate but do not mix in
+    // local prefill work.  PrefillDone candidates are contiguous because they
+    // all have priority zero above.
+    const bool build_prefill_handoff_batch =
+        config_.role == Role::kP && !candidates.empty() && candidates.front()->Is<fsm::PrefillDone>();
+
     const bool has_local_prefill = std::ranges::any_of(candidates, [this](const Request* request) {
         return (request->Is<fsm::Prefilling>() && request->PrefillSource() == fsm::PrefillSource::kLocal) ||
                (config_.role != Role::kD && request->Is<fsm::Submitted>()) ||
                (request->Is<fsm::Retracted>() && !recovery_queue_.empty() && request->Id() == recovery_queue_.front());
     });
-    const std::int32_t state_prefill_reserve =
-        config_.enable_mixed_prefill_decode && coordinator_.HasMambaStateGroup() && has_local_prefill
-            ? coordinator_.PrefixGranularity()
-            : 0;
+    const std::int32_t state_prefill_reserve = !build_prefill_handoff_batch && config_.enable_mixed_prefill_decode &&
+                                                       coordinator_.HasMambaStateGroup() && has_local_prefill
+                                                   ? coordinator_.PrefixGranularity()
+                                                   : 0;
 
     std::vector<ForwardOperation> operations;
     std::vector<LoadBackOperation> load_back_operations;
@@ -608,6 +622,9 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
 
     for (Request* request : candidates) {
         if (token_budget <= 0 || operations.size() == static_cast<std::size_t>(config_.max_batch_size)) {
+            break;
+        }
+        if (build_prefill_handoff_batch && !request->Is<fsm::PrefillDone>()) {
             break;
         }
 

@@ -26,15 +26,15 @@
 
 namespace tokenspeed {
 
-enum class PagedCacheGroupFamily { History, State };
+enum class CacheGroupFamily { History, State };
 
-enum class PagedCacheTransferPolicy {
+enum class CacheTransferPolicy {
     Unspecified,
     FullSuffix,
     LatestSnapshot,
 };
 
-struct PagedCacheGroupConfig {
+struct CacheGroupConfig {
     enum class Retention {
         FullHistory,
         SlidingWindow,
@@ -48,10 +48,19 @@ struct PagedCacheGroupConfig {
     std::int32_t cache_blocks_per_lcm_block{1};
     Retention retention{Retention::FullHistory};
     std::optional<std::int32_t> sliding_window_tokens{};
-    PagedCacheGroupFamily family{PagedCacheGroupFamily::History};
-    PagedCacheTransferPolicy transfer_policy{PagedCacheTransferPolicy::Unspecified};
+    CacheGroupFamily family{CacheGroupFamily::History};
+    CacheTransferPolicy transfer_policy{CacheTransferPolicy::Unspecified};
 
     std::int32_t BlockGranularity() const { return rows_per_page * entry_stride_tokens; }
+
+    // A State group WITHOUT SlidingWindow retention keeps one recurrent-state
+    // checkpoint per block instead of a token history: the mamba-style group
+    // whose PD destination layout is a LatestSnapshot. family=State alone is
+    // not enough -- it also covers linear-attention sliding groups.
+    bool IsSnapshotStateGroup() const {
+        return family == CacheGroupFamily::State && retention != Retention::SlidingWindow;
+    }
+
     void Validate() const;
 };
 

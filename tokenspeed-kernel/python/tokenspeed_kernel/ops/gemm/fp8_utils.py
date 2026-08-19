@@ -563,6 +563,7 @@ def per_token_group_quant_fp8(
 
     if (
         _is_nvidia
+        and group_size == 128
         and not column_major_scales
         and not scale_tma_aligned
         and not scale_ue8m0
@@ -659,6 +660,94 @@ def flashinfer_fp8_blockscale_quantize_prepacked(
         num_stages=1,
     )
     return x_q, x_s
+
+
+@triton.jit
+def _per_block_quant_fp8_kernel(
+    x_ptr,
+    q_ptr,
+    s_ptr,
+    N,
+    K,
+    x_stride_n,
+    s_stride_n,
+    block_n,
+    block_k,
+    eps,
+    bit8_min,
+    bit8_max,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Quantize one ``[block_n, block_k]`` tile with a single shared scale."""
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    rows = tl.arange(0, BLOCK_N)
+    cols = tl.arange(0, BLOCK_K)
+    offs_n = pid_n * block_n + rows
+    offs_k = pid_k * block_k + cols
+    mask = (rows[:, None] < block_n) & (cols[None, :] < block_k)
+    mask &= (offs_n[:, None] < N) & (offs_k[None, :] < K)
+    offsets = offs_n[:, None].to(tl.int64) * x_stride_n + offs_k[None, :]
+
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    absmax = tl.maximum(tl.max(tl.abs(x)), eps)
+    scale = absmax / bit8_max
+    q = tl.clamp(x / scale, bit8_min, bit8_max).to(q_ptr.dtype.element_ty)
+
+    tl.store(q_ptr + offsets, q, mask=mask)
+    tl.store(s_ptr + pid_n * s_stride_n + pid_k, scale)
+
+
+def per_block_quant_fp8(
+    x: torch.Tensor,
+    block_size: Tuple[int, int] = (128, 128),
+    eps: float = 1e-10,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a 2D tensor to FP8 with one scale per 2D block.
+
+    Args:
+        x: Weight matrix ``[N, K]`` in a floating-point dtype, row-major.
+        block_size: ``(block_n, block_k)`` tile shape of one scale.
+        eps: Lower bound on a tile's absmax, to avoid dividing by zero.
+
+    Returns:
+        Tuple of the FP8 tensor shaped like ``x`` and its ``float32`` scales
+        shaped ``[ceil(N / block_n), ceil(K / block_k)]``. The scales are
+        dequantization multipliers: ``x ~= q * scale``.
+    """
+    if x.dim() != 2:
+        raise ValueError(f"per_block_quant_fp8 expects a 2D tensor, got {x.dim()}D.")
+    block_n, block_k = int(block_size[0]), int(block_size[1])
+
+    x = x.contiguous()
+    N, K = x.shape
+    q = torch.empty_like(x, dtype=fp8_dtype)
+    scales = torch.empty(
+        (ceil_div(N, block_n), ceil_div(K, block_k)),
+        dtype=torch.float32,
+        device=x.device,
+    )
+
+    _per_block_quant_fp8_kernel[(scales.shape[0], scales.shape[1])](
+        x,
+        q,
+        scales,
+        N,
+        K,
+        x.stride(0),
+        scales.stride(0),
+        block_n,
+        block_k,
+        eps,
+        fp8_min,
+        fp8_max,
+        BLOCK_N=triton.next_power_of_2(block_n),
+        BLOCK_K=triton.next_power_of_2(block_k),
+        num_warps=8,
+    )
+    return q, scales
 
 
 def per_token_quant_fp8(

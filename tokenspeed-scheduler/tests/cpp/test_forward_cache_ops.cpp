@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -365,21 +366,21 @@ TEST(ForwardCacheOpsDecode, AdmissionWithEmptyHashesOnlySlidesAndAllocates) {
     }
 }
 
-TEST(MakeSpecsFromConfigTest, TranslatesPagedCacheGroups) {
+TEST(MakeSpecsFromConfigTest, TranslatesCacheGroups) {
     SchedulerConfig config;
     config.prefix_granularity = 16;
-    PagedCacheGroupConfig full_grp;
+    CacheGroupConfig full_grp;
     full_grp.group_id = "full";
     full_grp.rows_per_page = 16;
     full_grp.entry_stride_tokens = 1;
-    full_grp.retention = PagedCacheGroupConfig::Retention::FullHistory;
-    PagedCacheGroupConfig swa_grp;
+    full_grp.retention = CacheGroupConfig::Retention::FullHistory;
+    CacheGroupConfig swa_grp;
     swa_grp.group_id = "swa";
     swa_grp.rows_per_page = 16;
     swa_grp.entry_stride_tokens = 1;
-    swa_grp.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+    swa_grp.retention = CacheGroupConfig::Retention::SlidingWindow;
     swa_grp.sliding_window_tokens = 128;
-    config.paged_cache_groups = {full_grp, swa_grp};
+    config.cache_groups = {full_grp, swa_grp};
 
     std::vector<CacheGroupSpec> specs = MakeSpecsFromConfig(config);
     ASSERT_EQ(specs.size(), 2u);
@@ -394,17 +395,17 @@ TEST(MakeSpecsFromConfigTest, TranslatesPagedCacheGroups) {
 TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
     SchedulerConfig config;
     config.prefix_granularity = 4;
-    PagedCacheGroupConfig full_grp;
+    CacheGroupConfig full_grp;
     full_grp.group_id = "full_attention";
     full_grp.rows_per_page = 4;
     full_grp.entry_stride_tokens = 1;
-    full_grp.retention = PagedCacheGroupConfig::Retention::FullHistory;
-    PagedCacheGroupConfig state_grp;
+    full_grp.retention = CacheGroupConfig::Retention::FullHistory;
+    CacheGroupConfig state_grp;
     state_grp.group_id = "linear_attention";
     state_grp.rows_per_page = 4;
     state_grp.entry_stride_tokens = 1;
-    state_grp.family = PagedCacheGroupFamily::State;
-    config.paged_cache_groups = {full_grp, state_grp};
+    state_grp.family = CacheGroupFamily::State;
+    config.cache_groups = {full_grp, state_grp};
 
     std::vector<CacheGroupSpec> specs = MakeSpecsFromConfig(config);
     ASSERT_EQ(specs.size(), 2u);
@@ -417,21 +418,21 @@ TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
 TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
     SchedulerConfig config;
     config.prefix_granularity = 128;
-    PagedCacheGroupConfig full;
+    CacheGroupConfig full;
     full.group_id = "full";
     full.rows_per_page = 128;
     full.entry_stride_tokens = 1;
     full.cache_blocks_per_lcm_block = 16;
-    PagedCacheGroupConfig state0;
+    CacheGroupConfig state0;
     state0.group_id = "state0";
     state0.rows_per_page = 128;
     state0.entry_stride_tokens = 1;
-    state0.family = PagedCacheGroupFamily::State;
-    PagedCacheGroupConfig state1 = state0;
+    state0.family = CacheGroupFamily::State;
+    CacheGroupConfig state1 = state0;
     state1.group_id = "state1";
-    PagedCacheGroupConfig state2 = state0;
+    CacheGroupConfig state2 = state0;
     state2.group_id = "state2";
-    config.paged_cache_groups = {full, state0, state1, state2};
+    config.cache_groups = {full, state0, state1, state2};
 
     std::vector<CacheGroupSpec> specs = MakeSpecsFromConfig(config);
 
@@ -445,16 +446,16 @@ TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
 TEST(MakeSpecsFromConfigTest, PreservesPerGroupCachePageTokens) {
     SchedulerConfig config;
     config.prefix_granularity = 256;
-    PagedCacheGroupConfig history;
+    CacheGroupConfig history;
     history.group_id = "history";
     history.rows_per_page = 64;
     history.entry_stride_tokens = 4;
-    PagedCacheGroupConfig state;
+    CacheGroupConfig state;
     state.group_id = "compressor_state";
-    state.family = PagedCacheGroupFamily::State;
+    state.family = CacheGroupFamily::State;
     state.rows_per_page = 4;
     state.entry_stride_tokens = 1;
-    config.paged_cache_groups = {history, state};
+    config.cache_groups = {history, state};
 
     const std::vector<CacheGroupSpec> specs = MakeSpecsFromConfig(config);
 
@@ -463,68 +464,108 @@ TEST(MakeSpecsFromConfigTest, PreservesPerGroupCachePageTokens) {
     EXPECT_EQ(specs[1].block_granularity, 4);
 }
 
-TEST(MakeSpecsFromConfigTest, RejectsNonPositiveGlobalP) {
-    SchedulerConfig config;
-    config.prefix_granularity = 0;
-    config.paged_cache_groups.resize(1);
-    EXPECT_THROW(MakeSpecsFromConfig(config), std::runtime_error);
-
-    config.prefix_granularity = -1;
-    EXPECT_THROW(MakeSpecsFromConfig(config), std::runtime_error);
-}
-
-TEST(MakeSpecsFromConfigTest, RejectsNonPositivePerGroupPacking) {
+// A configuration SchedulerConfig::Validate() accepts, so that each rejection
+// test below can perturb exactly one field.
+SchedulerConfig MakeValidConfig() {
     SchedulerConfig config;
     config.prefix_granularity = 128;
-    config.paged_cache_groups.resize(1);
-    config.paged_cache_groups[0].cache_blocks_per_lcm_block = 0;
-    EXPECT_THROW(MakeSpecsFromConfig(config), std::runtime_error);
-
-    config.paged_cache_groups[0].cache_blocks_per_lcm_block = -1;
-    EXPECT_THROW(MakeSpecsFromConfig(config), std::runtime_error);
-}
-
-TEST(MakeSpecsFromConfigTest, RejectsMissingSlidingWindowWithGroupId) {
-    SchedulerConfig config;
-    config.prefix_granularity = 128;
-    PagedCacheGroupConfig group;
-    group.group_id = "missing_window";
+    config.device_allocator.total_pages = 32;
+    config.max_scheduled_tokens = 1024;
+    config.max_batch_size = 8;
+    CacheGroupConfig group;
+    group.group_id = "full";
     group.rows_per_page = 128;
     group.entry_stride_tokens = 1;
-    group.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
-    config.paged_cache_groups = {group};
+    group.total_pages = config.device_allocator.total_pages;
+    config.cache_groups = {group};
+    return config;
+}
 
+// Every message naming a group must identify which one: a model mixes several.
+void ExpectRejectedNamingGroup(const SchedulerConfig& config, const std::string& group_id) {
     try {
-        (void)MakeSpecsFromConfig(config);
-        FAIL() << "missing sliding_window_tokens was accepted";
+        config.Validate();
+        FAIL() << "invalid config was accepted";
     } catch (const std::invalid_argument& error) {
-        EXPECT_NE(std::string{error.what()}.find(group.group_id), std::string::npos);
+        EXPECT_NE(std::string{error.what()}.find(group_id), std::string::npos) << error.what();
     }
 }
 
-TEST(MakeSpecsFromConfigTest, RejectsNonPositiveSlidingWindowWithGroupId) {
-    SchedulerConfig config;
-    config.prefix_granularity = 128;
-    PagedCacheGroupConfig group;
-    group.group_id = "nonpositive_window";
-    group.rows_per_page = 128;
-    group.entry_stride_tokens = 1;
-    group.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
-    config.paged_cache_groups = {group};
+TEST(SchedulerConfigValidateTest, AcceptsAValidConfig) {
+    EXPECT_NO_THROW(MakeValidConfig().Validate());
+}
 
+TEST(SchedulerConfigValidateTest, RejectsNonPositiveGlobalP) {
+    SchedulerConfig config = MakeValidConfig();
+    for (const std::int32_t prefix_granularity : {0, -1}) {
+        config.prefix_granularity = prefix_granularity;
+        EXPECT_THROW(config.Validate(), std::invalid_argument);
+    }
+}
+
+TEST(SchedulerConfigValidateTest, RejectsNonPositivePerGroupPacking) {
+    SchedulerConfig config = MakeValidConfig();
+    for (const std::int32_t packing : {0, -1}) {
+        config.cache_groups[0].cache_blocks_per_lcm_block = packing;
+        ExpectRejectedNamingGroup(config, config.cache_groups[0].group_id);
+    }
+}
+
+TEST(SchedulerConfigValidateTest, RejectsBlockGranularityThatDoesNotDivideP) {
+    SchedulerConfig config = MakeValidConfig();
+    config.cache_groups[0].rows_per_page = 48;
+    ExpectRejectedNamingGroup(config, config.cache_groups[0].group_id);
+}
+
+TEST(SchedulerConfigValidateTest, RejectsMissingSlidingWindowWithGroupId) {
+    SchedulerConfig config = MakeValidConfig();
+    config.cache_groups[0].group_id = "missing_window";
+    config.cache_groups[0].retention = CacheGroupConfig::Retention::SlidingWindow;
+    ExpectRejectedNamingGroup(config, "missing_window");
+}
+
+TEST(SchedulerConfigValidateTest, RejectsNonPositiveSlidingWindowWithGroupId) {
+    SchedulerConfig config = MakeValidConfig();
+    config.cache_groups[0].group_id = "nonpositive_window";
+    config.cache_groups[0].retention = CacheGroupConfig::Retention::SlidingWindow;
     for (const std::int32_t window : {0, -1}) {
-        config.paged_cache_groups[0].sliding_window_tokens = window;
-        try {
-            (void)MakeSpecsFromConfig(config);
-            FAIL() << "sliding_window_tokens=" << window << " was accepted";
-        } catch (const std::invalid_argument& error) {
-            EXPECT_NE(std::string{error.what()}.find(group.group_id), std::string::npos);
-        }
+        config.cache_groups[0].sliding_window_tokens = window;
+        ExpectRejectedNamingGroup(config, "nonpositive_window");
     }
 }
 
-TEST(MakeSpecsFromConfigTest, PagedCacheGroupConfigRejectsNonPositivePacking) {
-    PagedCacheGroupConfig group;
+TEST(SchedulerConfigValidateTest, RejectsSnapshotStateGroupBelowOneCacheBlock) {
+    SchedulerConfig config = MakeValidConfig();
+    config.cache_groups[0].family = CacheGroupFamily::State;
+    config.max_scheduled_tokens = config.prefix_granularity - 1;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+
+    config.max_scheduled_tokens = config.prefix_granularity;
+    EXPECT_NO_THROW(config.Validate());
+}
+
+TEST(SchedulerConfigValidateTest, RejectsPdTransferPolicyMismatch) {
+    SchedulerConfig config = MakeValidConfig();
+    config.enable_pd_cache = true;
+    CacheGroupConfig& history = config.cache_groups[0];
+
+    // A History group ships its full suffix; leaving the policy to the default
+    // or claiming a snapshot layout are both rejected.
+    ExpectRejectedNamingGroup(config, history.group_id);
+    history.transfer_policy = CacheTransferPolicy::LatestSnapshot;
+    ExpectRejectedNamingGroup(config, history.group_id);
+    history.transfer_policy = CacheTransferPolicy::FullSuffix;
+    EXPECT_NO_THROW(config.Validate());
+
+    // A snapshot-state group is the mirror image.
+    history.family = CacheGroupFamily::State;
+    ExpectRejectedNamingGroup(config, history.group_id);
+    history.transfer_policy = CacheTransferPolicy::LatestSnapshot;
+    EXPECT_NO_THROW(config.Validate());
+}
+
+TEST(SchedulerConfigValidateTest, CacheGroupConfigRejectsNonPositivePacking) {
+    CacheGroupConfig group;
     group.group_id = "full";
     group.rows_per_page = 1;
     group.entry_stride_tokens = 1;

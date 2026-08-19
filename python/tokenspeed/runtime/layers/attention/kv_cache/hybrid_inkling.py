@@ -22,8 +22,6 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
@@ -35,20 +33,13 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
 class HybridInklingTokenToKVPool(HybridMHATokenToKVPool):
     """Hybrid MHA pool with Inkling ShortConv checkpoint views."""
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.conv_col_dtype = (
-            torch.bfloat16
-            if os.environ.get("INKLING_FP8_SCONV", "0") == "0"
-            else torch.float8_e5m2
-        )
-
     def kvconv_checkpoint_buffers(
         self, layer_id: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        field_layer = self._field_layer_id(layer_id)
         return (
-            self.field(f"layer.{layer_id}.kvconv_k", torch.bfloat16),
-            self.field(f"layer.{layer_id}.kvconv_v", torch.bfloat16),
+            self.arena.field(f"layer.{field_layer}.kvconv_k"),
+            self.arena.field(f"layer.{field_layer}.kvconv_v"),
         )
 
     def hiddenconv_checkpoint_buffer(
@@ -56,7 +47,7 @@ class HybridInklingTokenToKVPool(HybridMHATokenToKVPool):
     ) -> torch.Tensor:
         if component not in ("attnconv", "mlpconv"):
             raise ValueError(f"unknown Inkling hidden-conv component {component!r}")
-        return self.field(f"layer.{layer_id}.{component}", self.conv_col_dtype)
+        return self.arena.field(f"layer.{self._field_layer_id(layer_id)}.{component}")
 
 
 class HybridInklingTokenToKVPoolMXFP8(

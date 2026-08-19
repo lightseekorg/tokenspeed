@@ -313,13 +313,11 @@ if platform.is_nvidia:
         )
 
         if routed:
-            # FlashInfer's UnpackedPrecomputed mode requires bf16 route weights
-            # regardless of whether it finalizes the expert outputs. Deferred
-            # callers retain their original fp32 weights for the later fused
-            # finalize step.
+            # UnpackedPrecomputed route weights pass at their native dtype
+            # (fp32 or bf16), no cast needed since flashinfer 0.6.16.
             topk = (
                 topk_ids.to(torch.int32),
-                topk_weights.to(torch.bfloat16),
+                topk_weights,
             )
             result = trtllm_fp4_block_scale_routed_moe(
                 topk_ids=topk,

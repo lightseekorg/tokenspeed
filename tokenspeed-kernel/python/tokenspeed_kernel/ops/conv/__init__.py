@@ -122,7 +122,8 @@ def inkling_ring_sconv(
     later round covering the same boundary.
 
     Args:
-        x: Varlen-packed input ``[T, D]`` (e.g. bf16), D-contiguous.
+        x: Varlen-packed input ``[T, D]`` (e.g. bf16). May be a strided
+            slice of a wider buffer.
         weight: Per-channel FIR taps ``[D, W]``; tap ``W - 1`` multiplies
             the current token.
         conv_cache: Conv state ring ``[num_slots, R, D]`` with

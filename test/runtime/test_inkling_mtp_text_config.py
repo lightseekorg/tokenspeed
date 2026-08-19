@@ -3,7 +3,7 @@
 Checkpoints since 4d71c3ea mix SWA and full-attention MTP depths
 (``mtp_config.local_layer_ids``); ``inkling_mtp_text_config`` turns the base
 text config into the draft worker's depth config: depth-local ids become the
-``local_layer_ids`` that drive attention geometry and paged-cache labels,
+``local_layer_ids`` that drive attention geometry and cache-group labels,
 and depths beyond ``--speculative-num-steps`` are pruned (an MTP chain only
 runs depths 0..steps-1).
 """
@@ -12,9 +12,9 @@ import os
 import sys
 import unittest
 
-from tokenspeed.runtime.configs.inkling_config import (
-    inkling_kv_heads_for_layer,
-    inkling_mtp_text_config,
+from tokenspeed.runtime.configs.inkling_config import inkling_mtp_text_config
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
+    inkling_layer_kv_head_counts,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -34,6 +34,18 @@ def _mm_config(mtp_config):
     return InklingMMConfig(
         **{k: v for k, v in base.items() if k not in ("model_type", "architectures")}
     )
+
+
+class _ModelConfigOver:
+    """The two-level shape inkling_layer_kv_head_counts reads: a model config
+    whose hf_config resolves to this text config."""
+
+    def __init__(self, text_config):
+        self._text = text_config
+        self.hf_config = self
+
+    def get_text_config(self):
+        return self._text
 
 
 class TestInklingMTPTextConfig(unittest.TestCase):
@@ -59,20 +71,19 @@ class TestInklingMTPTextConfig(unittest.TestCase):
         self.assertEqual(cfg.local_layer_ids, [0, 2])
         self.assertEqual(cfg.dense_mlp_idx, 3)
         # Depth 1 is full attention at the ckpt head count; depths 0/2 are
-        # SWA at the swa count — the target model's byte-uniform pairing.
-        heads = [inkling_kv_heads_for_layer(cfg, i, True) for i in range(3)]
+        # SWA at the swa count -- the target model's byte-uniform pairing.
         self.assertEqual(
-            heads,
+            list(inkling_layer_kv_head_counts(_ModelConfigOver(cfg))),
             [
                 cfg.swa_num_key_value_heads,
                 cfg.ckpt_num_key_value_heads,
                 cfg.swa_num_key_value_heads,
             ],
         )
-        # Every depth gets its own paged-cache group so the shared slab has
+        # Every depth gets its own cache group so the shared slab has
         # no dead rows (1 full + 2 sliding sub-groups of one layer each).
         self.assertEqual(
-            cfg.paged_cache_layer_types,
+            cfg.cache_layer_types,
             ["sliding_attention_0", "full_attention", "sliding_attention_1"],
         )
         # The base config is untouched (deepcopy).
@@ -96,7 +107,7 @@ class TestInklingMTPTextConfig(unittest.TestCase):
         cfg = inkling_mtp_text_config(text)
         self.assertEqual(cfg.num_hidden_layers, 4)
         self.assertEqual(cfg.local_layer_ids, [])
-        self.assertEqual(cfg.paged_cache_layer_types, ["full_attention"] * 4)
+        self.assertEqual(cfg.cache_layer_types, ["full_attention"] * 4)
 
     def test_steps_beyond_depths_keeps_all_depths(self):
         # The registry raises for steps > depths; the config transform must

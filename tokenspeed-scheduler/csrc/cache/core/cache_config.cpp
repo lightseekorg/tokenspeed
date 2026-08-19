@@ -21,27 +21,31 @@
 #include "cache/core/cache_config.h"
 
 #include <stdexcept>
+#include <string>
 
 namespace tokenspeed {
 
-void PagedCacheGroupConfig::Validate() const {
+void CacheGroupConfig::Validate() const {
     if (group_id.empty()) {
-        throw std::invalid_argument("PagedCacheGroupConfig: group_id must be non-empty");
+        throw std::invalid_argument("CacheGroupConfig: group_id must be non-empty");
     }
+    // Every remaining message names the group: a model mixes several of them,
+    // and the offending one is the only actionable part of the diagnostic.
+    const std::string where = "Cache group '" + group_id + "': ";
     if (rows_per_page <= 0) {
-        throw std::invalid_argument("PagedCacheGroupConfig: rows_per_page must be > 0");
+        throw std::invalid_argument(where + "rows_per_page must be > 0");
     }
     if (entry_stride_tokens <= 0) {
-        throw std::invalid_argument("PagedCacheGroupConfig: entry_stride_tokens must be > 0");
+        throw std::invalid_argument(where + "entry_stride_tokens must be > 0");
     }
     if (total_pages < 1) {
-        throw std::invalid_argument("PagedCacheGroupConfig: total_pages must include the null page");
+        throw std::invalid_argument(where + "total_pages must include the null page");
     }
     if (cache_blocks_per_lcm_block <= 0) {
-        throw std::invalid_argument("PagedCacheGroupConfig: cache_blocks_per_lcm_block must be > 0");
+        throw std::invalid_argument(where + "cache_blocks_per_lcm_block must be > 0");
     }
     if (retention == Retention::SlidingWindow && (!sliding_window_tokens || *sliding_window_tokens <= 0)) {
-        throw std::invalid_argument("PagedCacheGroupConfig: sliding_window_tokens must be > 0 for sliding groups");
+        throw std::invalid_argument(where + "sliding_window_tokens must be > 0 for sliding groups");
     }
 }
 

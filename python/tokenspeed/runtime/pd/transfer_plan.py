@@ -54,7 +54,7 @@ class CacheTransferFragment:
     rows_per_page: int
 
 
-MAX_PAGED_CACHE_TP_SIZE = 1024
+MAX_CACHE_TP_SIZE = 1024
 
 
 @dataclass(frozen=True)
@@ -89,7 +89,7 @@ class _RankPartition:
     local_offset: int
 
 
-class PagedCacheTransferPlanner:
+class CacheTransferPlanner:
     """Plan model-neutral dense Paged-cache fields across unequal TP sizes."""
 
     def __init__(
@@ -102,12 +102,9 @@ class PagedCacheTransferPlanner:
     ):
         if prefill_tp_size <= 0 or decode_tp_size <= 0:
             raise UnsupportedPDLayoutError("Paged cache TP sizes must be positive")
-        if (
-            prefill_tp_size > MAX_PAGED_CACHE_TP_SIZE
-            or decode_tp_size > MAX_PAGED_CACHE_TP_SIZE
-        ):
+        if prefill_tp_size > MAX_CACHE_TP_SIZE or decode_tp_size > MAX_CACHE_TP_SIZE:
             raise UnsupportedPDLayoutError(
-                f"Paged cache TP sizes cannot exceed {MAX_PAGED_CACHE_TP_SIZE}"
+                f"Paged cache TP sizes cannot exceed {MAX_CACHE_TP_SIZE}"
             )
         self.prefill_tp_size = prefill_tp_size
         self.decode_tp_size = decode_tp_size

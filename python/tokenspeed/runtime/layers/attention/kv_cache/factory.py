@@ -5,35 +5,75 @@ from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
+from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import CachePoolSpec
+
+
+def create_cache_arena(
+    spec: CachePoolSpec,
+    *,
+    device: str,
+    enable_memory_saver: bool,
+) -> CacheArena:
+    """Allocate the one arena every compute view of this spec shares."""
+    return CacheArena(
+        spec.memory_plan,
+        device,
+        cache_group_specs=spec.cache_group_specs,
+        token_capacity=spec.token_capacity,
+        enable_memory_saver=enable_memory_saver,
+    )
+
+
+def _mha_pool_class(family: str, *, mxfp8: bool) -> type[CachePool]:
+    """The MHA-shaped pool for one family, in its plain or mxfp8 variant.
+
+    All three take the same arguments; only the recurrent-state aliasing (and
+    the scale planes) differ, which is the class's business, not the caller's.
+    """
+    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_inkling import (
+        HybridInklingTokenToKVPool,
+        HybridInklingTokenToKVPoolMXFP8,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
+        HybridMHATokenToKVPool,
+        HybridMHATokenToKVPoolMXFP8,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.mha import (
+        MHATokenToKVPool,
+        MHATokenToKVPoolMXFP8,
+    )
+
+    by_family = {
+        "mha": (MHATokenToKVPool, MHATokenToKVPoolMXFP8),
+        "inkling": (HybridInklingTokenToKVPool, HybridInklingTokenToKVPoolMXFP8),
+        "qwen_gdn": (HybridMHATokenToKVPool, HybridMHATokenToKVPoolMXFP8),
+    }
+    try:
+        plain, scaled = by_family[family]
+    except KeyError:
+        raise TypeError(
+            f"cache family {family!r} is incompatible with MHAConfig"
+        ) from None
+    return scaled if mxfp8 else plain
 
 
 def create_cache_pool(
     spec: CachePoolSpec,
     config: BaseAttnConfig,
+    arena: CacheArena,
     *,
     num_layers: int,
     rank: int,
-    enable_memory_saver: bool,
     field_layer_offset: int = 0,
-    backing_pool: CachePool | None = None,
 ) -> CachePool:
-    """Create the concrete compute interface for a prepared cache spec.
+    """Bind one model's compute views to an already-allocated arena.
 
-    The recipe's group specs, including PD transfer policies, and token
-    capacity travel via the spec; the pool base aligns the specs' physical
-    fields with the memory plan and publishes the runtime contract
-    (ModelExecutor fails fast without one).
+    ``field_layer_offset`` places this view's local layer ids onto the
+    merged plan's global layer window, so a draft view names the
+    continuation fields the target's plan already reserved.
     """
-    if (backing_pool is not None or field_layer_offset) and not (
-        (isinstance(config, MHAConfig) and spec.family == "mha")
-        or (type(config) is MLAConfig and spec.family == "mla")
-    ):
-        raise ValueError(
-            "backing cache views are only supported by ordinary MHA or MLA pools"
-        )
-    plan = spec.memory_plan
     if spec.family == "deepseek_v4":
         from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
             HybridDeepseekV4TokenToKVPool,
@@ -46,16 +86,12 @@ def create_cache_pool(
         if not isinstance(options, DeepseekV4PoolOptions):
             raise TypeError("DeepSeek V4 cache spec is missing pool options")
         return HybridDeepseekV4TokenToKVPool(
-            size=spec.pool_size,
+            arena,
             model_dtype=config.dtype,
             layout=options.layout,
             layer_num=num_layers,
-            device=config.device,
-            enable_memory_saver=enable_memory_saver,
             rank=rank,
-            memory_plan=plan,
-            paged_cache_group_specs=spec.paged_cache_group_specs,
-            token_capacity=spec.token_capacity,
+            field_layer_offset=field_layer_offset,
         )
     if isinstance(config, DSAConfig):
         from tokenspeed.runtime.layers.attention.kv_cache.dsa import (
@@ -63,22 +99,17 @@ def create_cache_pool(
         )
 
         return DSATokenToKVPool(
-            size=spec.pool_size,
+            arena,
             dtype=config.kv_cache_dtype,
             model_dtype=config.dtype,
             quant_method=config.kv_cache_quant_method,
             kv_lora_rank=config.kv_lora_rank,
             qk_rope_head_dim=config.qk_rope_head_dim,
             layer_num=num_layers,
-            device=config.device,
-            enable_memory_saver=enable_memory_saver,
-            prefix_granularity=plan.prefix_granularity,
             rank=rank,
             index_head_dim=config.index_head_dim,
-            memory_plan=plan,
-            paged_cache_group_specs=spec.paged_cache_group_specs,
-            token_capacity=spec.token_capacity,
             layer_group_ids=spec.layer_group_ids,
+            field_layer_offset=field_layer_offset,
         )
     if isinstance(config, MSAConfig):
         from tokenspeed.runtime.layers.attention.kv_cache.msa import (
@@ -86,98 +117,33 @@ def create_cache_pool(
         )
 
         return MSATokenToKVPool(
-            size=spec.pool_size,
+            arena=arena,
             dtype=config.kv_cache_dtype,
             head_num=max(config.num_kv_heads // config.attn_tp_size, 1),
             head_dim=config.head_dim,
             layer_num=num_layers,
-            device=config.device,
-            enable_memory_saver=enable_memory_saver,
-            prefix_granularity=plan.prefix_granularity,
             rank=rank,
             index_head_dim=config.index_head_dim,
             index_dtype=config.dtype,
             indexed_layer_ids=config.sparse_layer_ids,
             layer_types=spec.layer_types,
             layer_group_ids=spec.layer_group_ids,
-            memory_plan=plan,
-            paged_cache_group_specs=spec.paged_cache_group_specs,
-            token_capacity=spec.token_capacity,
+            field_layer_offset=field_layer_offset,
         )
     if isinstance(config, MHAConfig):
-        if spec.family == "mha":
-            from tokenspeed.runtime.layers.attention.kv_cache.mha import (
-                MHATokenToKVPool,
-                MHATokenToKVPoolMXFP8,
-            )
-
-            pool_cls = (
-                MHATokenToKVPoolMXFP8 if config.kv_cache_mxfp8 else MHATokenToKVPool
-            )
-            return pool_cls(
-                size=spec.pool_size,
-                dtype=config.kv_cache_dtype,
-                head_num=max(config.num_kv_heads // config.attn_tp_size, 1),
-                head_dim=config.head_dim,
-                layer_num=num_layers,
-                device=config.device,
-                enable_memory_saver=enable_memory_saver,
-                prefix_granularity=plan.prefix_granularity,
-                rank=rank,
-                layer_types=spec.layer_types,
-                layer_group_ids=spec.layer_group_ids,
-                memory_plan=plan,
-                paged_cache_group_specs=spec.paged_cache_group_specs,
-                token_capacity=spec.token_capacity,
-                field_layer_offset=field_layer_offset,
-                backing_pool=backing_pool,
-            )
-        if spec.family == "inkling":
-            from tokenspeed.runtime.layers.attention.kv_cache.hybrid_inkling import (
-                HybridInklingTokenToKVPool,
-                HybridInklingTokenToKVPoolMXFP8,
-            )
-
-            pool_cls = (
-                HybridInklingTokenToKVPoolMXFP8
-                if config.kv_cache_mxfp8
-                else HybridInklingTokenToKVPool
-            )
-        elif spec.family == "qwen_gdn":
-            from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
-                HybridMHATokenToKVPool,
-                HybridMHATokenToKVPoolMXFP8,
-            )
-
-            pool_cls = (
-                HybridMHATokenToKVPoolMXFP8
-                if config.kv_cache_mxfp8
-                else HybridMHATokenToKVPool
-            )
-        else:
-            raise TypeError(
-                f"cache family {spec.family!r} is incompatible with MHAConfig"
-            )
+        pool_cls = _mha_pool_class(spec.family, mxfp8=bool(config.kv_cache_mxfp8))
         return pool_cls(
-            size=spec.pool_size,
+            arena=arena,
             dtype=config.kv_cache_dtype,
             head_num=max(config.num_kv_heads // config.attn_tp_size, 1),
             head_dim=config.head_dim,
             layer_num=num_layers,
-            device=config.device,
-            enable_memory_saver=enable_memory_saver,
-            prefix_granularity=plan.prefix_granularity,
             rank=rank,
             layer_types=spec.layer_types,
             layer_kv_head_counts=spec.layer_kv_head_counts,
             kv_alloc_head_count=config.num_kv_heads,
-            memory_plan=plan,
             layer_group_ids=spec.layer_group_ids,
-            state_field_dtypes=spec.state_field_dtypes,
-            paged_cache_group_specs=spec.paged_cache_group_specs,
-            token_capacity=spec.token_capacity,
             field_layer_offset=field_layer_offset,
-            backing_pool=backing_pool,
         )
     if isinstance(config, MLAConfig):
         if spec.family == "mla":
@@ -186,23 +152,16 @@ def create_cache_pool(
             )
 
             return MLATokenToKVPool(
-                size=spec.pool_size,
+                arena,
                 dtype=config.kv_cache_dtype,
                 model_dtype=config.dtype,
                 quant_method=config.kv_cache_quant_method,
                 kv_lora_rank=config.kv_lora_rank,
                 qk_rope_head_dim=config.qk_rope_head_dim,
                 layer_num=num_layers,
-                device=config.device,
-                enable_memory_saver=enable_memory_saver,
-                prefix_granularity=plan.prefix_granularity,
                 rank=rank,
-                memory_plan=plan,
-                paged_cache_group_specs=spec.paged_cache_group_specs,
-                token_capacity=spec.token_capacity,
                 layer_group_ids=spec.layer_group_ids,
                 field_layer_offset=field_layer_offset,
-                backing_pool=backing_pool,
             )
 
         if spec.family != "kimi_k3":
@@ -215,22 +174,16 @@ def create_cache_pool(
         )
 
         return HybridKDATokenToKVPool(
-            size=spec.pool_size,
+            arena=arena,
             dtype=config.kv_cache_dtype,
             model_dtype=config.dtype,
             quant_method=config.kv_cache_quant_method,
             kv_lora_rank=config.kv_lora_rank,
             qk_rope_head_dim=config.qk_rope_head_dim,
             layer_num=num_layers,
-            device=config.device,
-            enable_memory_saver=enable_memory_saver,
-            prefix_granularity=plan.prefix_granularity,
             rank=rank,
             layer_types=spec.layer_types,
             layer_group_ids=spec.layer_group_ids,
-            state_field_dtypes=spec.state_field_dtypes,
-            memory_plan=plan,
-            paged_cache_group_specs=spec.paged_cache_group_specs,
-            token_capacity=spec.token_capacity,
+            field_layer_offset=field_layer_offset,
         )
     raise TypeError(f"cache setup does not support config type {type(config).__name__}")

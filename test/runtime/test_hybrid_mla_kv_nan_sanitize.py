@@ -18,83 +18,58 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""``LayerMappedKVPool.set_mla_kv_buffer`` layer remap + write pass-through.
+"""The KDA cache sanitizes its latent writes; the plain MLA cache does not.
 
 Context (the Kimi-K3 CUDA-graph "!!!" bug): under the prefill breakable graph,
 the dummy-batch capture (out_cache_loc == the reserved ``dummy_kv_slot``)
 writes NaN K/V. The paged MLA decode kernel then reads that shared dummy slot
-through the zero-padded block-table entries and computes ``q·k`` *before* the
+through the zero-padded block-table entries and computes ``q.k`` *before* the
 causal mask, so ``NaN + -inf = NaN`` survives the mask and poisons a live row's
-softmax -> all-NaN logits -> ``argmax`` picks token 0 ("!"). Eager prefill leaves
-the dummy slot finite (``q·0`` masks cleanly), so the bug only appears with the
-prefill graph on. The wrapper requests sanitization from the cache writer so
-the cache never stores NaN without allocating temporary tensors.
+softmax -> all-NaN logits -> ``argmax`` picks token 0 ("!"). Eager prefill
+leaves the dummy slot finite (``q.0`` masks cleanly), so the bug only appears
+with the prefill graph on.
+
+Sanitization is a fact of *this cache*, not of a wrapper around it: no call
+site passes ``sanitize=`` at all, so the default the pool class declares IS
+the contract -- and it holds for every view of the arena, target or draft.
 """
 
 from __future__ import annotations
 
-import torch
+import inspect
+import pathlib
 
-from tokenspeed.runtime.layers.attention.kv_cache.base import LayerMappedKVPool
-
-
-class _RecordingInnerPool:
-    """Minimal stand-in that records exactly what the wrapper forwards."""
-
-    page_size = 64
-
-    def __init__(self):
-        self.received = None
-
-    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope, sanitize=False):
-        self.received = (
-            layer.layer_id,
-            cache_k_nope,
-            cache_k_rope,
-            sanitize,
-        )
+from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
+    HybridKDATokenToKVPool,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 
 
-class _Layer:
-    def __init__(self, layer_id: int):
-        self.layer_id = layer_id
+def _sanitize_default(cls) -> bool:
+    return inspect.signature(cls.set_mla_kv_buffer).parameters["sanitize"].default
 
 
-def test_set_mla_kv_buffer_remaps_layer_and_forwards_untouched():
-    inner = _RecordingInnerPool()
-    # Hybrid model: only layers 3/7/11 are full-attention -> pool slots 0/1/2.
-    pool = LayerMappedKVPool(inner, [3, 7, 11])
-    layer = _Layer(7)
-
-    # NaN/Inf pass through by design: the write kernel squashes them in-kernel.
-    k_nope = torch.tensor([[1.0, float("nan")], [float("inf"), 2.0]])
-    k_rope = torch.tensor([[float("nan"), 3.0]])
-    loc = torch.zeros(2, dtype=torch.int64)
-
-    pool.set_mla_kv_buffer(layer, loc, k_nope, k_rope)
-
-    got_lid, got_nope, got_rope, sanitize = inner.received
-    # Global layer id is remapped to its pool slot for the inner write (7 -> 1)
-    # and restored on the layer object afterwards.
-    assert got_lid == 1
-    assert layer.layer_id == 7
-    # Sanitization is owned by the cache writer so the wrapper forwards the
-    # original views without allocating two temporary tensors.
-    assert sanitize is True
-    assert got_nope is k_nope
-    assert got_rope is k_rope
+def test_kda_cache_sanitizes_latent_writes_by_default() -> None:
+    assert _sanitize_default(HybridKDATokenToKVPool) is True
 
 
-def test_set_mla_kv_buffer_noop_for_finite_input():
-    inner = _RecordingInnerPool()
-    pool = LayerMappedKVPool(inner, [3, 7, 11])
-    k_nope = torch.randn(4, 8)
-    k_rope = torch.randn(4, 2)
-    loc = torch.arange(4, dtype=torch.int64)
+def test_plain_mla_cache_does_not_sanitize_by_default() -> None:
+    """The bug needs the KDA arena's aliased state pages; a pure MLA pool
+    keeps the cheaper write, so the two defaults must stay distinct."""
+    assert _sanitize_default(MLATokenToKVPool) is False
 
-    pool.set_mla_kv_buffer(_Layer(3), loc, k_nope, k_rope)
 
-    _, got_nope, got_rope, sanitize = inner.received
-    assert sanitize is True
-    assert got_nope is k_nope
-    assert got_rope is k_rope
+def test_the_default_is_the_whole_contract() -> None:
+    """No caller may pass ``sanitize=``: the pools' own defaults decide.
+
+    A call site that opts in per write would put the graph-padding contract
+    back in the callers' hands, which is how it came to live in a wrapper.
+    """
+    root = pathlib.Path(__file__).resolve().parents[2] / "python"
+    allowed = {"hybrid_kda.py", "mla.py"}  # the two definitions themselves
+    offenders = sorted(
+        str(path.relative_to(root))
+        for path in root.rglob("*.py")
+        if path.name not in allowed and "sanitize=" in path.read_text()
+    )
+    assert offenders == []

@@ -482,3 +482,204 @@ def triton_gdn_decode_mtp(
         intermediate_states_buffer=intermediate_states_buffer,
         per_token_output_state_indices=output_state_indices,
     )
+
+
+# ===-----------------------------------------------------------------------===#
+# ReplaySSM accepted-prefix commit
+# ===-----------------------------------------------------------------------===#
+
+
+@triton.jit(do_not_specialize=["B", "T", "PAYLOAD_LAYER_STRIDE"])
+def _gdn_replay_commit_kernel(
+    payload,
+    parameters,
+    state_addresses,
+    state_row_strides,
+    read_indices,
+    write_indices,
+    accepted_length,
+    B,
+    T,
+    PAYLOAD_LAYER_STRIDE,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    STATE_DTYPE_CODE: tl.constexpr,
+):
+    """Recompute accepted GDN states with one Triton program per state tile."""
+    i_k, i_v, i_lnh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_hv = i_lnh % HV
+    i_ln = i_lnh // HV
+    i_n = i_ln % B
+    i_l = i_ln // B
+    i_h = i_hv // (HV // H)
+
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
+
+    key_width: tl.constexpr = H * K
+    value_width: tl.constexpr = HV * V
+    payload_width: tl.constexpr = key_width + value_width + 2 * HV
+    layer_base = i_l * PAYLOAD_LAYER_STRIDE
+    request_base = layer_base + i_n * T * payload_width
+    p_k = payload + request_base + i_h * K + o_k
+    p_v = payload + request_base + key_width + i_hv * V + o_v
+    p_a = payload + request_base + key_width + value_width + i_hv
+    p_b = p_a + HV
+
+    layer_request = i_l * B + i_n
+    read_idx = tl.load(read_indices + layer_request).to(tl.int64)
+    steps = tl.load(accepted_length + i_n).to(tl.int32)
+    steps = tl.minimum(tl.maximum(steps, 0), T)
+    state_address = tl.load(state_addresses + i_l)
+    if STATE_DTYPE_CODE == 0:
+        state_pool = state_address.to(tl.pointer_type(tl.bfloat16))
+    elif STATE_DTYPE_CODE == 1:
+        state_pool = state_address.to(tl.pointer_type(tl.float16))
+    else:
+        state_pool = state_address.to(tl.pointer_type(tl.float32))
+    state_row_stride = tl.load(state_row_strides + i_l).to(tl.int64)
+    b_h = tl.zeros([BK, BV], dtype=tl.float32)
+    if read_idx >= 0:
+        p_h0 = (
+            state_pool
+            + read_idx * state_row_stride
+            + i_hv * V * K
+            + o_v[None, :] * K
+            + o_k[:, None]
+        )
+        b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+
+    parameter_base = i_l * 2 * HV + i_hv
+    b_A_log = tl.load(parameters + parameter_base).to(tl.float32)
+    b_dt_bias = tl.load(parameters + parameter_base + HV).to(tl.float32)
+    for _ in range(0, steps):
+        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+        b_a = tl.load(p_a).to(tl.float32)
+        b_beta_raw = tl.load(p_b).to(tl.float32)
+
+        x = b_a + b_dt_bias
+        softplus_x = tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
+        b_g = -tl.exp(b_A_log) * softplus_x
+        b_beta = 1.0 / (1.0 + tl.exp(-b_beta_raw))
+        b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+
+        next_h = b_h * tl.exp(b_g)
+        delta = b_v - tl.sum(next_h * b_k[:, None], 0)
+        next_h += b_k[:, None] * (delta * b_beta)[None, :]
+        b_h = next_h
+
+        p_k += payload_width
+        p_v += payload_width
+        p_a += payload_width
+        p_b += payload_width
+
+    write_idx = tl.load(write_indices + layer_request).to(tl.int64)
+    if write_idx >= 0:
+        p_out = (
+            state_pool
+            + write_idx * state_row_stride
+            + i_hv * V * K
+            + o_v[None, :] * K
+            + o_k[:, None]
+        )
+        tl.store(p_out, b_h.to(p_out.dtype.element_ty), mask=mask_h)
+
+
+@register_kernel(
+    "attention",
+    "gdn_replay_commit",
+    name="triton_gdn_replay_commit",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=format_signatures(
+        ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+    ),
+    priority=Priority.PORTABLE,
+    traits={"flat_state": frozenset({True})},
+    tags={"portability", "speculative-decoding", "replay"},
+)
+def triton_gdn_replay_commit(
+    payload: torch.Tensor,
+    parameters: torch.Tensor,
+    *,
+    state_addresses: torch.Tensor,
+    state_row_strides: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    draft_token_num: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    state_dtype: torch.dtype,
+) -> None:
+    """Replay all GDN layers and write their final accepted states.
+
+    This portable Triton implementation is shared by every registered GPU
+    vendor.
+
+    Args:
+        payload: Packed K/V/a/b storage shaped ``[L, rows, width]``.
+        parameters: Layer-major A_log/dt_bias table shaped ``[L, 2, HV]``.
+        state_addresses: Recurrent-state pool base addresses shaped ``[L]``.
+        state_row_strides: Pool row strides in elements, shaped ``[L]``.
+        read_indices: Committed-state pages shaped ``[L, B]``.
+        write_indices: Accepted-state destination pages shaped ``[L, B]``.
+        accepted_length: Number of verified tokens to replay per request,
+            shaped ``[B]`` and bounded by ``T``.
+        draft_token_num: Verify-window length ``T``.
+        num_k_heads: Key-head count ``H``.
+        num_v_heads: Value/state-head count ``HV``.
+        head_k_dim: Key/state dimension ``K``.
+        head_v_dim: Value/state dimension ``V``.
+        state_dtype: Common recurrent-state element dtype.
+
+    Returns:
+        ``None``. Every layer's accepted state is written through its pool
+        address in one kernel launch.
+    """
+    num_layers = payload.shape[0]
+    batch_size = accepted_length.numel()
+    state_dtype_codes = {
+        torch.bfloat16: 0,
+        torch.float16: 1,
+        torch.float32: 2,
+    }
+    if state_dtype not in state_dtype_codes:
+        raise ValueError(f"unsupported GDN replay state dtype: {state_dtype}")
+
+    BK = triton.next_power_of_2(head_k_dim)
+    BV = min(triton.next_power_of_2(head_v_dim), 32)
+    NK, NV = triton.cdiv(head_k_dim, BK), triton.cdiv(head_v_dim, BV)
+    if NK != 1:
+        raise ValueError("GDN replay does not support head dimensions above one tile")
+    _gdn_replay_commit_kernel[(NK, NV, num_layers * batch_size * num_v_heads)](
+        payload=payload,
+        parameters=parameters,
+        state_addresses=state_addresses,
+        state_row_strides=state_row_strides,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        accepted_length=accepted_length,
+        B=batch_size,
+        T=draft_token_num,
+        PAYLOAD_LAYER_STRIDE=payload.stride(0),
+        H=num_k_heads,
+        HV=num_v_heads,
+        K=head_k_dim,
+        V=head_v_dim,
+        BK=BK,
+        BV=BV,
+        STATE_DTYPE_CODE=state_dtype_codes[state_dtype],
+        num_warps=1,
+        num_stages=3,
+    )

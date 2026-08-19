@@ -37,7 +37,7 @@ class ZeroCachePagesContractTest(unittest.TestCase):
 
     def test_pure_attention_pool_ignores_page_reuse_list(self):
         # No zero_pages and not flagged as state-aliasing -> skip, no raise.
-        pool = types.SimpleNamespace(paged_cache_requires_page_zeroing=False)
+        pool = types.SimpleNamespace(requires_page_zeroing=False)
         self.assertIsNone(self._call(pool, [1, 2, 3]))
 
     def test_missing_flag_defaults_to_skip(self):
@@ -46,14 +46,14 @@ class ZeroCachePagesContractTest(unittest.TestCase):
 
     def test_state_aliasing_pool_without_impl_fails_loudly(self):
         # Declares it needs zeroing but forgot to implement it -> tripwire.
-        pool = types.SimpleNamespace(paged_cache_requires_page_zeroing=True)
+        pool = types.SimpleNamespace(requires_page_zeroing=True)
         with self.assertRaises(RuntimeError):
             self._call(pool, [1, 2, 3])
 
     def test_pool_with_impl_is_invoked(self):
         seen = []
         pool = types.SimpleNamespace(
-            paged_cache_requires_page_zeroing=True,
+            requires_page_zeroing=True,
             zero_pages=lambda page_ids: seen.append(list(page_ids)),
         )
         # device="cpu" -> returns None after invoking zero_pages.
@@ -63,7 +63,7 @@ class ZeroCachePagesContractTest(unittest.TestCase):
     def test_group_aware_pool_is_invoked(self):
         seen = []
         pool = types.SimpleNamespace(
-            paged_cache_requires_page_zeroing=True,
+            requires_page_zeroing=True,
             zero_new_blocks=lambda pages: seen.append(dict(pages)),
         )
         pages = {"full": [4, 5], "state": [9]}
@@ -74,14 +74,16 @@ class ZeroCachePagesContractTest(unittest.TestCase):
         target_seen = []
         draft_seen = []
         target = types.SimpleNamespace(
-            paged_cache_requires_page_zeroing=True,
+            requires_page_zeroing=True,
             zero_new_blocks=lambda pages: target_seen.append(dict(pages)),
         )
         draft = types.SimpleNamespace(
-            paged_cache_requires_page_zeroing=True,
-            paged_cache_group_specs=(
-                types.SimpleNamespace(group_id="history"),
-                types.SimpleNamespace(group_id="state"),
+            requires_page_zeroing=True,
+            arena=types.SimpleNamespace(
+                cache_group_specs=(
+                    types.SimpleNamespace(group_id="history"),
+                    types.SimpleNamespace(group_id="state"),
+                ),
             ),
             zero_new_blocks=lambda pages: draft_seen.append(dict(pages)),
         )

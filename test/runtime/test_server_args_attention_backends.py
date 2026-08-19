@@ -134,26 +134,6 @@ class TestAttentionBackendChoices(unittest.TestCase):
                 prefix_granularity=128,
             )
 
-    def test_lcm_group_block_granularities_are_published_before_backend_construction(
-        self,
-    ):
-        config = SimpleNamespace(group_block_granularities={"stale": 64})
-        spec = SimpleNamespace(
-            memory_plan=SimpleNamespace(prefix_granularity=128),
-            layer_group_ids=("full_attention", "linear_attention_0"),
-            paged_cache_group_specs=(
-                SimpleNamespace(group_id="full_attention", block_granularity=128),
-                SimpleNamespace(group_id="linear_attention_0", block_granularity=64),
-            ),
-        )
-
-        registry._set_cache_group_block_granularities(config, spec)
-
-        self.assertEqual(
-            config.group_block_granularities,
-            {"full_attention": 128, "linear_attention_0": 64},
-        )
-
     def test_mha_config_propagates_speculative_settings(self):
         server_args = SimpleNamespace(
             device="cuda",

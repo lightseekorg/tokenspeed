@@ -23,8 +23,8 @@ from __future__ import annotations
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
-    build_cache_layerwise_page_selection,
-    build_cache_page_manifest,
+    build_cache_block_manifest,
+    build_cache_layerwise_block_selection,
 )
 from tokenspeed.runtime.pd.mooncake.prefill import (
     MooncakeKVManagerPrefill,
@@ -124,7 +124,7 @@ class DisaggPrefillExecutor:
         """Preflight and enqueue one group-aware CachePD chunk per request.
 
         Decode's manifest is immutable for the request. Each Prefill chunk
-        selects newly ready source pages and positions inside that manifest;
+        selects newly ready source blocks and positions inside that manifest;
         the producer step range is reserved once for the whole forward batch.
         """
         pending = []
@@ -150,10 +150,10 @@ class DisaggPrefillExecutor:
             if not destinations:
                 continue
             first = destinations[0]
-            if first.page_manifest is None:
+            if first.block_manifest is None:
                 raise RuntimeError("Paged cache destination metadata is unavailable")
-            prefix_len = first.page_manifest.prefix_len
-            prompt_len = first.page_manifest.prompt_len
+            prefix_len = first.block_manifest.prefix_len
+            prompt_len = first.block_manifest.prompt_len
             chunk_begin = int(op.extend_prefix_lens[index])
             chunk_end = chunk_begin + int(op.input_lengths[index])
             if chunk_end > prompt_len:
@@ -161,14 +161,14 @@ class DisaggPrefillExecutor:
                     "Paged cache Prefill chunk extends past Decode's prompt manifest"
                 )
             is_last = chunk_end == prompt_len
-            # On the first submitted chunk, include pages that Prefill found in
+            # On the first submitted chunk, include blocks that Prefill found in
             # its local cache but Decode still needs. Once a chunk has been
             # submitted, each later selection starts at its own chunk boundary
-            # so already transferred pages are not sent again.
+            # so already transferred blocks are not sent again.
             selection_start = chunk_begin
             if not sender.layerwise_chunk_submitted():
                 selection_start = min(selection_start, prefix_len)
-            selection = build_cache_layerwise_page_selection(
+            block_selection = build_cache_layerwise_block_selection(
                 op,
                 layout=self.cache_layout,
                 request_row=index,
@@ -178,19 +178,19 @@ class DisaggPrefillExecutor:
                 chunk_end=chunk_end,
             )
             for destination in destinations:
-                if destination.page_manifest is None:
+                if destination.block_manifest is None:
                     raise RuntimeError(
                         "Paged cache destination metadata is unavailable"
                     )
                 if (
-                    destination.page_manifest.prefix_len != prefix_len
-                    or destination.page_manifest.prompt_len != prompt_len
+                    destination.block_manifest.prefix_len != prefix_len
+                    or destination.block_manifest.prompt_len != prompt_len
                 ):
                     raise ValueError(
                         "Paged cache destinations disagree on the prompt window"
                     )
             if (
-                not any(group.source_page_ids for group in selection.groups)
+                not any(group.source_block_ids for group in block_selection.groups)
                 and not is_last
             ):
                 continue
@@ -198,20 +198,20 @@ class DisaggPrefillExecutor:
                 (
                     sender,
                     is_last,
-                    selection,
+                    block_selection,
                 )
             )
 
         # The attention backend records one producer range for every forward,
-        # including batches whose current chunk completes no history page.
+        # including batches whose current chunk completes no history block.
         begin_cache_step = self.kv_manager.reserve_layerwise_cache_steps()
-        for sender, is_last, selection in pending:
+        for sender, is_last, block_selection in pending:
             sender.send_layerwise(
                 is_last,
                 begin_cache_step=begin_cache_step,
                 layerwise_interval=self._layerwise_interval,
                 wait_for_bootstrap_token=is_last,
-                cache_page_selection=selection,
+                cache_block_selection=block_selection,
             )
 
     def _cache_decode(self, op) -> None:
@@ -249,7 +249,7 @@ class DisaggPrefillExecutor:
                             True,
                             bootstrap_token=token,
                             spec_candidate_ids=spec_candidate_ids,
-                            page_manifest=None,
+                            block_manifest=None,
                         )
                         self._request_token.pop(request_id, None)
                         self._request_spec_candidate_ids.pop(request_id, None)
@@ -319,23 +319,24 @@ class DisaggPrefillExecutor:
                 )
                 continue
             destination = destinations[0]
-            if destination.page_manifest is None:
+            if destination.block_manifest is None:
                 raise RuntimeError("Paged cache destination metadata is unavailable")
-            manifest = build_cache_page_manifest(
+            block_manifest = build_cache_block_manifest(
                 op,
                 layout=self.cache_layout,
                 request_row=index,
-                prefix_len=destination.page_manifest.prefix_len,
-                prompt_len=destination.page_manifest.prompt_len,
+                prefix_len=destination.block_manifest.prefix_len,
+                prompt_len=destination.block_manifest.prompt_len,
             )
             for destination in destinations:
-                if destination.page_manifest is None:
+                if destination.block_manifest is None:
                     raise RuntimeError(
                         "Paged cache destination metadata is unavailable"
                     )
                 if (
-                    destination.page_manifest.prefix_len != manifest.prefix_len
-                    or destination.page_manifest.prompt_len != manifest.prompt_len
+                    destination.block_manifest.prefix_len != block_manifest.prefix_len
+                    or destination.block_manifest.prompt_len
+                    != block_manifest.prompt_len
                 ):
                     raise ValueError(
                         "Paged cache destinations disagree on the prompt window"
@@ -350,7 +351,7 @@ class DisaggPrefillExecutor:
                     sender,
                     token,
                     spec_candidate_ids,
-                    manifest,
+                    block_manifest,
                 )
             )
 
@@ -359,13 +360,13 @@ class DisaggPrefillExecutor:
             sender,
             token,
             spec_candidate_ids,
-            manifest,
+            block_manifest,
         ) in pending:
             sender.send(
                 True,
                 bootstrap_token=token,
                 spec_candidate_ids=spec_candidate_ids,
-                page_manifest=manifest,
+                block_manifest=block_manifest,
             )
             self._request_token.pop(request_id, None)
             self._request_spec_candidate_ids.pop(request_id, None)

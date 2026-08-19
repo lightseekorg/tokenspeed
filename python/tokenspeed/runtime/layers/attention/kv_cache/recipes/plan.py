@@ -23,15 +23,119 @@
 from __future__ import annotations
 
 import math
-import re
 from collections import defaultdict
-from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from itertools import pairwise
+from typing import TYPE_CHECKING
+
+import torch
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        CacheGroupSpec,
+    )
 
 # Planner/runtime limits, not model layout inputs.
 _MAX_LCM_BLOCK_BYTES = (1 << 63) - 1
 _MAX_KERNEL_PAGE_ID = (1 << 31) - 1
+
+# Byte width per cache dtype name. This module stays torch-free (pure integer
+# geometry, and the plan travels the PD wire as JSON), so dtypes are named by
+# string and their widths live in this table.
+_CACHE_DTYPE_BYTES = {
+    "uint8": 1,
+    "int8": 1,
+    "float8_e4m3fn": 1,
+    "float8_e5m2": 1,
+    "float8_e8m0fnu": 1,
+    "bfloat16": 2,
+    "float16": 2,
+    "int32": 4,
+    "float32": 4,
+    "int64": 8,
+    "float64": 8,
+}
+
+# Elementwise scatter (Tensor.index_put) has no fp8 kernel, so pools that
+# write KV that way view the bytes as uint8 instead. Pools whose writes go
+# through a dtype-aware kernel (MXFP8, via store_sf_interleaved and
+# quantize_store_kv_mxfp8) keep the fp8 view.
+_INDEX_PUT_UNSUPPORTED = ("float8_e5m2", "float8_e4m3fn")
+
+
+def cache_dtype_name(dtype) -> str:
+    """Return the plan-facing name of the dtype the arena views bytes as.
+
+    Args:
+        dtype: A ``torch.dtype`` or an already-normalized dtype name.
+
+    Returns:
+        The dtype name to record in the plan.
+
+    Raises:
+        ValueError: The dtype has no cache representation.
+    """
+    name = str(dtype).removeprefix("torch.")
+    if name not in _CACHE_DTYPE_BYTES:
+        raise ValueError(f"unsupported cache dtype {name!r}")
+    return name
+
+
+def scatter_stored_dtype_name(dtype) -> str:
+    """Plan dtype for a field whose pool writes it with elementwise scatter.
+
+    fp8 collapses to ``uint8`` because ``index_put`` has no fp8 kernel --
+    the same substitution the pools applied before the plan owned dtypes,
+    so the PD wire string is unchanged.
+
+    Args:
+        dtype: A ``torch.dtype`` or an already-normalized dtype name.
+
+    Returns:
+        The dtype name to record in the plan.
+    """
+    name = cache_dtype_name(dtype)
+    return "uint8" if name in _INDEX_PUT_UNSUPPORTED else name
+
+
+def cache_dtype_bytes(dtype_name: str) -> int:
+    """Return the byte width of one element of a plan dtype name.
+
+    Args:
+        dtype_name: A name produced by :func:`cache_dtype_name`.
+
+    Returns:
+        Bytes per element.
+
+    Raises:
+        ValueError: The name is not a known cache dtype.
+    """
+    try:
+        return _CACHE_DTYPE_BYTES[dtype_name]
+    except KeyError:
+        raise ValueError(f"unsupported cache dtype {dtype_name!r}") from None
+
+
+# Token span of one interleaved mxfp8 KV-scale tile, and the head-dim block a
+# single e8m0 scale covers. Both are properties of the fused FP8 attention
+# kernels, so the shape they imply is built here once.
+MXFP8_KV_SCALE_TILE_TOKENS = 128
+MXFP8_SCALE_BLOCK_SIZE = 32
+
+
+def cache_field_layer_id(field_id: str) -> int:
+    """Return the owning model layer encoded in a cache field ID."""
+    parts = field_id.split(".", 2)
+    if len(parts) != 3 or parts[0] != "layer":
+        raise ValueError(f"cache field {field_id!r} is not owned by a model layer")
+    try:
+        layer_id = int(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"cache field {field_id!r} has an invalid layer id") from exc
+    if layer_id < 0:
+        raise ValueError(f"cache field {field_id!r} has an invalid layer id")
+    return layer_id
 
 
 @dataclass(frozen=True)
@@ -54,9 +158,18 @@ class CacheFieldLayout:
     field_id: str
     plane_id: str
     shape: tuple[int, ...]
-    element_size: int
+    # The dtype the arena views these bytes as -- the plan is the single
+    # source, so no consumer has to supply it a second time.
+    dtype: str
     field_offset_bytes: int
     page_stride_bytes: int
+
+    def __post_init__(self) -> None:
+        cache_dtype_bytes(self.dtype)
+
+    @property
+    def element_size(self) -> int:
+        return cache_dtype_bytes(self.dtype)
 
     @property
     def payload_bytes(self) -> int:
@@ -219,11 +332,20 @@ class CacheMemoryPlan:
 
 @dataclass(frozen=True)
 class CacheFieldSpec:
-    group_id: str
+    """One field a cache group declares, without naming that group.
+
+    A field belongs to whichever group lists it in the ``{spec: fields}``
+    mapping handed to :func:`pack`, so a group id is written
+    once -- in its spec -- instead of once per field.
+    """
+
     field_id: str
     plane_id: str
     shape: tuple[int, ...]
-    element_size: int
+    # The dtype the arena views these bytes as. Recipes know this when they
+    # build the spec, so it travels with the geometry instead of being
+    # re-supplied at bind time.
+    dtype: str
     # True when the field's kernel walks pages by an implicit payload-sized
     # stride. False when the kernel consumes the tensor's runtime stride.
     exact_page_stride: bool = True
@@ -232,9 +354,63 @@ class CacheFieldSpec:
     # stride). The planner applies this in bytes after group packing.
     page_stride_alignment_bytes: int = 1
 
+    def __post_init__(self) -> None:
+        cache_dtype_bytes(self.dtype)
+
+    @property
+    def element_size(self) -> int:
+        return cache_dtype_bytes(self.dtype)
+
     @property
     def payload_bytes(self) -> int:
         return math.prod(self.shape) * self.element_size
+
+
+def mxfp8_kv_scale_fields(
+    *,
+    layer_id: int,
+    occurrence: int,
+    kv_heads: int,
+    head_dim: int,
+    prefix_granularity: int,
+) -> tuple[CacheFieldSpec, ...]:
+    """The k_scale/v_scale planes of one mxfp8 KV layer.
+
+    One kernel layout, one definition: the fused FP8 attention kernels read
+    scales as ``(num_ids, heads, tiles, 32, sf, sf)`` where a tile spans
+    ``MXFP8_KV_SCALE_TILE_TOKENS`` tokens, so the per-page shape a recipe
+    declares is fixed by the page's token span and the head count. Recipes
+    differ in how they arrive at those two numbers, never in the shape.
+    """
+    if prefix_granularity % MXFP8_KV_SCALE_TILE_TOKENS or kv_heads <= 0:
+        raise ValueError(
+            "mxfp8 KV scales need a page span that is a positive multiple of "
+            f"{MXFP8_KV_SCALE_TILE_TOKENS} and at least one KV head, got "
+            f"{prefix_granularity} and {kv_heads}"
+        )
+    if head_dim % MXFP8_SCALE_BLOCK_SIZE:
+        raise ValueError(
+            f"mxfp8 head_dim must be a multiple of {MXFP8_SCALE_BLOCK_SIZE}, "
+            f"got {head_dim}"
+        )
+    scale_dim = head_dim // MXFP8_SCALE_BLOCK_SIZE
+    shape = (
+        kv_heads,
+        prefix_granularity // MXFP8_KV_SCALE_TILE_TOKENS,
+        32,
+        scale_dim,
+        scale_dim,
+    )
+    dtype = cache_dtype_name(torch.float8_e8m0fnu)
+    return tuple(
+        CacheFieldSpec(
+            f"layer.{layer_id}.{plane}_scale",
+            f"unit.{occurrence}.{plane}_scale",
+            shape,
+            dtype,
+        )
+        for plane in ("k", "v")
+    )
 
 
 @dataclass(frozen=True)
@@ -247,7 +423,7 @@ class CacheLayout:
     plane_bytes: tuple[tuple[str, int], ...]
     fields: tuple[CacheFieldLayout, ...]
 
-    def with_num_lcm_blocks(self, num_lcm_blocks: int) -> CacheMemoryPlan:
+    def bind(self, num_lcm_blocks: int) -> CacheMemoryPlan:
         if (
             isinstance(num_lcm_blocks, bool)
             or not isinstance(num_lcm_blocks, int)
@@ -292,106 +468,22 @@ class CacheLayout:
         )
 
 
-def merge_continuation_layers(
-    *,
-    fields,
-    layer_types: tuple[str, ...],
-    group_ids: tuple[str, ...],
-    layer_kv_head_counts: tuple[int, ...] | None = None,
-    draft_fields=None,
-    draft_layer_types: tuple[str, ...] = (),
-    draft_group_ids: tuple[str, ...] = (),
-    draft_layer_kv_head_counts: tuple[int, ...] | None = None,
-) -> tuple:
-    """Merge a draft model's per-layer vectors after the target's.
-
-    One big model: the draft's fields renumber via
-    :func:`continue_layer_fields`; every other per-layer vector is plain
-    concatenation. Returns ``(fields, layer_types, group_ids,
-    layer_kv_head_counts, num_draft_layers)`` — all target-shaped, so
-    downstream builders stay draft-oblivious.
-    """
-    merged_fields = tuple(fields)
-    merged_layer_types = tuple(layer_types)
-    merged_group_ids = tuple(group_ids)
-    merged_head_counts = layer_kv_head_counts
-    num_draft_layers = 0
-    if draft_fields is not None:
-        num_target_layers = len(merged_group_ids)
-        num_draft_layers = len(draft_group_ids)
-        if len(draft_layer_types) != num_draft_layers:
-            raise ValueError(
-                f"draft layer_types has {len(draft_layer_types)} entries but "
-                f"draft group_ids has {num_draft_layers}"
-            )
-        merged_fields += continue_layer_fields(
-            draft_fields, first_layer_id=num_target_layers
-        )
-        merged_layer_types += tuple(draft_layer_types)
-        merged_group_ids += tuple(draft_group_ids)
-        if bool(layer_kv_head_counts) != bool(draft_layer_kv_head_counts):
-            raise ValueError(
-                "layer_kv_head_counts must be supplied for both sides or neither"
-            )
-        if layer_kv_head_counts is not None:
-            merged_head_counts = tuple(layer_kv_head_counts) + tuple(
-                draft_layer_kv_head_counts
-            )
-    return (
-        merged_fields,
-        merged_layer_types,
-        merged_group_ids,
-        merged_head_counts,
-        num_draft_layers,
-    )
-
-
-def continue_layer_fields(
-    fields,
-    *,
-    first_layer_id: int,
-) -> tuple[CacheFieldSpec, ...]:
-    """Renumber per-layer fields as continuation layers of one big model.
-
-    Draft layers join the target's ``solve_cache_layout`` as ordinary
-    layers of the ONE merged model:
-    a draft model's local ``layer.{i}...`` field/plane ids become the
-    global ``layer.{first_layer_id + i}...``. Group ids are untouched: a
-    draft layer in a target group shares its page-id space and packing by
-    construction. No draft-specific namespace exists — the merged plan is
-    simply a model with more layers.
-    """
-    renumber = re.compile(r"^(?P<head>layer|unit|slot)\.(?P<idx>\d+)")
-
-    def _shift(identifier: str) -> str:
-        return renumber.sub(
-            lambda m: f"{m.group('head')}.{int(m.group('idx')) + first_layer_id}",
-            identifier,
-        )
-
-    return tuple(
-        replace(
-            field,
-            field_id=_shift(field.field_id),
-            plane_id=_shift(field.plane_id),
-        )
-        for field in fields
-    )
-
-
 def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
 def _solve_packing(fields):
-    """Derive per-group cache blocks per LCM block from exact field ratios."""
+    """Derive per-group cache blocks per LCM block from exact field ratios.
+
+    ``fields`` are ``(group_id, CacheFieldSpec)`` pairs.
+    """
     exact_by_plane: dict[str, dict[str, int]] = {}
     groups = set()
-    for field in fields:
-        groups.add(field.group_id)
+    for group_id, field in fields:
+        groups.add(group_id)
         if field.exact_page_stride:
             plane = exact_by_plane.setdefault(field.plane_id, {})
-            plane[field.group_id] = plane.get(field.group_id, 0) + field.payload_bytes
+            plane[group_id] = plane.get(group_id, 0) + field.payload_bytes
 
     # ratio[g] = (num, den) expressing K_g as a multiple of its component root.
     root = {group_id: group_id for group_id in groups}
@@ -454,15 +546,16 @@ def _packing_by_group_ratio(raw_by_group):
 
 
 def _check_exact_page_strides(fields, plane_bytes, packing):
-    for field in fields:
+    """``fields`` are ``(group_id, CacheFieldSpec)`` pairs."""
+    for group_id, field in fields:
         if not field.exact_page_stride:
             continue
-        stride = plane_bytes[field.plane_id] // packing[field.group_id]
+        stride = plane_bytes[field.plane_id] // packing[group_id]
         if stride != field.payload_bytes:
             widest = max(
                 (
-                    (other.payload_bytes * packing[other.group_id], other.field_id)
-                    for other in fields
+                    (other.payload_bytes * packing[other_group], other.field_id)
+                    for other_group, other in fields
                     if other.plane_id == field.plane_id
                 ),
                 default=(0, ""),
@@ -477,15 +570,41 @@ def _check_exact_page_strides(fields, plane_bytes, packing):
             )
 
 
-def solve_cache_layout(
-    fields,
+def pack(
+    groups: Sequence[tuple[CacheGroupSpec, tuple[CacheFieldSpec, ...]]],
     *,
     prefix_granularity,
     cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
     alignment=1,
     max_padding_fraction=0.25,
 ):
-    """Solve one capacity-independent, plane-major LCM block layout."""
+    """Pack declared cache groups into one capacity-independent LCM block.
+
+    The second stage of the pipeline: ``group`` says which groups exist and
+    what bytes they need, this says how those bytes sit inside one physical
+    parent (plane sizes, per-field offsets and page strides), and
+    :meth:`CacheLayout.bind` later multiplies it out by a parent count.
+
+    Args:
+        groups: ``(group spec, its declared fields)`` pairs. The pairing is
+            the whole point: a group id is spelled once, in its spec, so the
+            planned group set equals the declared one by construction.
+        prefix_granularity: Scheduler-wide identity grain in tokens.
+        cache_blocks_per_lcm_block: How many of each group's CacheBlocks share
+            one parent. A recipe that owns this policy pins every group and
+            nothing is derived here; groups left unpinned are derived from
+            byte ratios plus the exact-page-stride constraints their fields
+            impose.
+        alignment: Byte alignment for plane sizes.
+        max_padding_fraction: Padding budget per group.
+
+    Returns:
+        The packed :class:`CacheLayout`.
+
+    Raises:
+        ValueError: No group declared, duplicate field ids, invalid geometry,
+            or packing pinned for a group outside the declaration.
+    """
     if prefix_granularity <= 0:
         raise ValueError("prefix_granularity must be > 0")
     if alignment <= 0:
@@ -493,68 +612,72 @@ def solve_cache_layout(
     if max_padding_fraction < 0:
         raise ValueError("max_padding_fraction must be >= 0")
 
+    groups = tuple(groups)
+    declared_ids = [spec.group_id for spec, _ in groups]
+    if len(declared_ids) != len(set(declared_ids)):
+        raise ValueError(f"cache group declared more than once: {declared_ids}")
+    empty = sorted(spec.group_id for spec, fields in groups if not fields)
+    if empty:
+        raise ValueError(
+            f"cache groups {empty} declare no fields; a group with no bytes "
+            "cannot be addressed"
+        )
+    # Each field carries its declaring group id from here on: the planner
+    # works in (group_id, field) pairs so nothing can rebind a field.
     ordered_fields = tuple(
         sorted(
-            fields,
-            key=lambda field: (field.plane_id, field.group_id, field.field_id),
+            ((spec.group_id, field) for spec, fields in groups for field in fields),
+            key=lambda entry: (entry[1].plane_id, entry[0], entry[1].field_id),
         )
     )
     if not ordered_fields:
-        raise ValueError("at least one cache field is required")
-    if len({field.field_id for field in ordered_fields}) != len(ordered_fields):
+        raise ValueError("at least one cache group is required")
+    if len({field.field_id for _, field in ordered_fields}) != len(ordered_fields):
         raise ValueError("cache field ids must be unique")
 
     raw_by_group: dict[str, int] = {}
-    for field in ordered_fields:
-        if not field.group_id or not field.field_id or not field.plane_id:
-            raise ValueError(
-                "cache field group_id, field_id and plane_id must be non-empty"
-            )
+    for group_id, field in ordered_fields:
+        if not group_id or not field.field_id or not field.plane_id:
+            raise ValueError("cache group id, field id and plane id must be non-empty")
         if (
-            field.element_size <= 0
-            or not field.shape
+            not field.shape
             or any(extent <= 0 for extent in field.shape)
             or isinstance(field.page_stride_alignment_bytes, bool)
             or not isinstance(field.page_stride_alignment_bytes, int)
             or field.page_stride_alignment_bytes <= 0
         ):
             raise ValueError(f"cache field {field.field_id!r} has invalid geometry")
-        raw_by_group[field.group_id] = (
-            raw_by_group.get(field.group_id, 0) + field.payload_bytes
-        )
+        raw_by_group[group_id] = raw_by_group.get(group_id, 0) + field.payload_bytes
 
     ordered_group_ids = tuple(sorted(raw_by_group))
-    has_explicit_packing = cache_blocks_per_lcm_block is not None
-    if has_explicit_packing:
-        unknown = set(cache_blocks_per_lcm_block) - set(ordered_group_ids)
-        if unknown:
-            raise ValueError(
-                "cache_blocks_per_lcm_block names groups outside the plan: "
-                f"{sorted(unknown)}"
-            )
-        if any(
-            isinstance(count, bool) or not isinstance(count, int) or count < 1
-            for count in cache_blocks_per_lcm_block.values()
-        ):
-            raise ValueError("cache group packing must be a positive integer")
-        # Pinned groups take the caller's count; groups the caller leaves
-        # unpinned pack by their byte ratio as in the unpinned solve.
-        packing = _packing_by_group_ratio(raw_by_group)
-        constrained = _solve_packing(ordered_fields)
-        if constrained is not None:
-            packing.update(constrained)
-        packing.update(cache_blocks_per_lcm_block)
+    pinned = dict(cache_blocks_per_lcm_block or {})
+    unknown = set(pinned) - set(ordered_group_ids)
+    if unknown:
+        raise ValueError(
+            "cache_blocks_per_lcm_block names groups outside the plan: "
+            f"{sorted(unknown)}"
+        )
+    if any(
+        isinstance(count, bool) or not isinstance(count, int) or count < 1
+        for count in pinned.values()
+    ):
+        raise ValueError("cache group packing must be a positive integer")
+    if set(pinned) == set(ordered_group_ids):
+        # The recipe owns the policy for every group; deriving one here only
+        # to overwrite it would be wasted work.
+        packing = pinned
     else:
         packing = _packing_by_group_ratio(raw_by_group)
         constrained = _solve_packing(ordered_fields)
         if constrained is not None:
             packing.update(constrained)
+        packing.update(pinned)
 
     plane_fields: dict[str, dict[str, list[CacheFieldSpec]]] = {}
-    for field in ordered_fields:
-        plane_fields.setdefault(field.plane_id, {}).setdefault(
-            field.group_id, []
-        ).append(field)
+    for group_id, field in ordered_fields:
+        plane_fields.setdefault(field.plane_id, {}).setdefault(group_id, []).append(
+            field
+        )
 
     field_offsets: dict[str, int] = {}
     group_plane_bytes: dict[str, dict[str, int]] = defaultdict(dict)
@@ -570,10 +693,10 @@ def solve_cache_layout(
     # Flexible fields consume explicit strides and can use slack left by exact
     # fields, but their K must divide every plane they occupy.
     exact_groups = {
-        field.group_id for field in ordered_fields if field.exact_page_stride
+        group_id for group_id, field in ordered_fields if field.exact_page_stride
     }
     flexible_groups = set(ordered_group_ids) - exact_groups
-    if flexible_groups and not has_explicit_packing:
+    if flexible_groups and not pinned:
         fixed_plane_bytes = {}
         for plane_id, by_group in plane_fields.items():
             fixed_alignment = alignment
@@ -682,17 +805,16 @@ def solve_cache_layout(
             )
 
     field_layouts = []
-    for field in ordered_fields:
+    for group_id, field in ordered_fields:
         field_layouts.append(
             CacheFieldLayout(
-                group_id=field.group_id,
+                group_id=group_id,
                 field_id=field.field_id,
                 plane_id=field.plane_id,
                 shape=field.shape,
-                element_size=field.element_size,
+                dtype=field.dtype,
                 field_offset_bytes=field_offsets[field.field_id],
-                page_stride_bytes=plane_bytes[field.plane_id]
-                // packing[field.group_id],
+                page_stride_bytes=plane_bytes[field.plane_id] // packing[group_id],
             )
         )
 

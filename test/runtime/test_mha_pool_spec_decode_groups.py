@@ -52,7 +52,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
         kwargs.update(overrides)
         from cache_pool_test_utils import make_layer_group_ids
 
-        kwargs["memory_plan"] = make_mha_memory_plan(
+        plan = make_mha_memory_plan(
             size=kwargs["size"],
             prefix_granularity=kwargs["prefix_granularity"],
             layer_num=kwargs["layer_num"],
@@ -70,13 +70,11 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
                 sliding_window_tokens=kwargs.get("sliding_window_tokens"),
             ),
         )
-        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-            build_paged_cache_group_specs,
-        )
+        from cache_pool_test_utils import specs_for_layers
 
         kwargs.setdefault(
-            "paged_cache_group_specs",
-            build_paged_cache_group_specs(
+            "cache_group_specs",
+            specs_for_layers(
                 layer_types=kwargs.get("layer_types", ()),
                 group_ids=kwargs["layer_group_ids"],
                 sliding_window_tokens=kwargs.get("sliding_window_tokens"),
@@ -84,21 +82,27 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             ),
         )
         kwargs.pop("sliding_window_tokens", None)
-        return self.MHATokenToKVPool(**kwargs)
+        device = kwargs.pop("device")
+        for owned_by_arena in ("size", "prefix_granularity", "enable_memory_saver"):
+            kwargs.pop(owned_by_arena, None)
+        from cache_pool_test_utils import make_pool
+
+        _, pool = make_pool(self.MHATokenToKVPool, plan, device=device, **kwargs)
+        return pool
 
     def test_plain_no_spec_publishes_single_full_group(self):
         # The scheduler allocates pages only through configured groups, so
         # plain models keep one full-history group published.
         pool = self._pool()
-        self.assertEqual(len(pool.paged_cache_group_specs), 1)
-        spec = pool.paged_cache_group_specs[0]
+        self.assertEqual(len(pool.arena.cache_group_specs), 1)
+        spec = pool.arena.cache_group_specs[0]
         self.assertEqual(spec.group_id, "full_attention")
         self.assertEqual(spec.retention, "full_history")
-        self.assertIn("full_attention", pool.paged_cache_group_page_counts)
-        self.assertIsNotNone(pool.buffer)
+        self.assertIn("full_attention", pool.arena.cache_group_page_counts)
+        self.assertIsNotNone(pool.arena.buffer)
         self.assertEqual(
             pool.k_buffer[0].untyped_storage().data_ptr(),
-            pool.buffer.untyped_storage().data_ptr(),
+            pool.arena.buffer.untyped_storage().data_ptr(),
         )
 
     def test_hybrid_no_spec_publishes_two_groups(self):
@@ -110,11 +114,11 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             layer_num=len(GPT_OSS_LAYER_TYPES),
         )
         self.assertEqual(
-            {s.group_id for s in pool.paged_cache_group_specs},
+            {s.group_id for s in pool.arena.cache_group_specs},
             {"full_attention", "sliding_attention"},
         )
         self.assertEqual(
-            set(pool.paged_cache_group_page_counts),
+            set(pool.arena.cache_group_page_counts),
             {"full_attention", "sliding_attention"},
         )
 

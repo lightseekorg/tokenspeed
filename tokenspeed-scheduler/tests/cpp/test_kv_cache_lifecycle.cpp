@@ -19,7 +19,7 @@
 // SOFTWARE.
 
 // End-to-end lifecycle tests for the two-level KV-cache FSM path.
-// Config: two paged-cache groups (full + sliding-window), no L2/L3.
+// Config: two cache groups (full + sliding-window), no L2/L3.
 
 #include <algorithm>
 #include <array>
@@ -43,25 +43,25 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
 
-        PagedCacheGroupConfig full_grp;
+        CacheGroupConfig full_grp;
         full_grp.group_id = "full";
         full_grp.rows_per_page = cfg.prefix_granularity;
         full_grp.entry_stride_tokens = 1;
         full_grp.total_pages = cfg.device_allocator.total_pages;
         full_grp.cache_blocks_per_lcm_block = 2;
-        full_grp.retention = PagedCacheGroupConfig::Retention::FullHistory;
-        full_grp.family = PagedCacheGroupFamily::History;
+        full_grp.retention = CacheGroupConfig::Retention::FullHistory;
+        full_grp.family = CacheGroupFamily::History;
 
-        PagedCacheGroupConfig swa_grp;
+        CacheGroupConfig swa_grp;
         swa_grp.group_id = "swa";
         swa_grp.rows_per_page = cfg.prefix_granularity;
         swa_grp.entry_stride_tokens = 1;
         swa_grp.total_pages = cfg.device_allocator.total_pages;
-        swa_grp.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+        swa_grp.retention = CacheGroupConfig::Retention::SlidingWindow;
         swa_grp.sliding_window_tokens = 4;
-        swa_grp.family = PagedCacheGroupFamily::State;
+        swa_grp.family = CacheGroupFamily::State;
 
-        cfg.paged_cache_groups = {full_grp, swa_grp};
+        cfg.cache_groups = {full_grp, swa_grp};
         return cfg;
     }
 };

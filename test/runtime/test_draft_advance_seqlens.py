@@ -134,7 +134,7 @@ def test_msa_init_cuda_graph_state_matches_helper_signature():
     raised TypeError: missing 1 required positional argument: 'seq_lens_buf'.
     """
     be = _msa_backend()
-    init_backend_cuda_graph_state(be, 8, paged_cache_group_specs=())
+    init_backend_cuda_graph_state(be, 8, cache_group_specs=())
     # And it must own the buffer rather than alias a controller tensor.
     assert be.cuda_graph_seq_lens.shape[0] == 8
     assert be.cuda_graph_seq_lens.dtype == torch.int32
@@ -143,7 +143,7 @@ def test_msa_init_cuda_graph_state_matches_helper_signature():
 def test_msa_inherits_default_advance():
     """msa's buffer uses the default name, so the base implementation applies."""
     be = _msa_backend()
-    init_backend_cuda_graph_state(be, 8, paged_cache_group_specs=())
+    init_backend_cuda_graph_state(be, 8, cache_group_specs=())
     seq_lens = torch.tensor([11, 12, 13, 14], dtype=torch.int32)
     be.advance_draft_forward_metadata(seq_lens)
     assert torch.equal(be.cuda_graph_seq_lens[:4], seq_lens)

@@ -494,3 +494,36 @@ def test_fused_gate_token_head_budget(num_q_heads, num_tokens, expect_fused):
         q_nope=q_nope,
     )
     assert (arg is not None) == expect_fused
+
+
+def test_fused_gate_declines_a_pool_that_overrides_the_latent_write():
+    """A pool that customizes set_mla_kv_buffer must not be fused past.
+
+    The hybrid KDA pool (Kimi-K3) overrides it to force sanitize=True, whose
+    docstring describes a padded row's NaN reaching a live row's softmax
+    through the shared dummy slot. The fused write does not sanitize, so
+    bypassing that override would reopen the hazard silently. It is an
+    MLATokenToKVPool subclass, so isinstance alone does not exclude it.
+    """
+    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
+        HybridKDATokenToKVPool,
+    )
+
+    assert issubclass(HybridKDATokenToKVPool, MLATokenToKVPool)
+
+    pool = _fake_mla_pool()
+    pool.__class__ = HybridKDATokenToKVPool
+    n_loc, num_q_heads = 8, 16
+    arg = create_fused_mla_set_kv_buffer_arg(
+        k_nope=torch.zeros(n_loc, 1, NOPE_DIM, device="cuda", dtype=torch.bfloat16),
+        rope_dim=ROPE_DIM,
+        rotary_emb=None,
+        out_cache_loc=torch.arange(n_loc, device="cuda", dtype=torch.int64),
+        token_to_kv_pool=pool,
+        layer_id=0,
+        num_q_heads=num_q_heads,
+        q_nope=torch.zeros(
+            n_loc, num_q_heads, NOPE_DIM, device="cuda", dtype=torch.bfloat16
+        ),
+    )
+    assert arg is None

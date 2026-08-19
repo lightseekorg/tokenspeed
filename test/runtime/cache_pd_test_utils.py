@@ -29,15 +29,16 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheGroupLayout,
     CacheMemoryPlan,
     CachePlaneLayout,
+    cache_dtype_bytes,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    PagedCacheGroupSpec,
+    CacheGroupSpec,
 )
 from tokenspeed.runtime.pd.cache_protocol import (
     CacheFieldPartition,
     CacheFieldTransferSpec,
-    CachePDGroupPages,
-    CachePDPageManifest,
+    CachePDBlockManifest,
+    CachePDGroupBlocks,
     CacheProducerSchedule,
     CacheTransferContract,
     CacheTransferSchema,
@@ -53,7 +54,6 @@ class _TestCacheField:
     page_zero_offset: int
     page_stride_bytes: int
     shape: tuple[int, ...]
-    element_size: int
     partition: CacheFieldPartition | None
     producer_step: int | None
 
@@ -84,7 +84,6 @@ def segment(
     *,
     shape: tuple[int, ...] = (1,),
     dtype: str = "uint8",
-    element_size: int = 1,
     offset: int = 0,
     stride: int | None = None,
     axis: int | None = None,
@@ -92,7 +91,7 @@ def segment(
     parts: tuple[int, ...] = (),
     producer_step: int | None = None,
 ) -> _TestCacheField:
-    payload = prod(shape) * element_size
+    payload = prod(shape) * cache_dtype_bytes(dtype)
     partition = (
         None
         if extent is None
@@ -108,7 +107,6 @@ def segment(
         offset,
         payload if stride is None else stride,
         shape,
-        element_size,
         partition,
         producer_step,
     )
@@ -142,24 +140,22 @@ def layout(
     )
     specs = tuple(
         (
-            PagedCacheGroupSpec(
+            CacheGroupSpec(
                 group_id=entry.group_id,
                 retention=entry.retention,
                 sliding_window_tokens=entry.sliding_window_tokens,
                 family=entry.family,
-                cache_blocks_per_lcm_block=entry.cache_blocks_per_lcm_block,
                 transfer_policy=entry.transfer_policy,
                 checkpoint_granularity=entry.prefix_granularity,
             )
             if entry.family == "state" and entry.retention == "full_history"
-            else PagedCacheGroupSpec(
+            else CacheGroupSpec(
                 group_id=entry.group_id,
                 retention=entry.retention,
                 rows_per_page=entry.prefix_granularity,
                 entry_stride_tokens=1,
                 sliding_window_tokens=entry.sliding_window_tokens,
                 family=entry.family,
-                cache_blocks_per_lcm_block=entry.cache_blocks_per_lcm_block,
                 transfer_policy=entry.transfer_policy,
             )
         )
@@ -168,7 +164,6 @@ def layout(
 
     fields: list[CacheFieldLayout] = []
     planes: list[CachePlaneLayout] = []
-    dtypes: list[str] = []
     for group_position, entry in enumerate(groups):
         for field_position, field in enumerate(entry.fields):
             plane_id = f"test.{group_position}.{field_position}.{field.field_id}"
@@ -185,12 +180,11 @@ def layout(
                     field_id=field.field_id,
                     plane_id=plane_id,
                     shape=field.shape,
-                    element_size=field.element_size,
+                    dtype=field.dtype,
                     field_offset_bytes=0,
                     page_stride_bytes=field.page_stride_bytes,
                 )
             )
-            dtypes.append(field.dtype)
 
     return CacheTransferContract(
         plan=CacheMemoryPlan(
@@ -202,7 +196,6 @@ def layout(
             fields=tuple(fields),
         ),
         group_specs=specs,
-        field_dtypes=tuple(dtypes),
         transfer_schema=CacheTransferSchema(
             tuple(
                 CacheFieldTransferSpec(field.field_id, field.partition)
@@ -228,13 +221,13 @@ def producer_schedule(
     )
 
 
-def manifest(
+def block_manifest(
     *groups: tuple[str, tuple[int, ...]],
     prefix: int = 0,
     prompt: int = 2,
-) -> CachePDPageManifest:
-    return CachePDPageManifest(
-        groups=tuple(CachePDGroupPages(*entry) for entry in groups),
+) -> CachePDBlockManifest:
+    return CachePDBlockManifest(
+        groups=tuple(CachePDGroupBlocks(*entry) for entry in groups),
         prefix_len=prefix,
         prompt_len=prompt,
     )

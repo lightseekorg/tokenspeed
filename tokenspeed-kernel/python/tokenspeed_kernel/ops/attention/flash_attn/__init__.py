@@ -623,6 +623,7 @@ if platform.is_nvidia and platform.is_blackwell:
         window_left: int = -1,
         return_lse: bool = False,
         softmax_scale: float | None = None,
+        tau: torch.Tensor | None = None,
         enable_pdl: bool = False,
         q_scale: torch.Tensor | None = None,
         k_scale: torch.Tensor | None = None,
@@ -648,6 +649,7 @@ if platform.is_nvidia and platform.is_blackwell:
                     window_left >= 0,
                     False,
                     enable_pdl,
+                    has_tau=tau is not None,
                 )
                 or not torch.cuda.is_current_stream_capturing()
             ):
@@ -662,8 +664,13 @@ if platform.is_nvidia and platform.is_blackwell:
                     max_seqlen_k=max_seqlen,
                     cu_seqlens_k=cu_seqlens,
                     softmax_scale=softmax_scale,
+                    tau=tau,
                     enable_pdl=enable_pdl,
                 )
+        if tau is not None:
+            # The fork fallback lacks fused tau; fold it into q and the bias.
+            q = q * tau[:, None, None].to(q.dtype)
+            rel_logits = rel_logits * tau[:, None, None].to(rel_logits.dtype)
         extra, window_size = _rel_attention_kwargs(rel_logits, window_left)
         out, lse = flash_attn_varlen_func(
             q=q,
@@ -717,6 +724,7 @@ if platform.is_nvidia and platform.is_blackwell:
         return_lse: bool = False,
         softmax_scale: float | None = None,
         enable_pdl: bool = False,
+        tau: torch.Tensor | None = None,
         # Call parity with the dispatcher's unconditional scale pass; the
         # dense path takes no scales (mxfp8 rides its own registration).
         q_scale: torch.Tensor | None = None,
@@ -745,6 +753,7 @@ if platform.is_nvidia and platform.is_blackwell:
                     window_left >= 0,
                     True,
                     enable_pdl,
+                    has_tau=tau is not None,
                 )
                 or not torch.cuda.is_current_stream_capturing()
             ):
@@ -760,8 +769,13 @@ if platform.is_nvidia and platform.is_blackwell:
                     page_table=page_table,
                     cache_seqlens=cache_seqlens,
                     softmax_scale=softmax_scale,
+                    tau=tau,
                     enable_pdl=enable_pdl,
                 )
+        if tau is not None:
+            # The fork fallback lacks fused tau; fold it into q and the bias.
+            q = q * tau[:, None, None].to(q.dtype)
+            rel_logits = rel_logits * tau[:, None, None].to(rel_logits.dtype)
         extra, window_size = _rel_attention_kwargs(rel_logits, window_left)
         out, lse = flash_attn_varlen_func(
             q=q,
@@ -813,6 +827,7 @@ if platform.is_nvidia and platform.is_blackwell:
         max_seqlen_q: int = 1,
         window_left: int = -1,
         softmax_scale: float | None = None,
+        tau: torch.Tensor | None = None,
         enable_pdl: bool = False,
         q_scale: torch.Tensor | None = None,
         k_scale: torch.Tensor | None = None,
@@ -844,7 +859,13 @@ if platform.is_nvidia and platform.is_blackwell:
             _pred = max_seqlen_q if _native_multiq else 1
             if not torch.cuda.is_current_stream_capturing() or (
                 is_compiled_for_v2(
-                    q, k_cache, _rl, window_left, enable_pdl, prediction=_pred
+                    q,
+                    k_cache,
+                    _rl,
+                    window_left,
+                    enable_pdl,
+                    prediction=_pred,
+                    has_tau=tau is not None,
                 )
                 and v2_buffers_ready(q, window_left, page_table, prediction=_pred)
             ):
@@ -859,6 +880,7 @@ if platform.is_nvidia and platform.is_blackwell:
                     rel_logits=_rl,
                     window_left=window_left,
                     softmax_scale=softmax_scale,
+                    tau=tau,
                     enable_pdl=enable_pdl,
                     prediction=_pred,
                 ).view(q.shape)
@@ -877,7 +899,14 @@ if platform.is_nvidia and platform.is_blackwell:
 
             # Never compile during graph capture; the engine's uncaptured warmup decode compiles first.
             if (
-                is_compiled_for(q, k_cache, rel_logits, window_left, enable_pdl)
+                is_compiled_for(
+                    q,
+                    k_cache,
+                    rel_logits,
+                    window_left,
+                    enable_pdl,
+                    has_tau=tau is not None,
+                )
                 or not torch.cuda.is_current_stream_capturing()
             ):
                 return rel_mha_decode_tsmha(
@@ -890,11 +919,18 @@ if platform.is_nvidia and platform.is_blackwell:
                     cu_seqlens_q=cu_seqlens_q,
                     window_left=window_left,
                     softmax_scale=softmax_scale,
+                    tau=tau,
                     enable_pdl=enable_pdl,
                 )
         # Varlen required: batch mode reports offset_q 0 for every request (wrong rel_logits rows).
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        if tau is not None:
+            # The fork fallback lacks fused tau; fold it into q and the bias.
+            q = q * tau[:, None, None].to(q.dtype)
+            rel_logits = rel_logits.reshape(q.shape[0], q.shape[1], -1) * tau[
+                :, None, None
+            ].to(rel_logits.dtype)
         extra, window_size = _rel_attention_kwargs(rel_logits, window_left)
         # Use split-kv heuristic (num_splits=0) for full attention.
         num_splits = 0 if window_left < 0 else 1
@@ -944,6 +980,7 @@ if platform.is_nvidia and platform.is_blackwell:
         max_seqlen_q: int = 1,
         window_left: int = -1,
         softmax_scale: float | None = None,
+        tau: torch.Tensor | None = None,
         enable_pdl: bool = False,
         q_scale: torch.Tensor | None = None,
         k_scale: torch.Tensor | None = None,
@@ -967,7 +1004,13 @@ if platform.is_nvidia and platform.is_blackwell:
 
         if (
             not is_compiled_for(
-                q, k_cache, rel_logits, window_left, enable_pdl, blockscaled=True
+                q,
+                k_cache,
+                rel_logits,
+                window_left,
+                enable_pdl,
+                blockscaled=True,
+                has_tau=tau is not None,
             )
             and torch.cuda.is_current_stream_capturing()
         ):
@@ -986,6 +1029,7 @@ if platform.is_nvidia and platform.is_blackwell:
             cu_seqlens_q=cu_seqlens_q,
             window_left=window_left,
             softmax_scale=softmax_scale,
+            tau=tau,
             enable_pdl=enable_pdl,
             q_scale=q_scale,
             k_scale=k_scale,
@@ -1023,6 +1067,7 @@ if platform.is_nvidia and platform.is_blackwell:
         window_left: int = -1,
         return_lse: bool = False,
         softmax_scale: float | None = None,
+        tau: torch.Tensor | None = None,
         enable_pdl: bool = False,
         q_scale: torch.Tensor | None = None,
         k_scale: torch.Tensor | None = None,
@@ -1058,6 +1103,7 @@ if platform.is_nvidia and platform.is_blackwell:
                 k_cache.shape[1] // 128,
                 blockscaled=True,
                 out_dtype=rel_logits.dtype,
+                has_tau=tau is not None,
             )
             and torch.cuda.is_current_stream_capturing()
         ):
@@ -1078,6 +1124,7 @@ if platform.is_nvidia and platform.is_blackwell:
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             softmax_scale=softmax_scale,
+            tau=tau,
             enable_pdl=enable_pdl,
             q_scale=q_scale,
             k_scale=k_scale,

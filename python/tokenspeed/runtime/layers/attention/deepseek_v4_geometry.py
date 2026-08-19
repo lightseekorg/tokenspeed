@@ -12,39 +12,46 @@
 #
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""DeepSeek V4 kernel cache geometry and cache-group vocabulary.
+
+Everything here is what the kernels, the model and the pool all have to agree
+on: how many bytes a row of each quantized cache costs, and what its cache
+group is called. It knows nothing about recipes, budgets or the scheduler --
+:mod:`tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4` builds
+the group specs on top of it, and depends on this module rather than the other
+way round.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
-from typing import Any
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
-)
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    PagedCacheGroupSpec,
-    compute_paged_cache_group_page_counts,
 )
 
 V4_KERNEL_BLOCK_ROWS: int = 64
 V4_SWA_KV_GROUP_ID = "v4.swa_kv"
 V4_INDEXER_COMPRESSOR_STATE_GROUP_ID = "v4.c4a.indexer_compressor_state"
 DEEPSEEK_V4_FP8_MAX = 448.0
-DEEPSEEK_V4_FP8_BLOCK_SIZE = 128
 DEEPSEEK_V4_FP8_QUANT_BLOCK = 64
 DEEPSEEK_V4_FP8_INDEXER_BLOCK_SIZE = 128
 DEEPSEEK_V4_FP8_SCALE_BYTES = 4
 DEEPSEEK_V4_MXFP4_BLOCK_SIZE = 32
 DEEPSEEK_V4_MXFP4_SCALE_BYTES = 1
 DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT = 128
-# V4's default scheduler prefix granularity. Kernel geometry never derives
-# from it (that sources from DEEPSEEK_V4_PAGE_SIZE); any positive multiple of
-# the kernel page is a valid prefix granularity.
-DEEPSEEK_V4_PREFIX_GRANULARITY = DEEPSEEK_V4_PAGE_SIZE
-_COMPRESSOR_STATE_WINDOW_TOKENS = {4: 8, 128: 128}
-_COMPRESSOR_STATE_ROWS_PER_PAGE = {4: 4, 128: 8}
+# Per compression ratio: how long the compressor tail must be retained, and how
+# many rows of it share one cache block. Both the kernel cache layout and the
+# recipe's group specs read these, so the tables live here once.
+V4_COMPRESSOR_STATE_WINDOW_TOKENS = {4: 8, 128: 128}
+V4_COMPRESSOR_STATE_ROWS_PER_PAGE = {4: 4, 128: 8}
 
 
 def deepseek_v4_nope_dim(head_dim: int, rope_dim: int) -> int:
@@ -158,6 +165,17 @@ def deepseek_v4_indexer_fp8_layout_from_row_bytes(
     return index_head_dim, scale_bytes
 
 
+def v4_compressed_rows_per_page(ratio: int) -> int:
+    """Kernel rows one compressed-KV cache block holds.
+
+    Sources from the kernel-page registry constant, never from the scheduler
+    prefix granularity.
+    """
+    if ratio <= 1:
+        raise ValueError(f"ratio must be > 1, got {ratio}")
+    return max(1, DEEPSEEK_V4_PAGE_SIZE // ratio)
+
+
 @dataclass(frozen=True)
 class DeepseekV4CacheLayout:
     """Per-model cache geometry derived from the HF config: layer compress
@@ -191,15 +209,11 @@ class DeepseekV4CacheLayout:
 
     def storage_block_size(self, compress_ratio: int) -> int:
         if compress_ratio > 1:
-            return max(1, DEEPSEEK_V4_PAGE_SIZE // compress_ratio)
+            return v4_compressed_rows_per_page(compress_ratio)
         return self.page_size
 
     def compressor_state_block_size(self, compress_ratio: int) -> int:
-        if compress_ratio == 4:
-            return 4
-        if compress_ratio == 128:
-            return 8
-        return self.page_size
+        return V4_COMPRESSOR_STATE_ROWS_PER_PAGE.get(compress_ratio, self.page_size)
 
     @property
     def indexer_row_bytes(self) -> int:
@@ -298,247 +312,3 @@ def first_v4_compressed_kv_group_id(group_ids) -> str | None:
     if not ratios:
         return None
     return ratios[min(ratios)]
-
-
-def _compressed_kernel_block_size(ratio: int) -> int:
-    # Kernel geometry sources from the kernel-page registry constant, never
-    # from the scheduler prefix granularity.
-    if ratio <= 1:
-        raise ValueError(f"ratio must be > 1, got {ratio}")
-    return max(1, DEEPSEEK_V4_PAGE_SIZE // ratio)
-
-
-def _resolve_sliding_window(hf_config: Any) -> int:
-    for source in (hf_config, getattr(hf_config, "text_config", None)):
-        if source is None:
-            continue
-        if hasattr(source, "sliding_window"):
-            value = source.sliding_window
-            if value is None:
-                raise ValueError("DeepSeek V4 sliding_window is None")
-            window = int(value)
-            if window <= 0:
-                raise ValueError(f"sliding_window must be positive, got {value!r}")
-            return window
-    raise ValueError("DeepSeek V4 hf_config is missing sliding_window")
-
-
-def build_v4_cache_specs(
-    hf_config: Any,
-    *,
-    layer_ratio: Sequence[int],
-    cache_blocks_per_lcm_block: Mapping[str, int] | None = None,
-    decode_input_tokens: int = 1,
-) -> list[PagedCacheGroupSpec]:
-    if (
-        isinstance(decode_input_tokens, bool)
-        or not isinstance(decode_input_tokens, int)
-        or decode_input_tokens <= 0
-    ):
-        raise ValueError("decode_input_tokens must be a positive integer")
-    swa_window = _resolve_sliding_window(hf_config)
-    unique_compress_ratios = sorted({int(r) for r in layer_ratio if int(r) > 1})
-    # c4 compression consumes the prior four-token state plus every token in
-    # the target verify block. Preserve the historical eight-token window for
-    # verify widths <= 4 and grow it for wider block-speculative decoders.
-    c4_state_window = max(
-        _COMPRESSOR_STATE_WINDOW_TOKENS[4],
-        4 + decode_input_tokens,
-    )
-
-    specs: list[PagedCacheGroupSpec] = [
-        # SWA kv: trailing window only -> State family.
-        PagedCacheGroupSpec(
-            group_id=V4_SWA_KV_GROUP_ID,
-            retention="sliding_window",
-            rows_per_page=V4_KERNEL_BLOCK_ROWS,
-            entry_stride_tokens=1,
-            sliding_window_tokens=swa_window,
-            family="state",
-        ),
-    ]
-    for ratio in unique_compress_ratios:
-        if ratio not in _COMPRESSOR_STATE_WINDOW_TOKENS:
-            raise ValueError(f"unsupported DeepSeek V4 compress_ratio={ratio}")
-        # Compressor state: tail buffer -> State family.
-        specs.append(
-            PagedCacheGroupSpec(
-                group_id=v4_compressor_state_group_id(ratio),
-                retention="sliding_window",
-                rows_per_page=_COMPRESSOR_STATE_ROWS_PER_PAGE[ratio],
-                entry_stride_tokens=1,
-                sliding_window_tokens=(
-                    c4_state_window
-                    if ratio == 4
-                    else _COMPRESSOR_STATE_WINDOW_TOKENS[ratio]
-                ),
-                family="state",
-            )
-        )
-        # Compressed kv: full-history chain (indexer K shares this group).
-        specs.append(
-            PagedCacheGroupSpec(
-                group_id=v4_compressed_kv_group_id(ratio),
-                retention="full_history",
-                rows_per_page=_compressed_kernel_block_size(ratio),
-                entry_stride_tokens=ratio,
-                sliding_window_tokens=None,
-                family="history",
-            )
-        )
-    if 4 in unique_compress_ratios:
-        # Indexer compressor state: tail buffer -> State family.
-        specs.append(
-            PagedCacheGroupSpec(
-                group_id=V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
-                retention="sliding_window",
-                rows_per_page=_COMPRESSOR_STATE_ROWS_PER_PAGE[4],
-                entry_stride_tokens=1,
-                sliding_window_tokens=c4_state_window,
-                family="state",
-            )
-        )
-    if cache_blocks_per_lcm_block is None:
-        return specs
-
-    packing = dict(cache_blocks_per_lcm_block)
-    group_ids = {spec.group_id for spec in specs}
-    if set(packing) != group_ids:
-        raise ValueError(
-            "DeepSeek V4 LCM packing must contain exactly the cache groups"
-        )
-    if any(
-        isinstance(count, bool) or not isinstance(count, int) or count <= 0
-        for count in packing.values()
-    ):
-        raise ValueError("DeepSeek V4 LCM packing values must be positive integers")
-    return [
-        replace(
-            spec,
-            cache_blocks_per_lcm_block=packing[spec.group_id],
-        )
-        for spec in specs
-    ]
-
-
-def deepseek_v4_lcm_blocks_needed(
-    specs: Sequence[PagedCacheGroupSpec],
-    *,
-    prefix_granularity: int,
-    token_capacity: int,
-    max_live_requests: int,
-    max_scheduled_tokens: int,
-    max_context_len: int,
-    decode_input_tokens: int = 1,
-    overlap_schedule_depth: int = 0,
-) -> int:
-    """Return physical parents needed by per-group CacheBlock tables."""
-    if prefix_granularity <= 0:
-        raise ValueError("prefix_granularity must be positive")
-    if token_capacity <= 0:
-        raise ValueError("token_capacity must be positive")
-    for spec in specs:
-        if prefix_granularity % spec.block_granularity:
-            raise ValueError(
-                f"group {spec.group_id!r} cache block tokens must divide "
-                f"prefix_granularity={prefix_granularity}"
-            )
-    counts = compute_paged_cache_group_page_counts(
-        specs,
-        max_live_requests=max_live_requests,
-        max_scheduled_tokens=max_scheduled_tokens,
-        max_total_tokens=token_capacity,
-        max_context_len=max_context_len,
-        decode_input_tokens=decode_input_tokens,
-        overlap_schedule_depth=overlap_schedule_depth,
-    )
-    parents = 0
-    for spec in specs:
-        child_pages = counts[spec.group_id] - 1  # page 0 is the null page
-        packing = spec.cache_blocks_per_lcm_block
-        parents += (child_pages + packing - 1) // packing
-    return parents
-
-
-def deepseek_v4_token_capacity_for_cache_pool(
-    specs: Sequence[PagedCacheGroupSpec],
-    *,
-    prefix_granularity: int,
-    num_lcm_blocks: int,
-    max_live_requests: int,
-    max_scheduled_tokens: int,
-    max_context_len: int,
-    decode_input_tokens: int = 1,
-    overlap_schedule_depth: int = 0,
-    upper_bound_tokens: int,
-) -> int:
-    """Invert :func:`deepseek_v4_lcm_blocks_needed` monotonically."""
-    if num_lcm_blocks <= 0:
-        raise ValueError("num_lcm_blocks must be positive")
-    if upper_bound_tokens <= 0:
-        raise ValueError("upper_bound_tokens must be positive")
-    sizing = {
-        "prefix_granularity": prefix_granularity,
-        "max_live_requests": max_live_requests,
-        "max_scheduled_tokens": max_scheduled_tokens,
-        "max_context_len": max_context_len,
-        "decode_input_tokens": decode_input_tokens,
-        "overlap_schedule_depth": overlap_schedule_depth,
-    }
-    low, high = 0, upper_bound_tokens
-    while low < high:
-        candidate = (low + high + 1) // 2
-        if (
-            deepseek_v4_lcm_blocks_needed(
-                specs,
-                token_capacity=candidate,
-                **sizing,
-            )
-            <= num_lcm_blocks
-        ):
-            low = candidate
-        else:
-            high = candidate - 1
-    if low == 0:
-        raise ValueError(
-            f"num_lcm_blocks={num_lcm_blocks} cannot admit one token with "
-            "the configured DeepSeek V4 scheduler limits"
-        )
-    return low
-
-
-__all__ = [
-    "DEEPSEEK_V4_PREFIX_GRANULARITY",
-    "DEEPSEEK_V4_FP8_BLOCK_SIZE",
-    "DEEPSEEK_V4_FP8_INDEXER_BLOCK_SIZE",
-    "DEEPSEEK_V4_FP8_MAX",
-    "DEEPSEEK_V4_FP8_QUANT_BLOCK",
-    "DEEPSEEK_V4_FP8_SCALE_BYTES",
-    "DEEPSEEK_V4_MXFP4_BLOCK_SIZE",
-    "DEEPSEEK_V4_MXFP4_SCALE_BYTES",
-    "DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT",
-    "V4_INDEXER_COMPRESSOR_STATE_GROUP_ID",
-    "V4_KERNEL_BLOCK_ROWS",
-    "V4_SWA_KV_GROUP_ID",
-    "DeepseekV4CacheLayout",
-    "build_v4_cache_specs",
-    "deepseek_v4_cache_layout_from_config",
-    "deepseek_v4_indexer_fp8_layout_from_row_bytes",
-    "deepseek_v4_indexer_fp8_row_bytes",
-    "deepseek_v4_indexer_fp8_scale_bytes",
-    "deepseek_v4_indexer_mxfp4_layout_from_row_bytes",
-    "deepseek_v4_indexer_mxfp4_row_bytes",
-    "deepseek_v4_indexer_mxfp4_scale_dim",
-    "deepseek_v4_indexer_mxfp4_value_bytes",
-    "deepseek_v4_lcm_blocks_needed",
-    "deepseek_v4_nope_dim",
-    "deepseek_v4_swa_row_bytes",
-    "deepseek_v4_swa_scale_dim",
-    "deepseek_v4_swa_token_stride",
-    "deepseek_v4_token_capacity_for_cache_pool",
-    "first_v4_compressed_kv_group_id",
-    "parse_v4_compressed_kv_group_id",
-    "parse_v4_compressor_state_group_id",
-    "v4_compressed_kv_group_id",
-    "v4_compressor_state_group_id",
-]

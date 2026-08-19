@@ -37,6 +37,13 @@ from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4ForwardMetadata,
 )
+from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
+    DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
+    V4_KERNEL_BLOCK_ROWS,
+    deepseek_v4_swa_row_bytes,
+    first_v4_compressed_kv_group_id,
+    v4_compressed_kv_group_id,
+)
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_build_dense_prefill_local_compressed_indices,
     deepseek_v4_combine_dense_swa_indices,
@@ -52,15 +59,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
     _split_block_tables_into_v4_metadata,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4_cache_spec import (
-    DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
-    V4_KERNEL_BLOCK_ROWS,
-    deepseek_v4_swa_row_bytes,
-    first_v4_compressed_kv_group_id,
-    v4_compressed_kv_group_id,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    PagedCacheGroupSpec,
+    CacheGroupSpec,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -245,7 +245,7 @@ def _refresh_decode_indexer_schedule_metadata(
 class DeepseekV4AttentionBackend(AttentionBackend):
     """Metadata owner for the model-local DeepSeek V4 attention path."""
 
-    uses_paged_cache_groups = True
+    needs_group_block_tables = True
     uses_cache_groups = True
     cache_group_tables_replace_draft_page_table = True
     cache_active_pages_must_be_real = True
@@ -338,10 +338,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
 
     def _configure_cache_group_contract(
         self,
-        paged_cache_group_specs=(),
-        paged_cache_group_page_counts=None,
+        cache_group_specs=(),
+        cache_group_page_counts=None,
     ) -> tuple[tuple[object, ...], dict[str, int]]:
-        specs = tuple(paged_cache_group_specs or ())
+        specs = tuple(cache_group_specs or ())
         group_ids = tuple(getattr(spec, "group_id", None) for spec in specs)
         if any(not isinstance(group_id, str) or not group_id for group_id in group_ids):
             raise RuntimeError(
@@ -349,7 +349,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
         if len(group_ids) != len(set(group_ids)):
             raise RuntimeError("DeepSeek V4 cache group specs contain duplicate IDs")
-        page_counts = dict(paged_cache_group_page_counts or {})
+        page_counts = dict(cache_group_page_counts or {})
         if not group_ids:
             if page_counts:
                 raise RuntimeError(
@@ -406,8 +406,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
 
     def configure_runtime(self, **kwargs) -> None:
         self._configure_cache_group_contract(
-            kwargs.pop("paged_cache_group_specs", ()),
-            kwargs.pop("paged_cache_group_page_counts", None),
+            kwargs.pop("cache_group_specs", ()),
+            kwargs.pop("cache_group_page_counts", None),
         )
 
     def _prepare_cache_group_tables(
@@ -592,7 +592,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
 
     def _cuda_graph_group_table_width(
         self,
-        spec: PagedCacheGroupSpec,
+        spec: CacheGroupSpec,
         *,
         max_tokens_per_req: int,
         overlap_schedule_depth: int,
@@ -960,7 +960,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         seq_lens_cpu = None
         if extend_prefix_lens_cpu is not None and query_lens_cpu is not None:
-            seq_lens_cpu = seq_lens[:bs].to(dtype=torch.int32, device="cpu")
             prefix_count = min(
                 int(extend_prefix_lens_cpu.numel()),
                 (
@@ -969,6 +968,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     else bs
                 ),
             )
+            if prefix_count == bs:
+                seq_lens_cpu = (
+                    extend_prefix_lens_cpu[:bs].to(dtype=torch.int32, device="cpu")
+                    + query_lens_cpu[:bs]
+                )
+            else:
+                # Mixed decode rows do not have a complete host sequence-length
+                # mirror. Preserve their exact values for decode metadata while
+                # keeping the all-prefill path synchronization-free.
+                seq_lens_cpu = seq_lens[:bs].to(dtype=torch.int32, device="cpu")
             if prefix_count:
                 seq_lens_cpu[:prefix_count] = (
                     extend_prefix_lens_cpu[:prefix_count].to(
@@ -977,15 +986,52 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     )
                     + query_lens_cpu[:prefix_count]
                 )
-        elif extend_seq_lens_cpu is not None and forward_mode is not None:
-            if forward_mode.is_extend():
-                seq_lens_cpu = extend_seq_lens_cpu[:bs].to(
-                    dtype=torch.int32,
-                    device="cpu",
+        elif (
+            extend_seq_lens_cpu is not None
+            and forward_mode is not None
+            and forward_mode.is_mixed()
+        ):
+            seq_lens_cpu = seq_lens[:bs].to(dtype=torch.int32, device="cpu")
+        prefill_seq_lens: list[int] = []
+        prefill_query_lens: list[int] = []
+        if num_prefill_reqs:
+            if (
+                seq_lens_cpu is None
+                or query_lens_cpu is None
+                or seq_lens_cpu.device.type != "cpu"
+                or query_lens_cpu.device.type != "cpu"
+                or seq_lens_cpu.numel() < num_prefill_reqs
+                or query_lens_cpu.numel() < num_prefill_reqs
+            ):
+                raise RuntimeError(
+                    "DeepSeek V4 prefill metadata requires complete CPU sequence "
+                    "and query length mirrors"
                 )
-            elif forward_mode.is_mixed():
-                seq_lens_cpu = seq_lens[:bs].to(dtype=torch.int32, device="cpu")
-        max_seq_len = int(seq_lens.max().item()) if bs else 0
+            prefill_seq_lens = [
+                int(value) for value in seq_lens_cpu[:num_prefill_reqs].tolist()
+            ]
+            prefill_query_lens = [
+                int(value) for value in query_lens_cpu[:num_prefill_reqs].tolist()
+            ]
+            if any(
+                query_len < 0 or seq_len < query_len
+                for seq_len, query_len in zip(
+                    prefill_seq_lens, prefill_query_lens, strict=True
+                )
+            ):
+                raise RuntimeError(
+                    "DeepSeek V4 prefill CPU length mirrors contain an invalid "
+                    "sequence/query pair"
+                )
+
+        if num_prefill_reqs == bs:
+            max_seq_len = max(prefill_seq_lens, default=0)
+        elif bs:
+            # Preserve mixed/decode sizing semantics. Those paths do not have
+            # a complete CPU sequence-length mirror.
+            max_seq_len = int(seq_lens.max().item())
+        else:
+            max_seq_len = 0
         if forward_mode is not None and forward_mode.is_extend():
             max_seq_len += max(self.speculative_num_steps - 1, 0)
         if is_packed_decode:
@@ -1031,25 +1077,29 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             base_offsets_on_device,
         )
         req_ids = torch.arange(bs, device=device, dtype=torch.int32)
-        token_to_req = torch.repeat_interleave(req_ids, query_lens.clamp_min(0))
-        if (
-            forward_mode is not None
-            and forward_mode.is_mixed()
-            and num_tokens_arg is not None
-        ):
-            # numel() reads tensor shape metadata only. Reducing query_lens and
-            # calling .item() here would synchronize its CUDA stream on every
-            # eager mixed batch.
-            metadata_tokens = token_to_req.numel()
-            if metadata_tokens != num_tokens:
-                raise RuntimeError(
-                    "DeepSeek V4 mixed metadata token count mismatch: "
-                    f"query_lens describe {metadata_tokens} tokens, packed input has "
-                    f"{num_tokens}"
-                )
-        num_prefill_tokens = (
-            int(query_lens[:num_prefill_reqs].sum().item()) if num_prefill_reqs else 0
-        )
+        num_prefill_tokens = sum(prefill_query_lens)
+        if num_prefill_reqs == bs:
+            token_to_req = torch.repeat_interleave(
+                req_ids,
+                query_lens.clamp_min(0),
+                output_size=num_prefill_tokens,
+            )
+        else:
+            token_to_req = torch.repeat_interleave(req_ids, query_lens.clamp_min(0))
+            if (
+                forward_mode is not None
+                and forward_mode.is_mixed()
+                and num_tokens_arg is not None
+            ):
+                # numel() reads tensor shape metadata only. Reducing query_lens
+                # and calling .item() here would synchronize its CUDA stream.
+                metadata_tokens = token_to_req.numel()
+                if metadata_tokens != num_tokens:
+                    raise RuntimeError(
+                        "DeepSeek V4 mixed metadata token count mismatch: "
+                        f"query_lens describe {metadata_tokens} tokens, packed input "
+                        f"has {num_tokens}"
+                    )
         query_start_loc = torch.nn.functional.pad(
             torch.cumsum(query_lens.to(torch.int32), dim=0, dtype=torch.int32),
             (1, 0),
@@ -1144,7 +1194,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
 
         cache_metadata = metadata.cache
         if cache_metadata.swa_page_table is None:
-            raise RuntimeError("DeepSeek V4 missing paged-cache block table for SWA KV")
+            raise RuntimeError("DeepSeek V4 missing cache-group block table for SWA KV")
         swa_page_table = cache_metadata.swa_page_table
         indices, lens = deepseek_v4_decode_swa_indices_and_lens(
             query_start_loc=metadata.query_start_loc,
@@ -1588,16 +1638,19 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             torch.full_like(prefix_lens, max(window_size - 1, 0)),
         )
         if cache_metadata.swa_page_table is None:
-            raise RuntimeError("DeepSeek V4 missing paged-cache block table for SWA KV")
+            raise RuntimeError("DeepSeek V4 missing cache-group block table for SWA KV")
         swa_page_table = cache_metadata.swa_page_table
-        max_gather_len = int(gather_lens.max().item()) if num_reqs else 1
         compressed_lens = (
             torch.div(metadata.seq_lens, compress_ratio, rounding_mode="floor")
             if compress_ratio > 1
             else torch.zeros_like(metadata.seq_lens)
         )
-        compressed_base = (
-            int(compressed_lens.max().item()) if compress_ratio > 1 and num_reqs else 0
+        max_gather_len, compressed_base = self._prefill_workspace_bounds(
+            metadata.seq_lens_cpu,
+            metadata.query_lens_cpu,
+            num_reqs=num_reqs,
+            window_size=window_size,
+            compress_ratio=compress_ratio,
         )
         workspace_width = max(1, compressed_base + max_gather_len)
         kv_workspace = self._get_prefill_workspace(
@@ -1716,6 +1769,54 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             compressed_base=compressed_base,
         )
         return kv_workspace, indices, lens
+
+    @staticmethod
+    def _prefill_workspace_bounds(
+        seq_lens_cpu: torch.Tensor | None,
+        query_lens_cpu: torch.Tensor | None,
+        *,
+        num_reqs: int,
+        window_size: int,
+        compress_ratio: int,
+    ) -> tuple[int, int]:
+        """Compute prefill allocation bounds without reading the CUDA stream."""
+        if num_reqs < 0:
+            raise ValueError(f"num_reqs must be non-negative, got {num_reqs}")
+        if num_reqs == 0:
+            return 1, 0
+        if (
+            seq_lens_cpu is None
+            or query_lens_cpu is None
+            or seq_lens_cpu.device.type != "cpu"
+            or query_lens_cpu.device.type != "cpu"
+            or seq_lens_cpu.numel() != num_reqs
+            or query_lens_cpu.numel() != num_reqs
+        ):
+            raise RuntimeError(
+                "DeepSeek V4 prefill workspace sizing requires matching CPU "
+                "sequence and query lengths"
+            )
+        seq_lens = [int(value) for value in seq_lens_cpu.tolist()]
+        query_lens = [int(value) for value in query_lens_cpu.tolist()]
+        if any(
+            query_len < 0 or seq_len < query_len
+            for seq_len, query_len in zip(seq_lens, query_lens, strict=True)
+        ):
+            raise RuntimeError(
+                "DeepSeek V4 prefill workspace CPU length mirrors contain an "
+                "invalid sequence/query pair"
+            )
+        gather_window = max(window_size - 1, 0)
+        max_gather_len = max(
+            query_len + min(seq_len - query_len, gather_window)
+            for seq_len, query_len in zip(seq_lens, query_lens, strict=True)
+        )
+        compressed_base = (
+            max(seq_len // compress_ratio for seq_len in seq_lens)
+            if compress_ratio > 1
+            else 0
+        )
+        return max_gather_len, compressed_base
 
     def _metadata_slice(
         self,
@@ -1929,10 +2030,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 topk_indices=topk_indices,
             )
 
-        token_offsets = [
-            int(x)
-            for x in metadata.query_start_loc[: num_reqs + 1].detach().cpu().tolist()
-        ]
+        query_lens_cpu = metadata.query_lens_cpu
+        if (
+            query_lens_cpu is None
+            or query_lens_cpu.device.type != "cpu"
+            or query_lens_cpu.numel() < num_reqs
+        ):
+            raise RuntimeError(
+                "DeepSeek V4 chunked prefill requires CPU query-length metadata"
+            )
+        token_offsets = [0]
+        for query_len in query_lens_cpu[:num_reqs].tolist():
+            token_offsets.append(token_offsets[-1] + int(query_len))
+        if token_offsets[-1] != q.shape[0]:
+            raise RuntimeError(
+                "DeepSeek V4 chunked prefill query lengths do not match token "
+                f"count: query_tokens={token_offsets[-1]}, q_tokens={q.shape[0]}"
+            )
         out = q.new_empty((q.shape[0], num_local_heads, head_dim))
         saved_metadata = self.forward_metadata
         try:
@@ -1977,8 +2091,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
-        paged_cache_group_specs=(),
-        paged_cache_group_page_counts=None,
+        cache_group_specs=(),
+        cache_group_page_counts=None,
         max_tokens_per_req: int = 1,
         overlap_schedule_depth: int = 0,
     ):
@@ -2041,8 +2155,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._cuda_graph_max_bs = max_bs
         self._cuda_graph_block_tables = {}
         specs, _ = self._configure_cache_group_contract(
-            paged_cache_group_specs,
-            paged_cache_group_page_counts,
+            cache_group_specs,
+            cache_group_page_counts,
         )
         group_ids = self._expected_cache_group_ids
         assert group_ids is not None
@@ -2097,14 +2211,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             if table is not None:
                 if int(table.shape[0]) < active_rows:
                     raise RuntimeError(
-                        "DeepSeek V4 CUDA graph paged cache table row count "
+                        "DeepSeek V4 CUDA graph cache-group table row count "
                         f"mismatch for {group_id!r}: got {int(table.shape[0])}, "
                         f"expected at least actual_bs {active_rows}"
                     )
                 cols = int(table.shape[1])
                 if cols > int(buf.shape[1]):
                     raise RuntimeError(
-                        "DeepSeek V4 CUDA graph paged cache table width "
+                        "DeepSeek V4 CUDA graph cache-group table width "
                         f"mismatch for {group_id!r}: got {cols}, capture "
                         f"buffer has {int(buf.shape[1])}"
                     )

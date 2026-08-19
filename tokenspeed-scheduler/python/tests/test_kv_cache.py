@@ -42,24 +42,24 @@ def _make_config() -> ts.SchedulerConfig:
     cfg.disable_l2_cache = True
     cfg.disable_prefix_cache = True
 
-    full = ts.PagedCacheGroupConfig(
+    full = ts.CacheGroupConfig(
         group_id="full",
         rows_per_page=cfg.prefix_granularity,
         entry_stride_tokens=1,
         total_pages=cfg.num_device_pages,
-        retention=ts.PagedCacheRetention.FullHistory,
-        family=ts.PagedCacheGroupFamily.History,
+        retention=ts.CacheRetention.FullHistory,
+        family=ts.CacheGroupFamily.History,
     )
-    swa = ts.PagedCacheGroupConfig(
+    swa = ts.CacheGroupConfig(
         group_id="swa",
         rows_per_page=cfg.prefix_granularity,
         entry_stride_tokens=1,
         total_pages=cfg.num_device_pages,
-        retention=ts.PagedCacheRetention.SlidingWindow,
+        retention=ts.CacheRetention.SlidingWindow,
         sliding_window_tokens=4,
-        family=ts.PagedCacheGroupFamily.State,
+        family=ts.CacheGroupFamily.State,
     )
-    cfg.paged_cache_groups = [full, swa]
+    cfg.cache_groups = [full, swa]
     return cfg
 
 
@@ -187,7 +187,7 @@ def _make_k3_128k_config(num_device_pages: int) -> ts.SchedulerConfig:
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = 8_192
     cfg.max_batch_size = 1
-    for group in cfg.paged_cache_groups:
+    for group in cfg.cache_groups:
         group.rows_per_page = cfg.prefix_granularity
         group.cache_blocks_per_lcm_block = (
             12 if group.group_id == K3_GROUP_IDS[0] else 1

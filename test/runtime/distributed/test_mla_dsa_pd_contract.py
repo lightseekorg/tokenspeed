@@ -43,14 +43,10 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
-    _dsa_fields,
-    _mla_fields,
+    OrdinaryRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
-    solve_cache_layout,
-)
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    build_paged_cache_group_specs,
+    pack,
 )
 
 _P = 64
@@ -58,95 +54,129 @@ _NUM_LAYERS = 3
 _NUM_LCM_BLOCKS = 6
 
 
-class _MLACfg:
-    kv_lora_rank = 512
-    qk_rope_head_dim = 64
-    kv_cache_dtype = torch.bfloat16
-    kv_cache_quant_method = ""
-    index_head_dim = 128
-    page_size = _P
-    dtype = torch.bfloat16
+def _attn_config(family: str, pd_enabled: bool):
+    """A real MLA/DSA config: the recipe dispatches fields on the type."""
+    from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 
-
-def _plan(fields):
-    layout = solve_cache_layout(
-        fields,
+    common = dict(
+        device="cpu",
+        backend_name="mla",
+        num_attention_heads=64,
+        num_kv_heads=64,
+        attn_tp_size=1,
+        head_dim=192,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        context_len=1024,
+        max_graph_bs=1,
+        max_bs=1,
         prefix_granularity=_P,
-        cache_blocks_per_lcm_block={f.group_id: 1 for f in fields},
-        alignment=1,
-        max_padding_fraction=1.0,
-    )
-    return layout.with_num_lcm_blocks(_NUM_LCM_BLOCKS)
-
-
-def _specs(plan, pd_enabled: bool):
-    return build_paged_cache_group_specs(
-        layer_types=("full_attention",) * _NUM_LAYERS,
-        group_ids=("full_attention",) * _NUM_LAYERS,
-        sliding_window_tokens=None,
-        prefix_granularity=_P,
+        kernel_page_size=_P,
+        kv_cache_quant_method="",
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        scaling=1.0,
+        kv_cache_dim=576,
+        max_scheduled_tokens=_P,
         pd_disaggregation_enabled=pd_enabled,
     )
+    if family == "dsa":
+        return DSAConfig(index_topk=1, index_head_dim=128, index_n_heads=1, **common)
+    return MLAConfig(**common)
+
+
+def _recipe(family: str, pd_enabled: bool = False):
+    """An ordinary recipe over ``_NUM_LAYERS`` MLA/DSA layers."""
+    from types import SimpleNamespace
+
+    config = _attn_config(family, pd_enabled)
+    return OrdinaryRecipe(
+        family=family,
+        server_args=SimpleNamespace(max_total_tokens=_NUM_LCM_BLOCKS * _P),
+        model_config=SimpleNamespace(num_attention_layers=_NUM_LAYERS),
+        attn_config=config,
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=1 << 30,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+
+
+def _plan_and_specs(family: str, pd_enabled: bool = False):
+    recipe = _recipe(family, pd_enabled)
+    groups = recipe.groups()
+    layout = pack(
+        groups,
+        prefix_granularity=recipe.prefix_granularity,
+        cache_blocks_per_lcm_block=recipe.packing(groups),
+        alignment=recipe.alignment,
+        max_padding_fraction=recipe.max_padding_fraction,
+    )
+    return layout.bind(_NUM_LCM_BLOCKS), tuple(spec for spec, _ in groups)
 
 
 def _make_mla_pool(pd_enabled: bool):
     from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 
-    fields = _mla_fields(_MLACfg(), _NUM_LAYERS)
-    plan = _plan(fields)
-    return MLATokenToKVPool(
-        size=_NUM_LCM_BLOCKS * _P,
+    plan, specs = _plan_and_specs("mla", pd_enabled)
+    from cache_pool_test_utils import make_pool
+
+    _, pool = make_pool(
+        MLATokenToKVPool,
+        plan,
+        device="cpu",
         model_dtype=torch.bfloat16,
         dtype=torch.bfloat16,
         quant_method="",
-        kv_lora_rank=_MLACfg.kv_lora_rank,
-        qk_rope_head_dim=_MLACfg.qk_rope_head_dim,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
         layer_num=_NUM_LAYERS,
-        device="cpu",
-        enable_memory_saver=False,
-        prefix_granularity=_P,
         rank=0,
-        memory_plan=plan,
-        paged_cache_group_specs=_specs(plan, pd_enabled),
+        cache_group_specs=specs,
         token_capacity=_NUM_LCM_BLOCKS * _P,
         layer_group_ids=("full_attention",) * _NUM_LAYERS,
     )
+    return pool
 
 
 def _make_dsa_pool(pd_enabled: bool):
     from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
 
-    fields = _dsa_fields(_MLACfg(), _NUM_LAYERS)
-    plan = _plan(fields)
-    return DSATokenToKVPool(
-        size=_NUM_LCM_BLOCKS * _P,
+    plan, specs = _plan_and_specs("dsa", pd_enabled)
+    from cache_pool_test_utils import make_pool
+
+    _, pool = make_pool(
+        DSATokenToKVPool,
+        plan,
+        device="cpu",
         model_dtype=torch.bfloat16,
         dtype=torch.bfloat16,
         quant_method="",
-        kv_lora_rank=_MLACfg.kv_lora_rank,
-        qk_rope_head_dim=_MLACfg.qk_rope_head_dim,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
         layer_num=_NUM_LAYERS,
-        device="cpu",
-        enable_memory_saver=False,
-        prefix_granularity=_P,
         rank=0,
-        index_head_dim=_MLACfg.index_head_dim,
-        memory_plan=plan,
-        paged_cache_group_specs=_specs(plan, pd_enabled),
+        index_head_dim=128,
+        cache_group_specs=specs,
         token_capacity=_NUM_LCM_BLOCKS * _P,
         layer_group_ids=("full_attention",) * _NUM_LAYERS,
     )
+    return pool
 
 
 def test_mla_pool_advertises_pd_contract_when_enabled() -> None:
     from tokenspeed.runtime.pd.cache_protocol import (
-        build_pool_cache_transfer_contract,
+        build_arena_cache_transfer_contract,
     )
 
     pool = _make_mla_pool(pd_enabled=True)
-    assert pool.supports_disaggregation is True
-    contract, base_addr = build_pool_cache_transfer_contract(pool)
-    assert base_addr == pool.buffer.data_ptr()
+    assert pool.arena.supports_disaggregation is True
+    contract, base_addr = build_arena_cache_transfer_contract(pool.arena)
+    assert base_addr == pool.arena.buffer.data_ptr()
     field_ids = {
         field.field_id for field in contract.fields_for_group("full_attention")
     }
@@ -155,13 +185,13 @@ def test_mla_pool_advertises_pd_contract_when_enabled() -> None:
 
 def test_dsa_pool_contract_covers_latent_and_index_k() -> None:
     from tokenspeed.runtime.pd.cache_protocol import (
-        build_pool_cache_transfer_contract,
+        build_arena_cache_transfer_contract,
     )
 
     pool = _make_dsa_pool(pd_enabled=True)
-    assert pool.supports_disaggregation is True
-    contract, base_addr = build_pool_cache_transfer_contract(pool)
-    assert base_addr == pool.buffer.data_ptr()
+    assert pool.arena.supports_disaggregation is True
+    contract, base_addr = build_arena_cache_transfer_contract(pool.arena)
+    assert base_addr == pool.arena.buffer.data_ptr()
     fields = contract.fields_for_group("full_attention")
     field_ids = {field.field_id for field in fields}
     # DSA packs BOTH latent_kv and index_k for every layer into the one
@@ -178,10 +208,10 @@ def test_pd_contract_refused_when_disabled() -> None:
     import pytest
 
     from tokenspeed.runtime.pd.cache_protocol import (
-        build_pool_cache_transfer_contract,
+        build_arena_cache_transfer_contract,
     )
 
     pool = _make_mla_pool(pd_enabled=False)
-    assert pool.supports_disaggregation is False
+    assert pool.arena.supports_disaggregation is False
     with pytest.raises(RuntimeError, match="no transfer policy"):
-        build_pool_cache_transfer_contract(pool)
+        build_arena_cache_transfer_contract(pool.arena)

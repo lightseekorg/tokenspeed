@@ -44,8 +44,8 @@ Layer layout: ``local_layer_ids`` use SWA (``sliding_window_size``) with
 ``rel_extent == sliding_window_size``; the rest are full attention with the
 config ``rel_extent``. KV heads default to the hetero layout (#647
 byte-uniform slots): full-attention layers keep their checkpoint-native
-head count (unconditional; the INKLING_HETERO_KV gate is retired) — uniform serving with
-full-layer KV replicated at load (see the config docstring).
+head count — uniform serving with full-layer KV replicated at load (see the
+config docstring).
 
 Multimodal towers (gated on ``*_config.decoder_dmodel`` being set; text-only
 checkpoints leave both off):
@@ -81,6 +81,9 @@ from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.attention.triton.log_scaling import (
+    log_scaling_tau as compute_log_scaling_tau,
+)
 from tokenspeed_kernel.ops.conv import inkling_ring_sconv
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
@@ -95,7 +98,6 @@ from tokenspeed.runtime.configs.inkling_config import (
     InklingModelConfig,
     InklingVisionConfig,
     inkling_conv_stream_layout,
-    inkling_kv_heads_for_layer,
 )
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -139,12 +141,6 @@ from tokenspeed.runtime.utils.pdl import pdl_enabled
 logger = logging.getLogger(__name__)
 
 _is_hopper_plus = current_platform().is_hopper_plus
-
-# Escape hatch: disable the rel-logits aux-stream fork (serial pre-attention).
-_ATTN_RELFORK = os.environ.get("INKLING_ATTN_RELFORK", "1") == "1"
-# Hetero KV (#647 byte-uniform slots): full layers keep their native half KV
-# head count. Unconditional since 2026-07-15 (INKLING_HETERO_KV gate retired).
-_HETERO_KV = True
 
 
 # Checkpoint attention projections -> qkvr fused shard ids.
@@ -283,18 +279,6 @@ def _load_block_param(
         load_param(name.replace(".w2_md.", ".down_proj."), w)
         return True
     return False
-
-
-def compute_log_scaling_tau(
-    positions: torch.Tensor, n_floor: int, alpha: float
-) -> torch.Tensor:
-    """Long-context query scaling factor (config-gated; see InklingAttention)."""
-    effective_n = (positions + 1).to(torch.float32)
-    return 1.0 + alpha * torch.log(torch.clamp(effective_n / float(n_floor), min=1.0))
-
-
-def _apply_log_scaling_tau(x: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
-    return x * tau.to(dtype=x.dtype)
 
 
 class InklingShortConvolution(nn.Module):
@@ -453,7 +437,7 @@ class InklingRelLogitsProj(nn.Module):
 
     def forward(self, r_out: torch.Tensor) -> torch.Tensor:
         # r_out: [T, num_heads, d_rel] -> rel_logits [T, num_heads, rel_extent]
-        return torch.einsum("thd,de->the", r_out, self.proj)
+        return torch.matmul(r_out, self.proj)
 
 
 class InklingAttention(nn.Module):
@@ -484,7 +468,11 @@ class InklingAttention(nn.Module):
         self.scaling = 1.0 / self.head_dim
 
         total_heads = config.num_attention_heads
-        total_kv_heads = inkling_kv_heads_for_layer(config, layer_id, _HETERO_KV)
+        total_kv_heads = (
+            config.swa_num_key_value_heads
+            if is_local
+            else config.ckpt_num_key_value_heads
+        )
         assert total_heads % attn_tp_size == 0
         self.num_tp_heads = total_heads // attn_tp_size
         if total_kv_heads >= attn_tp_size:
@@ -563,8 +551,8 @@ class InklingAttention(nn.Module):
             num_kv_heads=self.num_tp_kv_heads,
             layer_id=layer_id,
             sliding_window_size=(config.sliding_window_size - 1) if is_local else -1,
-            # Group ids == config.paged_cache_layer_types labels (sliding sub-groups included).
-            group_id=config.paged_cache_layer_types[layer_id],
+            # Group ids == config.cache_layer_types labels (sliding sub-groups included).
+            group_id=config.cache_layer_types[layer_id],
         )
 
         self.q_size = self.head_dim * self.num_tp_heads
@@ -601,25 +589,20 @@ class InklingAttention(nn.Module):
         qkvr, _ = self.qkvr(hidden_states)
         q, kv, r = qkvr.split([self.q_size, 2 * self.kv_size, self.r_size], dim=-1)
 
-        # Warm the R-slice projection serially on the capture topology, then
-        # overlap it during capture. INKLING_ATTN_RELFORK=0 stays serial.
         with self.stream_fork.scope(
-            enable=_ATTN_RELFORK and get_is_cuda_graph_phase(),
+            enable=get_is_cuda_graph_phase(),
             overlap=get_is_capture_mode(),
         ) as fork:
             with fork.branch():
                 rel_logits = self.rel_logits_proj(
                     r.view(num_tokens, self.num_tp_heads, self.d_rel)
                 )
-                if log_scaling_tau is not None and not self.is_local:
-                    rel_logits = _apply_log_scaling_tau(
-                        rel_logits, log_scaling_tau.view(-1, 1, 1)
-                    )
 
-            # K/V are adjacent in the qkvr output AND the conv pool, so both sconv streams fuse into one call.
+            # K/V are adjacent in the qkvr output AND the conv pool, so both
+            # sconv streams fuse into one call reading the strided slice.
             if self.use_sconv:
                 kv = _sconv_apply(
-                    kv.contiguous(),
+                    kv,
                     self._merged_kv_sconv_weight(),
                     ctx,
                     self.layer_id,
@@ -640,16 +623,14 @@ class InklingAttention(nn.Module):
                 enable_pdl=pdl_enabled(),
             )
 
-            if log_scaling_tau is not None and not self.is_local:
-                q = _apply_log_scaling_tau(q, log_scaling_tau.view(-1, 1))
-
         attn_output = self.attn(
             q,
             k,
             v,
             ctx,
             out_cache_loc,
-            rel_logits=rel_logits.contiguous(),
+            rel_logits=rel_logits,
+            log_scaling_tau=None if self.is_local else log_scaling_tau,
             # Inkling's readiness boundary is after both hidden-state sconv
             # writes below, not immediately after attention KV publication.
             record_kv_cache=False,
@@ -1451,7 +1432,6 @@ class InklingTextModel(nn.Module):
             if config.use_embed_norm
             else None
         )
-
         alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
         def get_layer(idx: int, prefix: str) -> InklingDecoderLayer:
@@ -1768,8 +1748,7 @@ class InklingForConditionalGeneration(nn.Module):
         ckpt_heads = (
             cfg.swa_num_key_value_heads if is_local else cfg.ckpt_num_key_value_heads
         )
-        served = inkling_kv_heads_for_layer(cfg, layer_id, _HETERO_KV)
-        target_heads = max(served, self.mapping.attn.tp_size)
+        target_heads = max(ckpt_heads, self.mapping.attn.tp_size)
         if target_heads == ckpt_heads:
             return loaded_weight
         assert (

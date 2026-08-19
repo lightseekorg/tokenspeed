@@ -1030,8 +1030,9 @@ def fused_recurrent_kda_megafuse(
     assert qkv_raw.stride(-1) == 1 and conv_w.is_contiguous() and w_fb.is_contiguous()
     N = T if cu_seqlens is None else len(cu_seqlens) - 1
     out = torch.empty(T, HV, V, dtype=qkv_raw.dtype, device=qkv_raw.device)
-    BV = 32
-    grid = (triton.cdiv(V, BV) * N * HV,)
+    # One program per (request, head): NV == 1 leaves the q/k taps unshared.
+    BV = triton.next_power_of_2(V)
+    grid = (N * HV,)
     fused_recurrent_kda_megafuse_fwd_kernel[grid](
         qkv_raw=qkv_raw,
         conv_w=conv_w,

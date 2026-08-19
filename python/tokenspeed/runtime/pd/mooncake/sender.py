@@ -22,8 +22,8 @@ import time
 
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
-    CachePDLayerwisePageSelection,
-    CachePDPageManifest,
+    CachePDBlockManifest,
+    CachePDLayerwiseBlockSelection,
 )
 from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -65,7 +65,7 @@ class MooncakeKVSender:
         is_last,
         bootstrap_token: int = -1,
         spec_candidate_ids: list[int] | None = None,
-        page_manifest: CachePDPageManifest | None = None,
+        block_manifest: CachePDBlockManifest | None = None,
     ):
         """Submit one final, manifest-backed CachePD transfer."""
         if not is_last:
@@ -83,7 +83,7 @@ class MooncakeKVSender:
             True,
             bootstrap_token=bootstrap_token,
             spec_candidate_ids=spec_candidate_ids,
-            page_manifest=page_manifest,
+            block_manifest=block_manifest,
         )
 
     def send_layerwise(
@@ -94,7 +94,7 @@ class MooncakeKVSender:
         bootstrap_token: int = -1,
         wait_for_bootstrap_token: bool = False,
         spec_candidate_ids: list[int] | None = None,
-        cache_page_selection: CachePDLayerwisePageSelection | None = None,
+        cache_block_selection: CachePDLayerwiseBlockSelection | None = None,
     ):
         self._layerwise_chunk_submitted = True
         self._layerwise_final_chunk_submitted = (
@@ -117,7 +117,7 @@ class MooncakeKVSender:
             layerwise_interval=layerwise_interval,
             wait_for_bootstrap_token=wait_for_bootstrap_token,
             spec_candidate_ids=spec_candidate_ids,
-            cache_page_selection=cache_page_selection,
+            cache_block_selection=cache_block_selection,
         )
 
     def poll(self) -> TransferPoll:

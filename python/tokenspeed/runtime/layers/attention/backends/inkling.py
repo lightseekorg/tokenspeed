@@ -227,8 +227,8 @@ class InklingAttnBackend(AttentionBackend):
 
     # Class-level flags on AttentionBackend would shadow __getattr__; mirror inner's explicitly.
     @property
-    def uses_paged_cache_groups(self):
-        return self.inner.uses_paged_cache_groups
+    def needs_group_block_tables(self):
+        return self.inner.needs_group_block_tables
 
     @property
     def uses_cache_groups(self):
@@ -642,6 +642,7 @@ class InklingAttnBackend(AttentionBackend):
         **kwargs,
     ):
         rel_logits = kwargs.pop("rel_logits", None)
+        tau = kwargs.pop("log_scaling_tau", None)
         if rel_logits is None:
             return self.inner.forward_decode(
                 q,
@@ -695,6 +696,7 @@ class InklingAttnBackend(AttentionBackend):
             max_seqlen_q=max_seqlen_q,
             window_left=layer.sliding_window_size,
             softmax_scale=layer.scaling,
+            tau=tau,
             enable_pdl=pdl_enabled(),
             solution=inner.kernel_solution,
             **scale_kwargs,
@@ -714,6 +716,7 @@ class InklingAttnBackend(AttentionBackend):
         **kwargs,
     ):
         rel_logits = kwargs.pop("rel_logits", None)
+        tau = kwargs.pop("log_scaling_tau", None)
         if rel_logits is None:
             return self.inner.forward_extend(
                 q,
@@ -759,6 +762,7 @@ class InklingAttnBackend(AttentionBackend):
                 max_seqlen=metadata.max_extend_seq_len,
                 window_left=layer.sliding_window_size,
                 softmax_scale=layer.scaling,
+                tau=tau,
                 enable_pdl=pdl_enabled(),
                 solution=inner.kernel_solution,
             )
@@ -791,6 +795,7 @@ class InklingAttnBackend(AttentionBackend):
             rel_logits=rel_logits,
             window_left=layer.sliding_window_size,
             softmax_scale=layer.scaling,
+            tau=tau,
             enable_pdl=pdl_enabled(),
             solution=inner.kernel_solution,
             **scale_kwargs,

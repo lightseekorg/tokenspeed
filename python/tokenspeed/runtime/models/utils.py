@@ -125,9 +125,8 @@ def create_fused_mla_set_kv_buffer_arg(
 
     ``None`` is the single place this configuration is judged to have no fused
     form, so callers fall back rather than branch. Every reason lives here:
-    ``token_to_kv_pool`` is not a plain ``MLATokenToKVPool`` (a
-    ``LayerMappedKVPool`` view over a merged pool -- Kimi-K3's own MLA layers,
-    and an ordinary model's same-family draft view -- fails this on purpose,
+    ``token_to_kv_pool`` is not an ``MLATokenToKVPool``, or it overrides the
+    latent write (Kimi-K3's hybrid KDA pool overrides it to force sanitize --
     see below); the token*head count is past the validated range; the pool's
     latent rows are not one dense ``[tokens, 1, nope+rope]`` tensor (the
     per-token-head quantized pool keeps three); or no registered RoPE solution
@@ -135,16 +134,9 @@ def create_fused_mla_set_kv_buffer_arg(
 
     ``rotary_emb=None`` is the NoPE form and IS fused when every other check
     passes -- the tables are simply absent from the returned argument. Kimi-K3
-    is NoPE, but its own MLA layers read through a ``LayerMappedKVPool`` and
-    so never reach this form; a K3 draft (a heterogeneous MLA cache view) gets
-    a plain pool and does.
-
-    The ``MLATokenToKVPool`` check is also what keeps this write off a
-    ``LayerMappedKVPool``'s ``sanitize=True`` contract (its ``set_mla_kv_buffer``
-    default -- see the comment there): this write does not sanitize, so it
-    must never reach a pool that requires it. That coupling is deliberate,
-    not incidental to the isinstance check happening to be here for other
-    reasons -- keep it if this gate is ever loosened to duck-type instead.
+    is NoPE, but its hybrid KDA pool overrides the latent write and so never
+    reaches this form; a K3 draft (a heterogeneous MLA cache view) gets a
+    plain pool and does.
     """
 
     from tokenspeed_kernel.ops.embedding import supports_fused_mla_kv_write
@@ -152,6 +144,15 @@ def create_fused_mla_set_kv_buffer_arg(
     from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 
     if not isinstance(token_to_kv_pool, MLATokenToKVPool):
+        return None
+    # A pool that overrides the latent write does so to add something this
+    # fused write does not have -- the hybrid KDA pool overrides it to force
+    # sanitize=True, whose comment describes a padded-row NaN reaching a live
+    # row's softmax through the shared dummy slot. Fusing would bypass the
+    # override silently, so decline whenever one exists.
+    if type(token_to_kv_pool).set_mla_kv_buffer is not (
+        MLATokenToKVPool.set_mla_kv_buffer
+    ):
         return None
     if out_cache_loc.numel() * num_q_heads > _FUSED_MLA_KV_MAX_TOKEN_HEADS:
         return None

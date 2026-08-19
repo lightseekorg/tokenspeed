@@ -90,6 +90,7 @@ report:
   github_step_summary: true
 perf_threshold: 0.9
 # Values are [Latency (tps/user), Throughput (tps/gpu)]; gate fails any conc whose actual falls below ref * perf_threshold.
-# Rounded down from an 8x MI350X concurrency-1 measurement: 43.05 / 5.26.
+# Rounded down from the median of the three most recent passing runs on the 8x
+# MI35x runner (67.48/8.09, 65.66/7.88, 65.15/7.79): 65.66 / 7.88.
 perf_reference:
-  1: [42, 5.2]
+  1: [65, 7.8]
