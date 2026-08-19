@@ -58,6 +58,10 @@ class DSAConfig(MLAConfig):
         is_draft: bool = False,
     ):
         base = MLAConfig.generate(server_args, model_config, is_draft)
+        if base.dcp_size > 1:
+            raise ValueError(
+                "decode context parallelism currently supports dense MLA, not DSA"
+            )
         if base.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             platform = current_platform()
             if not (platform.is_blackwell_plus or platform.is_cdna4_plus):

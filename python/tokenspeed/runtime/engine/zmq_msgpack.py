@@ -331,6 +331,7 @@ def connect_msgpack_engine_for_loop(
         world_size=loop.world_size,
         data_parallel_size=loop.dp_size,
         tensor_parallel_size=loop.attn_tp_size,
+        decode_context_parallel_size=loop.server_args.mapping.attn.dcp_size,
         data_parallel_rank=loop.dp_rank,
         max_num_seqs=server_args.max_num_seqs,
         # chunked_prefill_size=-1 means "disabled"; the wire field is a

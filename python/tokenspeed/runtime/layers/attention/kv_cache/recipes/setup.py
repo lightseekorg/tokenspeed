@@ -63,6 +63,24 @@ CacheModelFamily = Literal[
     "kimi_k3",
     "deepseek_v4",
 ]
+CachePlacement = Literal["cyclic_history", "replicated"]
+
+
+@dataclass(frozen=True)
+class CachePlacementContract:
+    """Python-only cache placement, distinct from scheduler row geometry."""
+
+    dcp_size: int
+    dcp_rank: int
+    layer_placements: tuple[CachePlacement, ...]
+
+    def layer_view(self, *, first_layer: int, num_layers: int):
+        return replace(
+            self,
+            layer_placements=self.layer_placements[
+                first_layer : first_layer + num_layers
+            ],
+        )
 
 
 @dataclass(frozen=True)
@@ -78,6 +96,7 @@ class CachePoolSpec:
     token_capacity: int
     layer_kv_head_counts: tuple[int, ...] | None = None
     pool_options: object | None = None
+    placement_contract: CachePlacementContract | None = None
 
     def layer_view(
         self,
@@ -110,6 +129,7 @@ class CachePoolSpec:
         # cache layout) narrows them to the same window; anything else is a
         # whole-pool fact and travels unchanged.
         narrow_options = getattr(self.pool_options, "layer_view", None)
+        narrow_placement = getattr(self.placement_contract, "layer_view", None)
         return replace(
             self,
             family=family or self.family,
@@ -123,6 +143,11 @@ class CachePoolSpec:
                 narrow_options(first_layer=first_layer, num_layers=num_layers)
                 if narrow_options is not None
                 else self.pool_options
+            ),
+            placement_contract=(
+                narrow_placement(first_layer=first_layer, num_layers=num_layers)
+                if narrow_placement is not None
+                else self.placement_contract
             ),
         )
 

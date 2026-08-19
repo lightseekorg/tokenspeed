@@ -725,10 +725,33 @@ def apply_pd_transfer_policies(
     ]
 
 
+def cyclic_history_spec(spec: CacheGroupSpec, *, dcp_size: int) -> CacheGroupSpec:
+    """Return rank-neutral scheduler geometry for cyclic DCP history."""
+    from dataclasses import replace
+
+    if dcp_size <= 0:
+        raise ValueError(f"dcp_size must be positive, got {dcp_size}")
+    if dcp_size == 1:
+        return spec
+    if spec.family != "history" or spec.retention != "full_history":
+        return spec
+    if spec.block_granularity % dcp_size:
+        raise ValueError(
+            f"group {spec.group_id!r} block granularity "
+            f"{spec.block_granularity} is not divisible by DCP size {dcp_size}"
+        )
+    return replace(
+        spec,
+        rows_per_page=spec.block_granularity // dcp_size,
+        entry_stride_tokens=dcp_size,
+    )
+
+
 __all__ = [
     "FULL_ATTENTION",
     "LINEAR_ATTENTION",
     "CacheGroupSpec",
+    "cyclic_history_spec",
     "Retention",
     "SlidingWindowTokens",
     "STATE_LAYER_TYPES",
