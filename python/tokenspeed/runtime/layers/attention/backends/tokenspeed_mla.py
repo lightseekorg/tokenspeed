@@ -58,6 +58,7 @@ from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.dcp.a2a import reconstruct_with_all_to_all
 from tokenspeed.runtime.layers.attention.dcp.comm import (
     gather_fp8_query_heads,
     reconstruct_and_reduce_scatter,
@@ -161,6 +162,7 @@ class CuteDSLMLABackend(AttentionBackend):
         self.dcp_size = config.dcp_size
         self.dcp_rank = config.dcp_rank
         self.dcp_group = config.dcp_group
+        self.dcp_comm_backend = global_server_args_dict.get("dcp_comm_backend", "ag_rs")
 
         # Decode scratch comes from the shared WorkspacePool: the kernel's own
         # get_workspace_size formula is B*H*q_len*split_kv*(D+1)*acc_bytes with
@@ -238,12 +240,15 @@ class CuteDSLMLABackend(AttentionBackend):
             device=self.device,
         )
         lse2 = torch.zeros(gathered.shape[:-1], dtype=torch.float32, device=self.device)
-        reconstruct_and_reduce_scatter(
-            partial,
-            lse2,
-            dcp_rank=self.dcp_rank,
-            group=self.dcp_group,
-        )
+        if self.dcp_comm_backend == "a2a":
+            reconstruct_with_all_to_all(partial, lse2, group=self.dcp_group)
+        else:
+            reconstruct_and_reduce_scatter(
+                partial,
+                lse2,
+                dcp_rank=self.dcp_rank,
+                group=self.dcp_group,
+            )
 
     def _cutedsl_workspace(self, q_len_capacity: int) -> torch.Tensor:
         """Per-use view of the shared block, sized by the closed-form bound."""
@@ -342,7 +347,7 @@ class CuteDSLMLABackend(AttentionBackend):
             return
         if not bool((pages > 0).all().item()):
             raise RuntimeError(
-                "MLA write location resolves to the null page 0 or a " "-1 table hole"
+                "MLA write location resolves to the null page 0 or a -1 table hole"
             )
 
     def _maybe_debug_check_write_locations(
@@ -1201,14 +1206,21 @@ class CuteDSLMLABackend(AttentionBackend):
             local_lse2,
             torch.full_like(local_lse2, -torch.inf),
         )
-        merged = reconstruct_and_reduce_scatter(
-            raw_out,
-            local_lse2,
-            dcp_rank=self.dcp_rank,
-            group=self.dcp_group,
-            local_nonempty=nonempty,
-        )
-        return merged.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        if self.dcp_comm_backend == "a2a":
+            merged = reconstruct_with_all_to_all(
+                raw_out,
+                local_lse2,
+                group=self.dcp_group,
+            )
+        else:
+            merged = reconstruct_and_reduce_scatter(
+                raw_out,
+                local_lse2,
+                dcp_rank=self.dcp_rank,
+                group=self.dcp_group,
+                local_nonempty=nonempty,
+            )
+        return merged.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     # ---- Forward: Extend/Prefill ----
 

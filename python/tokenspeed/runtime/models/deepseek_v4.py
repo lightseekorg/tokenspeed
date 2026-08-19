@@ -2367,6 +2367,8 @@ class DeepseekV4Compressor(nn.Module):
                         ctx.forward_mode is not None and ctx.forward_mode.is_decode()
                     ),
                     is_valid_token=valid_token,
+                    dcp_size=pool.dcp_size,
+                    dcp_rank=pool.dcp_rank,
                 )
             if memo is not None:
                 memo[("compressed", self.compress_ratio)] = compressed_slots

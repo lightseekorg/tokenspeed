@@ -64,6 +64,7 @@ _QWEN4_EXP_ARCHITECTURES = frozenset(
 )
 _MLA_ARCHITECTURES = frozenset(
     {
+        "DeepseekV2ForCausalLM",
         "DeepseekV3ForCausalLM",
         "DeepseekV3ForCausalLMNextN",
         "Eagle3DeepseekV2ForCausalLM",

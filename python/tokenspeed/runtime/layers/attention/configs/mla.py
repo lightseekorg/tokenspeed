@@ -95,15 +95,20 @@ class MLAConfig(BaseAttnConfig):
         effective_kv_streams = 1
         if dcp_size > 1:
             backend_name = server_args.attention_backend
-            if backend_name not in ("tokenspeed_mla", "hybrid_linear_attn"):
+            is_deepseek_v4 = backend_name == "deepseek_v4"
+            if backend_name not in (
+                "tokenspeed_mla",
+                "hybrid_linear_attn",
+                "deepseek_v4",
+            ):
                 raise ValueError(
-                    "decode context parallelism currently requires the "
-                    "tokenspeed_mla full-attention backend, got "
+                    "decode context parallelism requires a DCP-aware MLA "
+                    "backend, got "
                     f"{backend_name!r}"
                 )
-            if server_args.kv_cache_dtype != "fp8_e4m3":
+            if not is_deepseek_v4 and server_args.kv_cache_dtype != "fp8_e4m3":
                 raise ValueError(
-                    "decode context parallelism currently requires "
+                    "tokenspeed_mla decode context parallelism requires "
                     "--kv-cache-dtype fp8_e4m3"
                 )
             if server_args.kv_cache_quant_method != "none":

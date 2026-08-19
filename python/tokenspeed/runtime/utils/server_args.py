@@ -324,7 +324,7 @@ class ServerArgs:
     world_size: int | None = None
     attn_tp_size: int | None = None
     decode_context_parallel_size: int = 1
-    dcp_comm_backend: Literal["ag_rs"] = "ag_rs"
+    dcp_comm_backend: Literal["ag_rs", "a2a"] = "ag_rs"
     dense_tp_size: int | None = None
     moe_tp_size: int | None = None
     mapping: Mapping | None = None
@@ -611,7 +611,7 @@ class ServerArgs:
         dcp_size = self.decode_context_parallel_size
         if dcp_size <= 0:
             raise ValueError(
-                "--decode-context-parallel-size must be positive, got " f"{dcp_size}"
+                f"--decode-context-parallel-size must be positive, got {dcp_size}"
             )
         if attn_tp_size % dcp_size:
             raise ValueError(
@@ -622,6 +622,11 @@ class ServerArgs:
             raise ValueError(
                 "decode context parallelism cannot be combined with legacy "
                 "attention context parallelism"
+            )
+        if self.dcp_comm_backend == "a2a" and dcp_size == 1:
+            raise ValueError(
+                "--dcp-comm-backend a2a requires "
+                "--decode-context-parallel-size greater than 1"
             )
 
         # Dense layers default to the attention replica's TP width
@@ -979,8 +984,7 @@ class ServerArgs:
             nargs="?",
             metavar="model",
             default=None,
-            help="The model name or path (positional argument). "
-            "Equivalent to --model.",
+            help="The model name or path (positional argument). Equivalent to --model.",
         )
         parser.add_argument(
             "--model",
@@ -1718,9 +1722,7 @@ class ServerArgs:
             "--deepseek-v4-prefill-chunk-size",
             type=int,
             default=ServerArgs.deepseek_v4_prefill_chunk_size,
-            help=(
-                "Maximum number of requests per DeepSeek V4 FlashMLA prefill " "chunk."
-            ),
+            help=("Maximum number of requests per DeepSeek V4 FlashMLA prefill chunk."),
         )
         parser.add_argument(
             "--grammar-backend",
@@ -2049,7 +2051,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--dcp-comm-backend",
-            choices=["ag_rs"],
+            choices=["ag_rs", "a2a"],
             default=ServerArgs.dcp_comm_backend,
             help="DCP query/output communication strategy.",
         )
