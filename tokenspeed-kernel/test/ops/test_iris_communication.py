@@ -194,6 +194,31 @@ def test_producer_direct_admission_is_cdna4_only(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    ("world_size", "dtype", "min_bytes"),
+    [
+        (4, torch.bfloat16, 160 << 10),
+        (4, torch.float32, 160 << 10),
+        (8, torch.bfloat16, 96 << 10),
+        (8, torch.float32, 96 << 10),
+    ],
+)
+def test_producer_direct_two_stage_threshold(world_size, dtype, min_bytes):
+    try:
+        from tokenspeed_kernel.ops.communication.iris import (
+            _use_two_stage_producer_direct,
+        )
+    except ImportError:
+        pytest.skip("iris is not installed")
+
+    alignment = world_size * (8 // dtype.itemsize)
+    min_numel = min_bytes // dtype.itemsize
+    assert _use_two_stage_producer_direct(world_size, min_numel, dtype)
+    assert not _use_two_stage_producer_direct(world_size, min_numel - alignment, dtype)
+    assert not _use_two_stage_producer_direct(world_size, min_numel + 1, dtype)
+    assert not _use_two_stage_producer_direct(2, min_numel, dtype)
+
+
 # ---------------------------------------------------------------------------
 # Suite 1: iris_all_reduce
 # ---------------------------------------------------------------------------
@@ -286,6 +311,14 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             ((3, 5), (1, 1)),
             device,
         )
+        if world_size > 2:
+            _check_all_reduce_symmetric_outputs(
+                fp16_state,
+                rank,
+                world_size,
+                ((16, 7168), (16, 3584)),
+                device,
+            )
 
         fp32_state = create_iris_state(
             group=dist.group.WORLD,
@@ -300,6 +333,14 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             ((3, 5), (1, 1)),
             device,
         )
+        if world_size > 2:
+            _check_all_reduce_symmetric_outputs(
+                fp32_state,
+                rank,
+                world_size,
+                ((16, 7168), (16, 3584)),
+                device,
+            )
         if world_size == 8:
             _check_all_reduce_residual_attnres(state, rank, device)
     finally:
@@ -377,7 +418,8 @@ def _check_all_reduce_symmetric_outputs(
             output.fill_(index * (rank + 1))
         graph_results = iris_all_reduce_symmetric(state, outputs)
     dist.barrier()
-    graph.replay()
+    for _ in range(4):
+        graph.replay()
     torch.cuda.synchronize()
     for index, (output, result) in enumerate(zip(outputs, graph_results), start=1):
         torch.testing.assert_close(
@@ -513,7 +555,7 @@ def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
         state = create_iris_state(
             group=group,
             rank_in_group=group_rank,
-            max_numel=32,
+            max_numel=8 * (7168 + 3584),
             dtype=torch.bfloat16,
         )
         _check_all_reduce(
@@ -528,6 +570,13 @@ def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
             group_rank,
             len(groups[group_index]),
             ((3, 5), (1, 1)),
+            device,
+        )
+        _check_all_reduce_symmetric_outputs(
+            state,
+            group_rank,
+            len(groups[group_index]),
+            ((8, 7168), (8, 3584)),
             device,
         )
     except Exception:
