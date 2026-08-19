@@ -643,3 +643,34 @@ def test_fused_gate_admits_the_hybrid_kda_pool_and_carries_its_sanitize():
     plain_arg = _gate_arg_for_pool(plain)
     assert plain_arg is not None
     assert plain_arg.sanitize is False
+
+
+def test_every_fused_call_site_uses_the_probed_entry_point():
+    """The gate answers for ``embedding.rope_mla_set_kv``, so every launch
+    that carries its argument goes through that entry point.
+
+    Overrides are keyed by ``(family, mode)`` and resolve without trait
+    filtering, so a call site that builds the argument here and then launches
+    through ``embedding.rope`` -- as ``rotary_emb`` does -- can be redirected
+    to a solution that rejects the fused argument, and inference raises where
+    the gate promised a working kernel.
+    """
+    import ast
+    import pathlib
+
+    source = (
+        pathlib.Path(__file__).resolve().parents[3]
+        / "python/tokenspeed/runtime/models/deepseek_v3.py"
+    ).read_text()
+    tree = ast.parse(source)
+
+    carriers = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and any(kw.arg == "fused_mla_set_kv_buffer_arg" for kw in node.keywords)
+    ]
+    assert len(carriers) == 2, "expected the FP8 and BF16 fused branches"
+    for call in carriers:
+        assert isinstance(call.func, ast.Name), ast.dump(call.func)
+        assert call.func.id == "apply_rope_mla_set_kv", call.func.id

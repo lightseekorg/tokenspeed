@@ -967,12 +967,18 @@ class DeepseekV3AttentionMLA(nn.Module):
                 else None
             )
             if fused_mla_kv_arg is not None:
-                self.rotary_emb(
-                    positions,
-                    q_pe,
-                    K[..., self.kv_lora_rank :],
+                # The same entry point the FP8 branch takes, so the gate's
+                # probe and the launch resolve one dispatch key. Routing this
+                # through ``rotary_emb`` instead would dispatch
+                # ``embedding.rope``, which an override can redirect to a
+                # solution that rejects the fused argument -- after the gate
+                # already answered for ``embedding.rope_mla_set_kv``.
+                apply_rope_mla_set_kv(
+                    positions=positions,
+                    q_rope=q_pe,
+                    k_rope=K[..., self.kv_lora_rank :],
                     fused_mla_set_kv_buffer_arg=fused_mla_kv_arg,
-                    output_q_rope=Q[..., self.kv_lora_rank :],
+                    q_rope_out=Q[..., self.kv_lora_rank :],
                     enable_pdl=pdl_enabled(),
                 )
                 K = None
