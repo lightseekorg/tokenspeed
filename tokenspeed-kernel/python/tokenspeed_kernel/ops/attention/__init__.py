@@ -1807,10 +1807,12 @@ def kda_replay_commit_supported(
     *,
     solution: str | None = None,
 ) -> bool:
-    """Whether this platform has a KDA speculative replay-commit kernel.
+    """Whether this platform can run the KDA speculative replay path.
 
     Lets a caller decide up front whether it can skip allocating a
-    per-draft-position state scratch, before any verify batch has run.
+    per-draft-position state scratch, before any verify batch has run. That
+    decision needs BOTH ops the path launches -- the replay commit and the
+    fused paged verify -- because they are registered independently.
 
     Args:
         dtype: activation dtype the verify batch will use.
@@ -1827,6 +1829,17 @@ def kda_replay_commit_supported(
             "kda_replay_commit",
             signature,
             traits={"flat_state": True},
+            solution=solution,
+        )
+        # The replay path also drops the per-position verify scratch, so it
+        # needs the fused paged verify -- a separately registered op. A
+        # platform carrying only one of the two would enable replay and then
+        # fail on its first verify batch instead of keeping the fallback.
+        select_kernel(
+            "attention",
+            "kda_fused_paged_verify",
+            signature,
+            traits={"paged_state": True},
             solution=solution,
         )
     except NoKernelFoundError:

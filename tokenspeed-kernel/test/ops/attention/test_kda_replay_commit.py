@@ -593,3 +593,27 @@ def test_replay_commit_probe_tracks_dtype():
     from tokenspeed_kernel.ops.attention import kda_replay_commit_supported
 
     assert not kda_replay_commit_supported(torch.float32)
+
+
+def test_replay_probe_requires_both_ops_it_launches():
+    """The replay path drops the verify scratch, so it needs the fused paged
+    verify as well as the replay commit. The two are registered
+    independently, so a platform carrying only one must not enable replay --
+    it would fail on its first verify batch instead of keeping the fallback.
+    """
+    from unittest import mock
+
+    import tokenspeed_kernel.ops.attention as attention_ops
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    assert attention_ops.kda_replay_commit_supported(torch.bfloat16)
+
+    real = attention_ops.select_kernel
+
+    def missing_verify(family, mode, *args, **kwargs):
+        if mode == "kda_fused_paged_verify":
+            raise NoKernelFoundError("no fused verify on this platform")
+        return real(family, mode, *args, **kwargs)
+
+    with mock.patch.object(attention_ops, "select_kernel", missing_verify):
+        assert not attention_ops.kda_replay_commit_supported(torch.bfloat16)
