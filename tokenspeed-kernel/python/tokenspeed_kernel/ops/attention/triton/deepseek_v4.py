@@ -442,12 +442,20 @@ def deepseek_v4_sparse_attention(
 def _deepseek_v4_dequantize_selected_cache_rows_kernel(
     cache_ptr,
     slots_ptr,
+    lens_ptr,
     out_ptr,
+    indices_ptr,
+    selected_lens_ptr,
     cache_block_stride,
     slots_stride_token,
+    indices_stride_token,
     out_stride_token,
     out_stride_row,
     block_size,
+    OUTPUT_ROW_OFFSET: tl.constexpr,
+    INDEX_OFFSET: tl.constexpr,
+    WORKSPACE_WIDTH: tl.constexpr,
+    HAS_METADATA: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     NOPE_DIM: tl.constexpr,
     ROPE_DIM: tl.constexpr,
@@ -460,13 +468,19 @@ def _deepseek_v4_dequantize_selected_cache_rows_kernel(
     row_idx = tl.program_id(1)
     slot = tl.load(slots_ptr + token_idx * slots_stride_token + row_idx).to(tl.int64)
     valid = slot >= 0
+    if HAS_METADATA:
+        valid &= row_idx < tl.load(lens_ptr + token_idx)
     safe_slot = tl.maximum(slot, 0)
     cache_block = safe_slot // block_size
     cache_position = safe_slot % block_size
     block_base = cache_ptr + cache_block * cache_block_stride
     token_base = block_base + cache_position * TOKEN_STRIDE
     scale_base = block_base + block_size * TOKEN_STRIDE + cache_position * SCALE_DIM
-    out_base = out_ptr + token_idx * out_stride_token + row_idx * out_stride_row
+    out_base = (
+        out_ptr
+        + token_idx * out_stride_token
+        + (OUTPUT_ROW_OFFSET + row_idx) * out_stride_row
+    )
 
     dim = tl.arange(0, BLOCK_DIM)
     nope_mask = dim < NOPE_DIM
@@ -488,6 +502,17 @@ def _deepseek_v4_dequantize_selected_cache_rows_kernel(
     rope_ptr = (token_base + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
     rope = tl.load(rope_ptr + rope_offsets, mask=valid, other=0.0)
     tl.store(out_base + NOPE_DIM + rope_offsets, rope)
+    if HAS_METADATA:
+        flat_index = token_idx * WORKSPACE_WIDTH + INDEX_OFFSET + row_idx
+        tl.store(
+            indices_ptr + token_idx * indices_stride_token + INDEX_OFFSET + row_idx,
+            tl.where(valid, flat_index, -1),
+        )
+        tl.store(
+            selected_lens_ptr + token_idx,
+            WORKSPACE_WIDTH,
+            mask=row_idx == 0,
+        )
 
 
 def deepseek_v4_dequantize_selected_cache_rows(
@@ -525,12 +550,20 @@ def deepseek_v4_dequantize_selected_cache_rows(
     ](
         cache_2d,
         slots_2d,
+        slots_2d,
         output,
+        slots_2d,
+        slots_2d,
         cache_2d.stride(0),
+        slots_2d.stride(0),
         slots_2d.stride(0),
         output.stride(0),
         output.stride(1),
         block_size,
+        OUTPUT_ROW_OFFSET=0,
+        INDEX_OFFSET=0,
+        WORKSPACE_WIDTH=slots_2d.shape[1],
+        HAS_METADATA=False,
         HEAD_DIM=DEEPSEEK_V4_HEAD_DIM,
         NOPE_DIM=DEEPSEEK_V4_NOPE_DIM,
         ROPE_DIM=DEEPSEEK_V4_ROPE_DIM,
@@ -541,6 +574,56 @@ def deepseek_v4_dequantize_selected_cache_rows(
         num_warps=4,
     )
     return output
+
+
+def _deepseek_v4_dequantize_selected_cache_segment(
+    cache_2d: torch.Tensor,
+    slots: torch.Tensor,
+    lens: torch.Tensor,
+    block_size: int,
+    output: torch.Tensor,
+    indices: torch.Tensor,
+    selected_lens: torch.Tensor,
+    output_row_offset: int,
+    workspace_width: int,
+) -> None:
+    """Dequantize one cache segment and produce flattened attention metadata."""
+    slots_2d = slots.reshape(slots.shape[0], -1).to(torch.int32).contiguous()
+    lens_1d = lens.reshape(-1).to(torch.int32).contiguous()
+    if slots_2d.shape[0] != output.shape[0] or lens_1d.shape[0] != output.shape[0]:
+        raise ValueError("selected cache segment must have one row per query")
+    if output_row_offset + slots_2d.shape[1] > output.shape[1]:
+        raise ValueError("selected cache segment exceeds the output workspace")
+    if slots_2d.numel() == 0:
+        return
+    _deepseek_v4_dequantize_selected_cache_rows_kernel[
+        (slots_2d.shape[0], slots_2d.shape[1])
+    ](
+        cache_2d,
+        slots_2d,
+        lens_1d,
+        output,
+        indices,
+        selected_lens,
+        cache_2d.stride(0),
+        slots_2d.stride(0),
+        indices.stride(0),
+        output.stride(0),
+        output.stride(1),
+        block_size,
+        OUTPUT_ROW_OFFSET=output_row_offset,
+        INDEX_OFFSET=output_row_offset,
+        WORKSPACE_WIDTH=workspace_width,
+        HAS_METADATA=True,
+        HEAD_DIM=DEEPSEEK_V4_HEAD_DIM,
+        NOPE_DIM=DEEPSEEK_V4_NOPE_DIM,
+        ROPE_DIM=DEEPSEEK_V4_ROPE_DIM,
+        QUANT_BLOCK=DEEPSEEK_V4_FP8_QUANT_BLOCK,
+        TOKEN_STRIDE=DEEPSEEK_V4_SWA_TOKEN_STRIDE,
+        SCALE_DIM=DEEPSEEK_V4_SWA_SCALE_DIM,
+        BLOCK_DIM=triton.next_power_of_2(DEEPSEEK_V4_HEAD_DIM),
+        num_warps=4,
+    )
 
 
 @register_kernel(
@@ -585,84 +668,44 @@ def triton_deepseek_v4_paged_selected_attention(
     from tokenspeed_kernel.ops.attention import deepseek_v4_selected_attention
 
     tokens = q.shape[0]
-    swa_slots_2d = swa_slots.reshape(tokens, -1)
-    swa_offsets = torch.arange(
-        swa_slots_2d.shape[1],
-        dtype=torch.int32,
-        device=swa_slots.device,
-    )[None, :]
-    swa_valid = (swa_slots_2d >= 0) & (swa_offsets < swa_lens.reshape(-1, 1))
-    masked_swa_slots = torch.where(
-        swa_valid,
-        swa_slots_2d,
-        torch.full_like(swa_slots_2d, -1),
+    swa_width = swa_slots.numel() // tokens
+    extra_width = 0 if extra_slots is None else extra_slots.numel() // tokens
+    workspace_width = swa_width + extra_width
+    kv_workspace = torch.empty(
+        (tokens, workspace_width, DEEPSEEK_V4_HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=q.device,
     )
-    workspace_parts = [
-        deepseek_v4_dequantize_selected_cache_rows(
-            swa_kv_cache,
-            masked_swa_slots,
-            swa_page_size,
-        )
-    ]
-    index_parts = [
-        torch.where(
-            swa_valid,
-            swa_offsets,
-            torch.full_like(swa_offsets, -1),
-        )
-    ]
-
+    selected_indices = torch.empty(
+        (tokens, workspace_width), dtype=torch.int32, device=q.device
+    )
+    selected_lens = torch.empty((tokens,), dtype=torch.int32, device=q.device)
+    _deepseek_v4_dequantize_selected_cache_segment(
+        swa_kv_cache,
+        swa_slots,
+        swa_lens,
+        swa_page_size,
+        kv_workspace,
+        selected_indices,
+        selected_lens,
+        0,
+        workspace_width,
+    )
     if extra_kv_cache is not None:
         assert extra_slots is not None
         assert extra_lens is not None
         assert extra_page_size is not None
-        extra_slots_2d = extra_slots.reshape(tokens, -1)
-        extra_offsets = torch.arange(
-            extra_slots_2d.shape[1],
-            dtype=torch.int32,
-            device=extra_slots.device,
-        )[None, :]
-        extra_valid = (extra_slots_2d >= 0) & (
-            extra_offsets < extra_lens.reshape(-1, 1)
+        _deepseek_v4_dequantize_selected_cache_segment(
+            extra_kv_cache,
+            extra_slots,
+            extra_lens,
+            extra_page_size,
+            kv_workspace,
+            selected_indices,
+            selected_lens,
+            swa_width,
+            workspace_width,
         )
-        masked_extra_slots = torch.where(
-            extra_valid,
-            extra_slots_2d,
-            torch.full_like(extra_slots_2d, -1),
-        )
-        workspace_parts.append(
-            deepseek_v4_dequantize_selected_cache_rows(
-                extra_kv_cache,
-                masked_extra_slots,
-                extra_page_size,
-            )
-        )
-        index_parts.append(
-            torch.where(
-                extra_valid,
-                swa_slots_2d.shape[1] + extra_offsets,
-                torch.full_like(extra_offsets, -1),
-            )
-        )
-
-    kv_workspace = torch.cat(workspace_parts, dim=1)
-    selected_indices = torch.cat(index_parts, dim=1)
-    workspace_width = selected_indices.shape[1]
-    row_bases = (
-        torch.arange(tokens, dtype=torch.int32, device=selected_indices.device)[:, None]
-        * workspace_width
-    )
-    selected_indices = torch.where(
-        selected_indices >= 0,
-        selected_indices + row_bases,
-        selected_indices,
-    )
-    selected_lens = torch.full(
-        (tokens,),
-        workspace_width,
-        dtype=torch.int32,
-        device=q.device,
-    )
     return deepseek_v4_selected_attention(
         q=q,
         kv=kv_workspace,
