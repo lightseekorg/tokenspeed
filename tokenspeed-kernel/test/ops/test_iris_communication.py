@@ -159,6 +159,20 @@ def test_producer_direct_admission_is_cdna4_only(monkeypatch):
     )
 
 
+def test_producer_direct_admission_v4_pro_boundary(monkeypatch):
+    from tokenspeed_kernel.ops.communication import triton as triton_ops
+
+    monkeypatch.setattr(
+        triton_ops,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=True),
+    )
+    state = SimpleNamespace(world_size=8, max_bytes=1024 * 1024)
+
+    assert triton_ops.symm_outputs_can_run(state, ((73, 7168),), torch.bfloat16)
+    assert not triton_ops.symm_outputs_can_run(state, ((74, 7168),), torch.bfloat16)
+
+
 # ---------------------------------------------------------------------------
 # Suite 1: iris_all_reduce
 # ---------------------------------------------------------------------------
@@ -176,6 +190,7 @@ def _ar_shape_cases() -> List[Tuple[int, ...]]:
 def _ar_output_shape_cases() -> List[Tuple[Tuple[int, ...], ...]]:
     """Producer-direct collections spanning one, two, and three outputs."""
     return [
+        ((1, 7168),),
         ((1, 7168), (1, 3584)),
         ((2, 7168), (2, 3584)),
         ((4, 7168), (4, 3584)),

@@ -1144,6 +1144,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
     swiglu_beta: float = 1.0,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dispatch + combine for dynamic MXFP4 activations with precomputed top-k."""
     if topk_ids.ndim != 2:
@@ -1193,6 +1194,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         swiglu_alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
         swiglu_beta=swiglu_beta,
+        out=out,
     )
 
 
@@ -1214,6 +1216,7 @@ def _gluon_mxfp_dynamic_mxfp4_fused_moe_from_route(
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
     swiglu_beta: float = 1.0,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     n_tokens = hidden_states.shape[0]
 
@@ -1254,6 +1257,7 @@ def _gluon_mxfp_dynamic_mxfp4_fused_moe_from_route(
         n_tokens=n_tokens,
         n_expts_act=top_k,
         x_scale_ragged_padded=True,
+        out=out,
     )
 
 

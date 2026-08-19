@@ -438,6 +438,7 @@ if platform.is_amd:
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
             swiglu_beta=swiglu_beta,
+            out=getattr(w, "_situ_output_buffer", None),
         )
 
     @register_kernel(

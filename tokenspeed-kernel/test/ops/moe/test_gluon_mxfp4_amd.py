@@ -27,6 +27,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
     gluon_mxfp_fused_moe as _gfx950_static_moe,
 )
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
+    gluon_mxfp_precomputed_mxfp4_fused_moe,
+)
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (  # noqa: E402
     gluon_a16w4_situ_warp_decode_ep_gfx950,
 )
@@ -242,6 +245,19 @@ def test_dynamic_mxfp4_activation_moe(
     scores = torch.softmax(router_logits.float(), dim=-1)
     topk_weights, topk_ids = torch.topk(scores, top_k, dim=-1)
     topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+    output = torch.empty_like(hidden_states)
+    direct = gluon_mxfp_precomputed_mxfp4_fused_moe(
+        hidden_states,
+        topk_weights,
+        topk_ids.to(torch.int32),
+        module.w13_weight_triton_tensor,
+        module.w2_weight_triton_tensor,
+        w13_mx_scale=module.w13_precision_config.b_mx_scale,
+        w2_mx_scale=module.w2_precision_config.b_mx_scale,
+        out=output,
+    )
+    assert direct.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(direct, actual, atol=0, rtol=0)
     hidden = _dequantize_dynamic_mxfp4(hidden_states)
     w13 = dequantize_mxfp4(raw_w13, raw_w13_scale).to(torch.bfloat16)
     w2 = dequantize_mxfp4(raw_w2, raw_w2_scale).to(torch.bfloat16)
