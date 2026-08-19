@@ -244,15 +244,16 @@ existing `slurm-dispatch` coordinator and runner defaults. `gb300` is an
 explicit opt-in: select one YAML, then the workflow maps its single declared
 `b300-Ngpu` label to `gb300-Ngpu`, preserving an optional `slurm-` prefix for
 multi-node tasks (or validates one matching explicit runner). Effective GB300
-labels are not added to task YAMLs or default CI matrices. Registering the
-separate `slurm-dispatch-gb300` coordinator is an infrastructure prerequisite.
-GB300 perf tasks are disabled until GB300-specific reference values are
-measured.
+labels are not added to task YAMLs or default CI matrices. Four
+`slurm-dispatch-gb300` coordinators form one shared pool for manual and
+per-commit submissions. GB300 perf tasks are disabled until GB300-specific
+reference values are measured.
 
 The `GB300 Slurm Per Commit` workflow selects only multi-node model tasks with
-the `per-commit` trigger and submits them through the dedicated
-`slurm-dispatch-gb300-auto` coordinator. It runs for pushes to `main` and for
-non-draft pull requests whose head branch belongs to this repository. Fork
+the `per-commit` trigger and submits them through the same
+`slurm-dispatch-gb300` coordinator pool used by manual dispatch. It runs for
+pushes to `main` and for non-draft pull requests whose head branch belongs to
+this repository. Fork
 pull requests are skipped because their code must not execute automatically on
 the shared Slurm cluster; use the manual `Slurm Dispatch` workflow after
 review. New pull-request commits cancel the older run, while `main` runs keep

@@ -121,7 +121,7 @@ jobs:
       needs.scan.outputs.enabled == 'true' &&
       needs.scan.outputs.should_run == 'true' &&
       needs.scan.outputs.has_tasks == 'true'
-    runs-on: slurm-dispatch-gb300-auto
+    runs-on: slurm-dispatch-gb300
     timeout-minutes: 720
     strategy:
       fail-fast: false
