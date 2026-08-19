@@ -365,12 +365,21 @@ class Fp8LinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
         block_scale: torch.Tensor | None = None,
         output_dtype: torch.dtype | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
 
         if self.block_quant:
             input_2d = x.view(-1, x.shape[-1])
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
             output_dtype = output_dtype or x.dtype
+            output_2d = None
+            if output is not None:
+                if tuple(output.shape) != tuple(output_shape):
+                    raise ValueError(
+                        f"FP8 linear output shape must be {tuple(output_shape)}, "
+                        f"got {tuple(output.shape)}"
+                    )
+                output_2d = output.view(input_2d.shape[0], layer.weight.shape[0])
 
             if getattr(layer, "_use_deep_gemm_fp8", False):
                 override = "deep_gemm_mm_fp8_blockscale"
@@ -394,6 +403,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     else layer.weight_scale_inv
                 ),
                 bias=bias,
+                out=output_2d,
                 out_dtype=output_dtype,
                 quant="mxfp8",
                 block_size=self.quant_config.weight_block_size,
@@ -411,6 +421,14 @@ class Fp8LinearMethod(LinearMethodBase):
             # View input as 2D matrix for fp8 methods
             input_2d = input.view(-1, input.shape[-1])
             output_shape = [*input.shape[:-1], weight.shape[1]]
+            output_2d = None
+            if output is not None:
+                if tuple(output.shape) != tuple(output_shape):
+                    raise ValueError(
+                        f"FP8 linear output shape must be {tuple(output_shape)}, "
+                        f"got {tuple(output.shape)}"
+                    )
+                output_2d = output.view(input_2d.shape[0], weight.shape[1])
 
             if input_scale is not None:
                 if input_scale.numel() != 1:
@@ -428,8 +446,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight,
                 A_scales=x_scale,
                 B_scales=weight_scale,
+                out=output_2d,
                 out_dtype=input.dtype,
             )
             if bias is not None:
-                output = output + bias
+                output = output.add_(bias) if output_2d is not None else output + bias
             return output.view(*output_shape)
