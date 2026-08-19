@@ -33,6 +33,19 @@ PR_RE = re.compile(
 REPOSITORY_RE = re.compile(r"^(?P<owner>[A-Za-z0-9._-]+)/(?P<repo>[A-Za-z0-9._-]+)$")
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+TERMINAL_STATES = frozenset(
+    {
+        "BOOT_FAIL",
+        "CANCELLED",
+        "COMPLETED",
+        "DEADLINE",
+        "FAILED",
+        "NODE_FAIL",
+        "OUT_OF_MEMORY",
+        "PREEMPTED",
+        "TIMEOUT",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -704,6 +717,41 @@ def slurm_states(job_ids: list[str]) -> dict[str, dict[str, str]]:
     return states
 
 
+def scontrol_states(job_ids: list[str]) -> dict[str, dict[str, str]]:
+    states = {}
+    for job_id in job_ids:
+        result = subprocess.run(
+            ["scontrol", "show", "job", "-o", job_id],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode:
+            continue
+
+        def field(name: str) -> str | None:
+            match = re.search(rf"(?:^|\s){re.escape(name)}=(\S+)", result.stdout)
+            return match.group(1) if match else None
+
+        observed_id = field("JobId")
+        raw_state = field("JobState")
+        elapsed = field("RunTime")
+        exit_code = field("ExitCode")
+        if None in {observed_id, raw_state, elapsed, exit_code}:
+            continue
+        if observed_id.split("+", 1)[0] != job_id:
+            continue
+        state = raw_state.split("+", 1)[0].upper()
+        if state not in TERMINAL_STATES:
+            continue
+        states[job_id] = {
+            "state": state,
+            "elapsed": elapsed,
+            "exit_code": exit_code,
+        }
+    return states
+
+
 def queued_states(job_ids: list[str]) -> dict[str, dict[str, str]]:
     """Return live state for only the explicitly submitted Slurm jobs."""
     requested = set(job_ids)
@@ -942,6 +990,8 @@ def wait_all(
         states = {}
         for _ in range(6):
             states = slurm_states(job_ids)
+            missing = [job_id for job_id in job_ids if job_id not in states]
+            states.update(scontrol_states(missing))
             if len(states) == len(job_ids):
                 break
             time.sleep(2)

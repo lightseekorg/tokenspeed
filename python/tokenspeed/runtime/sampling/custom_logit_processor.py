@@ -21,10 +21,11 @@
 import json
 from abc import ABC, abstractmethod
 from functools import cache
-from typing import Any, Self
+from typing import Any
 
 import dill
 import torch
+from typing_extensions import Self
 
 
 @cache

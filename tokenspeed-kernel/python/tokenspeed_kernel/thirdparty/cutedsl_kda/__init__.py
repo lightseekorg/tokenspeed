@@ -78,9 +78,15 @@ def cutedsl_kda_check_config(gate_lower_bound: float) -> None:
     _module().cutedsl_kda_check_config(gate_lower_bound)
 
 
-def cutedsl_kda_workspace_size(cu_seqlens, heads: int) -> int:
-    """Decomposition-route workspace bytes for this shape (0 on the engine route)."""
-    return _module().cutedsl_kda_workspace_size(cu_seqlens, heads)
+def cutedsl_kda_workspace_size(cu_seqlens, heads: int, cu_seqlens_cpu=None) -> int:
+    """Decomposition-route workspace bytes for this shape (0 on the engine route).
+
+    ``cu_seqlens_cpu`` optionally carries a CPU copy of the boundary contents
+    so the wrapper can plan without a stream-synchronizing D2H read.
+    """
+    return _module().cutedsl_kda_workspace_size(
+        cu_seqlens, heads, cu_seqlens_cpu=cu_seqlens_cpu
+    )
 
 
 def cutedsl_kda_forward(*args, **kwargs):
