@@ -23,6 +23,8 @@ jobs:
             group: pr-test-nvidia
           - name: PR Test NVIDIA ARM
             group: pr-test-nvidia-arm
+          - name: GB300 Slurm Per Commit
+            group: gb300-slurm-per-commit
     concurrency:
       group: ${{ matrix.group }}-${{ github.event.pull_request.number }}
       cancel-in-progress: true

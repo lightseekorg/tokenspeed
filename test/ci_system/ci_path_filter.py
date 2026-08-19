@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-RUNNER_GROUPS = ("amd", "nvidia-arm", "nvidia-x86")
+RUNNER_GROUPS = ("amd", "nvidia-arm", "nvidia-gb300-slurm", "nvidia-x86")
 
 SHARED_DIRECTORIES = (
     "python",
@@ -21,11 +21,13 @@ SHARED_FILES = frozenset(
 VENDOR_DIRECTORIES = {
     "amd": ("tokenspeed-kernel-amd",),
     "nvidia-arm": ("tokenspeed-mla",),
+    "nvidia-gb300-slurm": ("tokenspeed-mla",),
     "nvidia-x86": ("tokenspeed-mla",),
 }
 VENDOR_WORKFLOWS = {
     "amd": ".github/workflows/pr-test-amd.yml",
     "nvidia-arm": ".github/workflows/pr-test-nvidia-arm.yml",
+    "nvidia-gb300-slurm": ".github/workflows/gb300-slurm-per-commit.yml",
     "nvidia-x86": ".github/workflows/pr-test-nvidia.yml",
 }
 
