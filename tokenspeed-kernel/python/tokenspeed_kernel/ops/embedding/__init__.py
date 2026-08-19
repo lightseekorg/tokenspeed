@@ -440,6 +440,7 @@ __all__ = [
     "FusedSetKVBufferArg",
     "apply_rope",
     "apply_rope_mla",
+    "apply_rope_mla_set_kv",
     "supports_fused_mla_kv_write",
 ]
 
