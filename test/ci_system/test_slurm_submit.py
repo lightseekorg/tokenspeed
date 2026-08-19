@@ -373,7 +373,10 @@ def test_render_script_mounts_only_allocated_gb300_devices():
     assert "\n  /dev/nvidia-nvswitchctl \\\n" in script
     assert "\n  /dev/nvidia-caps \\\n" in script
     assert "\n  /dev/nvidia-caps-imex-channels; do\n" in script
-    assert 'local_model_root="${TS_CI_LOCAL_MODEL_ROOT:-/scratch/${USER}-models}"' in script
+    assert (
+        'local_model_root="${TS_CI_LOCAL_MODEL_ROOT:-/scratch/${USER}-models}"'
+        in script
+    )
     assert 'model_mounts+=("$local_model_root:/models:ro")' in script
     assert '"${gpu_mounts[@]}" "${model_mounts[@]}" "${mounts[@]}"' in script
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
