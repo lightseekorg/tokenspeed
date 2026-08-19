@@ -2319,7 +2319,9 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         remapped = []
         for name, loaded_weight in weights:
             if "d2t" in name:
-                self.hot_token_id = loaded_weight + torch.arange(loaded_weight.size(0))
+                self.hot_token_id = loaded_weight + torch.arange(
+                    loaded_weight.size(0), device=loaded_weight.device
+                )
                 continue
             if "t2d" in name:
                 continue
