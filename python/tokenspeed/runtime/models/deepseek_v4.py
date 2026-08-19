@@ -51,6 +51,7 @@ from tokenspeed_kernel import (
 from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed_kernel import mhc_post as fast_mhc_post
 from tokenspeed_kernel import mhc_pre as fast_mhc_pre
+from tokenspeed_kernel.ops.activation.triton import silu_and_mul
 
 try:
     # Optional dependency; the module-level wrapper imports the external
@@ -2121,11 +2122,7 @@ class DeepseekV4MLP(nn.Module):
             )
             out, _ = self.down_proj(x_fp8, scale=scale)
         else:
-            gate, up = gate_up.float().chunk(2, dim=-1)
-            if self.swiglu_limit is not None and self.swiglu_limit > 0:
-                gate = torch.clamp(gate, max=self.swiglu_limit)
-                up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-            x = (F.silu(gate) * up).to(x.dtype)
+            x = silu_and_mul(gate_up, limit=self.swiglu_limit)
             out, _ = self.down_proj(x)
         return out
 
@@ -2541,6 +2538,7 @@ class DeepseekV4MoE(nn.Module):
                 activation="swiglu",
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 with_bias=not is_block_fp8,
+                routing_mode="precomputed_topk",
                 routing_config={
                     "routed_scaling_factor": self.routed_scaling_factor,
                     "normalize_topk_weights": config.norm_topk_prob,

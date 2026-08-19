@@ -237,6 +237,8 @@ def _silu_and_mul_kernel(
     hidden_dim: tl.constexpr,
     input_stride_row: tl.constexpr,
     out_stride_row: tl.constexpr,
+    limit: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
@@ -251,6 +253,9 @@ def _silu_and_mul_kernel(
 
     gate = tl.load(gate_addrs, mask=mask).to(tl.float32)
     up = tl.load(up_addrs, mask=mask).to(tl.float32)
+    if HAS_LIMIT:
+        gate = tl.minimum(gate, limit)
+        up = tl.clamp(up, -limit, limit)
     out = gate * tl.sigmoid(gate) * up
     tl.store(out_ptr + row * out_stride_row + col, out, mask=mask)
 
@@ -258,8 +263,8 @@ def _silu_and_mul_kernel(
 def silu_and_mul(
     x: torch.Tensor,
     out: torch.Tensor | None = None,
-    *,
     enable_pdl: bool = False,
+    limit: float | None = None,
 ) -> torch.Tensor:
     """Fused ``SiLU(x[..., :D]) * x[..., D:]``.
 
@@ -267,6 +272,8 @@ def silu_and_mul(
     and up values in the second half. The output has shape ``[..., D]``.
     """
     del enable_pdl
+    if limit is not None and limit <= 0:
+        raise ValueError(f"limit must be positive, got {limit}")
     if x.shape[-1] % 2 != 0:
         raise ValueError(f"last dimension must be even, got {x.shape[-1]}")
     if x.stride(-1) != 1:
@@ -297,6 +304,8 @@ def silu_and_mul(
         hidden_dim=hidden_dim,
         input_stride_row=flat_x.stride(0),
         out_stride_row=flat_out.stride(0),
+        limit=0.0 if limit is None else limit,
+        HAS_LIMIT=limit is not None,
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return out
