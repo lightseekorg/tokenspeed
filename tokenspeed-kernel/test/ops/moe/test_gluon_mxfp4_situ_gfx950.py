@@ -625,3 +625,173 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(captured, eager, atol=3e-4, rtol=3e-2)
+
+
+@pytest.mark.parametrize("num_tokens", [2, 4, 32])
+def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
+    num_tokens: int,
+) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20260818 + num_tokens)
+    num_experts, latent_size, intermediate_size, top_k = 16, 3584, 384, 16
+    module, raw = _make_mxfp4_module(
+        num_experts=num_experts,
+        latent_size=latent_size,
+        intermediate_size=intermediate_size,
+        top_k=top_k,
+        generator=generator,
+    )
+    hidden_states = 0.1 * torch.randn(
+        num_tokens,
+        latent_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_weights, topk_ids = make_round_robin_topk(num_tokens, num_experts, top_k)
+    router_logits = torch.zeros(
+        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
+    )
+    plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="situ",
+        routing_mode="precomputed_topk",
+        ep_size=1,
+        ispp=intermediate_size,
+        internal_activation_dtype="input",
+        solution="gluon",
+    )
+    assert plan["apply_kernel_name"] == "gluon_mxfp4_a8w4_situ_precomputed_moe_apply"
+    tokenspeed_kernel.moe_process_weights(plan, module)
+    actual = tokenspeed_kernel.moe_apply(
+        plan,
+        hidden_states,
+        module,
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+    expected = a16w4_mxfp4_moe_reference(
+        hidden_states,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_ids,
+        topk_weights,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)
+    if num_tokens <= 4:
+        output = torch.empty_like(actual)
+        module._situ_output_buffer = output
+
+        buffered = tokenspeed_kernel.moe_apply(
+            plan,
+            hidden_states,
+            module,
+            router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+        assert buffered.data_ptr() == output.data_ptr()
+        torch.testing.assert_close(buffered, expected, atol=2e-3, rtol=8e-2)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = tokenspeed_kernel.moe_apply(
+                plan,
+                hidden_states,
+                module,
+                router_logits,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, expected, atol=2e-3, rtol=8e-2)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4])
+def test_tp_situ_joint_shared_projection_gfx950(num_tokens: int) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20260818 + num_tokens)
+    module, _ = _make_mxfp4_module(
+        num_experts=16,
+        latent_size=3584,
+        intermediate_size=384,
+        top_k=16,
+        generator=generator,
+    )
+    hidden_states = torch.randn(
+        num_tokens,
+        3584,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_weights, topk_ids = make_round_robin_topk(num_tokens, 16, 16)
+    router_logits = torch.zeros(num_tokens, 16, dtype=torch.float32, device="cuda")
+    plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="situ",
+        routing_mode="precomputed_topk",
+        ep_size=1,
+        ispp=384,
+        internal_activation_dtype="input",
+        solution="gluon",
+    )
+    tokenspeed_kernel.moe_process_weights(plan, module)
+    routed_reference = tokenspeed_kernel.moe_apply(
+        plan,
+        hidden_states,
+        module,
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+    shared_input = torch.randn(
+        num_tokens, 768, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    shared_weight = torch.randn(
+        7168, 768, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    shared_reference = shared_input @ shared_weight.T
+    shared_out = torch.empty_like(shared_reference)
+
+    routed, shared = tokenspeed_kernel.moe_apply(
+        plan,
+        hidden_states,
+        module,
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_input=shared_input,
+        shared_weight=shared_weight,
+        shared_out=shared_out,
+    )
+
+    torch.testing.assert_close(routed, routed_reference, atol=0, rtol=0)
+    assert shared.data_ptr() == shared_out.data_ptr()
+    torch.testing.assert_close(shared, shared_reference, atol=0.125, rtol=2e-2)
+
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_routed, captured_shared = tokenspeed_kernel.moe_apply(
+            plan,
+            hidden_states,
+            module,
+            router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            shared_input=shared_input,
+            shared_weight=shared_weight,
+            shared_out=shared_out,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured_routed, routed_reference, atol=0, rtol=0)
+    torch.testing.assert_close(captured_shared, shared_reference, atol=0.125, rtol=2e-2)
