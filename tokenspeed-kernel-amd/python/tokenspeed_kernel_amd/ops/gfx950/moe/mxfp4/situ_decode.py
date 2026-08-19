@@ -51,6 +51,7 @@ WARP_DECODE_STAGE1_BLOCK_N = 8
 WARP_DECODE_STAGE1_BLOCK_KB = 1024
 WARP_DECODE_STAGE1_NUM_WARPS = 4
 WARP_DECODE_STAGE2_BLOCK_N = 8
+WARP_DECODE_STAGE2_BATCHED_BLOCK_N = 4
 WARP_DECODE_STAGE2_BLOCK_KB = 512
 WARP_DECODE_STAGE2_NUM_WARPS = 8
 WARP_DECODE_STAGE2_BATCHED_NUM_WARPS = 4
@@ -305,6 +306,7 @@ def _stage2_a16w4_warp_gemv_combine(
     BLOCK_N: gl.constexpr,
     BLOCK_KB: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    MASK_K_TAIL: gl.constexpr,
 ):
     pid = gl.program_id(0)
     if FUSE_SHARED_DOWN and pid >= NUM_ROUTED_PROGRAMS:
@@ -400,9 +402,19 @@ def _stage2_a16w4_warp_gemv_combine(
                 expanded_k = 2 * kb0 + gl.arange(
                     0, 2 * BLOCK_KB, layout=expanded_k_layout
                 )
+                if MASK_K_TAIL:
+                    packed_k_valid = offs_kb < packed_k
+                    expanded_k_valid = expanded_k < intermediate_dim
+                else:
+                    packed_k_valid = gl.full([BLOCK_KB], True, gl.int1, layout=k_layout)
+                    expanded_k_valid = gl.full(
+                        [2 * BLOCK_KB], True, gl.int1, layout=expanded_k_layout
+                    )
                 inter = gl.amd.cdna4.buffer_load(
                     ptr=inter_ptr,
                     offsets=(inter_row + expanded_k * stride_ipk).to(gl.int32),
+                    mask=expanded_k_valid,
+                    other=0.0,
                 ).to(gl.float32)
                 w_offsets = (
                     w_expert
@@ -426,12 +438,16 @@ def _stage2_a16w4_warp_gemv_combine(
                 packed = gl.amd.cdna4.buffer_load(
                     ptr=w2_ptr,
                     offsets=w_offsets.to(gl.int32),
+                    mask=packed_k_valid[None, :],
+                    other=0,
                 )
                 weight = gl.amd.cdna4.scaled_upcast(
                     packed,
                     gl.amd.cdna4.buffer_load(
                         ptr=w2_scale_ptr,
                         offsets=scale_offsets.to(gl.int32),
+                        mask=expanded_k_valid[None, :],
+                        other=0,
                     ),
                     gl.bfloat16,
                     axis=1,
@@ -579,10 +595,10 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         w13_stride_n = w13_weight.stride(2)
         w2_stride_k = w2_weight.stride(1)
         w2_stride_n = w2_weight.stride(2)
-    if hidden_dim % 256 or intermediate_dim % 256:
+    if hidden_dim % 256 or intermediate_dim % 128:
         raise ValueError(
-            "gfx950 warp decode requires hidden and intermediate dimensions "
-            "divisible by 256"
+            "gfx950 warp decode requires hidden dimensions divisible by 256 "
+            "and intermediate dimensions divisible by 128"
         )
 
     local_topk_ids = local_topk_ids.to(torch.int32)
@@ -644,7 +660,12 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         raise ValueError("routed output must match the hidden-state shape and dtype")
     if not out.is_contiguous() or out.device != hidden_states.device:
         raise ValueError("routed output must be contiguous and colocated")
-    stage2_block_n = WARP_DECODE_STAGE2_BLOCK_N
+    # Finer output tiles keep work balanced when local route counts differ.
+    stage2_block_n = (
+        WARP_DECODE_STAGE2_BATCHED_BLOCK_N
+        if num_tokens in (2, 4)
+        else WARP_DECODE_STAGE2_BLOCK_N
+    )
     packed_intermediate = intermediate_dim // 2
     stage2_block_kb = _largest_exact_block_kb(
         packed_intermediate,
@@ -656,8 +677,8 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         if num_tokens in (2, 4)
         else WARP_DECODE_STAGE2_NUM_WARPS
     )
-    if hidden_dim % stage2_block_n or packed_intermediate % stage2_block_kb:
-        raise ValueError("unmasked stage2 requires exact N and packed-K tiles")
+    if hidden_dim % stage2_block_n:
+        raise ValueError("stage2 requires exact output-column tiles")
     stage2_grid = num_tokens * triton.cdiv(hidden_dim, stage2_block_n)
     if fuse_shared_down:
         if shared_out is None:
@@ -721,6 +742,7 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         BLOCK_N=stage2_block_n,
         BLOCK_KB=stage2_block_kb,
         NUM_WARPS=stage2_warps,
+        MASK_K_TAIL=packed_intermediate % stage2_block_kb != 0,
         num_warps=stage2_warps,
     )
     if fuse_shared_down:

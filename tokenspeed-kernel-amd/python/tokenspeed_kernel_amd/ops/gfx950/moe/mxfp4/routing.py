@@ -358,7 +358,7 @@ def _launch_sigmoid_bias_topk_route_gluon(
     topk_weights = torch.empty(
         (M, topk), dtype=torch.float32, device=router_logits.device
     )
-    nw = 1 if M <= 2 else 4
+    nw = 1 if M == 1 else min(max(_next_pow2(M), 4), 8)
     _sigmoid_bias_topk_route_gluon_kernel[(1,)](
         router_logits,
         correction_bias,
