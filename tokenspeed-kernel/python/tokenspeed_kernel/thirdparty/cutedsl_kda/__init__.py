@@ -78,39 +78,15 @@ def cutedsl_kda_check_config(gate_lower_bound: float) -> None:
     _module().cutedsl_kda_check_config(gate_lower_bound)
 
 
-@lru_cache(maxsize=1)
-def cutedsl_kda_supports_host_hint() -> bool:
-    """Whether the installed package accepts ``cu_seqlens_cpu`` host hints.
-
-    Older package builds read ``cu_seqlens`` back to the host (one D2H plus a
-    stream sync per new boundary tensor); newer builds accept the
-    already-known host copy and stay sync-free. Callers probe this once and
-    only then thread the hint through, so either package version keeps
-    working. The probe inspects the explicit-signature size query because
-    ``cutedsl_kda_forward`` is a passthrough in every package version and
-    would always match.
-    """
-    import inspect
-
-    try:
-        sig = inspect.signature(_module().cutedsl_kda_workspace_size)
-    except (ImportError, ValueError, TypeError):
-        return False
-    return "cu_seqlens_cpu" in sig.parameters
-
-
 def cutedsl_kda_workspace_size(cu_seqlens, heads: int, cu_seqlens_cpu=None) -> int:
     """Decomposition-route workspace bytes for this shape (0 on the engine route).
 
     ``cu_seqlens_cpu`` optionally carries a CPU copy of the boundary contents
-    so the wrapper can plan without a stream-synchronizing D2H read; it is
-    forwarded only when set, so hint-unaware package builds keep working.
+    so the wrapper can plan without a stream-synchronizing D2H read.
     """
-    if cu_seqlens_cpu is not None:
-        return _module().cutedsl_kda_workspace_size(
-            cu_seqlens, heads, cu_seqlens_cpu=cu_seqlens_cpu
-        )
-    return _module().cutedsl_kda_workspace_size(cu_seqlens, heads)
+    return _module().cutedsl_kda_workspace_size(
+        cu_seqlens, heads, cu_seqlens_cpu=cu_seqlens_cpu
+    )
 
 
 def cutedsl_kda_forward(*args, **kwargs):
