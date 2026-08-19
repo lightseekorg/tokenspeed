@@ -110,11 +110,19 @@ class TrtllmAllReduceBackend(CommBackend):
                     )
                 )
 
-            # NVLS variant for the plain one-shot path (capability-gated,
+            # NVLS variants for the plain one-shot path (capability-gated,
             # collective, symmetric fallback): the fused-pattern wrappers in
-            # the kernel package arm their own copy; this one serves the
+            # the kernel package arm their own copy; these serve the
             # backend-level all_reduce (post-restructure attention ARs).
+            # Two workspaces, split by token count like _ar_fusion_workspace:
+            # the private kernel keeps decode-sized calls, upstream flashinfer
+            # takes M >= MNNVL_FLASHINFER_MIN_TOKENS and cross-node. The
+            # flashinfer workspace is a process-lifetime block shared with the
+            # kernel-package manager (group-keyed cache), so arming it here
+            # costs no extra memory. Both arming attempts are collectively
+            # voted, so every rank creates the same set.
             from tokenspeed_kernel.ops.communication.trtllm import (
+                _try_create_mnnvl_fi_workspace,
                 _try_create_mnnvl_workspace,
             )
 
@@ -125,16 +133,28 @@ class TrtllmAllReduceBackend(CommBackend):
                 hidden_dim,
                 device_group,
             )
+            mnnvl_fi_workspace = _try_create_mnnvl_fi_workspace(
+                rank,
+                len(group),
+                max_token_num,
+                hidden_dim,
+                device_group,
+            )
 
             # Nothing usable -> report failure so the backend keeps routing
             # this group through NCCL.
-            if workspace_tensor is None and mnnvl_workspace is None:
+            if (
+                workspace_tensor is None
+                and mnnvl_workspace is None
+                and mnnvl_fi_workspace is None
+            ):
                 return False
 
             self._resources[group] = {
                 "ipc_handles": ipc_handles,
                 "workspace": workspace_tensor,
                 "mnnvl": mnnvl_workspace,
+                "mnnvl_fi": mnnvl_fi_workspace,
                 "rank": rank,
                 "world_size": len(group),
                 "max_token_num": max_token_num,
@@ -256,6 +276,7 @@ class TrtllmAllReduceBackend(CommBackend):
             return None
 
         from tokenspeed_kernel.ops.communication.trtllm import (
+            MNNVL_FLASHINFER_MIN_TOKENS,
             MNNVL_PREFER_IPC_BYTES,
         )
 
@@ -265,26 +286,31 @@ class TrtllmAllReduceBackend(CommBackend):
 
         workspace = res["workspace"]
         mnnvl = res.get("mnnvl")
+        mnnvl_fi = res.get("mnnvl_fi")
         # Same Tier-2 split as _ar_fusion_workspace: prefer the IPC lamport
         # workspace (single-node only; cross-node it is None) once the payload
-        # reaches MNNVL_PREFER_IPC_BYTES, mnnvl below it. Unreachable while
-        # _MAX_ONESHOT_BYTES stays under the threshold, but keeps this path
-        # consistent with the kernel-side dispatch if either bound moves.
+        # reaches MNNVL_PREFER_IPC_BYTES; below it the private mnnvl kernel
+        # keeps decode-sized calls and upstream flashinfer takes M >=
+        # MNNVL_FLASHINFER_MIN_TOKENS (and cross-node), each falling back to
+        # the other when its supports() rejects the shape. Unreachable while
+        # _MAX_ONESHOT_BYTES stays under the IPC threshold, but keeps this
+        # path consistent with the kernel-side dispatch if either bound moves.
         payload_bytes = token_num * hidden_dim * tensor_2d.dtype.itemsize
         prefer_ipc = workspace is not None and payload_bytes >= MNNVL_PREFER_IPC_BYTES
-        if (
-            not prefer_ipc
-            and mnnvl is not None
-            and mnnvl.supports(
-                token_num,
-                hidden_dim,
-                tensor_2d.dtype,
-                res["world_size"],
-                AllReduceFusionPattern.kAllReduce,
-                use_oneshot=True,
-            )
-        ):
-            workspace = mnnvl
+        prefer_fi = token_num >= MNNVL_FLASHINFER_MIN_TOKENS or res["workspace"] is None
+        if not prefer_ipc:
+            candidates = (mnnvl_fi, mnnvl) if prefer_fi else (mnnvl, mnnvl_fi)
+            for candidate in candidates:
+                if candidate is not None and candidate.supports(
+                    token_num,
+                    hidden_dim,
+                    tensor_2d.dtype,
+                    res["world_size"],
+                    AllReduceFusionPattern.kAllReduce,
+                    use_oneshot=True,
+                ):
+                    workspace = candidate
+                    break
 
         # Shape not covered by mnnvl and no IPC fallback -> let the caller
         # fall back to NCCL (this function's None contract).

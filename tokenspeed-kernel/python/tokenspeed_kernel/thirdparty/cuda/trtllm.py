@@ -42,6 +42,30 @@ from tokenspeed_kernel.thirdparty.cuda.cuda_ipc import (
 )
 from torch.distributed import ProcessGroup
 
+# Upstream flashinfer MNNVL AR (multi-node NVLink fabric). Serves the generic
+# kAllReduce / kARResidualRMSNorm patterns in place of the private mnnvl
+# kernel below; on installs without it the sentinels stay None, the wrapper
+# workspace never arms, and routing keeps the private path -- importing this
+# module never fails on their account.
+try:
+    from flashinfer.comm.comm_backend import TorchDistBackend as _FIDistBackend
+    from flashinfer.comm.mapping import Mapping as _FIMapping
+    from flashinfer.comm.trtllm_mnnvl_ar import (
+        MNNVLAllReduceFusionWorkspace as _FIMnnvlWorkspace,
+    )
+    from flashinfer.comm.trtllm_mnnvl_ar import (
+        trtllm_mnnvl_allreduce as _fi_mnnvl_allreduce,
+    )
+    from flashinfer.comm.trtllm_mnnvl_ar import (
+        trtllm_mnnvl_fused_allreduce_add_rmsnorm as _fi_mnnvl_ar_add_rmsnorm,
+    )
+except ImportError:  # pragma: no cover - flashinfer without the mnnvl module
+    _FIDistBackend = None
+    _FIMapping = None
+    _FIMnnvlWorkspace = None
+    _fi_mnnvl_allreduce = None
+    _fi_mnnvl_ar_add_rmsnorm = None
+
 # ---------------------------------------------------------------------------
 # Utility
 # ---------------------------------------------------------------------------
@@ -259,6 +283,21 @@ MNNVL_TWOSHOT_MAX_TOKEN = 2048
 # workspace, and there mnnvl beats NCCL across the whole supported range.
 MNNVL_PREFER_IPC_BYTES = int(
     os.environ.get("TOKENSPEED_MNNVL_PREFER_IPC_BYTES", 12 * 1024 * 1024)
+)
+
+# Below this token count the private mnnvl kernel keeps the generic patterns
+# on a single node; from here up (until MNNVL_PREFER_IPC_BYTES hands over to
+# IPC) the upstream flashinfer kernel takes them. Isolated graph-replay favors
+# flashinfer at every M, but in-situ (nsys over steady decode, 8x B300) the
+# two are wait-inclusive equals at decode M while flashinfer's multicast
+# traffic slows overlapped neighbor kernels (~+75 us GPU / +30 us wall per
+# step) -- so decode-sized calls stay private. From M=32 flashinfer's
+# advantage is decisive (1.8-3.2x by M=64-128, both hidden widths), well past
+# any neighbor effect. Cross-node there is no IPC and no measured small-M
+# in-situ data; flashinfer takes the whole range there (it beats the private
+# two-shot 1.5-2.1x at every measured M and is the maintained implementation).
+MNNVL_FLASHINFER_MIN_TOKENS = int(
+    os.environ.get("TOKENSPEED_MNNVL_FLASHINFER_MIN_TOKENS", 32)
 )
 
 _MNNVL_SUPPORTED_PATTERNS = frozenset(
@@ -499,6 +538,132 @@ def trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
     )
 
 
+def flashinfer_mnnvl_module_available() -> bool:
+    """Whether the upstream flashinfer MNNVL AR module imported successfully."""
+    return _FIMnnvlWorkspace is not None
+
+
+class FlashinferMnnvlAllReduceFusionWorkspace:
+    """Upstream flashinfer MNNVL workspace behind the local dispatch contract.
+
+    Passing an instance as ``workspace_ptrs`` to :func:`trtllm_allreduce_fusion`
+    routes the call onto flashinfer's ``trtllm_mnnvl_ar`` kernels (McastGPUBuffer
+    over the NVLink fabric, one-shot/two-shot picked device-consistently from
+    the payload size). Covers only the generic patterns -- the K3-specific
+    epilogues (``kARResidualAttnResCombine``, ``kAllReduceLatentNorm``) stay on
+    the private mnnvl kernel until upstream grows them.
+    """
+
+    backend = "mnnvl-flashinfer"
+
+    _SUPPORTED_PATTERNS = frozenset(
+        {
+            AllReduceFusionPattern.kAllReduce,
+            AllReduceFusionPattern.kARResidualRMSNorm,
+        }
+    )
+
+    def __init__(self, workspace, max_token_num: int):
+        self.workspace = workspace
+        self.tp_rank = workspace.rank
+        self.tp_size = workspace.tp_size
+        self.max_token_num = max_token_num
+        self.buffer_size_bytes = workspace.buffer_size_bytes
+
+    def supports(
+        self,
+        token_num: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        world_size: int,
+        pattern_code: int,
+        use_oneshot: bool = True,
+        residual_reduce_scattered: bool = False,
+    ) -> bool:
+        """Whether this call shape can run on the upstream mnnvl kernel.
+
+        Args:
+            token_num: number of tokens in this call.
+            hidden_dim: hidden width of this call.
+            dtype: payload dtype (fp16/bf16 only).
+            world_size: TP world size of this call.
+            pattern_code: AllReduceFusionPattern value.
+            use_oneshot: advisory only; the strategy is picked from the
+                payload size (AUTO), identically on every rank.
+            residual_reduce_scattered: RS-residual mode (unsupported).
+
+        Returns:
+            True when the upstream path can serve the call; callers fall back
+            to the private mnnvl or IPC lamport workspace otherwise.
+        """
+        if residual_reduce_scattered:
+            return False
+        if pattern_code not in self._SUPPORTED_PATTERNS:
+            return False
+        if world_size != self.tp_size:
+            return False
+        if dtype not in (torch.bfloat16, torch.float16):
+            return False
+        # token_num <= 0 would reach the kernel launch with an empty grid;
+        # reject here like the private workspace does. No cap on
+        # self.max_token_num: the multicast allocation granularity is far
+        # larger than any requested size, so capacity is judged by the actual
+        # buffer bytes below -- this lets one workspace serve every caller of
+        # its group regardless of who created it first.
+        if token_num <= 0:
+            return False
+        # AUTO strategy: sufficiency is checked against whichever kernel the
+        # payload size actually selects, mirroring the call-time dispatch.
+        return self.workspace.is_buffer_size_sufficient(
+            self.tp_size, token_num, hidden_dim, dtype
+        )
+
+
+def trtllm_create_flashinfer_mnnvl_workspace_for_all_reduce_fusion(
+    tp_rank: int,
+    tp_size: int,
+    max_token_num: int,
+    hidden_dim: int,
+    group: Optional[ProcessGroup] = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> "FlashinferMnnvlAllReduceFusionWorkspace":
+    """Create the upstream flashinfer MNNVL workspace.
+
+    Collective: every rank of ``group`` must call this in lockstep (multicast
+    handle exchange over the group). Raises when the flashinfer module or
+    NVLink multicast is unavailable; callers should probe capabilities first
+    (see ops/communication/trtllm.py).
+
+    Args:
+        tp_rank: this rank within the group.
+        tp_size: group world size.
+        max_token_num: maximum tokens per call the workspace must serve.
+        hidden_dim: maximum hidden width the workspace must hold.
+        group: the process group to exchange handles over.
+        dtype: payload dtype used for sizing (2-byte fp16/bf16).
+
+    Returns:
+        FlashinferMnnvlAllReduceFusionWorkspace bound to this group.
+    """
+    if _FIMnnvlWorkspace is None:
+        raise RuntimeError(
+            "flashinfer.comm.trtllm_mnnvl_ar is unavailable in this install"
+        )
+    workspace = _FIMnnvlWorkspace(
+        _FIMapping(
+            world_size=tp_size,
+            rank=tp_rank,
+            gpus_per_node=min(tp_size, torch.cuda.device_count()),
+            tp_size=tp_size,
+        ),
+        max_num_tokens=max_token_num,
+        hidden_dim=hidden_dim,
+        dtype=dtype,
+        comm_backend=_FIDistBackend(group),
+    )
+    return FlashinferMnnvlAllReduceFusionWorkspace(workspace, max_token_num)
+
+
 # ---------------------------------------------------------------------------
 # AllReduce fusion
 # ---------------------------------------------------------------------------
@@ -607,6 +772,47 @@ def trtllm_allreduce_fusion(
         use_oneshot = _ar_should_use_oneshot(
             token_num, hidden_dim, allreduce_in.dtype, world_size
         )
+
+    if isinstance(workspace_ptrs, FlashinferMnnvlAllReduceFusionWorkspace):
+        # Upstream flashinfer MNNVL path. Strategy is left to the upstream
+        # AUTO heuristic (host-side, deterministic from the shape, so every
+        # rank picks the same kernel). ``fp32_acc`` and
+        # ``trigger_completion_at_end`` have no upstream equivalent: the
+        # kernels accumulate in fp32 internally and manage the Lamport buffer
+        # rotation themselves.
+        if not workspace_ptrs.supports(
+            token_num,
+            hidden_dim,
+            allreduce_in.dtype,
+            world_size,
+            pattern_code,
+            use_oneshot=use_oneshot,
+            residual_reduce_scattered=residual_reduce_scattered,
+        ):
+            raise RuntimeError(
+                "flashinfer mnnvl workspace does not support this call "
+                f"(token_num={token_num}, hidden_dim={hidden_dim}, "
+                f"dtype={allreduce_in.dtype}, pattern={pattern_code})"
+            )
+        if pattern_code == AllReduceFusionPattern.kAllReduce:
+            _fi_mnnvl_allreduce(
+                allreduce_in,
+                workspace_ptrs.workspace,
+                launch_with_pdl,
+                output=allreduce_out,
+            )
+        else:  # kARResidualRMSNorm (the only other supported pattern)
+            _fi_mnnvl_ar_add_rmsnorm(
+                allreduce_in,
+                residual_in,
+                rms_gamma,
+                workspace_ptrs.workspace,
+                epsilon=rms_eps,
+                output=norm_out,
+                residual_out=residual_out,
+                launch_with_pdl=launch_with_pdl,
+            )
+        return
 
     if isinstance(workspace_ptrs, MnnvlAllReduceFusionWorkspace):
         # MNNVL-structured one-shot path: single NVLS multicast payload store,
