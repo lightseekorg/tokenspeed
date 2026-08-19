@@ -384,6 +384,29 @@ class Kimi3LatentProjection(ReplicatedLinear):
         )
         return self._gather_shards(output), None
 
+    def project_shard_add_(
+        self,
+        hidden_states: torch.Tensor,
+        shared_output: torch.Tensor,
+        *,
+        norm_weight: torch.Tensor | None = None,
+        eps: float | None = None,
+    ) -> torch.Tensor:
+        """Project this rank's column shard into its shared-output slice."""
+
+        if self.shard_group is None:
+            raise ValueError("project_shard_add_ requires a sharded projection")
+        start, width = self.shard_slice
+        output = shared_output.narrow(-1, start, width)
+        return tokenspeed_kernel.kimi3_latent_projection_add(
+            hidden_states,
+            self.weight,
+            output,
+            norm_weight=norm_weight,
+            eps=eps,
+            out=output,
+        )
+
     def forward_add3(
         self,
         hidden_states: torch.Tensor,
@@ -482,6 +505,7 @@ class LatentMoELayer(nn.Module):
         joint_input_projections: JointInputProjector | None = None,
         joint_shared_weight: torch.Tensor | None = None,
         joint_expert_shared_max_tokens: int = 0,
+        sharded_output_min_tokens: int = 0,
     ) -> None:
         super().__init__()
         if input_projections is not None and shared_experts is None:
@@ -496,6 +520,10 @@ class LatentMoELayer(nn.Module):
             raise ValueError("joint expert/shared projection requires a token limit")
         if joint_input_projections is None and joint_expert_shared_max_tokens:
             raise ValueError("joint expert/shared token limit requires projections")
+        if sharded_output_min_tokens < 0:
+            raise ValueError("sharded output token limit must be nonnegative")
+        if sharded_output_min_tokens and not joint_reduce:
+            raise ValueError("sharded output projection requires joint_reduce")
         if shared_reduce is not None and shared_experts is None:
             raise ValueError("shared_reduce requires shared_experts")
         if joint_reduce and shared_experts is None:
@@ -553,6 +581,7 @@ class LatentMoELayer(nn.Module):
         self.joint_input_projections = joint_input_projections
         self.joint_shared_weight = joint_shared_weight
         self.joint_expert_shared_max_tokens = joint_expert_shared_max_tokens
+        self.sharded_output_min_tokens = sharded_output_min_tokens
 
     def finalize_output(
         self,
@@ -610,13 +639,19 @@ class LatentMoELayer(nn.Module):
         )
 
         output_shape = (num_tokens, hidden_size)
+        use_sharded_output = (
+            self.sharded_output_min_tokens > 0
+            and num_tokens >= self.sharded_output_min_tokens
+            and prefix_sum is not None
+            and getattr(self.routed_up_proj, "shard_group", None) is not None
+        )
         reduction_outputs = (
             acquire_all_reduce_outputs(
                 (output_shape, (num_tokens, int(self.experts.hidden_size))),
                 hidden_states,
                 self.joint_reduce_group,
             )
-            if self.joint_reduce and num_tokens > 0
+            if self.joint_reduce and not use_sharded_output and num_tokens > 0
             else None
         )
         shared_target, routed_target = (
@@ -774,6 +809,9 @@ class LatentMoELayer(nn.Module):
             _check_shape(shared_output, output_shape, "joint shared output")
             _check_shape(routed_latent, latent_shape, "joint routed latent")
             shared_reduction_applied = True
+        elif use_sharded_output:
+            routed_latent = all_reduce(routed_latent, self.joint_reduce_group)
+            _check_shape(routed_latent, latent_shape, "latent_reduce")
         elif self.latent_reduce is not None:
             routed_latent = self.latent_reduce(routed_latent)
             _check_shape(routed_latent, latent_shape, "latent_reduce")
@@ -784,6 +822,20 @@ class LatentMoELayer(nn.Module):
             routed_output = _module_tensor_output(self.routed_up_proj, routed_latent)
             _check_shape(routed_output, output_shape, "routed_up_proj")
             return routed_output
+        if use_sharded_output:
+            norm_weight = None if self.routed_norm is None else self.routed_norm.weight
+            eps = (
+                None if self.routed_norm is None else self.routed_norm.variance_epsilon
+            )
+            self.routed_up_proj.project_shard_add_(
+                routed_latent,
+                shared_output,
+                norm_weight=norm_weight,
+                eps=eps,
+            )
+            shared_output = all_reduce(shared_output, self.joint_reduce_group)
+            _check_shape(shared_output, output_shape, "sharded output reduce")
+            return prefix_sum + shared_output
         if prefix_sum is None:
             if self.routed_norm is not None:
                 routed_latent = _module_tensor_output(self.routed_norm, routed_latent)

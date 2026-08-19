@@ -45,6 +45,7 @@ def _rmsnorm_linear_add_kernel(
     shared_stride_m,
     output_stride_m,
     eps,
+    HAS_RESIDUAL: gl.constexpr,
 ):
     pid_m = gl.program_id(0)
     pid_n = gl.program_id(1)
@@ -108,9 +109,10 @@ def _rmsnorm_linear_add_kernel(
     residual_offset = pid_m * residual_stride_m + offs_n
     shared_offset = pid_m * shared_stride_m + offs_n
     output_offset = pid_m * output_stride_m + offs_n
-    acc += gl.amd.cdna4.buffer_load(residual_ptr, residual_offset.to(gl.int32)).to(
-        gl.float32
-    )
+    if HAS_RESIDUAL:
+        acc += gl.amd.cdna4.buffer_load(residual_ptr, residual_offset.to(gl.int32)).to(
+            gl.float32
+        )
     acc += gl.amd.cdna4.buffer_load(shared_ptr, shared_offset.to(gl.int32)).to(
         gl.float32
     )
@@ -121,27 +123,29 @@ def gluon_rmsnorm_linear_add_gfx950(
     latent: torch.Tensor,
     norm_weight: torch.Tensor,
     projection_weight: torch.Tensor,
-    residual: torch.Tensor,
+    residual: torch.Tensor | None,
     shared: torch.Tensor,
     *,
     eps: float,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if out is None:
-        out = torch.empty_like(residual)
+        out = torch.empty_like(shared)
     m = latent.shape[0]
+    residual_ptr = shared if residual is None else residual
     _rmsnorm_linear_add_kernel[(m, projection_weight.shape[0] // _BLOCK_N)](
         latent,
         norm_weight,
         projection_weight,
-        residual,
+        residual_ptr,
         shared,
         out,
         latent.stride(0),
-        residual.stride(0),
+        0 if residual is None else residual.stride(0),
         shared.stride(0),
         out.stride(0),
         float(eps),
+        HAS_RESIDUAL=residual is not None,
         num_warps=8,
         num_stages=1,
         waves_per_eu=0,
