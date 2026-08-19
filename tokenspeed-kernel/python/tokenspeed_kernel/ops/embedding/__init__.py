@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-import functools
 from dataclasses import dataclass
 
 import torch
@@ -59,7 +58,6 @@ class FusedMLASetKVBufferArg:
     sanitize: bool = False
 
 
-@functools.lru_cache(maxsize=64)
 def supports_fused_mla_kv_write(
     *,
     q_dtype: torch.dtype,
@@ -69,11 +67,6 @@ def supports_fused_mla_kv_write(
     has_q_nope: bool = False,
 ) -> bool:
     """Whether a registered kernel can do the fused MLA query + KV write.
-
-    Memoized: the model asks once per MLA layer per step and the answer only
-    depends on these flags, while resolving it costs several microseconds of
-    host time on the launch path. Registration happens at import, before any
-    forward, so a later-registered kernel going unseen is not reachable.
 
     Resolves the same (mode, signature, traits) key ``apply_rope_mla_set_kv``
     dispatches on, so a caller that gets ``True`` here runs the kernel this
