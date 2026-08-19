@@ -294,9 +294,38 @@ class DeepseekV4DSpark(BaseDrafter):
         hidden_states: torch.Tensor,
         num_extends: int,
     ) -> int:
+        if num_extends < 0:
+            raise ValueError(f"DSPARK num_extends must be non-negative: {num_extends}.")
+        if num_extends == 0:
+            return 0
+
+        # fill_input_buffers derives this host mirror from the same scheduler
+        # lengths as input_lengths_buf. Reading the CUDA buffer row-by-row here
+        # serialized every chunk behind the target stream.
+        lengths_cpu = self.input_buffers.extend_seq_lens_cpu
+        if (
+            not isinstance(lengths_cpu, torch.Tensor)
+            or lengths_cpu.device.type != "cpu"
+            or lengths_cpu.dtype != torch.int32
+            or lengths_cpu.ndim != 1
+            or lengths_cpu.numel() < num_extends
+        ):
+            raise RuntimeError(
+                "DSPARK prefill window seeding requires a complete int32 CPU "
+                "extend-length mirror."
+            )
+        chunk_lengths = [int(length) for length in lengths_cpu[:num_extends].tolist()]
+        if any(length < 0 for length in chunk_lengths):
+            raise RuntimeError("DSPARK prefill chunk lengths must be non-negative.")
+        total_prefill_tokens = sum(chunk_lengths)
+        if total_prefill_tokens > hidden_states.shape[0]:
+            raise RuntimeError(
+                "DSPARK prefill chunk lengths exceed captured hidden-state rows: "
+                f"{total_prefill_tokens} > {hidden_states.shape[0]}."
+            )
+
         offset = 0
-        for row in range(num_extends):
-            chunk_len = int(self.input_buffers.input_lengths_buf[row].item())
+        for row, chunk_len in enumerate(chunk_lengths):
             if chunk_len <= 0:
                 continue
             chunk_end = offset + chunk_len

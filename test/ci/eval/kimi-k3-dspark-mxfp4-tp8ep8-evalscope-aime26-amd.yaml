@@ -1,11 +1,11 @@
 api_version: ci.tokenspeed.io/v1
-# Kimi-K3 + DSpark on the same AIME26 gate as the speculator-free run, so the
-# two scores are directly comparable. Separate job from
-# eval-kimi-k3-mxfp4-tp8ep8-aime26-amd, which tracks the pure target.
+# Kimi-K3 + DSpark is the per-commit AIME26 gate. The matching speculator-free
+# configuration remains available as a manual control for direct comparison.
 name: eval-kimi-k3-dspark-mxfp4-tp8ep8-aime26-amd
 type: eval
 workflow_stage: model-test
 triggers:
+  - per-commit
   - manual
 runner:
   labels:
