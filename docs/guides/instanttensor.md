@@ -12,11 +12,25 @@ default safetensors loader, so model accuracy is unaffected.
 
 ## Installation
 
-InstantTensor is an optional extra, because it publishes x86_64 wheels only:
+InstantTensor is an optional extra, because PyPI carries x86_64 wheels only:
 
 ```bash
 pip install "tokenspeed[instanttensor]"
 ```
+
+On aarch64 hosts (GB200, GB300) there is no published wheel, but the sdist
+builds from source in about a minute. The extension reaches CUDA, cuFile, and
+NCCL through `dlopen` and vendors its own Boost, libaio, and liburing, so it
+needs a C++ toolchain and `make` -- not `nvcc`, and not a matching CUDA
+toolkit:
+
+```bash
+pip install --no-binary instanttensor "tokenspeed[instanttensor]"
+```
+
+This is why the dependency is an extra rather than a core one: as a core
+dependency every ARM install would compile it, whether or not the format is
+ever requested.
 
 It is imported lazily, so it is loaded only when you select
 `--load-format instanttensor`.
@@ -37,6 +51,19 @@ tokenspeed serve deepseek-ai/DeepSeek-R1 \
   --tensor-parallel-size 8 \
   --enable-expert-parallel
 ```
+
+## Measured effect
+
+Weight-load phase for Kimi-K3 (1.42 TiB over 96 shards, 497k tensors) on two
+GB300 nodes with `--tensor-parallel-size 8`, checkpoint on shared storage:
+
+| `--load-format` | weight-load phase |
+| --- | --- |
+| `auto` (safetensors) | 869-1106 s |
+| `instanttensor` | 231-234 s |
+
+The ranges are run-to-run variance on the shared filesystem. Both formats
+serve identical output, as the loaders are bit-for-bit equivalent.
 
 ## Memory considerations
 

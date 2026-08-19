@@ -29,8 +29,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 INSTANTTENSOR_AVAILABLE = find_spec("instanttensor") is not None
-# InstantTensor is NVIDIA-only. torch.cuda.is_available() is also True on ROCm,
-# so guard on the platform vendor to keep the parity test off AMD runners.
+# torch.cuda.is_available() is True on ROCm too, so guard on the vendor.
 IS_NVIDIA = current_platform().is_nvidia
 
 
@@ -51,8 +50,7 @@ class TestInstantTensorConfig(unittest.TestCase):
 
     def test_prepare_weights_treats_instanttensor_as_safetensors(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            # _prepare_weights only globs/filters file paths; it never reads the
-            # tensor data, so an empty placeholder shard is sufficient here.
+            # _prepare_weights only globs paths, never tensor data.
             open(os.path.join(tmpdir, "model.safetensors"), "wb").close()
 
             loader = DefaultModelLoader(LoadConfig(load_format="instanttensor"))
@@ -126,8 +124,7 @@ class TestSubByteDtypeGuard(unittest.TestCase):
     def test_unparsable_header_raises_rather_than_waving_the_shard_through(
         self,
     ) -> None:
-        # Failing open would let the very shard the guard cannot inspect carry
-        # the sub-byte tensors it exists to catch.
+        # Failing open would wave through the shard the guard cannot inspect.
         with tempfile.TemporaryDirectory() as d:
             cases = {
                 "truncated.safetensors": b"\x00",
@@ -157,8 +154,7 @@ class TestInstantTensorRejectsSubByteCheckpoints(unittest.TestCase):
                 f.write(blob)
                 f.write(b"\x11" * 1024)
 
-            # Validating only on the first ``next()`` would defer this until
-            # after the model skeleton is allocated on every rank.
+            # Validating on the first ``next()`` would defer this past alloc.
             with self.assertRaises(ValueError) as caught:
                 instanttensor_weights_iterator([shard])
             self.assertIn("F4", str(caught.exception))

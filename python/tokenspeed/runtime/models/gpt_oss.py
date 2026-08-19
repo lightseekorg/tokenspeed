@@ -725,11 +725,7 @@ class GptOssForCausalLM(BaseCausalLM):
         }
 
     def _load_mxfp4_weights(self, weights, weight_name_mapping: dict):
-        # A GPU-direct loader yields tensors already on the device, so buffering
-        # the expert tensors -- 9.5 of gpt-oss-20b's 12.8 GiB -- would hold most
-        # of the checkpoint resident at once and OOM mid-load. Stream those; the
-        # rest is still collected, and is not free (3.3 GiB, half of it the
-        # embedding and lm_head), but it is what the generic pass needs.
+        # Stream experts; buffering them pins most of the checkpoint on the GPU.
         normal_weights = []
 
         def expert_weights():
@@ -786,11 +782,7 @@ class GptOssForCausalLM(BaseCausalLM):
                 )
                 param.data[slices].copy_(narrow_weight[slices])
 
-        # The AMD-Quark per-expert layout (one tensor set per expert) and the
-        # fused layout have disjoint, unambiguous names, so each tensor routes
-        # on its own name -- a probe would have to consume the stream, and
-        # latching the layout off the first tensor would silently drop every
-        # tensor of the other layout.
+        # Route per name: probing would consume the stream and drop a layout.
         per_expert_re = re.compile(r"\.experts\.\d+\.(gate_up_proj|down_proj)\.")
 
         for name, weight in weights:

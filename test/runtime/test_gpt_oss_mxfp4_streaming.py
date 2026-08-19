@@ -26,9 +26,7 @@ from tokenspeed.runtime.models.gpt_oss import GptOssForCausalLM
 
 class TestGptOssMxfp4Streaming(unittest.TestCase):
     def test_load_mxfp4_weights_streams_experts(self):
-        # Expert tensors interleaved with the small non-expert weights, in
-        # checkpoint order. The "weight" stand-in is just the name string,
-        # because the stubbed loaders below never touch tensor data.
+        # The "weight" stand-in is the name; the stubs never touch tensor data.
         items = [
             "model.embed_tokens.weight",
             "model.layers.0.mlp.experts.gate_up_proj_blocks",
@@ -48,15 +46,11 @@ class TestGptOssMxfp4Streaming(unittest.TestCase):
         received = {}
 
         def fake_load_experts(weights):
-            # The dispatcher must hand us a lazy generator, not a materialized
-            # list of every expert tensor.
             received["is_generator"] = isinstance(weights, types.GeneratorType)
             iterator = iter(weights)
             first_expert = next(iterator)
             seen_experts.append(first_expert[0])
-            # Reaching the first expert (item #2) must not have drained the
-            # whole source iterator (5 items) -- proof that loading is
-            # interleaved with iteration, i.e. streamed.
+            # Item 2 of 5: reaching the first expert must not drain the source.
             received["pulled_after_first_expert"] = len(pulled)
             for name, _ in iterator:
                 seen_experts.append(name)
@@ -83,8 +77,6 @@ class TestGptOssMxfp4Streaming(unittest.TestCase):
         self.assertTrue(received["is_generator"])
         self.assertEqual(received["pulled_after_first_expert"], 2)
 
-        # Expert tensors (matched by the ".experts" marker) are routed to the
-        # expert loader, in order.
         self.assertEqual(
             seen_experts,
             [
@@ -93,8 +85,6 @@ class TestGptOssMxfp4Streaming(unittest.TestCase):
             ],
         )
 
-        # Everything else is collected for the generic loader, and the set of
-        # already-loaded expert params is threaded through to it.
         self.assertEqual(
             normal_seen["names"],
             [
@@ -179,8 +169,7 @@ class TestGptOssMxfp4ExpertRouting(unittest.TestCase):
             model, self._per_expert_stream(base)
         )
 
-        # Every per-expert target is reached. Latching the layout off the
-        # leading ``format_marker`` would have produced an empty set.
+        # Latching the layout off the leading ``format_marker`` would be empty.
         self.assertEqual(loaded, set(params))
 
 

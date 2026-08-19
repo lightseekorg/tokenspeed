@@ -584,8 +584,7 @@ def safetensors_weights_iterator(
 
 _SUB_BYTE_SAFETENSORS_DTYPES = frozenset({"F4", "F6_E2M3", "F6_E3M2"})
 
-# Real headers are a few hundred KB; the bound just keeps a corrupt length
-# prefix from turning into a multi-gigabyte read.
+# Bounds a corrupt length prefix; real headers are a few hundred KB.
 _MAX_SAFETENSORS_HEADER_BYTES = 128 * 1024 * 1024
 
 
@@ -666,8 +665,6 @@ def _instanttensor_tensors(
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     process_group = None
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-        # The default (world) group spans every rank in the job, matching the
-        # semantics InstantTensor expects for distributed loading.
         process_group = torch.distributed.group.WORLD
 
     device = torch.cuda.current_device()
@@ -679,14 +676,12 @@ def _instanttensor_tensors(
     with instanttensor.safe_open(
         hf_weights_files, framework="pt", device=device, process_group=process_group
     ) as f:
-        # Since InstantTensor 0.1.9, tensors are cloned internally by default,
-        # so no extra clone is needed here.
+        # InstantTensor 0.1.9 clones internally, so no extra clone here.
         yield from tqdm(
             f.tensors(),
             desc="Loading safetensors using InstantTensor loader",
             disable=not enable_tqdm,
             bar_format=_BAR_FORMAT,
-            position=tqdm._get_free_pos(),
             total=len(f.keys()),
             mininterval=1.0,
         )

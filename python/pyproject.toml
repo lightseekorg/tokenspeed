@@ -96,10 +96,7 @@ ts = "tokenspeed.cli:main"
 "Homepage" = "https://github.com/lightseekorg/tokenspeed"
 
 [project.optional-dependencies]
-# x86_64-only wheels (no aarch64 on PyPI as of 0.1.9), so a core dependency here
-# would break `pip install` on ARM whether or not the format is ever requested.
-# Capped: the loader drops its defensive clone because 0.1.9 clones internally,
-# and a release that stops doing so would alias silently rather than fail.
+# Capped: 0.1.9 clones internally, so a release that stops would alias silently.
 instanttensor = ["instanttensor>=0.1.9,<0.2"]
 
 [tool.setuptools]
