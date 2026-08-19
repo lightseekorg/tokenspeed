@@ -1,5 +1,5 @@
 api_version: ci.tokenspeed.io/v1
-name: eval-inkling-nvfp4-mtp-gsm8k
+name: eval-inkling-mxfp4-mtp-aime25
 type: eval
 workflow_stage: model-test
 triggers:
@@ -7,26 +7,24 @@ triggers:
   - manual
 runner:
   labels:
-    - b200-4gpu
+    - amd-mi35x-4gpu-test
 env:
   CI: "true"
 install:
-  - bash test/ci_system/install_deps.sh
+  - bash test/ci_system/install_deps_rocm.sh
 server:
   command: >-
     ts serve
-    --model thinkingmachines/Inkling-NVFP4
+    --model lightseekorg/Inkling-MXFP4
     --attn-tp-size 4
     --moe-tp-size 4
-    --max-model-len 81920
+    --max-model-len 102400
     --max-num-seqs 16
     --max-prefill-tokens 8192
     --chunked-prefill-size 8192
     --gpu-memory-utilization 0.95
     --disable-cuda-graph-padding
     --trust-remote-code
-    --attention-backend fa4
-    --moe-backend flashinfer_trtllm
     --enable-prefix-caching
     --disable-kvstore
     --block-size 128
@@ -47,14 +45,15 @@ eval:
   command: >-
     HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
-    --model thinkingmachines/Inkling-NVFP4
+    --model lightseekorg/Inkling-MXFP4
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
-    --datasets gsm8k
+    --datasets aime25
     --dataset-hub huggingface
-    --dataset-args '{"gsm8k":{"dataset_id":"openai/gsm8k"}}'
+    --dataset-args '{"aime25":{"dataset_id":"math-ai/aime25"}}'
     --eval-batch-size 16
-    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":8192}'
+    --stream
+    --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"max_tokens":81920,"timeout":1800}'
 report:
   github_step_summary: true
-score_threshold: 0.90
+score_threshold: 0.86

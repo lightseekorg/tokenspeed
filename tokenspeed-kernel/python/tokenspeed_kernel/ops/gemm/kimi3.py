@@ -18,6 +18,10 @@ import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.platform import Platform
 
+# FP8 storage dtypes served by the w8a8 projection branch (matches the
+# runtime quantization layers' width: e4m3fn on NVIDIA, e4m3fnuz on ROCm).
+_FP8_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
 KIMI3_HIDDEN_SIZE = 7168
 KIMI3_LATENT_SIZE = 3584
 KIMI3_QKVFAB_SIZE = 6288
@@ -710,23 +714,42 @@ def kimi3_qkvfab_projection(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
     *,
+    weight_scale: torch.Tensor | None = None,
+    prepacked_scales: torch.Tensor | None = None,
+    enable_pdl: bool = False,
     out: torch.Tensor | None = None,
     solution: str = "auto",
 ) -> torch.Tensor:
-    """Project all K3 KDA hidden-state consumers in one decode GEMV.
+    """Project all K3 KDA hidden-state consumers in one GEMM/GEMV.
 
     The output rows contain local Q/K/V/output-gate projections followed by the
     replicated ``f_a`` projection, local beta logits, and alignment padding.
 
+    BF16 weights keep the original dispatch. FP8 (e4m3) weights run the w8a8
+    blockscale path (TRT-LLM's FP8_PB_WO alias): per-token 1x128 online
+    activation quantization + block-scale GEMM — the same kernel path
+    ``Fp8LinearMethod`` uses, called through the ``mm`` dispatcher because
+    the merged projection is not a LinearBase module. Rows are padded to
+    ``N % 128 == 0`` at load so the flashinfer kernel stays selected; pad
+    rows carry zero codes and produce exact-zero outputs, and callers only
+    consume the used rows.
+
     Args:
         hidden_states: BF16 activation shaped ``[M, 7168]``.
-        weight: Stacked BF16 weight shaped ``[6288, 7168]``.
-        out: Optional contiguous BF16 output buffer shaped ``[M, 6288]``.
+        weight: Stacked weight ``[N, 7168]``: BF16, or FP8 with
+            ``weight_scale``.
+        weight_scale: f32 ``[N/128, 7168/128]`` block dequant multipliers
+            (FP8 weights only).
+        prepacked_scales: Optional flashinfer MN-major prepacked scales; when
+            given the flashinfer blockscale kernel is pinned.
+        enable_pdl: Programmatic Dependent Launch for the FP8 path.
+        out: Optional contiguous BF16 output buffer shaped ``[M, N]``.
         solution: ``"auto"`` selects the gfx950 Triton GEMV and otherwise
             falls back to Torch; ``"triton_gemv"`` and ``"torch"`` force one.
+            (BF16 path only.)
 
     Returns:
-        The projected BF16 tensor shaped ``[M, 6288]``.
+        The projected BF16 tensor shaped ``[M, N]``.
     """
     m, output_width, input_width = _validate_fallback_projection(
         hidden_states,
@@ -734,6 +757,36 @@ def kimi3_qkvfab_projection(
         out,
         name="Kimi K3 QKVFAB projection",
     )
+    if weight.dtype in _FP8_WEIGHT_DTYPES:
+        if weight_scale is None:
+            raise ValueError("FP8 Kimi K3 QKVFAB projection requires weight_scale")
+        # Lazy import: ops.gemm.__init__ imports this module at load time.
+        from tokenspeed_kernel.ops.gemm import mm as _mm
+
+        result = _mm(
+            hidden_states,
+            weight,
+            A_scales=None,
+            B_scales=(
+                prepacked_scales if prepacked_scales is not None else weight_scale
+            ),
+            out_dtype=hidden_states.dtype,
+            quant="mxfp8",
+            block_size=[128, 128],
+            override=(
+                "flashinfer_mm_fp8_blockscale" if prepacked_scales is not None else None
+            ),
+            prepacked_scales=prepacked_scales is not None,
+            enable_pdl=enable_pdl,
+        )
+        if out is None:
+            return result
+        out.copy_(result)
+        return out
+    if weight_scale is not None or prepacked_scales is not None:
+        raise ValueError(
+            "weight_scale / prepacked_scales are only valid with FP8 weights"
+        )
     if solution not in {"auto", "decode_gemv", "triton_gemv", "torch"}:
         raise ValueError(f"unknown Kimi K3 QKVFAB solution {solution!r}")
     specialized = (

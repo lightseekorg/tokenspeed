@@ -175,6 +175,8 @@ if current_platform().is_amd:
     )
     def gluon_kda_paged_prefill_gfx950(**kwargs) -> KdaPrefillResult:
         """Run specialized gfx950 KDA prefill with canonical K-major state."""
+        # Host-boundary hint is consumed only by the CuteDSL wrapper.
+        kwargs.pop("cu_seqlens_cpu", None)
         output, final_state = _kda_prefill_impl(**kwargs)
         return KdaPrefillResult(out=output, final_state=final_state)
 
@@ -198,6 +200,8 @@ if current_platform().is_amd:
     )
     def gluon_kda_paged_prefill_gfx1250(**kwargs) -> KdaPrefillResult:
         """Run specialized gfx1250 KDA prefill with canonical K-major state."""
+        # Host-boundary hint is consumed only by the CuteDSL wrapper.
+        kwargs.pop("cu_seqlens_cpu", None)
         output, final_state = _kda_prefill_gfx1250_impl(**kwargs)
         return KdaPrefillResult(out=output, final_state=final_state)
 

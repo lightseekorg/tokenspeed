@@ -1478,6 +1478,9 @@ class MambaAttnBackend(AttentionBackend):
         if fused_out is not None:
             return fused_out
 
+        # Stride-aware fused decoders consume packed projection views directly.
+        # Preserve the shared fallback's established compact input layout.
+        mixed_qkv = mixed_qkv.contiguous()
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,
@@ -1884,6 +1887,7 @@ class MambaAttnBackend(AttentionBackend):
                 seq_len=seq_len,
                 num_real_tokens=num_real_tokens,
                 lower_bound=gate_lower_bound,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             # Extend indices never carry pad(-1), so this write is unguarded.
@@ -2073,6 +2077,7 @@ class MambaAttnBackend(AttentionBackend):
         seq_len: int,
         num_real_tokens: int,
         lower_bound: float | None,
+        extend_seq_lens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Chunked scan of an extend/prefill batch, from the gathered state.
 
@@ -2100,6 +2105,10 @@ class MambaAttnBackend(AttentionBackend):
             seq_len: Padded token extent of the batch.
             num_real_tokens: Token extent excluding the graph padding tail.
             lower_bound: KDA decay clamp.
+            extend_seq_lens_cpu: Host-side per-sequence extend lengths whose
+                prefix sum equals ``query_start_loc``. The KDA override
+                forwards it so the CuteDSL wrapper can plan without a D2H
+                read; the GDN scan plans on device and ignores it.
 
         Returns:
             ``(core_attn_out, last_recurrent_state)``.

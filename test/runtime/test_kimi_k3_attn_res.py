@@ -668,7 +668,12 @@ class KimiKDAMergedProjTests(unittest.TestCase):
                     [ref(ws["q"], pl), ref(ws["k"], pl), ref(ws["v"], pl)], dim=-1
                 ),
             )
-            self.assertTrue(mixed_qkv.is_contiguous())
+            self.assertFalse(mixed_qkv.is_contiguous())
+            self.assertEqual(mixed_qkv.stride(), (m.weight.shape[0], 1))
+            self.assertEqual(
+                mixed_qkv.untyped_storage().data_ptr(),
+                gate.untyped_storage().data_ptr(),
+            )
             torch.testing.assert_close(gate, ref(ws["g"], pl))
             # f_a is replicated: full output on every rank.
             torch.testing.assert_close(f_a_out, x @ ws["f_a"].t())
@@ -681,9 +686,13 @@ class KimiKDAMergedProjTests(unittest.TestCase):
             hidden_size=8, proj=8, num_heads=2, head_dim=4, tp_rank=0, tp_size=1
         )
         torch.nn.init.normal_(m.weight)
-        mixed, _, _, _ = m(torch.randn(1, 8, dtype=torch.bfloat16))
+        mixed, gate, _, _ = m(torch.randn(1, 8, dtype=torch.bfloat16))
         # [1, 3p] slice of a [1, total] row is already contiguous: no copy.
         self.assertTrue(mixed.is_contiguous())
+        self.assertEqual(
+            mixed.untyped_storage().data_ptr(),
+            gate.untyped_storage().data_ptr(),
+        )
 
 
 if __name__ == "__main__":

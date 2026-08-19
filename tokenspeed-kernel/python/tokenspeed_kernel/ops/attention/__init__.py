@@ -1365,6 +1365,7 @@ def kda_paged_prefill(
     *,
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu=None,
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
@@ -1378,6 +1379,11 @@ def kda_paged_prefill(
         A_log/dt_bias: FP32 gate parameters.
         initial_state: One backend-owned recurrent state per sequence.
         cu_seqlens: Device sequence boundaries ``[num_sequences + 1]``.
+        cu_seqlens_cpu: Optional host copy of ``cu_seqlens`` (tuple, list, or
+            CPU tensor) whose contents must equal ``cu_seqlens``.
+            Host-planning kernels (CuteDSL) use it to skip the
+            stream-synchronizing D2H boundary read; device-planning kernels
+            ignore it.
         lower_bound: Optional safe lower bound for log decay.
         override: Optional exact kernel name.
         solution: Optional registered solution name.
@@ -1407,6 +1413,9 @@ def kda_paged_prefill(
         solution=solution,
         override=override,
     )
+    # Forwarded only when set so registered kernels without the
+    # host-boundary hint parameter keep working unchanged.
+    hint = {} if cu_seqlens_cpu is None else {"cu_seqlens_cpu": cu_seqlens_cpu}
     return kernel(
         q=q,
         k=k,
@@ -1418,6 +1427,7 @@ def kda_paged_prefill(
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
+        **hint,
     )
 
 

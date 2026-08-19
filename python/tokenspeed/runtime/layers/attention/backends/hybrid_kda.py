@@ -59,6 +59,34 @@ KDA_PREFILL_BACKENDS = ("auto", "fla", "flashkda", "cutedsl_kda")
 KDA_SLOT_TABLE_PADDING = 2
 
 
+def _cu_seqlens_cpu_hint(
+    extend_seq_lens_cpu: torch.Tensor | None, expected_len: int
+) -> tuple[int, ...] | None:
+    """Host prefix sum of the scheduler's extend lengths, or ``None``.
+
+    The tuple must equal the contents of ``query_start_loc`` — a wrong hint
+    silently corrupts the CuteDSL host chunk plan — so any absence or length
+    misalignment returns ``None`` (the wrapper then falls back to its own
+    boundary read).
+
+    Args:
+        extend_seq_lens_cpu: CPU per-sequence extend lengths, or ``None``.
+        expected_len: ``query_start_loc.numel()`` of the batch.
+
+    Returns:
+        ``(0, lens[0], lens[0]+lens[1], ...)`` when it has exactly
+        ``expected_len`` entries; ``None`` otherwise.
+    """
+    if extend_seq_lens_cpu is None:
+        return None
+    bounds = [0]
+    for n in extend_seq_lens_cpu.tolist():
+        bounds.append(bounds[-1] + int(n))
+    if len(bounds) != expected_len:
+        return None
+    return tuple(bounds)
+
+
 def _slice_kda_prefill_inputs(
     num_real_tokens: int,
     query: torch.Tensor,
@@ -530,6 +558,7 @@ class KdaAttnBackend(MambaAttnBackend):
         seq_len: int,
         num_real_tokens: int,
         lower_bound: float | None,
+        extend_seq_lens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run only the real-token prefix through the KDA prefill kernel.
 
@@ -537,6 +566,15 @@ class KdaAttnBackend(MambaAttnBackend):
         ``cu_seqlens``: bucket-padded inputs would leave the output tail
         unwritten and feed padding into its final full-tile loads. The graph
         handoff clears and restores the bucket tail afterward.
+
+        ``extend_seq_lens_cpu`` is the scheduler's host-side per-sequence
+        extend lengths; its prefix sum equals the contents of
+        ``query_start_loc``. Forwarding it as ``cu_seqlens_cpu`` lets the
+        CuteDSL wrapper plan on the host without a stream-synchronizing D2H
+        read of the boundaries — otherwise that read recurs on every KDA
+        layer of every prefill chunk (the wrapper's identity memo cannot hit
+        across layers because the op casts ``cu_seqlens`` to a fresh int64
+        tensor per call).
         """
         head_k_dim = query.shape[3]
         num_value_heads = value.shape[2]
@@ -551,6 +589,10 @@ class KdaAttnBackend(MambaAttnBackend):
             num_real_tokens, query, key, value, g_kda, beta_kda
         )
 
+        cu_seqlens_cpu = _cu_seqlens_cpu_hint(
+            extend_seq_lens_cpu, query_start_loc.numel()
+        )
+
         kda_result = kda_paged_prefill(
             query,
             key,
@@ -561,6 +603,7 @@ class KdaAttnBackend(MambaAttnBackend):
             dt_bias,
             initial_state=recurrent_state,
             cu_seqlens=query_start_loc,
+            cu_seqlens_cpu=cu_seqlens_cpu,
             lower_bound=lower_bound,
             solution=None if self.kda_backend == "auto" else self.kda_backend,
         )

@@ -56,6 +56,7 @@ def cutedsl_kda_chunk_prefill(
     *,
     initial_state: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
+    cu_seqlens_cpu=None,
     lower_bound: float | None = None,
     beta_is_logit: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -75,6 +76,13 @@ def cutedsl_kda_chunk_prefill(
             zero.
         cu_seqlens: Cumulative sequence boundaries ``[N + 1]`` (``B`` must
             be 1); ``None`` treats each batch row as one sequence.
+        cu_seqlens_cpu: Optional CPU copy of ``cu_seqlens`` (tuple, list, or
+            CPU tensor) whose contents MUST equal ``cu_seqlens``. The kernel
+            wrapper plans launch grids, routing, and workspace partitioning on
+            the host from the boundary values; without this hint it reads them
+            back with a stream-synchronizing D2H copy on every call (the
+            per-call ``.to(int64)`` below allocates a fresh boundaries tensor,
+            so the wrapper's identity memo never hits across layers).
         lower_bound: Safe-gate lower bound; required, and must match the
             value baked into the CUBIN (validated).
         beta_is_logit: Must be True; the kernel always applies sigmoid.
@@ -97,6 +105,13 @@ def cutedsl_kda_chunk_prefill(
     if cu_seqlens is not None:
         num_sequences = cu_seqlens.numel() - 1
         boundaries = cu_seqlens.to(dtype=torch.int64)
+        if cu_seqlens_cpu is not None and len(cu_seqlens_cpu) != num_sequences + 1:
+            # A wrong hint would silently corrupt the host-side chunk plan;
+            # a length mismatch means the caller wired the wrong tensor.
+            raise ValueError(
+                f"cu_seqlens_cpu has {len(cu_seqlens_cpu)} entries, "
+                f"cu_seqlens has {num_sequences + 1}"
+            )
     else:
         # The kernel is varlen-only with a unit batch dim; token-major
         # memory lets batch rows flatten to packed sequences as pure views.
@@ -104,6 +119,7 @@ def cutedsl_kda_chunk_prefill(
         boundaries = torch.arange(
             0, (batch + 1) * tokens, tokens, device=q.device, dtype=torch.int64
         )
+        cu_seqlens_cpu = tuple(range(0, (batch + 1) * tokens, tokens))
         q, k, v = (t.reshape(1, batch * tokens, -1, t.shape[-1]) for t in (q, k, v))
         g_raw = g_raw.reshape(1, batch * tokens, num_value_heads, key_dim)
         beta = beta.reshape(1, batch * tokens, num_value_heads)
@@ -132,7 +148,9 @@ def cutedsl_kda_chunk_prefill(
         )
     # Decomposition-route scratch (0 bytes on the engine route); preallocated
     # here so the wrapper does not allocate on the hot path.
-    ws_bytes = cutedsl_kda_workspace_size(boundaries, num_value_heads)
+    ws_bytes = cutedsl_kda_workspace_size(
+        boundaries, num_value_heads, cu_seqlens_cpu=cu_seqlens_cpu
+    )
     workspace = (
         torch.empty(ws_bytes, dtype=torch.uint8, device=q.device) if ws_bytes else None
     )
@@ -148,6 +166,7 @@ def cutedsl_kda_chunk_prefill(
         state_in,
         scale=DEFAULT_SCALE,
         workspace=workspace,
+        cu_seqlens_cpu=cu_seqlens_cpu,
     )
     # out is token-major [1, T, HV, V] already; state VK -> FLA-native KV.
     return out.view(batch, tokens, num_value_heads, value_dim), final_state.transpose(

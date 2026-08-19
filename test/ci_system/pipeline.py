@@ -482,46 +482,6 @@ def get_runner_specific_env(task: Dict[str, Any], runner: str) -> Dict[str, str]
     return {}
 
 
-def validate_gb300_runner_alias(declared_runner: str, effective_runner: str) -> str:
-    """Validate a B300-to-GB300 alias, preserving an optional Slurm prefix."""
-    declared_slurm = declared_runner.startswith("slurm-")
-    effective_slurm = effective_runner.startswith("slurm-")
-    declared_base = declared_runner.removeprefix("slurm-")
-    effective_base = effective_runner.removeprefix("slurm-")
-    if (
-        declared_slurm != effective_slurm
-        or not declared_base.startswith("b300-")
-        or not effective_base.startswith("gb300-")
-    ):
-        raise ValueError("runner alias must map [slurm-]b300-* to [slurm-]gb300-*")
-    gpu_pattern = re.compile(r"(?:^|-)([1-9]\d*)gpu(?:-|$)")
-    declared_gpus = gpu_pattern.findall(declared_runner)
-    effective_gpus = gpu_pattern.findall(effective_runner)
-    if len(declared_gpus) != 1 or declared_gpus != effective_gpus:
-        raise ValueError("runner alias GPU counts must match")
-    if declared_base.removeprefix("b300-") != effective_base.removeprefix("gb300-"):
-        raise ValueError("runner alias suffixes must match")
-    return effective_runner
-
-
-def apply_slurm_runner_override(
-    declared_runner: str,
-    runner_override: str | None,
-    setup_mode: str,
-    task_type: str,
-) -> str:
-    if runner_override is None:
-        return declared_runner
-    if setup_mode != "slurm":
-        raise ValueError("--runner-override requires --setup-mode=slurm")
-    if task_type == "perf":
-        raise ValueError("--runner-override is not supported for perf tasks")
-    try:
-        return validate_gb300_runner_alias(declared_runner, runner_override)
-    except ValueError as exc:
-        raise ValueError(str(exc).replace("runner alias", "runner override")) from exc
-
-
 def create_ci_venv_name(runner_name: str | None = None) -> str:
     if runner_name:
         # Fixed path per runner so flashinfer JIT cache (which embeds the
@@ -1679,7 +1639,6 @@ def execute_task(
     *,
     config: str,
     runner: str,
-    runner_override: str | None = None,
     work_dir: str,
     dry_run: bool,
     print_plan: bool,
@@ -1712,10 +1671,6 @@ def execute_task(
         raise ValueError(
             f"{config}: runner {runner!r} is not declared in runner.labels"
         )
-    declared_runner = runner
-    runner = apply_slurm_runner_override(
-        declared_runner, runner_override, setup_mode, str(task["type"])
-    )
     targets = summarize_task_targets(task, repo_root)
 
     env = merge_env(task.get("env", {}))
@@ -1723,7 +1678,7 @@ def execute_task(
     env["CI_TASK_TYPE"] = str(task["type"])
     env["CI_RUNNER_LABEL"] = runner
     env.update(get_default_runner_env(runner))
-    env.update(get_runner_specific_env(task, declared_runner))
+    env.update(get_runner_specific_env(task, runner))
 
     jit_cache_env = get_jit_cache_env(env) if uses_isolated_jit_cache(runner) else {}
     env.update(jit_cache_env)
@@ -1901,7 +1856,7 @@ def execute_task(
             task, command_results, stages_run, server_log_path
         )
         eval_score_check = check_eval_score_threshold(
-            task, command_results, stages_run, declared_runner
+            task, command_results, stages_run, runner
         )
         if eval_score_check is not None and not eval_score_check["passed"]:
             raise RuntimeError(
@@ -2010,10 +1965,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--runner", required=True, help="Runner label selected by the matrix"
     )
     execute_parser.add_argument(
-        "--runner-override",
-        help="Slurm-only effective GB300 runner for a declared B300 runner.",
-    )
-    execute_parser.add_argument(
         "--work-dir", default=".", help="Repository work directory"
     )
     execute_parser.add_argument(
@@ -2086,7 +2037,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         return execute_task(
             config=args.config,
             runner=args.runner,
-            runner_override=args.runner_override,
             work_dir=args.work_dir,
             dry_run=args.dry_run,
             print_plan=args.print_plan,

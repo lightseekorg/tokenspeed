@@ -103,6 +103,11 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
         self.assertEqual(state_in.tolist(), [5])
         self.assertEqual(state_out.tolist(), [8])
 
+    def test_sparse_prefill_ignores_intermediate_holes(self):
+        state_in, state_out = self._run([[7, 0, 0, 0, 9]], [4], [20])
+        self.assertEqual(state_in.tolist(), [7])
+        self.assertEqual(state_out.tolist(), [9])
+
     def test_batch_mixed(self):
         # Distinct rows per request: out pages are exclusive per batch (the scheduler
         # invariant the validate path enforces).

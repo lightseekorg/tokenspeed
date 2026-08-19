@@ -233,18 +233,17 @@ The defaults target GB200; on GB300 set the shared paths under
 TS_CI_ARTIFACT_ROOT=/data/home/$USER/tokenspeed-slurm \
 TS_CI_CACHE_DIR=/data/home/$USER/tokenspeed-cache \
 test/ci/run_slurm.sh \
-  test/ci/ut/ut-tokenspeed-kernel.yaml \
-  --runner-alias b300-1gpu=gb300-1gpu \
-  --type ut \
+  test/ci/eval/kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml \
+  --runner slurm-gb300-4gpu \
+  --type eval \
   --wait
 ```
 
 The `Slurm Dispatch` workflow exposes a `cluster` input. `gb200` keeps the
 existing `slurm-dispatch` coordinator and runner defaults. `gb300` is an
-explicit opt-in: select one YAML, then the workflow maps its single declared
-`b300-Ngpu` label to `gb300-Ngpu`, preserving an optional `slurm-` prefix for
-multi-node tasks (or validates one matching explicit runner). Effective GB300
-labels are not added to task YAMLs or default CI matrices. Four
+explicit opt-in: select one YAML that declares exactly one `gb300-Ngpu` or
+`slurm-gb300-Ngpu` label. The workflow passes that label through unchanged and
+validates any explicit runner selection against it. Four
 `slurm-dispatch-gb300` coordinators form one shared pool for manual and
 per-commit submissions. GB300 perf tasks are disabled until GB300-specific
 reference values are measured.
@@ -262,16 +261,14 @@ the in-flight evaluation and retain the latest pending commit.
 Submission is fail-closed and requires the repository variable
 `TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED` to equal `true`. The dedicated
 switch is separate from `TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS`: this workflow
-does not pass that variable to its matrix scan, so entries such as `b300`,
-which would otherwise also substring-match the `slurm-b300-4gpu` topology
-label, cannot filter the multi-node matrix here. During this workflow's
+does not pass that variable to its matrix scan, so entries such as `gb300`
+cannot filter the multi-node matrix here. During this workflow's
 bootstrap only, leave the switch unset; after dispatcher support reaches
 `main`, set it to `true` and re-run the merge commit's workflow.
 
-The two-node Kimi K3 task declares `slurm-b300-4gpu`, `slurm.nodes: 2`, and
-`slurm.gpus_per_node: 4`. Dispatch maps that label to
-`slurm-gb300-4gpu`; the runner label describes GPUs per node, while the Slurm
-topology fields describe the allocation.
+The two-node Kimi K3 task declares `slurm-gb300-4gpu`, `slurm.nodes: 2`, and
+`slurm.gpus_per_node: 4`. The runner label describes GPUs per node, while the
+Slurm topology fields describe the allocation.
 
 GB200 examples:
 
