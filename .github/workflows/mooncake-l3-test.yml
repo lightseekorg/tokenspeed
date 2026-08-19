@@ -36,12 +36,15 @@ jobs:
 
       - name: Install Mooncake master runtime
         run: |
-          sudo apt-get update -o Acquire::Retries=5
-          sudo apt-get install -y -o Acquire::Retries=5 \
-            libcurl4 libibverbs1 librdmacm1 libnuma1 rdma-core
           python -m pip install --retries 10 --timeout 60 \
             'mooncake-transfer-engine-non-cuda==0.3.12.post1' \
             'nvidia-cuda-runtime-cu12==12.9.79'
+          if ! sudo apt-get install -y \
+            libcurl4 libibverbs1 librdmacm1 libnuma1 rdma-core; then
+            sudo apt-get update -o Acquire::Retries=5
+            sudo apt-get install -y -o Acquire::Retries=5 \
+              libcurl4 libibverbs1 librdmacm1 libnuma1 rdma-core
+          fi
 
       - name: Run L3 unit tests and live master roundtrip
         env:
