@@ -21,8 +21,9 @@
 """Kimi-K3 cache recipe: MLA latents plus KDA recurrent state groups.
 
 The MLA layers and the KDA state layers live in one arena at P=128. MLA pages
-are dense and pin a 12:1 packing; the state groups pack to match the MLA
-plane's byte width so no parent is wasted.
+are dense and pin the smallest packing whose plane width covers one per-layer
+KDA state (12 at attn tp=8); the state groups pack to match the MLA plane's
+byte width so no parent is wasted.
 """
 
 from __future__ import annotations
@@ -57,7 +58,6 @@ _KIMI_K3_KDA_LAYERS = 69
 _KIMI_K3_MLA_LAYERS = 24
 _KIMI_K3_PREFIX_GRANULARITY = 128
 _KIMI_K3_STATE_GROUPS = 3
-_KIMI_K3_MLA_PACKING = 12
 
 
 def _one_based_layers(value: object, name: str, num_layers: int) -> tuple[int, ...]:
@@ -253,7 +253,7 @@ class KimiK3Recipe(CacheRecipe):
     @override
     def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
         fields_by_group = {spec.group_id: fields for spec, fields in groups}
-        mla_plane_bytes = _KIMI_K3_MLA_PACKING * next(
+        mla_page_bytes = next(
             field.payload_bytes for field in fields_by_group[FULL_ATTENTION]
         )
         first_state = f"{LINEAR_ATTENTION}_0"
@@ -262,12 +262,16 @@ class KimiK3Recipe(CacheRecipe):
             for field in fields_by_group[first_state]
             if field.plane_id == "slot.0"
         )
-        linear_packing = max(1, mla_plane_bytes // linear_plane_bytes)
+        # The smallest packing whose plane width covers one per-layer KDA
+        # state, so the state page rides inside the MLA plane at the least
+        # parent granularity. Attn tp=8 gives the historical 12; attention-DP
+        # (tp < 8) grows the state 8/tp-fold and the packing follows it up,
+        # while larger tp shrinks the state and the parent with it.
+        mla_packing = max(1, -(-linear_plane_bytes // mla_page_bytes))
+        linear_packing = max(1, mla_packing * mla_page_bytes // linear_plane_bytes)
         return {
             spec.group_id: (
-                _KIMI_K3_MLA_PACKING
-                if spec.group_id == FULL_ATTENTION
-                else linear_packing
+                mla_packing if spec.group_id == FULL_ATTENTION else linear_packing
             )
             for spec, _ in groups
         }
