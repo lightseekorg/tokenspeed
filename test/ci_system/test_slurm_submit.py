@@ -17,9 +17,11 @@ from slurm_submit import (
     queued_states,
     render_script,
     result_detail,
+    scontrol_states,
     select_tasks,
     source_pr_url,
     submit,
+    wait_all,
     write_report,
 )
 
@@ -572,6 +574,58 @@ def test_queued_states_queries_only_requested_jobs(monkeypatch):
             "reason": "Resources",
         },
     }
+
+
+def test_scontrol_states_parses_terminal_job(monkeypatch):
+    outputs = iter(
+        [
+            "JobId=123 JobState=COMPLETED RunTime=00:37:01 "
+            "DerivedExitCode=9:0 ExitCode=0:0\n",
+            "JobId=123 JobState=COMPLETING RunTime=00:37:01 ExitCode=0:0\n",
+        ]
+    )
+
+    def fake_run(command, **kwargs):
+        assert command == ["scontrol", "show", "job", "-o", "123"]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=next(outputs),
+            stderr="",
+        )
+
+    monkeypatch.setattr("slurm_submit.subprocess.run", fake_run)
+
+    assert scontrol_states(["123"]) == {
+        "123": {
+            "state": "COMPLETED",
+            "elapsed": "00:37:01",
+            "exit_code": "0:0",
+        }
+    }
+    assert scontrol_states(["123"]) == {}
+
+
+def test_wait_all_uses_scontrol_when_accounting_is_empty(monkeypatch, tmp_path):
+    monkeypatch.setattr("slurm_submit.queued_states", lambda _ids: {})
+    monkeypatch.setattr("slurm_submit.slurm_states", lambda _ids: {})
+    monkeypatch.setattr(
+        "slurm_submit.scontrol_states",
+        lambda _ids: {
+            "123": {
+                "state": "COMPLETED",
+                "elapsed": "00:01:00",
+                "exit_code": "0:0",
+            }
+        },
+    )
+
+    submission = Submission(
+        Task("test/ci/eval/example.yaml", "example", "eval", "gb300-4gpu", 4),
+        "123",
+        tmp_path / "123.log",
+    )
+    assert wait_all([submission], tmp_path / "runs", tmp_path / "report")
 
 
 def test_print_progress_omits_running_node(capsys, tmp_path):
