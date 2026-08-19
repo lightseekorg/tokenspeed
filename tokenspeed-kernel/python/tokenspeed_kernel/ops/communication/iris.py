@@ -382,6 +382,13 @@ class IrisAllReduce(object):
         assert len(group_ranks) == self.world_size
         assert group_ranks[rank_in_group] == dist.get_rank()
         self._input_buf = self._ctx.zeros((max_numel,), dtype=dtype)
+        self._attnres_input_buf = self._ctx.zeros((2, max_numel), dtype=dtype)
+        self._attnres_ready_flags = self._ctx.zeros(
+            (32, self.world_size), dtype=torch.int32
+        )
+        self._attnres_consumed_flags = self._ctx.zeros(
+            (32, self.world_size), dtype=torch.int32
+        )
         self._producer_direct_scratch_buf = self._ctx.zeros((max_numel,), dtype=dtype)
         self._producer_direct_output_buf = torch.empty(
             max_numel, dtype=dtype, device=self.device
@@ -579,7 +586,9 @@ class IrisAllReduce(object):
             op = dist.ReduceOp.SUM
         assert op == dist.ReduceOp.SUM, f"Iris all-reduce only supports SUM, got {op}"
         assert _platform.is_cdna4 and self.world_size == 8
-        assert partial.shape == residual.shape == (1, 7168)
+        num_tokens = partial.shape[0]
+        assert 0 < num_tokens <= 32
+        assert partial.shape == residual.shape == (num_tokens, 7168)
         assert partial.dtype == residual.dtype == self.dtype == torch.bfloat16
         assert partial.device == residual.device == self.device
         assert partial.is_contiguous() and residual.is_contiguous()
@@ -592,8 +601,8 @@ class IrisAllReduce(object):
         assert score_weight.device == output_weight.device == self.device
         assert score_weight.is_contiguous() and output_weight.is_contiguous()
         m, s_, acc = scratch
-        assert m.shape == s_.shape == (1,)
-        assert acc.shape == (1, 7168)
+        assert m.shape == s_.shape == (num_tokens,)
+        assert acc.shape == (num_tokens, 7168)
         assert m.dtype == s_.dtype == acc.dtype == torch.float32
         assert m.device == s_.device == acc.device == self.device
         assert m.is_contiguous() and s_.is_contiguous() and acc.is_contiguous()
@@ -601,10 +610,10 @@ class IrisAllReduce(object):
 
         hidden = torch.empty_like(partial)
         residual_out = torch.empty_like(residual)
-        iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel[(1,)](
+        iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel[(num_tokens,)](
             partial,
             residual,
-            self._input_buf,
+            self._attnres_input_buf,
             score_weight,
             output_weight,
             m,
@@ -612,12 +621,15 @@ class IrisAllReduce(object):
             acc,
             hidden,
             residual_out,
-            self._ready_flags,
+            self._attnres_ready_flags,
+            self._attnres_consumed_flags,
             *self._heap_base_addresses,
             RANK=self._iris_rank,
             WORLD_SIZE=self.world_size,
+            M=num_tokens,
             HIDDEN=7168,
             BLOCK=8192,
+            INPUT_SLOT_STRIDE=self.max_numel,
             EPS=eps,
             ELEMENTS_PER_THREAD=1,
             NUM_WARPS=4,
@@ -1158,6 +1170,7 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
     hidden_ptr,
     residual_out_ptr,
     ready_flags,
+    consumed_flags,
     heap_base_0,
     heap_base_1,
     heap_base_2,
@@ -1168,19 +1181,23 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
     heap_base_7,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
+    M: gl.constexpr,
     HIDDEN: gl.constexpr,
     BLOCK: gl.constexpr,
+    INPUT_SLOT_STRIDE: gl.constexpr,
     EPS: gl.constexpr,
     ELEMENTS_PER_THREAD: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
     """Kimi-K3 attention AR, residual, and split AttnRes combine."""
+    row = gl.program_id(0)
     layout: gl.constexpr = gl.BlockedLayout(
         [ELEMENTS_PER_THREAD], [64], [NUM_WARPS], [0]
     )
     offset = gl.arange(0, BLOCK, layout=layout)
     mask = offset < HIDDEN
-    offset_i32 = offset.to(gl.int32)
+    offset_i32 = (row * HIDDEN + offset).to(gl.int32)
+    weight_offset_i32 = offset.to(gl.int32)
 
     local = gl.amd.cdna4.buffer_load(
         partial_ptr,
@@ -1188,19 +1205,8 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
         mask=mask,
         other=0.0,
     ).to(gl.float32)
-    gl.amd.cdna4.buffer_store(
-        local.to(input_sym_ptr.dtype.element_ty),
-        input_sym_ptr,
-        offset_i32,
-        mask=mask,
-        cache=".wt",
-    )
-    gl.barrier()
-
-    local_ready = ready_flags + RANK
+    local_ready = ready_flags + row * WORLD_SIZE + RANK
     epoch = gl.load(local_ready).to(gl.int32) + 1
-    gl.atomic_xchg(local_ready, epoch, sem="release", scope="sys")
-
     local_heap = _iris_heap_base(
         RANK,
         heap_base_0,
@@ -1212,10 +1218,11 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
         heap_base_6,
         heap_base_7,
     )
+    reuse_epoch = gl.maximum(epoch - 2, 0)
     _iris_sync_rank_epoch(
-        ready_flags,
-        0,
-        epoch,
+        consumed_flags,
+        row,
+        reuse_epoch,
         local_heap,
         heap_base_0,
         heap_base_1,
@@ -1231,7 +1238,37 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
         PUBLISH=False,
     )
 
-    input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
+    input_slot_ptr = input_sym_ptr + (epoch & 1) * INPUT_SLOT_STRIDE
+    gl.amd.cdna4.buffer_store(
+        local.to(input_slot_ptr.dtype.element_ty),
+        input_slot_ptr,
+        offset_i32,
+        mask=mask,
+        cache=".wt",
+    )
+    gl.barrier()
+
+    gl.atomic_xchg(local_ready, epoch, sem="release", scope="sys")
+    _iris_sync_rank_epoch(
+        ready_flags,
+        row,
+        epoch,
+        local_heap,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+        RANK,
+        WORLD_SIZE,
+        NUM_WARPS,
+        PUBLISH=True,
+    )
+
+    input_heap_offset = tl.cast(input_slot_ptr, gl.uint64) - local_heap
     reduced = local
     for peer in gl.static_range(0, WORLD_SIZE):
         if peer != RANK:
@@ -1258,30 +1295,11 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
                 cache=".cg",
             ).to(gl.float32)
 
-    # Wait until every peer has consumed this rank's symmetric staging before
-    # a subsequent collective can reuse it.
+    # Publish consumption without serializing this epilogue. Reuse waits only
+    # when a later invocation wraps back to the same staging slot.
     gl.barrier()
-    read_done = ready_flags + WORLD_SIZE + RANK
-    read_epoch = gl.load(read_done).to(gl.int32) + 1
-    gl.atomic_xchg(read_done, read_epoch, sem="release", scope="sys")
-    _iris_sync_rank_epoch(
-        ready_flags,
-        1,
-        read_epoch,
-        local_heap,
-        heap_base_0,
-        heap_base_1,
-        heap_base_2,
-        heap_base_3,
-        heap_base_4,
-        heap_base_5,
-        heap_base_6,
-        heap_base_7,
-        RANK,
-        WORLD_SIZE,
-        NUM_WARPS,
-        PUBLISH=False,
-    )
+    consumed = consumed_flags + row * WORLD_SIZE + RANK
+    gl.atomic_xchg(consumed, epoch, sem="release", scope="sys")
 
     reduced = reduced.to(gl.bfloat16).to(gl.float32)
     residual = gl.amd.cdna4.buffer_load(
@@ -1300,7 +1318,7 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
 
     score_weight = gl.amd.cdna4.buffer_load(
         score_weight_ptr,
-        offset_i32,
+        weight_offset_i32,
         mask=mask,
         other=0.0,
     ).to(gl.float32)
@@ -1308,8 +1326,8 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
     dot = gl.sum(gl.where(mask, prefix * score_weight, 0.0), axis=0)
     prefix_logit = dot * gl.rsqrt(square_sum / HIDDEN + EPS)
 
-    block_m = gl.load(scratch_m_ptr)
-    block_s = gl.load(scratch_s_ptr)
+    block_m = gl.load(scratch_m_ptr + row)
+    block_s = gl.load(scratch_s_ptr + row)
     maximum = gl.maximum(block_m, prefix_logit)
     block_correction = gl.exp(block_m - maximum)
     prefix_weight = gl.exp(prefix_logit - maximum)
@@ -1330,7 +1348,7 @@ def iris_stage_one_shot_allreduce_residual_attnres_gluon_kernel(
     inverse_rms = gl.rsqrt(output_square_sum / HIDDEN + EPS)
     output_weight = gl.amd.cdna4.buffer_load(
         output_weight_ptr,
-        offset_i32,
+        weight_offset_i32,
         mask=mask,
         other=0.0,
     ).to(gl.float32)

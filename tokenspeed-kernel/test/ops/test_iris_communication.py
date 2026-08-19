@@ -443,44 +443,40 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
         allreduce_residual_attnres_combine_supported,
     )
 
-    torch.manual_seed(101)
-    hidden = 7168
-    blocks = (torch.randn(4, 1, hidden, device=device) * 0.1).to(torch.bfloat16)
-    score_weight = (torch.randn(hidden, device=device) * 0.02).to(torch.bfloat16)
-    output_weight = (1.0 + torch.randn(hidden, device=device) * 0.02).to(torch.bfloat16)
-    residual = (torch.randn(1, hidden, device=device) * 0.1).to(torch.bfloat16)
-    local = (torch.randn(1, hidden, device=device) * 0.01 + (rank + 1) * 0.002).to(
-        torch.bfloat16
-    )
-    scratch = (
-        torch.empty(1, device=device, dtype=torch.float32),
-        torch.empty(1, device=device, dtype=torch.float32),
-        torch.empty(1, hidden, device=device, dtype=torch.float32),
-    )
-    attnres_partial(blocks, score_weight, 1e-6, scratch)
+    for num_tokens in (1, 2, 4, 8, 16):
+        torch.manual_seed(101 + num_tokens)
+        hidden = 7168
+        blocks = (torch.randn(4, num_tokens, hidden, device=device) * 0.1).to(
+            torch.bfloat16
+        )
+        score_weight = (torch.randn(hidden, device=device) * 0.02).to(torch.bfloat16)
+        output_weight = (1.0 + torch.randn(hidden, device=device) * 0.02).to(
+            torch.bfloat16
+        )
+        residual = (torch.randn(num_tokens, hidden, device=device) * 0.1).to(
+            torch.bfloat16
+        )
+        local = (
+            torch.randn(num_tokens, hidden, device=device) * 0.01 + (rank + 1) * 0.002
+        ).to(torch.bfloat16)
+        scratch = (
+            torch.empty(num_tokens, device=device, dtype=torch.float32),
+            torch.empty(num_tokens, device=device, dtype=torch.float32),
+            torch.empty(num_tokens, hidden, device=device, dtype=torch.float32),
+        )
+        attnres_partial(blocks, score_weight, 1e-6, scratch)
 
-    reduced = iris_all_reduce(state, local.clone(), safe=False)
-    expected_residual = residual + reduced
-    expected_hidden = attnres_combine(
-        expected_residual,
-        score_weight,
-        output_weight,
-        1e-6,
-        scratch,
-        torch.empty_like(residual),
-    )
-    assert allreduce_residual_attnres_combine_supported(
-        local,
-        residual,
-        score_weight,
-        output_weight,
-        scratch,
-        rank=rank,
-        group=state.group,
-        local_world_size=8,
-    )
-    for _ in range(4):
-        actual_hidden, actual_residual = allreduce_residual_attnres_combine(
+        reduced = iris_all_reduce(state, local.clone(), safe=False)
+        expected_residual = residual + reduced
+        expected_hidden = attnres_combine(
+            expected_residual,
+            score_weight,
+            output_weight,
+            1e-6,
+            scratch,
+            torch.empty_like(residual),
+        )
+        assert allreduce_residual_attnres_combine_supported(
             local,
             residual,
             score_weight,
@@ -489,28 +485,43 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
             rank=rank,
             group=state.group,
             local_world_size=8,
-            eps=1e-6,
         )
-        torch.testing.assert_close(actual_residual, expected_residual, atol=0, rtol=0)
-        torch.testing.assert_close(actual_hidden, expected_hidden, atol=2e-2, rtol=2e-2)
+        for _ in range(4):
+            actual_hidden, actual_residual = allreduce_residual_attnres_combine(
+                local,
+                residual,
+                score_weight,
+                output_weight,
+                scratch,
+                rank=rank,
+                group=state.group,
+                local_world_size=8,
+                eps=1e-6,
+            )
+            torch.testing.assert_close(
+                actual_residual, expected_residual, atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                actual_hidden, expected_hidden, atol=2e-2, rtol=2e-2
+            )
 
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_hidden, graph_residual = allreduce_residual_attnres_combine(
-            local,
-            residual,
-            score_weight,
-            output_weight,
-            scratch,
-            rank=rank,
-            group=state.group,
-            local_world_size=8,
-            eps=1e-6,
-        )
-    graph.replay()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(graph_residual, expected_residual, atol=0, rtol=0)
-    torch.testing.assert_close(graph_hidden, expected_hidden, atol=2e-2, rtol=2e-2)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_hidden, graph_residual = allreduce_residual_attnres_combine(
+                local,
+                residual,
+                score_weight,
+                output_weight,
+                scratch,
+                rank=rank,
+                group=state.group,
+                local_world_size=8,
+                eps=1e-6,
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_residual, expected_residual, atol=0, rtol=0)
+        torch.testing.assert_close(graph_hidden, expected_hidden, atol=2e-2, rtol=2e-2)
 
 
 def _run_ar_test(world_size: int) -> None:
