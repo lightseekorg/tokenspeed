@@ -476,6 +476,10 @@ def apply_rope_mla_set_kv(
             latent NoPE half, the absorbed query half, and the RoPE tables.
         q_rope_out: ``[tokens, heads, nope_dim + rope_dim]`` query destination.
         enable_pdl: allow programmatic dependent launch.
+
+    Returns:
+        ``None``. The kernel writes through ``q_rope_out`` and the pool buffer
+        named by the arg; there is no value to hand back.
     """
     has_rope = fused_mla_set_kv_buffer_arg.cos_sin_cache is not None
     traits = {
