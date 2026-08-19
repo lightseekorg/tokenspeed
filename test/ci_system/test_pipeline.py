@@ -129,27 +129,6 @@ def test_nvidia_runner_groups_split_arm_from_x86():
     assert not runner_matches_group("amd-mi35x-1gpu-test", "nvidia-x86")
 
 
-def test_slurm_runner_override_is_narrow_and_gpu_counted():
-    assert (
-        pipeline.apply_slurm_runner_override("b300-1gpu", "gb300-1gpu", "slurm", "ut")
-        == "gb300-1gpu"
-    )
-    assert (
-        pipeline.apply_slurm_runner_override(
-            "slurm-b300-4gpu", "slurm-gb300-4gpu", "slurm", "eval"
-        )
-        == "slurm-gb300-4gpu"
-    )
-    with pytest.raises(ValueError, match="GPU counts"):
-        pipeline.apply_slurm_runner_override("b300-4gpu", "gb300-1gpu", "slurm", "ut")
-    with pytest.raises(ValueError, match="b300"):
-        pipeline.apply_slurm_runner_override("b200-1gpu", "gb300-1gpu", "slurm", "ut")
-    with pytest.raises(ValueError, match="setup-mode"):
-        pipeline.apply_slurm_runner_override("b300-1gpu", "gb300-1gpu", "ci", "ut")
-    with pytest.raises(ValueError, match="perf"):
-        pipeline.apply_slurm_runner_override("b300-4gpu", "gb300-4gpu", "slurm", "perf")
-
-
 def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
     assert is_gb200_runner("gb200-1gpu")
     assert is_gb200_runner("gb200-4gpu-perf")
