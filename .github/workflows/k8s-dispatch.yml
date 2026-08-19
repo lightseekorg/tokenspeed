@@ -19,8 +19,8 @@ on:
           - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k.yaml
           - test/ci/eval/glm-5.2-nvfp4-mtp-evalscope-aime26.yaml
           - test/ci/eval/gpt-oss-120b-mxfp4-evalscope-gpqa-diamond.yaml
-          - test/ci/eval/inkling-nvfp4-mtp-evalscope-gsm8k.yaml
-          - test/ci/eval/inkling-mxfp4-mtp-evalscope-gsm8k.yaml
+          - test/ci/eval/inkling-nvfp4-mtp-evalscope-aime25.yaml
+          - test/ci/eval/inkling-mxfp4-mtp-evalscope-aime25.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-dflash-evalscope-aime25.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-aime25.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-gpqa-diamond.yaml

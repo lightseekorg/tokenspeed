@@ -237,20 +237,28 @@ def test_kda_paged_decode_graph_padding_and_page_stride() -> None:
     )
 
 
-def test_kda_fused_paged_decode_matches_reference() -> None:
+@pytest.mark.parametrize(
+    ("batch", "active"),
+    [(1, 1), (2, 2), (4, 2), (8, 8), (16, 16), (32, 32)],
+)
+def test_kda_fused_paged_decode_matches_reference(batch: int, active: int) -> None:
     """The K3 megafusion preserves state paging and its fused norm epilogue."""
     if not (current_platform().is_cdna4 or current_platform().is_cdna5):
         pytest.skip("gfx950/gfx1250 KDA fusion test")
 
     torch.manual_seed(31)
-    batch, active, heads, head_dim, pages = 4, 2, 12, 128, 6
+    heads, head_dim, pages = 12, 128, 2 * active
     projection_width = heads * head_dim
-    mixed_qkv = torch.randn(
+    used_width = 4 * projection_width + head_dim + heads
+    packed_width = (used_width + 15) // 16 * 16
+    packed_projection = torch.randn(
         batch,
-        3 * projection_width,
+        packed_width,
         device="cuda",
         dtype=torch.bfloat16,
     )
+    mixed_qkv = packed_projection[:, : 3 * projection_width]
+    assert mixed_qkv.stride() == (packed_width, 1)
     conv_weights = 0.1 * torch.randn(
         3 * projection_width,
         4,
@@ -266,32 +274,19 @@ def test_kda_fused_paged_decode_matches_reference() -> None:
     )
     initial_conv_states = conv_states.clone()
     expected_conv_states = conv_states.clone()
-    f_a_out = torch.randn(
-        batch,
-        head_dim,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
+    f_a_start = 4 * projection_width
+    f_a_out = packed_projection[:, f_a_start : f_a_start + head_dim]
     f_b_weight = 0.1 * torch.randn(
         projection_width,
         head_dim,
         device="cuda",
         dtype=torch.bfloat16,
     )
-    beta_logits = torch.randn(
-        batch,
-        heads,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
+    beta_start = f_a_start + head_dim
+    beta_logits = packed_projection[:, beta_start : beta_start + heads]
     a_log = torch.randn(heads, device="cuda", dtype=torch.float32)
     dt_bias = torch.randn(projection_width, device="cuda", dtype=torch.float32)
-    output_gate = torch.randn(
-        batch,
-        projection_width,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
+    output_gate = packed_projection[:, 3 * projection_width : f_a_start]
     norm_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
     norm_eps = 1e-6
     state_pool = 0.01 * torch.randn(
@@ -304,9 +299,18 @@ def test_kda_fused_paged_decode_matches_reference() -> None:
     )
     initial_state_pool = state_pool.clone()
     expected_state_pool = state_pool.clone()
-    read_indices = torch.tensor([0, 1, -1, -1], device="cuda", dtype=torch.int32)
-    write_indices = torch.tensor([2, 3, -1, -1], device="cuda", dtype=torch.int32)
-    cu_seqlens = torch.tensor([0, 1, 2, 2, 2], device="cuda", dtype=torch.int32)
+    read_indices = torch.full((batch,), -1, device="cuda", dtype=torch.int32)
+    write_indices = torch.full((batch,), -1, device="cuda", dtype=torch.int32)
+    read_indices[:active] = torch.arange(active, device="cuda", dtype=torch.int32)
+    write_indices[:active] = torch.arange(
+        active, 2 * active, device="cuda", dtype=torch.int32
+    )
+    cu_seqlens = torch.cat(
+        (
+            torch.arange(active + 1, device="cuda", dtype=torch.int32),
+            torch.full((batch - active,), active, device="cuda", dtype=torch.int32),
+        )
+    )
 
     raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
     expected_out = torch.zeros(
