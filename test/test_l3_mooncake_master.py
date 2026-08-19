@@ -81,8 +81,8 @@ def _ensure_libcudart() -> str | None:
     current = os.environ.get("LD_LIBRARY_PATH", "")
     parts = [part for part in current.split(os.pathsep) if part]
     if lib_dir not in parts:
-        os.environ["LD_LIBRARY_PATH"] = (
-            lib_dir + (os.pathsep + current if current else "")
+        os.environ["LD_LIBRARY_PATH"] = lib_dir + (
+            os.pathsep + current if current else ""
         )
     return lib_dir
 
@@ -167,8 +167,10 @@ class MooncakeMasterLiveTest(unittest.TestCase):
         package_bin = os.path.join(
             os.path.dirname(mooncake.__file__), "mooncake_master"
         )
-        exe = package_bin if os.path.isfile(package_bin) else shutil.which(
-            "mooncake_master"
+        exe = (
+            package_bin
+            if os.path.isfile(package_bin)
+            else shutil.which("mooncake_master")
         )
         if not exe or not os.path.isfile(exe):
             _require_or_skip("mooncake_master is not installed")
@@ -179,8 +181,8 @@ class MooncakeMasterLiveTest(unittest.TestCase):
         log_path = os.path.join(log_dir, f"master-{port}.log")
         env = os.environ.copy()
         if cls._lib_dir:
-            env["LD_LIBRARY_PATH"] = cls._lib_dir + os.pathsep + env.get(
-                "LD_LIBRARY_PATH", ""
+            env["LD_LIBRARY_PATH"] = (
+                cls._lib_dir + os.pathsep + env.get("LD_LIBRARY_PATH", "")
             )
         cls.master_log = open(log_path, "wb")
         cls.master_proc = subprocess.Popen(
@@ -263,7 +265,9 @@ class MooncakeMasterLiveTest(unittest.TestCase):
         self.assertEqual(l3.backup(pages), [True])
         self.assertEqual(l3.exists(pages), [True])
         host.host_buffer[0 : len(payload)] = b"\x00" * len(payload)
-        self.assertEqual(bytes(host.host_buffer[0 : len(payload)]), b"\x00" * len(payload))
+        self.assertEqual(
+            bytes(host.host_buffer[0 : len(payload)]), b"\x00" * len(payload)
+        )
         self.assertEqual(l3.prefetch(pages), [True])
         self.assertEqual(bytes(host.host_buffer[0 : len(payload)]), payload)
         l3.close()
