@@ -407,6 +407,7 @@ def _mhc_pre_impl(
     sinkhorn_iters: int,
     prenorm_gemm,
     pre_mix_impl=None,
+    pre_reduce_apply_impl=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if residual.dtype != torch.bfloat16 or fn.dtype != torch.float32:
         raise RuntimeError("fast mHC requires bf16 residual and fp32 weights")
@@ -449,8 +450,12 @@ def _mhc_pre_impl(
     post_mix = torch.empty(
         num_tokens, hc_mult, dtype=torch.float32, device=residual.device
     )
-    pre_mix = torch.empty(
-        num_tokens, hc_mult, dtype=torch.float32, device=residual.device
+    pre_mix = (
+        None
+        if pre_reduce_apply_impl is not None
+        else torch.empty(
+            num_tokens, hc_mult, dtype=torch.float32, device=residual.device
+        )
     )
     comb_mix = torch.empty(
         num_tokens, hc_mult2, dtype=torch.float32, device=residual.device
@@ -474,34 +479,14 @@ def _mhc_pre_impl(
         n_splits,
     )
     block_h = 1024
-    if pre_mix_impl is None:
-        _mhc_pre_mix_triton_kernel[(num_tokens,)](
+    if pre_reduce_apply_impl is not None:
+        pre_reduce_apply_impl(
             gemm_out_mul,
             gemm_out_sqrsum,
             hc_scale,
             hc_base,
-            pre_mix,
-            post_mix,
-            comb_mix,
-            hidden_size=hidden_size,
-            rms_eps=rms_eps,
-            hc_eps=hc_eps,
-            sinkhorn_iters=sinkhorn_iters,
-            n_splits=n_splits,
-            hc_mult=hc_mult,
-            hc_mult2=hc_mult2,
-            hc_mult3=hc_mult3,
-            block_comb=triton.next_power_of_2(hc_mult2),
-            num_tokens=num_tokens,
-            num_warps=1,
-        )
-    else:
-        pre_mix_impl(
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            hc_scale,
-            hc_base,
-            pre_mix,
+            residual_flat,
+            layer_input,
             post_mix,
             comb_mix,
             hidden_size,
@@ -511,15 +496,53 @@ def _mhc_pre_impl(
             n_splits,
             num_tokens,
         )
-    _mhc_pre_layer_triton_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
-        pre_mix,
-        residual_flat,
-        layer_input,
-        hidden_size=hidden_size,
-        hc_mult=hc_mult,
-        block_h=block_h,
-        num_warps=4,
-    )
+    else:
+        if pre_mix_impl is None:
+            _mhc_pre_mix_triton_kernel[(num_tokens,)](
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                hc_scale,
+                hc_base,
+                pre_mix,
+                post_mix,
+                comb_mix,
+                hidden_size=hidden_size,
+                rms_eps=rms_eps,
+                hc_eps=hc_eps,
+                sinkhorn_iters=sinkhorn_iters,
+                n_splits=n_splits,
+                hc_mult=hc_mult,
+                hc_mult2=hc_mult2,
+                hc_mult3=hc_mult3,
+                block_comb=triton.next_power_of_2(hc_mult2),
+                num_tokens=num_tokens,
+                num_warps=1,
+            )
+        else:
+            pre_mix_impl(
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                hc_scale,
+                hc_base,
+                pre_mix,
+                post_mix,
+                comb_mix,
+                hidden_size,
+                rms_eps,
+                hc_eps,
+                sinkhorn_iters,
+                n_splits,
+                num_tokens,
+            )
+        _mhc_pre_layer_triton_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
+            pre_mix,
+            residual_flat,
+            layer_input,
+            hidden_size=hidden_size,
+            hc_mult=hc_mult,
+            block_h=block_h,
+            num_warps=4,
+        )
 
     return (
         layer_input.view(*outer_shape, hidden_size),

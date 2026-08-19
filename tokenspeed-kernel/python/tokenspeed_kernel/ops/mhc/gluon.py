@@ -37,7 +37,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.mhc import (
-        gluon_mhc_pre_mix_gfx950 as _mhc_pre_mix_impl,
+        gluon_mhc_pre_reduce_apply_gfx950 as _mhc_pre_reduce_apply_impl,
     )
 
     @register_kernel(
@@ -88,5 +88,5 @@ if current_platform().is_amd:
             hc_eps,
             sinkhorn_iters,
             _mhc_prenorm_gemm_triton,
-            _mhc_pre_mix_impl,
+            pre_reduce_apply_impl=_mhc_pre_reduce_apply_impl,
         )
