@@ -559,7 +559,7 @@ def _create_target_components(
         cache_spec,
         config,
         arena,
-        num_layers=len(cache_spec.layer_group_ids),
+        num_layers=len(cache_spec.layer_types),
         rank=rank,
     )
     if is_hybrid_linear:
@@ -907,7 +907,7 @@ def create_attn_components(
         spec.memory_plan.prefix_granularity,
         spec.memory_plan.num_lcm_blocks,
         spec.token_capacity,
-        len(spec.layer_group_ids),
+        len(spec.layer_types),
         cache_setup.num_draft_layers,
         {
             group.group_id: group.cache_blocks_per_lcm_block

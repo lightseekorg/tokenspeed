@@ -599,8 +599,7 @@ def group(
         raise ValueError(
             "group requires per-layer group_ids; the "
             "cache recipe is their single source: derive them with "
-            "layer_group_ids(...) and carry them via "
-            "CachePoolSpec.layer_group_ids"
+            "layer_group_ids(...)"
         )
     resolved_layer_types = tuple(layer_types) or (FULL_ATTENTION,) * len(
         resolved_group_ids

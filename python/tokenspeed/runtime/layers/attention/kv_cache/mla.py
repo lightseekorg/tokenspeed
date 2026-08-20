@@ -62,7 +62,6 @@ class MLATokenToKVPool(CachePool):
         layer_num: int,
         rank: int,
         *,
-        layer_group_ids: tuple[str, ...] = (),
         field_layer_offset: int = 0,
     ):
         super().__init__(
@@ -78,17 +77,6 @@ class MLATokenToKVPool(CachePool):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.layer_num = layer_num
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
-        # Physical group id per layer, from the cache recipe
-        # (CachePoolSpec.layer_group_ids) — the single source the scheduler
-        # groups are published from.
-        self.layer_cache_group_ids = tuple(layer_group_ids)
-        if len(self.layer_cache_group_ids) != layer_num:
-            raise ValueError(
-                f"layer_group_ids has {len(self.layer_cache_group_ids)} "
-                f"entries but the pool has {layer_num} layers; the cache "
-                "recipe must supply one group id per layer "
-                "(CachePoolSpec.layer_group_ids)"
-            )
         self._bind_layer_planes()
 
     # Quantized MLA splits one logical cache into three planes, so its

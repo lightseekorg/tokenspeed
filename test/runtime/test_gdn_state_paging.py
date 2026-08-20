@@ -47,12 +47,9 @@ class _ContractPool:
         )
         self.arena = SimpleNamespace(runtime_contract=contract)
         self._components = components
-        self._group_ids_by_layer = {
+        self.state_group_by_layer = {
             layer_id: group_id for layer_id, (group_id, _, _) in components.items()
         }
-
-    def group_id_for_layer(self, layer_id):
-        return self._group_ids_by_layer[layer_id]
 
     def get_component(self, layer_id, name):
         _, conv_state, recurrent_state = self._components[layer_id]

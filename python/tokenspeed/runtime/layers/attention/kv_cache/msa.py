@@ -29,7 +29,6 @@ class MSATokenToKVPool(MHATokenToKVPool):
         index_dtype: torch.dtype,
         indexed_layer_ids: frozenset[int],
         layer_types: tuple[str, ...] = (),
-        layer_group_ids: tuple[str, ...] = (),
         field_layer_offset: int = 0,
     ) -> None:
         self.index_head_dim = index_head_dim
@@ -43,7 +42,6 @@ class MSATokenToKVPool(MHATokenToKVPool):
             layer_num=layer_num,
             rank=rank,
             layer_types=layer_types,
-            layer_group_ids=layer_group_ids,
             field_layer_offset=field_layer_offset,
         )
 
