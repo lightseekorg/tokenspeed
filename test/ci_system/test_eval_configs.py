@@ -30,11 +30,11 @@ GPQA_DATASET_SOURCE_PRELUDE = (
 )
 DATASETS = {
     "aime25": {
-        "count": 8,
+        "count": 10,
         "dataset_args": {"dataset_id": "math-ai/aime25"},
     },
     "aime26": {
-        "count": 5,
+        "count": 7,
         "dataset_args": {"dataset_id": "math-ai/aime26"},
     },
     "gpqa_diamond": {
@@ -42,15 +42,23 @@ DATASETS = {
         "dataset_args": json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)["gpqa_diamond"],
     },
     "gsm8k": {
-        "count": 6,
+        "count": 4,
         "dataset_args": {"dataset_id": "openai/gsm8k"},
     },
     "mmlu": {
         "count": 1,
         "dataset_args": {"dataset_id": "cais/mmlu"},
     },
+    "mmmu_pro": {
+        "count": 1,
+        "dataset_args": {
+            "dataset_id": "AI-ModelScope/MMMU_Pro",
+            "extra_params": {"dataset_format": "vision"},
+        },
+        "dataset_hub": "modelscope",
+    },
     "ocr_bench": {
-        "count": 3,
+        "count": 4,
         "dataset_args": {"dataset_id": "echo840/OCRBench"},
     },
 }
@@ -106,7 +114,9 @@ def test_evalscope_configs_use_expected_dataset_sources():
             }
             dataset_args = json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)
         else:
-            assert flag_value(tokens, "--dataset-hub") == "huggingface", path
+            assert flag_value(tokens, "--dataset-hub") == expected.get(
+                "dataset_hub", "huggingface"
+            ), path
             dataset_args = json.loads(flag_value(tokens, "--dataset-args"))
         assert dataset_args == {dataset: expected["dataset_args"]}, path
 
