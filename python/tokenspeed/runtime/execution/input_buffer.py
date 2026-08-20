@@ -32,6 +32,7 @@ from tokenspeed.runtime.execution.cache_loc_kernel import (
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
 from tokenspeed.runtime.multimodal.inputs import Modality, substitute_mm_pad_
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
 
 
 logger = get_colorful_logger(__name__)
+FORCE_SINGLE_TOKEN_VERIFY = envs.TOKENSPEED_FORCE_SINGLE_TOKEN_VERIFY.get()
 
 
 class InputBuffers:
@@ -99,7 +101,11 @@ class InputBuffers:
             self.out_cache_loc_buf = torch.full(
                 (max_num_tokens,), dummy_kv_slot, dtype=torch.int32
             )
-            self.force_single_token_verify_buf = torch.zeros(max_bs, dtype=torch.bool)
+            # A process-wide diagnostic can start every row forced; the
+            # ordinary path leaves this false and remote recovery sets rows.
+            self.force_single_token_verify_buf = torch.full(
+                (max_bs,), FORCE_SINGLE_TOKEN_VERIFY, dtype=torch.bool
+            )
             self.extend_prefix_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
             self.extend_seq_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
 
@@ -296,7 +302,7 @@ class InputBuffers:
                 )
             self.force_single_token_verify_buf[
                 row_offset : row_offset + expected_count
-            ] = force_single_token
+            ] = (force_single_token | FORCE_SINGLE_TOKEN_VERIFY)
             runtime_states.remote_spec_candidate_ready[decode_req_pool_indices] = False
 
         # Decode-only fast path: one fused Triton kernel writes out_cache_loc,

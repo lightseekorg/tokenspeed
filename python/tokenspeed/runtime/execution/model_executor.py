@@ -49,7 +49,10 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.forward_thread import ForwardThread
-from tokenspeed.runtime.execution.input_buffer import InputBuffers
+from tokenspeed.runtime.execution.input_buffer import (
+    FORCE_SINGLE_TOKEN_VERIFY,
+    InputBuffers,
+)
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.nan_guard import NanGuard
@@ -818,7 +821,9 @@ class ModelExecutor:
         row_count: int,
         decode_input_ids: list[int] | None,
     ) -> torch.Tensor:
-        if decode_input_ids is None or row_count <= 0:
+        if row_count <= 0 or (
+            decode_input_ids is None and not FORCE_SINGLE_TOKEN_VERIFY
+        ):
             return accept_lengths
         force_mask = self.input_buffers.force_single_token_verify_buf[
             row_offset : row_offset + row_count
