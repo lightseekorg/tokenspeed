@@ -413,10 +413,19 @@ class KimiK3Recipe(CacheRecipe):
 
     @override
     def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        num_lcm_blocks = super().num_lcm_blocks(layout)
+        usable_bytes = self.cache_budget_bytes - self.workspace_bytes()
+        num_lcm_blocks = usable_bytes // layout.lcm_block_bytes - 1
+        if num_lcm_blocks < 1:
+            raise ValueError(
+                f"{self.family} cache budget must hold a null parent and one "
+                "usable LCM parent"
+            )
         token_limit = self.token_limit
         if token_limit is None:
             return num_lcm_blocks
+        # K3 mixes persistent MLA history with a fixed two-page working set
+        # for each KDA group.  The generic flat-packing cap is therefore not
+        # its inverse and can underallocate when DCP changes MLA packing.
         return min(num_lcm_blocks, self.parents_needed(layout, token_limit))
 
     @override
