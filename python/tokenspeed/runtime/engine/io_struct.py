@@ -856,22 +856,11 @@ class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     num_paused_requests: int | None = 0
 
 
-# Packed-tensor framing defaults. The trainer (producer) and the worker
-# (consumer) must agree on these, so they are part of the wire contract.
-DEFAULT_PACKED_BUFFER_SIZE_BYTES = 1024 * 1024 * 1024  # 1 GiB
-DEFAULT_PACKED_NUM_BUFFERS = 2
-
-
 class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     # Weight-update metadata shared with the trainer's NCCL sender.
     names: list[str]
     dtype_names: list[str]
     shapes: list[list[int]]
-    # Packed (batched small-tensor) broadcast. When True, multiple tensors are
-    # batched into shared buffers before broadcasting to cut NCCL overhead.
-    packed: bool = False
-    packed_buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES
-    packed_num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS
     group_name: str = "weight_update_group"
     flush_cache: bool = True
     # Optional: update the weight version after a successful push. When provided,
