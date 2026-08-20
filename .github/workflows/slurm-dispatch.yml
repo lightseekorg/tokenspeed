@@ -154,16 +154,23 @@ jobs:
 
           if [ "$YAML_SELECTION" != off ]; then
             args+=(--config "$YAML_SELECTION")
-            mapfile -t yaml_metadata < <(
-              python3 - "$YAML_SELECTION" "$CLUSTER" <<'PY'
+            yaml_metadata_output=$(
+              python3 - "$YAML_SELECTION" "$CLUSTER" "$PR" <<'PY'
           import sys
           from pathlib import Path
 
           sys.path.insert(0, "test/ci_system")
           from pipeline import normalize_task
+          from slurm_submit import pr_worktree
 
           repo = Path.cwd()
-          task = normalize_task(repo / sys.argv[1], repo)
+          selection = Path(sys.argv[1])
+          pr = sys.argv[3]
+          if pr:
+              with pr_worktree(repo, pr) as checkout:
+                  task = normalize_task(checkout / selection, checkout)
+          else:
+              task = normalize_task(repo / selection, repo)
           prefixes = {
               "gb200": ("b200-", "gb200-", "slurm-gb200-"),
               "gb300": ("gb300-", "slurm-gb300-"),
@@ -174,6 +181,11 @@ jobs:
                   print(label)
           PY
             )
+            mapfile -t yaml_metadata <<< "$yaml_metadata_output"
+            [[ "${yaml_metadata[0]-}" == type:* ]] || {
+              echo "Failed to read task metadata from $YAML_SELECTION" >&2
+              exit 2
+            }
             yaml_task_type="${yaml_metadata[0]#type:}"
             yaml_runners=("${yaml_metadata[@]:1}")
             ((${#yaml_runners[@]})) || {
