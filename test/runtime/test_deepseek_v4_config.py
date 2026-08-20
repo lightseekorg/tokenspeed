@@ -3095,15 +3095,18 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
 
-        backend.init_forward_metadata(
-            bs=3,
-            req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
-            seq_lens=torch.tensor([7, 10, 4], dtype=torch.int32),
-            forward_mode=ForwardMode.MIXED,
-            page_table=torch.zeros((3, 1), dtype=torch.int32),
-            extend_seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
-            num_extends=1,
-        )
+        with patch("torch.repeat_interleave", wraps=torch.repeat_interleave) as repeat:
+            backend.init_forward_metadata(
+                bs=3,
+                req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
+                seq_lens=torch.tensor([7, 10, 4], dtype=torch.int32),
+                forward_mode=ForwardMode.MIXED,
+                page_table=torch.zeros((3, 1), dtype=torch.int32),
+                extend_seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
+                num_extends=1,
+            )
+
+        self.assertEqual(repeat.call_args.kwargs["output_size"], 9)
 
         metadata = backend.forward_metadata
         self.assertIsNotNone(metadata)
@@ -4337,14 +4340,16 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
 
-        backend.init_forward_metadata(
-            bs=2,
-            num_tokens=8,
-            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
-            seq_lens=torch.tensor([70, 3], dtype=torch.int32),
-            forward_mode=ForwardMode.DECODE,
-            page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
-        )
+        with patch("torch.repeat_interleave", wraps=torch.repeat_interleave) as repeat:
+            backend.init_forward_metadata(
+                bs=2,
+                num_tokens=8,
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+                seq_lens=torch.tensor([70, 3], dtype=torch.int32),
+                forward_mode=ForwardMode.DECODE,
+                page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            )
+        self.assertEqual(repeat.call_args.kwargs["output_size"], 8)
         self.assertTrue(
             torch.equal(
                 backend.forward_metadata.query_lens,

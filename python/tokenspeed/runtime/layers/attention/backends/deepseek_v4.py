@@ -1019,17 +1019,18 @@ class DeepseekV4AttentionBackend(AttentionBackend):
 
         if num_prefill_reqs == bs:
             max_seq_len = max(prefill_seq_lens, default=0)
-        elif bs:
-            # Preserve mixed/decode sizing semantics. Those paths do not have
-            # a complete CPU sequence-length mirror.
-            max_seq_len = int(seq_lens.max().item())
+            if forward_mode is not None and forward_mode.is_extend():
+                max_seq_len += max(self.speculative_num_steps - 1, 0)
+            max_pages = (
+                max_seq_len + self.kernel_page_size - 1
+            ) // self.kernel_page_size
+        elif base_page_table is not None:
+            # Mixed and packed decode have no complete host length mirror. The
+            # kernels consume seq_lens, so retaining the live table width avoids
+            # synchronizing on CUDA max reductions just to trim a view.
+            max_pages = base_page_table.shape[1]
         else:
-            max_seq_len = 0
-        if forward_mode is not None and forward_mode.is_extend():
-            max_seq_len += max(self.speculative_num_steps - 1, 0)
-        if is_packed_decode:
-            max_seq_len += max(int(query_lens.max().item()) - 1, 0)
-        max_pages = (max_seq_len + self.kernel_page_size - 1) // self.kernel_page_size
+            max_pages = self.max_num_pages
         if base_page_table is not None:
             # The full-history group's batch-ordered table (row i == batch
             # position i); slice by batch rows directly.
@@ -1078,21 +1079,28 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 output_size=num_prefill_tokens,
             )
         else:
-            token_to_req = torch.repeat_interleave(req_ids, query_lens.clamp_min(0))
+            output_size = num_tokens
+            if num_tokens_arg is None and not isinstance(positions, torch.Tensor):
+                if query_lens_cpu is not None:
+                    output_size = sum(int(value) for value in query_lens_cpu.tolist())
             if (
                 forward_mode is not None
                 and forward_mode.is_mixed()
                 and num_tokens_arg is not None
+                and query_lens_cpu is not None
             ):
-                # numel() reads tensor shape metadata only. Reducing query_lens
-                # and calling .item() here would synchronize its CUDA stream.
-                metadata_tokens = token_to_req.numel()
+                metadata_tokens = sum(int(value) for value in query_lens_cpu.tolist())
                 if metadata_tokens != num_tokens:
                     raise RuntimeError(
                         "DeepSeek V4 mixed metadata token count mismatch: "
                         f"query_lens describe {metadata_tokens} tokens, packed input "
                         f"has {num_tokens}"
                     )
+            token_to_req = torch.repeat_interleave(
+                req_ids,
+                query_lens.clamp_min(0),
+                output_size=output_size,
+            )
         query_start_loc = torch.nn.functional.pad(
             torch.cumsum(query_lens.to(torch.int32), dim=0, dtype=torch.int32),
             (1, 0),
