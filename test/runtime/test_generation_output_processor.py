@@ -117,6 +117,30 @@ def test_mixed_forward_updates_reserve_for_decode_slots_only():
     assert reserve_events[0].reserve_num_tokens_in_next_schedule_event == 1
 
 
+def test_output_tensors_are_converted_once_per_forward():
+    class _ListOnlyTensor:
+        def __init__(self, values):
+            self.values = values
+            self.calls = 0
+
+        def tolist(self):
+            self.calls += 1
+            return self.values
+
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
+    processor.rid_to_state["decode"] = _state([5, 6, 7], computed_length=3)
+    result = _ExecutionResult()
+    result.output_tokens = _ListOnlyTensor([11, 22])
+    result.output_lengths = _ListOnlyTensor([1, 1])
+
+    processor.post_process_forward_op(_ForwardOp(), result)
+
+    assert result.output_tokens.calls == 1
+    assert result.output_lengths.calls == 1
+
+
 def test_mark_abort_notify_client_flag():
     """Pause-initiated aborts must flag the request to stream a terminating
     finish to the (passive) client; client-initiated aborts must not."""

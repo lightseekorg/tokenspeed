@@ -647,6 +647,8 @@ class OutputProcesser:
             if model_execution_results.output_nan_flags is not None
             else None
         )
+        output_lengths_list = model_execution_results.output_lengths.tolist()
+        output_tokens_list = model_execution_results.output_tokens.tolist()
         # Per-slot total prefill length as the OP sees it (C++ Request::PrefillSize()).
         # After a retract the victim's generated tokens are rebased into the
         # prefill window (RebasePrefill), so this can exceed the original prompt
@@ -654,10 +656,8 @@ class OutputProcesser:
         prefill_lengths = forward_op.prefill_lengths
         pt = 0
         for i, rid in enumerate(forward_op.request_ids):
-            output_length = model_execution_results.output_lengths[i].item()
-            model_output_ids = model_execution_results.output_tokens.tolist()[
-                pt : pt + output_length
-            ]
+            output_length = output_lengths_list[i]
+            model_output_ids = output_tokens_list[pt : pt + output_length]
             model_output_logprobs = (
                 output_logprobs_list[pt : pt + output_length]
                 if output_logprobs_list is not None
