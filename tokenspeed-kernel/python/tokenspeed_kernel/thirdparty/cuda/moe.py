@@ -144,3 +144,144 @@ def moe_finalize_fuse_shared(
         bool(enable_pdl),
     )
     return out
+
+
+def moe_pack_topk_quant_mxfp8(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare the small Kimi-K3 TRT-LLM MoE front in one CUDA launch.
+
+    Packs precomputed ``(expert_id, bf16 weight)`` pairs and quantizes the
+    3584-wide routed activations to MXFP8/UE8M0.  This preserves the model's
+    router-vs-routed-down stream overlap: the fusion runs only after those two
+    independent branches join.
+
+    Returns ``(packed_topk, hidden_states_fp8, scales_uint8)``.  The scale
+    tensor is flattened, matching FlashInfer's ``mxfp8_quantize`` result; the
+    caller may view it as ``[tokens, hidden // 32]``.
+    """
+    if (
+        hidden_states.dim() != 2
+        or hidden_states.shape[1] != 3584
+        or hidden_states.dtype != torch.bfloat16
+        or not hidden_states.is_cuda
+        or not 0 < hidden_states.shape[0] <= 64
+    ):
+        raise ValueError("prepared Kimi-K3 MoE input requires CUDA BF16 [1..64, 3584]")
+    expected_route_shape = (hidden_states.shape[0], 16)
+    if (
+        topk_ids.shape != expected_route_shape
+        or topk_ids.dtype != torch.int32
+        or topk_ids.device != hidden_states.device
+        or not topk_ids.is_contiguous()
+    ):
+        raise ValueError("topk_ids must be contiguous colocated INT32 [tokens, 16]")
+    if (
+        topk_weights.shape != expected_route_shape
+        or topk_weights.dtype != torch.bfloat16
+        or topk_weights.device != hidden_states.device
+        or not topk_weights.is_contiguous()
+    ):
+        raise ValueError("topk_weights must be contiguous colocated BF16 [tokens, 16]")
+
+    packed_topk = torch.empty_like(topk_ids)
+    hidden_states_quant = torch.empty_like(hidden_states, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(
+        hidden_states.shape[0] * (hidden_states.shape[1] // 32),
+        dtype=torch.uint8,
+        device=hidden_states.device,
+    )
+    mod = _load_moe_finalize_fuse_shared_module()
+    mod.moe_pack_topk_quant_mxfp8(
+        packed_topk,
+        hidden_states_quant,
+        scales,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+    )
+    return packed_topk, hidden_states_quant, scales
+
+
+def moe_route_pack_quant_mxfp8(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    routed_input: torch.Tensor,
+    *,
+    routed_scaling_factor: float,
+    renormalize: bool,
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Route and prepare Kimi-K3's small TRT-LLM MoE input in one launch.
+
+    One routing CTA and one MXFP8-quantization CTA run per token. The router
+    consumes a potentially strided FP32 ``[M, 896]`` view, while the quantizer
+    consumes a potentially strided FP32 or BF16 ``[M, 3584]`` view. This lets
+    both slices come directly from a wider fused projection without a copy.
+
+    Args:
+        router_logits: FP32 router logits shaped ``[M, 896]``.
+        correction_bias: FP32 expert-selection bias shaped ``[896]``.
+        routed_input: FP32 or BF16 routed activation shaped ``[M, 3584]``.
+        routed_scaling_factor: Scale applied to normalized route weights.
+        renormalize: Whether to normalize the selected sigmoid weights.
+        enable_pdl: Allow the launch to overlap scheduling with its predecessor.
+
+    Returns:
+        ``(weights_bf16, ids_int32, packed_topk, input_fp8, scales_uint8)``.
+    """
+    if (
+        router_logits.dim() != 2
+        or router_logits.shape[1] != 896
+        or router_logits.dtype != torch.float32
+        or not router_logits.is_cuda
+        or not 0 < router_logits.shape[0] <= 64
+        or router_logits.stride(1) != 1
+    ):
+        raise ValueError("router_logits must be CUDA FP32 [1..64, 896]")
+    tokens = router_logits.shape[0]
+    if (
+        correction_bias.shape != (896,)
+        or correction_bias.dtype != torch.float32
+        or correction_bias.device != router_logits.device
+        or not correction_bias.is_contiguous()
+    ):
+        raise ValueError("correction_bias must be contiguous colocated FP32 [896]")
+    if (
+        routed_input.shape != (tokens, 3584)
+        or routed_input.dtype not in (torch.float32, torch.bfloat16)
+        or routed_input.device != router_logits.device
+        or routed_input.stride(1) != 1
+    ):
+        raise ValueError(
+            "routed_input must be inner-contiguous colocated FP32/BF16 [tokens, 3584]"
+        )
+
+    topk_ids = torch.empty((tokens, 16), dtype=torch.int32, device=router_logits.device)
+    topk_weights = torch.empty(
+        (tokens, 16), dtype=torch.bfloat16, device=router_logits.device
+    )
+    packed_topk = torch.empty_like(topk_ids)
+    routed_quant = torch.empty(
+        (tokens, 3584), dtype=torch.float8_e4m3fn, device=router_logits.device
+    )
+    scales = torch.empty(
+        tokens * (3584 // 32), dtype=torch.uint8, device=router_logits.device
+    )
+    mod = _load_moe_finalize_fuse_shared_module()
+    mod.moe_route_pack_quant_mxfp8(
+        topk_weights,
+        topk_ids,
+        packed_topk,
+        routed_quant,
+        scales,
+        router_logits,
+        correction_bias,
+        routed_input,
+        float(routed_scaling_factor),
+        bool(renormalize),
+        bool(enable_pdl),
+    )
+    return topk_weights, topk_ids, packed_topk, routed_quant, scales

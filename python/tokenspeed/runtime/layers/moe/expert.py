@@ -291,6 +291,7 @@ class MoELayer(torch.nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         do_finalize: bool = True,
+        prepared_input: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         low_latency: bool | None = None,
         overlap_fn: Callable[[], None] | None = None,
     ):
@@ -303,6 +304,8 @@ class MoELayer(torch.nn.Module):
             num_global_tokens: Token count summed over the attention DP ranks.
             max_num_tokens_per_gpu: Largest per-GPU token count this forward.
             do_finalize: Whether the kernel must produce the finalized output.
+            prepared_input: Optional packed route, quantized activation, and
+                scale tensors prepared for a backend that accepts this ABI.
             low_latency: For all-to-all EP plans, whether to take the
                 latency-optimized dispatch/combine legs. Must be identical on
                 every rank of the EP group; see
@@ -334,6 +337,7 @@ class MoELayer(torch.nn.Module):
                 topk_output.router_logits,
                 topk_weights=topk_output.topk_weights,
                 topk_ids=topk_output.topk_ids,
+                prepared_input=prepared_input,
                 num_tokens_global=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 do_finalize=do_finalize,

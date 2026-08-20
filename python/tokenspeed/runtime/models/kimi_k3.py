@@ -66,6 +66,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     attnres_partial_dual,
     rmsnorm_gated_sigmoid,
     sigmoid_mul,
+    situ_and_mul,
 )
 from tokenspeed_kernel.ops.attention import mla_normalize_project_query
 from tokenspeed_kernel.ops.attn_res import attn_res_fwd, attn_res_fwd_available
@@ -82,6 +83,7 @@ from tokenspeed_kernel.ops.gemm.triton_gemv import (
     decode_gemv,
 )
 from tokenspeed_kernel.ops.moe import (
+    kimi3_route_pack_quant_mxfp8,
     latent_moe_decode_pipeline_available,
     latent_moe_input_projections,
 )
@@ -89,7 +91,7 @@ from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
     situ_moe_unavailable_reason,
 )
 from tokenspeed_kernel.ops.tuning import load_packaged_flashinfer_tuning_cache
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearConfig
@@ -121,7 +123,12 @@ from tokenspeed.runtime.layers.moe.latent import (
 )
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
-from tokenspeed.runtime.layers.moe.topk import TopK, TopKOutput, TopKOutputFormat
+from tokenspeed.runtime.layers.moe.topk import (
+    StandardTopKOutput,
+    TopK,
+    TopKOutput,
+    TopKOutputFormat,
+)
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
@@ -1675,6 +1682,60 @@ class KimiLinearMoE(nn.Module):
         )
         return router_logits, routed_input, shared_output
 
+    def _fused_front_projection(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Project multi-token router, routed, and shared inputs in one GEMM.
+
+        The three returned views retain the wide FP32 row stride. The route
+        preparation and shared SiTU kernels consume them without copies.
+        """
+        platform = current_platform()
+        packed = self.packed_input_projection_weight
+        if (
+            platform.arch_version != ArchVersion(10, 0)
+            or not get_is_capture_mode()
+            or hidden_states.shape[0] <= 1
+            or not self.execution_plan.use_trtllm
+            or packed is None
+            or hidden_states.dtype != torch.bfloat16
+        ):
+            return None
+
+        front = torch.mm(hidden_states, packed.t(), out_dtype=torch.float32)
+        router_end = self.num_experts
+        routed_end = router_end + self.routed_hidden
+        return (
+            front[:, :router_end],
+            front[:, router_end:routed_end],
+            front[:, routed_end:],
+        )
+
+    def _shared_from_fused_front(
+        self,
+        gate_up: torch.Tensor,
+        *,
+        down_out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Finish the shared-expert branch from its fused-front view."""
+        shared = self.shared_experts
+        activated = torch.empty(
+            (gate_up.shape[0], gate_up.shape[1] // 2),
+            dtype=torch.bfloat16,
+            device=gate_up.device,
+        )
+        situ_and_mul(
+            gate_up,
+            out=activated,
+            beta=shared.act_fn.beta,
+            linear_beta=shared.act_fn.linear_beta,
+        )
+        return kimi3_shared_down_projection(
+            activated,
+            shared.down_proj.weight,
+            out=down_out,
+        )
+
     def _routed_experts(
         self,
         routed_in: torch.Tensor,
@@ -1682,7 +1743,8 @@ class KimiLinearMoE(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         do_finalize: bool = True,
-    ) -> torch.Tensor:
+        prepared_input: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the precomputed-TopK SiTU MoE (TRT-LLM cubin or Hopper Marlin)."""
         plan = self.execution_plan
         if not plan.use_trtllm and not plan.use_marlin:
@@ -1696,6 +1758,7 @@ class KimiLinearMoE(nn.Module):
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
             do_finalize=do_finalize,
+            prepared_input=prepared_input,
         )
         # The kernel returns this rank's pre-reduce partial; the selected
         # tail tier owns the combining reduction.
@@ -1835,10 +1898,13 @@ class KimiLinearMoE(nn.Module):
         if num_tokens == 0:
             return prefix_sum
 
-        # Router runs uncontended on main (3us; on aux it starves to 14us
-        # under concurrent GEMMs). Topk is a single small CTA, so it overlaps
-        # down_proj from the aux stream, followed by the shared chain.
-        router_logits = self.gate(hidden_states)
+        fused_front = self._fused_front_projection(hidden_states)
+        if fused_front is None:
+            # Router runs uncontended on main. Top-k then overlaps routed-down
+            # on the auxiliary stream, followed by the shared chain.
+            router_logits = self.gate(hidden_states)
+        else:
+            router_logits, front_routed_input, front_shared_gate_up = fused_front
         plan = self.comm.plan(num_tokens, hidden_states)
         if plan.lane is not None:
             self.experts._situ_output_buffer = plan.lane[:, : self.routed_hidden]
@@ -1846,26 +1912,59 @@ class KimiLinearMoE(nn.Module):
             self.experts._situ_output_buffer = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with fork.branch():
-                topk_output = self.topk(hidden_states, router_logits)
-                if self._topk_ready is not None and fork._active:
-                    self._topk_ready.record(torch.cuda.current_stream())
-                shared_partial = self.shared_experts(
-                    hidden_states,
-                    down_out=(
-                        plan.lane[:, self.routed_hidden :]
-                        if plan.lane is not None
-                        else None
-                    ),
+                shared_out = (
+                    plan.lane[:, self.routed_hidden :]
+                    if plan.lane is not None
+                    else None
                 )
-            routed_in = decode_gemv(hidden_states, self.routed_expert_down_proj.weight)
-            if self._topk_ready is not None and fork._active:
-                self._topk_ready.wait(torch.cuda.current_stream())
+                if fused_front is None:
+                    topk_output = self.topk(hidden_states, router_logits)
+                    if self._topk_ready is not None and fork._active:
+                        self._topk_ready.record(torch.cuda.current_stream())
+                    shared_partial = self.shared_experts(
+                        hidden_states,
+                        down_out=shared_out,
+                    )
+                else:
+                    shared_partial = self._shared_from_fused_front(
+                        front_shared_gate_up,
+                        down_out=shared_out,
+                    )
+
+            prepared_input = None
+            if fused_front is None:
+                routed_in = decode_gemv(
+                    hidden_states, self.routed_expert_down_proj.weight
+                )
+                if self._topk_ready is not None and fork._active:
+                    self._topk_ready.wait(torch.cuda.current_stream())
+            else:
+                topk_weights, topk_ids, packed_topk, routed_in, routed_scales = (
+                    kimi3_route_pack_quant_mxfp8(
+                        router_logits,
+                        self.gate.e_score_correction_bias,
+                        front_routed_input,
+                        routed_scaling_factor=float(self.routed_scaling_factor),
+                        renormalize=bool(self.config.moe_renormalize),
+                        enable_pdl=True,
+                    )
+                )
+                topk_output = StandardTopKOutput(
+                    topk_weights,
+                    topk_ids,
+                    router_logits,
+                )
+                prepared_input = (packed_topk, routed_in, routed_scales)
+                # The backend dispatch key remains BF16 even though the
+                # prepared tensors replace this placeholder before execution.
+                routed_in = hidden_states.new_empty((num_tokens, self.routed_hidden))
             routed_partial = self._routed_experts(
                 routed_in,
                 topk_output,
                 num_global_tokens,
                 max_num_tokens_per_gpu,
                 do_finalize=not plan.defer_finalize,
+                prepared_input=prepared_input,
             )
             if plan.routed_in_fork:
                 # No fused collective to hide behind: reduce and project here
