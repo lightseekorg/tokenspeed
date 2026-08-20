@@ -163,9 +163,8 @@ def moe_sigmoid_bias_topk(
                 routed_scaling_factor=routed_scaling_factor,
                 normalize_topk_weights=normalize_topk_weights,
                 logical_to_physical_map=logical_to_physical_map,
+                weights_dtype=weights_dtype,
             )
-            if topk_weights.dtype != weights_dtype:
-                topk_weights = topk_weights.to(weights_dtype)
             return topk_weights, topk_ids
 
     kernel = select_kernel(
@@ -181,11 +180,10 @@ def moe_sigmoid_bias_topk(
         topk=topk,
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
+        weights_dtype=weights_dtype,
     )
     if logical_to_physical_map is not None:
         topk_ids = logical_to_physical_map[topk_ids.long()].to(torch.int32)
-    if topk_weights.dtype != weights_dtype:
-        topk_weights = topk_weights.to(weights_dtype)
     return topk_weights, topk_ids
 
 
@@ -208,6 +206,7 @@ def triton_minimax_sigmoid_bias_topk(
     topk: int,
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
+    weights_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused single-kernel routing via the minimax biased-topk Triton kernel.
 
@@ -218,6 +217,7 @@ def triton_minimax_sigmoid_bias_topk(
     """
     from tokenspeed_kernel.thirdparty.triton import minimax_biased_grouped_topk
 
+    # The kernel scales only when it renormalizes, so keep fp32 through mul_.
     topk_weights, topk_ids = minimax_biased_grouped_topk(
         router_logits,
         router_logits,
@@ -228,10 +228,11 @@ def triton_minimax_sigmoid_bias_topk(
         topk_group=1,
         num_fused_shared_experts=0,
         routed_scaling_factor=routed_scaling_factor,
-        weights_dtype=torch.float32,
+        weights_dtype=weights_dtype if normalize_topk_weights else torch.float32,
     )
     if not normalize_topk_weights:
         topk_weights.mul_(routed_scaling_factor)
+        topk_weights = topk_weights.to(weights_dtype)
     return topk_weights, topk_ids.to(torch.int32)
 
 
@@ -253,6 +254,7 @@ def torch_sigmoid_bias_topk(
     topk: int,
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
+    weights_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """PyTorch implementation matching Kimi's existing routing path."""
     scores = router_logits.sigmoid()
@@ -263,7 +265,7 @@ def torch_sigmoid_bias_topk(
     if normalize_topk_weights:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     topk_weights = topk_weights * routed_scaling_factor
-    return topk_weights.float(), topk_ids.to(torch.int32)
+    return topk_weights.to(weights_dtype), topk_ids.to(torch.int32)
 
 
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk  # noqa: E402,F401
