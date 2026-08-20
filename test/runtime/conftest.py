@@ -44,6 +44,7 @@ def kimi_recipe(
     overlap_schedule_depth: int = 0,
     speculative_algorithm: str | None = None,
     speculative_num_draft_tokens: int = 1,
+    kv_cache_dtype: torch.dtype = torch.float8_e4m3fn,
 ):
     """A Kimi-K3 recipe over the reference config, with tiny scheduler limits."""
     from types import SimpleNamespace
@@ -56,7 +57,7 @@ def kimi_recipe(
     text_config = text_config if text_config is not None else KimiLinearConfig()
     attn_config = SimpleNamespace(
         attn_tp_size=tp_size,
-        kv_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_dtype=kv_cache_dtype,
         kv_cache_quant_method=None,
         kv_lora_rank=text_config.kv_lora_rank,
         qk_rope_head_dim=text_config.qk_rope_head_dim,
