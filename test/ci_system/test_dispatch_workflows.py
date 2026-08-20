@@ -327,8 +327,7 @@ def test_kimi_k3_nvfp4_gb300_uses_pinned_local_models():
         "/models/nvidia--Kimi-K3-NVFP4/" "f8c5234a0a880bcc6cbf779a315e7ee2f405b812"
     )
     draft_path = (
-        "/models/lightseekorg--kimi-k3-dspark/"
-        "dbd305f7d6c2df88d62b101c82db6d36fa761a57"
+        "/models/Inferact--Kimi-K3-DSpark/" "cf6b8244620e7ea4b0651d214f28e89eac75bed6"
     )
     plain = load_yaml(
         REPO_ROOT / "test/ci/eval/"
