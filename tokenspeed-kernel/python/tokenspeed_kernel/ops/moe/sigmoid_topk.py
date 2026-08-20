@@ -94,16 +94,16 @@ def moe_sigmoid_bias_topk(
     platform = Platform.get()
     if (
         solution is None
-        and (platform.is_cdna4 or platform.is_nvidia)
-        and router_logits.shape == (1, 896)
+        and (platform.is_nvidia or (platform.is_cdna4 and tokens == 1))
+        and experts == 896
         and router_logits.dtype == torch.float32
         and correction_bias.dtype == torch.float32
+        and router_logits.is_cuda
+        and router_logits.is_contiguous()
+        and correction_bias.is_contiguous()
         and topk == 16
     ):
-        # The packed-key single-CTA kernel wins on both vendors for the K3
-        # decode shape: one bitonic top-16 instead of the grouped multi-pass
-        # (NVIDIA B300: 3.7us vs 7.0us for the minimax path, bit-identical
-        # selection and weights).
+        # CDNA4 retains M=1; NVIDIA runs one packed-key CTA per token.
         topk_weights, topk_ids = kimi3_sigmoid_bias_topk(
             router_logits,
             correction_bias,

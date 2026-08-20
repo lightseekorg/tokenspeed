@@ -82,12 +82,11 @@ def test_entry_point_selects_fused_kernel():
 
 @pytest.mark.parametrize("normalize", [False, True])
 @pytest.mark.parametrize("scale", [1.0, 2.5])
-def test_decode_shape_uses_lean_kernel_and_is_exact(normalize, scale):
-    """The K3 decode shape (1, 896) topk=16 takes the packed-key single-CTA
-    kernel on NVIDIA: exact expert set and weights vs torch, and CUDA-graph
-    capturable (the decode path replays it inside the step graph)."""
+@pytest.mark.parametrize("tokens", [1, 2, 16, 128])
+def test_kimi3_shape_uses_packed_key_kernel(tokens, normalize, scale):
+    """The packed-key row kernel is exact and CUDA-graph capturable."""
     torch.manual_seed(7)
-    logits = (torch.randn(1, 896, device="cuda") * 0.2).float()
+    logits = (torch.randn(tokens, 896, device="cuda") * 0.2).float()
     bias = (torch.randn(896, device="cuda") * 0.01).float()
     scores = logits.sigmoid()
     expected_ids = torch.topk(
@@ -111,20 +110,26 @@ def test_decode_shape_uses_lean_kernel_and_is_exact(normalize, scale):
     torch.cuda.synchronize()
 
     assert weights.dtype == torch.float32 and ids.dtype == torch.int32
-    assert set(ids[0].tolist()) == set(expected_ids[0].tolist())
-    expected_by_id = dict(
-        zip(expected_ids[0].tolist(), expected_weights[0].tolist(), strict=True)
-    )
-    for expert_id, weight in zip(ids[0].tolist(), weights[0].tolist(), strict=True):
-        assert weight == pytest.approx(expected_by_id[expert_id], abs=1e-5)
+    for row in range(tokens):
+        assert set(ids[row].tolist()) == set(expected_ids[row].tolist())
+        expected_by_id = dict(
+            zip(
+                expected_ids[row].tolist(),
+                expected_weights[row].tolist(),
+                strict=True,
+            )
+        )
+        for expert_id, weight in zip(
+            ids[row].tolist(), weights[row].tolist(), strict=True
+        ):
+            assert weight == pytest.approx(expected_by_id[expert_id], abs=1e-5)
 
 
 @pytest.mark.parametrize("tokens", [1, 2])
 @pytest.mark.parametrize("map_dtype", [torch.int32, torch.int64])
 def test_static_dispatch_map_and_weights_dtype(tokens, map_dtype):
     """The optional logical->physical map must translate the selected ids on
-    both the lean decode kernel (tokens=1) and the registry fallback
-    (tokens=2), and bf16 weight output must match the fp32 path."""
+    the lean decode kernel, and bf16 weight output must match the fp32 path."""
     torch.manual_seed(11)
     logits = torch.randn(tokens, 896, dtype=torch.float32, device="cuda")
     bias = torch.randn(896, dtype=torch.float32, device="cuda")
