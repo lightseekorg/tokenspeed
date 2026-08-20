@@ -178,7 +178,13 @@ class CacheRecipe(ABC):
     @property
     def num_target_layers(self) -> int:
         """Leading layers that belong to the target model."""
-        return self.model_config.num_attention_layers
+        configured = getattr(self.model_config, "num_attention_layers", None)
+        if configured is not None:
+            return int(configured)
+        # Lightweight recipe wrappers and synthetic layouts may not carry a
+        # full ModelConfig.  Their merged layer list still defines the target
+        # prefix exactly: target layers first, then draft continuation layers.
+        return len(self.layer_types) - self.num_draft_layers
 
     @property
     def num_draft_layers(self) -> int:
