@@ -2035,6 +2035,7 @@ def batched_kda_gate_precompute_kernel(
     addresses,
     rows,
     stride_fa: tl.constexpr,
+    stride_gate: tl.constexpr,
     lower_bound: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -2068,7 +2069,7 @@ def batched_kda_gate_precompute_kernel(
             fa = tl.load(f_a + row * stride_fa + o_fa).to(tl.float32)
             gate = tl.sum(wfb * fa[None, :], axis=1) + b_bias
             gate = lower_bound * tl.sigmoid(tl.exp(b_A) * gate)
-            tl.store(gate_scratch + row * HV * K + gc, gate, mask=mask_k)
+            tl.store(gate_scratch + row * stride_gate + gc, gate, mask=mask_k)
 
 
 @triton.jit
@@ -2083,6 +2084,7 @@ def batched_recurrent_kda_replay_commit_kernel(
     STRIDE_CONV: tl.constexpr,
     STRIDE_BETA: tl.constexpr,
     STRIDE_STATE: tl.constexpr,
+    STRIDE_GATE: tl.constexpr,
     CONV_WIDTH: tl.constexpr,
     LAYERS_PER_GROUP: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
@@ -2143,18 +2145,9 @@ def batched_recurrent_kda_replay_commit_kernel(
         tl.float32
     )
 
-    co = conv_pool + write_page * STRIDE_CONV
-    fq0, fq1, fq2 = s_q0, s_q1, s_q2
-    fk0, fk1, fk2 = s_k0, s_k1, s_k2
-    for i_t in range(steps):
-        tok = i_n * T + i_t
-        xq = tl.load(qkv + tok * STRIDE_QKV + qf, mask=mask_k, other=0.0).to(tl.float32)
-        xk = tl.load(qkv + tok * STRIDE_QKV + kf, mask=mask_k, other=0.0).to(tl.float32)
-        fq0, fq1, fq2 = fq1, fq2, xq
-        fk0, fk1, fk2 = fk1, fk2, xk
-
     # Keep the established BV=64 recurrence reduction order. Each program
-    # owns both V tiles sequentially, and therefore also owns its conv window.
+    # owns both V tiles sequentially. Convolution publication follows in a
+    # separate launch after every committed-window read has completed.
     for i_v in tl.range(0, K, BV, loop_unroll_factor=1):
         o_v = i_v + tl.arange(0, BV)
         mask_v = o_v < K
@@ -2233,7 +2226,7 @@ def batched_recurrent_kda_replay_commit_kernel(
                 s_v1,
                 s_v2,
                 b_h,
-                gate_scratch + tok * P + qf,
+                gate_scratch + tok * STRIDE_GATE + qf,
                 K**-0.5,
                 COMPUTE_OUT=False,
             )
@@ -2245,33 +2238,49 @@ def batched_recurrent_kda_replay_commit_kernel(
             + o_v[None, :]
         )
         tl.store(po, b_h, mask=mask_h & write_ok, eviction_policy="evict_first")
-        tl.store(
-            co + vf * (CONV_WIDTH - 1) + 0, s_v0.to(tl.bfloat16), mask=mask_v & write_ok
+
+
+@triton.jit
+def batched_kda_commit_conv_window_kernel(
+    addresses,
+    read_indices,
+    write_indices,
+    accepted_length,
+    B,
+    T: tl.constexpr,
+    STRIDE_QKV: tl.constexpr,
+    STRIDE_CONV: tl.constexpr,
+    CONV_DIM: tl.constexpr,
+    LAYERS_PER_GROUP: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Publish convolution windows after every recurrent program has read."""
+    i_l, i_n, i_cb = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    ab = i_l * 10
+    qkv = tl.load(addresses + ab).to(tl.pointer_type(tl.bfloat16))
+    conv_pool = tl.load(addresses + ab + 2).to(tl.pointer_type(tl.bfloat16))
+    group = i_l // LAYERS_PER_GROUP
+    read_page = tl.load(read_indices + group * B + i_n).to(tl.int64)
+    write_page = tl.load(write_indices + group * B + i_n).to(tl.int64)
+    steps = tl.load(accepted_length + i_n).to(tl.int32)
+    steps = tl.minimum(tl.maximum(steps, 0), T)
+    offsets = i_cb * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < CONV_DIM
+    src = conv_pool + read_page * STRIDE_CONV + offsets * 3
+    s0 = tl.load(src, mask=mask & (read_page >= 0), other=0.0)
+    s1 = tl.load(src + 1, mask=mask & (read_page >= 0), other=0.0)
+    s2 = tl.load(src + 2, mask=mask & (read_page >= 0), other=0.0)
+    for i_t in range(steps):
+        x = tl.load(
+            qkv + (i_n * T + i_t) * STRIDE_QKV + offsets,
+            mask=mask,
+            other=0.0,
         )
-        tl.store(
-            co + vf * (CONV_WIDTH - 1) + 1, s_v1.to(tl.bfloat16), mask=mask_v & write_ok
-        )
-        tl.store(
-            co + vf * (CONV_WIDTH - 1) + 2, s_v2.to(tl.bfloat16), mask=mask_v & write_ok
-        )
-    tl.store(
-        co + qf * (CONV_WIDTH - 1) + 0, fq0.to(tl.bfloat16), mask=mask_k & write_ok
-    )
-    tl.store(
-        co + qf * (CONV_WIDTH - 1) + 1, fq1.to(tl.bfloat16), mask=mask_k & write_ok
-    )
-    tl.store(
-        co + qf * (CONV_WIDTH - 1) + 2, fq2.to(tl.bfloat16), mask=mask_k & write_ok
-    )
-    tl.store(
-        co + kf * (CONV_WIDTH - 1) + 0, fk0.to(tl.bfloat16), mask=mask_k & write_ok
-    )
-    tl.store(
-        co + kf * (CONV_WIDTH - 1) + 1, fk1.to(tl.bfloat16), mask=mask_k & write_ok
-    )
-    tl.store(
-        co + kf * (CONV_WIDTH - 1) + 2, fk2.to(tl.bfloat16), mask=mask_k & write_ok
-    )
+        s0, s1, s2 = s1, s2, x
+    dst = conv_pool + write_page * STRIDE_CONV + offsets * 3
+    tl.store(dst, s0, mask=mask & (write_page >= 0))
+    tl.store(dst + 1, s1, mask=mask & (write_page >= 0))
+    tl.store(dst + 2, s2, mask=mask & (write_page >= 0))
 
 
 def batched_recurrent_kda_replay_commit(
@@ -2289,6 +2298,7 @@ def batched_recurrent_kda_replay_commit(
     f_a_stride: int,
     beta_stride: int,
     state_stride: int,
+    gate_stride: int,
     conv_width: int,
     layers_per_group: int,
     lower_bound: float,
@@ -2310,6 +2320,7 @@ def batched_recurrent_kda_replay_commit(
         addresses,
         rows,
         stride_fa=f_a_stride,
+        stride_gate=gate_stride,
         lower_bound=lower_bound,
         HV=num_heads,
         K=head_dim,
@@ -2329,6 +2340,7 @@ def batched_recurrent_kda_replay_commit(
         STRIDE_CONV=conv_stride,
         STRIDE_BETA=beta_stride,
         STRIDE_STATE=state_stride,
+        STRIDE_GATE=gate_stride,
         CONV_WIDTH=conv_width,
         LAYERS_PER_GROUP=layers_per_group,
         NUM_GROUPS=read_indices.shape[0],
@@ -2339,6 +2351,20 @@ def batched_recurrent_kda_replay_commit(
         BV=64,
         num_warps=4,
         num_stages=2,
+    )
+    batched_kda_commit_conv_window_kernel[(layers, batch, 1)](
+        addresses,
+        read_indices,
+        write_indices,
+        accepted_length,
+        batch,
+        T=draft_token_num,
+        STRIDE_QKV=qkv_stride,
+        STRIDE_CONV=conv_stride,
+        CONV_DIM=3 * num_heads * head_dim,
+        LAYERS_PER_GROUP=layers_per_group,
+        BLOCK=triton.next_power_of_2(3 * num_heads * head_dim),
+        num_warps=8,
     )
 
 

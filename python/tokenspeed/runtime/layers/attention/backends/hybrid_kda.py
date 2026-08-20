@@ -231,16 +231,24 @@ class KdaAttnBackend(MambaAttnBackend):
         if len(self._replay_descriptor_bound) == len(self._descriptor_row_by_layer):
             first = next(iter(self._replay_weights.values()))
             first_conv_w, first_f_b, _, _, first_heads, first_dim, _ = first
-            geometry = (first_heads, first_dim, first_f_b.shape[1], first_conv_w.shape[1])
+            geometry = (
+                first_heads,
+                first_dim,
+                first_f_b.shape[1],
+                first_conv_w.shape[1],
+            )
             first_layer = next(iter(self._replay_weights))
             first_conv, first_state = self._state_components(first_layer)
-            first_qkv, first_fa, first_beta, _ = self._replay_payload(first_layer)
+            first_qkv, first_fa, first_beta, first_gate = self._replay_payload(
+                first_layer
+            )
             strides = (
                 first_qkv.stride(0),
                 first_conv.stride(0),
                 first_fa.stride(0),
                 first_beta.stride(0),
                 first_state.stride(0),
+                first_gate.stride(0),
             )
             lower_bounds = set()
             for current_layer, layer_weights in self._replay_weights.items():
@@ -253,13 +261,16 @@ class KdaAttnBackend(MambaAttnBackend):
                 ) != geometry:
                     raise RuntimeError("batched KDA replay requires uniform geometry")
                 layer_conv, layer_state = self._state_components(current_layer)
-                layer_qkv, layer_fa, layer_beta, _ = self._replay_payload(current_layer)
+                layer_qkv, layer_fa, layer_beta, layer_gate = self._replay_payload(
+                    current_layer
+                )
                 if (
                     layer_qkv.stride(0),
                     layer_conv.stride(0),
                     layer_fa.stride(0),
                     layer_beta.stride(0),
                     layer_state.stride(0),
+                    layer_gate.stride(0),
                 ) != strides:
                     raise RuntimeError("batched KDA replay requires uniform strides")
                 lower_bounds.add(layer_weights[-1])
@@ -301,6 +312,7 @@ class KdaAttnBackend(MambaAttnBackend):
                         f_a_stride=strides[2],
                         beta_stride=strides[3],
                         state_stride=strides[4],
+                        gate_stride=strides[5],
                         conv_width=conv_width,
                         layers_per_group=layers_per_group,
                         lower_bound=next(iter(lower_bounds)),
@@ -362,9 +374,7 @@ class KdaAttnBackend(MambaAttnBackend):
             return super().preallocate_verify_workspace(max_bs, draft_token_num)
         self._ensure_verify_scratch(max_bs, draft_token_num)
         conv_bytes = sum(pair[0].nbytes for pair in self._verify_scratch.values())
-        payload_bytes = sum(
-            payload.nbytes for payload in (self._replay_payloads or ())
-        )
+        payload_bytes = sum(payload.nbytes for payload in (self._replay_payloads or ()))
         return conv_bytes + payload_bytes
 
     def _seed_replay_conv(self, layer_id: int, bs: int) -> None:

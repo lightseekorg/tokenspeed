@@ -129,6 +129,7 @@ def _batched_static_args(x, layers_per_group):
         f_a_stride=x["f_a"].stride(0),
         beta_stride=x["beta"].stride(0),
         state_stride=x["h_pool"].stride(0),
+        gate_stride=x["gate_scratch"].stride(0),
         conv_width=x["conv_w"].shape[1],
         layers_per_group=layers_per_group,
         lower_bound=LOWER_BOUND,
@@ -215,6 +216,92 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
     with pytest.raises(AssertionError):
         torch.testing.assert_close(
             negative[2]["h_pool"], loop[2]["h_pool"], atol=0, rtol=0
+        )
+
+
+@pytest.mark.parametrize(
+    ("accepted", "crossing"),
+    [
+        ([1, 1, 1, 1], [False, False, False, False]),
+        ([2, 3, 2, 3], [True, True, True, True]),
+        ([1, 1, 2, 3], [False, False, True, True]),
+    ],
+    ids=["in-place-only", "cross-only", "mixed-checkpoint-boundary"],
+)
+def test_batched_replay_checkpoint_boundary_matches_layer_loop(accepted, crossing):
+    """TP1 checkpoint-boundary schedule agrees with the layer-loop oracle."""
+    layers, n, t = 69, 4, 3
+    source = [_window(n, t, pages=24, seed=2701 + layer) for layer in range(layers)]
+    for x in source:
+        qkv = torch.empty(n * t, 9 * P, device=DEV, dtype=torch.bfloat16)
+        qkv[:, : 3 * P].copy_(x["qkv_raw"])
+        x["qkv_raw"] = qkv[:, : 3 * P]
+        beta = torch.empty(n * t, 3 * HV, device=DEV, dtype=torch.bfloat16)
+        beta[:, :HV].copy_(x["beta"])
+        x["beta"] = beta[:, :HV]
+        x["gate_scratch"] = torch.empty(n * t, 3 * P, device=DEV, dtype=torch.float32)[
+            :, :P
+        ]
+        pages = 24
+        page_bytes = 96 * 3 * P * 3 * torch.bfloat16.itemsize
+        arena = torch.empty(pages * page_bytes, device=DEV, dtype=torch.uint8)
+        conv_storage = arena.view(torch.bfloat16)
+        conv = torch.as_strided(
+            conv_storage, (pages, 9 * P, 3), (page_bytes // 2, 3, 1)
+        )
+        conv.zero_()
+        conv[:, : 3 * P].copy_(x["conv_pool"])
+        x["conv_pool"] = conv
+        state_storage = arena[3 * P * 3 * 2 :].view(torch.float32)
+        state = torch.as_strided(
+            state_storage,
+            (pages, 3 * HV, K, V),
+            (page_bytes // 4, K * V, V, 1),
+        )
+        state.zero_()
+        state[:, :HV].copy_(x["h_pool"])
+        x["h_pool"] = state
+    reads = torch.stack([torch.arange(2, 2 + n, device=DEV, dtype=torch.int32)] * 3)
+    crossed = torch.arange(10, 10 + n, device=DEV, dtype=torch.int32)
+    writes = torch.stack(
+        [torch.where(torch.tensor(crossing, device=DEV), crossed, reads[0])] * 3
+    ).to(torch.int32)
+    accepted_tensor = torch.tensor(accepted, device=DEV, dtype=torch.int32)
+    groups = [group for group in range(3) for _ in range(23)]
+
+    loop = []
+    for x, group in zip(source, groups, strict=True):
+        local = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in x.items()}
+        local["conv_pool"].zero_()
+        local["h_pool"].zero_()
+        local["read_indices"] = reads[group]
+        loop.append(_replay(local, writes[group], accepted_tensor, t))
+
+    batched = [
+        {k: (v.clone() if torch.is_tensor(v) else v) for k, v in x.items()}
+        for x in source
+    ]
+    for x, group in zip(batched, groups, strict=True):
+        x["conv_pool"].zero_()
+        x["h_pool"].zero_()
+        x["read_indices"] = reads[group]
+    batched_recurrent_kda_replay_commit(
+        _batched_descriptor(batched),
+        reads,
+        writes,
+        accepted_tensor,
+        draft_token_num=t,
+        num_heads=HV,
+        head_dim=K,
+        f_a_dim=D_FA,
+        **_batched_static_args(batched[0], layers_per_group=23),
+    )
+    for expected, actual in zip(loop, batched, strict=True):
+        torch.testing.assert_close(
+            actual["conv_pool"], expected["conv_pool"], atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            actual["h_pool"], expected["h_pool"], atol=1e-6, rtol=0
         )
 
 
