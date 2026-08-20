@@ -11,6 +11,10 @@ change is state I/O: instead of gather -> kernel -> scatter round-trips through
 ``at::index_elementwise``, the kernel reads ``h0_pool[read_idx]`` and writes
 ``h0_pool[write_idx]`` directly. ``write_idx < 0`` (graph padding) skips the
 store; read and write indices may differ (flat-KV page-boundary crossing).
+
+``fused_recurrent_kda_megafuse`` additionally accepts a tokenspeed-only gated
+RMSNorm epilogue (``output_gate``/``norm_weight``/``norm_eps``); with it unset
+the kernel is unchanged.
 """
 
 from __future__ import annotations
@@ -496,6 +500,7 @@ def fused_recurrent_kda_mtp(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "HAS_DT_BIAS": lambda args: args["dt_bias"] is not None,
         "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
+        "FUSE_OUTPUT_NORM": lambda args: args["gate"] is not None,
     }
 )
 @triton.jit(do_not_specialize=["N", "T"])
@@ -509,6 +514,9 @@ def fused_recurrent_kda_megafuse_fwd_kernel(
     A_log,
     dt_bias,
     o,
+    gate,  # tokenspeed extension: [T, HV*V] raw output-gate logits, or None
+    norm_w,  # tokenspeed extension: [V] gated-RMSNorm weight, or None
+    norm_eps,
     h_pool,
     read_indices,
     write_indices,
@@ -517,6 +525,7 @@ def fused_recurrent_kda_megafuse_fwd_kernel(
     stride_raw_tok: tl.constexpr,
     stride_fa_tok: tl.constexpr,
     stride_beta_tok: tl.constexpr,
+    stride_gate_tok: tl.constexpr,
     scale: tl.constexpr,
     N: tl.int64,
     T: tl.int64,
@@ -533,6 +542,7 @@ def fused_recurrent_kda_megafuse_fwd_kernel(
     IS_VARLEN: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    FUSE_OUTPUT_NORM: tl.constexpr,
 ):
     pid = tl.program_id(0)
     NV = tl.cdiv(V, BV)
@@ -675,6 +685,14 @@ def fused_recurrent_kda_megafuse_fwd_kernel(
     b_v *= b_beta
     b_h += b_k[:, None] * b_v[None, :]
     b_o = tl.sum(b_h * b_q[:, None], 0)
+    # tokenspeed extension: NV == 1, so b_o is the whole row the norm would reload.
+    if FUSE_OUTPUT_NORM:
+        b_rsig = tl.math.rsqrt(tl.sum(b_o * b_o) / V + norm_eps)
+        b_nw = tl.load(norm_w + o_v, mask=mask_v, other=0.0).to(tl.float32)
+        b_gate = tl.load(
+            gate + bos * stride_gate_tok + i_hv * V + o_v, mask=mask_v, other=0.0
+        ).to(tl.float32)
+        b_o = b_o * b_rsig * b_nw * tl.sigmoid(b_gate)
     tl.store(
         o + (bos * HV + i_hv) * V + o_v,
         b_o.to(o.dtype.element_ty),
@@ -1005,6 +1023,9 @@ def fused_recurrent_kda_megafuse(
     scale: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    output_gate: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
 ) -> torch.Tensor:
     """Single-step KDA decode with conv1d(+silu) and the f_b gate GEMV fused in.
 
@@ -1016,9 +1037,17 @@ def fused_recurrent_kda_megafuse(
         beta: ``[T, HV]`` raw logits (sigmoid in-kernel).
         h_pool / read_indices / write_indices: as in the pool kernel.
         num_heads/head_dim: per-rank head geometry (P = num_heads*head_dim).
+        output_gate: optional ``[T, HV*V]`` (or ``[T, HV, V]``) raw gate logits;
+            a row-strided slice of a wider packed projection is accepted.
+            Supplying it, with ``norm_weight`` and ``norm_eps``, folds the gated
+            RMSNorm epilogue ``rmsnorm(o)*norm_weight*sigmoid(gate)`` into this
+            kernel instead of running it as a second pass.
+        norm_weight: ``[V]`` RMSNorm weight; required with ``output_gate``.
+        norm_eps: RMSNorm epsilon; required with ``output_gate``.
 
     Returns:
-        o: ``[T, HV, V]`` attention output (bf16).
+        o: ``[T, HV, V]`` attention output (bf16), normalized and gated when
+        ``output_gate`` is given.
     """
     T = qkv_raw.shape[0]
     HV = num_heads
@@ -1028,6 +1057,24 @@ def fused_recurrent_kda_megafuse(
     if scale is None:
         scale = K**-0.5
     assert qkv_raw.stride(-1) == 1 and conv_w.is_contiguous() and w_fb.is_contiguous()
+    if (output_gate is None) != (norm_weight is None):
+        raise ValueError("output_gate and norm_weight must be given together")
+    if output_gate is not None:
+        if norm_eps is None:
+            raise ValueError("norm_eps is required with output_gate")
+        if output_gate.stride(-1) != 1 or output_gate.numel() != T * HV * V:
+            raise ValueError(
+                f"output_gate must be row-contiguous over {T * HV * V} elements, "
+                f"got shape {tuple(output_gate.shape)} stride "
+                f"{tuple(output_gate.stride())}"
+            )
+        if output_gate.dim() == 3 and output_gate.stride(1) != V:
+            raise ValueError("output_gate heads must be V-strided")
+        if norm_weight.numel() != V:
+            raise ValueError(f"norm_weight must be [{V}], got {norm_weight.shape}")
+        stride_gate_tok = output_gate.stride(0)
+    else:
+        stride_gate_tok = 0
     N = T if cu_seqlens is None else len(cu_seqlens) - 1
     out = torch.empty(T, HV, V, dtype=qkv_raw.dtype, device=qkv_raw.device)
     # One program per (request, head): NV == 1 leaves the q/k taps unshared.
@@ -1043,6 +1090,10 @@ def fused_recurrent_kda_megafuse(
         A_log=A_log,
         dt_bias=dt_bias,
         o=out,
+        gate=output_gate,
+        norm_w=norm_weight,
+        norm_eps=0.0 if norm_eps is None else norm_eps,
+        stride_gate_tok=stride_gate_tok,
         h_pool=h_pool,
         read_indices=read_indices,
         write_indices=write_indices,

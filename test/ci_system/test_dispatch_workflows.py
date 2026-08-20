@@ -13,7 +13,7 @@ SLURM_RUNNER_PREFIXES = (
     "gb200-",
     "slurm-b200-",
     "slurm-gb200-",
-    "slurm-b300-",
+    "slurm-gb300-",
 )
 
 
@@ -145,16 +145,19 @@ def test_slurm_dispatch_routes_gb300_to_its_coordinator():
 
 
 @pytest.mark.parametrize("runners", ["b200-4gpu,gb200-4gpu", "b200-4gpu, gb200-4gpu"])
-def test_slurm_dispatch_uses_optional_gb300_alias_and_shared_paths(tmp_path, runners):
+def test_slurm_dispatch_uses_declared_gb300_runner_and_shared_paths(tmp_path, runners):
     result = run_slurm_dispatch_script(
         tmp_path,
         CLUSTER="gb300",
-        YAML_SELECTION="test/ci/ut/ut-tokenspeed-kernel.yaml",
+        YAML_SELECTION=(
+            "test/ci/eval/"
+            "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
+        ),
         RUNNERS=runners,
     )
 
     assert result.returncode == 0, result.stderr
-    assert "arg=--runner-alias\narg=b300-1gpu=gb300-1gpu\n" in result.stdout
+    assert "arg=--runner\narg=slurm-gb300-4gpu\n" in result.stdout
     assert "arg=b200-4gpu" not in result.stdout
     assert "arg=gb200-4gpu" not in result.stdout
     assert "artifact=/data/home/test-coordinator/tokenspeed-slurm" in result.stdout
@@ -175,7 +178,10 @@ def test_slurm_dispatch_resolves_missing_coordinator_user(tmp_path):
     result = run_slurm_dispatch_script(
         tmp_path,
         CLUSTER="gb300",
-        YAML_SELECTION="test/ci/ut/ut-tokenspeed-kernel.yaml",
+        YAML_SELECTION=(
+            "test/ci/eval/"
+            "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
+        ),
         USER="",
     )
     coordinator_user = subprocess.run(
@@ -191,7 +197,10 @@ def test_slurm_dispatch_rejects_runner_for_another_cluster(tmp_path):
     result = run_slurm_dispatch_script(
         tmp_path,
         CLUSTER="gb300",
-        YAML_SELECTION="test/ci/ut/ut-tokenspeed-kernel.yaml",
+        YAML_SELECTION=(
+            "test/ci/eval/"
+            "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
+        ),
         RUNNERS="b200-4gpu",
     )
 
@@ -199,19 +208,33 @@ def test_slurm_dispatch_rejects_runner_for_another_cluster(tmp_path):
     assert "Runner b200-4gpu is not supported by the GB300 cluster" in result.stderr
 
 
-def test_slurm_dispatch_accepts_one_explicit_matching_gb300_runner(tmp_path):
+def test_slurm_dispatch_rejects_b300_yaml_for_gb300_cluster(tmp_path):
     result = run_slurm_dispatch_script(
         tmp_path,
         CLUSTER="gb300",
         YAML_SELECTION="test/ci/ut/ut-tokenspeed-kernel.yaml",
-        RUNNERS="gb300-1gpu",
+    )
+
+    assert result.returncode == 2
+    assert "No supported Slurm runners declared" in result.stderr
+
+
+def test_slurm_dispatch_accepts_one_explicit_matching_gb300_runner(tmp_path):
+    result = run_slurm_dispatch_script(
+        tmp_path,
+        CLUSTER="gb300",
+        YAML_SELECTION=(
+            "test/ci/eval/"
+            "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
+        ),
+        RUNNERS="slurm-gb300-4gpu",
     )
 
     assert result.returncode == 0, result.stderr
-    assert "arg=--runner-alias\narg=b300-1gpu=gb300-1gpu\n" in result.stdout
+    assert "arg=--runner\narg=slurm-gb300-4gpu\n" in result.stdout
 
 
-def test_slurm_dispatch_maps_multi_node_b300_runner(tmp_path):
+def test_slurm_dispatch_passes_multi_node_gb300_runner_unchanged(tmp_path):
     result = run_slurm_dispatch_script(
         tmp_path,
         CLUSTER="gb300",
@@ -222,16 +245,15 @@ def test_slurm_dispatch_maps_multi_node_b300_runner(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert (
-        "arg=--runner-alias\n" "arg=slurm-b300-4gpu=slurm-gb300-4gpu\n" in result.stdout
-    )
+    assert "arg=--runner\narg=slurm-gb300-4gpu\n" in result.stdout
+    assert "runner-alias" not in result.stdout
 
 
 @pytest.mark.parametrize(
     ("runners", "message"),
     [
-        ("gb300-4gpu", "does not match"),
-        ("gb300-1gpu,gb300-1gpu", "exactly one explicit runner"),
+        ("gb300-4gpu", "is not declared"),
+        ("slurm-gb300-4gpu,slurm-gb300-4gpu", "exactly one explicit runner"),
     ],
 )
 def test_slurm_dispatch_rejects_mismatched_or_multiple_gb300_runners(
@@ -240,7 +262,10 @@ def test_slurm_dispatch_rejects_mismatched_or_multiple_gb300_runners(
     result = run_slurm_dispatch_script(
         tmp_path,
         CLUSTER="gb300",
-        YAML_SELECTION="test/ci/ut/ut-tokenspeed-kernel.yaml",
+        YAML_SELECTION=(
+            "test/ci/eval/"
+            "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
+        ),
         RUNNERS=runners,
     )
 
@@ -255,9 +280,9 @@ def test_slurm_dispatch_requires_explicit_yaml_for_gb300(tmp_path):
     assert "GB300 requires an explicit YAML selection" in result.stderr
 
 
-def test_slurm_dispatch_rejects_ambiguous_b300_runner(tmp_path):
+def test_slurm_dispatch_rejects_ambiguous_gb300_runner(tmp_path):
     task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel.yaml")
-    task["runner"]["labels"] = ["b300-1gpu", "b300-4gpu"]
+    task["runner"]["labels"] = ["gb300-1gpu", "gb300-4gpu"]
     config = tmp_path / "ambiguous.yaml"
     config.write_text(yaml.safe_dump(task))
 
@@ -269,15 +294,16 @@ def test_slurm_dispatch_rejects_ambiguous_b300_runner(tmp_path):
     )
 
     assert result.returncode == 2
-    assert "exactly one declared [slurm-]b300-* runner" in result.stderr
+    assert "exactly one declared [slurm-]gb300-* runner" in result.stderr
 
 
-def test_default_task_matrices_do_not_declare_gb300():
-    labels = []
+def test_only_dedicated_task_declares_gb300():
+    configs = []
     for path in (REPO_ROOT / "test/ci").rglob("*.yaml"):
-        labels.extend(load_yaml(path)["runner"]["labels"])
+        if any("gb300-" in label for label in load_yaml(path)["runner"]["labels"]):
+            configs.append(path.name)
 
-    assert not any(label.startswith("gb300-") for label in labels)
+    assert configs == ["kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"]
 
 
 def test_kimi_k3_gb300_is_two_node_per_commit_tp8():
@@ -287,7 +313,7 @@ def test_kimi_k3_gb300_is_two_node_per_commit_tp8():
     )
 
     assert task["triggers"] == ["per-commit"]
-    assert task["runner"]["labels"] == ["slurm-b300-4gpu"]
+    assert task["runner"]["labels"] == ["slurm-gb300-4gpu"]
     assert task["slurm"] == {"nodes": 2, "gpus_per_node": 4}
     assert "--tensor-parallel-size 8" in task["server"]["command"]
 
@@ -310,16 +336,24 @@ def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
         for step in submit["steps"]
         if step.get("name") == "Submit and wait for GB300 Slurm task"
     )
+    checkout = next(
+        step for step in submit["steps"] if step.get("name") == "Checkout dispatcher"
+    )
 
     assert set(triggers) == {"push", "pull_request"}
     assert submit["runs-on"] == "slurm-dispatch-gb300"
     assert workflow["concurrency"]["cancel-in-progress"] == (
         "${{ github.event_name == 'pull_request' }}"
     )
-    assert "--runner-alias" in submit_script
-    assert "--pr" in submit_script
+    assert '--runner "$RUNNER"' in submit_script
+    assert "--runner-alias" not in submit_script
+    assert '--source-pr "$PR_NUMBER"' in submit_script
+    assert '--pr "$PR_NUMBER"' not in submit_script
     assert "secrets.HF_TOKEN" not in str(submit)
     assert "unset HF_TOKEN HUGGING_FACE_HUB_TOKEN" in submit_script
+    assert checkout["with"]["ref"] == "${{ github.sha }}"
+    assert checkout["with"]["fetch-depth"] == 0
+    assert checkout["with"]["persist-credentials"] is False
     assert "github.repository == 'lightseekorg/tokenspeed'" in gate["env"]["ALLOWED"]
     assert "github.event.pull_request.draft == false" in gate["env"]["ALLOWED"]
     assert (
@@ -363,7 +397,7 @@ def test_gb300_slurm_per_commit_matrix_selects_kimi_k3(monkeypatch):
                 "test/ci/eval/"
                 "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
             ),
-            "runner": "slurm-b300-4gpu",
+            "runner": "slurm-gb300-4gpu",
             "priority": "normal",
             "optional": False,
             "workflow_stage": "model-test",

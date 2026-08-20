@@ -667,12 +667,12 @@ def _prepare_verify_workspace(
     config,
     backend,
     draft_backend,
-    is_qwen_gdn: bool,
+    uses_paged_state_verify: bool,
     is_inkling: bool,
     expected_bytes: int,
 ) -> None:
-    if is_qwen_gdn and expected_bytes:
-        model_name = "GDN"
+    if uses_paged_state_verify and expected_bytes:
+        model_name = "paged-state"
         actual_bytes = backend.linear_attn_backend.preallocate_verify_workspace(
             config.max_bs,
             int(server_args.speculative_num_draft_tokens),
@@ -968,7 +968,7 @@ def create_attn_components(
         config=config,
         backend=backend,
         draft_backend=draft_attn_backend,
-        is_qwen_gdn=use_cache_gdn,
+        uses_paged_state_verify=use_cache_gdn or use_cache_k3,
         is_inkling=use_cache_inkling,
         expected_bytes=fixed_workspace_bytes,
     )

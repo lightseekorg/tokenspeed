@@ -82,8 +82,7 @@ def test_fused_mla_kv_write_is_not_amd_only():
     assert supports_fused_mla_kv_write(
         q_dtype=torch.bfloat16,
         k_dtype=torch.bfloat16,
-        head_size=64,
-        rotary_dim=64,
+        has_rope=True,
         is_neox=False,
     ), "no registered kernel offers the fused MLA KV write on this platform"
 

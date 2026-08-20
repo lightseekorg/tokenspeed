@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from pipeline import build_matrix, normalize_task, validate_gb300_runner_alias
+from pipeline import build_matrix, normalize_task
 
 GPU_RE = re.compile(r"(?:^|-)([1-9]\d*)gpu(?:-|$)")
 TASK_TYPES = {"ut", "server_smoke", "eval", "perf"}
@@ -56,7 +56,6 @@ class Task:
     runner: str
     gpus: int
     nodes: int = 1
-    declared_runner: str | None = None
 
 
 @dataclass(frozen=True)
@@ -77,7 +76,6 @@ def load_task(
     repo: Path,
     config: str,
     runner: str | None = None,
-    effective_runner: str | None = None,
 ) -> Task:
     path = (repo / config).resolve()
     try:
@@ -94,11 +92,6 @@ def load_task(
         runner = labels[0]
     if runner not in labels:
         raise ValueError(f"{runner!r} is not declared by {relative}")
-    declared_runner = runner
-    if effective_runner is not None:
-        if data["type"] == "perf":
-            raise ValueError("runner aliases are not supported for perf tasks")
-        runner = validate_gb300_runner_alias(declared_runner, effective_runner)
     gpus = gpu_count(runner)
     slurm = data.get("slurm", {})
     nodes = int(slurm.get("nodes", 1))
@@ -108,22 +101,7 @@ def load_task(
             f"{relative}: slurm.gpus_per_node={gpus_per_node} does not match "
             f"runner {runner!r} ({gpus} GPUs)"
         )
-    return Task(
-        relative,
-        str(data["name"]),
-        str(data["type"]),
-        runner,
-        gpus,
-        nodes,
-        declared_runner if effective_runner is not None else None,
-    )
-
-
-def parse_runner_alias(value: str) -> tuple[str, str]:
-    declared, separator, effective = value.partition("=")
-    if not separator or not declared or not effective:
-        raise ValueError("--runner-alias must be DECLARED=EFFECTIVE")
-    return declared, effective
+    return Task(relative, str(data["name"]), str(data["type"]), runner, gpus, nodes)
 
 
 def task_matches(repo: Path, task: Task, patterns: list[str]) -> bool:
@@ -140,7 +118,6 @@ def task_matches(repo: Path, task: Task, patterns: list[str]) -> bool:
 
 def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
     runners = args.runner or []
-    runner_aliases = getattr(args, "runner_alias", None) or []
     task_types = set(args.task_types or DEFAULT_TASK_TYPES)
     patterns = args.match or []
     excluded_patterns = getattr(args, "exclude_match", None) or []
@@ -151,19 +128,11 @@ def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
         )
 
     if args.config:
-        if runners and runner_aliases:
-            raise ValueError("--runner and --runner-alias cannot be combined")
-        if runner_aliases:
-            tasks = [
-                load_task(repo, args.config, *parse_runner_alias(value))
-                for value in runner_aliases
-            ]
-        else:
-            tasks = (
-                [load_task(repo, args.config, runner) for runner in runners]
-                if runners
-                else [load_task(repo, args.config)]
-            )
+        tasks = (
+            [load_task(repo, args.config, runner) for runner in runners]
+            if runners
+            else [load_task(repo, args.config)]
+        )
         tasks = [
             task
             for task in tasks
@@ -172,8 +141,6 @@ def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
         if not tasks:
             raise ValueError("the selected config does not match the task filters")
         return tasks
-    if runner_aliases:
-        raise ValueError("--runner-alias requires --config")
     if not runners:
         raise ValueError("--all requires --runner")
     matrix = build_matrix(repo / "test/ci", repo, args.trigger, "all", None, "all")
@@ -236,9 +203,15 @@ def print_target(repo: Path, source_pr: str | None, test_commit: str) -> None:
     url = source_pr_url(source_pr)
     if url is not None:
         print(f"Link: {url}", flush=True)
-    print(f"Target commit: {git(repo, 'rev-parse', 'HEAD^2')}", flush=True)
+    try:
+        target_commit = git(repo, "rev-parse", "HEAD^2")
+        base_commit = git(repo, "rev-parse", "HEAD^1")
+    except subprocess.CalledProcessError:
+        print(f"Target commit: {test_commit}", flush=True)
+        return
+    print(f"Target commit: {target_commit}", flush=True)
     print(f"Merged test commit: {test_commit}", flush=True)
-    print(f"Base commit: {git(repo, 'rev-parse', 'HEAD^1')}", flush=True)
+    print(f"Base commit: {base_commit}", flush=True)
 
 
 @contextlib.contextmanager
@@ -304,13 +277,16 @@ def snapshot(repo: Path, artifact_root: Path, commit: str) -> Path:
         raise ValueError("commit tracked changes before submitting")
     target = artifact_root / "snapshots" / f"{commit}.tar"
     target.parent.mkdir(parents=True, exist_ok=True)
-    if not target.exists():
-        temporary = target.with_suffix(f".{os.getpid()}.tmp")
-        subprocess.run(
-            ["git", "-C", str(repo), "archive", f"--output={temporary}", commit],
-            check=True,
-        )
-        temporary.replace(target)
+    handle, temporary_name = tempfile.mkstemp(
+        dir=target.parent, prefix=f"{commit}.", suffix=".tmp"
+    )
+    os.close(handle)
+    temporary = Path(temporary_name)
+    subprocess.run(
+        ["git", "-C", str(repo), "archive", f"--output={temporary}", commit],
+        check=True,
+    )
+    temporary.replace(target)
     return target
 
 
@@ -331,13 +307,11 @@ def render_script(
         "test/ci_system/pipeline.py",
         "execute",
         f"--config={task.config}",
-        f"--runner={task.declared_runner or task.runner}",
+        f"--runner={task.runner}",
         "--work-dir=/workspace",
         "--setup-mode=slurm",
         "--print-plan",
     ]
-    if task.declared_runner is not None:
-        pipeline.append(f"--runner-override={task.runner}")
     bootstrap = (
         'export LD_LIBRARY_PATH="/opt/tokenspeed-cuda-runtime'
         '${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"; '
@@ -363,7 +337,17 @@ def render_script(
         "SLURM_PROCID,SLURM_LOCALID",
     ]
     gpu_device_mounts = ""
+    local_model_mounts = ""
     if task.runner.startswith(("gb300-", "slurm-gb300-")):
+        local_model_mounts = r"""
+# GB300 nodes keep large model snapshots on their local RAID.  Keep the
+# source configurable for other coordinators while exposing one stable path
+# to server containers.
+local_model_root="${TS_CI_LOCAL_MODEL_ROOT:-/scratch/${USER}-models}"
+if [ -d "$local_model_root" ]; then
+  model_mounts+=("$local_model_root:/models:ro")
+fi
+"""
         gpu_device_mounts = r"""
 # The GB300 Pyxis hook does not expose allocated device nodes.
 gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"
@@ -421,8 +405,10 @@ mounts=(
   "$run:/workspace/.ci-artifacts"
   {shlex.quote(str(cache) + ":/home/runner/.cache")}
 )
+model_mounts=()
 gpu_mounts=()
 
+{local_model_mounts}
 {gpu_device_mounts}
 
 # The cluster Pyxis hooks omit driver libraries and tools.
@@ -464,7 +450,7 @@ nvidia_smi="$(command -v nvidia-smi 2>/dev/null || true)"
 trap 'rm -rf -- "$scratch"' EXIT
 mkdir -p "$src/.ci-artifacts" "$tmp"
 tar -xf "$source_archive" -C "$src"
-mounts=("$src:/workspace" "$tmp:/tmp" "${{gpu_mounts[@]}}" "${{mounts[@]}}")
+mounts=("$src:/workspace" "$tmp:/tmp" "${{gpu_mounts[@]}}" "${{model_mounts[@]}}" "${{mounts[@]}}")
 container_mounts="$(IFS=,; printf '%s' "${{mounts[*]}}")"
 {shell_array("srun_args", srun)}
 srun_args+=(--container-mounts="$container_mounts")
@@ -553,7 +539,7 @@ client_src="$scratch/client-src"
 server_tmp="$scratch/server-tmp"
 client_tmp="$scratch/client-tmp"
 # Full-node server allocations use the same GPU device IDs on every node.
-server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" "${{gpu_mounts[@]}}" "${{mounts[@]}}")
+server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" "${{gpu_mounts[@]}}" "${{model_mounts[@]}}" "${{mounts[@]}}")
 client_mounts=("$client_src:/workspace" "$client_tmp:/tmp" "${{mounts[@]}}")
 server_container_mounts="$(IFS=,; printf '%s' "${{server_mounts[*]}}")"
 client_container_mounts="$(IFS=,; printf '%s' "${{client_mounts[*]}}")"
@@ -903,8 +889,6 @@ def write_report(
         row = {
             "job_id": submission.job_id,
             "task": {
-                # Keep the public report schema stable; declared_runner is
-                # internal selection metadata for an effective alias.
                 "config": submission.task.config,
                 "name": submission.task.name,
                 "task_type": submission.task.task_type,
@@ -1011,14 +995,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     source.add_argument("--all", action="store_true")
     parser.add_argument("--runner", action="append")
     parser.add_argument(
-        "--runner-alias",
-        action="append",
-        help=(
-            "Slurm-only declared/effective runner pair: "
-            "[slurm-]b300-Ngpu=[slurm-]gb300-Ngpu."
-        ),
-    )
-    parser.add_argument(
         "--type", dest="task_types", action="append", choices=sorted(TASK_TYPES)
     )
     parser.add_argument(
@@ -1031,7 +1007,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         action="append",
         help="Exclude a case-insensitive task/config/model substring; repeat for OR.",
     )
-    parser.add_argument("--pr", help="PR number or GitHub pull request URL to merge.")
+    pull_request = parser.add_mutually_exclusive_group()
+    pull_request.add_argument(
+        "--pr", help="PR number or GitHub pull request URL to merge."
+    )
+    pull_request.add_argument(
+        "--source-pr",
+        help="PR number or GitHub pull request URL for the current checkout.",
+    )
     parser.add_argument("--list", action="store_true", help="List matching tasks only.")
     parser.add_argument(
         "--trigger", choices=("per-commit", "manual", "nightly", "debug", "slurm")
@@ -1075,7 +1058,8 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
         print_tasks(tasks)
         return 0
     commit = git(repo, "rev-parse", "HEAD")
-    print_target(repo, args.pr, commit)
+    source_pr = args.pr or args.source_pr
+    print_target(repo, source_pr, commit)
     print(f"Selected tasks: {len(tasks)}", flush=True)
     for task in tasks:
         print(
@@ -1107,7 +1091,7 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
             else artifact_root / "reports" / f"{commit[:12]}-{time.time_ns()}"
         )
         completed = wait_all(
-            submitted, artifact_root / "runs", report_dir, source_pr=args.pr
+            submitted, artifact_root / "runs", report_dir, source_pr=source_pr
         )
         print(f"Report: {report_dir}", flush=True)
         return 0 if completed else 1

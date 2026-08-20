@@ -95,6 +95,10 @@ ts = "tokenspeed.cli:main"
 [project.urls]
 "Homepage" = "https://github.com/lightseekorg/tokenspeed"
 
+[project.optional-dependencies]
+# Capped: 0.1.9 clones internally, so a release that stops would alias silently.
+instanttensor = ["instanttensor>=0.1.9,<0.2"]
+
 [tool.setuptools]
 license-files = ["LICENSE", "THIRDPARTYNOTICES"]
 

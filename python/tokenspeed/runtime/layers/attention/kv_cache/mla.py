@@ -47,6 +47,10 @@ def _get_tensor_size_bytes(t: torch.Tensor | list[torch.Tensor]):
 
 
 class MLATokenToKVPool(CachePool):
+    #: ``set_mla_kv_buffer``'s ``sanitize`` default; declared, not overridden,
+    #: so the fused MLA write gate's method-identity check still admits a pool.
+    latent_write_sanitizes: ClassVar[bool] = False
+
     def __init__(
         self,
         arena: CacheArena,
@@ -170,8 +174,10 @@ class MLATokenToKVPool(CachePool):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
-        sanitize: bool = False,
+        sanitize: bool | None = None,
     ):
+        if sanitize is None:
+            sanitize = self.latent_write_sanitizes
         layer_id = layer.layer_id
         if self.quant_method == "per_token_head":
             # Preserve the writer's sanitization contract for the quantized

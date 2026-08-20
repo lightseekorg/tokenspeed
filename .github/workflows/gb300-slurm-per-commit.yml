@@ -127,37 +127,37 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.scan.outputs.matrix || '{"include":[]}') }}
     steps:
-      - name: Checkout trusted dispatcher
+      - name: Checkout dispatcher
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && 'main' || github.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Submit and wait for GB300 Slurm task
         env:
           CONFIG: ${{ matrix.config }}
-          DECLARED_RUNNER: ${{ matrix.runner }}
+          RUNNER: ${{ matrix.runner }}
           TASK_TYPE: ${{ matrix.type }}
           PR_NUMBER: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
         run: |
           set -euo pipefail
           unset HF_TOKEN HUGGING_FACE_HUB_TOKEN
-          case "$DECLARED_RUNNER" in
-            slurm-b300-*) effective_runner="slurm-gb300-${DECLARED_RUNNER#slurm-b300-}" ;;
-            *) echo "Unsupported GB300 Slurm runner: $DECLARED_RUNNER" >&2; exit 2 ;;
+          case "$RUNNER" in
+            slurm-gb300-*) ;;
+            *) echo "Unsupported GB300 Slurm runner: $RUNNER" >&2; exit 2 ;;
           esac
           coordinator_user=${USER:-$(id -un)}
           export TS_CI_ARTIFACT_ROOT="/data/home/$coordinator_user/tokenspeed-slurm"
           export TS_CI_CACHE_DIR="/data/home/$coordinator_user/tokenspeed-cache"
           args=(
             --config "$CONFIG"
-            --runner-alias "$DECLARED_RUNNER=$effective_runner"
+            --runner "$RUNNER"
             --type "$TASK_TYPE"
             --wait
             --report-dir "$RUNNER_TEMP/slurm-report"
           )
-          [ -z "$PR_NUMBER" ] || args+=(--pr "$PR_NUMBER")
+          [ -z "$PR_NUMBER" ] || args+=(--source-pr "$PR_NUMBER")
           exec test/ci/run_slurm.sh "${args[@]}"
 
       - name: Publish job summary

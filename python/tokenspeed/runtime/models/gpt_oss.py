@@ -725,17 +725,18 @@ class GptOssForCausalLM(BaseCausalLM):
         }
 
     def _load_mxfp4_weights(self, weights, weight_name_mapping: dict):
-
-        mxfp4_weights = []
+        # Stream experts; buffering them pins most of the checkpoint on the GPU.
         normal_weights = []
 
-        for name, weight in weights:
-            if ".experts" in name:
-                mxfp4_weights.append((name, weight))
-            else:
-                normal_weights.append((name, weight))
+        def expert_weights():
+            for name, weight in weights:
+                if ".experts" in name:
+                    yield name, weight
+                else:
+                    normal_weights.append((name, weight))
 
-        mxfp4_loaded_params = self._load_mxfp4_experts_weights(mxfp4_weights)
+        # Draining the generator is what fills ``normal_weights``.
+        mxfp4_loaded_params = self._load_mxfp4_experts_weights(expert_weights())
         self._load_normal_weights(
             normal_weights,
             weight_name_mapping=weight_name_mapping,
@@ -781,27 +782,23 @@ class GptOssForCausalLM(BaseCausalLM):
                 )
                 param.data[slices].copy_(narrow_weight[slices])
 
-        # Detect AMD-Quark per-expert checkpoints (e.g.
-        # ``amd/gpt-oss-120b-w-mxfp4-a-fp8``). These store one set of tensors
-        # per expert (``...experts.{e}.gate_up_proj.{weight,...}``) plus a
-        # scalar ``input_scale`` for static FP8 activation quantization.
-        if any(
-            re.search(r"\.experts\.\d+\.(gate_up_proj|down_proj)\.", n)
-            for n, _ in weights
-        ):
-            return self._load_mxfp4_per_expert_weights(
-                weights,
-                params_dict=params_dict,
-                moe_tp_rank_start=moe_tp_rank_start,
-                moe_tp_rank_end=moe_tp_rank_end,
-                moe_ep_rank_start=moe_ep_rank_start,
-                moe_ep_rank_end=moe_ep_rank_end,
-                moe_tp_rank=moe_tp_rank,
-                copy_into_param=_copy_into_param,
-                mxfp4_block=mxfp4_block,
-            )
+        # Route per name: probing would consume the stream and drop a layout.
+        per_expert_re = re.compile(r"\.experts\.\d+\.(gate_up_proj|down_proj)\.")
 
         for name, weight in weights:
+            if per_expert_re.search(name):
+                loaded_params |= self._load_mxfp4_per_expert_weights(
+                    [(name, weight)],
+                    params_dict=params_dict,
+                    moe_tp_rank_start=moe_tp_rank_start,
+                    moe_tp_rank_end=moe_tp_rank_end,
+                    moe_ep_rank_start=moe_ep_rank_start,
+                    moe_ep_rank_end=moe_ep_rank_end,
+                    moe_tp_rank=moe_tp_rank,
+                    copy_into_param=_copy_into_param,
+                    mxfp4_block=mxfp4_block,
+                )
+                continue
             weight = _WeightCreator.maybe_materialize(weight)
 
             if "gate_up_proj_blocks" in name:

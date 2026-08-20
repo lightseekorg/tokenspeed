@@ -545,3 +545,13 @@ def test_rope_mla_quantize(
     assert key_fp8.dtype == torch.float8_e4m3fn
     torch.testing.assert_close(query_fp8.float(), q_ref.float(), rtol=0, atol=0.5)
     torch.testing.assert_close(key_fp8.float(), k_ref.float(), rtol=0, atol=0.5)
+
+
+def test_fused_mla_entry_points_are_exported():
+    """The fused MLA write is the supported dispatch path for a cross-package
+    caller, so it has to be reachable through the module's export list."""
+    import tokenspeed_kernel.ops.embedding as embedding
+
+    for name in ("apply_rope_mla_set_kv", "supports_fused_mla_kv_write"):
+        assert name in embedding.__all__, name
+        assert hasattr(embedding, name)

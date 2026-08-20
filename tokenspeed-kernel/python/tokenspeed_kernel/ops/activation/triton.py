@@ -932,6 +932,7 @@ def _rmsnorm_gated_kernel(
     weight_ptr,
     out_ptr,
     eps,
+    gate_stride,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -945,7 +946,8 @@ def _rmsnorm_gated_kernel(
     var = tl.sum(x * x, axis=1) / head_dim
     rsig = tl.math.rsqrt(var + eps)
     w = tl.load(weight_ptr + offs_d).to(tl.float32)
-    g = tl.load(gate_ptr + idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
+    gate_idx = token * gate_stride + offs_h[:, None] * head_dim + offs_d[None, :]
+    g = tl.load(gate_ptr + gate_idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
     y = x * rsig[:, None] * w[None, :] * tl.sigmoid(g)
     tl.store(out_ptr + idx, y.to(out_ptr.dtype.element_ty), mask=mask_h[:, None])
 
@@ -962,7 +964,7 @@ def rmsnorm_gated_sigmoid(
 
     Args:
         x: ``[num_tokens, num_heads*head_dim]`` bf16 input (contiguous).
-        gate: same shape as ``x``; raw gate logits (sigmoid applied in-kernel).
+        gate: same shape as ``x`` with unit inner stride; raw gate logits.
         weight: ``[head_dim]`` RMSNorm weight.
         eps: RMSNorm epsilon.
         num_heads / head_dim: per-head norm geometry.
@@ -970,7 +972,7 @@ def rmsnorm_gated_sigmoid(
     Returns:
         ``[num_tokens, num_heads*head_dim]`` tensor of ``x``'s dtype.
     """
-    assert x.is_contiguous() and gate.is_contiguous()
+    assert x.is_contiguous() and gate.shape == x.shape and gate.stride(-1) == 1
     out = torch.empty_like(x)
     _rmsnorm_gated_kernel[(x.shape[0],)](
         x,
@@ -978,6 +980,7 @@ def rmsnorm_gated_sigmoid(
         weight,
         out,
         eps,
+        gate.stride(0),
         num_heads=num_heads,
         head_dim=head_dim,
         BLOCK_H=triton.next_power_of_2(num_heads),
