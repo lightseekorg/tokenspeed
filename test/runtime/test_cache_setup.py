@@ -309,7 +309,9 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
 
 @pytest.mark.parametrize(
     ("replay_enabled", "replay_supported", "expected_workspace_bytes"),
-    ((False, True, 192), (True, False, 192), (True, True, 64)),
+    # Replay: 64 conv staging bytes plus the captured payload (6 rows of 4
+    # bf16 channels) and the fp32 A_log/dt_bias pair -- 64 + 48 + 8.
+    ((False, True, 192), (True, False, 192), (True, True, 120)),
 )
 def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     monkeypatch,

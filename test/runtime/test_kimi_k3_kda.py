@@ -80,6 +80,7 @@ def _backend_config(device: str, *, spec_tokens: int = 1) -> SimpleNamespace:
         head_dim=128,
         is_draft=False,
         speculative_num_draft_tokens=spec_tokens,
+        max_bs=8,
     )
 
 
@@ -412,6 +413,14 @@ class _KDAHarness:
         if extend_prefix_lens is not None:
             kwargs["extend_prefix_lens"] = torch.tensor(
                 extend_prefix_lens, dtype=torch.int32, device=self.device
+            )
+        if mode.is_extend_or_mixed():
+            # The executor guarantees host extend lengths for every extend
+            # batch; model that contract here.
+            prefix = extend_prefix_lens or [0] * bs
+            kwargs["extend_seq_lens_cpu"] = torch.tensor(
+                [int(s) - int(p) for s, p in zip(seq_lens, prefix)],
+                dtype=torch.int32,
             )
         self.backend.init_forward_metadata(
             bs=bs,

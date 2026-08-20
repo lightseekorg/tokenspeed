@@ -154,11 +154,14 @@ representing skipped intermediate checkpoints as null holes (`0`). State
 consumers may gather only the declared input/output slots; compacting the row or
 publishing an unwritten intermediate checkpoint would break position identity.
 
-Speculative KDA verification keeps its candidate recurrent states in a dense,
-graph-stable workspace outside the cache arena. The Kimi-K3 recipe reserves
-that workspace before sizing the arena (`max_bs * (draft_tokens + 1)` state
-rows), so two rolling persistent pages do not make speculative state memory
-disappear from the GPU budget.
+Speculative KDA verification stores no per-position recurrent states: it
+captures each window's raw projections in a compact payload and commits by
+replaying the accepted prefix from the committed page. The Kimi-K3 recipe
+reserves that workspace before sizing the arena — the transient conv rows
+plus the per-layer capture payloads — so speculative state memory does not
+disappear from the GPU budget. (Platforms without the replay kernels fall
+back to the dense `max_bs * (draft_tokens + 1)` per-position state
+workspace, reserved the same way.)
 
 ### Python runtime: maps logical to physical, perceives as little as possible
 

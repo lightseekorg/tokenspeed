@@ -420,11 +420,12 @@ def kimi3_latent_projection_add3(
             When provided, RMSNorm is applied to ``hidden_states`` before the
             projection.
         eps: Positive RMSNorm epsilon required with ``norm_weight``.
-        solution: ``"auto"`` selects the fused row-CTA GEMV for one-token
-            execution, the fused MFMA epilogue for the tuned M=16 tile, and
-            otherwise composes the registered projection and add kernels.
-            ``"rowcta_gemv"``, ``"gluon_mfma_add3"``, and ``"composed"``
-            force an implementation.
+        solution: ``"auto"`` selects the dual-residual skinny epilogue where
+            it holds a measured win (sm103, M <= 2), the fused row-CTA GEMV
+            for other one-token execution, the fused MFMA epilogue for the
+            tuned M=16 tile, and otherwise composes the registered projection
+            and add kernels. ``"rowcta_gemv"``, ``"skinny_add3"``,
+            ``"gluon_mfma_add3"``, and ``"composed"`` force an implementation.
 
     Returns:
         ``prefix + hidden_states @ weight.T + shared_output`` shaped ``[M, N]``.
@@ -452,7 +453,13 @@ def kimi3_latent_projection_add3(
                 f"Kimi K3 latent projection {name} must have unit inner stride"
             )
 
-    if solution not in {"auto", "rowcta_gemv", "gluon_mfma_add3", "composed"}:
+    if solution not in {
+        "auto",
+        "rowcta_gemv",
+        "skinny_add3",
+        "gluon_mfma_add3",
+        "composed",
+    }:
         raise ValueError(f"unknown Kimi K3 projection-add3 solution {solution!r}")
     specialized = (
         hidden_states.is_cuda
@@ -501,12 +508,33 @@ def kimi3_latent_projection_add3(
         raise ValueError("Kimi K3 RMSNorm epsilon requires a norm weight")
 
     if solution == "auto":
-        if m == 1 and specialized:
+        from tokenspeed_kernel.ops.gemm.routed_gemv import (
+            skinny_add3_supported,
+        )
+
+        if specialized and skinny_add3_supported(m, n, k, hidden_states.device):
+            # Dual-residual skinny epilogue: 1.06x over rowcta_gemv_add3.
+            solution = "skinny_add3"
+        elif m == 1 and specialized:
             solution = "rowcta_gemv"
         elif Platform.get().is_cdna4 and m == 16 and specialized:
             solution = "gluon_mfma_add3"
         else:
             solution = "composed"
+    if solution == "skinny_add3":
+        if not specialized:
+            raise ValueError(
+                "skinny_add3 projection-add3 requires contiguous CUDA BF16 "
+                "inputs at a K3 latent shape"
+            )
+        from tokenspeed_kernel.ops.gemm.routed_gemv import skinny_gemv_add3
+
+        return skinny_gemv_add3(
+            hidden_states,
+            weight,
+            prefix,
+            shared_output,
+        )
     if solution == "rowcta_gemv":
         if m != 1:
             raise ValueError("rowcta_gemv projection-add3 requires one input row")
@@ -795,17 +823,15 @@ def kimi3_qkvfab_projection(
         and weight.dtype == torch.bfloat16
         and hidden_states.is_contiguous()
         and weight.is_contiguous()
-        and m == 1
+        and m <= 8
         and input_width == KIMI3_HIDDEN_SIZE
         and output_width == KIMI3_QKVFAB_SIZE
     )
     if solution == "auto":
-        if Platform.get().is_cdna4 and specialized:
+        if Platform.get().is_cdna4 and specialized and m == 1:
             solution = "triton_gemv"
-        elif specialized and m == 1:
-            # NVIDIA (and other CUDA) decode: the registry GEMV keeps the
-            # row-per-CTA streaming kernel that beats cublasLt on this
-            # [6288, 7168] shape (dev's pre-refactor KimiKDAMergedProj path).
+        elif specialized:
+            # Let the registry pick per (M, N, K); unlisted shapes hit torch.mm.
             solution = "decode_gemv"
         else:
             solution = "torch"
@@ -818,7 +844,7 @@ def kimi3_qkvfab_projection(
         out.copy_(result)
         return out
     if solution == "triton_gemv":
-        if not specialized:
+        if not (specialized and m == 1):
             raise ValueError(
                 "Kimi K3 QKVFAB Triton GEMV requires contiguous gfx950 "
                 "BF16 [1, 7168] input and [6288, 7168] weight"
