@@ -117,11 +117,6 @@ class KdaAttnBackend(MambaAttnBackend):
         self._batched_replay_kernel = resolve_kda_batched_replay_commit(self.dtype)
         self._replay_payloads: tuple[torch.Tensor, ...] | None = None
         self._replay_weights: dict[int, tuple] = {}
-        # The pointer tuples below serve only the decomposed verify fallback;
-        # the fused verify + batched commit path never reads them.
-        self._replay_conv_copy: dict[int, tuple[torch.Tensor, ...]] = {}
-        self._replay_rows: torch.Tensor | None = None
-        self._graphs_captured = False
         self._replay_descriptors = None
         self._batched_replay_launch = None
         self._batched_replay_ready = False
@@ -327,14 +322,16 @@ class KdaAttnBackend(MambaAttnBackend):
             return super()._ensure_verify_scratch(bs, draft_token_num)
         rows = max(len(self.query_start_loc_list), bs)
         scratch = self._verify_scratch
-        if scratch is not None and next(iter(scratch.values()))[0].shape[0] >= rows:
-            return
-        if self._graphs_captured and scratch is not None:
+        if scratch is not None:
+            # Allocated once at its maximum; graphs may hold its addresses, so
+            # an overrun is an invariant violation, never a resize.
             capacity = next(iter(scratch.values()))[0].shape[0]
-            raise RuntimeError(
-                f"KDA verify needs {rows} transient conv rows after CUDA graphs "
-                f"were captured, but the graph-stable scratch holds {capacity}"
-            )
+            if capacity < rows:
+                raise RuntimeError(
+                    f"KDA verify needs {rows} transient conv rows but the "
+                    f"preallocated scratch holds {capacity}"
+                )
+            return
         self._verify_scratch = {}
         for layer_id in self._state_layer_ids():
             conv, _ = self._state_components(layer_id)
@@ -344,29 +341,6 @@ class KdaAttnBackend(MambaAttnBackend):
                 ),
                 None,
             )
-            self._replay_conv_copy[layer_id] = (
-                torch.tensor([conv.data_ptr()], dtype=torch.uint64, device=self.device),
-                torch.tensor(
-                    [self._verify_scratch[layer_id][0].data_ptr()],
-                    dtype=torch.uint64,
-                    device=self.device,
-                ),
-                torch.tensor(
-                    [conv.stride(0) * conv.element_size() // 4],
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                torch.tensor(
-                    [
-                        self._verify_scratch[layer_id][0].stride(0)
-                        * self._verify_scratch[layer_id][0].element_size()
-                        // 4
-                    ],
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-            )
-        self._replay_rows = torch.arange(rows, dtype=torch.int32, device=self.device)
 
     @override
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
@@ -376,28 +350,6 @@ class KdaAttnBackend(MambaAttnBackend):
         conv_bytes = sum(pair[0].nbytes for pair in self._verify_scratch.values())
         payload_bytes = sum(payload.nbytes for payload in (self._replay_payloads or ()))
         return conv_bytes + payload_bytes
-
-    def _seed_replay_conv(self, layer_id: int, bs: int) -> None:
-        """Copy one committed conv window per request into transient rows."""
-        from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
-
-        conv, _ = self._state_components(layer_id)
-        scratch, _ = self._verify_scratch[layer_id]
-        pages = self.forward_metadata.state_in_blocks_by_group[
-            self._state_group_for(layer_id)
-        ][:bs].to(torch.int64)
-        assert self._replay_rows is not None
-        dst = self._replay_rows[:bs]
-        src_ptr, dst_ptr, src_stride, dst_stride = self._replay_conv_copy[layer_id]
-        copy_state_rows(
-            src_ptr,
-            dst_ptr,
-            pages,
-            dst,
-            row_bytes=conv[0].numel() * conv.element_size(),
-            src_row_strides=src_stride,
-            dst_row_strides=dst_stride,
-        )
 
     def _kda_gate(
         self,
@@ -599,7 +551,7 @@ class KdaAttnBackend(MambaAttnBackend):
                     lower_bound,
                 )
                 self._bind_replay_descriptor(layer_id, self._replay_weights[layer_id])
-            return try_kda_fused_paged_verify(
+            fused_out = try_kda_fused_paged_verify(
                 mixed_qkv,
                 conv_weights,
                 conv_comp,
@@ -619,6 +571,12 @@ class KdaAttnBackend(MambaAttnBackend):
                 lower_bound=lower_bound,
                 store_states=False,
             )
+            if fused_out is None:
+                raise RuntimeError(
+                    "KDA fused paged verify kernel vanished after the replay "
+                    "capability probe reported it available"
+                )
+            return fused_out
         if f_a_out is None or bias is not None:
             return None
         else:
@@ -686,16 +644,10 @@ class KdaAttnBackend(MambaAttnBackend):
         )
 
         beta_b = beta_raw.view(batch_size, draft_token_num, num_value_heads)
-        if self._replay_active:
-            initial_pool = ssm_comp
-            initial_rows = state_in_blocks[:batch_size].to(torch.int64)
-            write_rows = torch.full_like(output_indices[:batch_size], -1)
-            state_out = ssm_comp
-        else:
-            initial_pool = ssm_scratch
-            initial_rows = output_indices[:batch_size, 0] - 1
-            write_rows = output_indices[:batch_size]
-            state_out = ssm_scratch
+        initial_pool = ssm_scratch
+        initial_rows = output_indices[:batch_size, 0] - 1
+        write_rows = output_indices[:batch_size]
+        state_out = ssm_scratch
 
         return fused_recurrent_kda_mtp(
             query_b,

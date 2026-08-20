@@ -1797,14 +1797,15 @@ def kda_replay_commit_supported(
 
     Lets a caller decide up front whether it can skip allocating a
     per-draft-position state scratch, before any verify batch has run. The
-    eager replay path only requires the standalone commit kernel.
+    eager replay path has no decomposed fallback, so it needs both the
+    standalone commit kernel and the no-store fused verify it rides on.
 
     Args:
         dtype: activation dtype the verify batch will use.
         solution: restrict to one registered solution, as in ``select_kernel``.
 
     Returns:
-        ``True`` when a kernel is registered for the current platform.
+        ``True`` when both kernels are registered for the current platform.
     """
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
@@ -1814,6 +1815,13 @@ def kda_replay_commit_supported(
             "kda_replay_commit",
             signature,
             traits={"flat_state": True},
+            solution=solution,
+        )
+        select_kernel(
+            "attention",
+            "kda_fused_paged_verify",
+            signature,
+            traits={"paged_state": True, "store_states": False},
             solution=solution,
         )
     except NoKernelFoundError:

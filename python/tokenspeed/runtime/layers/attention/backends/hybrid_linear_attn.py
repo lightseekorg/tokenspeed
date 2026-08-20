@@ -1678,18 +1678,11 @@ class MambaAttnBackend(AttentionBackend):
                 return fused_out
             # Read the committed window and write per-position states into the
             # verify scratch. The accepted position is committed afterward.
-            eager_replay = self._replay_active
-            if eager_replay:
-                self._seed_replay_conv(layer_id, batch_size)
-            elif layer_id == self._state_layer_ids()[0]:
+            if layer_id == self._state_layer_ids()[0]:
                 self._seed_verify_scratch_batched(batch_size, draft_token_num)
             conv_states = conv_scratch
-            if eager_replay:
-                conv_read = self._replay_rows[:batch_size]
-                conv_out = None
-            else:
-                conv_read = output_indices[:batch_size, 0] - 1
-                conv_out = output_indices[:batch_size]
+            conv_read = output_indices[:batch_size, 0] - 1
+            conv_out = output_indices[:batch_size]
             # shouldn't use contiguous here, because causal_conv1d_update
             # support input non-contiguous
             mixed_qkv_reshaped = mixed_qkv.view(

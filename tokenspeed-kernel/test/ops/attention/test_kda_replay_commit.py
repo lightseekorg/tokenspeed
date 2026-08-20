@@ -526,8 +526,9 @@ def test_replay_commit_probe_tracks_dtype():
 
 
 @requires_registered_replay
-def test_replay_probe_only_checks_commit_kernel():
-    """Eager replay does not depend on the independently registered verify op."""
+def test_replay_probe_requires_both_commit_and_fused_verify_kernels():
+    """Eager replay has no decomposed fallback: either kernel missing means
+    unsupported."""
     from unittest import mock
 
     import tokenspeed_kernel.ops.attention as attention_ops
@@ -535,13 +536,17 @@ def test_replay_probe_only_checks_commit_kernel():
 
     real = attention_ops.select_kernel
 
-    def missing_verify(family, mode, *args, **kwargs):
-        if mode == "kda_fused_paged_verify":
-            raise NoKernelFoundError("no fused verify on this platform")
-        return real(family, mode, *args, **kwargs)
+    def missing(mode_to_drop):
+        def probe(family, mode, *args, **kwargs):
+            if mode == mode_to_drop:
+                raise NoKernelFoundError(f"no {mode} on this platform")
+            return real(family, mode, *args, **kwargs)
 
-    with mock.patch.object(attention_ops, "select_kernel", missing_verify):
-        assert attention_ops.kda_replay_commit_supported(torch.bfloat16)
+        return probe
+
+    for mode in ("kda_fused_paged_verify", "kda_replay_commit"):
+        with mock.patch.object(attention_ops, "select_kernel", missing(mode)):
+            assert not attention_ops.kda_replay_commit_supported(torch.bfloat16)
 
 
 @requires_registered_replay

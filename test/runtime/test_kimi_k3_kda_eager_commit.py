@@ -359,14 +359,13 @@ def test_equal_geometry_pool_replacement_rebinds_batched_replay():
     assert harness.backend._batched_replay_ready
 
 
-def test_verify_scratch_cannot_grow_after_graph_capture():
-    """A late transient-row reallocation fails instead of invalidating graphs."""
+def test_verify_scratch_cannot_grow_after_preallocation():
+    """Scratch is allocated once; any later capacity overrun fails loudly."""
     harness = _Harness(eager_replay=True)
     harness.backend.preallocate_verify_workspace(harness.backend.max_bs, T)
     capacity = next(iter(harness.backend._verify_scratch.values()))[0].shape[0]
-    harness.backend._graphs_captured = True
     harness.backend.query_start_loc_list.extend([None] * (capacity + 1))
-    with pytest.raises(RuntimeError, match="after CUDA graphs were captured"):
+    with pytest.raises(RuntimeError, match="preallocated scratch holds"):
         harness.backend._ensure_verify_scratch(1, T)
 
 
