@@ -106,7 +106,7 @@ def test_speculative_verify_workspace_is_reserved_outside_the_arena(
     assert setup.spec.memory_plan.num_lcm_blocks == expected_parents
 
 
-def test_replay_verify_workspace_reserves_one_conv_row_per_request(
+def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -119,13 +119,18 @@ def test_replay_verify_workspace_reserves_one_conv_row_per_request(
         speculative_algorithm="DSPARK",
         speculative_num_draft_tokens=8,
     )
-    expected_workspace_bytes = 4 * sum(
+    conv_row_bytes = 4 * sum(
         field.payload_bytes
         for spec, fields in groups
         if spec.group_id != "full_attention"
         for field in fields
         if field.field_id.endswith(".conv_state")
     )
+    # 69 KDA layers x (4 requests x 8 draft tokens) rows, each one bf16
+    # qkv/f_a/beta row (4608 + 128 + 12 channels) plus an fp32 gate row
+    # (12 x 128), per rank at TP8.
+    expected_payload_bytes = 69 * 4 * 8 * ((4608 + 128 + 12) * 2 + 12 * 128 * 4)
+    expected_workspace_bytes = conv_row_bytes + expected_payload_bytes
 
     setup = recipe.setup()
 

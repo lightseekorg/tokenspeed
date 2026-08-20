@@ -528,12 +528,16 @@ class MambaAttnBackend(AttentionBackend):
         if not self.state_paging_active or self.is_draft:
             return 0
         self._ensure_verify_scratch(max_bs, draft_token_num)
-        return sum(
+        total = sum(
             tensor.nbytes
             for layer_scratch in self._verify_scratch.values()
             for tensor in layer_scratch
             if tensor is not None
         )
+        if self._gdn_replay is not None:
+            total += self._gdn_replay.payload.nbytes
+            total += self._gdn_replay.parameters.nbytes
+        return total
 
     def _verify_copy_tables_get(self) -> dict:
         """Pointer tables for the batched verify state copies and replay:
