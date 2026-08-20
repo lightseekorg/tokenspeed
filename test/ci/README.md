@@ -249,7 +249,7 @@ The `Slurm Dispatch` workflow exposes a `cluster` input. `gb200` keeps the
 existing `slurm-dispatch` coordinator and runner defaults. `gb300` is an
 explicit opt-in: select one YAML that declares exactly one `gb300-Ngpu` or
 `slurm-gb300-Ngpu` label. The workflow passes that label through unchanged and
-validates any explicit runner selection against it. Four
+validates any explicit runner selection against it. Five
 `slurm-dispatch-gb300` coordinators form one shared pool for manual and
 per-commit submissions. GB300 perf tasks are disabled until GB300-specific
 reference values are measured.
@@ -261,9 +261,8 @@ pushes to `main` and for non-draft pull requests whose head branch belongs to
 this repository. Pull-request runs execute the merge commit's dispatcher, so
 dispatcher changes are covered before merge. Fork pull requests remain skipped
 until the coordinator pool uses ephemeral runners with a protected approval
-environment; use the manual `Slurm Dispatch` workflow after review. New
-pull-request commits cancel the older run, while `main` runs keep the in-flight
-evaluation and retain the latest pending commit.
+environment; use the manual `Slurm Dispatch` workflow after review. New commits
+cancel the older run for the same pull request or the `main` branch.
 
 Submission is fail-closed and requires the repository variable
 `TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED` to equal `true`. The dedicated
