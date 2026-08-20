@@ -36,6 +36,7 @@ _DENSE_BF16_SIGNATURES = format_signatures(("q", "k", "v"), "dense", {torch.bflo
     traits={
         "paged_state": frozenset({True}),
         "fused_output_norm": frozenset({False, True}),
+        "recurrent_layout": frozenset({"k_major"}),
     },
     tags={"nvidia", "paged_cache", "cuda_graph", "fusion"},
 )
