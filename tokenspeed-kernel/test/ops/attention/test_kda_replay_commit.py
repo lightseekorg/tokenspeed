@@ -27,6 +27,17 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
+from tokenspeed_kernel.ops.attention import (  # noqa: E402
+    kda_replay_commit_supported,
+)
+
+#: The registry entries behind the probe and the no-store fused verify are
+#: vendor-gated (NVIDIA today); direct Triton-kernel tests below run anywhere.
+requires_registered_replay = pytest.mark.skipif(
+    not kda_replay_commit_supported(torch.bfloat16),
+    reason="KDA replay ops are not registered on this platform",
+)
+
 from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (  # noqa: E402
     batched_recurrent_kda_replay_commit,
     fused_recurrent_kda_replay_commit,
@@ -411,6 +422,7 @@ def test_in_place_commit_full_pool_accounting():
             torch.testing.assert_close(got["h_pool"][p], ref_h, atol=0.0, rtol=0.0)
 
 
+@requires_registered_replay
 def test_replay_commit_probe_tracks_dtype():
     """The capability probe must use the actual activation dtype."""
     from tokenspeed_kernel.ops.attention import kda_replay_commit_supported
@@ -419,6 +431,7 @@ def test_replay_commit_probe_tracks_dtype():
     assert kda_replay_commit_supported(torch.bfloat16)
 
 
+@requires_registered_replay
 def test_replay_probe_only_checks_commit_kernel():
     """Eager replay does not depend on the independently registered verify op."""
     from unittest import mock
@@ -437,6 +450,7 @@ def test_replay_probe_only_checks_commit_kernel():
         assert attention_ops.kda_replay_commit_supported(torch.bfloat16)
 
 
+@requires_registered_replay
 def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
     """The trait-selected no-store fusion returns the legacy output, sans tape."""
     from tokenspeed_kernel.ops.attention import try_kda_fused_paged_verify
