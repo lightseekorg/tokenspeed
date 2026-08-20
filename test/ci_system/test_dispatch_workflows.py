@@ -341,10 +341,9 @@ def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
     )
 
     assert set(triggers) == {"push", "pull_request"}
+    assert submit["name"] == "${{ matrix.name }}"
     assert submit["runs-on"] == "slurm-dispatch-gb300"
-    assert workflow["concurrency"]["cancel-in-progress"] == (
-        "${{ github.event_name == 'pull_request' }}"
-    )
+    assert workflow["concurrency"]["cancel-in-progress"] is True
     assert '--runner "$RUNNER"' in submit_script
     assert "--runner-alias" not in submit_script
     assert '--source-pr "$PR_NUMBER"' in submit_script
