@@ -68,6 +68,27 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         (2, 2304, 1536): "skinny",  # 2.52 vs 4.97 (1.97x)
         (4, 2304, 1536): "tgv",  # 2.86 vs 4.58 (1.60x)
         (8, 2304, 1536): "tgv",  # 2.86 vs 4.45 (1.56x)
+        # TP16 (GB200, sm100). The shapes were read off the decode_gemv
+        # dispatch during a live bs=1 run rather than scaled from TP8: only
+        # 1152x1536 halves, 3584x7168 is not TP-sharded at all, 2880x7168 has
+        # no TP8 analogue, and TP8's largest entry (6288x7168) never reaches
+        # decode_gemv here. Same >= 4% margin, same cold-L2 tuner.
+        (3, 3584, 7168): "skinny",  # 9.54 vs 11.23 (1.18x)
+        (1, 2880, 7168): "skinny",  # 7.13 vs rowcta 8.61 (1.21x)
+        (2, 2880, 7168): "skinny",  # 7.95 vs 9.80 (1.23x)
+        (3, 2880, 7168): "skinny",  # 8.24 vs 9.77 (1.19x)
+        (4, 2880, 7168): "skinny",  # 9.32 vs 9.78 (1.05x)
+        # 3584 and 2880 stay on the incumbent at M >= 5: skinny inverts there
+        # (15.85 vs cublas 11.06 at M=8, 3584x7168), so the win is not simply
+        # "skinny for small M" and the boundary has to be measured per width.
+        (2, 1152, 1536): "skinny",  # 1.99 vs 4.85 (2.44x)
+        (3, 1152, 1536): "skinny",  # 2.10 vs 4.47 (2.13x)
+        (4, 1152, 1536): "skinny",  # 2.24 vs 4.40 (1.97x)
+        (5, 1152, 1536): "skinny",  # 2.23 vs 4.40 (1.98x)
+        (6, 1152, 1536): "skinny",  # 2.35 vs 4.42 (1.89x)
+        (7, 1152, 1536): "skinny",  # 2.59 vs 4.45 (1.72x)
+        (8, 1152, 1536): "skinny",  # 2.72 vs 4.46 (1.64x)
+        # (1, 1152, 1536) stays on rowcta: 1.907 vs 1.943, inside the margin.
     }
 )
 
@@ -79,9 +100,12 @@ _BF16_SIG = frozenset(
         )
     }
 )
-# Measured on sm103; nothing below that ran the sweep.
+# sm100 (GB200/B200) and sm103 (GB300) both run these kernels -- the skinny
+# GEMM uses only generic CuTe primitives, and the sm103 gate recorded where the
+# sweep had been run, not what the kernels require. Re-swept on GB200: the
+# sm103 winners reproduce entry for entry at the TP8 shapes.
 _CAPABILITY = CapabilityRequirement(
-    min_arch_version=ArchVersion(10, 3),
+    min_arch_version=ArchVersion(10, 0),
     vendors=frozenset({"nvidia"}),
 )
 

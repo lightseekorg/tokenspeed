@@ -41,14 +41,22 @@ import sys
 
 import torch
 
-# (N, K, calls/step, label) -- from the serving trace, TP8, bs=1.
+# (N, K, calls/step, label). The (N, K) are OBSERVED -- logged at the
+# decode_gemv dispatch entry during a real TP16 bs=1 run, not derived. Two of
+# the three differ from the TP8 table, and the TP8 table's largest entry
+# (6288x7168) has no TP16 counterpart in decode_gemv at all.
+#
+# calls/step is NOT measured here: the shape probe dedups, so it reports which
+# shapes exist and not how often each fires. It is left at 0 so the per-step
+# projection below stays zero rather than quoting a number built on a count
+# carried over from a different parallelism. Labels are the shapes themselves;
+# mapping them to call sites would be a guess until the counts are traced.
 SHAPES = [
-    (3584, 7168, 92, "moe_latent_down"),
-    (6288, 7168, 69, "kda_in_proj"),
-    (3648, 7168, 24, "mla_qkv_a_gate"),
-    (2304, 1536, 24, "mla_q_b"),
+    (3584, 7168, 0, "n3584_k7168"),
+    (2880, 7168, 0, "n2880_k7168"),
+    (1152, 1536, 0, "n1152_k1536"),
 ]
-MS = [1]  # decode_gemv is only reached at M == 1 in serving
+MS = [1, 2, 3, 4, 5, 6, 7, 8]  # observed range: the gates admit M <= 8
 NUM_COPIES = 8
 # 41-round medians repeat within ~1-2%, so 4% clears noise without excluding
 # the consistent 6-11% skinny wins.
@@ -184,7 +192,10 @@ for n, k, calls, label in SHAPES:
             )
 
 print()
-print(f"projected saving vs incumbent: {per_step_gain:.0f} us/step")
+if any(c for _, _, c, _ in SHAPES):
+    print(f"projected saving vs incumbent: {per_step_gain:.0f} us/step")
+else:
+    print("per-step projection skipped: calls/step not measured")
 print(json.dumps(route, indent=2))
 if len(sys.argv) > 1:
     json.dump(route, open(sys.argv[1], "w"), indent=2)

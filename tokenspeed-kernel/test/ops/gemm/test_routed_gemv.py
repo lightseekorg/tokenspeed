@@ -20,9 +20,10 @@
 
 """The measured decode-GEMV route: dispatch reaches it, and it computes right.
 
-The routed backends only exist on sm103, where the route was measured; on
-anything else the whole module must be a no-op and the generic selection must
-be untouched -- both directions are asserted here.
+The routed backends are registered from sm100 up (GB200/B200 and GB300); below
+that the whole module must be a no-op and the generic selection must be
+untouched -- both directions are asserted here. The table is keyed per shape,
+so an arch that never runs a listed shape simply never matches.
 """
 
 from __future__ import annotations
@@ -36,8 +37,16 @@ from tokenspeed_kernel.ops.gemm.triton_gemv import _select, decode_gemv
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _is_sm103() -> bool:
-    return torch.cuda.get_device_capability() == (10, 3)
+def _is_routed_arch() -> bool:
+    # Mirrors _CAPABILITY in routed_gemv: sm100 and up, not sm103 exactly.
+    return torch.cuda.get_device_capability() >= (10, 0)
+
+
+def _is_add3_arch() -> bool:
+    # ADD3_ROUTE stores sm103-tuned TILE CONFIGS, not just a backend choice, so
+    # it stays gated where it was swept -- mirrors _is_measured_arch. Widening
+    # it would run another architecture's tuning parameters unmeasured.
+    return torch.cuda.get_device_capability() >= (10, 3)
 
 
 def _routed_cases():
@@ -45,8 +54,8 @@ def _routed_cases():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_sm103(),
-    reason="route is measured and registered for sm103 only",
+    not torch.cuda.is_available() or not _is_routed_arch(),
+    reason="route is registered for sm100 and up",
 )
 @pytest.mark.parametrize("shape,backend", _routed_cases())
 def test_dispatch_picks_the_measured_backend(shape, backend):
@@ -59,8 +68,8 @@ def test_dispatch_picks_the_measured_backend(shape, backend):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_sm103(),
-    reason="route is measured and registered for sm103 only",
+    not torch.cuda.is_available() or not _is_routed_arch(),
+    reason="route is registered for sm100 and up",
 )
 @pytest.mark.parametrize("shape,backend", _routed_cases())
 def test_routed_backend_matches_torch(shape, backend):
@@ -78,8 +87,8 @@ def test_routed_backend_matches_torch(shape, backend):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_sm103(),
-    reason="route is measured and registered for sm103 only",
+    not torch.cuda.is_available() or not _is_routed_arch(),
+    reason="route is registered for sm100 and up",
 )
 def test_non_bf16_inputs_fall_back_to_torch():
     from tokenspeed_kernel.ops.gemm.routed_gemv import skinny_gemv, tgv_gemv
@@ -96,8 +105,8 @@ def test_non_bf16_inputs_fall_back_to_torch():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_sm103(),
-    reason="route is measured and registered for sm103 only",
+    not torch.cuda.is_available() or not _is_routed_arch(),
+    reason="route is registered for sm100 and up",
 )
 def test_capture_of_a_warmed_shape_replays_correctly():
     """Warm eagerly, then capture: the routed kernel must be capturable and the
@@ -155,7 +164,7 @@ def test_capture_of_a_warmed_shape_replays_correctly():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_sm103(),
+    not torch.cuda.is_available() or not _is_routed_arch(),
     reason="add3 route is measured for sm103 only",
 )
 @pytest.mark.parametrize("m", [1, 2])
@@ -176,8 +185,8 @@ def test_skinny_add3_matches_reference(m):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_sm103(),
-    reason="add3 route is measured for sm103 only",
+    not torch.cuda.is_available() or not _is_add3_arch(),
+    reason="ADD3_ROUTE holds sm103-tuned tile configs; unswept below that",
 )
 def test_kimi3_add3_auto_selects_the_skinny_epilogue():
     from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_latent_projection_add3
@@ -196,7 +205,7 @@ def test_kimi3_add3_auto_selects_the_skinny_epilogue():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not _is_sm103(),
+    not torch.cuda.is_available() or not _is_routed_arch(),
     reason="add3 route is measured for sm103 only",
 )
 def test_skinny_add3_unwarmed_capture_falls_back(monkeypatch):
