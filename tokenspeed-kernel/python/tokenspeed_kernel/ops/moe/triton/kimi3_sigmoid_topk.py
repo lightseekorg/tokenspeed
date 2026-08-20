@@ -32,6 +32,10 @@ def _kimi3_sigmoid_bias_topk_kernel(
     num_experts: tl.constexpr = 896
     padded_experts: tl.constexpr = 1024
     topk: tl.constexpr = 16
+    row = tl.program_id(0)
+    logits += row * num_experts
+    topk_ids += row * topk
+    topk_weights += row * topk
     expert = tl.arange(0, padded_experts)
     valid = expert < num_experts
 
@@ -94,10 +98,10 @@ def kimi3_sigmoid_bias_topk(
     weights_dtype: torch.dtype = torch.float32,
     enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Route one Kimi K3 decode token to its top 16 of 896 experts.
+    """Route Kimi K3 decode tokens to their top 16 of 896 experts.
 
     Args:
-        router_logits: Contiguous FP32 logits shaped ``[1, 896]``.
+        router_logits: Contiguous FP32 logits shaped ``[tokens, 896]``.
         correction_bias: Contiguous FP32 selection bias shaped ``[896]``.
         routed_scaling_factor: Scale applied to selected route weights.
         normalize_topk_weights: Normalize selected sigmoid scores when true.
@@ -112,16 +116,21 @@ def kimi3_sigmoid_bias_topk(
             that writes ``router_logits`` is chained on the same stream/graph.
 
     Returns:
-        ``(topk_weights, topk_ids)`` shaped ``[1, 16]`` with ``weights_dtype``
-        weights and INT32 ids (physical ids when a dispatch map is given).
+        ``(topk_weights, topk_ids)`` shaped ``[tokens, 16]`` with
+        ``weights_dtype`` weights and INT32 ids (physical ids when a dispatch
+        map is given).
     """
+    if router_logits.ndim != 2:
+        raise ValueError("Kimi K3 top-k requires GPU FP32 logits shaped [tokens, 896]")
+    tokens, experts = router_logits.shape
     if (
-        router_logits.shape != (1, 896)
+        tokens <= 0
+        or experts != 896
         or router_logits.dtype != torch.float32
         or not router_logits.is_cuda
         or not router_logits.is_contiguous()
     ):
-        raise ValueError("Kimi K3 top-k requires contiguous GPU FP32 logits [1, 896]")
+        raise ValueError("Kimi K3 top-k requires contiguous GPU FP32 [tokens, 896]")
     if (
         correction_bias.shape != (896,)
         or correction_bias.dtype != torch.float32
@@ -141,12 +150,12 @@ def kimi3_sigmoid_bias_topk(
         )
 
     topk_ids = torch.empty(
-        (1, 16),
+        (tokens, 16),
         dtype=torch.int32,
         device=router_logits.device,
     )
     topk_weights = torch.empty(
-        (1, 16),
+        (tokens, 16),
         dtype=weights_dtype,
         device=router_logits.device,
     )
@@ -155,7 +164,7 @@ def kimi3_sigmoid_bias_topk(
     pdl_kwargs = (
         {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
     )
-    _kimi3_sigmoid_bias_topk_kernel[(1,)](
+    _kimi3_sigmoid_bias_topk_kernel[(tokens,)](
         router_logits,
         correction_bias,
         topk_ids,
