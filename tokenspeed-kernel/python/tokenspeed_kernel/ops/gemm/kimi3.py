@@ -866,6 +866,15 @@ def kimi3_qkvfab_projection(
 _ROUTER_CUDA_MAX_TOKENS = 4
 
 
+def _ll_bf16_usable(hidden_states: torch.Tensor, weight: torch.Tensor, m: int) -> bool:
+    """Whether the vendored CuTe dot-product router GEMM can serve this call."""
+    try:
+        from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_dotprod
+    except ImportError:
+        return False
+    return ll_bf16_dotprod.supports(hidden_states, weight, m)
+
+
 @lru_cache(maxsize=1)
 def _mm_out_dtype_supported() -> bool:
     """Whether ``torch.mm`` accepts ``out_dtype`` (BF16 in, FP32 out).
@@ -896,7 +905,9 @@ def kimi3_router_projection(
         out: Optional contiguous FP32 output buffer shaped ``[M, 896]``.
         solution: ``"auto"`` selects a specialized CDNA4 or Hopper kernel
             when eligible and otherwise falls back to Torch. On NVIDIA the
-            hand-written CUDA kernel serves ``M <= 4`` and ``"cublas"``
+            vendored CuTe ``"ll_bf16"`` dot-product kernel serves ``M <= 8``
+            when CuTe DSL is installed; otherwise the hand-written CUDA kernel
+            serves ``M <= 4`` and ``"cublas"``
             (``torch.mm`` with ``out_dtype``) serves larger batches: the CUDA
             kernel's per-thread token loop runs on CUDA cores, so its time
             grows linearly with M (4.0us at M=1 -> 34.8us at M=32 on B300)
@@ -914,7 +925,7 @@ def kimi3_router_projection(
         name="Kimi K3 router projection",
         out_dtype=torch.float32,
     )
-    if solution not in {"auto", "cuda", "cublas", "triton_gemv", "torch"}:
+    if solution not in {"auto", "ll_bf16", "cuda", "cublas", "triton_gemv", "torch"}:
         raise ValueError(f"unknown Kimi K3 router solution {solution!r}")
     specialized = (
         hidden_states.is_cuda
@@ -930,12 +941,18 @@ def kimi3_router_projection(
         if platform.is_cdna4 and specialized and m == 1:
             solution = "triton_gemv"
         elif platform.is_hopper_plus and specialized:
-            if m > _ROUTER_CUDA_MAX_TOKENS and _mm_out_dtype_supported():
+            if _ll_bf16_usable(hidden_states, weight, m):
+                solution = "ll_bf16"
+            elif m > _ROUTER_CUDA_MAX_TOKENS and _mm_out_dtype_supported():
                 solution = "cublas"
             else:
                 solution = "cuda"
         else:
             solution = "torch"
+    if solution == "ll_bf16":
+        from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_dotprod
+
+        return ll_bf16_dotprod(hidden_states, weight, out)
     if solution == "cublas":
         if not specialized or not _mm_out_dtype_supported():
             raise ValueError(
