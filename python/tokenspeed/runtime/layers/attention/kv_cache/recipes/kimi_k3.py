@@ -311,13 +311,31 @@ class KimiK3Recipe(CacheRecipe):
             # Replay starts from the committed convolution checkpoint and
             # reconstructs the accepted recurrent state.  The backend keeps
             # one such row per live request, not a state row per candidate.
-            return self.attn_config.max_bs * sum(
+            conv_bytes = self.attn_config.max_bs * sum(
                 field.payload_bytes
                 for spec, fields in self.groups()
                 if spec.group_id != FULL_ATTENTION
                 for field in fields
                 if field.field_id.endswith(".conv_state")
             )
+            conv_shape, recurrent_shape = self._kda_shapes
+            heads, head_dim, _ = recurrent_shape
+            rows = self.attn_config.max_bs * int(
+                self.server_args.speculative_num_draft_tokens
+            )
+            layer_count = sum(
+                field.field_id.endswith(".conv_state")
+                for spec, fields in self.groups()
+                if spec.group_id != FULL_ATTENTION
+                for field in fields
+            )
+            payload_bytes_per_row = (
+                conv_shape[0] * torch.bfloat16.itemsize
+                + head_dim * torch.bfloat16.itemsize
+                + heads * torch.bfloat16.itemsize
+                + heads * head_dim * torch.float32.itemsize
+            )
+            return conv_bytes + layer_count * rows * payload_bytes_per_row
         verify_rows = self.attn_config.max_bs * (
             int(self.server_args.speculative_num_draft_tokens) + 1
         )

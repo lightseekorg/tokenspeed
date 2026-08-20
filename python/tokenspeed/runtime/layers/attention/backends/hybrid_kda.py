@@ -361,7 +361,11 @@ class KdaAttnBackend(MambaAttnBackend):
         if not self._replay_active:
             return super().preallocate_verify_workspace(max_bs, draft_token_num)
         self._ensure_verify_scratch(max_bs, draft_token_num)
-        return sum(pair[0].nbytes for pair in self._verify_scratch.values())
+        conv_bytes = sum(pair[0].nbytes for pair in self._verify_scratch.values())
+        payload_bytes = sum(
+            payload.nbytes for payload in (self._replay_payloads or ())
+        )
+        return conv_bytes + payload_bytes
 
     def _seed_replay_conv(self, layer_id: int, bs: int) -> None:
         """Copy one committed conv window per request into transient rows."""

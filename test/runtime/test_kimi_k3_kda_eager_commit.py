@@ -299,6 +299,12 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
         speculative_num_draft_tokens=T,
     )
     planned_bytes = recipe.setup().fixed_workspace_bytes
+    harness.backend.preallocate_verify_workspace(harness.backend.max_bs, T)
+    conv_bytes = sum(
+        pair[0].nbytes for pair in harness.backend._verify_scratch.values()
+    )
+    payload_bytes = sum(payload.nbytes for payload in harness.backend._replay_payloads)
+    assert planned_bytes == conv_bytes + payload_bytes
     server_args = SimpleNamespace(speculative_num_draft_tokens=T)
     config = SimpleNamespace(max_bs=8)
     backend = SimpleNamespace(linear_attn_backend=harness.backend)
