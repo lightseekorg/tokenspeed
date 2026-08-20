@@ -869,10 +869,10 @@ _ROUTER_CUDA_MAX_TOKENS = 4
 def _ll_bf16_usable(hidden_states: torch.Tensor, weight: torch.Tensor, m: int) -> bool:
     """Whether the vendored CuTe dot-product router GEMM can serve this call."""
     try:
-        from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_dotprod
+        from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_router
     except ImportError:
         return False
-    return ll_bf16_dotprod.supports(hidden_states, weight, m)
+    return ll_bf16_router.supports(hidden_states, weight, m)
 
 
 @lru_cache(maxsize=1)
@@ -905,9 +905,9 @@ def kimi3_router_projection(
         out: Optional contiguous FP32 output buffer shaped ``[M, 896]``.
         solution: ``"auto"`` selects a specialized CDNA4 or Hopper kernel
             when eligible and otherwise falls back to Torch. On NVIDIA the
-            vendored CuTe ``"ll_bf16"`` dot-product kernel serves ``M <= 8``
-            when CuTe DSL is installed; otherwise the hand-written CUDA kernel
-            serves ``M <= 4`` and ``"cublas"``
+            vendored CuTe ``"ll_bf16"`` kernels serve ``M <= 32`` when CuTe
+            DSL is installed (dot product to 8, split-K above); otherwise the
+            hand-written CUDA kernel serves ``M <= 4`` and ``"cublas"``
             (``torch.mm`` with ``out_dtype``) serves larger batches: the CUDA
             kernel's per-thread token loop runs on CUDA cores, so its time
             grows linearly with M (4.0us at M=1 -> 34.8us at M=32 on B300)
@@ -950,9 +950,9 @@ def kimi3_router_projection(
         else:
             solution = "torch"
     if solution == "ll_bf16":
-        from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_dotprod
+        from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_router
 
-        return ll_bf16_dotprod(hidden_states, weight, out)
+        return ll_bf16_router(hidden_states, weight, out)
     if solution == "cublas":
         if not specialized or not _mm_out_dtype_supported():
             raise ValueError(

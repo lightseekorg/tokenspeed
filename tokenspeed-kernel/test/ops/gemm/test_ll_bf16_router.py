@@ -28,25 +28,26 @@ from tokenspeed_kernel.ops.gemm.kimi3 import (
     kimi3_router_projection,
 )
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import MAX_M, ll_bf16_dotprod
+from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import MAX_M, ll_bf16_router
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 if not current_platform().is_nvidia:
     pytest.skip("ll_bf16 router GEMM is an NVIDIA CuTe kernel", allow_module_level=True)
-if not ll_bf16_dotprod.is_available():
+if not ll_bf16_router.is_available():
     pytest.skip("CuTe DSL not installed", allow_module_level=True)
 
 
 def _inputs(m: int, seed: int = 0):
     torch.manual_seed(seed)
     a = torch.randn(m, KIMI3_HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(KIMI3_ROUTER_SIZE, KIMI3_HIDDEN_SIZE, device="cuda",
-                    dtype=torch.bfloat16)
+    b = torch.randn(
+        KIMI3_ROUTER_SIZE, KIMI3_HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+    )
     return a, b
 
 
-@pytest.mark.parametrize("m", [1, 2, 4, 8])
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 32])
 def test_matches_the_cuda_router_kernel(m: int) -> None:
     """FP32 accumulation, so it must agree with the kernel it replaces."""
     a, b = _inputs(m)
@@ -57,7 +58,7 @@ def test_matches_the_cuda_router_kernel(m: int) -> None:
     torch.testing.assert_close(got, reference, atol=2e-3, rtol=2e-3)
 
 
-@pytest.mark.parametrize("m", [1, 8])
+@pytest.mark.parametrize("m", [1, 8, 32])
 def test_auto_selects_it_and_honours_out(m: int) -> None:
     a, b = _inputs(m, seed=3)
     out = torch.empty(m, KIMI3_ROUTER_SIZE, device="cuda", dtype=torch.float32)
@@ -69,7 +70,7 @@ def test_auto_selects_it_and_honours_out(m: int) -> None:
 def test_declines_above_its_measured_range() -> None:
     """Past MAX_M the driver must refuse rather than serve a slower path."""
     a, b = _inputs(MAX_M + 8)
-    assert not ll_bf16_dotprod.supports(a, b, a.shape[0])
+    assert not ll_bf16_router.supports(a, b, a.shape[0])
     with pytest.raises(ValueError):
         kimi3_router_projection(a, b, solution="ll_bf16")
     # ``auto`` still answers, through cublas.
@@ -78,9 +79,9 @@ def test_declines_above_its_measured_range() -> None:
 
 def test_declines_non_contiguous_and_odd_k() -> None:
     a, b = _inputs(1)
-    assert not ll_bf16_dotprod.supports(a.expand(2, -1), b, 2)
+    assert not ll_bf16_router.supports(a.expand(2, -1), b, 2)
     odd = torch.randn(1, KIMI3_HIDDEN_SIZE + 1, device="cuda", dtype=torch.bfloat16)
     odd_w = torch.randn(
         KIMI3_ROUTER_SIZE, KIMI3_HIDDEN_SIZE + 1, device="cuda", dtype=torch.bfloat16
     )
-    assert not ll_bf16_dotprod.supports(odd, odd_w, 1)
+    assert not ll_bf16_router.supports(odd, odd_w, 1)

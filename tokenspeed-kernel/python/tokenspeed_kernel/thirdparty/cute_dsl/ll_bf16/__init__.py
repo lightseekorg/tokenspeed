@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# Ported from vLLM's LLBf16Gemm: the dot-product driver only, with tokenspeed's
-# stream/PDL helpers. The split-K backend vLLM uses above M == 4 is not ported.
+# Ported from vLLM's LLBf16Gemm: both backends, with tokenspeed's stream/PDL
+# helpers and cutovers measured here rather than inherited.
 
-"""Low-latency BF16 router GEMM: ``a @ b.T`` in FP32 for small-M decode."""
+"""Low-latency BF16 router GEMM: ``a @ b.T`` in FP32 for decode-sized M."""
 
 from __future__ import annotations
 
@@ -13,19 +13,43 @@ from typing import Any
 
 import torch
 
-# Measured on GB300 at K3's router shape ([M, 7168] x [896, 7168]), cold L2,
-# against the cublas path this displaces (us/call): M=1 3.39 vs 5.52, M=2 3.83
-# vs 7.06, M=4 4.99 vs 8.12, M=8 8.21 vs 10.04, M=16 12.27 vs 10.09. vLLM caps
-# their dot-product backend at M == 4 because their split-K kernel takes over
-# there; without that kernel the dot product is still the better of ours to 8.
-MAX_M = 8
+# Measured on GB300 at K3's router shape ([M, 7168] x [896, 7168]), cold L2, in
+# us/call, against the cublas path each backend displaces:
+#   M      1     2     4     8    16    32    64
+#   dotprod  3.39  3.83  4.99  8.21 12.27 19.96     -
+#   split-K     -     -     -  4.93  4.94  8.30 14.98
+#   cublas   9.51  9.69  9.82  9.89  9.94  9.56  9.62
+# Split-K takes over at 8 the way vLLM has it; the dot product only wins past 4
+# when split-K is absent. Both lose to cublas past 32, which vLLM does not gate
+# for -- their split-K reaches 90 us at M = 512 while cublas stays at 14.7.
+MAX_M_DOTPROD = 4
+MAX_M = 32
 _BLOCK_SIZE_BY_M: dict[int, int] = {1: 256, 2: 256, 4: 256, 8: 128}
 _DEFAULT_BLOCK_SIZE = 128
+# (split_k, num_stages) measured at the router shape; vLLM's tables cover
+# (K, N) of (4096, 256) through (7168, 384) and never (7168, 896), so they run
+# K3 on their (6, 4) default -- which loses to both of these at every M here
+# (5.75 / 8.74 / 9.19 us at M = 16 / 24 / 32).
+_SPLITK_CONFIG_BY_M: tuple[tuple[int, tuple[int, int]], ...] = (
+    (16, (4, 4)),  # 4.94 us at M = 16, against 6.04 for (4, 2)
+    (MAX_M, (4, 2)),  # 7.55 / 7.44 at M = 24 / 32, against 8.28 / 8.31
+)
+_SPLITK_TILE_N = 16
+_SPLITK_TILE_K = 256
+_SPLITK_DMA_WARPS = 4
 
 
 def block_size_for(m: int) -> int:
     """Threads per output column that measured fastest at this token count."""
     return _BLOCK_SIZE_BY_M.get(m, _DEFAULT_BLOCK_SIZE)
+
+
+def splitk_config_for(m: int) -> tuple[int, int]:
+    """``(split_k, num_stages)`` that measured fastest at this token count."""
+    for upper, config in _SPLITK_CONFIG_BY_M:
+        if m <= upper:
+            return config
+    return _SPLITK_CONFIG_BY_M[-1][1]
 
 
 def _cutedsl_available() -> bool:
@@ -38,12 +62,13 @@ def _cutedsl_available() -> bool:
     return True
 
 
-class LLBf16Dotprod:
-    """Compile-once-per-(M, K, block_size) driver for the vendored kernel."""
+class LLBf16Router:
+    """Compile-once driver for the two vendored CuTe router GEMM kernels."""
 
     def __init__(self) -> None:
         # Device-keyed: a callable compiled on one GPU must not run on another.
-        self._compiled: dict[tuple[int, int, int, int], Any] = {}
+        self._dotprod: dict[tuple[int, int, int, int], Any] = {}
+        self._splitk: dict[tuple[int, int, int], Any] = {}
         self._compile_lock = threading.Lock()
         self._available: bool | None = None
 
@@ -64,14 +89,14 @@ class LLBf16Dotprod:
         return torch.cuda.get_device_capability(device)[0] >= 9
 
     def supports(self, a: torch.Tensor, b: torch.Tensor, m: int) -> bool:
-        """Whether this driver can serve the given operands.
+        """Whether either backend can serve the given operands.
 
         Args:
             a: ``[M, K]`` activation; b: ``[N, K]`` weight.
-            m: Token count, which the kernel bakes in as a constant.
+            m: Token count.
 
         Returns:
-            True when the kernel is compilable and applicable here.
+            True when a vendored kernel is compilable and applicable here.
         """
         return (
             self.is_available()
@@ -85,13 +110,18 @@ class LLBf16Dotprod:
             and a.shape[1] == b.shape[1]
             and a.device == b.device
             and a.device.type == "cuda"
+            # Split-K reduces through DSMEM inside a thread block cluster.
+            and (
+                m <= MAX_M_DOTPROD or torch.cuda.get_device_capability(a.device)[0] >= 9
+            )
         )
 
-    def _compile(self, m: int, k: int, block_size: int, device: torch.device) -> None:
+    def _compile_dotprod(
+        self, m: int, k: int, block_size: int, device: torch.device
+    ) -> None:
         import cutlass.cute as cute
         from cutlass import BFloat16, Float32
         from quack.compile_utils import make_fake_tensor
-
         from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16._kernel import (
             LLBf16Dotprod as _Kernel,
         )
@@ -102,7 +132,7 @@ class LLBf16Dotprod:
         b = make_fake_tensor(BFloat16, (n, k), divisibility=divisibility)
         c = make_fake_tensor(Float32, (m, n), divisibility=1)
         gemm = _Kernel(k=k, bs=block_size, use_pdl=self._use_pdl(device))
-        self._compiled[(device.index or 0, m, k, block_size)] = cute.compile(
+        self._dotprod[(device.index or 0, m, k, block_size)] = cute.compile(
             gemm,
             a,
             b,
@@ -112,6 +142,31 @@ class LLBf16Dotprod:
             1,  # runtime N placeholder for the fake-tensor compile
             self._stream(device),
             options="--enable-tvm-ffi --ptxas-options -maxrregcount=64",
+        )
+
+    def _compile_splitk(self, config: tuple[int, int], device: torch.device) -> None:
+        import cutlass.cute as cute
+        from cutlass import BFloat16, Float32
+        from quack.compile_utils import make_fake_tensor
+        from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16._splitk_kernel import (
+            LLBf16SplitK as _Kernel,
+        )
+
+        split_k, num_stages = config
+        m, k, n = cute.sym_int(), cute.sym_int(), cute.sym_int()
+        a = make_fake_tensor(BFloat16, (m, k), divisibility=8)
+        b = make_fake_tensor(BFloat16, (n, k), divisibility=8)
+        c = make_fake_tensor(Float32, (m, n), divisibility=1)
+        gemm = _Kernel(
+            tile_n=_SPLITK_TILE_N,
+            tile_k=_SPLITK_TILE_K,
+            num_stages=num_stages,
+            num_dma_warps=_SPLITK_DMA_WARPS,
+            split_k=split_k,
+            use_pdl=self._use_pdl(device),
+        )
+        self._splitk[(device.index or 0, split_k, num_stages)] = cute.compile(
+            gemm, a, b, c, self._stream(device), options="--enable-tvm-ffi"
         )
 
     def __call__(
@@ -124,40 +179,61 @@ class LLBf16Dotprod:
     ) -> torch.Tensor:
         """Compute ``a @ b.T`` with FP32 accumulation and an FP32 result.
 
+        The dot-product kernel serves ``M <= MAX_M_DOTPROD`` and the split-K
+        kernel the rest up to ``MAX_M``.
+
         Args:
             a: ``[M, K]`` contiguous BF16 activation.
             b: ``[N, K]`` contiguous BF16 weight.
             out: Optional ``[M, N]`` FP32 destination; allocated when omitted.
-            block_size: Threads cooperating on one output column; the measured
-                pick for ``M`` when omitted.
+            block_size: Dot-product threads per output column; the measured
+                pick for ``M`` when omitted. Ignored by split-K.
 
         Returns:
             ``[M, N]`` FP32 tensor, ``out`` when it was given.
         """
         m, k = a.shape
         n = b.shape[0]
-        if block_size is None:
-            block_size = block_size_for(m)
         if not self.supports(a, b, m):
             raise ValueError(
-                f"ll_bf16 dotprod cannot serve M={m} K={k} "
-                f"dtypes={a.dtype}/{b.dtype}"
+                f"ll_bf16 cannot serve M={m} K={k} dtypes={a.dtype}/{b.dtype}"
             )
         if out is None:
             out = torch.empty(m, n, dtype=torch.float32, device=a.device)
         elif out.shape != (m, n) or out.dtype is not torch.float32:
             raise ValueError(f"out must be a [{m}, {n}] float32 tensor")
 
-        key = (a.device.index or 0, m, k, block_size)
-        if key not in self._compiled:
-            # Double-checked: cute.compile is expensive and not thread-safe.
+        device = a.device
+        stream = self._stream(device)
+        if m <= MAX_M_DOTPROD:
+            if block_size is None:
+                block_size = block_size_for(m)
+            key = (device.index or 0, m, k, block_size)
+            if key not in self._dotprod:
+                # Double-checked: cute.compile is expensive and not thread-safe.
+                with self._compile_lock:
+                    if key not in self._dotprod:
+                        self._compile_dotprod(m, k, block_size, device)
+            self._dotprod[key](a, b, out, n, stream)
+            return out
+
+        config = splitk_config_for(m)
+        key = (device.index or 0, *config)
+        if key not in self._splitk:
             with self._compile_lock:
-                if key not in self._compiled:
-                    self._compile(m, k, block_size, a.device)
-        self._compiled[key](a, b, out, n, self._stream(a.device))
+                if key not in self._splitk:
+                    self._compile_splitk(config, device)
+        self._splitk[key](a, b, out, stream, 1.0)
         return out
 
 
-ll_bf16_dotprod = LLBf16Dotprod()
+ll_bf16_router = LLBf16Router()
 
-__all__ = ["MAX_M", "LLBf16Dotprod", "block_size_for", "ll_bf16_dotprod"]
+__all__ = [
+    "MAX_M",
+    "MAX_M_DOTPROD",
+    "LLBf16Router",
+    "block_size_for",
+    "splitk_config_for",
+    "ll_bf16_router",
+]
