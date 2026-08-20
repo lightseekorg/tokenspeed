@@ -328,7 +328,17 @@ def render_script(
         "SLURM_PROCID,SLURM_LOCALID",
     ]
     gpu_device_mounts = ""
+    local_model_mounts = ""
     if task.runner.startswith(("gb300-", "slurm-gb300-")):
+        local_model_mounts = r"""
+# GB300 nodes keep large model snapshots on their local RAID.  Keep the
+# source configurable for other coordinators while exposing one stable path
+# to server containers.
+local_model_root="${TS_CI_LOCAL_MODEL_ROOT:-/scratch/${USER}-models}"
+if [ -d "$local_model_root" ]; then
+  model_mounts+=("$local_model_root:/models:ro")
+fi
+"""
         gpu_device_mounts = r"""
 # The GB300 Pyxis hook does not expose allocated device nodes.
 gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"
@@ -386,8 +396,10 @@ mounts=(
   "$run:/workspace/.ci-artifacts"
   {shlex.quote(str(cache) + ":/home/runner/.cache")}
 )
+model_mounts=()
 gpu_mounts=()
 
+{local_model_mounts}
 {gpu_device_mounts}
 
 # The cluster Pyxis hooks omit driver libraries and tools.
@@ -429,7 +441,7 @@ nvidia_smi="$(command -v nvidia-smi 2>/dev/null || true)"
 trap 'rm -rf -- "$scratch"' EXIT
 mkdir -p "$src/.ci-artifacts" "$tmp"
 tar -xf "$source_archive" -C "$src"
-mounts=("$src:/workspace" "$tmp:/tmp" "${{gpu_mounts[@]}}" "${{mounts[@]}}")
+mounts=("$src:/workspace" "$tmp:/tmp" "${{gpu_mounts[@]}}" "${{model_mounts[@]}}" "${{mounts[@]}}")
 container_mounts="$(IFS=,; printf '%s' "${{mounts[*]}}")"
 {shell_array("srun_args", srun)}
 srun_args+=(--container-mounts="$container_mounts")
@@ -518,7 +530,7 @@ client_src="$scratch/client-src"
 server_tmp="$scratch/server-tmp"
 client_tmp="$scratch/client-tmp"
 # Full-node server allocations use the same GPU device IDs on every node.
-server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" "${{gpu_mounts[@]}}" "${{mounts[@]}}")
+server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" "${{gpu_mounts[@]}}" "${{model_mounts[@]}}" "${{mounts[@]}}")
 client_mounts=("$client_src:/workspace" "$client_tmp:/tmp" "${{mounts[@]}}")
 server_container_mounts="$(IFS=,; printf '%s' "${{server_mounts[*]}}")"
 client_container_mounts="$(IFS=,; printf '%s' "${{client_mounts[*]}}")"

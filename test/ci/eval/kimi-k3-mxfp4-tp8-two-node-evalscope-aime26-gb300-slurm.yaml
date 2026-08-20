@@ -17,7 +17,7 @@ install:
   - python3 -m pip install flash-linear-attention
 server:
   command: >-
-    ts serve moonshotai/Kimi-K3
+    ts serve /models/moonshotai--Kimi-K3/9f62e4e9fffbd0a83ddd60e1c209d828994b3569
     --served-model-name kimi-k3
     --trust-remote-code
     --max-model-len 65536

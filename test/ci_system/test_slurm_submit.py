@@ -329,7 +329,12 @@ def test_render_script_mounts_only_allocated_gb300_devices():
     assert "\n  /dev/nvidia-nvswitchctl \\\n" in script
     assert "\n  /dev/nvidia-caps \\\n" in script
     assert "\n  /dev/nvidia-caps-imex-channels; do\n" in script
-    assert '"${gpu_mounts[@]}" "${mounts[@]}"' in script
+    assert (
+        'local_model_root="${TS_CI_LOCAL_MODEL_ROOT:-/scratch/${USER}-models}"'
+        in script
+    )
+    assert 'model_mounts+=("$local_model_root:/models:ro")' in script
+    assert '"${gpu_mounts[@]}" "${model_mounts[@]}" "${mounts[@]}"' in script
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
     multinode_script = render_script(
@@ -367,7 +372,7 @@ def test_render_multinode_gb300_keeps_devices_out_of_client_step():
 
     assert (
         'server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" '
-        '"${gpu_mounts[@]}" "${mounts[@]}")' in script
+        '"${gpu_mounts[@]}" "${model_mounts[@]}" "${mounts[@]}")' in script
     )
     assert (
         'client_mounts=("$client_src:/workspace" "$client_tmp:/tmp" '
