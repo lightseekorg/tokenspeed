@@ -270,12 +270,58 @@ def _prepare_gdn_decode_state_path(
     return initial_state_indices, output_state_indices, solution
 
 
+def _build_cu_extend_seq_lens_cpu(
+    extend_seq_lens_cpu: torch.Tensor | None, expected_len: int
+) -> tuple[int, ...]:
+    """Host prefix sum of the scheduler's extend lengths.
+
+    The tuple must equal the contents of ``query_start_loc`` — a wrong hint
+    silently corrupts the CuteDSL host chunk plan. Both are built together
+    here in ``init_forward_metadata`` (mirroring MHA's
+    ``cu_extend_seq_lens_cpu``), so absence or length misalignment can only
+    mean a caller broke that contract: fail loudly instead of silently
+    degrading to the wrapper's boundary re-read.
+
+    Args:
+        extend_seq_lens_cpu: CPU per-sequence extend lengths.
+        expected_len: ``query_start_loc.numel()`` of the batch.
+
+    Returns:
+        ``(0, lens[0], lens[0]+lens[1], ...)`` with ``expected_len`` entries.
+
+    Raises:
+        RuntimeError: the lengths are absent or disagree with
+            ``query_start_loc`` on the sequence count.
+    """
+    if extend_seq_lens_cpu is None:
+        raise RuntimeError(
+            "extend metadata requires the scheduler's host extend lengths; "
+            "the executor provides them for every extend batch"
+        )
+    bounds = [0]
+    for n in extend_seq_lens_cpu.tolist():
+        bounds.append(bounds[-1] + int(n))
+    if len(bounds) != expected_len:
+        raise RuntimeError(
+            "host extend lengths disagree with query_start_loc on the "
+            f"sequence count: {len(bounds)} boundaries vs {expected_len} "
+            "entries"
+        )
+    return tuple(bounds)
+
+
 @dataclass
 class MambaForwardMetadata:
     query_start_loc: torch.Tensor | None
     mamba_output_indices: torch.Tensor | None = None
     extend_prefix_lens: torch.Tensor | None = None
     extend_seq_lens_cpu: torch.Tensor | None = None
+    # Host prefix sum of extend_seq_lens_cpu, equal to query_start_loc's
+    # contents; built once per extend batch (mirroring MHA's field of the
+    # same name) and reused by every layer's prefill scan. A tuple, unlike
+    # MHA's list: it crosses into the CuteDSL wheel, which seeds a memo from
+    # it, so immutability rules out stale-aliasing.
+    cu_extend_seq_lens_cpu: tuple[int, ...] | None = None
     # Per-state-group metadata is gathered once per group and batch;
     # layers select their entry via ``pool.group_id_for_layer(layer_id)``.
     state_in_blocks_by_group: dict[str, torch.Tensor] | None = None
@@ -840,6 +886,7 @@ class MambaAttnBackend(AttentionBackend):
         if not 0 <= num_extends <= bs:
             raise ValueError("num_extends must be between 0 and bs")
         mamba_output_indices = None
+        cu_extend_seq_lens_cpu: tuple[int, ...] | None = None
         extend_seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
         if extend_seq_lens_cpu is not None:
             extend_seq_lens_cpu = extend_seq_lens_cpu[:num_extends]
@@ -861,10 +908,16 @@ class MambaAttnBackend(AttentionBackend):
                 )
                 set_total_chunks_hint_uniform(bs, tokens_per_req, query_start_loc)
             else:
+                if extend_seq_lens_cpu is None:
+                    raise RuntimeError(
+                        "extend metadata requires the scheduler's host extend "
+                        "lengths; the executor provides them for every extend "
+                        "batch"
+                    )
                 extend_start_loc = kwargs.get("extend_start_loc")
                 extend_seq_lens = kwargs.get("extend_seq_lens")
                 if forward_mode.is_mixed():
-                    if extend_seq_lens is None or extend_seq_lens_cpu is None:
+                    if extend_seq_lens is None:
                         raise RuntimeError(
                             "mixed GDN metadata requires extend sequence lengths"
                         )
@@ -895,10 +948,6 @@ class MambaAttnBackend(AttentionBackend):
                     )
                     query_start_loc[:bs] = extend_start_loc
                     query_start_loc[bs] = extend_start_loc[-1] + extend_seq_lens[-1]
-                    if extend_seq_lens_cpu is None:
-                        extend_seq_lens_cpu = extend_seq_lens[:bs].to(
-                            device="cpu", dtype=torch.int32
-                        )
                 else:
                     extend_prefix_lens = kwargs.get("extend_prefix_lens")
                     if extend_prefix_lens is not None:
@@ -912,9 +961,10 @@ class MambaAttnBackend(AttentionBackend):
                         bs + 1, dtype=torch.int32, device=self.device
                     )
                     torch.cumsum(extend_lens, dim=0, out=query_start_loc[1:])
-                    if extend_seq_lens_cpu is None:
-                        extend_seq_lens_cpu = extend_lens.to(device="cpu")
                 set_total_chunks_hint(extend_seq_lens_cpu, query_start_loc)
+                cu_extend_seq_lens_cpu = _build_cu_extend_seq_lens_cpu(
+                    extend_seq_lens_cpu, query_start_loc.numel()
+                )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
@@ -958,6 +1008,7 @@ class MambaAttnBackend(AttentionBackend):
             mamba_output_indices=mamba_output_indices,
             extend_prefix_lens=kwargs.get("extend_prefix_lens"),
             extend_seq_lens_cpu=extend_seq_lens_cpu,
+            cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
             state_in_blocks_by_group=state_in_blocks_by_group,
             state_out_blocks_by_group=state_out_blocks_by_group,
         )
@@ -1802,7 +1853,7 @@ class MambaAttnBackend(AttentionBackend):
                 seq_len=seq_len,
                 num_real_tokens=num_real_tokens,
                 lower_bound=gate_lower_bound,
-                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                cu_seqlens_cpu=self.forward_metadata.cu_extend_seq_lens_cpu,
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             # Extend indices never carry pad(-1), so this write is unguarded.
@@ -1990,7 +2041,7 @@ class MambaAttnBackend(AttentionBackend):
         seq_len: int,
         num_real_tokens: int,
         lower_bound: float | None,
-        extend_seq_lens_cpu: torch.Tensor | None = None,
+        cu_seqlens_cpu: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Chunked scan of an extend/prefill batch, from the gathered state.
 
@@ -2018,10 +2069,11 @@ class MambaAttnBackend(AttentionBackend):
             seq_len: Padded token extent of the batch.
             num_real_tokens: Token extent excluding the graph padding tail.
             lower_bound: KDA decay clamp.
-            extend_seq_lens_cpu: Host-side per-sequence extend lengths whose
-                prefix sum equals ``query_start_loc``. The KDA override
-                forwards it so the CuteDSL wrapper can plan without a D2H
-                read; the GDN scan plans on device and ignores it.
+            cu_seqlens_cpu: Metadata-built host copy of ``query_start_loc``'s
+                contents (see ``MambaForwardMetadata.cu_extend_seq_lens_cpu``). The
+                KDA override forwards it so the CuteDSL wrapper can plan
+                without a D2H read; the GDN scan plans on device and ignores
+                it.
 
         Returns:
             ``(core_attn_out, last_recurrent_state)``.
