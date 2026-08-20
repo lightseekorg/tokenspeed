@@ -35,6 +35,12 @@ def _gluon_eligible(
     )
 
 
+#: GB200, cold L2: packed wins to 256 rows and ties the grouped kernel at 320.
+_K3_PACKED_TOPK_MAX_ROWS_NVIDIA = 256
+#: Unmeasured past one row on CDNA4, so it keeps what it was tuned at.
+_K3_PACKED_TOPK_MAX_ROWS_CDNA4 = 1
+
+
 def moe_sigmoid_bias_topk(
     router_logits: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -92,18 +98,25 @@ def moe_sigmoid_bias_topk(
             torch.empty(shape, device=router_logits.device, dtype=torch.int32),
         )
     platform = Platform.get()
+    if platform.is_nvidia:
+        packed_max_rows = _K3_PACKED_TOPK_MAX_ROWS_NVIDIA
+    elif platform.is_cdna4:
+        packed_max_rows = _K3_PACKED_TOPK_MAX_ROWS_CDNA4
+    else:
+        packed_max_rows = 0
     if (
         solution is None
-        and (platform.is_cdna4 or platform.is_nvidia)
-        and router_logits.shape == (1, 896)
+        and router_logits.shape[1] == 896
+        and 0 < tokens <= packed_max_rows
         and router_logits.dtype == torch.float32
         and correction_bias.dtype == torch.float32
         and topk == 16
+        # The packed kernel raises on these layouts; the grouped one reads strides.
+        and router_logits.is_cuda
+        and router_logits.is_contiguous()
+        and correction_bias.is_contiguous()
     ):
-        # The packed-key single-CTA kernel wins on both vendors for the K3
-        # decode shape: one bitonic top-16 instead of the grouped multi-pass
-        # (NVIDIA B300: 3.7us vs 7.0us for the minimax path, bit-identical
-        # selection and weights).
+        # Selection matches the grouped kernel; the weights differ by an fp32 ulp.
         topk_weights, topk_ids = kimi3_sigmoid_bias_topk(
             router_logits,
             correction_bias,
