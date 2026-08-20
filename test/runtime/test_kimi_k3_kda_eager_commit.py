@@ -337,6 +337,20 @@ def test_descriptor_binding_rejects_nonuniform_conv_width():
         harness.forward(harness.inputs(1, 701), 1)
 
 
+def test_equal_geometry_pool_replacement_rebinds_batched_replay():
+    harness = _Harness(eager_replay=True)
+    pages = {group: [2] for group in _STATE_GROUPS}
+    harness.prepare_metadata([0], pages, [8 + T])
+    harness.forward(harness.inputs(1, 711), 1)
+    assert harness.backend._batched_replay_ready
+
+    replacement = _make_kimi_pool(DEV, usable_pages=24)
+    harness.backend.set_kv_pool(replacement)
+    harness.pool = replacement
+    harness.contract = replacement.arena.runtime_contract
+    harness.prepare_metadata([0], pages, [8 + T])
+    harness.forward(harness.inputs(1, 712), 1)
+    assert harness.backend._batched_replay_ready
 
 
 def test_verify_scratch_cannot_grow_after_graph_capture():

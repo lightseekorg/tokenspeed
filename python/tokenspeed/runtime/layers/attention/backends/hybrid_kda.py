@@ -187,6 +187,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 )
                 self._replay_descriptors = addresses
                 self._replay_descriptor_bound.clear()
+                self._replay_weights.clear()
                 self._batched_replay_launch = None
                 self._batched_replay_ready = False
 
