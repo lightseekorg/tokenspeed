@@ -403,6 +403,41 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
         self.assertEqual(len(specs), 2)
 
 
+class BroadcastWindowAsymmetryTest(unittest.TestCase):
+    """The one asymmetry between the two window spellings.
+
+    A scalar reaches every layer, so non-sliding layers must ignore it; the
+    same value written at that position in a sequence is a mislabeled layer
+    (see ``test_full_layer_with_positive_window_in_sequence_raises``).
+    """
+
+    def test_broadcast_scalar_leaves_full_group_windowless(self):
+        by_id = {
+            spec.group_id: spec
+            for spec in _specs(
+                layer_types=["full_attention", "sliding_attention"],
+                sliding_window_tokens=128,
+                prefix_granularity=16,
+            )
+        }
+        self.assertIsNone(by_id["full_attention"].sliding_window_tokens)
+        self.assertEqual(by_id["sliding_attention"].sliding_window_tokens, 128)
+
+    def test_broadcast_scalar_leaves_state_group_windowless(self):
+        by_id = {
+            spec.group_id: spec
+            for spec in _specs(
+                layer_types=["linear_attention", "sliding_attention"],
+                sliding_window_tokens=128,
+                prefix_granularity=16,
+            )
+        }
+        state = by_id["linear_attention"]
+        self.assertEqual(state.family, "state")
+        self.assertEqual(state.retention, "full_history")
+        self.assertIsNone(state.sliding_window_tokens)
+
+
 class CacheGroupSpecShapeTest(unittest.TestCase):
     """A spec declares exactly one geometry shape: row geometry (paged KV)
     or checkpoint_granularity (snapshot state)."""
