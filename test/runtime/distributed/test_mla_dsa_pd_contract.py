@@ -138,7 +138,6 @@ def _make_mla_pool(pd_enabled: bool):
         rank=0,
         cache_group_specs=specs,
         token_capacity=_NUM_LCM_BLOCKS * _P,
-        layer_group_ids=("full_attention",) * _NUM_LAYERS,
     )
     return pool
 
@@ -163,7 +162,6 @@ def _make_dsa_pool(pd_enabled: bool):
         index_head_dim=128,
         cache_group_specs=specs,
         token_capacity=_NUM_LCM_BLOCKS * _P,
-        layer_group_ids=("full_attention",) * _NUM_LAYERS,
     )
     return pool
 

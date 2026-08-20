@@ -148,7 +148,6 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
         layer_num=text_config.num_hidden_layers,
         rank=0,
         layer_types=layer_types,
-        layer_group_ids=group_ids,
         cache_group_specs=_kimi_group_specs(group_ids, layer_types, plan),
     )
     return pool
@@ -162,21 +161,21 @@ def kimi_pool():
 def layer_for_group(pool, group_id: str) -> int:
     return next(
         layer_id
-        for layer_id, candidate in pool._group_ids_by_layer.items()
+        for layer_id, candidate in sorted(pool.state_group_by_layer.items())
         if candidate == group_id
     )
 
 
 def mla_layer_id(pool) -> int:
-    return layer_for_group(pool, "full_attention")
+    return next(
+        layer_id
+        for layer_id in range(pool.layer_num)
+        if layer_id not in pool.state_group_by_layer
+    )
 
 
 def kda_layer_id(pool) -> int:
-    return next(
-        layer_id
-        for layer_id, group_id in pool._group_ids_by_layer.items()
-        if group_id != "full_attention"
-    )
+    return min(pool.state_group_by_layer)
 
 
 def cache_metadata_for(contract, tables, device, *, filler_page: int = 1):
