@@ -22,9 +22,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from tokenspeed_kernel.platform import current_platform
-
-_IS_NVIDIA = current_platform().is_nvidia
 
 
 @triton.jit
@@ -1252,19 +1249,10 @@ def fused_recurrent_kda_window_fwd_kernel(
     read_indices,  # [N] anchor page per request (-1 = fresh)
     write_indices,  # [N] destination page per request (STORE_FINAL only)
     n_steps,  # [N] tokens to consume per request (HAS_N_STEPS only)
-    prev_qkv,  # previous window's payload (HAS_REPLAY_PREFIX only)
-    prev_beta,
-    prev_base,  # [N] base payload row of the pending window (-1 = none)
-    prev_steps,  # [N] accepted tokens of the pending window
-    commit_indices,  # [N] page for the deferred state commit (-1 = skip)
     stride_raw_tok: tl.constexpr,
     stride_beta_tok: tl.constexpr,
-    stride_prev_raw_tok: tl.constexpr,
-    stride_prev_beta_tok: tl.constexpr,
     g,
-    prev_g,
     stride_g_tok: tl.constexpr,
-    stride_prev_g_tok: tl.constexpr,
     scale: tl.constexpr,
     T: tl.constexpr,
     H: tl.constexpr,
@@ -1280,20 +1268,16 @@ def fused_recurrent_kda_window_fwd_kernel(
     WRITE_OUTPUT: tl.constexpr,
     STORE_FINAL: tl.constexpr,
     HAS_N_STEPS: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
-    HAS_REPLAY_PREFIX: tl.constexpr,
 ):
     """Run a window of KDA decode steps from a committed page: conv(+silu),
     the f_b gate GEMV, and the delta-rule recurrence, per token.
-
-    One kernel serves every half of speculative decoding, so the paths can
-    never drift apart numerically:
 
     - **target verify** (``WRITE_OUTPUT``, no ``STORE_FINAL``) consumes all
       ``T`` draft positions and emits their outputs. The evolved state stays
       in registers and is thrown away: verification is tentative, and its
       final state ``S_{N+T}`` is only correct if every draft token is
-      accepted.
+      accepted. (Production verify runs the megafuse kernel; this mode is
+      the same arithmetic via ``_kda_window_step``.)
     - **replay commit** (``STORE_FINAL``, ``HAS_N_STEPS``, no output)
       re-consumes the first ``n_steps[n]`` positions of the same window from
       the same committed page, and stores the resulting conv window and
@@ -1301,24 +1285,10 @@ def fused_recurrent_kda_window_fwd_kernel(
       state a non-speculative decode of the accepted tokens would have
       reached, without verification ever having to materialize (and the
       caller ever having to keep) a state per draft position.
-    - **fused replay + verify** (``HAS_REPLAY_PREFIX`` + ``WRITE_OUTPUT``)
-      folds the previous round's replay commit into this round's verify:
-      it anchors at the page from BEFORE the previous window, replays that
-      window's accepted prefix from its captured payload (register-resident,
-      no output), stores the result to ``commit_indices[n]`` -- which IS the
-      previous round's deferred commit -- and rolls straight into the new
-      window's ``T`` verify steps. Relative to a standalone replay followed
-      by a verify this saves one full state read plus one kernel's fixed
-      front per layer per round, and it matches that pair up to compiler
-      FMA contraction (~1 ulp fp32; see the test header): the committed
-      fp32 state merely stays in registers instead of round-tripping
-      through memory, and the conv window entries are raw bf16 either way. ``prev_base[n] < 0`` (no pending window: a fresh
-      request, or a padded slot) degenerates to a plain verify.
 
-    ``n_steps[n] == 0`` / ``prev_steps[n] == 0`` are meaningful and must stay
-    supported: they commit the anchor state unchanged, which is what an
-    all-rejected window needs when the destination page differs from the
-    source page.
+    ``n_steps[n] == 0`` is meaningful and must stay supported: it commits
+    the anchor state unchanged, which is what an all-rejected window needs
+    when the destination page differs from the source page.
 
     Page-ownership precondition (NOT checked in-kernel): every commit /
     write page must be exclusively owned by its request for this launch.
@@ -1399,86 +1369,8 @@ def fused_recurrent_kda_window_fwd_kernel(
     b_h += tl.load(
         p_h0, mask=mask_h & read_ok, other=0.0, eviction_policy="evict_first"
     ).to(tl.float32)
-    if ENABLE_PDL:
-        # State and conv taps are independent of the gate, so they load while
-        # the precompute is still running; only the gate reads below need it.
-        tl.extra.cuda.gdc_wait()
 
     g_off = i_hv * K + o_k
-
-    if HAS_REPLAY_PREFIX:
-        # Deferred commit: replay the accepted prefix from the anchor, publish, continue -- state and conv window stay in registers across the seam.
-        p_base = tl.load(prev_base + i_n).to(tl.int64)
-        r_steps = 0
-        if p_base >= 0:
-            # prev_steps uses the previous window; staging flushes mismatched windows, so prev_steps <= T.
-            r_steps = tl.minimum(
-                tl.maximum(tl.load(prev_steps + i_n).to(tl.int32), 0), T
-            )
-        for i_t in range(r_steps):
-            ptok = p_base + i_t
-            (
-                s_q0,
-                s_q1,
-                s_q2,
-                s_k0,
-                s_k1,
-                s_k2,
-                s_v0,
-                s_v1,
-                s_v2,
-                b_h,
-                _,
-            ) = _kda_window_step(
-                prev_qkv,
-                prev_beta,
-                ptok,
-                stride_prev_raw_tok,
-                stride_prev_beta_tok,
-                i_hv,
-                qf,
-                kf,
-                vf,
-                mask_k,
-                mask_v,
-                w_q0,
-                w_q1,
-                w_q2,
-                w_q3,
-                w_k0,
-                w_k1,
-                w_k2,
-                w_k3,
-                w_v0,
-                w_v1,
-                w_v2,
-                w_v3,
-                s_q0,
-                s_q1,
-                s_q2,
-                s_k0,
-                s_k1,
-                s_k2,
-                s_v0,
-                s_v1,
-                s_v2,
-                b_h,
-                prev_g + (i_n * T + i_t) * stride_prev_g_tok + g_off,
-                scale,
-                COMPUTE_OUT=False,
-            )
-        # Gated on BOTH indices: p_base < 0 must write nothing even if the commit slot holds a stale page id.
-        b_commit = tl.load(commit_indices + i_n).to(tl.int64)
-        if p_base >= 0 and b_commit >= 0:
-            # In-place safe: each program touches only its own [BK, BV] slice; the conv window commits via kda_commit_conv_window.
-            p_hc = (
-                h_pool_out
-                + b_commit * stride_state_out_page
-                + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
-            )
-            tl.store(p_hc, b_h.to(p_hc.dtype.element_ty), mask=mask_h)
 
     steps = T
     if HAS_N_STEPS:
@@ -1561,9 +1453,6 @@ def fused_recurrent_kda_window_fwd_kernel(
             mask=mask_h & write_ok,
             eviction_policy="evict_first",
         )
-    if ENABLE_PDL:
-        # State and output are visible; the conv-window commit may begin.
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.heuristics(
@@ -1575,27 +1464,20 @@ def fused_recurrent_kda_window_fwd_kernel(
 @triton.jit
 def kda_gate_precompute_kernel(
     f_a,
-    prev_f_a,
     w_fb,
     A_log,
     dt_bias,
-    src_rows,
     gk_out,
     lower_bound,
     stride_fa_tok,
-    stride_prev_fa_tok,
     stride_gk_tok,
     rows,
-    split,
-    T: tl.constexpr,
     K: tl.constexpr,
     D_FA: tl.constexpr,
     BK: tl.constexpr,
     BT: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
-    INDEXED_SRC: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
 ):
     """Materialize the f_b gate for every token: ``gk[row, i_hv*K + k]``.
 
@@ -1606,13 +1488,7 @@ def kda_gate_precompute_kernel(
 
     The reduction is the same ``tl.sum(wfb * fa[None, :], axis=1)`` over the
     same tile shape as the in-kernel GEMV, so both paths agree bit for bit.
-    ``INDEXED_SRC`` reads row ``src_rows[row // T] + row % T`` instead of
-    ``row``, which is how the replay prefix addresses the payload ring.
     """
-    if ENABLE_PDL:
-        # f_a comes from the projection immediately upstream; every launch_pdl
-        # kernel here pairs the launch with a wait before touching producer data.
-        tl.extra.cuda.gdc_wait()
     i_hv = tl.program_id(0)
     i_tb = tl.program_id(1)
     i_kb = tl.program_id(2)
@@ -1635,15 +1511,7 @@ def kda_gate_precompute_kernel(
     for j in range(BT):
         row = i_tb * BT + j
         if row < rows:
-            if INDEXED_SRC and row >= split:
-                # Replay half: rows address the payload ring through the
-                # per-request base. Rows without a pending window read row 0
-                # and are ignored -- the consumer never replays them.
-                r = row - split
-                src = tl.maximum(tl.load(src_rows + r // T).to(tl.int64), 0) + r % T
-                fa = tl.load(prev_f_a + src * stride_prev_fa_tok + o_fa).to(tl.float32)
-            else:
-                fa = tl.load(f_a + row * stride_fa_tok + o_fa).to(tl.float32)
+            fa = tl.load(f_a + row * stride_fa_tok + o_fa).to(tl.float32)
             b_g = tl.sum(wfb * fa[None, :], axis=1)
             if HAS_DT_BIAS:
                 b_g = b_g + b_bias
@@ -1654,9 +1522,6 @@ def kda_gate_precompute_kernel(
                     b_g < 20.0, tl.math.log(1 + tl.math.exp(b_g)), b_g
                 )
             tl.store(gk_out + row * stride_gk_tok + gc, b_gk, mask=mask_k)
-    if ENABLE_PDL:
-        # The recurrence can start loading state the moment these land.
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 _SM_COUNT: dict[int, int] = {}
@@ -1668,9 +1533,8 @@ def _gate_tiling(rows: int, num_heads: int, head_dim: int, device):
     Both knobs only decide which rows a program owns -- every row still
     reduces over the whole D_FA axis -- so this never moves a result. What it
     does move is whether the weight-tile load has any parallelism to hide
-    behind: at one request the widest tiling leaves 48 programs and the kernel
-    costs 12.6us for eight rows of work, against 6.1us once the grid covers
-    the machine. At 256 rows both land at 14.3us.
+    behind: small batches need a narrower tiling to cover the machine, and at
+    large row counts the choices converge.
     """
     index = device.index if device.index is not None else torch.cuda.current_device()
     sms = _SM_COUNT.get(index)
@@ -1696,17 +1560,8 @@ def kda_gate_precompute(
     num_heads: int,
     head_dim: int,
     lower_bound: float | None,
-    prev_f_a: torch.Tensor | None = None,
-    prev_base: torch.Tensor | None = None,
-    draft_token_num: int = 1,
-    enable_pdl: bool = False,
 ) -> None:
     """Fill ``gk_out`` with the per-token f_b gate.
-
-    Rows ``[0, split)`` come from ``f_a`` packed token-major; when a replay
-    payload is given, rows ``[split, 2*split)`` come from ``prev_f_a`` at
-    ``prev_base[request] + position``. Both halves ride one launch because at
-    these sizes the kernel is launch-bound, not work-bound.
 
     Args:
         f_a: ``[tokens, D_FA]`` this round's low-rank gate input.
@@ -1715,45 +1570,31 @@ def kda_gate_precompute(
         gk_out: ``[rows, HV*K]`` fp32 destination.
         num_heads: value heads HV; head_dim: K.
         lower_bound: safe-gate lower bound, or None for the softplus form.
-        prev_f_a: payload ring holding the pending window's gate inputs.
-        prev_base: ``[requests]`` first ring row per request.
-        draft_token_num: rows per request in the replay half.
 
     Returns:
         None. ``gk_out`` is written in place.
     """
-    enable_pdl = bool(enable_pdl and _IS_NVIDIA)
     rows = gk_out.shape[0]
     if rows == 0:
         return
-    indexed = prev_base is not None
-    split = rows // 2 if indexed else rows
     block_t, block_k = _gate_tiling(rows, num_heads, head_dim, gk_out.device)
     kda_gate_precompute_kernel[
         (num_heads, triton.cdiv(rows, block_t), triton.cdiv(head_dim, block_k))
     ](
         f_a=f_a,
-        prev_f_a=prev_f_a if indexed else f_a,
         w_fb=w_fb,
         A_log=A_log,
         dt_bias=dt_bias,
-        src_rows=prev_base if indexed else f_a,
         gk_out=gk_out,
         lower_bound=lower_bound,
         stride_fa_tok=f_a.stride(0),
-        stride_prev_fa_tok=prev_f_a.stride(0) if indexed else 0,
         stride_gk_tok=gk_out.stride(0),
         rows=rows,
-        split=split,
-        T=draft_token_num,
         K=head_dim,
         D_FA=f_a.shape[-1],
         BK=block_k,
         BT=block_t,
-        INDEXED_SRC=indexed,
-        ENABLE_PDL=enable_pdl,
         num_warps=1 if block_t >= 4 else 2,
-        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 
@@ -1785,11 +1626,11 @@ def kda_gate_scratch(rows: int, width: int, device) -> torch.Tensor:
 # (BV, num_warps, num_stages). Splitting V costs redundancy -- every block
 # re-loads its (request, head) conv window -- so the tile is as wide as the
 # grid allows. Once the f_b gate moved out of the recurrence the spread across
-# tiles collapsed to a few percent (BV=32/64/128 within 3% at every batch
-# size), which is worth less than the property a single tile buys: BV changes
-# how the [BK, BV] state tile is spread over threads, and with it the order of
-# the reduction along K, so mixing tiles across rounds would make a request's
-# committed state depend on the batch size it happened to run at.
+# tiles collapsed to noise, which is worth less than the property a single
+# tile buys: BV changes how the [BK, BV] state tile is spread over threads,
+# and with it the order of the reduction along K, so mixing tiles across
+# rounds would make a request's committed state depend on the batch size it
+# happened to run at.
 _WINDOW_TILE = (64, 4, 2)  # the window kernel's (BV, num_warps, num_stages)
 
 
@@ -1809,8 +1650,6 @@ def _launch_kda_window(
     write_indices: torch.Tensor | None,
     n_steps: torch.Tensor | None,
     out: torch.Tensor | None,
-    pending: tuple | None = None,
-    enable_pdl: bool = False,
     num_heads: int,
     head_dim: int,
     draft_token_num: int,
@@ -1818,13 +1657,10 @@ def _launch_kda_window(
     lower_bound: float | None,
     gate_scratch: torch.Tensor | None = None,
 ) -> None:
-    """Shared launch for the verify / replay / fused halves of the window
-    kernel. ``pending`` is ``(prev_qkv, prev_f_a, prev_beta, prev_base,
-    prev_steps, commit_indices, commit_pool)`` for the fused replay prefix.
+    """Shared launch for the verify / replay halves of the window kernel.
     ``gate_scratch`` is caller-provided fp32 scratch for the hoisted gate
     (rows x ``num_heads*head_dim``, transient within this launch pair);
     ``None`` falls back to the module-local buffer."""
-    enable_pdl = bool(enable_pdl and _IS_NVIDIA)
     total = qkv_raw.shape[0]
     T = draft_token_num
     N = total // T
@@ -1840,31 +1676,12 @@ def _launch_kda_window(
         assert write_indices.numel() == N
     if n_steps is not None:
         assert n_steps.numel() == N
-    if pending is None:
-        prev_qkv = prev_f_a = prev_beta = None
-        prev_base = prev_steps = commit_indices = None
-        commit_pool = h_pool_out
-    else:
-        assert not store_final, "fused replay commits via commit_indices"
-        (
-            prev_qkv,
-            prev_f_a,
-            prev_beta,
-            prev_base,
-            prev_steps,
-            commit_indices,
-            commit_pool,
-        ) = pending
-        assert prev_qkv.stride(-1) == 1
-        for t in (prev_base, prev_steps, commit_indices):
-            assert t.numel() == N
     BV, warps, stages = _WINDOW_TILE
     grid = (triton.cdiv(V, BV) * N * HV,)
     # Hoist the f_b gate: computed here once per token, it stops costing the
     # recurrence kernel a live [K, D_FA] register tile (and its spills).
-    # Always hoisted -- measured faster at every size (8 rows: 36.9us vs
-    # 39.1us inline; 256 rows: 74.8 vs 117.9), and bit-identical.
-    rows = N * T * (2 if pending is not None else 1)
+    # Always hoisted -- measured faster at every size, and bit-identical.
+    rows = N * T
     if gate_scratch is not None:
         assert gate_scratch.shape[0] >= rows and gate_scratch.shape[1] == HV * K
         assert gate_scratch.dtype == torch.float32
@@ -1880,13 +1697,7 @@ def _launch_kda_window(
         num_heads=HV,
         head_dim=K,
         lower_bound=lower_bound,
-        prev_f_a=prev_f_a,
-        prev_base=prev_base,
-        draft_token_num=T,
-        enable_pdl=enable_pdl,
     )
-    g_cur = gate[: N * T]
-    g_prev = gate[N * T :] if pending is not None else g_cur
     fused_recurrent_kda_window_fwd_kernel[grid](
         qkv_raw=qkv_raw,
         conv_w=conv_w,
@@ -1894,23 +1705,14 @@ def _launch_kda_window(
         beta=beta,
         o=out,
         h_pool=h_pool,
-        h_pool_out=commit_pool,
+        h_pool_out=h_pool_out,
         read_indices=read_indices,
         write_indices=write_indices,
         n_steps=n_steps,
-        prev_qkv=prev_qkv,
-        prev_beta=prev_beta,
-        prev_base=prev_base,
-        prev_steps=prev_steps,
-        commit_indices=commit_indices,
         stride_raw_tok=qkv_raw.stride(0),
         stride_beta_tok=beta.stride(0),
-        stride_prev_raw_tok=prev_qkv.stride(0) if pending is not None else 0,
-        stride_prev_beta_tok=prev_beta.stride(0) if pending is not None else 0,
-        g=g_cur,
-        prev_g=g_prev,
-        stride_g_tok=g_cur.stride(0),
-        stride_prev_g_tok=g_prev.stride(0),
+        g=gate,
+        stride_g_tok=gate.stride(0),
         scale=scale,
         T=T,
         H=HV,
@@ -1921,16 +1723,13 @@ def _launch_kda_window(
         BK=triton.next_power_of_2(K),
         BV=BV,
         stride_state_page=h_pool.stride(0),
-        stride_state_out_page=commit_pool.stride(0) if commit_pool is not None else 0,
+        stride_state_out_page=h_pool_out.stride(0) if h_pool_out is not None else 0,
         stride_conv_page=conv_pool.stride(0),
         WRITE_OUTPUT=out is not None,
         STORE_FINAL=store_final,
         HAS_N_STEPS=n_steps is not None,
-        ENABLE_PDL=enable_pdl,
-        HAS_REPLAY_PREFIX=pending is not None,
         num_warps=warps,
         num_stages=stages,
-        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 
@@ -2370,34 +2169,19 @@ def batched_recurrent_kda_replay_commit(
 
 @triton.jit
 def kda_commit_conv_window_kernel(
-    qkv_raw,  # payload ring rows [2*cap, 3*P]: prev parity read, cur written
+    qkv_raw,  # [N*T, 3*P] raw projections the verify pass consumed
     conv_pool,  # [pages, 3*P, 3] committed conv window (read)
     conv_out,  # [pages, 3*P, 3] destination (may alias conv_pool)
     read_indices,  # [N] committed page per request (-1 = fresh)
     write_indices,  # [N] destination page per request (-1 skips)
     n_steps,  # [N] tokens consumed per request
-    row_base,  # [N] first payload row per request (-1 skips), parity-offset
-    src_qkv,  # [N*T, 3*P] THIS round's projections (capture source)
-    src_fa,  # [N*T, W_FA]
-    src_beta,  # [N*T, W_BETA]
-    dst_fa,  # ring [2*cap, W_FA]
-    dst_beta,  # ring [2*cap, W_BETA]
-    capture_base,  # [1] int64: this round's parity * cap (device-carried)
+    row_base,  # [N] first payload row per request (-1 skips)
     stride_raw_tok: tl.constexpr,
     stride_conv_page: tl.constexpr,
     stride_conv_out_page: tl.constexpr,
-    stride_src_tok: tl.constexpr,
-    stride_sfa_tok: tl.constexpr,
-    stride_sbeta_tok: tl.constexpr,
-    stride_dfa_tok: tl.constexpr,
-    stride_dbeta_tok: tl.constexpr,
     T: tl.constexpr,
     CONV_DIM: tl.constexpr,
-    W_FA: tl.constexpr,
-    W_BETA: tl.constexpr,
     BLOCK: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
-    CAPTURE: tl.constexpr,
 ):
     """Roll a committed conv window forward by ``n_steps`` raw tokens.
 
@@ -2414,34 +2198,6 @@ def kda_commit_conv_window_kernel(
     """
     i_n = tl.program_id(0)
     i_c = tl.program_id(1)
-
-    if CAPTURE:
-        # Stage THIS round's inputs into the ring's current parity half; the
-        # conv roll below reads the OTHER half, so the two never collide even
-        # when the batch re-packs slots between rounds. Runs before the
-        # early return: fresh requests still owe next round a payload.
-        cb = tl.load(capture_base)
-        offs_c = i_c * BLOCK + tl.arange(0, BLOCK)
-        m_q = offs_c < CONV_DIM
-        for i_t in range(T):
-            row = i_n * T + i_t
-            v = tl.load(src_qkv + row * stride_src_tok + offs_c, mask=m_q, other=0)
-            tl.store(qkv_raw + (cb + row) * stride_raw_tok + offs_c, v, mask=m_q)
-            # The gate payloads ride the same column blocks as qkv rather
-            # than one privileged program, so BLOCK can shrink to give small
-            # batches a grid without stranding f_a on a single program.
-            if i_c * BLOCK < W_FA:
-                m_f = offs_c < W_FA
-                vf = tl.load(src_fa + row * stride_sfa_tok + offs_c, mask=m_f, other=0)
-                tl.store(dst_fa + (cb + row) * stride_dfa_tok + offs_c, vf, mask=m_f)
-            if i_c * BLOCK < W_BETA:
-                m_b = offs_c < W_BETA
-                vb = tl.load(
-                    src_beta + row * stride_sbeta_tok + offs_c, mask=m_b, other=0
-                )
-                tl.store(
-                    dst_beta + (cb + row) * stride_dbeta_tok + offs_c, vb, mask=m_b
-                )
 
     b_write = tl.load(write_indices + i_n).to(tl.int64)
     base = tl.load(row_base + i_n).to(tl.int64)
@@ -2466,15 +2222,9 @@ def kda_commit_conv_window_kernel(
         s0, s1, s2 = s1, s2, x
 
     dst = conv_out + b_write * stride_conv_out_page + offsets * 3
-    if ENABLE_PDL:
-        # In place these stores overwrite slots the recurrence kernel reads;
-        # wait for it before the first store (loads above are safe early).
-        tl.extra.cuda.gdc_wait()
     tl.store(dst + 0, s0, mask=mask)
     tl.store(dst + 1, s1, mask=mask)
     tl.store(dst + 2, s2, mask=mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def kda_commit_conv_window(
@@ -2487,9 +2237,6 @@ def kda_commit_conv_window(
     *,
     conv_dim: int,
     draft_token_num: int,
-    row_base: torch.Tensor | None = None,
-    enable_pdl: bool = False,
-    capture: tuple | None = None,
 ) -> None:
     """Commit each request's conv window after replaying ``n_steps`` tokens.
 
@@ -2502,21 +2249,15 @@ def kda_commit_conv_window(
         n_steps: ``[N]`` tokens consumed, in ``[0, draft_token_num]``.
         conv_dim: channel count ``3 * num_heads * head_dim``.
         draft_token_num: draft positions per request (T).
-        row_base: ``[N]`` first payload row per request (-1 skips). Defaults
-            to the request-major layout ``n * draft_token_num``; the fused
-            lazy commit passes explicit bases because a request may sit at a
-            different batch slot than when its payload was captured.
 
     Returns:
         None. The destination windows are written in place.
     """
-    enable_pdl = bool(enable_pdl and _IS_NVIDIA)
     n = write_indices.numel()
-    if row_base is None:
-        row_base = (
-            torch.arange(n, device=write_indices.device, dtype=torch.int32)
-            * draft_token_num
-        )
+    row_base = (
+        torch.arange(n, device=write_indices.device, dtype=torch.int32)
+        * draft_token_num
+    )
     # Narrow the column block until the grid covers the machine: at one
     # request the widest block leaves 18 programs for 4608 channels.
     index = write_indices.device.index
@@ -2527,16 +2268,10 @@ def kda_commit_conv_window(
         sms = torch.cuda.get_device_properties(index).multi_processor_count
         _SM_COUNT[index] = sms
     # Narrowing past 64 stops paying: the columns each program owns get too
-    # few to amortize its own setup (one request, 4608 channels: 10.2us at
-    # 256, 9.0us at 128 and 64, back to 10.2us at 32).
+    # few to amortize its own setup.
     block = 256
     while block > 64 and n * triton.cdiv(conv_dim, block) < 4 * sms:
         block //= 2
-    if capture is not None:
-        src_qkv, src_fa, src_beta, dst_fa, dst_beta, capture_base = capture
-    else:
-        src_qkv = src_fa = src_beta = dst_fa = dst_beta = qkv_raw
-        capture_base = read_indices  # unused placeholder, same device
     kda_commit_conv_window_kernel[(n, triton.cdiv(conv_dim, block))](
         qkv_raw=qkv_raw,
         conv_pool=conv_pool,
@@ -2545,27 +2280,11 @@ def kda_commit_conv_window(
         write_indices=write_indices,
         n_steps=n_steps,
         row_base=row_base,
-        src_qkv=src_qkv,
-        src_fa=src_fa,
-        src_beta=src_beta,
-        dst_fa=dst_fa,
-        dst_beta=dst_beta,
-        capture_base=capture_base,
         stride_raw_tok=qkv_raw.stride(0),
         stride_conv_page=conv_pool.stride(0),
         stride_conv_out_page=conv_out.stride(0),
-        stride_src_tok=src_qkv.stride(0),
-        stride_sfa_tok=src_fa.stride(0),
-        stride_sbeta_tok=src_beta.stride(0),
-        stride_dfa_tok=dst_fa.stride(0),
-        stride_dbeta_tok=dst_beta.stride(0),
         T=draft_token_num,
         CONV_DIM=conv_dim,
-        W_FA=src_fa.shape[-1],
-        W_BETA=src_beta.shape[-1],
         BLOCK=block,
-        ENABLE_PDL=enable_pdl,
-        CAPTURE=capture is not None,
         num_warps=4,
-        **({"launch_pdl": True} if enable_pdl else {}),
     )
