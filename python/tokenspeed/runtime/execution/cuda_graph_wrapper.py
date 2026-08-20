@@ -213,9 +213,8 @@ class CudaGraphWrapper:
         self.capturable_grammar = capturable_grammar
         self.eager_grammar_buffers = eager_grammar_buffers
         self.runtime_states = runtime_states
-        self.enable_torch_compile = getattr(config, "enable_torch_compile", False)
         self.disable_padding = config.disable_cuda_graph_padding
-        self.enable_cudagraph_gc = getattr(config, "enable_cudagraph_gc", True)
+        self.enable_cudagraph_gc = config.enable_cudagraph_gc
         self.device = config.device
         self.gpu_id = config.gpu_id
         self.global_rank = config.global_rank
