@@ -436,6 +436,11 @@ async def is_paused(request: Request):
     return await _proxy_to_rl_control(request)
 
 
+@app.get("/is_sleeping")
+async def is_sleeping(request: Request):
+    return await _proxy_to_rl_control(request)
+
+
 # ---------------------------------------------------------------------------
 # RL weight transfer — SGLang dialect, proxied to the same in-engine control app
 #
