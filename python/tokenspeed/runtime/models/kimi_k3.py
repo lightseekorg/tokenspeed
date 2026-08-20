@@ -1844,6 +1844,7 @@ class KimiLinearMoE(nn.Module):
             self.experts._situ_output_buffer = plan.lane[:, : self.routed_hidden]
         else:
             self.experts._situ_output_buffer = None
+        prepared_shared_shard = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with fork.branch():
                 topk_output = self.topk(hidden_states, router_logits)
@@ -1857,6 +1858,10 @@ class KimiLinearMoE(nn.Module):
                         else None
                     ),
                 )
+                if plan.split_shared_rs and fork._active:
+                    prepared_shared_shard = self.comm.reduce_scatter_shared(
+                        shared_partial
+                    )
             routed_in, _ = self.routed_expert_down_proj(hidden_states)
             if self._topk_ready is not None and fork._active:
                 self._topk_ready.wait(torch.cuda.current_stream())
@@ -1880,6 +1885,7 @@ class KimiLinearMoE(nn.Module):
             prefix_sum,
             num_tokens,
             hidden_size,
+            prepared_shared_shard,
         )
         # Cross-DP-EP: the tail ran on the gathered token set; every DP rank
         # keeps only its slice (a no-op view when no gather happened).
