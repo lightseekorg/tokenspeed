@@ -54,7 +54,7 @@ eval:
     --thinking
     --think-mode opensource
     --stream
-    --max-connections 50
+    --max-connections 16
     --temperature 1.0
     --top-p 0.95
     --thinking-effort high
