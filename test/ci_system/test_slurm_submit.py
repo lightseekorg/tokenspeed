@@ -10,6 +10,8 @@ from slurm_submit import (
     Task,
     gpu_count,
     load_task,
+    main,
+    parse_args,
     parse_pr_number,
     pr_worktree,
     print_progress,
@@ -19,6 +21,7 @@ from slurm_submit import (
     result_detail,
     scontrol_states,
     select_tasks,
+    snapshot,
     source_pr_url,
     submit,
     wait_all,
@@ -264,6 +267,87 @@ def test_print_target_distinguishes_pr_head_from_merge(monkeypatch, capsys, tmp_
     ]
 
 
+def test_print_target_accepts_non_merge_checkout(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(
+        "slurm_submit.git",
+        lambda *_args: (_ for _ in ()).throw(subprocess.CalledProcessError(1, "git")),
+    )
+
+    print_target(tmp_path, "884", "pr-head")
+
+    assert capsys.readouterr().out.splitlines()[-1] == "Target commit: pr-head"
+
+
+def test_pr_and_source_pr_are_mutually_exclusive(tmp_path):
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--config=example.yaml",
+                "--pr=884",
+                "--source-pr=884",
+                f"--artifact-root={tmp_path}",
+                f"--cache-dir={tmp_path}",
+                "--container-image=example",
+            ]
+        )
+
+
+def test_source_pr_uses_current_checkout(monkeypatch, tmp_path):
+    captured = {}
+
+    def reject_worktree(*_args):
+        raise AssertionError("--source-pr must not create a PR worktree")
+
+    def capture_run(args, repo, _artifact_root, _cache):
+        captured.update(repo=repo, source_pr=args.source_pr)
+        return 0
+
+    monkeypatch.setattr("slurm_submit.pr_worktree", reject_worktree)
+    monkeypatch.setattr("slurm_submit.run", capture_run)
+
+    assert (
+        main(
+            [
+                "--config=example.yaml",
+                "--source-pr=884",
+                f"--repo-root={tmp_path}",
+                f"--artifact-root={tmp_path}",
+                f"--cache-dir={tmp_path}",
+                "--container-image=example",
+            ]
+        )
+        == 0
+    )
+    assert captured == {"repo": tmp_path.resolve(), "source_pr": "884"}
+
+
+def test_snapshot_replaces_existing_archive(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.name", "Test"], check=True)
+    subprocess.run(
+        ["git", "-C", repo, "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    (repo / "README.md").write_text("test\n")
+    subprocess.run(["git", "-C", repo, "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-qm", "initial"], check=True)
+    commit = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    target = tmp_path / "artifacts" / "snapshots" / f"{commit}.tar"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"stale")
+
+    snapshot(repo, tmp_path / "artifacts", commit)
+
+    assert target.read_bytes() != b"stale"
+
+
 def test_pr_worktree_rejects_shallow_checkout(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -459,7 +543,8 @@ def test_result_detail_reports_eval_score(tmp_path):
     assert result_detail(result) == "score=0.95, threshold=0.9"
 
 
-def test_write_report_collects_logs_and_results(tmp_path):
+def test_write_report_collects_logs_and_results(monkeypatch, tmp_path):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "lightseekorg/tokenspeed")
     log = tmp_path / "job.log"
     log.write_text("task output\n")
     run_root = tmp_path / "runs"
@@ -480,6 +565,7 @@ def test_write_report_collects_logs_and_results(tmp_path):
         },
         run_root,
         report,
+        source_pr="884",
     )
 
     assert (report / "123.log").read_text() == "task output\n"
@@ -495,6 +581,10 @@ def test_write_report_collects_logs_and_results(tmp_path):
     }
     assert (
         "| 123 | eval | gb200-1gpu | example | ✅ |"
+        in (report / "summary.md").read_text()
+    )
+    assert (
+        "**Target PR:** [#884](https://github.com/lightseekorg/tokenspeed/pull/884)"
         in (report / "summary.md").read_text()
     )
 

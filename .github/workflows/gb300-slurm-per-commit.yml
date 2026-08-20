@@ -127,12 +127,12 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.scan.outputs.matrix || '{"include":[]}') }}
     steps:
-      - name: Checkout trusted dispatcher
+      - name: Checkout dispatcher
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && 'main' || github.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Submit and wait for GB300 Slurm task
         env:
@@ -157,7 +157,7 @@ jobs:
             --wait
             --report-dir "$RUNNER_TEMP/slurm-report"
           )
-          [ -z "$PR_NUMBER" ] || args+=(--pr "$PR_NUMBER")
+          [ -z "$PR_NUMBER" ] || args+=(--source-pr "$PR_NUMBER")
           exec test/ci/run_slurm.sh "${args[@]}"
 
       - name: Publish job summary

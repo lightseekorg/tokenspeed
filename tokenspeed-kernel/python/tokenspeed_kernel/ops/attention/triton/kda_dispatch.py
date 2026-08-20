@@ -32,7 +32,7 @@ _DENSE_HALF_SIGNATURES = format_signatures(
     priority=Priority.SPECIALIZED,
     traits={
         "paged_state": frozenset({True}),
-        "fused_output_norm": frozenset({False}),
+        "fused_output_norm": frozenset({False, True}),
     },
     tags={"nvidia", "paged_cache", "cuda_graph", "fusion"},
 )
@@ -58,7 +58,6 @@ def triton_nvidia_kda_fused_paged_decode(
     norm_eps: float | None = None,
 ) -> torch.Tensor:
     """Adapt dev's NVIDIA conv/GEMV/recurrent megafusion."""
-    del output_gate, norm_weight, norm_eps
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
         fused_recurrent_kda_megafuse,
     )
@@ -79,6 +78,9 @@ def triton_nvidia_kda_fused_paged_decode(
         head_dim=head_dim,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
+        output_gate=output_gate,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
     ).view(1, -1, num_heads, head_dim)
 
 
