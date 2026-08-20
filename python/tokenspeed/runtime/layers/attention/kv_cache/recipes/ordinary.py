@@ -148,12 +148,26 @@ class OrdinaryRecipe(CacheRecipe):
 
     @override
     def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        if layout.lcm_block_bytes <= 0:
+        parent_bytes = layout.lcm_block_bytes
+        if not layout.group_packing:
+            # Capacity-only probes may not carry a packed layout.  Preserve
+            # ordinary cache sizing from the declared per-token payload while
+            # production plans use the exact (DCP-aware) packed parent bytes.
+            bytes_per_token = self.attn_config.cache_cell_size() * _storage_layers(
+                self.attn_config, self.num_target_layers
+            )
+            if self.draft_attn_config is not None:
+                bytes_per_token += (
+                    self.draft_attn_config.cache_cell_size()
+                    * _storage_layers(self.draft_attn_config, self.num_draft_layers)
+                )
+            parent_bytes = bytes_per_token * self.prefix_granularity
+        if parent_bytes <= 0:
             raise ValueError(
-                f"KV cache LCM block size must be positive, got {layout.lcm_block_bytes}"
+                f"KV cache LCM block size must be positive, got {parent_bytes}"
             )
         return self._capped_parents(
-            self.cache_budget_bytes // layout.lcm_block_bytes - 1,
+            self.cache_budget_bytes // parent_bytes - 1,
             parent_tokens=self.prefix_granularity,
         )
 
