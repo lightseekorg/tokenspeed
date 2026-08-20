@@ -20,6 +20,9 @@ from tokenspeed_kernel.signature import format_signatures
 _DENSE_HALF_SIGNATURES = format_signatures(
     ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
 )
+# The batched replay kernels dereference raw descriptor addresses as bf16,
+# so their registration must not claim other dtypes.
+_DENSE_BF16_SIGNATURES = format_signatures(("q", "k", "v"), "dense", {torch.bfloat16})
 
 
 @register_kernel(
@@ -354,7 +357,7 @@ def triton_nvidia_kda_replay_commit(
     name="triton_nvidia_kda_batched_replay_commit",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_DENSE_HALF_SIGNATURES,
+    signatures=_DENSE_BF16_SIGNATURES,
     priority=Priority.SPECIALIZED,
     traits={
         "flat_state": frozenset({True}),

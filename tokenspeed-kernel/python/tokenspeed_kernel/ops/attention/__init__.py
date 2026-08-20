@@ -1768,7 +1768,15 @@ def try_kda_replay_commit(
 def resolve_kda_batched_replay_commit(
     dtype: torch.dtype = torch.bfloat16,
 ):
-    """Resolve the all-layer replay kernel once, or return ``None``."""
+    """Resolve the all-layer replay kernel once, or return ``None``.
+
+    ``None`` for any dtype but bfloat16: the batched kernels dereference raw
+    descriptor addresses as bf16 (an override resolves by name and skips the
+    signature check), so other dtypes must use the per-layer commit, which
+    reads its dtypes from the tensors.
+    """
+    if dtype is not torch.bfloat16:
+        return None
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
     try:
