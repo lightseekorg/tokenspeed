@@ -203,9 +203,15 @@ def print_target(repo: Path, source_pr: str | None, test_commit: str) -> None:
     url = source_pr_url(source_pr)
     if url is not None:
         print(f"Link: {url}", flush=True)
-    print(f"Target commit: {git(repo, 'rev-parse', 'HEAD^2')}", flush=True)
+    try:
+        target_commit = git(repo, "rev-parse", "HEAD^2")
+        base_commit = git(repo, "rev-parse", "HEAD^1")
+    except subprocess.CalledProcessError:
+        print(f"Target commit: {test_commit}", flush=True)
+        return
+    print(f"Target commit: {target_commit}", flush=True)
     print(f"Merged test commit: {test_commit}", flush=True)
-    print(f"Base commit: {git(repo, 'rev-parse', 'HEAD^1')}", flush=True)
+    print(f"Base commit: {base_commit}", flush=True)
 
 
 @contextlib.contextmanager
@@ -271,13 +277,16 @@ def snapshot(repo: Path, artifact_root: Path, commit: str) -> Path:
         raise ValueError("commit tracked changes before submitting")
     target = artifact_root / "snapshots" / f"{commit}.tar"
     target.parent.mkdir(parents=True, exist_ok=True)
-    if not target.exists():
-        temporary = target.with_suffix(f".{os.getpid()}.tmp")
-        subprocess.run(
-            ["git", "-C", str(repo), "archive", f"--output={temporary}", commit],
-            check=True,
-        )
-        temporary.replace(target)
+    handle, temporary_name = tempfile.mkstemp(
+        dir=target.parent, prefix=f"{commit}.", suffix=".tmp"
+    )
+    os.close(handle)
+    temporary = Path(temporary_name)
+    subprocess.run(
+        ["git", "-C", str(repo), "archive", f"--output={temporary}", commit],
+        check=True,
+    )
+    temporary.replace(target)
     return target
 
 
@@ -998,7 +1007,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         action="append",
         help="Exclude a case-insensitive task/config/model substring; repeat for OR.",
     )
-    parser.add_argument("--pr", help="PR number or GitHub pull request URL to merge.")
+    pull_request = parser.add_mutually_exclusive_group()
+    pull_request.add_argument(
+        "--pr", help="PR number or GitHub pull request URL to merge."
+    )
+    pull_request.add_argument(
+        "--source-pr",
+        help="PR number or GitHub pull request URL for the current checkout.",
+    )
     parser.add_argument("--list", action="store_true", help="List matching tasks only.")
     parser.add_argument(
         "--trigger", choices=("per-commit", "manual", "nightly", "debug", "slurm")
@@ -1042,7 +1058,8 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
         print_tasks(tasks)
         return 0
     commit = git(repo, "rev-parse", "HEAD")
-    print_target(repo, args.pr, commit)
+    source_pr = args.pr or args.source_pr
+    print_target(repo, source_pr, commit)
     print(f"Selected tasks: {len(tasks)}", flush=True)
     for task in tasks:
         print(
@@ -1074,7 +1091,7 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
             else artifact_root / "reports" / f"{commit[:12]}-{time.time_ns()}"
         )
         completed = wait_all(
-            submitted, artifact_root / "runs", report_dir, source_pr=args.pr
+            submitted, artifact_root / "runs", report_dir, source_pr=source_pr
         )
         print(f"Report: {report_dir}", flush=True)
         return 0 if completed else 1

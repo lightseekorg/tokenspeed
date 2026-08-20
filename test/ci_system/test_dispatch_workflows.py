@@ -336,6 +336,9 @@ def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
         for step in submit["steps"]
         if step.get("name") == "Submit and wait for GB300 Slurm task"
     )
+    checkout = next(
+        step for step in submit["steps"] if step.get("name") == "Checkout dispatcher"
+    )
 
     assert set(triggers) == {"push", "pull_request"}
     assert submit["runs-on"] == "slurm-dispatch-gb300"
@@ -344,9 +347,13 @@ def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
     )
     assert '--runner "$RUNNER"' in submit_script
     assert "--runner-alias" not in submit_script
-    assert "--pr" in submit_script
+    assert '--source-pr "$PR_NUMBER"' in submit_script
+    assert '--pr "$PR_NUMBER"' not in submit_script
     assert "secrets.HF_TOKEN" not in str(submit)
     assert "unset HF_TOKEN HUGGING_FACE_HUB_TOKEN" in submit_script
+    assert checkout["with"]["ref"] == "${{ github.sha }}"
+    assert checkout["with"]["fetch-depth"] == 0
+    assert checkout["with"]["persist-credentials"] is False
     assert "github.repository == 'lightseekorg/tokenspeed'" in gate["env"]["ALLOWED"]
     assert "github.event.pull_request.draft == false" in gate["env"]["ALLOWED"]
     assert (
