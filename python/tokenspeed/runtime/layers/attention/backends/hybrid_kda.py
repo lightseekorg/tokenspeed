@@ -31,6 +31,8 @@ from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention import (
     kda_paged_decode,
     kda_paged_prefill,
+    kda_replay_commit_supported,
+    resolve_kda_batched_replay_commit,
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
 )
@@ -98,9 +100,11 @@ def _slice_kda_prefill_inputs(
 class KdaAttnBackend(MambaAttnBackend):
     """Attention backend for KDA linear attention layers (Kimi-K3).
 
-    Everything generic to linear attention -- state paging, cache groups,
-    cuda-graph buffers, the verify scratch and its commit -- is inherited
-    unchanged. KDA only replaces the scan seams: its decay gate is
+    Everything generic to linear attention -- state paging and cache groups --
+    is inherited. When replay commit is available, speculative verify captures
+    its compact projection payload and writes no per-position state tape;
+    commit immediately replays the accepted prefix from the committed page.
+    KDA also replaces the scan seams: its decay gate is
     per-channel (a low-rank ``f_a``/``f_b`` projection plus raw beta logits)
     where GDN's is scalar per head, and its decode/verify kernels can fuse
     the conv, the gate GEMV and the recurrence into a single launch.
@@ -108,6 +112,20 @@ class KdaAttnBackend(MambaAttnBackend):
 
     def __init__(self, config: BaseAttnConfig, kda_backend: str = "auto") -> None:
         super().__init__(config)
+        self.max_bs = config.max_bs
+        self._replay_active = kda_replay_commit_supported(self.dtype)
+        self._batched_replay_kernel = resolve_kda_batched_replay_commit(self.dtype)
+        self._replay_payloads: tuple[torch.Tensor, ...] | None = None
+        self._replay_weights: dict[int, tuple] = {}
+        # The pointer tuples below serve only the decomposed verify fallback;
+        # the fused verify + batched commit path never reads them.
+        self._replay_conv_copy: dict[int, tuple[torch.Tensor, ...]] = {}
+        self._replay_rows: torch.Tensor | None = None
+        self._graphs_captured = False
+        self._replay_descriptors = None
+        self._batched_replay_launch = None
+        self._batched_replay_ready = False
+        self._replay_descriptor_bound: set[int] = set()
         self.kda_backend = (kda_backend or "auto").strip().lower()
         if self.kda_backend not in KDA_PREFILL_BACKENDS:
             raise ValueError(
@@ -118,6 +136,247 @@ class KdaAttnBackend(MambaAttnBackend):
             "KDA prefill routes through %s; decode remains on the "
             "platform-selected kernels",
             self.kda_backend,
+        )
+
+    @override
+    def set_kv_pool(self, kv_pool) -> None:
+        super().set_kv_pool(kv_pool)
+        if self._replay_active and self.speculative_num_draft_tokens > 1:
+            rows = self.max_bs * self.speculative_num_draft_tokens
+            layer_ids = tuple(self._state_layer_ids())
+            self._descriptor_row_by_layer = {
+                layer_id: row for row, layer_id in enumerate(layer_ids)
+            }
+            self._replay_group_ids = tuple(self._state_groups())
+            self._replay_group_rows = {
+                group_id: row for row, group_id in enumerate(self._replay_group_ids)
+            }
+            with torch.inference_mode(False):
+                addresses = torch.zeros(
+                    (len(layer_ids), 10), dtype=torch.uint64, device=self.device
+                )
+                first_conv, first_ssm = self._state_components(layer_ids[0])
+                hv, head_dim = first_ssm.shape[1:3]
+                for layer_id in layer_ids[1:]:
+                    conv, ssm = self._state_components(layer_id)
+                    if (
+                        conv.shape[1:] != first_conv.shape[1:]
+                        or ssm.shape[1:] != first_ssm.shape[1:]
+                    ):
+                        raise RuntimeError(
+                            "batched KDA replay requires uniform layer pools"
+                        )
+                payload_shape = (len(layer_ids), rows)
+                self._replay_payloads = (
+                    torch.empty(
+                        (*payload_shape, first_conv.shape[1]),
+                        dtype=self.dtype,
+                        device=self.device,
+                    ),
+                    torch.empty(
+                        (*payload_shape, head_dim), dtype=self.dtype, device=self.device
+                    ),
+                    torch.empty(
+                        (*payload_shape, hv), dtype=self.dtype, device=self.device
+                    ),
+                    torch.empty(
+                        (*payload_shape, hv * head_dim),
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                )
+                self._replay_descriptors = addresses
+                self._replay_descriptor_bound.clear()
+                self._batched_replay_launch = None
+                self._batched_replay_ready = False
+
+    def _replay_payload(self, layer_id: int) -> tuple[torch.Tensor, ...]:
+        """Return one layer row from the stacked replay workspaces."""
+        assert self._replay_payloads is not None
+        row = self._descriptor_row_by_layer[layer_id]
+        return tuple(payload[row] for payload in self._replay_payloads)
+
+    def _bind_replay_descriptor(self, layer_id: int, weights: tuple) -> None:
+        """Publish one layer's stable pointers after its weights are observed."""
+        if layer_id in self._replay_descriptor_bound:
+            return
+        assert self._replay_descriptors is not None
+        conv_w, f_b, A_log, dt_bias, _num_heads, _head_dim, lower_bound = weights
+        if dt_bias is None or lower_bound is None:
+            return
+        conv, state = self._state_components(layer_id)
+        qkv, f_a, beta, gate = self._replay_payload(layer_id)
+        row = self._descriptor_row_by_layer[layer_id]
+        addresses = self._replay_descriptors
+        addresses[row].copy_(
+            torch.tensor(
+                [
+                    qkv.data_ptr(),
+                    conv_w.data_ptr(),
+                    conv.data_ptr(),
+                    f_a.data_ptr(),
+                    f_b.data_ptr(),
+                    beta.data_ptr(),
+                    A_log.data_ptr(),
+                    dt_bias.data_ptr(),
+                    state.data_ptr(),
+                    gate.data_ptr(),
+                ],
+                dtype=torch.uint64,
+                device=self.device,
+            )
+        )
+        self._replay_descriptor_bound.add(layer_id)
+        if len(self._replay_descriptor_bound) == len(self._descriptor_row_by_layer):
+            first = next(iter(self._replay_weights.values()))
+            _, first_f_b, _, _, first_heads, first_dim, _ = first
+            geometry = (first_heads, first_dim, first_f_b.shape[1])
+            first_layer = next(iter(self._replay_weights))
+            first_conv, first_state = self._state_components(first_layer)
+            first_qkv, first_fa, first_beta, _ = self._replay_payload(first_layer)
+            strides = (
+                first_qkv.stride(0),
+                first_conv.stride(0),
+                first_fa.stride(0),
+                first_beta.stride(0),
+                first_state.stride(0),
+            )
+            lower_bounds = set()
+            for current_layer, layer_weights in self._replay_weights.items():
+                _, layer_f_b, _, _, layer_heads, layer_dim, _ = layer_weights
+                if (layer_heads, layer_dim, layer_f_b.shape[1]) != geometry:
+                    raise RuntimeError("batched KDA replay requires uniform geometry")
+                layer_conv, layer_state = self._state_components(current_layer)
+                layer_qkv, layer_fa, layer_beta, _ = self._replay_payload(current_layer)
+                if (
+                    layer_qkv.stride(0),
+                    layer_conv.stride(0),
+                    layer_fa.stride(0),
+                    layer_beta.stride(0),
+                    layer_state.stride(0),
+                ) != strides:
+                    raise RuntimeError("batched KDA replay requires uniform strides")
+                lower_bounds.add(layer_weights[-1])
+            if len(lower_bounds) != 1:
+                raise RuntimeError("batched KDA replay requires one lower bound")
+            layers_per_group = len(self._descriptor_row_by_layer) // len(
+                self._replay_group_ids
+            )
+            expected_groups = tuple(
+                group_id
+                for group_id in self._replay_group_ids
+                for _ in range(layers_per_group)
+            )
+            actual_groups = tuple(
+                self._state_group_for(layer_id)
+                for layer_id in self._descriptor_row_by_layer
+            )
+            if actual_groups != expected_groups:
+                raise RuntimeError(
+                    "batched KDA replay requires equal contiguous layer groups"
+                )
+            conv_width = first[0].shape[1]
+            if self._batched_replay_kernel is not None:
+                descriptors = self._replay_descriptors
+                draft_tokens = self.speculative_num_draft_tokens
+
+                def launch(read_indices, write_indices, accepted_length):
+                    self._batched_replay_kernel(
+                        descriptors=descriptors,
+                        read_indices=read_indices,
+                        write_indices=write_indices,
+                        accepted_length=accepted_length,
+                        draft_token_num=draft_tokens,
+                        num_heads=geometry[0],
+                        head_dim=geometry[1],
+                        f_a_dim=geometry[2],
+                        qkv_stride=strides[0],
+                        conv_stride=strides[1],
+                        f_a_stride=strides[2],
+                        beta_stride=strides[3],
+                        state_stride=strides[4],
+                        conv_width=conv_width,
+                        layers_per_group=layers_per_group,
+                        lower_bound=next(iter(lower_bounds)),
+                    )
+
+                self._batched_replay_launch = launch
+                self._batched_replay_ready = True
+
+    @override
+    def _ensure_verify_scratch(self, bs: int, draft_token_num: int) -> None:
+        if not self._replay_active:
+            return super()._ensure_verify_scratch(bs, draft_token_num)
+        rows = max(len(self.query_start_loc_list), bs)
+        scratch = self._verify_scratch
+        if scratch is not None and next(iter(scratch.values()))[0].shape[0] >= rows:
+            return
+        if self._graphs_captured and scratch is not None:
+            capacity = next(iter(scratch.values()))[0].shape[0]
+            raise RuntimeError(
+                f"KDA verify needs {rows} transient conv rows after CUDA graphs "
+                f"were captured, but the graph-stable scratch holds {capacity}"
+            )
+        self._verify_scratch = {}
+        for layer_id in self._state_layer_ids():
+            conv, _ = self._state_components(layer_id)
+            self._verify_scratch[layer_id] = (
+                torch.empty(
+                    (rows, *conv.shape[1:]), dtype=conv.dtype, device=conv.device
+                ),
+                None,
+            )
+            self._replay_conv_copy[layer_id] = (
+                torch.tensor([conv.data_ptr()], dtype=torch.uint64, device=self.device),
+                torch.tensor(
+                    [self._verify_scratch[layer_id][0].data_ptr()],
+                    dtype=torch.uint64,
+                    device=self.device,
+                ),
+                torch.tensor(
+                    [conv.stride(0) * conv.element_size() // 4],
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                torch.tensor(
+                    [
+                        self._verify_scratch[layer_id][0].stride(0)
+                        * self._verify_scratch[layer_id][0].element_size()
+                        // 4
+                    ],
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+            )
+        self._replay_rows = torch.arange(rows, dtype=torch.int32, device=self.device)
+
+    @override
+    def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
+        if not self._replay_active:
+            return super().preallocate_verify_workspace(max_bs, draft_token_num)
+        self._ensure_verify_scratch(max_bs, draft_token_num)
+        return sum(pair[0].nbytes for pair in self._verify_scratch.values())
+
+    def _seed_replay_conv(self, layer_id: int, bs: int) -> None:
+        """Copy one committed conv window per request into transient rows."""
+        from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
+
+        conv, _ = self._state_components(layer_id)
+        scratch, _ = self._verify_scratch[layer_id]
+        pages = self.forward_metadata.state_in_blocks_by_group[
+            self._state_group_for(layer_id)
+        ][:bs].to(torch.int64)
+        assert self._replay_rows is not None
+        dst = self._replay_rows[:bs]
+        src_ptr, dst_ptr, src_stride, dst_stride = self._replay_conv_copy[layer_id]
+        copy_state_rows(
+            src_ptr,
+            dst_ptr,
+            pages,
+            dst,
+            row_bytes=conv[0].numel() * conv.element_size(),
+            src_row_strides=src_stride,
+            dst_row_strides=dst_stride,
         )
 
     def _kda_gate(
@@ -282,6 +541,7 @@ class KdaAttnBackend(MambaAttnBackend):
         state_in_blocks: torch.Tensor,
         output_indices: torch.Tensor,
         *,
+        layer_id: int,
         bias: torch.Tensor | None,
         f_a_out: torch.Tensor | None,
         f_b_weight: torch.Tensor | None,
@@ -295,7 +555,50 @@ class KdaAttnBackend(MambaAttnBackend):
         head_v_dim: int,
         lower_bound: float | None,
     ) -> torch.Tensor | None:
-
+        if self._replay_active:
+            if f_a_out is None or bias is not None:
+                raise RuntimeError(
+                    "KDA eager replay requires f_a_out and a bias-free convolution"
+                )
+            qkv, f_a, beta, _ = self._replay_payload(layer_id)
+            rows = batch_size * draft_token_num
+            qkv[:rows, : mixed_qkv.shape[-1]].copy_(mixed_qkv[:rows])
+            f_a[:rows, : f_a_out.shape[-1]].copy_(f_a_out[:rows])
+            beta[:rows, : beta_raw.shape[-1]].copy_(beta_raw[:rows])
+            num_value_heads = value_dim // attn_tp_size // head_v_dim
+            if layer_id not in self._replay_weights:
+                # Parameters are stable objects; model weight updates copy into
+                # their storage, so binding their pointers once cannot stale.
+                self._replay_weights[layer_id] = (
+                    conv_weights,
+                    f_b_weight,
+                    A_log,
+                    dt_bias,
+                    num_value_heads,
+                    head_v_dim,
+                    lower_bound,
+                )
+                self._bind_replay_descriptor(layer_id, self._replay_weights[layer_id])
+            return try_kda_fused_paged_verify(
+                mixed_qkv,
+                conv_weights,
+                conv_comp,
+                conv_scratch,
+                f_a_out,
+                f_b_weight,
+                beta_raw,
+                A_log,
+                dt_bias,
+                state_pool=ssm_comp,
+                state_scratch=ssm_scratch,
+                read_indices=state_in_blocks[:batch_size],
+                write_indices=output_indices[:batch_size],
+                num_heads=num_value_heads,
+                head_dim=head_v_dim,
+                draft_token_num=draft_token_num,
+                lower_bound=lower_bound,
+                store_states=False,
+            )
         if f_a_out is None or bias is not None:
             return None
         else:
@@ -363,7 +666,16 @@ class KdaAttnBackend(MambaAttnBackend):
         )
 
         beta_b = beta_raw.view(batch_size, draft_token_num, num_value_heads)
-        grid = output_indices[:batch_size]
+        if self._replay_active:
+            initial_pool = ssm_comp
+            initial_rows = state_in_blocks[:batch_size].to(torch.int64)
+            write_rows = torch.full_like(output_indices[:batch_size], -1)
+            state_out = ssm_comp
+        else:
+            initial_pool = ssm_scratch
+            initial_rows = output_indices[:batch_size, 0] - 1
+            write_rows = output_indices[:batch_size]
+            state_out = ssm_scratch
 
         return fused_recurrent_kda_mtp(
             query_b,
@@ -373,12 +685,85 @@ class KdaAttnBackend(MambaAttnBackend):
             beta_b,
             A_log,
             dt_bias,
-            ssm_comp,
-            state_in_blocks[:batch_size].to(torch.int64),
-            grid,
-            h_pool_out=ssm_scratch,
+            initial_pool,
+            initial_rows,
+            write_rows,
+            h_pool_out=state_out,
             lower_bound=lower_bound,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
+
+    @override
+    def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
+        """Replay and eagerly commit this round's accepted KDA prefix."""
+        if not self._replay_active:
+            return super().commit_verified_state(accepted_length)
+        ctx = self._verify_commit_ctx
+        if ctx is None:
+            return
+        from tokenspeed_kernel.ops.attention import try_kda_replay_commit
+
+        committed, tables, draft_token_num, read_pages_by_group = ctx
+        bs = accepted_length.shape[0]
+        # Runtime accept lengths count draft matches; the target token itself
+        # always advances state, matching the established scratch commit.
+        steps = accepted_length.to(torch.int64).clamp(min=1, max=draft_token_num)
+        new_last = committed[:bs] + steps - 1
+        slot = torch.div(
+            new_last.clamp_min(0),
+            self._checkpoint_granularity,
+            rounding_mode="floor",
+        )
+        pages_by_group = {}
+        for group_id in self._state_groups():
+            rows = tables[group_id]
+            safe = slot.clamp(max=rows.shape[1] - 1)
+            pages_by_group[group_id] = (
+                rows[:bs].gather(1, safe.unsqueeze(1)).squeeze(1).to(torch.int32)
+            )
+        rows = bs * draft_token_num
+        if self._batched_replay_ready:
+            read_pages = torch.stack(
+                [
+                    read_pages_by_group[group_id][:bs]
+                    for group_id in self._replay_group_ids
+                ]
+            ).to(torch.int32)
+            write_pages = torch.stack(
+                [pages_by_group[group_id] for group_id in self._replay_group_ids]
+            )
+            self._batched_replay_launch(read_pages, write_pages, steps.to(torch.int32))
+            self._verify_commit_ctx = None
+            return
+        for layer_id, weights in self._replay_weights.items():
+            conv_w, f_b, A_log, dt_bias, num_heads, head_dim, lower_bound = weights
+            group_id = self._state_group_for(layer_id)
+            conv, state = self._state_components(layer_id)
+            qkv, f_a, beta, gate = self._replay_payload(layer_id)
+            if not try_kda_replay_commit(
+                qkv[:rows, : conv_w.shape[0]],
+                conv_w,
+                conv,
+                conv,
+                f_a[:rows, : f_b.shape[1]],
+                f_b,
+                beta[:rows, :num_heads],
+                A_log,
+                dt_bias,
+                state_pool=state,
+                state_out=state,
+                read_indices=read_pages_by_group[group_id][:bs],
+                write_indices=pages_by_group[group_id],
+                accepted_length=steps.to(torch.int32),
+                num_heads=num_heads,
+                head_dim=head_dim,
+                draft_token_num=draft_token_num,
+                lower_bound=lower_bound,
+                gate_scratch=gate[:rows, : num_heads * head_dim],
+            ):
+                raise RuntimeError(
+                    "KDA replay commit kernel vanished after capability probing"
+                )
+        self._verify_commit_ctx = None
 
     @override
     def _prefill_scan(

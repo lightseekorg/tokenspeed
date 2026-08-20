@@ -80,6 +80,7 @@ def _backend_config(device: str, *, spec_tokens: int = 1) -> SimpleNamespace:
         head_dim=128,
         is_draft=False,
         speculative_num_draft_tokens=spec_tokens,
+        max_bs=8,
     )
 
 

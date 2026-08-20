@@ -79,7 +79,13 @@ def test_lcm_geometry_packs_two_kda_pages_at_tp16() -> None:
     assert conv.shape[0] == 3 * 96 * 128 // 16
 
 
-def test_speculative_verify_workspace_is_reserved_outside_the_arena() -> None:
+def test_speculative_verify_workspace_is_reserved_outside_the_arena(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda_replay_commit_supported",
+        lambda dtype: False,
+    )
     recipe, _, layout = kimi_tp8_layout(
         draft_layers=5,
         max_bs=4,
@@ -93,6 +99,37 @@ def test_speculative_verify_workspace_is_reserved_outside_the_arena() -> None:
     assert recipe.workspace_bytes() == expected_workspace_bytes
 
     setup = recipe.setup()
+    assert setup.fixed_workspace_bytes == expected_workspace_bytes
+    expected_parents = (
+        recipe.cache_budget_bytes - expected_workspace_bytes
+    ) // layout.lcm_block_bytes - 1
+    assert setup.spec.memory_plan.num_lcm_blocks == expected_parents
+
+
+def test_replay_verify_workspace_reserves_one_conv_row_per_request(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda_replay_commit_supported",
+        lambda dtype: True,
+    )
+    recipe, groups, layout = kimi_tp8_layout(
+        draft_layers=5,
+        max_bs=4,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=8,
+    )
+    expected_workspace_bytes = 4 * sum(
+        field.payload_bytes
+        for spec, fields in groups
+        if spec.group_id != "full_attention"
+        for field in fields
+        if field.field_id.endswith(".conv_state")
+    )
+
+    setup = recipe.setup()
+
+    assert recipe.workspace_bytes() == expected_workspace_bytes
     assert setup.fixed_workspace_bytes == expected_workspace_bytes
     expected_parents = (
         recipe.cache_budget_bytes - expected_workspace_bytes

@@ -56,6 +56,7 @@ def kimi_recipe(
     text_config = text_config if text_config is not None else KimiLinearConfig()
     attn_config = SimpleNamespace(
         attn_tp_size=tp_size,
+        dtype=torch.bfloat16,
         kv_cache_dtype=torch.float8_e4m3fn,
         kv_cache_quant_method=None,
         kv_lora_rank=text_config.kv_lora_rank,
