@@ -328,6 +328,17 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
         )
 
 
+def test_descriptor_binding_rejects_nonuniform_conv_width():
+    harness = _Harness(eager_replay=True)
+    last = harness.layer_ids[-1]
+    harness.params[last]["conv_weights"] = harness.params[last]["conv_weights"][:, :3]
+    harness.prepare_metadata([0], {group: [2] for group in _STATE_GROUPS}, [8 + T])
+    with pytest.raises(RuntimeError, match="uniform geometry"):
+        harness.forward(harness.inputs(1, 701), 1)
+
+
+
+
 def test_verify_scratch_cannot_grow_after_graph_capture():
     """A late transient-row reallocation fails instead of invalidating graphs."""
     harness = _Harness(eager_replay=True)

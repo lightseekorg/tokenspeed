@@ -229,8 +229,8 @@ class KdaAttnBackend(MambaAttnBackend):
         self._replay_descriptor_bound.add(layer_id)
         if len(self._replay_descriptor_bound) == len(self._descriptor_row_by_layer):
             first = next(iter(self._replay_weights.values()))
-            _, first_f_b, _, _, first_heads, first_dim, _ = first
-            geometry = (first_heads, first_dim, first_f_b.shape[1])
+            first_conv_w, first_f_b, _, _, first_heads, first_dim, _ = first
+            geometry = (first_heads, first_dim, first_f_b.shape[1], first_conv_w.shape[1])
             first_layer = next(iter(self._replay_weights))
             first_conv, first_state = self._state_components(first_layer)
             first_qkv, first_fa, first_beta, _ = self._replay_payload(first_layer)
@@ -243,8 +243,13 @@ class KdaAttnBackend(MambaAttnBackend):
             )
             lower_bounds = set()
             for current_layer, layer_weights in self._replay_weights.items():
-                _, layer_f_b, _, _, layer_heads, layer_dim, _ = layer_weights
-                if (layer_heads, layer_dim, layer_f_b.shape[1]) != geometry:
+                layer_conv_w, layer_f_b, _, _, layer_heads, layer_dim, _ = layer_weights
+                if (
+                    layer_heads,
+                    layer_dim,
+                    layer_f_b.shape[1],
+                    layer_conv_w.shape[1],
+                ) != geometry:
                     raise RuntimeError("batched KDA replay requires uniform geometry")
                 layer_conv, layer_state = self._state_components(current_layer)
                 layer_qkv, layer_fa, layer_beta, _ = self._replay_payload(current_layer)
@@ -275,7 +280,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 raise RuntimeError(
                     "batched KDA replay requires equal contiguous layer groups"
                 )
-            conv_width = first[0].shape[1]
+            conv_width = geometry[3]
             if self._batched_replay_kernel is not None:
                 descriptors = self._replay_descriptors
                 draft_tokens = self.speculative_num_draft_tokens
