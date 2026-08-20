@@ -27,13 +27,14 @@ import logging
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.gemm.aiter import preshuffle_fp8_weight
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_token_group_quant_fp8,
     per_token_quant_fp8,
     static_quant_fp8,
     swizzle_mxfp8_scale,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 from torch.nn.parameter import Parameter
 
 logger = logging.getLogger(__name__)
@@ -262,6 +263,17 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
                     layer._use_deep_gemm_fp8 = True
             layer._use_flashinfer_mxfp8 = False
+            layer._use_aiter_fp8_preshuffle = False
+            if (
+                _platform.is_amd
+                and _platform.arch_version == ArchVersion(9, 5)
+                and not is_bmm
+                and tuple(self.quant_config.weight_block_size) == (128, 128)
+                and tuple(layer.weight.shape) == (2048, 7168)
+                and layer.weight_scale_inv.dtype == torch.float32
+            ):
+                layer.weight.data = preshuffle_fp8_weight(layer.weight.data)
+                layer._use_aiter_fp8_preshuffle = True
             if (
                 not layer._use_deep_gemm_fp8
                 and not is_bmm
@@ -385,6 +397,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 override = "deep_gemm_mm_fp8_blockscale"
             elif getattr(layer, "_use_flashinfer_mxfp8", False):
                 override = "flashinfer_mm_mxfp8"
+            elif getattr(layer, "_use_aiter_fp8_preshuffle", False):
+                override = "triton_aiter_mm_fp8_blockscale_preshuffle_gfx950"
             elif (
                 getattr(layer, "_use_flashinfer_fp8_blockscale", False)
                 and block_scale is None

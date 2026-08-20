@@ -24,6 +24,7 @@ import logging
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
+import tokenspeed_kernel.ops.gemm.aiter  # noqa: F401
 import tokenspeed_kernel.ops.gemm.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
@@ -288,6 +289,10 @@ def _online_quantize_mxfp8(
             *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
             group_major_scales=_platform.is_nvidia,
         )
+    elif kernel_name == "triton_aiter_mm_fp8_blockscale_preshuffle_gfx950":
+        from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
+
+        return per_token_group_quant_fp8(A, block_k, column_major_scales=True)
     elif kernel_name == "triton_mm_fp8_blockscale":
         from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 
