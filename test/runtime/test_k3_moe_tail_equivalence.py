@@ -362,12 +362,14 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
     from tokenspeed.runtime.models import kimi_k3_comm as mod
 
     monkeypatch.setattr(mod, "get_is_cuda_graph_phase", lambda: True)
+    monkeypatch.setattr(mod, "get_is_capture_mode", lambda: True)
 
     def build(*, supports_deferred, fused_ar):
         comm = object.__new__(mod.K3MoeTailComm)
         comm.latent_tail = SimpleNamespace(
             max_num_tokens=16,
             supports_deferred_finalize=supports_deferred,
+            supports_split_collective=True,
         )
         comm.execution_plan = SimpleNamespace(fused_moe_ar=fused_ar)
         comm.state = SimpleNamespace(multimem_ar_ok=False)
@@ -378,12 +380,19 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
     plan = build(supports_deferred=True, fused_ar=True).plan(1, None)
     assert plan.tier is mod.K3MoETailTier.TAIL_FUSION
     assert plan.defer_finalize
+    assert not plan.split_shared_rs
     assert plan.lane is None and not plan.routed_in_fork
 
     # A tail op without the deferred variant must keep the materialized mode.
     plan = build(supports_deferred=False, fused_ar=True).plan(16, None)
     assert plan.tier is mod.K3MoETailTier.TAIL_FUSION
     assert not plan.defer_finalize
+    assert plan.split_shared_rs
+
+    # Split at the measured second-wave boundary, not at one exact graph size.
+    comm = build(supports_deferred=True, fused_ar=True)
+    assert not comm.plan(8, None).split_shared_rs
+    assert comm.plan(9, None).split_shared_rs
 
     # Without the fused-AR (trtllm) plan the experts kernel cannot defer.
     plan = build(supports_deferred=True, fused_ar=False).plan(1, None)

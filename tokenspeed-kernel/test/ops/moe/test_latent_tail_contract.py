@@ -57,6 +57,32 @@ def test_initialize_constructs_a_fresh_op(monkeypatch: pytest.MonkeyPatch) -> No
     assert len(constructed) == 2
 
 
+def test_initialize_propagates_split_collective_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contracts = []
+
+    def fake_init(self, contract, *args, **kwargs) -> None:
+        contracts.append(contract)
+
+    monkeypatch.setattr(KimiK3LatentTailOp, "__init__", fake_init)
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.moe.latent_tail.dist.get_world_size", lambda group: 8
+    )
+    KimiK3LatentTailOp.initialize(
+        group=SimpleNamespace(group_name="test-group"),
+        hidden_size=7168,
+        latent_size=3584,
+        rms_eps=1e-6,
+        device=torch.device("cuda", 0),
+        layer_index=1,
+        model_scope="model.layers",
+        split_collective=True,
+    )
+
+    assert contracts[0].split_collective is True
+
+
 def test_slot_binding_is_rank_identical_for_same_layer() -> None:
     rank_zero_slot = _tail_pool_slot(31, 2)
     rank_one_slot = _tail_pool_slot(31, 2)
