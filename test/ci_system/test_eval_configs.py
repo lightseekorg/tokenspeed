@@ -49,18 +49,22 @@ DATASETS = {
         "count": 1,
         "dataset_args": {"dataset_id": "cais/mmlu"},
     },
-    "mmmu_pro": {
-        "count": 1,
-        "dataset_args": {
-            "dataset_id": "AI-ModelScope/MMMU_Pro",
-            "extra_params": {"dataset_format": "vision"},
-        },
-        "dataset_hub": "modelscope",
-    },
     "ocr_bench": {
-        "count": 4,
+        "count": 3,
         "dataset_args": {"dataset_id": "echo840/OCRBench"},
     },
+}
+
+KVV_REVISION = "3dad65a760a8867cda72f6dd8848d876a4e851b4"
+KVV_CONFIGS = {
+    "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-ocr-bench-gb300-slurm.yaml": (
+        "ocrbench",
+        "16384",
+    ),
+    "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-mmmu-pro-vision-gb300-slurm.yaml": (
+        "mmmu",
+        "98304",
+    ),
 }
 
 
@@ -128,3 +132,19 @@ def test_evalscope_configs_use_expected_dataset_sources():
         len(paths) == expected_total
     ), f"expected {expected_total} EvalScope configs, found {len(paths)}"
     assert counts == expected_counts, f"expected {expected_counts}, found {counts}"
+
+
+def test_kvv_configs_use_pinned_upstream_and_local_api():
+    for filename, (benchmark, max_tokens) in KVV_CONFIGS.items():
+        path = EVAL_CONFIG_DIR / filename
+        task = yaml.safe_load(path.read_text(encoding="utf-8"))
+        install = task["eval"]["install"][0]
+        command = shlex.split(task["eval"]["command"])
+        script_index = command.index("/tmp/kvv/eval.py")
+
+        assert KVV_REVISION in install
+        assert "uv sync --project /tmp/kvv --frozen" in install
+        assert command[script_index + 1] == benchmark
+        assert "KIMI_BASE_URL=http://127.0.0.1:8000/v1" in command
+        assert flag_value(command, "--model") == "opensource/kimi-k3"
+        assert flag_value(command, "--max-tokens") == max_tokens

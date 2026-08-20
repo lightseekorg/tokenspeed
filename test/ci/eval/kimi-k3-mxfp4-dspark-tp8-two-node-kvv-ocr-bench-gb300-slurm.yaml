@@ -1,5 +1,5 @@
 api_version: ci.tokenspeed.io/v1
-name: eval-kimi-k3-mxfp4-dspark-tp8-two-node-mmmu-pro-vision-gb300-slurm
+name: eval-kimi-k3-mxfp4-dspark-tp8-two-node-ocr-bench-gb300-slurm
 type: eval
 workflow_stage: model-test
 triggers:
@@ -25,7 +25,7 @@ server:
     --speculative-num-draft-tokens 8
     --drafter-attention-backend mla
     --trust-remote-code
-    --max-model-len 131072
+    --max-model-len 65536
     --kv-cache-dtype fp8
     --tensor-parallel-size 8
     --mm-encoder-tp-mode data
@@ -42,19 +42,22 @@ server:
     interval: 10
 eval:
   install:
-    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+    - git init -q /tmp/kvv && git -C /tmp/kvv fetch --depth 1 https://github.com/MoonshotAI/Kimi-Vendor-Verifier.git 3dad65a760a8867cda72f6dd8848d876a4e851b4 && git -C /tmp/kvv checkout --detach FETCH_HEAD && python3 -m uv sync --project /tmp/kvv --frozen
   command: >-
     HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
-    /tmp/evalscope-perf/bin/evalscope eval
-    --model kimi-k3
-    --api-url http://127.0.0.1:8000/v1
-    --api-key EMPTY_TOKEN
-    --datasets mmmu_pro
-    --dataset-hub modelscope
-    --dataset-args '{"mmmu_pro":{"dataset_id":"AI-ModelScope/MMMU_Pro","extra_params":{"dataset_format":"vision"}}}'
-    --eval-batch-size 16
+    INSPECT_LOG_DIR=${RUNNER_TEMP:-/tmp}/kvv-logs
+    KIMI_API_KEY=EMPTY_TOKEN
+    KIMI_BASE_URL=http://127.0.0.1:8000/v1
+    /tmp/kvv/.venv/bin/python /tmp/kvv/eval.py ocrbench
+    --model opensource/kimi-k3
+    --max-tokens 16384
+    --thinking
+    --think-mode opensource
     --stream
-    --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"max_tokens":98304,"extra_body":{"reasoning_effort":"high"}}'
+    --max-connections 50
+    --temperature 1.0
+    --top-p 0.95
+    --thinking-effort high
 report:
   github_step_summary: true
-score_threshold: 0.76
+score_threshold: 0.89
