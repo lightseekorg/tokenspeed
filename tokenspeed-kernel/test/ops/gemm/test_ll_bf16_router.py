@@ -27,13 +27,17 @@ from tokenspeed_kernel.ops.gemm.kimi3 import (
     KIMI3_ROUTER_SIZE,
     kimi3_router_projection,
 )
+from tokenspeed_kernel.ops.gemm.ll_bf16 import MAX_M, ll_bf16_router_supported
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import MAX_M, ll_bf16_router
+from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_router
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
-if not current_platform().is_nvidia:
-    pytest.skip("ll_bf16 router GEMM is an NVIDIA CuTe kernel", allow_module_level=True)
+# Split-K needs SM90 clusters; the "cuda" reference solution is Hopper-plus too.
+if not (current_platform().is_nvidia and current_platform().is_hopper_plus):
+    pytest.skip(
+        "ll_bf16 router GEMM needs an NVIDIA Hopper-plus GPU", allow_module_level=True
+    )
 if not ll_bf16_router.is_available():
     pytest.skip("CuTe DSL not installed", allow_module_level=True)
 
@@ -70,7 +74,7 @@ def test_auto_selects_it_and_honours_out(m: int) -> None:
 def test_declines_above_its_measured_range() -> None:
     """Past MAX_M the driver must refuse rather than serve a slower path."""
     a, b = _inputs(MAX_M + 8)
-    assert not ll_bf16_router.supports(a, b, a.shape[0])
+    assert not ll_bf16_router_supported(a, b, a.shape[0])
     with pytest.raises(ValueError):
         kimi3_router_projection(a, b, solution="ll_bf16")
     # ``auto`` still answers, through cublas.
@@ -79,9 +83,9 @@ def test_declines_above_its_measured_range() -> None:
 
 def test_declines_non_contiguous_and_odd_k() -> None:
     a, b = _inputs(1)
-    assert not ll_bf16_router.supports(a.expand(2, -1), b, 2)
+    assert not ll_bf16_router_supported(a.expand(2, -1), b, 2)
     odd = torch.randn(1, KIMI3_HIDDEN_SIZE + 1, device="cuda", dtype=torch.bfloat16)
     odd_w = torch.randn(
         KIMI3_ROUTER_SIZE, KIMI3_HIDDEN_SIZE + 1, device="cuda", dtype=torch.bfloat16
     )
-    assert not ll_bf16_router.supports(odd, odd_w, 1)
+    assert not ll_bf16_router_supported(odd, odd_w, 1)

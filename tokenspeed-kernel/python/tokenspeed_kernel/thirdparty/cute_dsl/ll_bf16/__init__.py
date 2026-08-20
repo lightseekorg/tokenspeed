@@ -1,10 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# Ported from vLLM's LLBf16Gemm: both backends, with tokenspeed's stream/PDL
-# helpers and cutovers measured here rather than inherited.
+# Ported from vLLM's LLBf16Gemm; cutovers are measured here, not inherited.
 
-"""Low-latency BF16 router GEMM: ``a @ b.T`` in FP32 for decode-sized M."""
+"""Low-latency BF16 router GEMM: ``a @ b.T`` in FP32 for decode-sized M.
+
+Two vendored CuTe kernels serve K3's router shape (``[M, 7168] x [896, 7168]``).
+Measured on GB300, cold L2, us/call, against the cublas path they displace::
+
+    M          1     2     4     8    16    24    32    64   128   512
+    dot-prod  3.39  3.83  4.99  8.21 12.27     -     -     -     -     -
+    split-K      -     -     -  4.93  4.94  7.55  7.44 14.98 25.75 90.1
+    cublas    9.51  9.69  9.82  9.89  9.94  9.26  9.56  9.62 10.98  14.7
+
+Hence ``MAX_M_DOTPROD = 4`` (split-K wins from 8; the dot product only carries
+past 4 when split-K is absent) and ``MAX_M = 32`` (both lose to cublas above it,
+a bound vLLM does not apply). ``(split_k, num_stages)`` is tuned here too:
+vLLM's tables cover ``(K, N)`` from ``(4096, 256)`` to ``(7168, 384)`` and never
+``(7168, 896)``, so they run K3 on a ``(6, 4)`` default that loses at every M
+measured -- 5.75 / 8.74 / 9.19 us at M = 16 / 24 / 32 against the picks below.
+"""
 
 from __future__ import annotations
 
@@ -13,23 +28,10 @@ from typing import Any
 
 import torch
 
-# Measured on GB300 at K3's router shape ([M, 7168] x [896, 7168]), cold L2, in
-# us/call, against the cublas path each backend displaces:
-#   M      1     2     4     8    16    32    64
-#   dotprod  3.39  3.83  4.99  8.21 12.27 19.96     -
-#   split-K     -     -     -  4.93  4.94  8.30 14.98
-#   cublas   9.51  9.69  9.82  9.89  9.94  9.56  9.62
-# Split-K takes over at 8 the way vLLM has it; the dot product only wins past 4
-# when split-K is absent. Both lose to cublas past 32, which vLLM does not gate
-# for -- their split-K reaches 90 us at M = 512 while cublas stays at 14.7.
 MAX_M_DOTPROD = 4
 MAX_M = 32
 _BLOCK_SIZE_BY_M: dict[int, int] = {1: 256, 2: 256, 4: 256, 8: 128}
 _DEFAULT_BLOCK_SIZE = 128
-# (split_k, num_stages) measured at the router shape; vLLM's tables cover
-# (K, N) of (4096, 256) through (7168, 384) and never (7168, 896), so they run
-# K3 on their (6, 4) default -- which loses to both of these at every M here
-# (5.75 / 8.74 / 9.19 us at M = 16 / 24 / 32).
 _SPLITK_CONFIG_BY_M: tuple[tuple[int, tuple[int, int]], ...] = (
     (16, (4, 4)),  # 4.94 us at M = 16, against 6.04 for (4, 2)
     (MAX_M, (4, 2)),  # 7.55 / 7.44 at M = 24 / 32, against 8.28 / 8.31
@@ -132,17 +134,19 @@ class LLBf16Router:
         b = make_fake_tensor(BFloat16, (n, k), divisibility=divisibility)
         c = make_fake_tensor(Float32, (m, n), divisibility=1)
         gemm = _Kernel(k=k, bs=block_size, use_pdl=self._use_pdl(device))
-        self._dotprod[(device.index or 0, m, k, block_size)] = cute.compile(
-            gemm,
-            a,
-            b,
-            c,
-            m,
-            k,
-            1,  # runtime N placeholder for the fake-tensor compile
-            self._stream(device),
-            options="--enable-tvm-ffi --ptxas-options -maxrregcount=64",
-        )
+        # cute.compile targets the current device, not the operands'.
+        with torch.cuda.device(device):
+            self._dotprod[(device.index or 0, m, k, block_size)] = cute.compile(
+                gemm,
+                a,
+                b,
+                c,
+                m,
+                k,
+                1,  # runtime N placeholder for the fake-tensor compile
+                self._stream(device),
+                options="--enable-tvm-ffi --ptxas-options -maxrregcount=64",
+            )
 
     def _compile_splitk(self, config: tuple[int, int], device: torch.device) -> None:
         import cutlass.cute as cute
@@ -165,9 +169,10 @@ class LLBf16Router:
             split_k=split_k,
             use_pdl=self._use_pdl(device),
         )
-        self._splitk[(device.index or 0, split_k, num_stages)] = cute.compile(
-            gemm, a, b, c, self._stream(device), options="--enable-tvm-ffi"
-        )
+        with torch.cuda.device(device):
+            self._splitk[(device.index or 0, split_k, num_stages)] = cute.compile(
+                gemm, a, b, c, self._stream(device), options="--enable-tvm-ffi"
+            )
 
     def __call__(
         self,

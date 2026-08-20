@@ -869,10 +869,10 @@ _ROUTER_CUDA_MAX_TOKENS = 4
 def _ll_bf16_usable(hidden_states: torch.Tensor, weight: torch.Tensor, m: int) -> bool:
     """Whether the vendored CuTe dot-product router GEMM can serve this call."""
     try:
-        from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_router
+        from tokenspeed_kernel.ops.gemm.ll_bf16 import ll_bf16_router_supported
     except ImportError:
         return False
-    return ll_bf16_router.supports(hidden_states, weight, m)
+    return ll_bf16_router_supported(hidden_states, weight, m)
 
 
 @lru_cache(maxsize=1)
@@ -950,9 +950,9 @@ def kimi3_router_projection(
         else:
             solution = "torch"
     if solution == "ll_bf16":
-        from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_router
+        from tokenspeed_kernel.ops.gemm.ll_bf16 import cute_dsl_ll_bf16_router
 
-        return ll_bf16_router(hidden_states, weight, out)
+        return cute_dsl_ll_bf16_router(hidden_states, weight, out)
     if solution == "cublas":
         if not specialized or not _mm_out_dtype_supported():
             raise ValueError(

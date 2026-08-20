@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# Ported from vLLM's LLBf16SplitK: kernel body unchanged; the compile cache and
-# dispatch live in this package's __init__ instead of vLLM's LLBf16Gemm.
+# Ported from vLLM's LLBf16SplitK; kernel body unchanged.
 
 import math
 
