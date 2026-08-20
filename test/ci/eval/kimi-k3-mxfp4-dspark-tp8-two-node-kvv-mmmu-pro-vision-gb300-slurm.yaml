@@ -57,7 +57,7 @@ eval:
     --max-connections 16
     --temperature 1.0
     --top-p 0.95
-    --thinking-effort high
+    --thinking-effort max
 report:
   github_step_summary: true
 score_threshold: 0.76

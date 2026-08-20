@@ -148,3 +148,5 @@ def test_kvv_configs_use_pinned_upstream_and_local_api():
         assert "KIMI_BASE_URL=http://127.0.0.1:8000/v1" in command
         assert flag_value(command, "--model") == "opensource/kimi-k3"
         assert flag_value(command, "--max-tokens") == max_tokens
+        assert "--thinking" in command
+        assert flag_value(command, "--thinking-effort") == "max"
