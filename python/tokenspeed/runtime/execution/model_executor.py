@@ -171,10 +171,6 @@ class ModelExecutorConfig:
     model_is_mrope: bool
     enable_nan_detection: bool = False
     disable_autotune: bool = False
-    # Let the collector run during graph capture instead of freezing it. The
-    # default freeze keeps a mid-capture collection from walking the whole
-    # live object graph (weights, pools, per-bucket buffers); this is the
-    # escape hatch for when that interferes with debugging or memory.
     enable_cudagraph_gc: bool = False
 
     # ====== DP =========
