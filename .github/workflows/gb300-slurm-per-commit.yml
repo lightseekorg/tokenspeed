@@ -115,6 +115,7 @@ jobs:
             >> "$GITHUB_OUTPUT"
 
   submit:
+    name: ${{ matrix.name }}
     needs: scan
     if: |
       needs.scan.outputs.allowed == 'true' &&
