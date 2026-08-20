@@ -75,6 +75,7 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from tokenspeed.runtime.entrypoints.engine_base import EngineBase
+from tokenspeed.runtime.process_startup import wait_for_process_startup
 from tokenspeed.runtime.utils import (
     MultiprocessingSerializer,
     configure_logger,
@@ -520,6 +521,17 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
+def _terminate_scheduler_processes(processes: list[mp.Process]) -> None:
+    """Force-stop and reap scheduler trees after a startup failure."""
+    for process in processes:
+        if process.pid is None or not process.is_alive():
+            continue
+        kill_process_tree(process.pid)
+    for process in processes:
+        if process.pid is not None:
+            process.join(timeout=5)
+
+
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: PortArgs | None = None
 ) -> tuple[AsyncLLM, None, dict]:
@@ -541,56 +553,96 @@ def _launch_subprocesses(
     )
 
     scheduler_procs = []
-    if not server_args.mapping.attn.has_dp:
-        # Launch tensor parallel scheduler processes
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
-        )
+    scheduler_pipe_readers = []
 
-        scheduler_pipe_readers = []
-        rank_start = server_args.mapping.nprocs_per_node * server_args.node_rank
-        rank_end = rank_start + server_args.mapping.nprocs_per_node
-        for rank in range(rank_start, rank_end):
-            # Create per-rank server_args with rank-initialized mapping
-            rank_server_args = copy.copy(server_args)
-            rank_server_args.mapping = copy.deepcopy(server_args.mapping)
-            rank_server_args.mapping.rank = rank
+    def terminate_schedulers_on_startup_signal(_signum, _frame):
+        for process in scheduler_procs:
+            if process.is_alive():
+                process.terminate()
 
-            reader, writer = mp.Pipe(duplex=False)
+    # Install before spawning so an early child failure cannot hit SIG_DFL and
+    # terminate the supervisor before it has cleaned up the other ranks.
+    previous_sigusr1_handler = signal.getsignal(signal.SIGUSR1)
+    signal.signal(signal.SIGUSR1, terminate_schedulers_on_startup_signal)
 
-            proc = mp.Process(
-                target=run_event_loop,
-                args=(
-                    rank_server_args,
-                    port_args,
-                    writer,
-                ),
+    try:
+        if not server_args.mapping.attn.has_dp:
+            # Launch tensor parallel scheduler processes
+            memory_saver_adapter = TorchMemorySaverAdapter.create(
+                enable=server_args.enable_memory_saver
             )
-            with memory_saver_adapter.configure_subprocess():
-                proc.start()
-            scheduler_procs.append(proc)
+
+            rank_start = server_args.mapping.nprocs_per_node * server_args.node_rank
+            rank_end = rank_start + server_args.mapping.nprocs_per_node
+            for rank in range(rank_start, rank_end):
+                # Create per-rank server_args with rank-initialized mapping
+                rank_server_args = copy.copy(server_args)
+                rank_server_args.mapping = copy.deepcopy(server_args.mapping)
+                rank_server_args.mapping.rank = rank
+
+                reader, writer = mp.Pipe(duplex=False)
+
+                proc = mp.Process(
+                    target=run_event_loop,
+                    args=(
+                        rank_server_args,
+                        port_args,
+                        writer,
+                    ),
+                )
+                scheduler_pipe_readers.append(reader)
+                try:
+                    with memory_saver_adapter.configure_subprocess():
+                        proc.start()
+                        scheduler_procs.append(proc)
+                except BaseException:
+                    scheduler_pipe_readers.pop().close()
+                    raise
+                finally:
+                    writer.close()
+        else:
+            # Launch the data parallel controller
+            reader, writer = mp.Pipe(duplex=False)
+            proc = mp.Process(
+                target=run_data_parallel_controller_process,
+                args=(server_args, port_args, writer),
+            )
             scheduler_pipe_readers.append(reader)
-    else:
-        # Launch the data parallel controller
-        reader, writer = mp.Pipe(duplex=False)
-        scheduler_pipe_readers = [reader]
-        proc = mp.Process(
-            target=run_data_parallel_controller_process,
-            args=(server_args, port_args, writer),
+            try:
+                proc.start()
+                scheduler_procs.append(proc)
+            except BaseException:
+                scheduler_pipe_readers.pop().close()
+                raise
+            finally:
+                writer.close()
+
+        # Rank zero's frontend owns IPC endpoints used during scheduler startup.
+        tokenizer_manager = None
+        if server_args.node_rank == 0:
+            tokenizer_manager = AsyncLLM(server_args, port_args)
+
+        scheduler_infos = wait_for_process_startup(
+            scheduler_pipe_readers,
+            scheduler_procs,
+            description=(
+                "DataParallelController"
+                if server_args.mapping.attn.has_dp
+                else "scheduler rank"
+            ),
+            timeout_seconds=server_args.scheduler_startup_timeout_seconds,
         )
-        proc.start()
-        scheduler_procs.append(proc)
+    except BaseException:
+        _terminate_scheduler_processes(scheduler_procs)
+        raise
+    finally:
+        signal.signal(signal.SIGUSR1, previous_sigusr1_handler)
+        for reader in scheduler_pipe_readers:
+            reader.close()
 
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
         # so they can just wait here.
-
-        for reader in scheduler_pipe_readers:
-            data = reader.recv()
-            if data.get("status") != "ready":
-                raise RuntimeError(
-                    "Initialization failed. Please see the error messages above."
-                )
 
         if not envs.TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN.get():
             # When using `Engine` as a Python API, we don't want to block here.
@@ -609,30 +661,8 @@ def _launch_subprocesses(
             )
         return None, None, None
 
-    # Launch the main-process async frontend. The detokenizer runs
-    # inline inside AsyncLLM — no separate subprocess.
-    tokenizer_manager = AsyncLLM(server_args, port_args)
-
-    # Wait for the model to finish loading
-    scheduler_infos = []
-    for i in range(len(scheduler_pipe_readers)):
-        try:
-            data = scheduler_pipe_readers[i].recv()
-        except EOFError:
-            logger.error(
-                "Rank %s scheduler is dead. Please check if there are relevant logs.", i
-            )
-            scheduler_procs[i].join()
-            logger.error("Exit code: %s", scheduler_procs[i].exitcode)
-            raise
-
-        if data["status"] != "ready":
-            raise RuntimeError(
-                "Initialization failed. Please see the error messages above."
-            )
-        scheduler_infos.append(data)
-
     # Assume all schedulers have the same scheduler_info
+    assert tokenizer_manager is not None
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     tokenizer_manager.max_single_request_tokens = scheduler_info[
@@ -679,8 +709,8 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     scheduler_pipe_readers = []
 
     # SIGUSR1 is what a scheduler sends its parent on an internal exception
-    # (see run_event_loop) — the child itself then exits 0, so record the
-    # failure here or the supervisor would report success.
+    # after startup (see run_event_loop), so record the failure even if the
+    # child is terminated before its exit status can be observed.
     child_failed = threading.Event()
 
     def _terminate_schedulers(signum=None, _frame=None):
@@ -717,6 +747,7 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
             )
             with memory_saver_adapter.configure_subprocess():
                 proc.start()
+            writer.close()
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
     else:
@@ -727,25 +758,20 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
             args=(server_args, port_args, writer),
         )
         proc.start()
+        writer.close()
         scheduler_procs.append(proc)
 
     try:
-        for i, reader in enumerate(scheduler_pipe_readers):
-            try:
-                data = reader.recv()
-            except EOFError:
-                logger.error(
-                    "Rank %s scheduler is dead. Please check if there are "
-                    "relevant logs.",
-                    i,
-                )
-                scheduler_procs[i].join()
-                logger.error("Exit code: %s", scheduler_procs[i].exitcode)
-                raise
-            if data.get("status") != "ready":
-                raise RuntimeError(
-                    "Scheduler initialization failed. See the error messages above."
-                )
+        wait_for_process_startup(
+            scheduler_pipe_readers,
+            scheduler_procs,
+            description=(
+                "DataParallelController"
+                if server_args.mapping.attn.has_dp
+                else "scheduler rank"
+            ),
+            timeout_seconds=server_args.scheduler_startup_timeout_seconds,
+        )
         logger.info(
             "headless scheduler(s) ready; SMG handshake endpoint=%s",
             server_args.zmq_handshake_endpoint(),
@@ -783,6 +809,8 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
         _terminate_schedulers()
         for proc in scheduler_procs:
             proc.join(timeout=5)
+        for reader in scheduler_pipe_readers:
+            reader.close()
         kill_process_tree(os.getpid(), include_parent=False)
 
 

@@ -367,6 +367,7 @@ def run_data_parallel_controller_process(
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
     register_usr_signal()
+    startup_complete = False
 
     try:
         controller = DataParallelController(server_args, port_args)
@@ -383,6 +384,7 @@ def run_data_parallel_controller_process(
                 "cache_storage": controller.cache_storage,
             }
         )
+        startup_complete = True
         if server_args.node_rank == 0:
             controller.event_loop()
         for proc in controller.scheduler_procs:
@@ -395,4 +397,11 @@ def run_data_parallel_controller_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error("DataParallelController hit an exception: %s", traceback)
-        parent_process.send_signal(signal.SIGUSR1)
+        if startup_complete:
+            parent_process.send_signal(signal.SIGUSR1)
+        else:
+            try:
+                pipe_writer.send({"status": "error", "error": traceback})
+            except (BrokenPipeError, EOFError, OSError):
+                parent_process.send_signal(signal.SIGUSR1)
+        raise

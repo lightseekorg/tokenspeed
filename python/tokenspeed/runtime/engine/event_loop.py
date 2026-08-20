@@ -1903,6 +1903,7 @@ def run_event_loop(
     configure_logger(server_args, prefix=prefix)
 
     event_loop = None
+    startup_complete = False
     shutdown_event = threading.Event()
     previous_sigterm_handler = None
     try:
@@ -1947,6 +1948,7 @@ def run_event_loop(
                 "cache_storage": getattr(event_loop, "cache_storage", None),
             }
         )
+        startup_complete = True
 
         if event_loop.has_dp:
             # All DP schedulers must finish initialization before any rank enters
@@ -1961,7 +1963,14 @@ def run_event_loop(
     except Exception:
         traceback = get_exception_traceback()
         logger.error("Scheduler hit an exception: %s", traceback)
-        parent_process.send_signal(signal.SIGUSR1)
+        if startup_complete:
+            parent_process.send_signal(signal.SIGUSR1)
+        else:
+            try:
+                pipe_writer.send({"status": "error", "error": traceback})
+            except (BrokenPipeError, EOFError, OSError):
+                parent_process.send_signal(signal.SIGUSR1)
+        raise
     finally:
         if event_loop is not None:
             try:

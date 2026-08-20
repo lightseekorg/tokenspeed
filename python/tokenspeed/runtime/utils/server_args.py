@@ -149,6 +149,9 @@ class ServerArgs:
     enable_inline_detokenizer: bool = True
     seed: int | None = None
     distributed_timeout_seconds: int | None = None
+    # Keep this below the outer `ts serve` orchestrator's 1800s default so the
+    # engine can report the failing scheduler rank before the worker is killed.
+    scheduler_startup_timeout_seconds: int = 1500
     download_dir: str | None = None
     # Used for customizing extensible models
     ext_yaml: str | None = None
@@ -839,6 +842,9 @@ class ServerArgs:
             )
 
     def validate(self):
+        if self.scheduler_startup_timeout_seconds <= 0:
+            raise ValueError("scheduler_startup_timeout_seconds must be positive")
+
         if (
             self.max_num_seqs is not None
             and self.max_num_seqs < self.mapping.attn.dp_size
@@ -1230,6 +1236,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.distributed_timeout_seconds,
             help="Set timeout for torch.distributed initialization.",
+        )
+        parser.add_argument(
+            "--scheduler-startup-timeout-seconds",
+            metavar="SCHEDULER_STARTUP_TIMEOUT_SECONDS",
+            type=int,
+            default=ServerArgs.scheduler_startup_timeout_seconds,
+            help="Fail if scheduler processes do not become ready within this many seconds.",
         )
         parser.add_argument(
             "--download-dir",
