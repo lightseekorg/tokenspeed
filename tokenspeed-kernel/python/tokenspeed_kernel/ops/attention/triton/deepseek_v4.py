@@ -73,56 +73,26 @@ __all__ = [
 
 
 @triton.jit
-def _deepseek_v4_qnorm_rope_kernel(
+def _deepseek_v4_qnorm_rope_kv_insert_kernel(
     q_ptr,
-    positions_ptr,
-    cos_sin_cache_ptr,
-    q_stride_token,
-    q_stride_head,
-    cos_sin_stride,
-    rms_norm_eps,
-    HEAD_DIM: tl.constexpr,
-    NOPE_DIM: tl.constexpr,
-    ROPE_DIM: tl.constexpr,
-    BLOCK_DIM: tl.constexpr,
-):
-    token_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
-    offsets = tl.arange(0, BLOCK_DIM)
-    mask = offsets < HEAD_DIM
-    q_base = q_ptr + token_idx * q_stride_token + head_idx * q_stride_head
-    q = tl.load(q_base + offsets, mask=mask, other=0.0).to(tl.float32)
-    q *= tl.rsqrt(tl.sum(q * q, axis=0) / HEAD_DIM + rms_norm_eps)
-
-    NUM_PAIRS: tl.constexpr = BLOCK_DIM // 2
-    NOPE_PAIRS: tl.constexpr = NOPE_DIM // 2
-    pair_2d = tl.reshape(q, (NUM_PAIRS, 2))
-    even, odd = tl.split(pair_2d)
-    pair_idx = tl.arange(0, NUM_PAIRS)
-    rope_pair = pair_idx - NOPE_PAIRS
-    is_rope = (rope_pair >= 0) & (rope_pair < ROPE_DIM // 2)
-    cs_idx = tl.maximum(rope_pair, 0)
-    position = tl.load(positions_ptr + token_idx)
-    cs_base = cos_sin_cache_ptr + position * cos_sin_stride
-    cos_v = tl.load(cs_base + cs_idx, mask=is_rope, other=1.0).to(tl.float32)
-    sin_v = tl.load(cs_base + ROPE_DIM // 2 + cs_idx, mask=is_rope, other=0.0).to(
-        tl.float32
-    )
-    rotated = tl.interleave(even * cos_v - odd * sin_v, even * sin_v + odd * cos_v)
-    tl.store(q_base + offsets, rotated, mask=mask)
-
-
-@triton.jit
-def _deepseek_v4_k_rope_quant_insert_kernel(
+    q_out_ptr,
     kv_ptr,
     cache_ptr,
     slot_mapping_ptr,
     positions_ptr,
     cos_sin_cache_ptr,
+    q_stride_token,
+    q_stride_head,
+    q_out_stride_token,
+    q_out_stride_head,
     kv_stride_token,
     cache_block_stride,
     cos_sin_stride,
+    num_q_tokens,
+    num_insert,
+    rms_norm_eps,
     block_size,
+    NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     NOPE_DIM: tl.constexpr,
     ROPE_DIM: tl.constexpr,
@@ -133,81 +103,134 @@ def _deepseek_v4_k_rope_quant_insert_kernel(
     BLOCK_DIM: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
-    slot = tl.load(slot_mapping_ptr + token_idx)
-    if slot < 0:
-        return
-
+    role = tl.program_id(1)
     offsets = tl.arange(0, BLOCK_DIM)
     mask = offsets < HEAD_DIM
-    kv = tl.load(
-        kv_ptr + token_idx * kv_stride_token + offsets,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
 
-    NUM_PAIRS: tl.constexpr = BLOCK_DIM // 2
-    NOPE_PAIRS: tl.constexpr = NOPE_DIM // 2
-    pair_2d = tl.reshape(kv, (NUM_PAIRS, 2))
-    even, odd = tl.split(pair_2d)
-    pair_idx = tl.arange(0, NUM_PAIRS)
-    rope_pair = pair_idx - NOPE_PAIRS
-    is_rope = (rope_pair >= 0) & (rope_pair < ROPE_DIM // 2)
-    cs_idx = tl.maximum(rope_pair, 0)
-    position = tl.load(positions_ptr + token_idx)
-    cs_base = cos_sin_cache_ptr + position * cos_sin_stride
-    cos_v = tl.load(cs_base + cs_idx, mask=is_rope, other=1.0).to(tl.float32)
-    sin_v = tl.load(cs_base + ROPE_DIM // 2 + cs_idx, mask=is_rope, other=0.0).to(
-        tl.float32
-    )
-    rotated = tl.interleave(even * cos_v - odd * sin_v, even * sin_v + odd * cos_v)
+    if role < NUM_HEADS:
+        if token_idx < num_q_tokens:
+            q_base = q_ptr + token_idx * q_stride_token + role * q_stride_head
+            q_out_base = (
+                q_out_ptr + token_idx * q_out_stride_token + role * q_out_stride_head
+            )
+            q = tl.load(q_base + offsets, mask=mask, other=0.0).to(tl.float32)
+            q *= tl.rsqrt(tl.sum(q * q, axis=0) / HEAD_DIM + rms_norm_eps)
 
-    cache_block = slot // block_size
-    cache_position = slot % block_size
-    block_base = cache_ptr + cache_block.to(tl.int64) * cache_block_stride
-    token_base = block_base + cache_position * TOKEN_STRIDE
-    scale_base = block_base + block_size * TOKEN_STRIDE + cache_position * SCALE_DIM
+            NUM_PAIRS: tl.constexpr = BLOCK_DIM // 2
+            NOPE_PAIRS: tl.constexpr = NOPE_DIM // 2
+            pair_2d = tl.reshape(q, (NUM_PAIRS, 2))
+            even, odd = tl.split(pair_2d)
+            pair_idx = tl.arange(0, NUM_PAIRS)
+            rope_pair = pair_idx - NOPE_PAIRS
+            is_rope = (rope_pair >= 0) & (rope_pair < ROPE_DIM // 2)
+            cs_idx = tl.maximum(rope_pair, 0)
+            position = tl.load(positions_ptr + token_idx)
+            cs_base = cos_sin_cache_ptr + position * cos_sin_stride
+            cos_v = tl.load(cs_base + cs_idx, mask=is_rope, other=1.0).to(tl.float32)
+            sin_v = tl.load(
+                cs_base + ROPE_DIM // 2 + cs_idx,
+                mask=is_rope,
+                other=0.0,
+            ).to(tl.float32)
+            rotated = tl.interleave(
+                even * cos_v - odd * sin_v,
+                even * sin_v + odd * cos_v,
+            )
+            tl.store(q_out_base + offsets, rotated, mask=mask)
+    else:
+        if token_idx < num_insert:
+            slot = tl.load(slot_mapping_ptr + token_idx)
+            if slot >= 0:
+                kv = tl.load(
+                    kv_ptr + token_idx * kv_stride_token + offsets,
+                    mask=mask,
+                    other=0.0,
+                ).to(tl.float32)
 
-    N_QUANT_BLOCKS: tl.constexpr = BLOCK_DIM // QUANT_BLOCK
-    N_NOPE_BLOCKS: tl.constexpr = NOPE_DIM // QUANT_BLOCK
-    values_2d = tl.reshape(
-        rotated.to(tl.bfloat16).to(tl.float32),
-        (N_QUANT_BLOCKS, QUANT_BLOCK),
-    )
-    block_absmax = tl.maximum(tl.max(tl.abs(values_2d), axis=1), 1.0e-4)
-    exponents = tl.ceil(tl.log2(block_absmax / FP8_MAX))
-    inv_scales = tl.exp2(-exponents)
-    quantized = tl.clamp(
-        values_2d * tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1)),
-        -FP8_MAX,
-        FP8_MAX,
-    ).to(tl.float8e4nv)
-    quantized_u8 = tl.reshape(quantized.to(tl.uint8, bitcast=True), (BLOCK_DIM,))
-    tl.store(token_base + offsets, quantized_u8, mask=offsets < NOPE_DIM)
+                NUM_PAIRS: tl.constexpr = BLOCK_DIM // 2
+                NOPE_PAIRS: tl.constexpr = NOPE_DIM // 2
+                pair_2d = tl.reshape(kv, (NUM_PAIRS, 2))
+                even, odd = tl.split(pair_2d)
+                pair_idx = tl.arange(0, NUM_PAIRS)
+                rope_pair = pair_idx - NOPE_PAIRS
+                is_rope = (rope_pair >= 0) & (rope_pair < ROPE_DIM // 2)
+                cs_idx = tl.maximum(rope_pair, 0)
+                position = tl.load(positions_ptr + token_idx)
+                cs_base = cos_sin_cache_ptr + position * cos_sin_stride
+                cos_v = tl.load(cs_base + cs_idx, mask=is_rope, other=1.0).to(
+                    tl.float32
+                )
+                sin_v = tl.load(
+                    cs_base + ROPE_DIM // 2 + cs_idx,
+                    mask=is_rope,
+                    other=0.0,
+                ).to(tl.float32)
+                rotated = tl.interleave(
+                    even * cos_v - odd * sin_v,
+                    even * sin_v + odd * cos_v,
+                )
 
-    scale_offsets = tl.arange(0, N_QUANT_BLOCKS)
-    encoded_scales = tl.maximum(tl.minimum(exponents + 127.0, 255.0), 0.0)
-    tl.store(
-        scale_base + scale_offsets,
-        encoded_scales.to(tl.uint8),
-        mask=scale_offsets < N_NOPE_BLOCKS,
-    )
-    tl.store(scale_base + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
+                cache_block = slot // block_size
+                cache_position = slot % block_size
+                block_base = cache_ptr + cache_block.to(tl.int64) * cache_block_stride
+                token_base = block_base + cache_position * TOKEN_STRIDE
+                scale_base = (
+                    block_base + block_size * TOKEN_STRIDE + cache_position * SCALE_DIM
+                )
 
-    rope_offsets = tl.arange(0, ROPE_DIM)
-    rope_values = tl.load(
-        kv_ptr + token_idx * kv_stride_token + NOPE_DIM + rope_offsets
-    ).to(tl.float32)
-    rope_pairs = tl.reshape(rope_values, (ROPE_DIM // 2, 2))
-    rope_even, rope_odd = tl.split(rope_pairs)
-    rope_idx = tl.arange(0, ROPE_DIM // 2)
-    rope_cos = tl.load(cs_base + rope_idx).to(tl.float32)
-    rope_sin = tl.load(cs_base + ROPE_DIM // 2 + rope_idx).to(tl.float32)
-    rope_rotated = tl.interleave(
-        rope_even * rope_cos - rope_odd * rope_sin,
-        rope_even * rope_sin + rope_odd * rope_cos,
-    )
-    rope_ptr = (token_base + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
-    tl.store(rope_ptr + rope_offsets, rope_rotated.to(tl.bfloat16))
+                N_QUANT_BLOCKS: tl.constexpr = BLOCK_DIM // QUANT_BLOCK
+                N_NOPE_BLOCKS: tl.constexpr = NOPE_DIM // QUANT_BLOCK
+                values_2d = tl.reshape(
+                    rotated.to(tl.bfloat16).to(tl.float32),
+                    (N_QUANT_BLOCKS, QUANT_BLOCK),
+                )
+                block_absmax = tl.maximum(tl.max(tl.abs(values_2d), axis=1), 1.0e-4)
+                exponents = tl.ceil(tl.log2(block_absmax / FP8_MAX))
+                inv_scales = tl.exp2(-exponents)
+                quantized = tl.clamp(
+                    values_2d * tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1)),
+                    -FP8_MAX,
+                    FP8_MAX,
+                ).to(tl.float8e4nv)
+                quantized_u8 = tl.reshape(
+                    quantized.to(tl.uint8, bitcast=True), (BLOCK_DIM,)
+                )
+                tl.store(
+                    token_base + offsets,
+                    quantized_u8,
+                    mask=offsets < NOPE_DIM,
+                )
+
+                scale_offsets = tl.arange(0, N_QUANT_BLOCKS)
+                encoded_scales = tl.maximum(tl.minimum(exponents + 127.0, 255.0), 0.0)
+                tl.store(
+                    scale_base + scale_offsets,
+                    encoded_scales.to(tl.uint8),
+                    mask=scale_offsets < N_NOPE_BLOCKS,
+                )
+                tl.store(
+                    scale_base + N_NOPE_BLOCKS,
+                    tl.zeros((), dtype=tl.uint8),
+                )
+
+                rope_offsets = tl.arange(0, ROPE_DIM)
+                rope_values = tl.load(
+                    kv_ptr + token_idx * kv_stride_token + NOPE_DIM + rope_offsets
+                ).to(tl.float32)
+                rope_pairs = tl.reshape(rope_values, (ROPE_DIM // 2, 2))
+                rope_even, rope_odd = tl.split(rope_pairs)
+                rope_idx = tl.arange(0, ROPE_DIM // 2)
+                rope_cos = tl.load(cs_base + rope_idx).to(tl.float32)
+                rope_sin = tl.load(cs_base + ROPE_DIM // 2 + rope_idx).to(tl.float32)
+                rope_rotated = tl.interleave(
+                    rope_even * rope_cos - rope_odd * rope_sin,
+                    rope_even * rope_sin + rope_odd * rope_cos,
+                )
+                rope_ptr = (token_base + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+                tl.store(
+                    rope_ptr + rope_offsets,
+                    rope_rotated.to(tl.bfloat16),
+                )
 
 
 @register_kernel(
@@ -247,43 +270,37 @@ def deepseek_v4_fused_qnorm_rope_kv_insert(
 ) -> None:
     """Normalize/rotate Q and insert rotated K into the V4 SWA cache."""
 
-    q_destination = q
-    if q_out is not None:
-        q_out.copy_(q)
-        q_destination = q_out
+    q_destination = q if q_out is None else q_out
+    if q_destination.shape != q.shape or q_destination.dtype != q.dtype:
+        raise ValueError("DeepSeek V4 q_out must match q shape and dtype")
 
-    num_q_tokens, num_heads, head_dim = q_destination.shape
+    num_q_tokens, num_heads, head_dim = q.shape
     if head_dim != DEEPSEEK_V4_HEAD_DIM:
         raise ValueError(f"DeepSeek V4 Q head dimension must be 512, got {head_dim}")
-    if num_q_tokens > 0:
-        _deepseek_v4_qnorm_rope_kernel[(num_q_tokens, num_heads)](
-            q_destination,
-            positions,
-            cos_sin_cache,
-            q_destination.stride(0),
-            q_destination.stride(1),
-            cos_sin_cache.stride(0),
-            rms_norm_eps,
-            HEAD_DIM=DEEPSEEK_V4_HEAD_DIM,
-            NOPE_DIM=DEEPSEEK_V4_NOPE_DIM,
-            ROPE_DIM=DEEPSEEK_V4_ROPE_DIM,
-            BLOCK_DIM=triton.next_power_of_2(DEEPSEEK_V4_HEAD_DIM),
-            num_warps=4,
-        )
-
     num_insert = min(kv.shape[0], slot_mapping.numel(), positions.numel())
-    if num_insert == 0:
+    grid_tokens = max(num_q_tokens, num_insert)
+    if grid_tokens == 0:
         return
-    _deepseek_v4_k_rope_quant_insert_kernel[(num_insert,)](
+    _deepseek_v4_qnorm_rope_kv_insert_kernel[(grid_tokens, num_heads + 1)](
+        q,
+        q_destination,
         kv,
         swa_kv_cache,
         slot_mapping,
         positions,
         cos_sin_cache,
+        q.stride(0),
+        q.stride(1),
+        q_destination.stride(0),
+        q_destination.stride(1),
         kv.stride(0),
         swa_kv_cache.stride(0),
         cos_sin_cache.stride(0),
+        num_q_tokens,
+        num_insert,
+        rms_norm_eps,
         page_size,
+        NUM_HEADS=num_heads,
         HEAD_DIM=DEEPSEEK_V4_HEAD_DIM,
         NOPE_DIM=DEEPSEEK_V4_NOPE_DIM,
         ROPE_DIM=DEEPSEEK_V4_ROPE_DIM,

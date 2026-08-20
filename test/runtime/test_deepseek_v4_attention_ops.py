@@ -707,6 +707,56 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         # but no cache row is written for it.
         self.assertEqual(int(cache.view(-1)[3 * 576 : 4 * 576].sum()), 0)
 
+    def test_fused_qnorm_rope_kv_insert_q_out_matches_in_place(self):
+        torch.manual_seed(1235)
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+        num_tokens = 3
+        num_heads = 2
+        block_size = 4
+        q_source = torch.randn(
+            num_tokens, num_heads, HEAD_DIM, device=device, dtype=dtype
+        )
+        kv = torch.randn(num_tokens, HEAD_DIM, device=device, dtype=dtype)
+        positions = torch.tensor([0, 2, 5], device=device, dtype=torch.int64)
+        slots = torch.tensor([0, -1, 5], device=device, dtype=torch.int64)
+        cos_sin = torch.randn(8, ROPE_DIM, device=device, dtype=torch.float32) * 0.1
+
+        q_in_place = q_source.clone()
+        cache_in_place = torch.zeros(
+            2, block_size * 584, device=device, dtype=torch.uint8
+        )
+        fused_qnorm_rope_kv_insert(
+            q=q_in_place,
+            kv=kv,
+            swa_kv_cache_2d=cache_in_place,
+            slot_mapping=slots,
+            positions=positions,
+            cos_sin_cache=cos_sin,
+            rms_norm_eps=1.0e-6,
+            block_size=block_size,
+        )
+
+        q_input = q_source.clone()
+        q_out = torch.empty_like(q_input)
+        cache_out = torch.zeros_like(cache_in_place)
+        fused_qnorm_rope_kv_insert(
+            q=q_input,
+            q_out=q_out,
+            kv=kv,
+            swa_kv_cache_2d=cache_out,
+            slot_mapping=slots,
+            positions=positions,
+            cos_sin_cache=cos_sin,
+            rms_norm_eps=1.0e-6,
+            block_size=block_size,
+        )
+        torch.cuda.synchronize()
+
+        self.assertTrue(torch.equal(q_input, q_source))
+        self.assertTrue(torch.equal(q_out, q_in_place))
+        self.assertTrue(torch.equal(cache_out, cache_in_place))
+
     def test_hca_compressor_state_insert_matches_reference(self):
         torch.manual_seed(4321)
         device = torch.device("cuda")
