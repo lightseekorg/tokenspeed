@@ -226,8 +226,8 @@ def fused_decode_input_prep_kernel(
         page_ptrs = page_table_ptr + req_idx * max_pages + page_indices
         page_ids = tl.load(page_ptrs, mask=mask, other=0)
         cache_locs = page_ids * page_size + offsets_in_page
-        # Route overflow tokens to slot 0 (fixed safe dummy target).
-        cache_locs = tl.where(overflow, 0, cache_locs)
+        # Null/hole pages share the same fixed dummy target as overflow.
+        cache_locs = tl.where(overflow | (page_ids <= 0), 0, cache_locs)
 
         tl.store(
             out_cache_loc_ptr + output_offset + token_offsets,
@@ -323,7 +323,7 @@ def dflash_prepare_decode_kernel(
     page_ptrs = page_table_ptr + req_idx * max_pages + page_indices
     page_ids = tl.load(page_ptrs, mask=mask, other=0)
     cache_locs = page_ids * page_size + offsets_in_page
-    cache_locs = tl.where(overflow, 0, cache_locs)
+    cache_locs = tl.where(overflow | (page_ids <= 0), 0, cache_locs)
     tl.store(
         out_cache_loc_ptr + req_idx * draft_query_width + offsets,
         cache_locs,
