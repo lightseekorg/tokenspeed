@@ -220,17 +220,24 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
 
 
 @pytest.mark.parametrize(
-    ("accepted", "crossing"),
+    ("accepted", "crossing", "t"),
     [
-        ([1, 1, 1, 1], [False, False, False, False]),
-        ([2, 3, 2, 3], [True, True, True, True]),
-        ([1, 1, 2, 3], [False, False, True, True]),
+        ([1, 1, 1, 1], [False, False, False, False], 3),
+        ([2, 3, 2, 3], [True, True, True, True], 3),
+        ([1, 1, 2, 3], [False, False, True, True], 3),
+        # DSpark's draft width: longer replays cross the boundary more often.
+        ([1, 8, 4, 1], [False, True, True, False], 8),
     ],
-    ids=["in-place-only", "cross-only", "mixed-checkpoint-boundary"],
+    ids=[
+        "in-place-only",
+        "cross-only",
+        "mixed-checkpoint-boundary",
+        "mixed-boundary-t8",
+    ],
 )
-def test_batched_replay_checkpoint_boundary_matches_layer_loop(accepted, crossing):
+def test_batched_replay_checkpoint_boundary_matches_layer_loop(accepted, crossing, t):
     """TP1 checkpoint-boundary schedule agrees with the layer-loop oracle."""
-    layers, n, t = 69, 4, 3
+    layers, n = 69, 4
     source = [_window(n, t, pages=24, seed=2701 + layer) for layer in range(layers)]
     for x in source:
         qkv = torch.empty(n * t, 9 * P, device=DEV, dtype=torch.bfloat16)
