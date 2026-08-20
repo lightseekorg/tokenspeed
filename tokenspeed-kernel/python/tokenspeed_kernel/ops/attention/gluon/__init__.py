@@ -253,7 +253,7 @@ if current_platform().is_amd:
         traits={
             "tokens": frozenset({1, 2, 3, 4, 5, 6}),
             "head_dim": frozenset({512}),
-            "num_heads": frozenset({16}),
+            "num_heads": frozenset({16, 32}),
             "cache_layout": frozenset({"fp8_swa_page_planar"}),
             "topk_layout": frozenset({"global_slots"}),
             "support_sink": frozenset({True}),

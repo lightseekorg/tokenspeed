@@ -468,13 +468,15 @@ def _deepseek_v4_paged_split_stage_kernel(
     )
 
     token_idx = gl.program_id(axis=0)
+    head_block = gl.program_id(axis=1)
     split_idx = gl.program_id(axis=2)
+    head_offset = head_block * BLOCK_H
     raw_swa_len = gl.load(swa_lens + token_idx).to(gl.int32)
     raw_extra_len = gl.load(extra_lens + token_idx).to(gl.int32)
     swa_len = gl.minimum(gl.maximum(raw_swa_len, 0), SWA_WIDTH)
     extra_len = gl.minimum(gl.maximum(raw_extra_len, 0), EXTRA_WIDTH)
 
-    q_heads = gl.arange(
+    q_heads = head_offset + gl.arange(
         0,
         BLOCK_H,
         layout=gl.SliceLayout(1, q_load_layout),
@@ -500,7 +502,7 @@ def _deepseek_v4_paged_split_stage_kernel(
 
     gl.barrier()
     q_dot = q_shared.load(q_dot_layout)
-    score_heads = gl.arange(
+    score_heads = head_offset + gl.arange(
         0,
         BLOCK_H,
         layout=gl.SliceLayout(1, mfma_score),
@@ -629,7 +631,7 @@ def _deepseek_v4_paged_split_stage_kernel(
         0.0,
     )
 
-    out_heads = gl.arange(
+    out_heads = head_offset + gl.arange(
         0,
         BLOCK_H,
         layout=gl.SliceLayout(1, q_load_layout),
@@ -1037,11 +1039,11 @@ def gluon_deepseek_v4_paged_selected_attention_split_gfx950(
     extra_page_size: int | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run split-KV DeepSeek V4 Pro TP8 selected attention on GFX950.
+    """Run split-KV DeepSeek V4 Pro selected attention on GFX950.
 
     Args:
-        q: Contiguous BF16 queries shaped `[tokens, 16, 512]`, where tokens
-            is between 1 and 6 inclusive.
+        q: Contiguous BF16 queries shaped `[tokens, heads, 512]`, where heads
+            is 16 or 32 and tokens is between 1 and 6 inclusive.
         swa_kv_cache: Uint8 page-planar SWA cache with 64 rows per page.
         swa_slots: Contiguous int32 global SWA slots shaped `[tokens, 128]`.
         swa_lens: Contiguous int32 valid SWA widths shaped `[tokens]`.
@@ -1079,7 +1081,7 @@ def gluon_deepseek_v4_paged_selected_attention_split_gfx950(
     extra_width = extra_slots.numel() // tokens if extra_slots is not None else 0
     if not (
         tokens <= 6
-        and q.shape[1] == 16
+        and q.shape[1] in (16, 32)
         and swa_width == 128
         and swa_page_size == 64
         and has_extra
@@ -1087,7 +1089,7 @@ def gluon_deepseek_v4_paged_selected_attention_split_gfx950(
         and extra_page_size == 64
     ):
         raise ValueError(
-            "split GFX950 attention requires tokens 1..6, 16 heads, SWA width "
+            "split GFX950 attention requires tokens 1..6, 16 or 32 heads, SWA width "
             "128, extra width 1024, 64-row pages, and an extra segment"
         )
 
@@ -1097,17 +1099,18 @@ def gluon_deepseek_v4_paged_selected_attention_split_gfx950(
     assert extra_page_size is not None
     swa_slots_2d = swa_slots.view(tokens, 128)
     extra_slots_2d = extra_slots.view(tokens, 1024)
+    num_heads = q.shape[1]
     partial_out = torch.empty(
-        (tokens, 16, 18, 512),
+        (tokens, num_heads, 18, 512),
         dtype=torch.bfloat16,
         device=q.device,
     )
     partial_lse = torch.empty(
-        (tokens, 16, 18),
+        (tokens, num_heads, 18),
         dtype=torch.float32,
         device=q.device,
     )
-    _deepseek_v4_paged_split_stage_kernel[(tokens, 1, 18)](
+    _deepseek_v4_paged_split_stage_kernel[(tokens, num_heads // 16, 18)](
         q,
         swa_kv_cache,
         swa_kv_cache.view(torch.float8_e4m3fn),
@@ -1146,7 +1149,7 @@ def gluon_deepseek_v4_paged_selected_attention_split_gfx950(
         num_stages=1,
         waves_per_eu=1,
     )
-    _deepseek_v4_paged_split_reduce_kernel[(tokens, 16)](
+    _deepseek_v4_paged_split_reduce_kernel[(tokens, num_heads)](
         partial_out,
         partial_lse,
         attn_sink,

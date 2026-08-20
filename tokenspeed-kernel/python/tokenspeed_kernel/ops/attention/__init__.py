@@ -199,12 +199,12 @@ def deepseek_v4_padded_heads(num_local_heads: int) -> int:
 
     Returns:
         A kernel-compatible local head extent. GFX950 accepts the native
-        16-head Pro TP8 shape; other platform behavior retains the 64/128-head
-        padding policy.
+        16-head Pro TP8 and 32-head Pro TP4 shapes; other platform behavior
+        retains the 64/128-head padding policy.
     """
 
-    if current_platform().is_cdna4 and num_local_heads == 16:
-        return 16
+    if current_platform().is_cdna4 and num_local_heads in (16, 32):
+        return num_local_heads
     if num_local_heads <= 64:
         return 64
     if num_local_heads <= 128:

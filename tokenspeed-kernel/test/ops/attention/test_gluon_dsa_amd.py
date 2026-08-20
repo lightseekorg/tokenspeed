@@ -91,8 +91,9 @@ def test_deepseek_v4_selected_attention_matches_reference() -> None:
     torch.testing.assert_close(output[0], reference, rtol=3e-2, atol=3e-2)
 
 
+@pytest.mark.parametrize("num_heads", [16, 32])
 @pytest.mark.skipif(not is_cdna4(), reason="DeepSeek V4 Gluon kernel targets gfx950")
-def test_deepseek_v4_paged_split_attention_applies_sink_once() -> None:
+def test_deepseek_v4_paged_split_attention_applies_sink_once(num_heads: int) -> None:
     tokens = 2
 
     def constant_cache(pages: int) -> torch.Tensor:
@@ -107,14 +108,14 @@ def test_deepseek_v4_paged_split_attention_applies_sink_once() -> None:
         cache[:, 64 * 576 :].fill_(127)
         return cache
 
-    q = torch.zeros((tokens, 16, 512), device="cuda", dtype=torch.bfloat16)
+    q = torch.zeros((tokens, num_heads, 512), device="cuda", dtype=torch.bfloat16)
     swa_cache = constant_cache(2)
     extra_cache = constant_cache(16)
     swa_slots = torch.arange(128, device="cuda", dtype=torch.int32).repeat(tokens, 1)
     extra_slots = torch.arange(1024, device="cuda", dtype=torch.int32).repeat(tokens, 1)
     swa_lens = torch.full((tokens,), 128, device="cuda", dtype=torch.int32)
     extra_lens = torch.full((tokens,), 1024, device="cuda", dtype=torch.int32)
-    sink = torch.zeros((16,), device="cuda", dtype=torch.float32)
+    sink = torch.zeros((num_heads,), device="cuda", dtype=torch.float32)
     out = torch.empty_like(q)
 
     actual = gluon_deepseek_v4_paged_selected_attention_split_gfx950(

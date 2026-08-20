@@ -214,7 +214,7 @@ def test_deepseek_v4_padded_heads_platform_policy(
     try:
         Platform.override(mi350_platform)
         assert tokenspeed_kernel.deepseek_v4_padded_heads(16) == 16
-        assert tokenspeed_kernel.deepseek_v4_padded_heads(32) == 64
+        assert tokenspeed_kernel.deepseek_v4_padded_heads(32) == 32
         Platform.override(h100_platform)
         assert tokenspeed_kernel.deepseek_v4_padded_heads(16) == 64
         assert tokenspeed_kernel.deepseek_v4_padded_heads(65) == 128
