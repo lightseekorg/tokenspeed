@@ -27,7 +27,11 @@ from tokenspeed_kernel.ops.gemm.kimi3 import (
     KIMI3_ROUTER_SIZE,
     kimi3_router_projection,
 )
-from tokenspeed_kernel.ops.gemm.ll_bf16 import MAX_M, ll_bf16_router_supported
+from tokenspeed_kernel.ops.gemm.ll_bf16 import (
+    MAX_M,
+    cute_dsl_ll_bf16_router,
+    ll_bf16_router_supported,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_router
 
@@ -89,3 +93,31 @@ def test_declines_non_contiguous_and_odd_k() -> None:
         KIMI3_ROUTER_SIZE, KIMI3_HIDDEN_SIZE + 1, device="cuda", dtype=torch.bfloat16
     )
     assert not ll_bf16_router_supported(odd, odd_w, 1)
+
+
+def test_rejects_an_unusable_out_buffer() -> None:
+    """A wrongly laid out ``out`` must raise, not be written through blindly."""
+    a, b = _inputs(1)
+    strided = torch.empty(1, KIMI3_ROUTER_SIZE * 2, device="cuda")[:, ::2]
+    assert not strided.is_contiguous()
+    with pytest.raises(ValueError):
+        ll_bf16_router(a, b, strided)
+    half = torch.empty(1, KIMI3_ROUTER_SIZE, device="cuda", dtype=torch.float16)
+    with pytest.raises(ValueError):
+        ll_bf16_router(a, b, half)
+    if torch.cuda.device_count() > 1:
+        other = torch.empty(1, KIMI3_ROUTER_SIZE, device="cuda:1", dtype=torch.float32)
+        with pytest.raises(ValueError):
+            ll_bf16_router(a, b, other)
+
+
+@pytest.mark.parametrize("m", [1, 8])
+def test_serves_parameters_that_require_grad(m: int) -> None:
+    """The real gate holds an ``nn.Parameter``; DLPack rejects those undetached."""
+    a, b = _inputs(m, seed=5)
+    weight = torch.nn.Parameter(b.clone())
+    assert weight.requires_grad
+    got = cute_dsl_ll_bf16_router(a.requires_grad_(), weight)
+    torch.testing.assert_close(
+        got, kimi3_router_projection(a.detach(), b, solution="ll_bf16")
+    )

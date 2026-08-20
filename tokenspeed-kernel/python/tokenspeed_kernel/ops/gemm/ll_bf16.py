@@ -61,12 +61,13 @@ def cute_dsl_ll_bf16_router(
     Args:
         hidden_states: ``[M, K]`` contiguous BF16 activation.
         weight: ``[N, K]`` contiguous BF16 router weight.
-        out: Optional ``[M, N]`` FP32 destination; allocated when omitted.
+        out: Optional contiguous ``[M, N]`` FP32 destination on the operand
+            device; allocated when omitted.
 
     Returns:
         ``[M, N]`` FP32 router logits, ``out`` when it was given.
     """
-    return ll_bf16_router(hidden_states, weight, out)
+    return ll_bf16_router(hidden_states.detach(), weight.detach(), out)
 
 
 def ll_bf16_router_supported(

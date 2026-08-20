@@ -190,7 +190,8 @@ class LLBf16Router:
         Args:
             a: ``[M, K]`` contiguous BF16 activation.
             b: ``[N, K]`` contiguous BF16 weight.
-            out: Optional ``[M, N]`` FP32 destination; allocated when omitted.
+            out: Optional contiguous ``[M, N]`` FP32 destination on ``a``'s
+                device; allocated when omitted.
             block_size: Dot-product threads per output column; the measured
                 pick for ``M`` when omitted. Ignored by split-K.
 
@@ -205,8 +206,15 @@ class LLBf16Router:
             )
         if out is None:
             out = torch.empty(m, n, dtype=torch.float32, device=a.device)
-        elif out.shape != (m, n) or out.dtype is not torch.float32:
-            raise ValueError(f"out must be a [{m}, {n}] float32 tensor")
+        elif (
+            out.shape != (m, n)
+            or out.dtype is not torch.float32
+            or not out.is_contiguous()
+            or out.device != a.device
+        ):
+            raise ValueError(
+                f"out must be a contiguous [{m}, {n}] float32 tensor on {a.device}"
+            )
 
         device = a.device
         stream = self._stream(device)
