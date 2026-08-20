@@ -124,6 +124,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_reorder_c4_ape_2604,
     _deepseek_v4_routed_expert_quant_config,
     _deepseek_v4_should_reuse_index_topk,
+    _deepseek_v4_use_aux_stream,
     _DeepseekV4TopKBuffer,
     deepseek_v4_rope_config,
     deepseek_v4_select_experts,
@@ -1305,6 +1306,25 @@ class TestDeepseekV4Config(unittest.TestCase):
 
             global_server_args_dict["deepseek_v4_mega_moe_max_num_tokens"] = 256
             self.assertEqual(_deepseek_v4_mega_moe_max_num_tokens(), 256)
+        finally:
+            global_server_args_dict.clear()
+            global_server_args_dict.update(snapshot)
+
+    def test_deepseek_v4_aux_stream_policy_targets_non_speculative_c1(self):
+        snapshot = dict(global_server_args_dict)
+        try:
+            global_server_args_dict.update(
+                {"max_num_seqs": 1, "speculative_algorithm": None}
+            )
+            self.assertFalse(_deepseek_v4_use_aux_stream())
+
+            global_server_args_dict["max_num_seqs"] = 4
+            self.assertTrue(_deepseek_v4_use_aux_stream())
+
+            global_server_args_dict.update(
+                {"max_num_seqs": 1, "speculative_algorithm": "DSpark"}
+            )
+            self.assertTrue(_deepseek_v4_use_aux_stream())
         finally:
             global_server_args_dict.clear()
             global_server_args_dict.update(snapshot)

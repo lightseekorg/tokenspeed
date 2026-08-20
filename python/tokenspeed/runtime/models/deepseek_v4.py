@@ -167,6 +167,13 @@ if not deepseek_v4_supports_deep_gemm():
 logger = get_colorful_logger(__name__)
 
 
+def _deepseek_v4_use_aux_stream() -> bool:
+    return not (
+        int(global_server_args_dict.get("max_num_seqs", 2)) == 1
+        and global_server_args_dict.get("speculative_algorithm") is None
+    )
+
+
 def _deepseek_v4_metadata_matches_tokens(metadata, num_tokens: int) -> bool:
     return (
         metadata is not None
@@ -4158,7 +4165,11 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_eps = config.hc_eps
         self.rms_norm_eps = config.rms_norm_eps
-        self.aux_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        # At strict C1, concurrent FP8 and MXFP4 work contends on the recurrent
+        # last rank and delays every TP collective. Larger serving batches keep
+        # the original overlap schedule.
+        use_aux_stream = torch.cuda.is_available() and _deepseek_v4_use_aux_stream()
+        self.aux_stream = torch.cuda.Stream() if use_aux_stream else None
         self.topk_indices_buffer = _DeepseekV4TopKBuffer(int(config.index_topk))
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
