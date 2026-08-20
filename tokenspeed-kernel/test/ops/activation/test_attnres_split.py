@@ -94,3 +94,39 @@ def test_partial_dual_probes_are_independent(T, KB):
     for got, ref, side in ((ba_b, ab_a, "A->B"), (ba_a, ab_b, "B->A")):
         for x, y in zip(got, ref):
             assert torch.equal(x, y), f"probe {side} changed when slots swapped"
+
+
+@pytest.mark.parametrize("use_norm", [True, False])
+def test_combine_pdl_parity(use_norm):
+    """The PDL variant (prefetch + gdc_wait) must match the plain launch
+    bit-for-bit; standalone it degenerates to an immediate wait."""
+    torch.manual_seed(7)
+    T, KB = 1, 8
+    prefix = torch.randn(T, H, dtype=torch.bfloat16, device="cuda")
+    blocks = torch.randn(KB, T, H, dtype=torch.bfloat16, device="cuda")
+    wp = torch.randn(H, dtype=torch.bfloat16, device="cuda")
+    out_w = (
+        (torch.rand(H, dtype=torch.bfloat16, device="cuda") + 0.5) if use_norm else None
+    )
+    eps = 1e-5
+
+    scratch = _scratch(T)
+    attnres_partial(blocks, wp, eps, scratch)
+    plain = attnres_combine(
+        prefix,
+        wp,
+        out_w,
+        eps,
+        scratch,
+        torch.empty(T, H, dtype=torch.bfloat16, device="cuda"),
+    )
+    pdl = attnres_combine(
+        prefix,
+        wp,
+        out_w,
+        eps,
+        scratch,
+        torch.empty(T, H, dtype=torch.bfloat16, device="cuda"),
+        enable_pdl=True,
+    )
+    assert torch.equal(plain, pdl)

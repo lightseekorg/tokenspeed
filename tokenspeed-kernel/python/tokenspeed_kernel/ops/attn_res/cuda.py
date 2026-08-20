@@ -37,6 +37,7 @@ _HAS_CUDA_KERNEL = False
 if platform.is_nvidia and platform.is_blackwell:
     from tokenspeed_kernel.thirdparty.cuda.attn_res import (
         attn_res_fwd_packed,
+        attn_res_fwd_packed_v2,
         has_attn_res_fwd,
     )
 
@@ -99,5 +100,65 @@ if _HAS_CUDA_KERNEL:
             out_norm_weight=(
                 None if out_norm_weight is None else out_norm_weight.contiguous()
             ),
+        )
+        return out.squeeze(1)  # [T, H]
+
+    @register_kernel(
+        "attn_res",
+        "fwd",
+        name="cuda_attn_res_fwd_v2",
+        solution="cuda",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(
+            ("layer_residual", "block_residual"), "dense", {torch.bfloat16}
+        ),
+        # Above the older CUDA entry: same kernel family, but this revision
+        # carries the residual delta and a partial snapshot count in-kernel, so
+        # decode reaches it where the older one falls through to Triton.
+        priority=Priority.SPECIALIZED + 1,
+        traits={
+            "has_delta": frozenset({False, True}),
+            "inputs_on_same_gpu": frozenset({True}),
+            "partial_block_storage": frozenset({False, True}),
+            "separate_output_eps": frozenset({False}),
+            "writes_block": frozenset({False}),
+        },
+        tags={"latency", "throughput"},
+    )
+    def cuda_attn_res_fwd_v2(
+        *,
+        layer_residual,
+        block_residual,
+        res_weight,
+        rms_weight,
+        eps,
+        out_norm_weight=None,
+        out_norm_eps=None,
+        delta=None,
+        num_valid_blocks=None,
+        block_write_idx=-1,
+    ) -> torch.Tensor:
+        if block_write_idx >= 0:
+            raise ValueError("CUDA AttnRes v2 does not write snapshots")
+        if (
+            out_norm_weight is not None
+            and out_norm_eps is not None
+            and out_norm_eps != eps
+        ):
+            raise ValueError("CUDA AttnRes v2 requires matching RMSNorm epsilons")
+        out = attn_res_fwd_packed_v2(
+            layer_residual.unsqueeze(1).contiguous(),
+            block_residual.unsqueeze(2).contiguous(),
+            res_weight.contiguous(),
+            rms_weight.contiguous(),
+            eps,
+            out_norm_weight=(
+                None if out_norm_weight is None else out_norm_weight.contiguous()
+            ),
+            delta=None if delta is None else delta.unsqueeze(1).contiguous(),
+            num_blocks=num_valid_blocks,
         )
         return out.squeeze(1)  # [T, H]

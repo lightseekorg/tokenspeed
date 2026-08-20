@@ -35,3 +35,19 @@ void run_attn_res_fwd_tma(
     cudaStream_t stream);
 
 int attn_res_fwd_grid_size(int dev);
+
+void run_attn_res_fwd_online_v2(
+    const bf16_t* block_residual,
+    bf16_t* layer_residual,
+    const bf16_t* delta,
+    const bf16_t* res_weight,
+    const bf16_t* rms_weight,
+    const bf16_t* out_norm_weight,
+    bf16_t* output,
+    int N,
+    int T,
+    int block_stride_m,
+    int block_stride_r,
+    float rms_eps,
+    int num_sm,
+    cudaStream_t stream);
