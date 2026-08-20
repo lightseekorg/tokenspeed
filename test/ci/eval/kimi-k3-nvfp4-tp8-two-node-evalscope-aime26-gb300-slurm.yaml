@@ -1,9 +1,9 @@
 api_version: ci.tokenspeed.io/v1
 # NVFP4 sibling of the mxfp4 two-node gate: identical serve shape, but the
 # ModelOpt MIXED_PRECISION checkpoint (NVFP4 SiTU experts + FP8_PB_WO
-# attention kept FP8-resident). A cold runner's first boot downloads and
-# autotunes the trtllm-gen NVFP4 cubins (~15 min), covered by the 7200s
-# readiness timeout.
+# attention kept FP8-resident). The pinned checkpoint is loaded from the
+# node-local RAID mounted at /models; the 7200s readiness timeout also covers
+# first-boot trtllm-gen NVFP4 cubin autotuning (~15 min).
 name: eval-kimi-k3-nvfp4-tp8-two-node-aime26-gb300-slurm
 type: eval
 workflow_stage: model-test
@@ -22,7 +22,7 @@ install:
   - python3 -m pip install flash-linear-attention
 server:
   command: >-
-    ts serve nvidia/Kimi-K3-NVFP4
+    ts serve /models/nvidia--Kimi-K3-NVFP4/f8c5234a0a880bcc6cbf779a315e7ee2f405b812
     --served-model-name kimi-k3
     --trust-remote-code
     --max-model-len 65536

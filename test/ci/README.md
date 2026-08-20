@@ -242,8 +242,15 @@ test/ci/run_slurm.sh \
 
 GB300 server containers mount `TS_CI_LOCAL_MODEL_ROOT` read-only at `/models`.
 It defaults to `/scratch/$USER-models`, the node-local RAID path. The Kimi-K3
-GB300 task uses its pinned snapshot below that mount so weight loading does not
-read the shared Hugging Face cache.
+GB300 tasks use pinned snapshots below that mount so weight loading does not
+read the shared Hugging Face cache. Synchronize these directories to every
+eligible GB300 node before enabling the tasks:
+
+```text
+moonshotai--Kimi-K3/9f62e4e9fffbd0a83ddd60e1c209d828994b3569
+nvidia--Kimi-K3-NVFP4/f8c5234a0a880bcc6cbf779a315e7ee2f405b812
+lightseekorg--kimi-k3-dspark/dbd305f7d6c2df88d62b101c82db6d36fa761a57
+```
 
 The `Slurm Dispatch` workflow exposes a `cluster` input. `gb200` keeps the
 existing `slurm-dispatch` coordinator and runner defaults. `gb300` is an
@@ -272,9 +279,11 @@ cannot filter the multi-node matrix here. During this workflow's
 bootstrap only, leave the switch unset; after dispatcher support reaches
 `main`, set it to `true` and re-run the merge commit's workflow.
 
-The two-node Kimi K3 task declares `slurm-gb300-4gpu`, `slurm.nodes: 2`, and
+The two-node Kimi K3 tasks declare `slurm-gb300-4gpu`, `slurm.nodes: 2`, and
 `slurm.gpus_per_node: 4`. The runner label describes GPUs per node, while the
-Slurm topology fields describe the allocation.
+Slurm topology fields describe the allocation. The NVFP4 DSpark task pairs the
+pinned `nvidia/Kimi-K3-NVFP4` target with `lightseekorg/kimi-k3-dspark` and
+preserves the draft checkpoint's required `attn_res` auxiliary stream.
 
 GB200 examples:
 
