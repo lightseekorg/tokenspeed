@@ -181,6 +181,12 @@ is intentionally verbose and should only be enabled while debugging. For
 decode-only batches it also logs the anchor, draft candidates, target verify
 tokens, and their position-wise matches.
 
+Set `TOKENSPEED_FORCE_SINGLE_TOKEN_VERIFY=1` to keep the full speculative
+proposal and target-verify work while committing exactly one target token per
+decode round. This is a diagnostic for measuring speculative-round cost
+independently of acceptance, not a serving policy. It is read once at process
+startup and is disabled by default.
+
 ### Per-Request Stats
 
 `--enable-log-request-stats` enriches the scheduler's per-request finish line for
