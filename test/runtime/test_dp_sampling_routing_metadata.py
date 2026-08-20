@@ -137,10 +137,9 @@ def test_cuda_graph_wrapper_uses_existing_route_for_padding():
     assert wrapper.padded_bs(30, ctx) == 32
 
 
-@pytest.mark.parametrize("spec_algo", [None, "DFLASH", "DSPARK"])
-def test_cuda_graph_req_pool_padding_uses_reserved_sink_row(spec_algo):
+def test_cuda_graph_req_pool_padding_uses_reserved_sink_row():
     wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
-    wrapper.config = SimpleNamespace(max_req_pool_size=21, spec_algo=spec_algo)
+    wrapper.config = SimpleNamespace(max_req_pool_size=21)
     active_indices = torch.tensor([7, 8], dtype=torch.int64)
 
     padded_indices = wrapper._pad_graph_req_pool_indices(active_indices, 4)

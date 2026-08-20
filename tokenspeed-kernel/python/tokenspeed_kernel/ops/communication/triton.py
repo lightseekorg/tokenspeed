@@ -46,6 +46,32 @@ def _arnorm_backend() -> str:
     return backend
 
 
+def allreduce_residual_rmsnorm_preflight(
+    *,
+    single_node: bool,
+    has_tensor_parallel: bool,
+    has_data_parallel: bool,
+    speculative: bool,
+) -> bool:
+    """Check scheduling context against the selected AR+RMSNorm backend.
+
+    Backend names and capability policy stay in ``tokenspeed-kernel``; the
+    runtime supplies only the scheduling facts it owns.
+    """
+    if _arnorm_backend() != "triton_shmem":
+        return True
+    from tokenspeed_kernel.ops.communication.triton_shmem import (
+        runtime_context_supported,
+    )
+
+    return runtime_context_supported(
+        single_node=single_node,
+        has_tensor_parallel=has_tensor_parallel,
+        has_data_parallel=has_data_parallel,
+        speculative=speculative,
+    )
+
+
 __all__ = [
     "create_state",
     "get_token_dist",
@@ -61,6 +87,7 @@ __all__ = [
     "allreduce_residual_attnres_combine_supported",
     "allreduce_residual_attnres_combine",
     "allreduce_residual_rmsnorm",
+    "allreduce_residual_rmsnorm_preflight",
     "create_dp_sampling_state",
     "dp_sampling_gather",
     "dp_sampling_swap",
@@ -423,19 +450,6 @@ def symm_mem_barrier(
     local_signal = tl.load(signal_ptrs + rank).to(tl.pointer_type(tl.uint32))
     send_signal_to_peers(signal_ptrs, block_id, rank, world_size)
     wait_signal_from_peers(local_signal, block_id, world_size)
-
-
-@triton.jit
-def symm_mem_workgroup_barrier(
-    signal_pad_ptrs_dev,
-    block_id,
-    rank: tl.constexpr,
-    world_size: tl.constexpr,
-):
-    """Cross-rank barrier ordered with every wavefront in the workgroup."""
-    tl.debug_barrier()
-    symm_mem_barrier(signal_pad_ptrs_dev, block_id, rank, world_size)
-    tl.debug_barrier()
 
 
 # ------------------------------------------------------------------------------
@@ -1681,7 +1695,7 @@ def amd_allreduce_residual_rmsnorm_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     row = tl.program_id(0)
-    symm_mem_workgroup_barrier(signal_pad_ptrs_dev, row, RANK, WORLD_SIZE)
+    symm_mem_barrier(signal_pad_ptrs_dev, row, RANK, WORLD_SIZE)
 
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < HIDDEN_SIZE
@@ -1702,7 +1716,7 @@ def amd_allreduce_residual_rmsnorm_kernel(
     weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     tl.store(norm_out_ptr + row_offsets, residual_out * scale * weight, mask=mask)
 
-    symm_mem_workgroup_barrier(signal_pad_ptrs_dev, row, RANK, WORLD_SIZE)
+    symm_mem_barrier(signal_pad_ptrs_dev, row, RANK, WORLD_SIZE)
 
 
 def create_allreduce_residual_rmsnorm_state(
@@ -1847,16 +1861,10 @@ def allreduce_residual_rmsnorm(
             if not eligible:
                 return None, None, None, None
 
-            from . import triton_shmem as _ts_mod
+            import tokenspeed_kernel.ops.communication.triton_shmem as _ts_mod
 
-            ts_key = _ts_mod.triton_shmem_state_cache_key(
-                group,
-                max_token_num,
-                hidden_dim,
-                input_tensor.dtype,
-            )
             ts_states = _ts_mod.TRITON_SHMEM_AR_RMSNORM_STATES
-            if ts_key not in ts_states:
+            if key not in ts_states:
                 # State setup performs object collectives, rendezvous, and
                 # allocations. If warmup did not create this exact policy key,
                 # capture the complete unfused path instead.
@@ -1864,16 +1872,19 @@ def allreduce_residual_rmsnorm(
                     return None, None, None, None
                 # Cache None as a permanent decline for this complete policy key.
                 # Retrying would repeat distributed validation and memory setup.
-                ts_states[ts_key] = _ts_mod.create_triton_shmem_ar_rmsnorm_state(
+                ts_states[key] = _ts_mod.create_triton_shmem_ar_rmsnorm_state(
                     group=group,
                     rank_in_group=rank,
                     max_token_num=max_token_num,
                     hidden_dim=hidden_dim,
                     dtype=input_tensor.dtype,
                 )
-            ts_state = ts_states[ts_key]
+            ts_state = ts_states[key]
             if ts_state is None or not _ts_mod.triton_shmem_can_run(
-                ts_state, input_tensor
+                ts_state,
+                input_tensor,
+                residual,
+                weight,
             ):
                 return None, None, None, None
             norm_out, residual_out = _ts_mod.triton_shmem_allreduce_residual_rmsnorm(
@@ -1887,7 +1898,7 @@ def allreduce_residual_rmsnorm(
 
         if backend in {"auto", "iris"}:
             if eligible:
-                from . import iris as _iris_mod
+                import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
                 iris_state = _iris_mod.IRIS_AR_RMSNORM_STATES.get(key)
                 if iris_state is None:
