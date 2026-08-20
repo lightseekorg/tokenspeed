@@ -11,7 +11,7 @@ triggers:
   - per-commit
 runner:
   labels:
-    - slurm-b300-4gpu
+    - slurm-gb300-4gpu
 slurm:
   nodes: 2
   gpus_per_node: 4
