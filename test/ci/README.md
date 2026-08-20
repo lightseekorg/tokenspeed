@@ -284,6 +284,8 @@ The two-node Kimi K3 tasks declare `slurm-gb300-4gpu`, `slurm.nodes: 2`, and
 Slurm topology fields describe the allocation. The NVFP4 DSpark task pairs the
 pinned `nvidia/Kimi-K3-NVFP4` target with `Inferact/Kimi-K3-DSpark` and
 preserves the draft checkpoint's required `attn_res` auxiliary stream.
+The MXFP4 DSpark OCRBench and MMMU-Pro Vision tasks are manual-only baselines;
+select either YAML through `Slurm Dispatch` with the `gb300` cluster.
 
 GB200 examples:
 

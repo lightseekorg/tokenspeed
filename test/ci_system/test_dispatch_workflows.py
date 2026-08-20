@@ -304,6 +304,8 @@ def test_only_dedicated_tasks_declare_gb300():
             configs.append(path.name)
 
     assert sorted(configs) == [
+        "kimi-k3-mxfp4-dspark-tp8-two-node-evalscope-mmmu-pro-vision-gb300-slurm.yaml",
+        "kimi-k3-mxfp4-dspark-tp8-two-node-evalscope-ocr-bench-gb300-slurm.yaml",
         "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-dspark-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
