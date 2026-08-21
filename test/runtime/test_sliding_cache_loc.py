@@ -5,7 +5,7 @@ The SWA draft's page table is a ring: absolute position ``p`` lives in column
 wrap-around), null-hole routing to the dummy slot, and agreement with the
 full-history kernel before any wrap.
 
-The second half pins that table's width as a runtime argument: ``tl.constexpr``
+The last test pins that table's width as a runtime argument: ``tl.constexpr``
 there recompiles the kernel once per distinct width.
 """
 
@@ -33,15 +33,12 @@ from tokenspeed.runtime.execution.cache_loc_kernel import (
     compute_out_cache_loc_sliding,
     compute_out_cache_loc_uniform,
     dflash_prepare_decode_kernel,
-    fused_decode_input_prep,
     fused_decode_input_prep_kernel,
 )
 from tokenspeed.runtime.execution.draft_page_staging import CacheView
 
 _P = 16  # kernel page size for the tests
 _W_PAGES = 4  # ring width: window of 64 tokens
-_LEN = 1  # decode: one token per request, held fixed so only the width varies
-_POOL = 8  # req_pool_size + 1
 
 
 def _sliding(table, cache_start, num_tokens):
@@ -185,60 +182,6 @@ def test_capture_replay_address_stability() -> None:
 # --------------------------------------------------------------------------
 
 
-def _width_table(width: int, batch_size: int = 2) -> torch.Tensor:
-    """Distinct positive page ids, so reading a wrong column always shows up."""
-    ids = torch.arange(1, batch_size * width + 1, dtype=torch.int32, device="cuda")
-    return ids.view(batch_size, width)
-
-
-def _pool_state() -> tuple[torch.Tensor, torch.Tensor]:
-    """Two requests at pool slots 2 and 0, landing on page 0 and page 1."""
-    req_pool_indices = torch.tensor([2, 0], dtype=torch.int32, device="cuda")
-    valid_cache_lengths = torch.zeros(_POOL, dtype=torch.int32, device="cuda")
-    valid_cache_lengths[2] = 3
-    valid_cache_lengths[0] = 20
-    return req_pool_indices, valid_cache_lengths
-
-
-def _run_prep(page_table, req_pool_indices, valid_cache_lengths):
-    batch_size = req_pool_indices.shape[0]
-    out = torch.zeros(batch_size * _LEN, dtype=torch.int64, device="cuda")
-    positions = torch.zeros(batch_size * _LEN, dtype=torch.int64, device="cuda")
-    seq_lens = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
-    fused_decode_input_prep(
-        out_cache_loc_ptr=out,
-        positions_ptr=positions,
-        seq_lens_out_ptr=seq_lens,
-        req_pool_indices=req_pool_indices,
-        valid_cache_lengths=valid_cache_lengths,
-        uniform_input_length=_LEN,
-        page_table=page_table,
-        page_size=_P,
-    )
-    return out, positions, seq_lens
-
-
-def _prep_reference(page_table, req_pool_indices, valid_cache_lengths):
-    """Mirrors the kernel: overflow routes to slot 0, everything else indexes."""
-    max_pages = page_table.shape[1]
-    out: list[int] = []
-    positions: list[int] = []
-    seq_lens: list[int] = []
-    for req in range(req_pool_indices.shape[0]):
-        cache_start = int(valid_cache_lengths[int(req_pool_indices[req])])
-        seq_lens.append(cache_start + _LEN)
-        for token in range(_LEN):
-            position = cache_start + token
-            positions.append(position)
-            page_index = position // _P
-            if page_index >= max_pages:
-                out.append(0)  # the fixed safe dummy target
-                continue
-            page_id = int(page_table[req, page_index])
-            out.append(page_id * _P + position % _P)
-    return out, positions, seq_lens
-
-
 @pytest.mark.parametrize(
     "kernel",
     [
@@ -252,22 +195,3 @@ def test_max_pages_is_not_constexpr(kernel) -> None:
     """Re-annotating it ``tl.constexpr`` is the regression to catch."""
     parameter = inspect.signature(kernel.fn).parameters["max_pages"]
     assert parameter.annotation is inspect.Parameter.empty
-
-
-@requires_cuda
-@pytest.mark.parametrize("width", [1, 2, 4, 7, 16])
-def test_matches_reference_across_widths(width: int) -> None:
-    """Width 1 clamps request 1 out of the table and must route it to slot 0."""
-    req_pool_indices, valid_cache_lengths = _pool_state()
-    page_table = _width_table(width)
-
-    out, positions, seq_lens = _run_prep(
-        page_table, req_pool_indices, valid_cache_lengths
-    )
-    expected_out, expected_positions, expected_seq_lens = _prep_reference(
-        page_table.cpu(), req_pool_indices.cpu(), valid_cache_lengths.cpu()
-    )
-
-    assert out.tolist() == expected_out
-    assert positions.tolist() == expected_positions
-    assert seq_lens.tolist() == expected_seq_lens

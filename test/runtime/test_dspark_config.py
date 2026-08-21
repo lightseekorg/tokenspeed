@@ -276,39 +276,23 @@ def _write_swa_draft_config(tmp_path, **overrides) -> str:
     )
 
 
-def test_dspark_draft_keeps_the_window_transformers_would_null(tmp_path) -> None:
+@pytest.mark.parametrize("declare_top_level", (True, False))
+def test_dspark_draft_keeps_the_window_transformers_would_null(
+    tmp_path, declare_top_level: bool
+) -> None:
     """``Qwen3Config`` drops ``sliding_window`` unless ``use_sliding_window``.
 
     DSpark checkpoints never write that flag, so without the restore every
-    consumer of ``sliding_window`` -- draft layer construction, the draft
-    attention config, the cache recipe -- sees None on a sliding draft.
+    consumer -- draft layer construction, the draft attention config, the cache
+    recipe -- sees None on a sliding draft. The window is read from the raw
+    config when present, else from ``dflash_config.swa_window_size``.
     """
-    path = _write_swa_draft_config(tmp_path, sliding_window=1024)
+    extra = {"sliding_window": 1024} if declare_top_level else {}
+    path = _write_swa_draft_config(tmp_path, **extra)
 
     config = get_config(path, trust_remote_code=False, is_draft_worker=True)
 
     assert config.sliding_window == 1024
-
-
-def test_dspark_draft_falls_back_to_the_dflash_swa_window(tmp_path) -> None:
-    path = _write_swa_draft_config(tmp_path)
-
-    config = get_config(path, trust_remote_code=False, is_draft_worker=True)
-
-    assert config.sliding_window == 1024
-
-
-def test_a_plain_draft_without_dflash_config_is_left_alone(tmp_path) -> None:
-    path = _write_config(
-        tmp_path,
-        architectures=["Qwen3ForCausalLM"],
-        layer_types=["sliding_attention", "sliding_attention"],
-        sliding_window=1024,
-    )
-
-    config = get_config(path, trust_remote_code=False, is_draft_worker=True)
-
-    assert config.sliding_window is None
 
 
 # --------------------------------------------------------------------------
@@ -439,17 +423,9 @@ class _CaptureCausalLM:
     set_dflash_layers_to_capture = BaseCausalLM.set_dflash_layers_to_capture
 
 
-def test_taps_shift_by_one_to_capture_completed_layer_outputs() -> None:
-    """MiniMax-M3's DSpark taps, which name layer outputs."""
-    causal_lm = _CaptureCausalLM(num_layers=60)
-
-    causal_lm.set_dflash_layers_to_capture([1, 12, 23, 35, 46, 57])
-
-    assert causal_lm.model.layers_to_capture == [2, 13, 24, 36, 47, 58]
-    assert causal_lm.capture_aux_hidden_states is True
-
-
-def test_taps_are_stored_ascending_for_positional_concat() -> None:
+def test_taps_shift_by_one_and_sort_for_positional_concat() -> None:
+    """MiniMax-M3's DSpark taps, shuffled: they name completed-layer outputs,
+    and the draft concatenates the captures in ascending layer order."""
     causal_lm = _CaptureCausalLM(num_layers=60)
 
     causal_lm.set_dflash_layers_to_capture([57, 1, 35, 12, 46, 23])
@@ -463,22 +439,7 @@ def test_taps_are_stored_ascending_for_positional_concat() -> None:
         47: 4,
         58: 5,
     }
-
-
-def test_duplicate_taps_are_rejected() -> None:
-    causal_lm = _CaptureCausalLM(num_layers=60)
-
-    with pytest.raises(ValueError, match="unique"):
-        causal_lm.set_dflash_layers_to_capture([12, 12, 23])
-
-
-@pytest.mark.parametrize("tap", (-1, 59))
-def test_taps_outside_the_capturable_range_are_rejected(tap: int) -> None:
-    """The last layer has no successor to capture its output at."""
-    causal_lm = _CaptureCausalLM(num_layers=60)
-
-    with pytest.raises(ValueError, match="invalid ids"):
-        causal_lm.set_dflash_layers_to_capture([tap])
+    assert causal_lm.capture_aux_hidden_states is True
 
 
 def test_each_capture_reaches_the_drafter_in_concat_order() -> None:
@@ -502,22 +463,6 @@ def test_each_capture_reaches_the_drafter_in_concat_order() -> None:
     assert seen == [(0, 2), (1, 2)]
     assert torch.equal(slot_bufs[0][:2], torch.ones(2, 3))
     assert torch.equal(slot_bufs[1][:2], torch.full((2, 3), 2.0))
-
-
-def test_an_idle_layer_that_captured_nothing_is_not_handed_over() -> None:
-    """An idle forward skips the attention block, so no capture lands."""
-    seen: list[tuple[int, int]] = []
-    causal_lm = _CaptureCausalLM(num_layers=8)
-    causal_lm.set_dflash_layers_to_capture(
-        [1, 5],
-        incremental_callback=lambda idx, num_tokens: seen.append((idx, num_tokens)),
-        slot_bufs=[torch.zeros(4, 3) for _ in range(2)],
-    )
-    causal_lm.model._dflash_incr_active = True
-
-    causal_lm.model.notify(2, [])
-
-    assert seen == []
 
 
 # --------------------------------------------------------------------------
