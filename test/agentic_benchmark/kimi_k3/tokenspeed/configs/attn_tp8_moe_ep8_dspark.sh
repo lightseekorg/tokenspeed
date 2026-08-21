@@ -32,6 +32,7 @@ exec ts serve \
     --speculative-draft-model-path Inferact/Kimi-K3-DSpark \
     --speculative-num-draft-tokens 8 \
     --drafter-attention-backend mla \
+    --mm-encoder-tp-mode data \
     --enable-cache-report \
     --host 127.0.0.1 \
     --port 8000 \

@@ -14,6 +14,7 @@ exec ts serve \
     --kda-backend cutedsl_kda \
     --moe-backend flashinfer_trtllm \
     --kv-cache-dtype fp8 \
+    --mm-encoder-tp-mode data \
     --enable-cache-report \
     --host 127.0.0.1 \
     --port 8000 \
