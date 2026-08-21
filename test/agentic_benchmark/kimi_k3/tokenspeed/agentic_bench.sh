@@ -17,7 +17,10 @@ python3 -c "import evalscope" 2>/dev/null || \
     mv build_swe_smith_dataset.py.tmp build_swe_smith_dataset.py
 }
 
-# Note: Only 71 conversations can be built (measured with the Kimi-K3 tokenizer)
+# Note: only 71 conversations can be built. The builder's multi-worker
+# selection is nondeterministic — rebuilds do NOT reproduce the file — so
+# keep ONE agentic_dataset.json and reuse it across runs (see README for the
+# frozen CI artifact you can drop in instead).
 [ -f agentic_dataset.json ] || python3 build_swe_smith_dataset.py \
     --model-path moonshotai/Kimi-K3 \
     --first-turn-length 50000 \
@@ -28,17 +31,17 @@ python3 -c "import evalscope" 2>/dev/null || \
     --output-path agentic_dataset.json \
     --num-workers 32
 
-# The sweep + warmup consume conversations 0..69; fail fast if the dataset
-# ever builds fewer (tokenizer or upstream-dataset drift would otherwise
-# silently rotate and replay hot conversations).
+# The sweep + warmup consume conversations 0..69; fail fast on a stale or
+# wrong-recipe file. (Recipe-based so a dropped-in CI artifact also passes.)
 python3 - <<'PYEOF'
 import json
 d = json.load(open("agentic_dataset.json"))
 n = len(d["conversations"])
+m = d.get("metadata", {})
 assert n >= 70, f"agentic_dataset.json has only {n} conversations; need >= 70"
-mp = d.get("metadata", {}).get("model_path", "")
-assert "Kimi-K3" in mp, f"dataset built with wrong tokenizer: {mp!r}; delete agentic_dataset.json"
-print(f"dataset ok: {n} conversations (tokenizer: {mp})")
+recipe = (m.get("first_turn_length"), m.get("subsequent_turn_length"), m.get("min_turns"), m.get("max_turns"))
+assert recipe == (50000, 800, 10, 15), f"unexpected dataset recipe {recipe}; delete agentic_dataset.json"
+print(f"dataset ok: {n} conversations, recipe {recipe}")
 PYEOF
 
 # Sweep configs

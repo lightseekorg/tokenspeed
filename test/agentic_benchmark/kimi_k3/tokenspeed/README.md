@@ -19,11 +19,21 @@ To narrow the matrix, comment out entries in the `CONFIGS=()` array.
 
 ## Workload sizing
 
-First turn 50,000 tokens, +800/turn, 10–15 turns; each turn's 500-token
-completion joins the next prompt, so final prompts reach ~68.2K tokens —
-hence `--max-model-len 80000` in every config. 71 conversations build with
-the K3 tokenizer (the script asserts >= 70 and rejects stale datasets built
-with another tokenizer).
+The script builds the dataset with the kimi_k2.5 recipe (first turn 50,000
+tokens, +800/turn, 10-15 turns; 71 conversations build). Each turn's
+500-token completion joins the next prompt, so final prompts reach ~68.2K
+tokens — hence `--max-model-len 80000` in every config. The script asserts
+the count and the recipe parameters.
+
+**Use ONE input file for every run you intend to compare.** The builder's
+multi-worker selection is nondeterministic — rebuilding does not reproduce
+the file (verified: two same-recipe builds share 0/71 conversations) — so
+keep the first `agentic_dataset.json` and reuse it across runs and machines.
+For text-identical comparisons with other models, drop in the frozen CI
+artifact instead: `https://huggingface.co/datasets/lightseekorg/agentic-dataset`
+(the file fetched by `test/ci/perf/kimi-k2.5-nvfp4-evalscope-agentic.yaml`
+and the qwen3.5 agentic gates; K2.5-recipe, sizes verified identical under
+the K3 tokenizer).
 
 ## Configs
 
@@ -38,13 +48,21 @@ here first. tp4 layouts are omitted: the checkpoint does not fit 4 GPUs.
 |---|---|
 | `attn_tp8_moe_ep8` | baseline |
 | `attn_tp8_moe_tp8` | MoE TP variant |
-| `attn_dp8_moe_ep8` | attention DP; DP x DSpark is not yet validated on-machine (see config comments); never pass `--dense-tp-size`; chunked prefill pinned to 2048 (trtllm MoE workspace scales with chunk x 8 gathered tokens) |
+| `attn_dp8_moe_ep8` | attention DP; DP x DSpark validated on-machine (2026-08-21: boots in 1067s and completes the full 5-rung sweep with zero exceptions); never pass `--dense-tp-size`; chunked prefill pinned to 2048 (trtllm MoE workspace scales with chunk x 8 gathered tokens) |
 
 **Merge order**: the DP row needs #1152 (dynamic MLA packing, boot) and
 #1185 (merge_state head tiling, runtime) merged first.
 
+Run-to-run noise: sampling is deliberately NOT pinned (matching the
+kimi_k2.5/inkling convention — no seed, no greedy), so speculative
+acceptance drifts between runs. Measured across identical-config runs:
+TPOT +-7%, Decoded Tok/Iter +-13%. Differences smaller than ~10% need
+repeated sweeps before ranking two configs.
+
 Cross-model caveat: this directory pins evalscope `acd09b44` (kimi_k2.5 pins
-`9d052ca0`); metric implementations may differ between pins.
+`9d052ca0`). TPOT and Decoded Tok/Iter are verified identical between the two
+pins (same formulas and aggregation; the summary keys merely dropped the
+"Avg " prefix); the remaining columns are unverified between pins.
 
 To verify the parallelism actually applied, grep the server log:
 ```bash
