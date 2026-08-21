@@ -1,0 +1,21 @@
+[package]
+name = "ts-scheduler-pyo3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TokenSpeed scheduler Python bindings (pyo3 port of tokenspeed-scheduler/bindings/python_module.cpp)"
+
+[lib]
+name = "tokenspeed_scheduler_ext"
+crate-type = ["cdylib"]
+
+[dependencies]
+ts-scheduler-core = { path = "../ts-scheduler-core" }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+
+# The binding crate is the white-listed exception to `forbid(unsafe_code)`
+# (pyo3 machinery requires unsafe); the core crate stays unsafe-free.
+[lints.rust]
+unsafe_code = "allow"
+

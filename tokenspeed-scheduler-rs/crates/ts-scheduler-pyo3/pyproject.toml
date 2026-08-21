@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "tokenspeed-scheduler"
+version = "0.1.8"
+description = "TokenSpeed scheduler control plane (Rust port) with Python bindings"
+requires-python = ">=3.10"
+
+[tool.maturin]
+# Bundle the existing Python package (python/tokenspeed_scheduler) into the wheel.
+python-source = "python"
+module-name = "tokenspeed_scheduler.tokenspeed_scheduler_ext"
+features = ["pyo3/extension-module"]

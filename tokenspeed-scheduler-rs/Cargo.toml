@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/ts-scheduler-core", "crates/ts-scheduler-pyo3"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["LightSeek Foundation"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+
