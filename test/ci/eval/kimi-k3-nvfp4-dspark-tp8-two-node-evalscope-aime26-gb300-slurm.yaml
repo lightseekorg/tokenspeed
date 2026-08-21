@@ -19,7 +19,9 @@ slurm:
   gpus_per_node: 4
 env:
   CI: "true"
-  TOKENSPEED_DFLASH_AUX_STREAM: attn_res
+  TOKENSPEED_KERNEL_INSTALL_MODE: pypi
+  TOKENSPEED_KERNEL_PYPI_SPEC: tokenspeed-kernel==0.1.3
+  TOKENSPEED_INSTALL_NO_DEPS: "1"
 install:
   - bash test/ci_system/install_deps.sh
   - python3 -m pip install flash-linear-attention
@@ -28,7 +30,7 @@ server:
     ts serve /models/nvidia--Kimi-K3-NVFP4/f8c5234a0a880bcc6cbf779a315e7ee2f405b812
     --served-model-name kimi-k3
     --speculative-algorithm DSPARK
-    --speculative-draft-model-path /models/Inferact--Kimi-K3-DSpark/cf6b8244620e7ea4b0651d214f28e89eac75bed6
+    --speculative-draft-model-path /models/lightseekorg--kimi-k3-dspark/3db4c37d19e0dd945194b07d8219cdf52cb3a24c
     --speculative-num-draft-tokens 8
     --drafter-attention-backend mla
     --trust-remote-code

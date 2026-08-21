@@ -327,7 +327,8 @@ def test_kimi_k3_nvfp4_gb300_uses_pinned_local_models():
         "/models/nvidia--Kimi-K3-NVFP4/" "f8c5234a0a880bcc6cbf779a315e7ee2f405b812"
     )
     draft_path = (
-        "/models/Inferact--Kimi-K3-DSpark/" "cf6b8244620e7ea4b0651d214f28e89eac75bed6"
+        "/models/lightseekorg--kimi-k3-dspark/"
+        "3db4c37d19e0dd945194b07d8219cdf52cb3a24c"
     )
     plain = load_yaml(
         REPO_ROOT / "test/ci/eval/"
@@ -341,7 +342,7 @@ def test_kimi_k3_nvfp4_gb300_uses_pinned_local_models():
     assert target_path in plain["server"]["command"]
     assert target_path in dspark["server"]["command"]
     assert draft_path in dspark["server"]["command"]
-    assert dspark["env"]["TOKENSPEED_DFLASH_AUX_STREAM"] == "attn_res"
+    assert "TOKENSPEED_DFLASH_AUX_STREAM" not in dspark["env"]
 
 
 def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():

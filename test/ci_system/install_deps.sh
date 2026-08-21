@@ -160,8 +160,74 @@ if [[ "${FLASHINFER_PIN_VERSION}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.dev([0-9]{8})$ ]
 fi
 cd ${WORKSPACE}
 export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu${CUINDEX}"
-TOKENSPEED_KERNEL_BACKEND=cuda FLASHINFER_CUDA_ARCH_LIST="${FI_ARCH}" \
-pip_install_with_retry pip3 install tokenspeed-kernel/python/ --no-build-isolation -v
+if [ "${TOKENSPEED_KERNEL_INSTALL_MODE:-source}" = "pypi" ]; then
+    TOKENSPEED_KERNEL_PYPI_SPEC="${TOKENSPEED_KERNEL_PYPI_SPEC:-tokenspeed-kernel}"
+    echo "Installing published tokenspeed-kernel wheel: ${TOKENSPEED_KERNEL_PYPI_SPEC}"
+    pip_install_with_retry pip3 install --break-system-packages --no-deps \
+        "${TOKENSPEED_KERNEL_PYPI_SPEC}"
+    FLASHINFER_PYPI_SPEC="${TOKENSPEED_FLASHINFER_PYPI_SPEC:-flashinfer-python==0.6.16}"
+    echo "Installing runner-compatible published FlashInfer: ${FLASHINFER_PYPI_SPEC}"
+    pip_install_with_retry pip3 install --break-system-packages --no-deps \
+        "${FLASHINFER_PYPI_SPEC}"
+    FLASHINFER_CUBIN_SOURCE="$(cache_remote_wheel \
+        "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.16/flashinfer_cubin-0.6.16-py3-none-any.whl")"
+    pip_install_with_retry pip3 install --break-system-packages --no-deps \
+        "${FLASHINFER_CUBIN_SOURCE}"
+    TOKENSPEED_PYPI_RUNTIME_DEPS=(
+        "aiohttp"
+        "certifi"
+        "charset-normalizer"
+        "compressed-tensors"
+        "dill"
+        "einops"
+        "fastapi"
+        "grpcio-health-checking==1.81.1"
+        "grpcio-reflection==1.81.1"
+        "hf_transfer"
+        "huggingface_hub"
+        "idna"
+        "modelscope"
+        "msgspec"
+        "ninja"
+        "numpy"
+        "openai>=2.24.1"
+        "openai-harmony"
+        "orjson"
+        "packaging"
+        "partial-json-parser"
+        "peft"
+        "pillow"
+        "prometheus-client"
+        "psutil"
+        "pybase64"
+        "pybind11"
+        "pydantic"
+        "pytest-asyncio"
+        "python-multipart"
+        "pyzmq"
+        "requests"
+        "setproctitle"
+        "tiktoken"
+        "tokenspeed-mooncake>=0.3.12.post20260803"
+        "tokenspeed-smg==1.9.0.post20260815"
+        "tokenspeed-smg-grpc-proto==0.4.14.post20260814"
+        "tokenspeed-smg-grpc-servicer==0.8.0.post20260814"
+        "torch-memory-saver==0.0.9.post1"
+        "tqdm"
+        "transformers==5.12.0"
+        "urllib3"
+        "uv"
+        "uvicorn"
+        "uvloop"
+        "xgrammar==0.2.3"
+        "viztracer"
+    )
+    pip_install_with_retry pip3 install --break-system-packages --no-deps \
+        "${TOKENSPEED_PYPI_RUNTIME_DEPS[@]}"
+else
+    TOKENSPEED_KERNEL_BACKEND=cuda FLASHINFER_CUDA_ARCH_LIST="${FI_ARCH}" \
+    pip_install_with_retry pip3 install tokenspeed-kernel/python/ --no-build-isolation -v
+fi
 
 # ============================================================
 # Step 5: Install TokenSpeed Scheduler (C++)
@@ -177,8 +243,13 @@ echo "=== Step 6: Install TokenSpeed ==="
 # tokenspeed-smg / -grpc-servicer / -grpc-proto are pinned in
 # python/pyproject.toml; pip resolves them from PyPI as part of the
 # editable install below.
-pip_install_with_retry pip3 install -e "./python" \
-    --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX}
+if [ "${TOKENSPEED_INSTALL_NO_DEPS:-0}" = "1" ]; then
+    echo "Installing in-tree TokenSpeed without dependency resolution"
+    pip_install_with_retry pip3 install --break-system-packages --no-deps -e "./python"
+else
+    pip_install_with_retry pip3 install -e "./python" \
+        --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX}
+fi
 
 # ============================================================
 # Step 7: Optionally override tokenspeed-mla with in-tree source
@@ -198,6 +269,9 @@ fi
 # Step 8: Pin critical kernel deps to exact versions
 # ============================================================
 echo "=== Step 8: Pin critical kernel deps ==="
+if [ "${TOKENSPEED_KERNEL_INSTALL_MODE:-source}" = "pypi" ]; then
+    echo "Skipping source-kernel dependency pinning for published wheel mode"
+else
 pin_version() {
     # Extract exact-pinned package specs, including optional extras.
     local pkg="$1"
@@ -250,6 +324,7 @@ if [ -n "${FA4_SPEC}" ]; then
         --force-reinstall --no-deps "${FA4_SPEC}"
 else
     echo "No tokenspeed-fa4 pin found in ${THIRDPARTY_REQ}; skipping FA4 reinstall."
+fi
 fi
 
 # ============================================================
