@@ -546,6 +546,7 @@ flags above and add:
 --speculative-num-steps 3
 ```
 
+With `--speculative-draft-model-path` omitted, V4 uses the same checkpoint as the
 draft source (`DeepseekV4ForCausalLMNextN`). MTP runs on the non-overlap
 scheduler — the runtime disables overlap scheduling automatically when
 speculative decoding and cache groups are both active — and prefix caching
