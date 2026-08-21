@@ -22,10 +22,14 @@
 
 from __future__ import annotations
 
+from functools import cached_property
 from typing import ClassVar
 
 import torch
 
+from tokenspeed.runtime.layers.attention.kv_cache.base import (
+    derive_state_groups_by_layer,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     STATE_LAYER_TYPES,
@@ -43,26 +47,17 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
     def __init__(
         self,
         *,
-        layer_group_ids: tuple[str, ...],
         layer_types: tuple[str, ...],
         **kwargs,
     ):
         self._layer_types = tuple(layer_types)
-        group_ids = tuple(layer_group_ids)
-        self._group_ids_by_layer = dict(enumerate(group_ids))
         self._state_buffers_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.requires_page_zeroing = True
 
-        layer_num = kwargs["layer_num"]
-        if len(self._layer_types) != layer_num:
+        if len(self._layer_types) != kwargs["layer_num"]:
             raise ValueError("cache layer types must cover every model layer")
-        if len(group_ids) != layer_num:
-            raise ValueError("cache group ids must cover every model layer")
 
-        super().__init__(
-            layer_group_ids=group_ids,
-            **kwargs,
-        )
+        super().__init__(**kwargs)
 
     # A KDA layer has conv/recurrent planes planned and an MLA layer has a
     # latent plane; the plan's field list decides per layer. Latent-page
@@ -93,11 +88,19 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
     def state_slabs(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
         return list(self._state_buffers_by_layer.values())
 
-    def group_id_for_layer(self, layer_id: int) -> str:
-        try:
-            return self._group_ids_by_layer[layer_id]
-        except KeyError as exc:
-            raise ValueError(f"layer {layer_id} has no cache group") from exc
+    @cached_property
+    def state_group_by_layer(self) -> dict[int, str]:
+        """View-local state layer id -> its state-family cache group id."""
+        return derive_state_groups_by_layer(
+            self.arena,
+            first_layer=self._field_layer_offset,
+            num_layers=self.layer_num,
+            state_layer_ids=(
+                layer_id
+                for layer_id, label in enumerate(self._layer_types)
+                if label in STATE_LAYER_TYPES
+            ),
+        )
 
     def get_component(self, layer_id: int, component_name: str) -> torch.Tensor:
         """Return one KDA state plane. Latent KV is read via ``kv_buffer``."""

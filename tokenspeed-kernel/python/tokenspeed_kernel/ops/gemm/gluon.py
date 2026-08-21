@@ -137,7 +137,7 @@ if current_platform().is_amd:
             ),
             priority=Priority.SPECIALIZED,
             traits={
-                "tokens": frozenset({1}),
+                "tokens": frozenset({1, 2, 4}),
                 "input_size": frozenset({KIMI3_HIDDEN_SIZE}),
                 "output_size": frozenset({3648, KIMI3_QKVFAB_SIZE}),
                 "num_blocks": frozenset(range(1, 12)),

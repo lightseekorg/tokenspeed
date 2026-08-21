@@ -6,7 +6,7 @@ Coverage:
   ``state_out_blocks_by_group``
   mappings keyed by state group id, dual-index computed ONCE per group per
   batch, with a proof the three groups' indices are independent and selected
-  per layer via ``pool.group_id_for_layer``;
+  per layer via ``pool.state_group_by_layer``;
 - structural binding of the two KDA components (``conv_state`` /
   ``recurrent_state``) from the LCM pool's no-copy component views;
 - eager prefill and decode over dual state page indices compared against a
@@ -153,8 +153,9 @@ class _StubContractPool:
             for layer_id in self._groups
         }
 
-    def group_id_for_layer(self, layer_id: int) -> str:
-        return self._groups[layer_id]
+    @property
+    def state_group_by_layer(self) -> dict[int, str]:
+        return self._groups
 
     def get_component(self, layer_id: int, name: str) -> torch.Tensor:
         return self._components[layer_id][name]

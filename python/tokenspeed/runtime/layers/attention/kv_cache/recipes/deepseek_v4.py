@@ -220,18 +220,6 @@ class DeepseekV4Recipe(CacheRecipe):
         """The compression ratio per layer -- V4's own layer vocabulary."""
         return tuple(str(ratio) for ratio in self._cache_layout.layer_ratio)
 
-    @cached_property
-    def group_ids(self) -> tuple[str, ...]:
-        """The group a layer's own attention reads: SWA, or its chain."""
-        return tuple(
-            (
-                v4_compressed_kv_spec(ratio).group_id
-                if ratio > 1
-                else v4_swa_kv_spec(self.model_config.hf_config).group_id
-            )
-            for ratio in self._cache_layout.layer_ratio
-        )
-
     # ---- geometry ----
 
     @property

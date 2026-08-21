@@ -1527,6 +1527,7 @@ def try_kda_fused_paged_decode(
     output_gate: torch.Tensor | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
+    recurrent_layout: str = "k_major",
     override: str | None = None,
     solution: str | None = None,
 ) -> KdaFusedDecodeResult | None:
@@ -1545,6 +1546,8 @@ def try_kda_fused_paged_decode(
         raise ValueError("output_gate and norm_weight must be provided together")
     if output_gate is not None and norm_eps is None:
         raise ValueError("norm_eps is required with fused KDA output normalization")
+    if recurrent_layout not in ("k_major", "v_major"):
+        raise ValueError(f"unsupported KDA recurrent layout {recurrent_layout!r}")
 
     signature = _attention_format_signature(
         q=mixed_qkv,
@@ -1562,6 +1565,7 @@ def try_kda_fused_paged_decode(
                 "num_heads": num_heads,
                 "head_dim": head_dim,
                 "conv_kernel_size": conv_weights.shape[-1],
+                "recurrent_layout": recurrent_layout,
             },
             solution=solution,
             override=override,
@@ -1580,6 +1584,7 @@ def try_kda_fused_paged_decode(
                     "num_heads": num_heads,
                     "head_dim": head_dim,
                     "conv_kernel_size": conv_weights.shape[-1],
+                    "recurrent_layout": recurrent_layout,
                 },
                 solution=solution,
                 override=override,

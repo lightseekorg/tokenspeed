@@ -108,7 +108,6 @@ def create_cache_pool(
             layer_num=num_layers,
             rank=rank,
             index_head_dim=config.index_head_dim,
-            layer_group_ids=spec.layer_group_ids,
             field_layer_offset=field_layer_offset,
         )
     if isinstance(config, MSAConfig):
@@ -127,7 +126,6 @@ def create_cache_pool(
             index_dtype=config.dtype,
             indexed_layer_ids=config.sparse_layer_ids,
             layer_types=spec.layer_types,
-            layer_group_ids=spec.layer_group_ids,
             field_layer_offset=field_layer_offset,
         )
     if isinstance(config, MHAConfig):
@@ -142,7 +140,6 @@ def create_cache_pool(
             layer_types=spec.layer_types,
             layer_kv_head_counts=spec.layer_kv_head_counts,
             kv_alloc_head_count=config.num_kv_heads,
-            layer_group_ids=spec.layer_group_ids,
             field_layer_offset=field_layer_offset,
         )
     if isinstance(config, MLAConfig):
@@ -160,7 +157,6 @@ def create_cache_pool(
                 qk_rope_head_dim=config.qk_rope_head_dim,
                 layer_num=num_layers,
                 rank=rank,
-                layer_group_ids=spec.layer_group_ids,
                 field_layer_offset=field_layer_offset,
             )
 
@@ -183,7 +179,6 @@ def create_cache_pool(
             layer_num=num_layers,
             rank=rank,
             layer_types=spec.layer_types,
-            layer_group_ids=spec.layer_group_ids,
             field_layer_offset=field_layer_offset,
         )
     raise TypeError(f"cache setup does not support config type {type(config).__name__}")

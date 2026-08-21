@@ -47,6 +47,7 @@ if invoke_sigmoid_bias_topk_route_prefill_gluon is not None:
         topk: int,
         routed_scaling_factor: float,
         normalize_topk_weights: bool,
+        weights_dtype: torch.dtype = torch.float32,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         route = (
             invoke_sigmoid_bias_topk_route_gluon
@@ -60,7 +61,8 @@ if invoke_sigmoid_bias_topk_route_prefill_gluon is not None:
             routed_scaling_factor=routed_scaling_factor,
             normalize_topk_weights=normalize_topk_weights,
         )
-        return topk_weights, topk_ids
+        # The gluon route has no output-dtype argument to store through.
+        return topk_weights.to(weights_dtype), topk_ids
 
 else:
 

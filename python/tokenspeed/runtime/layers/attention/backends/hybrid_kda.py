@@ -82,7 +82,12 @@ class KdaAttnBackend(MambaAttnBackend):
     the conv, the gate GEMV and the recurrence into a single launch.
     """
 
-    def __init__(self, config: BaseAttnConfig, kda_backend: str = "auto") -> None:
+    def __init__(
+        self,
+        config: BaseAttnConfig,
+        kda_backend: str = "auto",
+        kda_recurrent_layout: str = "k_major",
+    ) -> None:
         super().__init__(config)
         self.max_bs = config.max_bs
         self._replay_active = kda_replay_commit_supported(self.dtype)
@@ -99,6 +104,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 f"--kda-backend must be one of {', '.join(KDA_PREFILL_BACKENDS)}; "
                 f"got {self.kda_backend!r}"
             )
+        self.kda_recurrent_layout = kda_recurrent_layout
         logger.info(
             "KDA prefill routes through %s; decode remains on the "
             "platform-selected kernels",
@@ -397,6 +403,7 @@ class KdaAttnBackend(MambaAttnBackend):
             output_gate=output_gate,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+            recurrent_layout=self.kda_recurrent_layout,
         )
         if result is None:
             return None
@@ -634,6 +641,7 @@ class KdaAttnBackend(MambaAttnBackend):
             write_rows,
             h_pool_out=state_out,
             lower_bound=lower_bound,
+            recurrent_layout=self.kda_recurrent_layout,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
     @override

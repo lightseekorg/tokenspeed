@@ -42,15 +42,9 @@ from tokenspeed.runtime.engine.output_processor import (  # noqa: E402
     OutputProcessor,
     ReqState,
 )
-from tokenspeed.runtime.engine.weight_transfer.manager import (  # noqa: E402
-    WeightTransferManager,
-)
 from tokenspeed.runtime.entrypoints import control_server  # noqa: E402
 from tokenspeed.runtime.entrypoints.sglang_compat_http import (  # noqa: E402
     build_sglang_compat_app,
-)
-from tokenspeed.runtime.entrypoints.vllm_compat_http import (  # noqa: E402
-    build_vllm_compat_app,
 )
 from tokenspeed.runtime.utils.server_args import (  # noqa: E402
     ServerArgs,
@@ -65,6 +59,9 @@ class _FakeLLM:
             model="model-x",
         )
         self.updates = []
+        self.scheduler_calls = []
+        self.admission_calls = []
+        self.memory_calls = []
         self.succeed = True
 
     async def init_weights_update_group(self, obj):
@@ -82,76 +79,43 @@ class _FakeLLM:
         self.updates.append(obj)
         return self.succeed, "disk", None
 
+    def block_generation_admission(self):
+        self.admission_calls.append("block")
 
-class TestWeightTransferVersionLifecycle(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self) -> None:
-        self.llm = _FakeLLM()
-        self.manager = WeightTransferManager(self.llm)
-        await self.manager.init_engine(
-            {
-                "master_address": "127.0.0.1",
-                "master_port": 1234,
-                "rank_offset": 1,
-                "world_size": 2,
-            }
-        )
-        self.payload = {
-            "names": ["weight"],
-            "dtype_names": ["float32"],
-            "shapes": [[1]],
-        }
+    def allow_generation_admission(self):
+        self.admission_calls.append("allow")
 
-    async def test_chunk_version_is_deferred_until_finish(self):
-        await self.manager.start_update()
-        await self.manager.update({**self.payload, "weight_version": "v1"})
+    async def pause_scheduler(self, *, mode="abort"):
+        self.scheduler_calls.append(("pause", mode))
+        return True
 
-        self.assertEqual(self.manager.weight_version, "default")
-        await self.manager.finish_update()
-        self.assertEqual(self.manager.weight_version, "v1")
+    async def resume_scheduler(self):
+        self.scheduler_calls.append(("resume", None))
+        return True
 
-    async def test_finish_version_overrides_chunk_version(self):
-        await self.manager.start_update()
-        await self.manager.update({**self.payload, "weight_version": "chunk"})
+    async def get_load(self):
+        return [
+            SimpleNamespace(
+                dp_rank=0,
+                num_reqs=2,
+                num_waiting_reqs=1,
+                num_pages=3,
+            )
+        ]
 
-        await self.manager.finish_update(weight_version="finish")
-        self.assertEqual(self.manager.weight_version, "finish")
+    async def release_memory_occupation(self, obj):
+        self.memory_calls.append(("release", obj.tags))
+        return SimpleNamespace(success=True, message="released")
 
-    async def test_missing_version_preserves_current_version(self):
-        self.llm.server_args.weight_version = "existing"
-        await self.manager.start_update()
-        await self.manager.update(self.payload)
+    async def resume_memory_occupation(self, obj):
+        self.memory_calls.append(("resume", obj.tags))
+        return SimpleNamespace(success=True, message="resumed")
 
-        await self.manager.finish_update()
-        self.assertEqual(self.manager.weight_version, "existing")
-
-
-class _FinishManager:
-    def __init__(self) -> None:
-        self.calls = []
-
-    async def finish_update(self, weight_version=None):
-        self.calls.append(weight_version)
+    def abort_request(self, rid):
+        self.scheduler_calls.append(("abort", rid))
 
 
 class TestWeightVersionHTTP(unittest.TestCase):
-    def test_vllm_finish_accepts_legacy_and_versioned_bodies(self):
-        manager = _FinishManager()
-        client = TestClient(build_vllm_compat_app(manager))
-
-        self.assertEqual(client.post("/finish_weight_update").status_code, 200)
-        self.assertEqual(
-            client.post("/finish_weight_update", content=b"not-json").status_code,
-            200,
-        )
-        self.assertEqual(
-            client.post(
-                "/finish_weight_update",
-                json={"weight_version": "v3"},
-            ).status_code,
-            200,
-        )
-        self.assertEqual(manager.calls, [None, None, "v3"])
-
     def test_sglang_version_endpoints(self):
         llm = _FakeLLM()
         client = TestClient(build_sglang_compat_app(llm))
@@ -197,7 +161,58 @@ class TestWeightVersionHTTP(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(llm.server_args.weight_version, "v8")
 
-    def test_control_server_registers_version_proxy_routes(self):
+    def test_sglang_scheduler_memory_and_load_endpoints(self):
+        llm = _FakeLLM()
+        client = TestClient(build_sglang_compat_app(llm))
+
+        self.assertEqual(client.post("/pause_generation").status_code, 200)
+        self.assertEqual(client.post("/continue_generation").status_code, 200)
+        self.assertEqual(
+            client.post("/abort_request", json={"abort_all": True}).status_code,
+            200,
+        )
+        self.assertEqual(
+            llm.scheduler_calls,
+            [
+                ("pause", "wait"),
+                ("resume", None),
+                ("pause", "abort"),
+                ("resume", None),
+            ],
+        )
+        self.assertEqual(llm.admission_calls, ["block", "allow", "block", "allow"])
+
+        self.assertEqual(
+            client.post(
+                "/release_memory_occupation", json={"tags": ["kv_cache"]}
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            client.post(
+                "/resume_memory_occupation", json={"tags": ["weights"]}
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            llm.memory_calls,
+            [("release", ["kv_cache"]), ("resume", ["weights"])],
+        )
+        self.assertEqual(
+            client.get("/v1/loads").json(),
+            {
+                "loads": [
+                    {
+                        "dp_rank": 0,
+                        "num_reqs": 2,
+                        "num_waiting_reqs": 1,
+                        "num_pages": 3,
+                    }
+                ]
+            },
+        )
+
+    def test_control_server_exposes_only_sglang_rl_routes(self):
         routes = {
             (route.path, frozenset(route.methods or []))
             for route in control_server.app.routes
@@ -205,6 +220,18 @@ class TestWeightVersionHTTP(unittest.TestCase):
         self.assertIn(("/get_weight_version", frozenset({"GET"})), routes)
         self.assertIn(("/model_info", frozenset({"GET"})), routes)
         self.assertIn(("/update_weight_version", frozenset({"POST"})), routes)
+        self.assertIn(("/v1/loads", frozenset({"GET"})), routes)
+        removed_vllm_routes = {
+            ("/init_weight_transfer_engine", frozenset({"POST"})),
+            ("/start_weight_update", frozenset({"POST"})),
+            ("/update_weights", frozenset({"POST"})),
+            ("/finish_weight_update", frozenset({"POST"})),
+            ("/pause", frozenset({"POST"})),
+            ("/resume", frozenset({"POST"})),
+            ("/get_world_size", frozenset({"GET"})),
+            ("/is_paused", frozenset({"GET"})),
+        }
+        self.assertTrue(removed_vllm_routes.isdisjoint(routes))
 
 
 class _Request:

@@ -141,7 +141,7 @@ class _Harness:
 
 def _assert_committed_pages_equal(left, right, pages):
     for layer_id in left.layer_ids:
-        group_id = left.pool.group_id_for_layer(layer_id)
+        group_id = left.pool.state_group_by_layer[layer_id]
         for page in pages[group_id]:
             torch.testing.assert_close(
                 left.pool.get_component(layer_id, "conv_state")[page],
@@ -393,7 +393,7 @@ def test_no_store_fused_verify_matches_decomposed_outputs():
 
     # Negative control: perturbing the decomposed base state must break the oracle.
     layer_id = decomposed.layer_ids[0]
-    group_id = decomposed.pool.group_id_for_layer(layer_id)
+    group_id = decomposed.pool.state_group_by_layer[layer_id]
     recurrent = decomposed.pool.get_component(layer_id, "recurrent_state")
     recurrent[torch.tensor(pages[group_id], device=DEV)] += 1
     wrong = decomposed.forward(inputs, len(rpis))[0]

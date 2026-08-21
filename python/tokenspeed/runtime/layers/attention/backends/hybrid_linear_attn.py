@@ -323,7 +323,7 @@ class MambaForwardMetadata:
     # it, so immutability rules out stale-aliasing.
     cu_extend_seq_lens_cpu: tuple[int, ...] | None = None
     # Per-state-group metadata is gathered once per group and batch;
-    # layers select their entry via ``pool.group_id_for_layer(layer_id)``.
+    # layers select their entry via ``pool.state_group_by_layer[layer_id]``.
     state_in_blocks_by_group: dict[str, torch.Tensor] | None = None
     state_out_blocks_by_group: dict[str, torch.Tensor] | None = None
 
@@ -387,11 +387,11 @@ class MambaAttnBackend(AttentionBackend):
             raise RuntimeError(
                 "MambaAttnBackend requires at least one state-family cache group"
             )
-        if not callable(getattr(kv_pool, "group_id_for_layer", None)) or not callable(
+        if getattr(kv_pool, "state_group_by_layer", None) is None or not callable(
             getattr(kv_pool, "get_component", None)
         ):
             raise RuntimeError(
-                "MambaAttnBackend requires group_id_for_layer() and get_component()"
+                "MambaAttnBackend requires state_group_by_layer and get_component()"
             )
         self._state_group_ids = state_group_ids
         self.state_paging_active = True
@@ -441,18 +441,18 @@ class MambaAttnBackend(AttentionBackend):
 
     def _state_layer_ids(self) -> list[int]:
         """Recurrent layer ids backed by the unified cache pool."""
-        state_groups = set(self._state_group_ids)
-        return sorted(
-            layer_id
-            for layer_id, group_id in self.kv_pool._group_ids_by_layer.items()
-            if group_id in state_groups
-        )
+        return sorted(self.kv_pool.state_group_by_layer)
 
     def _state_groups(self) -> tuple[str, ...]:
         return self._state_group_ids
 
     def _state_group_for(self, layer_id: int) -> str:
-        return self.kv_pool.group_id_for_layer(layer_id)
+        try:
+            return self.kv_pool.state_group_by_layer[layer_id]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"layer {layer_id} has no state-family cache group"
+            ) from exc
 
     def _state_components(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         return (
@@ -821,7 +821,7 @@ class MambaAttnBackend(AttentionBackend):
 
         The dual-index gather runs ONCE per state group per batch — never per
         layer. State layers select their group's entry via
-        ``pool.group_id_for_layer(layer_id)`` at forward time.
+        ``pool.state_group_by_layer[layer_id]`` at forward time.
 
         validate: explicit True/False wins; None (the hot-path default)
         validates only under TOKENSPEED_CACHE_DEBUG=1 (the checks host-sync).
