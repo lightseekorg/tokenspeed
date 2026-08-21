@@ -45,6 +45,11 @@ def _kda_recurrent_decode_kernel(
     H: gl.constexpr,
     K: gl.constexpr,
     V: gl.constexpr,
+    Q_TOKEN_STRIDE: gl.constexpr,
+    K_TOKEN_STRIDE: gl.constexpr,
+    V_TOKEN_STRIDE: gl.constexpr,
+    G_TOKEN_STRIDE: gl.constexpr,
+    BETA_TOKEN_STRIDE: gl.constexpr,
     BK: gl.constexpr,
     BV: gl.constexpr,
     NUM_SLOTS: gl.constexpr,
@@ -111,17 +116,17 @@ def _kda_recurrent_decode_kernel(
 
     token_idx = begin
     q_value = gl.load(
-        q + (token_idx * H + head_idx) * K + key_offsets,
+        q + token_idx * Q_TOKEN_STRIDE + head_idx * K + key_offsets,
         mask=key_mask,
         other=0.0,
     ).to(gl.float32)
     k_value = gl.load(
-        k + (token_idx * H + head_idx) * K + key_offsets,
+        k + token_idx * K_TOKEN_STRIDE + head_idx * K + key_offsets,
         mask=key_mask,
         other=0.0,
     ).to(gl.float32)
     gate_value = gl.load(
-        raw_g + (token_idx * H + head_idx) * K + key_offsets,
+        raw_g + token_idx * G_TOKEN_STRIDE + head_idx * K + key_offsets,
         mask=key_mask,
         other=0.0,
     ).to(gl.float32)
@@ -138,7 +143,9 @@ def _kda_recurrent_decode_kernel(
             1.0 + gl.exp(-gl.abs(gate_value))
         )
         log_decay = -a_value * softplus
-    beta_value = gl.load(raw_beta + token_idx * H + head_idx).to(gl.float32)
+    beta_value = gl.load(raw_beta + token_idx * BETA_TOKEN_STRIDE + head_idx).to(
+        gl.float32
+    )
     beta_value = 1.0 / (1.0 + gl.exp(-beta_value))
 
     scale: gl.constexpr = K**-0.5
@@ -157,7 +164,7 @@ def _kda_recurrent_decode_kernel(
         other=0.0,
     ).to(gl.float32)
     v_value = gl.load(
-        v + (token_idx * H + head_idx) * V + value_offsets,
+        v + token_idx * V_TOKEN_STRIDE + head_idx * V + value_offsets,
         mask=value_mask,
         other=0.0,
     ).to(gl.float32)
@@ -462,19 +469,27 @@ def gluon_kda_recurrent_decode_gfx1250(
         raise ValueError("state_pool pages must not overlap")
     if A_log.shape != (heads,) or dt_bias.numel() != heads * key_dim:
         raise ValueError("invalid KDA gate parameter shapes")
+    expected_inner_strides = (
+        (q, key_dim),
+        (k, key_dim),
+        (g_raw, key_dim),
+        (v, value_dim),
+    )
+    if any(
+        tensor.stride(-1) != 1 or tensor.stride(-2) != width
+        for tensor, width in expected_inner_strides
+    ):
+        raise ValueError("KDA inputs must have contiguous head vectors")
+    if beta_logits.stride(-1) != 1:
+        raise ValueError("KDA beta logits must have contiguous heads")
 
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-    g_raw = g_raw.contiguous()
-    beta_logits = beta_logits.contiguous()
     A_log = A_log.contiguous()
     dt_bias = dt_bias.view(heads, key_dim).contiguous()
     read_indices = read_indices.to(device=q.device, dtype=torch.int32).contiguous()
     write_indices = write_indices.to(device=q.device, dtype=torch.int32).contiguous()
     cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
 
-    output = torch.empty_like(v)
+    output = torch.empty(v.shape, dtype=v.dtype, device=v.device)
     block_key = triton.next_power_of_2(key_dim)
     block_value = min(32, triton.next_power_of_2(value_dim))
     _kda_recurrent_decode_kernel[(triton.cdiv(value_dim, block_value), tokens * heads)](
@@ -493,6 +508,11 @@ def gluon_kda_recurrent_decode_gfx1250(
         H=heads,
         K=key_dim,
         V=value_dim,
+        Q_TOKEN_STRIDE=q.stride(1),
+        K_TOKEN_STRIDE=k.stride(1),
+        V_TOKEN_STRIDE=v.stride(1),
+        G_TOKEN_STRIDE=g_raw.stride(1),
+        BETA_TOKEN_STRIDE=beta_logits.stride(1),
         BK=block_key,
         BV=block_value,
         NUM_SLOTS=state_pool.shape[0],
