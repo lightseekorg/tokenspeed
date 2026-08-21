@@ -5,11 +5,14 @@ set -euo pipefail
 # TP8 baseline + DSpark speculative decoding — the clearly-labelled spec row.
 # Speculative flags AND the memory envelope follow the CI DSpark gates
 # (kimi-k3-nvfp4-dspark two-node GB300 / kimi-k3-dspark mxfp4 AMD): both run
-# util 0.92 with the prefill graph and kvstore disabled — the draft weights,
-# its BF16 drafter cache, and the extra graph buckets eat the post-profiling
-# slack, and DSPARK+KVStore has zero CI coverage. One deliberate deviation:
-# max-model-len stays 80000 (the gates use 65536) because this workload's
-# final prompts reach ~68.2K; watch the first boot.
+# util 0.92 with the prefill graph disabled — the draft weights, its BF16
+# drafter cache, and the extra graph buckets eat the post-profiling slack.
+# The kvstore stays enabled like the rest of the matrix: DSPARK+KVStore was
+# validated on this machine (2026-08-21) — boots, byte-identical temperature-0 answers
+# vs kvstore-off, acceptance in the same noise band (3.1-3.9 tok/iter), and
+# 115 forced retracts -> L2 store -> host restore with zero exceptions.
+# One deliberate deviation: max-model-len stays 80000 (the gates use 65536)
+# because this workload's final prompts reach ~68.2K; watch the first boot.
 # The DP rows stay spec-off: the DP x speculative combination has no CI
 # coverage here, so this row is compared against TP8 spec-off rather than
 # filling the matrix.
@@ -27,7 +30,6 @@ exec ts serve \
     --moe-backend flashinfer_trtllm \
     --kv-cache-dtype fp8 \
     --disable-prefill-graph \
-    --disable-kvstore \
     --speculative-algorithm DSPARK \
     --speculative-draft-model-path Inferact/Kimi-K3-DSpark \
     --speculative-num-draft-tokens 8 \

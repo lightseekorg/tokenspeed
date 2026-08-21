@@ -42,8 +42,10 @@ configs; prefix caching (default-on) hit rate is reported.
    speculative combination has no CI coverage here, so a spec-on matrix
    cannot be filled honestly. The TP8+DSpark config is the separate,
    clearly-labelled spec row (`_dspark` suffix, runs last) — it follows the
-   CI DSpark gates' memory envelope (util 0.92, prefill graph and kvstore
-   off), so compare it against TP8 spec-off qualitatively, not as a
+   CI DSpark gates' memory envelope (util 0.92, prefill graph off; the
+   kvstore stays on like the rest of the matrix — the DSPARK+KVStore
+   combination was validated on-machine incl. the retract -> L2 -> restore
+   path), so compare it against TP8 spec-off qualitatively, not as a
    controlled ablation. "Decoded Tok/Iter" is only meaningful there
    (-1.0 elsewhere = not measured).
 3. Warmup pass before each config's sweep; one sweep owns the machine.
