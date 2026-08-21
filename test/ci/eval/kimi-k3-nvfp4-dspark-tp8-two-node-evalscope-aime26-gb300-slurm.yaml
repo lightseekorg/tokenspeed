@@ -19,9 +19,6 @@ slurm:
   gpus_per_node: 4
 env:
   CI: "true"
-  TOKENSPEED_KERNEL_INSTALL_MODE: pypi
-  TOKENSPEED_KERNEL_PYPI_SPEC: tokenspeed-kernel==0.1.3
-  TOKENSPEED_INSTALL_NO_DEPS: "1"
 install:
   - bash test/ci_system/install_deps.sh
   - python3 -m pip install flash-linear-attention
