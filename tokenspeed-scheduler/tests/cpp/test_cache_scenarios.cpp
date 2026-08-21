@@ -252,6 +252,32 @@ TEST(MambaStateCheckpointCapacityTest, CountsInputBodyAndReservedTailCheckpoints
     EXPECT_THROW(scheduler.SubmitRequests({too_long}), std::invalid_argument);
 }
 
+TEST(MambaStateCheckpointCapacityTest, CountsFirstChunkBodyAndSubPageTail) {
+    SchedulerConfig cfg{};
+    cfg.prefix_granularity = 4;
+    cfg.device_allocator.total_pages = 4;  // null + three usable state blocks
+    cfg.host_allocator.total_pages = 0;
+    cfg.max_scheduled_tokens = 8;
+    cfg.max_batch_size = 1;
+    cfg.disable_l2_cache = true;
+    cfg.cache_groups = {
+        MakeGroup("state", /*block_granularity=*/1, cfg.device_allocator.total_pages,
+                  CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
+    };
+
+    Scheduler scheduler{std::move(cfg)};
+
+    // A seven-token prompt would split into a four-token body and a
+    // three-token tail. The body checkpoint plus the reserved tail need four
+    // state blocks, so three usable blocks cannot admit it and its decode.
+    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 7);
+    RequestSpec too_long{
+        .request_id = "too-long",
+        .tokens = std::vector<std::int32_t>(7, 1),
+    };
+    EXPECT_THROW(scheduler.SubmitRequests({too_long}), std::invalid_argument);
+}
+
 class MambaStateCheckpointNoPrefixCacheSuite : public MambaStateCheckpointSplitSuite {
 protected:
     SchedulerConfig MakeConfig() override {
