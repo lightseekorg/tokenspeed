@@ -123,8 +123,6 @@ for CONFIG in "${CONFIGS[@]}"; do
         --outputs-dir /tmp/outputs
 
     echo "Benchmark..."
-    # The high-concurrency tail (64/32) is where capacity-oriented configs
-    # (attention DP, future hybrid) earn their keep on decode throughput.
     evalscope perf \
         --model nvidia/Kimi-K3-NVFP4 \
         --url http://127.0.0.1:8000/v1/chat/completions \
@@ -133,8 +131,8 @@ for CONFIG in "${CONFIGS[@]}"; do
         --dataset-path agentic_dataset.json \
         --max-tokens 500 \
         --multi-turn \
-        --number 4 8 8 16 32 64 \
-        --parallel 1 2 4 8 16 32 \
+        --number 4 8 8 16 32 \
+        --parallel 1 2 4 8 16 \
         --extra-args '{"ignore_eos": true}' \
         --name $CONFIG \
         --outputs-dir $SWEEP_DIR \

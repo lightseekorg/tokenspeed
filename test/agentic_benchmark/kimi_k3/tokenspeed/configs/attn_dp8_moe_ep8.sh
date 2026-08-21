@@ -18,7 +18,7 @@ exec ts serve \
     --ep-size 8 \
     --moe-tp-size 1 \
     --max-model-len 81920 \
-    --max-num-seqs 32 \
+    --max-num-seqs 16 \
     --max-prefill-tokens 2048 \
     --chunked-prefill-size 2048 \
     --gpu-memory-utilization 0.95 \

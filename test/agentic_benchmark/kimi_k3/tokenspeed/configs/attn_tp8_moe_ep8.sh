@@ -7,7 +7,7 @@ exec ts serve \
     --attn-tp-size 8 \
     --ep-size 8 \
     --max-model-len 81920 \
-    --max-num-seqs 32 \
+    --max-num-seqs 16 \
     --gpu-memory-utilization 0.95 \
     --trust-remote-code \
     --attention-backend tokenspeed_mla \
