@@ -11,10 +11,12 @@ from tokenspeed_kernel.ops.activation.triton import (
     attnres_partial,
     attnres_partial_dual,
 )
+from tokenspeed_kernel.platform import current_platform
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
+platform = current_platform()
 H = 7168  # K3 hidden size; the kernels static-assert two 4096 sweeps.
 
 
@@ -96,6 +98,7 @@ def test_partial_dual_probes_are_independent(T, KB):
             assert torch.equal(x, y), f"probe {side} changed when slots swapped"
 
 
+@pytest.mark.skipif(not platform.is_hopper_plus, reason="PDL requires SM90+")
 @pytest.mark.parametrize("use_norm", [True, False])
 def test_combine_pdl_parity(use_norm):
     """The PDL variant (prefetch + gdc_wait) must match the plain launch
