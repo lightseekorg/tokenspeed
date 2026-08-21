@@ -93,7 +93,59 @@ SHAPES = [
     (4096, 8, 128),
     (256, 12, 128),  # non-pow2 H — masking
     (256, 16, 64),  # different head_dim
+    (256, 64, 128),  # exactly at the 1024-thread block cap (kBdx=16)
+    (256, 96, 128),  # above the cap — MLA at attn tp=1; tiles across gridDim.y
+    (256, 96, 256),  # above the cap at kBdx=32 — one head row per warp
+    (256, 97, 128),  # above the cap, prime H — 2x49 tiling, one padding row
+    (256, 128, 128),  # pow2 H above the cap
+    (64, 96, 512),  # kBdx=32 with kMaxBdy=32 — gridDim.y=3
+    (256, 65, 128),  # just above the cap — 2x33, maximal relative padding
+    (256, 100, 128),  # balanced-ceil lands exact: 2x50, guard dormant
 ]
+
+
+# The production caller (DeepSeek chunked-KV prefill) merges with
+# ``inplace=True`` and PDL enabled, so the aliasing contract must hold on the
+# multi-block (gridDim.y > 1) geometries introduced by the head tiling — the
+# out-of-place sweeps above never alias.
+@pytest.mark.parametrize(
+    "T,H,D",
+    [
+        (31, 8, 64),  # single-block geometry (baseline)
+        (256, 96, 128),  # gridDim.y=2 — MLA at attn tp=1
+        (64, 96, 512),  # gridDim.y=3 at kBdx=32
+        (256, 97, 128),  # 2x49 with one padding row — guard active under aliasing
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_inplace_alias_multiblock(
+    device: str, T: int, H: int, D: int, enable_pdl: bool
+) -> None:
+    """inplace=True must write the merge through the v_a/s_a aliases."""
+    v_a, s_a, v_b, s_b = _make_inputs(T, H, D, device, torch.bfloat16, seed=3)
+    v_ref, s_ref = _reference_merge(v_a, s_a, v_b, s_b, LSE_LN)
+
+    v_out, s_out = merge_state(v_a, s_a, v_b, s_b, inplace=True, enable_pdl=enable_pdl)
+    torch.cuda.synchronize()
+
+    assert v_out.data_ptr() == v_a.data_ptr()
+    assert s_out.data_ptr() == s_a.data_ptr()
+    assert torch.allclose(v_a.float(), v_ref.float(), atol=5e-2, rtol=1e-2)
+    assert torch.allclose(s_a, s_ref, atol=1e-4, rtol=1e-5)
+
+
+def test_rejects_zero_heads(device: str) -> None:
+    """An empty head axis must raise (catchable), not SIGFPE in the tiled
+    launcher's group math."""
+    v_a, s_a, v_b, s_b = _make_inputs(4, 1, 128, device, torch.bfloat16)
+    empty = (
+        v_a[:, :0],
+        s_a[:, :0],
+        v_b[:, :0],
+        s_b[:, :0],
+    )
+    with pytest.raises(Exception, match="num_heads"):
+        merge_state(*[t.contiguous() for t in empty])
 
 
 @pytest.mark.parametrize("T,H,D", SHAPES)
