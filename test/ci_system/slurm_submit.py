@@ -102,9 +102,7 @@ def load_task(
             f"{relative}: slurm.gpus_per_node={gpus_per_node} does not match "
             f"runner {runner!r} ({gpus} GPUs)"
         )
-    task_env = {
-        str(key): str(value) for key, value in (data.get("env") or {}).items()
-    }
+    task_env = {str(key): str(value) for key, value in (data.get("env") or {}).items()}
     return Task(
         relative,
         str(data["name"]),

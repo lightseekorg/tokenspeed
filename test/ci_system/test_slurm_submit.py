@@ -439,7 +439,10 @@ def test_render_script_uses_task_model_root_override():
         "ghcr.io/example/image@sha256:abc",
     )
     assert "local_model_root=/scratch/ts-torchspec-bot-models" in script
-    assert 'local_model_root="${TS_CI_LOCAL_MODEL_ROOT:-/scratch/${USER}-models}"' not in script
+    assert (
+        'local_model_root="${TS_CI_LOCAL_MODEL_ROOT:-/scratch/${USER}-models}"'
+        not in script
+    )
 
     multinode_script = render_script(
         Task(
