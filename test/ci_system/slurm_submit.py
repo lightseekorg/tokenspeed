@@ -355,6 +355,17 @@ def render_script(
             if model_root_override
             else 'local_model_root="${TS_CI_LOCAL_MODEL_ROOT:-/scratch/${USER}-models}"'
         )
+        legacy_model_root = task.env.get("TS_CI_LEGACY_MODEL_ROOT")
+        legacy_model_mount = (
+            f"""
+legacy_model_root={shlex.quote(str(legacy_model_root))}
+if [ -d "$legacy_model_root" ]; then
+  model_mounts+=("$legacy_model_root:$legacy_model_root:ro")
+fi
+"""
+            if legacy_model_root
+            else ""
+        )
         local_model_mounts = f"""
 # GB300 nodes keep large model snapshots on their local RAID.  Keep the
 # source configurable for other coordinators while exposing one stable path
@@ -363,6 +374,7 @@ def render_script(
 if [ -d "$local_model_root" ]; then
   model_mounts+=("$local_model_root:/models:ro")
 fi
+{legacy_model_mount}
 """
         gpu_device_mounts = r"""
 # The GB300 Pyxis hook does not expose allocated device nodes.

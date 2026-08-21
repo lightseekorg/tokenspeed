@@ -20,6 +20,7 @@ slurm:
 env:
   CI: "true"
   TS_CI_LOCAL_MODEL_ROOT: /scratch/ts-torchspec-bot-models
+  TS_CI_LEGACY_MODEL_ROOT: /scratch/ts-yineng-models
 install:
   - bash test/ci_system/install_deps.sh
   - python3 -m pip install flash-linear-attention
