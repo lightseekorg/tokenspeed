@@ -36,6 +36,9 @@ from tokenspeed_kernel.ops.attention import (
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
 )
+from tokenspeed_kernel.ops.attention.triton.capture_payload import (
+    capture_replay_payload,
+)
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
@@ -513,9 +516,15 @@ class KdaAttnBackend(MambaAttnBackend):
                 )
             qkv, f_a, beta, _ = self._replay_payload(layer_id)
             rows = batch_size * draft_token_num
-            qkv[:rows, : mixed_qkv.shape[-1]].copy_(mixed_qkv[:rows])
-            f_a[:rows, : f_a_out.shape[-1]].copy_(f_a_out[:rows])
-            beta[:rows, : beta_raw.shape[-1]].copy_(beta_raw[:rows])
+            capture_replay_payload(
+                (mixed_qkv[:rows], f_a_out[:rows], beta_raw[:rows]),
+                (
+                    qkv[:rows, : mixed_qkv.shape[-1]],
+                    f_a[:rows, : f_a_out.shape[-1]],
+                    beta[:rows, : beta_raw.shape[-1]],
+                ),
+                rows,
+            )
             num_value_heads = value_dim // attn_tp_size // head_v_dim
             if layer_id not in self._replay_weights:
                 # Parameters are stable objects; model weight updates copy into
