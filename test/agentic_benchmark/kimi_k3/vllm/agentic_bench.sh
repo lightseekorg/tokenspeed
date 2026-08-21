@@ -1,13 +1,19 @@
 #!/usr/bin/bash
 
-# Tested on one OCI GB300 NVL72 segment (2 Slurm nodes x 4 GPUs) with vLLM
-# f8e060271381e352a4eabec97f1839a32e41ec41, CUDA 13.0, and FlashInfer 0.6.17.
+# Aligned to TokenSpeed PR #1187 head 97690af405321f4b7e586e37d632513e338c5b92.
+# Tested per row on one OCI GB300 NVL72 segment (2 Slurm nodes x 4 GPUs) with
+# vLLM f8e060271381e352a4eabec97f1839a32e41ec41, CUDA 13.0, and FlashInfer
+# 0.6.17. Both TP8 rows completed the full five-rung sweep with FP8 KV cache,
+# DSpark, PIECEWISE + FULL CUDA Graphs, zero failed requests, and exactly 500
+# output tokens/request (jobs 533940 and 534020, 2026-08-21).
 # Base container: vllm/vllm-openai:nightly-ba07e4a48fc951300d97eb506217dd530583dea3.
 # Main model revision: 1ec10fa5fca1a2d9c631f56325f5b221e3e3e209.
 # DSpark draft revision: cf6b8244620e7ea4b0651d214f28e89eac75bed6.
-# The TP8 rows completed full sweeps. Full-model DP8/EP8 is blocked on this
-# topology by a 16.27-GiB load allocation at about 268.39 GiB/GPU; the test
-# deliberately does not fall back to --language-model-only.
+# Frozen input SHA256: 2405552a4f320bbaaf084a0f25f57dc1c9af44e69612d0c9d098a137db3463f2.
+# Full-model DP8/EP8 + DSpark is blocked during fastsafetensors load: job
+# 533776 had about 268.42 GiB allocated and 5.10 GiB free per GPU before a
+# required 16.27-GiB allocation. The test deliberately does not fall back to
+# --language-model-only.
 
 set -euo pipefail
 
@@ -26,7 +32,10 @@ python3 -c "import evalscope" 2>/dev/null || \
     mv build_swe_smith_dataset.py.tmp build_swe_smith_dataset.py
 }
 
-# Note: Only 71 conversations can be built (measured with the Kimi-K3 tokenizer)
+# Note: only 71 conversations can be built. The builder's multi-worker
+# selection is nondeterministic — rebuilds do NOT reproduce the file — so
+# keep ONE agentic_dataset.json and reuse it across runs (see README for the
+# frozen CI artifact you can drop in instead).
 [ -f agentic_dataset.json ] || python3 build_swe_smith_dataset.py \
     --model-path moonshotai/Kimi-K3 \
     --first-turn-length 50000 \
@@ -37,17 +46,17 @@ python3 -c "import evalscope" 2>/dev/null || \
     --output-path agentic_dataset.json \
     --num-workers 32
 
-# The sweep + warmup consume conversations 0..69; fail fast if the dataset
-# ever builds fewer (tokenizer or upstream-dataset drift would otherwise
-# silently rotate and replay hot conversations).
+# The sweep + warmup consume conversations 0..69; fail fast on a stale or
+# wrong-recipe file. (Recipe-based so a dropped-in CI artifact also passes.)
 python3 - <<'PYEOF'
 import json
 d = json.load(open("agentic_dataset.json"))
 n = len(d["conversations"])
+m = d.get("metadata", {})
 assert n >= 70, f"agentic_dataset.json has only {n} conversations; need >= 70"
-mp = d.get("metadata", {}).get("model_path", "")
-assert "Kimi-K3" in mp, f"dataset built with wrong tokenizer: {mp!r}; delete agentic_dataset.json"
-print(f"dataset ok: {n} conversations (tokenizer: {mp})")
+recipe = (m.get("first_turn_length"), m.get("subsequent_turn_length"), m.get("min_turns"), m.get("max_turns"))
+assert recipe == (50000, 800, 10, 15), f"unexpected dataset recipe {recipe}; delete agentic_dataset.json"
+print(f"dataset ok: {n} conversations, recipe {recipe}")
 PYEOF
 
 # Sweep configs
@@ -55,7 +64,6 @@ CONFIGS=(
     attn_tp8_moe_ep8
     attn_tp8_moe_tp8
     attn_dp8_moe_ep8
-    attn_tp8_moe_ep8_dspark
 )
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
