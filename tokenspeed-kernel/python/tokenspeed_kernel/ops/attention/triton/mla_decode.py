@@ -100,7 +100,7 @@ def _mla_decode_kernel(
             page_table + cur_batch * page_table_stride_b + page_indices,
             mask=mask_n,
             other=0,
-        )
+        ).to(tl.int64)
         cache_base = (
             physical_pages * stride_kv_page
             + page_offsets * stride_kv_token

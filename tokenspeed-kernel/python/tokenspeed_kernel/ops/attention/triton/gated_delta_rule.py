@@ -198,7 +198,7 @@ def _fused_gdn_decode_update_kernel(
     mask_h = mask_k[:, None] & mask_v[None, :]
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    idx = tl.load(h0_indices + i_n)
+    idx = tl.load(h0_indices + i_n).to(tl.int64)
     if idx >= 0:
         # K-last [.., HV, V, K]: row v (stride K), col k (stride 1) -- the
         # opposite of this kernel's own [BK, BV] (K-row, V-col) tile layout,

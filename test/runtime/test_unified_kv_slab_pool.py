@@ -181,7 +181,6 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
 
     def _pool(self, **overrides):
         from cache_pool_test_utils import (
-            make_layer_group_ids,
             make_mha_memory_plan,
             make_pool,
         )
@@ -209,14 +208,6 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             dtype=kwargs["dtype"],
             layer_types=kwargs.get("layer_types", ()),
             sliding_window_tokens=kwargs.get("sliding_window_tokens"),
-        )
-        kwargs.setdefault(
-            "layer_group_ids",
-            make_layer_group_ids(
-                layer_num=kwargs["layer_num"],
-                layer_types=kwargs.get("layer_types", ()),
-                sliding_window_tokens=kwargs.get("sliding_window_tokens"),
-            ),
         )
         kwargs.pop("sliding_window_tokens", None)
         # The arena owns the allocation; ``size`` and the plan geometry are
@@ -333,7 +324,6 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             pd_disaggregation_enabled=True,
         )
         pool = self._pool(
-            layer_group_ids=group_ids,
             cache_group_specs=specs,
         )
 
@@ -439,7 +429,6 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
             qk_rope_head_dim=2,
             layer_num=1,
             rank=0,
-            layer_group_ids=("full_attention",),
             cache_group_specs=_specs_for_layers(
                 layer_types=(),
                 group_ids=("full_attention",),
@@ -571,7 +560,6 @@ class CachePoolFieldBindingTest(unittest.TestCase):
             layer_num=2,
             rank=0,
             layer_types=("linear_attention", "full_attention"),
-            layer_group_ids=("linear_attention_0", "full_attention"),
             cache_group_specs=_specs_for_layers(
                 layer_types=("linear_attention", "full_attention"),
                 group_ids=("linear_attention_0", "full_attention"),
@@ -601,7 +589,6 @@ class CachePoolFieldBindingTest(unittest.TestCase):
             layer_num=2,
             rank=0,
             layer_types=("linear_attention", "full_attention"),
-            layer_group_ids=("linear_attention", "full_attention"),
         )
         return pool
 
@@ -631,7 +618,7 @@ class CachePoolFieldBindingTest(unittest.TestCase):
             pool.arena.runtime_contract.group_page_counts,
             {"linear_attention_0": 3, "full_attention": 2},
         )
-        self.assertEqual(pool.group_id_for_layer(0), "linear_attention_0")
+        self.assertEqual(pool.state_group_by_layer[0], "linear_attention_0")
         conv, ssm = pool.get_state_buffers(0)
         self.assertIs(pool.get_component(0, "conv_state"), conv)
         self.assertIs(pool.get_component(0, "recurrent_state"), ssm)
@@ -651,6 +638,74 @@ class CachePoolFieldBindingTest(unittest.TestCase):
         self.assertTrue(all(buffer is not None for buffer in pool.v_buffer))
         self.assertFalse(hasattr(pool, "lcm_pool"))
         self.assertFalse(hasattr(pool, "state_slabs"))
+
+
+class DeriveStateGroupsByLayerTest(unittest.TestCase):
+    """The plan's field declarations are the single layer -> group record."""
+
+    def setUp(self):
+        try:
+            from tokenspeed.runtime.layers.attention.kv_cache.base import (
+                derive_state_groups_by_layer,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        self.derive = derive_state_groups_by_layer
+
+    @staticmethod
+    def _arena(fields, families):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            plan=SimpleNamespace(
+                fields=tuple(
+                    SimpleNamespace(field_id=field_id, group_id=group_id)
+                    for field_id, group_id in fields
+                )
+            ),
+            cache_group_specs=tuple(
+                SimpleNamespace(group_id=group_id, family=family)
+                for group_id, family in families.items()
+            ),
+        )
+
+    def test_reads_state_groups_back_from_planned_fields(self):
+        arena = self._arena(
+            fields=(
+                ("layer.0.conv", "linear_attention_0"),
+                ("layer.0.ssm", "linear_attention_0"),
+                ("layer.1.k", "full_attention"),
+                ("layer.1.v", "full_attention"),
+            ),
+            families={"linear_attention_0": "state", "full_attention": "history"},
+        )
+        mapping = self.derive(arena, first_layer=0, num_layers=2, state_layer_ids=(0,))
+        self.assertEqual(mapping, {0: "linear_attention_0"})
+
+    def test_draft_view_window_offsets_layer_ids(self):
+        arena = self._arena(
+            fields=(
+                ("layer.0.k", "full_attention"),
+                ("layer.1.conv", "linear_attention_0"),
+            ),
+            families={"linear_attention_0": "state", "full_attention": "history"},
+        )
+        mapping = self.derive(arena, first_layer=1, num_layers=1, state_layer_ids=(0,))
+        self.assertEqual(mapping, {0: "linear_attention_0"})
+
+    def test_rejects_a_layer_spanning_two_state_groups(self):
+        arena = self._arena(
+            fields=(
+                ("layer.0.conv", "linear_attention_0"),
+                ("layer.0.ssm", "linear_attention_1"),
+            ),
+            families={
+                "linear_attention_0": "state",
+                "linear_attention_1": "state",
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "more than one cache group"):
+            self.derive(arena, first_layer=0, num_layers=1, state_layer_ids=(0,))
 
 
 if __name__ == "__main__":

@@ -22,11 +22,14 @@
 
 from __future__ import annotations
 
+from functools import cached_property
 from typing import ClassVar
 
 import torch
-from typing_extensions import override
 
+from tokenspeed.runtime.layers.attention.kv_cache.base import (
+    derive_state_groups_by_layer,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     STATE_LAYER_TYPES,
@@ -36,29 +39,25 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 class HybridKDATokenToKVPool(MLATokenToKVPool):
     """MLA compute interface whose latent KV and KDA state share one buffer."""
 
+    #: Sanitizing latent write: under the prefill graph a padded row's NaN
+    #: reaches a live row's softmax through the shared dummy slot, because the
+    #: paged MLA decode computes ``q·k`` before the causal mask.
+    latent_write_sanitizes: ClassVar[bool] = True
+
     def __init__(
         self,
         *,
-        layer_group_ids: tuple[str, ...],
         layer_types: tuple[str, ...],
         **kwargs,
     ):
         self._layer_types = tuple(layer_types)
-        group_ids = tuple(layer_group_ids)
-        self._group_ids_by_layer = dict(enumerate(group_ids))
         self._state_buffers_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.requires_page_zeroing = True
 
-        layer_num = kwargs["layer_num"]
-        if len(self._layer_types) != layer_num:
+        if len(self._layer_types) != kwargs["layer_num"]:
             raise ValueError("cache layer types must cover every model layer")
-        if len(group_ids) != layer_num:
-            raise ValueError("cache group ids must cover every model layer")
 
-        super().__init__(
-            layer_group_ids=group_ids,
-            **kwargs,
-        )
+        super().__init__(**kwargs)
 
     # A KDA layer has conv/recurrent planes planned and an MLA layer has a
     # latent plane; the plan's field list decides per layer. Latent-page
@@ -89,36 +88,18 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
     def state_slabs(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
         return list(self._state_buffers_by_layer.values())
 
-    def group_id_for_layer(self, layer_id: int) -> str:
-        try:
-            return self._group_ids_by_layer[layer_id]
-        except KeyError as exc:
-            raise ValueError(f"layer {layer_id} has no cache group") from exc
-
-    @override
-    def set_mla_kv_buffer(
-        self,
-        layer,
-        loc: torch.Tensor,
-        cache_k_nope: torch.Tensor,
-        cache_k_rope: torch.Tensor,
-        sanitize: bool = True,
-    ):
-        """Latent write that sanitizes by default -- a fact of this cache.
-
-        Prefill breakable-graph padding contract: the dummy-batch capture (and
-        bucket-padding rows) whose ``out_cache_loc`` is the reserved
-        ``dummy_kv_slot`` can carry NaN into this fp8 KV write. The paged MLA
-        decode kernel reads that shared dummy slot through the zero-padded
-        block-table entries and computes ``q·k`` BEFORE applying the causal
-        mask, so the NaN survives it (``NaN + -inf = NaN``) and poisons a live
-        row's softmax -> NaN logits -> token 0. Eager prefill leaves the dummy
-        slot finite (``q·0`` masks cleanly), which is why the bug only appears
-        with the prefill graph on. Sanitizing in-kernel keeps real rows bitwise
-        unchanged without allocating two temporary tensors.
-        """
-        super().set_mla_kv_buffer(
-            layer, loc, cache_k_nope, cache_k_rope, sanitize=sanitize
+    @cached_property
+    def state_group_by_layer(self) -> dict[int, str]:
+        """View-local state layer id -> its state-family cache group id."""
+        return derive_state_groups_by_layer(
+            self.arena,
+            first_layer=self._field_layer_offset,
+            num_layers=self.layer_num,
+            state_layer_ids=(
+                layer_id
+                for layer_id, label in enumerate(self._layer_types)
+                if label in STATE_LAYER_TYPES
+            ),
         )
 
     def get_component(self, layer_id: int, component_name: str) -> torch.Tensor:

@@ -83,6 +83,7 @@ def _decode_sigmoid_bias_topk(
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
     logical_to_physical_map: torch.Tensor | None = None,
+    weights_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Route one decode token using biased sigmoid scores.
 
@@ -96,7 +97,7 @@ def _decode_sigmoid_bias_topk(
             router expert ids to physical expert ids.
 
     Returns:
-        ``(topk_weights, topk_ids)`` shaped ``[1, topk]`` with FP32 weights
+        ``(topk_weights, topk_ids)`` shaped ``[1, topk]`` with ``weights_dtype``
         and INT32 ids.
     """
     experts = router_logits.shape[1] if router_logits.ndim == 2 else 0
@@ -138,7 +139,7 @@ def _decode_sigmoid_bias_topk(
     )
     topk_weights = torch.empty(
         (1, topk),
-        dtype=torch.float32,
+        dtype=weights_dtype,
         device=router_logits.device,
     )
     padded_experts = triton.next_power_of_2(experts)
@@ -183,6 +184,7 @@ def triton_decode_sigmoid_bias_topk(
     topk: int,
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
+    weights_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _decode_sigmoid_bias_topk(
         router_logits,
@@ -190,6 +192,7 @@ def triton_decode_sigmoid_bias_topk(
         topk=topk,
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
+        weights_dtype=weights_dtype,
     )
 
 
@@ -216,6 +219,7 @@ def triton_decode_sigmoid_bias_topk_mapped(
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
     logical_to_physical_map: torch.Tensor,
+    weights_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _decode_sigmoid_bias_topk(
         router_logits,
@@ -224,6 +228,7 @@ def triton_decode_sigmoid_bias_topk_mapped(
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
         logical_to_physical_map=logical_to_physical_map,
+        weights_dtype=weights_dtype,
     )
 
 

@@ -224,9 +224,33 @@ class QwenGDNRecipe(CacheRecipe):
         # Replay reconstructs the ssm state, so only the conv checkpoint is
         # staged; the backend reads the same decision off attn_config.
         suffixes = (".conv",) if self.replay_ssm else (".conv", ".ssm")
-        return verify_rows * sum(
+        staged = verify_rows * sum(
             field.payload_bytes
             for _, fields in self.groups()
             for field in fields
             if field.field_id.endswith(suffixes)
         )
+        if self.replay_ssm:
+            return staged + self._replay_payload_bytes()
+        return staged
+
+    def _replay_payload_bytes(self) -> int:
+        """Captured verify projections, stacked per GDN layer.
+
+        Mirrors ``_GDNReplayWorkspace``: one key/value/a/b payload row per
+        draft position in the model dtype, plus the per-layer fp32
+        ``A_log``/``dt_bias`` pair.
+        """
+        conv_shape, _, ssm_shape, _ = self._state_shapes
+        num_v_heads, head_v_dim, _ = ssm_shape
+        key_width = (conv_shape[0] - num_v_heads * head_v_dim) // 2
+        row_width = key_width + num_v_heads * head_v_dim + 2 * num_v_heads
+        num_layers = sum(
+            layer_type == LINEAR_ATTENTION for layer_type in self.target_layer_types
+        )
+        rows = self.attn_config.max_bs * int(
+            self.server_args.speculative_num_draft_tokens
+        )
+        payload = num_layers * rows * row_width * self.attn_config.dtype.itemsize
+        parameters = num_layers * 2 * num_v_heads * torch.float32.itemsize
+        return payload + parameters

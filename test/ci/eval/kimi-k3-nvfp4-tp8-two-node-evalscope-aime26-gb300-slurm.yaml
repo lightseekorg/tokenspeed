@@ -1,0 +1,62 @@
+api_version: ci.tokenspeed.io/v1
+# NVFP4 sibling of the mxfp4 two-node gate: identical serve shape, but the
+# ModelOpt MIXED_PRECISION checkpoint (NVFP4 SiTU experts + FP8_PB_WO
+# attention kept FP8-resident). The pinned checkpoint is loaded from the
+# node-local RAID mounted at /models; the 7200s readiness timeout also covers
+# first-boot trtllm-gen NVFP4 cubin autotuning (~15 min).
+name: eval-kimi-k3-nvfp4-tp8-two-node-aime26-gb300-slurm
+type: eval
+workflow_stage: model-test
+triggers:
+  - per-commit
+runner:
+  labels:
+    - slurm-gb300-4gpu
+slurm:
+  nodes: 2
+  gpus_per_node: 4
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+  - python3 -m pip install flash-linear-attention
+server:
+  command: >-
+    ts serve /models/nvidia--Kimi-K3-NVFP4/f8c5234a0a880bcc6cbf779a315e7ee2f405b812
+    --served-model-name kimi-k3
+    --trust-remote-code
+    --max-model-len 65536
+    --kv-cache-dtype fp8
+    --tensor-parallel-size 8
+    --mm-encoder-tp-mode data
+    --moe-backend flashinfer_trtllm
+    --gpu-memory-utilization 0.94
+    --max-num-seqs 16
+    --disable-kvstore
+    --host 0.0.0.0
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 7200
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model kimi-k3
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets aime26
+    --dataset-hub huggingface
+    --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
+    --eval-batch-size 16
+    --stream
+    --generation-config '{"do_sample":true,"temperature":1.0,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'
+report:
+  github_step_summary: true
+# Same bar as the mxfp4 sibling gate. NVFP4 measured 0.9333-0.9667 on the
+# 65536-token evalscope protocol (tp16, PR #1128); the mxfp4 sibling records
+# 0.9333 on this exact 32768-token CI protocol.
+score_threshold: 0.90

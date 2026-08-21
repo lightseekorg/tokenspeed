@@ -18,39 +18,56 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Runtime-side ``cu_seqlens_cpu`` hint construction for the KDA backend.
+"""Metadata-side ``cu_extend_seq_lens_cpu`` construction for linear attention.
 
-The hint tuple must equal the contents of ``query_start_loc`` (a wrong hint
-silently corrupts the CuteDSL host chunk plan), so the builder returns
-``None`` on any absence or length misalignment rather than guessing.
+The tuple must equal the contents of ``query_start_loc`` (a wrong hint
+silently corrupts the CuteDSL host chunk plan). Both are built together by
+``init_forward_metadata`` once per extend batch — mirroring MHA's
+``cu_extend_seq_lens_cpu`` — so the builder raises on absence or length
+misalignment instead of silently degrading to the wrapper's boundary
+re-read.
 """
 
 from __future__ import annotations
 
-import torch
+import os
+import sys
 
-from tokenspeed.runtime.layers.attention.backends.hybrid_kda import (
-    _cu_seqlens_cpu_hint,
+_TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _TEST_DIR)
+sys.path.insert(0, os.path.dirname(_TEST_DIR))
+
+import pytest
+import torch
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
+
+from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
+    _build_cu_extend_seq_lens_cpu,
 )
 
 
 def test_prefix_sum_matches_query_start_loc_contents() -> None:
     lens = torch.tensor([3, 5, 2], dtype=torch.int32)
-    assert _cu_seqlens_cpu_hint(lens, expected_len=4) == (0, 3, 8, 10)
+    assert _build_cu_extend_seq_lens_cpu(lens, expected_len=4) == (0, 3, 8, 10)
 
 
-def test_absent_lens_yield_none() -> None:
-    assert _cu_seqlens_cpu_hint(None, expected_len=4) is None
+def test_absent_lens_raise() -> None:
+    with pytest.raises(RuntimeError, match="host extend lengths"):
+        _build_cu_extend_seq_lens_cpu(None, expected_len=4)
 
 
-def test_length_misalignment_yields_none() -> None:
+def test_length_misalignment_raises() -> None:
     lens = torch.tensor([3, 5], dtype=torch.int32)
     # query_start_loc has 4 entries but only 2 lens -> 3 bounds: mismatch.
-    assert _cu_seqlens_cpu_hint(lens, expected_len=4) is None
+    with pytest.raises(RuntimeError, match="disagree with query_start_loc"):
+        _build_cu_extend_seq_lens_cpu(lens, expected_len=4)
     # And the over-long case.
-    assert _cu_seqlens_cpu_hint(lens, expected_len=2) is None
+    with pytest.raises(RuntimeError, match="disagree with query_start_loc"):
+        _build_cu_extend_seq_lens_cpu(lens, expected_len=2)
 
 
 def test_single_sequence() -> None:
     lens = torch.tensor([129104], dtype=torch.int32)
-    assert _cu_seqlens_cpu_hint(lens, expected_len=2) == (0, 129104)
+    assert _build_cu_extend_seq_lens_cpu(lens, expected_len=2) == (0, 129104)

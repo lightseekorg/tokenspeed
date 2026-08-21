@@ -2411,7 +2411,9 @@ class KimiLinearModel(nn.Module):
         self.mapping = mapping
         self.quant_config = quant_config
 
-        alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        alt_stream = (
+            torch.cuda.Stream(priority=-1) if torch.cuda.is_available() else None
+        )
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,

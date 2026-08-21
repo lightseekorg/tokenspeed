@@ -1,0 +1,71 @@
+api_version: ci.tokenspeed.io/v1
+# NVFP4 target + DSpark speculative decoding, on the same two-node shape as
+# the speculator-free NVFP4 gate. Speculative flags follow the proven AMD
+# DSpark gate (kimi-k3-dspark-mxfp4-tp8ep8-evalscope-aime26-amd.yaml):
+# --disable-prefill-graph because prefill graphs add ~40 capture buckets on
+# top of the decode ones the speculator rides on, and the draft weights plus
+# its BF16 cache (kept BF16 automatically when the target KV is FP8) need the
+# headroom — hence also the lower 0.92 memory fraction.
+name: eval-kimi-k3-nvfp4-dspark-tp8-two-node-aime26-gb300-slurm
+type: eval
+workflow_stage: model-test
+triggers:
+  - per-commit
+runner:
+  labels:
+    - slurm-gb300-4gpu
+slurm:
+  nodes: 2
+  gpus_per_node: 4
+env:
+  CI: "true"
+  TOKENSPEED_DFLASH_AUX_STREAM: attn_res
+install:
+  - bash test/ci_system/install_deps.sh
+  - python3 -m pip install flash-linear-attention
+server:
+  command: >-
+    ts serve /models/nvidia--Kimi-K3-NVFP4/f8c5234a0a880bcc6cbf779a315e7ee2f405b812
+    --served-model-name kimi-k3
+    --speculative-algorithm DSPARK
+    --speculative-draft-model-path /models/Inferact--Kimi-K3-DSpark/cf6b8244620e7ea4b0651d214f28e89eac75bed6
+    --speculative-num-draft-tokens 8
+    --drafter-attention-backend mla
+    --trust-remote-code
+    --max-model-len 65536
+    --kv-cache-dtype fp8
+    --tensor-parallel-size 8
+    --mm-encoder-tp-mode data
+    --moe-backend flashinfer_trtllm
+    --gpu-memory-utilization 0.92
+    --max-num-seqs 16
+    --disable-prefill-graph
+    --disable-kvstore
+    --host 0.0.0.0
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 7200
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model kimi-k3
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets aime26
+    --dataset-hub huggingface
+    --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
+    --eval-batch-size 16
+    --stream
+    --generation-config '{"do_sample":true,"temperature":1.0,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'
+report:
+  github_step_summary: true
+# Same bar as the speculator-free NVFP4 gate: DSpark preserves the target's
+# distribution rather than its exact tokens, so the score is the correctness
+# check that matters (see the AMD DSpark gate's same-machine control for the
+# accuracy/TPOT evidence).
+score_threshold: 0.90

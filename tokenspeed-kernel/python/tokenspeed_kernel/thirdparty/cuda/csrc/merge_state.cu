@@ -38,40 +38,48 @@ __global__ void MergeStateKernel(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* 
 
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t pos = blockIdx.x;
-  uint32_t head_idx = ty;
+  uint32_t head_idx = blockIdx.y * blockDim.y + ty;
+  // Rows past num_heads are launch padding (gridDim.y * blockDim.y rounds up
+  // to cover all heads). They skip every load/store but must still reach the
+  // sync below — an early return would diverge around __syncwarp/__syncthreads.
+  const bool active = head_idx < num_heads;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;");
 #endif
-  // Load phase: snapshot every aliasable input into registers before any store fires.
-  float s_a_val = s_a[pos * num_heads + head_idx] * lse_scale_log2;
-  float s_b_val = s_b[pos * num_heads + head_idx] * lse_scale_log2;
-  vec_t<float, kVecSize> v_a_vec, v_b_vec, v_merged_vec;
-  v_a_vec.cast_load(v_a + (pos * num_heads + head_idx) * HeadDim + tx * kVecSize);
-  v_b_vec.cast_load(v_b + (pos * num_heads + head_idx) * HeadDim + tx * kVecSize);
+  float s_a_val = 0.f, s_b_val = 0.f, s_max = 0.f;
+  if (active) {
+    // Load phase: snapshot every aliasable input into registers before any store fires.
+    s_a_val = s_a[pos * num_heads + head_idx] * lse_scale_log2;
+    s_b_val = s_b[pos * num_heads + head_idx] * lse_scale_log2;
+    vec_t<float, kVecSize> v_a_vec, v_b_vec, v_merged_vec;
+    v_a_vec.cast_load(v_a + (pos * num_heads + head_idx) * HeadDim + tx * kVecSize);
+    v_b_vec.cast_load(v_b + (pos * num_heads + head_idx) * HeadDim + tx * kVecSize);
 
-  // Compute phase: register-only.
-  float s_max = max(s_a_val, s_b_val);
-  s_a_val = math::ptx_exp2(s_a_val - s_max);
-  s_b_val = math::ptx_exp2(s_b_val - s_max);
-  float a_scale = s_a_val / (s_a_val + s_b_val);
-  float b_scale = s_b_val / (s_a_val + s_b_val);
+    // Compute phase: register-only.
+    s_max = max(s_a_val, s_b_val);
+    s_a_val = math::ptx_exp2(s_a_val - s_max);
+    s_b_val = math::ptx_exp2(s_b_val - s_max);
+    float a_scale = s_a_val / (s_a_val + s_b_val);
+    float b_scale = s_b_val / (s_a_val + s_b_val);
 #pragma unroll
-  for (uint32_t i = 0; i < kVecSize; ++i) {
-    v_merged_vec[i] = a_scale * v_a_vec[i] + b_scale * v_b_vec[i];
+    for (uint32_t i = 0; i < kVecSize; ++i) {
+      v_merged_vec[i] = a_scale * v_a_vec[i] + b_scale * v_b_vec[i];
+    }
+
+    // v_merged store: per-lane disjoint slice, no cross-lane ordering needed.
+    v_merged_vec.cast_store(v_merged + (pos * num_heads + head_idx) * HeadDim + tx * kVecSize);
   }
 
-  // v_merged store: per-lane disjoint slice, no cross-lane ordering needed.
-  v_merged_vec.cast_store(v_merged + (pos * num_heads + head_idx) * HeadDim + tx * kVecSize);
-
   // s_merged store: kBdx lanes share one slot. Sync so every lane's s_a load
-  // is complete before the writer fires, then a single lane writes.
+  // is complete before the writer fires, then a single lane writes. Every
+  // row — active or padding — participates in the sync.
   if constexpr (kBdx <= 32) {
     __syncwarp();
   } else {
     __syncthreads();
   }
-  if (tx == 0) {
+  if (active && tx == 0) {
     s_merged[pos * num_heads + head_idx] =
         (math::ptx_log2(s_a_val + s_b_val) + s_max) * lse_scale_inv;
   }
@@ -93,8 +101,17 @@ cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DType
   DISPATCH_HEAD_DIM(head_dim, HeadDim, {
     constexpr size_t kVecSize = std::max(16U / sizeof(DTypeIn), HeadDim / 32U);
     constexpr size_t kBdx = HeadDim / kVecSize;
-    uint32_t bdy = num_heads;
-    dim3 nblks(seq_len);
+    // Blocks are capped at 1024 threads, so large head counts (e.g. MLA at
+    // attn tp=1: 96 heads x kBdx=16 = 1536) tile across gridDim.y: groups is
+    // the fewest blocks that respect the cap, and bdy spreads the heads
+    // evenly so the whole launch carries at most bdy-1 padding rows, which
+    // the kernel masks with its `active` guard (96 heads -> 2x48 exact;
+    // 97 -> 2x49 with a single padding row). ceil(H/ceil(H/M)) <= M, so the
+    // cap holds for every head count.
+    constexpr uint32_t kMaxBdy = static_cast<uint32_t>(1024 / kBdx);
+    uint32_t groups = (num_heads + kMaxBdy - 1) / kMaxBdy;
+    uint32_t bdy = (num_heads + groups - 1) / groups;
+    dim3 nblks(seq_len, groups);
     dim3 nthrs(static_cast<uint32_t>(kBdx), bdy);
     auto kernel = MergeStateKernel<HeadDim, DTypeIn, DTypeO>;
 
@@ -147,6 +164,10 @@ void merge_state(TensorView v_a, TensorView s_a, TensorView v_b, TensorView s_b,
   unsigned int seq_len = v_a.size(0);
   unsigned int num_heads = v_a.size(1);
   unsigned int head_dim = v_a.size(2);
+  // An empty head axis would make the launcher's group math divide by zero
+  // (groups = ceil(0/kMaxBdy) = 0, host-side SIGFPE); reject it as a
+  // catchable error instead.
+  TVM_FFI_ICHECK_GT(num_heads, 0) << "merge_state requires num_heads > 0";
 
   cudaSetDevice(v_a.device().device_id);
   const cudaStream_t stream = get_stream(v_a.device());
