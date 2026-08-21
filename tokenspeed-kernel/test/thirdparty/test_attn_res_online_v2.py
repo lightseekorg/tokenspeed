@@ -20,10 +20,7 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.thirdparty.cuda.attn_res import (
-    attn_res_fwd_packed,
-    attn_res_fwd_packed_v2,
-)
+from tokenspeed_kernel.thirdparty.cuda.attn_res import attn_res_fwd_packed
 
 
 def _blackwell_available() -> bool:
@@ -98,7 +95,7 @@ def test_online_v2_matches_reference(
         num_blocks,
         1e-5,
     )
-    actual = attn_res_fwd_packed_v2(
+    actual = attn_res_fwd_packed(
         layer,
         blocks,
         res_weight,
@@ -128,15 +125,14 @@ def test_online_v2_cuda_graph_capture(with_out_norm: bool) -> None:
         else None
     )
 
-    attn_res_fwd_packed_v2(layer, blocks, res_weight, rms_weight, 1e-5, out_norm_weight)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = attn_res_fwd_packed_v2(
-            layer, blocks, res_weight, rms_weight, 1e-5, out_norm_weight
-        )
-    graph.replay()
     expected = attn_res_fwd_packed(
         layer, blocks, res_weight, rms_weight, 1e-5, out_norm_weight
     )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = attn_res_fwd_packed(
+            layer, blocks, res_weight, rms_weight, 1e-5, out_norm_weight
+        )
+    graph.replay()
 
     torch.testing.assert_close(captured, expected, atol=0.5, rtol=2e-2)

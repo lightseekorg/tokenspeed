@@ -477,7 +477,6 @@ KERNEL_GROUPS = [
     (
         "attn_res",
         [
-            CUDA_CSRC_DIR / "attn_res" / "attn_res_fwd_tma.cu",
             CUDA_CSRC_DIR / "attn_res" / "attn_res_fwd_online_v2.cu",
             CUDA_CSRC_DIR / "attn_res_binding.cu",
         ],

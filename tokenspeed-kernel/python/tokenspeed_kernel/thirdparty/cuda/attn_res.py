@@ -48,91 +48,7 @@ def has_attn_res_fwd() -> bool:
     return hasattr(module, "attn_res_fwd")
 
 
-def _attn_res_fwd_packed(
-    module_entry: str,
-    layer_residual: torch.Tensor,
-    block_residual: torch.Tensor,
-    res_weight: torch.Tensor,
-    rms_weight: torch.Tensor,
-    rms_eps: float = 1e-6,
-    out_norm_weight: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Fused Attention-Residual forward (RMSNorm + per-candidate softmax + mix).
-
-    Candidates are ``block_residual[0..K-1]`` then ``layer_residual`` (N=K+1).
-    All inputs must be contiguous bf16 CUDA tensors; supports B=1, N in [1,12],
-    T in [1,16384], H a multiple of 1024 in [4096,8192].
-
-    Args:
-        layer_residual: bf16 ``[T, B, H]`` current residual stream.
-        block_residual: bf16 ``[K, T, B, H]`` periodic snapshots.
-        res_weight: bf16 ``[H]`` scorer projection weight.
-        rms_weight: bf16 ``[H]`` RMSNorm weight.
-        rms_eps: RMSNorm epsilon.
-        out_norm_weight: optional bf16 ``[H]``; when given the following RMSNorm
-            (same eps) is fused into the epilogue: ``rmsnorm(mix) * weight``.
-
-    Returns:
-        bf16 ``[T, B, H]`` mixed residual.
-    """
-    T, B, H = layer_residual.shape
-    N = block_residual.shape[0] + 1
-    output = torch.empty_like(layer_residual)
-    # rsigma/probs/logits preserve the shared caller-owned ABI. The existing
-    # kernel writes them; online-v2 leaves them unused.
-    rsigma = torch.empty((N, T, B), device=layer_residual.device, dtype=torch.float32)
-    probs = torch.empty_like(rsigma)
-    logits = torch.empty_like(rsigma)
-    module = _load_attn_res_module()
-    if out_norm_weight is None:
-        getattr(module, module_entry)(
-            layer_residual,
-            block_residual,
-            res_weight,
-            rms_weight,
-            output,
-            rsigma,
-            probs,
-            logits,
-            float(rms_eps),
-        )
-    else:
-        getattr(module, f"{module_entry}_out_norm")(
-            layer_residual,
-            block_residual,
-            res_weight,
-            rms_weight,
-            out_norm_weight,
-            output,
-            rsigma,
-            probs,
-            logits,
-            float(rms_eps),
-        )
-    return output
-
-
 def attn_res_fwd_packed(
-    layer_residual: torch.Tensor,
-    block_residual: torch.Tensor,
-    res_weight: torch.Tensor,
-    rms_weight: torch.Tensor,
-    rms_eps: float = 1e-6,
-    out_norm_weight: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Run the existing NVIDIA DevTech packed AttnRes kernel."""
-    return _attn_res_fwd_packed(
-        "attn_res_fwd",
-        layer_residual,
-        block_residual,
-        res_weight,
-        rms_weight,
-        rms_eps,
-        out_norm_weight,
-    )
-
-
-def attn_res_fwd_packed_v2(
     layer_residual: torch.Tensor,
     block_residual: torch.Tensor,
     res_weight: torch.Tensor,
@@ -142,13 +58,27 @@ def attn_res_fwd_packed_v2(
     delta: torch.Tensor | None = None,
     num_blocks: int | None = None,
 ) -> torch.Tensor:
-    """Run the NVIDIA online-v2 AttnRes rewrite for H=7168.
+    """Fused Attention-Residual forward (RMSNorm + per-candidate softmax + mix).
 
-    ``delta`` is added into ``layer_residual`` in place before that residual is
-    used as the final candidate, matching Kimi K3's pending-residual semantics.
-    ``num_blocks`` selects a prefix of the block capacity and defaults to all
-    blocks. This measurement-only entry does not affect runtime dispatch
-    through attn_res_fwd_packed.
+    Candidates are ``block_residual[0..num_blocks-1]`` then ``layer_residual``
+    (N = num_blocks + 1). All inputs must be contiguous bf16 CUDA tensors;
+    supports B = 1, N in [1, 12], T in [1, 16384], H = 7168.
+
+    Args:
+        layer_residual: bf16 ``[T, B, H]`` current residual stream; updated in
+            place when ``delta`` is given (Kimi K3's pending-residual add).
+        block_residual: bf16 ``[K, T, B, H]`` periodic snapshots.
+        res_weight: bf16 ``[H]`` scorer projection weight.
+        rms_weight: bf16 ``[H]`` RMSNorm weight.
+        rms_eps: RMSNorm epsilon.
+        out_norm_weight: optional bf16 ``[H]``; when given the following RMSNorm
+            (same eps) is fused into the epilogue: ``rmsnorm(mix) * weight``.
+        delta: optional bf16 ``[T, B, H]`` added into ``layer_residual`` before
+            it is used as the final candidate.
+        num_blocks: selects a prefix of the block capacity (default: all).
+
+    Returns:
+        bf16 ``[T, B, H]`` mixed residual.
     """
     block_count = block_residual.shape[0] if num_blocks is None else num_blocks
     if not 0 <= block_count <= block_residual.shape[0]:
@@ -156,18 +86,12 @@ def attn_res_fwd_packed_v2(
             f"num_blocks must be in [0, {block_residual.shape[0]}], got "
             f"{block_count}"
         )
-
-    T, B, _ = layer_residual.shape
-    N = block_count + 1
     output = torch.empty_like(layer_residual)
-    rsigma = torch.empty((N, T, B), device=layer_residual.device, dtype=torch.float32)
-    probs = torch.empty_like(rsigma)
-    logits = torch.empty_like(rsigma)
     module = _load_attn_res_module()
     args = (layer_residual, delta, block_residual, res_weight, rms_weight)
     if out_norm_weight is not None:
         args += (out_norm_weight,)
-    args += (output, rsigma, probs, logits, int(block_count), float(rms_eps))
-    entry = "attn_res_fwd_v2" + ("_out_norm" if out_norm_weight is not None else "")
+    args += (output, int(block_count), float(rms_eps))
+    entry = "attn_res_fwd" + ("_out_norm" if out_norm_weight is not None else "")
     getattr(module, entry)(*args)
     return output
