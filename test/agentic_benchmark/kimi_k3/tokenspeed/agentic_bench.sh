@@ -9,9 +9,9 @@ pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@$
 [ -f build_swe_smith_dataset.py ] || wget https://raw.githubusercontent.com/modelscope/evalscope/${EVALSCOPE_COMMIT}/examples/perf/build_swe_smith_dataset.py \
     -O build_swe_smith_dataset.py
 
-# Note: Only 83 conversations can be built
+# Note: Only 71 conversations can be built (measured with the Kimi-K3 tokenizer)
 [ -f agentic_dataset.json ] || python3 build_swe_smith_dataset.py \
-    --model nvidia/Kimi-K3-NVFP4 \
+    --model moonshotai/Kimi-K3 \
     --first-turn-length 50000 \
     --subsequent-turn-length 800 \
     --min-turns 10 \
