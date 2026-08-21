@@ -105,13 +105,18 @@ def fused_recurrent_kda_pool_fwd_kernel(
 
     mask_k = o_k < K
     mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
+    if V_MAJOR:
+        mask_h = mask_v[:, None] & mask_k[None, :]
+    else:
+        mask_h = mask_k[:, None] & mask_v[None, :]
 
     b_read = tl.load(read_indices + i_n).to(tl.int64)
-    b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    state_off = o_k[:, None] * V + o_v[None, :]
     if V_MAJOR:
-        state_off = o_v[None, :] * K + o_k[:, None]
+        b_h = tl.zeros([BV, BK], dtype=tl.float32)
+        state_off = o_v[:, None] * K + o_k[None, :]
+    else:
+        b_h = tl.zeros([BK, BV], dtype=tl.float32)
+        state_off = o_k[:, None] * V + o_v[None, :]
     p_h0 = h_pool + b_read * stride_state_page + i_hv * K * V + state_off
     b_h += tl.load(p_h0, mask=mask_h & (b_read >= 0), other=0).to(tl.float32)
 
@@ -146,14 +151,22 @@ def fused_recurrent_kda_pool_fwd_kernel(
         else:
             b_gk = b_g
 
-        b_h *= tl.exp(b_gk[:, None])
-        b_v -= tl.sum(b_h * b_k[:, None], 0)
+        if V_MAJOR:
+            b_h *= tl.exp(b_gk)[None, :]
+            b_v -= tl.sum(b_h * b_k[None, :], axis=1)
+        else:
+            b_h *= tl.exp(b_gk[:, None])
+            b_v -= tl.sum(b_h * b_k[:, None], 0)
         b_beta = tl.load(p_beta, eviction_policy="evict_last").to(tl.float32)
         if APPLY_BETA_SIGMOID:
             b_beta = tl.sigmoid(b_beta)
         b_v *= b_beta
-        b_h += b_k[:, None] * b_v[None, :]
-        b_o = tl.sum(b_h * b_q[:, None], 0)
+        if V_MAJOR:
+            b_h += b_v[:, None] * b_k[None, :]
+            b_o = tl.sum(b_h * b_q[None, :], axis=1)
+        else:
+            b_h += b_k[:, None] * b_v[None, :]
+            b_o = tl.sum(b_h * b_q[:, None], 0)
         tl.store(
             p_o,
             b_o.to(p_o.dtype.element_ty),
@@ -1445,6 +1458,11 @@ def _kda_window_step(
     g_at,
     scale,
     COMPUTE_OUT: tl.constexpr,
+    TRANSPOSE_STATE: tl.constexpr,
+    conv_qkv=None,
+    stride_conv_qkv_tok: tl.constexpr = 0,
+    HAS_PRECOMPUTED_GATE: tl.constexpr = False,
+    HAS_PRECOMPUTED_CONV: tl.constexpr = False,
 ):
     """One KDA token step: conv(+silu), f_b gate GEMV, delta-rule update.
 
@@ -1456,53 +1474,71 @@ def _kda_window_step(
     attention output (zeros unless ``COMPUTE_OUT``; replayed positions never
     need it, and skipping it drops the output dot from the critical path).
     """
-    x_q = tl.load(qkv_raw + tok * stride_raw_tok + qf, mask=mask_k, other=0.0).to(
-        tl.float32
-    )
-    x_k = tl.load(qkv_raw + tok * stride_raw_tok + kf, mask=mask_k, other=0.0).to(
-        tl.float32
-    )
-    x_v = tl.load(qkv_raw + tok * stride_raw_tok + vf, mask=mask_v, other=0.0).to(
-        tl.float32
-    )
-
-    acc_q = x_q * w_q3 + s_q0 * w_q0 + s_q1 * w_q1 + s_q2 * w_q2
-    acc_k = x_k * w_k3 + s_k0 * w_k0 + s_k1 * w_k1 + s_k2 * w_k2
-    acc_v = x_v * w_v3 + s_v0 * w_v0 + s_v1 * w_v1 + s_v2 * w_v2
-    b_q = acc_q * tl.sigmoid(acc_q)
-    b_k = acc_k * tl.sigmoid(acc_k)
-    b_v = acc_v * tl.sigmoid(acc_v)
-
-    # roll the window: after consuming x_t the taps are (x_{t-2}, x_{t-1}, x_t)
-    s_q0, s_q1, s_q2 = s_q1, s_q2, x_q
-    s_k0, s_k1, s_k2 = s_k1, s_k2, x_k
-    s_v0, s_v1, s_v2 = s_v1, s_v2, x_v
+    if HAS_PRECOMPUTED_CONV:
+        cq = conv_qkv + tok * stride_conv_qkv_tok
+        b_q = tl.load(cq + qf, mask=mask_k, other=0.0).to(tl.float32)
+        b_k = tl.load(cq + kf, mask=mask_k, other=0.0).to(tl.float32)
+        b_v = tl.load(cq + vf, mask=mask_v, other=0.0).to(tl.float32)
+    else:
+        x_q = tl.load(qkv_raw + tok * stride_raw_tok + qf, mask=mask_k, other=0.0).to(
+            tl.float32
+        )
+        x_k = tl.load(qkv_raw + tok * stride_raw_tok + kf, mask=mask_k, other=0.0).to(
+            tl.float32
+        )
+        x_v = tl.load(qkv_raw + tok * stride_raw_tok + vf, mask=mask_v, other=0.0).to(
+            tl.float32
+        )
+        acc_q = x_q * w_q3 + s_q0 * w_q0 + s_q1 * w_q1 + s_q2 * w_q2
+        acc_k = x_k * w_k3 + s_k0 * w_k0 + s_k1 * w_k1 + s_k2 * w_k2
+        acc_v = x_v * w_v3 + s_v0 * w_v0 + s_v1 * w_v1 + s_v2 * w_v2
+        b_q = acc_q * tl.sigmoid(acc_q)
+        b_k = acc_k * tl.sigmoid(acc_k)
+        b_v = acc_v * tl.sigmoid(acc_v)
+        s_q0, s_q1, s_q2 = s_q1, s_q2, x_q
+        s_k0, s_k1, s_k2 = s_k1, s_k2, x_k
+        s_v0, s_v1, s_v2 = s_v1, s_v2, x_v
 
     # f_b gate for this token: read it, or run the GEMV inline. Reading wins
     # whenever the caller can amortize the [K, D_FA] weight tile -- held live
     # across the recurrence it costs 128 registers per thread and spills.
-    b_gk = tl.load(g_at, mask=mask_k, other=0.0)
+    if HAS_PRECOMPUTED_GATE:
+        b_gk = g_at
+    else:
+        b_gk = tl.load(g_at, mask=mask_k, other=0.0)
 
     b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
     b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
     b_q = b_q * scale
 
-    b_h *= tl.exp(b_gk[:, None])
-    b_v = b_v - tl.sum(b_h * b_k[:, None], 0)
+    if TRANSPOSE_STATE:
+        b_h *= tl.exp(b_gk)[None, :]
+        b_v = b_v - tl.sum(b_h * b_k[None, :], axis=1)
+    else:
+        b_h *= tl.exp(b_gk[:, None])
+        b_v = b_v - tl.sum(b_h * b_k[:, None], 0)
     b_beta = tl.load(beta + tok * stride_beta_tok + i_hv).to(tl.float32)
     b_beta = tl.sigmoid(b_beta)
     b_v *= b_beta
-    b_h += b_k[:, None] * b_v[None, :]
+    if TRANSPOSE_STATE:
+        b_h += b_v[:, None] * b_k[None, :]
+    else:
+        b_h += b_k[:, None] * b_v[None, :]
     b_o = tl.zeros_like(b_v)
     if COMPUTE_OUT:
-        b_o = tl.sum(b_h * b_q[:, None], 0)
+        if TRANSPOSE_STATE:
+            b_o = tl.sum(b_h * b_q[None, :], axis=1)
+        else:
+            b_o = tl.sum(b_h * b_q[:, None], 0)
     return s_q0, s_q1, s_q2, s_k0, s_k1, s_k2, s_v0, s_v1, s_v2, b_h, b_o
 
 
-# Pool/window/batched kernels intentionally retain weak-form V-major tiles.
+# Pool/window/batched kernels use strong-form V-major state tiles.
 @triton.jit
 def fused_recurrent_kda_window_fwd_kernel(
     qkv_raw,  # [N*T, 3*P] pre-conv packed projections (token-strided)
+    g_raw,  # [N*T, P] optional precomputed raw f_b gate
+    conv_qkv,  # [N*T, 3*P] optional precomputed conv(+silu) q|k|v
     conv_w,  # [3*P, 4] fused conv bank
     conv_pool,  # [pages, 3*P, 3] committed conv state (read-only here)
     beta,
@@ -1513,6 +1549,8 @@ def fused_recurrent_kda_window_fwd_kernel(
     write_indices,  # [N] destination page per request (STORE_FINAL only)
     n_steps,  # [N] tokens to consume per request (HAS_N_STEPS only)
     stride_raw_tok: tl.constexpr,
+    stride_graw_tok: tl.constexpr,
+    stride_conv_qkv_tok: tl.constexpr,
     stride_beta_tok: tl.constexpr,
     g,
     stride_g_tok: tl.constexpr,
@@ -1528,6 +1566,13 @@ def fused_recurrent_kda_window_fwd_kernel(
     stride_state_page: tl.constexpr,
     stride_state_out_page: tl.constexpr,
     stride_conv_page: tl.constexpr,
+    A_log,
+    dt_bias,
+    lower_bound,
+    HAS_DT_BIAS: tl.constexpr,
+    HAS_PRECOMPUTED_GATE: tl.constexpr,
+    HAS_PRECOMPUTED_CONV: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
     WRITE_OUTPUT: tl.constexpr,
     STORE_FINAL: tl.constexpr,
     HAS_N_STEPS: tl.constexpr,
@@ -1574,7 +1619,10 @@ def fused_recurrent_kda_window_fwd_kernel(
     o_v = i_v * BV + tl.arange(0, BV)
     mask_k = o_k < K
     mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
+    if V_MAJOR:
+        mask_h = mask_v[:, None] & mask_k[None, :]
+    else:
+        mask_h = mask_k[:, None] & mask_v[None, :]
 
     b_read = tl.load(read_indices + i_n).to(tl.int64)
     read_ok = b_read >= 0
@@ -1584,18 +1632,32 @@ def fused_recurrent_kda_window_fwd_kernel(
     vf = 2 * P + i_hv * V + o_v
 
     # conv taps (weights are loop-invariant)
-    w_q0 = tl.load(conv_w + qf * 4 + 0, mask=mask_k, other=0.0).to(tl.float32)
-    w_q1 = tl.load(conv_w + qf * 4 + 1, mask=mask_k, other=0.0).to(tl.float32)
-    w_q2 = tl.load(conv_w + qf * 4 + 2, mask=mask_k, other=0.0).to(tl.float32)
-    w_q3 = tl.load(conv_w + qf * 4 + 3, mask=mask_k, other=0.0).to(tl.float32)
-    w_k0 = tl.load(conv_w + kf * 4 + 0, mask=mask_k, other=0.0).to(tl.float32)
-    w_k1 = tl.load(conv_w + kf * 4 + 1, mask=mask_k, other=0.0).to(tl.float32)
-    w_k2 = tl.load(conv_w + kf * 4 + 2, mask=mask_k, other=0.0).to(tl.float32)
-    w_k3 = tl.load(conv_w + kf * 4 + 3, mask=mask_k, other=0.0).to(tl.float32)
-    w_v0 = tl.load(conv_w + vf * 4 + 0, mask=mask_v, other=0.0).to(tl.float32)
-    w_v1 = tl.load(conv_w + vf * 4 + 1, mask=mask_v, other=0.0).to(tl.float32)
-    w_v2 = tl.load(conv_w + vf * 4 + 2, mask=mask_v, other=0.0).to(tl.float32)
-    w_v3 = tl.load(conv_w + vf * 4 + 3, mask=mask_v, other=0.0).to(tl.float32)
+    if not HAS_PRECOMPUTED_CONV:
+        w_q0 = tl.load(conv_w + qf * 4 + 0, mask=mask_k, other=0.0).to(tl.float32)
+        w_q1 = tl.load(conv_w + qf * 4 + 1, mask=mask_k, other=0.0).to(tl.float32)
+        w_q2 = tl.load(conv_w + qf * 4 + 2, mask=mask_k, other=0.0).to(tl.float32)
+        w_q3 = tl.load(conv_w + qf * 4 + 3, mask=mask_k, other=0.0).to(tl.float32)
+        w_k0 = tl.load(conv_w + kf * 4 + 0, mask=mask_k, other=0.0).to(tl.float32)
+        w_k1 = tl.load(conv_w + kf * 4 + 1, mask=mask_k, other=0.0).to(tl.float32)
+        w_k2 = tl.load(conv_w + kf * 4 + 2, mask=mask_k, other=0.0).to(tl.float32)
+        w_k3 = tl.load(conv_w + kf * 4 + 3, mask=mask_k, other=0.0).to(tl.float32)
+        w_v0 = tl.load(conv_w + vf * 4 + 0, mask=mask_v, other=0.0).to(tl.float32)
+        w_v1 = tl.load(conv_w + vf * 4 + 1, mask=mask_v, other=0.0).to(tl.float32)
+        w_v2 = tl.load(conv_w + vf * 4 + 2, mask=mask_v, other=0.0).to(tl.float32)
+        w_v3 = tl.load(conv_w + vf * 4 + 3, mask=mask_v, other=0.0).to(tl.float32)
+    else:
+        w_q0 = tl.zeros([BK], dtype=tl.float32)
+        w_q1 = tl.zeros([BK], dtype=tl.float32)
+        w_q2 = tl.zeros([BK], dtype=tl.float32)
+        w_q3 = tl.zeros([BK], dtype=tl.float32)
+        w_k0 = tl.zeros([BK], dtype=tl.float32)
+        w_k1 = tl.zeros([BK], dtype=tl.float32)
+        w_k2 = tl.zeros([BK], dtype=tl.float32)
+        w_k3 = tl.zeros([BK], dtype=tl.float32)
+        w_v0 = tl.zeros([BV], dtype=tl.float32)
+        w_v1 = tl.zeros([BV], dtype=tl.float32)
+        w_v2 = tl.zeros([BV], dtype=tl.float32)
+        w_v3 = tl.zeros([BV], dtype=tl.float32)
 
     # initial conv window from the committed page (zeros for fresh requests)
     s_q0 = tl.zeros([BK], dtype=tl.float32)
@@ -1607,23 +1669,26 @@ def fused_recurrent_kda_window_fwd_kernel(
     s_v0 = tl.zeros([BV], dtype=tl.float32)
     s_v1 = tl.zeros([BV], dtype=tl.float32)
     s_v2 = tl.zeros([BV], dtype=tl.float32)
-    if read_ok:
-        cp = conv_pool + b_read * stride_conv_page
-        s_q0 = tl.load(cp + qf * 3 + 0, mask=mask_k, other=0.0).to(tl.float32)
-        s_q1 = tl.load(cp + qf * 3 + 1, mask=mask_k, other=0.0).to(tl.float32)
-        s_q2 = tl.load(cp + qf * 3 + 2, mask=mask_k, other=0.0).to(tl.float32)
-        s_k0 = tl.load(cp + kf * 3 + 0, mask=mask_k, other=0.0).to(tl.float32)
-        s_k1 = tl.load(cp + kf * 3 + 1, mask=mask_k, other=0.0).to(tl.float32)
-        s_k2 = tl.load(cp + kf * 3 + 2, mask=mask_k, other=0.0).to(tl.float32)
-        s_v0 = tl.load(cp + vf * 3 + 0, mask=mask_v, other=0.0).to(tl.float32)
-        s_v1 = tl.load(cp + vf * 3 + 1, mask=mask_v, other=0.0).to(tl.float32)
-        s_v2 = tl.load(cp + vf * 3 + 2, mask=mask_v, other=0.0).to(tl.float32)
+    if not HAS_PRECOMPUTED_CONV:
+        if read_ok:
+            cp = conv_pool + b_read * stride_conv_page
+            s_q0 = tl.load(cp + qf * 3 + 0, mask=mask_k, other=0.0).to(tl.float32)
+            s_q1 = tl.load(cp + qf * 3 + 1, mask=mask_k, other=0.0).to(tl.float32)
+            s_q2 = tl.load(cp + qf * 3 + 2, mask=mask_k, other=0.0).to(tl.float32)
+            s_k0 = tl.load(cp + kf * 3 + 0, mask=mask_k, other=0.0).to(tl.float32)
+            s_k1 = tl.load(cp + kf * 3 + 1, mask=mask_k, other=0.0).to(tl.float32)
+            s_k2 = tl.load(cp + kf * 3 + 2, mask=mask_k, other=0.0).to(tl.float32)
+            s_v0 = tl.load(cp + vf * 3 + 0, mask=mask_v, other=0.0).to(tl.float32)
+            s_v1 = tl.load(cp + vf * 3 + 1, mask=mask_v, other=0.0).to(tl.float32)
+            s_v2 = tl.load(cp + vf * 3 + 2, mask=mask_v, other=0.0).to(tl.float32)
 
     # initial recurrent state from the committed page
-    b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    state_off = o_k[:, None] * V + o_v[None, :]
     if V_MAJOR:
-        state_off = o_v[None, :] * K + o_k[:, None]
+        b_h = tl.zeros([BV, BK], dtype=tl.float32)
+        state_off = o_v[:, None] * K + o_k[None, :]
+    else:
+        b_h = tl.zeros([BK, BV], dtype=tl.float32)
+        state_off = o_k[:, None] * V + o_v[None, :]
     p_h0 = h_pool + b_read * stride_state_page + i_hv * K * V + state_off
     # The state tile is touched exactly once per round; keeping it out of L2
     # leaves the cache to the MoE GEMM weights this kernel runs beside.
@@ -1632,6 +1697,10 @@ def fused_recurrent_kda_window_fwd_kernel(
     ).to(tl.float32)
 
     g_off = i_hv * K + o_k
+    if HAS_PRECOMPUTED_GATE:
+        b_A = tl.load(A_log + i_hv).to(tl.float32)
+        if HAS_DT_BIAS:
+            b_bias = tl.load(dt_bias + g_off, mask=mask_k, other=0.0).to(tl.float32)
 
     steps = T
     if HAS_N_STEPS:
@@ -1640,6 +1709,20 @@ def fused_recurrent_kda_window_fwd_kernel(
 
     for i_t in range(steps):
         tok = bos + i_t
+        g_at = g + tok * stride_g_tok + g_off
+        if HAS_PRECOMPUTED_GATE:
+            b_g = tl.load(
+                g_raw + tok * stride_graw_tok + g_off, mask=mask_k, other=0.0
+            ).to(tl.float32)
+            if HAS_DT_BIAS:
+                b_g += b_bias
+            if USE_LOWER_BOUND:
+                b_gk = lower_bound * tl.sigmoid(tl.exp(b_A) * b_g)
+            else:
+                b_gk = -tl.exp(b_A) * tl.where(
+                    b_g < 20.0, tl.math.log(1 + tl.math.exp(b_g)), b_g
+                )
+            g_at = b_gk
         (
             s_q0,
             s_q1,
@@ -1686,9 +1769,14 @@ def fused_recurrent_kda_window_fwd_kernel(
             s_v1,
             s_v2,
             b_h,
-            g + tok * stride_g_tok + g_off,
+            g_at,
             scale,
             COMPUTE_OUT=WRITE_OUTPUT,
+            conv_qkv=conv_qkv,
+            stride_conv_qkv_tok=stride_conv_qkv_tok,
+            HAS_PRECOMPUTED_GATE=HAS_PRECOMPUTED_GATE,
+            HAS_PRECOMPUTED_CONV=HAS_PRECOMPUTED_CONV,
+            TRANSPOSE_STATE=V_MAJOR,
         )
         if WRITE_OUTPUT:
             tl.store(
@@ -1700,7 +1788,7 @@ def fused_recurrent_kda_window_fwd_kernel(
     if STORE_FINAL:
         b_write = tl.load(write_indices + i_n).to(tl.int64)
         write_ok = b_write >= 0
-        # Recurrent state only; disjoint [BK, BV] slices make in-place writes safe.
+        # Recurrent state tiles are disjoint, so in-place writes are safe.
         p_ht = h_pool_out + b_write * stride_state_out_page + i_hv * K * V + state_off
         tl.store(
             p_ht,
@@ -1912,6 +2000,11 @@ def _launch_kda_window(
     lower_bound: float | None,
     gate_scratch: torch.Tensor | None = None,
     recurrent_layout: str = "k_major",
+    g_raw: torch.Tensor | None = None,
+    conv_qkv: torch.Tensor | None = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
+    bv: int | None = None,
 ) -> None:
     """Shared launch for the verify / replay halves of the window kernel.
     ``gate_scratch`` is caller-provided fp32 scratch for the hoisted gate
@@ -1926,36 +2019,63 @@ def _launch_kda_window(
         scale = K**-0.5
     assert total == N * T
     assert qkv_raw.stride(-1) == 1 and conv_w.is_contiguous() and w_fb.is_contiguous()
+    P = HV * K
+    if g_raw is not None:
+        if g_raw.shape != (N * T, P):
+            raise ValueError(f"g_raw must have shape [{N * T}, {P}], got {g_raw.shape}")
+        if g_raw.dtype != f_a.dtype:
+            raise ValueError(f"g_raw must have dtype {f_a.dtype}, got {g_raw.dtype}")
+        if g_raw.stride(-1) != 1:
+            raise ValueError("g_raw must have last-dimension stride 1")
+    if conv_qkv is not None:
+        if conv_qkv.shape != (N * T, 3 * P):
+            raise ValueError(
+                f"conv_qkv must have shape [{N * T}, {3 * P}], got {conv_qkv.shape}"
+            )
+        if conv_qkv.dtype != qkv_raw.dtype:
+            raise ValueError(
+                f"conv_qkv must have dtype {qkv_raw.dtype}, got {conv_qkv.dtype}"
+            )
+        if conv_qkv.stride(-1) != 1:
+            raise ValueError("conv_qkv must have last-dimension stride 1")
     store_final = h_pool_out is not None
     assert store_final == (write_indices is not None)
     if store_final:
         assert write_indices.numel() == N
     if n_steps is not None:
         assert n_steps.numel() == N
-    BV, warps, stages = _WINDOW_TILE
+    default_bv, default_warps, default_stages = _WINDOW_TILE
+    BV = default_bv if bv is None else bv
+    warps = default_warps if num_warps is None else num_warps
+    stages = default_stages if num_stages is None else num_stages
     grid = (triton.cdiv(V, BV) * N * HV,)
     # Hoist the f_b gate: computed here once per token, it stops costing the
     # recurrence kernel a live [K, D_FA] register tile (and its spills).
     # Always hoisted -- measured faster at every size, and bit-identical.
     rows = N * T
-    if gate_scratch is not None:
-        assert gate_scratch.shape[0] >= rows and gate_scratch.shape[1] == HV * K
-        assert gate_scratch.dtype == torch.float32
-        gate = gate_scratch[:rows]
+    if g_raw is not None:
+        gate = g_raw
     else:
-        gate = kda_gate_scratch(rows, HV * K, qkv_raw.device)
-    kda_gate_precompute(
-        f_a,
-        w_fb,
-        A_log,
-        dt_bias,
-        gate,
-        num_heads=HV,
-        head_dim=K,
-        lower_bound=lower_bound,
-    )
+        if gate_scratch is not None:
+            assert gate_scratch.shape[0] >= rows and gate_scratch.shape[1] == HV * K
+            assert gate_scratch.dtype == torch.float32
+            gate = gate_scratch[:rows]
+        else:
+            gate = kda_gate_scratch(rows, HV * K, qkv_raw.device)
+        kda_gate_precompute(
+            f_a,
+            w_fb,
+            A_log,
+            dt_bias,
+            gate,
+            num_heads=HV,
+            head_dim=K,
+            lower_bound=lower_bound,
+        )
     fused_recurrent_kda_window_fwd_kernel[grid](
         qkv_raw=qkv_raw,
+        g_raw=g_raw,
+        conv_qkv=conv_qkv,
         conv_w=conv_w,
         conv_pool=conv_pool,
         beta=beta,
@@ -1966,9 +2086,11 @@ def _launch_kda_window(
         write_indices=write_indices,
         n_steps=n_steps,
         stride_raw_tok=qkv_raw.stride(0),
+        stride_graw_tok=0 if g_raw is None else g_raw.stride(0),
+        stride_conv_qkv_tok=0 if conv_qkv is None else conv_qkv.stride(0),
         stride_beta_tok=beta.stride(0),
         g=gate,
-        stride_g_tok=gate.stride(0),
+        stride_g_tok=0 if g_raw is not None else gate.stride(0),
         scale=scale,
         T=T,
         H=HV,
@@ -1981,6 +2103,13 @@ def _launch_kda_window(
         stride_state_page=h_pool.stride(0),
         stride_state_out_page=h_pool_out.stride(0) if h_pool_out is not None else 0,
         stride_conv_page=conv_pool.stride(0),
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        HAS_DT_BIAS=dt_bias is not None,
+        HAS_PRECOMPUTED_GATE=g_raw is not None,
+        HAS_PRECOMPUTED_CONV=conv_qkv is not None,
+        USE_LOWER_BOUND=lower_bound is not None,
         WRITE_OUTPUT=out is not None,
         STORE_FINAL=store_final,
         HAS_N_STEPS=n_steps is not None,
@@ -2013,6 +2142,11 @@ def fused_recurrent_kda_replay_commit(
     lower_bound: float | None = None,
     gate_scratch: torch.Tensor | None = None,
     recurrent_layout: str = "k_major",
+    g_raw: torch.Tensor | None = None,
+    conv_qkv: torch.Tensor | None = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
+    bv: int | None = None,
 ) -> None:
     """Commit the accepted prefix of a verified draft window by replaying it.
 
@@ -2048,6 +2182,8 @@ def fused_recurrent_kda_replay_commit(
         gate_scratch: caller-provided fp32 gate scratch,
             ``[>= N*T, num_heads*head_dim]``; ``None`` falls back to a
             module-local buffer.
+        g_raw: Optional ``[N*T, P]`` precomputed ``f_a @ w_fb.T`` gate.
+        conv_qkv: Optional ``[N*T, 3*P]`` precomputed conv(+silu) q|k|v.
 
     Returns:
         None. The destination pages are written in place.
@@ -2075,6 +2211,11 @@ def fused_recurrent_kda_replay_commit(
         lower_bound=lower_bound,
         gate_scratch=gate_scratch,
         recurrent_layout=recurrent_layout,
+        g_raw=g_raw,
+        conv_qkv=conv_qkv,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        bv=bv,
     )
     kda_commit_conv_window(
         qkv_raw,
@@ -2210,7 +2351,10 @@ def batched_recurrent_kda_replay_commit_kernel(
     for i_v in tl.range(0, K, BV, loop_unroll_factor=1):
         o_v = i_v + tl.arange(0, BV)
         mask_v = o_v < K
-        mask_h = mask_k[:, None] & mask_v[None, :]
+        if V_MAJOR:
+            mask_h = mask_v[:, None] & mask_k[None, :]
+        else:
+            mask_h = mask_k[:, None] & mask_v[None, :]
         vf = 2 * P + i_hv * K + o_v
         w_v0 = tl.load(conv_w + vf * CONV_WIDTH + 0, mask=mask_v, other=0.0).to(
             tl.float32
@@ -2233,13 +2377,17 @@ def batched_recurrent_kda_replay_commit_kernel(
         s_v2 = tl.load(
             cp + vf * (CONV_WIDTH - 1) + 2, mask=mask_v & read_ok, other=0.0
         ).to(tl.float32)
-        state_off = o_k[:, None] * K + o_v[None, :]
         if V_MAJOR:
-            state_off = o_v[None, :] * K + o_k[:, None]
+            state_off = o_v[:, None] * K + o_k[None, :]
+        else:
+            state_off = o_k[:, None] * K + o_v[None, :]
         ph = state + read_page * STRIDE_STATE + i_hv * K * K + state_off
         # Match fused_recurrent_kda_window_fwd_kernel's initialization exactly;
         # keeping the same TTIR expression preserves its fp32 replay bits.
-        b_h = tl.zeros([BK, BV], dtype=tl.float32)
+        if V_MAJOR:
+            b_h = tl.zeros([BV, BK], dtype=tl.float32)
+        else:
+            b_h = tl.zeros([BK, BV], dtype=tl.float32)
         b_h += tl.load(
             ph, mask=mask_h & read_ok, other=0.0, eviction_policy="evict_first"
         ).to(tl.float32)
@@ -2285,6 +2433,7 @@ def batched_recurrent_kda_replay_commit_kernel(
                 gate_scratch + tok * STRIDE_GATE + qf,
                 K**-0.5,
                 COMPUTE_OUT=False,
+                TRANSPOSE_STATE=V_MAJOR,
             )
         po = state + write_page * STRIDE_STATE + i_hv * K * K + state_off
         tl.store(po, b_h, mask=mask_h & write_ok, eviction_policy="evict_first")
