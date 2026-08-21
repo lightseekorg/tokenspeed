@@ -15,8 +15,14 @@ set -euo pipefail
 # the dense group spans DP ranks.
 #
 # chunked-prefill stays at 2048: the trtllm MoE workspace scales with
-# gathered GLOBAL tokens (chunk x 8 under DP), and 0.95 utilization only
-# leaves room for 2048-token chunks (8192 needs util <= 0.90).
+# gathered GLOBAL tokens (chunk x 8 under DP), and high utilization only
+# leaves room for 2048-token chunks.
+#
+# DSpark rides on the DP recipe like the rest of the matrix. util drops to
+# 0.92: the 7.1GB draft weights replicate per rank on top of the already
+# heaviest weight budget in the matrix, and the drafter's cache pages join
+# the shared pool. DP x DSpark has no CI coverage and no on-machine
+# validation yet — boot-validate before trusting this row's numbers.
 
 exec ts serve \
     --model nvidia/Kimi-K3-NVFP4 \
@@ -27,12 +33,16 @@ exec ts serve \
     --max-num-seqs 16 \
     --max-prefill-tokens 2048 \
     --chunked-prefill-size 2048 \
-    --gpu-memory-utilization 0.95 \
+    --gpu-memory-utilization 0.92 \
     --trust-remote-code \
     --attention-backend tokenspeed_mla \
     --kda-backend cutedsl_kda \
     --moe-backend flashinfer_trtllm \
     --kv-cache-dtype fp8 \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path Inferact/Kimi-K3-DSpark \
+    --speculative-num-draft-tokens 8 \
+    --drafter-attention-backend mla \
     --mm-encoder-tp-mode data \
     --enable-cache-report \
     --host 127.0.0.1 \
