@@ -168,6 +168,8 @@ private:
     std::int32_t max_single_request_tokens_{0};
 
     std::unordered_map<std::string, std::int32_t> pending_forward_results_;
+    std::unordered_set<std::string> newly_submitted_prefills_;
+    std::unordered_map<std::string, std::int32_t> submitted_prefill_delay_passes_;
     std::unordered_set<std::string> pd_transfer_pins_;
     std::deque<std::string> recovery_queue_;
     std::optional<std::string> recovery_barrier_;

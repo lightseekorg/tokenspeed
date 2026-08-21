@@ -135,6 +135,7 @@ class ServerArgs:
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
     enable_mixed_batch: bool = False
+    enable_experimental_m16_prefill_delayer: bool = False
     # Kernel page size. Scheduler prefix pages come from the LCM
     # runtime contract and must not overwrite this value.
     prefix_granularity: int = 64
@@ -838,7 +839,29 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+    def validate_experimental_scheduler_options(self):
+        if self.enable_experimental_m16_prefill_delayer:
+            if self.enable_mixed_batch:
+                raise ValueError(
+                    "--enable-experimental-m16-prefill-delayer cannot be combined "
+                    "with --enable-mixed-batch"
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "--enable-experimental-m16-prefill-delayer requires aggregate serving"
+                )
+            if (
+                self.mapping.attn.tp_size != 8
+                or self.mapping.attn.dp_size != 1
+                or self.mapping.attn.cp_size != 1
+            ):
+                raise ValueError(
+                    "--enable-experimental-m16-prefill-delayer requires attention "
+                    "tp_size=8, dp_size=1, and cp_size=1"
+                )
+
     def validate(self):
+        self.validate_experimental_scheduler_options()
         if (
             self.max_num_seqs is not None
             and self.max_num_seqs < self.mapping.attn.dp_size
@@ -1118,6 +1141,12 @@ class ServerArgs:
             dest="enable_mixed_batch",
             default=ServerArgs.enable_mixed_batch,
             help="Allow the scheduler to issue prefill and decode requests in the same iteration.",
+        )
+        parser.add_argument(
+            "--enable-experimental-m16-prefill-delayer",
+            action="store_true",
+            default=ServerArgs.enable_experimental_m16_prefill_delayer,
+            help="On aggregate attention TP8, experimentally delay a lone new prefill for up to two pure decode iterations.",
         )
         parser.add_argument(
             "--prefix-granularity",

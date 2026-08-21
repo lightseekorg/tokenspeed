@@ -298,10 +298,51 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertEqual(sa.max_prefill_tokens, 8192)
         self.assertEqual(sa.chunked_prefill_size, 8192)
         self.assertFalse(sa.enable_mixed_batch)
+        self.assertFalse(sa.enable_experimental_m16_prefill_delayer)
 
     def test_mixed_batch_can_be_enabled(self):
         args = self._parse_args(["--model", "test/model", "--enable-mixed-batch"])
         self.assertTrue(args.enable_mixed_batch)
+
+    def test_experimental_m16_prefill_delayer_can_be_enabled(self):
+        args = self._parse_args(
+            ["--model", "test/model", "--enable-experimental-m16-prefill-delayer"]
+        )
+        self.assertTrue(args.enable_experimental_m16_prefill_delayer)
+
+    def test_experimental_m16_prefill_delayer_rejects_unsupported_modes(self):
+        args = self._parse_args(
+            ["--model", "test/model", "--enable-experimental-m16-prefill-delayer"]
+        )
+        sa = self._from_cli_args_no_init(args)
+        sa.mapping = SimpleNamespace(
+            attn=SimpleNamespace(tp_size=8, dp_size=1, cp_size=1),
+        )
+        sa.validate_experimental_scheduler_options()
+
+        sa.enable_mixed_batch = True
+        with self.assertRaisesRegex(ValueError, "mixed-batch"):
+            sa.validate_experimental_scheduler_options()
+        sa.enable_mixed_batch = False
+
+        sa.mapping.attn.tp_size = 2
+        with self.assertRaisesRegex(ValueError, "tp_size=8"):
+            sa.validate_experimental_scheduler_options()
+        sa.mapping.attn.tp_size = 8
+
+        sa.mapping.attn.dp_size = 2
+        with self.assertRaisesRegex(ValueError, "dp_size=1"):
+            sa.validate_experimental_scheduler_options()
+        sa.mapping.attn.dp_size = 1
+
+        sa.mapping.attn.cp_size = 2
+        with self.assertRaisesRegex(ValueError, "cp_size=1"):
+            sa.validate_experimental_scheduler_options()
+        sa.mapping.attn.cp_size = 1
+
+        sa.disaggregation_mode = "decode"
+        with self.assertRaisesRegex(ValueError, "aggregate serving"):
+            sa.validate_experimental_scheduler_options()
 
     def test_distributed_timeout_seconds_arg(self):
         args = self._parse_args(

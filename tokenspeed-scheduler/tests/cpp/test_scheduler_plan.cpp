@@ -203,6 +203,159 @@ TEST_F(StableCandidateOrderingSuite, ForwardBatchIsInsertionOrderIndependent) {
     EXPECT_EQ(ids_a, ids_b);
 }
 
+class ExperimentalM16PrefillDelayerSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.enable_experimental_m16_prefill_delayer = true;
+        return cfg;
+    }
+
+    void StartDecode(const std::string& id = "decode") {
+        Submit(MakeRequestSpec(id, 1));
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* prefill = FindForwardBatch(plan);
+        ASSERT_NE(prefill, nullptr);
+        ASSERT_EQ(prefill->request_ids, std::vector<std::string>{id});
+        SendForwardDone(id, {100});
+    }
+
+    static ForwardBatch Batch(const ExecutionPlan& plan) {
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        if (batch == nullptr) {
+            ADD_FAILURE() << "execution plan has no ForwardBatch";
+            return ForwardBatch{std::vector<ForwardOperation>{}};
+        }
+        return *batch;
+    }
+};
+
+TEST_F(ExperimentalM16PrefillDelayerSuite, DelaysLoneSubmittedPrefillForAtMostTwoDecodePasses) {
+    StartDecode();
+    Submit(MakeRequestSpec("prefill", 1, 200));
+
+    const ForwardBatch first = Batch(PlanOnce());
+    EXPECT_EQ(first.request_ids, std::vector<std::string>{"decode"});
+    EXPECT_EQ(first.NumExtends(), 0u);
+    SendForwardDone("decode", {101});
+
+    const ForwardBatch second = Batch(PlanOnce());
+    EXPECT_EQ(second.request_ids, std::vector<std::string>{"decode"});
+    EXPECT_EQ(second.NumExtends(), 0u);
+    SendForwardDone("decode", {102});
+
+    const ForwardBatch third = Batch(PlanOnce());
+    EXPECT_EQ(third.request_ids, std::vector<std::string>{"prefill"});
+    EXPECT_EQ(third.NumExtends(), 1u);
+    EXPECT_TRUE(third.decode_input_ids.empty());
+}
+
+TEST_F(ExperimentalM16PrefillDelayerSuite, ReleasesEarlyWhenSecondSubmittedPrefillArrives) {
+    StartDecode();
+    Submit(MakeRequestSpec("prefill_a", 1, 200));
+
+    EXPECT_EQ(Batch(PlanOnce()).request_ids, std::vector<std::string>{"decode"});
+    SendForwardDone("decode", {101});
+    Submit(MakeRequestSpec("prefill_b", 1, 300));
+
+    const ForwardBatch released = Batch(PlanOnce());
+    EXPECT_EQ(released.request_ids, (std::vector<std::string>{"prefill_a", "prefill_b"}));
+    EXPECT_EQ(released.NumExtends(), 2u);
+    EXPECT_TRUE(released.decode_input_ids.empty());
+}
+
+TEST_F(ExperimentalM16PrefillDelayerSuite, EarlyReleaseIsSubmissionOrderIndependent) {
+    StartDecode();
+    Submit({MakeRequestSpec("prefill_b", 1, 300), MakeRequestSpec("prefill_a", 1, 200)});
+    const std::vector<std::string> first_ids = Batch(PlanOnce()).request_ids;
+
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    StartDecode();
+    Submit({MakeRequestSpec("prefill_a", 1, 200), MakeRequestSpec("prefill_b", 1, 300)});
+    const std::vector<std::string> second_ids = Batch(PlanOnce()).request_ids;
+
+    EXPECT_EQ(first_ids, (std::vector<std::string>{"prefill_a", "prefill_b"}));
+    EXPECT_EQ(first_ids, second_ids);
+}
+
+TEST_F(ExperimentalM16PrefillDelayerSuite, DoesNotDelayWithoutRunnableDecode) {
+    Submit(MakeRequestSpec("prefill", 1));
+    const ForwardBatch batch = Batch(PlanOnce());
+    EXPECT_EQ(batch.request_ids, std::vector<std::string>{"prefill"});
+    EXPECT_EQ(batch.NumExtends(), 1u);
+}
+
+class ExperimentalM16InsufficientDecodeBudgetSuite : public ExperimentalM16PrefillDelayerSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = ExperimentalM16PrefillDelayerSuite::MakeConfig();
+        cfg.max_scheduled_tokens = 1;
+        cfg.decode_input_tokens = 2;
+        return cfg;
+    }
+};
+
+TEST_F(ExperimentalM16InsufficientDecodeBudgetSuite, FallsThroughWhenDecodeCannotFitTokenBudget) {
+    Submit(MakeRequestSpec("decode", 1));
+    EXPECT_EQ(Batch(PlanOnce()).request_ids, std::vector<std::string>{"decode"});
+    EXPECT_EQ(Batch(PlanOnce()).request_ids, std::vector<std::string>{"decode"});
+    SendForwardDone("decode", {100, 101});
+    Submit(MakeRequestSpec("prefill", 1, 200));
+
+    const ForwardBatch batch = Batch(PlanOnce());
+    EXPECT_EQ(batch.request_ids, std::vector<std::string>{"prefill"});
+    EXPECT_EQ(batch.NumExtends(), 1u);
+    EXPECT_TRUE(batch.decode_input_ids.empty());
+}
+
+class ExperimentalM16ChunkedPrefillSuite : public ExperimentalM16PrefillDelayerSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = ExperimentalM16PrefillDelayerSuite::MakeConfig();
+        cfg.max_scheduled_tokens = 2;
+        return cfg;
+    }
+};
+
+TEST_F(ExperimentalM16ChunkedPrefillSuite, NeverDelaysAlreadyPrefillingRequest) {
+    StartDecode();
+    Submit({MakeRequestSpec("prefill_a", 2, 200), MakeRequestSpec("prefill_b", 2, 300)});
+
+    const ForwardBatch first_chunk = Batch(PlanOnce());
+    ASSERT_EQ(first_chunk.request_ids, std::vector<std::string>{"prefill_a"});
+    EXPECT_EQ(first_chunk.input_lengths, std::vector<std::int32_t>{2});
+
+    const ForwardBatch second_chunk = Batch(PlanOnce());
+    EXPECT_EQ(second_chunk.request_ids, std::vector<std::string>{"prefill_a"});
+    EXPECT_EQ(second_chunk.input_lengths, std::vector<std::int32_t>{2});
+    EXPECT_TRUE(second_chunk.decode_input_ids.empty());
+}
+
+TEST_F(SchedulerTestSuite, ExperimentalM16PrefillDelayerDefaultsOff) {
+    EXPECT_FALSE(config_.enable_experimental_m16_prefill_delayer);
+
+    Submit(MakeRequestSpec("decode", 1));
+    PlanOnce();
+    SendForwardDone("decode", {100});
+    Submit(MakeRequestSpec("prefill", 1, 200));
+
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->request_ids, std::vector<std::string>{"prefill"});
+    EXPECT_EQ(batch->NumExtends(), 1u);
+}
+
+TEST_F(SchedulerTestSuite, ExperimentalM16PrefillDelayerRejectsMixedAndPdModes) {
+    config_.enable_experimental_m16_prefill_delayer = true;
+    config_.enable_mixed_prefill_decode = true;
+    EXPECT_THROW({ Scheduler scheduler{config_}; }, std::invalid_argument);
+
+    config_.enable_mixed_prefill_decode = false;
+    config_.role = Role::kD;
+    EXPECT_THROW({ Scheduler scheduler{config_}; }, std::invalid_argument);
+}
+
 class SchedulerKvCacheEventTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

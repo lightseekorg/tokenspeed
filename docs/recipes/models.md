@@ -553,6 +553,18 @@ speculative decoding and cache groups are both active — and prefix caching
 stays on by default. Add `--enable-metrics` to read `Decoded Tok/Iter` and the
 speculative accept rate from the run summary.
 
+For MI350 agentic serving capped at 16 sessions, capture prefill graph buckets
+through the scheduler's 8192-token chunk:
+
+```bash
+--prefill-graph-max-tokens 8192
+```
+
+This increases graph memory, so retain the default 2048 ceiling on smaller-memory
+devices. Pro TP8 can additionally coalesce staggered new turns for at most two
+decode passes with `--enable-experimental-m16-prefill-delayer`. The delayer is
+restricted to aggregate TP8 and must not be combined with mixed batching.
+
 ### DSpark speculative decoding with Prefix Replay
 
 A V4-Flash checkpoint that includes complete DSpark draft weights can use

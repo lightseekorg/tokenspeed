@@ -339,6 +339,9 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     for (std::size_t i = 0; i < request_specs.size(); ++i) {
         const bool inserted = requests_.emplace(request_specs[i].request_id, std::move(pending_requests[i])).second;
         FatalCheck(inserted, "validated request id became duplicate before insertion");
+        if (config_.enable_experimental_m16_prefill_delayer) {
+            newly_submitted_prefills_.insert(request_specs[i].request_id);
+        }
     }
 }
 

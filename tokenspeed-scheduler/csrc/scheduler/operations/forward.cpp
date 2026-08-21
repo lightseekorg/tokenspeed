@@ -48,6 +48,9 @@ namespace tokenspeed {
 
 namespace {
 
+constexpr std::int32_t kM16MaxDecodeDelayPasses = 2;
+constexpr std::size_t kM16UsefulPrefillBatchSize = 2;
+
 template <typename Operation>
 void fillBlockTables(Operation& operation, Request& request, const CacheCoordinator& coordinator,
                      std::span<const std::string> group_ids) {
@@ -532,7 +535,42 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
             recovery_barrier_.reset();
         }
     }
-    const auto priority = [this](const Request* request) {
+    bool delay_submitted_prefills = false;
+    if (config_.enable_experimental_m16_prefill_delayer) {
+        std::erase_if(newly_submitted_prefills_, [this](const std::string& id) {
+            Request* request = findRequest(id);
+            return request == nullptr || !request->Is<fsm::Submitted>();
+        });
+        std::erase_if(submitted_prefill_delay_passes_, [this](const auto& item) {
+            Request* request = findRequest(item.first);
+            return request == nullptr || !request->Is<fsm::Submitted>() ||
+                   !newly_submitted_prefills_.contains(item.first);
+        });
+        const std::size_t submitted_prefills =
+            static_cast<std::size_t>(std::ranges::count_if(candidates, [this](const Request* request) {
+                return request->Is<fsm::Submitted>() && newly_submitted_prefills_.contains(request->Id());
+            }));
+        const bool has_decode_work = std::ranges::any_of(candidates, [](const Request* request) {
+            return request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>();
+        });
+        const bool has_in_progress_prefill = std::ranges::any_of(candidates, [this](const Request* request) {
+            return request->Is<fsm::Prefilling>() || request->Is<fsm::Retracted>() ||
+                   (request->Is<fsm::Submitted>() && !newly_submitted_prefills_.contains(request->Id()));
+        });
+        const std::size_t useful_prefill_batch_size =
+            std::min(kM16UsefulPrefillBatchSize, static_cast<std::size_t>(config_.max_batch_size));
+        const bool delay_budget_remaining = std::ranges::all_of(candidates, [this](const Request* request) {
+            if (!request->Is<fsm::Submitted>() || !newly_submitted_prefills_.contains(request->Id())) {
+                return true;
+            }
+            const auto it = submitted_prefill_delay_passes_.find(request->Id());
+            return it == submitted_prefill_delay_passes_.end() || it->second < kM16MaxDecodeDelayPasses;
+        });
+        delay_submitted_prefills = submitted_prefills > 0 && submitted_prefills < useful_prefill_batch_size &&
+                                   has_decode_work && !has_in_progress_prefill && delay_budget_remaining;
+    }
+
+    const auto priority = [this, delay_submitted_prefills](const Request* request) {
         const bool recovery_front = !recovery_queue_.empty() && request->Id() == recovery_queue_.front();
         const bool local_decode_prefill =
             request->Is<fsm::Prefilling>() && request->PrefillSource() == fsm::PrefillSource::kLocal;
@@ -559,7 +597,7 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
             return 3;
         }
         if (request->Is<fsm::Submitted>()) {
-            return 4;
+            return delay_submitted_prefills ? 6 : 4;
         }
         if (request->Is<fsm::Decoding>() || request->Is<fsm::PrefillDone>()) {
             return config_.enable_mixed_prefill_decode ? 3 : 5;
@@ -677,6 +715,9 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         }
 
         if (request->Is<fsm::Submitted>()) {
+            if (delay_submitted_prefills && pushed_decode) {
+                break;
+            }
             if (config_.role == Role::kD && pushed_decode) {
                 break;
             }
@@ -711,6 +752,13 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
 
     if (operations.empty() && context.admission_failed) {
         retractForCapacity(context, candidates, write_back_operations);
+    }
+    if (delay_submitted_prefills && pushed_decode) {
+        for (const Request* request : candidates) {
+            if (request->Is<fsm::Submitted>() && newly_submitted_prefills_.contains(request->Id())) {
+                ++submitted_prefill_delay_passes_[request->Id()];
+            }
+        }
     }
     return {std::move(operations), std::move(load_back_operations)};
 }
