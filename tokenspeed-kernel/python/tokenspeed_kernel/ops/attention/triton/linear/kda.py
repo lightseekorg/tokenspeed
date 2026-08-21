@@ -52,6 +52,7 @@ def kda_chunk_prefill(
     initial_state: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    recurrent_layout: str = "k_major",
     beta_is_logit: bool = True,
 ):
     """Chunked prefill KDA scan (varlen via ``cu_seqlens``).
@@ -101,13 +102,15 @@ def kda_recurrent_decode_pool(
     write_indices: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    recurrent_layout: str = "k_major",
 ) -> torch.Tensor:
     """Single-step decode KDA update with in-kernel state-pool addressing.
 
     Same math as :func:`kda_recurrent_decode`, but reads ``h_pool[read_indices]``
     and writes ``h_pool[write_indices]`` inside the kernel (negative write ids
     skip the store), eliminating the python-side gather/scatter round-trip.
-    ``h_pool`` is ``[num_pages, HV, K, V]`` fp32 and is updated in place.
+    ``h_pool`` is ``[num_pages, HV, K, V]`` fp32 (``[num_pages, HV, V, K]``
+    for ``recurrent_layout="v_major"``) and is updated in place.
     Returns ``o [B, T, HV, V]``.
     """
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
@@ -130,6 +133,7 @@ def kda_recurrent_decode_pool(
         use_qk_l2norm_in_kernel=True,
         use_gate_in_kernel=True,
         use_beta_sigmoid_in_kernel=True,
+        recurrent_layout=recurrent_layout,
     )
 
 

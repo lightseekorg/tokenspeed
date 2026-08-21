@@ -70,6 +70,45 @@ register_cuda_ci(est_time=240, suite="runtime-1gpu")
 _LOWER_BOUND = -5.0
 
 
+def test_vmajor_prefill_handoff_round_trips_canonical_state(monkeypatch) -> None:
+    backend = object.__new__(KdaAttnBackend)
+    backend.kda_recurrent_layout = "v_major"
+    backend.kda_backend = "auto"
+    backend._kda_gate = lambda g_raw, *_args: g_raw
+    canonical = torch.arange(24, dtype=torch.float32).view(1, 2, 3, 4)
+    physical = canonical.transpose(-1, -2).contiguous()
+    captured = {}
+
+    def fake_prefill(*_args, **kwargs):
+        captured["initial_state"] = kwargs["initial_state"]
+        return SimpleNamespace(out=torch.empty(1, 1, 2, 4), final_state=canonical)
+
+    monkeypatch.setattr(hybrid_kda, "kda_paged_prefill", fake_prefill)
+    query = torch.empty(1, 1, 2, 3)
+    value = torch.empty(1, 1, 2, 4)
+    _, final_state = backend._prefill_scan(
+        query,
+        query,
+        value,
+        physical,
+        torch.tensor([0, 1]),
+        A_log=torch.empty(2),
+        dt_bias=torch.empty(2, 3),
+        a=None,
+        b=None,
+        g_raw=torch.empty_like(query),
+        f_a_out=None,
+        f_b_weight=None,
+        beta_raw=torch.empty(1, 1, 2),
+        seq_len=1,
+        num_real_tokens=1,
+        lower_bound=-5.0,
+        cu_seqlens_cpu=(0, 1),
+    )
+    torch.testing.assert_close(captured["initial_state"], canonical)
+    torch.testing.assert_close(final_state, physical)
+
+
 def _backend_config(device: str, *, spec_tokens: int = 1) -> SimpleNamespace:
     return SimpleNamespace(
         device=device,

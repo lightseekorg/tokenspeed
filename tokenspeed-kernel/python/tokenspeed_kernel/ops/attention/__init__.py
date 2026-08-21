@@ -1448,6 +1448,7 @@ def kda_paged_decode(
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
+    recurrent_layout: str = "k_major",
 ) -> torch.Tensor:
     """Run post-convolution KDA decode against an indexed state pool.
 
@@ -1487,6 +1488,7 @@ def kda_paged_decode(
         traits={
             "indexed_state": True,
             "single_token": q.shape[1] == num_sequences,
+            "recurrent_layout": recurrent_layout,
         },
         solution=solution,
         override=override,
@@ -1504,6 +1506,7 @@ def kda_paged_decode(
         write_indices=write_indices,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
+        recurrent_layout=recurrent_layout,
     )
 
 
@@ -1645,9 +1648,11 @@ def try_kda_fused_paged_verify(
     head_dim: int,
     draft_token_num: int,
     lower_bound: float | None = -5.0,
+    recurrent_layout: str = "k_major",
     override: str | None = None,
     solution: str | None = None,
     store_states: bool = True,
+    split_producers: bool = False,
 ) -> torch.Tensor | None:
     """Try a registered pre-convolution KDA target-verify fusion.
 
@@ -1656,6 +1661,8 @@ def try_kda_fused_paged_verify(
     scratches for partial-accept commit. Returns ``None`` only when no
     implementation supports the current platform.
     """
+    if recurrent_layout not in ("k_major", "v_major"):
+        raise ValueError(f"unsupported KDA recurrent layout {recurrent_layout!r}")
     signature = _attention_format_signature(
         q=mixed_qkv,
         k=mixed_qkv,
@@ -1666,7 +1673,12 @@ def try_kda_fused_paged_verify(
             "attention",
             "kda_fused_paged_verify",
             signature,
-            traits={"paged_state": True, "store_states": store_states},
+            traits={
+                "paged_state": True,
+                "store_states": store_states,
+                "recurrent_layout": recurrent_layout,
+                **({"split_producers": True} if split_producers else {}),
+            },
             solution=solution,
             override=override,
         )
@@ -1716,6 +1728,7 @@ def try_kda_replay_commit(
     override: str | None = None,
     solution: str | None = None,
     gate_scratch: torch.Tensor | None = None,
+    recurrent_layout: str = "k_major",
 ) -> bool:
     """Try a registered KDA speculative replay-commit.
 
@@ -1740,7 +1753,7 @@ def try_kda_replay_commit(
             "attention",
             "kda_replay_commit",
             signature,
-            traits={"flat_state": True},
+            traits={"flat_state": True, "recurrent_layout": recurrent_layout},
             solution=solution,
             override=override,
         )
@@ -1766,12 +1779,14 @@ def try_kda_replay_commit(
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
         gate_scratch=gate_scratch,
+        recurrent_layout=recurrent_layout,
     )
     return True
 
 
 def resolve_kda_batched_replay_commit(
     dtype: torch.dtype = torch.bfloat16,
+    recurrent_layout: str = "k_major",
 ):
     """Resolve the all-layer replay kernel once, or return ``None``.
 
@@ -1789,8 +1804,16 @@ def resolve_kda_batched_replay_commit(
             "attention",
             "kda_replay_commit",
             signature,
-            traits={"flat_state": True, "batched_layers": True},
-            override="triton_nvidia_kda_batched_replay_commit",
+            traits={
+                "flat_state": True,
+                "batched_layers": True,
+                "recurrent_layout": recurrent_layout,
+            },
+            override=(
+                "triton_nvidia_kda_batched_replay_commit_vmajor"
+                if recurrent_layout == "v_major"
+                else "triton_nvidia_kda_batched_replay_commit"
+            ),
         )
     except NoKernelFoundError:
         return None
@@ -1805,6 +1828,7 @@ def kda_replay_commit_supported(
     dtype: torch.dtype = torch.bfloat16,
     *,
     solution: str | None = None,
+    recurrent_layout: str = "k_major",
 ) -> bool:
     """Whether this platform can run the KDA speculative replay path.
 
@@ -1827,14 +1851,18 @@ def kda_replay_commit_supported(
             "attention",
             "kda_replay_commit",
             signature,
-            traits={"flat_state": True},
+            traits={"flat_state": True, "recurrent_layout": recurrent_layout},
             solution=solution,
         )
         select_kernel(
             "attention",
             "kda_fused_paged_verify",
             signature,
-            traits={"paged_state": True, "store_states": False},
+            traits={
+                "paged_state": True,
+                "store_states": False,
+                "recurrent_layout": recurrent_layout,
+            },
             solution=solution,
         )
     except NoKernelFoundError:

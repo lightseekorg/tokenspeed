@@ -90,8 +90,13 @@ class KdaAttnBackend(MambaAttnBackend):
     ) -> None:
         super().__init__(config)
         self.max_bs = config.max_bs
-        self._replay_active = kda_replay_commit_supported(self.dtype)
-        self._batched_replay_kernel = resolve_kda_batched_replay_commit(self.dtype)
+        self.kda_recurrent_layout = kda_recurrent_layout
+        self._replay_active = kda_replay_commit_supported(
+            self.dtype, recurrent_layout=self.kda_recurrent_layout
+        )
+        self._batched_replay_kernel = resolve_kda_batched_replay_commit(
+            self.dtype, self.kda_recurrent_layout
+        )
         self._replay_payloads: tuple[torch.Tensor, ...] | None = None
         self._replay_weights: dict[int, tuple] = {}
         self._replay_descriptors = None
@@ -104,7 +109,6 @@ class KdaAttnBackend(MambaAttnBackend):
                 f"--kda-backend must be one of {', '.join(KDA_PREFILL_BACKENDS)}; "
                 f"got {self.kda_backend!r}"
             )
-        self.kda_recurrent_layout = kda_recurrent_layout
         logger.info(
             "KDA prefill routes through %s; decode remains on the "
             "platform-selected kernels",
@@ -468,6 +472,7 @@ class KdaAttnBackend(MambaAttnBackend):
             write_indices=write_indices,
             cu_seqlens=query_start_loc,
             lower_bound=lower_bound,
+            recurrent_layout=self.kda_recurrent_layout,
         )
         if output_gate is not None:
             core_attn_out = rmsnorm_gated_sigmoid(
@@ -549,6 +554,8 @@ class KdaAttnBackend(MambaAttnBackend):
                 draft_token_num=draft_token_num,
                 lower_bound=lower_bound,
                 store_states=False,
+                recurrent_layout=self.kda_recurrent_layout,
+                split_producers=True,
             )
             if fused_out is None:
                 raise RuntimeError(
@@ -578,6 +585,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 head_dim=head_v_dim,
                 draft_token_num=draft_token_num,
                 lower_bound=lower_bound,
+                recurrent_layout=self.kda_recurrent_layout,
             )
 
     @override
@@ -711,6 +719,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 draft_token_num=draft_token_num,
                 lower_bound=lower_bound,
                 gate_scratch=gate[:rows, : num_heads * head_dim],
+                recurrent_layout=self.kda_recurrent_layout,
             ):
                 raise RuntimeError(
                     "KDA replay commit kernel vanished after capability probing"
@@ -776,6 +785,9 @@ class KdaAttnBackend(MambaAttnBackend):
                 "batch"
             )
 
+        initial_state = recurrent_state
+        if self.kda_recurrent_layout == "v_major":
+            initial_state = recurrent_state.transpose(-1, -2).contiguous()
         kda_result = kda_paged_prefill(
             query,
             key,
@@ -784,14 +796,17 @@ class KdaAttnBackend(MambaAttnBackend):
             beta_kda,
             A_log,
             dt_bias,
-            initial_state=recurrent_state,
+            initial_state=initial_state,
             cu_seqlens=query_start_loc,
             cu_seqlens_cpu=cu_seqlens_cpu,
             lower_bound=lower_bound,
             solution=None if self.kda_backend == "auto" else self.kda_backend,
         )
 
-        return kda_result.out.squeeze(0), kda_result.final_state
+        final_state = kda_result.final_state
+        if self.kda_recurrent_layout == "v_major":
+            final_state = final_state.transpose(-1, -2).contiguous()
+        return kda_result.out.squeeze(0), final_state
 
 
 class HybridKDABackend(HybridLinearAttnBackend):

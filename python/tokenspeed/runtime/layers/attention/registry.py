@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -427,7 +428,15 @@ def _create_hybrid_linear_attn_backend(
     kda_backend = (getattr(server_args, "kda_backend", None) or "auto").strip().lower()
     if is_kda:
         kda_backend = _resolve_kda_backend(kda_backend)
-        kda_recurrent_layout = "v_major" if current_platform().is_cdna4 else "k_major"
+        kda_recurrent_layout = os.getenv("TOKENSPEED_KDA_RECURRENT_LAYOUT")
+        if kda_recurrent_layout is None:
+            platform = current_platform()
+            # Split verify prefers K-major at NVIDIA's measured BV=8/16 configs.
+            kda_recurrent_layout = "v_major" if platform.is_cdna4 else "k_major"
+        elif kda_recurrent_layout not in ("k_major", "v_major"):
+            raise ValueError(
+                "TOKENSPEED_KDA_RECURRENT_LAYOUT must be k_major or v_major"
+            )
         linear_attn_backend = KdaAttnBackend(
             config,
             kda_backend=kda_backend,
