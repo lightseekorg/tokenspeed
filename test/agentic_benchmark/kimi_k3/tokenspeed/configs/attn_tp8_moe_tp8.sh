@@ -6,8 +6,7 @@ exec ts serve \
     --model nvidia/Kimi-K3-NVFP4 \
     --attn-tp-size 8 \
     --moe-tp-size 8 \
-    --ep-size 1 \
-    --max-model-len 81920 \
+    --max-model-len 80000 \
     --max-num-seqs 16 \
     --gpu-memory-utilization 0.95 \
     --trust-remote-code \

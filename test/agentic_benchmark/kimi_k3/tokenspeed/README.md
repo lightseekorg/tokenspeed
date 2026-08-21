@@ -19,7 +19,8 @@ swe_smith multi-turn conversations sized identically to `kimi_k2.5`: first
 turn 50,000 tokens, subsequent turns 800, 10-15 turns (71 conversations build
 with the Kimi-K3 tokenizer). Each turn's 500-token completion joins the next
 turn's prompt, so the worst-case final prompt is ~50,000 + 14 x (800+500)
-= 68.2K tokens plus chat-template overhead — `--max-model-len 81920` covers it
+= 68.2K tokens plus chat-template overhead — `--max-model-len 80000` (the
+kimi_k2.5 value) covers it
 in every config, including the attention-DP per-rank cache budget. Fixed
 `--max-tokens 500` with `ignore_eos` keeps decode segments equal-length across
 configs; prefix caching (default-on) hit rate is reported.

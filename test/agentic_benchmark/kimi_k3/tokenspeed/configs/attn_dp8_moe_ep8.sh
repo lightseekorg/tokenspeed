@@ -17,7 +17,7 @@ exec ts serve \
     --data-parallel-size 8 \
     --ep-size 8 \
     --moe-tp-size 1 \
-    --max-model-len 81920 \
+    --max-model-len 80000 \
     --max-num-seqs 16 \
     --max-prefill-tokens 2048 \
     --chunked-prefill-size 2048 \
