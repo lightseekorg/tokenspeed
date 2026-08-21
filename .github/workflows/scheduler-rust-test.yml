@@ -1,0 +1,55 @@
+name: scheduler-rust-test
+
+on:
+  pull_request:
+    paths:
+      - "tokenspeed-scheduler-rs/**"
+      - ".github/workflows/scheduler-rust-test.yml"
+  push:
+    branches: [main]
+    paths:
+      - "tokenspeed-scheduler-rs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: scheduler-rust-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Rust fmt / clippy / tests
+        working-directory: tokenspeed-scheduler-rs
+        run: |
+          cargo fmt --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+
+      - name: Install maturin and Python test deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install maturin pytest numpy
+
+      - name: Build and install scheduler wheel
+        working-directory: tokenspeed-scheduler-rs/crates/ts-scheduler-pyo3
+        run: |
+          maturin build --release
+          python -m pip install ../../target/wheels/*.whl
+
+      - name: Run scheduler Python tests
+        working-directory: tokenspeed-scheduler-rs
+        run: python -m pytest ../tokenspeed-scheduler/python/tests
