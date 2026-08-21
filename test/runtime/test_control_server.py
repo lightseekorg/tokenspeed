@@ -19,6 +19,7 @@ sidecar (PR #305):
 """
 
 import asyncio
+import json
 import threading
 import time
 import unittest
@@ -276,6 +277,23 @@ class TestGrpcDirect(unittest.TestCase):
             self.assertIn("detail", body)
         finally:
             server.should_exit = True
+
+
+class TestSGLangRequestTranslation(unittest.TestCase):
+    def test_sampling_seed_is_translated(self):
+        from tokenspeed.runtime.entrypoints import control_server as hs
+
+        body = json.dumps(
+            {
+                "model": "model-x",
+                "input_ids": [1],
+                "sampling_params": {"sampling_seed": 17},
+            }
+        ).encode()
+        translated = asyncio.run(hs._prepare_sglang_generate_body(body))
+        sampling_params = json.loads(translated)["sampling_params"]
+        self.assertEqual(sampling_params["seed"], 17)
+        self.assertNotIn("sampling_seed", sampling_params)
 
 
 class TestProxyTimeout(unittest.TestCase):

@@ -174,7 +174,7 @@ if current_platform().is_amd:
         tags={"amd", "gfx950", "paged_cache"},
     )
     def gluon_kda_paged_prefill_gfx950(**kwargs) -> KdaPrefillResult:
-        """Run specialized gfx950 KDA prefill with canonical K-major state."""
+        """Run specialized gfx950 KDA prefill with V-major state."""
         # Host-boundary hint is consumed only by the CuteDSL wrapper.
         kwargs.pop("cu_seqlens_cpu", None)
         output, final_state = _kda_prefill_impl(**kwargs)
@@ -224,17 +224,18 @@ if current_platform().is_amd:
         traits={
             "indexed_state": frozenset({True}),
             "single_token": frozenset({True}),
+            "recurrent_layout": frozenset({"v_major"}),
         },
         tags={"amd", "gfx950", "paged_cache", "cuda_graph"},
     )
     def gluon_kda_paged_decode_gfx950(**kwargs):
-        """Run specialized gfx950 KDA decode against the canonical K-major pool."""
+        """Run specialized gfx950 KDA decode against the physical V-major pool."""
         return _kda_decode_impl(**kwargs)
 
     @register_kernel(
         "attention",
         "kda_fused_paged_decode",
-        name="gluon_kda_fused_paged_decode_gfx950",
+        name="gluon_kda_fused_paged_decode_vmajor_gfx950",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -253,10 +254,11 @@ if current_platform().is_amd:
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "conv_kernel_size": frozenset({4}),
+            "recurrent_layout": frozenset({"v_major"}),
         },
         tags={"amd", "gfx950", "paged_cache", "cuda_graph", "fusion"},
     )
-    def gluon_kda_fused_paged_decode_gfx950(
+    def gluon_kda_fused_paged_decode_vmajor_gfx950(
         mixed_qkv: torch.Tensor,
         conv_weights: torch.Tensor,
         conv_states: torch.Tensor,
@@ -277,7 +279,7 @@ if current_platform().is_amd:
         norm_weight: torch.Tensor | None,
         norm_eps: float | None,
     ):
-        """Run the decay projection and fused gfx950 KDA decode epilogue."""
+        """Run the decay projection and V-major gfx950 fused decode."""
         if output_gate is None or norm_weight is None or norm_eps is None:
             raise ValueError("gfx950 fused KDA decode requires output normalization")
         raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)

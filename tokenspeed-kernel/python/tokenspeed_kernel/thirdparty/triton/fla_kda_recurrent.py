@@ -299,6 +299,7 @@ def fused_recurrent_kda_mtp_fwd_kernel(
     BV: tl.constexpr,
     stride_state_page: tl.constexpr,
     stride_state_out_page: tl.constexpr,
+    V_MAJOR: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     USE_GATE_IN_KERNEL: tl.constexpr,
     APPLY_BETA_SIGMOID: tl.constexpr,
@@ -335,13 +336,11 @@ def fused_recurrent_kda_mtp_fwd_kernel(
 
     b_read = tl.load(read_indices + i_n).to(tl.int64)
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    p_h0 = (
-        h_pool
-        + b_read * stride_state_page
-        + i_hv * K * V
-        + o_k[:, None] * V
-        + o_v[None, :]
-    )
+    p_h0 = h_pool + b_read * stride_state_page + i_hv * K * V
+    if V_MAJOR:
+        p_h0 += o_v[None, :] * K + o_k[:, None]
+    else:
+        p_h0 += o_k[:, None] * V + o_v[None, :]
     b_h += tl.load(p_h0, mask=mask_h & (b_read >= 0), other=0).to(tl.float32)
 
     for i_t in tl.range(0, T, num_stages=num_stages):
@@ -391,13 +390,11 @@ def fused_recurrent_kda_mtp_fwd_kernel(
         )
 
         b_write = tl.load(write_indices + i_n * T + i_t).to(tl.int64)
-        p_ht = (
-            h_pool_out
-            + b_write * stride_state_out_page
-            + i_hv * K * V
-            + o_k[:, None] * V
-            + o_v[None, :]
-        )
+        p_ht = h_pool_out + b_write * stride_state_out_page + i_hv * K * V
+        if V_MAJOR:
+            p_ht += o_v[None, :] * K + o_k[:, None]
+        else:
+            p_ht += o_k[:, None] * V + o_v[None, :]
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h & (b_write >= 0))
 
         p_q += stride_q_tok
@@ -423,6 +420,7 @@ def fused_recurrent_kda_mtp(
     h_pool_out: torch.Tensor | None = None,
     scale: float | None = None,
     lower_bound: float | None = None,
+    recurrent_layout: str = "k_major",
     use_qk_l2norm_in_kernel: bool = True,
     use_gate_in_kernel: bool = True,
     use_beta_sigmoid_in_kernel: bool = True,
@@ -433,7 +431,8 @@ def fused_recurrent_kda_mtp(
         q/k: ``[B, T, H, K]``; v: ``[B, T, HV, V]``; g: ``[B, T, HV, K]``;
             beta: ``[B, T, HV]`` — dense request-major verify batch,
             ``T`` = draft_token_num.
-        h_pool: ``[num_pages, HV, K, V]`` fp32 state pool (read side).
+        h_pool: FP32 state pool (read side), physically ``[num_pages, HV, K, V]``
+            for ``k_major`` or ``[num_pages, HV, V, K]`` for ``v_major``.
         read_indices: ``[B]`` initial-state page per request (< 0 reads zeros).
         write_indices: ``[B, T]`` per-position output rows (< 0 skips).
         h_pool_out: optional write-side pool (verify scratch); defaults to
@@ -444,6 +443,8 @@ def fused_recurrent_kda_mtp(
     """
     if h_pool_out is None:
         h_pool_out = h_pool
+    if recurrent_layout not in ("k_major", "v_major"):
+        raise ValueError(f"unsupported KDA recurrent layout {recurrent_layout!r}")
     B, T, H, K = k.shape
     V = v.shape[-1]
     HV = v.shape[2]
@@ -484,6 +485,7 @@ def fused_recurrent_kda_mtp(
         BV=32,
         stride_state_page=h_pool.stride(0),
         stride_state_out_page=h_pool_out.stride(0),
+        V_MAJOR=recurrent_layout == "v_major",
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         USE_GATE_IN_KERNEL=use_gate_in_kernel,
         APPLY_BETA_SIGMOID=use_beta_sigmoid_in_kernel,

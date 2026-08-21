@@ -427,7 +427,12 @@ def _create_hybrid_linear_attn_backend(
     kda_backend = (getattr(server_args, "kda_backend", None) or "auto").strip().lower()
     if is_kda:
         kda_backend = _resolve_kda_backend(kda_backend)
-        linear_attn_backend = KdaAttnBackend(config, kda_backend=kda_backend)
+        kda_recurrent_layout = "v_major" if current_platform().is_cdna4 else "k_major"
+        linear_attn_backend = KdaAttnBackend(
+            config,
+            kda_backend=kda_backend,
+            kda_recurrent_layout=kda_recurrent_layout,
+        )
     else:
         linear_attn_backend = MambaAttnBackend(config)
 
@@ -559,7 +564,7 @@ def _create_target_components(
         cache_spec,
         config,
         arena,
-        num_layers=len(cache_spec.layer_group_ids),
+        num_layers=len(cache_spec.layer_types),
         rank=rank,
     )
     if is_hybrid_linear:
@@ -907,7 +912,7 @@ def create_attn_components(
         spec.memory_plan.prefix_granularity,
         spec.memory_plan.num_lcm_blocks,
         spec.token_capacity,
-        len(spec.layer_group_ids),
+        len(spec.layer_types),
         cache_setup.num_draft_layers,
         {
             group.group_id: group.cache_blocks_per_lcm_block

@@ -1202,10 +1202,13 @@ def _attnres_combine_kernel(
     eps,
     HAS_OUTNORM: tl.constexpr,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Fold the prefix candidate into the block partial; optional out-norm.
 
-    All operands are read once and stay register-resident.
+    All operands are read once and stay register-resident. Under PDL all but
+    the prefix are prefetched before ``gdc_wait``, so the caller must ensure
+    the immediate same-stream predecessor writes only the prefix.
     """
     t = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
@@ -1217,31 +1220,36 @@ def _attnres_combine_kernel(
     mask0 = col0 < n_cols
     mask1 = col1 < n_cols
 
-    v0 = tl.load(prefix_ptr + t * stride_p + col0, mask=mask0, other=0.0).to(tl.float32)
-    v1 = tl.load(prefix_ptr + t * stride_p + col1, mask=mask1, other=0.0).to(tl.float32)
     wp0 = tl.load(wp_ptr + col0, mask=mask0, other=0.0).to(tl.float32)
     wp1 = tl.load(wp_ptr + col1, mask=mask1, other=0.0).to(tl.float32)
+    m_b = tl.load(m_ptr + t)
+    s_b = tl.load(s_ptr + t)
+    a0 = tl.load(acc_ptr + t * n_cols + col0, mask=mask0, other=0.0)
+    a1 = tl.load(acc_ptr + t * n_cols + col1, mask=mask1, other=0.0)
+    if HAS_OUTNORM:
+        ow0 = tl.load(outw_ptr + col0, mask=mask0, other=0.0).to(tl.float32)
+        ow1 = tl.load(outw_ptr + col1, mask=mask1, other=0.0).to(tl.float32)
+
+    if ENABLE_PDL:
+        # The prefix is the predecessor's output; everything above is not.
+        tl.extra.cuda.gdc_wait()
+
+    v0 = tl.load(prefix_ptr + t * stride_p + col0, mask=mask0, other=0.0).to(tl.float32)
+    v1 = tl.load(prefix_ptr + t * stride_p + col1, mask=mask1, other=0.0).to(tl.float32)
     sq = tl.sum(v0 * v0) + tl.sum(v1 * v1)
     dot = tl.sum(v0 * wp0) + tl.sum(v1 * wp1)
     rsig = tl.math.rsqrt(sq / n_cols + eps)
     logit_p = dot * rsig
-    m_b = tl.load(m_ptr + t)
-    s_b = tl.load(s_ptr + t)
     m = tl.maximum(m_b, logit_p)
     corr = tl.exp(m_b - m)
     w_p = tl.exp(logit_p - m)
     inv_s = 1.0 / (s_b * corr + w_p)
-
-    a0 = tl.load(acc_ptr + t * n_cols + col0, mask=mask0, other=0.0)
-    a1 = tl.load(acc_ptr + t * n_cols + col1, mask=mask1, other=0.0)
     mix0 = ((a0 * corr + w_p * v0) * inv_s).to(tl.bfloat16).to(tl.float32)
     mix1 = ((a1 * corr + w_p * v1) * inv_s).to(tl.bfloat16).to(tl.float32)
 
     if HAS_OUTNORM:
         mix_sq = tl.sum(mix0 * mix0) + tl.sum(mix1 * mix1)
         rsig_mix = tl.math.rsqrt(mix_sq / n_cols + eps)
-        ow0 = tl.load(outw_ptr + col0, mask=mask0, other=0.0).to(tl.float32)
-        ow1 = tl.load(outw_ptr + col1, mask=mask1, other=0.0).to(tl.float32)
         tl.store(
             out_ptr + t * stride_o + col0,
             (mix0 * rsig_mix * ow0).to(out_ptr.dtype.element_ty),
@@ -1263,6 +1271,8 @@ def _attnres_combine_kernel(
             mix1.to(out_ptr.dtype.element_ty),
             mask=mask1,
         )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def attnres_partial(blocks, wp, eps, scratch):
@@ -1317,19 +1327,22 @@ def attnres_partial_dual(blocks, wp_a, wp_b, eps, scratch_a, scratch_b):
     )
 
 
-def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out):
+def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out, enable_pdl=False):
     """Merge the prefix candidate into the partial; optional fused out-norm.
 
     Args:
         prefix: ``[T, H]`` residual stream.
         scratch: (m, s, acc) from :func:`attnres_partial`.
         out: ``[T, H]`` mixed (and out-normed) hidden destination.
+        enable_pdl: programmatic dependent launch; prefetches everything
+            but the prefix before ``gdc_wait``.
 
     Returns:
         ``out``.
     """
     T, H = prefix.shape
     m, s_, acc = scratch
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _attnres_combine_kernel[(T,)](
         prefix,
         wp,
@@ -1345,5 +1358,7 @@ def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out):
         HAS_OUTNORM=out_norm_w is not None,
         BLOCK=4096,
         num_warps=8,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return out

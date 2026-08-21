@@ -165,6 +165,7 @@ def _torch_decode_gemv(
 def _select(m: int, n: int, k: int, on_cuda: bool):
     if not on_cuda:
         return _torch_decode_gemv
+    from tokenspeed_kernel.platform import current_platform
     from tokenspeed_kernel.registry import KernelRegistry
     from tokenspeed_kernel.selection import (
         spec_matches_shape_traits,
@@ -172,7 +173,11 @@ def _select(m: int, n: int, k: int, on_cuda: bool):
     )
 
     reg = KernelRegistry.get()
-    for spec in reg.get_for_operator("gemm", "decode_gemv"):
+    # platform= makes the registry honor each spec's capability gate; without
+    # it an arch-gated spec (the measured sm103 route) would match anywhere.
+    for spec in reg.get_for_operator(
+        "gemm", "decode_gemv", platform=current_platform()
+    ):
         if spec_matches_traits(spec, {"m": m}) and spec_matches_shape_traits(
             spec, {"N": n, "K": k}
         ):

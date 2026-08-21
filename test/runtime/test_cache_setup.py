@@ -222,7 +222,6 @@ def test_attention_configs_do_not_own_cache_setup() -> None:
         "ssm_dtype",
         "recurrent_dtype",
         "lcm_memory_plan",
-        "layer_cache_group_ids",
         "token_capacity",
     }
 
@@ -291,10 +290,12 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
     assert attn_config.kernel_page_size == 64
     assert setup.spec.memory_plan.prefix_granularity == 128
     assert setup.num_draft_layers == 0
-    assert setup.spec.layer_group_ids == (
-        f"{LINEAR_ATTENTION}_0",
-        FULL_ATTENTION,
-    )
+    # The plan's field declarations are the single record of layer -> group.
+    plan_groups = {
+        field.field_id: field.group_id for field in setup.spec.memory_plan.fields
+    }
+    assert plan_groups["layer.0.conv"] == f"{LINEAR_ATTENTION}_0"
+    assert plan_groups["layer.1.k"] == FULL_ATTENTION
     # The plan is the single source of field dtypes; no side channel.
     plan_dtypes = {
         field.field_id: field.dtype for field in setup.spec.memory_plan.fields
@@ -682,14 +683,10 @@ def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:
     # own packing, and its spec joins the ONE published spec set.
     assert setup.num_draft_layers == 2
     plan = setup.spec.memory_plan
+    assert plan.field("layer.0.kv").group_id == "full_attention"
     assert plan.field("layer.1.kv").group_id == "full_attention"
     assert plan.field("layer.2.kv").group_id == "draft_swa"
     assert plan.group("draft_swa").cache_blocks_per_lcm_block >= 1
-    assert setup.spec.layer_group_ids == (
-        "full_attention",
-        "full_attention",
-        "draft_swa",
-    )
     published = {spec.group_id for spec in setup.spec.cache_group_specs}
     assert published == {"full_attention", "draft_swa"}
 

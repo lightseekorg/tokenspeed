@@ -41,12 +41,13 @@ def test_k3_safe_gate_reference_matches_sigmoid_contract() -> None:
     assert not torch.allclose(actual, legacy)
 
 
-def test_kda_paged_prefill_uses_canonical_k_major_state() -> None:
-    """Native prefill preserves the public [N,H,K,V] state layout."""
+def test_kda_paged_prefill_preserves_native_state_layout() -> None:
+    """Native prefill preserves each backend's physical state layout."""
     platform = current_platform()
     if not (platform.is_cdna4 or platform.is_cdna5):
         pytest.skip("gfx950/gfx1250 KDA dispatch test")
 
+    use_vmajor = platform.is_cdna4
     device = "cuda"
     torch.manual_seed(3)
     tokens, heads, key_dim, value_dim = 65, 2, 128, 128
@@ -64,8 +65,8 @@ def test_kda_paged_prefill_uses_canonical_k_major_state() -> None:
     state = torch.randn(
         1,
         heads,
-        key_dim,
-        value_dim,
+        value_dim if use_vmajor else key_dim,
+        key_dim if use_vmajor else value_dim,
         device=device,
         dtype=torch.float32,
     )
@@ -73,13 +74,16 @@ def test_kda_paged_prefill_uses_canonical_k_major_state() -> None:
     dt_bias = torch.randn(heads, key_dim, device=device, dtype=torch.float32)
     cu_seqlens = torch.tensor([0, tokens], device=device, dtype=torch.int32)
 
+    reference_state = (
+        state[0] if use_vmajor else state[0].transpose(-1, -2).contiguous()
+    )
     expected_out, expected_state = reference_kda_recurrent(
         q,
         k,
         v,
         raw_g,
         beta,
-        state[0].transpose(-1, -2).contiguous(),
+        reference_state,
         a_log,
         dt_bias,
     )
@@ -98,9 +102,12 @@ def test_kda_paged_prefill_uses_canonical_k_major_state() -> None:
     torch.testing.assert_close(
         result.out[0].float(), expected_out.float(), atol=6e-2, rtol=6e-2
     )
+    expected_final_state = (
+        expected_state if use_vmajor else expected_state.transpose(-1, -2)
+    ).unsqueeze(0)
     torch.testing.assert_close(
         result.final_state,
-        expected_state.transpose(-1, -2).unsqueeze(0),
+        expected_final_state,
         atol=6e-2,
         rtol=6e-2,
     )
@@ -124,6 +131,7 @@ def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
     if not (platform.is_cdna4 or platform.is_cdna5):
         pytest.skip("gfx950/gfx1250 KDA dispatch test")
 
+    use_vmajor = platform.is_cdna4
     device = "cuda"
     torch.manual_seed(13)
     tokens = 3
@@ -166,8 +174,8 @@ def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
     state_pool = torch.randn(
         6,
         heads,
-        key_dim,
-        value_dim,
+        value_dim if use_vmajor else key_dim,
+        key_dim if use_vmajor else value_dim,
         device=device,
         dtype=torch.float32,
     )
@@ -194,19 +202,22 @@ def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
 
     expected_out = []
     for row in range(tokens):
+        physical_state = initial_pool[read_indices[row].long()]
         out, final_state = reference_kda_recurrent(
             q[0, row : row + 1],
             k[0, row : row + 1],
             v[0, row : row + 1],
             raw_g[0, row : row + 1],
             beta[0, row : row + 1],
-            initial_pool[read_indices[row].long()].transpose(-1, -2),
+            physical_state if use_vmajor else physical_state.transpose(-1, -2),
             a_log,
             dt_bias,
             lower_bound=lower_bound,
         )
         expected_out.append(out[0])
-        expected_pool[write_indices[row].long()] = final_state.transpose(-1, -2)
+        expected_pool[write_indices[row].long()] = (
+            final_state if use_vmajor else final_state.transpose(-1, -2)
+        )
     expected_out = torch.stack(expected_out).unsqueeze(0)
     actual_out = kda_paged_decode(
         q,
@@ -236,9 +247,15 @@ def test_kda_paged_decode_graph_padding_and_page_stride() -> None:
 
     torch.manual_seed(23)
     batch, active, heads, key_dim, value_dim = 4, 2, 2, 8, 5
+    use_vmajor = current_platform().is_cdna4
     state_elements = heads * key_dim * value_dim
     raw_pool = torch.randn(7, state_elements + 11, device="cuda", dtype=torch.float32)
-    state_pool = raw_pool[:, :state_elements].view(7, heads, key_dim, value_dim)
+    state_pool = raw_pool[:, :state_elements].view(
+        7,
+        heads,
+        value_dim if use_vmajor else key_dim,
+        key_dim if use_vmajor else value_dim,
+    )
     q = torch.randn(1, batch, heads, key_dim, device="cuda", dtype=torch.bfloat16)
     k = torch.randn_like(q)
     v = torch.randn(1, batch, heads, value_dim, device="cuda", dtype=torch.bfloat16)
@@ -375,7 +392,7 @@ def test_kda_fused_paged_decode_matches_reference(batch: int, active: int) -> No
             v.unsqueeze(0),
             raw_g[row].view(1, heads, head_dim),
             beta_logits[row].unsqueeze(0),
-            initial_state_pool[read_idx].transpose(-1, -2),
+            initial_state_pool[read_idx],
             a_log,
             dt_bias.view(heads, head_dim),
         )
@@ -387,7 +404,7 @@ def test_kda_fused_paged_decode_matches_reference(batch: int, active: int) -> No
             * norm_weight.float()[None, :]
             * torch.sigmoid(output_gate[row].view(heads, head_dim).float())
         ).to(torch.bfloat16)
-        expected_state_pool[write_idx] = final_state.transpose(-1, -2)
+        expected_state_pool[write_idx] = final_state
         expected_conv_states[write_idx] = torch.stack(
             (history[..., 1], history[..., 2], current), dim=-1
         ).reshape(3 * projection_width, 3)
@@ -410,6 +427,7 @@ def test_kda_fused_paged_decode_matches_reference(batch: int, active: int) -> No
         output_gate=output_gate,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
+        recurrent_layout="v_major",
     )
 
     assert result is not None
