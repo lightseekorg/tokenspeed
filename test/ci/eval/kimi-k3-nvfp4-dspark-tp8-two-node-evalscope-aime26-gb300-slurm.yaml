@@ -19,6 +19,7 @@ slurm:
   gpus_per_node: 4
 env:
   CI: "true"
+  TS_CI_LOCAL_MODEL_ROOT: /scratch/ts-torchspec-bot-models
 install:
   - bash test/ci_system/install_deps.sh
   - python3 -m pip install flash-linear-attention

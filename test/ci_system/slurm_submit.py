@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -56,6 +56,7 @@ class Task:
     runner: str
     gpus: int
     nodes: int = 1
+    env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -101,7 +102,18 @@ def load_task(
             f"{relative}: slurm.gpus_per_node={gpus_per_node} does not match "
             f"runner {runner!r} ({gpus} GPUs)"
         )
-    return Task(relative, str(data["name"]), str(data["type"]), runner, gpus, nodes)
+    task_env = {
+        str(key): str(value) for key, value in (data.get("env") or {}).items()
+    }
+    return Task(
+        relative,
+        str(data["name"]),
+        str(data["type"]),
+        runner,
+        gpus,
+        nodes,
+        task_env,
+    )
 
 
 def task_matches(repo: Path, task: Task, patterns: list[str]) -> bool:
@@ -339,11 +351,17 @@ def render_script(
     gpu_device_mounts = ""
     local_model_mounts = ""
     if task.runner.startswith(("gb300-", "slurm-gb300-")):
-        local_model_mounts = r"""
+        model_root_override = task.env.get("TS_CI_LOCAL_MODEL_ROOT")
+        model_root_assignment = (
+            f"local_model_root={shlex.quote(str(model_root_override))}"
+            if model_root_override
+            else 'local_model_root="${TS_CI_LOCAL_MODEL_ROOT:-/scratch/${USER}-models}"'
+        )
+        local_model_mounts = f"""
 # GB300 nodes keep large model snapshots on their local RAID.  Keep the
 # source configurable for other coordinators while exposing one stable path
 # to server containers.
-local_model_root="${TS_CI_LOCAL_MODEL_ROOT:-/scratch/${USER}-models}"
+{model_root_assignment}
 if [ -d "$local_model_root" ]; then
   model_mounts+=("$local_model_root:/models:ro")
 fi
