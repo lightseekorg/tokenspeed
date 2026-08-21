@@ -141,6 +141,13 @@ class LogitsMetadata:
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class _AmdDistArgmaxState:
+    """Static metadata for candidate-only AMD vocabulary reduction."""
+
+    vocab_per_rank: int
+
+
 _FUSED_LM_HEAD_GEMM = None
 
 
@@ -190,14 +197,15 @@ def _lm_head_matmul(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.
 
 
 class LogitsProcessor(nn.Module):
-
     _LOGITS_AG_MAX_TOKENS = 128
     _LOGITS_AG_STATE_UNINITIALIZED = object()
     _LOGITS_AG_STATES = {}
 
     _LOGITS_DIST_ARGMAX_MAX_TOKENS = 8192
+    _LOGITS_AMD_DIST_ARGMAX_MIN_TOKENS = 2
     _LOGITS_DIST_ARGMAX_UNINITIALIZED = object()
     _LOGITS_DIST_ARGMAX_STATES = {}
+    _LOGITS_DIST_ARGMAX_FP32_INDEX_MAX = 1 << 24
 
     def __init__(
         self,
@@ -233,6 +241,7 @@ class LogitsProcessor(nn.Module):
 
         self._all_gather_state = self._LOGITS_AG_STATE_UNINITIALIZED
         self._dist_argmax_state = self._LOGITS_DIST_ARGMAX_UNINITIALIZED
+        self._amd_dist_argmax_state = self._LOGITS_DIST_ARGMAX_UNINITIALIZED
 
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
@@ -362,6 +371,31 @@ class LogitsProcessor(nn.Module):
             )
 
         return self._LOGITS_DIST_ARGMAX_STATES[key]
+
+    def _init_amd_dist_argmax_state(
+        self, lm_head: VocabParallelEmbedding
+    ) -> _AmdDistArgmaxState | None:
+        if not current_platform().is_amd or not self.do_argmax:
+            return None
+
+        if (
+            # TP2 candidate packing did not amortize its extra local kernels.
+            self.tp_size < 4
+            or self.skip_all_gather
+            or self.dp_sampling_enabled
+            or self._tp_group_spans_nodes()
+            or not hasattr(lm_head, "weight")
+        ):
+            return None
+
+        vocab_per_rank = lm_head.weight.size(0)
+        vocab_size = vocab_per_rank * self.tp_size
+        if vocab_size != self.config.vocab_size:
+            return None
+        if vocab_size - 1 > self._LOGITS_DIST_ARGMAX_FP32_INDEX_MAX:
+            return None
+
+        return _AmdDistArgmaxState(vocab_per_rank=vocab_per_rank)
 
     def forward(
         self,
@@ -618,6 +652,25 @@ class LogitsProcessor(nn.Module):
                 ):
                     return logits
 
+                if (
+                    self._dist_argmax_state is None
+                    and self._amd_dist_argmax_state
+                    is self._LOGITS_DIST_ARGMAX_UNINITIALIZED
+                ):
+                    self._amd_dist_argmax_state = self._init_amd_dist_argmax_state(
+                        lm_head
+                    )
+                if (
+                    self._amd_dist_argmax_state
+                    not in (self._LOGITS_DIST_ARGMAX_UNINITIALIZED, None)
+                    and self._LOGITS_AMD_DIST_ARGMAX_MIN_TOKENS
+                    <= logits.size(0)
+                    <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
+                ):
+                    if self.final_logit_softcapping:
+                        fused_softcap_generic(logits, self.final_logit_softcapping)
+                    return logits
+
             if self._all_gather_state is self._LOGITS_AG_STATE_UNINITIALIZED:
                 self._all_gather_state = self._init_all_gather_state(lm_head)
 
@@ -666,8 +719,51 @@ class LogitsProcessor(nn.Module):
         ):
             _, idx = distributed_argmax(self._dist_argmax_state, logits)
             return idx
-        else:
-            return sampling_argmax(logits)
+        if (
+            self._amd_dist_argmax_state
+            not in (self._LOGITS_DIST_ARGMAX_UNINITIALIZED, None)
+            and self._LOGITS_AMD_DIST_ARGMAX_MIN_TOKENS
+            <= logits.size(0)
+            <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
+        ):
+            return self._amd_distributed_argmax(logits)
+        return sampling_argmax(logits)
+
+    def _amd_distributed_argmax(self, logits: torch.Tensor) -> torch.Tensor:
+        state = self._amd_dist_argmax_state
+        assert isinstance(state, _AmdDistArgmaxState)
+
+        local_indices = sampling_argmax(logits).to(torch.int64)
+        safe_local_indices = local_indices.clamp_min(0)
+        local_values = logits.gather(1, safe_local_indices[:, None]).squeeze(1).float()
+        valid_local = (local_indices >= 0) & ~torch.isnan(local_values)
+        global_indices = local_indices + self.tp_rank * state.vocab_per_rank
+        global_indices = torch.where(valid_local, global_indices, -1)
+        local_candidates = torch.stack(
+            (local_values, global_indices.to(torch.float32)), dim=1
+        )
+
+        num_rows = logits.size(0)
+        gathered_candidates = torch.empty(
+            self.tp_size * num_rows,
+            2,
+            dtype=torch.float32,
+            device=logits.device,
+        )
+        all_gather_into_tensor(gathered_candidates, local_candidates, self.tp_group)
+        candidates = gathered_candidates.view(self.tp_size, num_rows, 2)
+        candidate_values = candidates[:, :, 0]
+        candidate_indices = candidates[:, :, 1].to(torch.int64)
+        valid = candidate_indices >= 0
+        candidate_values = torch.where(valid, candidate_values, -float("inf"))
+        max_values = candidate_values.max(dim=0).values
+        winners = valid & (candidate_values == max_values[None, :])
+        lowest_indices = (
+            torch.where(winners, candidate_indices, self.config.vocab_size)
+            .min(dim=0)
+            .values
+        )
+        return torch.where(valid.any(dim=0), lowest_indices, -1)
 
     @staticmethod
     def get_top_logprobs(all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata):
