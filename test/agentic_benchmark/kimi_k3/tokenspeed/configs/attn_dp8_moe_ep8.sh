@@ -17,7 +17,7 @@ exec ts serve \
     --data-parallel-size 8 \
     --ep-size 8 \
     --moe-tp-size 1 \
-    --max-model-len 65536 \
+    --max-model-len 81920 \
     --max-num-seqs 32 \
     --max-prefill-tokens 2048 \
     --chunked-prefill-size 2048 \
@@ -27,9 +27,6 @@ exec ts serve \
     --kda-backend cutedsl_kda \
     --moe-backend flashinfer_trtllm \
     --kv-cache-dtype fp8 \
-    --enable-prefix-caching \
-    --disable-kvstore \
     --enable-cache-report \
     --host 127.0.0.1 \
-    --port 8000 \
-    --dist-init-addr 127.0.0.1:4000
+    --port 8000

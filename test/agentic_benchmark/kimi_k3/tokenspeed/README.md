@@ -16,16 +16,20 @@ python3 collect_outputs.py outputs/<sweep_ts>   # one CSV ranking table
 ## Workload
 
 swe_smith multi-turn conversations sized for K3: first turn 50,000 tokens,
-subsequent turns 800, 10-15 turns. Worst-case conversation is ~62K tokens,
-which fits `--max-model-len 65536` in every config, including the attention-DP
-per-rank cache budget (32 concurrent x 62K spread over 8 ranks). Fixed
-`--max-tokens 500` with `ignore_eos` keeps decode segments equal-length across
-configs; prefix caching is on and the hit rate is reported.
+subsequent turns 800, 10-15 turns. Each turn's 500-token completion joins the
+next turn's prompt, so the worst-case final prompt is ~50,000 + 14 x (800+500)
+= 68.2K tokens plus chat-template overhead — `--max-model-len 81920` (the
+inkling value) covers it in every config, including the attention-DP per-rank
+cache budget (32 concurrent x ~69K spread over 8 ranks is ~276K tokens/rank,
+well under the ~1.45M pool). Fixed `--max-tokens 500` with `ignore_eos` keeps
+decode segments equal-length across configs; prefix caching (default-on) hit
+rate is reported.
 
 ## Metrics (from collect_outputs.py)
 
 - Latency (tps/user) — decode speed per stream (1000 / TPOT)
-- **Throughput (tps/gpu) — the ranking metric**
+- **Output Throughput (tps/gpu) — the ranking metric** (generated tokens only;
+  total throughput would be dominated by the 50K prompts)
 - Approx Cache Hit, Decoded Tok/Iter
 
 ## Fairness rules

@@ -12,7 +12,7 @@ COLUMNS = [
     "config",
     "Conc.",
     "Latency (tps/user)",
-    "Throughput (tps/gpu)",
+    "Output Throughput (tps/gpu)",
     "Approx Cache Hit",
     "Decoded Tok/Iter",
 ]
@@ -37,13 +37,13 @@ def collect(sweep_dir: Path):
             s = json.loads(summary_path.read_text())
             tpot_ms = s["TPOT (ms)"]
             decode_tps_user = 1000.0 / tpot_ms if tpot_ms else 0.0
-            tps_gpu = s["Total Throughput (tok/s)"] / n_gpus
+            tps_gpu = s["Output Throughput (tok/s)"] / n_gpus
             rows.append(
                 {
                     "config": config,
                     "Conc.": s["Concurrency"],
                     "Latency (tps/user)": round(decode_tps_user, 2),
-                    "Throughput (tps/gpu)": round(tps_gpu, 2),
+                    "Output Throughput (tps/gpu)": round(tps_gpu, 2),
                     "Approx Cache Hit": round(s["KV Cache Hit Rate (%)"], 2),
                     "Decoded Tok/Iter": round(s["Decoded Tok/Iter"], 4),
                 }
