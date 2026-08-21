@@ -115,6 +115,16 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
     const std::int64_t max_prompt_tokens =
         std::max<std::int64_t>(static_cast<std::int64_t>(token_limit) - decode_width, 0);
     const std::int64_t chunk_tokens = config_.max_scheduled_tokens;
+    const std::int64_t prefix_granularity = config_.prefix_granularity;
+    // A cached prefix supplies the live input checkpoint.  Among all prompts
+    // up to max_prompt_tokens, the largest final sub-page tail that can be
+    // split after at least one aligned body page is bounded independently by
+    // the prefix grain, the issue budget, and the prompt length.
+    const std::int64_t max_split_tail_tokens =
+        config_.role == Role::kD || config_.disable_prefix_cache
+            ? 0
+            : std::max<std::int64_t>(0, std::min({prefix_granularity - 1, chunk_tokens - prefix_granularity,
+                                                  max_prompt_tokens - 2 * prefix_granularity}));
 
     std::vector<std::int64_t> group_pages(static_cast<std::size_t>(coordinator_.NumGroups()));
     for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
@@ -125,7 +135,11 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
                 if (token_limit == 0) return std::int64_t{0};
                 const std::int64_t input_lookback =
                     max_prompt_tokens > chunk_tokens ? coordinator_.GroupBoundaryLookbackPages(i) : 0;
-                return std::max<std::int64_t>(2, input_lookback + 1);
+                const std::int64_t split_checkpoint_peak = max_split_tail_tokens == 0
+                                                               ? 0
+                                                               : coordinator_.GroupBoundaryLookbackPages(i) + 1 +
+                                                                     ceilDiv(max_split_tail_tokens, block_granularity);
+                return std::max({std::int64_t{2}, input_lookback + 1, split_checkpoint_peak});
             }
             // Across every prompt up to max_prompt_tokens, retain the largest
             // resident window seen by either the first chunk or a later chunk.
