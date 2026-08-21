@@ -39,6 +39,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 import torch
+from torch import nn
+
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     K3_DSPARK_SKIPPED_WEIGHT_PREFIXES,
     k3_dspark_inactive_features,
@@ -63,7 +65,6 @@ from tokenspeed.runtime.models.deepseek_v3 import (
 from tokenspeed.runtime.models.dflash import DFlashMLP
 from tokenspeed.runtime.models.dspark import VanillaMarkov
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
-from torch import nn
 
 logger = get_colorful_logger(__name__)
 
