@@ -195,9 +195,14 @@ def test_qwen_verify_caches_kv_without_draft_recurrent_states():
     backend, pool = _make_backend(conv, recurrent, replay=True)
     rows = BATCH * (DRAFT_TOKENS + 1)
     expected_conv_workspace = rows * conv[0].nbytes
+    payload_row_width = KEY_DIM + VALUE_DIM + 2 * NUM_V_HEADS
+    expected_replay_workspace = (
+        BATCH * DRAFT_TOKENS * payload_row_width * conv.element_size()
+        + 2 * NUM_V_HEADS * torch.float32.itemsize
+    )
 
     assert backend.preallocate_verify_workspace(BATCH, DRAFT_TOKENS) == (
-        expected_conv_workspace
+        expected_conv_workspace + expected_replay_workspace
     )
     conv_scratch, recurrent_scratch = backend._verify_scratch[0]
     assert conv_scratch.shape[0] == rows

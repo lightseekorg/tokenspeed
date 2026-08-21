@@ -739,9 +739,10 @@ def _mfma_lds_mediumm_kernel(
     NUM_BUFFERS: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
     ADD3: gl.constexpr,
+    PID_OFFSET: gl.constexpr = 0,
 ):
     """MFMA/LDS dense16 GEMM for selected 8 <= M <= 128 decode tiles."""
-    pid = gl.program_id(axis=0)
+    pid = gl.program_id(axis=0) - PID_OFFSET
     num_pid_m = gl.cdiv(M, BLOCK_M)
     num_pid_n = gl.cdiv(N, BLOCK_N)
     pid_m, pid_n = _tile_to_pid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)

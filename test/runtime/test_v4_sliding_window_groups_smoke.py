@@ -60,7 +60,6 @@ class _CapacityProbe(CacheRecipe):
 
     family = "deepseek_v4"
     layer_types = ()
-    group_ids = ()
 
     def __init__(self, specs, limits) -> None:
         self._specs = tuple(specs)

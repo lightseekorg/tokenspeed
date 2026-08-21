@@ -180,6 +180,7 @@ private:
     std::unordered_set<std::string> pd_transfer_pins_;
     std::deque<std::string> recovery_queue_;
     std::optional<std::string> recovery_barrier_;
+    bool fused_capacity_drain_{false};
 
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;
     std::vector<KvCacheEvent> kv_events_;

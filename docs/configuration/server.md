@@ -16,7 +16,7 @@ For a compact compatibility table, see
 | `--tokenizer` | Tokenizer path when it differs from the model path. |
 | `--tokenizer-mode` | Select tokenizer behavior. `auto` uses fast tokenizers and model-specific hooks when available. |
 | `--skip-tokenizer-init` | Skip tokenizer initialization for input-ID-only serving paths. |
-| `--load-format` | Weight loading format: `auto`, `pt`, `safetensors`, `npcache`, `dummy`, or `extensible`. |
+| `--load-format` | Weight loading format: `auto`, `pt`, `safetensors`, `instanttensor`, `npcache`, `dummy`, or `extensible`. See [InstantTensor](/guides/instanttensor) for the accelerated NVIDIA loader. |
 | `--trust-remote-code` | Allow custom model code from the model repository. |
 | `--revision` | Model branch, tag, or commit. |
 | `--download-dir` | Hugging Face download/cache directory. |
@@ -51,21 +51,47 @@ Every generation response includes the current version in
 `meta_info["weight_version"]`. RL trainers can use this value to identify the
 policy version that produced a sample.
 
-The RL control plane updates the version only when the trainer supplies one:
-
-- SGLang-compatible `update_weights_from_distributed`,
-  `update_weights_from_tensor`, and `update_weights_from_disk` requests accept
-  an optional `weight_version`. The version changes only after the update
-  succeeds.
-- The vLLM-compatible `finish_weight_update` request accepts an optional
-  `weight_version`. A version sent with an update chunk is deferred until
-  `finish_weight_update`, so partially updated weights never advertise the new
-  version.
-- Omitting `weight_version` preserves the current value.
+The SGLang-compatible `update_weights_from_distributed`,
+`update_weights_from_tensor`, and `update_weights_from_disk` requests accept an
+optional `weight_version`. The version changes only after the update succeeds;
+omitting it preserves the current value.
 
 Use `GET /get_weight_version` to read the current value,
 `POST /update_weight_version` with `{"new_version": "..."}` to set it directly,
 and `GET /model_info` to read the model path and version together.
+
+### Slime RL Compatibility
+
+TokenSpeed exposes the SGLang HTTP surface used by slime. The supported path is
+an externally launched TokenSpeed rollout engine on separate GPUs, using full
+NCCL weight updates and TokenSpeed data-parallel size 1:
+
+- rollout: `POST /generate`, `POST /abort_request`, `GET /v1/loads`, and
+  `GET /health_generate`;
+- update coordination: `POST /pause_generation`,
+  `POST /continue_generation`, and `GET /flush_cache`;
+- NCCL weight sync: `POST /init_weights_update_group`,
+  `POST /update_weights_from_distributed`, and
+  `POST /destroy_weights_update_group`;
+- memory control: `POST /release_memory_occupation` and
+  `POST /resume_memory_occupation`.
+
+Use TokenSpeed's control-server address, not its OpenAI gateway address, as the
+external rollout-engine address. Real rollout log probabilities require
+`--enable-output-logprobs`.
+
+The following slime paths are not yet supported end to end:
+
+- colocated CUDA-IPC updates through `update_weights_from_tensor`;
+- quantized-update hooks `post_process_weights` and `weights_checker`;
+- disk-delta `pull_weights`;
+- slime's retained top-p token set (`rollout_top_p != 1.0`). Use
+  `--rollout-top-p 1.0` until TokenSpeed returns that metadata;
+- rollout routing replay (`--use-rollout-routing-replay`).
+
+The HTTP route for `update_weights_from_tensor` remains for SGLang clients, but
+TokenSpeed's scheduler does not yet implement its CUDA-IPC receive path. Use the
+distributed update mode until that implementation is added.
 
 ## Scheduler And Memory
 

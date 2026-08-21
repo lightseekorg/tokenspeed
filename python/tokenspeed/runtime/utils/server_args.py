@@ -171,15 +171,9 @@ class ServerArgs:
     enable_cache_report: bool = False
     kv_events_config: str | None = None
 
-    # RL online weight sync (always on / ungated). NOTE: these endpoints can
-    # overwrite model weights, reload checkpoints from disk, and pause/abort
-    # serving, and are exposed on the public control port. See
-    # runtime/engine/weight_transfer/ and runtime/entrypoints/vllm_compat_http.py.
-    weight_transfer_config: str | None = None
-    # Port for the in-engine RL control-plane HTTP app (weight sync + pause/resume
-    # + memory occupation, both the native and SGLang-compatible dialects). Set by
-    # the ``ts serve`` orchestrator (allocated + proxied by the sidecar); None
-    # disables the in-engine app.
+    # Port for the in-engine SGLang-compatible RL control app (weight sync,
+    # pause/resume, and memory occupation). Set by the ``ts serve`` orchestrator;
+    # None disables the in-engine app.
     rl_control_port: int | None = None
     # Version identifier for the model weights. Stamped into every generation
     # response's meta_info so RL trainers know which policy version produced each
@@ -292,8 +286,8 @@ class ServerArgs:
     disable_cuda_graph_padding: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
-    enable_nccl_nvls: bool = False
-    enable_symm_mem: bool = False
+    disable_nccl_nvls: bool = False
+    disable_symm_mem: bool = False
     disable_overlap_schedule: bool = False
     disable_tf32: bool = False
     force_deterministic_rsag: bool = False
@@ -988,6 +982,7 @@ class ServerArgs:
                 "auto",
                 "pt",
                 "safetensors",
+                "instanttensor",
                 "npcache",
                 "dummy",
                 "extensible",
@@ -998,6 +993,9 @@ class ServerArgs:
             "is not available. "
             '"pt" will load the weights in the pytorch bin format. '
             '"safetensors" will load the weights in the safetensors format. '
+            '"instanttensor" accelerates safetensors loading on NVIDIA GPUs '
+            "via distributed loading, pipelined prefetching, and direct I/O "
+            "(with optional GPUDirect Storage support). "
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values.',
@@ -1780,14 +1778,14 @@ class ServerArgs:
             help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
         )
         parser.add_argument(
-            "--enable-nccl-nvls",
+            "--disable-nccl-nvls",
             action="store_true",
-            help="Enable NCCL NVLS for prefill heavy requests when available.",
+            help="Disable NCCL NVLS even when an MNNVL-capable fabric is detected.",
         )
         parser.add_argument(
-            "--enable-symm-mem",
+            "--disable-symm-mem",
             action="store_true",
-            help="Enable NCCL symmetric memory for fast collectives.",
+            help="Disable NCCL cuMem support even when an MNNVL-capable fabric is detected.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -2069,14 +2067,7 @@ class ServerArgs:
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
 
-        # RL online weight sync (always on / ungated).
-        parser.add_argument(
-            "--weight-transfer-config",
-            type=str,
-            default=ServerArgs.weight_transfer_config,
-            help='JSON config for weight transfer, e.g. \'{"backend":"nccl"}\'. '
-            "Backend is one of 'nccl' (disaggregated) or 'ipc' (colocated).",
-        )
+        # SGLang-compatible RL control app.
         parser.add_argument(
             "--rl-control-port",
             type=int,
@@ -2138,14 +2129,6 @@ class ServerArgs:
         """The frontend handshake endpoint dialed under ``--zmq-msgpack``,
         composed from ``--data-parallel-address``/``--data-parallel-rpc-port``."""
         return f"tcp://{self.data_parallel_address}:{self.data_parallel_rpc_port}"
-
-    def get_weight_transfer_config(self):
-        """Parse ``--weight-transfer-config`` JSON into a ``WeightTransferConfig``."""
-        from tokenspeed.runtime.engine.weight_transfer.config import (
-            WeightTransferConfig,
-        )
-
-        return WeightTransferConfig.from_json(self.weight_transfer_config)
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:

@@ -483,6 +483,25 @@ class TailPlan:
     routed_in_fork: bool = False
 
 
+def _tail_finalize_top_k(
+    top_k: int,
+    execution_plan,
+    experts_supports_deferred_finalize: bool,
+) -> int | None:
+    """Deferred-finalize arming decision for the latent tail (rank-uniform).
+
+    Both inputs are identical on every rank: ``fused_moe_ar`` comes from the
+    negotiated execution plan, and ``experts_supports_deferred_finalize`` is
+    the experts kernel plan's capability bit (``MoELayer.plan``), so all
+    ranks arm — or don't — together. Returns ``top_k`` to request the
+    deferred triple from the experts kernel, or ``None`` for the
+    materialized-input tail.
+    """
+    if execution_plan.fused_moe_ar and experts_supports_deferred_finalize:
+        return top_k
+    return None
+
+
 class K3MoeTailComm:
     """MoE-tail routing and execution for one KimiLinearMoE module.
 
@@ -503,6 +522,7 @@ class K3MoeTailComm:
         routed_norm,
         up_proj,
         execution_plan,
+        experts_supports_deferred_finalize: bool,
     ) -> None:
         self.state = K3MoeTailCommState.get(
             mapping=mapping,
@@ -526,26 +546,20 @@ class K3MoeTailComm:
         self._shard_up_projection = up_proj.shard_group is not None
         self.latent_tail = None
         if self.state.latent_tail_ok:
-            # Deferred-finalize arming (rank-uniform: execution_plan and the
-            # negotiated state agree on every rank). fused_moe_ar already
-            # implies use_trtllm at construction, and only the trtllm SiTU
-            # kernel emits the deferred triple; the explicit use_trtllm check
-            # keeps that assumption visible.
-            # NOTE: use_trtllm is a *proxy* for "the producer echoes bf16
-            # expert scales" — this comm layer never sees the experts module,
-            # so it cannot assert the kernel's supports_deferred_finalize
-            # trait or weight dtype here. The backstops are explicit: the
-            # experts layer raises on do_finalize=False without the trait,
-            # and KimiK3LatentTailOp.call_deferred raises on non-BF16 scales
-            # (no silent down-cast), so a future fp32-scale producer fails
-            # loudly instead of silently degrading precision.
-            tail_finalize_top_k = (
-                top_k
-                if (
-                    execution_plan.fused_moe_ar
-                    and getattr(execution_plan, "use_trtllm", False)
-                )
-                else None
+            # Deferred-finalize arming (rank-uniform). The gate is the
+            # experts kernel plan's own supports_deferred_finalize bit,
+            # passed in by the model (this comm layer never sees the experts
+            # module itself) — NOT a use_trtllm proxy: the trtllm solution
+            # spans kernels with either capability (the SiTU variants emit
+            # the deferred triple, mxfp4 SwiGLU does not). The backstops stay
+            # explicit: the experts layer raises on do_finalize=False without
+            # the trait, and KimiK3LatentTailOp.call_deferred raises on
+            # non-BF16 scales (no silent down-cast), so a mis-armed or
+            # fp32-scale producer fails loudly instead of silently degrading.
+            tail_finalize_top_k = _tail_finalize_top_k(
+                top_k,
+                execution_plan,
+                experts_supports_deferred_finalize,
             )
             # Per-module mailbox. Constructor failures must propagate because
             # peers are already rendezvousing: a rank that failed mid-way has

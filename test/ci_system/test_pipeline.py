@@ -106,12 +106,23 @@ def test_amd_runner_prefixes_cover_legacy_and_arc_labels():
 
 def test_nvidia_runner_groups_split_arm_from_x86():
     assert is_nvidia_arm_runner("gb200-1gpu")
+    assert is_nvidia_arm_runner("gb300-4gpu")
     assert not is_nvidia_arm_runner("b200-1gpu")
     assert not is_nvidia_arm_runner("amd-mi35x-1gpu-test")
 
     assert runner_matches_group("gb200-1gpu", "nvidia")
     assert runner_matches_group("gb200-1gpu", "nvidia-arm")
     assert not runner_matches_group("gb200-1gpu", "nvidia-x86")
+    assert runner_matches_group("gb300-4gpu", "nvidia")
+    assert runner_matches_group("gb300-4gpu", "nvidia-arm")
+    assert not runner_matches_group("gb300-4gpu", "nvidia-x86")
+    assert runner_matches_group("slurm-b300-4gpu", "nvidia-arm")
+    assert runner_matches_group("slurm-gb200-4node-4gpu", "nvidia-arm")
+    assert runner_matches_group("slurm-gb300-4gpu", "nvidia-arm")
+    assert not runner_matches_group("slurm-b300-4gpu", "nvidia-x86")
+    assert not runner_matches_group("slurm-gb200-4node-4gpu", "nvidia-x86")
+    assert pipeline.get_default_runner_env("slurm-b300-4gpu")["SM"] == "sm103"
+    assert pipeline.uses_isolated_jit_cache("slurm-gb300-4gpu")
     assert runner_matches_group("b200-1gpu", "nvidia-x86")
     assert runner_matches_group("b300-4gpu", "nvidia-x86")
     assert not runner_matches_group("amd-mi35x-1gpu-test", "nvidia-arm")
@@ -123,10 +134,12 @@ def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
     assert is_gb200_runner("gb200-4gpu-perf")
     assert is_gb200_runner("slurm-gb200-4node-4gpu")
     assert not is_gb200_runner("b300-4gpu")
+    assert not is_gb200_runner("gb300-4gpu")
 
     assert should_run_nvidia_gpu_cleanup("gb200-1gpu")
     assert should_run_nvidia_gpu_cleanup("gb200-4gpu-perf")
     assert should_run_nvidia_gpu_cleanup("b300-4gpu")
+    assert not should_run_nvidia_gpu_cleanup("gb300-4gpu")
     assert not should_run_nvidia_gpu_cleanup("b200-4gpu")
     assert not should_run_nvidia_gpu_cleanup("h100-1gpu")
     assert not should_run_nvidia_gpu_cleanup("amd-mi35x-2gpu-test")
@@ -156,6 +169,13 @@ def test_execute_cli_defaults_to_ci_setup_mode():
     )
 
     assert args.setup_mode == "ci"
+
+
+def test_scan_cli_excludes_multi_node_tasks_by_default():
+    args = parse_args(["scan"])
+
+    assert args.runner_group == "all"
+    assert args.multi_node == "exclude"
 
 
 def test_execute_cli_accepts_slurm_setup_mode():
@@ -224,8 +244,15 @@ def test_multi_node_slurm_task_validation():
 
     validate_task(task, Path("task.yaml"))
 
+    task["triggers"] = ["per-commit"]
+    validate_task(task, Path("task.yaml"))
+
     task["triggers"] = ["manual"]
-    with pytest.raises(ValueError, match="only the 'slurm' trigger"):
+    with pytest.raises(ValueError, match="exactly one"):
+        validate_task(task, Path("task.yaml"))
+
+    task["triggers"] = ["per-commit", "slurm"]
+    with pytest.raises(ValueError, match="exactly one"):
         validate_task(task, Path("task.yaml"))
 
 
@@ -889,6 +916,73 @@ def test_build_matrix_default_priority_preserves_existing_order(tmp_path):
     ]
     assert all(e["priority"] == "normal" for e in matrix["include"])
     assert all(e["optional"] is False for e in matrix["include"])
+
+
+def test_build_matrix_can_select_or_exclude_multi_node_tasks(tmp_path):
+    _write_task_yaml(
+        tmp_path,
+        "single.yaml",
+        _default_body("single", ["gb300-4gpu"]),
+    )
+    _write_task_yaml(
+        tmp_path,
+        "multi.yaml",
+        """
+        api_version: ci.tokenspeed.io/v1
+        name: multi
+        type: eval
+        workflow_stage: model-test
+        triggers: [per-commit]
+        runner:
+          labels: [slurm-b300-4gpu]
+        slurm:
+          nodes: 2
+          gpus_per_node: 4
+        server:
+          command: ts serve example/model
+          ready:
+            url: http://127.0.0.1:8000/readiness
+        eval:
+          command: run eval
+        """,
+    )
+
+    only = build_matrix(
+        tmp_path,
+        tmp_path,
+        trigger="per-commit",
+        runner_group="nvidia-arm",
+        multi_node="only",
+    )
+    excluded = build_matrix(
+        tmp_path,
+        tmp_path,
+        trigger="per-commit",
+        runner_group="nvidia-arm",
+        multi_node="exclude",
+    )
+    default = build_matrix(
+        tmp_path,
+        tmp_path,
+        trigger="per-commit",
+        runner_group="nvidia-arm",
+    )
+
+    assert [entry["name"] for entry in only["include"]] == ["multi"]
+    assert [entry["name"] for entry in excluded["include"]] == ["single"]
+    assert default == excluded
+    assert build_matrix(
+        tmp_path,
+        tmp_path,
+        trigger="per-commit",
+        runner_group="nvidia-x86",
+    ) == {"include": []}
+    assert build_matrix(
+        tmp_path,
+        tmp_path,
+        trigger="per-commit",
+        runner_group="amd",
+    ) == {"include": []}
 
 
 def test_build_matrix_excludes_runner_label_substrings_case_insensitively(

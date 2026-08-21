@@ -44,6 +44,7 @@ SUPPORTED_SETUP_MODES = ("ci", "slurm")
 SUPPORTED_PRIORITIES = ("high", "normal", "low")
 DEFAULT_PRIORITY = "normal"
 SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
+SUPPORTED_MULTI_NODE_FILTERS = ("all", "only", "exclude")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
 EXCLUDED_RUNNER_LABELS_ENV = "TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"
@@ -66,12 +67,23 @@ JIT_CACHE_ENV_SUBDIRS = {
 RUNNER_SM_PREFIXES = (
     (("h100", "h200"), "sm90"),
     (("b200", "gb200", "slurm-gb200"), "sm100"),
-    (("b300", "gb300"), "sm103"),
+    (("b300", "gb300", "slurm-b300", "slurm-gb300"), "sm103"),
 )
 
 AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-")
-NVIDIA_ARM_RUNNER_PREFIXES = ("gb200",)
+NVIDIA_ARM_RUNNER_PREFIXES = (
+    "gb200",
+    "gb300",
+    "slurm-b300",
+    "slurm-gb200",
+    "slurm-gb300",
+)
 GB200_RUNNER_PREFIXES = ("gb200", "slurm-gb200")
+ISOLATED_JIT_CACHE_RUNNER_PREFIXES = (
+    *GB200_RUNNER_PREFIXES,
+    "slurm-b300",
+    "slurm-gb300",
+)
 NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES = ("gb200", "b300")
 PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
 
@@ -100,6 +112,10 @@ def runner_matches_group(runner: str, runner_group: str) -> bool:
 
 def is_gb200_runner(runner: str) -> bool:
     return runner.startswith(GB200_RUNNER_PREFIXES)
+
+
+def uses_isolated_jit_cache(runner: str) -> bool:
+    return runner.startswith(ISOLATED_JIT_CACHE_RUNNER_PREFIXES)
 
 
 def should_run_nvidia_gpu_cleanup(runner: str) -> bool:
@@ -246,9 +262,13 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 raise ValueError(
                     f"{path}: multi-node Slurm tasks must have type 'eval' or 'perf'"
                 )
-            if data["triggers"] != ["slurm"]:
+            if len(data["triggers"]) != 1 or data["triggers"][0] not in {
+                "per-commit",
+                "slurm",
+            }:
                 raise ValueError(
-                    f"{path}: multi-node Slurm tasks must use only the 'slurm' trigger"
+                    f"{path}: multi-node Slurm tasks must use exactly one of the "
+                    "'per-commit' or 'slurm' triggers"
                 )
             if not all(label.startswith("slurm-") for label in labels):
                 raise ValueError(
@@ -344,12 +364,20 @@ def build_matrix(
     trigger: str | None,
     runner_group: str = "all",
     workflow_stage: str | None = None,
+    multi_node: str = "exclude",
 ) -> Dict[str, Any]:
+    if multi_node not in SUPPORTED_MULTI_NODE_FILTERS:
+        raise ValueError(f"unsupported multi-node filter: {multi_node!r}")
     include = []
     excluded_runner_labels = get_excluded_runner_labels()
     for path in find_task_files(root):
         task = normalize_task(path, repo_root)
         if trigger and trigger not in task["triggers"]:
+            continue
+        is_multi_node = task.get("slurm", {}).get("nodes", 1) > 1
+        if multi_node == "only" and not is_multi_node:
+            continue
+        if multi_node == "exclude" and is_multi_node:
             continue
         task_workflow_stage = task.get("workflow_stage")
         if workflow_stage:
@@ -1652,7 +1680,7 @@ def execute_task(
     env.update(get_default_runner_env(runner))
     env.update(get_runner_specific_env(task, runner))
 
-    jit_cache_env = get_jit_cache_env(env) if is_gb200_runner(runner) else {}
+    jit_cache_env = get_jit_cache_env(env) if uses_isolated_jit_cache(runner) else {}
     env.update(jit_cache_env)
     if not dry_run:
         for cache_dir in jit_cache_env.values():
@@ -1922,6 +1950,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional workflow stage filter",
     )
+    scan_parser.add_argument(
+        "--multi-node",
+        choices=SUPPORTED_MULTI_NODE_FILTERS,
+        default="exclude",
+        help="Optionally select only or exclude multi-node Slurm tasks",
+    )
 
     execute_parser = subparsers.add_parser("execute", help="Execute one CI task")
     execute_parser.add_argument(
@@ -1994,6 +2028,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.trigger,
             args.runner_group,
             args.workflow_stage,
+            args.multi_node,
         )
         print(json.dumps(matrix, separators=(",", ":")))
         return 0

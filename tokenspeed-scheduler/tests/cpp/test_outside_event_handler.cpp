@@ -688,11 +688,10 @@ protected:
 };
 
 TEST_F(PdLocalRecoveryCapacityTestSuite, SingleRequestCapacityIncludesLocalRecoveryWorkingSet) {
-    // Full KV uses ceil(tokens / 4) parents. A local-recovery chunk peaks at
-    // five State parents: one lookback plus four pages for an eight-token
-    // chunk, including the final decode reservation where applicable.
-    // Eight usable parents therefore admit at most 12 total tokens.
-    EXPECT_EQ(scheduler_->MaxSingleRequestTokens(), 12);
+    // Full KV uses ceil(tokens / 4) parents. Non-overlap sparse local recovery
+    // needs two State parents: input checkpoint and final output. Eight usable
+    // parents therefore admit at most 24 total tokens.
+    EXPECT_EQ(scheduler_->MaxSingleRequestTokens(), 24);
 }
 
 TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapshotAtomically) {
@@ -707,16 +706,15 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapsh
     EXPECT_TRUE(std::ranges::all_of(full, [](std::int32_t page_id) { return page_id > 0; }));
 
     const auto& state = destination->block_tables.at("state").at(0);
-    ASSERT_EQ(state.size(), 5u);
+    ASSERT_EQ(state.size(), 4u);
     EXPECT_EQ(state[0], 0);
     EXPECT_EQ(state[1], 0);
     EXPECT_EQ(state[2], 0);
     EXPECT_GT(state[3], 0);
-    EXPECT_GT(state[4], 0);
     ASSERT_EQ(plan.pages_to_zero.size(), 2u);
     EXPECT_EQ(plan.pages_to_zero.at("full"), full);
-    EXPECT_EQ(plan.pages_to_zero.at("state"), (std::vector<std::int32_t>{state[3], state[4]}));
-    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 1);
+    EXPECT_EQ(plan.pages_to_zero.at("state"), (std::vector<std::int32_t>{state[3]}));
+    EXPECT_EQ(scheduler_->PoolFreeBlocks(), 2);
     EXPECT_TRUE(scheduler_->PdTransferPinned("r0"));
 
     SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
@@ -724,7 +722,10 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapsh
     const ExecutionPlan decode_plan = PlanOnce();
     const ForwardBatch* decode = FindForwardBatch(decode_plan.Operations());
     ASSERT_NE(decode, nullptr);
-    EXPECT_EQ(decode->block_tables, destination->block_tables);
+    const auto& decode_state = decode->block_tables.at("state").at(0);
+    ASSERT_EQ(decode_state.size(), 5u);
+    EXPECT_EQ(decode_state[3], state[3]);
+    EXPECT_GT(decode_state[4], 0);
 
     ExecutionEvent succeeded;
     succeeded.With(pd::SucceededEvent{"r0"});
@@ -741,9 +742,8 @@ TEST_F(PdSmallStatePagesTestSuite, LatestSnapshotUsesTheStateGroupsBlockGranular
     ASSERT_NE(destination, nullptr);
 
     const auto& state = destination->block_tables.at("state").at(0);
-    ASSERT_EQ(state.size(), 9u);
-    EXPECT_TRUE(std::ranges::all_of(state.begin(), state.end() - 2, [](std::int32_t page_id) { return page_id == 0; }));
-    EXPECT_GT(state[state.size() - 2], 0);
+    ASSERT_EQ(state.size(), 8u);
+    EXPECT_TRUE(std::ranges::all_of(state.begin(), state.end() - 1, [](std::int32_t page_id) { return page_id == 0; }));
     EXPECT_GT(state.back(), 0);
 }
 
@@ -770,12 +770,11 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndLeavesStatePrefix
     EXPECT_TRUE(std::ranges::all_of(full, [](std::int32_t page_id) { return page_id > 0; }));
 
     const auto& state = destination->block_tables.at("state").at(0);
-    ASSERT_EQ(state.size(), 5u);
+    ASSERT_EQ(state.size(), 4u);
     EXPECT_EQ(state[0], 0);
     EXPECT_EQ(state[1], 0);
     EXPECT_EQ(state[2], 0);
     EXPECT_GT(state[3], 0);
-    EXPECT_GT(state[4], 0);
 }
 
 TEST_F(PdSlidingSparseDecodeAdmissionTestSuite, KeepsCachedPrefixIslandWhileMaterializingRemoteTail) {

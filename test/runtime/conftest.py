@@ -42,6 +42,8 @@ def kimi_recipe(
     context_len: int = 4096,
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
+    speculative_algorithm: str | None = None,
+    speculative_num_draft_tokens: int = 1,
 ):
     """A Kimi-K3 recipe over the reference config, with tiny scheduler limits."""
     from types import SimpleNamespace
@@ -54,6 +56,7 @@ def kimi_recipe(
     text_config = text_config if text_config is not None else KimiLinearConfig()
     attn_config = SimpleNamespace(
         attn_tp_size=tp_size,
+        dtype=torch.bfloat16,
         kv_cache_dtype=torch.float8_e4m3fn,
         kv_cache_quant_method=None,
         kv_lora_rank=text_config.kv_lora_rank,
@@ -73,7 +76,10 @@ def kimi_recipe(
     )
     return KimiK3Recipe(
         server_args=SimpleNamespace(
-            max_total_tokens=None, chunked_prefill_size=max_scheduled_tokens
+            max_total_tokens=None,
+            chunked_prefill_size=max_scheduled_tokens,
+            speculative_algorithm=speculative_algorithm,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(text_config=text_config)
@@ -142,7 +148,6 @@ def make_kimi_pool(device, usable_pages: int = 6, *, with_mla_dims: bool = True)
         layer_num=text_config.num_hidden_layers,
         rank=0,
         layer_types=layer_types,
-        layer_group_ids=group_ids,
         cache_group_specs=_kimi_group_specs(group_ids, layer_types, plan),
     )
     return pool
@@ -156,21 +161,21 @@ def kimi_pool():
 def layer_for_group(pool, group_id: str) -> int:
     return next(
         layer_id
-        for layer_id, candidate in pool._group_ids_by_layer.items()
+        for layer_id, candidate in sorted(pool.state_group_by_layer.items())
         if candidate == group_id
     )
 
 
 def mla_layer_id(pool) -> int:
-    return layer_for_group(pool, "full_attention")
+    return next(
+        layer_id
+        for layer_id in range(pool.layer_num)
+        if layer_id not in pool.state_group_by_layer
+    )
 
 
 def kda_layer_id(pool) -> int:
-    return next(
-        layer_id
-        for layer_id, group_id in pool._group_ids_by_layer.items()
-        if group_id != "full_attention"
-    )
+    return min(pool.state_group_by_layer)
 
 
 def cache_metadata_for(contract, tables, device, *, filler_page: int = 1):

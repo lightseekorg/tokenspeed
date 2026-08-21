@@ -42,6 +42,7 @@ __all__ = [
 
 _REGISTERED_TOPK_WIDTHS = (512, 1024, 2048)
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+_GFX1250_COMPUTE_UNITS = 256
 
 
 @gluon.jit
@@ -52,12 +53,21 @@ def _dsa_selected_dense_wmma_kernel(
     topk_slots,
     topk_lens,
     out,
+    partial_m,
+    partial_l,
+    partial_acc,
     stride_q_t: tl.int64,
     stride_q_h: tl.int64,
     stride_lora_t: tl.int64,
     stride_rope_t: tl.int64,
     stride_o_t: tl.int64,
     stride_o_h: tl.int64,
+    stride_pm_t: tl.int64,
+    stride_pm_s: tl.int64,
+    stride_pm_h: tl.int64,
+    stride_pa_t: tl.int64,
+    stride_pa_s: tl.int64,
+    stride_pa_h: tl.int64,
     stride_topk_t: tl.int64,
     total_slots: tl.int32,
     num_heads: gl.constexpr,
@@ -69,6 +79,7 @@ def _dsa_selected_dense_wmma_kernel(
     BLOCK_K: gl.constexpr,
     IS_FP8: gl.constexpr,
     OUTPUT_WITHIN_2GB: gl.constexpr,
+    KV_SPLITS: gl.constexpr,
 ):
     """Wave32 WMMA attention with a two-stage selected-row TDM pipeline."""
 
@@ -124,6 +135,7 @@ def _dsa_selected_dense_wmma_kernel(
 
     token = gl.program_id(0)
     head_block = gl.program_id(1)
+    split_id = gl.program_id(2)
     head_base = head_block * BLOCK_H
     valid_len = gl.load(topk_lens + token).to(tl.int32)
 
@@ -214,10 +226,21 @@ def _dsa_selected_dense_wmma_kernel(
     l_i = gl.full([BLOCK_H], 0.0, gl.float32, layout=gl.SliceLayout(1, qk_layout))
     acc = gl.zeros([BLOCK_H, KV_LORA_RANK], gl.float32, layout=pv_layout)
 
-    if valid_len > 0:
-        num_tiles = (valid_len + BLOCK_K - 1) // BLOCK_K
-        gl.amd.gfx1250.tdm.async_load(slot_desc, [0, 0], slot_buffers.index(0))
-        gl.amd.gfx1250.tdm.async_load(slot_desc, [0, BLOCK_K], slot_buffers.index(1))
+    num_tiles = (valid_len + BLOCK_K - 1) // BLOCK_K
+    tiles_per_split = (num_tiles + KV_SPLITS - 1) // KV_SPLITS
+    tile_start = split_id * tiles_per_split
+    tile_end = gl.minimum(tile_start + tiles_per_split, num_tiles)
+    split_tiles = tile_end - tile_start
+
+    if tile_start < tile_end:
+        gl.amd.gfx1250.tdm.async_load(
+            slot_desc, [0, tile_start * BLOCK_K], slot_buffers.index(0)
+        )
+        gl.amd.gfx1250.tdm.async_load(
+            slot_desc,
+            [0, gl.minimum(tile_start + 1, tile_end - 1) * BLOCK_K],
+            slot_buffers.index(1),
+        )
         gl.amd.gfx1250.tdm.async_wait(1)
         slots = slot_buffers.index(0).reshape([BLOCK_K]).load(slot_layout)
         cur_valid = slots >= 0
@@ -228,11 +251,14 @@ def _dsa_selected_dense_wmma_kernel(
 
         # Slot loads run one tile ahead of the two KV gathers.  Keeping three
         # TDM operations outstanding mirrors the AITER gfx1250 FIFO schedule.
-        for tile in tl.range(0, num_tiles - 1):
+        for tile in tl.range(0, split_tiles - 1):
             next_buffer = 1 - buffer_index
             gl.amd.gfx1250.tdm.async_load(
                 slot_desc,
-                [0, (tile + 2) * BLOCK_K],
+                [
+                    0,
+                    gl.minimum(tile_start + tile + 2, tile_end - 1) * BLOCK_K,
+                ],
                 slot_buffers.index(tile % 2),
             )
             gl.amd.gfx1250.tdm.async_wait(3)
@@ -265,7 +291,7 @@ def _dsa_selected_dense_wmma_kernel(
             valid_col = gl.convert_layout(cur_valid, valid_col_layout)
             scores = gl.where(valid_col[None, :], scores, -float("inf"))
             m_new = gl.maximum(m_i, gl.max(scores, axis=1))
-            alpha = gl.exp2(m_i - m_new)
+            alpha = gl.where(l_i > 0.0, gl.exp2(m_i - m_new), 0.0)
             probs = gl.exp2(scores - m_new[:, None])
             probs = gl.where(valid_col[None, :], probs, 0.0)
             l_i = l_i * alpha + gl.sum(probs, axis=1)
@@ -288,7 +314,7 @@ def _dsa_selected_dense_wmma_kernel(
             buffer_index = next_buffer
 
         gl.amd.gfx1250.tdm.async_wait(0)
-        final_valid = ((num_tiles - 1) * BLOCK_K + slot_offsets < valid_len) & cur_valid
+        final_valid = ((tile_end - 1) * BLOCK_K + slot_offsets < valid_len) & cur_valid
         k_lora = lora_buffers.index(buffer_index).permute([1, 0]).load(k_dot_layout)
         k_rope = rope_buffers.index(buffer_index).permute([1, 0]).load(k_dot_layout)
         if not IS_FP8:
@@ -321,30 +347,60 @@ def _dsa_selected_dense_wmma_kernel(
             v_lora = lora_buffers.index(buffer_index).load(v_dot_layout).to(gl.bfloat16)
         p_dot = gl.convert_layout(probs, p_dot_layout)
         acc = gl.amd.gfx1250.wmma(p_dot, v_lora, acc)
+        m_i = m_new
 
-    denom = gl.convert_layout(l_i, gl.SliceLayout(1, pv_layout))
-    denom = gl.where(denom > 0.0, denom, 1.0)
-    result = acc / denom[:, None]
     h_out = head_base + gl.arange(
         0, BLOCK_H, layout=gl.SliceLayout(1, q_lora_load_layout)
     )
     d_out = gl.arange(0, KV_LORA_RANK, layout=gl.SliceLayout(0, q_lora_load_layout))
-    result = gl.convert_layout(result.to(out.dtype.element_ty), q_lora_load_layout)
-    output_offsets = (
-        token.to(tl.int64) * stride_o_t
-        + h_out[:, None].to(tl.int64) * stride_o_h
-        + d_out[None, :].to(tl.int64)
-    )
-    output_mask = h_out[:, None] < num_heads
-    if OUTPUT_WITHIN_2GB:
+    if KV_SPLITS > 1:
+        stats_base = (
+            token.to(tl.int64) * stride_pm_t
+            + split_id.to(tl.int64) * stride_pm_s
+            + h_out.to(tl.int64) * stride_pm_h
+        )
+        stats_mask = h_out < num_heads
+        gl.store(
+            partial_m + stats_base,
+            gl.convert_layout(m_i, gl.SliceLayout(1, q_lora_load_layout)),
+            mask=stats_mask,
+        )
+        gl.store(
+            partial_l + stats_base,
+            gl.convert_layout(l_i, gl.SliceLayout(1, q_lora_load_layout)),
+            mask=stats_mask,
+        )
         gl.amd.gfx1250.buffer_store(
-            result,
-            out,
-            output_offsets.to(tl.int32),
-            mask=output_mask,
+            gl.convert_layout(acc, q_lora_load_layout),
+            partial_acc,
+            (
+                token.to(tl.int64) * stride_pa_t
+                + split_id.to(tl.int64) * stride_pa_s
+                + h_out[:, None].to(tl.int64) * stride_pa_h
+                + d_out[None, :].to(tl.int64)
+            ).to(tl.int32),
+            mask=stats_mask[:, None],
         )
     else:
-        gl.store(out + output_offsets, result, mask=output_mask)
+        denom = gl.convert_layout(l_i, gl.SliceLayout(1, pv_layout))
+        denom = gl.where(denom > 0.0, denom, 1.0)
+        result = acc / denom[:, None]
+        result = gl.convert_layout(result.to(out.dtype.element_ty), q_lora_load_layout)
+        output_offsets = (
+            token.to(tl.int64) * stride_o_t
+            + h_out[:, None].to(tl.int64) * stride_o_h
+            + d_out[None, :].to(tl.int64)
+        )
+        output_mask = h_out[:, None] < num_heads
+        if OUTPUT_WITHIN_2GB:
+            gl.amd.gfx1250.buffer_store(
+                result,
+                out,
+                output_offsets.to(tl.int32),
+                mask=output_mask,
+            )
+        else:
+            gl.store(out + output_offsets, result, mask=output_mask)
 
 
 @gluon.constexpr_function
@@ -746,7 +802,7 @@ def _dsa_selected_packed_wmma_kernel(
 
 
 @gluon.jit
-def _dsa_selected_packed_wmma_reduce_kernel(
+def _dsa_selected_wmma_reduce_kernel(
     partial_m,
     partial_l,
     partial_acc,
@@ -762,6 +818,7 @@ def _dsa_selected_packed_wmma_reduce_kernel(
     num_heads: gl.constexpr,
     KV_SPLITS: gl.constexpr,
     BLOCK_D: gl.constexpr,
+    OUTPUT_WITHIN_2GB: gl.constexpr,
 ):
     """Wave32 reduction of split-K online-softmax partials."""
 
@@ -821,15 +878,20 @@ def _dsa_selected_packed_wmma_reduce_kernel(
     result = acc_total / denom[:, None]
 
     dims = gl.arange(0, BLOCK_D, layout=gl.SliceLayout(0, output_layout))
-    gl.amd.gfx1250.buffer_store(
-        result.to(out.dtype.element_ty),
-        out,
-        (
-            token.to(tl.int64) * stride_o_t
-            + head.to(tl.int64) * stride_o_h
-            + dims[None, :].to(tl.int64)
-        ).to(tl.int32),
+    output_offsets = (
+        token.to(tl.int64) * stride_o_t
+        + head.to(tl.int64) * stride_o_h
+        + dims[None, :].to(tl.int64)
     )
+    result = result.to(out.dtype.element_ty)
+    if OUTPUT_WITHIN_2GB:
+        gl.amd.gfx1250.buffer_store(
+            result,
+            out,
+            output_offsets.to(tl.int32),
+        )
+    else:
+        gl.store(out + output_offsets, result)
 
 
 def _flatten_query(q: torch.Tensor) -> torch.Tensor:
@@ -920,6 +982,46 @@ def _output_within_2gb(out: torch.Tensor) -> bool:
     return (max_element_offset + 1) * out.element_size() < 1 << 31
 
 
+def _select_num_kv_splits(
+    *,
+    num_tokens: int,
+    num_heads: int,
+    topk_width: int,
+    max_seqlen_k: int,
+    block_h: int,
+    block_k: int,
+    kv_lora_rank: int,
+) -> int:
+    """Select the occupancy-based power-of-two split count for dense decode."""
+    # Keep very small workloads unsplit.
+    effective_topk = min(int(topk_width), int(max_seqlen_k))
+    work_tiles = max(1, triton.cdiv(effective_topk, block_k))
+    if work_tiles <= 3:
+        return 1
+
+    # Choose how many full waves of CTAs are needed to occupy the GPU.
+    base_ctas = max(1, int(num_tokens) * triton.cdiv(int(num_heads), block_h))
+    if kv_lora_rank == 512:
+        target_waves = 1
+    elif block_k == 64:
+        target_waves = 2
+    else:
+        target_waves = 4
+    target_ctas = _GFX1250_COMPUTE_UNITS * target_waves
+    occupancy_splits = max(1, target_ctas // base_ctas)
+
+    # Cap split count where reduction overhead outweighs additional parallelism.
+    if kv_lora_rank == 128 and block_k == 32 and effective_topk <= 1024:
+        max_splits = 8
+    else:
+        max_splits = 16
+    num_kv_splits = min(work_tiles, max_splits, occupancy_splits)
+
+    # The reducer maps the full split axis into one BlockedLayout/TDM tile,
+    # whose split extent must be a power of two.
+    return 1 << (num_kv_splits.bit_length() - 1)
+
+
 def _run_dense(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -930,6 +1032,9 @@ def _run_dense(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     block_h: int,
+    max_seqlen_k: int,
+    split_kv: bool,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     dense = _flatten_dense_cache(kv_cache)
     expected_dim = kv_lora_rank + qk_rope_head_dim
@@ -942,9 +1047,37 @@ def _run_dense(
         )
     dense = dense.contiguous()
     q = q.contiguous()
-    out = _allocate_output(q, kv_lora_rank)
+    if out is None:
+        out = _allocate_output(q, kv_lora_rank)
     is_fp8 = q.dtype == dense.dtype and q.dtype in _FP8_DTYPES
-    grid = (q.shape[0], triton.cdiv(q.shape[1], block_h))
+    block_k = 64 if is_fp8 else 32
+    if split_kv:
+        num_kv_splits = _select_num_kv_splits(
+            num_tokens=q.shape[0],
+            num_heads=q.shape[1],
+            topk_width=topk_slots.shape[1],
+            max_seqlen_k=max_seqlen_k,
+            block_h=block_h,
+            block_k=block_k,
+            kv_lora_rank=kv_lora_rank,
+        )
+    else:
+        num_kv_splits = 1
+    if num_kv_splits > 1:
+        partial_m = torch.empty(
+            (q.shape[0], num_kv_splits, q.shape[1]),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        partial_l = torch.empty_like(partial_m)
+        partial_acc = torch.empty(
+            (q.shape[0], num_kv_splits, q.shape[1], kv_lora_rank),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:
+        partial_m = partial_l = partial_acc = out
+    grid = (q.shape[0], triton.cdiv(q.shape[1], block_h), num_kv_splits)
     _dsa_selected_dense_wmma_kernel[grid](
         q,
         dense,
@@ -952,12 +1085,21 @@ def _run_dense(
         topk_slots,
         topk_lens,
         out,
+        partial_m,
+        partial_l,
+        partial_acc,
         q.stride(0),
         q.stride(1),
         dense.stride(0),
         dense.stride(0),
         out.stride(0),
         out.stride(1),
+        partial_m.stride(0) if num_kv_splits > 1 else 0,
+        partial_m.stride(1) if num_kv_splits > 1 else 0,
+        partial_m.stride(2) if num_kv_splits > 1 else 0,
+        partial_acc.stride(0) if num_kv_splits > 1 else 0,
+        partial_acc.stride(1) if num_kv_splits > 1 else 0,
+        partial_acc.stride(2) if num_kv_splits > 1 else 0,
         topk_slots.stride(0),
         dense.shape[0],
         q.shape[1],
@@ -966,11 +1108,32 @@ def _run_dense(
         QK_ROPE_HEAD_DIM=qk_rope_head_dim,
         SOFTMAX_SCALE=float(softmax_scale),
         BLOCK_H=block_h,
-        BLOCK_K=64 if is_fp8 else 32,
+        BLOCK_K=block_k,
         IS_FP8=is_fp8,
         OUTPUT_WITHIN_2GB=_output_within_2gb(out),
+        KV_SPLITS=num_kv_splits,
         num_warps=4,
     )
+    if num_kv_splits > 1:
+        _dsa_selected_wmma_reduce_kernel[(q.shape[0], q.shape[1])](
+            partial_m,
+            partial_l,
+            partial_acc,
+            out,
+            partial_m.stride(0),
+            partial_m.stride(1),
+            partial_m.stride(2),
+            partial_acc.stride(0),
+            partial_acc.stride(1),
+            partial_acc.stride(2),
+            out.stride(0),
+            out.stride(1),
+            q.shape[1],
+            num_kv_splits,
+            kv_lora_rank,
+            OUTPUT_WITHIN_2GB=_output_within_2gb(out),
+            num_warps=4,
+        )
     return out
 
 
@@ -998,20 +1161,20 @@ def _run_packed(
     if kv_lora_rank in (128, 512) and (
         q.dtype == torch.bfloat16 or q.dtype in _FP8_DTYPES
     ):
-        kv_splits = 16
+        num_kv_splits = 16
         partial_m = torch.empty(
-            (q.shape[0], kv_splits, q.shape[1]),
+            (q.shape[0], num_kv_splits, q.shape[1]),
             dtype=torch.float32,
             device=q.device,
         )
         partial_l = torch.empty_like(partial_m)
         partial_acc = torch.empty(
-            (q.shape[0], kv_splits, q.shape[1], kv_lora_rank),
+            (q.shape[0], num_kv_splits, q.shape[1], kv_lora_rank),
             dtype=torch.float32,
             device=q.device,
         )
         _dsa_selected_packed_wmma_kernel[
-            (q.shape[0], triton.cdiv(q.shape[1], 16), kv_splits)
+            (q.shape[0], triton.cdiv(q.shape[1], 16), num_kv_splits)
         ](
             q,
             packed.view(torch.float8_e4m3fn),
@@ -1034,7 +1197,7 @@ def _run_packed(
             packed.shape[0],
             q.shape[1],
             topk_slots.shape[1],
-            kv_splits,
+            num_kv_splits,
             float(softmax_scale),
             packed.shape[1],
             KV_LORA_RANK=kv_lora_rank,
@@ -1043,7 +1206,7 @@ def _run_packed(
             BLOCK_K=16,
             num_warps=4,
         )
-        _dsa_selected_packed_wmma_reduce_kernel[(q.shape[0], q.shape[1])](
+        _dsa_selected_wmma_reduce_kernel[(q.shape[0], q.shape[1])](
             partial_m,
             partial_l,
             partial_acc,
@@ -1057,8 +1220,9 @@ def _run_packed(
             out.stride(0),
             out.stride(1),
             q.shape[1],
-            kv_splits,
+            num_kv_splits,
             kv_lora_rank,
+            OUTPUT_WITHIN_2GB=_output_within_2gb(out),
             num_warps=4,
         )
     else:
@@ -1116,6 +1280,8 @@ def _prepare(
 def _finish(result: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
     if out is None:
         return result
+    if result.untyped_storage().data_ptr() == out.untyped_storage().data_ptr():
+        return out
     out.reshape_as(result).copy_(result)
     return out
 
@@ -1165,6 +1331,19 @@ def gluon_dsa_decode_gfx1250(
             qk_rope_head_dim=qk_rope_head_dim,
         )
     elif kv_cache is not None:
+        out_view = None
+        if (
+            out is not None
+            and out.is_contiguous()
+            and out.device == q.device
+            and out.dtype == (torch.bfloat16 if q.dtype in _FP8_DTYPES else q.dtype)
+            and out.numel() == q.shape[0] * q.shape[1] * kv_lora_rank
+            and all(
+                out.untyped_storage().data_ptr() != tensor.untyped_storage().data_ptr()
+                for tensor in (q, kv_cache, topk_slots, topk_lens)
+            )
+        ):
+            out_view = out.view(q.shape[0], q.shape[1], kv_lora_rank)
         result = _run_dense(
             q,
             kv_cache,
@@ -1174,6 +1353,9 @@ def gluon_dsa_decode_gfx1250(
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
             block_h=16,
+            max_seqlen_k=max_seqlen_k,
+            split_kv=True,
+            out=out_view,
         )
     else:
         raise ValueError("Gluon DSA requires kv_cache or sparse_kv_cache")
@@ -1236,6 +1418,8 @@ def gluon_dsa_prefill_gfx1250(
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
             block_h=32,
+            max_seqlen_k=max_seqlen_k,
+            split_kv=False,
         )
     else:
         raise ValueError("Gluon DSA requires kv_cache or sparse_kv_cache")

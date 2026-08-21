@@ -171,6 +171,7 @@ class ModelExecutorConfig:
     model_is_mrope: bool
     enable_nan_detection: bool = False
     disable_autotune: bool = False
+    enable_cudagraph_gc: bool = False
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -272,6 +273,7 @@ class ModelExecutorConfig:
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
             disable_autotune=server_args.disable_autotune,
+            enable_cudagraph_gc=server_args.enable_cudagraph_gc,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
             disable_prefill_graph=disable_prefill_graph,
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),

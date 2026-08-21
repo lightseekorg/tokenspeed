@@ -50,7 +50,6 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
         layer_num=text_config.num_hidden_layers,
         rank=0,
         layer_types=layer_types,
-        layer_group_ids=group_ids,
     )
 
     assert pool.num_lcm_blocks == num_lcm_blocks
@@ -107,7 +106,6 @@ def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
         family="kimi_k3",
         memory_plan=plan,
         layer_types=recipe.layer_types,
-        layer_group_ids=recipe.group_ids,
         cache_group_specs=tuple(spec for spec, _ in groups),
         token_capacity=128,
     )

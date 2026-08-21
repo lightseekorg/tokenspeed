@@ -291,6 +291,61 @@ class KimiK3Recipe(CacheRecipe):
                 f"{len(layout.plane_bytes)}"
             )
 
+    # ---- extras ----
+
+    @cached_property
+    def replay_kda(self) -> bool:
+        """Whether verify commits by replaying from one conv checkpoint row."""
+        if self.server_args.speculative_algorithm is None:
+            return False
+        from tokenspeed_kernel.ops.attention import kda_replay_commit_supported
+
+        return bool(kda_replay_commit_supported(self.attn_config.dtype))
+
+    @override
+    def workspace_bytes(self) -> int:
+        """KDA verify staging reserved outside the cache arena."""
+        if self.server_args.speculative_algorithm is None:
+            return 0
+        if self.replay_kda:
+            # Replay starts from the committed convolution checkpoint and
+            # reconstructs the accepted recurrent state.  The backend keeps
+            # one such row per live request, not a state row per candidate.
+            conv_bytes = self.attn_config.max_bs * sum(
+                field.payload_bytes
+                for spec, fields in self.groups()
+                if spec.group_id != FULL_ATTENTION
+                for field in fields
+                if field.field_id.endswith(".conv_state")
+            )
+            conv_shape, recurrent_shape = self._kda_shapes
+            heads, head_dim, _ = recurrent_shape
+            rows = self.attn_config.max_bs * int(
+                self.server_args.speculative_num_draft_tokens
+            )
+            layer_count = sum(
+                field.field_id.endswith(".conv_state")
+                for spec, fields in self.groups()
+                if spec.group_id != FULL_ATTENTION
+                for field in fields
+            )
+            payload_bytes_per_row = (
+                conv_shape[0] * torch.bfloat16.itemsize
+                + head_dim * torch.bfloat16.itemsize
+                + heads * torch.bfloat16.itemsize
+                + heads * head_dim * torch.float32.itemsize
+            )
+            return conv_bytes + layer_count * rows * payload_bytes_per_row
+        verify_rows = self.attn_config.max_bs * (
+            int(self.server_args.speculative_num_draft_tokens) + 1
+        )
+        return verify_rows * sum(
+            field.payload_bytes
+            for spec, fields in self.groups()
+            if spec.group_id != FULL_ATTENTION
+            for field in fields
+        )
+
     # ---- capacity: the scheduler's concurrency decides, then a search ----
 
     @override
@@ -328,9 +383,6 @@ class KimiK3Recipe(CacheRecipe):
         protected_pages = max_live_requests * math.ceil(
             depth * limits["decode_input_tokens"] / page_tokens
         )
-        scheduled_pages = math.ceil(
-            min(limits["max_scheduled_tokens"], token_capacity) / page_tokens
-        )
         parents = 0
         for group_id, packing in layout.group_packing:
             if group_id == FULL_ATTENTION:
@@ -341,6 +393,7 @@ class KimiK3Recipe(CacheRecipe):
                     + protected_pages
                 )
             else:
-                child_pages = 2 * max_live_requests + scheduled_pages + protected_pages
+                # Snapshot state rolls between two pages per live request.
+                child_pages = 2 * max_live_requests
             parents += math.ceil(child_pages / packing)
         return parents

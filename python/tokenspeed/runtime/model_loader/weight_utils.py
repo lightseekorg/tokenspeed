@@ -27,6 +27,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import struct
 import tempfile
 import threading
 import time
@@ -41,6 +42,7 @@ import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
+from tokenspeed_kernel.platform import current_platform
 from tqdm.auto import tqdm
 
 from tokenspeed.runtime.configs.load_config import LoadConfig
@@ -578,6 +580,111 @@ def safetensors_weights_iterator(
         yield from result.items()
         if prefetcher is not None:
             prefetcher.advance(file_idx)
+
+
+_SUB_BYTE_SAFETENSORS_DTYPES = frozenset({"F4", "F6_E2M3", "F6_E3M2"})
+
+# Bounds a corrupt length prefix; real headers are a few hundred KB.
+_MAX_SAFETENSORS_HEADER_BYTES = 128 * 1024 * 1024
+
+
+def _find_sub_byte_dtype(hf_weights_files: list[str]) -> str | None:
+    """Return the first sub-byte dtype any shard declares, else ``None``.
+
+    InstantTensor 0.1.9 applies a header's logical element count to a torch
+    dtype whose element is a packed pair, so an ``F4`` tensor declared ``[2048]``
+    over 1024 bytes arrives as shape ``(2048,)`` -- twice its own storage --
+    where safetensors correctly reports ``(1024,)``. Nothing raises, so callers
+    must refuse these checkpoints rather than load them wrong.
+
+    Only each shard's length-prefixed JSON header is read, never tensor data.
+    A header that will not parse raises: this decides whether a checkpoint is
+    safe to load, so it must not wave through the shard it cannot inspect.
+    """
+    for path in hf_weights_files:
+        with open(path, "rb") as f:
+            (header_len,) = struct.unpack("<Q", f.read(8))
+            if header_len > _MAX_SAFETENSORS_HEADER_BYTES:
+                raise ValueError(
+                    f"{path}: safetensors header claims {header_len} bytes"
+                )
+            header = json.loads(f.read(header_len))
+
+        if not isinstance(header, dict):
+            raise ValueError(f"{path}: safetensors header is not a JSON object")
+
+        for name, meta in header.items():
+            if name == "__metadata__" or not isinstance(meta, dict):
+                continue
+            if meta.get("dtype") in _SUB_BYTE_SAFETENSORS_DTYPES:
+                return meta["dtype"]
+    return None
+
+
+def instanttensor_weights_iterator(
+    hf_weights_files: list[str],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the model safetensor files using the
+    InstantTensor library.
+
+    InstantTensor accelerates loading safetensors weights on NVIDIA GPUs
+    through distributed loading, pipelined prefetching, and direct I/O. When
+    the job spans multiple ranks, the world process group is passed to
+    InstantTensor so reads are sharded across ranks.
+
+    Args:
+        hf_weights_files: Local paths to the ``*.safetensors`` shards to load.
+
+    Yields:
+        ``(name, tensor)`` pairs for every tensor in the checkpoint, with the
+        tensors materialized on the current CUDA device.
+    """
+    if not current_platform().is_nvidia:
+        raise ValueError("InstantTensor requires NVIDIA GPUs")
+
+    try:
+        import instanttensor
+    except ImportError as e:
+        raise ImportError(
+            'Please install instanttensor via `pip install "tokenspeed[instanttensor]"`'
+        ) from e
+
+    sub_byte_dtype = _find_sub_byte_dtype(hf_weights_files)
+    if sub_byte_dtype is not None:
+        raise ValueError(
+            f"This checkpoint declares the sub-byte safetensors dtype "
+            f"{sub_byte_dtype!r}, which InstantTensor loads incorrectly. "
+            "Use --load-format auto instead."
+        )
+
+    return _instanttensor_tensors(instanttensor, hf_weights_files)
+
+
+def _instanttensor_tensors(
+    instanttensor, hf_weights_files: list[str]
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    process_group = None
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        process_group = torch.distributed.group.WORLD
+
+    device = torch.cuda.current_device()
+
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+
+    with instanttensor.safe_open(
+        hf_weights_files, framework="pt", device=device, process_group=process_group
+    ) as f:
+        # InstantTensor 0.1.9 clones internally, so no extra clone here.
+        yield from tqdm(
+            f.tensors(),
+            desc="Loading safetensors using InstantTensor loader",
+            disable=not enable_tqdm,
+            bar_format=_BAR_FORMAT,
+            total=len(f.keys()),
+            mininterval=1.0,
+        )
 
 
 def pt_weights_iterator(

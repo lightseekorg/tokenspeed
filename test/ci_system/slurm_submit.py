@@ -33,6 +33,19 @@ PR_RE = re.compile(
 REPOSITORY_RE = re.compile(r"^(?P<owner>[A-Za-z0-9._-]+)/(?P<repo>[A-Za-z0-9._-]+)$")
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+TERMINAL_STATES = frozenset(
+    {
+        "BOOT_FAIL",
+        "CANCELLED",
+        "COMPLETED",
+        "DEADLINE",
+        "FAILED",
+        "NODE_FAIL",
+        "OUT_OF_MEMORY",
+        "PREEMPTED",
+        "TIMEOUT",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -59,7 +72,11 @@ def gpu_count(runner: str) -> int:
     return int(matches[0])
 
 
-def load_task(repo: Path, config: str, runner: str | None = None) -> Task:
+def load_task(
+    repo: Path,
+    config: str,
+    runner: str | None = None,
+) -> Task:
     path = (repo / config).resolve()
     try:
         relative = path.relative_to(repo).as_posix()
@@ -126,7 +143,7 @@ def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
         return tasks
     if not runners:
         raise ValueError("--all requires --runner")
-    matrix = build_matrix(repo / "test/ci", repo, args.trigger)
+    matrix = build_matrix(repo / "test/ci", repo, args.trigger, "all", None, "all")
     tasks = [
         load_task(repo, item["config"], item["runner"])
         for item in matrix["include"]
@@ -186,9 +203,15 @@ def print_target(repo: Path, source_pr: str | None, test_commit: str) -> None:
     url = source_pr_url(source_pr)
     if url is not None:
         print(f"Link: {url}", flush=True)
-    print(f"Target commit: {git(repo, 'rev-parse', 'HEAD^2')}", flush=True)
+    try:
+        target_commit = git(repo, "rev-parse", "HEAD^2")
+        base_commit = git(repo, "rev-parse", "HEAD^1")
+    except subprocess.CalledProcessError:
+        print(f"Target commit: {test_commit}", flush=True)
+        return
+    print(f"Target commit: {target_commit}", flush=True)
     print(f"Merged test commit: {test_commit}", flush=True)
-    print(f"Base commit: {git(repo, 'rev-parse', 'HEAD^1')}", flush=True)
+    print(f"Base commit: {base_commit}", flush=True)
 
 
 @contextlib.contextmanager
@@ -254,13 +277,16 @@ def snapshot(repo: Path, artifact_root: Path, commit: str) -> Path:
         raise ValueError("commit tracked changes before submitting")
     target = artifact_root / "snapshots" / f"{commit}.tar"
     target.parent.mkdir(parents=True, exist_ok=True)
-    if not target.exists():
-        temporary = target.with_suffix(f".{os.getpid()}.tmp")
-        subprocess.run(
-            ["git", "-C", str(repo), "archive", f"--output={temporary}", commit],
-            check=True,
-        )
-        temporary.replace(target)
+    handle, temporary_name = tempfile.mkstemp(
+        dir=target.parent, prefix=f"{commit}.", suffix=".tmp"
+    )
+    os.close(handle)
+    temporary = Path(temporary_name)
+    subprocess.run(
+        ["git", "-C", str(repo), "archive", f"--output={temporary}", commit],
+        check=True,
+    )
+    temporary.replace(target)
     return target
 
 
@@ -310,6 +336,55 @@ def render_script(
         "SLURM_STEP_ID,SLURM_STEP_NUM_NODES,SLURM_STEP_NODELIST,SLURM_NODEID,"
         "SLURM_PROCID,SLURM_LOCALID",
     ]
+    gpu_device_mounts = ""
+    local_model_mounts = ""
+    if task.runner.startswith(("gb300-", "slurm-gb300-")):
+        local_model_mounts = r"""
+# GB300 nodes keep large model snapshots on their local RAID.  Keep the
+# source configurable for other coordinators while exposing one stable path
+# to server containers.
+local_model_root="${TS_CI_LOCAL_MODEL_ROOT:-/scratch/${USER}-models}"
+if [ -d "$local_model_root" ]; then
+  model_mounts+=("$local_model_root:/models:ro")
+fi
+"""
+        gpu_device_mounts = r"""
+# The GB300 Pyxis hook does not expose allocated device nodes.
+gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"
+IFS=',' read -ra visible_gpus <<< "$gpu_ids"
+mounted_gpu_count=0
+for token in "${visible_gpus[@]}"; do
+  if [[ "$token" =~ ^[0-9]+$ ]]; then
+    first_gpu=$((10#$token))
+    last_gpu=$first_gpu
+  elif [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+    first_gpu=$((10#${BASH_REMATCH[1]}))
+    last_gpu=$((10#${BASH_REMATCH[2]}))
+  else
+    continue
+  fi
+  for ((gpu = first_gpu; gpu <= last_gpu; gpu++)); do
+    device="/dev/nvidia$gpu"
+    if [ -e "$device" ]; then
+      gpu_mounts+=("$device:$device")
+      mounted_gpu_count=$((mounted_gpu_count + 1))
+    fi
+  done
+done
+if ((mounted_gpu_count == 0)); then
+  echo "No NVIDIA device nodes matched Slurm GPU allocation: ${gpu_ids:-<unset>}" >&2
+  exit 2
+fi
+for device in \
+  /dev/nvidiactl \
+  /dev/nvidia-uvm \
+  /dev/nvidia-uvm-tools \
+  /dev/nvidia-nvswitchctl \
+  /dev/nvidia-caps \
+  /dev/nvidia-caps-imex-channels; do
+  [ ! -e "$device" ] || gpu_mounts+=("$device:$device")
+done
+"""
     common = f"""#!/usr/bin/env bash
 set -euo pipefail
 
@@ -330,8 +405,13 @@ mounts=(
   "$run:/workspace/.ci-artifacts"
   {shlex.quote(str(cache) + ":/home/runner/.cache")}
 )
+model_mounts=()
+gpu_mounts=()
 
-# This cluster's Pyxis hook exposes devices but omits driver libraries/tools.
+{local_model_mounts}
+{gpu_device_mounts}
+
+# The cluster Pyxis hooks omit driver libraries and tools.
 driver_dir=""
 for lib in libcuda.so.1 libnvidia-ml.so.1 libnvidia-ptxjitcompiler.so.1 libnvidia-nvvm.so.4; do
   link="$(ldconfig -p 2>/dev/null | awk -v name="$lib" \
@@ -370,7 +450,7 @@ nvidia_smi="$(command -v nvidia-smi 2>/dev/null || true)"
 trap 'rm -rf -- "$scratch"' EXIT
 mkdir -p "$src/.ci-artifacts" "$tmp"
 tar -xf "$source_archive" -C "$src"
-mounts=("$src:/workspace" "$tmp:/tmp" "${{mounts[@]}}")
+mounts=("$src:/workspace" "$tmp:/tmp" "${{gpu_mounts[@]}}" "${{model_mounts[@]}}" "${{mounts[@]}}")
 container_mounts="$(IFS=,; printf '%s' "${{mounts[*]}}")"
 {shell_array("srun_args", srun)}
 srun_args+=(--container-mounts="$container_mounts")
@@ -394,6 +474,19 @@ srun "${{srun_args[@]}}" "${{container_command[@]}}"
         "--gres=none",
         "--unbuffered",
         "--kill-on-bad-exit=1",
+    ]
+    image_prepare_args = [
+        "--overlap",
+        "--nodes=1",
+        "--ntasks=1",
+        "--gres=none",
+        "--unbuffered",
+        "--kill-on-bad-exit=1",
+        "--export=ALL",
+        f"--container-image={image}",
+        "--no-container-entrypoint",
+        "--no-container-mount-home",
+        "--container-remap-root",
     ]
     server_srun = [
         "--overlap",
@@ -438,18 +531,21 @@ srun "${{srun_args[@]}}" "${{container_command[@]}}"
     return common + f"""
 {shell_array("prepare_args", prepare_args)}
 {shell_array("client_prepare_args", client_prepare_args)}
+{shell_array("image_prepare_args", image_prepare_args)}
 {shell_array("cleanup_args", cleanup_args)}
 
 server_src="$scratch/server-src"
 client_src="$scratch/client-src"
 server_tmp="$scratch/server-tmp"
 client_tmp="$scratch/client-tmp"
-server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" "${{mounts[@]}}")
+# Full-node server allocations use the same GPU device IDs on every node.
+server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" "${{gpu_mounts[@]}}" "${{model_mounts[@]}}" "${{mounts[@]}}")
 client_mounts=("$client_src:/workspace" "$client_tmp:/tmp" "${{mounts[@]}}")
 server_container_mounts="$(IFS=,; printf '%s' "${{server_mounts[*]}}")"
 client_container_mounts="$(IFS=,; printf '%s' "${{client_mounts[*]}}")"
 head_node="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n '1p')"
 client_prepare_args+=(--nodelist="$head_node")
+image_prepare_args+=(--nodelist="$head_node")
 
 server_step_pid=""
 client_step_pid=""
@@ -469,6 +565,10 @@ cleanup() {{
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# Import a new image digest once before every node opens the shared Enroot
+# cache. Concurrent first-use imports race on the cache's final rename.
+srun "${{image_prepare_args[@]}}" true
 
 srun "${{prepare_args[@]}}" \
   bash -c 'set -euo pipefail; mkdir -p "$1/.ci-artifacts" "$2"; tar -xf "$3" -C "$1"' \
@@ -603,6 +703,41 @@ def slurm_states(job_ids: list[str]) -> dict[str, dict[str, str]]:
     return states
 
 
+def scontrol_states(job_ids: list[str]) -> dict[str, dict[str, str]]:
+    states = {}
+    for job_id in job_ids:
+        result = subprocess.run(
+            ["scontrol", "show", "job", "-o", job_id],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode:
+            continue
+
+        def field(name: str) -> str | None:
+            match = re.search(rf"(?:^|\s){re.escape(name)}=(\S+)", result.stdout)
+            return match.group(1) if match else None
+
+        observed_id = field("JobId")
+        raw_state = field("JobState")
+        elapsed = field("RunTime")
+        exit_code = field("ExitCode")
+        if None in {observed_id, raw_state, elapsed, exit_code}:
+            continue
+        if observed_id.split("+", 1)[0] != job_id:
+            continue
+        state = raw_state.split("+", 1)[0].upper()
+        if state not in TERMINAL_STATES:
+            continue
+        states[job_id] = {
+            "state": state,
+            "elapsed": elapsed,
+            "exit_code": exit_code,
+        }
+    return states
+
+
 def queued_states(job_ids: list[str]) -> dict[str, dict[str, str]]:
     """Return live state for only the explicitly submitted Slurm jobs."""
     requested = set(job_ids)
@@ -638,10 +773,11 @@ def print_progress(
 ) -> None:
     print(f"\nSlurm progress ({time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())})")
     for submission in submissions:
-        state = states.get(
-            submission.job_id,
-            {"state": "UNKNOWN", "elapsed": "", "reason": ""},
-        )
+        state = states.get(submission.job_id) or {
+            "state": "UNKNOWN",
+            "elapsed": "",
+            "reason": "",
+        }
         status = {
             "COMPLETED": "PASS",
             "FAILED": "FAIL",
@@ -752,7 +888,14 @@ def write_report(
         detail = result_detail(result_path)
         row = {
             "job_id": submission.job_id,
-            "task": submission.task.__dict__,
+            "task": {
+                "config": submission.task.config,
+                "name": submission.task.name,
+                "task_type": submission.task.task_type,
+                "runner": submission.task.runner,
+                "gpus": submission.task.gpus,
+                "nodes": submission.task.nodes,
+            },
             "log": str(submission.log),
             "result": str(result_path),
             **state,
@@ -831,6 +974,8 @@ def wait_all(
         states = {}
         for _ in range(6):
             states = slurm_states(job_ids)
+            missing = [job_id for job_id in job_ids if job_id not in states]
+            states.update(scontrol_states(missing))
             if len(states) == len(job_ids):
                 break
             time.sleep(2)
@@ -862,7 +1007,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         action="append",
         help="Exclude a case-insensitive task/config/model substring; repeat for OR.",
     )
-    parser.add_argument("--pr", help="PR number or GitHub pull request URL to merge.")
+    pull_request = parser.add_mutually_exclusive_group()
+    pull_request.add_argument(
+        "--pr", help="PR number or GitHub pull request URL to merge."
+    )
+    pull_request.add_argument(
+        "--source-pr",
+        help="PR number or GitHub pull request URL for the current checkout.",
+    )
     parser.add_argument("--list", action="store_true", help="List matching tasks only.")
     parser.add_argument(
         "--trigger", choices=("per-commit", "manual", "nightly", "debug", "slurm")
@@ -906,7 +1058,8 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
         print_tasks(tasks)
         return 0
     commit = git(repo, "rev-parse", "HEAD")
-    print_target(repo, args.pr, commit)
+    source_pr = args.pr or args.source_pr
+    print_target(repo, source_pr, commit)
     print(f"Selected tasks: {len(tasks)}", flush=True)
     for task in tasks:
         print(
@@ -938,7 +1091,7 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
             else artifact_root / "reports" / f"{commit[:12]}-{time.time_ns()}"
         )
         completed = wait_all(
-            submitted, artifact_root / "runs", report_dir, source_pr=args.pr
+            submitted, artifact_root / "runs", report_dir, source_pr=source_pr
         )
         print(f"Report: {report_dir}", flush=True)
         return 0 if completed else 1

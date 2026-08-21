@@ -47,12 +47,9 @@ class _ContractPool:
         )
         self.arena = SimpleNamespace(runtime_contract=contract)
         self._components = components
-        self._group_ids_by_layer = {
+        self.state_group_by_layer = {
             layer_id: group_id for layer_id, (group_id, _, _) in components.items()
         }
-
-    def group_id_for_layer(self, layer_id):
-        return self._group_ids_by_layer[layer_id]
 
     def get_component(self, layer_id, name):
         _, conv_state, recurrent_state = self._components[layer_id]
@@ -102,6 +99,11 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
         state_in, state_out = self._run([[3, 5, 8]], [8], [9])
         self.assertEqual(state_in.tolist(), [5])
         self.assertEqual(state_out.tolist(), [8])
+
+    def test_sparse_prefill_ignores_intermediate_holes(self):
+        state_in, state_out = self._run([[7, 0, 0, 0, 9]], [4], [20])
+        self.assertEqual(state_in.tolist(), [7])
+        self.assertEqual(state_out.tolist(), [9])
 
     def test_batch_mixed(self):
         # Distinct rows per request: out pages are exclusive per batch (the scheduler
@@ -195,6 +197,7 @@ class CacheContractMetadataTest(unittest.TestCase):
             head_dim=128,
             is_draft=False,
             speculative_num_draft_tokens=1,
+            max_bs=8,
         )
         backend = MambaAttnBackend(config)
         stub_pool = _ContractPool(
@@ -221,6 +224,8 @@ class CacheContractMetadataTest(unittest.TestCase):
         # before = 8 -> page slot 1 (row 2); after = 9 -> page slot 2 (row 3).
         self.assertEqual(md.state_in_blocks_by_group["linear_attention"].tolist(), [2])
         self.assertEqual(md.state_out_blocks_by_group["linear_attention"].tolist(), [3])
+        # Decode builds no host boundary tuple; only extend batches carry one.
+        self.assertIsNone(md.cu_extend_seq_lens_cpu)
 
     def test_extend_metadata(self):
         torch = self.torch
@@ -231,6 +236,7 @@ class CacheContractMetadataTest(unittest.TestCase):
             seq_lens=torch.tensor([8], dtype=torch.int32),
             forward_mode=self.ForwardMode.EXTEND,
             extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
+            extend_seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
             cache_metadata=_CacheMetadata(
                 {"linear_attention": torch.tensor([[1, 2]], dtype=torch.int32)}
             ),
@@ -238,6 +244,48 @@ class CacheContractMetadataTest(unittest.TestCase):
         md = backend.forward_metadata
         self.assertEqual(md.state_in_blocks_by_group["linear_attention"].tolist(), [0])
         self.assertEqual(md.state_out_blocks_by_group["linear_attention"].tolist(), [2])
+        # The metadata builds the host boundary tuple once, next to
+        # query_start_loc, and keeps the raw lengths for the conv kernel.
+        self.assertEqual(md.cu_extend_seq_lens_cpu, (0, 8))
+        self.assertEqual(md.extend_seq_lens_cpu.tolist(), [8])
+        self.assertEqual(md.query_start_loc.tolist(), [0, 8])
+
+    def test_extend_metadata_requires_host_lens(self):
+        torch = self.torch
+        backend = self.backend
+        with self.assertRaisesRegex(RuntimeError, "host extend lengths"):
+            backend.init_forward_metadata(
+                bs=1,
+                req_pool_indices=torch.tensor([0], dtype=torch.int32),
+                seq_lens=torch.tensor([8], dtype=torch.int32),
+                forward_mode=self.ForwardMode.EXTEND,
+                extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
+                cache_metadata=_CacheMetadata(
+                    {"linear_attention": torch.tensor([[1, 2]], dtype=torch.int32)}
+                ),
+            )
+
+    def test_mixed_metadata_pads_decode_rows(self):
+        torch = self.torch
+        backend = self.backend
+        backend.init_forward_metadata(
+            bs=2,
+            num_extends=1,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+            seq_lens=torch.tensor([8, 9], dtype=torch.int32),
+            forward_mode=self.ForwardMode.MIXED,
+            extend_seq_lens=torch.tensor([5, 1], dtype=torch.int32),
+            extend_seq_lens_cpu=torch.tensor([5], dtype=torch.int32),
+            cache_metadata=_CacheMetadata(
+                {"linear_attention": torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)}
+            ),
+        )
+        md = backend.forward_metadata
+        # One extend row (5 tokens) plus one decode row padded to
+        # spec_num_tokens (= 1): boundaries and the raw cat agree.
+        self.assertEqual(md.cu_extend_seq_lens_cpu, (0, 5, 6))
+        self.assertEqual(md.extend_seq_lens_cpu.tolist(), [5, 1])
+        self.assertEqual(md.query_start_loc.tolist(), [0, 5, 6])
 
     def test_capture_replay_metadata(self):
         torch = self.torch
@@ -296,6 +344,7 @@ class VerifyMetadataTest(unittest.TestCase):
             head_dim=2,
             is_draft=False,
             speculative_num_draft_tokens=4,
+            max_bs=8,
         )
         self.backend = MambaAttnBackend(config)
         self.state_buffers = {
@@ -406,6 +455,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             is_draft=False,
             speculative_num_draft_tokens=spec_num_tokens,
             replay_ssm=replay_ssm,
+            max_bs=8,
         )
         backend = self.MambaAttnBackend(config)
         stub_pool = _ContractPool(
@@ -554,6 +604,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             seq_lens=torch.tensor([self.PREFILL], dtype=torch.int32, device="cuda"),
             forward_mode=ForwardMode.EXTEND,
             extend_prefix_lens=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            extend_seq_lens_cpu=torch.tensor([self.PREFILL], dtype=torch.int32),
             cache_metadata=_CacheMetadata(
                 {
                     "linear_attention": torch.tensor(

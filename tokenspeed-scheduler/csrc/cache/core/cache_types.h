@@ -98,7 +98,8 @@ struct GroupDemand {
     std::int32_t reserve_tokens{0};
     // -1 materializes the ordinary dense suffix. A non-negative value keeps
     // earlier logical slots as null holes and materializes only this suffix.
-    // Decode-side PD uses this for latest snapshots and retained sliding tails.
+    // Snapshot-state local prefill uses an absolute endpoint here; Decode-side
+    // PD also uses it for latest snapshots and retained sliding tails.
     std::int32_t materialized_suffix_start{-1};
 };
 

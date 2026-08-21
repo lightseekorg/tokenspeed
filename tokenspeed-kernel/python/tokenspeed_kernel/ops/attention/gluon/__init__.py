@@ -122,6 +122,9 @@ if current_platform().is_amd:
         gluon_dsa_prefill_topk_fp8_gfx1250 as _dsa_prefill_topk_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
+        gluon_kda_fused_decode_gfx1250 as _kda_fused_decode_gfx1250_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
         gluon_kda_recurrent_decode_gfx1250 as _kda_decode_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.prefill import (
@@ -171,7 +174,9 @@ if current_platform().is_amd:
         tags={"amd", "gfx950", "paged_cache"},
     )
     def gluon_kda_paged_prefill_gfx950(**kwargs) -> KdaPrefillResult:
-        """Run specialized gfx950 KDA prefill with canonical K-major state."""
+        """Run specialized gfx950 KDA prefill with V-major state."""
+        # Host-boundary hint is consumed only by the CuteDSL wrapper.
+        kwargs.pop("cu_seqlens_cpu", None)
         output, final_state = _kda_prefill_impl(**kwargs)
         return KdaPrefillResult(out=output, final_state=final_state)
 
@@ -195,6 +200,8 @@ if current_platform().is_amd:
     )
     def gluon_kda_paged_prefill_gfx1250(**kwargs) -> KdaPrefillResult:
         """Run specialized gfx1250 KDA prefill with canonical K-major state."""
+        # Host-boundary hint is consumed only by the CuteDSL wrapper.
+        kwargs.pop("cu_seqlens_cpu", None)
         output, final_state = _kda_prefill_gfx1250_impl(**kwargs)
         return KdaPrefillResult(out=output, final_state=final_state)
 
@@ -217,17 +224,18 @@ if current_platform().is_amd:
         traits={
             "indexed_state": frozenset({True}),
             "single_token": frozenset({True}),
+            "recurrent_layout": frozenset({"v_major"}),
         },
         tags={"amd", "gfx950", "paged_cache", "cuda_graph"},
     )
     def gluon_kda_paged_decode_gfx950(**kwargs):
-        """Run specialized gfx950 KDA decode against the canonical K-major pool."""
+        """Run specialized gfx950 KDA decode against the physical V-major pool."""
         return _kda_decode_impl(**kwargs)
 
     @register_kernel(
         "attention",
         "kda_fused_paged_decode",
-        name="gluon_kda_fused_paged_decode_gfx950",
+        name="gluon_kda_fused_paged_decode_vmajor_gfx950",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -246,10 +254,11 @@ if current_platform().is_amd:
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "conv_kernel_size": frozenset({4}),
+            "recurrent_layout": frozenset({"v_major"}),
         },
         tags={"amd", "gfx950", "paged_cache", "cuda_graph", "fusion"},
     )
-    def gluon_kda_fused_paged_decode_gfx950(
+    def gluon_kda_fused_paged_decode_vmajor_gfx950(
         mixed_qkv: torch.Tensor,
         conv_weights: torch.Tensor,
         conv_states: torch.Tensor,
@@ -270,7 +279,7 @@ if current_platform().is_amd:
         norm_weight: torch.Tensor | None,
         norm_eps: float | None,
     ):
-        """Run the decay projection and fused gfx950 KDA decode epilogue."""
+        """Run the decay projection and V-major gfx950 fused decode."""
         if output_gate is None or norm_weight is None or norm_eps is None:
             raise ValueError("gfx950 fused KDA decode requires output normalization")
         raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
@@ -319,6 +328,76 @@ if current_platform().is_amd:
     def gluon_kda_paged_decode_gfx1250(**kwargs):
         """Run specialized gfx1250 KDA decode against the canonical K-major pool."""
         return _kda_decode_gfx1250_impl(**kwargs)
+
+    @register_kernel(
+        "attention",
+        "kda_fused_paged_decode",
+        name="gluon_kda_fused_paged_decode_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k", "v"),
+            "dense",
+            {torch.bfloat16},
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "paged_state": frozenset({True}),
+            "fused_output_norm": frozenset({True}),
+            "num_heads": frozenset({12}),
+            "head_dim": frozenset({128}),
+            "conv_kernel_size": frozenset({4}),
+        },
+        tags={"amd", "gfx1250", "paged_cache", "cuda_graph", "fusion"},
+    )
+    def gluon_kda_fused_paged_decode_gfx1250(
+        mixed_qkv: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_states: torch.Tensor,
+        f_a_out: torch.Tensor,
+        f_b_weight: torch.Tensor,
+        beta_logits: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        *,
+        state_pool: torch.Tensor,
+        read_indices: torch.Tensor,
+        write_indices: torch.Tensor,
+        num_heads: int,
+        head_dim: int,
+        cu_seqlens: torch.Tensor,
+        lower_bound: float | None,
+        output_gate: torch.Tensor | None,
+        norm_weight: torch.Tensor | None,
+        norm_eps: float | None,
+    ):
+        """Run the decay projection and fused gfx1250 KDA decode epilogue."""
+        if output_gate is None or norm_weight is None or norm_eps is None:
+            raise ValueError("gfx1250 fused KDA decode requires output normalization")
+        raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
+        return _kda_fused_decode_gfx1250_impl(
+            mixed_qkv=mixed_qkv,
+            conv_weights=conv_weights,
+            conv_states=conv_states,
+            raw_g=raw_g,
+            beta_logits=beta_logits,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            output_gate=output_gate,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            state_pool=state_pool,
+            read_indices=read_indices,
+            write_indices=write_indices,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            cu_seqlens=cu_seqlens,
+            lower_bound=lower_bound,
+        )
 
     @register_kernel(
         "attention",

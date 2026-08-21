@@ -416,6 +416,12 @@ class MoECheckpointLoader:
                     * self._ep_rank : local_num_experts
                     * (self._ep_rank + 1)
                 ]
+                if getattr(param, "block_scale_inv", None) is not None:
+                    raise MoECheckpointLoadError(
+                        f"{mapped_name} needs online FP8 block quantization, "
+                        "which the fused local-tensor loader cannot apply; load a "
+                        "pre-quantized checkpoint or drop --quantization fp8."
+                    )
                 if tensor_to_load.dtype == torch.float8_e5m2:
                     default_weight_loader(param, local_experts.to(torch.bfloat16))
                 else:

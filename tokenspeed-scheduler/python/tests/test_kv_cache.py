@@ -199,23 +199,24 @@ def _make_k3_128k_config(num_device_pages: int) -> ts.SchedulerConfig:
 
 
 def test_k3_reports_group_aware_single_request_capacity() -> None:
-    # Each State group peaks at one lookback page plus 64 chunk pages and a
-    # one-token decode reserve: 66 parents. The three groups therefore leave
-    # 86 of the 284 usable parents for Full KV.
-    # K_full=12 and P=128 therefore expose 86 * 12 * 128 tokens.
+    # Each sparse State group needs two rolling checkpoints. The three groups
+    # therefore leave 278 of the 284 usable parents for Full KV.
+    # K_full=12 and P=128 expose 278 * 12 * 128 tokens.
     scheduler = ts.Scheduler(_make_k3_128k_config(285))
-    assert scheduler.max_single_request_tokens() == 132_096
+    assert scheduler.max_single_request_tokens() == 427_008
 
 
 def test_k3_128k_requires_group_aware_shared_pool_geometry() -> None:
     prompt = _spec("128k", list(range(131_072)))
 
-    undersized = ts.Scheduler(_make_k3_128k_config(284))
+    # Six State parents plus 86 Full parents admit 128K; one fewer Full parent
+    # is 512 tokens short because each Full parent carries 12 * 128 tokens.
+    undersized = ts.Scheduler(_make_k3_128k_config(92))
     assert undersized.max_single_request_tokens() < 131_072
 
-    corrected = ts.Scheduler(_make_k3_128k_config(285))
+    corrected = ts.Scheduler(_make_k3_128k_config(93))
     before = corrected.available_kv_pages()
-    assert before == 284
+    assert before == 92
     corrected.submit_requests([prompt])
     completed_tokens = 0
     for chunk in range(32):
@@ -329,9 +330,17 @@ def test_k3_readmit_rebuilds_all_four_tables_and_restores_pages() -> None:
 
         tail = row[prefix_slots:]
         assert len(tail) == 2
-        assert all(page > 0 for page in tail)
         group_tail = _positive_pages(tail)
-        assert len(group_tail) == 2
+        if group_id == K3_GROUP_IDS[0]:
+            # Full history remains dense.
+            assert all(page > 0 for page in tail)
+            assert len(group_tail) == 2
+        else:
+            # Sparse State recovery materializes only the endpoint checkpoint;
+            # the first logical tail slot remains a null hole.
+            assert tail[0] == 0
+            assert tail[1] > 0
+            assert len(group_tail) == 1
         fresh_tail_entries.extend(group_tail)
 
     assert len(set(all_positive_entries)) == len(all_positive_entries)

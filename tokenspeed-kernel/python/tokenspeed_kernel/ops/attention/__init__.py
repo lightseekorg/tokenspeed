@@ -138,6 +138,9 @@ __all__ = [
     "try_kda_fused_paged_decode",
     "try_kda_fused_paged_verify",
     "KdaFusedDecodeResult",
+    "try_kda_replay_commit",
+    "resolve_kda_batched_replay_commit",
+    "kda_replay_commit_supported",
     "KdaPrefillResult",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
@@ -1363,6 +1366,7 @@ def kda_paged_prefill(
     *,
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu=None,
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
@@ -1376,6 +1380,11 @@ def kda_paged_prefill(
         A_log/dt_bias: FP32 gate parameters.
         initial_state: One backend-owned recurrent state per sequence.
         cu_seqlens: Device sequence boundaries ``[num_sequences + 1]``.
+        cu_seqlens_cpu: Optional host copy of ``cu_seqlens`` (tuple, list, or
+            CPU tensor) whose contents must equal ``cu_seqlens``.
+            Host-planning kernels (CuteDSL) use it to skip the
+            stream-synchronizing D2H boundary read; device-planning kernels
+            ignore it.
         lower_bound: Optional safe lower bound for log decay.
         override: Optional exact kernel name.
         solution: Optional registered solution name.
@@ -1405,6 +1414,9 @@ def kda_paged_prefill(
         solution=solution,
         override=override,
     )
+    # Forwarded only when set so registered kernels without the
+    # host-boundary hint parameter keep working unchanged.
+    hint = {} if cu_seqlens_cpu is None else {"cu_seqlens_cpu": cu_seqlens_cpu}
     return kernel(
         q=q,
         k=k,
@@ -1416,6 +1428,7 @@ def kda_paged_prefill(
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
+        **hint,
     )
 
 
@@ -1514,6 +1527,7 @@ def try_kda_fused_paged_decode(
     output_gate: torch.Tensor | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
+    recurrent_layout: str = "k_major",
     override: str | None = None,
     solution: str | None = None,
 ) -> KdaFusedDecodeResult | None:
@@ -1532,6 +1546,8 @@ def try_kda_fused_paged_decode(
         raise ValueError("output_gate and norm_weight must be provided together")
     if output_gate is not None and norm_eps is None:
         raise ValueError("norm_eps is required with fused KDA output normalization")
+    if recurrent_layout not in ("k_major", "v_major"):
+        raise ValueError(f"unsupported KDA recurrent layout {recurrent_layout!r}")
 
     signature = _attention_format_signature(
         q=mixed_qkv,
@@ -1549,6 +1565,7 @@ def try_kda_fused_paged_decode(
                 "num_heads": num_heads,
                 "head_dim": head_dim,
                 "conv_kernel_size": conv_weights.shape[-1],
+                "recurrent_layout": recurrent_layout,
             },
             solution=solution,
             override=override,
@@ -1567,6 +1584,7 @@ def try_kda_fused_paged_decode(
                     "num_heads": num_heads,
                     "head_dim": head_dim,
                     "conv_kernel_size": conv_weights.shape[-1],
+                    "recurrent_layout": recurrent_layout,
                 },
                 solution=solution,
                 override=override,
@@ -1629,6 +1647,7 @@ def try_kda_fused_paged_verify(
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
+    store_states: bool = True,
 ) -> torch.Tensor | None:
     """Try a registered pre-convolution KDA target-verify fusion.
 
@@ -1647,7 +1666,7 @@ def try_kda_fused_paged_verify(
             "attention",
             "kda_fused_paged_verify",
             signature,
-            traits={"paged_state": True},
+            traits={"paged_state": True, "store_states": store_states},
             solution=solution,
             override=override,
         )
@@ -1674,9 +1693,153 @@ def try_kda_fused_paged_verify(
     )
 
 
+def try_kda_replay_commit(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_out: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    state_out: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None = -5.0,
+    override: str | None = None,
+    solution: str | None = None,
+    gate_scratch: torch.Tensor | None = None,
+) -> bool:
+    """Try a registered KDA speculative replay-commit.
+
+    Replays the accepted prefix of a verified draft window from the committed
+    page, so the caller never has to keep a recurrent state per draft
+    position. Pass the SAME projections the verify pass consumed.
+    ``gate_scratch`` is transient fp32 scratch for the hoisted gate
+    (``[>= N*T, num_heads*head_dim]``); ``None`` falls back to a
+    kernel-module buffer.
+
+    Returns:
+        ``True`` when a kernel ran, ``False`` when none supports the current
+        platform (the caller must then fall back to a scratch-based commit).
+    """
+    signature = _attention_format_signature(
+        q=mixed_qkv,
+        k=mixed_qkv,
+        v=mixed_qkv,
+    )
+    try:
+        kernel = select_kernel(
+            "attention",
+            "kda_replay_commit",
+            signature,
+            traits={"flat_state": True},
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return False
+    kernel(
+        mixed_qkv=mixed_qkv,
+        conv_weights=conv_weights,
+        conv_states=conv_states,
+        conv_out=conv_out,
+        f_a_out=f_a_out,
+        f_b_weight=f_b_weight,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        state_out=state_out,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        accepted_length=accepted_length,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+        gate_scratch=gate_scratch,
+    )
+    return True
+
+
+def resolve_kda_batched_replay_commit(
+    dtype: torch.dtype = torch.bfloat16,
+):
+    """Resolve the all-layer replay kernel once, or return ``None``.
+
+    ``None`` for any dtype but bfloat16: the batched kernels dereference raw
+    descriptor addresses as bf16 (an override resolves by name and skips the
+    signature check), so other dtypes must use the per-layer commit, which
+    reads its dtypes from the tensors.
+    """
+    if dtype is not torch.bfloat16:
+        return None
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    try:
+        return select_kernel(
+            "attention",
+            "kda_replay_commit",
+            signature,
+            traits={"flat_state": True, "batched_layers": True},
+            override="triton_nvidia_kda_batched_replay_commit",
+        )
+    except NoKernelFoundError:
+        return None
+
+
 # ===-----------------------------------------------------------------------===#
 # MHA Kernels
 # ===-----------------------------------------------------------------------===#
+
+
+def kda_replay_commit_supported(
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    solution: str | None = None,
+) -> bool:
+    """Whether this platform can run the KDA speculative replay path.
+
+    Lets a caller decide up front whether it can skip allocating a
+    per-draft-position state scratch, before any verify batch has run. The
+    eager replay path has no decomposed fallback, so it needs both the
+    standalone commit kernel and the no-store fused verify it rides on.
+
+    Args:
+        dtype: activation dtype the verify batch will use.
+        solution: restrict to one registered solution, as in ``select_kernel``.
+
+    Returns:
+        ``True`` when both kernels are registered for the current platform.
+    """
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    try:
+        select_kernel(
+            "attention",
+            "kda_replay_commit",
+            signature,
+            traits={"flat_state": True},
+            solution=solution,
+        )
+        select_kernel(
+            "attention",
+            "kda_fused_paged_verify",
+            signature,
+            traits={"paged_state": True, "store_states": False},
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return False
+    return True
 
 
 def mha_prefill(

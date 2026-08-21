@@ -42,13 +42,15 @@ def _reference_sequence(
     beta = beta_logits.float().sigmoid()
 
     outputs = []
+    # V-major: state is [heads, V, K] (value-major), matching gfx950's
+    # physical recurrent-state pool layout.
     state = state.float().clone()
     for token in range(q.shape[0]):
-        state *= gate[token].exp()[..., None]
-        prediction = torch.einsum("hkv,hk->hv", state, k[token])
+        state *= gate[token].exp()[:, None, :]
+        prediction = torch.einsum("hvk,hk->hv", state, k[token])
         delta = beta[token, :, None] * (v[token] - prediction)
-        state += torch.einsum("hk,hv->hkv", k[token], delta)
-        outputs.append(torch.einsum("hkv,hk->hv", state, q[token]))
+        state += torch.einsum("hv,hk->hvk", delta, k[token])
+        outputs.append(torch.einsum("hvk,hk->hv", state, q[token]))
     if not outputs:
         return v.new_empty((0, *v.shape[1:]), dtype=torch.float32), state
     return torch.stack(outputs), state
