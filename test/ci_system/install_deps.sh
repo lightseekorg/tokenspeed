@@ -165,6 +165,13 @@ if [ "${TOKENSPEED_KERNEL_INSTALL_MODE:-source}" = "pypi" ]; then
     echo "Installing published tokenspeed-kernel wheel: ${TOKENSPEED_KERNEL_PYPI_SPEC}"
     pip_install_with_retry pip3 install --break-system-packages --no-deps \
         "${TOKENSPEED_KERNEL_PYPI_SPEC}"
+    # The published wheel eagerly imports its vendor Triton bridge.
+    TOKENSPEED_KERNEL_PYPI_RUNTIME_DEPS=(
+        "tokenspeed-proton>=3.8.10.post20260721"
+        "tokenspeed-triton>=3.8.10.post20260721"
+    )
+    pip_install_with_retry pip3 install --break-system-packages --no-deps \
+        "${TOKENSPEED_KERNEL_PYPI_RUNTIME_DEPS[@]}"
     FLASHINFER_PYPI_SPEC="${TOKENSPEED_FLASHINFER_PYPI_SPEC:-flashinfer-python==0.6.16}"
     echo "Installing runner-compatible published FlashInfer: ${FLASHINFER_PYPI_SPEC}"
     pip_install_with_retry pip3 install --break-system-packages --no-deps \
