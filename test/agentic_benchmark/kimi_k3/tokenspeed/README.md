@@ -41,7 +41,7 @@ configs; prefix caching (default-on) hit rate is reported.
 2. Speculative decoding is OFF in every config: the drafter family raises
    under dp>1, so a spec-on matrix cannot be filled. A TP8+DSpark row can be
    added later as a separate, clearly-labelled entry.
-3. Warmup pass before every measured run; one sweep owns the machine.
+3. Warmup pass before each config's sweep; one sweep owns the machine.
 
 ## Configs
 
@@ -49,7 +49,7 @@ configs; prefix caching (default-on) hit rate is reported.
 |---|---|
 | `attn_tp8_moe_ep8` | baseline |
 | `attn_tp8_moe_tp8` | MoE TP variant (same capacity, different comm shape) |
-| `attn_dp8_moe_ep8` | attention DP; requires the dynamic MLA packing fix (#1152) and must not pass `--dense-tp-size` (see config comments) |
+| `attn_dp8_moe_ep8` | attention DP; requires #1152 (dynamic MLA packing, boot) AND #1185 (merge_state head tiling, runtime) — merge this PR after both. Must not pass `--dense-tp-size` (see config comments) |
 
 tp4 variants are omitted: the K3-NVFP4 checkpoint does not fit a 4-GPU
 partition.

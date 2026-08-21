@@ -16,4 +16,5 @@ exec ts serve \
     --kv-cache-dtype fp8 \
     --enable-cache-report \
     --host 127.0.0.1 \
-    --port 8000
+    --port 8000 \
+    --engine-startup-timeout 3600

@@ -35,6 +35,9 @@ def collect(sweep_dir: Path):
             if not summary_path.is_file():
                 continue
             s = json.loads(summary_path.read_text())
+            # "Decoded Tok/Iter" is only emitted with speculative decoding
+            # active and "KV Cache Hit Rate (%)" only when cache reporting
+            # works end-to-end; our matrix runs spec-off, so guard both.
             tpot_ms = s["TPOT (ms)"]
             decode_tps_user = 1000.0 / tpot_ms if tpot_ms else 0.0
             tps_gpu = s["Total Throughput (tok/s)"] / n_gpus
@@ -44,8 +47,8 @@ def collect(sweep_dir: Path):
                     "Conc.": s["Concurrency"],
                     "Latency (tps/user)": round(decode_tps_user, 2),
                     "Throughput (tps/gpu)": round(tps_gpu, 2),
-                    "Approx Cache Hit": round(s["KV Cache Hit Rate (%)"], 2),
-                    "Decoded Tok/Iter": round(s["Decoded Tok/Iter"], 4),
+                    "Approx Cache Hit": round(s.get("KV Cache Hit Rate (%)", -1.0), 2),
+                    "Decoded Tok/Iter": round(s.get("Decoded Tok/Iter", 1.0), 4),
                 }
             )
     rows.sort(key=lambda r: (r["config"], r["Conc."]))

@@ -2,8 +2,14 @@
 
 set -euo pipefail
 
-# Attention data-parallel recipe. Requires the dynamic MLA packing fix
-# (PR #1152) — the K3 cache recipe rejects attn tp=1 layouts without it.
+# Attention data-parallel recipe. Requires TWO merged prerequisites:
+#   - PR #1152 (dynamic MLA packing) — the K3 cache recipe rejects attn tp=1
+#     layouts without it (boot failure);
+#   - PR #1185 (merge_state head tiling) — attn tp=1 runs 96 heads/rank and
+#     the old kernel rejects >64-head launches (runtime crash on any prompt
+#     that crosses a chunk boundary).
+# --dist-init-addr is REQUIRED here: dp>1 on bare metal hard-raises without
+# it (PortArgs.init_new); only Slurm steps can derive it from the topology.
 # Do NOT pass --dense-tp-size: the K3 dense MLP binds dense.tp_group directly
 # and skips on zero rows, which cross-deadlocks against the MoE gather when
 # the dense group spans DP ranks.
@@ -29,4 +35,6 @@ exec ts serve \
     --kv-cache-dtype fp8 \
     --enable-cache-report \
     --host 127.0.0.1 \
-    --port 8000
+    --port 8000 \
+    --engine-startup-timeout 3600 \
+    --dist-init-addr 127.0.0.1:4000

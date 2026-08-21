@@ -11,7 +11,7 @@ pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@$
 
 # Note: Only 71 conversations can be built (measured with the Kimi-K3 tokenizer)
 [ -f agentic_dataset.json ] || python3 build_swe_smith_dataset.py \
-    --model moonshotai/Kimi-K3 \
+    --model-path moonshotai/Kimi-K3 \
     --first-turn-length 50000 \
     --subsequent-turn-length 800 \
     --min-turns 10 \
@@ -19,6 +19,16 @@ pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@$
     --number 128 \
     --output-path agentic_dataset.json \
     --num-workers 32
+
+# The sweep + warmup consume conversations 0..69; fail fast if the dataset
+# ever builds fewer (tokenizer or upstream-dataset drift would otherwise
+# silently rotate and replay hot conversations).
+python3 - <<'PYEOF'
+import json
+n = len(json.load(open("agentic_dataset.json"))["conversations"])
+assert n >= 70, f"agentic_dataset.json has only {n} conversations; need >= 70"
+print(f"dataset ok: {n} conversations")
+PYEOF
 
 # Sweep configs
 CONFIGS=(
@@ -39,9 +49,10 @@ launch_server() {
 }
 
 wait_for_ready() {
-    # K3-NVFP4 is a ~1T-class checkpoint; cold load takes far longer than the
-    # smaller agentic-bench models.
-    local TIMEOUT=1800
+    # K3-NVFP4 is a ~1T-class checkpoint; cold load can exceed 30 minutes.
+    # Must stay >= the --engine-startup-timeout the configs pass to ts serve,
+    # or the harness gives up while the engine is still legitimately loading.
+    local TIMEOUT=3600
     local START=$SECONDS
     until curl -sf -o /dev/null http://127.0.0.1:8000/readiness; do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -49,7 +60,7 @@ wait_for_ready() {
             tail -100 "$SERVER_LOG" >&2
             return 1
         fi
-        if grep -qE "CUDA out of memory|OutOfMemory|RuntimeError|Killed" "$SERVER_LOG"; then
+        if grep -qE "CUDA out of memory|OutOfMemory|RuntimeError|ValueError|NoKernelFoundError|Killed" "$SERVER_LOG"; then
             echo "Server hit a fatal error:" >&2
             tail -100 "$SERVER_LOG" >&2
             return 1
