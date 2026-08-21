@@ -59,6 +59,9 @@ if _HAS_CUDA_KERNEL:
         priority=Priority.SPECIALIZED,
         traits={
             "has_delta": frozenset({False, True}),
+            # The kernel is instantiated at H=7168 only and checks it; without
+            # this the registry picks it for any H and the check aborts.
+            "hidden_size": frozenset({7168}),
             "inputs_on_same_gpu": frozenset({True}),
             "partial_block_storage": frozenset({False, True}),
             "separate_output_eps": frozenset({False}),
