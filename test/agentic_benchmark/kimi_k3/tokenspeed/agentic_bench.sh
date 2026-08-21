@@ -33,6 +33,7 @@ PYEOF
 # Sweep configs
 CONFIGS=(
     attn_tp8_moe_ep8
+    attn_tp8_moe_ep8_dspark
     attn_tp8_moe_tp8
     attn_dp8_moe_ep8
 )

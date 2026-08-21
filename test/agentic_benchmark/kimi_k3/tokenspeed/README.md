@@ -38,9 +38,11 @@ configs; prefix caching (default-on) hit rate is reported.
    TP8 = default 8192 chunks; attention-DP = 2048 chunks (the trtllm MoE
    workspace scales with gathered global tokens = chunk x 8 under DP, so
    larger chunks OOM at 0.95 utilization).
-2. Speculative decoding is OFF in every config: the drafter family raises
-   under dp>1, so a spec-on matrix cannot be filled. A TP8+DSpark row can be
-   added later as a separate, clearly-labelled entry.
+2. Speculative decoding is OFF in the parallelism matrix: the drafter family
+   raises under dp>1, so a spec-on matrix cannot be filled. The TP8+DSpark
+   config is the separate, clearly-labelled spec row (`_dspark` suffix) —
+   compare it against TP8 spec-off, not against the DP rows, and note
+   "Decoded Tok/Iter" is only meaningful there.
 3. Warmup pass before each config's sweep; one sweep owns the machine.
 
 ## Configs
@@ -48,6 +50,7 @@ configs; prefix caching (default-on) hit rate is reported.
 | config | notes |
 |---|---|
 | `attn_tp8_moe_ep8` | baseline |
+| `attn_tp8_moe_ep8_dspark` | baseline + DSpark speculative decoding (CI-proven flags); the spec reference row |
 | `attn_tp8_moe_tp8` | MoE TP variant (same capacity, different comm shape) |
 | `attn_dp8_moe_ep8` | attention DP; requires #1152 (dynamic MLA packing, boot) AND #1185 (merge_state head tiling, runtime) — merge this PR after both. Must not pass `--dense-tp-size` (see config comments) |
 
