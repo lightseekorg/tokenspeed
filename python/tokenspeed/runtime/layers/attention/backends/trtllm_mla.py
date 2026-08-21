@@ -462,9 +462,13 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         max_blocks = self._calc_padded_blocks(self.max_context_len)
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks]
 
-        # For capture we don't have page_table yet; just zero-fill the block indices.
-        # The actual indices will be filled on replay. seq_lens_k views the
-        # backend-owned cuda_graph_seq_lens_buf (set in init_cuda_graph_state).
+        # For capture we don't have a page table yet. Use the reserved null page
+        # for every synthetic row so capture does not depend on private request
+        # pages. Replay replaces these entries with the live page table.
+        block_kv_indices.fill_(int(getattr(self, "cuda_graph_capture_dummy_page", 0)))
+
+        # seq_lens_k views the backend-owned cuda_graph_seq_lens_buf (set in
+        # init_cuda_graph_state).
         capture_q_len = self._graph_verify_q_len()
         group_out_cache_loc = None
         if self._cache_contract_bound:
@@ -619,7 +623,10 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         num_extends = 0 if self.draft_block_decode else metadata.num_extends
         q_len_per_req = q.shape[0] // bs if bs > 0 else 1
 
-        if q_len_per_req > 1 and self.is_draft:
+        if q_len_per_req > 1:
+            # Multi-token decode is used by target verification and by the
+            # draft first-step catch-up and block-decode paths. Flatten to one
+            # decode query per token so each row gets its own cache bound.
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
             page_table = metadata.block_kv_indices[num_extends:].repeat_interleave(
                 q_len_per_req, dim=0
@@ -632,13 +639,24 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 # query sees the same block-end length (non-causal block decode).
                 seq_lens = base_lens
                 max_seq_len = metadata.max_seq_len_k
-            else:
+            elif self.is_draft:
                 # Eagle/MTP catch-up: each successive token sees one more KV.
                 offsets = torch.arange(
                     q_len_per_req, device=base_lens.device, dtype=base_lens.dtype
                 ).repeat(bs)
                 seq_lens = base_lens + offsets
                 max_seq_len = metadata.max_seq_len_k + q_len_per_req
+            else:
+                # Target verification receives seq_lens at the end of the
+                # speculative window. Convert to per-token causal bounds.
+                base_lens = torch.clamp(base_lens - (q_len_per_req - 1), min=1)
+                offsets = torch.arange(
+                    q_len_per_req,
+                    device=base_lens.device,
+                    dtype=base_lens.dtype,
+                ).repeat(bs)
+                seq_lens = base_lens + offsets
+                max_seq_len = metadata.max_seq_len_k
         else:
             # Plain decode (q_len=1) or bs-grouped multi-token decode.
             query = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)

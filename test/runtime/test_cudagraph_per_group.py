@@ -135,6 +135,53 @@ class CacheGroupIdsTest(_TorchCase):
         self.assertEqual(out, ())
 
 
+class AttentionCaptureBuffersTest(_TorchCase):
+    """Capture uses the shared null page without touching private pages."""
+
+    def setUp(self):
+        super().setUp()
+        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+            CudaGraphWrapper,
+        )
+
+        self.prepare = CudaGraphWrapper._prepare_attention_capture_buffers
+
+    def test_seeds_null_page_and_skips_state_only_layers(self):
+        torch = self.torch
+        target_backend = SimpleNamespace()
+        draft_backend = SimpleNamespace()
+        target_leaf = torch.ones(8)
+        target_quantized = torch.ones(8)
+        draft_leaf = torch.ones(8)
+        wrapper = SimpleNamespace(
+            max_tokens_per_req=3,
+            input_buffers=SimpleNamespace(
+                seq_lens_buf=torch.ones(4, dtype=torch.int32),
+                page_size=2,
+                dummy_kv_slot=2,
+                out_cache_loc_buf=torch.full((16,), -1, dtype=torch.int32),
+            ),
+            attn_backend=target_backend,
+            draft_attn_backend=draft_backend,
+            token_to_kv_pool=SimpleNamespace(
+                kv_buffer=[target_leaf, (target_quantized, None)]
+            ),
+            draft_token_to_kv_pool=SimpleNamespace(kv_buffer=[draft_leaf]),
+        )
+
+        self.prepare(wrapper, bs=2)
+
+        self.assertEqual(wrapper.input_buffers.seq_lens_buf.tolist(), [3, 3, 1, 1])
+        self.assertTrue((wrapper.input_buffers.out_cache_loc_buf[:6] == 2).all())
+        self.assertTrue((wrapper.input_buffers.out_cache_loc_buf[6:] == -1).all())
+        self.assertEqual(target_backend.cuda_graph_capture_dummy_page, 1)
+        self.assertEqual(draft_backend.cuda_graph_capture_dummy_page, 1)
+        for buffer in (target_leaf, target_quantized, draft_leaf):
+            self.assertTrue((buffer[:2] == 1).all())
+            self.assertTrue((buffer[2:4] == 0).all())
+            self.assertTrue((buffer[4:] == 1).all())
+
+
 class DraftCacheGroupIdsTest(_TorchCase):
     """DFLASH owns an independent draft page table; EAGLE-style drafts use
     target cache-group tables at matching page ids."""
