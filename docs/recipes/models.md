@@ -546,26 +546,11 @@ flags above and add:
 --speculative-num-steps 3
 ```
 
-For latency-sensitive agentic serving capped at 16 concurrent sessions on
-MI350, use three MTP steps for V4-Flash and two for V4-Pro. The smaller Flash
-target amortizes the third draft step, while Pro's lower multi-turn acceptance
-makes two steps faster end to end:
-
-```text
-V4-Flash TP2: --speculative-num-steps 3
-V4-Pro   TP8: --speculative-num-steps 2
-```
-
-Keep mixed batching disabled for this low-concurrency profile. It is intended
-for throughput-oriented prefill/decode co-scheduling and can reduce per-user
-decode rate when growing agentic turns compete with active generations. Set
-`--max-num-seqs 16` to enforce the interactivity admission cap.
-
-With `--speculative-draft-model-path` omitted, V4 uses the same checkpoint as the
-draft source (`DeepseekV4ForCausalLMNextN`). MTP supports the overlap scheduler;
-pass `--disable-overlap-schedule` only for a controlled diagnostic. Prefix
-caching stays on by default. Add `--enable-metrics` to read `Decoded Tok/Iter`
-and the speculative accept rate from the run summary.
+draft source (`DeepseekV4ForCausalLMNextN`). MTP runs on the non-overlap
+scheduler — the runtime disables overlap scheduling automatically when
+speculative decoding and cache groups are both active — and prefix caching
+stays on by default. Add `--enable-metrics` to read `Decoded Tok/Iter` and the
+speculative accept rate from the run summary.
 
 ### DSpark speculative decoding with Prefix Replay
 
