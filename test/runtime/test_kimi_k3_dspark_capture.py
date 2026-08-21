@@ -10,7 +10,7 @@ import torch
 
 def _make_model(num_layers: int = 8):
     model = type("Model", (), {})()
-    model.layers = [object() for _ in range(num_layers)]
+    model.layers = [SimpleNamespace() for _ in range(num_layers)]
     model.layers_to_capture = []
     model.dflash_aux_stream = "prefix"
     model._dflash_capture_idx_map = {}
@@ -31,6 +31,7 @@ class _CausalLM:
 
     def __init__(self, model) -> None:
         self.model = model
+        self.config = SimpleNamespace(attn_res_block_size=1)
         self.capture_aux_hidden_states = False
 
 
