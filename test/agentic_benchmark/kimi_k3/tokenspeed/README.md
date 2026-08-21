@@ -38,11 +38,14 @@ configs; prefix caching (default-on) hit rate is reported.
    TP8 = default 8192 chunks; attention-DP = 2048 chunks (the trtllm MoE
    workspace scales with gathered global tokens = chunk x 8 under DP, so
    larger chunks OOM at 0.95 utilization).
-2. Speculative decoding is OFF in the parallelism matrix: the drafter family
-   raises under dp>1, so a spec-on matrix cannot be filled. The TP8+DSpark
-   config is the separate, clearly-labelled spec row (`_dspark` suffix) —
-   compare it against TP8 spec-off, not against the DP rows, and note
-   "Decoded Tok/Iter" is only meaningful there.
+2. Speculative decoding is OFF in the parallelism matrix: the DP x
+   speculative combination has no CI coverage here, so a spec-on matrix
+   cannot be filled honestly. The TP8+DSpark config is the separate,
+   clearly-labelled spec row (`_dspark` suffix, runs last) — it follows the
+   CI DSpark gates' memory envelope (util 0.92, prefill graph and kvstore
+   off), so compare it against TP8 spec-off qualitatively, not as a
+   controlled ablation. "Decoded Tok/Iter" is only meaningful there
+   (-1.0 elsewhere = not measured).
 3. Warmup pass before each config's sweep; one sweep owns the machine.
 
 ## Configs
@@ -50,12 +53,17 @@ configs; prefix caching (default-on) hit rate is reported.
 | config | notes |
 |---|---|
 | `attn_tp8_moe_ep8` | baseline |
-| `attn_tp8_moe_ep8_dspark` | baseline + DSpark speculative decoding (CI-proven flags); the spec reference row |
+| `attn_tp8_moe_ep8_dspark` | + DSpark speculative decoding (spec flags and memory envelope from the CI gates); the spec reference row, runs last |
 | `attn_tp8_moe_tp8` | MoE TP variant (same capacity, different comm shape) |
 | `attn_dp8_moe_ep8` | attention DP; requires #1152 (dynamic MLA packing, boot) AND #1185 (merge_state head tiling, runtime) — merge this PR after both. Must not pass `--dense-tp-size` (see config comments) |
 
 tp4 variants are omitted: the K3-NVFP4 checkpoint does not fit a 4-GPU
 partition.
+
+Cross-model caveat: this directory pins evalscope acd09b44 (the inkling pin);
+kimi_k2.5 pins 9d052ca0. Dataset recipe and sweep ladder are identical, but
+metric implementations may differ between pins — compare across models with
+that in mind.
 
 ## Future work
 

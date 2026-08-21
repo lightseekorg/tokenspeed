@@ -4,10 +4,18 @@ set -euo pipefail
 
 # Prepare dataset
 EVALSCOPE_COMMIT=acd09b44384d53174768bb1063f675420f76fae9
-pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@${EVALSCOPE_COMMIT}"
+# Skip the install when evalscope is already importable so offline reruns
+# survive; delete the venv to force a re-pin.
+python3 -c "import evalscope" 2>/dev/null || \
+    pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@${EVALSCOPE_COMMIT}"
 
-[ -f build_swe_smith_dataset.py ] || wget https://raw.githubusercontent.com/modelscope/evalscope/${EVALSCOPE_COMMIT}/examples/perf/build_swe_smith_dataset.py \
-    -O build_swe_smith_dataset.py
+# curl (already a hard dependency of the readiness probe) + tmp/mv so a
+# failed download cannot leave a truncated file behind the -s guard.
+[ -s build_swe_smith_dataset.py ] || {
+    curl -fsSL "https://raw.githubusercontent.com/modelscope/evalscope/${EVALSCOPE_COMMIT}/examples/perf/build_swe_smith_dataset.py" \
+        -o build_swe_smith_dataset.py.tmp
+    mv build_swe_smith_dataset.py.tmp build_swe_smith_dataset.py
+}
 
 # Note: Only 71 conversations can be built (measured with the Kimi-K3 tokenizer)
 [ -f agentic_dataset.json ] || python3 build_swe_smith_dataset.py \
@@ -25,17 +33,20 @@ pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@$
 # silently rotate and replay hot conversations).
 python3 - <<'PYEOF'
 import json
-n = len(json.load(open("agentic_dataset.json"))["conversations"])
+d = json.load(open("agentic_dataset.json"))
+n = len(d["conversations"])
 assert n >= 70, f"agentic_dataset.json has only {n} conversations; need >= 70"
-print(f"dataset ok: {n} conversations")
+mp = d.get("metadata", {}).get("model_path", "")
+assert "Kimi-K3" in mp, f"dataset built with wrong tokenizer: {mp!r}; delete agentic_dataset.json"
+print(f"dataset ok: {n} conversations (tokenizer: {mp})")
 PYEOF
 
 # Sweep configs
 CONFIGS=(
     attn_tp8_moe_ep8
-    attn_tp8_moe_ep8_dspark
     attn_tp8_moe_tp8
     attn_dp8_moe_ep8
+    attn_tp8_moe_ep8_dspark
 )
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,10 +61,10 @@ launch_server() {
 }
 
 wait_for_ready() {
-    # K3-NVFP4 is a ~1T-class checkpoint; cold load can exceed 30 minutes.
-    # Must stay >= the --engine-startup-timeout the configs pass to ts serve,
-    # or the harness gives up while the engine is still legitimately loading.
-    local TIMEOUT=3600
+    # CI gives this checkpoint a 7200s readiness window (first boot autotunes
+    # trtllm-gen NVFP4 cubins for ~15 min; the dspark row also pulls 7.1GB of
+    # draft weights). Must stay >= the configs' --engine-startup-timeout.
+    local TIMEOUT=7200
     local START=$SECONDS
     until curl -sf -o /dev/null http://127.0.0.1:8000/readiness; do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -61,7 +72,7 @@ wait_for_ready() {
             tail -100 "$SERVER_LOG" >&2
             return 1
         fi
-        if grep -qE "CUDA out of memory|OutOfMemory|RuntimeError|ValueError|NoKernelFoundError|Killed" "$SERVER_LOG"; then
+        if grep -qE "CUDA out of memory|OutOfMemory|Traceback|Killed" "$SERVER_LOG"; then
             echo "Server hit a fatal error:" >&2
             tail -100 "$SERVER_LOG" >&2
             return 1
@@ -103,8 +114,9 @@ wait_for_port_free() {
 
 trap stop_server EXIT  # safety net for Ctrl-C / errors
 
-# Preflight: bail out if port 8000 is already in use
+# Preflight: bail out if the serve port or the DP rendezvous port is in use
 wait_for_port_free 8000
+wait_for_port_free 4000
 
 SWEEP_TS=$(date +%Y%m%d_%H%M%S)
 SWEEP_DIR="${SCRIPT_DIR}/outputs/${SWEEP_TS}"
