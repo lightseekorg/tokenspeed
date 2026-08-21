@@ -36,6 +36,7 @@ __all__ = [
     "latent_moe_decode_pipeline_available",
     "latent_moe_expert_shared",
     "latent_moe_input_projections",
+    "kimi3_route_pack_quant_mxfp8",
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
@@ -43,6 +44,9 @@ __all__ = [
     "moe_softmax_topk",
 ]
 
+from tokenspeed_kernel.ops.moe.kimi3_front import (  # noqa: E402
+    kimi3_route_pack_quant_mxfp8,
+)
 from tokenspeed_kernel.ops.moe.latent_decode import (  # noqa: E402
     latent_moe_decode_pipeline_available,
     latent_moe_expert_shared,
@@ -322,6 +326,7 @@ def moe_apply(
     # top-k routing results
     topk_weights: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    prepared_input: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     # token length
     num_tokens_global: int | None = None,
     max_num_tokens_per_gpu: int | None = None,
@@ -343,6 +348,8 @@ def moe_apply(
             [tokens, top_k]. Required when plan support_routing is false.
         topk_ids: Optional precomputed expert ids with shape [tokens, top_k].
             Required when plan support_routing is false.
+        prepared_input: Optional backend-specific ``(packed_topk, quantized_x,
+            x_scales)`` tuple. Only kernels that declare this ABI consume it.
         num_tokens_global: Optional global token count for distributed MoE.
         max_num_tokens_per_gpu: Optional per-GPU token capacity hint.
         do_finalize: Whether the kernel must produce the finalized output.
@@ -373,6 +380,9 @@ def moe_apply(
         if _uses_all_to_all_ep(plan.get("a2a_backend"))
         else {}
     )
+    prepared_kwargs = (
+        {"prepared_input": prepared_input} if prepared_input is not None else {}
+    )
     return kernel(
         plan=plan,
         x=x,
@@ -380,6 +390,7 @@ def moe_apply(
         router_logits=router_logits,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
+        **prepared_kwargs,
         num_tokens_global=num_tokens_global,
         max_num_tokens_per_gpu=max_num_tokens_per_gpu,
         do_finalize=do_finalize,

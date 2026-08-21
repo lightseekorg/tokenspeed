@@ -199,6 +199,25 @@ def test_situ_and_mul_writes_provided_output(device: str) -> None:
     assert same.data_ptr() == out.data_ptr()
 
 
+def test_situ_and_mul_strided_fp32_front_writes_bf16(device: str) -> None:
+    front = torch.randn(16, 6016, device=device, dtype=torch.float32)
+    x = front[:, -1536:]
+    assert x.stride() == (6016, 1)
+    out = torch.empty(16, 768, device=device, dtype=torch.bfloat16)
+    gate, up = x.chunk(2, dim=-1)
+    expected = (
+        4.0
+        * torch.tanh(gate / 4.0)
+        * torch.sigmoid(gate)
+        * (25.0 * torch.tanh(up / 25.0))
+    ).bfloat16()
+
+    same = situ_and_mul(x, out, beta=4.0, linear_beta=25.0)
+
+    assert same.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
+
+
 def test_situ_and_mul_writes_noncontiguous_output(device: str) -> None:
     x = torch.randn(2, 3, 64, device=device, dtype=torch.bfloat16)
     gate, up = x.float().chunk(2, dim=-1)

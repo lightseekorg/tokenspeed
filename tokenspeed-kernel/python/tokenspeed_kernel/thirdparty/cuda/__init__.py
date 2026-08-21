@@ -39,7 +39,11 @@ from tokenspeed_kernel.thirdparty.cuda.marlin_moe import (
     moe_align_block_size,
     moe_wna16_marlin_gemm,
 )
-from tokenspeed_kernel.thirdparty.cuda.moe import moe_finalize_fuse_shared
+from tokenspeed_kernel.thirdparty.cuda.moe import (
+    moe_finalize_fuse_shared,
+    moe_pack_topk_quant_mxfp8,
+    moe_route_pack_quant_mxfp8,
+)
 from tokenspeed_kernel.thirdparty.cuda.rmsnorm import rmsnorm_fused_parallel
 from tokenspeed_kernel.thirdparty.cuda.rope import apply_rope_with_cos_sin_cache_inplace
 from tokenspeed_kernel.thirdparty.cuda.routing import (
@@ -65,6 +69,8 @@ __all__ = [
     "marlin_make_workspace",
     "moe_align_block_size",
     "moe_finalize_fuse_shared",
+    "moe_pack_topk_quant_mxfp8",
+    "moe_route_pack_quant_mxfp8",
     "moe_wna16_marlin_gemm",
     "rmsnorm_fused_parallel",
     "routing_flash",

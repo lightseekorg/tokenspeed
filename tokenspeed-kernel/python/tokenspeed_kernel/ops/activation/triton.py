@@ -418,17 +418,20 @@ def situ_and_mul(
     SiTU computes ``beta * tanh(gate / beta) * sigmoid(gate) * up``.
     When ``linear_beta`` is provided, it first soft-clips the up branch as
     ``linear_beta * tanh(up / linear_beta)``. The nonlinear math is evaluated
-    in FP32 and the result is stored in the input/output dtype.
+    in FP32. By default the result uses the input dtype; an explicit BF16
+    ``out`` is also accepted for an FP32 input so a strided fused-GEMM view can
+    feed a BF16 projection without a materialization kernel.
 
     Args:
         x: Tensor shaped ``[..., 2 * D]`` with a contiguous final dimension.
-        out: Optional output tensor shaped ``[..., D]``.
+        out: Optional output tensor shaped ``[..., D]``. Its dtype must match
+            ``x``, except an FP32 ``x`` may write a BF16 ``out``.
         beta: Positive gate soft-clipping scale.
         linear_beta: Optional positive up-branch soft-clipping scale.
         enable_pdl: Reserved for API compatibility; ignored on this kernel.
 
     Returns:
-        Tensor shaped ``[..., D]`` in the same dtype and device as ``x``.
+        Tensor shaped ``[..., D]`` on the same device as ``x``.
     """
     del enable_pdl
     if x.shape[-1] % 2 != 0:
@@ -446,8 +449,11 @@ def situ_and_mul(
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
     elif tuple(out.shape) != output_shape:
         raise ValueError(f"out shape must be {output_shape}, got {tuple(out.shape)}")
-    if out.dtype != x.dtype or out.device != x.device:
-        raise ValueError("out must have the same dtype and device as x")
+    mixed_fp32_to_bf16 = x.dtype == torch.float32 and out.dtype == torch.bfloat16
+    if (out.dtype != x.dtype and not mixed_fp32_to_bf16) or out.device != x.device:
+        raise ValueError(
+            "out must share x's device and dtype, except FP32 x may write BF16"
+        )
     if out.stride(-1) != 1:
         raise ValueError("out must have stride(-1) == 1")
 

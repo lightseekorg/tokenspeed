@@ -137,6 +137,8 @@ if platform.is_nvidia:
         _SITU_ACTIVATION_TYPE = None
         _situ_import_error = exc
 
+    from tokenspeed_kernel.thirdparty.cuda.moe import moe_pack_topk_quant_mxfp8
+
     def _get_device_permute_indices(
         x: torch.Tensor,
         epilogue_tile_m: int,
@@ -433,14 +435,14 @@ if platform.is_nvidia:
 
     def _call_mxfp4_situ_routed_moe(
         w: torch.nn.Module,
-        topk_weights: torch.Tensor,
+        topk_weights: torch.Tensor | None,
         topk_ids: torch.Tensor,
         x: torch.Tensor,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
         enable_pdl: bool,
         hidden_states_scale: torch.Tensor | None = None,
         do_finalize: bool = True,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
         if local_experts != w.w13_weight.shape[0]:
             raise RuntimeError(
@@ -455,13 +457,15 @@ if platform.is_nvidia:
                 f"{local_expert_offset + local_experts}) for {num_experts} experts"
             )
         topk = (
-            topk_ids.to(torch.int32).contiguous(),
-            topk_weights.to(torch.bfloat16).contiguous(),
+            topk_ids
+            if topk_weights is None
+            else (
+                topk_ids.to(torch.int32).contiguous(),
+                topk_weights.to(torch.bfloat16).contiguous(),
+            )
         )
-        # The unpacked ``(ids, weights)`` tuple is flashinfer's precomputed-topk
-        # format; expert IDs stay global and the kernel filters to the local
-        # range. routing_method_type=1 (Renormalize) matches K3's
-        # pre-normalized topk weights, which the kernel consumes as-is.
+        # Packed input skips FlashInfer's unpacked-route preparation. Expert
+        # IDs remain global and the kernel filters to the local range.
         result = _fi_fp4_routed_moe(
             topk_ids=topk,
             routing_bias=None,
@@ -638,6 +642,7 @@ if platform.is_nvidia:
         max_num_tokens_per_gpu: int | None = None,
         do_finalize: bool = True,
         enable_pdl: bool = False,
+        prepared_input: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ):
         if topk_weights is None or topk_ids is None:
             raise ValueError("precomputed_topk plan requires topk_weights and topk_ids")
@@ -660,12 +665,46 @@ if platform.is_nvidia:
                 value=0.0,
             )
 
-        # cute-dsl beats the cuda backend at every size under CUDA-graph
-        # replay (1.5x at decode M, +6-16% at prefill); its higher eager
-        # launch overhead is amortized by graph capture.
-        x, x_scale = mxfp8_quantize(
-            x, False, alignment=hidden_padded, backend="cute-dsl"
-        )
+        packed_topk = None
+        if prepared_input is not None:
+            packed_topk, prepared_x, x_scale = prepared_input
+            expected_route = (x.shape[0], 16)
+            expected_x = (x.shape[0], hidden_padded)
+            if (
+                hidden_padded != 3584
+                or packed_topk.shape != expected_route
+                or packed_topk.dtype != torch.int32
+                or packed_topk.device != x.device
+                or not packed_topk.is_contiguous()
+                or prepared_x.shape != expected_x
+                or prepared_x.dtype != torch.float8_e4m3fn
+                or prepared_x.device != x.device
+                or not prepared_x.is_contiguous()
+                or x_scale.numel() != x.shape[0] * (hidden_padded // 32)
+                or x_scale.dtype != torch.uint8
+                or x_scale.device != x.device
+                or not x_scale.is_contiguous()
+            ):
+                raise ValueError("invalid prepared Kimi-K3 MXFP8 MoE input")
+            x = prepared_x
+        elif (
+            hidden_padded == 3584
+            and 0 < x.shape[0] <= 64
+            and topk_ids.shape == (x.shape[0], 16)
+            and topk_ids.dtype == torch.int32
+            and topk_ids.is_contiguous()
+            and topk_weights.shape == (x.shape[0], 16)
+            and topk_weights.dtype == torch.bfloat16
+            and topk_weights.is_contiguous()
+        ):
+            packed_topk, x, x_scale = moe_pack_topk_quant_mxfp8(
+                x, topk_ids, topk_weights
+            )
+        else:
+            # Retain the general quantizer for non-K3 shapes.
+            x, x_scale = mxfp8_quantize(
+                x, False, alignment=hidden_padded, backend="cute-dsl"
+            )
         hidden_states_scale = x_scale.view(torch.float8_e4m3fn).reshape(x.shape[0], -1)
 
         # Deferred finalize returns the raw triple, so it needs no
@@ -690,8 +729,8 @@ if platform.is_nvidia:
         # fallback. Serving never enters a tuning context.
         result = _call_mxfp4_situ_routed_moe(
             w,
-            topk_weights,
-            topk_ids,
+            None if packed_topk is not None else topk_weights,
+            packed_topk if packed_topk is not None else topk_ids,
             x,
             output,
             enable_pdl,
