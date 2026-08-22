@@ -77,6 +77,14 @@ class MLATokenToKVPool(CachePool):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.layer_num = layer_num
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
+        placement = getattr(arena, "placement_contract", None)
+        placements = getattr(placement, "layer_placements", ())
+        self._cyclic_layers = frozenset(
+            local_layer_id
+            for local_layer_id in range(layer_num)
+            if field_layer_offset + local_layer_id < len(placements)
+            and placements[field_layer_offset + local_layer_id] == "cyclic_history"
+        )
         self._bind_layer_planes()
 
     # Quantized MLA splits one logical cache into three planes, so its
@@ -163,10 +171,12 @@ class MLATokenToKVPool(CachePool):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
         sanitize: bool | None = None,
+        skip_zero: bool = False,
     ):
         if sanitize is None:
             sanitize = self.latent_write_sanitizes
         layer_id = layer.layer_id
+        skip_zero = skip_zero or layer_id in self._cyclic_layers
         if self.quant_method == "per_token_head":
             # Preserve the writer's sanitization contract for the quantized
             # fallback. The BF16 path below folds this work into Triton.
@@ -198,6 +208,7 @@ class MLATokenToKVPool(CachePool):
                 cache_k_rope,
                 enable_pdl=pdl_enabled(),
                 sanitize=sanitize,
+                skip_zero=skip_zero,
             )
 
     def get_mla_kv_buffer(

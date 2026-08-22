@@ -54,6 +54,7 @@ class CacheBatchMetadata:
 
     group_ids: tuple[str, ...]
     _group_tables: Mapping[str, torch.Tensor] = field(repr=False, compare=False)
+    _group_specs: Mapping[str, Any] = field(repr=False, compare=False)
     num_requests: int
     max_page_ids: Mapping[str, int]
     # Grain of the scheduler's full-history table (equals prefix_granularity
@@ -117,6 +118,7 @@ class CacheBatchMetadata:
         return cls._from_validated_tables(
             group_ids=group_ids,
             group_tables=tables,
+            group_specs={spec.group_id: spec for spec in contract.group_specs},
             num_requests=num_requests,
             max_page_ids=max_page_ids,
             block_granularity=block_granularity,
@@ -132,6 +134,7 @@ class CacheBatchMetadata:
         *,
         group_ids: tuple[str, ...],
         group_tables: Mapping[str, torch.Tensor],
+        group_specs: Mapping[str, Any],
         num_requests: int,
         max_page_ids: Mapping[str, int],
         block_granularity: int,
@@ -142,6 +145,8 @@ class CacheBatchMetadata:
             raise ValueError(
                 "cache group table mapping must exactly match contract order"
             )
+        if tuple(group_specs) != group_ids:
+            raise ValueError("cache group specs must exactly match contract order")
         table_device: torch.device | None = None
         ordered = dict(group_tables)
         for group_id, table in ordered.items():
@@ -167,6 +172,9 @@ class CacheBatchMetadata:
         metadata = object.__new__(cls)
         object.__setattr__(metadata, "group_ids", group_ids)
         object.__setattr__(metadata, "_group_tables", MappingProxyType(ordered))
+        object.__setattr__(
+            metadata, "_group_specs", MappingProxyType(dict(group_specs))
+        )
         object.__setattr__(metadata, "num_requests", num_requests)
         object.__setattr__(
             metadata, "max_page_ids", MappingProxyType(dict(max_page_ids))
@@ -299,6 +307,64 @@ class CacheBatchMetadata:
                 kernel_page_size=kernel_page_size,
                 max_kernel_pages=max_pages,
             )
+        self._kernel_tables[key] = expanded
+        return expanded
+
+    def dcp_kernel_table(
+        self,
+        group_id: str | None = None,
+        *,
+        kernel_page_size: int,
+        dcp_size: int,
+        max_pages: int | None = None,
+        active_forward_op: Any,
+    ) -> torch.Tensor:
+        """Return the rank-local kernel pages for cyclic DCP history.
+
+        The scheduler block remains global and shared across ranks, while the
+        physical field contains only ``rows_per_page`` local rows. Therefore a
+        scheduler page expands by ``rows_per_page / kernel_page_size``, not by
+        the global ``block_granularity / kernel_page_size`` ratio.
+        """
+        if dcp_size <= 1:
+            return self.kernel_table(
+                group_id,
+                kernel_page_size=kernel_page_size,
+                max_pages=max_pages,
+                active_forward_op=active_forward_op,
+            )
+        if group_id is None:
+            table = self.require_full_attention_table(
+                active_forward_op=active_forward_op
+            )
+            group_id = self.full_attention_group_id
+        else:
+            table = self.require_table(group_id, active_forward_op=active_forward_op)
+        spec = self._group_specs[group_id]
+        if (
+            spec.rows_per_page is None
+            or spec.entry_stride_tokens != dcp_size
+            or spec.rows_per_page * dcp_size != spec.block_granularity
+        ):
+            raise RuntimeError(
+                f"cache group {group_id!r} does not publish cyclic DCP{dcp_size} "
+                "row geometry"
+            )
+        if spec.rows_per_page % kernel_page_size:
+            raise RuntimeError(
+                f"DCP local rows {spec.rows_per_page} are not a multiple of "
+                f"kernel page size {kernel_page_size}"
+            )
+        key = ("dcp", group_id, int(kernel_page_size), int(dcp_size), max_pages)
+        cached = self._kernel_tables.get(key)
+        if cached is not None:
+            return cached
+        expanded = expand_page_table(
+            table.contiguous(),
+            block_granularity=spec.rows_per_page,
+            kernel_page_size=kernel_page_size,
+            max_kernel_pages=max_pages,
+        )
         self._kernel_tables[key] = expanded
         return expanded
 

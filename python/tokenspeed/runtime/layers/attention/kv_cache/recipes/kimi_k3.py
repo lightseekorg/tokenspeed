@@ -21,8 +21,8 @@
 """Kimi-K3 cache recipe: MLA latents plus KDA recurrent state groups.
 
 The MLA layers and the KDA state layers live in one arena at P=128. MLA pages
-are dense and pin a 12:1 packing; the state groups pack to match the MLA
-plane's byte width so no parent is wasted.
+are dense and pin at least a 12:1 packing; DCP may raise that packing so the
+replicated KDA tenants still fit in each sharded MLA plane.
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
+    cyclic_history_spec,
 )
 
 _KIMI_K3_LAYERS = 93
@@ -170,7 +171,33 @@ class KimiK3Recipe(CacheRecipe):
     @property
     @override
     def prefix_granularity(self) -> int:
-        return _KIMI_K3_PREFIX_GRANULARITY
+        dcp_size = int(getattr(self.attn_config, "dcp_size", 1))
+        if dcp_size == 1:
+            return _KIMI_K3_PREFIX_GRANULARITY
+        kernel_page_size = int(
+            getattr(self.attn_config, "kernel_page_size", None) or 64
+        )
+        return math.lcm(_KIMI_K3_PREFIX_GRANULARITY, kernel_page_size * dcp_size)
+
+    @override
+    def groups(self) -> tuple[CacheGroupDeclaration, ...]:
+        from dataclasses import replace
+
+        dcp_size = int(getattr(self.attn_config, "dcp_size", 1))
+        groups = super().groups()
+        if dcp_size == 1:
+            return groups
+        resolved = []
+        for spec, fields in groups:
+            if spec.family == "state":
+                spec = replace(
+                    spec,
+                    checkpoint_granularity=_KIMI_K3_PREFIX_GRANULARITY,
+                )
+            else:
+                spec = cyclic_history_spec(spec, dcp_size=dcp_size)
+            resolved.append((spec, fields))
+        return tuple(resolved)
 
     @property
     @override
@@ -222,12 +249,19 @@ class KimiK3Recipe(CacheRecipe):
                 else self.draft_attn_config
             )
             latent_width = config.kv_lora_rank + config.qk_rope_head_dim
+            dcp_size = int(getattr(config, "dcp_size", 1))
+            if self.prefix_granularity % dcp_size:
+                raise ValueError(
+                    f"Kimi-K3 prefix grain {self.prefix_granularity} is not "
+                    f"divisible by DCP size {dcp_size}"
+                )
             return (
                 CacheFieldSpec(
                     f"layer.{layer_id}.latent_kv",
                     plane_id,
-                    (self.prefix_granularity, 1, latent_width),
+                    (self.prefix_granularity // dcp_size, 1, latent_width),
                     scatter_stored_dtype_name(config.kv_cache_dtype),
+                    row_addressed=True,
                 ),
             )
         conv_shape, recurrent_shape = self._kda_shapes
@@ -253,7 +287,7 @@ class KimiK3Recipe(CacheRecipe):
     @override
     def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
         fields_by_group = {spec.group_id: fields for spec, fields in groups}
-        mla_plane_bytes = _KIMI_K3_MLA_PACKING * next(
+        mla_page_bytes = next(
             field.payload_bytes for field in fields_by_group[FULL_ATTENTION]
         )
         first_state = f"{LINEAR_ATTENTION}_0"
@@ -262,12 +296,18 @@ class KimiK3Recipe(CacheRecipe):
             for field in fields_by_group[first_state]
             if field.plane_id == "slot.0"
         )
+        # Full-attention fields require an exact page stride. DCP shrinks
+        # their payload while KDA state remains replicated, so raise the
+        # historical packing until a complete state page fits in the plane.
+        mla_packing = max(
+            _KIMI_K3_MLA_PACKING,
+            math.ceil(linear_plane_bytes / mla_page_bytes),
+        )
+        mla_plane_bytes = mla_packing * mla_page_bytes
         linear_packing = max(1, mla_plane_bytes // linear_plane_bytes)
         return {
             spec.group_id: (
-                _KIMI_K3_MLA_PACKING
-                if spec.group_id == FULL_ATTENTION
-                else linear_packing
+                mla_packing if spec.group_id == FULL_ATTENTION else linear_packing
             )
             for spec, _ in groups
         }
@@ -350,10 +390,19 @@ class KimiK3Recipe(CacheRecipe):
 
     @override
     def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        num_lcm_blocks = super().num_lcm_blocks(layout)
+        usable_bytes = self.cache_budget_bytes - self.workspace_bytes()
+        num_lcm_blocks = usable_bytes // layout.lcm_block_bytes - 1
+        if num_lcm_blocks < 1:
+            raise ValueError(
+                f"{self.family} cache budget must hold a null parent and one "
+                "usable LCM parent"
+            )
         token_limit = self.token_limit
         if token_limit is None:
             return num_lcm_blocks
+        # K3 mixes persistent MLA history with a fixed two-page working set
+        # for each KDA group.  The generic flat-packing cap is therefore not
+        # its inverse and can underallocate when DCP changes MLA packing.
         return min(num_lcm_blocks, self.parents_needed(layout, token_limit))
 
     @override
@@ -372,7 +421,7 @@ class KimiK3Recipe(CacheRecipe):
         closed forms (history pages for MLA, a fixed working set for the state
         groups) rather than the contract's per-retention page-count formula.
         """
-        page_tokens = layout.prefix_granularity
+        specs = {spec.group_id: spec for spec in self._group_specs}
         limits = self.scheduler_limits
         max_live_requests = limits["max_live_requests"]
         depth = limits["overlap_schedule_depth"]
@@ -380,14 +429,15 @@ class KimiK3Recipe(CacheRecipe):
             raise ValueError(f"overlap_schedule_depth must be 0 or 1, got {depth}")
         if depth and limits["decode_input_tokens"] == 0:
             raise ValueError("overlapped cache sizing requires decode_input_tokens > 0")
-        protected_pages = max_live_requests * math.ceil(
-            depth * limits["decode_input_tokens"] / page_tokens
-        )
         parents = 0
         for group_id, packing in layout.group_packing:
+            block_tokens = specs[group_id].block_granularity
             if group_id == FULL_ATTENTION:
+                protected_pages = max_live_requests * math.ceil(
+                    depth * limits["decode_input_tokens"] / block_tokens
+                )
                 child_pages = (
-                    math.ceil(token_capacity / page_tokens)
+                    math.ceil(token_capacity / block_tokens)
                     + max_live_requests
                     - 1
                     + protected_pages

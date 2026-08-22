@@ -162,6 +162,8 @@ class DistributedInitializer:
         )
         pg_manager.init_process_group(config.mapping.world_group)
         pg_manager.init_process_group(config.mapping.attn.tp_group)
+        if config.mapping.attn.has_dcp:
+            pg_manager.init_process_group(config.mapping.attn.dcp_group)
         pg_manager.init_process_group(config.mapping.attn.dp_group)
         pg_manager.init_process_group(config.mapping.dense.tp_group)
         pg_manager.init_process_group(config.mapping.moe.tp_ep_group)

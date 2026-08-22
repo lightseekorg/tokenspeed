@@ -47,6 +47,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     MXFP8_KV_SCALE_TILE_TOKENS,
+    cyclic_history_spec,
     hybrid_slab_group_size,
     layer_group_ids,
 )
@@ -71,8 +72,10 @@ class OrdinaryRecipe(CacheRecipe):
         ids = _config_group_ids(self.attn_config, self.num_target_layers)
         if self.draft_attn_config is None:
             return ids
-        if self.draft_attn_config.prefix_granularity != self.prefix_granularity:
-            raise ValueError("target and draft cache page sizes must match")
+        if self.prefix_granularity % self.draft_attn_config.prefix_granularity:
+            raise ValueError(
+                "the widened target prefix grain must contain whole draft pages"
+            )
         return ids + _config_group_ids(self.draft_attn_config, self.num_draft_layers)
 
     @cached_property
@@ -127,30 +130,45 @@ class OrdinaryRecipe(CacheRecipe):
             layer_id=layer_id,
             local_layer_id=local_layer_id,
             occurrence=occurrence,
+            block_span=self.prefix_granularity,
+        )
+
+    @override
+    def groups(self) -> tuple[CacheGroupDeclaration, ...]:
+        groups = super().groups()
+        dcp_size = int(getattr(self.attn_config, "dcp_size", 1))
+        if dcp_size == 1:
+            return groups
+        return tuple(
+            (cyclic_history_spec(spec, dcp_size=dcp_size), fields)
+            for spec, fields in groups
         )
 
     # ---- capacity: profiled bytes per token, not parent size ----
 
     @override
     def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        bytes_per_token = self.attn_config.cache_cell_size() * _storage_layers(
-            self.attn_config, self.num_target_layers
-        )
-        if self.draft_attn_config is not None:
-            bytes_per_token += (
-                self.draft_attn_config.cache_cell_size()
-                * _storage_layers(self.draft_attn_config, self.num_draft_layers)
+        parent_bytes = layout.lcm_block_bytes
+        if not layout.group_packing:
+            # Capacity-only probes may not carry a packed layout.  Preserve
+            # ordinary cache sizing from the declared per-token payload while
+            # production plans use the exact (DCP-aware) packed parent bytes.
+            bytes_per_token = self.attn_config.cache_cell_size() * _storage_layers(
+                self.attn_config, self.num_target_layers
             )
-        if bytes_per_token <= 0:
+            if self.draft_attn_config is not None:
+                bytes_per_token += (
+                    self.draft_attn_config.cache_cell_size()
+                    * _storage_layers(self.draft_attn_config, self.num_draft_layers)
+                )
+            parent_bytes = bytes_per_token * self.prefix_granularity
+        if parent_bytes <= 0:
             raise ValueError(
-                f"KV cache cell size must be positive, got {bytes_per_token}"
+                f"KV cache LCM block size must be positive, got {parent_bytes}"
             )
-        # Every group packs one CacheBlock per parent, so a parent spans the
-        # identity grain and profiled bytes/token size it directly.
-        page_size = self.prefix_granularity
         return self._capped_parents(
-            self.cache_budget_bytes // (bytes_per_token * page_size) - 1,
-            parent_tokens=page_size,
+            self.cache_budget_bytes // parent_bytes - 1,
+            parent_tokens=self.prefix_granularity,
         )
 
 
@@ -183,7 +201,12 @@ def _config_group_ids(config, num_layers: int) -> tuple[str, ...]:
 
 
 def _config_layer_fields(
-    config, *, layer_id: int, local_layer_id: int, occurrence: int
+    config,
+    *,
+    layer_id: int,
+    local_layer_id: int,
+    occurrence: int,
+    block_span: int,
 ) -> tuple[CacheFieldSpec, ...]:
     """What one layer costs, dispatched on the config that owns the layer."""
     from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
@@ -192,22 +215,22 @@ def _config_layer_fields(
     from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
 
     if isinstance(config, DSAConfig):
-        return _mla_layer_fields(config, layer_id, occurrence) + (
+        return _mla_layer_fields(config, layer_id, occurrence, block_span) + (
             _index_k_field(config, layer_id),
         )
     if isinstance(config, MSAConfig):
-        fields = _mha_layer_fields(config, layer_id, occurrence)
+        fields = _mha_layer_fields(config, layer_id, occurrence, block_span)
         if local_layer_id in config.sparse_layer_ids:
             fields += (_index_k_field(config, layer_id),)
         return fields
     if isinstance(config, MLAConfig):
-        return _mla_layer_fields(config, layer_id, occurrence)
+        return _mla_layer_fields(config, layer_id, occurrence, block_span)
     if isinstance(config, MHAConfig):
-        return _mha_layer_fields(config, layer_id, occurrence)
+        return _mha_layer_fields(config, layer_id, occurrence, block_span)
     raise TypeError(f"no ordinary cache recipe for {type(config).__name__}")
 
 
-def _mha_layer_fields(config, layer_id: int, occurrence: int):
+def _mha_layer_fields(config, layer_id: int, occurrence: int, block_span: int):
     """One MHA layer's K/V pages, with mxfp8 scale planes when enabled."""
     mxfp8 = bool(config.kv_cache_mxfp8)
     if mxfp8 and config.prefix_granularity != MXFP8_KV_SCALE_TILE_TOKENS:
@@ -220,7 +243,7 @@ def _mha_layer_fields(config, layer_id: int, occurrence: int):
     head_dim = config.head_dim
     if config.prefix_granularity <= 0 or kv_heads <= 0 or head_dim <= 0:
         raise ValueError("MHA full-attention geometry must be positive")
-    shape = (config.prefix_granularity, kv_heads, head_dim)
+    shape = (block_span, kv_heads, head_dim)
     kv_dtype = (
         # MXFP8 writes go through dtype-aware kernels, so the arena keeps the
         # fp8 view; the scatter-written paths fall back to uint8.
@@ -239,22 +262,25 @@ def _mha_layer_fields(config, layer_id: int, occurrence: int):
         occurrence=occurrence,
         kv_heads=kv_heads,
         head_dim=head_dim,
-        prefix_granularity=config.prefix_granularity,
+        prefix_granularity=block_span,
     )
 
 
-def _mla_layer_fields(config, layer_id: int, occurrence: int):
+def _mla_layer_fields(config, layer_id: int, occurrence: int, block_span: int):
     """One MLA layer's latent page, split into planes when quantized."""
-    if config.prefix_granularity <= 0:
+    dcp_size = int(getattr(config, "dcp_size", 1))
+    if block_span <= 0 or block_span % dcp_size:
         raise ValueError("MLA full-attention geometry must be positive")
+    physical_rows = block_span // dcp_size
     if config.kv_cache_quant_method != "per_token_head":
         latent_width = config.kv_lora_rank + config.qk_rope_head_dim
         return (
             CacheFieldSpec(
                 f"layer.{layer_id}.latent_kv",
                 f"slot.{occurrence}",
-                (config.prefix_granularity, 1, latent_width),
+                (physical_rows, 1, latent_width),
                 scatter_stored_dtype_name(config.kv_cache_dtype),
+                row_addressed=True,
             ),
         )
     return tuple(
@@ -263,21 +289,22 @@ def _mla_layer_fields(config, layer_id: int, occurrence: int):
             f"layer.{layer_id}.{name}",
             shape,
             dtype,
+            row_addressed=True,
         )
         for name, shape, dtype in (
             (
                 "latent_kv",
-                (config.prefix_granularity, 1, config.kv_lora_rank),
+                (physical_rows, 1, config.kv_lora_rank),
                 scatter_stored_dtype_name(config.kv_cache_dtype),
             ),
             (
                 "latent_scale",
-                (config.prefix_granularity, 1, 1),
+                (physical_rows, 1, 1),
                 cache_dtype_name(torch.float32),
             ),
             (
                 "rope_k",
-                (config.prefix_granularity, 1, config.qk_rope_head_dim),
+                (physical_rows, 1, config.qk_rope_head_dim),
                 cache_dtype_name(config.dtype),
             ),
         )

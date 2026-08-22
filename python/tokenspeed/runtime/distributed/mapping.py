@@ -139,11 +139,25 @@ class AttentionLayerMapping(MappingBase):
         tp_size: int | None = None,
         cp_size: int | None = None,
         dp_size: int | None = None,
+        dcp_size: int = 1,
     ):
         super().__init__(rank, world_size)
         self.tp_size, self.cp_size, self.dp_size = _resolve_parallelism_sizes(
             self.world_size, tp_size, cp_size, dp_size
         )
+        if dcp_size <= 0:
+            raise ValueError(f"dcp_size must be positive, got {dcp_size}")
+        if self.tp_size % dcp_size:
+            raise ValueError(
+                f"attention tp_size={self.tp_size} must be divisible by "
+                f"dcp_size={dcp_size}"
+            )
+        if dcp_size > 1 and self.cp_size > 1:
+            raise ValueError(
+                "decode context parallelism cannot be combined with legacy "
+                "attention context parallelism"
+            )
+        self.dcp_size = dcp_size
 
     @cached_property
     def has_tp(self) -> bool:
@@ -156,6 +170,26 @@ class AttentionLayerMapping(MappingBase):
     @cached_property
     def tp_group(self) -> Group:
         return _make_parallelism_group(self.rank, self.tp_size, stride=1)
+
+    @cached_property
+    def has_dcp(self) -> bool:
+        return self.dcp_size > 1
+
+    @cached_property
+    def dcp_rank(self) -> int:
+        """Rank inside the DCP subgroup nested within attention TP."""
+        return self.tp_rank % self.dcp_size
+
+    @cached_property
+    def dcp_replica_rank(self) -> int:
+        """Index of this DCP subgroup inside the attention TP group."""
+        return self.tp_rank // self.dcp_size
+
+    @cached_property
+    def dcp_group(self) -> Group:
+        """Consecutive TP ranks that sequence-shard one latent KV stream."""
+        start = self.dcp_replica_rank * self.dcp_size
+        return self.tp_group[start : start + self.dcp_size]
 
     @cached_property
     def has_cp(self) -> bool:
@@ -322,6 +356,7 @@ class Mapping(MappingBase):
         attn_tp_size: int | None = None,
         attn_cp_size: int | None = None,
         attn_dp_size: int | None = None,
+        attn_dcp_size: int = 1,
         dense_tp_size: int | None = None,
         dense_dp_size: int | None = None,
         moe_tp_size: int | None = None,
@@ -341,6 +376,7 @@ class Mapping(MappingBase):
             tp_size=attn_tp_size,
             cp_size=attn_cp_size,
             dp_size=attn_dp_size,
+            dcp_size=attn_dcp_size,
         )
         self.dense = DenseLayerMapping(
             rank=rank,
@@ -386,6 +422,10 @@ class Mapping(MappingBase):
         return self.attn.has_cp
 
     @cached_property
+    def has_attn_dcp(self) -> bool:
+        return self.attn.has_dcp
+
+    @cached_property
     def has_attn_dp(self) -> bool:
         return self.attn.has_dp
 
@@ -406,7 +446,7 @@ class Mapping(MappingBase):
         lines = [
             f"Mapping(rank={rank_str}, world_size={self.world_size})",
             f"  Cluster : {self.nnodes} node(s) x {self.nprocs_per_node} proc(s)",
-            f"  Attention: tp={self.attn.tp_size}  cp={self.attn.cp_size}  dp={self.attn.dp_size}",
+            f"  Attention: tp={self.attn.tp_size}  dcp={self.attn.dcp_size}  cp={self.attn.cp_size}  dp={self.attn.dp_size}",
             f"    Vision: tp={self.vision.tp_size}  item_dp={self.vision.dp_size}",
             f"  Dense   : tp={self.dense.tp_size}  dp={self.dense.dp_size}",
             f"  MoE     : tp={self.moe.tp_size}  ep={self.moe.ep_size}  dp={self.moe.dp_size}",

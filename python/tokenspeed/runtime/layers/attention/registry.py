@@ -121,11 +121,14 @@ def _cache_storage_report(
     packing = {
         group.group_id: int(group.cache_blocks_per_lcm_block) for group in plan.groups
     }
-    # The arena is the one definition of child-token capacity.
-    physical_token_capacity = int(arena.size)
+    # Admission capacity is a scheduler-contract fact. ``arena.size`` is the
+    # most finely packed group's addressable row span and can exceed it for
+    # heterogeneous/Kimi layouts (especially under DCP).
+    token_capacity = int(arena.runtime_contract.token_capacity)
     geometry = {
         "prefix_granularity": int(plan.prefix_granularity),
         "num_lcm_blocks": int(plan.num_lcm_blocks),
+        "max_addressable_row_span": int(arena.size),
         "cache_blocks_per_lcm_block": packing,
         # Fraction of a parent each group's binding actually uses;
         # aliased slabs are sized by their widest tenant, so a narrow
@@ -148,8 +151,8 @@ def _cache_storage_report(
     return {
         "configured_cache_bytes": int(configured_cache_bytes),
         "allocated_cache_bytes": allocated_cache_bytes,
-        "physical_token_capacity": physical_token_capacity,
-        "capacity_source": "lcm_geometry",
+        "physical_token_capacity": token_capacity,
+        "capacity_source": "scheduler_contract",
         "geometry": geometry
         | {
             "arena_bytes": arena_bytes,
@@ -825,6 +828,21 @@ def create_attn_components(
         if is_hybrid_linear
         else config.backend_name
     )
+    if server_args.mapping.attn.dcp_size > 1:
+        if type(config) is not MLAConfig:
+            raise ValueError(
+                "decode context parallelism is implemented only for dense MLA "
+                f"targets, got {type(config).__name__}"
+            )
+        supported_dcp_backend = (
+            "deepseek_v4" if is_deepseek_v4_model else "tokenspeed_mla"
+        )
+        if target_full_attn_backend_name != supported_dcp_backend:
+            raise ValueError(
+                "decode context parallelism requires the resolved full-attention "
+                f"backend to be {supported_dcp_backend!r}, got "
+                f"{target_full_attn_backend_name!r}"
+            )
     draft_attn_config = (
         _create_attn_config(server_args, draft_model_config, is_draft=True)
         if draft_model_config and not is_dspark_draft_model

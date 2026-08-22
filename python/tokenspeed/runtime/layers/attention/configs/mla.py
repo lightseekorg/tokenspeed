@@ -87,6 +87,59 @@ class MLAConfig(BaseAttnConfig):
         draft_block_decode = bool(
             is_draft and server_args.speculative_algorithm in ("DFLASH", "DSPARK")
         )
+        mapping = server_args.mapping.attn
+        dcp_size = 1 if is_draft else mapping.dcp_size
+        # MLA persists one compressed latent KV stream per request. Generic HF
+        # configs often omit num_key_value_heads, which ModelConfig then
+        # defaults to the query-head count; that fallback is not MLA geometry.
+        effective_kv_streams = 1
+        if dcp_size > 1:
+            backend_name = server_args.attention_backend
+            is_deepseek_v4 = backend_name == "deepseek_v4"
+            if backend_name not in (
+                "tokenspeed_mla",
+                "hybrid_linear_attn",
+                "deepseek_v4",
+            ):
+                raise ValueError(
+                    "decode context parallelism requires a DCP-aware MLA "
+                    "backend, got "
+                    f"{backend_name!r}"
+                )
+            if not is_deepseek_v4 and server_args.kv_cache_dtype != "fp8_e4m3":
+                raise ValueError(
+                    "tokenspeed_mla decode context parallelism requires "
+                    "--kv-cache-dtype fp8_e4m3"
+                )
+            if server_args.kv_cache_quant_method != "none":
+                raise ValueError(
+                    "decode context parallelism does not support "
+                    f"--kv-cache-quant-method {server_args.kv_cache_quant_method!r}"
+                )
+            if server_args.disaggregation_mode != "null":
+                raise ValueError(
+                    "decode context parallelism does not yet support PD "
+                    "disaggregation; use --disaggregation-mode null"
+                )
+            if server_args.kvstore_storage_backend is not None:
+                raise ValueError(
+                    "decode context parallelism does not yet namespace shared "
+                    "KVStore storage by DCP rank; disable the storage backend"
+                )
+            local_heads = model_config.num_attention_heads // mapping.tp_size
+            if local_heads * dcp_size > 128:
+                raise ValueError(
+                    "tokenspeed_mla DCP supports at most 128 gathered query "
+                    f"heads, got {local_heads * dcp_size}"
+                )
+            max_dcp_size = mapping.tp_size // effective_kv_streams
+            if dcp_size > max_dcp_size:
+                raise ValueError(
+                    "decode context parallel subgroups must stay within one "
+                    "KV stream: require DCP size <= attention TP size / "
+                    f"num KV streams ({mapping.tp_size} / {effective_kv_streams} = "
+                    f"{max_dcp_size}), got {dcp_size}"
+                )
         return cls(
             device=server_args.device,
             context_len=model_config.context_len + server_args.spec_context_pad,
@@ -96,7 +149,7 @@ class MLAConfig(BaseAttnConfig):
                 else server_args.drafter_attention_backend
             ),
             num_attention_heads=model_config.num_attention_heads,
-            num_kv_heads=model_config.num_key_value_heads,
+            num_kv_heads=effective_kv_streams,
             head_dim=model_config.head_dim,
             attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
             dtype=model_config.dtype,
@@ -122,6 +175,9 @@ class MLAConfig(BaseAttnConfig):
                 server_args, "disaggregation_mode", "null"
             )
             != "null",
+            dcp_size=dcp_size,
+            dcp_rank=mapping.dcp_rank if dcp_size > 1 else 0,
+            dcp_group=mapping.dcp_group if dcp_size > 1 else (0,),
             **kwargs,
         )
 

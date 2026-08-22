@@ -40,6 +40,7 @@ def set_mla_kv_buffer_kernel(
     ENABLE_PDL: tl.constexpr,
     SANITIZE: tl.constexpr,
     MAX_FINITE: tl.constexpr,
+    SKIP_ZERO: tl.constexpr,
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -53,6 +54,8 @@ def set_mla_kv_buffer_kernel(
     mask = offs < total_dim
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
+    if SKIP_ZERO:
+        mask = mask & (loc > 0)
     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
 
     if base + BLOCK <= nope_dim:
@@ -95,6 +98,7 @@ def set_mla_kv_buffer_per_loc_kernel(
     ENABLE_PDL: tl.constexpr,
     SANITIZE: tl.constexpr,
     MAX_FINITE: tl.constexpr,
+    SKIP_ZERO: tl.constexpr,
 ):
     """Each CTA writes BLOCK_LOC locs (the full nope+rope span for each).
     Grid is ceil(n_loc / BLOCK_LOC). With BLOCK_LOC > 1 each CTA processes
@@ -110,6 +114,8 @@ def set_mla_kv_buffer_per_loc_kernel(
     loc_indices = pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)
     loc_mask = loc_indices < n_loc
     locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
+    if SKIP_ZERO:
+        loc_mask = loc_mask & (locs > 0)
 
     # Nope tile: [BLOCK_LOC, nope_dim]
     nope_offs = tl.arange(0, nope_dim)
@@ -156,6 +162,7 @@ def set_mla_kv_buffer_triton(
     cache_k_rope: torch.Tensor,
     enable_pdl: bool = False,
     sanitize: bool = False,
+    skip_zero: bool = False,
 ):
     # Dispatch buckets from experiments on B200 GPUs.
     #   n_loc <  512  : block-split kernel — more CTAs/loc fills SMs at decode
@@ -203,6 +210,7 @@ def set_mla_kv_buffer_triton(
             ENABLE_PDL=enable_pdl,
             SANITIZE=sanitize,
             MAX_FINITE=max_finite,
+            SKIP_ZERO=skip_zero,
             num_warps=num_warps,
             num_stages=num_stages,
             **extra_kwargs,
@@ -228,6 +236,7 @@ def set_mla_kv_buffer_triton(
             ENABLE_PDL=enable_pdl,
             SANITIZE=sanitize,
             MAX_FINITE=max_finite,
+            SKIP_ZERO=skip_zero,
             **extra_kwargs,
         )
 

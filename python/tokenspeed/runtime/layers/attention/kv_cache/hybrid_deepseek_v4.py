@@ -197,8 +197,10 @@ class DeepseekV4CacheMetadata:
     )
     indexer_state_block_table: torch.Tensor | None = None
     indexer_state_base_logical_page: torch.Tensor | None = None
-    decode_compressed_slot_mappings: dict[tuple[int, int], torch.Tensor] = field(
-        default_factory=dict
+    decode_compressed_slot_mappings: dict[tuple[int, int, int, int], torch.Tensor] = (
+        field(
+            default_factory=dict,
+        )
     )
 
     def compressed_page_table(
@@ -233,10 +235,12 @@ class DeepseekV4CacheMetadata:
         seq_lens: torch.Tensor,
         compress_ratio: int,
         kv_cache_block_size: int,
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
         is_valid_token: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = token_to_req_indices.shape[0]
-        key = (compress_ratio, kv_cache_block_size)
+        key = (compress_ratio, kv_cache_block_size, dcp_size, dcp_rank)
         out = self.decode_compressed_slot_mappings.get(key)
         if out is None or out.shape[0] < num_tokens or out.device != seq_lens.device:
             if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
@@ -265,6 +269,11 @@ class DeepseekV4CacheMetadata:
                 compress_ratio,
                 rounding_mode="floor",
             )
+            owner = compressed_pos % dcp_size
+            if dcp_size > 1:
+                compressed_pos = torch.div(
+                    compressed_pos, dcp_size, rounding_mode="floor"
+                )
             page_indices = torch.div(
                 compressed_pos,
                 kv_cache_block_size,
@@ -287,6 +296,8 @@ class DeepseekV4CacheMetadata:
                 positions,
                 compress_ratio,
             )
+            if dcp_size > 1:
+                valid_slots = valid_slots & (owner == dcp_rank)
             slot_mapping = torch.where(
                 valid_slots,
                 page_ids * kv_cache_block_size + offsets,
@@ -295,6 +306,11 @@ class DeepseekV4CacheMetadata:
             out.copy_(_mask_invalid_graph_tokens(slot_mapping, is_valid_token))
             return out
 
+        if dcp_size > 1:
+            raise RuntimeError(
+                "DeepSeek V4 DCP compressed history requires its named "
+                "compressed cache-group table"
+            )
         mapping = deepseek_v4_compressed_slot_mapping(
             num_tokens=num_tokens,
             query_start_loc=query_start_loc,
@@ -316,7 +332,7 @@ class DeepseekV4CacheMetadata:
         seq_lens: torch.Tensor,
         is_valid_token: torch.Tensor | None = None,
     ) -> None:
-        for compress_ratio, kv_cache_block_size in list(
+        for compress_ratio, kv_cache_block_size, dcp_size, dcp_rank in list(
             self.decode_compressed_slot_mappings
         ):
             self._update_decode_compressed_slot_mapping(
@@ -325,6 +341,8 @@ class DeepseekV4CacheMetadata:
                 seq_lens=seq_lens,
                 compress_ratio=compress_ratio,
                 kv_cache_block_size=kv_cache_block_size,
+                dcp_size=dcp_size,
+                dcp_rank=dcp_rank,
                 is_valid_token=is_valid_token,
             )
 
@@ -339,6 +357,8 @@ class DeepseekV4CacheMetadata:
         kv_cache_block_size: int | None = None,
         use_decode_cache: bool = False,
         is_valid_token: torch.Tensor | None = None,
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
     ) -> torch.Tensor:
         if kv_cache_block_size is None:
             kv_cache_block_size = self.page_size
@@ -349,7 +369,7 @@ class DeepseekV4CacheMetadata:
             and (page_table.is_cuda or self.page_table.is_cuda)
         ):
             cached = self.decode_compressed_slot_mappings.get(
-                (compress_ratio, kv_cache_block_size)
+                (compress_ratio, kv_cache_block_size, dcp_size, dcp_rank)
             )
             if (
                 cached is not None
@@ -363,12 +383,17 @@ class DeepseekV4CacheMetadata:
                 seq_lens=seq_lens,
                 compress_ratio=compress_ratio,
                 kv_cache_block_size=kv_cache_block_size,
+                dcp_size=dcp_size,
+                dcp_rank=dcp_rank,
                 is_valid_token=is_valid_token,
             )
             return mapping[: positions.numel()]
         compressed_pos = torch.div(
             positions.to(torch.int64), compress_ratio, rounding_mode="floor"
         )
+        owner = compressed_pos % dcp_size
+        if dcp_size > 1:
+            compressed_pos = torch.div(compressed_pos, dcp_size, rounding_mode="floor")
         page_indices = torch.div(
             compressed_pos, kv_cache_block_size, rounding_mode="floor"
         )
@@ -394,6 +419,8 @@ class DeepseekV4CacheMetadata:
             positions,
             compress_ratio,
         )
+        if dcp_size > 1:
+            valid_slots = valid_slots & (owner == dcp_rank)
         slot_mapping = torch.where(
             valid_slots,
             slots,
@@ -440,6 +467,9 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         self.model_dtype = model_dtype
         self.layout = layout
         self.layer_num = layer_num
+        placement = getattr(arena, "placement_contract", None)
+        self.dcp_size = int(getattr(placement, "dcp_size", 1))
+        self.dcp_rank = int(getattr(placement, "dcp_rank", 0))
         self._cache_group_specs_by_id = {
             spec.group_id: spec for spec in self.arena.cache_group_specs
         }
@@ -461,7 +491,14 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         )
         self.swa_block_bytes = layout.swa_block_bytes(self.swa_block_size)
         self.compressed_block_sizes = tuple(
-            layout.storage_block_size(ratio) if ratio > 1 else prefix_granularity
+            (
+                _group_rows(
+                    v4_compressed_kv_group_id(ratio),
+                    layout.storage_block_size(ratio),
+                )
+                if ratio > 1
+                else prefix_granularity
+            )
             for ratio in layout.layer_ratio
         )
         self.indexer_block_sizes = tuple(

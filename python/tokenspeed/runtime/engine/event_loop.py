@@ -1111,6 +1111,7 @@ class EventLoop:
             world_size=self.world_size,
             data_parallel_size=self.dp_size,
             tensor_parallel_size=self.attn_tp_size,
+            decode_context_parallel_size=(self.server_args.mapping.attn.dcp_size),
             data_parallel_rank=self.dp_rank,
             max_num_seqs=self.server_args.max_num_seqs,
             # chunked_prefill_size=-1 means "disabled"; the wire field is a

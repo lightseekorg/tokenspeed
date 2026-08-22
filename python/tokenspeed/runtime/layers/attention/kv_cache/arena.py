@@ -60,6 +60,7 @@ class CacheArena:
         device: str,
         *,
         cache_group_specs: tuple[CacheGroupSpec, ...],
+        placement_contract=None,
         token_capacity: int | None = None,
         enable_memory_saver: bool = False,
     ):
@@ -69,6 +70,7 @@ class CacheArena:
             )
         self.plan = plan
         self.device = device
+        self.placement_contract = placement_contract
         # One adapter for the whole arena. The allocation happens inside its
         # region, so the sleep/wake lifetime is a property of the arena.
         # Tag as "kv_cache", no CPU backup: cache bytes are discarded on
@@ -181,7 +183,7 @@ class CacheArena:
             ),
             self.field_block_byte_offset(field.field_id, 0) // field.element_size,
         )
-        if field.shape[0] != self.plan.prefix_granularity:
+        if not field.row_addressed and field.shape[0] != self.plan.prefix_granularity:
             return pages
         return pages.view(-1, *field.shape[1:])
 

@@ -21,6 +21,7 @@ def create_cache_arena(
         spec.memory_plan,
         device,
         cache_group_specs=spec.cache_group_specs,
+        placement_contract=spec.placement_contract,
         token_capacity=spec.token_capacity,
         enable_memory_saver=enable_memory_saver,
     )

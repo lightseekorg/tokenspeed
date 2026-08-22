@@ -525,9 +525,18 @@ class DeepseekV3AttentionMLA(nn.Module):
         self.cli_factor = getattr(config, "cli_factor", 1)
         self.prefix = prefix
 
-        # modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
+        # Transformers may normalize an absent rope_scaling configuration to a
+        # default RoPE dictionary.  That is not a YaRN configuration and does
+        # not contain the YaRN-specific factor fields.
         if rope_scaling:
-            rope_scaling["rope_type"] = "deepseek_yarn"
+            rope_scaling = dict(rope_scaling)
+            rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+            if rope_type == "default":
+                rope_scaling = None
+            else:
+                # modification to rope_scaling must be done early enough, b/c
+                # e.g. Indexer needs it
+                rope_scaling["rope_type"] = "deepseek_yarn"
 
         if self.q_lora_rank is not None:
             self.fused_qkv_a_proj_with_mqa = DeepseekV3FusedQkvAProjWithMqa(
@@ -1111,7 +1120,6 @@ class DeepseekV3AttentionMLA(nn.Module):
         use_fp8_prefill = self._mla_kv_is_fp8(ctx, k_scale)
 
         if use_fp8_prefill:
-
             if self.rotary_emb is not None:
                 k_rope = k_pe.expand(-1, self.num_local_heads, -1)
                 cos_sin_cache = self.rotary_emb.cos_sin_cache
@@ -1224,6 +1232,9 @@ class DeepseekV3AttentionMLA(nn.Module):
             kv_a_normed, k_pe = token_to_kv_pool.get_mla_kv_buffer(
                 self.attn_mha, chunk_kv_indices, read_dtype
             )
+            reconstruct_prefix_kv = getattr(attn_backend, "reconstruct_prefix_kv", None)
+            if reconstruct_prefix_kv is not None:
+                kv_a_normed, k_pe = reconstruct_prefix_kv(kv_a_normed, k_pe)
 
             kv_a_normed = kv_a_normed.squeeze(1)
             kv = self.kv_b_proj(kv_a_normed)[0]
@@ -2434,7 +2445,12 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         torch.cuda.synchronize()
 
 
+class DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
+    """DeepSeek-V2 uses the same MLA/MoE checkpoint layout as this runtime."""
+
+
 EntryClass = [
+    DeepseekV2ForCausalLM,
     DeepseekV3ForCausalLM,
     Eagle3DeepseekV2ForCausalLM,
 ]

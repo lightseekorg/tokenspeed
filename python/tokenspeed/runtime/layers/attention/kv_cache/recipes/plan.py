@@ -163,6 +163,9 @@ class CacheFieldLayout:
     dtype: str
     field_offset_bytes: int
     page_stride_bytes: int
+    # Explicitly flatten the page and leading-row axes for token-addressed
+    # fields whose physical DCP row count differs from the global prefix grain.
+    row_addressed: bool = False
 
     def __post_init__(self) -> None:
         cache_dtype_bytes(self.dtype)
@@ -353,6 +356,9 @@ class CacheFieldSpec:
     # stride to satisfy an alignment constraint (for example, a TMA row
     # stride). The planner applies this in bytes after group packing.
     page_stride_alignment_bytes: int = 1
+    # Token-addressed fields normally infer this from shape[0] == the global
+    # prefix grain. DCP needs an explicit marker because it stores only P/D rows.
+    row_addressed: bool = False
 
     def __post_init__(self) -> None:
         cache_dtype_bytes(self.dtype)
@@ -815,6 +821,7 @@ def pack(
                 dtype=field.dtype,
                 field_offset_bytes=field_offsets[field.field_id],
                 page_stride_bytes=plane_bytes[field.plane_id] // packing[group_id],
+                row_addressed=field.row_addressed,
             )
         )
 
