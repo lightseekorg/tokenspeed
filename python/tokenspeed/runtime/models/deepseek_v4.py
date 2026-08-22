@@ -18,12 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Inference-only DeepSeek V4 model skeleton.
-
-This module intentionally registers only architecture pieces that map to the
-DeepSeek V4 Flash checkpoint. The sparse MLA forward path still fails loudly
-until the HCA/CSA cache kernels are wired into TokenSpeed.
-"""
+"""Inference-only DeepSeek V4 Flash and Pro model implementation."""
 
 from __future__ import annotations
 
@@ -34,6 +29,21 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel import (
+    deepseek_v4_grouped_output_projection,
+    deepseek_v4_grouped_output_projection_plan,
+    deepseek_v4_grouped_output_projection_warmup_model,
+    deepseek_v4_indexer_cache_format,
+    deepseek_v4_linear_fp32,
+    deepseek_v4_padded_heads,
+    deepseek_v4_select_experts,
+    deepseek_v4_supports_deep_gemm,
+    dsa_decode_topk,
+    dsa_prefill_topk,
+)
+from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
+from tokenspeed_kernel import mhc_post as fast_mhc_post
+from tokenspeed_kernel import mhc_pre as fast_mhc_pre
 
 try:
     # Optional dependency; the module-level wrapper imports the external
@@ -51,12 +61,6 @@ from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_indexer_decode_metadata_compute,
-)
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cuda import (
-    dsv3_router_gemm,
-    hash_softplus_sqrt_topk_flash,
-    softplus_sqrt_topk_flash,
 )
 from tokenspeed_kernel.thirdparty.triton import (
     stage_deepseek_v4_mega_moe_inputs as _stage_deepseek_v4_mega_moe_inputs,
@@ -80,6 +84,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4ForwardMetadata,
     DeepseekV4IndexerBatchMetadata,
@@ -100,9 +105,8 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_csa_compress_kv_cache_insert,
     deepseek_v4_csa_indexer_cache_insert,
-    deepseek_v4_fused_inv_rope_fp8_quant,
     deepseek_v4_hca_compress_kv_cache_insert,
-    deepseek_v4_prepare_indexer_q_fp8,
+    deepseek_v4_prepare_indexer_q,
     deepseek_v4_prepare_indexer_q_mxfp4,
     fused_qnorm_rope_kv_insert,
     gather_paged_indexer_fp8_cache,
@@ -112,9 +116,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     _group_slot_mapping_from_raw,
     _mask_invalid_graph_tokens,
 )
-from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_fused_hc as fast_mhc_fused_hc
-from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_post as fast_mhc_post
-from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_pre as fast_mhc_pre
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -150,7 +151,8 @@ from tokenspeed.runtime.utils.custom_ops import direct_register_custom_op
 from tokenspeed.runtime.utils.env import global_server_args_dict, pdl_enabled
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
-_platform = current_platform()
+if not deepseek_v4_supports_deep_gemm():
+    deep_gemm = None  # type: ignore[assignment]
 
 
 logger = get_colorful_logger(__name__)
@@ -233,129 +235,6 @@ def _dequant_fp8_weight(layer: nn.Module, shape: tuple[int, ...]) -> torch.Tenso
     return weight.float() * expanded_scale[:, :out_dim, :in_dim]
 
 
-def _deepseek_v4_router_gemm(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-) -> torch.Tensor:
-    if (
-        hidden_states.dim() == 2
-        and hidden_states.shape[0] > 0
-        and hidden_states.is_cuda
-        and hidden_states.dtype == torch.bfloat16
-        and weight.dtype in (torch.bfloat16, torch.float32)
-        and (_platform.is_hopper or _platform.is_blackwell)
-    ):
-        return dsv3_router_gemm(
-            hidden_states,
-            weight,
-            out_dtype=torch.float32,
-            enable_pdl=pdl_enabled(),
-        )
-
-    x = (
-        hidden_states
-        if hidden_states.dtype == weight.dtype
-        else hidden_states.to(weight.dtype)
-    )
-    return F.linear(x, weight, None).to(torch.float32)
-
-
-def _deepseek_v4_bf16_linear_fp32(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-) -> torch.Tensor | None:
-    if (
-        hidden_states.dim() == 2
-        and hidden_states.shape[0] > 0
-        and hidden_states.is_cuda
-        and hidden_states.dtype == torch.bfloat16
-        and weight.is_cuda
-        and weight.dtype == torch.bfloat16
-        and weight.dim() == 2
-        and hidden_states.shape[1] == weight.shape[1]
-        and (_platform.is_hopper or _platform.is_blackwell)
-    ):
-        return dsv3_router_gemm(
-            hidden_states,
-            weight,
-            out_dtype=torch.float32,
-            enable_pdl=False,
-        )
-    return None
-
-
-def _deepseek_v4_fused_select_experts(
-    router_logits: torch.Tensor,
-    top_k: int,
-    renormalize: bool,
-    *,
-    correction_bias: torch.Tensor | None = None,
-    hash_indices_table: torch.Tensor | None = None,
-    input_ids: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if (
-        not router_logits.is_cuda
-        or router_logits.dim() != 2
-        or top_k <= 0
-        or top_k > 32
-        or router_logits.dtype not in (torch.float32, torch.float16, torch.bfloat16)
-    ):
-        return None
-
-    num_experts = router_logits.shape[1]
-
-    topk_weights = torch.empty(
-        router_logits.shape[0],
-        top_k,
-        dtype=torch.float32,
-        device=router_logits.device,
-    )
-    topk_ids = torch.empty(
-        router_logits.shape[0],
-        top_k,
-        dtype=torch.int32,
-        device=router_logits.device,
-    )
-
-    if num_experts not in (256, 384) or top_k != 6 or not renormalize:
-        return None
-
-    logits_f32 = router_logits.float().contiguous()
-
-    try:
-        if hash_indices_table is not None:
-            if input_ids is None:
-                raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
-            hash_softplus_sqrt_topk_flash(
-                logits_f32,
-                input_ids.reshape(-1).to(device=router_logits.device).contiguous(),
-                hash_indices_table.to(
-                    device=router_logits.device, dtype=torch.int32
-                ).contiguous(),
-                topk_ids,
-                topk_weights,
-                1.0,
-                renormalize,
-            )
-        elif correction_bias is not None:
-            softplus_sqrt_topk_flash(
-                logits_f32,
-                correction_bias.to(
-                    device=router_logits.device, dtype=torch.float32
-                ).contiguous(),
-                topk_ids,
-                topk_weights,
-                1.0,
-                renormalize,
-            )
-        else:
-            return None
-    except (AttributeError, RuntimeError):
-        return None
-
-    return topk_weights, topk_ids
-
-
 def _deepseek_v4_reorder_c4_ape_2604(ape: torch.Tensor) -> torch.Tensor:
     """Convert C4 overlap APE from checkpoint layout to runtime window layout."""
 
@@ -435,68 +314,6 @@ def hc_head(
     pre = torch.sigmoid(mixes * hc_scale.float() + hc_base.float()) + hc_eps
     y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
     return y.to(dtype)
-
-
-def deepseek_v4_select_experts(
-    router_logits: torch.Tensor,
-    top_k: int,
-    renormalize: bool,
-    *,
-    correction_bias: torch.Tensor | None = None,
-    hash_indices_table: torch.Tensor | None = None,
-    input_ids: torch.Tensor | None = None,
-    need_scores: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """DeepSeek V4 MoE routing.
-
-    DeepSeek V4 uses sqrt(softplus(logits)) as expert scores. Correction bias
-    only affects expert selection; the gathered expert weights come from the
-    unbiased scores. Hash-routed layers use checkpoint-provided expert ids but
-    still gather weights from the gate scores.
-
-    Set ``need_scores=False`` when the caller discards the third return value
-    (e.g. mega_moe) to skip the redundant sqrt(softplus(logits)) computation.
-    """
-
-    fused_topk = _deepseek_v4_fused_select_experts(
-        router_logits,
-        top_k,
-        renormalize,
-        correction_bias=correction_bias,
-        hash_indices_table=hash_indices_table,
-        input_ids=input_ids,
-    )
-    if fused_topk is not None:
-        topk_weights, topk_ids = fused_topk
-        if need_scores:
-            scores = torch.sqrt(F.softplus(router_logits.float()))
-        else:
-            scores = router_logits
-        return topk_weights, topk_ids, scores
-
-    scores = torch.sqrt(F.softplus(router_logits.float()))
-    if hash_indices_table is not None:
-        if input_ids is None:
-            raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
-        topk_ids = hash_indices_table[input_ids.reshape(-1)].to(
-            device=scores.device,
-            dtype=torch.long,
-        )
-    else:
-        scores_for_choice = scores
-        if correction_bias is not None:
-            scores_for_choice = scores_for_choice + correction_bias.to(
-                device=scores.device,
-                dtype=scores.dtype,
-            ).unsqueeze(0)
-        topk_ids = torch.topk(scores_for_choice, k=top_k, dim=-1, sorted=True)[1]
-
-    topk_weights = scores.gather(1, topk_ids)
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
-            torch.finfo(topk_weights.dtype).tiny
-        )
-    return topk_weights.to(torch.float32), topk_ids.to(torch.int32), scores
 
 
 def pack_topk_as_router_logits(
@@ -678,8 +495,7 @@ def _deepseek_v4_indexer_topk_from_logits(
         )
     if topk_tokens not in (512, 1024, 2048):
         raise RuntimeError(
-            "DeepSeek V4 decode indexer top-k supports topk_tokens in "
-            "{512, 1024, 2048}"
+            "DeepSeek V4 decode indexer top-k supports topk_tokens in {512, 1024, 2048}"
         )
 
     if (
@@ -928,6 +744,7 @@ def _deepseek_v4_indexer_prefill_request_gather_plan(
     req_end: int,
     query_start: int,
     query_end: int,
+    block_table_base_offsets: torch.Tensor | None = None,
     build_slots: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     device = block_table.device
@@ -976,6 +793,22 @@ def _deepseek_v4_indexer_prefill_request_gather_plan(
         dtype=torch.int64,
         device=device,
     )
+    request_ids = torch.arange(req_start, req_end, device=device, dtype=torch.int64)
+    if block_table_base_offsets is None:
+        request_base_pages = torch.zeros_like(request_ids)
+    else:
+        if block_table_base_offsets.ndim != 1:
+            raise ValueError("block_table_base_offsets must be one-dimensional")
+        request_base_pages = block_table_base_offsets.to(
+            device=device, dtype=torch.int64
+        )[request_ids]
+    request_base_rows = request_base_pages * int(cache_block_size)
+    request_capacity_ends = request_base_rows + int(block_table.shape[1]) * int(
+        cache_block_size
+    )
+    request_starts = torch.minimum(request_base_rows, compressed_lens).clamp_min(0)
+    request_ends = torch.minimum(request_capacity_ends, compressed_lens)
+    request_ends = torch.maximum(request_ends, request_starts)
 
     cu_seq_lens = torch.empty(
         compressed_lens.numel() + 1,
@@ -987,8 +820,15 @@ def _deepseek_v4_indexer_prefill_request_gather_plan(
 
     req_local_tensor = torch.tensor(req_local_list, dtype=torch.int64, device=device)
     row_lens = torch.tensor(row_lens_list, dtype=torch.int32, device=device)
-    cu_start = cu_seq_lens[:-1][req_local_tensor]
-    cu_end = cu_start + row_lens
+    group_starts = cu_seq_lens[:-1][req_local_tensor]
+    logical_starts = request_starts[req_local_tensor]
+    logical_ends = torch.minimum(
+        row_lens.to(torch.int64), request_ends[req_local_tensor]
+    )
+    logical_ends = torch.maximum(logical_ends, logical_starts)
+    cu_start = group_starts + logical_starts.to(torch.int32)
+    cu_end = group_starts + logical_ends.to(torch.int32)
+    row_lens = (logical_ends - logical_starts).to(torch.int32)
 
     if total_k <= 0 or not build_slots:
         empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
@@ -1004,8 +844,21 @@ def _deepseek_v4_indexer_prefill_request_gather_plan(
     local = torch.arange(total_k, device=device, dtype=torch.int64) - group_bases
     pages = torch.div(local, cache_block_size, rounding_mode="floor")
     page_offsets = local % cache_block_size
-    page_ids = block_table[req_ids, pages.long()].to(torch.int64)
-    slots = page_ids * cache_block_size + page_offsets
+    base_pages = block_table_base_offsets
+    if base_pages is None:
+        base_pages_for_k = torch.zeros_like(req_ids)
+    else:
+        base_pages_for_k = base_pages.to(device=device, dtype=torch.int64)[req_ids]
+    table_pages = pages - base_pages_for_k
+    valid_pages = (table_pages >= 0) & (table_pages < block_table.shape[1])
+    safe_pages = table_pages.clamp(0, max(int(block_table.shape[1]) - 1, 0))
+    page_ids = block_table[req_ids, safe_pages.long()].to(torch.int64)
+    valid_pages = valid_pages & (page_ids >= 0)
+    slots = torch.where(
+        valid_pages,
+        page_ids * cache_block_size + page_offsets,
+        torch.zeros_like(page_offsets),
+    )
     return slots, cu_start, cu_end, row_lens, max_len
 
 
@@ -1028,6 +881,7 @@ def _deepseek_v4_indexer_prefill_metadata(
     cache_block_size: int,
     compress_ratio: int,
     num_prefill_tokens: int,
+    block_table_base_offsets: torch.Tensor | None = None,
 ) -> DeepseekV4IndexerPrefillMetadata:
     device = block_table.device
     if num_prefill_tokens <= 0:
@@ -1041,7 +895,16 @@ def _deepseek_v4_indexer_prefill_metadata(
 
     seq_lens_cpu = seq_lens_cpu[:num_prefill_reqs]
     query_lens_cpu = query_lens_cpu[:num_prefill_reqs]
-    cache_key = (compress_ratio, cache_block_size, num_prefill_tokens)
+    cache_key = (
+        compress_ratio,
+        cache_block_size,
+        num_prefill_tokens,
+        (
+            0
+            if block_table_base_offsets is None
+            else int(block_table_base_offsets.data_ptr())
+        ),
+    )
     cache = metadata.indexer.prefill_plan_cache
     cached = cache.get(cache_key)
     if cached is not None and cached.slots.device == device:
@@ -1079,7 +942,8 @@ def _deepseek_v4_indexer_prefill_metadata(
                 req_end=chunk.req_end,
                 query_start=chunk.query_start,
                 query_end=chunk.query_end,
-                build_slots=False,
+                block_table_base_offsets=block_table_base_offsets,
+                build_slots=True,
             )
         )
         slot_count = _deepseek_v4_indexer_prefill_chunk_total_rows(
@@ -2022,14 +1886,21 @@ class _DeepseekV4TopKBuffer:
         return self.buffer[:num_tokens]
 
 
-def _deepseek_v4_padded_heads(num_local_heads: int) -> int:
-    if num_local_heads <= 64:
-        return 64
-    if num_local_heads <= 128:
-        return 128
-    raise ValueError(
-        f"DeepSeek V4 attention supports at most 128 local heads, got {num_local_heads}"
+def _deepseek_v4_indexer_page_table(
+    metadata: DeepseekV4ForwardMetadata,
+    compress_ratio: int,
+    indexer_block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    page_table = metadata.cache.compressed_page_table(
+        compress_ratio,
+        indexer_block_size,
     )
+    base_offsets = None
+    if page_table is not metadata.cache.page_table:
+        base_offsets = metadata.cache.block_table_base_offsets.get(
+            v4_compressed_kv_group_id(compress_ratio)
+        )
+    return page_table, base_offsets
 
 
 def _deepseek_v4_sanitize_swa_slot_mapping(
@@ -2100,18 +1971,13 @@ def _deepseek_v4_swa_slot_mapping(
 
 def _attention_use_fp4_indexer_cache(config: PretrainedConfig) -> bool:
     override = global_server_args_dict.get("attention_use_fp4_indexer_cache", None)
-    if override is not None:
-        return bool(override)
     attention_config = getattr(config, "attention_config", None)
     if isinstance(attention_config, dict):
         configured = attention_config.get("use_fp4_indexer_cache", None)
     else:
         configured = getattr(attention_config, "use_fp4_indexer_cache", None)
-    if configured is not None:
-        return bool(configured)
-    # FP4 indexer tensor cores are Blackwell-only (SM100+). On Hopper (SM90)
-    # and earlier, default to the FP8 indexer cache/kernels.
-    return _platform.arch_version.major >= 10
+    requested = override if override is not None else configured
+    return deepseek_v4_indexer_cache_format(requested) == "mxfp4"
 
 
 def deepseek_v4_rope_config(
@@ -2182,6 +2048,7 @@ class DeepseekV4MLP(nn.Module):
             prefix=add_prefix("down_proj", prefix),
         )
         self.swiglu_limit = swiglu_limit
+        self.act_fn = SiluAndMul(swiglu_limit)
         self.reduce_results = reduce_results
         self.tp_rank = tp.tp_rank
         self.tp_size = tp.tp_size
@@ -2215,11 +2082,7 @@ class DeepseekV4MLP(nn.Module):
             )
             out, _ = self.down_proj(x_fp8, scale=scale)
         else:
-            gate, up = gate_up.float().chunk(2, dim=-1)
-            if self.swiglu_limit is not None and self.swiglu_limit > 0:
-                gate = torch.clamp(gate, max=self.swiglu_limit)
-                up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-            x = (F.silu(gate) * up).to(x.dtype)
+            x = self.act_fn(gate_up)
             out, _ = self.down_proj(x)
         return out
 
@@ -2257,7 +2120,11 @@ class DeepseekV4MoEGate(nn.Module):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return _deepseek_v4_router_gemm(hidden_states, self.weight)
+        return deepseek_v4_linear_fp32(
+            hidden_states,
+            self.weight,
+            enable_pdl=pdl_enabled(),
+        )
 
 
 class DeepseekV4MegaMoEExperts(nn.Module):
@@ -2631,6 +2498,7 @@ class DeepseekV4MoE(nn.Module):
                 activation="swiglu",
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 with_bias=not is_block_fp8,
+                routing_mode="precomputed_topk",
                 routing_config={
                     "routed_scaling_factor": self.routed_scaling_factor,
                     "normalize_topk_weights": config.norm_topk_prob,
@@ -2845,10 +2713,7 @@ class DeepseekV4Compressor(nn.Module):
         weight = self.fused_wkv_wgate.weight.view(*weight_shape)
         if weight.dtype == torch.float8_e4m3fn:
             weight = _dequant_fp8_weight(self.fused_wkv_wgate, weight_shape)
-        kv_score = _deepseek_v4_bf16_linear_fp32(hidden_states, weight)
-        if kv_score is None:
-            kv_score = torch.matmul(hidden_states.float(), weight.float().T)
-        return kv_score
+        return deepseek_v4_linear_fp32(hidden_states, weight)
 
     def forward(
         self,
@@ -2887,9 +2752,7 @@ class DeepseekV4Compressor(nn.Module):
                 if weight.dtype == torch.float8_e4m3fn:
                     weight = _dequant_fp8_weight(self.fused_wkv_wgate, weight_shape)
             with nvtx_range(f"{profile_prefix}_matmul"):
-                kv_score = _deepseek_v4_bf16_linear_fp32(hidden_states, weight)
-                if kv_score is None:
-                    kv_score = torch.matmul(hidden_states.float(), weight.float().T)
+                kv_score = deepseek_v4_linear_fp32(hidden_states, weight)
         kv, score = kv_score.split([self.coff * self.head_dim] * 2, dim=-1)
         if state_cache is None:
             state_cache = pool.get_compressor_state_buffer(layer_index)
@@ -3020,6 +2883,12 @@ class DeepseekV4Indexer(nn.Module):
         topk_buffer: _DeepseekV4TopKBuffer | None = None,
     ) -> None:
         super().__init__()
+        self.use_fp4_cache = _attention_use_fp4_indexer_cache(config)
+        if self.use_fp4_cache and deep_gemm is None:
+            raise RuntimeError(
+                "DeepSeek V4 MXFP4 indexer cache requires DeepGEMM; disable "
+                "--attention-use-fp4-indexer-cache on unsupported platforms"
+            )
         self.wq_b = ReplicatedLinear(
             config.q_lora_rank,
             config.index_n_heads * config.index_head_dim,
@@ -3041,7 +2910,6 @@ class DeepseekV4Indexer(nn.Module):
             compress_ratio,
             add_prefix("compressor", prefix),
         )
-        self.use_fp4_cache = _attention_use_fp4_indexer_cache(config)
         self.compress_ratio = compress_ratio
         self.n_head = int(config.index_n_heads)
         self.head_dim = int(config.index_head_dim)
@@ -3106,7 +2974,7 @@ class DeepseekV4Indexer(nn.Module):
         ctx: ForwardContext,
         indexer_block_size: int,
     ) -> None:
-        if deep_gemm is None or not positions.is_cuda:
+        if not self.use_fp4_cache or deep_gemm is None or not positions.is_cuda:
             return
         forward_mode = ctx.forward_mode
         if forward_mode is not None and forward_mode.is_mixed():
@@ -3128,17 +2996,13 @@ class DeepseekV4Indexer(nn.Module):
             if getattr(metadata, "is_valid_token", None) is not None
             else None
         )
-        indexer_page_table = metadata.cache.compressed_page_table(
-            self.compress_ratio,
-            indexer_block_size,
-        )
-        indexer_page_table_base_offsets = None
-        if indexer_page_table is not metadata.cache.page_table:
-            indexer_page_table_base_offsets = (
-                metadata.cache.block_table_base_offsets.get(
-                    v4_compressed_kv_group_id(self.compress_ratio)
-                )
+        indexer_page_table, indexer_page_table_base_offsets = (
+            _deepseek_v4_indexer_page_table(
+                metadata,
+                self.compress_ratio,
+                indexer_block_size,
             )
+        )
         decode_plan = _deepseek_v4_indexer_decode_plan(
             positions=decode_positions,
             token_to_req_indices=metadata.token_to_req_indices[decode_start:decode_end],
@@ -3157,6 +3021,101 @@ class DeepseekV4Indexer(nn.Module):
             context_lens=decode_plan.context_lens,
         )
 
+    def _forward_sparse_indexer_portable(
+        self,
+        query: torch.Tensor,
+        weights: torch.Tensor,
+        indexer_cache: torch.Tensor,
+        indexer_block_size: int,
+        prefill_metadata: DeepseekV4IndexerPrefillMetadata,
+        decode_plan: DeepseekV4IndexerDecodePlan | None,
+        num_prefill_tokens: int,
+        num_decode_tokens: int,
+        token_to_req_indices: torch.Tensor,
+        block_table_base_offsets: torch.Tensor | None,
+        topk_out: torch.Tensor,
+    ) -> torch.Tensor:
+        topk_out.fill_(-1)
+        max_logits_mb = int(
+            global_server_args_dict.get(
+                "deepseek_v4_indexer_prefill_max_logits_mb", 512
+            )
+            or 512
+        )
+        for chunk in prefill_metadata.chunks:
+            token_slice = slice(chunk.token_start, chunk.token_end)
+            row_slice = slice(chunk.gather_row_start, chunk.gather_row_end)
+            slots = prefill_metadata.slots[chunk.slot_start : chunk.slot_end]
+            row_starts = prefill_metadata.cu_seqlen_k_start[row_slice]
+            row_ends = prefill_metadata.cu_seqlen_k_end[row_slice]
+            selected, _ = dsa_prefill_topk(
+                query[token_slice],
+                weights[token_slice],
+                slots,
+                row_starts,
+                row_ends,
+                topk=self.topk_tokens,
+                softmax_scale=self.softmax_scale,
+                index_k_cache=indexer_cache,
+                page_size=indexer_block_size,
+                max_logits_bytes=max_logits_mb * 1024 * 1024,
+                out=topk_out[token_slice],
+            )
+            selected_i64 = selected.to(torch.int64)
+            row_starts_i64 = row_starts.to(torch.int64)
+            if block_table_base_offsets is None:
+                base_rows = torch.zeros_like(row_starts_i64)
+            else:
+                req_indices = token_to_req_indices[token_slice].to(torch.int64)
+                safe_req_indices = req_indices.clamp(
+                    0, block_table_base_offsets.shape[0] - 1
+                )
+                base_rows = block_table_base_offsets.to(
+                    device=selected.device, dtype=torch.int64
+                )[safe_req_indices] * int(indexer_block_size)
+            logical = selected_i64 - row_starts_i64[:, None] + base_rows[:, None]
+            valid = (selected_i64 >= row_starts_i64[:, None]) & (
+                selected_i64 < row_ends.to(torch.int64)[:, None]
+            )
+            topk_out[token_slice].copy_(
+                torch.where(valid, logical, torch.full_like(logical, -1)).to(
+                    torch.int32
+                )
+            )
+
+        if num_decode_tokens <= 0:
+            return topk_out
+        if decode_plan is None:
+            raise RuntimeError("DeepSeek V4 decode indexer plan is missing")
+        decode_start = num_prefill_tokens
+        decode_end = decode_start + num_decode_tokens
+        decode_slice = slice(decode_start, decode_end)
+        seq_lens = decode_plan.context_lens[:, -1].to(torch.int32).contiguous()
+        decode_base_offsets = None
+        if block_table_base_offsets is not None:
+            decode_req_indices = token_to_req_indices[decode_slice].to(torch.int64)
+            safe_req_indices = decode_req_indices.clamp(
+                0, block_table_base_offsets.shape[0] - 1
+            )
+            decode_base_offsets = block_table_base_offsets.to(
+                device=decode_req_indices.device, dtype=torch.int32
+            )[safe_req_indices]
+            seq_lens = seq_lens + decode_base_offsets * int(indexer_block_size)
+        dsa_decode_topk(
+            query[decode_slice],
+            weights[decode_slice],
+            seq_lens,
+            decode_plan.page_table,
+            page_size=indexer_block_size,
+            topk=self.topk_tokens,
+            softmax_scale=self.softmax_scale,
+            index_k_cache=indexer_cache,
+            topk_layout="logical_offsets",
+            block_table_base_offsets=decode_base_offsets,
+            out=topk_out[decode_slice],
+        )
+        return topk_out
+
     def _forward_sparse_indexer_custom_op(
         self,
         *,
@@ -3169,8 +3128,6 @@ class DeepseekV4Indexer(nn.Module):
         indexer_block_size: int,
         cos_sin_cache: torch.Tensor,
     ) -> torch.Tensor:
-        if deep_gemm is None:
-            raise RuntimeError("DeepSeek V4 sparse indexer requires DeepGEMM")
         if not positions.is_cuda:
             raise RuntimeError("DeepSeek V4 sparse indexer requires CUDA tensors")
 
@@ -3193,7 +3150,25 @@ class DeepseekV4Indexer(nn.Module):
             index_q = index_q.view(-1, self.n_head, self.head_dim)
         with nvtx_range("indexer_weights_proj"):
             weights, _ = self.weights_proj(hidden_states)
-        if self.use_fp4_cache:
+        if not self.use_fp4_cache:
+            with nvtx_range("indexer_prepare_portable"):
+                q_values, packed_weights = deepseek_v4_prepare_indexer_q(
+                    index_q=index_q,
+                    positions=positions,
+                    cos_sin_cache=cos_sin_cache,
+                    weights=weights,
+                    head_scale=self.n_head**-0.5,
+                )
+            packed_index_q = (
+                q_values,
+                q_values.new_empty((q_values.shape[0], 0), dtype=torch.float32),
+            )
+        else:
+            if deep_gemm is None:
+                raise RuntimeError(
+                    "DeepSeek V4 MXFP4 indexer cache requires DeepGEMM; "
+                    "set --attention-use-fp4-indexer-cache false"
+                )
             with nvtx_range("indexer_prepare_mxfp4"):
                 packed_index_q, packed_weights = deepseek_v4_prepare_indexer_q_mxfp4(
                     index_q=index_q,
@@ -3207,26 +3182,6 @@ class DeepseekV4Indexer(nn.Module):
                 raise RuntimeError(
                     "DeepSeek V4 sparse indexer requires DeepGEMM FP4 support"
                 )
-        else:
-            # FP8 (SM90) path: q is a plain fp8 tensor with the softmax/head
-            # scales folded into the weights, so there is no per-token query
-            # scale. Pair it with a zero-width scales tensor -- it keeps the
-            # leading token dimension (so the custom op's per-request slicing
-            # stays coherent) while making it explicit that the fp8 kernels
-            # read no query scales.
-            with nvtx_range("indexer_prepare_fp8"):
-                q_fp8, packed_weights = deepseek_v4_prepare_indexer_q_fp8(
-                    index_q=index_q,
-                    positions=positions,
-                    cos_sin_cache=cos_sin_cache,
-                    weights=weights,
-                    softmax_scale=self.softmax_scale,
-                    head_scale=self.n_head**-0.5,
-                )
-            q_scales_placeholder = q_fp8.new_empty(
-                (q_fp8.shape[0], 0), dtype=torch.float32
-            )
-            packed_index_q = (q_fp8, q_scales_placeholder)
 
         empty_cpu = torch.empty(0, dtype=torch.int32, device="cpu")
         seq_lens_cpu = (
@@ -3239,9 +3194,12 @@ class DeepseekV4Indexer(nn.Module):
             if metadata.query_lens_cpu is not None and num_prefill_tokens > 0
             else empty_cpu
         )
-        indexer_page_table = metadata.cache.compressed_page_table(
-            self.compress_ratio,
-            indexer_block_size,
+        indexer_page_table, indexer_page_table_base_offsets = (
+            _deepseek_v4_indexer_page_table(
+                metadata,
+                self.compress_ratio,
+                indexer_block_size,
+            )
         )
         prefill_metadata = _deepseek_v4_indexer_prefill_metadata(
             metadata=metadata,
@@ -3249,6 +3207,9 @@ class DeepseekV4Indexer(nn.Module):
             cache_block_size=indexer_block_size,
             compress_ratio=self.compress_ratio,
             num_prefill_tokens=num_prefill_tokens,
+            block_table_base_offsets=(
+                None if self.use_fp4_cache else indexer_page_table_base_offsets
+            ),
         )
 
         decode_schedule_metadata = None
@@ -3272,14 +3233,18 @@ class DeepseekV4Indexer(nn.Module):
                 compress_ratio=self.compress_ratio,
                 metadata=metadata,
                 is_valid_token=decode_valid_token,
+                block_table_base_offsets=indexer_page_table_base_offsets,
             )
-            decode_schedule_metadata = _deepseek_v4_indexer_decode_schedule_metadata(
-                positions=decode_positions,
-                cache_block_size=indexer_block_size,
-                compress_ratio=self.compress_ratio,
-                metadata=metadata,
-                context_lens=decode_plan.context_lens,
-            )
+            if self.use_fp4_cache:
+                decode_schedule_metadata = (
+                    _deepseek_v4_indexer_decode_schedule_metadata(
+                        positions=decode_positions,
+                        cache_block_size=indexer_block_size,
+                        compress_ratio=self.compress_ratio,
+                        metadata=metadata,
+                        context_lens=decode_plan.context_lens,
+                    )
+                )
         indexer_metadata = DeepseekV4SparseIndexerMetadata(
             batch_metadata=DeepseekV4IndexerBatchMetadata(
                 positions=positions,
@@ -3307,6 +3272,20 @@ class DeepseekV4Indexer(nn.Module):
                 dtype=torch.int32,
             )
         )[:total_tokens]
+        if not self.use_fp4_cache:
+            return self._forward_sparse_indexer_portable(
+                query=packed_index_q[0],
+                weights=packed_weights,
+                indexer_cache=indexer_cache,
+                indexer_block_size=indexer_block_size,
+                prefill_metadata=prefill_metadata,
+                decode_plan=decode_plan,
+                num_prefill_tokens=num_prefill_tokens,
+                num_decode_tokens=num_decode_tokens,
+                token_to_req_indices=metadata.token_to_req_indices[:total_tokens],
+                block_table_base_offsets=indexer_page_table_base_offsets,
+                topk_out=topk_out,
+            )
         return _deepseek_v4_sparse_attn_indexer(
             indexer_metadata=indexer_metadata,
             indexer_cache=indexer_cache,
@@ -3490,7 +3469,7 @@ class DeepseekV4Attention(nn.Module):
                 f"by attn_tp_size={tp_size}"
             )
         self.num_local_heads = self.num_heads // tp_size
-        self.padded_heads = _deepseek_v4_padded_heads(self.num_local_heads)
+        self.padded_heads = deepseek_v4_padded_heads(self.num_local_heads)
         self.head_dim = int(config.head_dim)
         self.qk_rope_head_dim = int(config.qk_rope_head_dim)
         self.nope_head_dim = deepseek_v4_nope_dim(
@@ -3560,11 +3539,23 @@ class DeepseekV4Attention(nn.Module):
             tp_size=tp_size,
             tp_group=tp_group,
         )
-        self.wo_a.is_bmm = True
-        self.wo_a.bmm_batch_size = self.num_local_groups
-        # SM100 packs the FP8 output-proj scales as INT32 UE8M0 (fp8_einsum
-        # recipe (1,1,128)); SM90 keeps FP32 block scales (recipe (1,128,128)).
-        self._o_tma_aligned = torch.cuda.get_device_capability()[0] >= 10
+        wo_a_quant_config = self.wo_a.quant_method.quant_config
+        self._wo_a_output_projection_plan = deepseek_v4_grouped_output_projection_plan(
+            input_dtype=self.wo_a.orig_dtype,
+            weight_dtype=self.wo_a.weight.dtype,
+            weight_scale_dtype=self.wo_a.weight_scale_inv.dtype,
+            num_groups=self.num_local_groups,
+            heads_per_group=self.num_local_heads // self.num_local_groups,
+            head_dim=self.head_dim,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.qk_rope_head_dim,
+            output_dim=self.o_lora_rank,
+            block_size=wo_a_quant_config.weight_block_size,
+            scale_format=getattr(wo_a_quant_config, "scale_fmt", None),
+        )
+        self.wo_a._deepseek_v4_grouped_output_projection_plan = (
+            self._wo_a_output_projection_plan
+        )
         self.wo_b = RowParallelLinear(
             self.o_groups * self.o_lora_rank,
             config.hidden_size,
@@ -3660,36 +3651,13 @@ class DeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
     ) -> torch.Tensor:
-        # Inverse RoPE + grouped block-scaled FP8 quant in one Triton kernel,
-        # then a single native FP8 GEMM via deep_gemm.fp8_einsum -- replaces the
-        # inv-rope + per-group online-quant + GEMM chain. wo_a's block scale was
-        # transformed into the deep_gemm MN-major layout at load time.
-        heads_per_group = self.num_local_heads // self.num_local_groups
-        o_fp8, o_scale = deepseek_v4_fused_inv_rope_fp8_quant(
+        z = deepseek_v4_grouped_output_projection(
+            self._wo_a_output_projection_plan,
             attn_output,
             positions,
             cos_sin_cache,
-            n_groups=self.num_local_groups,
-            heads_per_group=heads_per_group,
-            nope_dim=self.nope_head_dim,
-            rope_dim=self.qk_rope_head_dim,
-            tma_aligned_scales=self._o_tma_aligned,
-        )
-        in_dim = self.num_heads * self.head_dim // self.o_groups
-        weight = self.wo_a.weight.view(self.num_local_groups, self.o_lora_rank, in_dim)
-        block_n, block_k = self.wo_a._deep_gemm_block_size
-        recipe = (1, 1, block_n) if self._o_tma_aligned else (1, block_n, block_k)
-        z = torch.empty(
-            (attn_output.shape[0], self.num_local_groups, self.o_lora_rank),
-            device=attn_output.device,
-            dtype=torch.bfloat16,
-        )
-        deep_gemm.fp8_einsum(
-            "bhr,hdr->bhd",
-            (o_fp8, o_scale),
-            (weight, self.wo_a.weight_scale_inv),
-            z,
-            recipe=recipe,
+            self.wo_a.weight,
+            self.wo_a.weight_scale_inv,
         )
         out, _ = self.wo_b(z.flatten(1))
         return out
@@ -4481,6 +4449,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
 
     def post_quant_warmup(self) -> None:
         """Called by the weight loader after all quant process_weights_after_loading."""
+        deepseek_v4_grouped_output_projection_warmup_model(
+            self, max_tokens=_deepseek_v4_mega_moe_max_num_tokens()
+        )
         if deep_gemm is not None:
             deep_gemm.warmup_fp8_gemm_nt_from_model(
                 self, max_tokens=_deepseek_v4_mega_moe_max_num_tokens()

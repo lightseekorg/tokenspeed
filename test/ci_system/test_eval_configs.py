@@ -42,7 +42,7 @@ DATASETS = {
         "dataset_args": json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)["gpqa_diamond"],
     },
     "gsm8k": {
-        "count": 4,
+        "count": 6,
         "dataset_args": {"dataset_id": "openai/gsm8k"},
     },
     "mmlu": {
@@ -64,6 +64,21 @@ KVV_CONFIGS = {
     "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-mmmu-pro-vision-gb300-slurm.yaml": (
         "mmmu",
         "98304",
+    ),
+}
+
+AMD_DEEPSEEK_V4_MTP_CONFIGS = {
+    "deepseek-v4-flash-mtp-evalscope-gsm8k-amd.yaml": (
+        "deepseek-ai/DeepSeek-V4-Flash",
+        "amd-mi35x-2gpu-test",
+        "2",
+        "3",
+    ),
+    "deepseek-v4-pro-mtp-evalscope-gsm8k-amd.yaml": (
+        "deepseek-ai/DeepSeek-V4-Pro",
+        "amd-mi35x-8gpu-test",
+        "8",
+        "2",
     ),
 }
 
@@ -132,6 +147,42 @@ def test_evalscope_configs_use_expected_dataset_sources():
         len(paths) == expected_total
     ), f"expected {expected_total} EvalScope configs, found {len(paths)}"
     assert counts == expected_counts, f"expected {expected_counts}, found {counts}"
+
+
+def test_amd_deepseek_v4_mtp_configs_use_supported_defaults():
+    omitted_flags = {
+        "--attention-use-fp4-indexer-cache",
+        "--enable-mixed-batch",
+        "--enable-prefix-caching",
+        "--no-enable-prefix-caching",
+        "--speculative-draft-model-path",
+    }
+
+    for filename, (
+        model,
+        runner,
+        tp_size,
+        mtp_steps,
+    ) in AMD_DEEPSEEK_V4_MTP_CONFIGS.items():
+        path = EVAL_CONFIG_DIR / filename
+        task = yaml.safe_load(path.read_text(encoding="utf-8"))
+        command = shlex.split(task["server"]["command"])
+
+        assert task["triggers"] == ["per-commit", "manual"]
+        assert task["runner"]["labels"] == [runner]
+        assert task["install"] == ["bash test/ci_system/install_deps_rocm.sh"]
+        assert flag_value(command, "--model") == model
+        assert flag_value(command, "--tensor-parallel-size") == tp_size
+        assert flag_value(command, "--speculative-algorithm") == "MTP"
+        assert flag_value(command, "--speculative-num-steps") == mtp_steps
+        assert flag_value(command, "--moe-backend") == "gluon"
+        assert flag_value(command, "--kv-cache-dtype") == "fp8_e4m3"
+        assert flag_value(command, "--max-model-len") == "8192"
+        assert flag_value(command, "--max-num-seqs") == "16"
+        assert flag_value(command, "--max-total-tokens") == "16384"
+        assert flag_value(command, "--chunked-prefill-size") == "8192"
+        assert flag_value(command, "--prefill-graph-max-tokens") == "8192"
+        assert not omitted_flags.intersection(command)
 
 
 def test_kvv_configs_use_pinned_upstream_and_local_api():

@@ -24,6 +24,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, suite="runtime-1gpu")
 
+from tokenspeed_kernel import deepseek_v4_paged_selected_attention
 from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_mxfp4_paged_gather,
     has_persistent_topk,
@@ -513,7 +514,6 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class DeepseekV4AttentionOpsTest(unittest.TestCase):
-
     def test_sanitized_insert_write_safety_under_graph_replay(self):
         # Full producer -> sanitize -> CUDA graph replay -> cache write path.
         # Slots and validity mutate between replays through static buffers;
@@ -706,6 +706,56 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         # The fourth token was DP-style padding for KV insert: Q is still updated,
         # but no cache row is written for it.
         self.assertEqual(int(cache.view(-1)[3 * 576 : 4 * 576].sum()), 0)
+
+    def test_fused_qnorm_rope_kv_insert_q_out_matches_in_place(self):
+        torch.manual_seed(1235)
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+        num_tokens = 3
+        num_heads = 2
+        block_size = 4
+        q_source = torch.randn(
+            num_tokens, num_heads, HEAD_DIM, device=device, dtype=dtype
+        )
+        kv = torch.randn(num_tokens, HEAD_DIM, device=device, dtype=dtype)
+        positions = torch.tensor([0, 2, 5], device=device, dtype=torch.int64)
+        slots = torch.tensor([0, -1, 5], device=device, dtype=torch.int64)
+        cos_sin = torch.randn(8, ROPE_DIM, device=device, dtype=torch.float32) * 0.1
+
+        q_in_place = q_source.clone()
+        cache_in_place = torch.zeros(
+            2, block_size * 584, device=device, dtype=torch.uint8
+        )
+        fused_qnorm_rope_kv_insert(
+            q=q_in_place,
+            kv=kv,
+            swa_kv_cache_2d=cache_in_place,
+            slot_mapping=slots,
+            positions=positions,
+            cos_sin_cache=cos_sin,
+            rms_norm_eps=1.0e-6,
+            block_size=block_size,
+        )
+
+        q_input = q_source.clone()
+        q_out = torch.empty_like(q_input)
+        cache_out = torch.zeros_like(cache_in_place)
+        fused_qnorm_rope_kv_insert(
+            q=q_input,
+            q_out=q_out,
+            kv=kv,
+            swa_kv_cache_2d=cache_out,
+            slot_mapping=slots,
+            positions=positions,
+            cos_sin_cache=cos_sin,
+            rms_norm_eps=1.0e-6,
+            block_size=block_size,
+        )
+        torch.cuda.synchronize()
+
+        self.assertTrue(torch.equal(q_input, q_source))
+        self.assertTrue(torch.equal(q_out, q_in_place))
+        self.assertTrue(torch.equal(cache_out, cache_in_place))
 
     def test_hca_compressor_state_insert_matches_reference(self):
         torch.manual_seed(4321)
@@ -1334,7 +1384,32 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             torch.tensor([0, 1], device=device, dtype=torch.int64),
             kv_cache_block_size,
         )
-        self.assertGreater(float(fp8_rows.abs().sum()), 0.0)
+        expected_fp8_rows = []
+        for position in (compress_ratio - 1, num_tokens - 1):
+            normed = _expected_overlap_normed(
+                kv, score, ape, position, compress_ratio, head_dim, rms_weight, eps
+            )
+            rotated = _apply_gptj_rope_with_nope(
+                normed.view(1, -1),
+                torch.tensor(
+                    [(position // compress_ratio) * compress_ratio],
+                    device=device,
+                    dtype=torch.int64,
+                ),
+                cos_sin,
+                head_dim - ROPE_DIM,
+            )[0]
+            rotated = _hadamard_rotate(rotated)
+            value_bytes, scale = _fp8_pow2_bytes_and_scale(rotated)
+            expected_fp8_rows.append(
+                value_bytes.view(torch.float8_e4m3fn).float() * scale
+            )
+        torch.testing.assert_close(
+            fp8_rows,
+            torch.stack(expected_fp8_rows),
+            atol=0,
+            rtol=0,
+        )
 
     def test_fp8_ds_mla_cache_dequant_and_inv_rope_output_reference(self):
         torch.manual_seed(9012)
@@ -1382,6 +1457,117 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         )
         self.assertEqual(float(dequant[2].abs().sum()), 0.0)
         self.assertGreater(float(dequant[:2].abs().sum()), 0.0)
+
+    def test_paged_selected_attention_masks_segments_independently(self):
+        torch.manual_seed(9013)
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+
+        def pack_rows(rows: torch.Tensor, block_size: int) -> torch.Tensor:
+            num_pages = (rows.shape[0] + block_size - 1) // block_size
+            cache = torch.zeros(
+                num_pages,
+                block_size * (SWA_TOKEN_STRIDE + SWA_SCALE_DIM),
+                device=device,
+                dtype=torch.uint8,
+            )
+            flat = cache.view(-1)
+            for slot in range(rows.shape[0]):
+                page = slot // block_size
+                position = slot % block_size
+                page_base = page * cache.stride(0)
+                token_base = page_base + position * SWA_TOKEN_STRIDE
+                scale_base = (
+                    page_base + block_size * SWA_TOKEN_STRIDE + position * SWA_SCALE_DIM
+                )
+                for qblock in range(7):
+                    start = qblock * 64
+                    values, scale = _fp8_bytes_and_scale(
+                        rows[slot, start : start + 64].float()
+                    )
+                    flat[token_base + start : token_base + start + 64].copy_(values)
+                    flat[scale_base + qblock] = scale
+                flat[token_base + NOPE_DIM : token_base + SWA_TOKEN_STRIDE].copy_(
+                    rows[slot, NOPE_DIM:].view(torch.uint8)
+                )
+            return cache
+
+        swa_rows = torch.randn(8, HEAD_DIM, device=device, dtype=dtype) * 0.25
+        extra_rows = torch.randn(4, HEAD_DIM, device=device, dtype=dtype) * 0.25
+        swa_cache = pack_rows(swa_rows, 4)
+        extra_cache = pack_rows(extra_rows, 2)
+        swa_slots = torch.tensor(
+            [[0, 1, 7, -1], [4, -1, 2, 1]],
+            device=device,
+            dtype=torch.int32,
+        )
+        swa_lens = torch.tensor([2, 3], device=device, dtype=torch.int32)
+        extra_slots = torch.tensor(
+            [[[3, -1, 1]], [[0, 2, 3]]],
+            device=device,
+            dtype=torch.int32,
+        )
+        extra_lens = torch.tensor([2, 2], device=device, dtype=torch.int32)
+        q = torch.randn(2, 2, HEAD_DIM, device=device, dtype=dtype) * 0.25
+        sink = torch.tensor([-0.4, 0.3], device=device, dtype=torch.float32)
+        scale = HEAD_DIM**-0.5
+        out = torch.empty_like(q)
+
+        actual = deepseek_v4_paged_selected_attention(
+            q=q,
+            swa_kv_cache=swa_cache,
+            swa_slots=swa_slots,
+            swa_lens=swa_lens,
+            swa_page_size=4,
+            attn_sink=sink,
+            softmax_scale=scale,
+            extra_kv_cache=extra_cache,
+            extra_slots=extra_slots,
+            extra_lens=extra_lens,
+            extra_page_size=2,
+            out=out,
+            override="triton_deepseek_v4_paged_selected_attention",
+        )
+        self.assertIs(actual, out)
+
+        swa_dequant = dequantize_deepseek_v4_fp8_ds_mla_cache(
+            swa_cache,
+            torch.arange(8, device=device),
+            4,
+            head_dim=HEAD_DIM,
+            rope_dim=ROPE_DIM,
+        )
+        extra_dequant = dequantize_deepseek_v4_fp8_ds_mla_cache(
+            extra_cache,
+            torch.arange(4, device=device),
+            2,
+            head_dim=HEAD_DIM,
+            rope_dim=ROPE_DIM,
+        )
+        expected = torch.empty_like(q)
+        for token in range(q.shape[0]):
+            selected = []
+            for offset, slot in enumerate(swa_slots[token].tolist()):
+                if offset < int(swa_lens[token]) and slot >= 0:
+                    selected.append(swa_dequant[slot])
+            for offset, slot in enumerate(extra_slots[token].reshape(-1).tolist()):
+                if offset < int(extra_lens[token]) and slot >= 0:
+                    selected.append(extra_dequant[slot])
+            keys = torch.stack(selected).float()
+            for head in range(q.shape[1]):
+                logits = torch.mv(keys, q[token, head].float()) * scale
+                probabilities = torch.softmax(
+                    torch.cat((logits, sink[head].view(1))),
+                    dim=0,
+                )[:-1]
+                expected[token, head] = torch.mv(keys.t(), probabilities).to(dtype)
+
+        torch.testing.assert_close(
+            actual.float().cpu(),
+            expected.float().cpu(),
+            atol=4.0e-2,
+            rtol=4.0e-2,
+        )
 
     def test_indexer_q_prepare_matches_fp4_weight_contract(self):
         torch.manual_seed(9123)
@@ -1550,6 +1736,35 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         torch.testing.assert_close(
             actual_lens.cpu(), expected_lens.cpu(), atol=0, rtol=0
         )
+
+    def test_sparse_prefill_combine_topk_swa_indices_respects_compact_base(self):
+        device = torch.device("cuda")
+        topk_indices = torch.tensor([[4, 5, -1, -1]], device=device, dtype=torch.int32)
+
+        actual, actual_lens = deepseek_v4_combine_topk_swa_indices(
+            topk_indices=topk_indices,
+            query_start_loc=torch.tensor([0, 1], device=device, dtype=torch.int32),
+            seq_lens=torch.tensor([24], device=device, dtype=torch.int32),
+            gather_lens=torch.tensor([4], device=device, dtype=torch.int32),
+            window_size=4,
+            compress_ratio=4,
+            topk=4,
+            workspace_width=12,
+            compressed_base=8,
+            block_table_base_offsets=torch.tensor(
+                [2], device=device, dtype=torch.int32
+            ),
+            compressed_block_size=2,
+            compressed_table_capacity=2,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                actual[0, :6].cpu(),
+                torch.tensor([4, 5, 8, 9, 10, 11], dtype=torch.int32),
+            )
+        )
+        self.assertEqual(actual_lens.item(), 6)
 
     def test_sparse_prefill_combine_dense_swa_indices_matches_reference(self):
         device = torch.device("cuda")

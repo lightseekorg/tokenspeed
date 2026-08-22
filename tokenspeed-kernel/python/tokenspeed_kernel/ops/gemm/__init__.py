@@ -24,14 +24,24 @@ import logging
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
+import tokenspeed_kernel.ops.gemm.cuda  # noqa: F401
 import tokenspeed_kernel.ops.gemm.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.ll_bf16  # noqa: F401
+import tokenspeed_kernel.ops.gemm.pytorch  # noqa: F401
 import tokenspeed_kernel.ops.gemm.routed_gemv  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.gemm.deepseek_v4 import (
+    deepseek_v4_grouped_output_projection,
+    deepseek_v4_grouped_output_projection_plan,
+    deepseek_v4_grouped_output_projection_process_weights,
+    deepseek_v4_grouped_output_projection_warmup,
+    deepseek_v4_grouped_output_projection_warmup_model,
+    deepseek_v4_linear_fp32,
+)
 from tokenspeed_kernel.ops.gemm.kimi3 import (
     kimi3_latent_projection,
     kimi3_latent_projection_add3,
@@ -60,6 +70,12 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "bmm",
+    "deepseek_v4_grouped_output_projection",
+    "deepseek_v4_grouped_output_projection_plan",
+    "deepseek_v4_grouped_output_projection_process_weights",
+    "deepseek_v4_grouped_output_projection_warmup",
+    "deepseek_v4_grouped_output_projection_warmup_model",
+    "deepseek_v4_linear_fp32",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
     "kimi3_latent_projection",
@@ -70,10 +86,17 @@ __all__ = [
     "kimi3_shared_down_projection",
     "kimi3_shared_situ_projection",
     "mm",
+    "supports_deep_gemm",
 ]
 
 _platform = Platform.get()
 _fp8_dtype = torch.float8_e4m3fn
+
+
+def supports_deep_gemm() -> bool:
+    """Return whether this platform may use DeepGEMM weight layouts."""
+    return _platform.is_nvidia
+
 
 # Kernels that accept and own bias application inside their GEMM wrapper.
 # For any kernel not listed here, dispatch applies the bias with a post-GEMM

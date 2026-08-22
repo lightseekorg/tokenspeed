@@ -47,6 +47,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
 
 
 _decode_sched_meta_cache: dict[tuple, object] = {}
+_deepseek_v4_tile_meta_cache: dict[tuple, object] = {}
 _query_workspace_cache: dict[tuple, torch.Tensor] = {}
 
 
@@ -176,6 +177,34 @@ def _get_decode_sched_meta(
     return meta
 
 
+def _get_deepseek_v4_tile_meta(q: torch.Tensor, selected_width: int) -> object:
+    phase = "graph" if torch.cuda.is_current_stream_capturing() else "eager"
+    key = (
+        phase,
+        q.device,
+        q.dtype,
+        tuple(q.shape),
+        int(selected_width),
+    )
+    meta = _deepseek_v4_tile_meta_cache.get(key)
+    if meta is None:
+        meta = get_mla_metadata()[0]
+        _deepseek_v4_tile_meta_cache[key] = meta
+    return meta
+
+
+def _fp8_page_planar_cache_view(
+    cache: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    row_bytes = cache.shape[1] // int(page_size)
+    return torch.as_strided(
+        cache,
+        (cache.shape[0], int(page_size), 1, row_bytes),
+        (cache.stride(0), row_bytes, row_bytes, 1),
+    )
+
+
 if (
     platform.is_nvidia
     and platform.is_hopper_plus
@@ -268,6 +297,93 @@ if (
 if (
     platform.is_nvidia
     and platform.is_hopper_plus
+    and flash_mla_with_kvcache is not error_fn
+):
+
+    @register_kernel(
+        "attention",
+        "deepseek_v4_paged_selected_attention",
+        name="flashmla_deepseek_v4_paged_selected_attention",
+        solution="flashmla",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    swa_kv_cache=dense_tensor_format(torch.uint8),
+                )
+            }
+        ),
+        traits={
+            "head_dim": frozenset({512}),
+            "cache_layout": frozenset({"fp8_swa_page_planar"}),
+            "topk_layout": frozenset({"global_slots"}),
+            "support_sink": frozenset({True}),
+            "has_extra_segment": frozenset({False, True}),
+            "metadata_dtypes": frozenset({torch.int32}),
+        },
+        priority=Priority.PERFORMANT,
+        tags={"nvidia", "paged_cache", "selected_attention"},
+    )
+    def flashmla_deepseek_v4_paged_selected_attention(
+        q: torch.Tensor,
+        swa_kv_cache: torch.Tensor,
+        swa_slots: torch.Tensor,
+        swa_lens: torch.Tensor,
+        swa_page_size: int,
+        attn_sink: torch.Tensor,
+        softmax_scale: float,
+        extra_kv_cache: torch.Tensor | None = None,
+        extra_slots: torch.Tensor | None = None,
+        extra_lens: torch.Tensor | None = None,
+        extra_page_size: int | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        q_kernel = q.unsqueeze(1)
+        swa_indices = swa_slots.reshape(q.shape[0], 1, -1)
+        extra_cache = None
+        extra_indices = None
+        if extra_kv_cache is not None:
+            assert extra_slots is not None
+            assert extra_page_size is not None
+            extra_cache = _fp8_page_planar_cache_view(
+                extra_kv_cache,
+                extra_page_size,
+            )
+            extra_indices = extra_slots.reshape(q.shape[0], 1, -1)
+        result, _ = flash_mla_with_kvcache(
+            q=q_kernel,
+            k_cache=_fp8_page_planar_cache_view(swa_kv_cache, swa_page_size),
+            block_table=None,
+            cache_seqlens=None,
+            head_dim_v=q.shape[-1],
+            tile_scheduler_metadata=_get_deepseek_v4_tile_meta(
+                q_kernel,
+                swa_indices.shape[-1],
+            ),
+            softmax_scale=float(softmax_scale),
+            is_fp8_kvcache=True,
+            indices=swa_indices,
+            attn_sink=attn_sink,
+            extra_k_cache=extra_cache,
+            extra_indices_in_kvcache=extra_indices,
+            topk_length=swa_lens,
+            extra_topk_length=extra_lens,
+        )
+        if result.dim() == 4:
+            result = result.squeeze(1)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+
+
+if (
+    platform.is_nvidia
+    and platform.is_hopper_plus
     and flash_mla_sparse_fwd is not error_fn
 ):
 
@@ -332,6 +448,60 @@ if (
         result = result[:, :actual_heads, :]
         if out is not None:
             out.reshape_as(result).copy_(result)
+            return out
+        return result
+
+
+if (
+    platform.is_nvidia
+    and platform.is_hopper_plus
+    and flash_mla_sparse_fwd is not error_fn
+):
+
+    @register_kernel(
+        "attention",
+        "deepseek_v4_selected_attention",
+        name="flashmla_deepseek_v4_selected_attention",
+        solution="flashmla",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    kv=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        traits={
+            "head_dim": frozenset({512}),
+            "cache_layout": frozenset({"dense_workspace"}),
+            "support_sink": frozenset({True}),
+            "metadata_dtypes": frozenset({torch.int32}),
+        },
+        priority=Priority.PERFORMANT,
+    )
+    def flashmla_deepseek_v4_selected_attention(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        indices: torch.Tensor,
+        lens: torch.Tensor,
+        attn_sink: torch.Tensor,
+        softmax_scale: float,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        result, _, _ = flash_mla_sparse_fwd(
+            q=q,
+            kv=kv.reshape(-1, 1, q.shape[-1]),
+            indices=indices.unsqueeze(1),
+            sm_scale=float(softmax_scale),
+            attn_sink=attn_sink,
+            topk_length=lens,
+        )
+        if out is not None:
+            out.copy_(result)
             return out
         return result
 

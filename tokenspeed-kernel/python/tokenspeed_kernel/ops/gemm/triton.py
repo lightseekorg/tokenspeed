@@ -33,6 +33,7 @@ from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platf
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
+    dense_tensor_format,
     format_signature,
     format_signatures,
     tensor_format,
@@ -483,7 +484,7 @@ def w8a8_block_fp8_matmul_triton(
         # Each K tile consumes one scale, so its width must equal the scale group.
         if Platform.get().is_amd:
             config = {
-                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_M": 16 if M <= 128 else 32,
                 "BLOCK_SIZE_N": 64,
                 "BLOCK_SIZE_K": block_size[1],
                 "GROUP_SIZE_M": 8,
@@ -818,6 +819,289 @@ def triton_mm_fp8_blockscale(
         output_dtype=out_dtype,
         out=out,
     )
+
+
+@triton.jit
+def _w8a8_block_fp8_bmm(
+    A,
+    B,
+    C,
+    As,
+    Bs,
+    M,
+    N,
+    K,
+    group_n,
+    group_k,
+    stride_ab,
+    stride_am,
+    stride_ak,
+    stride_bb,
+    stride_bn,
+    stride_bk,
+    stride_cb,
+    stride_cm,
+    stride_cn,
+    stride_asb,
+    stride_asm,
+    stride_ask,
+    stride_bsb,
+    stride_bsn,
+    stride_bsk,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k_start in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_offsets = k_start * BLOCK_SIZE_K + offs_k
+        a = tl.load(
+            A
+            + batch * stride_ab
+            + offs_m[:, None] * stride_am
+            + k_offsets[None, :] * stride_ak,
+            mask=(offs_m[:, None] < M) & (k_offsets[None, :] < K),
+            other=0.0,
+        )
+        b = tl.load(
+            B
+            + batch * stride_bb
+            + offs_n[None, :] * stride_bn
+            + k_offsets[:, None] * stride_bk,
+            mask=(offs_n[None, :] < N) & (k_offsets[:, None] < K),
+            other=0.0,
+        )
+        scale_k = (k_start * BLOCK_SIZE_K) // group_k
+        a_scale = tl.load(
+            As + batch * stride_asb + offs_m * stride_asm + scale_k * stride_ask,
+            mask=offs_m < M,
+            other=0.0,
+        )
+        b_scale = tl.load(
+            Bs
+            + batch * stride_bsb
+            + (offs_n // group_n) * stride_bsn
+            + scale_k * stride_bsk,
+            mask=offs_n < N,
+            other=0.0,
+        )
+        if As.dtype.element_ty == tl.uint8:
+            a_scale = tl.exp2(a_scale.to(tl.float32) - 127.0)
+        if Bs.dtype.element_ty == tl.uint8:
+            b_scale = tl.exp2(b_scale.to(tl.float32) - 127.0)
+        acc += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+
+    tl.store(
+        C
+        + batch * stride_cb
+        + offs_m[:, None] * stride_cm
+        + offs_n[None, :] * stride_cn,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+@register_kernel(
+    "gemm",
+    "bmm",
+    name="triton_bmm_fp8_blockscale",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=_MXFP8_FORMAT_SIGNATURES,
+    traits={
+        "a_inner_stride_one": frozenset({True}),
+        "out_inner_stride_one": frozenset({True}),
+    },
+    priority=Priority.PERFORMANT + 3,
+    tags={"portability"},
+)
+def triton_bmm_fp8_blockscale(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if alpha is not None:
+        raise ValueError("triton block-scaled FP8 BMM does not support alpha")
+    if block_size is None:
+        raise ValueError("block_size is required for triton block-scaled FP8 BMM")
+    if A_scales is None or B_scales is None:
+        raise ValueError("A_scales and B_scales are required for FP8 BMM")
+
+    batch, m, k = A.shape
+    b_batch, n, b_k = B.shape
+    block_n, block_k = block_size
+    if b_batch != batch or b_k != k:
+        raise ValueError(f"FP8 BMM shape mismatch: A={A.shape}, B={B.shape}")
+    if A_scales.shape != (batch, m, triton.cdiv(k, block_k)):
+        raise ValueError(
+            f"FP8 BMM A scale shape mismatch: A={A.shape}, scales={A_scales.shape}"
+        )
+    expected_b_scales = (batch, triton.cdiv(n, block_n), triton.cdiv(k, block_k))
+    if B_scales.shape != expected_b_scales:
+        raise ValueError(
+            "FP8 BMM B scale shape mismatch: "
+            f"expected {expected_b_scales}, got {tuple(B_scales.shape)}"
+        )
+
+    C = (
+        out
+        if out is not None
+        else torch.empty((batch, m, n), device=A.device, dtype=out_dtype)
+    )
+    config = {
+        "BLOCK_SIZE_M": 16 if Platform.get().is_amd and m <= 128 else 32,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": block_k,
+        "num_warps": 4,
+        "num_stages": 1 if Platform.get().is_amd else 3,
+    }
+    _w8a8_block_fp8_bmm[
+        (batch, triton.cdiv(m, config["BLOCK_SIZE_M"]), triton.cdiv(n, 64))
+    ](
+        A,
+        B,
+        C,
+        A_scales,
+        B_scales,
+        m,
+        n,
+        k,
+        block_n,
+        block_k,
+        A.stride(0),
+        A.stride(1),
+        A.stride(2),
+        B.stride(0),
+        B.stride(1),
+        B.stride(2),
+        C.stride(0),
+        C.stride(1),
+        C.stride(2),
+        A_scales.stride(0),
+        A_scales.stride(1),
+        A_scales.stride(2),
+        B_scales.stride(0),
+        B_scales.stride(1),
+        B_scales.stride(2),
+        **config,
+    )
+    return C
+
+
+def _triton_deepseek_v4_grouped_output_projection_weights(
+    *,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    num_groups: int,
+    output_dim: int,
+    input_dim: int,
+    block_size: tuple[int, int],
+    recipe: tuple[int, int, int],
+) -> torch.Tensor:
+    del weight, recipe
+    block_n, block_k = block_size
+    expected_shape = (
+        num_groups * (output_dim // block_n),
+        input_dim // block_k,
+    )
+    if tuple(weight_scale.shape) != expected_shape:
+        raise ValueError(
+            "grouped output projection scale shape mismatch: "
+            f"expected {expected_shape}, got {tuple(weight_scale.shape)}"
+        )
+    return weight_scale
+
+
+@register_kernel(
+    "gemm",
+    "deepseek_v4_grouped_output_projection",
+    name="triton_deepseek_v4_grouped_output_projection",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=frozenset(
+        format_signature(
+            attention=dense_tensor_format(input_dtype),
+            weight=dense_tensor_format(_fp8_dtype),
+        )
+        for input_dtype in (torch.float16, torch.bfloat16)
+    ),
+    traits={},
+    priority=Priority.PERFORMANT + 3,
+    tags={"portability"},
+    weight_preprocessor=_triton_deepseek_v4_grouped_output_projection_weights,
+)
+def triton_deepseek_v4_grouped_output_projection(
+    *,
+    attention: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    num_groups: int,
+    heads_per_group: int,
+    output_dim: int,
+    nope_dim: int,
+    rope_dim: int,
+    block_size: tuple[int, int],
+    tma_aligned_scales: bool,
+    recipe: tuple[int, int, int],
+) -> torch.Tensor:
+    """Run V4's grouped output projection with canonical scales and Triton BMM."""
+    del recipe
+    if tma_aligned_scales:
+        raise ValueError("the portable projection requires canonical scales")
+    from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+        deepseek_v4_fused_inv_rope_fp8_quant,
+    )
+
+    values, scales = deepseek_v4_fused_inv_rope_fp8_quant(
+        attention,
+        positions,
+        cos_sin_cache,
+        n_groups=num_groups,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+        quant_group_size=block_size[1],
+        tma_aligned_scales=False,
+    )
+    input_dim = heads_per_group * attention.shape[-1]
+    grouped_weight = weight.view(num_groups, output_dim, input_dim)
+    block_n, block_k = block_size
+    grouped_scales = weight_scale.view(
+        num_groups,
+        output_dim // block_n,
+        input_dim // block_k,
+    )
+    output = torch.empty(
+        (attention.shape[0], num_groups, output_dim),
+        dtype=torch.bfloat16,
+        device=attention.device,
+    )
+    triton_bmm_fp8_blockscale(
+        values.transpose(0, 1),
+        grouped_weight,
+        scales.transpose(0, 1),
+        grouped_scales,
+        output.dtype,
+        block_size=list(block_size),
+        out=output.transpose(0, 1),
+    )
+    return output
 
 
 @triton.jit

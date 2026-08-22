@@ -40,6 +40,12 @@ if current_platform().is_amd:
     _DSA_FULL_TOPK_WIDTHS = frozenset({512, 1024, 2048})
     _DSA_PREFILL_TOPK_WIDTHS = _DSA_FULL_TOPK_WIDTHS
 
+    from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4 import (
+        gluon_deepseek_v4_paged_selected_attention_split_gfx950 as _deepseek_v4_paged_selected_attention_split_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4 import (
+        gluon_deepseek_v4_selected_attention_gfx950 as _deepseek_v4_selected_attention_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
         gluon_dsa_decode_gfx950 as _dsa_decode_impl,
     )
@@ -160,6 +166,76 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.project_value import (
         gluon_mla_project_value_gfx1250 as _mla_project_value_gfx1250_impl,
     )
+
+    @register_kernel(
+        "attention",
+        "deepseek_v4_paged_selected_attention",
+        name="gluon_deepseek_v4_paged_selected_attention_split_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    swa_kv_cache=dense_tensor_format(torch.uint8),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "tokens": frozenset({1, 2, 3, 4, 5, 6}),
+            "head_dim": frozenset({512}),
+            "num_heads": frozenset({16, 32}),
+            "cache_layout": frozenset({"fp8_swa_page_planar"}),
+            "topk_layout": frozenset({"global_slots"}),
+            "support_sink": frozenset({True}),
+            "has_extra": frozenset({True}),
+            "has_extra_segment": frozenset({True}),
+            "swa_selected_width": frozenset({128}),
+            "extra_selected_width": frozenset({1024}),
+            "swa_page_size": frozenset({64}),
+            "extra_page_size": frozenset({64}),
+            "metadata_dtypes": frozenset({torch.int32}),
+        },
+        tags={"amd", "gfx950", "paged_cache", "selected_attention"},
+    )
+    def gluon_deepseek_v4_paged_selected_attention_split_gfx950(*args, **kwargs):
+        return _deepseek_v4_paged_selected_attention_split_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "deepseek_v4_selected_attention",
+        name="gluon_deepseek_v4_selected_attention_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    kv=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": frozenset({512}),
+            "cache_layout": frozenset({"dense_workspace"}),
+            "support_sink": frozenset({True}),
+            "selected_width": frozenset({384, 512, 640, 768, 1024, 1152}),
+            "metadata_dtypes": frozenset({torch.int32}),
+        },
+        tags={"amd", "gfx950", "selected_attention"},
+    )
+    def gluon_deepseek_v4_selected_attention_gfx950(*args, **kwargs):
+        return _deepseek_v4_selected_attention_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
@@ -1143,6 +1219,7 @@ if current_platform().is_amd:
             "page_size": frozenset({64}),
             "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
             "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
     )
     def gluon_dsa_decode_topk_standard_gfx950(*args, **kwargs):
@@ -1175,6 +1252,7 @@ if current_platform().is_amd:
             "topk": frozenset({512, 1024, 2048}),
             "page_size": frozenset({64}),
             "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
     )
     def gluon_dsa_prefill_topk_standard_gfx950(*args, **kwargs):
@@ -1209,6 +1287,7 @@ if current_platform().is_amd:
             "page_size": frozenset({64}),
             "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
             "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
     )
     def gluon_dsa_decode_topk_fp8_gfx950(*args, **kwargs):
@@ -1242,6 +1321,7 @@ if current_platform().is_amd:
             "topk": frozenset({512, 1024, 2048}),
             "page_size": frozenset({64}),
             "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
     )
     def gluon_dsa_prefill_topk_fp8_gfx950(*args, **kwargs):
@@ -1378,6 +1458,7 @@ if current_platform().is_amd:
             "page_size": frozenset({64}),
             "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
             "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
         tags={"amd", "gfx1250"},
     )
@@ -1412,6 +1493,7 @@ if current_platform().is_amd:
             "topk": _DSA_PREFILL_TOPK_WIDTHS,
             "page_size": frozenset({64}),
             "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
         tags={"amd", "gfx1250"},
     )

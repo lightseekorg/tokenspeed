@@ -21,17 +21,21 @@ from collections.abc import Callable
 from typing import Any
 
 # Backend registration (side-effect imports)
+import tokenspeed_kernel.ops.moe.cuda  # noqa: F401
 import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
 import tokenspeed_kernel.ops.moe.marlin  # noqa: F401
+import tokenspeed_kernel.ops.moe.pytorch  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.moe.deepseek_v4 import deepseek_v4_select_experts
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
+    "deepseek_v4_select_experts",
     "native_latent_moe_available",
     "latent_moe_decode_pipeline_available",
     "latent_moe_expert_shared",
