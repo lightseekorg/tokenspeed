@@ -31,8 +31,11 @@ try:
         warmup_compile_prefill,
     )
 except ImportError:
+    from tokenspeed_kernel.ops.attention.tokenspeed_mla.fallback import (
+        mla_kv_pack_quantize_fp8,
+    )
+
     get_num_sm = error_fn
-    mla_kv_pack_quantize_fp8 = error_fn
     tokenspeed_mla_decode = error_fn
     tokenspeed_mla_prefill = error_fn
     warmup_compile_prefill = error_fn
