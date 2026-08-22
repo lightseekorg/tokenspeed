@@ -2643,6 +2643,7 @@ def _deepseek_v4_paged_kv_tile(
     fp8_dim: tl.constexpr,
     quant_block: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    N_QB: tl.constexpr,
 ):
     """Load and dequantize ``BLOCK_K`` slot-addressed cache rows.
 
@@ -2670,30 +2671,43 @@ def _deepseek_v4_paged_kv_tile(
     )
 
     is_nope = offs_d < fp8_dim
-    nope_mask = valid[:, None] & is_nope[None, :]
     raw = tl.load(
-        cache_ptr + data_off[:, None] + offs_d[None, :], mask=nope_mask, other=0
+        cache_ptr + data_off[:, None] + offs_d[None, :],
+        mask=valid[:, None] & is_nope[None, :],
+        other=0,
     )
-    values = raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
+    # One exponent per quantization block, broadcast across the block's columns.
+    # Addressing it per output column instead issues D byte-gathers per row to
+    # fetch the handful of exponents the row actually has.
+    offs_qb = tl.arange(0, N_QB)
     exponent = tl.load(
-        cache_ptr + scale_off[:, None] + (offs_d // quant_block)[None, :],
-        mask=nope_mask,
+        cache_ptr + scale_off[:, None] + offs_qb[None, :],
+        mask=valid[:, None] & (offs_qb < fp8_dim // quant_block)[None, :],
         other=127,
-    ).to(tl.float32)
-    nope = values * tl.exp2(exponent - 127.0)
+    )
+    exponent = tl.reshape(
+        tl.broadcast_to(exponent[:, :, None], (BLOCK_K, N_QB, quant_block)),
+        (BLOCK_K, N_QB * quant_block),
+    )
+    nope = (
+        raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        * tl.exp2(exponent.to(tl.float32) - 127.0)
+    ).to(tl.bfloat16)
 
     # Payload byte offsets and ``fp8_dim`` are both even, so the rope tail is
-    # addressable through a bfloat16 view of the cache.
+    # addressable through a bfloat16 view of the cache. It is stored bfloat16,
+    # so it is loaded that way -- keeping two [BLOCK_K, D] float32 tiles from
+    # being live at once is what lets the kernel hold more than one wave.
     cache_bf16 = cache_ptr.to(tl.pointer_type(tl.bfloat16))
     rope_off = (data_off + fp8_dim) // 2
     rope = tl.load(
         cache_bf16 + rope_off[:, None] + (offs_d - fp8_dim)[None, :],
         mask=valid[:, None] & (offs_d >= fp8_dim)[None, :],
         other=0.0,
-    ).to(tl.float32)
+    )
 
-    kv = tl.where(is_nope[None, :], nope, rope).to(tl.bfloat16)
-    return kv, valid
+    return tl.where(is_nope[None, :], nope, rope), valid
 
 
 @triton.jit
@@ -2747,6 +2761,7 @@ def _deepseek_v4_fused_paged_sparse_attn_kernel(
     scale_dim: tl.constexpr,
     fp8_dim: tl.constexpr,
     quant_block: tl.constexpr,
+    N_QB: tl.constexpr,
     HAS_EXTRA: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -2794,6 +2809,7 @@ def _deepseek_v4_fused_paged_sparse_attn_kernel(
             fp8_dim=fp8_dim,
             quant_block=quant_block,
             BLOCK_K=BLOCK_K,
+            N_QB=N_QB,
         )
         m_i, l_i, acc_o = _deepseek_v4_online_softmax_step(
             q, kv, valid, scale, m_i, l_i, acc_o, neg=neg
@@ -2817,6 +2833,7 @@ def _deepseek_v4_fused_paged_sparse_attn_kernel(
                 fp8_dim=fp8_dim,
                 quant_block=quant_block,
                 BLOCK_K=BLOCK_K,
+                N_QB=N_QB,
             )
             m_i, l_i, acc_o = _deepseek_v4_online_softmax_step(
                 q, kv, valid, scale, m_i, l_i, acc_o, neg=neg
@@ -2942,6 +2959,18 @@ def deepseek_v4_fused_paged_sparse_attn(
         )
     if attn_sink.numel() < num_heads:
         raise ValueError(f"attn_sink has {attn_sink.numel()} entries, need {num_heads}")
+    if head_dim % DEEPSEEK_V4_FP8_QUANT_BLOCK != 0:
+        raise ValueError(
+            f"head_dim {head_dim} must be a multiple of the quantization block "
+            f"{DEEPSEEK_V4_FP8_QUANT_BLOCK}: the dequantized tile broadcasts one "
+            "exponent per block across the block's columns"
+        )
+    if head_dim // DEEPSEEK_V4_FP8_QUANT_BLOCK > DEEPSEEK_V4_SWA_SCALE_DIM:
+        raise ValueError(
+            "scale vector is too short to cover the head dimension: "
+            f"{DEEPSEEK_V4_SWA_SCALE_DIM} entries for "
+            f"{head_dim // DEEPSEEK_V4_FP8_QUANT_BLOCK} blocks"
+        )
 
     swa_slots = swa_slots.reshape(num_tokens, -1)
     swa_topk = swa_slots.shape[1]
@@ -3011,9 +3040,13 @@ def deepseek_v4_fused_paged_sparse_attn(
         scale_dim=DEEPSEEK_V4_SWA_SCALE_DIM,
         fp8_dim=DEEPSEEK_V4_NOPE_DIM,
         quant_block=DEEPSEEK_V4_FP8_QUANT_BLOCK,
+        N_QB=head_dim // DEEPSEEK_V4_FP8_QUANT_BLOCK,
         HAS_EXTRA=has_extra,
         num_warps=4,
-        num_stages=2,
+        # Software pipelining double-buffers the [BLOCK_K, head_dim] tiles, and
+        # at these widths the second buffer costs more in occupancy than the
+        # overlap returns.
+        num_stages=1,
     )
     _deepseek_v4_fused_paged_sparse_attn_combine_kernel[(num_tokens,)](
         partial_acc,

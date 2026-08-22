@@ -171,6 +171,13 @@ class TestDeepseekV4FusedPagedAttn(unittest.TestCase):
             0, num_rows, (num_tokens, width), device=self.device, dtype=torch.int32
         )
 
+    def _pad_past_len(self, slots: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
+        """Match the producers: -1 fills the tail past each row's length."""
+        order = torch.arange(slots.shape[1], device=self.device, dtype=torch.int32)
+        return torch.where(
+            order.unsqueeze(0) >= lens.unsqueeze(1), torch.full_like(slots, -1), slots
+        )
+
     def test_sliding_window_only(self) -> None:
         num_rows, block_size, num_tokens, width = 512, 64, 8, 128
         cache = self._populate(num_rows, block_size)
@@ -266,6 +273,84 @@ class TestDeepseekV4FusedPagedAttn(unittest.TestCase):
             q, cache, slots, lens, block_size, self.sink, SOFTMAX_SCALE
         )
         self.assertTrue(torch.all(fused == 0))
+
+    def test_randomized_shapes(self) -> None:
+        """Sweep shapes rather than trusting a handful of fixed ones.
+
+        Head count, token count, both widths, both block sizes and the ragged
+        lengths all vary. The fixed cases above pin specific contracts; this
+        is what gives confidence the dequantization is right across the space,
+        since a per-quantization-block bug shows up only at some widths.
+        """
+        for seed in range(12):
+            with self.subTest(seed=seed):
+                gen = torch.Generator().manual_seed(seed)
+
+                def pick(lo, hi):
+                    return int(torch.randint(lo, hi, (1,), generator=gen).item())
+
+                torch.manual_seed(seed)
+                num_heads = 1 << pick(0, 4)
+                num_tokens = pick(1, 12)
+                swa_width = pick(1, 96)
+                extra_width = pick(0, 96)
+                swa_block = 1 << pick(4, 8)
+                extra_block = 1 << pick(4, 8)
+                swa_rows = swa_width + pick(1, 300)
+
+                self.sink = torch.randn(
+                    num_heads, device=self.device, dtype=torch.float32
+                )
+                q = torch.randn(
+                    num_tokens,
+                    num_heads,
+                    DEEPSEEK_V4_HEAD_DIM,
+                    device=self.device,
+                    dtype=torch.bfloat16,
+                )
+                swa_cache = self._populate(swa_rows, swa_block)
+                swa_slots = self._slots(num_tokens, swa_width, swa_rows)
+                swa_lens = torch.randint(
+                    0,
+                    swa_width + 1,
+                    (num_tokens,),
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+                swa_slots = self._pad_past_len(swa_slots, swa_lens)
+
+                extra = None
+                if extra_width:
+                    extra_rows = extra_width + pick(1, 400)
+                    extra_cache = self._populate(extra_rows, extra_block)
+                    extra_slots = self._slots(num_tokens, extra_width, extra_rows)
+                    extra_lens = torch.randint(
+                        0,
+                        extra_width + 1,
+                        (num_tokens,),
+                        device=self.device,
+                        dtype=torch.int32,
+                    )
+                    extra_slots = self._pad_past_len(extra_slots, extra_lens)
+                    extra = (extra_cache, extra_slots, extra_lens, extra_block)
+
+                fused = deepseek_v4_fused_paged_sparse_attn(
+                    q,
+                    swa_cache,
+                    swa_slots,
+                    swa_lens,
+                    swa_block,
+                    self.sink,
+                    SOFTMAX_SCALE,
+                    extra_cache=extra[0] if extra else None,
+                    extra_slots=extra[1] if extra else None,
+                    extra_lens=extra[2] if extra else None,
+                    extra_block_size=extra[3] if extra else 1,
+                )
+                ref = self._reference(
+                    q, (swa_cache, swa_slots, swa_lens, swa_block), extra
+                )
+                self._assert_matches(fused, ref)
 
     def test_narrow_slot_lists(self) -> None:
         """Widths below the largest K tile still cover every valid row."""
