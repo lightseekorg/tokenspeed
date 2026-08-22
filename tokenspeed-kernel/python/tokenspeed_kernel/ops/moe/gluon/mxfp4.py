@@ -83,6 +83,35 @@ if platform.is_amd:
         if tensors[0].shape[0] != expected:
             raise ValueError("linear MXFP4 weights have the wrong local expert count")
 
+    def _localize_topk_ids_for_ep(
+        w: torch.nn.Module,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Remap global expert ids to this rank's local range for EP.
+
+        Under expert parallelism the weight tensors hold only this rank's
+        experts, so routing must see local ids. Ids owned by other ranks are
+        mapped to -1: the Gluon router drops out-of-range ids, so those pairs
+        are never dispatched and cost nothing. The caller reduces the per-rank
+        partial outputs.
+
+        Returns ``topk_ids`` unchanged when expert parallelism is off.
+        """
+        ep_size = int(getattr(w, "ep_size", 1))
+        if ep_size <= 1:
+            return topk_ids
+        num_local_experts = getattr(w, "num_local_experts", None)
+        if num_local_experts is None:
+            num_local_experts = w.w13_weight.shape[0]
+        num_local_experts = int(num_local_experts)
+        expert_start = int(getattr(w, "ep_rank", 0)) * num_local_experts
+        local = topk_ids.to(torch.int32) - expert_start
+        return torch.where(
+            (local >= 0) & (local < num_local_experts),
+            local,
+            torch.full_like(local, -1),
+        )
+
     def _swiglu_args(w: torch.nn.Module) -> tuple[float, float, float]:
         swiglu_arg = getattr(w, "swiglu_arg", None)
         if swiglu_arg is None:
@@ -394,7 +423,11 @@ if platform.is_amd:
             "activation": frozenset({"silu", "swiglu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({False}),
-            "supports_ep": frozenset({False}),
+            # Expert parallelism: global expert ids are remapped into this
+            # rank's local range before routing, and the router drops the
+            # out-of-range ids that remain, so each rank computes only the
+            # experts it owns and non-local pairs cost nothing.
+            "supports_ep": frozenset({True, False}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({1}),
             "internal_activation_dtype": frozenset({"input"}),
@@ -423,6 +456,7 @@ if platform.is_amd:
         swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
         w13_precision_config = w.w13_precision_config
         w2_precision_config = w.w2_precision_config
+        topk_ids = _localize_topk_ids_for_ep(w, topk_ids)
 
         return gluon_mxfp_precomputed_mxfp4_fused_moe(
             x,
