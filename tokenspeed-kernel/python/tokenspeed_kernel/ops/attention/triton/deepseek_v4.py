@@ -60,7 +60,13 @@ __all__ = [
     "deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4",
     "deepseek_v4_fused_sparse_compress_cache_insert",
     "deepseek_v4_gather_indexer_mxfp4_cache",
+    "deepseek_v4_gather_paged_indexer_fp8_padded",
+    "deepseek_v4_gather_slots_bf16",
     "deepseek_v4_indexer_decode_metadata_compute",
+    "deepseek_v4_indexer_mqa_logits",
+    "deepseek_v4_kv_rope_quant_insert",
+    "deepseek_v4_q_norm_rope",
+    "deepseek_v4_sparse_attn",
     "deepseek_v4_save_compressor_state",
     "write_deepseek_v4_indexer_mxfp4_cache_cuda",
 ]
@@ -1867,6 +1873,812 @@ def deepseek_v4_indexer_decode_metadata_compute(
         cache_block_size=int(cache_block_size),
         max_blocks=int(max_blocks),
         candidate_block=candidate_block,
+    )
+
+
+# Weightless per-head RMS norm + forward RoPE over the query's trailing rope
+# dims, matching the reference:
+#     q *= rsqrt(q.square().mean(-1) + eps)
+#     apply_rotary_emb(q[..., -rope_dim:], freqs_cis)
+# RoPE pairs adjacent lanes (``offs ^ 1``), so cos/sin are indexed by the pair
+# index and the cache holds cos in ``[0, half_rope)`` and sin in
+# ``[half_rope, rope_dim)`` -- the same layout the inverse-RoPE kernel below
+# consumes, with the sin term's sign flipped.
+@triton.jit(do_not_specialize=["num_tokens"])
+def _deepseek_v4_q_norm_rope_per_head(
+    q_ptr,
+    positions_ptr,
+    cos_sin_cache_ptr,
+    num_tokens,
+    q_stride_token,
+    q_stride_head,
+    cache_stride_pos,
+    rms_eps,
+    HEAD_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    HALF_ROPE: tl.constexpr,
+):
+    pid_token = tl.program_id(0)
+    pid_head = tl.program_id(1)
+    if pid_token >= num_tokens:
+        return
+
+    q_base = q_ptr + pid_token * q_stride_token + pid_head * q_stride_head
+    offsets = tl.arange(0, HEAD_DIM)
+    x_raw = tl.load(q_base + offsets).to(tl.float32)
+
+    # Weightless RMS norm across the full head, before RoPE.
+    var = tl.sum(x_raw * x_raw, axis=0) / HEAD_DIM
+    scale = tl.rsqrt(var + rms_eps)
+    x = x_raw * scale
+
+    rope_start: tl.constexpr = HEAD_DIM - ROPE_DIM
+    is_rope = offsets >= rope_start
+    rope_local = offsets - rope_start
+
+    pos = tl.load(positions_ptr + pid_token)
+    cache_base = cos_sin_cache_ptr + pos * cache_stride_pos
+    cs_idx = tl.maximum(rope_local >> 1, 0)
+    cos_v = tl.load(cache_base + cs_idx, mask=is_rope, other=1.0)
+    sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope, other=0.0)
+
+    # The norm is a single per-head scale, so the paired lane can be reloaded
+    # raw and scaled rather than shuffled out of ``x``.
+    partner = (
+        tl.load(q_base + (offsets ^ 1), mask=is_rope, other=0.0).to(tl.float32) * scale
+    )
+
+    is_even = (rope_local & 1) == 0
+    rotated = tl.where(
+        is_even, x * cos_v - partner * sin_v, x * cos_v + partner * sin_v
+    )
+    x = tl.where(is_rope, rotated, x)
+
+    tl.store(q_base + offsets, x.to(q_ptr.dtype.element_ty))
+
+
+def deepseek_v4_q_norm_rope(
+    q: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    rms_norm_eps: float,
+    rope_dim: int = 64,
+) -> None:
+    """Weightless per-head RMS norm + forward RoPE on the query, in place.
+
+    Args:
+        q: ``[num_tokens, num_heads, head_dim]``, mutated in place. The norm
+            spans ``head_dim``; RoPE applies only to the trailing ``rope_dim``.
+        positions: ``[num_tokens]`` absolute token positions.
+        cos_sin_cache: ``[max_position, rope_dim]`` float32, cos in the first
+            half and sin in the second.
+        rms_norm_eps: epsilon added to the mean square before the reciprocal
+            square root.
+        rope_dim: width of the rotary section at the end of each head.
+    """
+    num_tokens, num_heads, head_dim = q.shape
+    if num_tokens == 0:
+        return
+    if rope_dim % 2 != 0:
+        raise ValueError(f"rope_dim must be even, got {rope_dim}")
+    if rope_dim > head_dim:
+        raise ValueError(f"rope_dim={rope_dim} exceeds head_dim={head_dim}")
+    _deepseek_v4_q_norm_rope_per_head[(num_tokens, num_heads)](
+        q,
+        positions,
+        cos_sin_cache,
+        num_tokens,
+        q.stride(0),
+        q.stride(1),
+        cos_sin_cache.stride(0),
+        rms_norm_eps,
+        HEAD_DIM=head_dim,
+        ROPE_DIM=rope_dim,
+        HALF_ROPE=rope_dim // 2,
+        num_warps=4,
+    )
+
+
+# Capture-safe paged gather for the indexer's FP8 keys. The torch gather reads
+# the cumulative length back to the host to size its output, which a CUDA graph
+# capture forbids; this writes into a fixed [tokens, max_len] window instead, so
+# every shape is known before capture begins. Rows past a token's context are
+# left as written by the caller.
+@triton.jit(do_not_specialize=["num_tokens", "max_len"])
+def _deepseek_v4_gather_paged_indexer_fp8_padded_kernel(
+    cache_ptr,
+    context_lens_ptr,
+    block_table_ptr,
+    values_ptr,
+    scales_ptr,
+    cache_stride_page,
+    block_table_stride,
+    max_blocks,
+    num_tokens,
+    max_len,
+    cache_block_size: tl.constexpr,
+    head_dim: tl.constexpr,
+    scale_bytes: tl.constexpr,
+    BLOCK_J: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_j = tl.program_id(1)
+    if pid_t >= num_tokens:
+        return
+
+    context_len = tl.load(context_lens_ptr + pid_t)
+    offs_j = pid_j * BLOCK_J + tl.arange(0, BLOCK_J)
+    active = (offs_j < max_len) & (offs_j < context_len)
+
+    logical_block = offs_j // cache_block_size
+    in_block = offs_j % cache_block_size
+    block_ok = active & (logical_block < max_blocks)
+    phys = tl.load(
+        block_table_ptr + pid_t * block_table_stride + logical_block,
+        mask=block_ok,
+        other=-1,
+    )
+    ok = block_ok & (phys >= 0)
+
+    page_base = cache_ptr + phys.to(tl.int64) * cache_stride_page
+
+    offs_d = tl.arange(0, head_dim)
+    values = tl.load(
+        page_base[:, None] + in_block[:, None] * head_dim + offs_d[None, :],
+        mask=ok[:, None],
+        other=0,
+    )
+    tl.store(
+        values_ptr + (pid_t * max_len + offs_j)[:, None] * head_dim + offs_d[None, :],
+        values,
+        mask=ok[:, None],
+    )
+
+    # Per-token fp32 scale stored as ``scale_bytes`` raw bytes after the values.
+    offs_b = tl.arange(0, scale_bytes)
+    scale_raw = tl.load(
+        page_base[:, None]
+        + cache_block_size * head_dim
+        + in_block[:, None] * scale_bytes
+        + offs_b[None, :],
+        mask=ok[:, None],
+        other=0,
+    )
+    tl.store(
+        scales_ptr
+        + (pid_t * max_len + offs_j)[:, None] * scale_bytes
+        + offs_b[None, :],
+        scale_raw,
+        mask=ok[:, None],
+    )
+
+
+def deepseek_v4_gather_paged_indexer_fp8_padded(
+    cache_2d: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    head_dim: int,
+    max_len: int,
+    scale_bytes: int = 4,
+    values_out: torch.Tensor | None = None,
+    scales_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather paged FP8 indexer keys into a padded ``[tokens * max_len, dim]`` buffer.
+
+    Unlike the torch gather this performs no device-to-host reads, so it is safe
+    to call inside a CUDA graph capture. Token ``t`` occupies rows
+    ``[t * max_len, t * max_len + context_lens[t])``.
+
+    Args:
+        cache_2d: ``[pages, block_size * (head_dim + scale_bytes)]`` uint8 cache.
+        context_lens: ``[tokens]`` valid key count per token.
+        block_table: ``[tokens, max_blocks]`` logical-to-physical page map.
+        block_size: tokens per page.
+        head_dim: indexer head dimension.
+        max_len: padded per-token width.
+        scale_bytes: bytes per stored scale (4 for fp32).
+        values_out: optional preallocated uint8 value buffer.
+        scales_out: optional preallocated uint8 scale buffer.
+
+    Returns:
+        ``(values, scales)`` as ``float8_e4m3fn`` ``[tokens * max_len, head_dim]``
+        and ``float32`` ``[tokens * max_len]``.
+    """
+    if cache_2d.dtype != torch.uint8:
+        raise TypeError(f"cache_2d must be uint8, got {cache_2d.dtype}")
+    num_tokens = int(context_lens.reshape(-1).shape[0])
+    rows = max(1, num_tokens * max_len)
+    device = cache_2d.device
+    if values_out is None:
+        values_out = torch.zeros(rows, head_dim, dtype=torch.uint8, device=device)
+    if scales_out is None:
+        scales_out = torch.zeros(rows, scale_bytes, dtype=torch.uint8, device=device)
+    if num_tokens == 0 or max_len == 0:
+        return (
+            values_out.view(torch.float8_e4m3fn),
+            scales_out.view(torch.float32).reshape(-1),
+        )
+    block_j = 32
+    block_table_i32 = _as_int32_block_table(block_table)
+    _deepseek_v4_gather_paged_indexer_fp8_padded_kernel[
+        (num_tokens, triton.cdiv(max_len, block_j))
+    ](
+        cache_2d,
+        context_lens.reshape(-1).to(torch.int32),
+        block_table_i32,
+        values_out,
+        scales_out,
+        cache_2d.stride(0),
+        block_table_i32.stride(0),
+        block_table_i32.shape[-1],
+        num_tokens,
+        max_len,
+        cache_block_size=block_size,
+        head_dim=head_dim,
+        scale_bytes=scale_bytes,
+        BLOCK_J=block_j,
+        num_warps=4,
+    )
+    return (
+        values_out.view(torch.float8_e4m3fn),
+        scales_out.view(torch.float32).reshape(-1),
+    )
+
+
+# Dequantize slot-addressed rows of a paged fp8_ds_mla cache into a contiguous
+# bf16 workspace. Decode selects arbitrary slots per token, so it cannot use the
+# sequential gather; dequantizing first lets the sparse-attention kernel run
+# unchanged over both the sliding-window and compressed caches, exactly as the
+# prefill path already does with its own workspace.
+@triton.jit(do_not_specialize=["num_tokens", "topk"])
+def _deepseek_v4_gather_slots_bf16_kernel(
+    cache_ptr,
+    slots_ptr,
+    lens_ptr,
+    out_ptr,
+    block_stride,
+    slots_stride_token,
+    out_stride_token,
+    out_stride_row,
+    dst_offset,
+    num_tokens,
+    topk,
+    cache_block_size: tl.constexpr,
+    token_data_size: tl.constexpr,
+    scale_dim: tl.constexpr,
+    fp8_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    quant_block: tl.constexpr,
+    n_quant_blocks: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    if pid_t >= num_tokens or pid_k >= topk:
+        return
+
+    length = tl.load(lens_ptr + pid_t)
+    out_row = out_ptr + pid_t * out_stride_token + (dst_offset + pid_k) * out_stride_row
+    if pid_k >= length:
+        return
+
+    slot = tl.load(slots_ptr + pid_t * slots_stride_token + pid_k)
+    if slot < 0:
+        return
+
+    block_idx = slot // cache_block_size
+    pos_in_block = slot % cache_block_size
+    cache_block = cache_ptr + block_idx.to(tl.int64) * block_stride
+    token_data = cache_block + pos_in_block * token_data_size
+    token_scales = (
+        cache_block + cache_block_size * token_data_size + pos_in_block * scale_dim
+    )
+
+    for qblock_idx in tl.static_range(n_quant_blocks):
+        offsets = qblock_idx * quant_block + tl.arange(0, quant_block)
+        mask = offsets < fp8_dim
+        raw = tl.load(token_data + offsets, mask=mask, other=0)
+        values = raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        exponent = tl.load(token_scales + qblock_idx).to(tl.float32) - 127.0
+        tl.store(
+            out_row + offsets,
+            (values * tl.exp2(exponent)).to(tl.bfloat16),
+            mask=mask,
+        )
+
+    rope_offsets = tl.arange(0, rope_dim)
+    rope_src = (token_data + fp8_dim).to(tl.pointer_type(tl.bfloat16))
+    tl.store(
+        out_row + fp8_dim + rope_offsets,
+        tl.load(rope_src + rope_offsets),
+    )
+
+
+def deepseek_v4_gather_slots_bf16(
+    cache: torch.Tensor,
+    slots: torch.Tensor,
+    lens: torch.Tensor,
+    block_size: int,
+    out: torch.Tensor,
+    dst_offset: int = 0,
+) -> torch.Tensor:
+    """Dequantize slot-addressed fp8_ds_mla rows into a bf16 workspace.
+
+    Args:
+        cache: uint8 paged cache viewed as ``[num_blocks, block_bytes]``.
+        slots: ``[num_tokens, topk]`` slot indices; negative entries are skipped.
+        lens: ``[num_tokens]`` valid entry count per row of ``slots``.
+        block_size: tokens per cache block.
+        out: ``[num_tokens, workspace_width, head_dim]`` bf16 destination.
+        dst_offset: column offset into ``out`` for this cache's rows, so that
+            several caches can share one workspace.
+
+    Returns:
+        ``out``, for chaining.
+    """
+    if cache.dtype != torch.uint8:
+        raise TypeError(f"cache must be uint8, got {cache.dtype}")
+    # Callers pass [tokens, topk] or a [tokens, 1, topk]-style view.
+    slots = slots.reshape(slots.shape[0], -1)
+    num_tokens, topk = slots.shape
+    if num_tokens == 0 or topk == 0:
+        return out
+    _deepseek_v4_gather_slots_bf16_kernel[(num_tokens, topk)](
+        cache,
+        slots,
+        lens,
+        out,
+        cache.stride(0),
+        slots.stride(0),
+        out.stride(0),
+        out.stride(1),
+        dst_offset,
+        num_tokens,
+        topk,
+        cache_block_size=block_size,
+        token_data_size=DEEPSEEK_V4_SWA_TOKEN_STRIDE,
+        scale_dim=DEEPSEEK_V4_SWA_SCALE_DIM,
+        fp8_dim=DEEPSEEK_V4_NOPE_DIM,
+        rope_dim=DEEPSEEK_V4_ROPE_DIM,
+        quant_block=DEEPSEEK_V4_FP8_QUANT_BLOCK,
+        n_quant_blocks=DEEPSEEK_V4_NOPE_DIM // DEEPSEEK_V4_FP8_QUANT_BLOCK,
+        num_warps=4,
+    )
+    return out
+
+
+# Weighted MQA logits for the V4 sparse indexer. The reference scores each head
+# independently, rectifies, then takes the weighted sum over heads::
+#
+#     score = einsum("bshd,btd->bsht", q, kv).relu_()
+#     logits = (score * weights.unsqueeze(-1)).sum(dim=2)
+#
+# The ReLU is per-head and precedes the reduction, so it cannot be folded into
+# the weights. Query scales are already folded into ``weights`` by the FP8
+# preparation step; the per-key scale is positive and independent of the head,
+# so it factors out of the rectified sum.
+@triton.jit(do_not_specialize=["max_len"])
+def _deepseek_v4_indexer_mqa_logits_kernel(
+    q_ptr,
+    k_ptr,
+    k_scale_ptr,
+    weights_ptr,
+    cu_start_ptr,
+    cu_end_ptr,
+    logits_ptr,
+    q_stride_token,
+    q_stride_head,
+    k_stride_row,
+    w_stride_token,
+    logits_stride_token,
+    max_len,
+    num_heads,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_J: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_j = tl.program_id(1)
+
+    start = tl.load(cu_start_ptr + pid_t)
+    end = tl.load(cu_end_ptr + pid_t)
+    num_keys = end - start
+
+    offs_j = pid_j * BLOCK_J + tl.arange(0, BLOCK_J)
+    valid = (offs_j < num_keys) & (offs_j < max_len)
+
+    offs_h = tl.arange(0, H)
+    offs_d = tl.arange(0, D)
+    head_ok = offs_h < num_heads
+
+    q = tl.load(
+        q_ptr
+        + pid_t * q_stride_token
+        + offs_h[:, None] * q_stride_head
+        + offs_d[None, :],
+        mask=head_ok[:, None],
+        other=0.0,
+    )
+    k = tl.load(
+        k_ptr + (start + offs_j)[:, None].to(tl.int64) * k_stride_row + offs_d[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    )
+
+    scores = tl.dot(q, tl.trans(k)).to(tl.float32)
+    scores = tl.maximum(scores, 0.0)
+
+    w = tl.load(
+        weights_ptr + pid_t * w_stride_token + offs_h,
+        mask=head_ok,
+        other=0.0,
+    ).to(tl.float32)
+    logits = tl.sum(scores * w[:, None], axis=0)
+
+    k_scale = tl.load(k_scale_ptr + start + offs_j, mask=valid, other=0.0)
+    logits = logits * k_scale
+
+    tl.store(
+        logits_ptr + pid_t * logits_stride_token + offs_j,
+        logits,
+        mask=valid,
+    )
+
+
+def deepseek_v4_indexer_mqa_logits(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    k_scale: torch.Tensor,
+    weights: torch.Tensor,
+    cu_start: torch.Tensor,
+    cu_end: torch.Tensor,
+    max_len: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Rectified, weight-summed MQA logits for the V4 sparse indexer.
+
+    Args:
+        q: ``[tokens, heads, index_head_dim]`` FP8 (or bf16) indexer queries,
+            with the softmax and head scales already folded into ``weights``.
+        k: ``[total_keys, index_head_dim]`` FP8 (or bf16) indexer keys, laid out
+            contiguously in request order.
+        k_scale: ``[total_keys]`` float32 per-key dequant scales.
+        weights: ``[tokens, heads]`` float32 per-head weights.
+        cu_start: ``[tokens]`` int32 first key index for each token.
+        cu_end: ``[tokens]`` int32 one-past-last key index for each token.
+        max_len: width of the logits buffer.
+        out: optional ``[tokens, max_len]`` float32 destination.
+
+    Returns:
+        ``[tokens, max_len]`` float32 logits; entries beyond a token's key range
+        are left untouched.
+    """
+    num_tokens, num_heads, head_dim = q.shape
+    if out is None:
+        out = torch.zeros(num_tokens, max_len, dtype=torch.float32, device=q.device)
+    if num_tokens == 0 or max_len == 0:
+        return out
+    if k.shape[-1] != head_dim:
+        raise ValueError(f"k head_dim {k.shape[-1]} must match q head_dim {head_dim}")
+    if weights.dtype != torch.float32:
+        weights = weights.float()
+    weights = weights.reshape(num_tokens, -1).contiguous()
+    # tl.dot needs at least 16 rows; pad the head axis and mask the extras.
+    h_block = max(16, triton.next_power_of_2(num_heads))
+    block_j = 64
+    grid = (num_tokens, triton.cdiv(max_len, block_j))
+    _deepseek_v4_indexer_mqa_logits_kernel[grid](
+        q,
+        k,
+        k_scale,
+        weights,
+        cu_start,
+        cu_end,
+        out,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        weights.stride(0),
+        out.stride(0),
+        max_len,
+        num_heads,
+        H=h_block,
+        D=head_dim,
+        BLOCK_J=block_j,
+        num_warps=4,
+    )
+    return out
+
+
+# Sparse MQA attention over gathered top-k rows, with DeepSeek V4's learned
+# per-head attention sink. Mirrors the reference kernel: q and the latent KV
+# share one 512-wide space (KV is both key and value), scores are taken over
+# valid gathered rows under an online softmax, and the sink enters the
+# denominator once at the end as ``exp(sink - running_max)`` -- it has no
+# matching value row, so it never contributes to the numerator.
+_DEEPSEEK_V4_ATTN_NEG = -1.0e30
+
+
+@triton.jit(do_not_specialize=["num_tokens", "topk"])
+def _deepseek_v4_sparse_attn_kernel(
+    q_ptr,
+    kv_ptr,
+    indices_ptr,
+    lens_ptr,
+    sink_ptr,
+    out_ptr,
+    q_stride_token,
+    q_stride_head,
+    kv_stride_row,
+    idx_stride_token,
+    out_stride_token,
+    out_stride_head,
+    scale,
+    num_tokens,
+    topk,
+    neg: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= num_tokens:
+        return
+
+    offs_h = tl.arange(0, H)
+    offs_d = tl.arange(0, D)
+    q = tl.load(
+        q_ptr + pid * q_stride_token + offs_h[:, None] * q_stride_head + offs_d[None, :]
+    )
+
+    length = tl.load(lens_ptr + pid)
+
+    acc_o = tl.zeros((H, D), dtype=tl.float32)
+    m_i = tl.full((H,), neg, tl.float32)
+    l_i = tl.zeros((H,), dtype=tl.float32)
+
+    for k0 in range(0, topk, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        in_range = (offs_k < topk) & (offs_k < length)
+        idx = tl.load(
+            indices_ptr + pid * idx_stride_token + offs_k,
+            mask=in_range,
+            other=-1,
+        )
+        valid = in_range & (idx >= 0)
+        kv = tl.load(
+            kv_ptr + idx[:, None].to(tl.int64) * kv_stride_row + offs_d[None, :],
+            mask=valid[:, None],
+            other=0.0,
+        )
+
+        scores = tl.dot(q, tl.trans(kv)).to(tl.float32) * scale
+        scores = tl.where(valid[None, :], scores, neg)
+
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.where(valid[None, :], tl.exp(scores - m_new[:, None]), 0.0)
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc_o = acc_o * alpha[:, None] + tl.dot(p.to(kv.dtype), kv).to(tl.float32)
+        m_i = m_new
+
+    # The sink is a denominator-only term, applied against the final running max.
+    sink = tl.load(sink_ptr + offs_h).to(tl.float32)
+    l_i = l_i + tl.exp(sink - m_i)
+
+    out = acc_o / l_i[:, None]
+    tl.store(
+        out_ptr
+        + pid * out_stride_token
+        + offs_h[:, None] * out_stride_head
+        + offs_d[None, :],
+        out.to(out_ptr.dtype.element_ty),
+    )
+
+
+def deepseek_v4_sparse_attn(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    lens: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sparse latent attention with a per-head sink.
+
+    Args:
+        q: ``[num_tokens, num_heads, head_dim]`` queries; ``num_heads`` must be
+            a power of two (pad before calling).
+        kv: ``[num_rows, head_dim]`` gathered latent KV, serving as both key and
+            value.
+        indices: ``[num_tokens, topk]`` int32 row indices into ``kv``; negative
+            entries are masked out.
+        lens: ``[num_tokens]`` count of valid entries per row of ``indices``.
+        attn_sink: ``[num_heads]`` float32 learned sink logits.
+        softmax_scale: multiplier applied to the raw scores.
+        out: optional ``[num_tokens, num_heads, head_dim]`` destination.
+
+    Returns:
+        The attention output, ``out`` when provided.
+    """
+    num_tokens, num_heads, head_dim = q.shape
+    topk = indices.shape[-1]
+    if out is None:
+        out = torch.empty_like(q)
+    if num_tokens == 0:
+        return out
+    if kv.shape[-1] != head_dim:
+        raise ValueError(f"kv head_dim {kv.shape[-1]} must match q head_dim {head_dim}")
+    if attn_sink.numel() < num_heads:
+        raise ValueError(f"attn_sink has {attn_sink.numel()} entries, need {num_heads}")
+    indices_2d = indices.reshape(num_tokens, topk)
+    _deepseek_v4_sparse_attn_kernel[(num_tokens,)](
+        q,
+        kv,
+        indices_2d,
+        lens,
+        attn_sink,
+        out,
+        q.stride(0),
+        q.stride(1),
+        kv.stride(0),
+        indices_2d.stride(0),
+        out.stride(0),
+        out.stride(1),
+        softmax_scale,
+        num_tokens,
+        topk,
+        neg=_DEEPSEEK_V4_ATTN_NEG,
+        H=num_heads,
+        D=head_dim,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+# Forward RoPE + block-scaled FP8 quant + paged scatter of the KV latent into
+# the sliding-window cache, matching the reference::
+#
+#     apply_rotary_emb(kv[..., -rope_dim:], freqs_cis)
+#     act_quant(kv[..., :-rope_dim], 64, ...)   # rope dims stay bf16
+#
+# The written layout is the one _deepseek_v4_dequantize_and_gather_k_kernel
+# reads back: within a block the token payloads come first as
+# ``cache_block_size * token_data_size`` bytes, then the per-token scale
+# vectors. Each payload is ``fp8_dim`` bytes of e4m3 followed by ``rope_dim``
+# bf16 values; each scale is a ``uint8`` e8m0 exponent biased by 127.
+@triton.jit(do_not_specialize=["num_tokens"])
+def _deepseek_v4_kv_rope_quant_insert_kernel(
+    kv_ptr,
+    slot_mapping_ptr,
+    positions_ptr,
+    cos_sin_cache_ptr,
+    k_cache_ptr,
+    kv_stride_token,
+    cache_stride_pos,
+    block_stride,
+    num_tokens,
+    eps,
+    fp8_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    scale_dim: tl.constexpr,
+    quant_block: tl.constexpr,
+    cache_block_size: tl.constexpr,
+    token_data_size: tl.constexpr,
+    fp8_max: tl.constexpr,
+    n_quant_blocks: tl.constexpr,
+    HALF_ROPE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= num_tokens:
+        return
+
+    slot = tl.load(slot_mapping_ptr + pid)
+    # Masked or out-of-capacity tokens arrive as -1 and must not be written.
+    if slot < 0:
+        return
+
+    block_idx = slot // cache_block_size
+    pos_in_block = slot % cache_block_size
+    cache_block = k_cache_ptr + block_idx.to(tl.int64) * block_stride
+    token_data = cache_block + pos_in_block * token_data_size
+    token_scales = (
+        cache_block + cache_block_size * token_data_size + pos_in_block * scale_dim
+    )
+
+    kv_base = kv_ptr + pid * kv_stride_token
+
+    # --- rope section: rotate, keep bf16 ---
+    rope_offsets = tl.arange(0, rope_dim)
+    r = tl.load(kv_base + fp8_dim + rope_offsets).to(tl.float32)
+    partner = tl.load(kv_base + fp8_dim + (rope_offsets ^ 1)).to(tl.float32)
+
+    pos = tl.load(positions_ptr + pid)
+    cache_base = cos_sin_cache_ptr + pos * cache_stride_pos
+    cs_idx = rope_offsets >> 1
+    cos_v = tl.load(cache_base + cs_idx)
+    sin_v = tl.load(cache_base + HALF_ROPE + cs_idx)
+    is_even = (rope_offsets & 1) == 0
+    rotated = tl.where(
+        is_even, r * cos_v - partner * sin_v, r * cos_v + partner * sin_v
+    )
+
+    bf16_cache = (token_data + fp8_dim).to(tl.pointer_type(tl.bfloat16))
+    tl.store(bf16_cache + rope_offsets, rotated.to(tl.bfloat16))
+
+    # --- nope section: per-block e8m0 scale + e4m3 payload ---
+    for qblock_idx in tl.static_range(n_quant_blocks):
+        offsets = qblock_idx * quant_block + tl.arange(0, quant_block)
+        mask = offsets < fp8_dim
+        x = tl.load(kv_base + offsets, mask=mask, other=0.0).to(tl.float32)
+        absmax = tl.maximum(tl.max(tl.abs(x), axis=0), eps)
+        # exp2/log2 round-trip keeps the scale a power of two, which is what an
+        # e8m0 exponent can represent exactly.
+        exponent = tl.ceil(tl.log2(absmax / fp8_max))
+        exponent = tl.minimum(tl.maximum(exponent + 127.0, 0.0), 255.0)
+        scale = tl.exp2(exponent - 127.0)
+        q = tl.clamp(x / scale, -fp8_max, fp8_max).to(tl.float8e4nv)
+        tl.store(token_data + offsets, q.to(tl.uint8, bitcast=True), mask=mask)
+        tl.store(token_scales + qblock_idx, exponent.to(tl.uint8))
+
+
+def deepseek_v4_kv_rope_quant_insert(
+    kv: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_size: int,
+) -> None:
+    """RoPE, quantize, and scatter the KV latent into the paged SWA cache.
+
+    Args:
+        kv: ``[num_tokens, head_dim]`` KV latent, already RMS-normalized. The
+            leading ``head_dim - rope_dim`` values are quantized to e4m3; the
+            trailing ``rope_dim`` are rotated and stored bf16.
+        slot_mapping: ``[num_tokens]`` destination slots; negative entries are
+            skipped.
+        positions: ``[num_tokens]`` absolute token positions for RoPE.
+        cos_sin_cache: ``[max_position, rope_dim]`` float32, cos then sin.
+        k_cache: uint8 cache viewed as ``[num_blocks, block_bytes]``.
+        block_size: tokens per cache block.
+    """
+    if k_cache.dtype != torch.uint8:
+        raise TypeError(f"k_cache must be uint8, got {k_cache.dtype}")
+    if cos_sin_cache.dtype != torch.float32:
+        raise TypeError(f"cos_sin_cache must be float32, got {cos_sin_cache.dtype}")
+    num_tokens = kv.shape[0]
+    if num_tokens == 0:
+        return
+    if kv.shape[-1] != DEEPSEEK_V4_HEAD_DIM:
+        raise ValueError(
+            f"kv last dim must be {DEEPSEEK_V4_HEAD_DIM}, got {kv.shape[-1]}"
+        )
+    _deepseek_v4_kv_rope_quant_insert_kernel[(num_tokens,)](
+        kv,
+        slot_mapping.to(torch.int64),
+        positions.to(torch.int64),
+        cos_sin_cache,
+        k_cache,
+        kv.stride(0),
+        cos_sin_cache.stride(0),
+        k_cache.stride(0),
+        num_tokens,
+        1e-10,
+        fp8_dim=DEEPSEEK_V4_NOPE_DIM,
+        rope_dim=DEEPSEEK_V4_ROPE_DIM,
+        scale_dim=DEEPSEEK_V4_SWA_SCALE_DIM,
+        quant_block=DEEPSEEK_V4_FP8_QUANT_BLOCK,
+        cache_block_size=block_size,
+        token_data_size=DEEPSEEK_V4_SWA_TOKEN_STRIDE,
+        fp8_max=DEEPSEEK_V4_FP8_MAX,
+        n_quant_blocks=DEEPSEEK_V4_NOPE_DIM // DEEPSEEK_V4_FP8_QUANT_BLOCK,
+        HALF_ROPE=DEEPSEEK_V4_ROPE_DIM // 2,
+        num_warps=4,
     )
 
 
