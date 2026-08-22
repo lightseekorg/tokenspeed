@@ -170,7 +170,6 @@ def make_config(
     disable_prefix_cache: bool = False,
     cache_groups: Sequence["CacheGroupConfig"] | None = None,
     enable_mixed_prefill_decode: bool = False,
-    enable_experimental_m16_prefill_delayer: bool = False,
     prefix_replay_tokens: int = 0,
 ) -> SchedulerConfig:
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
@@ -201,9 +200,6 @@ def make_config(
     cfg.disable_l2_cache = disable_l2_cache
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
-    cfg.enable_experimental_m16_prefill_delayer = (
-        enable_experimental_m16_prefill_delayer
-    )
     if cache_groups:
         cfg.cache_groups = list(cache_groups)
     return cfg

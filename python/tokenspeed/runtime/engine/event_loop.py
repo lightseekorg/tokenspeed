@@ -438,7 +438,6 @@ class EventLoop:
             prefix_replay_tokens=prefix_replay_tokens,
             cache_groups=cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
-            enable_experimental_m16_prefill_delayer=server_args.enable_experimental_m16_prefill_delayer,
         )
         scheduler_cfg.enable_pd_cache = self._pd_cache_enabled
         logger.info(

@@ -75,12 +75,6 @@ void SchedulerConfig::Validate() const {
     if (prefix_replay_tokens < 0) {
         throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
     }
-    if (enable_experimental_m16_prefill_delayer && enable_mixed_prefill_decode) {
-        throw std::invalid_argument("Scheduler: the experimental M16 prefill delayer requires pure batches");
-    }
-    if (enable_experimental_m16_prefill_delayer && (role != Role::kFused || enable_pd_cache)) {
-        throw std::invalid_argument("Scheduler: the experimental M16 prefill delayer requires fused serving");
-    }
     if (enable_l3_storage) {
         throw std::invalid_argument("Scheduler: L3 storage is not supported by the cache coordinator");
     }

@@ -105,7 +105,6 @@ distributed update mode until that implementation is added.
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
 | `--block-size` | KV cache block size. |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | Enable or disable prefix cache reuse. |
-| `--enable-experimental-m16-prefill-delayer` | Opt into the bounded pure-batch M16 prefill delayer described below. |
 | `--enforce-eager` | Disable CUDA graph execution. |
 | `--max-cudagraph-capture-size` | Largest batch size to capture with CUDA graphs. |
 | `--cudagraph-capture-sizes` | Explicit CUDA graph capture sizes. |
@@ -113,22 +112,6 @@ distributed update mode until that implementation is added.
 `--chunked-prefill-size` is intentionally separate from
 `--max-num-batched-tokens`: in TokenSpeed it is the scheduler's per-iteration
 issue budget, while `--max-total-tokens` controls the global token pool.
-
-### Experimental Scheduling Flags
-
-`--enable-experimental-m16-prefill-delayer` is off by default. In aggregate
-serving with attention TP size exactly 8, DP size 1, and CP size 1, it may hold
-a lone newly submitted prefill while runnable decode work is issued. The hold
-is bounded to two plans that actually schedule decode work. The prefill is
-released on the next scheduling pass, or earlier when a second submitted
-prefill is waiting so the two can form a useful pure-prefill batch.
-
-The policy never delays a request that has started prefill, a retracted/recovery
-request, or a submitted request when no decode operation can be scheduled. It
-does not mix prefill and decode in one batch. The flag is rejected with
-`--enable-mixed-batch`, PD disaggregation, attention DP greater than 1, or
-attention CP greater than 1. Attention TP sizes other than 8, including TP2,
-are rejected. It does not enable CP or two-batch-overlap (TBO) execution.
 
 ## Parallelism
 

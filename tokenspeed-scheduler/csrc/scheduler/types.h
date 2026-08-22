@@ -57,7 +57,6 @@ struct SchedulerConfig {
     bool enable_l3_storage{false};
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
-    bool enable_experimental_m16_prefill_delayer{false};
 
     Role role{Role::kFused};
     bool enable_pd_cache{false};
