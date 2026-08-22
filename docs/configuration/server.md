@@ -290,4 +290,10 @@ features directly:
 - `--mla-chunk-multiplier`
 - `--disaggregation-*`
 - `--comm-fusion-max-num-tokens`
-- `--enable-allreduce-fusion`
+- `--allreduce-fusion={auto,on,off}`
+
+On AMD, `TS_ARNORM_BACKEND` selects the fused AR+RMSNorm backend: `auto`
+(default), `iris`, `symm_mem`, or `triton_shmem`. The `triton_shmem` example is
+opt-in (`TS_ARNORM_BACKEND=triton_shmem`) and requires gfx950, BF16, a
+single-node TP group of size 2, 4, or 8, no attention DP, and no speculative
+execution.

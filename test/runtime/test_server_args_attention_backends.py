@@ -19,6 +19,7 @@ import contextlib
 import io
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.layers.attention import registry
@@ -98,6 +99,43 @@ class TestAttentionBackendChoices(unittest.TestCase):
     def test_prepare_server_args_accepts_model_path_alias(self):
         args = prepare_server_args(["--model-path", "x"])
         self.assertEqual(args.model, "x")
+
+    def test_allreduce_fusion_is_tri_state(self):
+        parser = self._build_parser()
+        default = parser.parse_args(["--model", "x"])
+        enabled = parser.parse_args(["--model", "x", "--allreduce-fusion=on"])
+        disabled = parser.parse_args(["--model", "x", "--allreduce-fusion=off"])
+        self.assertEqual(default.allreduce_fusion, "auto")
+        self.assertEqual(enabled.allreduce_fusion, "on")
+        self.assertEqual(disabled.allreduce_fusion, "off")
+
+    def test_arnorm_preflight_owns_backend_policy(self):
+        args = ServerArgs(model="x", allreduce_fusion="on")
+        args.mapping = SimpleNamespace(
+            nnodes=1,
+            has_attn_tp=True,
+            has_attn_dp=True,
+            attn=SimpleNamespace(tp_size=4),
+            dense=SimpleNamespace(tp_size=4),
+        )
+        with mock.patch(
+            "tokenspeed_kernel.ops.communication.triton."
+            "allreduce_residual_rmsnorm_preflight",
+            return_value=False,
+        ) as preflight:
+            args.resolve_communication()
+        self.assertFalse(args.enable_allreduce_fusion)
+        preflight.assert_called_once_with(
+            single_node=True,
+            has_tensor_parallel=True,
+            has_data_parallel=True,
+            speculative=False,
+        )
+
+    def test_invalid_arnorm_backend_fails_during_arg_resolution(self):
+        with mock.patch.dict(os.environ, {"TS_ARNORM_BACKEND": "typo"}, clear=False):
+            with self.assertRaisesRegex(ValueError, "TS_ARNORM_BACKEND must be"):
+                prepare_server_args(["--model", "x"])
 
     def test_defaults_to_mha_for_mha(self):
         self.assertEqual(registry._get_default_backend_name(AttentionArch.MHA), "mha")

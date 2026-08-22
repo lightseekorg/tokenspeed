@@ -20,6 +20,7 @@
 
 import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, List, Tuple
 
@@ -30,6 +31,46 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
 
 logger = logging.getLogger(__file__)
+
+_ARNORM_BACKEND_ENV = "TS_ARNORM_BACKEND"
+
+
+def _arnorm_backend() -> str:
+    """Resolve the explicit AMD fused AR+RMSNorm backend override."""
+    backend = os.environ.get(_ARNORM_BACKEND_ENV, "auto").strip().lower()
+    if backend not in {"auto", "triton_shmem", "iris", "symm_mem"}:
+        raise ValueError(
+            f"{_ARNORM_BACKEND_ENV} must be auto, triton_shmem, iris, or "
+            f"symm_mem; got {backend!r}"
+        )
+    return backend
+
+
+def allreduce_residual_rmsnorm_preflight(
+    *,
+    single_node: bool,
+    has_tensor_parallel: bool,
+    has_data_parallel: bool,
+    speculative: bool,
+) -> bool:
+    """Check scheduling context against the selected AR+RMSNorm backend.
+
+    Backend names and capability policy stay in ``tokenspeed-kernel``; the
+    runtime supplies only the scheduling facts it owns.
+    """
+    if _arnorm_backend() != "triton_shmem":
+        return True
+    from tokenspeed_kernel.ops.communication.triton_shmem import (
+        runtime_context_supported,
+    )
+
+    return runtime_context_supported(
+        single_node=single_node,
+        has_tensor_parallel=has_tensor_parallel,
+        has_data_parallel=has_data_parallel,
+        speculative=speculative,
+    )
+
 
 __all__ = [
     "create_state",
@@ -46,6 +87,7 @@ __all__ = [
     "allreduce_residual_attnres_combine_supported",
     "allreduce_residual_attnres_combine",
     "allreduce_residual_rmsnorm",
+    "allreduce_residual_rmsnorm_preflight",
     "create_dp_sampling_state",
     "dp_sampling_gather",
     "dp_sampling_swap",
@@ -1798,10 +1840,8 @@ def allreduce_residual_rmsnorm(
             return None, None, None, None
 
         token_num, hidden_dim = input_tensor.shape
-
-        import tokenspeed_kernel.ops.communication.iris as _iris_mod
-
-        if (
+        backend = _arnorm_backend()
+        eligible = (
             input_tensor.is_cuda
             and residual.is_cuda
             and weight.is_cuda
@@ -1814,26 +1854,72 @@ def allreduce_residual_rmsnorm(
             and weight.shape == (hidden_dim,)
             and group.size() > 1
             and token_num <= max_token_num
-        ):
-            key = (id(group), max_token_num, hidden_dim, input_tensor.dtype)
-            iris_state = _iris_mod.IRIS_AR_RMSNORM_STATES.get(key)
-            if iris_state is None:
-                iris_state = _iris_mod.create_iris_ar_rmsnorm_state(
+        )
+        key = (id(group), max_token_num, hidden_dim, input_tensor.dtype)
+
+        if backend == "triton_shmem":
+            if not eligible:
+                return None, None, None, None
+
+            import tokenspeed_kernel.ops.communication.triton_shmem as _ts_mod
+
+            ts_states = _ts_mod.TRITON_SHMEM_AR_RMSNORM_STATES
+            if key not in ts_states:
+                # State setup performs object collectives, rendezvous, and
+                # allocations. If warmup did not create this exact policy key,
+                # capture the complete unfused path instead.
+                if torch.cuda.is_current_stream_capturing():
+                    return None, None, None, None
+                # Cache None as a permanent decline for this complete policy key.
+                # Retrying would repeat distributed validation and memory setup.
+                ts_states[key] = _ts_mod.create_triton_shmem_ar_rmsnorm_state(
                     group=group,
                     rank_in_group=rank,
                     max_token_num=max_token_num,
                     hidden_dim=hidden_dim,
                     dtype=input_tensor.dtype,
                 )
-                _iris_mod.IRIS_AR_RMSNORM_STATES[key] = iris_state
-            norm_out, residual_out = _iris_mod.iris_allreduce_residual_rmsnorm(
-                iris_state,
+            ts_state = ts_states[key]
+            if ts_state is None or not _ts_mod.triton_shmem_can_run(
+                ts_state,
+                input_tensor,
+                residual,
+                weight,
+            ):
+                return None, None, None, None
+            norm_out, residual_out = _ts_mod.triton_shmem_allreduce_residual_rmsnorm(
+                ts_state,
                 input_tensor=input_tensor,
                 residual=residual,
                 weight=weight,
                 eps=eps,
             )
             return norm_out, residual_out, None, None
+
+        if backend in {"auto", "iris"}:
+            if eligible:
+                import tokenspeed_kernel.ops.communication.iris as _iris_mod
+
+                iris_state = _iris_mod.IRIS_AR_RMSNORM_STATES.get(key)
+                if iris_state is None:
+                    iris_state = _iris_mod.create_iris_ar_rmsnorm_state(
+                        group=group,
+                        rank_in_group=rank,
+                        max_token_num=max_token_num,
+                        hidden_dim=hidden_dim,
+                        dtype=input_tensor.dtype,
+                    )
+                    _iris_mod.IRIS_AR_RMSNORM_STATES[key] = iris_state
+                norm_out, residual_out = _iris_mod.iris_allreduce_residual_rmsnorm(
+                    iris_state,
+                    input_tensor=input_tensor,
+                    residual=residual,
+                    weight=weight,
+                    eps=eps,
+                )
+                return norm_out, residual_out, None, None
+            if backend == "iris":
+                return None, None, None, None
 
         state = allreduce_residual_rmsnorm_get_state(
             group=group,

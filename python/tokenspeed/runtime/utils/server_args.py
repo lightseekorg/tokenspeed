@@ -336,7 +336,8 @@ class ServerArgs:
 
     # For communication + norm fusion
     comm_fusion_max_num_tokens: int = 2048
-    enable_allreduce_fusion: bool = False
+    allreduce_fusion: Literal["auto", "on", "off"] = "auto"
+    enable_allreduce_fusion: bool = dataclasses.field(init=False, default=False)
 
     enable_expert_parallel: bool = False
 
@@ -722,16 +723,34 @@ class ServerArgs:
             )
 
     def resolve_communication(self):
-        # Auto-enable allreduce fusion on supported single-node TP configurations.
+        from tokenspeed_kernel.ops.communication.triton import (
+            allreduce_residual_rmsnorm_preflight,
+        )
+
         platform = current_platform()
-        if (
-            not self.enable_allreduce_fusion
-            and (current_platform().is_hopper_plus or platform.is_amd)
+        auto_supported = (
+            (platform.is_hopper_plus or platform.is_amd)
             and self.mapping.nnodes == 1
             and self.mapping.has_attn_tp
             and not self.mapping.has_attn_dp
-        ):
-            self.enable_allreduce_fusion = True
+        )
+        backend_supported = allreduce_residual_rmsnorm_preflight(
+            single_node=self.mapping.nnodes == 1,
+            has_tensor_parallel=self.mapping.has_attn_tp,
+            has_data_parallel=self.mapping.has_attn_dp,
+            speculative=self.speculative_algorithm is not None,
+        )
+
+        self.enable_allreduce_fusion = self.allreduce_fusion == "on" or (
+            self.allreduce_fusion == "auto" and auto_supported
+        )
+        if self.enable_allreduce_fusion and not backend_supported:
+            self.enable_allreduce_fusion = False
+            logger.warning(
+                "The selected AR+RMSNorm backend declined the runtime scheduling "
+                "context; using the complete unfused path"
+            )
+        elif self.enable_allreduce_fusion and self.allreduce_fusion == "auto":
             logger.info("Auto-enabled allreduce fusion")
 
         if self.mapping.attn.tp_size != self.mapping.dense.tp_size:
@@ -2021,9 +2040,11 @@ class ServerArgs:
             help="Max num tokens for communication fusion workspace",
         )
         parser.add_argument(
-            "--enable-allreduce-fusion",
-            action="store_true",
-            help="Enable allreduce fusion for improved decode performance. Auto-enabled on supported single-node TP configurations.",
+            "--allreduce-fusion",
+            choices=["auto", "on", "off"],
+            default=ServerArgs.allreduce_fusion,
+            help="All-reduce fusion policy. 'auto' enables it on supported "
+            "single-node TP configurations.",
         )
         parser.add_argument(
             "--disaggregation-bootstrap-port",
