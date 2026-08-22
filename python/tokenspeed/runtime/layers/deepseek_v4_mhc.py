@@ -29,6 +29,112 @@ def _compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
 
 
 @triton.jit
+def _hc_prenorm_gemm_triton_kernel(
+    a_ptr,
+    w_ptr,
+    mul_ptr,
+    sqrsum_ptr,
+    num_tokens,
+    stride_at,
+    stride_ak,
+    stride_wn,
+    stride_wk,
+    k_size: tl.constexpr,
+    n_size: tl.constexpr,
+    n_splits: tl.constexpr,
+    block_t: tl.constexpr,
+    block_k: tl.constexpr,
+    block_n: tl.constexpr,
+):
+    """Split-K ``A @ W.T`` fused with A's per-row sum of squares.
+
+    Emits the same two partial buffers ``tf32_hc_prenorm_gemm`` does:
+    ``mul[split, token, n]`` and ``sqrsum[split, token]``, both contiguous and
+    both reduced over ``split`` by the mix kernel. Fusing the two lets the
+    residual be read once; it is a [T, 16384] x [16384, 24] contraction for
+    V4-Flash, so the read of A dominates.
+    """
+    pid_t = tl.program_id(0)
+    split_id = tl.program_id(1)
+
+    offs_t = pid_t * block_t + tl.arange(0, block_t)
+    offs_n = tl.arange(0, block_n)
+    mask_t = offs_t < num_tokens
+    mask_n = offs_n < n_size
+
+    k_per_split = tl.cdiv(k_size, n_splits)
+    k_begin = split_id * k_per_split
+    k_end = tl.minimum(k_begin + k_per_split, k_size)
+
+    acc = tl.zeros((block_t, block_n), dtype=tl.float32)
+    sqr = tl.zeros((block_t,), dtype=tl.float32)
+
+    for k0 in range(k_begin, k_end, block_k):
+        offs_k = k0 + tl.arange(0, block_k)
+        mask_k = offs_k < k_end
+        a = tl.load(
+            a_ptr + offs_t[:, None] * stride_at + offs_k[None, :] * stride_ak,
+            mask=mask_t[:, None] & mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        w = tl.load(
+            w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
+            mask=mask_n[:, None] & mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.dot(a, tl.trans(w))
+        sqr += tl.sum(a * a, axis=1)
+
+    mul_offset = (
+        split_id * num_tokens * n_size + offs_t[:, None] * n_size + offs_n[None, :]
+    )
+    tl.store(mul_ptr + mul_offset, acc, mask=mask_t[:, None] & mask_n[None, :])
+    tl.store(sqrsum_ptr + split_id * num_tokens + offs_t, sqr, mask=mask_t)
+
+
+def hc_prenorm_gemm_triton(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    mul_out: torch.Tensor,
+    sqrsum_out: torch.Tensor,
+    n_splits: int,
+) -> None:
+    """Portable ``tf32_hc_prenorm_gemm`` replacement.
+
+    Args:
+        a: ``[num_tokens, k]`` activations, any float dtype.
+        w: ``[n, k]`` weights, contracted along ``k``.
+        mul_out: ``[n_splits, num_tokens, n]`` float32, written in place.
+        sqrsum_out: ``[n_splits, num_tokens]`` float32, written in place.
+        n_splits: number of K-splits; each output slice holds one partial.
+    """
+    num_tokens, k_size = a.shape
+    n_size = w.shape[0]
+    block_t = 64
+    block_k = 64
+    block_n = max(16, triton.next_power_of_2(n_size))
+    grid = (ceil_div(num_tokens, block_t), n_splits)
+    _hc_prenorm_gemm_triton_kernel[grid](
+        a,
+        w,
+        mul_out,
+        sqrsum_out,
+        num_tokens,
+        a.stride(0),
+        a.stride(1),
+        w.stride(0),
+        w.stride(1),
+        k_size=k_size,
+        n_size=n_size,
+        n_splits=n_splits,
+        block_t=block_t,
+        block_k=block_k,
+        block_n=block_n,
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _load_reduced_mix(
     gemm_out_mul,
     token_id,
@@ -348,9 +454,6 @@ def mhc_pre(
     if not residual.is_cuda:
         raise RuntimeError("fast mHC requires CUDA tensors")
 
-    if deep_gemm is None:
-        raise RuntimeError("deep_gemm.tf32_hc_prenorm_gemm is unavailable")
-
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
     hc_mult2 = hc_mult * hc_mult
@@ -403,13 +506,23 @@ def mhc_pre(
         n_splits, num_tokens, dtype=torch.float32, device=residual.device
     )
 
-    deep_gemm.tf32_hc_prenorm_gemm(
-        residual_flat.view(num_tokens, hc_hidden_size),
-        fn,
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        n_splits,
-    )
+    residual_2d = residual_flat.view(num_tokens, hc_hidden_size)
+    if deep_gemm is None:
+        hc_prenorm_gemm_triton(
+            residual_2d,
+            fn,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            n_splits,
+        )
+    else:
+        deep_gemm.tf32_hc_prenorm_gemm(
+            residual_2d,
+            fn,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            n_splits,
+        )
     block_h = 1024
     block_comb = triton.next_power_of_2(hc_mult2)
     _mhc_pre_mix_triton_kernel[(num_tokens,)](
