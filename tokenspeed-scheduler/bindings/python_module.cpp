@@ -28,6 +28,8 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
+#include <stdexcept>
+
 #include "scheduler/outside_events/inc.h"
 #include "scheduler/operations/inc.h"
 #include "scheduler/execution_event.h"
@@ -267,13 +269,18 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("op_ids", &tokenspeed::LoadBackBatch::op_ids)
         .def_ro("group_ids", &tokenspeed::LoadBackBatch::group_ids)
         .def_ro("src_pages", &tokenspeed::LoadBackBatch::src_pages)
-        .def_ro("dst_pages", &tokenspeed::LoadBackBatch::dst_pages);
+        .def_ro("dst_pages", &tokenspeed::LoadBackBatch::dst_pages)
+        .def_ro("content_hashes", &tokenspeed::LoadBackBatch::content_hashes)
+        .def_ro("page_offsets", &tokenspeed::LoadBackBatch::page_offsets)
+        .def_ro("prefetch_from_storage", &tokenspeed::LoadBackBatch::prefetch_from_storage);
 
     nb::class_<tokenspeed::WriteBackBatch>(cache, "WriteBackOp")
         .def_ro("op_ids", &tokenspeed::WriteBackBatch::op_ids)
         .def_ro("group_ids", &tokenspeed::WriteBackBatch::group_ids)
         .def_ro("src_pages", &tokenspeed::WriteBackBatch::src_pages)
-        .def_ro("dst_pages", &tokenspeed::WriteBackBatch::dst_pages);
+        .def_ro("dst_pages", &tokenspeed::WriteBackBatch::dst_pages)
+        .def_ro("content_hashes", &tokenspeed::WriteBackBatch::content_hashes)
+        .def_ro("page_offsets", &tokenspeed::WriteBackBatch::page_offsets);
 
     auto collect_forward = [](const tokenspeed::ExecutionPlan& plan) -> nb::list {
         nb::list result;
@@ -327,5 +334,43 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
         .def("clear_cache", &tokenspeed::Scheduler::ClearCache)
         .def("cache_group_total_pages", &tokenspeed::Scheduler::CacheGroupTotalPages, nb::arg("group_id"))
-        .def("cache_group_available_pages", &tokenspeed::Scheduler::CacheGroupAvailablePages, nb::arg("group_id"));
+        .def("cache_group_available_pages", &tokenspeed::Scheduler::CacheGroupAvailablePages, nb::arg("group_id"))
+        .def("prefix_hashes_for_tokens", &tokenspeed::Scheduler::PrefixHashesForTokens, nb::arg("tokens"))
+        .def(
+            "expand_prefix_keys",
+            [](const tokenspeed::Scheduler& scheduler, const std::vector<std::string>& content_hashes) {
+                const std::vector<tokenspeed::CacheKey> keys = scheduler.ExpandPrefixKeys(content_hashes);
+                std::vector<std::uint32_t> group_ids;
+                std::vector<std::string> hashes;
+                std::vector<std::int32_t> page_offsets;
+                group_ids.reserve(keys.size());
+                hashes.reserve(keys.size());
+                page_offsets.reserve(keys.size());
+                for (const tokenspeed::CacheKey& key : keys) {
+                    group_ids.push_back(key.group_id);
+                    hashes.push_back(key.content_hash);
+                    page_offsets.push_back(key.page_offset);
+                }
+                return std::tuple{std::move(group_ids), std::move(hashes), std::move(page_offsets)};
+            },
+            nb::arg("content_hashes"))
+        .def(
+            "register_storage_keys",
+            [](tokenspeed::Scheduler& scheduler, const std::vector<std::uint32_t>& group_ids,
+               const std::vector<std::string>& content_hashes, const std::vector<std::int32_t>& page_offsets) {
+                if (group_ids.size() != content_hashes.size() || group_ids.size() != page_offsets.size()) {
+                    throw std::invalid_argument("register_storage_keys requires aligned group/hash/offset lists");
+                }
+                std::vector<tokenspeed::CacheKey> keys;
+                keys.reserve(group_ids.size());
+                for (std::size_t i = 0; i < group_ids.size(); ++i) {
+                    keys.push_back(tokenspeed::CacheKey{
+                        .group_id = group_ids[i],
+                        .content_hash = content_hashes[i],
+                        .page_offset = page_offsets[i],
+                    });
+                }
+                scheduler.RegisterStorageKeys(keys);
+            },
+            nb::arg("group_ids"), nb::arg("content_hashes"), nb::arg("page_offsets"));
 }

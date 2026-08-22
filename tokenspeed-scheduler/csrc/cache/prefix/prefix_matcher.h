@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <span>
+#include <unordered_set>
 
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_types.h"
@@ -30,6 +31,11 @@
 #include "utils.h"
 
 namespace tokenspeed {
+
+inline bool PrefixKeyIsHit(const PrefixCacheIndex& index, const BlockPool& pool, const CacheKey& key,
+                           const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) {
+    return index.Contains(pool, key) || (extra_hits != nullptr && extra_hits->contains(key));
+}
 
 // Per-attention-kind prefix-match policy. A matcher only reads the group's
 // PrefixCacheIndex; it never touches allocation or physical placement.
@@ -44,8 +50,10 @@ public:
     virtual std::int32_t BoundaryLookbackPages() const = 0;
     // Probes keys[begin_blocks, begin_blocks + max_blocks) against the index.
     // probe.hits[i] marks keys[begin_blocks + i]; holes are 0.
+    // extra_hits is an optional L3 storage index: keys known to exist below Host.
     virtual GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
-                                   std::int32_t begin_blocks, std::int32_t max_blocks) const = 0;
+                                   std::int32_t begin_blocks, std::int32_t max_blocks,
+                                   const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits = nullptr) const = 0;
 };
 
 // Full attention: a hit is a contiguous run with no holes, so both the device
@@ -56,12 +64,13 @@ public:
     std::int32_t BoundaryLookbackPages() const override { return 0; }
 
     GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
-                           std::int32_t begin_blocks, std::int32_t max_blocks) const override {
+                           std::int32_t begin_blocks, std::int32_t max_blocks,
+                           const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits = nullptr) const override {
         const std::int32_t end_blocks =
             static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
         GroupPrefixProbe probe;
         for (std::int32_t j = begin_blocks; j < end_blocks; ++j) {
-            if (!index.Contains(pool, keys[static_cast<std::size_t>(j)])) {
+            if (!PrefixKeyIsHit(index, pool, keys[static_cast<std::size_t>(j)], extra_hits)) {
                 break;
             }
             probe.hits.push_back(1);
@@ -86,7 +95,8 @@ public:
 
     // Right->left scan for a run backing a resumable boundary; slots left of it stay holes.
     GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
-                           std::int32_t begin_blocks, std::int32_t max_blocks) const override {
+                           std::int32_t begin_blocks, std::int32_t max_blocks,
+                           const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits = nullptr) const override {
         const std::int32_t end_blocks =
             static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
         GroupPrefixProbe probe;
@@ -99,8 +109,8 @@ public:
             return probe;
         }
         const auto [boundary, hits_begin] = findResumableBoundary(
-            [&](std::int32_t i) { return index.Contains(pool, keys[static_cast<std::size_t>(i)]); }, begin_blocks,
-            end_blocks);
+            [&](std::int32_t i) { return PrefixKeyIsHit(index, pool, keys[static_cast<std::size_t>(i)], extra_hits); },
+            begin_blocks, end_blocks);
         if (boundary == begin_blocks) {
             return probe;
         }

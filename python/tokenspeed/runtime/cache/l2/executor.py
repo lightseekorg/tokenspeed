@@ -35,6 +35,7 @@ from tokenspeed.runtime.cache.l2.storage import (
     HostCacheStorage,
     compute_host_lcm_block_bytes,
 )
+from tokenspeed.runtime.cache.l3.executor import L3HostStore, StoragePage
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
@@ -71,6 +72,7 @@ def _ordered_unique(values: Iterable[int]) -> list[int]:
 class _Ack(NamedTuple):
     finish_event: object
     op_ids: list[int]
+    backup_pages: list[StoragePage]
 
 
 def _num_host_lcm_blocks(
@@ -100,6 +102,9 @@ class L2CacheExecutor:
         host_ratio: float,
         host_size_gb: float,
         io_backend: str,
+        storage_backend=None,
+        storage_key_prefix: str = "",
+        storage_rank: int = 0,
     ):
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
@@ -137,6 +142,13 @@ class L2CacheExecutor:
             self.layout,
             num_host_lcm_blocks=host_lcm_blocks,
         )
+        self.l3_store = None
+        if storage_backend is not None:
+            self.attach_l3_storage(
+                storage_backend,
+                key_prefix=storage_key_prefix,
+                rank=storage_rank,
+            )
         # The scheduler wire includes logical null LCMBlock 0 in its count.
         self.num_host_pages = host_lcm_blocks + 1
         logger.info(
@@ -163,11 +175,37 @@ class L2CacheExecutor:
         self._ready_write_op_ids: list[int] = []
         self._ready_load_op_ids: list[int] = []
 
+    def attach_l3_storage(
+        self,
+        storage_backend,
+        *,
+        key_prefix: str = "",
+        rank: int = 0,
+    ) -> None:
+        """Bind an L3 backend to the compact Host buffer after allocation.
+
+        Mooncake Store must ``register_buffer`` against the pinned Host L2
+        allocation, so the backend is constructed after ``HostCacheStorage``.
+        """
+
+        if self.l3_store is not None:
+            raise RuntimeError("L3 storage backend is already attached")
+        if storage_backend is None:
+            raise ValueError("storage_backend is required")
+        self.l3_store = L3HostStore(
+            storage_backend,
+            self.host_storage,
+            key_prefix=key_prefix,
+            rank=rank,
+        )
+
     def submit_plan(self, plan) -> None:
         write_op_ids: list[int] = []
         write_transfers: list[tuple[int, int, int]] = []
+        write_pages: list[StoragePage] = []
         load_op_ids: list[int] = []
         load_transfers: list[tuple[int, int, int]] = []
+        prefetch_pages: list[StoragePage] = []
         for operation in plan.cache:
             if isinstance(operation, Cache.WriteBackOp):
                 self._append_transfers(
@@ -179,6 +217,9 @@ class L2CacheExecutor:
                     transfers=write_transfers,
                     source_is_device=True,
                 )
+                write_pages.extend(
+                    self._storage_pages(operation, host_is_destination=True)
+                )
             elif isinstance(operation, Cache.LoadBackOp):
                 self._append_transfers(
                     operation.op_ids,
@@ -189,13 +230,67 @@ class L2CacheExecutor:
                     transfers=load_transfers,
                     source_is_device=False,
                 )
+                prefetch_pages.extend(
+                    self._storage_pages(
+                        operation,
+                        host_is_destination=False,
+                        prefetch_only=True,
+                    )
+                )
             else:
                 raise TypeError(f"unsupported cache op {type(operation).__name__}")
 
+        if prefetch_pages:
+            self._prefetch_from_storage(prefetch_pages)
         load_index = self._start_loading(load_op_ids, load_transfers)
         for tracker, _ in self._load_trackers:
             tracker.set_consumers(load_index if load_index is not None else -1)
-        self._start_writing(write_op_ids, write_transfers)
+        self._start_writing(write_op_ids, write_transfers, write_pages)
+
+    @staticmethod
+    def _storage_pages(
+        operation,
+        *,
+        host_is_destination: bool,
+        prefetch_only: bool = False,
+    ) -> list[StoragePage]:
+        hashes = getattr(operation, "content_hashes", None)
+        offsets = getattr(operation, "page_offsets", None)
+        if not hashes or not offsets:
+            return []
+        host_pages = operation.dst_pages if host_is_destination else operation.src_pages
+        prefetch_flags = getattr(operation, "prefetch_from_storage", None)
+        pages: list[StoragePage] = []
+        for groups, hosts, hash_row, offset_row, flags in zip(
+            operation.group_ids,
+            host_pages,
+            hashes,
+            offsets,
+            prefetch_flags or [None] * len(hashes),
+        ):
+            flag_row = flags if flags is not None else [1] * len(groups)
+            for group, host_page, content_hash, page_offset, flag in zip(
+                groups, hosts, hash_row, offset_row, flag_row
+            ):
+                if prefetch_only and int(flag) == 0:
+                    continue
+                if not content_hash:
+                    continue
+                pages.append(
+                    (int(group), int(host_page), str(content_hash), int(page_offset))
+                )
+        return pages
+
+    def _prefetch_from_storage(self, pages: Sequence[StoragePage]) -> None:
+        l3_store = getattr(self, "l3_store", None)
+        if l3_store is None:
+            raise RuntimeError(
+                "LoadBack requested L3 prefetch but no storage backend is configured"
+            )
+        results = l3_store.prefetch(pages)
+        if not all(results):
+            missed = [page for page, ok in zip(pages, results) if not ok]
+            raise RuntimeError(f"L3 prefetch failed for {len(missed)} Host page(s)")
 
     @staticmethod
     def _append_transfers(
@@ -252,11 +347,14 @@ class L2CacheExecutor:
         self,
         op_ids: Sequence[int],
         transfers: Sequence[tuple[int, int, int]],
+        backup_pages: Sequence[StoragePage] | None = None,
     ) -> None:
         if not op_ids:
             return
         op_ids = _ordered_unique(op_ids)
+        backup_pages = list(backup_pages or ())
         if not transfers:
+            self._backup_to_storage(backup_pages)
             self._ready_write_op_ids.extend(op_ids)
             return
         logger.info(
@@ -280,7 +378,7 @@ class L2CacheExecutor:
         )
         finish = torch.cuda.Event()
         finish.record(self.write_stream)
-        self._write_acks.append(_Ack(finish, op_ids))
+        self._write_acks.append(_Ack(finish, op_ids, backup_pages))
 
     def _start_loading(
         self,
@@ -333,7 +431,7 @@ class L2CacheExecutor:
             consumer_offset += consumer_count
         if load_index is None or finish is None:
             raise RuntimeError("cache transfer layout has no layer consumers")
-        self._load_acks.append(_Ack(finish, op_ids))
+        self._load_acks.append(_Ack(finish, op_ids, []))
         return load_index
 
     def poll_results(self) -> list:
@@ -341,9 +439,30 @@ class L2CacheExecutor:
         self._ready_write_op_ids.clear()
         results.extend(self._load_done(op_id) for op_id in self._ready_load_op_ids)
         self._ready_load_op_ids.clear()
-        self._write_acks[:] = self._drain(self._write_acks, self._write_done, results)
+        self._write_acks[:] = self._drain_writes(self._write_acks, results)
         self._load_acks[:] = self._drain(self._load_acks, self._load_done, results)
         return results
+
+    def _backup_to_storage(self, pages: Sequence[StoragePage]) -> None:
+        l3_store = getattr(self, "l3_store", None)
+        if not pages or l3_store is None:
+            return
+        results = l3_store.backup(pages)
+        if len(results) != len(pages) or not all(results):
+            ok = sum(1 for flag in results if flag)
+            raise RuntimeError(
+                f"L3 backup failed for Host page(s): ok={ok}/{len(pages)}"
+            )
+
+    def _drain_writes(self, queue, results):
+        pending = []
+        for ack in queue:
+            if ack.finish_event.query():
+                self._backup_to_storage(ack.backup_pages)
+                results.extend(self._write_done(op_id) for op_id in ack.op_ids)
+            else:
+                pending.append(ack)
+        return pending
 
     @staticmethod
     def _drain(queue, done, results):
@@ -370,6 +489,8 @@ class L2CacheExecutor:
     def shutdown(self) -> None:
         self.write_stream.synchronize()
         self.load_stream.synchronize()
+        if getattr(self, "l3_store", None) is not None:
+            self.l3_store.close()
 
     def reset(self) -> None:
         self.shutdown()

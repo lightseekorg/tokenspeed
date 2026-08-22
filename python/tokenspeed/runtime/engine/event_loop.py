@@ -33,6 +33,8 @@ import zmq
 from tokenspeed_scheduler import PD, Cache, ExecutionEvent, ForwardEvent, Scheduler
 
 from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+from tokenspeed.runtime.cache.l3.backend import storage_key_prefix
+from tokenspeed.runtime.cache.l3.factory import create_kvstore_storage_backend
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -355,11 +357,6 @@ class EventLoop:
             self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
             self._dp_global_info = torch.zeros(mapping.world_size, 3, dtype=torch.int32)
         if server_args.enable_kvstore:
-            if server_args.kvstore_storage_backend is not None:
-                raise NotImplementedError(
-                    "the cache-group scheduler has no L3 storage tier; unset "
-                    "--kvstore-storage-backend"
-                )
             self.l2_cache_executor = L2CacheExecutor(
                 device_pool=token_to_kv_pool,
                 draft_pool=draft_token_to_kv_pool,
@@ -367,6 +364,20 @@ class EventLoop:
                 host_size_gb=server_args.kvstore_size,
                 io_backend=server_args.kvstore_io_backend,
             )
+            if server_args.kvstore_storage_backend is not None:
+                storage_backend = create_kvstore_storage_backend(
+                    server_args.kvstore_storage_backend,
+                    server_args.kvstore_storage_backend_extra_config,
+                    host_buffer=self.l2_cache_executor.host_storage.host_buffer,
+                    tp_size=self.attn_tp_size,
+                )
+                self.l2_cache_executor.attach_l3_storage(
+                    storage_backend,
+                    key_prefix=storage_key_prefix(
+                        server_args.served_model_name or server_args.model
+                    ),
+                    rank=attn_tp_rank,
+                )
             num_host_pages = self.l2_cache_executor.num_host_pages
         else:
             self.l2_cache_executor = None
@@ -444,6 +455,7 @@ class EventLoop:
             "Scheduler config: prefix_granularity=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s "
             "overlap_schedule_depth=%s disable_l2_cache=%s "
+            "enable_l3_storage=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
             "disable_prefix_cache=%s prefix_replay_tokens=%s "
             "cache_groups=%s",
@@ -453,6 +465,7 @@ class EventLoop:
             scheduler_cfg.decode_input_tokens,
             scheduler_cfg.overlap_schedule_depth,
             scheduler_cfg.disable_l2_cache,
+            scheduler_cfg.enable_l3_storage,
             scheduler_cfg.max_batch_size,
             server_args.max_num_seqs,
             self.dp_size,
@@ -737,7 +750,7 @@ class EventLoop:
                 self.kv_transfer.register(rid, bootstrap)
             admitted_specs.append(spec)
         if admitted_specs:
-            self.scheduler.submit_requests(admitted_specs)
+            self._submit_scheduler_requests(admitted_specs)
         elif self.epd_admission.has_pending():
             # Nothing advanced this cycle but requests are still receiving; yield the
             # GIL so the Python daemon transfer/recv threads run (rank-consistent:
@@ -1006,6 +1019,59 @@ class EventLoop:
             extend_seq_lens=list(forward_op.input_lengths[:num_extends]),
         )
 
+    def _submit_scheduler_requests(self, specs) -> None:
+        self._register_l3_storage_hits(specs)
+        self.scheduler.submit_requests(specs)
+
+    def _register_l3_storage_hits(self, specs) -> None:
+        """Tell the scheduler which prefix pages already live in L3.
+
+        Cross-instance reuse cannot see Mooncake objects through the Host
+        index. Probe them with the same content hashes the scheduler will
+        use, then register only keys every TP rank agrees exist.
+        """
+
+        l2 = self.l2_cache_executor
+        l3_store = getattr(l2, "l3_store", None) if l2 is not None else None
+        if l3_store is None or not specs:
+            return
+        hashes = []
+        seen: set[str] = set()
+        for spec in specs:
+            for content_hash in self.scheduler.prefix_hashes_for_tokens(
+                list(spec.tokens)
+            ):
+                if content_hash in seen:
+                    continue
+                seen.add(content_hash)
+                hashes.append(content_hash)
+        if not hashes:
+            return
+        group_ids, content_hashes, page_offsets = self.scheduler.expand_prefix_keys(
+            hashes
+        )
+        pages = [
+            (int(group_id), 0, content_hash, int(page_offset))
+            for group_id, content_hash, page_offset in zip(
+                group_ids, content_hashes, page_offsets
+            )
+        ]
+        exists = l3_store.exists(pages)
+        if self.attn_tp_size > 1 and self.attn_tp_cpu_group is not None and exists:
+            flags = torch.tensor(
+                [1 if present else 0 for present in exists], dtype=torch.int32
+            )
+            dist.all_reduce(flags, op=dist.ReduceOp.MIN, group=self.attn_tp_cpu_group)
+            exists = [bool(flag) for flag in flags.tolist()]
+        hit_groups, hit_hashes, hit_offsets = l3_store.present_keys(
+            group_ids,
+            content_hashes,
+            page_offsets,
+            exists=exists,
+        )
+        if hit_groups:
+            self.scheduler.register_storage_keys(hit_groups, hit_hashes, hit_offsets)
+
     def _submit_cache_ops(self, execution_plan) -> None:
         if self.l2_cache_executor is None:
             return
@@ -1223,7 +1289,7 @@ class EventLoop:
                 if self._reap_or_keep_buffered_spec(spec)
             ]
             if specs:
-                self.scheduler.submit_requests(specs)
+                self._submit_scheduler_requests(specs)
 
         # Partition new requests by grammar readiness. Compile-bound requests
         # are queued in GrammarManager and admitted in a later iteration when
@@ -1327,7 +1393,7 @@ class EventLoop:
             return
 
         if admitted_specs:
-            self.scheduler.submit_requests(admitted_specs)
+            self._submit_scheduler_requests(admitted_specs)
 
     @nvtx_range("loop:commit", color="rapids")
     def _commit_forward_results(
@@ -1886,6 +1952,10 @@ class EventLoop:
         close_transfer = getattr(self.kv_transfer, "close", None)
         if callable(close_transfer):
             close_transfer()
+        l2 = getattr(self, "l2_cache_executor", None)
+        shutdown_l2 = getattr(l2, "shutdown", None)
+        if callable(shutdown_l2):
+            shutdown_l2()
 
 
 def run_event_loop(
