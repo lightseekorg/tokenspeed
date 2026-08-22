@@ -8,6 +8,7 @@ import torch
 from tokenspeed_kernel.ops.gemm.kimi3 import (
     _use_gluon_largem,
     _use_gluon_mediumm,
+    _use_gluon_smallm,
 )
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk
 from utils import is_cdna4
@@ -24,6 +25,8 @@ if not is_cdna4():
     [
         (7168, 3584, 1),
         (3584, 7168, 1),
+        (3584, 7168, 2),
+        (3584, 7168, 4),
         (7168, 3584, 128),
         (3584, 7168, 128),
         (7168, 3584, 768),
@@ -83,6 +86,22 @@ def test_kimi3_latent_projection_dispatch_boundaries(
     assert _use_gluon_largem(m, k, n) is uses_large
 
 
+@pytest.mark.parametrize(
+    "m,k,n,expected",
+    [
+        (1, 3584, 7168, False),
+        (2, 3584, 7168, True),
+        (4, 3584, 7168, True),
+        (4, 7168, 3584, False),
+        (8, 3584, 7168, False),
+    ],
+)
+def test_kimi3_latent_projection_smallm_dispatch(
+    m: int, k: int, n: int, expected: bool
+) -> None:
+    assert _use_gluon_smallm(m, k, n) is expected
+
+
 @pytest.mark.parametrize("input_size,output_size", [(7168, 3584), (3584, 7168)])
 def test_kimi3_latent_projection_writes_out_and_captures(
     input_size: int,
@@ -105,7 +124,7 @@ def test_kimi3_latent_projection_writes_out_and_captures(
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 16])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 16])
 def test_kimi3_latent_projection_add3_matches_torch_and_captures(
     num_tokens: int,
 ) -> None:
