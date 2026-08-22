@@ -249,3 +249,28 @@ def test_unlisted_shapes_keep_the_generic_selection():
     assert "torch" in getattr(impl, "__name__", "")
     impl = _select(1, 2304, 1536, True)
     assert "rowcta" in getattr(impl, "__name__", "")
+
+
+@pytest.mark.parametrize("m", [1, 2, 4])
+def test_shared_projections_route_and_match_torch(m):
+    """The K3 shared gate_up/down call sites take the measured route on
+    covered shapes and stay bit-compatible with the torch composition."""
+    from tokenspeed_kernel.ops.gemm.kimi3 import (
+        kimi3_shared_down_projection,
+        kimi3_shared_situ_projection,
+    )
+
+    torch.manual_seed(m)
+    x = torch.randn(m, 7168, device="cuda", dtype=torch.bfloat16)
+    gate_up_w = torch.randn(1536, 7168, device="cuda", dtype=torch.bfloat16)
+    act = kimi3_shared_situ_projection(x, gate_up_w, beta=4.0, linear_beta=25.0)
+    ref = kimi3_shared_situ_projection(
+        x, gate_up_w, beta=4.0, linear_beta=25.0, solution="torch"
+    )
+    torch.testing.assert_close(act, ref, atol=5e-2, rtol=2e-2)
+
+    y = torch.randn(m, 768, device="cuda", dtype=torch.bfloat16)
+    down_w = torch.randn(7168, 768, device="cuda", dtype=torch.bfloat16)
+    got = kimi3_shared_down_projection(y, down_w)
+    want = kimi3_shared_down_projection(y, down_w, solution="torch")
+    torch.testing.assert_close(got, want, atol=5e-2, rtol=2e-2)

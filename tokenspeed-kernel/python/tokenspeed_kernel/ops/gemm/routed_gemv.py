@@ -39,6 +39,7 @@ literals wholesale.
 from __future__ import annotations
 
 import functools
+import os
 import threading
 from types import MappingProxyType
 
@@ -53,6 +54,22 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
     {
         (1, 3584, 7168): "skinny",  # MoE latent down-proj, 92 calls/step
+        # The three shard families below are GB300-measured (2026-08-21);
+        # GB200 owes the same tune_route.py re-sweep the other entries got.
+        # KDA o_proj shard, 69 calls/step: tgv 2.83 vs cublas 5.98 (2.11x)
+        (1, 7168, 1536): "tgv",
+        (2, 7168, 1536): "tgv",
+        (4, 7168, 1536): "tgv",
+        (8, 7168, 1536): "tgv",
+        # Shared gate_up shard, 92 calls/step: skinny 5.56 vs cublas 9.13 (1.64x)
+        (1, 1536, 7168): "skinny",
+        (2, 1536, 7168): "skinny",
+        (4, 1536, 7168): "skinny",
+        # Shared down shard, 92 calls/step: tgv 2.52 vs cublas 2.99 (1.19x)
+        (1, 7168, 768): "tgv",
+        (2, 7168, 768): "tgv",
+        (4, 7168, 768): "tgv",
+        (8, 7168, 768): "tgv",
         (1, 6288, 7168): "skinny",  # KDA in_proj (qkvgfab), 69 calls/step
         (1, 3648, 7168): "skinny",  # MLA fused qkv_a + gate, 24 calls/step
         # (1, 2304, 1536) mla_q_b stays on rowcta: 2.48 vs skinny 2.53.
@@ -228,8 +245,9 @@ def tgv_gemv(
         return _torch_decode_gemv(x, weight, out)
     bias = _tgv_bias(n, dev)
     # TGV is CuTe DSL inside FlashInfer: same DLPack no-grad rule.
+    pdl = os.environ.get("TOKENSPEED_DISABLE_PDL") != "1"
     result = mm_bf16(
-        x.detach(), weight.detach().t(), bias=bias, pdl=True, backend="tgv", out=out
+        x.detach(), weight.detach().t(), bias=bias, pdl=pdl, backend="tgv", out=out
     )
     _mark_warmed("tgv", dev, m, n, k)
     return result
@@ -250,6 +268,32 @@ ADD3_ROUTE: MappingProxyType[tuple[int, int, int], tuple[int, int, int]] = (
 
 
 @functools.lru_cache(maxsize=8)
+def decode_gemv_routed(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Whether :data:`MEASURED_ROUTE` covers this call on this platform.
+
+    Args:
+        x: ``[M, K]`` activation.
+        weight: ``[N, K]`` weight.
+
+    Returns:
+        True when ``decode_gemv`` would reach a measured backend rather than
+        the portable fallback.
+    """
+    if (
+        not x.is_cuda
+        or x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or not x.is_contiguous()
+        or not weight.is_contiguous()
+        or x.ndim != 2
+    ):
+        return False
+    m, k = x.shape
+    return (m, weight.shape[0], k) in MEASURED_ROUTE and _is_measured_arch(
+        x.device.index or 0
+    )
+
+
 def _is_measured_arch(device_index: int) -> bool:
     from tokenspeed_kernel.platform import current_platform
 
