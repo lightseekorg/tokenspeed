@@ -52,10 +52,14 @@ import torch
 # carried over from a different parallelism. Labels are the shapes themselves;
 # mapping them to call sites would be a guess until the counts are traced.
 SHAPES = [
+    (3584, 7168, 92, "n3584_k7168"),
+    (2880, 7168, 0, "n2880_k7168"),
+    (1152, 1536, 0, "n1152_k1536"),
+    (7168, 1536, 69, "kda_o_proj_shard"),
     (1536, 7168, 92, "shared_gate_up_shard"),
-    (3584, 7168, 92, "latent_down_proj"),
+    (7168, 768, 92, "shared_down_shard"),
 ]
-MS = [5, 6, 7, 8]  # observed range: the gates admit M <= 8
+MS = [1, 2, 3, 4, 5, 6, 7, 8]  # observed range: the gates admit M <= 8
 NUM_COPIES = 8
 # 41-round medians repeat within ~1-2%, so 4% clears noise without excluding
 # the consistent 6-11% skinny wins.

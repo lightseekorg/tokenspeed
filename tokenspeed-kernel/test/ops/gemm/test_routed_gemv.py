@@ -294,3 +294,22 @@ def test_forced_torch_solution_is_not_routed():
     ):
         kimi3.kimi3_latent_projection(x, latent_w, solution="torch")
         kimi3.kimi3_shared_down_projection(y, down_w, solution="torch")
+
+
+def test_route_predicate_admits_the_registered_arch_floor():
+    """MEASURED_ROUTE registers at sm100 and documents a GB200 re-sweep, so the
+    predicate must not gate on ADD3_ROUTE's stricter sm103 floor."""
+    from unittest.mock import patch
+
+    from tokenspeed_kernel.ops.gemm import routed_gemv
+
+    x = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(3584, 7168, device="cuda", dtype=torch.bfloat16)
+    nvidia = type("P", (), {"vendor": "nvidia"})()
+    for capability, expected in (((10, 0), True), ((9, 0), False)):
+        routed_gemv._is_routed_arch.cache_clear()
+        with patch("torch.cuda.get_device_capability", return_value=capability), patch(
+            "tokenspeed_kernel.platform.current_platform", return_value=nvidia
+        ):
+            assert routed_gemv.decode_gemv_routed(x, w) is expected
+    routed_gemv._is_routed_arch.cache_clear()

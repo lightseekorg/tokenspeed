@@ -186,9 +186,7 @@ def _run(args, W, tokens, tactic_setter, tactic, iters, do_finalize=True):
 
     x_q, x_scale, topk_ids, topk_weights = tokens
     w13, w13_scale, w2, w2_scale = W
-    # The cache key carries the output tensor's shape, so a table swept with
-    # do_finalize=True never matches the deferred path serving takes when the
-    # MoE tail owns finalize. Sweep the mode the caller asks for.
+    # The cache key carries the output shape, so the modes need separate sweeps.
     output = (
         torch.zeros(
             x_q.shape[0], args.hidden_size, dtype=torch.bfloat16, device=x_q.device
@@ -339,9 +337,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"--- sweeping do_finalize={do_finalize} ({label}) ---")
         seen = set(tuner.profiling_cache)
 
-        # One native autotune pass materializes every bucket's cache entry (with
-        # the tuner's own picks -- kept for buckets below --min-bucket) under the
-        # exact key layout the runtime will look up.
+        # One native pass materializes every bucket under the runtime's key layout.
         tokens_max = _make_tokens(
             SITU_TUNE_MAX_NUM_TOKENS,
             args.hidden_size,
@@ -390,8 +386,7 @@ def main(argv: list[str] | None = None) -> int:
                     args, W, tokens, set_tactic, tac, iters, do_finalize=do_finalize
                 )
 
-            # Stage 1: a few configs per family picks the family (<3% intra-family
-            # spread measured); stage 2 refines within the winner.
+            # Stage 1 picks the tile_N family, stage 2 refines within it.
             stage1: list[tuple[float, tuple[int, int]]] = []
             for family in families:
                 for tac in [t for t in candidates if t[0] == family][

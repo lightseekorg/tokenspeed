@@ -738,7 +738,7 @@ def kimi3_shared_down_projection(
     routed = solution == "auto"
     if solution == "auto":
         solution = "triton_gemv" if Platform.get().is_cdna4 and specialized else "torch"
-    if routed and solution == "torch" and decode_gemv_routed(hidden_states, weight):
+    if routed and decode_gemv_routed(hidden_states, weight):
         from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
 
         return decode_gemv(hidden_states, weight, out)
