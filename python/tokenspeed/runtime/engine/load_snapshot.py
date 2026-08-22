@@ -22,11 +22,182 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from tokenspeed.runtime.engine.io_struct import GetLoadReqOutput, LoadSnapshot
+import zmq
+
+from tokenspeed.runtime.engine.io_struct import (
+    GetLoadReqOutput,
+    LoadSnapshot,
+    MsgpackEncoder,
+)
+
+logger = logging.getLogger(__name__)
+
+_LoadValues = tuple[int, int, int, int, int]
+_SocketFactory = Callable[[str], tuple[object, object]]
+_SEND_RETRY_INTERVAL_S = 0.01
+_CLOSE_TIMEOUT_S = 1.0
+
+
+def _open_snapshot_socket(endpoint: str) -> tuple[zmq.Context, zmq.Socket]:
+    """Create the publisher's private context and configured PUSH socket."""
+    context = zmq.Context()
+    socket = context.socket(zmq.PUSH)
+    socket.setsockopt(zmq.SNDHWM, 1)
+    socket.setsockopt(zmq.CONFLATE, 1)
+    socket.connect(endpoint)
+    return context, socket
+
+
+class NullLoadSnapshotPublisher:
+    """No-op publisher used outside standard-serving attention TP0."""
+
+    @staticmethod
+    def observe(values: _LoadValues) -> None:
+        return None
+
+    @staticmethod
+    def close() -> None:
+        return None
+
+
+class LoadSnapshotPublisher:
+    """Publish the newest scheduler load tuple from a private transport thread.
+
+    ``observe`` is the scheduler-thread boundary: it only compares a tuple,
+    replaces one guarded slot, and notifies the publisher. The background
+    thread owns all snapshot encoding and ZMQ context/socket lifecycle work.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        dp_rank: int,
+        heartbeat_interval: float,
+        socket_factory: _SocketFactory | None = None,
+    ) -> None:
+        self._endpoint = endpoint
+        self._dp_rank = dp_rank
+        self._heartbeat_interval = max(1.0, heartbeat_interval)
+        self._valid_for_ms = int(3 * self._heartbeat_interval * 1_000)
+        self._socket_factory = socket_factory or _open_snapshot_socket
+        self._epoch = uuid.uuid4().hex
+
+        self._condition = threading.Condition()
+        self._latest_values: _LoadValues | None = None
+        self._generation = 0
+        self._closed = False
+        self._sequence = 0
+        self.socket_owner_thread: int | None = None
+
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"load-snapshot-publisher-dp{dp_rank}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def observe(self, values: _LoadValues) -> None:
+        """Replace the mailbox when scalar load state changes."""
+        with self._condition:
+            if self._closed or values == self._latest_values:
+                return
+            self._latest_values = values
+            self._generation += 1
+            self._condition.notify()
+
+    def close(self) -> None:
+        """Stop the publisher without waiting indefinitely for transport."""
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._condition.notify()
+        self._thread.join(timeout=_CLOSE_TIMEOUT_S)
+        if self._thread.is_alive():
+            logger.warning(
+                "Load snapshot publisher did not stop within %.1fs", _CLOSE_TIMEOUT_S
+            )
+
+    def _run(self) -> None:
+        self.socket_owner_thread = threading.get_ident()
+        context = None
+        socket = None
+        try:
+            context, socket = self._socket_factory(self._endpoint)
+            encoder = MsgpackEncoder()
+            pending: LoadSnapshot | None = None
+            pending_generation = -1
+            sent_generation = -1
+            last_sent_at: float | None = None
+
+            while True:
+                with self._condition:
+                    while True:
+                        if self._closed:
+                            return
+
+                        generation = self._generation
+                        values = self._latest_values
+                        if values is not None and generation != pending_generation:
+                            if pending is not None or generation != sent_generation:
+                                pending = self._new_snapshot(values)
+                                pending_generation = generation
+                                break
+
+                        if pending is not None:
+                            break
+
+                        if values is None or last_sent_at is None:
+                            self._condition.wait()
+                            continue
+
+                        heartbeat_remaining = (
+                            last_sent_at + self._heartbeat_interval - time.monotonic()
+                        )
+                        if heartbeat_remaining <= 0:
+                            pending = self._new_snapshot(values)
+                            pending_generation = generation
+                            break
+                        self._condition.wait(timeout=heartbeat_remaining)
+
+                frames = encoder.encode(pending)
+                if len(frames) != 1:
+                    raise RuntimeError("LoadSnapshot must encode as exactly one frame")
+                try:
+                    socket.send(frames[0], flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    with self._condition:
+                        if not self._closed:
+                            self._condition.wait(timeout=_SEND_RETRY_INTERVAL_S)
+                    continue
+
+                sent_generation = pending_generation
+                last_sent_at = time.monotonic()
+                pending = None
+        except Exception:
+            logger.exception("Load snapshot publisher stopped unexpectedly")
+        finally:
+            if socket is not None:
+                socket.close(linger=0)
+            if context is not None:
+                context.term()
+
+    def _new_snapshot(self, values: _LoadValues) -> LoadSnapshot:
+        self._sequence += 1
+        return LoadSnapshot(
+            self._epoch,
+            self._sequence,
+            self._dp_rank,
+            *values,
+            self._valid_for_ms,
+        )
 
 
 @dataclass(frozen=True)

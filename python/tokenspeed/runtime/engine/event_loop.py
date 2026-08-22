@@ -39,6 +39,10 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
 from tokenspeed.runtime.engine.io_struct import IpcReceiver, IpcSender
+from tokenspeed.runtime.engine.load_snapshot import (
+    LoadSnapshotPublisher,
+    NullLoadSnapshotPublisher,
+)
 from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
 from tokenspeed.runtime.engine.pause import PauseController
 from tokenspeed.runtime.engine.request_handler import RequestHandler
@@ -494,6 +498,7 @@ class EventLoop:
             self.kv_event_publisher = NullEventPublisher(attn_dp_rank=dp_rank)
 
         self._init_interprocess_comm()
+        self._init_load_snapshot_publisher()
 
         # Pause/resume control state. Shared with the request handler, which
         # drives the control-request side; the event loop reads the gate.
@@ -1089,6 +1094,18 @@ class EventLoop:
             self.recv_from_tokenizer = None
             self.send_to_tokenizer = _NullSender()
 
+    def _init_load_snapshot_publisher(self) -> None:
+        if self.attn_tp_rank == 0 and not self.server_args.zmq_msgpack:
+            self.load_snapshot_publisher = LoadSnapshotPublisher(
+                self.port_args.metrics_ipc_name,
+                self.dp_rank,
+                self.server_args.load_watch_interval,
+            )
+        else:
+            # Direct-ZMQ will project the observation onto ordinary output
+            # batches; it must not create this standard-serving PUSH socket.
+            self.load_snapshot_publisher = NullLoadSnapshotPublisher()
+
     def _init_msgpack_transport(self, context):
         """Complete the SMG startup handshake and return the wrapped msgpack
         input/output sockets."""
@@ -1515,6 +1532,18 @@ class EventLoop:
             "num_queue_reqs": self.scheduler.waiting_size(),
         }
 
+    def _observe_load_snapshot(self, stats: dict) -> None:
+        """Copy the already-sampled scheduler scalars into the publisher mailbox."""
+        self.load_snapshot_publisher.observe(
+            (
+                len(self.output_processor.rid_to_state),
+                stats["num_queue_reqs"],
+                stats["num_active_pages"],
+                stats["num_cached_pages"],
+                self._scheduler_cache_geometry.num_usable_pages,
+            )
+        )
+
     def _record_scheduler_iteration_metrics(
         self, stats: dict, num_iteration_tokens: int
     ) -> None:
@@ -1575,6 +1604,8 @@ class EventLoop:
             )
             advance_forward(self.scheduler, request_changes)
             self._publish_scheduler_kv_events()
+            stats = self._get_scheduler_stats()
+            self._observe_load_snapshot(stats)
 
         if self.has_dp:
             dp_metadata = self._dp_sync_and_check(None)
@@ -1621,6 +1652,7 @@ class EventLoop:
 
             forward_op = self._get_forward_op(execution_plan)
             stats = self._get_scheduler_stats()
+            self._observe_load_snapshot(stats)
             num_iter_tokens = (
                 sum(forward_op.input_lengths) if forward_op is not None else 0
             )
@@ -1774,6 +1806,7 @@ class EventLoop:
 
             forward_op = self._get_forward_op(execution_plan)
             stats = self._get_scheduler_stats()
+            self._observe_load_snapshot(stats)
             num_iter_tokens = (
                 sum(forward_op.input_lengths) if forward_op is not None else 0
             )
@@ -1877,6 +1910,7 @@ class EventLoop:
             prev_forward_op = forward_op
 
     def close(self) -> None:
+        self.load_snapshot_publisher.close()
         # Best-effort: tell an attached SMG frontend this engine is going away
         # (msgpack mode only; the pickle sender has no such helper) so the
         # worker is marked dead instead of staying healthy-idle.
