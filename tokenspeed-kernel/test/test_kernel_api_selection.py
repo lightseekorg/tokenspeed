@@ -48,6 +48,7 @@ import tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule as _attention
 import tokenspeed_kernel.ops.attention.gluon as _attention_gluon
 import tokenspeed_kernel.ops.attention.triton as _attention_triton
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
+import tokenspeed_kernel.ops.gemm.cuda as _gemm_cuda
 import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
 import tokenspeed_kernel.ops.gemm.deepseek_v4 as _gemm_deepseek_v4
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
@@ -55,8 +56,11 @@ import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
 import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
 import tokenspeed_kernel.ops.mhc as _mhc_pkg
+import tokenspeed_kernel.ops.mhc.deep_gemm as _mhc_deep_gemm
+import tokenspeed_kernel.ops.mhc.gluon as _mhc_gluon
 import tokenspeed_kernel.ops.mhc.triton as _mhc_triton
 import tokenspeed_kernel.ops.moe as _moe_pkg
+import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
 import tokenspeed_kernel.ops.moe.deep_gemm as _moe_deep_gemm
 import tokenspeed_kernel.ops.moe.deepseek_v4 as _moe_deepseek_v4
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
@@ -117,6 +121,9 @@ from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, error_fn
 from tokenspeed_kernel.selection import SelectedKernel, spec_matches_traits
 
+_gemm_pytorch = importlib.import_module("tokenspeed_kernel.ops.gemm.pytorch")
+_moe_pytorch = importlib.import_module("tokenspeed_kernel.ops.moe.pytorch")
+
 _RELOAD_MODULES = [
     # Attention registration modules.
     _attention_cuda_deepseek_v4,
@@ -140,17 +147,22 @@ _RELOAD_MODULES = [
     _attention_pkg,
     # GEMM registration modules.
     _gemm_reference,
+    _gemm_cuda,
     _gemm_deep_gemm,
     _gemm_deepseek_v4,
     _gemm_flashinfer,
     _gemm_gluon,
+    _gemm_pytorch,
     _gemm_triton,
     _gemm_trtllm,
     _gemm_pkg,
     # mHC registration modules.
+    _mhc_deep_gemm,
+    _mhc_gluon,
     _mhc_triton,
     _mhc_pkg,
     # MoE registration modules.
+    _moe_cuda,
     _moe_deep_gemm_deepep_fp8,
     _moe_deep_gemm,
     _moe_deepseek_v4,
@@ -167,6 +179,7 @@ _RELOAD_MODULES = [
     _moe_gluon_deepseek_v4,
     _moe_gluon_mxfp4,
     _moe_gluon,
+    _moe_pytorch,
     _moe_triton_bf16,
     _moe_triton_mxfp4,
     _moe_triton,
@@ -363,14 +376,17 @@ def _deepseek_v4_linear_fp32() -> torch.Tensor:
     return tokenspeed_kernel.deepseek_v4_linear_fp32(hidden_states, weight)
 
 
-def test_deepseek_v4_linear_fp32_torch_accumulates_in_fp32() -> None:
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16])
+def test_deepseek_v4_linear_fp32_torch_accumulates_in_fp32(
+    weight_dtype: torch.dtype,
+) -> None:
     hidden_states = torch.tensor(
         [[1.25, -0.5, 3.0], [-2.0, 0.75, 0.125]],
         dtype=torch.bfloat16,
     )
     weight = torch.tensor(
         [[0.5, 2.0, -1.0], [1.5, -0.25, 0.75]],
-        dtype=torch.float32,
+        dtype=weight_dtype,
     )
 
     actual = tokenspeed_kernel.deepseek_v4_linear_fp32(
@@ -1660,6 +1676,68 @@ def test_dsa_topk_selection_receives_index_heads(
     assert captured["index_heads"] == index_heads
 
 
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+@pytest.mark.parametrize(
+    ("cache", "expected"),
+    [
+        (torch.empty((64, 132), dtype=torch.uint8), "packed"),
+        (torch.empty((1, 64 * 132), dtype=torch.uint8), "page_planar"),
+    ],
+)
+def test_dsa_topk_selection_receives_cache_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    cache: torch.Tensor,
+    expected: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _SelectedKernel:
+        name = "test_dsa_topk"
+
+        def __call__(self, **kwargs):
+            tokens = kwargs["q"].shape[0]
+            topk = int(kwargs["topk"])
+            return (
+                torch.full((tokens, topk), -1, dtype=torch.int32),
+                torch.zeros((tokens,), dtype=torch.int32),
+            )
+
+    def select_dsa_topk(*args, **kwargs):
+        captured.update(kwargs["traits"])
+        return _SelectedKernel()
+
+    monkeypatch.setattr(_attention_pkg, "select_kernel", select_dsa_topk)
+    q = torch.empty((1, 32, 128), dtype=torch.bfloat16)
+    weights = torch.empty((1, 32), dtype=torch.float32)
+
+    if mode == "decode":
+        tokenspeed_kernel.dsa_decode_topk(
+            q,
+            weights,
+            torch.tensor([1], dtype=torch.int32),
+            torch.zeros((1, 1), dtype=torch.int32),
+            page_size=64,
+            topk=1,
+            softmax_scale=1.0,
+            index_k_cache=cache,
+        )
+    else:
+        tokenspeed_kernel.dsa_prefill_topk(
+            q,
+            weights,
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([1], dtype=torch.int32),
+            topk=1,
+            softmax_scale=1.0,
+            index_k_cache=cache,
+            page_size=64,
+        )
+
+    assert captured["index_k_layout"] == expected
+
+
 @pytest.mark.parametrize("missing", ["values", "scales"])
 def test_dsa_prefill_topk_rejects_incomplete_workspace_rows(missing: str) -> None:
     inputs = {
@@ -2292,7 +2370,7 @@ def _deepseek_v4_select_experts_bias() -> object:
 
 def _deepseek_v4_select_experts_hash() -> object:
     router_logits = torch.empty((2, 384), dtype=torch.bfloat16)
-    hash_indices_table = torch.empty((8, 6), dtype=torch.int32)
+    hash_indices_table = torch.zeros((8, 6), dtype=torch.int32)
     input_ids = torch.zeros((2,), dtype=torch.int64)
     return tokenspeed_kernel.deepseek_v4_select_experts(
         router_logits,

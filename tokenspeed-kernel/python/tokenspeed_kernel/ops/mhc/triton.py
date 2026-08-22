@@ -57,8 +57,9 @@ def _mhc_prenorm_gemm_triton_kernel(
 ):
     split_id = tl.program_id(0)
     token_block = tl.program_id(1)
+    n_block = tl.program_id(2)
     offs_m = token_block * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
+    offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
     split_start = split_id * SPLIT_K
     dot_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     square_acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -92,7 +93,7 @@ def _mhc_prenorm_gemm_triton_kernel(
     tl.store(
         out_sqrsum + split_id * num_tokens + offs_m,
         square_acc,
-        mask=offs_m < num_tokens,
+        mask=(offs_m < num_tokens) & (n_block == 0),
     )
 
 
@@ -107,7 +108,9 @@ def _mhc_prenorm_gemm_triton(
     n = fn.shape[0]
     block_k = 64
     split_k = triton.cdiv(triton.cdiv(k, n_splits), block_k) * block_k
-    _mhc_prenorm_gemm_triton_kernel[(n_splits, triton.cdiv(num_tokens, 16))](
+    _mhc_prenorm_gemm_triton_kernel[
+        (n_splits, triton.cdiv(num_tokens, 16), triton.cdiv(n, 32))
+    ](
         x,
         fn,
         out_mul,

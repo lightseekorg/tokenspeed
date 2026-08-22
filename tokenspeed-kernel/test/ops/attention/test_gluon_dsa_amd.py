@@ -476,6 +476,98 @@ def _pack_index_k_cache(
     return packed, (x_fp8.float() * scale).reshape_as(index_k)
 
 
+def _with_padded_page_stride(
+    packed: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    row_bytes = packed.shape[1]
+    num_pages = packed.shape[0] // page_size
+    page_bytes = page_size * row_bytes
+    backing = torch.full(
+        (num_pages, page_bytes + 256),
+        0xA5,
+        device=packed.device,
+        dtype=torch.uint8,
+    )
+    page_planar = backing[:, :page_bytes]
+    page_planar.copy_(packed.view(num_pages, page_bytes))
+    return page_planar
+
+
+def test_dsa_topk_fp8_accepts_padded_page_stride() -> None:
+    device = "cuda"
+    page_size = 64
+    seq_len = 513
+    num_slots = 9 * page_size
+    gen = _generator(device, 811)
+    q = _randn_bf16((1, 16, 128), device=device, generator=gen)
+    weights = _normal_weights((1, 16), device=device, generator=gen)
+    packed, _ = _pack_index_k_cache(
+        _randn_bf16((num_slots, 128), device=device, generator=gen),
+        page_size,
+    )
+    page_planar = _with_padded_page_stride(packed, page_size)
+    seq_lens = torch.tensor([seq_len], device=device, dtype=torch.int32)
+    block_table = torch.arange(9, device=device, dtype=torch.int32).unsqueeze(0)
+
+    packed_decode = gluon_dsa_decode_topk_fp8(
+        q,
+        weights,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        topk=512,
+        softmax_scale=128**-0.5,
+        index_k_cache=packed,
+    )
+    planar_decode = gluon_dsa_decode_topk_fp8(
+        q,
+        weights,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        topk=512,
+        softmax_scale=128**-0.5,
+        index_k_cache=page_planar,
+    )
+    torch.testing.assert_close(
+        planar_decode[0].sort(dim=-1).values,
+        packed_decode[0].sort(dim=-1).values,
+    )
+    torch.testing.assert_close(planar_decode[1], packed_decode[1])
+
+    workspace_slots = torch.arange(seq_len, device=device, dtype=torch.int64)
+    row_starts = torch.zeros((1,), device=device, dtype=torch.int32)
+    row_ends = torch.full((1,), seq_len, device=device, dtype=torch.int32)
+    packed_prefill = gluon_dsa_prefill_topk_fp8(
+        q,
+        weights,
+        workspace_slots,
+        row_starts,
+        row_ends,
+        topk=512,
+        softmax_scale=128**-0.5,
+        index_k_cache=packed,
+        page_size=page_size,
+    )
+    planar_prefill = gluon_dsa_prefill_topk_fp8(
+        q,
+        weights,
+        workspace_slots,
+        row_starts,
+        row_ends,
+        topk=512,
+        softmax_scale=128**-0.5,
+        index_k_cache=page_planar,
+        page_size=page_size,
+    )
+    torch.testing.assert_close(
+        planar_prefill[0].sort(dim=-1).values,
+        packed_prefill[0].sort(dim=-1).values,
+    )
+    torch.testing.assert_close(planar_prefill[1], packed_prefill[1])
+
+
 def _generator(device: str, seed: int) -> torch.Generator:
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)

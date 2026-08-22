@@ -179,6 +179,7 @@ if platform.is_nvidia:
             "topk": frozenset({512, 1024, 2048}),
             "page_size": frozenset({64}),
             "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed"}),
             "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
         },
         priority=Priority.PERFORMANT,
@@ -352,6 +353,7 @@ if platform.is_nvidia:
             "head_dim": frozenset({128}),
             "topk": frozenset({512, 1024, 2048}),
             "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed"}),
         },
         priority=Priority.PERFORMANT,
     )

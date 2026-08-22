@@ -25,13 +25,9 @@ from __future__ import annotations
 from math import prod
 
 import torch
-import torch.nn.functional as F
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-from tokenspeed_kernel.thirdparty.cuda.dsv3_gemm import dsv3_router_gemm
 
 
 def deepseek_v4_linear_fp32(
@@ -105,78 +101,6 @@ def deepseek_v4_linear_fp32(
         **shape_params,
     ):
         return kernel(hidden_states, weight, enable_pdl=enable_pdl)
-
-
-@register_kernel(
-    "gemm",
-    "deepseek_v4_linear_fp32",
-    name="cuda_dsv3_deepseek_v4_linear_fp32",
-    solution="cuda",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 0),
-        max_arch_version=ArchVersion(10, 9),
-        vendors=frozenset({"nvidia"}),
-    ),
-    signatures=frozenset(
-        {
-            format_signature(
-                hidden_states=dense_tensor_format(torch.bfloat16),
-                weight=dense_tensor_format(weight_dtype),
-            )
-            for weight_dtype in (torch.bfloat16, torch.float32)
-        }
-    ),
-    traits={
-        "hidden_rank": frozenset({2}),
-        "weight_rank": frozenset({2}),
-        "has_tokens": frozenset({True}),
-        "k_match": frozenset({True}),
-    },
-    priority=Priority.SPECIALIZED,
-    tags={"nvidia", "latency"},
-)
-def cuda_dsv3_deepseek_v4_linear_fp32(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-    enable_pdl: bool = False,
-) -> torch.Tensor:
-    """Run the DSV3 router GEMM specialization."""
-    return dsv3_router_gemm(
-        hidden_states,
-        weight,
-        out_dtype=torch.float32,
-        enable_pdl=enable_pdl,
-    )
-
-
-@register_kernel(
-    "gemm",
-    "deepseek_v4_linear_fp32",
-    name="torch_deepseek_v4_linear_fp32",
-    solution="torch",
-    signatures=frozenset(
-        format_signature(
-            hidden_states=dense_tensor_format(hidden_dtype),
-            weight=dense_tensor_format(weight_dtype),
-        )
-        for hidden_dtype in (torch.float16, torch.bfloat16, torch.float32)
-        for weight_dtype in (torch.float16, torch.bfloat16, torch.float32)
-    ),
-    priority=Priority.PORTABLE,
-    tags={"portability", "reference"},
-)
-def torch_deepseek_v4_linear_fp32(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-    enable_pdl: bool = False,
-) -> torch.Tensor:
-    """Run the projection with matching operand dtypes and return FP32."""
-    activations = (
-        hidden_states
-        if hidden_states.dtype == weight.dtype
-        else hidden_states.to(weight.dtype)
-    )
-    return F.linear(activations, weight).to(torch.float32)
 
 
 __all__ = ["deepseek_v4_linear_fp32"]

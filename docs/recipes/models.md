@@ -542,11 +542,13 @@ tokenspeed serve openai/gpt-oss-120b \
 
 ## DeepSeek V4-Flash / V4-Pro
 
-DeepSeek V4 needs FP8 KV cache, the DeepGEMM `mega_moe` experts, and the FP4
-indexer cache. `tokenspeed serve` auto-selects `--reasoning-parser deepseek_v31`
-and `--tool-call-parser deepseek_v4`, and auto-sets `block_size=256` (pass
-`--block-size N` with `N != 64` to override). Requires
-`tokenspeed-deepgemm>=2.5.0.post20260629` and `tokenspeed-flashmla`.
+DeepSeek V4 uses FP8 KV cache. The NVIDIA recipes below use DeepGEMM-backed
+experts, the FP4 indexer cache, and FlashMLA; the MI350 recipes use Gluon MoE
+and the checkpoint-default FP8 indexer cache. `tokenspeed serve` auto-selects
+`--reasoning-parser deepseek_v31` and `--tool-call-parser deepseek_v4`, and
+auto-sets `block_size=256` (pass `--block-size N` with `N != 64` to override).
+The NVIDIA configurations require `tokenspeed-deepgemm>=2.5.0.post20260629` and
+`tokenspeed-flashmla`.
 
 **V4-Flash** — 4× B200 (SM100), data-parallel + expert-parallel:
 
@@ -603,11 +605,55 @@ flags above and add:
 ```
 
 With `--speculative-draft-model-path` omitted, V4 uses the same checkpoint as the
-draft source (`DeepseekV4ForCausalLMNextN`). MTP runs on the non-overlap
-scheduler — the runtime disables overlap scheduling automatically when
-speculative decoding and cache groups are both active — and prefix caching
-stays on by default. Add `--enable-metrics` to read `Decoded Tok/Iter` and the
-speculative accept rate from the run summary.
+draft source (`DeepseekV4ForCausalLMNextN`). Scheduler and prefix-cache policy
+remain explicit launch choices; for example, the NVIDIA MTP CI recipe disables
+both overlap scheduling and prefix caching. Add `--enable-metrics` to read
+`Decoded Tok/Iter` and the speculative accept rate from the run summary.
+
+The validated MI350 agentic profiles use the GFX950 Gluon MoE backend,
+checkpoint-default FP8 indexer cache, prefix caching, and pure batching:
+
+```bash
+# V4-Flash: 2x MI350, MTP3
+tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
+  --served-model-name deepseek-v4-flash \
+  --trust-remote-code \
+  --tensor-parallel-size 2 \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-backend gluon \
+  --max-model-len 80000 \
+  --max-num-seqs 16 \
+  --max-total-tokens 1280000 \
+  --chunked-prefill-size 8192 \
+  --prefill-graph-max-tokens 8192 \
+  --gpu-memory-utilization 0.9 \
+  --disable-kvstore \
+  --speculative-algorithm MTP \
+  --speculative-num-steps 3 \
+  --enable-metrics
+
+# V4-Pro: 8x MI350, MTP2
+tokenspeed serve deepseek-ai/DeepSeek-V4-Pro \
+  --served-model-name deepseek-v4-pro \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-backend gluon \
+  --max-model-len 80000 \
+  --max-num-seqs 16 \
+  --max-total-tokens 2560000 \
+  --chunked-prefill-size 8192 \
+  --prefill-graph-max-tokens 8192 \
+  --gpu-memory-utilization 0.9 \
+  --disable-kvstore \
+  --speculative-algorithm MTP \
+  --speculative-num-steps 2 \
+  --enable-metrics
+```
+
+Do not enable mixed batching for these profiles. An experimental prefill
+delayer was removed after a matched closed-loop C16 run showed that it delayed
+cache-heavy later turns and reduced throughput.
 
 ### DSpark speculative decoding with Prefix Replay
 

@@ -58,7 +58,6 @@ __all__ = [
     "deepseek_v4_compute_global_topk_indices_and_lens",
     "deepseek_v4_decode_swa_indices_and_lens",
     "deepseek_v4_dequantize_and_gather_k_cache",
-    "deepseek_v4_dequantize_selected_cache_rows",
     "deepseek_v4_fused_csa_indexer_fp8_cache_insert",
     "deepseek_v4_fused_csa_indexer_mxfp4_cache_insert",
     "deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4",
@@ -92,6 +91,7 @@ def _deepseek_v4_qnorm_rope_kv_insert_kernel(
     num_insert,
     rms_norm_eps,
     block_size,
+    max_cache_slots,
     NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     NOPE_DIM: tl.constexpr,
@@ -140,7 +140,7 @@ def _deepseek_v4_qnorm_rope_kv_insert_kernel(
     else:
         if token_idx < num_insert:
             slot = tl.load(slot_mapping_ptr + token_idx)
-            if slot >= 0:
+            if slot >= 0 and slot < max_cache_slots:
                 kv = tl.load(
                     kv_ptr + token_idx * kv_stride_token + offsets,
                     mask=mask,
@@ -300,6 +300,7 @@ def deepseek_v4_fused_qnorm_rope_kv_insert(
         num_insert,
         rms_norm_eps,
         page_size,
+        swa_kv_cache.shape[0] * page_size,
         NUM_HEADS=num_heads,
         HEAD_DIM=DEEPSEEK_V4_HEAD_DIM,
         NOPE_DIM=DEEPSEEK_V4_NOPE_DIM,
@@ -328,6 +329,7 @@ def _deepseek_v4_sparse_attention_kernel(
     out_stride_token,
     out_stride_head,
     softmax_scale,
+    num_kv_rows,
     TOPK: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
@@ -357,7 +359,8 @@ def _deepseek_v4_sparse_attention_kernel(
             mask=valid,
             other=-1,
         ).to(tl.int64)
-        valid = valid & (rows >= 0)
+        valid = valid & (rows >= 0) & (rows < num_kv_rows)
+        rows = tl.where(valid, rows, 0)
         kv = tl.load(
             kv_ptr + rows[:, None] * kv_stride_row + dim[None, :],
             mask=valid[:, None] & dim_mask[None, :],
@@ -445,6 +448,7 @@ def deepseek_v4_sparse_attention(
         output.stride(0),
         output.stride(1),
         softmax_scale,
+        kv_2d.shape[0],
         TOPK=indices_2d.shape[1],
         HEAD_DIM=DEEPSEEK_V4_HEAD_DIM,
         BLOCK_TOPK=16,
@@ -469,6 +473,7 @@ def _deepseek_v4_dequantize_selected_cache_rows_kernel(
     out_stride_token,
     out_stride_row,
     block_size,
+    cache_capacity,
     OUTPUT_ROW_OFFSET: tl.constexpr,
     INDEX_OFFSET: tl.constexpr,
     WORKSPACE_WIDTH: tl.constexpr,
@@ -484,10 +489,10 @@ def _deepseek_v4_dequantize_selected_cache_rows_kernel(
     token_idx = tl.program_id(0)
     row_idx = tl.program_id(1)
     slot = tl.load(slots_ptr + token_idx * slots_stride_token + row_idx).to(tl.int64)
-    valid = slot >= 0
+    valid = (slot >= 0) & (slot < cache_capacity)
     if HAS_METADATA:
         valid &= row_idx < tl.load(lens_ptr + token_idx)
-    safe_slot = tl.maximum(slot, 0)
+    safe_slot = tl.where(valid, slot, 0)
     cache_block = safe_slot // block_size
     cache_position = safe_slot % block_size
     block_base = cache_ptr + cache_block * cache_block_stride
@@ -532,67 +537,6 @@ def _deepseek_v4_dequantize_selected_cache_rows_kernel(
         )
 
 
-def deepseek_v4_dequantize_selected_cache_rows(
-    cache_2d: torch.Tensor,
-    slots: torch.Tensor,
-    block_size: int,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Materialize arbitrary selected V4 cache rows as dense BF16 K/V."""
-
-    slots_2d = slots.reshape(slots.shape[0], -1).to(torch.int32).contiguous()
-    expected_shape = (
-        slots_2d.shape[0],
-        slots_2d.shape[1],
-        DEEPSEEK_V4_HEAD_DIM,
-    )
-    output = (
-        out
-        if out is not None
-        else torch.empty(
-            expected_shape,
-            dtype=torch.bfloat16,
-            device=cache_2d.device,
-        )
-    )
-    if output.shape != expected_shape or output.dtype != torch.bfloat16:
-        raise ValueError(
-            f"selected cache output must be BF16 {expected_shape}, got "
-            f"{output.dtype} {tuple(output.shape)}"
-        )
-    if slots_2d.numel() == 0:
-        return output
-    _deepseek_v4_dequantize_selected_cache_rows_kernel[
-        (slots_2d.shape[0], slots_2d.shape[1])
-    ](
-        cache_2d,
-        slots_2d,
-        slots_2d,
-        output,
-        slots_2d,
-        slots_2d,
-        cache_2d.stride(0),
-        slots_2d.stride(0),
-        slots_2d.stride(0),
-        output.stride(0),
-        output.stride(1),
-        block_size,
-        OUTPUT_ROW_OFFSET=0,
-        INDEX_OFFSET=0,
-        WORKSPACE_WIDTH=slots_2d.shape[1],
-        HAS_METADATA=False,
-        HEAD_DIM=DEEPSEEK_V4_HEAD_DIM,
-        NOPE_DIM=DEEPSEEK_V4_NOPE_DIM,
-        ROPE_DIM=DEEPSEEK_V4_ROPE_DIM,
-        QUANT_BLOCK=DEEPSEEK_V4_FP8_QUANT_BLOCK,
-        TOKEN_STRIDE=DEEPSEEK_V4_SWA_TOKEN_STRIDE,
-        SCALE_DIM=DEEPSEEK_V4_SWA_SCALE_DIM,
-        BLOCK_DIM=triton.next_power_of_2(DEEPSEEK_V4_HEAD_DIM),
-        num_warps=4,
-    )
-    return output
-
-
 def _deepseek_v4_dequantize_selected_cache_segment(
     cache_2d: torch.Tensor,
     slots: torch.Tensor,
@@ -628,6 +572,7 @@ def _deepseek_v4_dequantize_selected_cache_segment(
         output.stride(0),
         output.stride(1),
         block_size,
+        cache_2d.shape[0] * block_size,
         OUTPUT_ROW_OFFSET=output_row_offset,
         INDEX_OFFSET=output_row_offset,
         WORKSPACE_WIDTH=workspace_width,
@@ -1193,6 +1138,10 @@ def _deepseek_v4_fused_csa_indexer_fp8_cache_kernel(
     k_cache_ptr,
     kv_slot_mapping_ptr,
     kv_cache_block_size,
+    state_cache_blocks,
+    block_table_rows,
+    cos_sin_rows,
+    kv_cache_blocks,
     HEAD_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
     STATE_WIDTH: tl.constexpr,
@@ -1207,18 +1156,25 @@ def _deepseek_v4_fused_csa_indexer_fp8_cache_kernel(
     token_idx = tl.program_id(0)
 
     state_slot = tl.load(slot_mapping_ptr + token_idx)
-    if state_slot < 0:
+    if state_slot < 0 or state_slot >= state_cache_blocks * state_block_size:
         return
 
     position = tl.load(positions_ptr + token_idx)
-    if (position + 1) % COMPRESS_RATIO != 0:
+    compressed_pos = (position // COMPRESS_RATIO) * COMPRESS_RATIO
+    if (
+        position < 0
+        or (position + 1) % COMPRESS_RATIO != 0
+        or compressed_pos >= cos_sin_rows
+    ):
         return
 
     kv_slot = tl.load(kv_slot_mapping_ptr + token_idx)
-    if kv_slot < 0:
+    if kv_slot < 0 or kv_slot >= kv_cache_blocks * kv_cache_block_size:
         return
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    if req_idx < 0 or req_idx >= block_table_rows:
+        return
     if block_table_base_offsets_ptr is not None:
         base_logical_page = tl.load(block_table_base_offsets_ptr + req_idx)
     else:
@@ -1245,7 +1201,11 @@ def _deepseek_v4_fused_csa_indexer_fp8_cache_kernel(
         + pos_in_block[:, None] * state_cache_stride1
         + head_offset[:, None]
     )
-    valid_rows = valid_pos[:, None] & (block_numbers[:, None] >= 0)
+    valid_rows = (
+        valid_pos[:, None]
+        & (block_numbers[:, None] >= 0)
+        & (block_numbers[:, None] < state_cache_blocks)
+    )
     score = tl.load(
         row_base + STATE_WIDTH + dim[None, :],
         mask=valid_rows,
@@ -1270,7 +1230,6 @@ def _deepseek_v4_fused_csa_indexer_fp8_cache_kernel(
     is_rope = rope_pair >= 0
     cs_idx = tl.maximum(rope_pair, 0)
 
-    compressed_pos = (position // COMPRESS_RATIO) * COMPRESS_RATIO
     cs_base = cos_sin_cache_ptr + compressed_pos * cos_sin_stride
     cos_v = tl.load(cs_base + cs_idx, mask=is_rope, other=1.0)
     sin_v = tl.load(cs_base + HALF_ROPE + cs_idx, mask=is_rope, other=0.0)
@@ -1416,6 +1375,10 @@ def deepseek_v4_fused_csa_indexer_fp8_cache_insert(
         kv_cache_2d,
         kv_slot_mapping[:num_actual],
         kv_cache_block_size,
+        state_cache.shape[0],
+        block_table_i32.shape[0],
+        cos_sin_cache.shape[0],
+        kv_cache_2d.shape[0],
         HEAD_SIZE=DEEPSEEK_V4_INDEXER_DIM,
         TRITON_BLOCK_SIZE=triton.next_power_of_2(DEEPSEEK_V4_INDEXER_DIM),
         STATE_WIDTH=state_cache.shape[-1] // 2,

@@ -42,6 +42,22 @@ from tokenspeed_kernel.ops.attention.kda_utils import (
     KdaFusedDecodeResult,
     KdaPrefillResult,
 )
+from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    deepseek_v4_build_dense_prefill_local_compressed_indices,
+    deepseek_v4_combine_dense_swa_indices,
+    deepseek_v4_combine_topk_swa_indices,
+    deepseek_v4_compressed_slot_mapping,
+    deepseek_v4_compute_global_topk_indices_and_lens,
+    deepseek_v4_decode_swa_indices_and_lens,
+    deepseek_v4_dequantize_and_gather_k_cache,
+    deepseek_v4_fused_csa_indexer_mxfp4_cache_insert,
+    deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4,
+    deepseek_v4_fused_inv_rope_fp8_quant,
+    deepseek_v4_fused_sparse_compress_cache_insert,
+    deepseek_v4_indexer_decode_metadata_compute,
+    deepseek_v4_save_compressor_state,
+    write_deepseek_v4_indexer_mxfp4_cache_cuda,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
@@ -158,12 +174,26 @@ __all__ = [
     "dsa_decode_topk",
     "dsa_plan",
     "deepseek_v4_csa_indexer_fp8_cache_insert",
+    "deepseek_v4_build_dense_prefill_local_compressed_indices",
+    "deepseek_v4_combine_dense_swa_indices",
+    "deepseek_v4_combine_topk_swa_indices",
+    "deepseek_v4_compressed_slot_mapping",
+    "deepseek_v4_compute_global_topk_indices_and_lens",
+    "deepseek_v4_decode_swa_indices_and_lens",
+    "deepseek_v4_dequantize_and_gather_k_cache",
+    "deepseek_v4_fused_csa_indexer_mxfp4_cache_insert",
+    "deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4",
+    "deepseek_v4_fused_inv_rope_fp8_quant",
+    "deepseek_v4_fused_sparse_compress_cache_insert",
+    "deepseek_v4_indexer_decode_metadata_compute",
     "deepseek_v4_indexer_cache_format",
     "deepseek_v4_padded_heads",
     "deepseek_v4_paged_selected_attention",
+    "deepseek_v4_save_compressor_state",
     "deepseek_v4_selected_attention",
     "deepseek_v4_supports_deep_gemm",
     "deepseek_v4_swa_cache_insert",
+    "write_deepseek_v4_indexer_mxfp4_cache_cuda",
     "msa_decode_with_kvcache",
     "msa_extend_with_kvcache",
     "attn_merge_state",
@@ -3195,8 +3225,8 @@ def deepseek_v4_swa_cache_insert(
             ``q_out`` is not provided.
         kv: Shared K/V latents shaped ``[tokens, 512]``.
         swa_kv_cache: Uint8 page-planar V4 FP8 SWA cache.
-        slot_mapping: Destination cache slot for each inserted token. Negative
-            slots suppress insertion.
+        slot_mapping: Destination cache slot for each inserted token. Slots
+            outside the cache capacity suppress insertion.
         positions: Absolute positions for all query/KV tokens.
         cos_sin_cache: FP32 GPT-J-style fused cosine/sine cache of width 64.
         rms_norm_eps: Positive epsilon used to normalize Q.
@@ -3209,6 +3239,64 @@ def deepseek_v4_swa_cache_insert(
     Returns:
         None. Q and the selected cache rows are written in place.
     """
+    if q.ndim != 3 or q.shape[-1] != 512:
+        raise ValueError(
+            f"q must have shape [tokens, heads, 512], got {tuple(q.shape)}"
+        )
+    if kv.shape != (q.shape[0], 512):
+        raise ValueError(f"kv must have shape [tokens, 512], got {tuple(kv.shape)}")
+    if q.dtype not in (torch.float16, torch.bfloat16) or kv.dtype != q.dtype:
+        raise TypeError("q and kv must have matching float16 or bfloat16 dtypes")
+    if not q.is_contiguous() or not kv.is_contiguous():
+        raise ValueError("q and kv must be contiguous")
+    if positions.ndim != 1 or positions.numel() != q.shape[0]:
+        raise ValueError("positions must have one entry per query token")
+    if slot_mapping.ndim != 1 or slot_mapping.numel() > q.shape[0]:
+        raise ValueError("slot_mapping must be one-dimensional and no longer than q")
+    if positions.dtype not in (torch.int32, torch.int64):
+        raise TypeError("positions must have dtype int32 or int64")
+    if slot_mapping.dtype not in (torch.int32, torch.int64):
+        raise TypeError("slot_mapping must have dtype int32 or int64")
+    if not positions.is_contiguous() or not slot_mapping.is_contiguous():
+        raise ValueError("positions and slot_mapping must be contiguous")
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    if rms_norm_eps <= 0.0:
+        raise ValueError(f"rms_norm_eps must be positive, got {rms_norm_eps}")
+    if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[-1] != 64:
+        raise ValueError("cos_sin_cache must have shape [max_position, 64]")
+    if cos_sin_cache.dtype != torch.float32 or not cos_sin_cache.is_contiguous():
+        raise TypeError("cos_sin_cache must be contiguous float32")
+    row_bytes = 448 + 2 * 64 + 448 // 64 + 1
+    if (
+        swa_kv_cache.dtype != torch.uint8
+        or swa_kv_cache.ndim != 2
+        or swa_kv_cache.shape[1] < page_size * row_bytes
+        or swa_kv_cache.stride(1) != 1
+    ):
+        raise ValueError(
+            "swa_kv_cache must be a 2D uint8 page-planar cache with "
+            f"at least {page_size * row_bytes} bytes per page"
+        )
+    tensors = (kv, swa_kv_cache, slot_mapping, positions, cos_sin_cache)
+    if any(tensor.device != q.device for tensor in tensors):
+        raise ValueError("all DeepSeek V4 SWA cache tensors must share a device")
+    positions_valid = ((positions >= 0) & (positions < cos_sin_cache.shape[0])).all()
+    position_error = "positions entries must index cos_sin_cache"
+    if positions.device.type == "cpu":
+        if not bool(positions_valid.item()):
+            raise ValueError(position_error)
+    else:
+        torch._assert_async(positions_valid, position_error)
+    if q_out is not None and (
+        q_out.shape != q.shape
+        or q_out.dtype != q.dtype
+        or q_out.device != q.device
+        or not q_out.is_contiguous()
+    ):
+        raise ValueError(
+            "q_out must be contiguous and match q shape, dtype, and device"
+        )
 
     signature = format_signature(
         q=dense_tensor_format(q.dtype),
@@ -3384,6 +3472,8 @@ def deepseek_v4_selected_attention(
         q: BF16 queries shaped ``[tokens, heads, 512]``.
         kv: BF16 selected K/V workspace with rows of width 512.
         indices: Selected workspace row indices shaped ``[tokens, width]``.
+            Negative entries are ignored. Nonnegative entries in each active
+            prefix must be smaller than the number of rows in ``kv``.
         lens: Valid selected width for each query token.
         attn_sink: One attention sink logit per query head.
         softmax_scale: Scale applied to query-key dot products.
@@ -3394,6 +3484,29 @@ def deepseek_v4_selected_attention(
     Returns:
         BF16 attention output shaped like ``q``.
     """
+    if q.ndim != 3 or q.shape[0] < 1 or q.shape[-1] != 512:
+        raise ValueError(
+            f"q must have shape [tokens, heads, 512], got {tuple(q.shape)}"
+        )
+    if kv.ndim < 2 or kv.shape[-1] != 512:
+        raise ValueError(f"kv must contain rows of width 512, got {tuple(kv.shape)}")
+    tokens = int(q.shape[0])
+    if indices.ndim != 2 or indices.shape[0] != tokens:
+        raise ValueError("indices must have one row per query token")
+    if lens.ndim != 1 or lens.numel() != tokens:
+        raise ValueError("lens must have one entry per query token")
+    if indices.dtype not in (torch.int32, torch.int64):
+        raise TypeError("indices must have dtype int32 or int64")
+    if lens.dtype not in (torch.int32, torch.int64):
+        raise TypeError("lens must have dtype int32 or int64")
+    if attn_sink.numel() < q.shape[1]:
+        raise ValueError("attn_sink must provide one value per query head")
+    if any(tensor.device != q.device for tensor in (kv, indices, lens, attn_sink)):
+        raise ValueError("all selected-attention tensors must share a device")
+    if out is not None and (
+        out.shape != q.shape or out.dtype != q.dtype or out.device != q.device
+    ):
+        raise ValueError("out must match q shape, dtype, and device")
 
     signature = _attention_format_signature(q=q, kv=kv)
     traits = {
@@ -3469,12 +3582,16 @@ def deepseek_v4_paged_selected_attention(
         swa_kv_cache: Uint8 page-planar SWA cache shaped
             ``[pages, page_size * row_bytes]``.
         swa_slots: Selected global SWA slots with one row per query token.
+            Negative entries are ignored. Nonnegative entries in each active
+            prefix must be smaller than ``pages * swa_page_size``.
         swa_lens: Valid SWA selection length for each query token.
         swa_page_size: Number of SWA rows in each cache page.
         attn_sink: One attention sink logit per query head.
         softmax_scale: Scale applied to query-key dot products.
         extra_kv_cache: Optional uint8 page-planar compressed cache.
-        extra_slots: Selected global slots in ``extra_kv_cache``.
+        extra_slots: Selected global slots in ``extra_kv_cache``. Nonnegative
+            entries in each active prefix must be smaller than
+            ``extra_pages * extra_page_size``.
         extra_lens: Valid extra selection length for each query token.
         extra_page_size: Number of rows in each extra cache page.
         out: Optional output shaped like ``q``.
@@ -3497,8 +3614,17 @@ def deepseek_v4_paged_selected_attention(
         raise ValueError("swa_slots must have one row per query token")
     if swa_lens.numel() != tokens:
         raise ValueError("swa_lens must have one entry per query token")
+    if swa_slots.dtype not in (torch.int32, torch.int64):
+        raise TypeError("swa_slots must have dtype int32 or int64")
+    if swa_lens.dtype not in (torch.int32, torch.int64):
+        raise TypeError("swa_lens must have dtype int32 or int64")
     if attn_sink.numel() < q.shape[1]:
         raise ValueError("attn_sink must provide one value per query head")
+    if any(
+        tensor.device != q.device
+        for tensor in (swa_kv_cache, swa_slots, swa_lens, attn_sink)
+    ):
+        raise ValueError("all paged selected-attention tensors must share a device")
 
     extra_values = (extra_kv_cache, extra_slots, extra_lens, extra_page_size)
     has_extra_segment = any(value is not None for value in extra_values)
@@ -3521,6 +3647,15 @@ def deepseek_v4_paged_selected_attention(
             raise ValueError("extra_slots must have one row per query token")
         if extra_lens.numel() != tokens:
             raise ValueError("extra_lens must have one entry per query token")
+        if extra_slots.dtype not in (torch.int32, torch.int64):
+            raise TypeError("extra_slots must have dtype int32 or int64")
+        if extra_lens.dtype not in (torch.int32, torch.int64):
+            raise TypeError("extra_lens must have dtype int32 or int64")
+        if any(
+            tensor.device != q.device
+            for tensor in (extra_kv_cache, extra_slots, extra_lens)
+        ):
+            raise ValueError("all extra selected-attention tensors must share a device")
     if out is not None and (
         out.shape != q.shape or out.dtype != q.dtype or out.device != q.device
     ):
@@ -3827,8 +3962,9 @@ def dsa_prefill_topk(
         softmax_scale: Score scale. Each candidate score is exactly
             ``softmax_scale * sum_h(weights[h] * relu(dot(dequant(q[h]), dequant(k))))``.
             BF16 queries are already in their compute representation.
-        index_k_cache: Packed paged FP8 index-K cache with scales (uint8). Used
-            with kv_workspace_slots to resolve workspace rows inside the
+        index_k_cache: Packed or page-planar FP8 index-K cache with scales
+            (uint8). Page-planar caches may have a padded outer page stride.
+            Used with kv_workspace_slots to resolve workspace rows inside the
             selected implementation.
         page_size: KV cache page size for index_k_cache.
         index_k_fp8: FP8 index-K rows already in workspace-row order. Must be
@@ -3847,8 +3983,9 @@ def dsa_prefill_topk(
         solution: Optional kernel solution to force through normal selection.
 
     Implementations may accept a strided outer weight dimension, including the
-    fused model projection view. q, index_k_cache, kv_workspace_slots,
-    row_starts, and row_ends must be contiguous on q's device.
+    fused model projection view. q, kv_workspace_slots, row_starts, and row_ends
+    must be contiguous on q's device. index_k_cache may be a contiguous packed
+    slot matrix or a page-planar matrix with contiguous bytes within each page.
     kv_workspace_slots must be int64; row_starts and row_ends must be int32.
 
     Returns:
@@ -3878,6 +4015,13 @@ def dsa_prefill_topk(
     has_fp8 = index_k_cache is not None or has_workspace_rows
     if has_fp8:
         traits["index_k_format"] = "fp8_scaled"
+    if index_k_cache is not None:
+        row_bytes = q.shape[-1] + q.shape[-1] // 128 * 4
+        traits["index_k_layout"] = (
+            "packed"
+            if index_k_cache.ndim == 2 and index_k_cache.shape[1] == row_bytes
+            else "page_planar"
+        )
     signature = _attention_format_signature(q=q, weights=weights)
     kernel = select_kernel(
         "attention",
@@ -3963,8 +4107,8 @@ def dsa_decode_topk(
             BF16 queries are already in their compute representation.
         q_len_per_req: Query rows per request (spec-verify next_n). Plain
             decode uses 1, where per-request is equivalent to per-token.
-        index_k_cache: Packed FP8 index-K cache with scales (uint8). Used by
-            both Triton and DeepGEMM.
+        index_k_cache: Packed or page-planar FP8 index-K cache with scales
+            (uint8). Page-planar caches may have a padded outer page stride.
         q_scales: Optional positive FP32 scale per token/head for FP8 queries,
             defining ``dequant(q[token, head]) = q[token, head].float() *
             q_scales[token, head]``.
@@ -3977,8 +4121,10 @@ def dsa_decode_topk(
         solution: Optional kernel solution to force through normal selection.
 
     Implementations may accept a strided outer weight dimension, including the
-    fused model projection view. q, index_k_cache, seq_lens, and block_table
-    must be contiguous on q's device. seq_lens and block_table must be int32.
+    fused model projection view. q, seq_lens, and block_table must be contiguous
+    on q's device. index_k_cache may be a contiguous packed slot matrix or a
+    page-planar matrix with contiguous bytes within each page. seq_lens and
+    block_table must be int32.
 
     Returns:
         Tuple of global KV slots and valid counts; invalid entries are -1.
@@ -4000,6 +4146,12 @@ def dsa_decode_topk(
     }
     if index_k_cache is not None:
         traits["index_k_format"] = "fp8_scaled"
+        row_bytes = q.shape[-1] + q.shape[-1] // 128 * 4
+        traits["index_k_layout"] = (
+            "packed"
+            if index_k_cache.ndim == 2 and index_k_cache.shape[1] == row_bytes
+            else "page_planar"
+        )
     signature = _attention_format_signature(q=q, weights=weights)
     kernel = select_kernel(
         "attention",

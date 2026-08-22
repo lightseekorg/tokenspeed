@@ -21,10 +21,12 @@ from collections.abc import Callable
 from typing import Any
 
 # Backend registration (side-effect imports)
+import tokenspeed_kernel.ops.moe.cuda  # noqa: F401
 import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
 import tokenspeed_kernel.ops.moe.marlin  # noqa: F401
+import tokenspeed_kernel.ops.moe.pytorch  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.ops.moe.deepseek_v4 import deepseek_v4_select_experts

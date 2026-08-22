@@ -74,6 +74,24 @@ def _pack_index_k_cache(
     return packed, (x_fp8.float() * scale).reshape_as(index_k)
 
 
+def _with_padded_page_stride(
+    packed: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    row_bytes = packed.shape[1]
+    num_pages = packed.shape[0] // page_size
+    page_bytes = page_size * row_bytes
+    backing = torch.full(
+        (num_pages, page_bytes + 256),
+        0xA5,
+        device=packed.device,
+        dtype=torch.uint8,
+    )
+    page_planar = backing[:, :page_bytes]
+    page_planar.copy_(packed.view(num_pages, page_bytes))
+    return page_planar
+
+
 def _assert_topk_sets_match(
     actual: torch.Tensor,
     actual_lens: torch.Tensor,
@@ -87,7 +105,8 @@ def _assert_topk_sets_match(
         assert (actual[row, count:] == -1).all()
 
 
-def test_dsa_decode_topk_fp8(device: str, require) -> None:
+@pytest.mark.parametrize("padded_page_stride", [False, True])
+def test_dsa_decode_topk_fp8(device: str, require, padded_page_stride: bool) -> None:
     require("attention", "dsa_decode_topk", "triton", torch.bfloat16, "q")
 
     page_size = 64
@@ -98,6 +117,8 @@ def test_dsa_decode_topk_fp8(device: str, require) -> None:
         torch.randn((4 * page_size, 128), device=device, dtype=torch.bfloat16),
         page_size,
     )
+    if padded_page_stride:
+        packed_index_k = _with_padded_page_stride(packed_index_k, page_size)
     seq_lens = torch.tensor([20, 65, 3], device=device, dtype=torch.int32)
     block_table = torch.tensor(
         [[1, 3], [0, 2], [2, 1]], device=device, dtype=torch.int32
@@ -193,7 +214,8 @@ def test_dsa_decode_topk_fp8_mtp(device: str, q_len_per_req: int, require) -> No
             assert ref == got, f"token {token}: {len(ref ^ got)} slots differ"
 
 
-def test_dsa_prefill_topk_fp8(device: str, require) -> None:
+@pytest.mark.parametrize("padded_page_stride", [False, True])
+def test_dsa_prefill_topk_fp8(device: str, require, padded_page_stride: bool) -> None:
     require("attention", "dsa_prefill_topk", "triton", torch.bfloat16, "q")
 
     page_size = 64
@@ -204,6 +226,8 @@ def test_dsa_prefill_topk_fp8(device: str, require) -> None:
         torch.randn((4 * page_size, 128), device=device, dtype=torch.bfloat16),
         page_size,
     )
+    if padded_page_stride:
+        packed_index_k = _with_padded_page_stride(packed_index_k, page_size)
     kv_workspace_slots = torch.arange(85, device=device, dtype=torch.int64) + 17
     row_starts = torch.tensor([0, 10, 70], device=device, dtype=torch.int32)
     row_ends = torch.tensor([20, 75, 85], device=device, dtype=torch.int32)

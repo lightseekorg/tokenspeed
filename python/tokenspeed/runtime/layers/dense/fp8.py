@@ -27,7 +27,7 @@ import logging
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.gemm.aiter import preshuffle_fp8_weight
+from tokenspeed_kernel import supports_deep_gemm
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_block_quant_fp8,
     per_token_group_quant_fp8,
@@ -35,11 +35,9 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
     static_quant_fp8,
     swizzle_mxfp8_scale,
 )
-from tokenspeed_kernel.platform import ArchVersion, current_platform
 from torch.nn.parameter import Parameter
 
 logger = logging.getLogger(__name__)
-_platform = current_platform()
 
 try:
     from tokenspeed_kernel.thirdparty.deep_gemm import ceil_to_ue8m0 as _ceil_to_ue8m0
@@ -234,7 +232,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 _transform_sf is not None
                 and _ceil_to_ue8m0 is not None
                 and scale_requires_transform
-                and _platform.is_nvidia
+                and supports_deep_gemm()
             ):
                 N, K = layer.weight.shape
                 block_n, block_k = self.quant_config.weight_block_size
@@ -273,17 +271,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
                     layer._use_deep_gemm_fp8 = True
             layer._use_flashinfer_mxfp8 = False
-            layer._use_aiter_fp8_preshuffle = False
-            if (
-                _platform.is_amd
-                and _platform.arch_version == ArchVersion(9, 5)
-                and not is_bmm
-                and tuple(self.quant_config.weight_block_size) == (128, 128)
-                and tuple(layer.weight.shape) == (2048, 7168)
-                and layer.weight_scale_inv.dtype == torch.float32
-            ):
-                layer.weight.data = preshuffle_fp8_weight(layer.weight.data)
-                layer._use_aiter_fp8_preshuffle = True
             if (
                 not layer._use_deep_gemm_fp8
                 and not is_bmm
@@ -387,28 +374,17 @@ class Fp8LinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
         block_scale: torch.Tensor | None = None,
         output_dtype: torch.dtype | None = None,
-        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
 
         if self.block_quant:
             input_2d = x.view(-1, x.shape[-1])
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
             output_dtype = output_dtype or x.dtype
-            output_2d = None
-            if output is not None:
-                if tuple(output.shape) != tuple(output_shape):
-                    raise ValueError(
-                        f"FP8 linear output shape must be {tuple(output_shape)}, "
-                        f"got {tuple(output.shape)}"
-                    )
-                output_2d = output.view(input_2d.shape[0], layer.weight.shape[0])
 
             if getattr(layer, "_use_deep_gemm_fp8", False):
                 override = "deep_gemm_mm_fp8_blockscale"
             elif getattr(layer, "_use_flashinfer_mxfp8", False):
                 override = "flashinfer_mm_mxfp8"
-            elif getattr(layer, "_use_aiter_fp8_preshuffle", False):
-                override = "triton_aiter_mm_fp8_blockscale_preshuffle_gfx950"
             elif (
                 getattr(layer, "_use_flashinfer_fp8_blockscale", False)
                 and block_scale is None
@@ -427,7 +403,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     else layer.weight_scale_inv
                 ),
                 bias=bias,
-                out=output_2d,
                 out_dtype=output_dtype,
                 quant="mxfp8",
                 block_size=self.quant_config.weight_block_size,
@@ -445,14 +420,6 @@ class Fp8LinearMethod(LinearMethodBase):
             # View input as 2D matrix for fp8 methods
             input_2d = input.view(-1, input.shape[-1])
             output_shape = [*input.shape[:-1], weight.shape[1]]
-            output_2d = None
-            if output is not None:
-                if tuple(output.shape) != tuple(output_shape):
-                    raise ValueError(
-                        f"FP8 linear output shape must be {tuple(output_shape)}, "
-                        f"got {tuple(output.shape)}"
-                    )
-                output_2d = output.view(input_2d.shape[0], weight.shape[1])
 
             if input_scale is not None:
                 if input_scale.numel() != 1:
@@ -470,9 +437,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight,
                 A_scales=x_scale,
                 B_scales=weight_scale,
-                out=output_2d,
                 out_dtype=input.dtype,
             )
             if bias is not None:
-                output = output.add_(bias) if output_2d is not None else output + bias
+                output = output + bias
             return output.view(*output_shape)

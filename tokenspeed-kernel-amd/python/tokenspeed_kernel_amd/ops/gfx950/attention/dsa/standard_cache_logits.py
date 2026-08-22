@@ -142,6 +142,7 @@ def _load_key_tile_to_shared(
     block_table_stride,
     PAGE_SIZE: gl.constexpr,
     ROW_BYTES: gl.constexpr,
+    PAGE_STRIDE_BYTES: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
@@ -165,7 +166,7 @@ def _load_key_tile_to_shared(
     )
     pages = slots // PAGE_SIZE
     page_rows = slots - pages * PAGE_SIZE
-    byte_offsets = pages * (PAGE_SIZE * ROW_BYTES) + page_rows * HEAD_DIM + dims
+    byte_offsets = pages * PAGE_STRIDE_BYTES + page_rows * HEAD_DIM + dims
     if USE_BUFFER_LOAD:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             key_shared.index(buffer_id),
@@ -194,6 +195,7 @@ def _load_key_scales(
     output_layout: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
     ROW_BYTES: gl.constexpr,
+    PAGE_STRIDE_BYTES: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     BLOCK_N: gl.constexpr,
     IS_PREFILL: gl.constexpr,
@@ -215,7 +217,7 @@ def _load_key_scales(
     pages = slots // PAGE_SIZE
     page_rows = slots - pages * PAGE_SIZE
     scale_offsets = (
-        pages * ((PAGE_SIZE * ROW_BYTES) // 4) + (PAGE_SIZE * HEAD_DIM) // 4 + page_rows
+        pages * (PAGE_STRIDE_BYTES // 4) + (PAGE_SIZE * HEAD_DIM) // 4 + page_rows
     )
     if USE_BUFFER_LOAD:
         scales = gl.amd.cdna4.buffer_load(
@@ -377,6 +379,7 @@ def _standard_cache_logits_body(
     q_len_per_req,
     PAGE_SIZE: gl.constexpr,
     ROW_BYTES: gl.constexpr,
+    PAGE_STRIDE_BYTES: gl.constexpr,
     NUM_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     BLOCK_N: gl.constexpr,
@@ -477,6 +480,7 @@ def _standard_cache_logits_body(
         block_table_stride,
         PAGE_SIZE,
         ROW_BYTES,
+        PAGE_STRIDE_BYTES,
         HEAD_DIM,
         BLOCK_N,
         NUM_WARPS,
@@ -495,6 +499,7 @@ def _standard_cache_logits_body(
         block_table_stride,
         PAGE_SIZE,
         ROW_BYTES,
+        PAGE_STRIDE_BYTES,
         HEAD_DIM,
         BLOCK_N,
         NUM_WARPS,
@@ -518,6 +523,7 @@ def _standard_cache_logits_body(
             output_layout,
             PAGE_SIZE,
             ROW_BYTES,
+            PAGE_STRIDE_BYTES,
             HEAD_DIM,
             BLOCK_N,
             IS_PREFILL,
@@ -543,6 +549,7 @@ def _standard_cache_logits_body(
                 block_table_stride,
                 PAGE_SIZE,
                 ROW_BYTES,
+                PAGE_STRIDE_BYTES,
                 HEAD_DIM,
                 BLOCK_N,
                 NUM_WARPS,
@@ -606,6 +613,7 @@ def _dsa_standard_prefill_logits_kernel(
     workspace_rows,
     PAGE_SIZE: gl.constexpr,
     ROW_BYTES: gl.constexpr,
+    PAGE_STRIDE_BYTES: gl.constexpr,
     NUM_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     BLOCK_N: gl.constexpr,
@@ -640,6 +648,7 @@ def _dsa_standard_prefill_logits_kernel(
         1,
         PAGE_SIZE,
         ROW_BYTES,
+        PAGE_STRIDE_BYTES,
         NUM_HEADS,
         HEAD_DIM,
         BLOCK_N,
@@ -676,6 +685,7 @@ def _dsa_standard_decode_logits_kernel(
     q_len_per_req,
     PAGE_SIZE: gl.constexpr,
     ROW_BYTES: gl.constexpr,
+    PAGE_STRIDE_BYTES: gl.constexpr,
     NUM_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     BLOCK_N: gl.constexpr,
@@ -711,6 +721,7 @@ def _dsa_standard_decode_logits_kernel(
         q_len_per_req,
         PAGE_SIZE,
         ROW_BYTES,
+        PAGE_STRIDE_BYTES,
         NUM_HEADS,
         HEAD_DIM,
         BLOCK_N,

@@ -24,11 +24,48 @@ of hand-computed scalar checks.
 
 from __future__ import annotations
 
+import os
+import sys
+
+# CI Registration (parsed via AST, runtime no-op)
+sys.path.insert(
+    0,
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+)
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=20, suite="runtime-1gpu")
+
 import pytest
 import torch
 from tokenspeed_kernel.ops.activation.triton import add3
 
-from tokenspeed.runtime.layers.activation import SituAndMul
+from tokenspeed.runtime.layers.activation import SiluAndMul, SituAndMul
+
+
+def _ref_swiglu(x: torch.Tensor, limit: float | None) -> torch.Tensor:
+    gate, up = x.float().chunk(2, dim=-1)
+    if limit is not None and limit > 0:
+        gate = gate.clamp_max(limit)
+        up = up.clamp(-limit, limit)
+    return (torch.nn.functional.silu(gate) * up).to(x.dtype)
+
+
+@pytest.mark.parametrize("limit", [None, 0.0, -1.0])
+def test_swiglu_nonpositive_limit_disables_clamp(limit):
+    x = torch.tensor([[20.0, -20.0, 30.0, -30.0]])
+
+    actual = SiluAndMul(limit)(x)
+
+    torch.testing.assert_close(actual, _ref_swiglu(x, None))
+
+
+def test_swiglu_positive_limit_clamps_gate_and_up():
+    x = torch.tensor([[20.0, -20.0, 30.0, -30.0]])
+
+    actual = SiluAndMul(5.0)(x)
+
+    torch.testing.assert_close(actual, _ref_swiglu(x, 5.0))
 
 
 def _ref_situ(x: torch.Tensor, beta: float, linear_beta: float | None):

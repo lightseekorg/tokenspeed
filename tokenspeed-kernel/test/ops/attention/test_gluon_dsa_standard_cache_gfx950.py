@@ -156,6 +156,20 @@ def _pack_standard_cache(
     return packed, reference, key_fp8, scales
 
 
+def _with_padded_page_stride(packed: torch.Tensor) -> torch.Tensor:
+    num_pages = packed.shape[0] // _PAGE_SIZE
+    page_bytes = _PAGE_SIZE * packed.shape[1]
+    backing = torch.full(
+        (num_pages, page_bytes + 256),
+        0xA5,
+        device=packed.device,
+        dtype=torch.uint8,
+    )
+    page_planar = backing[:, :page_bytes]
+    page_planar.copy_(packed.view(num_pages, page_bytes))
+    return page_planar
+
+
 def _weighted_relu_scores(
     query: torch.Tensor,
     weights: torch.Tensor,
@@ -246,7 +260,11 @@ def _assert_topk(
         f"w{str(case.weight_dtype).removeprefix('torch.')}"
     ),
 )
-def test_standard_cache_decode_matches_weighted_relu_oracle(case: _DecodeCase) -> None:
+@pytest.mark.parametrize("padded_page_stride", [False, True])
+def test_standard_cache_decode_matches_weighted_relu_oracle(
+    case: _DecodeCase,
+    padded_page_stride: bool,
+) -> None:
     generator = _generator(100 + case.q_len)
     seq_lens = torch.tensor((515, 641), device=_DEVICE, dtype=torch.int32)
     page_count = 11
@@ -269,6 +287,8 @@ def test_standard_cache_decode_matches_weighted_relu_oracle(case: _DecodeCase) -
         * 0.15
     )
     cache, key_reference, _, _ = _pack_standard_cache(keys)
+    if padded_page_stride:
+        cache = _with_padded_page_stride(cache)
     query, q_scales, query_reference = _prepared_query(
         2 * case.q_len, case.heads, case.q_dtype, generator
     )
@@ -309,10 +329,12 @@ def test_standard_cache_decode_matches_weighted_relu_oracle(case: _DecodeCase) -
         (64, torch.float8_e4m3fn, torch.bfloat16),
     ),
 )
+@pytest.mark.parametrize("padded_page_stride", [False, True])
 def test_standard_cache_prefill_uses_workspace_rows_not_global_slots(
     heads: int,
     q_dtype: torch.dtype,
     weight_dtype: torch.dtype,
+    padded_page_stride: bool,
 ) -> None:
     generator = _generator(200 + heads)
     num_slots = 22 * _PAGE_SIZE
@@ -326,6 +348,8 @@ def test_standard_cache_prefill_uses_workspace_rows_not_global_slots(
         * 0.15
     )
     cache, key_reference, _, _ = _pack_standard_cache(keys)
+    if padded_page_stride:
+        cache = _with_padded_page_stride(cache)
     workspace_rows = 704
     workspace_slots = (
         torch.arange(workspace_rows, device=_DEVICE) * 37 + 41
@@ -503,6 +527,7 @@ def test_standard_cache_decode_logits_cover_empty_and_short_spans() -> None:
         1,
         PAGE_SIZE=_PAGE_SIZE,
         ROW_BYTES=132,
+        PAGE_STRIDE_BYTES=_PAGE_SIZE * 132,
         NUM_HEADS=32,
         HEAD_DIM=_HEAD_DIM,
         BLOCK_N=64,

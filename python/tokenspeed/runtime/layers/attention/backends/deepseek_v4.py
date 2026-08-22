@@ -17,12 +17,10 @@ from collections.abc import Mapping
 
 import torch
 from tokenspeed_kernel import (
+    deepseek_v4_indexer_decode_metadata_compute,
     deepseek_v4_paged_selected_attention,
     deepseek_v4_selected_attention,
     deepseek_v4_supports_deep_gemm,
-)
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
-    deepseek_v4_indexer_decode_metadata_compute,
 )
 
 try:

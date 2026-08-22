@@ -24,11 +24,12 @@ import logging
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
-import tokenspeed_kernel.ops.gemm.aiter  # noqa: F401
+import tokenspeed_kernel.ops.gemm.cuda  # noqa: F401
 import tokenspeed_kernel.ops.gemm.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.ll_bf16  # noqa: F401
+import tokenspeed_kernel.ops.gemm.pytorch  # noqa: F401
 import tokenspeed_kernel.ops.gemm.routed_gemv  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
@@ -73,10 +74,17 @@ __all__ = [
     "kimi3_shared_down_projection",
     "kimi3_shared_situ_projection",
     "mm",
+    "supports_deep_gemm",
 ]
 
 _platform = Platform.get()
 _fp8_dtype = torch.float8_e4m3fn
+
+
+def supports_deep_gemm() -> bool:
+    """Return whether this platform may use DeepGEMM weight layouts."""
+    return _platform.is_nvidia
+
 
 # Kernels that accept and own bias application inside their GEMM wrapper.
 # For any kernel not listed here, dispatch applies the bias with a post-GEMM
@@ -291,10 +299,6 @@ def _online_quantize_mxfp8(
             *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
             group_major_scales=_platform.is_nvidia,
         )
-    elif kernel_name == "triton_aiter_mm_fp8_blockscale_preshuffle_gfx950":
-        from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
-
-        return per_token_group_quant_fp8(A, block_k, column_major_scales=True)
     elif kernel_name == "triton_mm_fp8_blockscale":
         from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 

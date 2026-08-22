@@ -22,16 +22,29 @@ from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 
 bootstrap_profiling_from_env()
 
-from tokenspeed_kernel.ops.activation import add3, situ_and_mul
+from tokenspeed_kernel.ops.activation import add3, silu_and_mul, situ_and_mul
 from tokenspeed_kernel.ops.attention import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
     MLAQueryProjection,
     attn_merge_state,
+    deepseek_v4_build_dense_prefill_local_compressed_indices,
+    deepseek_v4_combine_dense_swa_indices,
+    deepseek_v4_combine_topk_swa_indices,
+    deepseek_v4_compressed_slot_mapping,
+    deepseek_v4_compute_global_topk_indices_and_lens,
     deepseek_v4_csa_indexer_fp8_cache_insert,
+    deepseek_v4_decode_swa_indices_and_lens,
+    deepseek_v4_dequantize_and_gather_k_cache,
+    deepseek_v4_fused_csa_indexer_mxfp4_cache_insert,
+    deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4,
+    deepseek_v4_fused_inv_rope_fp8_quant,
+    deepseek_v4_fused_sparse_compress_cache_insert,
     deepseek_v4_indexer_cache_format,
+    deepseek_v4_indexer_decode_metadata_compute,
     deepseek_v4_padded_heads,
     deepseek_v4_paged_selected_attention,
+    deepseek_v4_save_compressor_state,
     deepseek_v4_selected_attention,
     deepseek_v4_supports_deep_gemm,
     deepseek_v4_swa_cache_insert,
@@ -59,6 +72,7 @@ from tokenspeed_kernel.ops.attention import (
     rel_mha_extend_with_kvcache,
     rel_mha_plan,
     rel_mha_prefill,
+    write_deepseek_v4_indexer_mxfp4_cache_cuda,
 )
 from tokenspeed_kernel.ops.gemm import (
     bmm,
@@ -71,6 +85,7 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_down_projection,
     kimi3_shared_situ_projection,
     mm,
+    supports_deep_gemm,
 )
 from tokenspeed_kernel.ops.mhc import mhc_fused_hc, mhc_post, mhc_pre
 from tokenspeed_kernel.ops.moe import (
@@ -107,6 +122,7 @@ __all__ = [
     "kimi3_shared_down_projection",
     "kimi3_shared_situ_projection",
     "mm",
+    "supports_deep_gemm",
     # attention
     "mha_plan",
     "mha_prefill",
@@ -131,13 +147,27 @@ __all__ = [
     "msa_decode_with_kvcache",
     "msa_extend_with_kvcache",
     "attn_merge_state",
+    "deepseek_v4_build_dense_prefill_local_compressed_indices",
+    "deepseek_v4_combine_dense_swa_indices",
+    "deepseek_v4_combine_topk_swa_indices",
+    "deepseek_v4_compressed_slot_mapping",
+    "deepseek_v4_compute_global_topk_indices_and_lens",
     "deepseek_v4_csa_indexer_fp8_cache_insert",
+    "deepseek_v4_decode_swa_indices_and_lens",
+    "deepseek_v4_dequantize_and_gather_k_cache",
+    "deepseek_v4_fused_csa_indexer_mxfp4_cache_insert",
+    "deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4",
+    "deepseek_v4_fused_inv_rope_fp8_quant",
+    "deepseek_v4_fused_sparse_compress_cache_insert",
+    "deepseek_v4_indexer_decode_metadata_compute",
     "deepseek_v4_indexer_cache_format",
     "deepseek_v4_padded_heads",
     "deepseek_v4_paged_selected_attention",
+    "deepseek_v4_save_compressor_state",
     "deepseek_v4_selected_attention",
     "deepseek_v4_supports_deep_gemm",
     "deepseek_v4_swa_cache_insert",
+    "write_deepseek_v4_indexer_mxfp4_cache_cuda",
     "gdn_chunk_prefill",
     "gdn_decode_step",
     "gdn_decode_mtp",
@@ -145,6 +175,7 @@ __all__ = [
     "GdnChunkPrefillResult",
     # activation
     "add3",
+    "silu_and_mul",
     "situ_and_mul",
     # moe
     "deepseek_v4_select_experts",

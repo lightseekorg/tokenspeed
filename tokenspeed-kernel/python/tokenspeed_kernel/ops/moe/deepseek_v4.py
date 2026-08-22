@@ -23,16 +23,24 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
-from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.registry import KernelRegistry, Priority, register_kernel
+from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-from tokenspeed_kernel.thirdparty.cuda.routing import (
-    hash_softplus_sqrt_topk_flash,
-    softplus_sqrt_topk_flash,
-)
+
+
+def _assert_indices_in_range(
+    indices: torch.Tensor,
+    upper_bound: int,
+    name: str,
+) -> None:
+    valid = ((indices >= 0) & (indices < upper_bound)).all()
+    message = f"{name} entries must be in [0, {upper_bound})"
+    if indices.device.type == "cpu":
+        if not bool(valid.item()):
+            raise ValueError(message)
+    else:
+        torch._assert_async(valid, message)
 
 
 def _routing_kind(
@@ -89,8 +97,32 @@ def deepseek_v4_select_experts(
         raise ValueError(f"top_k must be in [1, {experts}], got {top_k}")
     if correction_bias is not None and correction_bias.shape != (experts,):
         raise ValueError(f"correction_bias must have shape [{experts}]")
-    if hash_indices_table is not None and input_ids is None:
-        raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
+    if hash_indices_table is not None:
+        if input_ids is None:
+            raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
+        if (
+            hash_indices_table.ndim != 2
+            or hash_indices_table.shape[0] == 0
+            or hash_indices_table.shape[1] != top_k
+        ):
+            raise ValueError("hash_indices_table must have shape [vocabulary, top_k]")
+        if hash_indices_table.dtype not in (torch.int32, torch.int64):
+            raise ValueError("hash_indices_table must have dtype int32 or int64")
+        if input_ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("input_ids must have dtype int32 or int64")
+        if input_ids.numel() != tokens:
+            raise ValueError(f"input_ids must contain {tokens} token ids")
+        if hash_indices_table.device != router_logits.device:
+            raise ValueError(
+                "hash_indices_table must be on the same device as router_logits"
+            )
+        if input_ids.device != router_logits.device:
+            raise ValueError("input_ids must be on the same device as router_logits")
+        _assert_indices_in_range(input_ids, hash_indices_table.shape[0], "input_ids")
+        safe_input_ids = input_ids.clamp(0, hash_indices_table.shape[0] - 1)
+        selected_experts = hash_indices_table[safe_input_ids.reshape(-1).long()]
+        _assert_indices_in_range(selected_experts, experts, "hash_indices_table")
+        input_ids = safe_input_ids
 
     routing_kind = _routing_kind(correction_bias, hash_indices_table)
     traits = {
@@ -163,135 +195,6 @@ def deepseek_v4_select_experts(
             input_ids,
             need_scores,
         )
-
-
-@register_kernel(
-    "moe",
-    "deepseek_v4_select_experts",
-    name="cuda_deepseek_v4_select_experts",
-    solution="cuda",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=frozenset(
-        format_signature(router_logits=dense_tensor_format(dtype))
-        for dtype in (torch.float16, torch.bfloat16, torch.float32)
-    ),
-    traits={
-        "experts": frozenset({256, 384}),
-        "top_k": frozenset({6}),
-        "renormalize": frozenset({True}),
-        "routing_kind": frozenset({"bias", "hash"}),
-    },
-    priority=Priority.SPECIALIZED,
-    tags={"nvidia", "routing", "latency"},
-)
-def cuda_deepseek_v4_select_experts(
-    router_logits: torch.Tensor,
-    top_k: int,
-    renormalize: bool,
-    correction_bias: torch.Tensor | None,
-    hash_indices_table: torch.Tensor | None,
-    input_ids: torch.Tensor | None,
-    need_scores: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the fused CUDA sqrt-softplus expert selector."""
-    logits_f32 = router_logits.float().contiguous()
-    topk_weights = torch.empty(
-        router_logits.shape[0],
-        top_k,
-        dtype=torch.float32,
-        device=router_logits.device,
-    )
-    topk_ids = torch.empty(
-        router_logits.shape[0],
-        top_k,
-        dtype=torch.int32,
-        device=router_logits.device,
-    )
-    if hash_indices_table is not None:
-        if input_ids is None:
-            raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
-        hash_softplus_sqrt_topk_flash(
-            logits_f32,
-            input_ids.reshape(-1).to(device=router_logits.device).contiguous(),
-            hash_indices_table.to(
-                device=router_logits.device,
-                dtype=torch.int32,
-            ).contiguous(),
-            topk_ids,
-            topk_weights,
-            1.0,
-            renormalize,
-        )
-    elif correction_bias is not None:
-        softplus_sqrt_topk_flash(
-            logits_f32,
-            correction_bias.to(
-                device=router_logits.device,
-                dtype=torch.float32,
-            ).contiguous(),
-            topk_ids,
-            topk_weights,
-            1.0,
-            renormalize,
-        )
-    else:
-        raise ValueError("fused DeepSeek V4 selection requires bias or hash routing")
-    scores = (
-        torch.sqrt(F.softplus(router_logits.float())) if need_scores else router_logits
-    )
-    return topk_weights, topk_ids, scores
-
-
-@register_kernel(
-    "moe",
-    "deepseek_v4_select_experts",
-    name="torch_deepseek_v4_select_experts",
-    solution="torch",
-    signatures=frozenset(
-        format_signature(router_logits=dense_tensor_format(dtype))
-        for dtype in (torch.float16, torch.bfloat16, torch.float32)
-    ),
-    priority=Priority.PORTABLE,
-    tags={"portability", "reference", "routing"},
-)
-def torch_deepseek_v4_select_experts(
-    router_logits: torch.Tensor,
-    top_k: int,
-    renormalize: bool,
-    correction_bias: torch.Tensor | None,
-    hash_indices_table: torch.Tensor | None,
-    input_ids: torch.Tensor | None,
-    need_scores: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run portable sqrt-softplus expert selection with PyTorch."""
-    scores = torch.sqrt(F.softplus(router_logits.float()))
-    if hash_indices_table is not None:
-        if input_ids is None:
-            raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
-        table = hash_indices_table.to(device=scores.device, dtype=torch.int64)
-        ids = input_ids.reshape(-1).to(device=scores.device, dtype=torch.int64)
-        topk_ids = table[ids]
-    else:
-        scores_for_choice = scores
-        if correction_bias is not None:
-            scores_for_choice = scores_for_choice + correction_bias.to(
-                device=scores.device,
-                dtype=scores.dtype,
-            ).unsqueeze(0)
-        topk_ids = torch.topk(
-            scores_for_choice,
-            k=top_k,
-            dim=-1,
-            sorted=True,
-        ).indices
-
-    topk_weights = scores.gather(1, topk_ids.long())
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(
-            dim=-1,
-            keepdim=True,
-        ).clamp_min(torch.finfo(topk_weights.dtype).tiny)
-    return topk_weights.to(torch.float32), topk_ids.to(torch.int32), scores
 
 
 __all__ = ["deepseek_v4_select_experts"]

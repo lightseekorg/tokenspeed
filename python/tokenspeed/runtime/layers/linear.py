@@ -1226,7 +1226,7 @@ class RowParallelLinear(LinearBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         return None
 
-    def forward(self, input_, scale=None, output: torch.Tensor | None = None):
+    def forward(self, input_, scale=None):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1237,42 +1237,16 @@ class RowParallelLinear(LinearBase):
 
         # Matrix multiply.
         assert self.quant_method is not None
-        if output is not None:
-            if not isinstance(self.quant_method, Fp8LinearMethod):
-                raise ValueError(
-                    "RowParallelLinear output is supported only for FP8 linear methods"
-                )
-            if self.reduce_results and self.tp_size > 1:
-                raise ValueError(
-                    "RowParallelLinear output requires reduce_results=False under TP"
-                )
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
 
         if scale is not None:
-            if output is None:
-                output_parallel = self.quant_method.apply(
-                    self, input_parallel, bias_, scale, torch.bfloat16
-                )
-            else:
-                output_parallel = self.quant_method.apply(
-                    self,
-                    input_parallel,
-                    bias_,
-                    scale,
-                    torch.bfloat16,
-                    output=output,
-                )
+            output_parallel = self.quant_method.apply(
+                self, input_parallel, bias_, scale, torch.bfloat16
+            )
         else:
-            if output is None:
-                output_parallel = self.quant_method.apply(
-                    self, input_parallel, bias=bias_
-                )
-            else:
-                output_parallel = self.quant_method.apply(
-                    self, input_parallel, bias=bias_, output=output
-                )
+            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
         if self.reduce_results and self.tp_size > 1:
             output = all_reduce(output_parallel, self.tp_group)
         else:

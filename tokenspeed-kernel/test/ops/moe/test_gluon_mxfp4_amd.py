@@ -129,7 +129,7 @@ def _make_static_fp8_moe_module(
     return module
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4])
 def test_dynamic_mxfp4_activation_moe(
     monkeypatch: pytest.MonkeyPatch, num_tokens: int
 ) -> None:
@@ -242,7 +242,8 @@ def test_dynamic_mxfp4_activation_moe(
     )
 
     torch.cuda.synchronize()
-    assert stages == [1, 2]
+    expected_stages = [1, 2] if num_tokens <= 2 else []
+    assert stages == expected_stages
     assert actual.shape == hidden_states.shape
 
     scores = torch.softmax(router_logits.float(), dim=-1)
@@ -260,7 +261,7 @@ def test_dynamic_mxfp4_activation_moe(
         out=output,
     )
     torch.cuda.synchronize()
-    assert stages == [1, 2, 1, 2]
+    assert stages == expected_stages * 2
     assert direct.data_ptr() == output.data_ptr()
     torch.testing.assert_close(direct, actual, atol=0, rtol=0)
     hidden = _dequantize_dynamic_mxfp4(hidden_states)

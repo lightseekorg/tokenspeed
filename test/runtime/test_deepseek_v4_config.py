@@ -111,9 +111,9 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4MoEGate,
     _deepseek_v4_expert_scale_parameter_name,
     _deepseek_v4_forward_metadata,
-    _deepseek_v4_fused_select_experts,
     _deepseek_v4_indexer_decode_max_len,
     _deepseek_v4_indexer_decode_plan,
+    _deepseek_v4_indexer_page_table,
     _deepseek_v4_indexer_prefill_max_logits_bytes,
     _deepseek_v4_indexer_prefill_metadata,
     _deepseek_v4_indexer_prefill_request_chunks,
@@ -123,8 +123,6 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_mega_moe_max_num_tokens,
     _deepseek_v4_reorder_c4_ape_2604,
     _deepseek_v4_routed_expert_quant_config,
-    _deepseek_v4_should_reuse_index_topk,
-    _deepseek_v4_use_aux_stream,
     _DeepseekV4TopKBuffer,
     deepseek_v4_rope_config,
     deepseek_v4_select_experts,
@@ -1306,25 +1304,6 @@ class TestDeepseekV4Config(unittest.TestCase):
 
             global_server_args_dict["deepseek_v4_mega_moe_max_num_tokens"] = 256
             self.assertEqual(_deepseek_v4_mega_moe_max_num_tokens(), 256)
-        finally:
-            global_server_args_dict.clear()
-            global_server_args_dict.update(snapshot)
-
-    def test_deepseek_v4_aux_stream_policy_targets_non_speculative_c1(self):
-        snapshot = dict(global_server_args_dict)
-        try:
-            global_server_args_dict.update(
-                {"max_num_seqs": 1, "speculative_algorithm": None}
-            )
-            self.assertFalse(_deepseek_v4_use_aux_stream())
-
-            global_server_args_dict["max_num_seqs"] = 4
-            self.assertTrue(_deepseek_v4_use_aux_stream())
-
-            global_server_args_dict.update(
-                {"max_num_seqs": 1, "speculative_algorithm": "DSpark"}
-            )
-            self.assertTrue(_deepseek_v4_use_aux_stream())
         finally:
             global_server_args_dict.clear()
             global_server_args_dict.update(snapshot)
@@ -5530,46 +5509,47 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(third.shape, (4, 3))
         self.assertGreaterEqual(buffer.buffer.shape[0], 4)
 
-    def test_deepseek_v4_index_topk_frequency_reuses_after_refresh(self):
-        config = SimpleNamespace(
-            use_index_cache=True,
-            index_topk_freq=4,
-            index_topk_pattern=None,
-            compress_ratios=[128, 4, 1, 4, 128, 4, 4, 4],
+    def test_deepseek_v4_indexer_rejects_mxfp4_without_deepgemm(self):
+        with (
+            patch.object(
+                deepseek_v4_model,
+                "_attention_use_fp4_indexer_cache",
+                return_value=True,
+            ),
+            patch.object(deepseek_v4_model, "deep_gemm", None),
+            self.assertRaisesRegex(RuntimeError, "requires DeepGEMM"),
+        ):
+            DeepseekV4Indexer(
+                SimpleNamespace(),
+                mapping=None,
+                quant_config=None,
+                prefix="indexer",
+                compress_ratio=4,
+            )
+
+    def test_portable_indexer_preserves_compressed_page_table_base_offsets(self):
+        full_table = torch.zeros((1, 4), dtype=torch.int32)
+        compressed_table = torch.ones((1, 2), dtype=torch.int32)
+        base_offsets = torch.tensor([3], dtype=torch.int32)
+        metadata = SimpleNamespace(
+            cache=SimpleNamespace(
+                page_table=full_table,
+                compressed_page_table=lambda _ratio, _block_size: compressed_table,
+                block_table_base_offsets={
+                    "v4.c4a.compressed_kv": base_offsets,
+                },
+            )
+        )
+        indexer = SimpleNamespace(compress_ratio=4)
+
+        table, offsets = _deepseek_v4_indexer_page_table(
+            metadata,
+            indexer.compress_ratio,
+            indexer_block_size=64,
         )
 
-        actual = [
-            _deepseek_v4_should_reuse_index_topk(config, layer_id)
-            for layer_id in range(len(config.compress_ratios))
-        ]
-
-        self.assertEqual(actual, [False, False, False, True, False, True, True, False])
-
-    def test_deepseek_v4_index_topk_pattern_overrides_frequency(self):
-        config = SimpleNamespace(
-            use_index_cache=True,
-            index_topk_freq=1,
-            index_topk_pattern="RSSR",
-            compress_ratios=[4, 4, 4, 4],
-        )
-
-        actual = [
-            _deepseek_v4_should_reuse_index_topk(config, layer_id)
-            for layer_id in range(len(config.compress_ratios))
-        ]
-
-        self.assertEqual(actual, [False, True, True, False])
-
-    def test_deepseek_v4_index_topk_rejects_nonpositive_frequency(self):
-        config = SimpleNamespace(
-            use_index_cache=True,
-            index_topk_freq=0,
-            index_topk_pattern=None,
-            compress_ratios=[4, 4],
-        )
-
-        with self.assertRaisesRegex(ValueError, "positive integer"):
-            _deepseek_v4_should_reuse_index_topk(config, 0)
+        self.assertIs(table, compressed_table)
+        self.assertIs(offsets, base_offsets)
 
     def test_deepseek_v4_sparse_indexer_custom_op_registered(self):
         self.assertTrue(
@@ -6278,21 +6258,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.allclose(scores, expected_scores))
         self.assertTrue(torch.equal(topk_ids, expected_ids.to(torch.int32)))
         self.assertTrue(torch.allclose(topk_weights, expected_weights, atol=1e-6))
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_deepseek_v4_bias_fused_router_runs_by_default(self):
-        logits = torch.zeros(2, 256, device="cuda", dtype=torch.float32)
-        bias = torch.linspace(0.25, -0.25, 256, device="cuda", dtype=torch.float32)
-
-        out = _deepseek_v4_fused_select_experts(
-            logits, top_k=6, renormalize=True, correction_bias=bias
-        )
-
-        if out is None:
-            self.skipTest("fused DeepSeek V4 router op unavailable")
-        topk_weights, topk_ids = out
-        self.assertEqual(tuple(topk_weights.shape), (2, 6))
-        self.assertEqual(tuple(topk_ids.shape), (2, 6))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_deepseek_v4_fused_hash_topk_matches_reference(self):

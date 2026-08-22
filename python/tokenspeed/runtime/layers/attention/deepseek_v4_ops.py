@@ -26,35 +26,21 @@ import math
 
 import torch
 from tokenspeed_kernel import (
-    deepseek_v4_csa_indexer_fp8_cache_insert,
-    deepseek_v4_swa_cache_insert,
-)
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_build_dense_prefill_local_compressed_indices,
     deepseek_v4_combine_dense_swa_indices,
     deepseek_v4_combine_topk_swa_indices,
     deepseek_v4_compressed_slot_mapping,
     deepseek_v4_compute_global_topk_indices_and_lens,
+    deepseek_v4_csa_indexer_fp8_cache_insert,
     deepseek_v4_decode_swa_indices_and_lens,
     deepseek_v4_dequantize_and_gather_k_cache,
-)
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
-    deepseek_v4_fused_csa_indexer_mxfp4_cache_insert as _triton_fused_csa_indexer_mxfp4_cache_insert,
-)
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
-    deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4 as _triton_fused_indexer_q_rope_hadamard_mxfp4,
-)
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    deepseek_v4_fused_csa_indexer_mxfp4_cache_insert,
+    deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4,
     deepseek_v4_fused_inv_rope_fp8_quant,
-)
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
-    deepseek_v4_fused_sparse_compress_cache_insert as _triton_fused_sparse_compress_cache_insert,
-)
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
-    deepseek_v4_save_compressor_state as _triton_save_compressor_state,
-)
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
-    write_deepseek_v4_indexer_mxfp4_cache_cuda as _triton_write_indexer_mxfp4_cache_cuda,
+    deepseek_v4_fused_sparse_compress_cache_insert,
+    deepseek_v4_save_compressor_state,
+    deepseek_v4_swa_cache_insert,
+    write_deepseek_v4_indexer_mxfp4_cache_cuda,
 )
 from tokenspeed_kernel.ops.transform import hadamard_transform
 
@@ -150,71 +136,6 @@ def fused_qnorm_rope_kv_insert(
     - slot_mapping: output token slots in the paged SWA cache
     - positions: absolute token positions
     """
-
-    if q.dim() != 3 or q.shape[-1] != 512:
-        raise ValueError(f"q must be [tokens, heads, 512], got {tuple(q.shape)}")
-    if kv.shape != (q.shape[0], 512):
-        raise ValueError(f"kv must be [tokens, 512], got {tuple(kv.shape)}")
-    if q.dtype not in (torch.float16, torch.bfloat16) or kv.dtype != q.dtype:
-        raise TypeError("q and kv must have matching float16 or bfloat16 dtypes")
-    if not q.is_contiguous() or not kv.is_contiguous():
-        raise ValueError("q and kv must be contiguous")
-    if positions.dim() != 1 or positions.numel() != q.shape[0]:
-        raise ValueError(
-            f"positions must have one entry per token, got {tuple(positions.shape)}"
-        )
-    if slot_mapping.dim() != 1 or slot_mapping.numel() > q.shape[0]:
-        raise ValueError(
-            "slot_mapping must be one-dimensional and no longer than q, got "
-            f"{tuple(slot_mapping.shape)}"
-        )
-    if positions.dtype not in (torch.int32, torch.int64):
-        raise TypeError(f"positions must be int32 or int64, got {positions.dtype}")
-    if slot_mapping.dtype not in (torch.int32, torch.int64):
-        raise TypeError(
-            f"slot_mapping must be int32 or int64, got {slot_mapping.dtype}"
-        )
-    if not positions.is_contiguous() or not slot_mapping.is_contiguous():
-        raise ValueError("positions and slot_mapping must be contiguous")
-    if cos_sin_cache.dim() != 2 or cos_sin_cache.shape[-1] != 64:
-        raise ValueError(
-            f"cos_sin_cache must be [max_position, 64], got {tuple(cos_sin_cache.shape)}"
-        )
-    if cos_sin_cache.dtype != torch.float32 or not cos_sin_cache.is_contiguous():
-        raise TypeError("cos_sin_cache must be contiguous float32")
-    if block_size <= 0:
-        raise ValueError(f"block_size must be positive, got {block_size}")
-    if rms_norm_eps <= 0.0:
-        raise ValueError(f"rms_norm_eps must be positive, got {rms_norm_eps}")
-    min_block_bytes = block_size * deepseek_v4_swa_row_bytes(512, 64)
-    if (
-        swa_kv_cache_2d.dtype != torch.uint8
-        or swa_kv_cache_2d.dim() != 2
-        or swa_kv_cache_2d.shape[1] < min_block_bytes
-        or swa_kv_cache_2d.stride(1) != 1
-    ):
-        raise ValueError(
-            "swa_kv_cache_2d must be an inner-contiguous uint8 tensor shaped "
-            f"[pages, >= {min_block_bytes}], got {tuple(swa_kv_cache_2d.shape)}"
-        )
-    if q_out is not None and (
-        q_out.shape != q.shape
-        or q_out.dtype != q.dtype
-        or q_out.device != q.device
-        or not q_out.is_contiguous()
-    ):
-        raise ValueError(
-            "q_out must be contiguous and match q shape, dtype, and device"
-        )
-    tensors = (
-        kv,
-        swa_kv_cache_2d,
-        slot_mapping,
-        positions,
-        cos_sin_cache,
-    )
-    if any(tensor.device != q.device for tensor in tensors):
-        raise ValueError("all DeepSeek V4 SWA cache insert tensors must share a device")
 
     deepseek_v4_swa_cache_insert(
         q=q,
@@ -368,7 +289,7 @@ def deepseek_v4_prepare_indexer_q_mxfp4(
         raise ValueError(
             "deepseek_v4_prepare_indexer_q_mxfp4 only supports CUDA tensors."
         )
-    return _triton_fused_indexer_q_rope_hadamard_mxfp4(
+    return deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4(
         index_q=index_q,
         positions=positions,
         cos_sin_cache=cos_sin_cache,
@@ -718,7 +639,7 @@ def save_deepseek_v4_compressor_state(
             "save_deepseek_v4_compressor_state only supports CUDA tensors."
         )
 
-    _triton_save_compressor_state(
+    deepseek_v4_save_compressor_state(
         kv=kv,
         score=score,
         ape=ape,
@@ -798,7 +719,7 @@ def write_deepseek_v4_indexer_mxfp4_cache(
             "write_deepseek_v4_indexer_mxfp4_cache only supports CUDA tensors."
         )
     valid = torch.ones(num_actual, device=index_k.device, dtype=torch.bool)
-    _triton_write_indexer_mxfp4_cache_cuda(
+    write_deepseek_v4_indexer_mxfp4_cache_cuda(
         index_k[:num_actual],
         cache_2d,
         slot_mapping[:num_actual],
@@ -1126,7 +1047,7 @@ def deepseek_v4_hca_compress_kv_cache_insert(
             "deepseek_v4_hca_compress_kv_cache_insert only supports CUDA tensors."
         )
 
-    _triton_fused_sparse_compress_cache_insert(
+    deepseek_v4_fused_sparse_compress_cache_insert(
         state_cache=state_cache,
         token_to_req_indices=token_to_req_indices,
         positions=positions,
@@ -1204,7 +1125,7 @@ def deepseek_v4_csa_compress_kv_cache_insert(
             "deepseek_v4_csa_compress_kv_cache_insert only supports CUDA tensors."
         )
 
-    _triton_fused_sparse_compress_cache_insert(
+    deepseek_v4_fused_sparse_compress_cache_insert(
         state_cache=state_cache,
         token_to_req_indices=token_to_req_indices,
         positions=positions,
@@ -1264,7 +1185,7 @@ def deepseek_v4_csa_indexer_cache_insert(
             "deepseek_v4_csa_indexer_cache_insert only supports CUDA tensors."
         )
     if use_fp4_cache:
-        _triton_fused_csa_indexer_mxfp4_cache_insert(
+        deepseek_v4_fused_csa_indexer_mxfp4_cache_insert(
             state_cache=state_cache,
             token_to_req_indices=token_to_req_indices,
             positions=positions,

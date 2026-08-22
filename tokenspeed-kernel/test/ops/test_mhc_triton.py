@@ -18,16 +18,39 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""DeepSeek V4 attention kernels for AMD GFX950."""
+from __future__ import annotations
 
-from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4.attention import (
-    gluon_deepseek_v4_selected_attention_gfx950,
-)
-from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4.paged_attention import (
-    gluon_deepseek_v4_paged_selected_attention_split_gfx950,
-)
+import pytest
+import torch
+from tokenspeed_kernel.ops.mhc.triton import _mhc_prenorm_gemm_triton
 
-__all__ = [
-    "gluon_deepseek_v4_paged_selected_attention_split_gfx950",
-    "gluon_deepseek_v4_selected_attention_gfx950",
-]
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+
+
+def test_mhc_prenorm_gemm_covers_all_columns_for_hc5() -> None:
+    torch.manual_seed(17)
+    tokens = 3
+    hc_mult = 5
+    hidden_size = 64
+    n = 2 * hc_mult + hc_mult**2
+    x = torch.randn(
+        (tokens, hc_mult * hidden_size), device="cuda", dtype=torch.bfloat16
+    )
+    fn = torch.randn((n, x.shape[1]), device="cuda", dtype=torch.float32)
+    out_mul = torch.empty((1, tokens, n), device="cuda", dtype=torch.float32)
+    out_sqrsum = torch.empty((1, tokens), device="cuda", dtype=torch.float32)
+
+    _mhc_prenorm_gemm_triton(x, fn, out_mul, out_sqrsum, n_splits=1)
+
+    torch.testing.assert_close(
+        out_mul.sum(dim=0),
+        x.float() @ fn.T,
+        rtol=2e-4,
+        atol=2e-3,
+    )
+    torch.testing.assert_close(
+        out_sqrsum.sum(dim=0),
+        x.float().square().sum(dim=1),
+        rtol=2e-5,
+        atol=2e-3,
+    )
