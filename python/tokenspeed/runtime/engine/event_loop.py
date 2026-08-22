@@ -1027,15 +1027,20 @@ class EventLoop:
     ) -> ModelConfig:
         server_args = self.server_args
         quantization = server_args.quantization
+        dtype = server_args.dtype
         if is_draft_worker:
             quantization = server_args.speculative_draft_model_quantization
+            if dtype == "auto":
+                # A draft is fed the target's hidden states and borrows its
+                # embedding and LM head, so the two dtypes have to agree.
+                dtype = self.model_config.dtype
         return ModelConfig(
             model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
             context_length=server_args.max_model_len,
             model_override_args=server_args.hf_overrides,
-            dtype=server_args.dtype,
+            dtype=dtype,
             quantization=quantization,
             server_args=server_args,
             is_draft_worker=is_draft_worker,

@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
 
 def _make_model(num_layers: int = 8):
     model = type("Model", (), {})()
-    model.layers = [SimpleNamespace() for _ in range(num_layers)]
+    model.layers = [object() for _ in range(num_layers)]
     model.layers_to_capture = []
-    model.dflash_aux_stream = "prefix"
     model._dflash_capture_idx_map = {}
     model._dflash_incremental_callback = None
     model._dflash_slot_bufs = None
@@ -31,7 +28,6 @@ class _CausalLM:
 
     def __init__(self, model) -> None:
         self.model = model
-        self.config = SimpleNamespace(attn_res_block_size=1)
         self.capture_aux_hidden_states = False
 
 
@@ -40,9 +36,6 @@ def _bind_setter():
 
     _CausalLM.set_dflash_layers_to_capture = (
         KimiLinearForCausalLM.set_dflash_layers_to_capture
-    )
-    _CausalLM.set_dflash_aux_hidden_stream = (
-        KimiLinearForCausalLM.set_dflash_aux_hidden_stream
     )
 
 
@@ -74,43 +67,6 @@ def test_negative_taps_are_rejected() -> None:
     holder = _CausalLM(_make_model(num_layers=93))
     with pytest.raises(ValueError, match="invalid ids"):
         holder.set_dflash_layers_to_capture([-1, 23])
-
-
-def test_attn_res_capture_only_falls_back_on_the_consumer_layers() -> None:
-    _bind_setter()
-    holder = _CausalLM(_make_model(num_layers=8))
-    holder.set_dflash_layers_to_capture([2, 5, 7])
-    holder.set_dflash_aux_hidden_stream("attn_res")
-
-    assert [
-        getattr(layer, "_dflash_attnres_capture_fallback", False)
-        for layer in holder.model.layers
-    ] == [False, False, False, True, False, False, True, False]
-
-
-def test_prefix_capture_keeps_the_fused_path_enabled() -> None:
-    _bind_setter()
-    holder = _CausalLM(_make_model(num_layers=8))
-    holder.set_dflash_layers_to_capture([2, 5, 7])
-
-    assert not any(
-        getattr(layer, "_dflash_attnres_capture_fallback", False)
-        for layer in holder.model.layers
-    )
-
-
-def test_attn_res_capture_fallback_is_replay_static() -> None:
-    from tokenspeed.runtime.models.kimi_k3 import KimiLinearDecoderLayer
-
-    layer = SimpleNamespace(_dflash_attnres_capture_fallback=True)
-    hidden_states = torch.empty(2, 8)
-    block_residual = torch.empty(1, 2, 8)
-    assert (
-        KimiLinearDecoderLayer._fused_attnres_graph_available(
-            layer, hidden_states, block_residual
-        )
-        is False
-    )
 
 
 # --------------------------------------------------------------------------

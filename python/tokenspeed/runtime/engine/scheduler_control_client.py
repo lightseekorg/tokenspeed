@@ -205,7 +205,6 @@ class SchedulerControlClient:
         self.get_load_communicator = _Communicator(
             self.engine_core_client.send_to_scheduler,
             server_args.mapping.attn.dp_size,
-            mode="watching",
         )
 
         self._result_dispatcher += self._get_communicator_dispatcher()

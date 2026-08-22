@@ -136,12 +136,26 @@ def test_slurm_dispatch_lists_every_supported_cluster():
 
 def test_slurm_dispatch_routes_gb300_to_its_coordinator():
     workflow = load_yaml(REPO_ROOT / ".github/workflows/slurm-dispatch.yml")
+    checkout = next(
+        step
+        for step in workflow["jobs"]["dispatch"]["steps"]
+        if step.get("name") == "Checkout trusted dispatcher"
+    )
+    dispatch_script = next(
+        step["run"]
+        for step in workflow["jobs"]["dispatch"]["steps"]
+        if step.get("name") == "Submit and wait for Slurm tasks"
+    )
 
     assert workflow["jobs"]["dispatch"]["runs-on"] == (
         "${{ inputs.cluster == 'gb300' && "
         "'slurm-dispatch-gb300' || 'slurm-dispatch' }}"
     )
     assert "${{ inputs.cluster }}" in workflow["concurrency"]["group"]
+    assert checkout["with"]["ref"] == "main"
+    assert 'python3 - "$YAML_SELECTION" "$CLUSTER" "$PR"' in dispatch_script
+    assert "from slurm_submit import pr_worktree" in dispatch_script
+    assert "with pr_worktree(repo, pr) as checkout:" in dispatch_script
 
 
 @pytest.mark.parametrize("runners", ["b200-4gpu,gb200-4gpu", "b200-4gpu, gb200-4gpu"])
@@ -304,6 +318,8 @@ def test_only_dedicated_tasks_declare_gb300():
             configs.append(path.name)
 
     assert sorted(configs) == [
+        "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-mmmu-pro-vision-gb300-slurm.yaml",
+        "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-ocr-bench-gb300-slurm.yaml",
         "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-dspark-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
@@ -327,8 +343,7 @@ def test_kimi_k3_nvfp4_gb300_uses_pinned_local_models():
         "/models/nvidia--Kimi-K3-NVFP4/" "f8c5234a0a880bcc6cbf779a315e7ee2f405b812"
     )
     draft_path = (
-        "/models/lightseekorg--kimi-k3-dspark/"
-        "3db4c37d19e0dd945194b07d8219cdf52cb3a24c"
+        "/models/Inferact--Kimi-K3-DSpark/" "cf6b8244620e7ea4b0651d214f28e89eac75bed6"
     )
     plain = load_yaml(
         REPO_ROOT / "test/ci/eval/"
@@ -342,7 +357,7 @@ def test_kimi_k3_nvfp4_gb300_uses_pinned_local_models():
     assert target_path in plain["server"]["command"]
     assert target_path in dspark["server"]["command"]
     assert draft_path in dspark["server"]["command"]
-    assert "TOKENSPEED_DFLASH_AUX_STREAM" not in dspark["env"]
+    assert dspark["env"]["TOKENSPEED_DFLASH_AUX_STREAM"] == "attn_res"
 
 
 def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():

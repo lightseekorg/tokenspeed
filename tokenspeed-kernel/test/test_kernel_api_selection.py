@@ -1386,6 +1386,132 @@ def _attention_dsa_prefill_topk_bf16_weights() -> object:
     return _attention_dsa_prefill_topk(weights_dtype=torch.bfloat16)
 
 
+def _attention_dsa_decode_topk_standard(
+    index_heads: int,
+    q_dtype: torch.dtype = torch.bfloat16,
+) -> object:
+    q = torch.empty((2, index_heads, 128), dtype=q_dtype)
+    q_scales = (
+        torch.ones((2, index_heads), dtype=torch.float32)
+        if q_dtype == torch.float8_e4m3fn
+        else None
+    )
+    return tokenspeed_kernel.dsa_decode_topk(
+        q,
+        torch.empty((2, index_heads), dtype=torch.bfloat16),
+        torch.tensor([64, 64], dtype=torch.int32),
+        torch.zeros((2, 1), dtype=torch.int32),
+        page_size=64,
+        topk=512,
+        softmax_scale=1.0,
+        index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
+        q_scales=q_scales,
+    )
+
+
+def _attention_dsa_prefill_topk_standard(
+    index_heads: int,
+    q_dtype: torch.dtype = torch.bfloat16,
+) -> object:
+    q = torch.empty((2, index_heads, 128), dtype=q_dtype)
+    q_scales = (
+        torch.ones((2, index_heads), dtype=torch.float32)
+        if q_dtype == torch.float8_e4m3fn
+        else None
+    )
+    return tokenspeed_kernel.dsa_prefill_topk(
+        q,
+        torch.empty((2, index_heads), dtype=torch.float32),
+        torch.arange(64, dtype=torch.int64),
+        torch.tensor([0, 8], dtype=torch.int32),
+        torch.tensor([8, 16], dtype=torch.int32),
+        topk=512,
+        softmax_scale=1.0,
+        index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
+        page_size=64,
+        q_scales=q_scales,
+    )
+
+
+@pytest.mark.parametrize("index_heads", [32, 64])
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+def test_dsa_topk_selection_receives_index_heads(
+    monkeypatch: pytest.MonkeyPatch,
+    index_heads: int,
+    mode: str,
+) -> None:
+    """The public request exposes head count for exact DSA registrations."""
+    captured: dict[str, object] = {}
+
+    class _SelectedKernel:
+        name = "test_dsa_topk"
+
+        def __call__(self, **kwargs):
+            tokens = kwargs["q"].shape[0]
+            topk = int(kwargs["topk"])
+            return (
+                torch.full((tokens, topk), -1, dtype=torch.int32),
+                torch.zeros((tokens,), dtype=torch.int32),
+            )
+
+    def select_dsa_topk(*args, **kwargs):
+        captured.update(kwargs["traits"])
+        return _SelectedKernel()
+
+    monkeypatch.setattr(_attention_pkg, "select_kernel", select_dsa_topk)
+    q = torch.empty((1, index_heads, 128), dtype=torch.bfloat16)
+    weights = torch.empty((1, index_heads), dtype=torch.float32)
+    index_k_cache = torch.empty((64, 132), dtype=torch.uint8)
+
+    if mode == "decode":
+        tokenspeed_kernel.dsa_decode_topk(
+            q,
+            weights,
+            torch.tensor([1], dtype=torch.int32),
+            torch.zeros((1, 1), dtype=torch.int32),
+            page_size=64,
+            topk=1,
+            softmax_scale=1.0,
+            index_k_cache=index_k_cache,
+        )
+    else:
+        tokenspeed_kernel.dsa_prefill_topk(
+            q,
+            weights,
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([1], dtype=torch.int32),
+            topk=1,
+            softmax_scale=1.0,
+            index_k_cache=index_k_cache,
+            page_size=64,
+        )
+
+    assert captured["index_heads"] == index_heads
+
+
+@pytest.mark.parametrize("missing", ["values", "scales"])
+def test_dsa_prefill_topk_rejects_incomplete_workspace_rows(missing: str) -> None:
+    inputs = {
+        "index_k_fp8": torch.empty((1, 128), dtype=torch.float8_e4m3fn),
+        "index_k_scale": torch.ones((1, 1), dtype=torch.float32),
+    }
+    inputs.pop("index_k_fp8" if missing == "values" else "index_k_scale")
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        tokenspeed_kernel.dsa_prefill_topk(
+            torch.empty((1, 32, 128), dtype=torch.bfloat16),
+            torch.empty((1, 32), dtype=torch.float32),
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([1], dtype=torch.int32),
+            topk=1,
+            softmax_scale=1.0,
+            page_size=64,
+            **inputs,
+        )
+
+
 def _attention_dsa_plan() -> object:
     seq_lens_2d = torch.tensor([[64], [64]], dtype=torch.int32)
     return tokenspeed_kernel.dsa_plan(seq_lens_2d=seq_lens_2d, page_size=64)
@@ -2738,6 +2864,31 @@ _CASES = [
         "gluon_dsa_prefill_topk_fp8_gfx950",
         _attention_dsa_prefill_topk_bf16_weights,
         id_suffix="bf16-weights",
+    ),
+    *(
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "attention",
+            operation,
+            expected,
+            lambda heads=heads, dtype=dtype, invoke=invoke: invoke(heads, dtype),
+            id_suffix=f"h{heads}-{str(dtype).removeprefix('torch.')}",
+        )
+        for operation, expected, invoke in (
+            (
+                "dsa_decode_topk",
+                "gluon_dsa_decode_topk_standard_gfx950",
+                _attention_dsa_decode_topk_standard,
+            ),
+            (
+                "dsa_prefill_topk",
+                "gluon_dsa_prefill_topk_standard_gfx950",
+                _attention_dsa_prefill_topk_standard,
+            ),
+        )
+        for heads in (32, 64)
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn)
     ),
     _case(
         _is_cdna4,

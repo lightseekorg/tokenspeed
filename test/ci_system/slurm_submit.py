@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -56,7 +56,6 @@ class Task:
     runner: str
     gpus: int
     nodes: int = 1
-    env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -102,16 +101,7 @@ def load_task(
             f"{relative}: slurm.gpus_per_node={gpus_per_node} does not match "
             f"runner {runner!r} ({gpus} GPUs)"
         )
-    task_env = {str(key): str(value) for key, value in (data.get("env") or {}).items()}
-    return Task(
-        relative,
-        str(data["name"]),
-        str(data["type"]),
-        runner,
-        gpus,
-        nodes,
-        task_env,
-    )
+    return Task(relative, str(data["name"]), str(data["type"]), runner, gpus, nodes)
 
 
 def task_matches(repo: Path, task: Task, patterns: list[str]) -> bool:
@@ -349,32 +339,14 @@ def render_script(
     gpu_device_mounts = ""
     local_model_mounts = ""
     if task.runner.startswith(("gb300-", "slurm-gb300-")):
-        model_root_override = task.env.get("TS_CI_LOCAL_MODEL_ROOT")
-        model_root_assignment = (
-            f"local_model_root={shlex.quote(str(model_root_override))}"
-            if model_root_override
-            else 'local_model_root="${TS_CI_LOCAL_MODEL_ROOT:-/scratch/${USER}-models}"'
-        )
-        legacy_model_root = task.env.get("TS_CI_LEGACY_MODEL_ROOT")
-        legacy_model_mount = (
-            f"""
-legacy_model_root={shlex.quote(str(legacy_model_root))}
-if [ -d "$legacy_model_root" ]; then
-  model_mounts+=("$legacy_model_root:$legacy_model_root:ro")
-fi
-"""
-            if legacy_model_root
-            else ""
-        )
-        local_model_mounts = f"""
+        local_model_mounts = r"""
 # GB300 nodes keep large model snapshots on their local RAID.  Keep the
 # source configurable for other coordinators while exposing one stable path
 # to server containers.
-{model_root_assignment}
+local_model_root="${TS_CI_LOCAL_MODEL_ROOT:-/scratch/${USER}-models}"
 if [ -d "$local_model_root" ]; then
   model_mounts+=("$local_model_root:/models:ro")
 fi
-{legacy_model_mount}
 """
         gpu_device_mounts = r"""
 # The GB300 Pyxis hook does not expose allocated device nodes.
@@ -838,12 +810,15 @@ def result_detail(path: Path) -> str:
     for command_result in reversed(command_results):
         if not isinstance(command_result, dict):
             continue
-        score = command_result.get("evalscope_score")
-        if score is not None:
-            try:
-                return f"score={float(score):g}"
-            except (TypeError, ValueError):
-                continue
+        if command_result.get("stage") != "eval":
+            continue
+        for key in ("evalscope_score", "inspect_score"):
+            score = command_result.get(key)
+            if score is not None:
+                try:
+                    return f"score={float(score):g}"
+                except (TypeError, ValueError):
+                    continue
     if command_results and command_results[-1].get("pytest_summary"):
         return str(command_results[-1]["pytest_summary"])
     return str(data.get("error", ""))

@@ -231,6 +231,31 @@ def _restore_raw_glm_dsa_fields(config: PretrainedConfig, raw_config: dict) -> N
             setattr(config, key, raw_config[key])
 
 
+def _restore_raw_dflash_fields(config: PretrainedConfig, raw_config: dict) -> None:
+    """Re-assert a DFLASH/DSpark draft's sliding window.
+
+    ``Qwen3DSparkModel`` parses as ``Qwen3Config``, which nulls
+    ``sliding_window`` unless ``use_sliding_window`` is set -- a flag these
+    checkpoints never write, since they carry the window in ``dflash_config``.
+    """
+    dflash_config = raw_config.get("dflash_config")
+    if not isinstance(dflash_config, dict):
+        return
+    if getattr(config, "sliding_window", None) is not None:
+        return
+
+    sliding_window = raw_config.get("sliding_window")
+    if sliding_window is None and dflash_config.get("use_swa"):
+        sliding_window = dflash_config.get("swa_window_size")
+    if sliding_window is None:
+        return
+
+    config.sliding_window = int(sliding_window)
+    if hasattr(config, "use_sliding_window"):
+        # transformers gates the window on this flag; keep the two consistent.
+        config.use_sliding_window = True
+
+
 def get_config(
     model: str,
     trust_remote_code: bool,
@@ -327,6 +352,7 @@ def get_config(
 
     _materialize_architectures(config, raw_config)
     _restore_raw_glm_dsa_fields(config, raw_config)
+    _restore_raw_dflash_fields(config, raw_config)
 
     # extract 'text_config'
     text_config = get_hf_text_config(config)

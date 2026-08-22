@@ -421,34 +421,6 @@ def test_render_script_mounts_only_allocated_gb300_devices():
     assert '"${gpu_mounts[@]}" "${model_mounts[@]}" "${mounts[@]}"' in script
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
-
-def test_render_script_uses_task_model_root_override():
-    script = render_script(
-        Task(
-            "test/ci/eval/example.yaml",
-            "example",
-            "eval",
-            "slurm-gb300-4gpu",
-            4,
-            nodes=2,
-            env={
-                "TS_CI_LOCAL_MODEL_ROOT": "/scratch/ts-torchspec-bot-models",
-                "TS_CI_LEGACY_MODEL_ROOT": "/scratch/ts-yineng-models",
-            },
-        ),
-        Path("/shared/source.tar"),
-        Path("/shared/runs"),
-        Path("/shared/cache"),
-        "ghcr.io/example/image@sha256:abc",
-    )
-    assert "local_model_root=/scratch/ts-torchspec-bot-models" in script
-    assert "legacy_model_root=/scratch/ts-yineng-models" in script
-    assert 'model_mounts+=("$legacy_model_root:$legacy_model_root:ro")' in script
-    assert (
-        'local_model_root="${TS_CI_LOCAL_MODEL_ROOT:-/scratch/${USER}-models}"'
-        not in script
-    )
-
     multinode_script = render_script(
         Task(
             "test/ci/eval/example.yaml",

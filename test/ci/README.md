@@ -249,7 +249,7 @@ eligible GB300 node before enabling the tasks:
 ```text
 moonshotai--Kimi-K3/9f62e4e9fffbd0a83ddd60e1c209d828994b3569
 nvidia--Kimi-K3-NVFP4/f8c5234a0a880bcc6cbf779a315e7ee2f405b812
-lightseekorg--kimi-k3-dspark/3db4c37d19e0dd945194b07d8219cdf52cb3a24c
+Inferact--Kimi-K3-DSpark/cf6b8244620e7ea4b0651d214f28e89eac75bed6
 ```
 
 The `Slurm Dispatch` workflow exposes a `cluster` input. `gb200` keeps the
@@ -282,8 +282,11 @@ bootstrap only, leave the switch unset; after dispatcher support reaches
 The two-node Kimi K3 tasks declare `slurm-gb300-4gpu`, `slurm.nodes: 2`, and
 `slurm.gpus_per_node: 4`. The runner label describes GPUs per node, while the
 Slurm topology fields describe the allocation. The NVFP4 DSpark task pairs the
-pinned `nvidia/Kimi-K3-NVFP4` target with `lightseekorg/kimi-k3-dspark` and
+pinned `nvidia/Kimi-K3-NVFP4` target with `Inferact/Kimi-K3-DSpark` and
 preserves the draft checkpoint's required `attn_res` auxiliary stream.
+The MXFP4 DSpark OCRBench and MMMU-Pro Vision tasks are manual-only baselines
+that use a pinned Kimi Vendor Verifier revision; select either YAML through
+`Slurm Dispatch` with the `gb300` cluster.
 
 GB200 examples:
 

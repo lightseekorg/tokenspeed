@@ -29,6 +29,7 @@ on:
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-ocr-bench.yaml
           - test/ci/eval/kimi-k2.5-mxfp4-eagle3-evalscope-aime25-amd.yaml
           - test/ci/eval/kimi-k3-mxfp4-tp8ep8-evalscope-aime26-amd.yaml
+          - test/ci/eval/minimax-m3-nvfp4-dspark-evalscope-aime26.yaml
           - test/ci/eval/minimax-m3-nvfp4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d-evalscope-ocr-bench.yaml
           - test/ci/eval/qwen3.5-122b-a10b-nvfp4-evalscope-ocr-bench.yaml

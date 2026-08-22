@@ -174,7 +174,7 @@ the values accepted by the bundled `tokenspeed-smg` package.
 | Parameter | Purpose |
 | --- | --- |
 | `--speculative-config` | JSON speculative decoding configuration. |
-| `--speculative-algorithm` | Speculative algorithm, such as `EAGLE3`, `MTP`, or `DFLASH`. |
+| `--speculative-algorithm` | Speculative algorithm, such as `EAGLE3`, `MTP`, `DFLASH`, or `DSPARK`. |
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
 | `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
@@ -184,6 +184,21 @@ the values accepted by the bundled `tokenspeed-smg` package.
 
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.
+
+`DFLASH` and `DSPARK` are block drafters: one draft forward proposes a whole
+block instead of one token per step, so their two token counts are coupled.
+`--speculative-num-draft-tokens` is the verify width -- one anchor row plus one
+row per drafted token -- and `--speculative-num-steps` must be one less. The
+draft checkpoint's `block_size` fixes both, and a mismatch is rejected at
+startup rather than silently drafting a wrong-width block. A checkpoint with
+`block_size: 8` therefore wants `--speculative-num-draft-tokens 8
+--speculative-num-steps 7`.
+
+A block drafter writes its KV at the target's cache locations, so it shares the
+target's page table: `--block-size` is a target-side choice and the draft
+follows it. Any sliding window the draft checkpoint declares is an attention
+mask applied by the draft's own layers, never a cache-retention policy of its
+own.
 
 ## Observability
 

@@ -8,7 +8,7 @@ triggers:
   - manual
 runner:
   labels:
-    - amd-mi35x-8gpu-test
+    - amd-mi350-8gpu-bench
 env:
   CI: "true"
 install:
@@ -22,7 +22,7 @@ server:
     --model moonshotai/Kimi-K3
     --served-model-name kimi-k3
     --speculative-algorithm DSPARK
-    --speculative-draft-model-path lightseekorg/kimi-k3-dspark
+    --speculative-draft-model-path Inferact/Kimi-K3-DSpark
     --speculative-num-draft-tokens 8
     --tp 8
     --ep-size 8
