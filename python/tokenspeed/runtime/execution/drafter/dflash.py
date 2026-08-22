@@ -49,6 +49,15 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 
+def _resolve_aux_hidden_stream(cfg) -> str:
+    """Read the target residual stream from the draft config."""
+    dflash_cfg = getattr(cfg, "dflash_config", {}) or {}
+    stream = dflash_cfg.get("aux_hidden_stream") or getattr(
+        cfg, "aux_hidden_stream", None
+    )
+    return str(stream or "prefix").lower()
+
+
 def _resolve_block_geometry(cfg, spec_num_tokens: int) -> tuple[int, int]:
     """Resolve (verify_width, draft_block_size) for a block drafter.
 
@@ -246,6 +255,20 @@ class DFlash(BaseDrafter):
             incremental_callback=incr_callback,
             slot_bufs=incr_slot_bufs,
         )
+        self._wire_aux_hidden_stream(target_model)
+
+    def _wire_aux_hidden_stream(self, target_model) -> None:
+        """Tell the target which residual stream the draft was trained on."""
+        stream = _resolve_aux_hidden_stream(self.model.config)
+        setter = getattr(target_model, "set_dflash_aux_hidden_stream", None)
+        if setter is not None:
+            setter(stream)
+        elif stream != "prefix":
+            raise ValueError(
+                f"The draft asks for the {stream!r} target hidden stream but "
+                f"{type(target_model).__name__} does not implement "
+                "set_dflash_aux_hidden_stream, so it can only supply 'prefix'."
+            )
 
     def _greedy_gather_capacity(self) -> int:
         """Max element count for the greedy head's tensor-parallel all-gather
@@ -679,6 +702,12 @@ class DFlash(BaseDrafter):
         if not self._fused_kv_enabled:
             return
         if self._kv_aux_stream is None:
+            return
+        if getattr(self.draft_model_runner.model, "fc_norm", None) is not None:
+            logger.info(
+                "DFLASH incremental projection disabled: this draft normalizes "
+                "each target tap (fc_norm) before projecting."
+            )
             return
         try:
             fc = self.draft_model_runner.model.fc
