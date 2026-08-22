@@ -74,7 +74,8 @@ static const bf16_t* attn_res_delta_ptr(Optional<TensorView> delta,
 static void attn_res_fwd_impl(TensorView layer_residual, TensorView block_residual,
                               TensorView res_weight, TensorView rms_weight,
                               const bf16_t* delta_ptr, const bf16_t* out_norm_ptr,
-                              TensorView output, int num_blocks, double rms_eps) {
+                              TensorView output, int num_blocks,
+                              int block_write_idx, double rms_eps) {
   cudaSetDevice(layer_residual.device().device_id);
 
   TVM_FFI_ICHECK_EQ(layer_residual.ndim(), 3) << "attn_res_fwd: layer_residual must be [T, B, H]";
@@ -88,6 +89,10 @@ static void attn_res_fwd_impl(TensorView layer_residual, TensorView block_residu
   TVM_FFI_ICHECK(num_blocks >= 0 && num_blocks <= block_residual.size(0))
       << "attn_res_fwd: num_blocks=" << num_blocks << " must be in [0, "
       << block_residual.size(0) << "]";
+  TVM_FFI_ICHECK(block_write_idx == -1 ||
+                 (block_write_idx == num_blocks &&
+                  block_write_idx < block_residual.size(0)))
+      << "attn_res_fwd: block_write_idx must append within block_residual";
 
   TVM_FFI_ICHECK_EQ(B, 1) << "attn_res_fwd: only B=1 supported, got " << B;
   TVM_FFI_ICHECK(N >= 1 && N <= 12) << "attn_res_fwd: N=" << N << " must be in [1, 12]";
@@ -113,14 +118,17 @@ static void attn_res_fwd_impl(TensorView layer_residual, TensorView block_residu
   CHECK_CONTIGUOUS(res_weight);
   CHECK_CONTIGUOUS(rms_weight);
 
-  const bf16_t* block_ptr =
-      N > 1 ? reinterpret_cast<const bf16_t*>(block_residual.data_ptr()) : nullptr;
+  bf16_t* block_ptr =
+      N > 1 || block_write_idx >= 0
+          ? reinterpret_cast<bf16_t*>(block_residual.data_ptr())
+          : nullptr;
 
   run_attn_res_fwd_online_v2(
       block_ptr, reinterpret_cast<bf16_t*>(layer_residual.data_ptr()), delta_ptr,
       reinterpret_cast<const bf16_t*>(res_weight.data_ptr()),
       reinterpret_cast<const bf16_t*>(rms_weight.data_ptr()), out_norm_ptr,
       reinterpret_cast<bf16_t*>(output.data_ptr()), N, T, H, T * B * H,
+      block_write_idx,
       static_cast<float>(rms_eps),
       attn_res_fwd_grid_size(layer_residual.device().device_id),
       get_stream(layer_residual.device()));
@@ -129,10 +137,11 @@ static void attn_res_fwd_impl(TensorView layer_residual, TensorView block_residu
 void attn_res_fwd(TensorView layer_residual, Optional<TensorView> delta,
                   TensorView block_residual, TensorView res_weight,
                   TensorView rms_weight, TensorView output, int64_t num_blocks,
-                  double rms_eps) {
+                  int64_t block_write_idx, double rms_eps) {
   attn_res_fwd_impl(layer_residual, block_residual, res_weight, rms_weight,
                     attn_res_delta_ptr(delta, layer_residual), nullptr, output,
-                    static_cast<int>(num_blocks), rms_eps);
+                    static_cast<int>(num_blocks), static_cast<int>(block_write_idx),
+                    rms_eps);
 }
 
 // Variant with the following RMSNorm fused into the epilogue:
@@ -140,7 +149,8 @@ void attn_res_fwd(TensorView layer_residual, Optional<TensorView> delta,
 void attn_res_fwd_out_norm(TensorView layer_residual, Optional<TensorView> delta,
                            TensorView block_residual, TensorView res_weight,
                            TensorView rms_weight, TensorView out_norm_weight,
-                           TensorView output, int64_t num_blocks, double rms_eps) {
+                           TensorView output, int64_t num_blocks,
+                           int64_t block_write_idx, double rms_eps) {
   TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(out_norm_weight.dtype()), bfloat16_code)
       << "attn_res_fwd: out_norm_weight must be bf16";
   TVM_FFI_ICHECK_EQ(out_norm_weight.numel(), layer_residual.size(2))
@@ -149,7 +159,8 @@ void attn_res_fwd_out_norm(TensorView layer_residual, Optional<TensorView> delta
   attn_res_fwd_impl(layer_residual, block_residual, res_weight, rms_weight,
                     attn_res_delta_ptr(delta, layer_residual),
                     reinterpret_cast<const bf16_t*>(out_norm_weight.data_ptr()),
-                    output, static_cast<int>(num_blocks), rms_eps);
+                    output, static_cast<int>(num_blocks),
+                    static_cast<int>(block_write_idx), rms_eps);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(attn_res_fwd, attn_res_fwd);

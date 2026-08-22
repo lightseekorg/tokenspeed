@@ -240,12 +240,13 @@ __device__ __forceinline__ void cp_async_bulk(void* smem_dst,
 
 template <int H, int N, int NC = N_CHUNK_DEFAULT, int B = 1,
           bool RELEASE_TMEM = false, bool HAS_DELTA = false,
-          bool HAS_OUTPUT_NORM = false, bool OUTPUT_NORM_IN_SMEM = false>
+          bool HAS_OUTPUT_NORM = false, bool OUTPUT_NORM_IN_SMEM = false,
+          bool WRITE_BLOCK = false>
 __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
-    const bf16_t* __restrict__ block_res, bf16_t* __restrict__ layer_res,
+    bf16_t* __restrict__ block_res, bf16_t* __restrict__ layer_res,
     const bf16_t* __restrict__ delta, const bf16_t* __restrict__ res_w,
     const bf16_t* __restrict__ rms_w, bf16_t* __restrict__ output, int T,
-    int block_stride_m, int block_stride_r, float rms_eps,
+    int block_stride_m, int block_stride_r, int block_write_idx, float rms_eps,
     const bf16_t* __restrict__ output_norm_weight, float output_norm_eps) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1100
   constexpr float LOG2_E = 1.4426950408889634f;
@@ -451,9 +452,9 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
                   int2 vp =
                       *reinterpret_cast<const int2*>(buf_ptr(slot) + h_base);
                   auto* v2 = reinterpret_cast<__nv_bfloat162*>(&vp);
-                  if constexpr (HAS_DELTA) {
-                    int prefix_n = N - 1 - ns;
-                    if (n == prefix_n) {
+                  int prefix_n = N - 1 - ns;
+                  if (n == prefix_n) {
+                    if constexpr (HAS_DELTA) {
                       const bf16_t* delta_ptr =
                           delta_buf_ptr(chunk_slot) + h_base;
   #pragma unroll
@@ -464,6 +465,11 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
                       }
                       *reinterpret_cast<int2*>(layer_res + (long long)tb * H +
                                                h_base) = vp;
+                    }
+                    if constexpr (WRITE_BLOCK) {
+                      *reinterpret_cast<int2*>(
+                          block_res + (long long)tb * block_stride_m +
+                          block_write_idx * block_stride_r + h_base) = vp;
                     }
                   }
                   float2 f[2] = {__bfloat1622float2(v2[0]),
@@ -489,9 +495,9 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
               int slot = slot_of(gci, n);
               int4 vp = *reinterpret_cast<const int4*>(buf_ptr(slot) + h_base);
               auto* v2 = reinterpret_cast<__nv_bfloat162*>(&vp);
-              if constexpr (HAS_DELTA) {
-                int prefix_n = N - 1 - ns;
-                if (n == prefix_n) {
+              int prefix_n = N - 1 - ns;
+              if (n == prefix_n) {
+                if constexpr (HAS_DELTA) {
                   const bf16_t* delta_ptr = delta_buf_ptr(chunk_slot) + h_base;
   #pragma unroll
                   for (int j = 0; j < VEC / 2; j++) {
@@ -501,6 +507,11 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
                   }
                   *reinterpret_cast<int4*>(layer_res + (long long)tb * H +
                                            h_base) = vp;
+                }
+                if constexpr (WRITE_BLOCK) {
+                  *reinterpret_cast<int4*>(
+                      block_res + (long long)tb * block_stride_m +
+                      block_write_idx * block_stride_r + h_base) = vp;
                 }
               }
               float2 f[4] = {
@@ -878,14 +889,14 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
 
 template <int H, int N, int NC = N_CHUNK_DEFAULT, bool RELEASE_TMEM = false,
           bool HAS_DELTA = false, bool HAS_OUTPUT_NORM = false,
-          bool OUTPUT_NORM_IN_SMEM = false>
-static void launch_fwd(const bf16_t* block_residual, bf16_t* layer_residual,
+          bool OUTPUT_NORM_IN_SMEM = false, bool WRITE_BLOCK = false>
+static void launch_fwd(bf16_t* block_residual, bf16_t* layer_residual,
                        const bf16_t* delta, const bf16_t* res_weight,
                        const bf16_t* rms_weight, bf16_t* output, int T,
                        float rms_eps, int num_sm, cudaStream_t stream,
                        const bf16_t* output_norm_weight = nullptr,
                        float output_norm_eps = 0.f, int block_stride_m = 0,
-                       int block_stride_r = 0) {
+                       int block_stride_r = 0, int block_write_idx = -1) {
   constexpr size_t smem_size =
       ((size_t)CHUNK_DEPTH * (NC + (HAS_DELTA ? 1 : 0)) * H * sizeof(bf16_t) +
        (OUTPUT_NORM_IN_SMEM ? (size_t)H * sizeof(bf16_t) : 0) +
@@ -893,7 +904,8 @@ static void launch_fwd(const bf16_t* block_residual, bf16_t* layer_residual,
       ~size_t(15);
   auto kernel =
       &attn_res_fwd_online_v2_kernel<H, N, NC, 1, RELEASE_TMEM, HAS_DELTA,
-                                     HAS_OUTPUT_NORM, OUTPUT_NORM_IN_SMEM>;
+                                     HAS_OUTPUT_NORM, OUTPUT_NORM_IN_SMEM,
+                                     WRITE_BLOCK>;
   static bool attrs_set = false;
   if (!attrs_set) {
     if (smem_size > 48 * 1024) {
@@ -915,39 +927,48 @@ static void launch_fwd(const bf16_t* block_residual, bf16_t* layer_residual,
   config.numAttrs = 1;
   cudaLaunchKernelEx(&config, kernel, block_residual, layer_residual, delta,
                      res_weight, rms_weight, output, T, block_stride_m,
-                     block_stride_r, rms_eps, output_norm_weight,
+                     block_stride_r, block_write_idx, rms_eps, output_norm_weight,
                      output_norm_eps);
 }
 }  // namespace fwd_prod_v2
 }  // namespace sm100
 
 void run_attn_res_fwd_online_v2(
-    const bf16_t* block_residual, bf16_t* layer_residual,
+    bf16_t* block_residual, bf16_t* layer_residual,
     const bf16_t* delta, const bf16_t* res_weight, const bf16_t* rms_weight,
     const bf16_t* output_norm_weight, bf16_t* output, int N, int T,
-    int block_stride_m, int block_stride_r, float rms_eps, int num_sm,
+    int block_stride_m, int block_stride_r, int block_write_idx, float rms_eps,
+    int num_sm,
     cudaStream_t stream) {
   using namespace sm100::fwd_prod_v2;
   auto dispatch_options = [&](auto nsrc_tok, auto delta_tok,
-                              auto output_norm_tok) {
+                              auto output_norm_tok, auto write_block_tok) {
     constexpr int NSRC = decltype(nsrc_tok)::value;
     constexpr bool HAS_DELTA = decltype(delta_tok)::value;
     constexpr bool HAS_OUTPUT_NORM = decltype(output_norm_tok)::value;
+    constexpr bool WRITE_BLOCK = decltype(write_block_tok)::value;
     launch_fwd<7168, NSRC, 3, false, HAS_DELTA, HAS_OUTPUT_NORM,
-               HAS_OUTPUT_NORM>(
+               HAS_OUTPUT_NORM, WRITE_BLOCK>(
         block_residual, layer_residual, delta, res_weight, rms_weight, output, T,
         rms_eps, num_sm, stream, output_norm_weight, rms_eps, block_stride_m,
-        block_stride_r);
+        block_stride_r, block_write_idx);
   };
   auto dispatch = [&](auto nsrc_tok) {
+    auto dispatch_write = [&](auto delta_tok, auto output_norm_tok) {
+      if (block_write_idx >= 0) {
+        dispatch_options(nsrc_tok, delta_tok, output_norm_tok, std::true_type{});
+      } else {
+        dispatch_options(nsrc_tok, delta_tok, output_norm_tok, std::false_type{});
+      }
+    };
     if (delta == nullptr && output_norm_weight == nullptr) {
-      dispatch_options(nsrc_tok, std::false_type{}, std::false_type{});
+      dispatch_write(std::false_type{}, std::false_type{});
     } else if (delta == nullptr) {
-      dispatch_options(nsrc_tok, std::false_type{}, std::true_type{});
+      dispatch_write(std::false_type{}, std::true_type{});
     } else if (output_norm_weight == nullptr) {
-      dispatch_options(nsrc_tok, std::true_type{}, std::false_type{});
+      dispatch_write(std::true_type{}, std::false_type{});
     } else {
-      dispatch_options(nsrc_tok, std::true_type{}, std::true_type{});
+      dispatch_write(std::true_type{}, std::true_type{});
     }
   };
   switch (N) {

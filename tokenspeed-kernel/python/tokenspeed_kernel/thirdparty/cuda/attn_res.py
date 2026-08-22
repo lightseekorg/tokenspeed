@@ -57,6 +57,7 @@ def attn_res_fwd_packed(
     out_norm_weight: torch.Tensor | None = None,
     delta: torch.Tensor | None = None,
     num_blocks: int | None = None,
+    block_write_idx: int = -1,
 ) -> torch.Tensor:
     """Fused Attention-Residual forward (RMSNorm + per-candidate softmax + mix).
 
@@ -76,6 +77,8 @@ def attn_res_fwd_packed(
         delta: optional bf16 ``[T, B, H]`` added into ``layer_residual`` before
             it is used as the final candidate.
         num_blocks: selects a prefix of the block capacity (default: all).
+        block_write_idx: Optional snapshot row receiving the updated layer; it
+            must immediately follow ``num_blocks``.
 
     Returns:
         bf16 ``[T, B, H]`` mixed residual.
@@ -86,12 +89,16 @@ def attn_res_fwd_packed(
             f"num_blocks must be in [0, {block_residual.shape[0]}], got "
             f"{block_count}"
         )
+    if block_write_idx != -1 and (
+        block_write_idx != block_count or block_write_idx >= block_residual.shape[0]
+    ):
+        raise ValueError("block_write_idx must append within block_residual")
     output = torch.empty_like(layer_residual)
     module = _load_attn_res_module()
     args = (layer_residual, delta, block_residual, res_weight, rms_weight)
     if out_norm_weight is not None:
         args += (out_norm_weight,)
-    args += (output, int(block_count), float(rms_eps))
+    args += (output, int(block_count), int(block_write_idx), float(rms_eps))
     entry = "attn_res_fwd" + ("_out_norm" if out_norm_weight is not None else "")
     getattr(module, entry)(*args)
     return output

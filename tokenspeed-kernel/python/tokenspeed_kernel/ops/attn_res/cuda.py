@@ -65,7 +65,7 @@ if _HAS_CUDA_KERNEL:
             "inputs_on_same_gpu": frozenset({True}),
             "partial_block_storage": frozenset({False, True}),
             "separate_output_eps": frozenset({False}),
-            "writes_block": frozenset({False}),
+            "writes_block": frozenset({False, True}),
         },
         tags={"latency", "throughput"},
     )
@@ -82,8 +82,6 @@ if _HAS_CUDA_KERNEL:
         num_valid_blocks=None,
         block_write_idx=-1,
     ) -> torch.Tensor:
-        if block_write_idx >= 0:
-            raise ValueError("CUDA AttnRes does not write snapshots")
         if (
             out_norm_weight is not None
             and out_norm_eps is not None
@@ -101,5 +99,6 @@ if _HAS_CUDA_KERNEL:
             ),
             delta=None if delta is None else delta.unsqueeze(1).contiguous(),
             num_blocks=num_valid_blocks,
+            block_write_idx=block_write_idx,
         )
         return out.squeeze(1)  # [T, H]
