@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_fused_qnorm_rope_kv_insert as _cuda_has_fused_qnorm_rope_kv_insert,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    DEEPSEEK_V4_ROPE_DIM,
     deepseek_v4_build_dense_prefill_local_compressed_indices,
     deepseek_v4_combine_dense_swa_indices,
     deepseek_v4_combine_topk_swa_indices,
@@ -51,6 +52,10 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_fused_sparse_compress_cache_insert as _triton_fused_sparse_compress_cache_insert,
+)
+from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    deepseek_v4_kv_rope_quant_insert,
+    deepseek_v4_q_norm_rope,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_save_compressor_state as _triton_save_compressor_state,
@@ -151,12 +156,26 @@ def fused_qnorm_rope_kv_insert(
     """
 
     if not _cuda_has_fused_qnorm_rope_kv_insert():
-        raise RuntimeError(
-            "DeepSeek V4 fused SWA cache insert op "
-            "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert is unavailable. "
-            "Build `tokenspeed-kernel/python` so the deepseek_v4_attention CUDA "
-            "library is present before running this path."
+        # No CUDA library (ROCm): run the same work as two portable Triton
+        # kernels. They are independent -- the query norm/RoPE never touches the
+        # cache -- so splitting the fusion costs an extra pass over q and kv but
+        # produces the identical cache layout.
+        deepseek_v4_q_norm_rope(
+            q,
+            positions,
+            cos_sin_cache,
+            rms_norm_eps,
+            rope_dim=DEEPSEEK_V4_ROPE_DIM,
         )
+        deepseek_v4_kv_rope_quant_insert(
+            kv,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            swa_kv_cache_2d,
+            block_size,
+        )
+        return
 
     _cuda_fused_qnorm_rope_kv_insert(
         q,

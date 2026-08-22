@@ -50,7 +50,9 @@ from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     persistent_topk,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    deepseek_v4_gather_paged_indexer_fp8_padded,
     deepseek_v4_indexer_decode_metadata_compute,
+    deepseek_v4_indexer_mqa_logits,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda import (
@@ -599,6 +601,15 @@ def _deepseek_v4_gather_paged_indexer_mxfp4_cache(
     return values.view(torch.int8), scales.view(torch.int32).squeeze(-1)
 
 
+def _deepseek_v4_indexer_topk_kernels_available() -> bool:
+    """Whether a vendor top-k selector backs the indexer on this platform."""
+    if deep_gemm is not None:
+        return True
+    if getattr(fast_topk_v2, "__name__", "") == "error_fn":
+        return False
+    return True
+
+
 def _deepseek_v4_indexer_topk_from_logits(
     logits: torch.Tensor,
     lengths: torch.Tensor,
@@ -661,6 +672,27 @@ def _deepseek_v4_indexer_topk_from_logits(
         else:
             row_ends_for_kernel = row_ends.to(torch.int32).reshape(-1)
         length_rows = (row_ends_for_kernel - row_starts_for_kernel).clamp_min(0)
+
+    if not _deepseek_v4_indexer_topk_kernels_available():
+        # No TRT-LLM or DeepGEMM selector (ROCm): mask each row to its own key
+        # range and take a dense top-k. Rows with fewer than ``topk_tokens``
+        # candidates keep the -1 padding already filled in above.
+        positions = torch.arange(max_len, device=logits.device).unsqueeze(0)
+        if row_starts_for_kernel is not None and row_ends_for_kernel is not None:
+            lo = row_starts_for_kernel.reshape(-1, 1)
+            hi = row_ends_for_kernel.reshape(-1, 1)
+        else:
+            lo = torch.zeros_like(length_rows).reshape(-1, 1)
+            hi = length_rows.reshape(-1, 1)
+        valid = (positions >= lo) & (positions < hi)
+        masked = logits[:num_tokens].masked_fill(~valid, float("-inf"))
+        selected = min(topk_tokens, max_len)
+        values, indices = torch.topk(masked, selected, dim=-1)
+        indices = torch.where(
+            torch.isfinite(values), indices, torch.full_like(indices, -1)
+        )
+        topk[:, :selected] = indices.to(torch.int32)
+        return topk
 
     if use_prefill_topk_op:
         return _deepseek_v4_indexer_topk_from_logits_prefill_op(
@@ -1386,8 +1418,8 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
     q_values, q_scales = index_q
     if use_fp4_cache and not _deepseek_v4_deepgemm_fp4_indexer_available(q_values):
         raise RuntimeError("DeepSeek V4 sparse indexer requires DeepGEMM FP4 support")
-    if not use_fp4_cache and deep_gemm is None:
-        raise RuntimeError("DeepSeek V4 sparse indexer requires DeepGEMM")
+    # The FP8 branch below falls back to the Triton MQA-logits kernel where
+    # DeepGEMM is absent; only the FP4 path is hard-bound to it.
 
     num_tokens = q_values.shape[0]
     if num_tokens == 0:
@@ -1444,16 +1476,28 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
                 )
         k_values, k_scales = gathered_k
 
-        with nvtx_range("indexer_topk_prefill_deepgemm_logits"):
-            logits = deep_gemm.fp8_mqa_logits(
-                q_values.contiguous(),
-                (k_values, k_scales),
-                weights.contiguous(),
-                cu_start,
-                cu_end,
-                clean_logits=False,
-                max_seqlen_k=max_len,
-            )
+        if deep_gemm is None:
+            with nvtx_range("indexer_topk_prefill_triton_logits"):
+                logits = deepseek_v4_indexer_mqa_logits(
+                    q_values.contiguous(),
+                    k_values,
+                    k_scales,
+                    weights.contiguous(),
+                    cu_start,
+                    cu_end,
+                    max_len,
+                )
+        else:
+            with nvtx_range("indexer_topk_prefill_deepgemm_logits"):
+                logits = deep_gemm.fp8_mqa_logits(
+                    q_values.contiguous(),
+                    (k_values, k_scales),
+                    weights.contiguous(),
+                    cu_start,
+                    cu_end,
+                    clean_logits=False,
+                    max_seqlen_k=max_len,
+                )
 
     with nvtx_range("indexer_topk_prefill_select"):
         return (
@@ -1491,8 +1535,8 @@ def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
     q_values, q_scales = index_q
     if use_fp4_cache and not _deepseek_v4_deepgemm_fp4_indexer_available(q_values):
         raise RuntimeError("DeepSeek V4 sparse indexer requires DeepGEMM FP4 support")
-    if not use_fp4_cache and deep_gemm is None:
-        raise RuntimeError("DeepSeek V4 sparse indexer requires DeepGEMM")
+    # The FP8 decode branch falls back to the Triton MQA-logits kernel where
+    # DeepGEMM is absent; only the FP4 path is hard-bound to it.
 
     num_tokens = positions.numel()
     if num_tokens == 0:
@@ -1544,7 +1588,8 @@ def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
         schedule_metadata = (
             schedule_cache.get(schedule_key) if schedule_cache is not None else None
         )
-    if schedule_metadata is None:
+    # The Triton path below schedules itself, so this metadata is DeepGEMM-only.
+    if schedule_metadata is None and deep_gemm is not None:
         with nvtx_range("indexer_decode_schedule_metadata"):
             schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                 context_lens,
@@ -1570,6 +1615,37 @@ def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
                 clean_logits=False,
                 logits_dtype=torch.float32,
             )
+        elif deep_gemm is None:
+            # Portable path: gather each decode token's paged context into a
+            # contiguous FP8 buffer, then score it with the same Triton MQA
+            # logits kernel the prefill path uses.
+            # Decode runs under CUDA graph capture, so the gather must not read
+            # any length back to the host: pad every token to ``max_len``.
+            lens_1d = context_lens.reshape(-1)[:num_tokens].to(torch.int32).contiguous()
+            head_dim = q_values.shape[-1]
+            with nvtx_range("indexer_decode_triton_gather"):
+                k_values, k_scales = deepseek_v4_gather_paged_indexer_fp8_padded(
+                    cache_2d,
+                    lens_1d,
+                    block_tables,
+                    cache_block_size,
+                    head_dim,
+                    max_len,
+                )
+            row_base = (
+                torch.arange(num_tokens, dtype=torch.int32, device=lens_1d.device)
+                * max_len
+            )
+            with nvtx_range("indexer_decode_triton_logits"):
+                logits = deepseek_v4_indexer_mqa_logits(
+                    q_values.contiguous(),
+                    k_values,
+                    k_scales,
+                    weights.contiguous(),
+                    row_base,
+                    row_base + lens_1d,
+                    max_len,
+                )
         else:
             # deep_gemm.fp8_paged_mqa_logits consumes the query as a plain
             # float8_e4m3fn tensor [bs, next_n=1, heads, dim] and 2D context_lens.
@@ -3169,8 +3245,6 @@ class DeepseekV4Indexer(nn.Module):
         indexer_block_size: int,
         cos_sin_cache: torch.Tensor,
     ) -> torch.Tensor:
-        if deep_gemm is None:
-            raise RuntimeError("DeepSeek V4 sparse indexer requires DeepGEMM")
         if not positions.is_cuda:
             raise RuntimeError("DeepSeek V4 sparse indexer requires CUDA tensors")
 
@@ -3660,6 +3734,10 @@ class DeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
     ) -> torch.Tensor:
+        if getattr(self.wo_a, "_use_bmm_bf16_fallback", False):
+            return self._project_attention_output_bf16(
+                attn_output, positions, cos_sin_cache
+            )
         # Inverse RoPE + grouped block-scaled FP8 quant in one Triton kernel,
         # then a single native FP8 GEMM via deep_gemm.fp8_einsum -- replaces the
         # inv-rope + per-group online-quant + GEMM chain. wo_a's block scale was
@@ -3691,6 +3769,53 @@ class DeepseekV4Attention(nn.Module):
             z,
             recipe=recipe,
         )
+        out, _ = self.wo_b(z.flatten(1))
+        return out
+
+    def _project_attention_output_bf16(
+        self,
+        attn_output: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Grouped output projection without deep_gemm's native FP8 einsum.
+
+        Runs the same fused inverse-RoPE + block-scaled FP8 quant Triton kernel
+        as the native path, then dequantizes both operands and contracts them as
+        a plain batched GEMM. Keeping the activation quant means this path sees
+        the same quantization error as the FP8 einsum rather than diverging from
+        it; only the contraction differs.
+        """
+        heads_per_group = self.num_local_heads // self.num_local_groups
+        o_fp8, o_scale = deepseek_v4_fused_inv_rope_fp8_quant(
+            attn_output,
+            positions,
+            cos_sin_cache,
+            n_groups=self.num_local_groups,
+            heads_per_group=heads_per_group,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.qk_rope_head_dim,
+            # Float32 block scales; the TMA-aligned layout packs them as INT32
+            # UE8M0, which only deep_gemm decodes.
+            tma_aligned_scales=False,
+        )
+        # o_fp8 [T, G, D], o_scale [T, G, D // quant_group_size].
+        num_tokens, num_groups, d = o_fp8.shape
+        num_blocks = o_scale.shape[-1]
+        o_bf16 = (
+            (
+                o_fp8.to(torch.float32).view(
+                    num_tokens, num_groups, num_blocks, d // num_blocks
+                )
+                * o_scale.to(torch.float32).unsqueeze(-1)
+            )
+            .view(num_tokens, num_groups, d)
+            .to(torch.bfloat16)
+        )
+
+        in_dim = self.num_heads * self.head_dim // self.o_groups
+        weight = self.wo_a.weight.view(num_groups, self.o_lora_rank, in_dim)
+        z = torch.einsum("bhr,hdr->bhd", o_bf16, weight)
         out, _ = self.wo_b(z.flatten(1))
         return out
 

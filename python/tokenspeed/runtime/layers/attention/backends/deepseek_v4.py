@@ -22,7 +22,9 @@ from tokenspeed_kernel.ops.attention.flash_mla import (
     get_mla_metadata,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    deepseek_v4_gather_slots_bf16,
     deepseek_v4_indexer_decode_metadata_compute,
+    deepseek_v4_sparse_attn,
 )
 from tokenspeed_kernel.registry import error_fn
 
@@ -1384,6 +1386,100 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._decode_tile_metadata[(phase, kind, bs)] = tile_metadata
         return tile_metadata
 
+    def _forward_deepseek_v4_decode_triton(
+        self,
+        *,
+        q_padded: torch.Tensor,
+        token_to_kv_pool,
+        layer_id: int,
+        compress_ratio: int,
+        num_local_heads: int,
+        head_dim: int,
+        softmax_scale: float,
+        attn_sink: torch.Tensor,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        swa_block_size: int,
+        extra_indices: torch.Tensor | None,
+        extra_lens: torch.Tensor | None,
+        compressed_block_size: int,
+    ) -> torch.Tensor:
+        """Dual-cache decode without FlashMLA.
+
+        The sliding-window rows occupy the first columns of the workspace and
+        the compressed rows follow, so a single index range per token covers
+        both caches and one softmax spans them -- matching what FlashMLA does
+        with ``extra_k_cache``.
+        """
+        num_tokens = q_padded.shape[0]
+        swa_indices = swa_indices.reshape(num_tokens, -1)
+        if extra_indices is not None:
+            extra_indices = extra_indices.reshape(num_tokens, -1)
+        swa_width = swa_indices.shape[-1]
+        extra_width = (
+            extra_indices.shape[-1]
+            if extra_indices is not None and compress_ratio > 1
+            else 0
+        )
+        workspace_width = max(1, swa_width + extra_width)
+        workspace = torch.zeros(
+            (num_tokens, workspace_width, head_dim),
+            dtype=q_padded.dtype,
+            device=q_padded.device,
+        )
+
+        swa_lens_i32 = swa_lens.to(torch.int32)
+        deepseek_v4_gather_slots_bf16(
+            token_to_kv_pool.get_swa_kv_buffer(layer_id),
+            swa_indices,
+            swa_lens_i32,
+            swa_block_size,
+            workspace,
+            dst_offset=0,
+        )
+
+        # Compact both caches into one contiguous run per token: the compressed
+        # rows must start where this token's sliding-window rows end, not at a
+        # fixed column, or the combined length would span the gap.
+        combined_lens = swa_lens_i32
+        if extra_width > 0 and extra_lens is not None:
+            extra_lens_i32 = extra_lens.to(torch.int32)
+            deepseek_v4_gather_slots_bf16(
+                token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id),
+                extra_indices,
+                extra_lens_i32,
+                compressed_block_size,
+                workspace,
+                dst_offset=swa_width,
+            )
+            combined_lens = swa_lens_i32 + extra_lens_i32
+
+        # Column j of a token's index row addresses the workspace directly:
+        # the first swa_lens[t] entries are the sliding-window rows, the next
+        # extra_lens[t] are the compressed rows that start at column swa_width.
+        order = torch.arange(
+            workspace_width, device=q_padded.device, dtype=torch.int32
+        ).unsqueeze(0)
+        swa_count = swa_lens_i32.unsqueeze(1)
+        local = torch.where(order < swa_count, order, swa_width + (order - swa_count))
+        valid = order < combined_lens.unsqueeze(1)
+
+        row_base = (
+            torch.arange(num_tokens, device=q_padded.device, dtype=torch.int32)
+            * workspace_width
+        ).unsqueeze(1)
+        indices = torch.where(valid, row_base + local, torch.full_like(local, -1))
+
+        out = deepseek_v4_sparse_attn(
+            q_padded,
+            workspace.reshape(-1, head_dim),
+            indices.contiguous(),
+            combined_lens,
+            attn_sink,
+            softmax_scale,
+        )
+        return out[:, :num_local_heads]
+
     def _fp8_ds_mla_cache_view(
         self,
         cache_2d: torch.Tensor,
@@ -1439,12 +1535,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 f"metadata_tokens={metadata.token_to_req_indices.numel()}, "
                 f"q_tokens={q.shape[0]}"
             )
-        if flash_mla_with_kvcache is error_fn:
-            raise RuntimeError(
-                "DeepSeek V4 decode requires FlashMLA latent attention. "
-                "Build/install `tokenspeed-kernel/python` with FlashMLA."
-            )
-
         if q.shape[1] == padded_heads:
             q_padded = q.contiguous()
         else:
@@ -1488,6 +1578,29 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             compressed_cache = self._fp8_ds_mla_cache_view(
                 token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id),
                 compressed_block_size,
+            )
+
+        if flash_mla_with_kvcache is error_fn:
+            # No FlashMLA build (ROCm). FlashMLA fuses the dual-cache read into
+            # its attention kernel; here the sliding-window and compressed rows
+            # are dequantized side by side into one workspace first, so the same
+            # sparse-attention kernel the prefill path uses can run over both
+            # under a single softmax.
+            return self._forward_deepseek_v4_decode_triton(
+                q_padded=q_padded,
+                token_to_kv_pool=token_to_kv_pool,
+                layer_id=layer_id,
+                compress_ratio=compress_ratio,
+                num_local_heads=num_local_heads,
+                head_dim=head_dim,
+                softmax_scale=softmax_scale,
+                attn_sink=attn_sink,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                swa_block_size=swa_block_size,
+                extra_indices=extra_indices,
+                extra_lens=extra_lens,
+                compressed_block_size=compressed_block_size,
             )
 
         out, _ = flash_mla_with_kvcache(
@@ -1934,11 +2047,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
-        if flash_mla_sparse_fwd is error_fn:
-            raise RuntimeError(
-                "DeepSeek V4 prefill requires FlashMLA sparse attention. "
-                "Build/install `tokenspeed-kernel/python` with FlashMLA."
-            )
 
         with nvtx_range(f"attn_{kind}_prefill_pad_q"):
             if q.shape[1] == padded_heads:
@@ -1960,6 +2068,19 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 head_dim=head_dim,
                 topk_indices=topk_indices,
             )
+        if flash_mla_sparse_fwd is error_fn:
+            # No FlashMLA build (ROCm): the workspace above is already the
+            # gathered, dequantized latent KV that the sparse kernel wants.
+            with nvtx_range(f"attn_{kind}_prefill_triton"):
+                out = deepseek_v4_sparse_attn(
+                    q_padded,
+                    kv_workspace.view(-1, head_dim),
+                    indices,
+                    lens,
+                    attn_sink,
+                    softmax_scale,
+                )
+            return out[:, :num_local_heads]
         with nvtx_range(f"attn_{kind}_prefill_flashmla"):
             out, _, _ = flash_mla_sparse_fwd(
                 q=q_padded,
