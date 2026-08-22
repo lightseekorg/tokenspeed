@@ -36,9 +36,7 @@ class _Sender(Protocol):
 class _Communicator(Generic[T]):
     """Note: The communicator now only run up to 1 in-flight request at any time."""
 
-    def __init__(
-        self, sender: _Sender, fan_out: int, mode: _Mode = "queueing"
-    ) -> None:
+    def __init__(self, sender: _Sender, fan_out: int, mode: _Mode = "queueing") -> None:
         self._sender = sender
         self._fan_out = fan_out
         self._mode = mode
