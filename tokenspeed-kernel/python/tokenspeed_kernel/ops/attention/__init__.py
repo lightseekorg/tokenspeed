@@ -1365,7 +1365,8 @@ def kda_recurrent_layout() -> str:
         differ only in which axis is contiguous.
     """
     platform = current_platform()
-    return "v_major" if platform.is_nvidia or platform.is_cdna4 else "k_major"
+    v_major = platform.is_nvidia or platform.is_cdna4 or platform.is_cdna5
+    return "v_major" if v_major else "k_major"
 
 
 def kda_paged_prefill(
