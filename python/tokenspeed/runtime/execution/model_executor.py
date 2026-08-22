@@ -982,6 +982,7 @@ class ModelExecutor:
         dp_global_bs=None,
         dp_all_decode_or_idle: bool = False,
         dp_all_extend: bool = False,
+        dp_any_custom_tree_mask: bool = False,
         grammar_inputs=None,
         multimodal_context=None,
         capture_next_input_ids: bool = False,
@@ -1024,6 +1025,7 @@ class ModelExecutor:
             dp_global_bs,
             dp_all_decode_or_idle,
             dp_all_extend,
+            dp_any_custom_tree_mask,
             grammar_inputs=grammar_inputs,
             multimodal_context=multimodal_context,
             capture_next_input_ids=capture_next_input_ids,
@@ -1092,6 +1094,7 @@ class ModelExecutor:
         global_num_tokens: list[int],
         global_bs: list[int],
         all_decode_or_idle: bool,
+        any_custom_tree_mask: bool = False,
     ):
         """Run a zero-token forward so this rank participates in NCCL collectives.
 
@@ -1110,6 +1113,7 @@ class ModelExecutor:
             global_num_tokens=global_num_tokens,
             global_bs=global_bs,
             all_decode_or_idle=all_decode_or_idle,
+            any_custom_tree_mask=any_custom_tree_mask,
         )
         sampling_info = SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
@@ -1291,6 +1295,7 @@ class ModelExecutor:
         dp_global_bs=None,
         dp_all_decode_or_idle: bool = False,
         dp_all_extend: bool = False,
+        dp_any_custom_tree_mask: bool = False,
         grammar_inputs=None,
         multimodal_context=None,
         capture_next_input_ids: bool = False,
@@ -1443,6 +1448,7 @@ class ModelExecutor:
                     ctx.global_bs = dp_global_bs
                     ctx.all_decode_or_idle = dp_all_decode_or_idle
                     ctx.all_extend = dp_all_extend
+                    ctx.any_custom_tree_mask = dp_any_custom_tree_mask
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_start = time.perf_counter() if timing_enabled else 0.0
                     sampling_info = self._build_sampling_info(bs, sampling_params_list)
@@ -1512,6 +1518,7 @@ class ModelExecutor:
                         forward_batch=(
                             forward_op if cache_metadata is not None else None
                         ),
+                        spec_info=getattr(forward_op, "spec_info", None),
                     )
                     if timing_enabled:
                         forward_step_ms = (

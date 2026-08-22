@@ -1005,12 +1005,12 @@ class CudaGraphWrapper:
                 draft_prefill_seq_lens = (
                     seq_lens if self.use_v4_mtp_paged_metadata else draft_seq_lens
                 )
-                # Drafter consumes its own groups' tables (see _draft_group_tables).
-                draft_extend_kwargs = (
-                    {**kwargs, "block_tables": draft_group_tables}
-                    if kwargs.get("block_tables") is not None
-                    else kwargs
-                )
+                # Drafter consumes its own groups' tables (see _draft_group_tables),
+                # but target verify metadata must never leak into draft attention.
+                draft_extend_kwargs = dict(kwargs)
+                draft_extend_kwargs.pop("spec_info", None)
+                if kwargs.get("block_tables") is not None:
+                    draft_extend_kwargs["block_tables"] = draft_group_tables
                 if self.use_v4_mtp_paged_metadata:
                     # cache_metadata describes the target pool and exposes all
                     # target cache groups. The V4 drafter has a narrower cache
@@ -1071,6 +1071,8 @@ class CudaGraphWrapper:
             return False
         if not ctx.forward_mode.is_decode():
             return False
+        if getattr(ctx, "any_custom_tree_mask", False):
+            return False
         if self.dp_size > 1:
             if not ctx.all_decode_or_idle:
                 return False
@@ -1083,6 +1085,13 @@ class CudaGraphWrapper:
         if self.disable_padding:
             return self._has_cuda_graph_for_bs(bs)
         return bs <= self.max_bs
+
+    @staticmethod
+    def _has_custom_tree_mask(spec_info) -> bool:
+        return (
+            spec_info is not None
+            and getattr(spec_info, "custom_mask", None) is not None
+        )
 
     def can_run(self, bs: int, ctx: ForwardContext) -> bool:
         return self._can_use_graph(bs, ctx)
@@ -1143,6 +1152,7 @@ class CudaGraphWrapper:
         extend_seq_lens_cpu: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         out_cache_loc: torch.Tensor | None = None,
+        spec_info=None,
         block_tables: dict | None = None,
         block_table_base_offsets: dict | None = None,
         cache_metadata=None,
@@ -1156,6 +1166,11 @@ class CudaGraphWrapper:
         path was taken.
         """
         use_graph = self._can_use_graph(bs, ctx)
+        if use_graph and self._has_custom_tree_mask(spec_info):
+            # Tree-mask verify needs per-request mask tensors. The current decode
+            # graph captures stable dummy non-tree masks and replay only refreshes
+            # metadata, so run these batches eagerly until graph mask buffers exist.
+            use_graph = False
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
         active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
@@ -1282,6 +1297,7 @@ class CudaGraphWrapper:
                 global_num_tokens=ctx.global_num_tokens,
                 all_decode_or_idle=ctx.all_decode_or_idle,
                 capture_hidden_mode=ctx.capture_hidden_mode,
+                spec_info=spec_info,
                 **metadata_num_tokens,
                 block_tables=(
                     block_tables if self._any_backend_uses_cache_groups() else None
