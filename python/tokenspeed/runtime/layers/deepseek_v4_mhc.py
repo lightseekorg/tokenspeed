@@ -135,19 +135,35 @@ def hc_prenorm_gemm_triton(
 
 
 @triton.jit
-def _load_reduced_mix(
+def _reduce_split_partials(
     gemm_out_mul,
     token_id,
-    mix_id: tl.constexpr,
+    first_mix_id: tl.constexpr,
+    width,
     num_tokens,
     hc_mult3: tl.constexpr,
     n_splits: tl.constexpr,
+    block_split: tl.constexpr,
+    block_w: tl.constexpr,
 ):
-    value = tl.full((), 0.0, tl.float32)
-    for split_id in tl.static_range(0, n_splits):
-        offset = split_id * num_tokens * hc_mult3 + token_id * hc_mult3 + mix_id
-        value += tl.load(gemm_out_mul + offset)
-    return value
+    """Sum ``width`` consecutive mix partials across all K-splits.
+
+    The partials for one token are ``n_splits`` rows of ``hc_mult3`` floats
+    strided by ``num_tokens * hc_mult3``, so the whole reduction is one 2D tile
+    load. Walking it as scalars instead costs ``n_splits * width`` dependent
+    loads per token, which is what dominated this kernel at decode widths.
+    """
+    splits = tl.arange(0, block_split)
+    cols = tl.arange(0, block_w)
+    offsets = (
+        splits[:, None] * (num_tokens * hc_mult3)
+        + token_id * hc_mult3
+        + first_mix_id
+        + cols[None, :]
+    )
+    live = (splits < n_splits)[:, None] & (cols < width)[None, :]
+    tile = tl.load(gemm_out_mul + offsets, mask=live, other=0.0)
+    return tl.sum(tile, axis=0)
 
 
 @triton.jit
@@ -168,55 +184,70 @@ def _mhc_pre_mix_triton_kernel(
     hc_mult2: tl.constexpr,
     hc_mult3: tl.constexpr,
     block_comb: tl.constexpr,
+    block_gate: tl.constexpr,
+    block_split: tl.constexpr,
     num_tokens,
 ):
     token_id = tl.program_id(0)
 
-    rms_sum = tl.full((), 0.0, tl.float32)
-    for split_id in tl.static_range(0, n_splits):
-        rms_sum += tl.load(gemm_out_sqrsum + split_id * num_tokens + token_id)
+    splits = tl.arange(0, block_split)
+    rms_sum = tl.sum(
+        tl.load(
+            gemm_out_sqrsum + splits * num_tokens + token_id,
+            mask=splits < n_splits,
+            other=0.0,
+        ),
+        axis=0,
+    )
     rms = tl.rsqrt(rms_sum / (hc_mult * hidden_size) + rms_eps)
 
-    pre_scale = tl.load(hc_scale)
-    for hc_id in tl.static_range(0, hc_mult):
-        mix = _load_reduced_mix(
-            gemm_out_mul,
-            token_id,
-            hc_id,
-            num_tokens,
-            hc_mult3,
-            n_splits,
-        )
-        pre = tl.sigmoid(mix * rms * pre_scale + tl.load(hc_base + hc_id)) + hc_eps
-        tl.store(pre_mix + token_id * hc_mult + hc_id, pre)
-
-    post_scale = tl.load(hc_scale + 1)
-    for hc_id in tl.static_range(0, hc_mult):
-        mix = _load_reduced_mix(
-            gemm_out_mul,
-            token_id,
-            hc_mult + hc_id,
-            num_tokens,
-            hc_mult3,
-            n_splits,
-        )
-        post = (
-            tl.sigmoid(mix * rms * post_scale + tl.load(hc_base + hc_mult + hc_id))
-            * 2.0
-        )
-        tl.store(post_mix + token_id * hc_mult + hc_id, post)
+    # The pre and post gates share a tile: both are sigmoids of the same
+    # affine form, differing only in which scale they use and how the result
+    # is finished.
+    gate_offsets = tl.arange(0, block_gate)
+    gate_active = gate_offsets < hc_mult * 2
+    is_pre = gate_offsets < hc_mult
+    gate_mix = _reduce_split_partials(
+        gemm_out_mul,
+        token_id,
+        0,
+        hc_mult * 2,
+        num_tokens,
+        hc_mult3,
+        n_splits,
+        block_split,
+        block_gate,
+    )
+    gate_scale = tl.where(is_pre, tl.load(hc_scale), tl.load(hc_scale + 1))
+    gate = tl.sigmoid(
+        gate_mix * rms * gate_scale
+        + tl.load(hc_base + gate_offsets, mask=gate_active, other=0.0)
+    )
+    tl.store(
+        pre_mix + token_id * hc_mult + gate_offsets,
+        gate + hc_eps,
+        mask=is_pre,
+    )
+    tl.store(
+        post_mix + token_id * hc_mult + gate_offsets - hc_mult,
+        gate * 2.0,
+        mask=gate_active & (gate_offsets >= hc_mult),
+    )
 
     comb_offsets = tl.arange(0, block_comb)
     comb_mask = comb_offsets < hc_mult2
     comb_scale = tl.load(hc_scale + 2)
-    comb_mix_values = tl.zeros((block_comb,), tl.float32)
-    for split_id in tl.static_range(0, n_splits):
-        split_base = split_id * num_tokens * hc_mult3 + token_id * hc_mult3
-        comb_mix_values += tl.load(
-            gemm_out_mul + split_base + hc_mult * 2 + comb_offsets,
-            mask=comb_mask,
-            other=0.0,
-        )
+    comb_mix_values = _reduce_split_partials(
+        gemm_out_mul,
+        token_id,
+        hc_mult * 2,
+        hc_mult2,
+        num_tokens,
+        hc_mult3,
+        n_splits,
+        block_split,
+        block_comb,
+    )
     comb_values = comb_mix_values * rms * comb_scale + tl.load(
         hc_base + hc_mult * 2 + comb_offsets, mask=comb_mask, other=0.0
     )
@@ -525,6 +556,8 @@ def mhc_pre(
         )
     block_h = 1024
     block_comb = triton.next_power_of_2(hc_mult2)
+    block_gate = triton.next_power_of_2(hc_mult * 2)
+    block_split = triton.next_power_of_2(n_splits)
     _mhc_pre_mix_triton_kernel[(num_tokens,)](
         gemm_out_mul,
         gemm_out_sqrsum,
@@ -542,6 +575,8 @@ def mhc_pre(
         hc_mult2=hc_mult2,
         hc_mult3=hc_mult3,
         block_comb=block_comb,
+        block_gate=block_gate,
+        block_split=block_split,
         num_tokens=num_tokens,
         num_warps=1,
     )

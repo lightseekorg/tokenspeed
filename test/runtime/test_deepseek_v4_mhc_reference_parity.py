@@ -137,6 +137,16 @@ class TestDeepseekV4MhcReferenceParity(unittest.TestCase):
         """The 8192-token chunk the engine issues, at V4-Flash's hidden size."""
         self._run(num_tokens=8192, hidden_size=4096)
 
+    def test_odd_split_count(self) -> None:
+        """A hidden size whose K-split count is not a power of two.
+
+        The mix kernel reduces the split partials as one padded tile, so the
+        rows past ``n_splits`` have to be masked off rather than summed. Every
+        other size here happens to land on a power of two and would not catch
+        a missing mask; 768 gives 12 splits.
+        """
+        self._run(num_tokens=8, hidden_size=768)
+
     def test_sinkhorn_output_is_doubly_normalized(self) -> None:
         """After Sinkhorn the coupling matrix should be near doubly stochastic.
 
