@@ -445,7 +445,15 @@ def gluon_mxfp_combine(
     # tiling/W-scale reads, but store only the caller-visible width.
     logical_n = int(getattr(w, "original_n", N))
     y_n = logical_n if logical_n < N else N
-    y = torch.empty((n_rows, y_n), device=x.device, dtype=out_dtype)
+    if scatter_indx is None:
+        y = torch.empty((n_rows, y_n), device=x.device, dtype=out_dtype)
+    else:
+        # The scatter only writes rows whose (token, slot) pair was routed.
+        # Rows for unrouted pairs -- every pair whose expert id fell outside
+        # [0, n_experts), which is the common case under expert parallelism --
+        # are never stored to, so the buffer must start at zero rather than
+        # carrying whatever the allocator handed back.
+        y = torch.zeros((n_rows, y_n), device=x.device, dtype=out_dtype)
     # GEMM2 X is already in expert-sorted ragged order. Store through
     # scatter_indx to recover flat token/top-k row order before reduction.
     _launch_kernel(

@@ -1137,8 +1137,13 @@ def _route_from_topk(
     torch.Tensor,
 ]:
     flat_ids = topk_ids.reshape(-1).to(torch.long)
-    valid = flat_ids >= 0
-    safe_ids = torch.where(valid, flat_ids, flat_ids.new_zeros(()))
+    # Ids outside [0, num_experts) are unrouted -- expert parallelism marks
+    # every pair owned by another rank this way. They must sort *after* all
+    # real experts: parking them at expert 0 instead would interleave them with
+    # genuine expert-0 rows, while the slice sizes below count only valid
+    # pairs, so every expert's ragged slice would then address the wrong rows.
+    valid = (flat_ids >= 0) & (flat_ids < num_experts)
+    safe_ids = torch.where(valid, flat_ids, flat_ids.new_full((), num_experts))
     sort_order = torch.argsort(safe_ids, stable=True)
 
     top_k = topk_ids.shape[1]
@@ -1151,8 +1156,12 @@ def _route_from_topk(
     if dtype is not None and gate_scal.dtype != dtype:
         gate_scal = gate_scal.to(dtype)
 
-    col_sum = torch.zeros((num_experts,), dtype=torch.int32, device=safe_ids.device)
+    # One extra bucket absorbs the unrouted sentinel; it accumulates zero
+    # because those entries contribute ``valid == 0``, and is dropped before
+    # building the ragged metadata.
+    col_sum = torch.zeros((num_experts + 1,), dtype=torch.int32, device=safe_ids.device)
     col_sum.scatter_add_(0, safe_ids, valid.to(torch.int32))
+    col_sum = col_sum[:num_experts]
     ragged_metadata = make_ragged_tensor_metadata(col_sum, int(sort_order.numel()))
     return ragged_metadata, gather_indx, scatter_indx, gate_scal
 
