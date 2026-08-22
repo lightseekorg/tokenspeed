@@ -52,6 +52,29 @@ logger = get_colorful_logger(__name__)
 class SiluAndMul(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, fp8_out: bool = False) -> torch.Tensor:
+        # A DP rank's idle forward (ForwardMode.IDLE) runs the model over a
+        # 0-token batch to stay in the group's collectives. The activation
+        # kernels cannot launch over 0 rows (flashinfer's silu_and_mul dies
+        # with cudaErrorInvalidValue on an empty grid), and an empty input
+        # fully determines the output — return it without launching.
+        if x.shape[-2] == 0:
+            d = x.shape[-1] // 2
+            out = torch.empty(
+                x.shape[:-1] + (d,),
+                dtype=torch.float8_e4m3fn if fp8_out else x.dtype,
+                device=x.device,
+            )
+            if fp8_out:
+                # Same 0-row shape the fused path's TMA-aligned scale
+                # collapses to: (rows=0, d // 128).
+                scale = torch.empty(
+                    x.shape[:-2] + (0, d // 128),
+                    device=x.device,
+                    dtype=torch.float32,
+                )
+                return out, scale
+            return out
+
         if not _is_amd:
 
             def get_tma_aligned_scale(x):
