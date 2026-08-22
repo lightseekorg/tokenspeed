@@ -22,7 +22,7 @@ from tokenspeed_kernel.ops.attention.flash_mla import (
     get_mla_metadata,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
-    deepseek_v4_gather_slots_bf16,
+    deepseek_v4_fused_paged_sparse_attn,
     deepseek_v4_indexer_decode_metadata_compute,
     deepseek_v4_sparse_attn,
 )
@@ -1394,7 +1394,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         layer_id: int,
         compress_ratio: int,
         num_local_heads: int,
-        head_dim: int,
         softmax_scale: float,
         attn_sink: torch.Tensor,
         swa_indices: torch.Tensor,
@@ -1406,77 +1405,41 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Dual-cache decode without FlashMLA.
 
-        The sliding-window rows occupy the first columns of the workspace and
-        the compressed rows follow, so a single index range per token covers
-        both caches and one softmax spans them -- matching what FlashMLA does
-        with ``extra_k_cache``.
+        One kernel walks both slot lists and dequantizes each cache row as the
+        online softmax consumes it, so a single softmax spans both caches --
+        matching what FlashMLA does with ``extra_k_cache`` -- without staging a
+        bf16 workspace in HBM that attention would read straight back.
         """
         num_tokens = q_padded.shape[0]
         swa_indices = swa_indices.reshape(num_tokens, -1)
         if extra_indices is not None:
             extra_indices = extra_indices.reshape(num_tokens, -1)
-        swa_width = swa_indices.shape[-1]
         extra_width = (
             extra_indices.shape[-1]
             if extra_indices is not None and compress_ratio > 1
             else 0
         )
-        workspace_width = max(1, swa_width + extra_width)
-        workspace = torch.zeros(
-            (num_tokens, workspace_width, head_dim),
-            dtype=q_padded.dtype,
-            device=q_padded.device,
-        )
 
-        swa_lens_i32 = swa_lens.to(torch.int32)
-        deepseek_v4_gather_slots_bf16(
+        extra_cache = None
+        extra_lens_i32 = None
+        if extra_width > 0 and extra_lens is not None:
+            extra_cache = token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id)
+            extra_lens_i32 = extra_lens.to(torch.int32)
+        else:
+            extra_indices = None
+
+        out = deepseek_v4_fused_paged_sparse_attn(
+            q_padded,
             token_to_kv_pool.get_swa_kv_buffer(layer_id),
             swa_indices,
-            swa_lens_i32,
+            swa_lens.to(torch.int32),
             swa_block_size,
-            workspace,
-            dst_offset=0,
-        )
-
-        # Compact both caches into one contiguous run per token: the compressed
-        # rows must start where this token's sliding-window rows end, not at a
-        # fixed column, or the combined length would span the gap.
-        combined_lens = swa_lens_i32
-        if extra_width > 0 and extra_lens is not None:
-            extra_lens_i32 = extra_lens.to(torch.int32)
-            deepseek_v4_gather_slots_bf16(
-                token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id),
-                extra_indices,
-                extra_lens_i32,
-                compressed_block_size,
-                workspace,
-                dst_offset=swa_width,
-            )
-            combined_lens = swa_lens_i32 + extra_lens_i32
-
-        # Column j of a token's index row addresses the workspace directly:
-        # the first swa_lens[t] entries are the sliding-window rows, the next
-        # extra_lens[t] are the compressed rows that start at column swa_width.
-        order = torch.arange(
-            workspace_width, device=q_padded.device, dtype=torch.int32
-        ).unsqueeze(0)
-        swa_count = swa_lens_i32.unsqueeze(1)
-        local = torch.where(order < swa_count, order, swa_width + (order - swa_count))
-        valid = order < combined_lens.unsqueeze(1)
-
-        row_base = (
-            torch.arange(num_tokens, device=q_padded.device, dtype=torch.int32)
-            * workspace_width
-        ).unsqueeze(1)
-        indices = torch.where(valid, row_base + local, torch.full_like(local, -1))
-
-        out = deepseek_v4_sparse_attn(
-            q_padded,
-            workspace.reshape(-1, head_dim),
-            indices.contiguous(),
-            combined_lens,
             attn_sink,
             softmax_scale,
+            extra_cache=extra_cache,
+            extra_slots=extra_indices,
+            extra_lens=extra_lens_i32,
+            extra_block_size=compressed_block_size,
         )
         return out[:, :num_local_heads]
 
@@ -1592,7 +1555,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 layer_id=layer_id,
                 compress_ratio=compress_ratio,
                 num_local_heads=num_local_heads,
-                head_dim=head_dim,
                 softmax_scale=softmax_scale,
                 attn_sink=attn_sink,
                 swa_indices=swa_indices,

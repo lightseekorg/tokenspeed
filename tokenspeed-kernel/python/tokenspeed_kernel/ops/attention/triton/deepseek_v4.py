@@ -58,6 +58,7 @@ __all__ = [
     "deepseek_v4_dequantize_and_gather_k_cache",
     "deepseek_v4_fused_csa_indexer_mxfp4_cache_insert",
     "deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4",
+    "deepseek_v4_fused_paged_sparse_attn",
     "deepseek_v4_fused_sparse_compress_cache_insert",
     "deepseek_v4_gather_indexer_mxfp4_cache",
     "deepseek_v4_gather_paged_indexer_fp8_padded",
@@ -2538,6 +2539,467 @@ def deepseek_v4_sparse_attn(
         num_stages=2,
     )
     return out
+
+
+# Decode attention that dequantizes the paged cache inside the softmax loop.
+#
+# ``deepseek_v4_gather_slots_bf16`` followed by ``deepseek_v4_sparse_attn`` is
+# correct but pays for a full bf16 workspace in HBM that attention reads back
+# immediately. This kernel removes that round trip: it walks the same slot lists
+# and dequantizes each row into registers as the online softmax consumes it.
+#
+# The two caches keep their own slot list, length vector and block size, and are
+# walked as two phases sharing one set of accumulators -- which is what makes a
+# single softmax span both, without the host-side index arithmetic that packing
+# them into a shared workspace required.
+@triton.jit
+def _deepseek_v4_paged_kv_tile(
+    cache_ptr,
+    slots_ptr,
+    lens_ptr,
+    pid_t,
+    slots_stride_token,
+    block_stride,
+    k0,
+    topk,
+    offs_d,
+    cache_block_size: tl.constexpr,
+    token_data_size: tl.constexpr,
+    scale_dim: tl.constexpr,
+    fp8_dim: tl.constexpr,
+    quant_block: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Load and dequantize ``BLOCK_K`` slot-addressed cache rows.
+
+    Returns ``(kv, valid)`` where ``kv`` is a ``[BLOCK_K, D]`` bfloat16 tile and
+    ``valid`` marks the rows backed by a real slot. Rounding matches the bf16
+    workspace the gather kernel writes, so results are bit-identical.
+    """
+    length = tl.load(lens_ptr + pid_t)
+    offs_k = k0 + tl.arange(0, BLOCK_K)
+    in_range = (offs_k < topk) & (offs_k < length)
+    slot = tl.load(
+        slots_ptr + pid_t * slots_stride_token + offs_k, mask=in_range, other=-1
+    )
+    valid = in_range & (slot >= 0)
+    slot = tl.where(valid, slot, 0)
+
+    block_idx = slot // cache_block_size
+    pos_in_block = slot % cache_block_size
+    block_base = block_idx.to(tl.int64) * block_stride
+    data_off = block_base + pos_in_block.to(tl.int64) * token_data_size
+    scale_off = (
+        block_base
+        + cache_block_size * token_data_size
+        + pos_in_block.to(tl.int64) * scale_dim
+    )
+
+    is_nope = offs_d < fp8_dim
+    nope_mask = valid[:, None] & is_nope[None, :]
+    raw = tl.load(
+        cache_ptr + data_off[:, None] + offs_d[None, :], mask=nope_mask, other=0
+    )
+    values = raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    exponent = tl.load(
+        cache_ptr + scale_off[:, None] + (offs_d // quant_block)[None, :],
+        mask=nope_mask,
+        other=127,
+    ).to(tl.float32)
+    nope = values * tl.exp2(exponent - 127.0)
+
+    # Payload byte offsets and ``fp8_dim`` are both even, so the rope tail is
+    # addressable through a bfloat16 view of the cache.
+    cache_bf16 = cache_ptr.to(tl.pointer_type(tl.bfloat16))
+    rope_off = (data_off + fp8_dim) // 2
+    rope = tl.load(
+        cache_bf16 + rope_off[:, None] + (offs_d - fp8_dim)[None, :],
+        mask=valid[:, None] & (offs_d >= fp8_dim)[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    kv = tl.where(is_nope[None, :], nope, rope).to(tl.bfloat16)
+    return kv, valid
+
+
+@triton.jit
+def _deepseek_v4_online_softmax_step(
+    q, kv, valid, scale, m_i, l_i, acc_o, neg: tl.constexpr
+):
+    """Fold one ``[BLOCK_K, D]`` key/value tile into the running softmax."""
+    scores = tl.dot(q, tl.trans(kv)).to(tl.float32) * scale
+    scores = tl.where(valid[None, :], scores, neg)
+
+    m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+    alpha = tl.exp(m_i - m_new)
+    p = tl.where(valid[None, :], tl.exp(scores - m_new[:, None]), 0.0)
+
+    l_i = l_i * alpha + tl.sum(p, axis=1)
+    acc_o = acc_o * alpha[:, None] + tl.dot(p.to(kv.dtype), kv).to(tl.float32)
+    return m_new, l_i, acc_o
+
+
+@triton.jit(do_not_specialize=["num_tokens", "swa_topk", "extra_topk"])
+def _deepseek_v4_fused_paged_sparse_attn_kernel(
+    q_ptr,
+    acc_ptr,
+    m_ptr,
+    l_ptr,
+    swa_cache_ptr,
+    swa_slots_ptr,
+    swa_lens_ptr,
+    swa_block_stride,
+    swa_slots_stride_token,
+    extra_cache_ptr,
+    extra_slots_ptr,
+    extra_lens_ptr,
+    extra_block_stride,
+    extra_slots_stride_token,
+    q_stride_token,
+    q_stride_head,
+    scale,
+    num_tokens,
+    swa_topk,
+    extra_topk,
+    split_width,
+    neg: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    swa_block_size: tl.constexpr,
+    extra_block_size: tl.constexpr,
+    token_data_size: tl.constexpr,
+    scale_dim: tl.constexpr,
+    fp8_dim: tl.constexpr,
+    quant_block: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    split_id = tl.program_id(1)
+    if pid >= num_tokens:
+        return
+
+    # Splits carve the concatenated slot range so each covers one contiguous
+    # run; a split that straddles the cache boundary walks the tail of one and
+    # the head of the other.
+    lo = split_id * split_width
+    hi = lo + split_width
+    # The last split's range runs past the end of the concatenated slot list,
+    # so both ends are clamped to their own cache rather than leaving the
+    # overhang to be masked off by the lengths.
+    swa_lo = tl.minimum(lo, swa_topk)
+    swa_hi = tl.minimum(hi, swa_topk)
+    extra_lo = tl.minimum(tl.maximum(lo - swa_topk, 0), extra_topk)
+    extra_hi = tl.minimum(tl.maximum(hi - swa_topk, 0), extra_topk)
+
+    offs_h = tl.arange(0, H)
+    offs_d = tl.arange(0, D)
+    q = tl.load(
+        q_ptr + pid * q_stride_token + offs_h[:, None] * q_stride_head + offs_d[None, :]
+    )
+
+    acc_o = tl.zeros((H, D), dtype=tl.float32)
+    m_i = tl.full((H,), neg, tl.float32)
+    l_i = tl.zeros((H,), dtype=tl.float32)
+
+    for k0 in range(swa_lo, swa_hi, BLOCK_K):
+        kv, valid = _deepseek_v4_paged_kv_tile(
+            swa_cache_ptr,
+            swa_slots_ptr,
+            swa_lens_ptr,
+            pid,
+            swa_slots_stride_token,
+            swa_block_stride,
+            k0,
+            swa_hi,
+            offs_d,
+            cache_block_size=swa_block_size,
+            token_data_size=token_data_size,
+            scale_dim=scale_dim,
+            fp8_dim=fp8_dim,
+            quant_block=quant_block,
+            BLOCK_K=BLOCK_K,
+        )
+        m_i, l_i, acc_o = _deepseek_v4_online_softmax_step(
+            q, kv, valid, scale, m_i, l_i, acc_o, neg=neg
+        )
+
+    if HAS_EXTRA:
+        for k0 in range(extra_lo, extra_hi, BLOCK_K):
+            kv, valid = _deepseek_v4_paged_kv_tile(
+                extra_cache_ptr,
+                extra_slots_ptr,
+                extra_lens_ptr,
+                pid,
+                extra_slots_stride_token,
+                extra_block_stride,
+                k0,
+                extra_hi,
+                offs_d,
+                cache_block_size=extra_block_size,
+                token_data_size=token_data_size,
+                scale_dim=scale_dim,
+                fp8_dim=fp8_dim,
+                quant_block=quant_block,
+                BLOCK_K=BLOCK_K,
+            )
+            m_i, l_i, acc_o = _deepseek_v4_online_softmax_step(
+                q, kv, valid, scale, m_i, l_i, acc_o, neg=neg
+            )
+
+    base = (pid * NUM_SPLITS + split_id) * H
+    tl.store(m_ptr + base + offs_h, m_i)
+    tl.store(l_ptr + base + offs_h, l_i)
+    tl.store(acc_ptr + base * D + offs_h[:, None] * D + offs_d[None, :], acc_o)
+
+
+# Merge the per-split partials. Each split ran its own online softmax over a
+# disjoint slot range, so rescaling every partial against the global running
+# max and summing gives the same result as one sequential pass. The sink joins
+# the denominator once, against that global max.
+@triton.jit(do_not_specialize=["num_tokens"])
+def _deepseek_v4_fused_paged_sparse_attn_combine_kernel(
+    acc_ptr,
+    m_ptr,
+    l_ptr,
+    sink_ptr,
+    out_ptr,
+    out_stride_token,
+    out_stride_head,
+    num_tokens,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= num_tokens:
+        return
+
+    offs_h = tl.arange(0, H)
+    offs_d = tl.arange(0, D)
+    offs_s = tl.arange(0, NUM_SPLITS)
+
+    sm = (pid * NUM_SPLITS + offs_s)[:, None] * H + offs_h[None, :]
+    m_s = tl.load(m_ptr + sm)
+    l_s = tl.load(l_ptr + sm)
+
+    m_g = tl.max(m_s, axis=0)
+    alpha = tl.exp(m_s - m_g[None, :])
+    l_g = tl.sum(l_s * alpha, axis=0)
+
+    acc = tl.zeros((H, D), dtype=tl.float32)
+    for split_id in tl.static_range(0, NUM_SPLITS):
+        part = tl.load(
+            acc_ptr
+            + ((pid * NUM_SPLITS + split_id) * H + offs_h)[:, None] * D
+            + offs_d[None, :]
+        )
+        scale_s = tl.exp(
+            tl.load(m_ptr + (pid * NUM_SPLITS + split_id) * H + offs_h) - m_g
+        )
+        acc += part * scale_s[:, None]
+
+    sink = tl.load(sink_ptr + offs_h).to(tl.float32)
+    l_g = l_g + tl.exp(sink - m_g)
+
+    out = acc / l_g[:, None]
+    tl.store(
+        out_ptr
+        + pid * out_stride_token
+        + offs_h[:, None] * out_stride_head
+        + offs_d[None, :],
+        out.to(out_ptr.dtype.element_ty),
+    )
+
+
+def deepseek_v4_fused_paged_sparse_attn(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    swa_slots: torch.Tensor,
+    swa_lens: torch.Tensor,
+    swa_block_size: int,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    extra_cache: torch.Tensor | None = None,
+    extra_slots: torch.Tensor | None = None,
+    extra_lens: torch.Tensor | None = None,
+    extra_block_size: int = 1,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sparse latent attention read straight from the paged fp8_ds_mla caches.
+
+    Equivalent to dequantizing both caches into one bf16 workspace with
+    ``deepseek_v4_gather_slots_bf16`` and calling ``deepseek_v4_sparse_attn``
+    over it, but without materializing the workspace.
+
+    Args:
+        q: ``[num_tokens, num_heads, head_dim]`` queries; ``num_heads`` must be
+            a power of two (pad before calling).
+        swa_cache: uint8 sliding-window cache viewed as
+            ``[num_blocks, block_bytes]``.
+        swa_slots: ``[num_tokens, swa_topk]`` slot indices; negatives are
+            skipped.
+        swa_lens: ``[num_tokens]`` valid entry count per row of ``swa_slots``.
+        swa_block_size: tokens per sliding-window cache block.
+        attn_sink: ``[num_heads]`` float32 learned sink logits, entering the
+            denominator once against the final running max.
+        softmax_scale: multiplier applied to the raw scores.
+        extra_cache: optional uint8 compressed cache in the same layout.
+        extra_slots: ``[num_tokens, extra_topk]`` slots into ``extra_cache``.
+        extra_lens: ``[num_tokens]`` valid entry count for ``extra_slots``.
+        extra_block_size: tokens per compressed cache block.
+        out: optional ``[num_tokens, num_heads, head_dim]`` destination.
+
+    Returns:
+        The attention output, ``out`` when provided.
+    """
+    num_tokens, num_heads, head_dim = q.shape
+    if out is None:
+        out = torch.empty_like(q)
+    if num_tokens == 0:
+        return out
+    if swa_cache.dtype != torch.uint8:
+        raise TypeError(f"swa_cache must be uint8, got {swa_cache.dtype}")
+    if head_dim != DEEPSEEK_V4_HEAD_DIM:
+        raise ValueError(
+            f"head_dim {head_dim} must be {DEEPSEEK_V4_HEAD_DIM} for the "
+            "fp8_ds_mla cache layout"
+        )
+    if attn_sink.numel() < num_heads:
+        raise ValueError(f"attn_sink has {attn_sink.numel()} entries, need {num_heads}")
+
+    swa_slots = swa_slots.reshape(num_tokens, -1)
+    swa_topk = swa_slots.shape[1]
+
+    has_extra = (
+        extra_cache is not None and extra_slots is not None and extra_lens is not None
+    )
+    if has_extra:
+        if extra_cache.dtype != torch.uint8:
+            raise TypeError(f"extra_cache must be uint8, got {extra_cache.dtype}")
+        extra_slots = extra_slots.reshape(num_tokens, -1)
+        extra_topk = extra_slots.shape[1]
+        has_extra = extra_topk > 0
+    if not has_extra:
+        # Triton still needs well-formed arguments for the disabled branch.
+        extra_cache = swa_cache
+        extra_slots = swa_slots
+        extra_lens = swa_lens
+        extra_topk = 0
+        extra_block_size = swa_block_size
+
+    block_k = _deepseek_v4_fused_attn_block_k(swa_topk, extra_topk)
+    num_splits, split_width = _deepseek_v4_fused_attn_split(
+        num_tokens, swa_topk + extra_topk, block_k, q.device
+    )
+
+    partial_acc = torch.empty(
+        (num_tokens, num_splits, num_heads, head_dim),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    partial_m = torch.empty(
+        (num_tokens, num_splits, num_heads), dtype=torch.float32, device=q.device
+    )
+    partial_l = torch.empty_like(partial_m)
+
+    _deepseek_v4_fused_paged_sparse_attn_kernel[(num_tokens, num_splits)](
+        q,
+        partial_acc,
+        partial_m,
+        partial_l,
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        swa_cache.stride(0),
+        swa_slots.stride(0),
+        extra_cache,
+        extra_slots,
+        extra_lens,
+        extra_cache.stride(0),
+        extra_slots.stride(0),
+        q.stride(0),
+        q.stride(1),
+        softmax_scale,
+        num_tokens,
+        swa_topk,
+        extra_topk,
+        split_width,
+        neg=_DEEPSEEK_V4_ATTN_NEG,
+        H=num_heads,
+        D=head_dim,
+        BLOCK_K=block_k,
+        NUM_SPLITS=num_splits,
+        swa_block_size=swa_block_size,
+        extra_block_size=extra_block_size,
+        token_data_size=DEEPSEEK_V4_SWA_TOKEN_STRIDE,
+        scale_dim=DEEPSEEK_V4_SWA_SCALE_DIM,
+        fp8_dim=DEEPSEEK_V4_NOPE_DIM,
+        quant_block=DEEPSEEK_V4_FP8_QUANT_BLOCK,
+        HAS_EXTRA=has_extra,
+        num_warps=4,
+        num_stages=2,
+    )
+    _deepseek_v4_fused_paged_sparse_attn_combine_kernel[(num_tokens,)](
+        partial_acc,
+        partial_m,
+        partial_l,
+        attn_sink,
+        out,
+        out.stride(0),
+        out.stride(1),
+        num_tokens,
+        H=num_heads,
+        D=head_dim,
+        NUM_SPLITS=num_splits,
+        num_warps=4,
+    )
+    return out
+
+
+@functools.lru_cache(maxsize=None)
+def _deepseek_v4_attn_core_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _deepseek_v4_fused_attn_split(
+    num_tokens: int, total_topk: int, block_k: int, device: torch.device
+) -> tuple[int, int]:
+    """Choose a K-split count that keeps the machine busy at decode widths.
+
+    One program per token leaves all but ``num_tokens`` compute units idle,
+    which is the common case at low concurrency. Splitting the slot range
+    trades a small combine pass for parallelism, so the split count only needs
+    to grow until the grid covers the device.
+
+    Returns ``(num_splits, split_width)`` with ``split_width`` a multiple of
+    ``block_k`` so no split starts mid-tile.
+    """
+    tiles = max(1, triton.cdiv(total_topk, block_k))
+    cores = _deepseek_v4_attn_core_count(
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    wanted = min(tiles, max(1, triton.cdiv(cores, max(1, num_tokens))))
+    # The combine kernel reduces the splits as one tile, so keep the count a
+    # power of two rather than rounding up past the tiles that exist.
+    num_splits = 1 << (wanted.bit_length() - 1)
+    return num_splits, triton.cdiv(tiles, num_splits) * block_k
+
+
+def _deepseek_v4_fused_attn_block_k(swa_topk: int, extra_topk: int) -> int:
+    """Pick a K tile that does not overshoot short slot lists.
+
+    Both phases share the tile width, so it is capped by the shorter list to
+    keep masked-off lanes from dominating the sliding-window phase, whose length
+    is the model's sliding window rather than the indexer top-k.
+    """
+    widths = [w for w in (swa_topk, extra_topk) if w > 0]
+    smallest = min(widths) if widths else 1
+    block_k = 16
+    while block_k < 64 and block_k * 2 <= smallest:
+        block_k *= 2
+    return block_k
 
 
 # Forward RoPE + block-scaled FP8 quant + paged scatter of the KV latent into
