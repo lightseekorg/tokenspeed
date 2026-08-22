@@ -529,13 +529,14 @@ def _wu_vector_fwd_kernel(
     length = end - begin
     token0 = local_chunk * BT
 
-    load_t_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
-    load_x_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
+    load_t_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [8, 1], [1, 0])
+    load_x_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [8, 1], [1, 0])
     mfma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         instr_shape=[16, 16, 32],
         transposed=True,
-        warp_bases=[[1, 0], [2, 0]],
+        # BT spans only four 16-row tiles, so the last warp pair splits BO.
+        warp_bases=[[1, 0], [2, 0], [0, 1]],
         reg_bases=[],
     )
     a_layout: gl.constexpr = gl.DotOperandLayout(0, mfma_layout, k_width=8)
@@ -573,9 +574,9 @@ def _wu_vector_fwd_kernel(
 
     key_mask = (token0 + rows_x[:, None] < length) & (value_offsets < K)
     bk_offsets = (token_offsets * H + head) * K + value_offsets
-    bk = gl.load(kn + bk_offsets, mask=key_mask, other=0.0).to(gl.float32)
+    raw_k = gl.load(kn + bk_offsets, mask=key_mask, other=0.0).to(gl.float32)
     gate = gl.load(bg + bk_offsets, mask=key_mask, other=0.0).to(gl.float32)
-    bk *= beta[:, None] * gl.exp(gate)
+    bk = raw_k * beta[:, None] * gl.exp(gate)
     rhs_k = gl.convert_layout(bk.to(gl.bfloat16), b_layout)
     acc_k = gl.zeros([BT, BO], gl.float32, mfma_layout)
     acc_k = gfx1250.wmma(lhs, rhs_k, acc_k)
@@ -597,8 +598,7 @@ def _wu_vector_fwd_kernel(
 
     valid_keys = (token0 + rows_x[:, None] < length) & (value_offsets < K)
     last_gate = gl.min(gl.where(valid_keys, gate, float("inf")), axis=0)
-    gated_key = gl.load(kn + bk_offsets, mask=key_mask, other=0.0).to(gl.float32)
-    gated_key *= gl.exp(last_gate[None, :] - gate)
+    gated_key = raw_k * gl.exp(last_gate[None, :] - gate)
     gl.store(kg + bk_offsets, gated_key.to(gl.bfloat16), mask=key_mask)
 
 
@@ -923,7 +923,7 @@ def _launch_producer(
         V=value_dim,
         BT=chunk_size,
         BO=128,
-        num_warps=4,
+        num_warps=8,
     )
 
 
