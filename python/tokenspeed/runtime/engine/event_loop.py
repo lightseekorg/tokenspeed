@@ -1126,6 +1126,10 @@ class EventLoop:
             ready_response,
             self.model_config.vocab_size,
             enable_output_logprobs=self.server_args.enable_output_logprobs,
+            # Multimodal ingest: the msgpack path materializes precomputed mm
+            # inputs itself (pad values, M-RoPE, pad substitution) — the
+            # frontend that normally does it is bypassed on this wire.
+            model_config=self.model_config,
         )
 
     # ------------------------------------------------------------------

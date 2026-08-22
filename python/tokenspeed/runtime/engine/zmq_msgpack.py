@@ -28,6 +28,9 @@ from tokenspeed.runtime.engine.io_struct import (
     MsgpackEncoder,
     TokenizedGenerateReqInput,
 )
+from tokenspeed.runtime.multimodal.materialize import (
+    materialize_precomputed_inputs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +74,12 @@ class MsgpackRecvSocket:
         socket: zmq.Socket,
         vocab_size: int,
         enable_output_logprobs: bool = False,
+        model_config=None,
     ) -> None:
         self._socket = socket
         self._vocab_size = vocab_size
         self._enable_output_logprobs = enable_output_logprobs
+        self._model_config = model_config
         self._pending: collections.deque = collections.deque()
 
     def _validation_error(self, obj: TokenizedGenerateReqInput) -> str | None:
@@ -88,6 +93,38 @@ class MsgpackRecvSocket:
             obj.sampling_params.verify(self._vocab_size)
         except ValueError as exc:
             return str(exc)
+        return None
+
+    def _materialize_multimodal(self, obj: TokenizedGenerateReqInput) -> str | None:
+        """Derive the scheduler-required multimodal state on ingest.
+
+        The pickle path's InputProcessor performs this in the frontend; the
+        msgpack path bypasses it, so requests arrive with expanded placeholder
+        ``input_ids`` plus items carrying features/hashes/offsets, and the
+        derived pieces (pad values, M-RoPE, pad substitution) are produced
+        here — by the same shared function, so both admission paths agree.
+        Returns a rejection reason, or None on success. A payload that already
+        carries ``input_ids_unpadded`` is taken as fully materialized upstream
+        and passed through untouched.
+        """
+        if obj.multimodal_inputs is None or obj.input_ids_unpadded is not None:
+            return None
+        if self._model_config is None or not getattr(
+            self._model_config, "is_multimodal_active", False
+        ):
+            return "multimodal_inputs were provided for a text-only model"
+        if obj.input_ids is None:
+            return "multimodal_inputs require input_ids"
+        try:
+            obj.input_ids, obj.input_ids_unpadded = materialize_precomputed_inputs(
+                self._model_config.hf_config,
+                list(obj.input_ids),
+                obj.multimodal_inputs,
+            )
+        except Exception as exc:
+            # A malformed mm payload must terminate this request's stream, not
+            # the scheduler; surface the reason like any validation failure.
+            return f"failed to materialize multimodal inputs: {exc}"
         return None
 
     def recv_pyobj(self, flags: int = 0):
@@ -115,7 +152,11 @@ class MsgpackRecvSocket:
                 # are validated. A rejected request still flows, pre-marked.
                 # The wire layer may have marked it already (e.g. n != 1).
                 if isinstance(obj, TokenizedGenerateReqInput):
-                    reason = obj.validation_error or self._validation_error(obj)
+                    reason = (
+                        obj.validation_error
+                        or self._validation_error(obj)
+                        or self._materialize_multimodal(obj)
+                    )
                     if reason is not None:
                         logger.warning(
                             "msgpack input: aborting invalid request %s: %s",
@@ -197,6 +238,7 @@ def connect_msgpack_engine(
     ready_response: "zmq_wire.WireEngineCoreReadyResponse",
     vocab_size: int,
     enable_output_logprobs: bool = False,
+    model_config=None,
 ) -> tuple[MsgpackRecvSocket, MsgpackSendSocket]:
     """Run the startup handshake against SMG and return the wrapped
     data-plane sockets.
@@ -253,6 +295,11 @@ def connect_msgpack_engine(
     handshake.close()
     logger.info("msgpack handshake: complete (engine_index=%s)", engine_index)
     return (
-        MsgpackRecvSocket(input_socket, vocab_size, enable_output_logprobs),
+        MsgpackRecvSocket(
+            input_socket,
+            vocab_size,
+            enable_output_logprobs,
+            model_config=model_config,
+        ),
         MsgpackSendSocket(output_socket, engine_index=engine_index),
     )
