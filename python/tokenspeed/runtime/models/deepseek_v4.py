@@ -53,6 +53,7 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_gather_paged_indexer_fp8_padded,
     deepseek_v4_indexer_decode_metadata_compute,
     deepseek_v4_indexer_mqa_logits,
+    deepseek_v4_indexer_select_all,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda import (
@@ -674,9 +675,17 @@ def _deepseek_v4_indexer_topk_from_logits(
         length_rows = (row_ends_for_kernel - row_starts_for_kernel).clamp_min(0)
 
     if not _deepseek_v4_indexer_topk_kernels_available():
-        # No TRT-LLM or DeepGEMM selector (ROCm): mask each row to its own key
-        # range and take a dense top-k. Rows with fewer than ``topk_tokens``
-        # candidates keep the -1 padding already filled in above.
+        # No TRT-LLM or DeepGEMM selector (ROCm).
+        if topk_tokens >= max_len:
+            # Every row has at most ``max_len`` candidates, so a top-k that
+            # wide keeps all of them and the scores decide nothing. Skip the
+            # masked copy, the sort and the -1 rewrite and write the answer.
+            return deepseek_v4_indexer_select_all(
+                topk, length_rows, row_starts=row_starts_for_kernel
+            )
+        # Otherwise mask each row to its own key range and take a dense top-k.
+        # Rows with fewer than ``topk_tokens`` candidates keep the -1 padding
+        # already filled in above.
         positions = torch.arange(max_len, device=logits.device).unsqueeze(0)
         if row_starts_for_kernel is not None and row_ends_for_kernel is not None:
             lo = row_starts_for_kernel.reshape(-1, 1)

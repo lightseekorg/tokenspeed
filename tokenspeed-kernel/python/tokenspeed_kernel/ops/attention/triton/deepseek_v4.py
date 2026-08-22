@@ -64,6 +64,7 @@ __all__ = [
     "deepseek_v4_gather_paged_indexer_fp8_padded",
     "deepseek_v4_gather_slots_bf16",
     "deepseek_v4_indexer_decode_metadata_compute",
+    "deepseek_v4_indexer_select_all",
     "deepseek_v4_indexer_mqa_logits",
     "deepseek_v4_kv_rope_quant_insert",
     "deepseek_v4_q_norm_rope",
@@ -1160,6 +1161,79 @@ def deepseek_v4_dequantize_and_gather_k_cache(
         n_quant_blocks=DEEPSEEK_V4_NOPE_DIM // DEEPSEEK_V4_FP8_QUANT_BLOCK,
         num_warps=num_warps,
     )
+
+
+# Indexer selection when every candidate survives. ``topk_tokens`` keys are
+# taken per row, so a row with no more than that many candidates selects all of
+# them and the scores decide nothing. The dense path still pays for a
+# ``[tokens, max_len]`` masked copy, a sort and the -1 rewrite to reach that
+# answer; this writes it directly.
+#
+# Order within a row is not part of the contract: the selected indices address
+# rows of a cache that attention reduces under a softmax, so any permutation of
+# the same set gives the same output. What does matter is that the valid
+# entries stay packed at the front, because the consumer reports a length
+# rather than a mask.
+@triton.jit(do_not_specialize=["num_tokens", "topk"])
+def _deepseek_v4_indexer_select_all_kernel(
+    out_ptr,
+    lens_ptr,
+    row_starts_ptr,
+    out_stride_token,
+    num_tokens,
+    topk,
+    HAS_ROW_STARTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    if pid_t >= num_tokens:
+        return
+
+    length = tl.load(lens_ptr + pid_t)
+    start = tl.load(row_starts_ptr + pid_t) if HAS_ROW_STARTS else 0
+
+    offsets = pid_k * BLOCK + tl.arange(0, BLOCK)
+    in_row = offsets < topk
+    values = tl.where(offsets < length, start + offsets, -1)
+    tl.store(out_ptr + pid_t * out_stride_token + offsets, values, mask=in_row)
+
+
+def deepseek_v4_indexer_select_all(
+    out: torch.Tensor,
+    lens: torch.Tensor,
+    row_starts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fill indexer top-k rows with every candidate, in order.
+
+    Valid for rows whose candidate count does not exceed the top-k width, where
+    selection cannot discard anything.
+
+    Args:
+        out: ``[num_tokens, topk_tokens]`` int32 destination.
+        lens: ``[num_tokens]`` candidate count per row.
+        row_starts: optional ``[num_tokens]`` first key index per row; absent
+            means every row starts at zero.
+
+    Returns:
+        ``out``, for chaining.
+    """
+    num_tokens, topk = out.shape
+    if num_tokens == 0 or topk == 0:
+        return out
+    block = min(1024, triton.next_power_of_2(topk))
+    _deepseek_v4_indexer_select_all_kernel[(num_tokens, triton.cdiv(topk, block))](
+        out,
+        lens,
+        row_starts,
+        out.stride(0),
+        num_tokens,
+        topk,
+        HAS_ROW_STARTS=row_starts is not None,
+        BLOCK=block,
+        num_warps=4,
+    )
+    return out
 
 
 @triton.jit
