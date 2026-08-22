@@ -3332,6 +3332,7 @@ def dsa_prefill_topk(
     page_size: int | None = None,
     index_k_fp8: torch.Tensor | None = None,
     index_k_scale: torch.Tensor | None = None,
+    q_scales: torch.Tensor | None = None,
     max_logits_bytes: int | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
@@ -3341,7 +3342,8 @@ def dsa_prefill_topk(
     """Compute DSA prefill top-k over packed workspace rows.
 
     Args:
-        q: BF16 indexer query with shape [tokens, index_heads, head_dim].
+        q: BF16 or FP8 E4M3 indexer query with shape
+            [tokens, index_heads, head_dim]. FP8 queries require q_scales.
         weights: Per-token/head weights with shape [tokens, index_heads],
             FP32 or raw BF16 (implementations upcast on the fly).
         kv_workspace_slots: Global KV slot for each workspace row, shape
@@ -3349,13 +3351,20 @@ def dsa_prefill_topk(
         row_starts: Inclusive workspace-row start per query token, shape [tokens].
         row_ends: Exclusive workspace-row end per query token, shape [tokens].
         topk: Number of workspace candidates to select.
-        softmax_scale: Score scale, normally index_head_dim ** -0.5.
-        index_k_cache: Packed FP8 index-K cache with scales (uint8). Used by
-            Triton with kv_workspace_slots and by DeepGEMM to gather workspace
-            rows internally.
+        softmax_scale: Score scale. Each candidate score is exactly
+            ``softmax_scale * sum_h(weights[h] * relu(dot(dequant(q[h]), dequant(k))))``.
+            BF16 queries are already in their compute representation.
+        index_k_cache: Packed paged FP8 index-K cache with scales (uint8). Used
+            with kv_workspace_slots to resolve workspace rows inside the
+            selected implementation.
         page_size: KV cache page size for index_k_cache.
-        index_k_fp8: FP8 index-K rows in workspace-row order. Used by DeepGEMM.
-        index_k_scale: FP8 index-K scales in workspace-row order. Used by DeepGEMM.
+        index_k_fp8: FP8 index-K rows already in workspace-row order. Must be
+            provided together with index_k_scale.
+        index_k_scale: FP8 index-K scales already in workspace-row order. Must
+            be provided together with index_k_fp8.
+        q_scales: Optional positive FP32 scale per token/head for FP8 queries,
+            defining ``dequant(q[token, head]) = q[token, head].float() *
+            q_scales[token, head]``.
         max_logits_bytes: Optional temporary logits memory cap.
         out: Optional contiguous int32 output buffer on q's device with shape
             [tokens, topk].
@@ -3364,10 +3373,10 @@ def dsa_prefill_topk(
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
-    Gluon compacts weights when needed. It requires q, index_k_cache,
-    kv_workspace_slots, row_starts, and row_ends to be contiguous on q's
-    device. kv_workspace_slots must be int64; row_starts and row_ends must be
-    int32.
+    Implementations may accept a strided outer weight dimension, including the
+    fused model projection view. q, index_k_cache, kv_workspace_slots,
+    row_starts, and row_ends must be contiguous on q's device.
+    kv_workspace_slots must be int64; row_starts and row_ends must be int32.
 
     Returns:
         Tuple of workspace row ids and valid counts. Returned indices are
@@ -3382,13 +3391,18 @@ def dsa_prefill_topk(
             f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
         )
     traits = {
+        "index_heads": q.shape[1],
         "head_dim": q.shape[-1],
         "topk": int(topk),
         "page_size": None if page_size is None else int(page_size),
     }
-    has_fp8 = index_k_cache is not None or (
-        index_k_fp8 is not None and index_k_scale is not None
-    )
+    has_workspace_rows = index_k_fp8 is not None and index_k_scale is not None
+    if (index_k_fp8 is None) != (index_k_scale is None):
+        raise ValueError(
+            "index_k_fp8 and index_k_scale must be provided together for "
+            "workspace-row input"
+        )
+    has_fp8 = index_k_cache is not None or has_workspace_rows
     if has_fp8:
         traits["index_k_format"] = "fp8_scaled"
     signature = _attention_format_signature(q=q, weights=weights)
@@ -3417,22 +3431,25 @@ def dsa_prefill_topk(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        return kernel(
-            q=q,
-            weights=weights,
-            kv_workspace_slots=kv_workspace_slots,
-            row_starts=row_starts,
-            row_ends=row_ends,
-            topk=topk,
-            softmax_scale=softmax_scale,
-            index_k_cache=index_k_cache,
-            page_size=page_size,
-            index_k_fp8=index_k_fp8,
-            index_k_scale=index_k_scale,
-            max_logits_bytes=max_logits_bytes,
-            out=out,
-            lens_out=lens_out,
-        )
+        kernel_kwargs = {
+            "q": q,
+            "weights": weights,
+            "kv_workspace_slots": kv_workspace_slots,
+            "row_starts": row_starts,
+            "row_ends": row_ends,
+            "topk": topk,
+            "softmax_scale": softmax_scale,
+            "index_k_cache": index_k_cache,
+            "page_size": page_size,
+            "index_k_fp8": index_k_fp8,
+            "index_k_scale": index_k_scale,
+            "max_logits_bytes": max_logits_bytes,
+            "out": out,
+            "lens_out": lens_out,
+        }
+        if q_scales is not None:
+            kernel_kwargs["q_scales"] = q_scales
+        return kernel(**kernel_kwargs)
 
 
 def dsa_decode_topk(
@@ -3446,6 +3463,7 @@ def dsa_decode_topk(
     softmax_scale: float,
     q_len_per_req: int = 1,
     index_k_cache: torch.Tensor | None = None,
+    q_scales: torch.Tensor | None = None,
     seq_lens_2d: torch.Tensor | None = None,
     plan: object | None = None,
     out: torch.Tensor | None = None,
@@ -3456,7 +3474,8 @@ def dsa_decode_topk(
     """Compute DSA decode top-k over a paged KV cache.
 
     Args:
-        q: BF16 indexer query with shape [tokens, index_heads, head_dim].
+        q: BF16 or FP8 E4M3 indexer query with shape
+            [tokens, index_heads, head_dim]. FP8 queries require q_scales.
         weights: Per-token/head weights with shape [tokens, index_heads],
             FP32 or raw BF16 (implementations upcast on the fly).
         seq_lens: Per-request full KV length, shape [num_reqs] (= tokens /
@@ -3466,11 +3485,16 @@ def dsa_decode_topk(
             shape [num_reqs, max_pages].
         page_size: Number of tokens per KV page.
         topk: Number of KV candidates to select.
-        softmax_scale: Score scale, normally index_head_dim ** -0.5.
+        softmax_scale: Score scale. Each candidate score is exactly
+            ``softmax_scale * sum_h(weights[h] * relu(dot(dequant(q[h]), dequant(k))))``.
+            BF16 queries are already in their compute representation.
         q_len_per_req: Query rows per request (spec-verify next_n). Plain
             decode uses 1, where per-request is equivalent to per-token.
         index_k_cache: Packed FP8 index-K cache with scales (uint8). Used by
             both Triton and DeepGEMM.
+        q_scales: Optional positive FP32 scale per token/head for FP8 queries,
+            defining ``dequant(q[token, head]) = q[token, head].float() *
+            q_scales[token, head]``.
         plan: Optional opaque backend-specific plan.
         out: Optional contiguous int32 output buffer on q's device with shape
             [tokens, topk].
@@ -3479,9 +3503,9 @@ def dsa_decode_topk(
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
-    Gluon compacts weights when needed. It requires q, index_k_cache, seq_lens,
-    and block_table to be contiguous on q's device. seq_lens and block_table
-    must be int32.
+    Implementations may accept a strided outer weight dimension, including the
+    fused model projection view. q, index_k_cache, seq_lens, and block_table
+    must be contiguous on q's device. seq_lens and block_table must be int32.
 
     Returns:
         Tuple of global KV slots and valid counts; invalid entries are -1.
@@ -3495,6 +3519,7 @@ def dsa_decode_topk(
             f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
         )
     traits = {
+        "index_heads": q.shape[1],
         "head_dim": q.shape[-1],
         "topk": int(topk),
         "page_size": int(page_size),
@@ -3530,21 +3555,24 @@ def dsa_decode_topk(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        return kernel(
-            q=q,
-            weights=weights,
-            seq_lens=seq_lens,
-            block_table=block_table,
-            page_size=page_size,
-            topk=topk,
-            softmax_scale=softmax_scale,
-            q_len_per_req=q_len_per_req,
-            index_k_cache=index_k_cache,
-            seq_lens_2d=seq_lens_2d,
-            plan=plan,
-            out=out,
-            lens_out=lens_out,
-        )
+        kernel_kwargs = {
+            "q": q,
+            "weights": weights,
+            "seq_lens": seq_lens,
+            "block_table": block_table,
+            "page_size": page_size,
+            "topk": topk,
+            "softmax_scale": softmax_scale,
+            "q_len_per_req": q_len_per_req,
+            "index_k_cache": index_k_cache,
+            "seq_lens_2d": seq_lens_2d,
+            "plan": plan,
+            "out": out,
+            "lens_out": lens_out,
+        }
+        if q_scales is not None:
+            kernel_kwargs["q_scales"] = q_scales
+        return kernel(**kernel_kwargs)
 
 
 def dsa_plan(

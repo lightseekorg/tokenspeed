@@ -74,6 +74,19 @@ def _pack_index_k_cache(
     return packed, (x_fp8.float() * scale).reshape_as(index_k)
 
 
+def _assert_topk_sets_match(
+    actual: torch.Tensor,
+    actual_lens: torch.Tensor,
+    expected: torch.Tensor,
+    expected_lens: torch.Tensor,
+) -> None:
+    torch.testing.assert_close(actual_lens.cpu(), expected_lens.cpu())
+    for row in range(actual.shape[0]):
+        count = int(expected_lens[row].item())
+        assert set(actual[row, :count].tolist()) == set(expected[row, :count].tolist())
+        assert (actual[row, count:] == -1).all()
+
+
 def test_dsa_decode_topk_fp8(device: str, require) -> None:
     require("attention", "dsa_decode_topk", "triton", torch.bfloat16, "q")
 
@@ -111,7 +124,7 @@ def test_dsa_decode_topk_fp8(device: str, require) -> None:
             page = int(block_table[token, offset // page_size].item())
             slot = page * page_size + offset % page_size
             per_head = (q[token].float() * index_k[slot].float()).sum(dim=-1)
-            scores.append((per_head * weights[token]).sum() * (128**-0.5))
+            scores.append((per_head.relu() * weights[token]).sum() * (128**-0.5))
             slots.append(slot)
         local = torch.topk(
             torch.stack(scores), int(expected_lens[token].item())
@@ -120,9 +133,7 @@ def test_dsa_decode_topk_fp8(device: str, require) -> None:
             [slots[int(i)] for i in local.tolist()], device=device, dtype=torch.int32
         )
 
-    torch.testing.assert_close(topk_lens.cpu(), expected_lens.cpu())
-    torch.testing.assert_close(topk_slots[:, :65].cpu(), expected[:, :65].cpu())
-    assert (topk_slots[0, int(expected_lens[0].item()) :] == -1).all()
+    _assert_topk_sets_match(topk_slots, topk_lens, expected, expected_lens)
 
 
 @pytest.mark.parametrize("q_len_per_req", [2, 4])
@@ -172,7 +183,7 @@ def test_dsa_decode_topk_fp8_mtp(device: str, q_len_per_req: int, require) -> No
                 page = int(block_table[r, off // page_size].item())
                 slot = page * page_size + off % page_size
                 per_head = (q[token].float() * index_k[slot].float()).sum(dim=-1)
-                scores.append((per_head * weights[token]).sum() * (128**-0.5))
+                scores.append((per_head.relu() * weights[token]).sum() * (128**-0.5))
                 slots.append(slot)
             k = min(causal_len, topk)
             local = torch.topk(torch.stack(scores), k).indices
@@ -220,7 +231,7 @@ def test_dsa_prefill_topk_fp8(device: str, require) -> None:
         for row in range(int(row_starts[token].item()), int(row_ends[token].item())):
             slot = int(kv_workspace_slots[row].item())
             per_head = (q[token].float() * index_k[slot].float()).sum(dim=-1)
-            scores.append((per_head * weights[token]).sum() * (128**-0.5))
+            scores.append((per_head.relu() * weights[token]).sum() * (128**-0.5))
             rows.append(row)
         local = torch.topk(
             torch.stack(scores), int(expected_lens[token].item())
@@ -229,9 +240,12 @@ def test_dsa_prefill_topk_fp8(device: str, require) -> None:
             [rows[int(i)] for i in local.tolist()], device=device, dtype=torch.int32
         )
 
-    torch.testing.assert_close(topk_lens.cpu(), expected_lens.cpu())
-    torch.testing.assert_close(workspace_indices[:, :65].cpu(), expected[:, :65].cpu())
-    assert (workspace_indices[0, int(expected_lens[0].item()) :] == -1).all()
+    _assert_topk_sets_match(
+        workspace_indices,
+        topk_lens,
+        expected,
+        expected_lens,
+    )
 
 
 def test_dsa_plan_triton(device: str) -> None:
