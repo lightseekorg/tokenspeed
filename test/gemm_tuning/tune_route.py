@@ -150,7 +150,7 @@ def candidates(m: int, n: int, k: int):
 
 
 route: dict[str, str] = {}
-per_step_gain = 0.0
+per_step_gain: dict[int, float] = dict.fromkeys(MS, 0.0)
 print(f"cold-L2 sweep: {NUM_COPIES} weight copies per backend")
 print(f"{'call site':<18}{'NxK':>12} {'M':>2}  ", end="")
 print("  ".join(f"{t:>8}" for t in ("cublas", "rowcta", "skinny", "tgv")), end="")
@@ -182,7 +182,7 @@ for n, k, calls, label in SHAPES:
         )
         if best and ok[best] * MARGIN <= incumbent:
             route[f"{m},{n},{k}"] = best
-            per_step_gain += (incumbent - ok[best]) * calls
+            per_step_gain[m] += (incumbent - ok[best]) * calls
             print(
                 f"{label:<18}{f'{n}x{k}':>12} {m:>2}  {cells}  {best:<8} "
                 f"{incumbent / ok[best]:5.2f}x"
@@ -196,7 +196,9 @@ for n, k, calls, label in SHAPES:
 
 print()
 if any(c for _, _, c, _ in SHAPES):
-    print(f"projected saving vs incumbent: {per_step_gain:.0f} us/step")
+    # A step runs one M, so the widths are mutually exclusive and never summed.
+    for m in MS:
+        print(f"projected saving vs incumbent at M={m}: {per_step_gain[m]:.0f} us/step")
 else:
     print("per-step projection skipped: calls/step not measured")
 print(json.dumps(route, indent=2))
