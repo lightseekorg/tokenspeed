@@ -1857,7 +1857,7 @@ class KimiLinearMoE(nn.Module):
                         else None
                     ),
                 )
-            routed_in = decode_gemv(hidden_states, self.routed_expert_down_proj.weight)
+            routed_in, _ = self.routed_expert_down_proj(hidden_states)
             if self._topk_ready is not None and fork._active:
                 self._topk_ready.wait(torch.cuda.current_stream())
             routed_partial = self._routed_experts(

@@ -356,6 +356,10 @@ def kimi3_latent_projection(
                 "Kimi K3 Gluon latent projection requires an aligned large-M shape"
             )
         return output
+    if decode_gemv_routed(hidden_states, weight):
+        from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+
+        return decode_gemv(hidden_states, weight, out)
     if out is None:
         return torch.nn.functional.linear(hidden_states, weight)
     return torch.mm(hidden_states, weight.T, out=out)

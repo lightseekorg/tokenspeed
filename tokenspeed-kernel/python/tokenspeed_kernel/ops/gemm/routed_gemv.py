@@ -65,6 +65,21 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         (1, 1536, 7168): "skinny",
         (2, 1536, 7168): "skinny",
         (4, 1536, 7168): "skinny",
+        (5, 1536, 7168): "skinny",  # 8.04 vs 9.22 (1.15x)
+        (6, 1536, 7168): "skinny",  # 8.43 vs 9.45 (1.12x)
+        # M >= 7 here and the whole M >= 5 range for the latent down-proj are
+        # the one place the 4% margin is waived: tgv leads by only ~3% cold,
+        # but cublas reaches these shapes through a split-K kernel whose
+        # separate splitKreduce pass costs another 92 launches per step
+        # (890 us/step of pure reduction at bs = 8, measured in serving,
+        # where a two-kernel chain also pays co-residency twice). e2e at
+        # bs = 8 is the acceptance test, not the cold-L2 delta.
+        (7, 1536, 7168): "tgv",  # 9.10 vs 9.37 cold; no split-K reduce
+        (8, 1536, 7168): "tgv",  # 9.12 vs 9.36 cold; no split-K reduce
+        (5, 3584, 7168): "tgv",  # 11.10 vs 11.36 cold; no split-K reduce
+        (6, 3584, 7168): "tgv",  # 11.08 vs 11.44 cold; no split-K reduce
+        (7, 3584, 7168): "tgv",  # 11.09 vs 11.47 cold; no split-K reduce
+        (8, 3584, 7168): "tgv",  # 11.12 vs 11.46 cold; no split-K reduce
         # Shared down shard, 92 calls/step: tgv 2.52 vs cublas 2.99 (1.19x)
         (1, 7168, 768): "tgv",
         (2, 7168, 768): "tgv",
@@ -267,7 +282,6 @@ ADD3_ROUTE: MappingProxyType[tuple[int, int, int], tuple[int, int, int]] = (
 )
 
 
-@functools.lru_cache(maxsize=8)
 def decode_gemv_routed(x: torch.Tensor, weight: torch.Tensor) -> bool:
     """Whether :data:`MEASURED_ROUTE` covers this call on this platform.
 
@@ -294,6 +308,7 @@ def decode_gemv_routed(x: torch.Tensor, weight: torch.Tensor) -> bool:
     )
 
 
+@functools.lru_cache(maxsize=8)
 def _is_measured_arch(device_index: int) -> bool:
     from tokenspeed_kernel.platform import current_platform
 
