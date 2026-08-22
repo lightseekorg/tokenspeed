@@ -65,7 +65,10 @@ from tokenspeed.runtime.layers.parameter import (
 )
 from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
-from tokenspeed.runtime.layers.quantization.utils import convert_to_channelwise
+from tokenspeed.runtime.layers.quantization.utils import (
+    block_dequant,
+    convert_to_channelwise,
+)
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
@@ -268,16 +271,44 @@ class Fp8LinearMethod(LinearMethodBase):
                         is_sfa=False,
                     )
                     layer._use_deep_gemm_fp8 = True
+            layer._use_bmm_bf16_fallback = False
             if is_bmm and not layer._use_deep_gemm_fp8:
-                # The is_bmm runtime path (DeepSeek-V4 o_proj) has no FP32
-                # fallback, so fail fast at load with a clear message instead of
-                # a cryptic AttributeError on the first forward.
-                raise RuntimeError(
-                    "is_bmm weight requires the deep_gemm FP8 block-scale path "
-                    "but it could not be prepared (deep_gemm_available="
-                    f"{_transform_sf is not None}, ue8m0={is_ue8m0}, "
-                    f"weight={tuple(layer.weight.shape)}); ensure FP8 block-quant "
-                    "ue8m0 weights with block-aligned dims and deep_gemm installed."
+                # The grouped runtime path (DeepSeek-V4 attention wo_a) normally
+                # runs as a single native FP8 GEMM through deep_gemm.fp8_einsum.
+                # Where that path cannot be prepared -- notably on ROCm, which
+                # has no deep_gemm build -- dequantize the block-scaled weight to
+                # bfloat16 once at load so the projection can still run, as a
+                # plain batched GEMM. The weight doubles in size and the GEMM is
+                # slower, so the FP8 path stays preferred wherever it exists.
+                # Where deep_gemm *is* available, a preparation failure means
+                # the weight itself is wrong (unaligned dims, missing scales).
+                # Keep failing fast there rather than quietly degrading.
+                if _transform_sf is not None or layer.weight_scale_inv is None:
+                    raise RuntimeError(
+                        "is_bmm weight requires the deep_gemm FP8 block-scale "
+                        "path but it could not be prepared (deep_gemm_available="
+                        f"{_transform_sf is not None}, ue8m0={is_ue8m0}, "
+                        f"weight={tuple(layer.weight.shape)}); ensure FP8 "
+                        "block-quant ue8m0 weights with block-aligned dims and "
+                        "deep_gemm installed."
+                    )
+                layer.weight = Parameter(
+                    block_dequant(
+                        layer.weight.data,
+                        layer.weight_scale_inv.data,
+                        list(self.quant_config.weight_block_size),
+                    ).to(torch.bfloat16),
+                    requires_grad=False,
+                )
+                layer._use_bmm_bf16_fallback = True
+                logger.warning(
+                    "Dequantizing is_bmm weight %s to bfloat16: the deep_gemm "
+                    "FP8 block-scale path is unavailable (deep_gemm_available=%s, "
+                    "ue8m0=%s). Expect higher memory use and lower throughput on "
+                    "this projection.",
+                    tuple(layer.weight.shape),
+                    _transform_sf is not None,
+                    is_ue8m0,
                 )
             layer._use_flashinfer_mxfp8 = False
             if (
