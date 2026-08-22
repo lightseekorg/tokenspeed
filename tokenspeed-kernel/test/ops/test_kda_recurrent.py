@@ -12,14 +12,270 @@ from tokenspeed_kernel.ops.attention import (
     kda_paged_decode,
     kda_paged_prefill,
     try_kda_fused_paged_decode,
+    try_kda_fused_paged_verify,
+    try_kda_replay_commit,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
+from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    _kda_verify_bv,
+    _kda_verify_launch_config,
+    fused_recurrent_kda_pool,
+)
 
 # K3 serving values: gate lower bound from the config, RMSNorm eps from the model.
 LOWER_BOUND = -5.0
 NORM_EPS = 1e-6
+
+
+@pytest.mark.parametrize(
+    "batch_size,value_dim,store_states,recurrent_layout,expected",
+    [
+        (3, 128, False, "k_major", 32),
+        (4, 128, False, "k_major", 64),
+        (7, 128, False, "v_major", 64),
+        (8, 128, False, "v_major", 128),
+        (7, 128, True, "k_major", 32),
+        (8, 128, True, "k_major", 128),
+        (8, 128, True, "v_major", 32),
+        (16, 128, True, "v_major", 32),
+        (8, 64, False, "k_major", 32),
+        (8, 256, False, "k_major", 32),
+    ],
+)
+def test_kda_verify_bv_routing(
+    batch_size, value_dim, store_states, recurrent_layout, expected
+) -> None:
+    assert (
+        _kda_verify_bv(batch_size, value_dim, store_states, recurrent_layout)
+        == expected
+    )
+
+
+@pytest.mark.parametrize("batch_size,expected_bv", [(1, 8), (15, 8), (16, 16)])
+def test_kda_verify_split_launch_routing(batch_size, expected_bv) -> None:
+    assert _kda_verify_launch_config(
+        batch_size,
+        128,
+        False,
+        "v_major",
+        split_producers=True,
+        bv=None,
+        num_warps=None,
+        num_stages=None,
+    ) == (expected_bv, 1, 3)
+
+
+def test_kda_verify_split_launch_requires_both_hoists_and_honors_overrides() -> None:
+    assert _kda_verify_launch_config(
+        4,
+        128,
+        False,
+        "k_major",
+        split_producers=False,
+        bv=None,
+        num_warps=None,
+        num_stages=None,
+    ) == (64, 4, 2)
+    assert _kda_verify_launch_config(
+        8,
+        128,
+        True,
+        "k_major",
+        split_producers=True,
+        bv=None,
+        num_warps=None,
+        num_stages=None,
+    ) == (128, 4, 2)
+    assert _kda_verify_launch_config(
+        4,
+        128,
+        False,
+        "k_major",
+        split_producers=True,
+        bv=32,
+        num_warps=8,
+        num_stages=5,
+    ) == (32, 8, 5)
+
+
+@pytest.mark.parametrize(
+    "recurrent_layout,store_states,split_producers",
+    [
+        ("k_major", False, False),
+        ("k_major", True, False),
+        ("v_major", False, False),
+        ("v_major", True, False),
+        ("k_major", False, True),
+    ],
+)
+def test_kda_fused_verify_selects_all_layout_traits(
+    monkeypatch, recurrent_layout, store_states, split_producers
+) -> None:
+    selected = {}
+
+    def fake_select_kernel(*args, **kwargs):
+        selected.update(kwargs["traits"])
+        return lambda **kernel_kwargs: kernel_kwargs["mixed_qkv"]
+
+    monkeypatch.setattr(attention_ops, "select_kernel", fake_select_kernel)
+    tensor = torch.empty(1, dtype=torch.bfloat16)
+    result = try_kda_fused_paged_verify(
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        state_pool=tensor,
+        state_scratch=tensor,
+        read_indices=tensor,
+        write_indices=tensor,
+        num_heads=1,
+        head_dim=1,
+        draft_token_num=1,
+        recurrent_layout=recurrent_layout,
+        store_states=store_states,
+        split_producers=split_producers,
+    )
+    assert result is tensor
+    expected = {
+        "paged_state": True,
+        "store_states": store_states,
+        "recurrent_layout": recurrent_layout,
+        "split_producers": split_producers,
+    }
+    assert selected == expected
+
+
+@pytest.mark.parametrize(
+    "kernel_name,recurrent_layout",
+    [
+        ("triton_nvidia_kda_fused_paged_verify_split", "k_major"),
+        ("triton_nvidia_kda_fused_paged_verify_split_vmajor", "v_major"),
+    ],
+)
+def test_kda_split_verify_registration_traits(kernel_name, recurrent_layout) -> None:
+    spec = KernelRegistry.get().get_by_name(kernel_name)
+    assert spec is not None
+    assert spec.traits == {
+        "paged_state": frozenset({True}),
+        "store_states": frozenset({False}),
+        "split_producers": frozenset({True}),
+        "recurrent_layout": frozenset({recurrent_layout}),
+    }
+
+
+@pytest.mark.parametrize(
+    "kernel_name,recurrent_layout,extra_traits",
+    [
+        ("triton_nvidia_kda_paged_decode", "k_major", {"indexed_state": True}),
+        ("triton_nvidia_kda_paged_decode_vmajor", "v_major", {"indexed_state": True}),
+        ("triton_nvidia_kda_replay_commit", "k_major", {"flat_state": True}),
+        ("triton_nvidia_kda_replay_commit_vmajor", "v_major", {"flat_state": True}),
+        (
+            "triton_nvidia_kda_batched_replay_commit",
+            "k_major",
+            {"flat_state": True, "batched_layers": True},
+        ),
+        (
+            "triton_nvidia_kda_batched_replay_commit_vmajor",
+            "v_major",
+            {"flat_state": True, "batched_layers": True},
+        ),
+    ],
+)
+def test_nvidia_kda_state_consumer_layout_traits(
+    kernel_name, recurrent_layout, extra_traits
+) -> None:
+    spec = KernelRegistry.get().get_by_name(kernel_name)
+    assert spec is not None
+    expected = {key: frozenset({value}) for key, value in extra_traits.items()}
+    expected["recurrent_layout"] = frozenset({recurrent_layout})
+    assert spec.traits == expected
+
+
+@pytest.mark.parametrize("recurrent_layout", ["k_major", "v_major"])
+def test_kda_decode_and_replay_select_layout_trait(
+    monkeypatch, recurrent_layout
+) -> None:
+    selected = []
+
+    def fake_select_kernel(*args, **kwargs):
+        selected.append(kwargs["traits"])
+        return lambda **_kwargs: torch.empty(0)
+
+    monkeypatch.setattr(attention_ops, "select_kernel", fake_select_kernel)
+    tensor = torch.empty(1, dtype=torch.bfloat16)
+    kda_paged_decode(
+        tensor.view(1, 1, 1, 1),
+        tensor.view(1, 1, 1, 1),
+        tensor.view(1, 1, 1, 1),
+        tensor.view(1, 1, 1, 1),
+        tensor.view(1, 1, 1),
+        tensor,
+        tensor,
+        state_pool=tensor,
+        read_indices=tensor,
+        write_indices=tensor,
+        cu_seqlens=torch.empty(2),
+        recurrent_layout=recurrent_layout,
+    )
+    try_kda_replay_commit(
+        *([tensor] * 9),
+        state_pool=tensor,
+        state_out=tensor,
+        read_indices=tensor,
+        write_indices=tensor,
+        accepted_length=tensor,
+        num_heads=1,
+        head_dim=1,
+        draft_token_num=1,
+        recurrent_layout=recurrent_layout,
+    )
+    assert selected[0]["recurrent_layout"] == recurrent_layout
+    assert selected[1]["recurrent_layout"] == recurrent_layout
+
+
+def test_nvidia_kda_pool_kmajor_vmajor_equivalence() -> None:
+    if not current_platform().is_nvidia:
+        pytest.skip("NVIDIA KDA pool layout test")
+    torch.manual_seed(29)
+    batch, heads, dim, pages = 3, 2, 32, 8
+    tensors = [
+        torch.randn(1, batch, heads, dim, device="cuda", dtype=torch.bfloat16)
+        for _ in range(4)
+    ]
+    beta = torch.randn(1, batch, heads, device="cuda", dtype=torch.bfloat16)
+    a_log = torch.randn(heads, device="cuda", dtype=torch.float32)
+    dt_bias = torch.randn(heads, dim, device="cuda", dtype=torch.float32)
+    initial = torch.randn(pages, heads, dim, dim, device="cuda")
+    reads = torch.arange(batch, device="cuda", dtype=torch.int32)
+    writes = reads + batch
+    cu_seqlens = torch.arange(batch + 1, device="cuda", dtype=torch.int32)
+    pools = [initial.clone(), initial.transpose(-1, -2).contiguous()]
+    outputs = []
+    for pool, layout in zip(pools, ("k_major", "v_major"), strict=True):
+        outputs.append(
+            fused_recurrent_kda_pool(
+                *tensors[:3],
+                tensors[3],
+                beta,
+                a_log,
+                dt_bias,
+                pool,
+                reads,
+                writes,
+                cu_seqlens=cu_seqlens,
+                recurrent_layout=layout,
+            )
+        )
+    torch.testing.assert_close(outputs[0], outputs[1])
+    torch.testing.assert_close(pools[0], pools[1].transpose(-1, -2))
 
 
 def test_k3_safe_gate_reference_matches_sigmoid_contract() -> None:
@@ -446,7 +702,7 @@ def test_kda_fused_decode_override_preserves_external_output_norm(monkeypatch) -
     ).traits["fused_output_norm"] == frozenset({False, True})
 
     # The verify kernel is registered without the trait at all.
-    kernel_name = "triton_nvidia_kda_fused_paged_verify"
+    kernel_name = "triton_nvidia_kda_fused_paged_verify_no_store"
     spec = KernelRegistry.get().get_by_name(kernel_name)
     assert spec is not None
     assert "fused_output_norm" not in spec.traits

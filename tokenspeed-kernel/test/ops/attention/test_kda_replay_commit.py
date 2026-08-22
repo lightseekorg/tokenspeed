@@ -75,7 +75,7 @@ def _window(n, t, pages=32, seed=0):
     )
 
 
-def _replay(x, write_indices, accepted, t):
+def _replay(x, write_indices, accepted, t, recurrent_layout="k_major"):
     """Commit ``accepted`` replayed positions; returns the mutated pools."""
     x = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in x.items()}
     fused_recurrent_kda_replay_commit(
@@ -98,8 +98,59 @@ def _replay(x, write_indices, accepted, t):
         draft_token_num=t,
         lower_bound=LOWER_BOUND,
         gate_scratch=x["gate_scratch"],
+        recurrent_layout=recurrent_layout,
     )
     return x
+
+
+def test_replay_kmajor_vmajor_outputs_and_state_match():
+    n, t = 3, 4
+    x = _window(n, t, seed=91)
+    writes = torch.arange(12, 12 + n, device=DEV, dtype=torch.int32)
+    accepted = torch.tensor([0, 2, 4], device=DEV, dtype=torch.int32)
+    k_result = _replay(x, writes, accepted, t)
+    v_input = {
+        key: (value.clone() if torch.is_tensor(value) else value)
+        for key, value in x.items()
+    }
+    v_input["h_pool"] = x["h_pool"].transpose(-1, -2).contiguous()
+    v_result = _replay(v_input, writes, accepted, t, recurrent_layout="v_major")
+    torch.testing.assert_close(v_result["conv_pool"], k_result["conv_pool"])
+    torch.testing.assert_close(v_result["h_pool"].transpose(-1, -2), k_result["h_pool"])
+
+
+def test_batched_replay_kmajor_vmajor_state_matches():
+    layers, n, t = 2, 3, 4
+    accepted = torch.tensor([1, 4, 2], device=DEV, dtype=torch.int32)
+    reads = torch.arange(1, n + 1, device=DEV, dtype=torch.int32).unsqueeze(0)
+    writes = torch.arange(12, 12 + n, device=DEV, dtype=torch.int32).unsqueeze(0)
+    k_layers = [_window(n, t, seed=130 + layer) for layer in range(layers)]
+    v_layers = [
+        {
+            key: (value.clone() if torch.is_tensor(value) else value)
+            for key, value in x.items()
+        }
+        for x in k_layers
+    ]
+    for x in v_layers:
+        x["h_pool"] = x["h_pool"].transpose(-1, -2).contiguous()
+    for xs, layout in ((k_layers, "k_major"), (v_layers, "v_major")):
+        batched_recurrent_kda_replay_commit(
+            _batched_descriptor(xs),
+            reads,
+            writes,
+            accepted,
+            draft_token_num=t,
+            num_heads=HV,
+            head_dim=K,
+            f_a_dim=D_FA,
+            recurrent_layout=layout,
+            **_batched_static_args(xs[0], layers_per_group=layers),
+        )
+    for k_state, v_state in zip(k_layers, v_layers, strict=True):
+        torch.testing.assert_close(
+            k_state["h_pool"], v_state["h_pool"].transpose(-1, -2)
+        )
 
 
 def _batched_descriptor(xs):
@@ -584,7 +635,7 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
     torch.testing.assert_close(conv_tape, conv_before, atol=0.0, rtol=0.0)
     torch.testing.assert_close(state_tape, state_before, atol=0.0, rtol=0.0)
 
-    stored = try_kda_fused_paged_verify(
+    stored = fused_recurrent_kda_verify_megafuse(
         x["qkv_raw"],
         x["conv_w"],
         x["conv_pool"],
@@ -594,16 +645,16 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
         x["beta"],
         x["A_log"],
         x["dt_bias"],
-        state_pool=x["h_pool"],
-        state_scratch=state_tape,
-        read_indices=x["read_indices"],
-        write_indices=writes,
+        x["h_pool"],
+        state_tape,
+        x["read_indices"],
+        writes,
         num_heads=HV,
         head_dim=V,
         draft_token_num=t,
         lower_bound=LOWER_BOUND,
         store_states=True,
-    )
+    ).view(1, -1, HV, V)
     torch.testing.assert_close(no_store, stored, atol=0.0, rtol=0.0)
     assert not torch.equal(conv_tape, conv_before)
     assert not torch.equal(state_tape, state_before)
@@ -632,6 +683,45 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
         store_states=False,
     )
     assert not torch.equal(wrong, no_store)
+
+
+@requires_registered_replay
+@pytest.mark.parametrize("n", [1, 4])
+def test_split_verify_wrapper_matches_fused_wrapper(n):
+    from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
+        triton_nvidia_kda_fused_paged_verify_no_store,
+        triton_nvidia_kda_fused_paged_verify_split,
+    )
+
+    t = 3
+    x = _window(n, t, seed=49 + n)
+    writes = torch.arange(n * t, device=DEV, dtype=torch.int32).view(n, t)
+    conv_scratch = torch.empty(n * t, 3 * P, 3, device=DEV, dtype=torch.bfloat16)
+    state_scratch = torch.empty(n * t, HV, K, V, device=DEV, dtype=torch.float32)
+    kwargs = dict(
+        state_pool=x["h_pool"],
+        state_scratch=state_scratch,
+        read_indices=x["read_indices"],
+        write_indices=writes,
+        num_heads=HV,
+        head_dim=V,
+        draft_token_num=t,
+        lower_bound=LOWER_BOUND,
+    )
+    args = (
+        x["qkv_raw"],
+        x["conv_w"],
+        x["conv_pool"],
+        conv_scratch,
+        x["f_a"],
+        x["w_fb"],
+        x["beta"],
+        x["A_log"],
+        x["dt_bias"],
+    )
+    fused = triton_nvidia_kda_fused_paged_verify_no_store(*args, **kwargs)
+    split = triton_nvidia_kda_fused_paged_verify_split(*args, **kwargs)
+    torch.testing.assert_close(split, fused, atol=2e-2, rtol=2e-2)
 
 
 def test_fused_verify_default_store_is_bit_identical_to_explicit_trait():
@@ -669,3 +759,65 @@ def test_fused_verify_default_store_is_bit_identical_to_explicit_trait():
     torch.testing.assert_close(outputs[0], outputs[1], atol=0.0, rtol=0.0)
     torch.testing.assert_close(tapes[0][0], tapes[1][0], atol=0.0, rtol=0.0)
     torch.testing.assert_close(tapes[0][1], tapes[1][1], atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("n,t", [(1, 3), (2, 3), (4, 8)])
+def test_fused_verify_routed_bv_matches_bv32(n, t):
+    x = _window(n, t, seed=61)
+    writes = torch.arange(n * t, device=DEV, dtype=torch.int32).view(n, t)
+    results = []
+    for bv in (32, None):
+        conv = torch.zeros(n * t, 3 * P, 3, device=DEV, dtype=torch.bfloat16)
+        state = torch.zeros(n * t, HV, K, V, device=DEV, dtype=torch.float32)
+        out = fused_recurrent_kda_verify_megafuse(
+            x["qkv_raw"],
+            x["conv_w"],
+            x["conv_pool"],
+            conv,
+            x["f_a"],
+            x["w_fb"],
+            x["beta"],
+            x["A_log"],
+            x["dt_bias"],
+            x["h_pool"],
+            state,
+            x["read_indices"],
+            writes,
+            num_heads=HV,
+            head_dim=V,
+            draft_token_num=t,
+            lower_bound=LOWER_BOUND,
+            store_states=True,
+            bv=bv,
+        )
+        results.append((out, conv, state))
+    for a, b in zip(results[0], results[1]):
+        torch.testing.assert_close(a, b, atol=2e-2, rtol=2e-2)
+
+
+def test_fused_verify_rejects_non_power_of_two_bv():
+    x = _window(1, 3, seed=62)
+    writes = torch.arange(3, device=DEV, dtype=torch.int32).view(1, 3)
+    conv = torch.zeros(3, 3 * P, 3, device=DEV, dtype=torch.bfloat16)
+    state = torch.zeros(3, HV, K, V, device=DEV, dtype=torch.float32)
+    with pytest.raises(ValueError, match="positive power of two"):
+        fused_recurrent_kda_verify_megafuse(
+            x["qkv_raw"],
+            x["conv_w"],
+            x["conv_pool"],
+            conv,
+            x["f_a"],
+            x["w_fb"],
+            x["beta"],
+            x["A_log"],
+            x["dt_bias"],
+            x["h_pool"],
+            state,
+            x["read_indices"],
+            writes,
+            num_heads=HV,
+            head_dim=V,
+            draft_token_num=3,
+            lower_bound=LOWER_BOUND,
+            bv=48,
+        )

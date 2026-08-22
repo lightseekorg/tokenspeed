@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
 from tokenspeed_kernel.platform import CapabilityRequirement
@@ -20,9 +22,57 @@ from tokenspeed_kernel.signature import format_signatures
 _DENSE_HALF_SIGNATURES = format_signatures(
     ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
 )
-# The batched replay kernels dereference raw descriptor addresses as bf16,
-# so their registration must not claim other dtypes.
+# Descriptor addresses are dereferenced as bf16, so registrations exclude fp16.
 _DENSE_BF16_SIGNATURES = format_signatures(("q", "k", "v"), "dense", {torch.bfloat16})
+
+
+def _nvidia_fused_decode(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float | None,
+    output_gate: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
+    recurrent_layout: str,
+) -> torch.Tensor:
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        fused_recurrent_kda_megafuse,
+    )
+
+    return fused_recurrent_kda_megafuse(
+        mixed_qkv,
+        conv_weights,
+        conv_states,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        h_pool=state_pool,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+        output_gate=output_gate,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        recurrent_layout=recurrent_layout,
+    ).view(1, -1, num_heads, head_dim)
 
 
 @register_kernel(
@@ -62,11 +112,7 @@ def triton_nvidia_kda_fused_paged_decode(
     norm_eps: float | None = None,
 ) -> torch.Tensor:
     """Adapt dev's NVIDIA conv/GEMV/recurrent megafusion."""
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
-        fused_recurrent_kda_megafuse,
-    )
-
-    return fused_recurrent_kda_megafuse(
+    return _nvidia_fused_decode(
         mixed_qkv,
         conv_weights,
         conv_states,
@@ -75,7 +121,7 @@ def triton_nvidia_kda_fused_paged_decode(
         beta_logits,
         A_log,
         dt_bias,
-        h_pool=state_pool,
+        state_pool=state_pool,
         read_indices=read_indices,
         write_indices=write_indices,
         num_heads=num_heads,
@@ -85,24 +131,71 @@ def triton_nvidia_kda_fused_paged_decode(
         output_gate=output_gate,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
-    ).view(1, -1, num_heads, head_dim)
+        recurrent_layout="k_major",
+    )
 
 
 @register_kernel(
     "attention",
-    "kda_fused_paged_verify",
-    name="triton_nvidia_kda_fused_paged_verify",
+    "kda_fused_paged_decode",
+    name="triton_nvidia_kda_fused_paged_decode_vmajor",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
     traits={
         "paged_state": frozenset({True}),
-        "store_states": frozenset({True}),
+        "fused_output_norm": frozenset({False, True}),
+        "recurrent_layout": frozenset({"v_major"}),
     },
-    tags={"nvidia", "paged_cache", "cuda_graph", "fusion", "speculative"},
+    tags={"nvidia", "paged_cache", "cuda_graph", "fusion"},
 )
-def triton_nvidia_kda_fused_paged_verify(
+def triton_nvidia_kda_fused_paged_decode_vmajor(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float | None,
+    output_gate: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
+) -> torch.Tensor:
+    """Decode against a physically V-major ``[pages, HV, V, K]`` state slab."""
+    return _nvidia_fused_decode(
+        mixed_qkv,
+        conv_weights,
+        conv_states,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        state_pool=state_pool,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+        output_gate=output_gate,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        recurrent_layout="v_major",
+    )
+
+
+def _nvidia_fused_verify(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
     conv_states: torch.Tensor,
@@ -114,18 +207,35 @@ def triton_nvidia_kda_fused_paged_verify(
     dt_bias: torch.Tensor,
     *,
     state_pool: torch.Tensor,
-    state_scratch: torch.Tensor,
+    state_scratch: torch.Tensor | None,
     read_indices: torch.Tensor,
     write_indices: torch.Tensor,
     num_heads: int,
     head_dim: int,
     draft_token_num: int,
     lower_bound: float | None,
+    store_states: bool,
+    recurrent_layout: str,
+    split_producers: bool = False,
 ) -> torch.Tensor:
-    """Adapt the NVIDIA conv/GEMV/recurrent megafusion to target verify."""
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        fused_kda_verify_conv_update,
         fused_recurrent_kda_verify_megafuse,
     )
+
+    conv_qkv = None
+    g_raw = None
+    if split_producers:
+        conv_qkv = fused_kda_verify_conv_update(
+            mixed_qkv,
+            conv_weights,
+            conv_states,
+            read_indices,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            draft_token_num=draft_token_num,
+        )
+        g_raw = torch.mm(f_a_out, f_b_weight.t()).contiguous()
 
     return fused_recurrent_kda_verify_megafuse(
         mixed_qkv,
@@ -138,13 +248,17 @@ def triton_nvidia_kda_fused_paged_verify(
         A_log,
         dt_bias,
         state_pool,
-        state_scratch,
+        state_pool if state_scratch is None else state_scratch,
         read_indices,
         write_indices,
         num_heads=num_heads,
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
+        store_states=store_states,
+        recurrent_layout=recurrent_layout,
+        g_raw=g_raw,
+        conv_qkv=conv_qkv,
     ).view(1, -1, num_heads, head_dim)
 
 
@@ -159,6 +273,8 @@ def triton_nvidia_kda_fused_paged_verify(
     traits={
         "paged_state": frozenset({True}),
         "store_states": frozenset({False}),
+        "recurrent_layout": frozenset({"k_major"}),
+        "split_producers": frozenset({False}),
     },
     tags={"nvidia", "paged_cache", "cuda_graph", "fusion", "speculative"},
 )
@@ -183,11 +299,7 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
     lower_bound: float | None,
 ) -> torch.Tensor:
     """Run fused target verify without materializing rollback states."""
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
-        fused_recurrent_kda_verify_megafuse,
-    )
-
-    return fused_recurrent_kda_verify_megafuse(
+    return _nvidia_fused_verify(
         mixed_qkv,
         conv_weights,
         conv_states,
@@ -197,16 +309,199 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
         beta_logits,
         A_log,
         dt_bias,
-        state_pool,
-        state_pool if state_scratch is None else state_scratch,
-        read_indices,
-        write_indices,
+        state_pool=state_pool,
+        state_scratch=state_scratch,
+        read_indices=read_indices,
+        write_indices=write_indices,
         num_heads=num_heads,
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
         store_states=False,
-    ).view(1, -1, num_heads, head_dim)
+        recurrent_layout="k_major",
+    )
+
+
+@register_kernel(
+    "attention",
+    "kda_fused_paged_verify",
+    name="triton_nvidia_kda_fused_paged_verify_no_store_vmajor",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_DENSE_HALF_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={
+        "paged_state": frozenset({True}),
+        "store_states": frozenset({False}),
+        "recurrent_layout": frozenset({"v_major"}),
+        "split_producers": frozenset({False}),
+    },
+    tags={"nvidia", "paged_cache", "cuda_graph", "fusion", "speculative"},
+)
+def triton_nvidia_kda_fused_paged_verify_no_store_vmajor(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_scratch: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    state_scratch: torch.Tensor | None,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None,
+) -> torch.Tensor:
+    """V-major target verify without materializing rollback states."""
+    return _nvidia_fused_verify(
+        mixed_qkv,
+        conv_weights,
+        conv_states,
+        conv_scratch,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        state_pool=state_pool,
+        state_scratch=state_scratch,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+        store_states=False,
+        recurrent_layout="v_major",
+    )
+
+
+@register_kernel(
+    "attention",
+    "kda_fused_paged_verify",
+    name="triton_nvidia_kda_fused_paged_verify_split",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_DENSE_HALF_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={
+        "paged_state": frozenset({True}),
+        "store_states": frozenset({False}),
+        "split_producers": frozenset({True}),
+        "recurrent_layout": frozenset({"k_major"}),
+    },
+    tags={"nvidia", "paged_cache", "cuda_graph", "fusion", "speculative"},
+)
+def triton_nvidia_kda_fused_paged_verify_split(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_scratch: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    state_scratch: torch.Tensor | None,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None,
+) -> torch.Tensor:
+    """Run K-major target verify with split convolution and gate producers."""
+    return _nvidia_fused_verify(
+        mixed_qkv,
+        conv_weights,
+        conv_states,
+        conv_scratch,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        state_pool=state_pool,
+        state_scratch=state_scratch,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+        store_states=False,
+        recurrent_layout="k_major",
+        split_producers=True,
+    )
+
+
+@register_kernel(
+    "attention",
+    "kda_fused_paged_verify",
+    name="triton_nvidia_kda_fused_paged_verify_split_vmajor",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_DENSE_HALF_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={
+        "paged_state": frozenset({True}),
+        "store_states": frozenset({False}),
+        "split_producers": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+    },
+    tags={"nvidia", "paged_cache", "cuda_graph", "fusion", "speculative"},
+)
+def triton_nvidia_kda_fused_paged_verify_split_vmajor(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_scratch: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    state_scratch: torch.Tensor | None,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None,
+) -> torch.Tensor:
+    """Run V-major target verify with split convolution and gate producers."""
+    return _nvidia_fused_verify(
+        mixed_qkv,
+        conv_weights,
+        conv_states,
+        conv_scratch,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        state_pool=state_pool,
+        state_scratch=state_scratch,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+        store_states=False,
+        recurrent_layout="v_major",
+        split_producers=True,
+    )
 
 
 @register_kernel(
@@ -217,7 +512,10 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.PERFORMANT,
-    traits={"indexed_state": frozenset({True})},
+    traits={
+        "indexed_state": frozenset({True}),
+        "recurrent_layout": frozenset({"k_major"}),
+    },
     tags={"nvidia", "paged_cache", "cuda_graph"},
 )
 def triton_nvidia_kda_paged_decode(
@@ -234,8 +532,42 @@ def triton_nvidia_kda_paged_decode(
     write_indices: torch.Tensor,
     cu_seqlens: torch.Tensor,
     lower_bound: float | None,
+    recurrent_layout: str = "k_major",
 ) -> torch.Tensor:
     """Adapt dev's NVIDIA indexed recurrent decode kernel."""
+    return _nvidia_kda_paged_decode(
+        q,
+        k,
+        v,
+        g_raw,
+        beta_logits,
+        A_log,
+        dt_bias,
+        state_pool=state_pool,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+        recurrent_layout="k_major",
+    )
+
+
+def _nvidia_kda_paged_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_raw: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float | None,
+    recurrent_layout: str,
+) -> torch.Tensor:
     from tokenspeed_kernel.ops.attention.triton.linear.kda import (
         kda_recurrent_decode_pool,
     )
@@ -253,11 +585,32 @@ def triton_nvidia_kda_paged_decode(
         write_indices=write_indices,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
+        recurrent_layout=recurrent_layout,
     )
 
 
+@register_kernel(
+    "attention",
+    "kda_paged_decode",
+    name="triton_nvidia_kda_paged_decode_vmajor",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_DENSE_HALF_SIGNATURES,
+    priority=Priority.PERFORMANT,
+    traits={
+        "indexed_state": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+    },
+    tags={"nvidia", "paged_cache", "cuda_graph"},
+)
+def triton_nvidia_kda_paged_decode_vmajor(*args, **kwargs) -> torch.Tensor:
+    """Run indexed recurrent decode against a V-major state slab."""
+    kwargs.pop("recurrent_layout", None)
+    return _nvidia_kda_paged_decode(*args, **kwargs, recurrent_layout="v_major")
+
+
 def _nvidia_kda_prefill(
-    implementation,
+    implementation: Callable[..., tuple[torch.Tensor, torch.Tensor]],
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -269,10 +622,8 @@ def _nvidia_kda_prefill(
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
     lower_bound: float | None,
-    cu_seqlens_cpu=None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
 ) -> KdaPrefillResult:
-    # Forwarded only when set so implementations without the host-boundary
-    # hint parameter keep working unchanged.
     hint = {} if cu_seqlens_cpu is None else {"cu_seqlens_cpu": cu_seqlens_cpu}
     out, final_state = implementation(
         q,
@@ -299,7 +650,10 @@ def _nvidia_kda_prefill(
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    traits={"flat_state": frozenset({True})},
+    traits={
+        "flat_state": frozenset({True}),
+        "recurrent_layout": frozenset({"k_major"}),
+    },
     tags={"nvidia", "flat_kv", "fusion", "speculative"},
 )
 def triton_nvidia_kda_replay_commit(
@@ -323,8 +677,56 @@ def triton_nvidia_kda_replay_commit(
     draft_token_num: int,
     lower_bound: float | None,
     gate_scratch: torch.Tensor | None = None,
+    recurrent_layout: str = "k_major",
 ) -> None:
     """Replay the accepted prefix of a verified window into the state pool."""
+    _nvidia_kda_replay_commit(
+        mixed_qkv,
+        conv_weights,
+        conv_states,
+        conv_out,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        state_pool=state_pool,
+        state_out=state_out,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        accepted_length=accepted_length,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+        gate_scratch=gate_scratch,
+        recurrent_layout="k_major",
+    )
+
+
+def _nvidia_kda_replay_commit(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_out: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    state_out: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None,
+    gate_scratch: torch.Tensor | None,
+    recurrent_layout: str,
+) -> None:
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
         fused_recurrent_kda_replay_commit,
     )
@@ -349,7 +751,28 @@ def triton_nvidia_kda_replay_commit(
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
         gate_scratch=gate_scratch,
+        recurrent_layout=recurrent_layout,
     )
+
+
+@register_kernel(
+    "attention",
+    "kda_replay_commit",
+    name="triton_nvidia_kda_replay_commit_vmajor",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_DENSE_HALF_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={
+        "flat_state": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+    },
+    tags={"nvidia", "flat_kv", "fusion", "speculative"},
+)
+def triton_nvidia_kda_replay_commit_vmajor(*args, **kwargs) -> None:
+    """Replay and commit into a V-major recurrent slab."""
+    kwargs.pop("recurrent_layout", None)
+    _nvidia_kda_replay_commit(*args, **kwargs, recurrent_layout="v_major")
 
 
 @register_kernel(
@@ -363,6 +786,7 @@ def triton_nvidia_kda_replay_commit(
     traits={
         "flat_state": frozenset({True}),
         "batched_layers": frozenset({True}),
+        "recurrent_layout": frozenset({"k_major"}),
     },
     tags={"nvidia", "flat_kv", "fusion", "speculative", "batched_layers"},
 )
@@ -387,6 +811,49 @@ def triton_nvidia_kda_batched_replay_commit(
     lower_bound: float,
 ) -> None:
     """Replay every KDA layer described by stable device pointer tables."""
+    _nvidia_kda_batched_replay_commit(
+        descriptors,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        accepted_length=accepted_length,
+        draft_token_num=draft_token_num,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        f_a_dim=f_a_dim,
+        qkv_stride=qkv_stride,
+        conv_stride=conv_stride,
+        f_a_stride=f_a_stride,
+        beta_stride=beta_stride,
+        state_stride=state_stride,
+        gate_stride=gate_stride,
+        conv_width=conv_width,
+        layers_per_group=layers_per_group,
+        lower_bound=lower_bound,
+        recurrent_layout="k_major",
+    )
+
+
+def _nvidia_kda_batched_replay_commit(
+    descriptors: torch.Tensor,
+    *,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    draft_token_num: int,
+    num_heads: int,
+    head_dim: int,
+    f_a_dim: int,
+    qkv_stride: int,
+    conv_stride: int,
+    f_a_stride: int,
+    beta_stride: int,
+    state_stride: int,
+    gate_stride: int,
+    conv_width: int,
+    layers_per_group: int,
+    lower_bound: float,
+    recurrent_layout: str,
+) -> None:
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
         batched_recurrent_kda_replay_commit,
     )
@@ -409,7 +876,29 @@ def triton_nvidia_kda_batched_replay_commit(
         conv_width=conv_width,
         layers_per_group=layers_per_group,
         lower_bound=lower_bound,
+        recurrent_layout=recurrent_layout,
     )
+
+
+@register_kernel(
+    "attention",
+    "kda_replay_commit",
+    name="triton_nvidia_kda_batched_replay_commit_vmajor",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_DENSE_BF16_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={
+        "flat_state": frozenset({True}),
+        "batched_layers": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+    },
+    tags={"nvidia", "flat_kv", "fusion", "speculative", "batched_layers"},
+)
+def triton_nvidia_kda_batched_replay_commit_vmajor(*args, **kwargs) -> None:
+    """Replay every descriptor-table layer against V-major state."""
+    kwargs.pop("recurrent_layout", None)
+    _nvidia_kda_batched_replay_commit(*args, **kwargs, recurrent_layout="v_major")
 
 
 @register_kernel(
