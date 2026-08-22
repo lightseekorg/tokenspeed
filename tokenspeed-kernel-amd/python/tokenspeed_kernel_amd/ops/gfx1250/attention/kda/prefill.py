@@ -550,6 +550,8 @@ def _wu_vector_fwd_kernel(
         mask=(token0 + rows_t[:, None] < length),
         other=0.0,
     )
+    # Cleared here instead of via the load mask, which would break vectorization.
+    t = gl.where(cols_t[None, :] <= rows_t[:, None], t, 0.0)
     lhs = gl.convert_layout(t.to(gl.bfloat16), a_layout)
 
     rows_x = gl.arange(0, BT, layout=gl.SliceLayout(1, load_x_layout))
@@ -843,6 +845,8 @@ def _output_fwd_kernel(
     a_offsets = ((begin + token0 + a_rows[:, None]) * H + head) * BT + a_cols[None, :]
     a_mask = token0 + a_rows[:, None] < length
     a_value = gl.load(aqk + a_offsets, mask=a_mask, other=0.0)
+    # Cleared here instead of via the load mask, which would break vectorization.
+    a_value = gl.where(a_cols[None, :] <= a_rows[:, None], a_value, 0.0)
     lhs = gl.convert_layout(a_value.to(gl.bfloat16), a_layout)
 
     v_rows = gl.arange(0, BT, layout=gl.SliceLayout(1, load_v_layout))
@@ -1007,7 +1011,9 @@ def gluon_kda_paged_prefill_gfx1250(
         device=q.device,
         dtype=torch.float32,
     )
-    aqk = torch.zeros(
+    # Producers only write the causal lower triangle of aqk and tinv; each
+    # consumer clears the rest after loading, so no zero fill is needed.
+    aqk = torch.empty(
         1,
         total_tokens,
         heads,
@@ -1041,7 +1047,7 @@ def gluon_kda_paged_prefill_gfx1250(
         LOWER_BOUND=0.0 if lower_bound is None else lower_bound,
         num_warps=_FUSED_PREPROCESS_WARPS,
     )
-    tinv = torch.zeros(
+    tinv = torch.empty(
         1,
         total_tokens,
         heads,
