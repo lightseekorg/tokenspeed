@@ -71,7 +71,7 @@ dependencies = [
     "torchvision",
     "tokenspeed-kernel>=0.1.3.dev0",
     "tokenspeed-mooncake>=0.3.12.post20260803",
-    "tokenspeed-scheduler>=0.1.8",
+    "tokenspeed-scheduler>=0.1.9",
     "tokenspeed-smg==1.9.0.post20260821",
     "tokenspeed-smg-grpc-proto==0.4.14.post20260821",
     "tokenspeed-smg-grpc-servicer==0.8.0.post20260821",
