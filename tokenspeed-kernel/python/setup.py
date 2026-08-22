@@ -71,6 +71,9 @@ BASE_VERSION = "0.1.3"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
+# Architectures whose generic build target uses an architecture-specific suffix.
+# Explicit suffixes supplied by users are preserved for all architectures.
+CUDA_ARCHS_WITH_A_SUFFIX = frozenset({(9, 0), (10, 0), (10, 3)})
 
 # CUDA kernels source and output directories
 CUDA_CSRC_DIR = THIRDPARTY_DIR / "cuda" / "csrc"
@@ -503,7 +506,7 @@ class CudaKernelBuilder:
         else:
             major = int(arch_clean[:-1])
             minor = int(arch_clean[-1])
-        suffix = "a" if has_suffix or major >= 9 else ""
+        suffix = "a" if has_suffix or (major, minor) in CUDA_ARCHS_WITH_A_SUFFIX else ""
         return f"{major}{minor}{suffix}"
 
     def _detect_cuda_archs(self):
