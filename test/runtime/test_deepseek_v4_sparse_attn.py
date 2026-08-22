@@ -66,8 +66,8 @@ def _reference(
         valid = (torch.arange(topk, device=q.device) < lens[t]) & (indices[t] >= 0)
         if not bool(valid.any()):
             continue
-        rows = kvf[indices[t][valid].long()]           # [v, d]
-        scores = (qf[t] @ rows.T) * scale              # [h, v]
+        rows = kvf[indices[t][valid].long()]  # [v, d]
+        scores = (qf[t] @ rows.T) * scale  # [h, v]
         row_max = scores.max(dim=-1, keepdim=True).values
         exp_scores = torch.exp(scores - row_max)
         denom = exp_scores.sum(dim=-1) + torch.exp(
@@ -93,24 +93,16 @@ class TestDeepseekV4SparseAttn(unittest.TestCase):
             device=self.device,
             dtype=torch.bfloat16,
         )
-        kv = torch.randn(
-            num_rows, HEAD_DIM, device=self.device, dtype=torch.bfloat16
-        )
+        kv = torch.randn(num_rows, HEAD_DIM, device=self.device, dtype=torch.bfloat16)
         indices = torch.randint(
             0, num_rows, (num_tokens, topk), device=self.device, dtype=torch.int32
         )
-        lens = torch.full(
-            (num_tokens,), topk, device=self.device, dtype=torch.int32
-        )
-        attn_sink = torch.randn(
-            num_heads, device=self.device, dtype=torch.float32
-        )
+        lens = torch.full((num_tokens,), topk, device=self.device, dtype=torch.int32)
+        attn_sink = torch.randn(num_heads, device=self.device, dtype=torch.float32)
         return q, kv, indices, lens, attn_sink
 
     def _check(self, q, kv, indices, lens, attn_sink) -> None:
-        got = deepseek_v4_sparse_attn(
-            q, kv, indices, lens, attn_sink, self.scale
-        )
+        got = deepseek_v4_sparse_attn(q, kv, indices, lens, attn_sink, self.scale)
         expected = _reference(q, kv, indices, lens, attn_sink, self.scale)
         peak = expected.abs().max().item()
         max_abs = (got.to(torch.float32) - expected).abs().max().item()
@@ -129,9 +121,7 @@ class TestDeepseekV4SparseAttn(unittest.TestCase):
         q, kv, indices, lens, sink = self._make(
             num_tokens=16, num_heads=16, num_rows=512, topk=128
         )
-        lens = torch.randint(
-            1, 129, (16,), device=self.device, dtype=torch.int32
-        )
+        lens = torch.randint(1, 129, (16,), device=self.device, dtype=torch.int32)
         self._check(q, kv, indices, lens, sink)
 
     def test_negative_indices_are_masked(self) -> None:
@@ -153,12 +143,12 @@ class TestDeepseekV4SparseAttn(unittest.TestCase):
         small = torch.full((16,), -30.0, device=self.device, dtype=torch.float32)
         large = torch.full((16,), 30.0, device=self.device, dtype=torch.float32)
 
-        out_small = deepseek_v4_sparse_attn(
-            q, kv, indices, lens, small, self.scale
-        ).to(torch.float32)
-        out_large = deepseek_v4_sparse_attn(
-            q, kv, indices, lens, large, self.scale
-        ).to(torch.float32)
+        out_small = deepseek_v4_sparse_attn(q, kv, indices, lens, small, self.scale).to(
+            torch.float32
+        )
+        out_large = deepseek_v4_sparse_attn(q, kv, indices, lens, large, self.scale).to(
+            torch.float32
+        )
 
         # A dominant sink drives the normalized output toward zero.
         self.assertLess(
@@ -179,9 +169,9 @@ class TestDeepseekV4SparseAttn(unittest.TestCase):
         sink = torch.full((16,), -30.0, device=self.device, dtype=torch.float32)
         sink[0] = 30.0  # only head 0 is damped
 
-        got = deepseek_v4_sparse_attn(
-            q, kv, indices, lens, sink, self.scale
-        ).to(torch.float32)
+        got = deepseek_v4_sparse_attn(q, kv, indices, lens, sink, self.scale).to(
+            torch.float32
+        )
         head0 = got[:, 0].abs().max().item()
         others = got[:, 1:].abs().max().item()
         self.assertLess(head0, 0.2 * others)
@@ -192,9 +182,7 @@ class TestDeepseekV4SparseAttn(unittest.TestCase):
 
     def test_prefill_scale_batch(self) -> None:
         """A chunk-sized batch at the model's real topk of 512."""
-        self._check(
-            *self._make(num_tokens=256, num_heads=16, num_rows=8192, topk=512)
-        )
+        self._check(*self._make(num_tokens=256, num_heads=16, num_rows=8192, topk=512))
 
 
 if __name__ == "__main__":

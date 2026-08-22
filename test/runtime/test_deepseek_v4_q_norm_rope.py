@@ -92,9 +92,7 @@ class TestDeepseekV4QNormRope(unittest.TestCase):
             self.skipTest("GPU is required")
         self.device = torch.device("cuda")
         torch.manual_seed(0)
-        self.cache, self.freqs_cis = _make_cos_sin_cache(
-            4096, ROPE_DIM, self.device
-        )
+        self.cache, self.freqs_cis = _make_cos_sin_cache(4096, ROPE_DIM, self.device)
 
     def _run(self, num_tokens: int, num_heads: int) -> None:
         q = torch.randn(
@@ -111,9 +109,7 @@ class TestDeepseekV4QNormRope(unittest.TestCase):
         expected = _reference(q, positions, self.freqs_cis, ROPE_DIM, EPS)
 
         actual = q.clone()
-        deepseek_v4_q_norm_rope(
-            actual, positions, self.cache, EPS, rope_dim=ROPE_DIM
-        )
+        deepseek_v4_q_norm_rope(actual, positions, self.cache, EPS, rope_dim=ROPE_DIM)
 
         peak = expected.abs().max().item()
         max_abs = (actual.to(torch.float32) - expected).abs().max().item()
@@ -151,9 +147,7 @@ class TestDeepseekV4QNormRope(unittest.TestCase):
         )
 
         actual = q.clone()
-        deepseek_v4_q_norm_rope(
-            actual, positions, self.cache, EPS, rope_dim=ROPE_DIM
-        )
+        deepseek_v4_q_norm_rope(actual, positions, self.cache, EPS, rope_dim=ROPE_DIM)
 
         nope = actual[..., :-ROPE_DIM].to(torch.float32)
         torch.testing.assert_close(
@@ -161,9 +155,11 @@ class TestDeepseekV4QNormRope(unittest.TestCase):
         )
         # And the rope section must actually have changed.
         rope_delta = (
-            actual[..., -ROPE_DIM:].to(torch.float32)
-            - norm_only[..., -ROPE_DIM:]
-        ).abs().max().item()
+            (actual[..., -ROPE_DIM:].to(torch.float32) - norm_only[..., -ROPE_DIM:])
+            .abs()
+            .max()
+            .item()
+        )
         self.assertGreater(rope_delta, 1e-3)
 
     def test_position_zero_is_identity_rotation(self) -> None:
@@ -176,17 +172,13 @@ class TestDeepseekV4QNormRope(unittest.TestCase):
             device=self.device,
             dtype=torch.bfloat16,
         )
-        positions = torch.zeros(
-            num_tokens, device=self.device, dtype=torch.int64
-        )
+        positions = torch.zeros(num_tokens, device=self.device, dtype=torch.int64)
         norm_only = q.to(torch.float32) * torch.rsqrt(
             q.to(torch.float32).square().mean(-1, keepdim=True) + EPS
         )
 
         actual = q.clone()
-        deepseek_v4_q_norm_rope(
-            actual, positions, self.cache, EPS, rope_dim=ROPE_DIM
-        )
+        deepseek_v4_q_norm_rope(actual, positions, self.cache, EPS, rope_dim=ROPE_DIM)
         torch.testing.assert_close(
             actual.to(torch.float32), norm_only, rtol=2e-2, atol=2e-2
         )
@@ -214,9 +206,7 @@ class TestDeepseekV4QNormRope(unittest.TestCase):
         normed = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + EPS)
 
         rotated = q.clone()
-        deepseek_v4_q_norm_rope(
-            rotated, positions, self.cache, EPS, rope_dim=ROPE_DIM
-        )
+        deepseek_v4_q_norm_rope(rotated, positions, self.cache, EPS, rope_dim=ROPE_DIM)
 
         # De-rotate exactly as the inverse kernel does.
         half = ROPE_DIM // 2
@@ -224,9 +214,9 @@ class TestDeepseekV4QNormRope(unittest.TestCase):
         sin_v = self.cache[positions][:, None, half:].repeat_interleave(2, dim=-1)
         rope = rotated[..., -ROPE_DIM:]
         partner = rope.unflatten(-1, (-1, 2)).flip(-1).flatten(-2)
-        lane_is_even = (
-            torch.arange(ROPE_DIM, device=self.device) % 2 == 0
-        ).view(1, 1, -1)
+        lane_is_even = (torch.arange(ROPE_DIM, device=self.device) % 2 == 0).view(
+            1, 1, -1
+        )
         restored = torch.where(
             lane_is_even,
             rope * cos_v + partner * sin_v,
@@ -260,9 +250,7 @@ class TestDeepseekV4QNormRope(unittest.TestCase):
         max_abs = (q.to(torch.float32) - expected).abs().max().item()
         self.assertLessEqual(max_abs, 2e-2 * peak + 1e-2)
         # Writing through a view must not disturb neighbouring heads.
-        torch.testing.assert_close(
-            backing[:, num_heads:, :], untouched, rtol=0, atol=0
-        )
+        torch.testing.assert_close(backing[:, num_heads:, :], untouched, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

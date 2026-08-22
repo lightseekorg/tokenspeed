@@ -68,8 +68,8 @@ def _reference(
         n = min(end - start, max_len)
         if n <= 0:
             continue
-        rows = kf[start : start + n]                     # [n, d]
-        scores = (qf[t] @ rows.T).relu()                 # [h, n]
+        rows = kf[start : start + n]  # [n, d]
+        scores = (qf[t] @ rows.T).relu()  # [h, n]
         weighted = (scores * weights[t].float()[:, None]).sum(0)
         out[t, :n] = weighted * k_scale[start : start + n].float()
     return out
@@ -94,8 +94,7 @@ class TestDeepseekV4IndexerLogits(unittest.TestCase):
             total_keys, INDEX_HEAD_DIM, device=self.device, dtype=torch.bfloat16
         )
         k_scale = (
-            torch.rand(total_keys, device=self.device, dtype=torch.float32) * 0.5
-            + 0.25
+            torch.rand(total_keys, device=self.device, dtype=torch.float32) * 0.5 + 0.25
         )
         weights = torch.randn(
             num_tokens, num_heads, device=self.device, dtype=torch.float32
@@ -106,9 +105,7 @@ class TestDeepseekV4IndexerLogits(unittest.TestCase):
         got = deepseek_v4_indexer_mqa_logits(
             q, k, k_scale, weights, cu_start, cu_end, max_len
         )
-        expected = _reference(
-            q, k, k_scale, weights, cu_start, cu_end, max_len
-        )
+        expected = _reference(q, k, k_scale, weights, cu_start, cu_end, max_len)
         peak = expected.abs().max().item()
         max_abs = (got - expected).abs().max().item()
         self.assertLessEqual(
@@ -118,24 +115,17 @@ class TestDeepseekV4IndexerLogits(unittest.TestCase):
     def test_uniform_ranges(self) -> None:
         num_tokens, num_heads, total = 16, 8, 512
         q, k, k_scale, weights = self._make(num_tokens, num_heads, total)
-        cu_start = torch.zeros(
-            num_tokens, device=self.device, dtype=torch.int32
-        )
-        cu_end = torch.full(
-            (num_tokens,), 256, device=self.device, dtype=torch.int32
-        )
+        cu_start = torch.zeros(num_tokens, device=self.device, dtype=torch.int32)
+        cu_end = torch.full((num_tokens,), 256, device=self.device, dtype=torch.int32)
         self._check(q, k, k_scale, weights, cu_start, cu_end, 256)
 
     def test_ragged_causal_ranges(self) -> None:
         """Each token sees a different, growing key range."""
         num_tokens, num_heads, total = 32, 8, 1024
         q, k, k_scale, weights = self._make(num_tokens, num_heads, total)
-        cu_start = torch.zeros(
-            num_tokens, device=self.device, dtype=torch.int32
-        )
+        cu_start = torch.zeros(num_tokens, device=self.device, dtype=torch.int32)
         cu_end = (
-            torch.arange(1, num_tokens + 1, device=self.device, dtype=torch.int32)
-            * 8
+            torch.arange(1, num_tokens + 1, device=self.device, dtype=torch.int32) * 8
         )
         self._check(q, k, k_scale, weights, cu_start, cu_end, int(cu_end.max()))
 
@@ -143,9 +133,7 @@ class TestDeepseekV4IndexerLogits(unittest.TestCase):
         """Non-zero cu_start must offset into the gathered key buffer."""
         num_tokens, num_heads, total = 8, 8, 1024
         q, k, k_scale, weights = self._make(num_tokens, num_heads, total)
-        cu_start = torch.full(
-            (num_tokens,), 128, device=self.device, dtype=torch.int32
-        )
+        cu_start = torch.full((num_tokens,), 128, device=self.device, dtype=torch.int32)
         cu_end = torch.full(
             (num_tokens,), 128 + 192, device=self.device, dtype=torch.int32
         )
@@ -160,9 +148,7 @@ class TestDeepseekV4IndexerLogits(unittest.TestCase):
         num_tokens, num_heads, total = 8, 8, 256
         q, k, k_scale, weights = self._make(num_tokens, num_heads, total)
         cu_start = torch.zeros(num_tokens, device=self.device, dtype=torch.int32)
-        cu_end = torch.full(
-            (num_tokens,), 128, device=self.device, dtype=torch.int32
-        )
+        cu_end = torch.full((num_tokens,), 128, device=self.device, dtype=torch.int32)
 
         got = deepseek_v4_indexer_mqa_logits(
             q, k, k_scale, weights, cu_start, cu_end, 128
@@ -173,9 +159,7 @@ class TestDeepseekV4IndexerLogits(unittest.TestCase):
         no_relu = torch.zeros_like(got)
         for t in range(num_tokens):
             scores = qf[t] @ kf[:128].T
-            no_relu[t, :128] = (scores * weights[t][:, None]).sum(0) * k_scale[
-                :128
-            ]
+            no_relu[t, :128] = (scores * weights[t][:, None]).sum(0) * k_scale[:128]
 
         self.assertGreater(
             (got - no_relu).abs().max().item(),
@@ -191,9 +175,7 @@ class TestDeepseekV4IndexerLogits(unittest.TestCase):
             with self.subTest(num_heads=num_heads):
                 q, k, k_scale, weights = self._make(8, num_heads, 256)
                 cu_start = torch.zeros(8, device=self.device, dtype=torch.int32)
-                cu_end = torch.full(
-                    (8,), 128, device=self.device, dtype=torch.int32
-                )
+                cu_end = torch.full((8,), 128, device=self.device, dtype=torch.int32)
                 self._check(q, k, k_scale, weights, cu_start, cu_end, 128)
 
     def test_empty_range_leaves_zeros(self) -> None:

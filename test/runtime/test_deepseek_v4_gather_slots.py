@@ -96,9 +96,7 @@ class TestDeepseekV4GatherSlots(unittest.TestCase):
         slots = torch.randint(
             0, num_rows, (num_tokens, topk), device=self.device, dtype=torch.int64
         )
-        lens = torch.full(
-            (num_tokens,), topk, device=self.device, dtype=torch.int32
-        )
+        lens = torch.full((num_tokens,), topk, device=self.device, dtype=torch.int32)
         out = torch.zeros(
             num_tokens,
             topk,
@@ -113,15 +111,25 @@ class TestDeepseekV4GatherSlots(unittest.TestCase):
         )
         # nope survives an fp8 round trip; rope is stored bf16.
         nope_err = (
-            out[..., :DEEPSEEK_V4_NOPE_DIM].float()
-            - expected[..., :DEEPSEEK_V4_NOPE_DIM].float()
-        ).abs().max().item()
+            (
+                out[..., :DEEPSEEK_V4_NOPE_DIM].float()
+                - expected[..., :DEEPSEEK_V4_NOPE_DIM].float()
+            )
+            .abs()
+            .max()
+            .item()
+        )
         peak = expected[..., :DEEPSEEK_V4_NOPE_DIM].float().abs().max().item()
         self.assertLessEqual(nope_err, 0.1 * peak)
         rope_err = (
-            out[..., -DEEPSEEK_V4_ROPE_DIM:].float()
-            - expected[..., -DEEPSEEK_V4_ROPE_DIM:].float()
-        ).abs().max().item()
+            (
+                out[..., -DEEPSEEK_V4_ROPE_DIM:].float()
+                - expected[..., -DEEPSEEK_V4_ROPE_DIM:].float()
+            )
+            .abs()
+            .max()
+            .item()
+        )
         self.assertLessEqual(rope_err, 5e-2)
 
     def test_rows_beyond_len_are_untouched(self) -> None:
@@ -148,9 +156,7 @@ class TestDeepseekV4GatherSlots(unittest.TestCase):
             0, 128, (num_tokens, topk), device=self.device, dtype=torch.int64
         )
         slots[:, ::2] = -1
-        lens = torch.full(
-            (num_tokens,), topk, device=self.device, dtype=torch.int32
-        )
+        lens = torch.full((num_tokens,), topk, device=self.device, dtype=torch.int32)
         out = torch.full(
             (num_tokens, topk, DEEPSEEK_V4_HEAD_DIM),
             7.0,
@@ -167,12 +173,12 @@ class TestDeepseekV4GatherSlots(unittest.TestCase):
         cache_b, kv_b = self._populate(num_blocks=2, num_rows=128)
 
         num_tokens, topk_a, topk_b = 4, 8, 8
-        slots_a = torch.arange(
-            topk_a, device=self.device, dtype=torch.int64
-        ).repeat(num_tokens, 1)
-        slots_b = torch.arange(
-            topk_b, device=self.device, dtype=torch.int64
-        ).repeat(num_tokens, 1)
+        slots_a = torch.arange(topk_a, device=self.device, dtype=torch.int64).repeat(
+            num_tokens, 1
+        )
+        slots_b = torch.arange(topk_b, device=self.device, dtype=torch.int64).repeat(
+            num_tokens, 1
+        )
         lens_a = torch.full(
             (num_tokens,), topk_a, device=self.device, dtype=torch.int32
         )
@@ -199,9 +205,14 @@ class TestDeepseekV4GatherSlots(unittest.TestCase):
             ("b", out[:, topk_a:], kv_b[:topk_b]),
         ):
             err = (
-                got[..., -DEEPSEEK_V4_ROPE_DIM:].float()
-                - want[..., -DEEPSEEK_V4_ROPE_DIM:].float()
-            ).abs().max().item()
+                (
+                    got[..., -DEEPSEEK_V4_ROPE_DIM:].float()
+                    - want[..., -DEEPSEEK_V4_ROPE_DIM:].float()
+                )
+                .abs()
+                .max()
+                .item()
+            )
             self.assertLessEqual(err, 5e-2, f"cache {name}")
 
 

@@ -137,16 +137,19 @@ class TestDeepseekV4KvRopeQuantInsert(unittest.TestCase):
         positions = torch.arange(seq_len, device=self.device, dtype=torch.int64)
         slot_mapping = torch.arange(seq_len, device=self.device, dtype=torch.int64)
 
-        got = self._write_then_gather(
-            kv, positions, slot_mapping, num_blocks, seq_len
-        )
+        got = self._write_then_gather(kv, positions, slot_mapping, num_blocks, seq_len)
         expected = _rope_reference(kv, positions, self.freqs_cis)
 
         # The rope half survives as bf16 and should be near-exact.
         rope_err = (
-            got[:, -DEEPSEEK_V4_ROPE_DIM:].to(torch.float32)
-            - expected[:, -DEEPSEEK_V4_ROPE_DIM:]
-        ).abs().max().item()
+            (
+                got[:, -DEEPSEEK_V4_ROPE_DIM:].to(torch.float32)
+                - expected[:, -DEEPSEEK_V4_ROPE_DIM:]
+            )
+            .abs()
+            .max()
+            .item()
+        )
         self.assertLessEqual(rope_err, 5e-2, f"rope max_abs={rope_err}")
 
         # The nope half is e4m3 with one e8m0 scale per 64 values; relative
@@ -204,9 +207,14 @@ class TestDeepseekV4KvRopeQuantInsert(unittest.TestCase):
         # seq_len-1-s.
         expected = kv.flip(0).to(torch.float32)
         nope_err = (
-            got[:, :DEEPSEEK_V4_NOPE_DIM].to(torch.float32)
-            - expected[:, :DEEPSEEK_V4_NOPE_DIM]
-        ).abs().max().item()
+            (
+                got[:, :DEEPSEEK_V4_NOPE_DIM].to(torch.float32)
+                - expected[:, :DEEPSEEK_V4_NOPE_DIM]
+            )
+            .abs()
+            .max()
+            .item()
+        )
         peak = expected[:, :DEEPSEEK_V4_NOPE_DIM].abs().max().item()
         self.assertLessEqual(nope_err, 0.1 * peak)
 
@@ -229,13 +237,14 @@ class TestDeepseekV4KvRopeQuantInsert(unittest.TestCase):
         for token in range(seq_len):
             row = k_cache[
                 0,
-                scales_base + token * DEEPSEEK_V4_SWA_SCALE_DIM : scales_base
+                scales_base
+                + token * DEEPSEEK_V4_SWA_SCALE_DIM : scales_base
                 + token * DEEPSEEK_V4_SWA_SCALE_DIM
                 + n_blocks,
             ]
             for blk in range(n_blocks):
-                absmax = kv[token, blk * 64 : (blk + 1) * 64].abs().max().to(
-                    torch.float32
+                absmax = (
+                    kv[token, blk * 64 : (blk + 1) * 64].abs().max().to(torch.float32)
                 )
                 expected_exp = torch.ceil(torch.log2(absmax / 448.0)) + 127.0
                 self.assertEqual(
@@ -254,14 +263,17 @@ class TestDeepseekV4KvRopeQuantInsert(unittest.TestCase):
         positions = torch.arange(seq_len, device=self.device, dtype=torch.int64)
         slot_mapping = torch.arange(seq_len, device=self.device, dtype=torch.int64)
 
-        got = self._write_then_gather(
-            kv, positions, slot_mapping, num_blocks, seq_len
-        )
+        got = self._write_then_gather(kv, positions, slot_mapping, num_blocks, seq_len)
         expected = _rope_reference(kv, positions, self.freqs_cis)
         rope_err = (
-            got[:, -DEEPSEEK_V4_ROPE_DIM:].to(torch.float32)
-            - expected[:, -DEEPSEEK_V4_ROPE_DIM:]
-        ).abs().max().item()
+            (
+                got[:, -DEEPSEEK_V4_ROPE_DIM:].to(torch.float32)
+                - expected[:, -DEEPSEEK_V4_ROPE_DIM:]
+            )
+            .abs()
+            .max()
+            .item()
+        )
         self.assertLessEqual(rope_err, 5e-2)
 
 

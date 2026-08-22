@@ -59,9 +59,7 @@ def _reference(
     mul = torch.zeros(
         n_splits, num_tokens, w.shape[0], dtype=torch.float32, device=a.device
     )
-    sqrsum = torch.zeros(
-        n_splits, num_tokens, dtype=torch.float32, device=a.device
-    )
+    sqrsum = torch.zeros(n_splits, num_tokens, dtype=torch.float32, device=a.device)
     a_f32 = a.to(torch.float32)
     for split in range(n_splits):
         begin = split * k_per_split
@@ -82,12 +80,8 @@ class TestMhcPrenormGemm(unittest.TestCase):
         torch.manual_seed(0)
 
     def _run(self, num_tokens: int, n_splits: int) -> None:
-        a = torch.randn(
-            num_tokens, K_SIZE, device=self.device, dtype=torch.bfloat16
-        )
-        w = torch.randn(
-            N_SIZE, K_SIZE, device=self.device, dtype=torch.float32
-        ) * 0.05
+        a = torch.randn(num_tokens, K_SIZE, device=self.device, dtype=torch.bfloat16)
+        w = torch.randn(N_SIZE, K_SIZE, device=self.device, dtype=torch.float32) * 0.05
 
         mul = torch.empty(
             n_splits, num_tokens, N_SIZE, dtype=torch.float32, device=self.device
@@ -101,9 +95,7 @@ class TestMhcPrenormGemm(unittest.TestCase):
 
         # The mix kernel consumes the sum over splits, so check that too: a
         # split-boundary bug can cancel within a partial but not in the total.
-        torch.testing.assert_close(
-            mul.sum(0), ref_mul.sum(0), rtol=2e-2, atol=2e-2
-        )
+        torch.testing.assert_close(mul.sum(0), ref_mul.sum(0), rtol=2e-2, atol=2e-2)
         torch.testing.assert_close(
             sqrsum.sum(0), ref_sqrsum.sum(0), rtol=2e-2, atol=2e-2
         )
@@ -132,12 +124,8 @@ class TestMhcPrenormGemm(unittest.TestCase):
         """Splits that run off the end of K must contribute zero, not garbage."""
         num_tokens = 32
         n_splits = 3
-        a = torch.randn(
-            num_tokens, K_SIZE, device=self.device, dtype=torch.bfloat16
-        )
-        w = torch.randn(
-            N_SIZE, K_SIZE, device=self.device, dtype=torch.float32
-        ) * 0.05
+        a = torch.randn(num_tokens, K_SIZE, device=self.device, dtype=torch.bfloat16)
+        w = torch.randn(N_SIZE, K_SIZE, device=self.device, dtype=torch.float32) * 0.05
         mul = torch.empty(
             n_splits, num_tokens, N_SIZE, dtype=torch.float32, device=self.device
         )

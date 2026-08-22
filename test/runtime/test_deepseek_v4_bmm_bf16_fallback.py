@@ -59,9 +59,9 @@ def _block_quantize(
             block = weight[
                 i * BLOCK_N : (i + 1) * BLOCK_N, j * BLOCK_K : (j + 1) * BLOCK_K
             ]
-            out[
-                i * BLOCK_N : (i + 1) * BLOCK_N, j * BLOCK_K : (j + 1) * BLOCK_K
-            ] = (block / scales[i, j]).to(torch.float8_e4m3fn)
+            out[i * BLOCK_N : (i + 1) * BLOCK_N, j * BLOCK_K : (j + 1) * BLOCK_K] = (
+                block / scales[i, j]
+            ).to(torch.float8_e4m3fn)
     return out
 
 
@@ -74,9 +74,9 @@ class TestDeepseekV4BmmBf16Fallback(unittest.TestCase):
 
     def _make_block_quantized_weight(self, num_groups: int):
         rows = num_groups * O_LORA_RANK
-        reference = torch.randn(
-            rows, IN_DIM, device=self.device, dtype=torch.float32
-        ) * 0.02
+        reference = (
+            torch.randn(rows, IN_DIM, device=self.device, dtype=torch.float32) * 0.02
+        )
         scales = (
             torch.rand(
                 rows // BLOCK_N,
@@ -138,9 +138,9 @@ class TestDeepseekV4BmmBf16Fallback(unittest.TestCase):
         """Per-128-block activation scales broadcast over the contracted axis."""
         num_groups, num_tokens = 2, 5
         num_blocks = IN_DIM // BLOCK_K
-        values = torch.randn(
-            num_tokens, num_groups, IN_DIM, device=self.device
-        ).to(torch.float8_e4m3fn)
+        values = torch.randn(num_tokens, num_groups, IN_DIM, device=self.device).to(
+            torch.float8_e4m3fn
+        )
         scales = torch.rand(
             num_tokens, num_groups, num_blocks, device=self.device, dtype=torch.float32
         )
@@ -157,9 +157,9 @@ class TestDeepseekV4BmmBf16Fallback(unittest.TestCase):
         )
         for block in range(num_blocks):
             cols = slice(block * BLOCK_K, (block + 1) * BLOCK_K)
-            expected[:, :, cols] = values[:, :, cols].to(
-                torch.float32
-            ) * scales[:, :, block : block + 1]
+            expected[:, :, cols] = (
+                values[:, :, cols].to(torch.float32) * scales[:, :, block : block + 1]
+            )
 
         torch.testing.assert_close(expanded, expected, rtol=0, atol=0)
 

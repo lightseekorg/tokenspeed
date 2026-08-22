@@ -63,15 +63,13 @@ def _reference_hc_pre(
     num_tokens, hc, dim = residual.shape
     x = residual.reshape(num_tokens, hc * dim).float()
     rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + rms_eps)
-    mixes = F.linear(x, fn) * rsqrt                       # [tokens, mix_hc]
+    mixes = F.linear(x, fn) * rsqrt  # [tokens, mix_hc]
 
     pre = torch.sigmoid(mixes[:, :hc] * hc_scale[0] + hc_base[:hc]) + hc_eps
-    post = 2 * torch.sigmoid(
-        mixes[:, hc : 2 * hc] * hc_scale[1] + hc_base[hc : 2 * hc]
-    )
-    comb = mixes[:, 2 * hc :].reshape(num_tokens, hc, hc) * hc_scale[
-        2
-    ] + hc_base[2 * hc :].reshape(hc, hc)
+    post = 2 * torch.sigmoid(mixes[:, hc : 2 * hc] * hc_scale[1] + hc_base[hc : 2 * hc])
+    comb = mixes[:, 2 * hc :].reshape(num_tokens, hc, hc) * hc_scale[2] + hc_base[
+        2 * hc :
+    ].reshape(hc, hc)
 
     # comb = comb.softmax(-1) + eps, then alternating column/row normalization.
     comb = comb.softmax(-1) + hc_eps
@@ -196,8 +194,8 @@ class TestDeepseekV4MhcReferenceParity(unittest.TestCase):
         expected = residual.float().sum(dim=1) * (0.5 + HC_EPS)
         peak = expected.abs().max().item()
         err = (
-            layer_input.float().reshape(expected.shape) - expected
-        ).abs().max().item()
+            (layer_input.float().reshape(expected.shape) - expected).abs().max().item()
+        )
         self.assertLessEqual(err, 2e-2 * peak + 1e-3)
 
 
