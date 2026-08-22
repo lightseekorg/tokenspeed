@@ -110,6 +110,12 @@ class ServerArgs:
     revision: str | None = None
     language_model_only: bool = False
 
+    # Weight cache daemon (CUDA IPC zero-copy weight loading for fast engine
+    # recovery). "off" disables it; "daemon" launches per-rank daemons and
+    # loads via IPC; "client" connects to pre-running daemons (restart path).
+    weight_cache_mode: str = "off"
+    weight_cache_socket: str | None = None
+
     # Direct SMG msgpack ZMQ path. When enabled, the scheduler skips the pickle
     # PULL/PUSH IPC and instead connects to SMG (which binds the handshake/input/
     # output sockets) over the msgpack wire. Default OFF;
@@ -993,6 +999,28 @@ class ServerArgs:
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values.',
+        )
+        parser.add_argument(
+            "--weight-cache-mode",
+            type=str,
+            default=ServerArgs.weight_cache_mode,
+            choices=["off", "daemon", "client"],
+            help="Weight cache daemon mode for fast engine recovery via CUDA "
+            "IPC zero-copy weight loading. "
+            '"off" (default) loads weights from disk normally. '
+            '"daemon" launches one weight cache daemon per rank, then maps '
+            "their post-quantized weights via IPC (first start). "
+            '"client" connects to pre-running daemons and maps their weights '
+            "via IPC (engine restart); falls back to disk load only when no "
+            "daemon socket is present.",
+        )
+        parser.add_argument(
+            "--weight-cache-socket",
+            type=str,
+            default=ServerArgs.weight_cache_socket,
+            help="Override the auto-derived per-rank Unix socket path used to "
+            "reach the weight cache daemon. Defaults to "
+            "/tmp/tokenspeed_weight_cache_rank{rank}.sock.",
         )
         parser.add_argument(
             "--trust-remote-code",

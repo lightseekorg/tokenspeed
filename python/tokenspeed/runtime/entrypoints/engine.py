@@ -520,6 +520,47 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
+def _launch_weight_cache_daemons(server_args: ServerArgs) -> list:
+    """Spawn one weight cache daemon per local rank and wait until they are ready.
+
+    Returns the list of daemon subprocess handles (already loaded and serving
+    IPC handles). The daemons keep running independently of this call; each
+    installs a parent-death signal so it exits with the engine.
+    """
+    from tokenspeed.runtime.weight_cache.daemon import launch_weight_cache_daemons
+
+    mapping = server_args.mapping
+    if mapping.nnodes > 1:
+        raise ValueError(
+            "--weight-cache-mode daemon currently supports single-node "
+            "deployments only. For multi-node, pre-launch daemons on each node "
+            "with `python -m tokenspeed.runtime.weight_cache.daemon ...` and "
+            "start the engine with --weight-cache-mode client."
+        )
+
+    logger.info("Launching weight cache daemons (mode=daemon) ...")
+    return launch_weight_cache_daemons(
+        model_path=server_args.model,
+        attn_tp_size=mapping.attn.tp_size,
+        dense_tp_size=mapping.dense.tp_size,
+        moe_tp_size=mapping.moe.tp_size,
+        ep_size=mapping.moe.ep_size,
+        dp_size=mapping.attn.dp_size,
+        nnodes=mapping.nnodes,
+        node_rank=server_args.node_rank,
+        base_gpu_id=server_args.base_gpu_id,
+        gpu_id_step=server_args.gpu_id_step,
+        load_format=server_args.load_format,
+        dtype=server_args.dtype,
+        quantization=server_args.quantization,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.revision,
+        download_dir=server_args.download_dir,
+        device=server_args.device,
+        wait=True,
+    )
+
+
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: PortArgs | None = None
 ) -> tuple[AsyncLLM, None, dict]:
@@ -539,6 +580,21 @@ def _launch_subprocesses(
     server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
         server_args.model, server_args.tokenizer
     )
+
+    # Weight cache daemon (fast engine recovery via CUDA IPC). In "daemon" mode
+    # the engine spawns one weight cache daemon per local rank and blocks until
+    # they finish loading from disk; every engine rank then maps their
+    # post-quantized weights via zero-copy IPC. In "client" mode the daemons are
+    # assumed to be pre-running (started out-of-band), so nothing is launched
+    # here — the engine ranks connect to the existing sockets.
+    weight_cache_daemon_procs = None
+    if getattr(server_args, "weight_cache_mode", "off") == "daemon":
+        weight_cache_daemon_procs = _launch_weight_cache_daemons(server_args)
+        logger.info(
+            "%d weight cache daemon(s) ready; engine ranks will map weights "
+            "via CUDA IPC.",
+            len(weight_cache_daemon_procs),
+        )
 
     scheduler_procs = []
     if not server_args.mapping.attn.has_dp:

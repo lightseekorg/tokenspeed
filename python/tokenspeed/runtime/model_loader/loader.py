@@ -665,4 +665,19 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
     if load_config.load_format == LoadFormat.EXTENSIBLE:
         return ExtensibleModelLoader(load_config)
 
+    if load_config.load_format == LoadFormat.IPC_CACHE:
+        # Imported lazily so the common load paths don't pull in torch IPC and
+        # the weight cache stack on every get_model_loader() call.
+        from tokenspeed.runtime.weight_cache.ipc_loader import IpcModelLoader
+
+        return IpcModelLoader(
+            load_config,
+            socket_path=load_config.weight_cache_socket,
+            weight_cache_mode=(
+                load_config.weight_cache_mode
+                if load_config.weight_cache_mode != "off"
+                else "client"
+            ),
+        )
+
     return DefaultModelLoader(load_config)

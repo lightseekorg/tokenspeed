@@ -39,6 +39,9 @@ class LoadFormat(str, enum.Enum):
     SHARDED_STATE = "sharded_state"
     MISTRAL = "mistral"
     EXTENSIBLE = "extensible"
+    # Load post-quantized, TP-sharded weights from a running weight cache
+    # daemon via CUDA IPC zero-copy mapping instead of from disk.
+    IPC_CACHE = "ipc_cache"
 
 
 @dataclass
@@ -76,6 +79,12 @@ class LoadConfig:
     weight_loader_prefetch_num_threads: int = 4
 
     ext_yaml: str | None = None
+
+    # Weight cache daemon (CUDA IPC zero-copy weight loading). ``weight_cache_mode``
+    # is one of "off" | "daemon" | "client"; ``weight_cache_socket`` optionally
+    # overrides the auto-derived per-rank Unix socket path used to reach the daemon.
+    weight_cache_mode: str = "off"
+    weight_cache_socket: str | None = None
 
     def __post_init__(self) -> None:
         model_loader_extra_config = self.model_loader_extra_config or {}
