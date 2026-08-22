@@ -67,6 +67,7 @@ from tokenspeed.runtime.engine.io_struct import (
     IsSchedulerPausedReqOutput,
     IsSleepingReqInput,
     IsSleepingReqOutput,
+    LoadSnapshot,
     MsgpackDecoder,
     MsgpackEncoder,
     OpenSessionReqInput,
@@ -118,6 +119,16 @@ def _roundtrip(obj):
     enc = MsgpackEncoder()
     dec = MsgpackDecoder(ipc_message_union())
     return dec.decode(enc.encode(obj))
+
+
+def test_load_snapshot_round_trips_as_one_tagged_frame():
+    """The scheduler snapshot stays a standalone, single-frame IPC message."""
+    snapshot = LoadSnapshot("boot-a", 1, 0, 2, 3, 4, 5, 6, 1_000)
+
+    frames = MsgpackEncoder().encode(snapshot)
+
+    assert len(frames) == 1
+    assert _roundtrip(snapshot) == snapshot
 
 
 def _batch_token_id_out(**overrides) -> BatchTokenIDOut:

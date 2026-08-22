@@ -1059,6 +1059,26 @@ class GetLoadReqOutput(BaseReq, kw_only=True):
     num_pages: int = 0
 
 
+class LoadSnapshot(
+    msgspec.Struct, frozen=True, tag=True, tag_field="_tag", array_like=True
+):
+    """Immutable scheduler load replica sent over engine IPC.
+
+    Fields are positional on the wire. Append any future fields only at the
+    end so older decoders can retain their prefix compatibility.
+    """
+
+    epoch: str
+    sequence: int
+    dp_rank: int
+    num_running_reqs: int
+    num_waiting_reqs: int
+    num_active_pages: int
+    num_used_pages: int
+    max_total_pages: int
+    valid_for_ms: int
+
+
 class WatchLoadUpdateReq(BaseReq, kw_only=True):
     loads: list[GetLoadReqOutput] = []
 
@@ -1247,7 +1267,9 @@ def ipc_message_union():
     """
     types = tuple(
         dict.fromkeys(
-            _walk_subclasses(BaseReq) + _walk_subclasses(BaseBatchReq) + [PickleWrapper]
+            _walk_subclasses(BaseReq)
+            + _walk_subclasses(BaseBatchReq)
+            + [LoadSnapshot, PickleWrapper]
         )
     )
     return Union[types]  # noqa: UP007 — dynamic union over a runtime tuple
