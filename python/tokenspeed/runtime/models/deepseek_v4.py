@@ -30,7 +30,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel import (
-    bmm,
+    deepseek_v4_grouped_output_projection,
+    deepseek_v4_grouped_output_projection_plan,
+    deepseek_v4_grouped_output_projection_warmup_model,
     deepseek_v4_indexer_cache_format,
     deepseek_v4_linear_fp32,
     deepseek_v4_padded_heads,
@@ -103,7 +105,6 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_csa_compress_kv_cache_insert,
     deepseek_v4_csa_indexer_cache_insert,
-    deepseek_v4_fused_inv_rope_fp8_quant,
     deepseek_v4_hca_compress_kv_cache_insert,
     deepseek_v4_prepare_indexer_q,
     deepseek_v4_prepare_indexer_q_mxfp4,
@@ -743,6 +744,7 @@ def _deepseek_v4_indexer_prefill_request_gather_plan(
     req_end: int,
     query_start: int,
     query_end: int,
+    block_table_base_offsets: torch.Tensor | None = None,
     build_slots: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     device = block_table.device
@@ -791,6 +793,22 @@ def _deepseek_v4_indexer_prefill_request_gather_plan(
         dtype=torch.int64,
         device=device,
     )
+    request_ids = torch.arange(req_start, req_end, device=device, dtype=torch.int64)
+    if block_table_base_offsets is None:
+        request_base_pages = torch.zeros_like(request_ids)
+    else:
+        if block_table_base_offsets.ndim != 1:
+            raise ValueError("block_table_base_offsets must be one-dimensional")
+        request_base_pages = block_table_base_offsets.to(
+            device=device, dtype=torch.int64
+        )[request_ids]
+    request_base_rows = request_base_pages * int(cache_block_size)
+    request_capacity_ends = request_base_rows + int(block_table.shape[1]) * int(
+        cache_block_size
+    )
+    request_starts = torch.minimum(request_base_rows, compressed_lens).clamp_min(0)
+    request_ends = torch.minimum(request_capacity_ends, compressed_lens)
+    request_ends = torch.maximum(request_ends, request_starts)
 
     cu_seq_lens = torch.empty(
         compressed_lens.numel() + 1,
@@ -802,8 +820,15 @@ def _deepseek_v4_indexer_prefill_request_gather_plan(
 
     req_local_tensor = torch.tensor(req_local_list, dtype=torch.int64, device=device)
     row_lens = torch.tensor(row_lens_list, dtype=torch.int32, device=device)
-    cu_start = cu_seq_lens[:-1][req_local_tensor]
-    cu_end = cu_start + row_lens
+    group_starts = cu_seq_lens[:-1][req_local_tensor]
+    logical_starts = request_starts[req_local_tensor]
+    logical_ends = torch.minimum(
+        row_lens.to(torch.int64), request_ends[req_local_tensor]
+    )
+    logical_ends = torch.maximum(logical_ends, logical_starts)
+    cu_start = group_starts + logical_starts.to(torch.int32)
+    cu_end = group_starts + logical_ends.to(torch.int32)
+    row_lens = (logical_ends - logical_starts).to(torch.int32)
 
     if total_k <= 0 or not build_slots:
         empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
@@ -819,8 +844,21 @@ def _deepseek_v4_indexer_prefill_request_gather_plan(
     local = torch.arange(total_k, device=device, dtype=torch.int64) - group_bases
     pages = torch.div(local, cache_block_size, rounding_mode="floor")
     page_offsets = local % cache_block_size
-    page_ids = block_table[req_ids, pages.long()].to(torch.int64)
-    slots = page_ids * cache_block_size + page_offsets
+    base_pages = block_table_base_offsets
+    if base_pages is None:
+        base_pages_for_k = torch.zeros_like(req_ids)
+    else:
+        base_pages_for_k = base_pages.to(device=device, dtype=torch.int64)[req_ids]
+    table_pages = pages - base_pages_for_k
+    valid_pages = (table_pages >= 0) & (table_pages < block_table.shape[1])
+    safe_pages = table_pages.clamp(0, max(int(block_table.shape[1]) - 1, 0))
+    page_ids = block_table[req_ids, safe_pages.long()].to(torch.int64)
+    valid_pages = valid_pages & (page_ids >= 0)
+    slots = torch.where(
+        valid_pages,
+        page_ids * cache_block_size + page_offsets,
+        torch.zeros_like(page_offsets),
+    )
     return slots, cu_start, cu_end, row_lens, max_len
 
 
@@ -843,6 +881,7 @@ def _deepseek_v4_indexer_prefill_metadata(
     cache_block_size: int,
     compress_ratio: int,
     num_prefill_tokens: int,
+    block_table_base_offsets: torch.Tensor | None = None,
 ) -> DeepseekV4IndexerPrefillMetadata:
     device = block_table.device
     if num_prefill_tokens <= 0:
@@ -856,7 +895,16 @@ def _deepseek_v4_indexer_prefill_metadata(
 
     seq_lens_cpu = seq_lens_cpu[:num_prefill_reqs]
     query_lens_cpu = query_lens_cpu[:num_prefill_reqs]
-    cache_key = (compress_ratio, cache_block_size, num_prefill_tokens)
+    cache_key = (
+        compress_ratio,
+        cache_block_size,
+        num_prefill_tokens,
+        (
+            0
+            if block_table_base_offsets is None
+            else int(block_table_base_offsets.data_ptr())
+        ),
+    )
     cache = metadata.indexer.prefill_plan_cache
     cached = cache.get(cache_key)
     if cached is not None and cached.slots.device == device:
@@ -894,6 +942,7 @@ def _deepseek_v4_indexer_prefill_metadata(
                 req_end=chunk.req_end,
                 query_start=chunk.query_start,
                 query_end=chunk.query_end,
+                block_table_base_offsets=block_table_base_offsets,
                 build_slots=True,
             )
         )
@@ -2977,12 +3026,13 @@ class DeepseekV4Indexer(nn.Module):
         query: torch.Tensor,
         weights: torch.Tensor,
         indexer_cache: torch.Tensor,
-        indexer_page_table: torch.Tensor,
         indexer_block_size: int,
         prefill_metadata: DeepseekV4IndexerPrefillMetadata,
         decode_plan: DeepseekV4IndexerDecodePlan | None,
         num_prefill_tokens: int,
         num_decode_tokens: int,
+        token_to_req_indices: torch.Tensor,
+        block_table_base_offsets: torch.Tensor | None,
         topk_out: torch.Tensor,
     ) -> torch.Tensor:
         topk_out.fill_(-1)
@@ -3011,10 +3061,26 @@ class DeepseekV4Indexer(nn.Module):
                 max_logits_bytes=max_logits_mb * 1024 * 1024,
                 out=topk_out[token_slice],
             )
-            local = selected.to(torch.int64) - row_starts.to(torch.int64)[:, None]
-            valid = (selected >= 0) & (selected < row_ends[:, None])
+            selected_i64 = selected.to(torch.int64)
+            row_starts_i64 = row_starts.to(torch.int64)
+            if block_table_base_offsets is None:
+                base_rows = torch.zeros_like(row_starts_i64)
+            else:
+                req_indices = token_to_req_indices[token_slice].to(torch.int64)
+                safe_req_indices = req_indices.clamp(
+                    0, block_table_base_offsets.shape[0] - 1
+                )
+                base_rows = block_table_base_offsets.to(
+                    device=selected.device, dtype=torch.int64
+                )[safe_req_indices] * int(indexer_block_size)
+            logical = selected_i64 - row_starts_i64[:, None] + base_rows[:, None]
+            valid = (selected_i64 >= row_starts_i64[:, None]) & (
+                selected_i64 < row_ends.to(torch.int64)[:, None]
+            )
             topk_out[token_slice].copy_(
-                torch.where(valid, local, torch.full_like(local, -1)).to(torch.int32)
+                torch.where(valid, logical, torch.full_like(logical, -1)).to(
+                    torch.int32
+                )
             )
 
         if num_decode_tokens <= 0:
@@ -3025,7 +3091,17 @@ class DeepseekV4Indexer(nn.Module):
         decode_end = decode_start + num_decode_tokens
         decode_slice = slice(decode_start, decode_end)
         seq_lens = decode_plan.context_lens[:, -1].to(torch.int32).contiguous()
-        selected, _ = dsa_decode_topk(
+        decode_base_offsets = None
+        if block_table_base_offsets is not None:
+            decode_req_indices = token_to_req_indices[decode_slice].to(torch.int64)
+            safe_req_indices = decode_req_indices.clamp(
+                0, block_table_base_offsets.shape[0] - 1
+            )
+            decode_base_offsets = block_table_base_offsets.to(
+                device=decode_req_indices.device, dtype=torch.int32
+            )[safe_req_indices]
+            seq_lens = seq_lens + decode_base_offsets * int(indexer_block_size)
+        dsa_decode_topk(
             query[decode_slice],
             weights[decode_slice],
             seq_lens,
@@ -3034,24 +3110,9 @@ class DeepseekV4Indexer(nn.Module):
             topk=self.topk_tokens,
             softmax_scale=self.softmax_scale,
             index_k_cache=indexer_cache,
+            topk_layout="logical_offsets",
+            block_table_base_offsets=decode_base_offsets,
             out=topk_out[decode_slice],
-        )
-        selected_i64 = selected.to(torch.int64)
-        selected_pages = torch.div(
-            selected_i64.clamp_min(0),
-            indexer_block_size,
-            rounding_mode="floor",
-        )
-        page_table = decode_plan.page_table.to(torch.int64)
-        page_matches = page_table[:, None, :] == selected_pages[:, :, None]
-        has_page = page_matches.any(dim=-1)
-        logical_pages = page_matches.to(torch.int32).argmax(dim=-1).to(torch.int64)
-        local = logical_pages * indexer_block_size + torch.remainder(
-            selected_i64.clamp_min(0), indexer_block_size
-        )
-        valid = (selected_i64 >= 0) & has_page & (local < seq_lens[:, None])
-        topk_out[decode_slice].copy_(
-            torch.where(valid, local, torch.full_like(local, -1)).to(torch.int32)
         )
         return topk_out
 
@@ -3146,6 +3207,9 @@ class DeepseekV4Indexer(nn.Module):
             cache_block_size=indexer_block_size,
             compress_ratio=self.compress_ratio,
             num_prefill_tokens=num_prefill_tokens,
+            block_table_base_offsets=(
+                None if self.use_fp4_cache else indexer_page_table_base_offsets
+            ),
         )
 
         decode_schedule_metadata = None
@@ -3213,12 +3277,13 @@ class DeepseekV4Indexer(nn.Module):
                 query=packed_index_q[0],
                 weights=packed_weights,
                 indexer_cache=indexer_cache,
-                indexer_page_table=indexer_page_table,
                 indexer_block_size=indexer_block_size,
                 prefill_metadata=prefill_metadata,
                 decode_plan=decode_plan,
                 num_prefill_tokens=num_prefill_tokens,
                 num_decode_tokens=num_decode_tokens,
+                token_to_req_indices=metadata.token_to_req_indices[:total_tokens],
+                block_table_base_offsets=indexer_page_table_base_offsets,
                 topk_out=topk_out,
             )
         return _deepseek_v4_sparse_attn_indexer(
@@ -3474,11 +3539,23 @@ class DeepseekV4Attention(nn.Module):
             tp_size=tp_size,
             tp_group=tp_group,
         )
-        self.wo_a.is_bmm = True
-        self.wo_a.bmm_batch_size = self.num_local_groups
-        # SM100 packs the FP8 output-proj scales as INT32 UE8M0 (fp8_einsum
-        # recipe (1,1,128)); SM90 keeps FP32 block scales (recipe (1,128,128)).
-        self._o_tma_aligned = torch.cuda.get_device_capability()[0] >= 10
+        wo_a_quant_config = self.wo_a.quant_method.quant_config
+        self._wo_a_output_projection_plan = deepseek_v4_grouped_output_projection_plan(
+            input_dtype=self.wo_a.orig_dtype,
+            weight_dtype=self.wo_a.weight.dtype,
+            weight_scale_dtype=self.wo_a.weight_scale_inv.dtype,
+            num_groups=self.num_local_groups,
+            heads_per_group=self.num_local_heads // self.num_local_groups,
+            head_dim=self.head_dim,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.qk_rope_head_dim,
+            output_dim=self.o_lora_rank,
+            block_size=wo_a_quant_config.weight_block_size,
+            scale_format=getattr(wo_a_quant_config, "scale_fmt", None),
+        )
+        self.wo_a._deepseek_v4_grouped_output_projection_plan = (
+            self._wo_a_output_projection_plan
+        )
         self.wo_b = RowParallelLinear(
             self.o_groups * self.o_lora_rank,
             config.hidden_size,
@@ -3574,54 +3651,14 @@ class DeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
     ) -> torch.Tensor:
-        # Inverse RoPE + grouped block-scaled FP8 quant in one Triton kernel.
-        # DeepGEMM consumes its transformed scale layout when available; the
-        # public BMM path consumes canonical checkpoint scales on other devices.
-        heads_per_group = self.num_local_heads // self.num_local_groups
-        use_deep_gemm = getattr(self.wo_a, "_use_deep_gemm_fp8", False)
-        o_fp8, o_scale = deepseek_v4_fused_inv_rope_fp8_quant(
+        z = deepseek_v4_grouped_output_projection(
+            self._wo_a_output_projection_plan,
             attn_output,
             positions,
             cos_sin_cache,
-            n_groups=self.num_local_groups,
-            heads_per_group=heads_per_group,
-            nope_dim=self.nope_head_dim,
-            rope_dim=self.qk_rope_head_dim,
-            tma_aligned_scales=self._o_tma_aligned and use_deep_gemm,
+            self.wo_a.weight,
+            self.wo_a.weight_scale_inv,
         )
-        in_dim = self.num_heads * self.head_dim // self.o_groups
-        weight = self.wo_a.weight.view(self.num_local_groups, self.o_lora_rank, in_dim)
-        block_n, block_k = self.wo_a.quant_config.weight_block_size
-        z = torch.empty(
-            (attn_output.shape[0], self.num_local_groups, self.o_lora_rank),
-            device=attn_output.device,
-            dtype=torch.bfloat16,
-        )
-        if use_deep_gemm:
-            recipe = (1, 1, block_n) if self._o_tma_aligned else (1, block_n, block_k)
-            deep_gemm.fp8_einsum(
-                "bhr,hdr->bhd",
-                (o_fp8, o_scale),
-                (weight, self.wo_a.weight_scale_inv),
-                z,
-                recipe=recipe,
-            )
-        else:
-            weight_scale = self.wo_a.weight_scale_inv.view(
-                self.num_local_groups,
-                self.o_lora_rank // block_n,
-                in_dim // block_k,
-            )
-            bmm(
-                o_fp8.transpose(0, 1),
-                weight,
-                A_scales=o_scale.transpose(0, 1),
-                B_scales=weight_scale,
-                out=z.transpose(0, 1),
-                out_dtype=z.dtype,
-                block_size=[block_n, block_k],
-                quant="mxfp8",
-            )
         out, _ = self.wo_b(z.flatten(1))
         return out
 
@@ -4412,6 +4449,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
 
     def post_quant_warmup(self) -> None:
         """Called by the weight loader after all quant process_weights_after_loading."""
+        deepseek_v4_grouped_output_projection_warmup_model(
+            self, max_tokens=_deepseek_v4_mega_moe_max_num_tokens()
+        )
         if deep_gemm is not None:
             deep_gemm.warmup_fp8_gemm_nt_from_model(
                 self, max_tokens=_deepseek_v4_mega_moe_max_num_tokens()

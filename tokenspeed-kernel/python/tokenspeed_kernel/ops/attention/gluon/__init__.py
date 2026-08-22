@@ -199,6 +199,7 @@ if current_platform().is_amd:
             "extra_selected_width": frozenset({1024}),
             "swa_page_size": frozenset({64}),
             "extra_page_size": frozenset({64}),
+            "metadata_dtypes": frozenset({torch.int32}),
         },
         tags={"amd", "gfx950", "paged_cache", "selected_attention"},
     )
@@ -229,6 +230,7 @@ if current_platform().is_amd:
             "cache_layout": frozenset({"dense_workspace"}),
             "support_sink": frozenset({True}),
             "selected_width": frozenset({384, 512, 640, 768, 1024, 1152}),
+            "metadata_dtypes": frozenset({torch.int32}),
         },
         tags={"amd", "gfx950", "selected_attention"},
     )

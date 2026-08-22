@@ -33,6 +33,7 @@ from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platf
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
+    dense_tensor_format,
     format_signature,
     format_signatures,
     tensor_format,
@@ -999,6 +1000,108 @@ def triton_bmm_fp8_blockscale(
         **config,
     )
     return C
+
+
+def _triton_deepseek_v4_grouped_output_projection_weights(
+    *,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    num_groups: int,
+    output_dim: int,
+    input_dim: int,
+    block_size: tuple[int, int],
+    recipe: tuple[int, int, int],
+) -> torch.Tensor:
+    del weight, recipe
+    block_n, block_k = block_size
+    expected_shape = (
+        num_groups * (output_dim // block_n),
+        input_dim // block_k,
+    )
+    if tuple(weight_scale.shape) != expected_shape:
+        raise ValueError(
+            "grouped output projection scale shape mismatch: "
+            f"expected {expected_shape}, got {tuple(weight_scale.shape)}"
+        )
+    return weight_scale
+
+
+@register_kernel(
+    "gemm",
+    "deepseek_v4_grouped_output_projection",
+    name="triton_deepseek_v4_grouped_output_projection",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=frozenset(
+        format_signature(
+            attention=dense_tensor_format(input_dtype),
+            weight=dense_tensor_format(_fp8_dtype),
+        )
+        for input_dtype in (torch.float16, torch.bfloat16)
+    ),
+    traits={},
+    priority=Priority.PERFORMANT + 3,
+    tags={"portability"},
+    weight_preprocessor=_triton_deepseek_v4_grouped_output_projection_weights,
+)
+def triton_deepseek_v4_grouped_output_projection(
+    *,
+    attention: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    num_groups: int,
+    heads_per_group: int,
+    output_dim: int,
+    nope_dim: int,
+    rope_dim: int,
+    block_size: tuple[int, int],
+    tma_aligned_scales: bool,
+    recipe: tuple[int, int, int],
+) -> torch.Tensor:
+    """Run V4's grouped output projection with canonical scales and Triton BMM."""
+    del recipe
+    if tma_aligned_scales:
+        raise ValueError("the portable projection requires canonical scales")
+    from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+        deepseek_v4_fused_inv_rope_fp8_quant,
+    )
+
+    values, scales = deepseek_v4_fused_inv_rope_fp8_quant(
+        attention,
+        positions,
+        cos_sin_cache,
+        n_groups=num_groups,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+        quant_group_size=block_size[1],
+        tma_aligned_scales=False,
+    )
+    input_dim = heads_per_group * attention.shape[-1]
+    grouped_weight = weight.view(num_groups, output_dim, input_dim)
+    block_n, block_k = block_size
+    grouped_scales = weight_scale.view(
+        num_groups,
+        output_dim // block_n,
+        input_dim // block_k,
+    )
+    output = torch.empty(
+        (attention.shape[0], num_groups, output_dim),
+        dtype=torch.bfloat16,
+        device=attention.device,
+    )
+    triton_bmm_fp8_blockscale(
+        values.transpose(0, 1),
+        grouped_weight,
+        scales.transpose(0, 1),
+        grouped_scales,
+        output.dtype,
+        block_size=list(block_size),
+        out=output.transpose(0, 1),
+    )
+    return output
 
 
 @triton.jit

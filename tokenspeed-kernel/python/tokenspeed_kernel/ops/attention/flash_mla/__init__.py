@@ -323,6 +323,7 @@ if (
             "topk_layout": frozenset({"global_slots"}),
             "support_sink": frozenset({True}),
             "has_extra_segment": frozenset({False, True}),
+            "metadata_dtypes": frozenset({torch.int32}),
         },
         priority=Priority.PERFORMANT,
         tags={"nvidia", "paged_cache", "selected_attention"},
@@ -478,6 +479,7 @@ if (
             "head_dim": frozenset({512}),
             "cache_layout": frozenset({"dense_workspace"}),
             "support_sink": frozenset({True}),
+            "metadata_dtypes": frozenset({torch.int32}),
         },
         priority=Priority.PERFORMANT,
     )

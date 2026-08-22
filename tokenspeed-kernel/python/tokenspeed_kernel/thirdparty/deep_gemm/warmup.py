@@ -461,92 +461,15 @@ def warmup_fp8_gemm_nt(
     torch.cuda.synchronize()
 
 
-def warmup_fp8_einsum(
-    bmm_layers: list[tuple[torch.Tensor, torch.Tensor, int, int]],
-    max_tokens: int,
-    device: torch.device,
-) -> None:
-    """Pre-compile ``fp8_einsum("bhr,hdr->bhd")`` for is_bmm output projections.
-
-    The attention output projection (V4 ``wo_a``) runs a per-group *batched* FP8
-    GEMM via ``deep_gemm.fp8_einsum`` -- a distinct ``GemmType::Batched`` path that
-    ``warmup_fp8_gemm_nt`` does NOT cover. Its ``block_m`` grows with the prefill
-    token count M, so serving JITs new (N, K, block_m) tiles inline unless we
-    sweep M offline. The activation operand is laid out exactly as
-    ``deepseek_v4_fused_inv_rope_fp8_quant`` returns it (per-group, transposed,
-    TMA-aligned INT32 UE8M0 scales); only its values are dummy -- the kernel's
-    JIT key is shape-only.
-
-    Args:
-        bmm_layers: ``(weight, weight_scale_inv, n_groups, block_n)`` tuples taken
-            from the loaded model (real weights/scales are reused so no scale
-            layout is guessed). ``weight`` is ``[n_groups * N, K]``; per group the
-            GEMM is ``(M, K) x (N, K) -> (M, N)``.
-        max_tokens: maximum prefill token count to warm up to.
-        device: CUDA device.
-    """
-    try:
-        from tokenspeed_kernel.thirdparty.deep_gemm import fp8_einsum
-    except ImportError:
-        logger.warning("deep_gemm fp8_einsum unavailable, skipping bmm warmup")
-        return
-
-    for weight, weight_scale_inv, n_groups, block_n in bmm_layers:
-        in_dim = weight.shape[1]  # K (== r == per-group quant dim)
-        o_lora_rank = weight.shape[0] // n_groups  # N (per-group output)
-        w = weight.view(n_groups, o_lora_rank, in_dim)
-        recipe = (1, 1, block_n)
-        num_scale_blocks = in_dim // block_n
-
-        # N drives the batched GEMM's block_m heuristic, so sweep M against it.
-        for num_tokens in _warmup_m_values(max_tokens):
-            tma_aligned_t = ((num_tokens + 3) // 4) * 4
-            scale_inner = (num_scale_blocks + 3) // 4  # tma-aligned INT32 scales
-            o_fp8 = torch.zeros(
-                (n_groups, num_tokens, in_dim),
-                dtype=torch.float8_e4m3fn,
-                device=device,
-            ).transpose(0, 1)
-            o_scale = (
-                torch.zeros(
-                    n_groups * scale_inner * tma_aligned_t,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                .as_strided(
-                    (n_groups, num_tokens, scale_inner),
-                    (scale_inner * tma_aligned_t, 1, tma_aligned_t),
-                )
-                .transpose(0, 1)
-            )
-            z = torch.empty(
-                (num_tokens, n_groups, o_lora_rank),
-                dtype=torch.bfloat16,
-                device=device,
-            )
-            fp8_einsum(
-                "bhr,hdr->bhd",
-                (o_fp8, o_scale),
-                (w, weight_scale_inv),
-                z,
-                recipe=recipe,
-            )
-
-    logger.info("Warmed up fp8_einsum for %d bmm shapes", len(bmm_layers))
-    torch.cuda.synchronize()
-
-
 def warmup_fp8_gemm_nt_from_model(
     model: torch.nn.Module,
     max_tokens: int = 8192,
 ) -> None:
     """Scan a model for deep_gemm FP8 linear layers and warm their JIT tiles.
 
-    Collects (N, K) weight shapes from all modules where
-    ``_use_deep_gemm_fp8=True`` (set by ``Fp8LinearMethod.process_weights_after_loading``):
-    plain projections are warmed via ``fp8_gemm_nt`` and is_bmm projections
-    (V4 ``wo_a``) via ``fp8_einsum`` -- both grow ``block_m`` with M, so both must
-    be swept offline or they JIT inline on the first long prefill.
+    Plain projections marked ``_use_deep_gemm_fp8`` are warmed via
+    ``fp8_gemm_nt``. Grouped output projections use their backend-neutral
+    public warmup API separately.
 
     Call after ``quant_method.process_weights_after_loading()`` has run on all
     modules so the ``_use_deep_gemm_fp8`` flag is set.
@@ -554,34 +477,14 @@ def warmup_fp8_gemm_nt_from_model(
     if torch.cuda.get_device_capability()[0] < 10:
         return
     shapes: set[tuple[int, int]] = set()
-    bmm_layers: list[tuple[torch.Tensor, torch.Tensor, int, int]] = []
-    bmm_seen: set[tuple] = set()
     for module in model.modules():
         if not getattr(module, "_use_deep_gemm_fp8", False):
             continue
-        if getattr(module, "is_bmm", False):
-            n_groups = getattr(module, "bmm_batch_size", 0)
-            block_size = getattr(module, "_deep_gemm_block_size", None)
-            if not n_groups or not block_size:
-                continue
-            key = (tuple(module.weight.shape), n_groups, block_size[0])
-            if key in bmm_seen:
-                continue
-            bmm_seen.add(key)
-            bmm_layers.append(
-                (module.weight, module.weight_scale_inv, n_groups, block_size[0])
-            )
-        else:
-            n, k = module.weight.shape
-            shapes.add((n, k))
-    if not shapes and not bmm_layers:
+        n, k = module.weight.shape
+        shapes.add((n, k))
+    if not shapes:
         return
     device = next(model.parameters()).device
     if shapes:
         logger.info("Pre-compiling %d deep_gemm FP8 GEMM shapes...", len(shapes))
         warmup_fp8_gemm_nt(list(shapes), max_tokens, device)
-    if bmm_layers:
-        logger.info(
-            "Pre-compiling %d deep_gemm FP8 einsum (bmm) shapes...", len(bmm_layers)
-        )
-        warmup_fp8_einsum(bmm_layers, max_tokens, device)

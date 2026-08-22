@@ -111,8 +111,8 @@ class DeepseekV4IndexerMetadata:
         default_factory=dict
     )
     decode_plan_refreshed_keys: set[tuple[int, int, int]] = field(default_factory=set)
-    prefill_plan_cache: dict[tuple[int, int, int], DeepseekV4IndexerPrefillMetadata] = (
-        field(default_factory=dict)
+    prefill_plan_cache: dict[tuple[int, ...], DeepseekV4IndexerPrefillMetadata] = field(
+        default_factory=dict
     )
 
 

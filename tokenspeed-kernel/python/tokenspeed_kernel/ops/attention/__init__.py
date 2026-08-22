@@ -3514,6 +3514,7 @@ def deepseek_v4_selected_attention(
         "cache_layout": "dense_workspace",
         "support_sink": True,
         "selected_width": int(indices.shape[-1]),
+        "metadata_dtypes": frozenset({indices.dtype, lens.dtype}),
     }
     kernel = select_kernel(
         "attention",
@@ -3677,6 +3678,17 @@ def deepseek_v4_paged_selected_attention(
         "extra_selected_width": extra_width,
         "swa_page_size": int(swa_page_size),
         "extra_page_size": int(extra_page_size or 0),
+        "metadata_dtypes": frozenset(
+            {
+                swa_slots.dtype,
+                swa_lens.dtype,
+                *(
+                    (extra_slots.dtype, extra_lens.dtype)
+                    if extra_slots is not None and extra_lens is not None
+                    else ()
+                ),
+            }
+        ),
     }
     kernel = select_kernel(
         "attention",
@@ -4079,6 +4091,8 @@ def dsa_decode_topk(
     topk: int,
     softmax_scale: float,
     q_len_per_req: int = 1,
+    topk_layout: str = "global_slots",
+    block_table_base_offsets: torch.Tensor | None = None,
     index_k_cache: torch.Tensor | None = None,
     q_scales: torch.Tensor | None = None,
     seq_lens_2d: torch.Tensor | None = None,
@@ -4107,6 +4121,10 @@ def dsa_decode_topk(
             BF16 queries are already in their compute representation.
         q_len_per_req: Query rows per request (spec-verify next_n). Plain
             decode uses 1, where per-request is equivalent to per-token.
+        topk_layout: Return physical cache slots when ``global_slots`` or
+            absolute logical row offsets when ``logical_offsets``.
+        block_table_base_offsets: Optional compact-table base page per request.
+            Used only with ``topk_layout="logical_offsets"``.
         index_k_cache: Packed or page-planar FP8 index-K cache with scales
             (uint8). Page-planar caches may have a padded outer page stride.
         q_scales: Optional positive FP32 scale per token/head for FP8 queries,
@@ -4127,11 +4145,46 @@ def dsa_decode_topk(
     block_table must be int32.
 
     Returns:
-        Tuple of global KV slots and valid counts; invalid entries are -1.
+        Tuple of selected indices and valid counts. Indices are global KV slots
+        or absolute logical offsets according to ``topk_layout``; invalid
+        entries are -1.
     """
     if out is not None and out.shape != (q.shape[0], int(topk)):
         raise ValueError(
             f"out must have shape {(q.shape[0], int(topk))}, got {tuple(out.shape)}"
+        )
+    if topk_layout not in ("global_slots", "logical_offsets"):
+        raise ValueError(
+            "topk_layout must be 'global_slots' or 'logical_offsets', got "
+            f"{topk_layout!r}"
+        )
+    if q_len_per_req < 1 or q.shape[0] % int(q_len_per_req) != 0:
+        raise ValueError(
+            f"q_len_per_req={q_len_per_req} must divide tokens={q.shape[0]}"
+        )
+    if block_table_base_offsets is not None and topk_layout != "logical_offsets":
+        raise ValueError(
+            "block_table_base_offsets requires topk_layout='logical_offsets'"
+        )
+    kernel_seq_lens = seq_lens
+    if block_table_base_offsets is not None:
+        num_reqs = q.shape[0] // int(q_len_per_req)
+        if (
+            block_table_base_offsets.ndim != 1
+            or block_table_base_offsets.numel() < num_reqs
+            or block_table_base_offsets.device != seq_lens.device
+        ):
+            raise ValueError(
+                "block_table_base_offsets must have one entry per request on "
+                "the same device as seq_lens"
+            )
+        kernel_seq_lens = (
+            (
+                seq_lens.to(torch.int64)
+                - block_table_base_offsets[:num_reqs].to(torch.int64) * int(page_size)
+            )
+            .clamp(0, int(block_table.shape[1]) * int(page_size))
+            .to(torch.int32)
         )
     if lens_out is not None and lens_out.shape != (q.shape[0],):
         raise ValueError(
@@ -4158,6 +4211,9 @@ def dsa_decode_topk(
         "dsa_decode_topk",
         signature,
         traits=traits,
+        features=(
+            frozenset({"logical_offsets"}) if topk_layout == "logical_offsets" else None
+        ),
         solution=solution,
         override=override,
     )
@@ -4183,7 +4239,7 @@ def dsa_decode_topk(
         kernel_kwargs = {
             "q": q,
             "weights": weights,
-            "seq_lens": seq_lens,
+            "seq_lens": kernel_seq_lens,
             "block_table": block_table,
             "page_size": page_size,
             "topk": topk,
@@ -4195,6 +4251,9 @@ def dsa_decode_topk(
             "out": out,
             "lens_out": lens_out,
         }
+        if topk_layout == "logical_offsets":
+            kernel_kwargs["topk_layout"] = topk_layout
+            kernel_kwargs["block_table_base_offsets"] = block_table_base_offsets
         if q_scales is not None:
             kernel_kwargs["q_scales"] = q_scales
         return kernel(**kernel_kwargs)

@@ -157,6 +157,37 @@ def test_dsa_decode_topk_fp8(device: str, require, padded_page_stride: bool) -> 
     _assert_topk_sets_match(topk_slots, topk_lens, expected, expected_lens)
 
 
+def test_dsa_decode_topk_returns_absolute_logical_offsets(device: str, require) -> None:
+    require("attention", "dsa_decode_topk", "triton", torch.bfloat16, "q")
+
+    page_size = 64
+    q = torch.randn((1, 2, 128), device=device, dtype=torch.bfloat16)
+    weights = torch.randn((1, 2), device=device, dtype=torch.float32)
+    packed_index_k, _ = _pack_index_k_cache(
+        torch.randn((3 * page_size, 128), device=device, dtype=torch.bfloat16),
+        page_size,
+    )
+    seq_lens = torch.tensor([4 * page_size + 1], device=device, dtype=torch.int32)
+    block_table = torch.tensor([[2, 0]], device=device, dtype=torch.int32)
+
+    logical, lens = dsa_decode_topk(
+        q,
+        weights,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        topk=512,
+        softmax_scale=128**-0.5,
+        index_k_cache=packed_index_k,
+        topk_layout="logical_offsets",
+        block_table_base_offsets=torch.tensor([3], device=device, dtype=torch.int32),
+    )
+
+    assert lens.item() == 65
+    assert set(logical[0, :65].tolist()) == set(range(3 * page_size, 4 * page_size + 1))
+    assert (logical[0, 65:] == -1).all()
+
+
 @pytest.mark.parametrize("q_len_per_req", [2, 4])
 def test_dsa_decode_topk_fp8_mtp(device: str, q_len_per_req: int, require) -> None:
     """Per-request (MTP) decode: seq_lens/block_table are per-request and the

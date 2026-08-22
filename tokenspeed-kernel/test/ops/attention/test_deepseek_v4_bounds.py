@@ -54,7 +54,10 @@ def _constant_swa_cache(value: float) -> torch.Tensor:
     return cache
 
 
-def test_selected_attention_masks_positive_out_of_range_rows() -> None:
+@pytest.mark.parametrize("metadata_dtype", [torch.int32, torch.int64])
+def test_selected_attention_masks_positive_out_of_range_rows(
+    metadata_dtype: torch.dtype,
+) -> None:
     q = torch.zeros((1, 1, HEAD_DIM), device="cuda", dtype=torch.bfloat16)
     kv = torch.stack(
         (
@@ -62,8 +65,8 @@ def test_selected_attention_masks_positive_out_of_range_rows() -> None:
             torch.full((HEAD_DIM,), 3.0, device="cuda", dtype=torch.bfloat16),
         )
     )
-    indices = torch.tensor([[0, 2, 1]], device="cuda", dtype=torch.int32)
-    lens = torch.tensor([3], device="cuda", dtype=torch.int32)
+    indices = torch.tensor([[0, 2, 1]], device="cuda", dtype=metadata_dtype)
+    lens = torch.tensor([3], device="cuda", dtype=metadata_dtype)
     sink = torch.zeros((1,), device="cuda", dtype=torch.float32)
 
     actual = deepseek_v4_selected_attention(
@@ -84,11 +87,40 @@ def test_selected_attention_masks_positive_out_of_range_rows() -> None:
     )
 
 
-def test_paged_selected_attention_masks_positive_out_of_range_slots() -> None:
+@pytest.mark.parametrize("metadata_dtype", [torch.int32, torch.int64])
+def test_paged_selected_attention_masks_positive_out_of_range_slots(
+    metadata_dtype: torch.dtype,
+) -> None:
     q = torch.zeros((1, 1, HEAD_DIM), device="cuda", dtype=torch.bfloat16)
     cache = _constant_swa_cache(1.0)
-    slots = torch.tensor([[0, PAGE_SIZE]], device="cuda", dtype=torch.int32)
-    lens = torch.tensor([2], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([[0, PAGE_SIZE]], device="cuda", dtype=metadata_dtype)
+    lens = torch.tensor([2], device="cuda", dtype=metadata_dtype)
+    sink = torch.zeros((1,), device="cuda", dtype=torch.float32)
+
+    actual = deepseek_v4_paged_selected_attention(
+        q,
+        cache,
+        slots,
+        lens,
+        PAGE_SIZE,
+        sink,
+        1.0,
+        override="triton_deepseek_v4_paged_selected_attention",
+    )
+
+    torch.testing.assert_close(
+        actual,
+        torch.full_like(actual, 0.5),
+        rtol=2e-3,
+        atol=2e-3,
+    )
+
+
+def test_paged_selected_attention_masks_extreme_negative_int64_slot() -> None:
+    q = torch.zeros((1, 1, HEAD_DIM), device="cuda", dtype=torch.bfloat16)
+    cache = _constant_swa_cache(1.0)
+    slots = torch.tensor([[0, -(1 << 32)]], device="cuda", dtype=torch.int64)
+    lens = torch.tensor([2], device="cuda", dtype=torch.int64)
     sink = torch.zeros((1,), device="cuda", dtype=torch.float32)
 
     actual = deepseek_v4_paged_selected_attention(

@@ -348,7 +348,7 @@ def _deepseek_v4_sparse_attention_kernel(
     max_logit = tl.load(sink_ptr + head_idx).to(tl.float32)
     denominator = tl.full((), 1.0, tl.float32)
     accumulator = tl.zeros((BLOCK_DIM,), tl.float32)
-    valid_len = tl.load(lens_ptr + token_idx).to(tl.int32)
+    valid_len = tl.minimum(tl.maximum(tl.load(lens_ptr + token_idx), 0), TOPK)
     topk_offsets = tl.arange(0, BLOCK_TOPK)
 
     for start in range(0, TOPK, BLOCK_TOPK):
@@ -406,6 +406,7 @@ def _deepseek_v4_sparse_attention_kernel(
         "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
         "cache_layout": frozenset({"dense_workspace"}),
         "support_sink": frozenset({True}),
+        "metadata_dtypes": frozenset({torch.int32, torch.int64}),
     },
     priority=Priority.PORTABLE,
     tags={"portability"},
@@ -549,8 +550,8 @@ def _deepseek_v4_dequantize_selected_cache_segment(
     workspace_width: int,
 ) -> None:
     """Dequantize one cache segment and produce flattened attention metadata."""
-    slots_2d = slots.reshape(slots.shape[0], -1).to(torch.int32).contiguous()
-    lens_1d = lens.reshape(-1).to(torch.int32).contiguous()
+    slots_2d = slots.reshape(slots.shape[0], -1).contiguous()
+    lens_1d = lens.reshape(-1).contiguous()
     if slots_2d.shape[0] != output.shape[0] or lens_1d.shape[0] != output.shape[0]:
         raise ValueError("selected cache segment must have one row per query")
     if output_row_offset + slots_2d.shape[1] > output.shape[1]:
@@ -608,6 +609,7 @@ def _deepseek_v4_dequantize_selected_cache_segment(
         "topk_layout": frozenset({"global_slots"}),
         "support_sink": frozenset({True}),
         "has_extra_segment": frozenset({False, True}),
+        "metadata_dtypes": frozenset({torch.int32, torch.int64}),
     },
     priority=Priority.PORTABLE,
     tags={"portability", "paged_cache", "selected_attention"},
@@ -2180,8 +2182,12 @@ def _deepseek_v4_combine_topk_swa_indices_kernel(
     query_start_loc_ptr,
     seq_lens_ptr,
     gather_lens_ptr,
+    block_table_base_offsets_ptr,
     workspace_width,
     compressed_base,
+    compressed_block_size,
+    compressed_table_capacity,
+    has_block_table_base_offsets: tl.constexpr,
     topk: tl.constexpr,
     compress_ratio: tl.constexpr,
     window_size: tl.constexpr,
@@ -2203,7 +2209,19 @@ def _deepseek_v4_combine_topk_swa_indices_kernel(
     for token_idx in range(query_start + worker_id, query_end, num_workers):
         token_idx_in_query = token_idx - query_start
         pos = start_pos + token_idx_in_query
-        topk_len = tl.minimum((pos + 1) // compress_ratio, topk)
+        base_row = tl.zeros((), dtype=tl.int32)
+        if has_block_table_base_offsets:
+            base_row = (
+                tl.load(block_table_base_offsets_ptr + batch_idx).to(tl.int32)
+                * compressed_block_size
+            )
+        live_compressed_len = tl.maximum(
+            tl.minimum(
+                (pos + 1) // compress_ratio - base_row, compressed_table_capacity
+            ),
+            0,
+        )
+        topk_len = tl.minimum(live_compressed_len, topk)
         swa_len = tl.minimum(pos + 1, window_size)
 
         topk_offsets = tl.arange(0, padded_topk)
@@ -2213,10 +2231,11 @@ def _deepseek_v4_combine_topk_swa_indices_kernel(
             mask=topk_mask,
             other=-1,
         )
+        valid_topk = topk_mask & (topk_values >= 0)
         tl.store(
             combined_indices_ptr + token_idx * combined_indices_stride + topk_offsets,
             topk_values + workspace_width * batch_idx,
-            mask=topk_mask,
+            mask=valid_topk,
         )
 
         swa_offsets = tl.arange(0, window_size)
@@ -2249,6 +2268,9 @@ def deepseek_v4_combine_topk_swa_indices(
     topk: int,
     workspace_width: int,
     compressed_base: int,
+    block_table_base_offsets: torch.Tensor | None = None,
+    compressed_block_size: int = 1,
+    compressed_table_capacity: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build FlashMLA sparse prefill indices from compressed prefix and SWA."""
 
@@ -2270,6 +2292,10 @@ def deepseek_v4_combine_topk_swa_indices(
     )
     if num_tokens == 0 or num_reqs == 0:
         return combined_indices, combined_lens
+    if compressed_block_size <= 0:
+        raise ValueError("compressed_block_size must be positive")
+    if compressed_table_capacity is None:
+        compressed_table_capacity = compressed_base
 
     _deepseek_v4_combine_topk_swa_indices_kernel[(num_reqs, 128)](
         combined_indices,
@@ -2280,8 +2306,16 @@ def deepseek_v4_combine_topk_swa_indices(
         query_start_loc.to(torch.int32),
         seq_lens.to(torch.int32),
         gather_lens.to(torch.int32),
+        (
+            block_table_base_offsets.to(torch.int32)
+            if block_table_base_offsets is not None
+            else seq_lens
+        ),
         workspace_width,
         compressed_base,
+        compressed_block_size,
+        compressed_table_capacity,
+        has_block_table_base_offsets=block_table_base_offsets is not None,
         topk=topk,
         compress_ratio=compress_ratio,
         window_size=window_size,
@@ -2295,17 +2329,32 @@ def _deepseek_v4_build_dense_prefill_local_compressed_indices_kernel(
     out_ptr,
     out_stride,
     positions_ptr,
+    token_to_req_indices_ptr,
+    block_table_base_offsets_ptr,
+    compressed_block_size,
+    compressed_table_capacity,
+    has_block_table_base_offsets: tl.constexpr,
     width: tl.constexpr,
     compress_ratio: tl.constexpr,
     block: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     position = tl.load(positions_ptr + token_idx).to(tl.int64)
-    compressed_len = tl.minimum((position + 1) // compress_ratio, width)
+    base_row = tl.zeros((), dtype=tl.int64)
+    if has_block_table_base_offsets:
+        req_idx = tl.load(token_to_req_indices_ptr + token_idx).to(tl.int64)
+        base_row = (
+            tl.load(block_table_base_offsets_ptr + req_idx).to(tl.int64)
+            * compressed_block_size
+        )
+    compressed_len = tl.minimum(
+        tl.maximum((position + 1) // compress_ratio - base_row, 0),
+        tl.minimum(width, compressed_table_capacity),
+    )
     for start in range(0, width, block):
         offsets = start + tl.arange(0, block)
         mask = offsets < width
-        values = tl.where(offsets < compressed_len, offsets, -1)
+        values = tl.where(offsets < compressed_len, base_row + offsets, -1)
         tl.store(out_ptr + token_idx * out_stride + offsets, values, mask=mask)
 
 
@@ -2315,6 +2364,10 @@ def deepseek_v4_build_dense_prefill_local_compressed_indices(
     compress_ratio: int,
     width: int,
     out: torch.Tensor,
+    token_to_req_indices: torch.Tensor | None = None,
+    block_table_base_offsets: torch.Tensor | None = None,
+    compressed_block_size: int = 1,
+    compressed_table_capacity: int | None = None,
 ) -> torch.Tensor:
     """Build C128A/HCA prefill-local compressed prefix indices into `out`."""
 
@@ -2325,6 +2378,16 @@ def deepseek_v4_build_dense_prefill_local_compressed_indices(
         raise ValueError(
             "dense prefill compressed indices output must be contiguous in the last dim"
         )
+    if block_table_base_offsets is not None and token_to_req_indices is None:
+        raise ValueError(
+            "token_to_req_indices is required with block_table_base_offsets"
+        )
+    if compressed_table_capacity is None:
+        compressed_table_capacity = width
+    metadata_arg = positions if token_to_req_indices is None else token_to_req_indices
+    base_offsets_arg = (
+        positions if block_table_base_offsets is None else block_table_base_offsets
+    )
     if positions.is_cuda:
         _deepseek_v4_build_dense_prefill_local_compressed_indices_kernel[
             (positions.numel(),)
@@ -2332,19 +2395,33 @@ def deepseek_v4_build_dense_prefill_local_compressed_indices(
             result,
             result.stride(0),
             positions,
+            metadata_arg,
+            base_offsets_arg,
+            compressed_block_size,
+            compressed_table_capacity,
+            has_block_table_base_offsets=block_table_base_offsets is not None,
             width=width,
             compress_ratio=compress_ratio,
             block=1024,
         )
         return result
 
-    compressed_lens = torch.div(
+    compressed_ends = torch.div(
         positions.to(torch.int64) + 1,
         compress_ratio,
         rounding_mode="floor",
-    ).clamp(0, width)
+    )
+    if block_table_base_offsets is None:
+        base_rows = torch.zeros_like(compressed_ends)
+    else:
+        base_rows = block_table_base_offsets.to(torch.int64)[
+            token_to_req_indices.to(torch.int64)
+        ] * int(compressed_block_size)
+    compressed_lens = (compressed_ends - base_rows).clamp(
+        0, min(width, int(compressed_table_capacity))
+    )
     offsets = torch.arange(width, dtype=torch.int64, device=positions.device)
-    local = offsets[None, :].expand(positions.numel(), -1)
+    local = base_rows[:, None] + offsets[None, :]
     valid = offsets[None, :] < compressed_lens[:, None]
     result.copy_(torch.where(valid, local, torch.full_like(local, -1)).to(torch.int32))
     return result
@@ -2759,9 +2836,8 @@ def deepseek_v4_indexer_decode_metadata_compute(
 
 
 # Fused inverse-RoPE + block-scaled FP8 quant for the V4 attention output
-# projection. Output scale is pre-transformed (MN-major TMA-aligned;
-# INT32-packed UE8M0 on SM100, FP32 on SM90) so deep_gemm.fp8_einsum can
-# consume it without re-transforming.
+# projection. The caller selects either canonical FP32 scales for portable BMM
+# and Hopper DeepGEMM or packed, TMA-aligned UE8M0 scales for Blackwell.
 @triton.jit(do_not_specialize=["num_tokens"])
 def _deepseek_v4_fused_inv_rope_fp8_quant_per_head(
     o_ptr,
@@ -2885,8 +2961,8 @@ def deepseek_v4_fused_inv_rope_fp8_quant(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Inverse RoPE + grouped block-scaled FP8 quant of the attention output.
 
-    Returns (o_fp8 [T, G, D] float8_e4m3fn, o_scale [T, G, scale_inner])
-    pre-laid-out for ``deep_gemm.fp8_einsum("bhr,hdr->bhd")``.
+    Returns ``(o_fp8, o_scale)`` in the scale layout requested by the selected
+    grouped output projection implementation.
     """
     num_tokens, num_heads, head_dim = o.shape
     d = heads_per_group * head_dim

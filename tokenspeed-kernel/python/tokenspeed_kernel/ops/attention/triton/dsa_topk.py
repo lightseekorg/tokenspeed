@@ -41,11 +41,14 @@ def _local_topk_to_global_slots_kernel(
     local_topk_offsets_stride,
     seq_lens_ptr,
     block_table_ptr,
+    block_table_base_offsets_ptr,
     block_table_stride,
     block_table_cols: tl.constexpr,
     block_size: tl.constexpr,
     topk: tl.constexpr,
     has_seq_lens: tl.constexpr,
+    has_block_table_base_offsets: tl.constexpr,
+    return_logical_offsets: tl.constexpr,
     q_len_per_req: tl.constexpr,
     block: tl.constexpr,
 ):
@@ -70,12 +73,18 @@ def _local_topk_to_global_slots_kernel(
         block_idx = local_idx // block_size
         block_offset = local_idx % block_size
         valid = valid & (block_idx >= 0) & (block_idx < block_table_cols)
-        page = tl.load(
-            block_table_ptr + req_idx * block_table_stride + block_idx,
-            mask=mask & valid,
-            other=0,
-        )
-        slot = page * block_size + block_offset
+        if return_logical_offsets:
+            base_page = tl.zeros((), dtype=tl.int64)
+            if has_block_table_base_offsets:
+                base_page = tl.load(block_table_base_offsets_ptr + req_idx).to(tl.int64)
+            slot = local_idx.to(tl.int64) + base_page * block_size
+        else:
+            page = tl.load(
+                block_table_ptr + req_idx * block_table_stride + block_idx,
+                mask=mask & valid,
+                other=0,
+            )
+            slot = page * block_size + block_offset
         tl.store(
             global_topk_slots_ptr + token_idx * global_topk_slots_stride + offsets,
             tl.where(valid, slot, -1),
@@ -93,6 +102,8 @@ def local_topk_to_global_slots(
     block_size: int,
     seq_lens: torch.Tensor | None = None,
     q_len_per_req: int = 1,
+    topk_layout: str = "global_slots",
+    block_table_base_offsets: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -112,6 +123,11 @@ def local_topk_to_global_slots(
     if block_table.shape[1] == 0:
         raise ValueError("block_table must have at least one page column")
     num_tokens, topk = local_topk_offsets.shape
+    if topk_layout not in ("global_slots", "logical_offsets"):
+        raise ValueError(
+            "topk_layout must be 'global_slots' or 'logical_offsets', got "
+            f"{topk_layout!r}"
+        )
     q_len_per_req = int(q_len_per_req)
     if q_len_per_req < 1 or num_tokens % q_len_per_req != 0:
         raise ValueError(
@@ -129,6 +145,13 @@ def local_topk_to_global_slots(
         raise ValueError(
             "seq_lens must have at least one entry per request: "
             f"lens={seq_lens.numel()}, reqs={num_reqs}"
+        )
+    if block_table_base_offsets is not None and (
+        block_table_base_offsets.dim() != 1
+        or block_table_base_offsets.numel() < num_reqs
+    ):
+        raise ValueError(
+            "block_table_base_offsets must have at least one entry per request"
         )
 
     if out is None:
@@ -174,7 +197,16 @@ def local_topk_to_global_slots(
     block_table = block_table.to(device=local_topk_offsets.device, dtype=torch.int32)
     if seq_lens is not None:
         seq_lens = seq_lens.to(device=local_topk_offsets.device, dtype=torch.int32)
+    if block_table_base_offsets is not None:
+        block_table_base_offsets = block_table_base_offsets.to(
+            device=local_topk_offsets.device, dtype=torch.int32
+        )
     seq_lens_arg = block_table[:, 0] if seq_lens is None else seq_lens
+    base_offsets_arg = (
+        block_table[:, 0]
+        if block_table_base_offsets is None
+        else block_table_base_offsets
+    )
     _local_topk_to_global_slots_kernel[(num_tokens,)](
         global_slots,
         global_slots.stride(0),
@@ -183,11 +215,14 @@ def local_topk_to_global_slots(
         local_topk_offsets.stride(0),
         seq_lens_arg,
         block_table,
+        base_offsets_arg,
         block_table.stride(0),
         block_table.shape[1],
         block_size=int(block_size),
         topk=topk,
         has_seq_lens=seq_lens is not None,
+        has_block_table_base_offsets=block_table_base_offsets is not None,
+        return_logical_offsets=topk_layout == "logical_offsets",
         q_len_per_req=q_len_per_req,
         block=1024,
     )
@@ -935,6 +970,8 @@ def dsa_decode_topk_fp8(
     topk: int,
     softmax_scale: float,
     q_len_per_req: int = 1,
+    topk_layout: str = "global_slots",
+    block_table_base_offsets: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1017,6 +1054,8 @@ def dsa_decode_topk_fp8(
         block_size=int(page_size),
         seq_lens=seq_lens,
         q_len_per_req=q_len_per_req,
+        topk_layout=topk_layout,
+        block_table_base_offsets=block_table_base_offsets,
         out=out,
         lens_out=lens_out,
     )
@@ -1169,6 +1208,7 @@ def triton_dsa_plan(
         "index_k_format": frozenset({"fp8_scaled"}),
         "index_k_layout": frozenset({"packed", "page_planar"}),
     },
+    features={"logical_offsets"},
     priority=Priority.PORTABLE,
     tags={"portability"},
 )
@@ -1182,6 +1222,8 @@ def triton_dsa_decode_topk_fp8(
     topk: int,
     softmax_scale: float,
     q_len_per_req: int = 1,
+    topk_layout: str = "global_slots",
+    block_table_base_offsets: torch.Tensor | None = None,
     index_k_cache: torch.Tensor | None = None,
     seq_lens_2d: torch.Tensor | None = None,
     plan: object | None = None,
@@ -1202,6 +1244,8 @@ def triton_dsa_decode_topk_fp8(
         topk=topk,
         softmax_scale=softmax_scale,
         q_len_per_req=q_len_per_req,
+        topk_layout=topk_layout,
+        block_table_base_offsets=block_table_base_offsets,
         out=out,
         lens_out=lens_out,
     )

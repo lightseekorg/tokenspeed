@@ -76,6 +76,11 @@ from tokenspeed_kernel.ops.attention import (
 )
 from tokenspeed_kernel.ops.gemm import (
     bmm,
+    deepseek_v4_grouped_output_projection,
+    deepseek_v4_grouped_output_projection_plan,
+    deepseek_v4_grouped_output_projection_process_weights,
+    deepseek_v4_grouped_output_projection_warmup,
+    deepseek_v4_grouped_output_projection_warmup_model,
     deepseek_v4_linear_fp32,
     kimi3_latent_projection,
     kimi3_latent_projection_add3,
@@ -113,6 +118,11 @@ __all__ = [
     "NoKernelFoundError",
     # gemm
     "bmm",
+    "deepseek_v4_grouped_output_projection",
+    "deepseek_v4_grouped_output_projection_plan",
+    "deepseek_v4_grouped_output_projection_process_weights",
+    "deepseek_v4_grouped_output_projection_warmup",
+    "deepseek_v4_grouped_output_projection_warmup_model",
     "deepseek_v4_linear_fp32",
     "kimi3_latent_projection",
     "kimi3_mla_qkv_gate_projection",

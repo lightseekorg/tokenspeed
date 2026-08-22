@@ -5527,29 +5527,138 @@ class TestDeepseekV4Config(unittest.TestCase):
                 compress_ratio=4,
             )
 
-    def test_portable_indexer_preserves_compressed_page_table_base_offsets(self):
-        full_table = torch.zeros((1, 4), dtype=torch.int32)
-        compressed_table = torch.ones((1, 2), dtype=torch.int32)
-        base_offsets = torch.tensor([3], dtype=torch.int32)
-        metadata = SimpleNamespace(
-            cache=SimpleNamespace(
-                page_table=full_table,
-                compressed_page_table=lambda _ratio, _block_size: compressed_table,
-                block_table_base_offsets={
-                    "v4.c4a.compressed_kv": base_offsets,
-                },
+    def test_portable_indexer_consumes_compact_page_tables_once(self):
+        compact_table = torch.tensor([[7], [8]], dtype=torch.int32)
+        base_offsets = torch.tensor([3, 1], dtype=torch.int32)
+        slots, row_starts, row_ends, row_lens, _ = (
+            _deepseek_v4_indexer_prefill_request_gather_plan(
+                seq_lens_cpu=torch.tensor([64, 40], dtype=torch.int32),
+                query_lens_cpu=torch.tensor([4, 4], dtype=torch.int32),
+                block_table=compact_table,
+                block_table_base_offsets=base_offsets,
+                cache_block_size=4,
+                compress_ratio=4,
+                req_start=0,
+                req_end=2,
+                query_start=0,
+                query_end=8,
             )
         )
-        indexer = SimpleNamespace(compress_ratio=4)
+        self.assertTrue(torch.equal(slots[12:16], torch.tensor([28, 29, 30, 31])))
+        self.assertTrue(torch.equal(slots[20:24], torch.tensor([32, 33, 34, 35])))
+        self.assertTrue(
+            torch.equal(row_starts, torch.tensor([12, 12, 12, 12, 20, 20, 20, 20]))
+        )
+        self.assertTrue(
+            torch.equal(row_ends, torch.tensor([15, 15, 15, 16, 24, 24, 24, 24]))
+        )
+        self.assertTrue(torch.equal(row_lens, torch.tensor([3, 3, 3, 4, 4, 4, 4, 4])))
 
-        table, offsets = _deepseek_v4_indexer_page_table(
-            metadata,
-            indexer.compress_ratio,
-            indexer_block_size=64,
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                prefix_granularity=4,
+                kernel_page_size=4,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=512,
+                context_len=64,
+            )
+        )
+        backend.init_forward_metadata(
+            bs=2,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            seq_lens=torch.tensor([64, 40], dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            page_table=torch.zeros((2, 1), dtype=torch.int32),
+            block_tables=_v4_compressed_kv_tables(c4=compact_table),
+            block_table_base_offsets={"v4.c4a.compressed_kv": base_offsets},
+        )
+        indices, lens = backend._decode_compressed_attention_indices_and_lens(
+            torch.tensor([63, 39], dtype=torch.int64),
+            compress_ratio=4,
+            block_size=4,
+            topk_indices=torch.tensor([[12, 15, -1], [4, 7, -1]], dtype=torch.int32),
+        )
+        self.assertTrue(torch.equal(lens, torch.tensor([2, 2], dtype=torch.int32)))
+        self.assertTrue(
+            torch.equal(
+                indices[:, 0, :3],
+                torch.tensor([[28, 31, -1], [32, 35, -1]], dtype=torch.int32),
+            )
         )
 
-        self.assertIs(table, compressed_table)
-        self.assertIs(offsets, base_offsets)
+    def test_portable_indexer_returns_absolute_rows_for_compact_tables(self):
+        self_obj = SimpleNamespace(topk_tokens=3, softmax_scale=1.0)
+        prefill_metadata = SimpleNamespace(
+            chunks=(
+                SimpleNamespace(
+                    token_start=0,
+                    token_end=1,
+                    gather_row_start=0,
+                    gather_row_end=1,
+                    slot_start=0,
+                    slot_end=16,
+                ),
+            ),
+            slots=torch.arange(16, dtype=torch.int64),
+            cu_seqlen_k_start=torch.tensor([12], dtype=torch.int32),
+            cu_seqlen_k_end=torch.tensor([16], dtype=torch.int32),
+        )
+        decode_plan = SimpleNamespace(
+            context_lens=torch.tensor([[4]], dtype=torch.int32),
+            page_table=torch.tensor([[8]], dtype=torch.int32),
+        )
+
+        def fake_prefill(*args, **kwargs):
+            selected = torch.tensor([[12, 15, -1]], dtype=torch.int32)
+            kwargs["out"].copy_(selected)
+            return kwargs["out"], torch.tensor([2], dtype=torch.int32)
+
+        def fake_decode(*args, **kwargs):
+            self.assertEqual(kwargs["topk_layout"], "logical_offsets")
+            self.assertTrue(
+                torch.equal(
+                    kwargs["block_table_base_offsets"],
+                    torch.tensor([1], dtype=torch.int32),
+                )
+            )
+            self.assertTrue(torch.equal(args[2], torch.tensor([8], dtype=torch.int32)))
+            selected = torch.tensor([[4, 7, -1]], dtype=torch.int32)
+            kwargs["out"].copy_(selected)
+            return kwargs["out"], torch.tensor([2], dtype=torch.int32)
+
+        with (
+            patch.object(
+                deepseek_v4_model, "dsa_prefill_topk", side_effect=fake_prefill
+            ),
+            patch.object(deepseek_v4_model, "dsa_decode_topk", side_effect=fake_decode),
+        ):
+            actual = DeepseekV4Indexer._forward_sparse_indexer_portable(
+                self_obj,
+                query=torch.empty((2, 1, 128), dtype=torch.bfloat16),
+                weights=torch.empty((2, 1), dtype=torch.float32),
+                indexer_cache=torch.empty((1, 4 * 132), dtype=torch.uint8),
+                indexer_block_size=4,
+                prefill_metadata=prefill_metadata,
+                decode_plan=decode_plan,
+                num_prefill_tokens=1,
+                num_decode_tokens=1,
+                token_to_req_indices=torch.tensor([0, 1], dtype=torch.int32),
+                block_table_base_offsets=torch.tensor([3, 1], dtype=torch.int32),
+                topk_out=torch.empty((2, 3), dtype=torch.int32),
+            )
+
+        self.assertTrue(
+            torch.equal(
+                actual,
+                torch.tensor([[12, 15, -1], [4, 7, -1]], dtype=torch.int32),
+            )
+        )
 
     def test_deepseek_v4_sparse_indexer_custom_op_registered(self):
         self.assertTrue(

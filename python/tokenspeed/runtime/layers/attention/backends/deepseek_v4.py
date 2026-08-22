@@ -1343,6 +1343,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         *,
         compress_ratio: int,
         width: int,
+        token_to_req_indices: torch.Tensor | None = None,
+        block_table_base_offsets: torch.Tensor | None = None,
+        compressed_block_size: int = 1,
+        compressed_table_capacity: int | None = None,
     ) -> torch.Tensor:
         shape = (positions.numel(), width)
         if (
@@ -1362,6 +1366,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             compress_ratio=compress_ratio,
             width=width,
             out=out,
+            token_to_req_indices=token_to_req_indices,
+            block_table_base_offsets=block_table_base_offsets,
+            compressed_block_size=compressed_block_size,
+            compressed_table_capacity=compressed_table_capacity,
         )
 
     def forward_deepseek_v4_decode(
@@ -1604,12 +1612,21 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compress_ratio,
                 compressed_block_size,
             )
+            compressed_base_offsets = (
+                _compressed_block_table_base_offsets(metadata, compress_ratio)
+                if compressed_page_table is not cache_metadata.page_table
+                else None
+            )
+            compressed_table_capacity = (
+                compressed_page_table.shape[1] * compressed_block_size
+            )
             deepseek_v4_dequantize_and_gather_k_cache(
                 out=kv_workspace,
                 cache_2d=compressed_cache,
                 seq_lens=compressed_lens,
                 gather_lens=None,
                 block_table=compressed_page_table,
+                block_table_base_offsets=compressed_base_offsets,
                 block_size=compressed_block_size,
                 offset=0,
                 max_gather_len=compressed_base,
@@ -1635,6 +1652,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 topk=topk_indices.shape[-1],
                 workspace_width=workspace_width,
                 compressed_base=compressed_base,
+                block_table_base_offsets=compressed_base_offsets,
+                compressed_block_size=compressed_block_size,
+                compressed_table_capacity=compressed_table_capacity,
             )
             return kv_workspace, indices, lens
 
@@ -1654,12 +1674,21 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compress_ratio,
                 compressed_block_size,
             )
+            compressed_base_offsets = (
+                _compressed_block_table_base_offsets(metadata, compress_ratio)
+                if compressed_page_table is not cache_metadata.page_table
+                else None
+            )
+            compressed_table_capacity = (
+                compressed_page_table.shape[1] * compressed_block_size
+            )
             deepseek_v4_dequantize_and_gather_k_cache(
                 out=kv_workspace,
                 cache_2d=compressed_cache,
                 seq_lens=compressed_lens,
                 gather_lens=None,
                 block_table=compressed_page_table,
+                block_table_base_offsets=compressed_base_offsets,
                 block_size=compressed_block_size,
                 offset=0,
                 max_gather_len=compressed_base,
@@ -1680,6 +1709,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 positions,
                 compress_ratio=compress_ratio,
                 width=self._dense_compressed_indices_width(compress_ratio),
+                token_to_req_indices=metadata.token_to_req_indices[: positions.numel()],
+                block_table_base_offsets=compressed_base_offsets,
+                compressed_block_size=compressed_block_size,
+                compressed_table_capacity=compressed_table_capacity,
             )
             indices, lens = deepseek_v4_combine_topk_swa_indices(
                 topk_indices=dense_compressed_indices,
@@ -1691,6 +1724,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 topk=dense_compressed_indices.shape[-1],
                 workspace_width=workspace_width,
                 compressed_base=compressed_base,
+                block_table_base_offsets=compressed_base_offsets,
+                compressed_block_size=compressed_block_size,
+                compressed_table_capacity=compressed_table_capacity,
             )
             return kv_workspace, indices, lens
 

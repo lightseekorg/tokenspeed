@@ -1737,6 +1737,35 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             actual_lens.cpu(), expected_lens.cpu(), atol=0, rtol=0
         )
 
+    def test_sparse_prefill_combine_topk_swa_indices_respects_compact_base(self):
+        device = torch.device("cuda")
+        topk_indices = torch.tensor([[4, 5, -1, -1]], device=device, dtype=torch.int32)
+
+        actual, actual_lens = deepseek_v4_combine_topk_swa_indices(
+            topk_indices=topk_indices,
+            query_start_loc=torch.tensor([0, 1], device=device, dtype=torch.int32),
+            seq_lens=torch.tensor([24], device=device, dtype=torch.int32),
+            gather_lens=torch.tensor([4], device=device, dtype=torch.int32),
+            window_size=4,
+            compress_ratio=4,
+            topk=4,
+            workspace_width=12,
+            compressed_base=8,
+            block_table_base_offsets=torch.tensor(
+                [2], device=device, dtype=torch.int32
+            ),
+            compressed_block_size=2,
+            compressed_table_capacity=2,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                actual[0, :6].cpu(),
+                torch.tensor([4, 5, 8, 9, 10, 11], dtype=torch.int32),
+            )
+        )
+        self.assertEqual(actual_lens.item(), 6)
+
     def test_sparse_prefill_combine_dense_swa_indices_matches_reference(self):
         device = torch.device("cuda")
         positions = torch.tensor([4, 5, 5, 6, 7], device=device, dtype=torch.int64)

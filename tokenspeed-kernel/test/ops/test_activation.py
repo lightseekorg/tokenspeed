@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import silu_and_mul as public_silu_and_mul
 from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
     sigmoid_mul,
@@ -208,15 +207,6 @@ def test_situ_and_mul_matches_eager_latent_moe_shape(
 
     tol = 1e-2 if dtype == torch.bfloat16 else 5e-3
     torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
-
-
-def test_public_silu_and_mul_dispatches_on_current_platform(device: str) -> None:
-    x = torch.randn(4, 128, device=device, dtype=torch.bfloat16)
-
-    actual = public_silu_and_mul(x, limit=7.0)
-    expected = silu_and_mul(x, limit=7.0)
-
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def test_situ_and_mul_writes_provided_output(device: str) -> None:

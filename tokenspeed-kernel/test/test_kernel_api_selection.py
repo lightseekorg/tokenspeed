@@ -1235,6 +1235,19 @@ def _attention_deepseek_v4_selected_short() -> object:
     return _attention_deepseek_v4_selected(128)
 
 
+def _attention_deepseek_v4_selected_i64() -> object:
+    q = torch.empty((1, 16, 512), dtype=torch.bfloat16)
+    kv = torch.empty((640, 512), dtype=torch.bfloat16)
+    return tokenspeed_kernel.deepseek_v4_selected_attention(
+        q,
+        kv,
+        torch.arange(640, dtype=torch.int32).unsqueeze(0),
+        torch.tensor([640], dtype=torch.int64),
+        torch.empty((16,), dtype=torch.float32),
+        512**-0.5,
+    )
+
+
 def _attention_deepseek_v4_paged_selected(with_extra: bool = True) -> object:
     q = torch.empty((2, 16, 512), dtype=torch.bfloat16)
     swa_cache = torch.empty((2, 64 * 584), dtype=torch.uint8)
@@ -1286,6 +1299,23 @@ def _attention_deepseek_v4_paged_selected_pro_tp8() -> object:
         extra_kv_cache=extra_cache,
         extra_slots=extra_slots,
         extra_lens=extra_lens,
+        extra_page_size=64,
+    )
+
+
+def _attention_deepseek_v4_paged_selected_pro_tp8_i64() -> object:
+    tokens = 6
+    return tokenspeed_kernel.deepseek_v4_paged_selected_attention(
+        q=torch.empty((tokens, 16, 512), dtype=torch.bfloat16),
+        swa_kv_cache=torch.empty((2, 64 * 584), dtype=torch.uint8),
+        swa_slots=torch.empty((tokens, 128), dtype=torch.int32),
+        swa_lens=torch.empty((tokens,), dtype=torch.int32),
+        swa_page_size=64,
+        attn_sink=torch.empty((16,), dtype=torch.float32),
+        softmax_scale=512**-0.5,
+        extra_kv_cache=torch.empty((16, 64 * 584), dtype=torch.uint8),
+        extra_slots=torch.empty((tokens, 1024), dtype=torch.int32),
+        extra_lens=torch.empty((tokens,), dtype=torch.int64),
         extra_page_size=64,
     )
 
@@ -1538,6 +1568,22 @@ def _attention_dsa_decode_topk(*, weights_dtype: torch.dtype = torch.float32) ->
 
 def _attention_dsa_decode_topk_bf16_weights() -> object:
     return _attention_dsa_decode_topk(weights_dtype=torch.bfloat16)
+
+
+def _attention_dsa_decode_topk_logical() -> object:
+    q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
+    return tokenspeed_kernel.dsa_decode_topk(
+        q,
+        torch.empty((2, 2), dtype=torch.float32),
+        torch.tensor([64, 64], dtype=torch.int32),
+        torch.zeros((2, 1), dtype=torch.int32),
+        page_size=64,
+        topk=512,
+        softmax_scale=1.0,
+        index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
+        topk_layout="logical_offsets",
+        block_table_base_offsets=torch.tensor([3, 5], dtype=torch.int32),
+    )
 
 
 def _attention_dsa_prefill_topk(
@@ -2925,6 +2971,15 @@ _CASES = [
         "attention",
         "deepseek_v4_paged_selected_attention",
         "triton_deepseek_v4_paged_selected_attention",
+        _attention_deepseek_v4_paged_selected_pro_tp8_i64,
+        id_suffix="pro-tp8-int64-metadata",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "deepseek_v4_paged_selected_attention",
+        "triton_deepseek_v4_paged_selected_attention",
         _attention_deepseek_v4_paged_selected,
         id_suffix="extra-segment",
     ),
@@ -2945,6 +3000,15 @@ _CASES = [
         "gluon_deepseek_v4_selected_attention_gfx950",
         _attention_deepseek_v4_selected,
         id_suffix="width640",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "deepseek_v4_selected_attention",
+        "triton_deepseek_v4_selected_attention",
+        _attention_deepseek_v4_selected_i64,
+        id_suffix="width640-int64-metadata",
     ),
     _case(
         _is_cdna4,
@@ -3214,6 +3278,15 @@ _CASES = [
         "gluon_dsa_decode_topk_fp8_gfx950",
         _attention_dsa_decode_topk_bf16_weights,
         id_suffix="bf16-weights",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_decode_topk",
+        "triton_dsa_decode_topk_fp8",
+        _attention_dsa_decode_topk_logical,
+        id_suffix="logical-offsets",
     ),
     _case(
         _is_cdna4,
