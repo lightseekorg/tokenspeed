@@ -144,13 +144,25 @@ class MsgpackSendSocket:
         self._socket = socket
         self._engine_index = engine_index
         self._encoder = MsgpackEncoder()
+        # Late-bound scheduler-load sampler, () -> (num_running, num_waiting,
+        # kv_active_pages, kv_total_pages). The socket is created during the
+        # startup handshake, before the scheduler exists, so the event loop
+        # binds this once the scheduler is up. None means "no snapshot":
+        # the slim batch's load fields stay at their 0 defaults.
+        self.load_fn = None
 
     def send_pyobj(self, obj) -> None:
         if isinstance(obj, BatchTokenIDOut):
             # The PULL side carries no routing identity, so the batch itself
             # names its producing rank; the frontend attributes per-rank
-            # outputs and load by this index under DP.
-            slim = BatchTokenIDOutSlim.from_full(obj, engine_index=self._engine_index)
+            # outputs and load by this index under DP. The load snapshot rides
+            # every batch because this wire has no control-reply channel for
+            # the GetLoad poll (dropped below).
+            slim = BatchTokenIDOutSlim.from_full(
+                obj,
+                engine_index=self._engine_index,
+                load=self.load_fn() if self.load_fn is not None else None,
+            )
             self._socket.send_multipart(self._encoder.encode(slim), copy=False)
         else:
             logger.warning(

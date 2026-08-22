@@ -712,10 +712,26 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # DP the batch itself names its rank. Appended field: defaults to 0 so
     # older peers on either side stay compatible.
     engine_index: int = 0
+    # Piggybacked scheduler-load snapshot from the producing rank, sampled at
+    # send time. The pickle-mode GetLoad poll has no msgpack transport (control
+    # replies are dropped on this wire), so the output batch is the only
+    # in-band load channel; an external frontend uses these for least-loaded
+    # routing across a DP group. Same sources as the per-iteration Prometheus
+    # snapshot: running = resident request states, waiting = scheduler queue
+    # depth, and the KV ratio's numerator/denominator carried as exact page
+    # counts. Appended fields: all default to 0 so older peers stay
+    # compatible; a 0 kv_total_pages means "no snapshot" to the frontend.
+    num_running: int = 0
+    num_waiting: int = 0
+    kv_active_pages: int = 0
+    kv_total_pages: int = 0
 
     @classmethod
     def from_full(
-        cls, out: BatchTokenIDOut, engine_index: int = 0
+        cls,
+        out: BatchTokenIDOut,
+        engine_index: int = 0,
+        load: tuple[int, int, int, int] | None = None,
     ) -> "BatchTokenIDOutSlim":
         # Token source: ``out.output_ids`` — the not-yet-sent slice of each
         # request's generated ids. NOT ``out.decode_ids``: that is the
@@ -729,8 +745,13 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
                 "BatchTokenIDOut.output_ids is None; the msgpack wire needs "
                 "the per-request generated token ids"
             )
+        num_running, num_waiting, kv_active_pages, kv_total_pages = load or (0, 0, 0, 0)
         return cls(
             engine_index=engine_index,
+            num_running=num_running,
+            num_waiting=num_waiting,
+            kv_active_pages=kv_active_pages,
+            kv_total_pages=kv_total_pages,
             rids=list(out.rids),
             output_ids=[list(ids) for ids in out.output_ids],
             finished_reasons=[_finish_type(fr) for fr in out.finished_reasons],

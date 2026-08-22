@@ -565,6 +565,20 @@ class EventLoop:
             ),
             metrics=self.metrics,
         )
+
+        # msgpack wire only: piggyback a load snapshot on every output batch.
+        # The socket predates the scheduler (it is built during the startup
+        # handshake), so the sampler late-binds here — the first point where
+        # scheduler, cache geometry, and output processor all exist. Same
+        # sources as the per-iteration Prometheus snapshot in
+        # _record_scheduler_iteration_metrics.
+        if self.server_args.zmq_msgpack and self.attn_tp_rank == 0:
+            self.send_to_tokenizer.load_fn = lambda: (
+                len(self.output_processor.rid_to_state),
+                self.scheduler.waiting_size(),
+                self.scheduler.active_kv_pages(),
+                self._scheduler_cache_geometry.num_usable_pages,
+            )
         if server_args.disaggregation_mode != "null":
             assert pd_topology is not None
             kv_args = get_kv_args(
