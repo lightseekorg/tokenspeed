@@ -1392,7 +1392,9 @@ def kda_paged_prefill(
     Returns:
         Packed output and final state.
 
-    Recurrent states use the canonical ``[N,H,K,V]`` layout across backends.
+    Recurrent states use the canonical ``[N,H,K,V]`` layout, except on the AMD
+    gfx950 and gfx1250 backends, which take and return the physical V-major
+    ``[N,H,V,K]`` layout shared with their decode state pools.
     """
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("KDA q must be [1, total_tokens, heads, key_dim]")

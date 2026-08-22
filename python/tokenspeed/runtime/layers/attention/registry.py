@@ -427,7 +427,9 @@ def _create_hybrid_linear_attn_backend(
     kda_backend = (getattr(server_args, "kda_backend", None) or "auto").strip().lower()
     if is_kda:
         kda_backend = _resolve_kda_backend(kda_backend)
-        kda_recurrent_layout = "v_major" if current_platform().is_cdna4 else "k_major"
+        platform = current_platform()
+        v_major = platform.is_cdna4 or platform.is_cdna5
+        kda_recurrent_layout = "v_major" if v_major else "k_major"
         linear_attn_backend = KdaAttnBackend(
             config,
             kda_backend=kda_backend,
