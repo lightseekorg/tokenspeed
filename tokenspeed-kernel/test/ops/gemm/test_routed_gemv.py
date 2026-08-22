@@ -274,3 +274,23 @@ def test_shared_projections_route_and_match_torch(m):
     got = kimi3_shared_down_projection(y, down_w)
     want = kimi3_shared_down_projection(y, down_w, solution="torch")
     torch.testing.assert_close(got, want, atol=5e-2, rtol=2e-2)
+
+
+def test_forced_torch_solution_is_not_routed():
+    """solution="torch" must stay the vendor-BLAS baseline even for shapes the
+    measured route covers, or A/B comparisons silently measure the route."""
+    from unittest.mock import patch
+
+    from tokenspeed_kernel.ops.gemm import kimi3
+
+    x = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
+    latent_w = torch.randn(3584, 7168, device="cuda", dtype=torch.bfloat16)
+    down_w = torch.randn(7168, 768, device="cuda", dtype=torch.bfloat16)
+    y = torch.randn(1, 768, device="cuda", dtype=torch.bfloat16)
+
+    with patch(
+        "tokenspeed_kernel.ops.gemm.triton_gemv.decode_gemv",
+        side_effect=AssertionError("forced torch path must not route"),
+    ):
+        kimi3.kimi3_latent_projection(x, latent_w, solution="torch")
+        kimi3.kimi3_shared_down_projection(y, down_w, solution="torch")

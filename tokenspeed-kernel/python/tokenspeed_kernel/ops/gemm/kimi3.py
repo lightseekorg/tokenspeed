@@ -308,6 +308,7 @@ def kimi3_latent_projection(
         and weight.is_contiguous()
         and (k, n) in _KIMI3_SHAPES
     )
+    routed = solution == "auto"
     if solution == "auto":
         if Platform.get().is_cdna4 and specialized and m == 1:
             solution = "triton_gemv"
@@ -356,7 +357,7 @@ def kimi3_latent_projection(
                 "Kimi K3 Gluon latent projection requires an aligned large-M shape"
             )
         return output
-    if decode_gemv_routed(hidden_states, weight):
+    if routed and decode_gemv_routed(hidden_states, weight):
         from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
 
         return decode_gemv(hidden_states, weight, out)
