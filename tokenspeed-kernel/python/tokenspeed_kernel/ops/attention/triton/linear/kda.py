@@ -53,7 +53,7 @@ def kda_chunk_prefill(
     cu_seqlens: torch.Tensor | None = None,
     lower_bound: float | None = None,
     beta_is_logit: bool = True,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Chunked prefill KDA scan (varlen via ``cu_seqlens``).
 
     q/k: ``[B, T, H, K]``; v: ``[B, T, HV, V]``; g_raw: ``[B, T, HV, K]``;
@@ -107,7 +107,7 @@ def kda_recurrent_decode_pool(
     Same math as :func:`kda_recurrent_decode`, but reads ``h_pool[read_indices]``
     and writes ``h_pool[write_indices]`` inside the kernel (negative write ids
     skip the store), eliminating the python-side gather/scatter round-trip.
-    ``h_pool`` is ``[num_pages, HV, K, V]`` fp32 and is updated in place.
+    ``h_pool`` is ``[num_pages, HV, V, K]`` fp32 and is updated in place.
     Returns ``o [B, T, HV, V]``.
     """
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (

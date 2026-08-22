@@ -312,6 +312,11 @@ def test_batched_replay_checkpoint_boundary_matches_layer_loop(accepted, crossin
         )
 
 
+def _canonical(page):
+    """View a V-major state page as the ``[HV, K, V]`` the reference builds."""
+    return page.transpose(-1, -2)
+
+
 def _reference(x, n, t, accepted):
     """fp32 torch reference: ``accepted[i]`` sequential decode steps.
 
@@ -326,7 +331,7 @@ def _reference(x, n, t, accepted):
     for i in range(n):
         r = int(x["read_indices"][i])
         window = x["conv_pool"][r].float()
-        h = x["h_pool"][r].clone()
+        h = _canonical(x["h_pool"][r]).clone()
         for step in range(int(accepted[i])):
             tok = i * t + step
             xt = x["qkv_raw"][tok].float()
@@ -358,7 +363,9 @@ def _check_against_reference(x, out, write_indices, n, t, accepted):
         # so only reduction order differs: measured worst case 4.8e-7. Keep
         # atol tight enough to catch a wrong update; rtol stays loose because
         # the state has near-zero entries.
-        torch.testing.assert_close(out["h_pool"][w], states[i], atol=1e-5, rtol=1e-2)
+        torch.testing.assert_close(
+            _canonical(out["h_pool"][w]), states[i], atol=1e-5, rtol=1e-2
+        )
 
 
 @pytest.mark.parametrize("t", [1, 2, 3, 5])
@@ -551,8 +558,15 @@ def test_replay_probe_requires_both_commit_and_fused_verify_kernels():
 
 @requires_registered_replay
 def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
-    """The trait-selected no-store fusion returns the legacy output, sans tape."""
-    from tokenspeed_kernel.ops.attention import try_kda_fused_paged_verify
+    """The inline-producer no-store fusion returns the store output, sans tape.
+
+    Selection prefers the split-producer variant for this trait set, so the
+    twin is named directly: the point here is that dropping the tape does not
+    disturb the recurrence, not which producers ran.
+    """
+    from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
+        triton_nvidia_kda_fused_paged_verify_no_store as try_kda_fused_paged_verify,
+    )
 
     n, t, rows = 2, 3, 12
     x = _window(n, t, seed=47)
@@ -579,12 +593,11 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
         head_dim=V,
         draft_token_num=t,
         lower_bound=LOWER_BOUND,
-        store_states=False,
     )
     torch.testing.assert_close(conv_tape, conv_before, atol=0.0, rtol=0.0)
     torch.testing.assert_close(state_tape, state_before, atol=0.0, rtol=0.0)
 
-    stored = try_kda_fused_paged_verify(
+    stored = fused_recurrent_kda_verify_megafuse(
         x["qkv_raw"],
         x["conv_w"],
         x["conv_pool"],
@@ -594,16 +607,16 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
         x["beta"],
         x["A_log"],
         x["dt_bias"],
-        state_pool=x["h_pool"],
-        state_scratch=state_tape,
-        read_indices=x["read_indices"],
-        write_indices=writes,
+        x["h_pool"],
+        state_tape,
+        x["read_indices"],
+        writes,
         num_heads=HV,
         head_dim=V,
         draft_token_num=t,
         lower_bound=LOWER_BOUND,
         store_states=True,
-    )
+    ).view(1, -1, HV, V)
     torch.testing.assert_close(no_store, stored, atol=0.0, rtol=0.0)
     assert not torch.equal(conv_tape, conv_before)
     assert not torch.equal(state_tape, state_before)
@@ -629,9 +642,47 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
         head_dim=V,
         draft_token_num=t,
         lower_bound=LOWER_BOUND,
-        store_states=False,
     )
     assert not torch.equal(wrong, no_store)
+
+
+@requires_registered_replay
+@pytest.mark.parametrize("n", [1, 4])
+def test_split_verify_wrapper_matches_fused_wrapper(n):
+    from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
+        triton_nvidia_kda_fused_paged_verify_no_store,
+        triton_nvidia_kda_fused_paged_verify_split,
+    )
+
+    t = 3
+    x = _window(n, t, seed=49 + n)
+    writes = torch.arange(n * t, device=DEV, dtype=torch.int32).view(n, t)
+    conv_scratch = torch.empty(n * t, 3 * P, 3, device=DEV, dtype=torch.bfloat16)
+    state_scratch = torch.empty(n * t, HV, K, V, device=DEV, dtype=torch.float32)
+    kwargs = dict(
+        state_pool=x["h_pool"],
+        state_scratch=state_scratch,
+        read_indices=x["read_indices"],
+        write_indices=writes,
+        num_heads=HV,
+        head_dim=V,
+        draft_token_num=t,
+        lower_bound=LOWER_BOUND,
+    )
+    args = (
+        x["qkv_raw"],
+        x["conv_w"],
+        x["conv_pool"],
+        conv_scratch,
+        x["f_a"],
+        x["w_fb"],
+        x["beta"],
+        x["A_log"],
+        x["dt_bias"],
+    )
+    fused = triton_nvidia_kda_fused_paged_verify_no_store(*args, **kwargs)
+    split = triton_nvidia_kda_fused_paged_verify_split(*args, **kwargs)
+    torch.testing.assert_close(split, fused, atol=2e-2, rtol=2e-2)
 
 
 def test_fused_verify_default_store_is_bit_identical_to_explicit_trait():
@@ -669,3 +720,109 @@ def test_fused_verify_default_store_is_bit_identical_to_explicit_trait():
     torch.testing.assert_close(outputs[0], outputs[1], atol=0.0, rtol=0.0)
     torch.testing.assert_close(tapes[0][0], tapes[1][0], atol=0.0, rtol=0.0)
     torch.testing.assert_close(tapes[0][1], tapes[1][1], atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("n,t", [(4, 3), (8, 4), (16, 4)])
+def test_fused_verify_routed_bv_matches_bv32(n, t):
+    """The routed wide tiles (64/128) must agree with BV=32 to one bf16 ulp.
+
+    Each program owns its V rows outright, so tile width can only reorder
+    the fp32 K reduction — a one-ulp wobble after the bf16 store. A masking
+    or boundary bug shifts whole rows, far beyond that.
+    """
+    x = _window(n, t, seed=61)
+    writes = torch.arange(n * t, device=DEV, dtype=torch.int32).view(n, t)
+    results = []
+    for bv in (32, None):
+        out = fused_recurrent_kda_verify_megafuse(
+            x["qkv_raw"],
+            x["conv_w"],
+            x["conv_pool"],
+            x["conv_pool"],
+            x["f_a"],
+            x["w_fb"],
+            x["beta"],
+            x["A_log"],
+            x["dt_bias"],
+            x["h_pool"],
+            x["h_pool"],
+            x["read_indices"],
+            writes,
+            num_heads=HV,
+            head_dim=V,
+            draft_token_num=t,
+            lower_bound=LOWER_BOUND,
+            store_states=False,
+            bv=bv,
+        )
+        results.append(out)
+    torch.testing.assert_close(results[0], results[1], atol=1e-5, rtol=8e-3)
+
+
+def test_fused_verify_store_follows_permuted_write_rows():
+    """Stored tapes land at write_indices[tok], not at the token index."""
+    n, t = 2, 3
+    x = _window(n, t, seed=63)
+    rows = n * t
+    perm = torch.randperm(rows, generator=torch.Generator().manual_seed(5))
+    writes = perm.to(device=DEV, dtype=torch.int32).view(n, t)
+    identity = torch.arange(rows, device=DEV, dtype=torch.int32).view(n, t)
+    outs, convs, states = [], [], []
+    for w in (identity, writes):
+        conv = torch.zeros(rows, 3 * P, 3, device=DEV, dtype=torch.bfloat16)
+        state = torch.zeros(rows, HV, K, V, device=DEV, dtype=torch.float32)
+        outs.append(
+            fused_recurrent_kda_verify_megafuse(
+                x["qkv_raw"],
+                x["conv_w"],
+                x["conv_pool"],
+                conv,
+                x["f_a"],
+                x["w_fb"],
+                x["beta"],
+                x["A_log"],
+                x["dt_bias"],
+                x["h_pool"],
+                state,
+                x["read_indices"],
+                w,
+                num_heads=HV,
+                head_dim=V,
+                draft_token_num=t,
+                lower_bound=LOWER_BOUND,
+                store_states=True,
+            )
+        )
+        convs.append(conv)
+        states.append(state)
+    torch.testing.assert_close(outs[0], outs[1], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(convs[1][perm], convs[0], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(states[1][perm], states[0], atol=0.0, rtol=0.0)
+
+
+def test_fused_verify_rejects_non_power_of_two_bv():
+    x = _window(1, 3, seed=62)
+    writes = torch.arange(3, device=DEV, dtype=torch.int32).view(1, 3)
+    conv = torch.zeros(3, 3 * P, 3, device=DEV, dtype=torch.bfloat16)
+    state = torch.zeros(3, HV, K, V, device=DEV, dtype=torch.float32)
+    with pytest.raises(ValueError, match="positive power of two"):
+        fused_recurrent_kda_verify_megafuse(
+            x["qkv_raw"],
+            x["conv_w"],
+            x["conv_pool"],
+            conv,
+            x["f_a"],
+            x["w_fb"],
+            x["beta"],
+            x["A_log"],
+            x["dt_bias"],
+            x["h_pool"],
+            state,
+            x["read_indices"],
+            writes,
+            num_heads=HV,
+            head_dim=V,
+            draft_token_num=3,
+            lower_bound=LOWER_BOUND,
+            bv=48,
+        )

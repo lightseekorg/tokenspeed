@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention import kda_recurrent_layout
 from tokenspeed_kernel.platform import current_platform
 
 # The chunked-prefill KDA path resolves to the flash-linear-attention ("fla")
@@ -68,6 +69,46 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 register_cuda_ci(est_time=240, suite="runtime-1gpu")
 
 _LOWER_BOUND = -5.0
+
+
+def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None:
+    backend = object.__new__(KdaAttnBackend)
+    backend.kda_recurrent_layout = "v_major"
+    backend.kda_backend = "auto"
+    backend._kda_gate = lambda g_raw, *_args: g_raw
+    stored = torch.arange(24, dtype=torch.float32).view(1, 2, 3, 4)
+    final = torch.empty(1, 2, 3, 4)
+    captured = {}
+
+    def fake_prefill(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(out=torch.empty(1, 1, 2, 4), final_state=final)
+
+    monkeypatch.setattr(hybrid_kda, "kda_paged_prefill", fake_prefill)
+    query = torch.empty(1, 1, 2, 3)
+    value = torch.empty(1, 1, 2, 4)
+    _, final_state = backend._prefill_scan(
+        query,
+        query,
+        value,
+        stored,
+        torch.tensor([0, 1]),
+        A_log=torch.empty(2),
+        dt_bias=torch.empty(2, 3),
+        a=None,
+        b=None,
+        g_raw=torch.empty_like(query),
+        f_a_out=None,
+        f_b_weight=None,
+        beta_raw=torch.empty(1, 1, 2),
+        seq_len=1,
+        num_real_tokens=1,
+        lower_bound=-5.0,
+        cu_seqlens_cpu=(0, 1),
+    )
+    assert captured["initial_state"] is stored
+    assert captured["recurrent_layout"] == "v_major"
+    assert final_state is final
 
 
 def _backend_config(device: str, *, spec_tokens: int = 1) -> SimpleNamespace:
@@ -538,10 +579,17 @@ class _KDAHarness:
         )
         return (
             naive_out.flatten(0, 1),
-            naive_state,
+            _to_slab_layout(naive_state),
             fla_out[0].flatten(0, 1),
-            fla_state[0].float(),
+            _to_slab_layout(fla_state[0].float()),
         )
+
+
+def _to_slab_layout(state: torch.Tensor) -> torch.Tensor:
+    """Oracles build K-major states; the slab holds the platform's own layout."""
+    if kda_recurrent_layout() == "v_major":
+        return state.transpose(-1, -2)
+    return state
 
 
 def _assert_close(actual, expected, what, mean_tol=2e-3, atol=1e-1, rtol=1e-2):

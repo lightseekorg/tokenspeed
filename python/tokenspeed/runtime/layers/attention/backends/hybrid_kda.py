@@ -31,6 +31,11 @@ from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention import (
     kda_paged_decode,
     kda_paged_prefill,
+)
+from tokenspeed_kernel.ops.attention import (
+    kda_recurrent_layout as kda_recurrent_layout_default,
+)
+from tokenspeed_kernel.ops.attention import (
     kda_replay_commit_supported,
     resolve_kda_batched_replay_commit,
     try_kda_fused_paged_decode,
@@ -86,11 +91,14 @@ class KdaAttnBackend(MambaAttnBackend):
         self,
         config: BaseAttnConfig,
         kda_backend: str = "auto",
-        kda_recurrent_layout: str = "k_major",
     ) -> None:
         super().__init__(config)
         self.max_bs = config.max_bs
-        self._replay_active = kda_replay_commit_supported(self.dtype)
+        # The platform layout; the workspace planner probes the same one.
+        self.kda_recurrent_layout = kda_recurrent_layout_default()
+        self._replay_active = kda_replay_commit_supported(
+            self.dtype, recurrent_layout=self.kda_recurrent_layout
+        )
         self._batched_replay_kernel = resolve_kda_batched_replay_commit(self.dtype)
         self._replay_payloads: tuple[torch.Tensor, ...] | None = None
         self._replay_weights: dict[int, tuple] = {}
@@ -104,7 +112,6 @@ class KdaAttnBackend(MambaAttnBackend):
                 f"--kda-backend must be one of {', '.join(KDA_PREFILL_BACKENDS)}; "
                 f"got {self.kda_backend!r}"
             )
-        self.kda_recurrent_layout = kda_recurrent_layout
         logger.info(
             "KDA prefill routes through %s; decode remains on the "
             "platform-selected kernels",
@@ -468,6 +475,7 @@ class KdaAttnBackend(MambaAttnBackend):
             write_indices=write_indices,
             cu_seqlens=query_start_loc,
             lower_bound=lower_bound,
+            recurrent_layout=self.kda_recurrent_layout,
         )
         if output_gate is not None:
             core_attn_out = rmsnorm_gated_sigmoid(
@@ -549,6 +557,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 draft_token_num=draft_token_num,
                 lower_bound=lower_bound,
                 store_states=False,
+                recurrent_layout=self.kda_recurrent_layout,
             )
             if fused_out is None:
                 raise RuntimeError(
@@ -578,6 +587,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 head_dim=head_v_dim,
                 draft_token_num=draft_token_num,
                 lower_bound=lower_bound,
+                recurrent_layout=self.kda_recurrent_layout,
             )
 
     @override
@@ -711,6 +721,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 draft_token_num=draft_token_num,
                 lower_bound=lower_bound,
                 gate_scratch=gate[:rows, : num_heads * head_dim],
+                recurrent_layout=self.kda_recurrent_layout,
             ):
                 raise RuntimeError(
                     "KDA replay commit kernel vanished after capability probing"
@@ -789,6 +800,7 @@ class KdaAttnBackend(MambaAttnBackend):
             cu_seqlens_cpu=cu_seqlens_cpu,
             lower_bound=lower_bound,
             solution=None if self.kda_backend == "auto" else self.kda_backend,
+            recurrent_layout=self.kda_recurrent_layout,
         )
 
         return kda_result.out.squeeze(0), kda_result.final_state
