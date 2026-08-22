@@ -432,7 +432,7 @@ class MoEConfig:
                 )
             )
 
-        if self.USE_WMMA_SCALED:
+        if self.USE_WMMA_SCALED and WITH_X_MX_SCALE:
             self.shared_layout_x_scale = gl.constexpr(
                 gl.PaddedSharedLayout.with_identity_for(
                     [[256, 8]],
@@ -440,6 +440,10 @@ class MoEConfig:
                     [1, 0],
                 )
             )
+        else:
+            self.shared_layout_x_scale = gl.constexpr(0)
+
+        if self.USE_WMMA_SCALED and WITH_W_MX_SCALE:
             self.shared_layout_w_scale = gl.constexpr(
                 gl.PaddedSharedLayout.with_identity_for(
                     [[256, 8]],
@@ -448,7 +452,6 @@ class MoEConfig:
                 )
             )
         else:
-            self.shared_layout_x_scale = gl.constexpr(0)
             self.shared_layout_w_scale = gl.constexpr(0)
 
 

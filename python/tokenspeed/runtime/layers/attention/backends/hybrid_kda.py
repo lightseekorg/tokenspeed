@@ -411,7 +411,7 @@ class KdaAttnBackend(MambaAttnBackend):
             return result.out
         return rmsnorm_gated_sigmoid(
             result.out.reshape(-1, num_value_heads * head_v_dim).contiguous(),
-            output_gate.contiguous(),
+            output_gate,
             norm_weight,
             norm_eps,
             num_value_heads,
@@ -472,7 +472,7 @@ class KdaAttnBackend(MambaAttnBackend):
         if output_gate is not None:
             core_attn_out = rmsnorm_gated_sigmoid(
                 core_attn_out.reshape(-1, num_value_heads * head_v_dim).contiguous(),
-                output_gate.contiguous(),
+                output_gate,
                 norm_weight,
                 norm_eps,
                 num_value_heads,
