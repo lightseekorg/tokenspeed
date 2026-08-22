@@ -138,6 +138,9 @@ __all__ = [
     "try_kda_fused_paged_decode",
     "try_kda_fused_paged_verify",
     "KdaFusedDecodeResult",
+    "try_kda_replay_commit",
+    "resolve_kda_batched_replay_commit",
+    "kda_replay_commit_supported",
     "KdaPrefillResult",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
@@ -1420,6 +1423,7 @@ def kda_paged_prefill(
     *,
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu=None,
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
@@ -1433,6 +1437,11 @@ def kda_paged_prefill(
         A_log/dt_bias: FP32 gate parameters.
         initial_state: One backend-owned recurrent state per sequence.
         cu_seqlens: Device sequence boundaries ``[num_sequences + 1]``.
+        cu_seqlens_cpu: Optional host copy of ``cu_seqlens`` (tuple, list, or
+            CPU tensor) whose contents must equal ``cu_seqlens``.
+            Host-planning kernels (CuteDSL) use it to skip the
+            stream-synchronizing D2H boundary read; device-planning kernels
+            ignore it.
         lower_bound: Optional safe lower bound for log decay.
         override: Optional exact kernel name.
         solution: Optional registered solution name.
@@ -1462,6 +1471,9 @@ def kda_paged_prefill(
         solution=solution,
         override=override,
     )
+    # Forwarded only when set so registered kernels without the
+    # host-boundary hint parameter keep working unchanged.
+    hint = {} if cu_seqlens_cpu is None else {"cu_seqlens_cpu": cu_seqlens_cpu}
     return kernel(
         q=q,
         k=k,
@@ -1473,6 +1485,7 @@ def kda_paged_prefill(
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
+        **hint,
     )
 
 
@@ -1571,6 +1584,7 @@ def try_kda_fused_paged_decode(
     output_gate: torch.Tensor | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
+    recurrent_layout: str = "k_major",
     override: str | None = None,
     solution: str | None = None,
 ) -> KdaFusedDecodeResult | None:
@@ -1589,6 +1603,8 @@ def try_kda_fused_paged_decode(
         raise ValueError("output_gate and norm_weight must be provided together")
     if output_gate is not None and norm_eps is None:
         raise ValueError("norm_eps is required with fused KDA output normalization")
+    if recurrent_layout not in ("k_major", "v_major"):
+        raise ValueError(f"unsupported KDA recurrent layout {recurrent_layout!r}")
 
     signature = _attention_format_signature(
         q=mixed_qkv,
@@ -1606,6 +1622,7 @@ def try_kda_fused_paged_decode(
                 "num_heads": num_heads,
                 "head_dim": head_dim,
                 "conv_kernel_size": conv_weights.shape[-1],
+                "recurrent_layout": recurrent_layout,
             },
             solution=solution,
             override=override,
@@ -1624,6 +1641,7 @@ def try_kda_fused_paged_decode(
                     "num_heads": num_heads,
                     "head_dim": head_dim,
                     "conv_kernel_size": conv_weights.shape[-1],
+                    "recurrent_layout": recurrent_layout,
                 },
                 solution=solution,
                 override=override,
@@ -1686,6 +1704,7 @@ def try_kda_fused_paged_verify(
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
+    store_states: bool = True,
 ) -> torch.Tensor | None:
     """Try a registered pre-convolution KDA target-verify fusion.
 
@@ -1704,7 +1723,7 @@ def try_kda_fused_paged_verify(
             "attention",
             "kda_fused_paged_verify",
             signature,
-            traits={"paged_state": True},
+            traits={"paged_state": True, "store_states": store_states},
             solution=solution,
             override=override,
         )
@@ -1731,9 +1750,153 @@ def try_kda_fused_paged_verify(
     )
 
 
+def try_kda_replay_commit(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    conv_out: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    state_out: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None = -5.0,
+    override: str | None = None,
+    solution: str | None = None,
+    gate_scratch: torch.Tensor | None = None,
+) -> bool:
+    """Try a registered KDA speculative replay-commit.
+
+    Replays the accepted prefix of a verified draft window from the committed
+    page, so the caller never has to keep a recurrent state per draft
+    position. Pass the SAME projections the verify pass consumed.
+    ``gate_scratch`` is transient fp32 scratch for the hoisted gate
+    (``[>= N*T, num_heads*head_dim]``); ``None`` falls back to a
+    kernel-module buffer.
+
+    Returns:
+        ``True`` when a kernel ran, ``False`` when none supports the current
+        platform (the caller must then fall back to a scratch-based commit).
+    """
+    signature = _attention_format_signature(
+        q=mixed_qkv,
+        k=mixed_qkv,
+        v=mixed_qkv,
+    )
+    try:
+        kernel = select_kernel(
+            "attention",
+            "kda_replay_commit",
+            signature,
+            traits={"flat_state": True},
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return False
+    kernel(
+        mixed_qkv=mixed_qkv,
+        conv_weights=conv_weights,
+        conv_states=conv_states,
+        conv_out=conv_out,
+        f_a_out=f_a_out,
+        f_b_weight=f_b_weight,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        state_out=state_out,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        accepted_length=accepted_length,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+        gate_scratch=gate_scratch,
+    )
+    return True
+
+
+def resolve_kda_batched_replay_commit(
+    dtype: torch.dtype = torch.bfloat16,
+):
+    """Resolve the all-layer replay kernel once, or return ``None``.
+
+    ``None`` for any dtype but bfloat16: the batched kernels dereference raw
+    descriptor addresses as bf16 (an override resolves by name and skips the
+    signature check), so other dtypes must use the per-layer commit, which
+    reads its dtypes from the tensors.
+    """
+    if dtype is not torch.bfloat16:
+        return None
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    try:
+        return select_kernel(
+            "attention",
+            "kda_replay_commit",
+            signature,
+            traits={"flat_state": True, "batched_layers": True},
+            override="triton_nvidia_kda_batched_replay_commit",
+        )
+    except NoKernelFoundError:
+        return None
+
+
 # ===-----------------------------------------------------------------------===#
 # MHA Kernels
 # ===-----------------------------------------------------------------------===#
+
+
+def kda_replay_commit_supported(
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    solution: str | None = None,
+) -> bool:
+    """Whether this platform can run the KDA speculative replay path.
+
+    Lets a caller decide up front whether it can skip allocating a
+    per-draft-position state scratch, before any verify batch has run. The
+    eager replay path has no decomposed fallback, so it needs both the
+    standalone commit kernel and the no-store fused verify it rides on.
+
+    Args:
+        dtype: activation dtype the verify batch will use.
+        solution: restrict to one registered solution, as in ``select_kernel``.
+
+    Returns:
+        ``True`` when both kernels are registered for the current platform.
+    """
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    try:
+        select_kernel(
+            "attention",
+            "kda_replay_commit",
+            signature,
+            traits={"flat_state": True},
+            solution=solution,
+        )
+        select_kernel(
+            "attention",
+            "kda_fused_paged_verify",
+            signature,
+            traits={"paged_state": True, "store_states": False},
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return False
+    return True
 
 
 def mha_prefill(
@@ -3642,6 +3805,7 @@ def dsa_prefill_topk(
     page_size: int | None = None,
     index_k_fp8: torch.Tensor | None = None,
     index_k_scale: torch.Tensor | None = None,
+    q_scales: torch.Tensor | None = None,
     max_logits_bytes: int | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
@@ -3651,7 +3815,8 @@ def dsa_prefill_topk(
     """Compute DSA prefill top-k over packed workspace rows.
 
     Args:
-        q: BF16 indexer query with shape [tokens, index_heads, head_dim].
+        q: BF16 or FP8 E4M3 indexer query with shape
+            [tokens, index_heads, head_dim]. FP8 queries require q_scales.
         weights: Per-token/head weights with shape [tokens, index_heads],
             FP32 or raw BF16 (implementations upcast on the fly).
         kv_workspace_slots: Global KV slot for each workspace row, shape
@@ -3659,13 +3824,20 @@ def dsa_prefill_topk(
         row_starts: Inclusive workspace-row start per query token, shape [tokens].
         row_ends: Exclusive workspace-row end per query token, shape [tokens].
         topk: Number of workspace candidates to select.
-        softmax_scale: Score scale, normally index_head_dim ** -0.5.
-        index_k_cache: Packed FP8 index-K cache with scales (uint8). Used by
-            Triton with kv_workspace_slots and by DeepGEMM to gather workspace
-            rows internally.
+        softmax_scale: Score scale. Each candidate score is exactly
+            ``softmax_scale * sum_h(weights[h] * relu(dot(dequant(q[h]), dequant(k))))``.
+            BF16 queries are already in their compute representation.
+        index_k_cache: Packed paged FP8 index-K cache with scales (uint8). Used
+            with kv_workspace_slots to resolve workspace rows inside the
+            selected implementation.
         page_size: KV cache page size for index_k_cache.
-        index_k_fp8: FP8 index-K rows in workspace-row order. Used by DeepGEMM.
-        index_k_scale: FP8 index-K scales in workspace-row order. Used by DeepGEMM.
+        index_k_fp8: FP8 index-K rows already in workspace-row order. Must be
+            provided together with index_k_scale.
+        index_k_scale: FP8 index-K scales already in workspace-row order. Must
+            be provided together with index_k_fp8.
+        q_scales: Optional positive FP32 scale per token/head for FP8 queries,
+            defining ``dequant(q[token, head]) = q[token, head].float() *
+            q_scales[token, head]``.
         max_logits_bytes: Optional temporary logits memory cap.
         out: Optional contiguous int32 output buffer on q's device with shape
             [tokens, topk].
@@ -3674,10 +3846,10 @@ def dsa_prefill_topk(
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
-    Gluon compacts weights when needed. It requires q, index_k_cache,
-    kv_workspace_slots, row_starts, and row_ends to be contiguous on q's
-    device. kv_workspace_slots must be int64; row_starts and row_ends must be
-    int32.
+    Implementations may accept a strided outer weight dimension, including the
+    fused model projection view. q, index_k_cache, kv_workspace_slots,
+    row_starts, and row_ends must be contiguous on q's device.
+    kv_workspace_slots must be int64; row_starts and row_ends must be int32.
 
     Returns:
         Tuple of workspace row ids and valid counts. Returned indices are
@@ -3692,13 +3864,18 @@ def dsa_prefill_topk(
             f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
         )
     traits = {
+        "index_heads": q.shape[1],
         "head_dim": q.shape[-1],
         "topk": int(topk),
         "page_size": None if page_size is None else int(page_size),
     }
-    has_fp8 = index_k_cache is not None or (
-        index_k_fp8 is not None and index_k_scale is not None
-    )
+    has_workspace_rows = index_k_fp8 is not None and index_k_scale is not None
+    if (index_k_fp8 is None) != (index_k_scale is None):
+        raise ValueError(
+            "index_k_fp8 and index_k_scale must be provided together for "
+            "workspace-row input"
+        )
+    has_fp8 = index_k_cache is not None or has_workspace_rows
     if has_fp8:
         traits["index_k_format"] = "fp8_scaled"
     signature = _attention_format_signature(q=q, weights=weights)
@@ -3727,22 +3904,25 @@ def dsa_prefill_topk(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        return kernel(
-            q=q,
-            weights=weights,
-            kv_workspace_slots=kv_workspace_slots,
-            row_starts=row_starts,
-            row_ends=row_ends,
-            topk=topk,
-            softmax_scale=softmax_scale,
-            index_k_cache=index_k_cache,
-            page_size=page_size,
-            index_k_fp8=index_k_fp8,
-            index_k_scale=index_k_scale,
-            max_logits_bytes=max_logits_bytes,
-            out=out,
-            lens_out=lens_out,
-        )
+        kernel_kwargs = {
+            "q": q,
+            "weights": weights,
+            "kv_workspace_slots": kv_workspace_slots,
+            "row_starts": row_starts,
+            "row_ends": row_ends,
+            "topk": topk,
+            "softmax_scale": softmax_scale,
+            "index_k_cache": index_k_cache,
+            "page_size": page_size,
+            "index_k_fp8": index_k_fp8,
+            "index_k_scale": index_k_scale,
+            "max_logits_bytes": max_logits_bytes,
+            "out": out,
+            "lens_out": lens_out,
+        }
+        if q_scales is not None:
+            kernel_kwargs["q_scales"] = q_scales
+        return kernel(**kernel_kwargs)
 
 
 def dsa_decode_topk(
@@ -3756,6 +3936,7 @@ def dsa_decode_topk(
     softmax_scale: float,
     q_len_per_req: int = 1,
     index_k_cache: torch.Tensor | None = None,
+    q_scales: torch.Tensor | None = None,
     seq_lens_2d: torch.Tensor | None = None,
     plan: object | None = None,
     out: torch.Tensor | None = None,
@@ -3766,7 +3947,8 @@ def dsa_decode_topk(
     """Compute DSA decode top-k over a paged KV cache.
 
     Args:
-        q: BF16 indexer query with shape [tokens, index_heads, head_dim].
+        q: BF16 or FP8 E4M3 indexer query with shape
+            [tokens, index_heads, head_dim]. FP8 queries require q_scales.
         weights: Per-token/head weights with shape [tokens, index_heads],
             FP32 or raw BF16 (implementations upcast on the fly).
         seq_lens: Per-request full KV length, shape [num_reqs] (= tokens /
@@ -3776,11 +3958,16 @@ def dsa_decode_topk(
             shape [num_reqs, max_pages].
         page_size: Number of tokens per KV page.
         topk: Number of KV candidates to select.
-        softmax_scale: Score scale, normally index_head_dim ** -0.5.
+        softmax_scale: Score scale. Each candidate score is exactly
+            ``softmax_scale * sum_h(weights[h] * relu(dot(dequant(q[h]), dequant(k))))``.
+            BF16 queries are already in their compute representation.
         q_len_per_req: Query rows per request (spec-verify next_n). Plain
             decode uses 1, where per-request is equivalent to per-token.
         index_k_cache: Packed FP8 index-K cache with scales (uint8). Used by
             both Triton and DeepGEMM.
+        q_scales: Optional positive FP32 scale per token/head for FP8 queries,
+            defining ``dequant(q[token, head]) = q[token, head].float() *
+            q_scales[token, head]``.
         plan: Optional opaque backend-specific plan.
         out: Optional contiguous int32 output buffer on q's device with shape
             [tokens, topk].
@@ -3789,9 +3976,9 @@ def dsa_decode_topk(
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
-    Gluon compacts weights when needed. It requires q, index_k_cache, seq_lens,
-    and block_table to be contiguous on q's device. seq_lens and block_table
-    must be int32.
+    Implementations may accept a strided outer weight dimension, including the
+    fused model projection view. q, index_k_cache, seq_lens, and block_table
+    must be contiguous on q's device. seq_lens and block_table must be int32.
 
     Returns:
         Tuple of global KV slots and valid counts; invalid entries are -1.
@@ -3805,6 +3992,7 @@ def dsa_decode_topk(
             f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
         )
     traits = {
+        "index_heads": q.shape[1],
         "head_dim": q.shape[-1],
         "topk": int(topk),
         "page_size": int(page_size),
@@ -3840,21 +4028,24 @@ def dsa_decode_topk(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        return kernel(
-            q=q,
-            weights=weights,
-            seq_lens=seq_lens,
-            block_table=block_table,
-            page_size=page_size,
-            topk=topk,
-            softmax_scale=softmax_scale,
-            q_len_per_req=q_len_per_req,
-            index_k_cache=index_k_cache,
-            seq_lens_2d=seq_lens_2d,
-            plan=plan,
-            out=out,
-            lens_out=lens_out,
-        )
+        kernel_kwargs = {
+            "q": q,
+            "weights": weights,
+            "seq_lens": seq_lens,
+            "block_table": block_table,
+            "page_size": page_size,
+            "topk": topk,
+            "softmax_scale": softmax_scale,
+            "q_len_per_req": q_len_per_req,
+            "index_k_cache": index_k_cache,
+            "seq_lens_2d": seq_lens_2d,
+            "plan": plan,
+            "out": out,
+            "lens_out": lens_out,
+        }
+        if q_scales is not None:
+            kernel_kwargs["q_scales"] = q_scales
+        return kernel(**kernel_kwargs)
 
 
 def dsa_plan(

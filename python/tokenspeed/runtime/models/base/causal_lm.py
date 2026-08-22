@@ -143,6 +143,39 @@ class BaseCausalLM(nn.Module):
 
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    def set_dflash_layers_to_capture(
+        self,
+        layer_ids: list[int],
+        incremental_callback=None,
+        slot_bufs: list | None = None,
+    ) -> None:
+        """Capture the target hidden states a DFLASH/DSpark draft consumes.
+
+        Checkpoints name layer *outputs*, but a layer captures the residual
+        entering it -- hence the ``+ 1`` shift, same as EAGLE3.
+        """
+
+        num_layers = len(self.model.layers)
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError("DFLASH target_layer_ids must be unique.")
+        invalid = [val for val in layer_ids if val < 0 or val + 1 >= num_layers]
+        if invalid:
+            raise ValueError(
+                "DFLASH target_layer_ids must map to capturable target layer "
+                f"outputs. Got invalid ids {invalid}; valid range is "
+                f"[0, {num_layers - 2}] for {num_layers} target layers."
+            )
+
+        self.capture_aux_hidden_states = True
+        capture_layers = sorted(val + 1 for val in layer_ids)
+        self.model.layers_to_capture = capture_layers
+        # The draft concatenates captures in ascending layer order.
+        self.model._dflash_capture_idx_map = {
+            layer_idx: i for i, layer_idx in enumerate(capture_layers)
+        }
+        self.model._dflash_incremental_callback = incremental_callback
+        self.model._dflash_slot_bufs = slot_bufs
+
     @torch.no_grad()
     def forward(
         self,

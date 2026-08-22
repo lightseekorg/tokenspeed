@@ -17,6 +17,10 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 
+# K3 serving values: gate lower bound from the config, RMSNorm eps from the model.
+LOWER_BOUND = -5.0
+NORM_EPS = 1e-6
+
 
 def test_k3_safe_gate_reference_matches_sigmoid_contract() -> None:
     """Distinguish K3's safe sigmoid gate from a clamped softplus gate."""
@@ -37,12 +41,13 @@ def test_k3_safe_gate_reference_matches_sigmoid_contract() -> None:
     assert not torch.allclose(actual, legacy)
 
 
-def test_kda_paged_prefill_uses_canonical_k_major_state() -> None:
-    """Native prefill preserves the public [N,H,K,V] state layout."""
+def test_kda_paged_prefill_preserves_native_state_layout() -> None:
+    """Native prefill preserves each backend's physical state layout."""
     platform = current_platform()
     if not (platform.is_cdna4 or platform.is_cdna5):
         pytest.skip("gfx950/gfx1250 KDA dispatch test")
 
+    use_vmajor = platform.is_cdna4
     device = "cuda"
     torch.manual_seed(3)
     tokens, heads, key_dim, value_dim = 65, 2, 128, 128
@@ -60,8 +65,8 @@ def test_kda_paged_prefill_uses_canonical_k_major_state() -> None:
     state = torch.randn(
         1,
         heads,
-        key_dim,
-        value_dim,
+        value_dim if use_vmajor else key_dim,
+        key_dim if use_vmajor else value_dim,
         device=device,
         dtype=torch.float32,
     )
@@ -69,13 +74,16 @@ def test_kda_paged_prefill_uses_canonical_k_major_state() -> None:
     dt_bias = torch.randn(heads, key_dim, device=device, dtype=torch.float32)
     cu_seqlens = torch.tensor([0, tokens], device=device, dtype=torch.int32)
 
+    reference_state = (
+        state[0] if use_vmajor else state[0].transpose(-1, -2).contiguous()
+    )
     expected_out, expected_state = reference_kda_recurrent(
         q,
         k,
         v,
         raw_g,
         beta,
-        state[0].transpose(-1, -2).contiguous(),
+        reference_state,
         a_log,
         dt_bias,
     )
@@ -94,21 +102,26 @@ def test_kda_paged_prefill_uses_canonical_k_major_state() -> None:
     torch.testing.assert_close(
         result.out[0].float(), expected_out.float(), atol=6e-2, rtol=6e-2
     )
+    expected_final_state = (
+        expected_state if use_vmajor else expected_state.transpose(-1, -2)
+    ).unsqueeze(0)
     torch.testing.assert_close(
         result.final_state,
-        expected_state.transpose(-1, -2).unsqueeze(0),
+        expected_final_state,
         atol=6e-2,
         rtol=6e-2,
     )
 
 
 @pytest.mark.parametrize("lower_bound", [-5.0, None])
+@pytest.mark.parametrize("strided_inputs", [False, True])
 @pytest.mark.parametrize(
     ("heads", "key_dim", "value_dim"),
     [(2, 8, 8), (2, 8, 5), (12, 128, 128)],
 )
 def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
     lower_bound: float | None,
+    strided_inputs: bool,
     heads: int,
     key_dim: int,
     value_dim: int,
@@ -118,19 +131,51 @@ def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
     if not (platform.is_cdna4 or platform.is_cdna5):
         pytest.skip("gfx950/gfx1250 KDA dispatch test")
 
+    use_vmajor = platform.is_cdna4
     device = "cuda"
     torch.manual_seed(13)
     tokens = 3
-    q = torch.randn(1, tokens, heads, key_dim, device=device, dtype=torch.bfloat16)
-    k = torch.randn_like(q)
-    v = torch.randn(1, tokens, heads, value_dim, device=device, dtype=torch.bfloat16)
-    raw_g = torch.randn_like(q)
-    beta = torch.randn(1, tokens, heads, device=device, dtype=torch.bfloat16)
+    if strided_inputs:
+        qkv = torch.randn(
+            1,
+            tokens,
+            heads * (2 * key_dim + value_dim) + 7,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        q_end = heads * key_dim
+        k_end = 2 * q_end
+        v_end = k_end + heads * value_dim
+        q = qkv[..., :q_end].view(1, tokens, heads, key_dim)
+        k = qkv[..., q_end:k_end].view(1, tokens, heads, key_dim)
+        v = qkv[..., k_end:v_end].view(1, tokens, heads, value_dim)
+        raw_g = torch.randn(
+            1,
+            tokens,
+            heads * key_dim + 5,
+            device=device,
+            dtype=torch.bfloat16,
+        )[..., :q_end].view(1, tokens, heads, key_dim)
+        beta = torch.randn(
+            1,
+            tokens,
+            heads + 3,
+            device=device,
+            dtype=torch.bfloat16,
+        )[..., :heads]
+    else:
+        q = torch.randn(1, tokens, heads, key_dim, device=device, dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn(
+            1, tokens, heads, value_dim, device=device, dtype=torch.bfloat16
+        )
+        raw_g = torch.randn_like(q)
+        beta = torch.randn(1, tokens, heads, device=device, dtype=torch.bfloat16)
     state_pool = torch.randn(
         6,
         heads,
-        key_dim,
-        value_dim,
+        value_dim if use_vmajor else key_dim,
+        key_dim if use_vmajor else value_dim,
         device=device,
         dtype=torch.float32,
     )
@@ -157,19 +202,22 @@ def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
 
     expected_out = []
     for row in range(tokens):
+        physical_state = initial_pool[read_indices[row].long()]
         out, final_state = reference_kda_recurrent(
             q[0, row : row + 1],
             k[0, row : row + 1],
             v[0, row : row + 1],
             raw_g[0, row : row + 1],
             beta[0, row : row + 1],
-            initial_pool[read_indices[row].long()].transpose(-1, -2),
+            physical_state if use_vmajor else physical_state.transpose(-1, -2),
             a_log,
             dt_bias,
             lower_bound=lower_bound,
         )
         expected_out.append(out[0])
-        expected_pool[write_indices[row].long()] = final_state.transpose(-1, -2)
+        expected_pool[write_indices[row].long()] = (
+            final_state if use_vmajor else final_state.transpose(-1, -2)
+        )
     expected_out = torch.stack(expected_out).unsqueeze(0)
     actual_out = kda_paged_decode(
         q,
@@ -199,9 +247,15 @@ def test_kda_paged_decode_graph_padding_and_page_stride() -> None:
 
     torch.manual_seed(23)
     batch, active, heads, key_dim, value_dim = 4, 2, 2, 8, 5
+    use_vmajor = current_platform().is_cdna4
     state_elements = heads * key_dim * value_dim
     raw_pool = torch.randn(7, state_elements + 11, device="cuda", dtype=torch.float32)
-    state_pool = raw_pool[:, :state_elements].view(7, heads, key_dim, value_dim)
+    state_pool = raw_pool[:, :state_elements].view(
+        7,
+        heads,
+        value_dim if use_vmajor else key_dim,
+        key_dim if use_vmajor else value_dim,
+    )
     q = torch.randn(1, batch, heads, key_dim, device="cuda", dtype=torch.bfloat16)
     k = torch.randn_like(q)
     v = torch.randn(1, batch, heads, value_dim, device="cuda", dtype=torch.bfloat16)
@@ -237,20 +291,30 @@ def test_kda_paged_decode_graph_padding_and_page_stride() -> None:
     )
 
 
-def test_kda_fused_paged_decode_matches_reference() -> None:
+@pytest.mark.parametrize(
+    ("batch", "active"),
+    [(1, 1), (2, 2), (4, 2), (8, 8), (16, 16), (32, 32)],
+)
+def test_kda_fused_paged_decode_matches_reference(batch: int, active: int) -> None:
     """The K3 megafusion preserves state paging and its fused norm epilogue."""
-    if not current_platform().is_cdna4:
-        pytest.skip("gfx950 KDA fusion test")
+    # NVIDIA is covered by test_kda_megafuse_fused_norm_matches_separate_norm: the
+    # 2e-4 state tolerance below is tuned to the gfx950 kernel's accumulation.
+    if not (current_platform().is_cdna4 or current_platform().is_cdna5):
+        pytest.skip("gfx950/gfx1250 KDA fusion test")
 
     torch.manual_seed(31)
-    batch, active, heads, head_dim, pages = 4, 2, 12, 128, 6
+    heads, head_dim, pages = 12, 128, 2 * active
     projection_width = heads * head_dim
-    mixed_qkv = torch.randn(
+    used_width = 4 * projection_width + head_dim + heads
+    packed_width = (used_width + 15) // 16 * 16
+    packed_projection = torch.randn(
         batch,
-        3 * projection_width,
+        packed_width,
         device="cuda",
         dtype=torch.bfloat16,
     )
+    mixed_qkv = packed_projection[:, : 3 * projection_width]
+    assert mixed_qkv.stride() == (packed_width, 1)
     conv_weights = 0.1 * torch.randn(
         3 * projection_width,
         4,
@@ -266,32 +330,19 @@ def test_kda_fused_paged_decode_matches_reference() -> None:
     )
     initial_conv_states = conv_states.clone()
     expected_conv_states = conv_states.clone()
-    f_a_out = torch.randn(
-        batch,
-        head_dim,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
+    f_a_start = 4 * projection_width
+    f_a_out = packed_projection[:, f_a_start : f_a_start + head_dim]
     f_b_weight = 0.1 * torch.randn(
         projection_width,
         head_dim,
         device="cuda",
         dtype=torch.bfloat16,
     )
-    beta_logits = torch.randn(
-        batch,
-        heads,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
+    beta_start = f_a_start + head_dim
+    beta_logits = packed_projection[:, beta_start : beta_start + heads]
     a_log = torch.randn(heads, device="cuda", dtype=torch.float32)
     dt_bias = torch.randn(projection_width, device="cuda", dtype=torch.float32)
-    output_gate = torch.randn(
-        batch,
-        projection_width,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
+    output_gate = packed_projection[:, 3 * projection_width : f_a_start]
     norm_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
     norm_eps = 1e-6
     state_pool = 0.01 * torch.randn(
@@ -304,9 +355,18 @@ def test_kda_fused_paged_decode_matches_reference() -> None:
     )
     initial_state_pool = state_pool.clone()
     expected_state_pool = state_pool.clone()
-    read_indices = torch.tensor([0, 1, -1, -1], device="cuda", dtype=torch.int32)
-    write_indices = torch.tensor([2, 3, -1, -1], device="cuda", dtype=torch.int32)
-    cu_seqlens = torch.tensor([0, 1, 2, 2, 2], device="cuda", dtype=torch.int32)
+    read_indices = torch.full((batch,), -1, device="cuda", dtype=torch.int32)
+    write_indices = torch.full((batch,), -1, device="cuda", dtype=torch.int32)
+    read_indices[:active] = torch.arange(active, device="cuda", dtype=torch.int32)
+    write_indices[:active] = torch.arange(
+        active, 2 * active, device="cuda", dtype=torch.int32
+    )
+    cu_seqlens = torch.cat(
+        (
+            torch.arange(active + 1, device="cuda", dtype=torch.int32),
+            torch.full((batch - active,), active, device="cuda", dtype=torch.int32),
+        )
+    )
 
     raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
     expected_out = torch.zeros(
@@ -332,7 +392,7 @@ def test_kda_fused_paged_decode_matches_reference() -> None:
             v.unsqueeze(0),
             raw_g[row].view(1, heads, head_dim),
             beta_logits[row].unsqueeze(0),
-            initial_state_pool[read_idx].transpose(-1, -2),
+            initial_state_pool[read_idx],
             a_log,
             dt_bias.view(heads, head_dim),
         )
@@ -344,7 +404,7 @@ def test_kda_fused_paged_decode_matches_reference() -> None:
             * norm_weight.float()[None, :]
             * torch.sigmoid(output_gate[row].view(heads, head_dim).float())
         ).to(torch.bfloat16)
-        expected_state_pool[write_idx] = final_state.transpose(-1, -2)
+        expected_state_pool[write_idx] = final_state
         expected_conv_states[write_idx] = torch.stack(
             (history[..., 1], history[..., 2], current), dim=-1
         ).reshape(3 * projection_width, 3)
@@ -367,6 +427,7 @@ def test_kda_fused_paged_decode_matches_reference() -> None:
         output_gate=output_gate,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
+        recurrent_layout="v_major",
     )
 
     assert result is not None
@@ -380,10 +441,15 @@ def test_kda_fused_paged_decode_matches_reference() -> None:
 
 def test_kda_fused_decode_override_preserves_external_output_norm(monkeypatch) -> None:
     """A core-only override must not claim that it applied output normalization."""
-    kernel_name = "triton_nvidia_kda_fused_paged_decode"
+    assert KernelRegistry.get().get_by_name(
+        "triton_nvidia_kda_fused_paged_decode"
+    ).traits["fused_output_norm"] == frozenset({False, True})
+
+    # The verify kernel is registered without the trait at all.
+    kernel_name = "triton_nvidia_kda_fused_paged_verify"
     spec = KernelRegistry.get().get_by_name(kernel_name)
     assert spec is not None
-    assert spec.traits["fused_output_norm"] == frozenset({False})
+    assert "fused_output_norm" not in spec.traits
 
     captured_kwargs = {}
 
@@ -430,8 +496,8 @@ def test_kda_fused_decode_override_preserves_external_output_norm(monkeypatch) -
 
 def test_kda_fused_decode_rejects_unsupported_conv_width() -> None:
     """Unsupported convolution widths must fall back before kernel execution."""
-    if not current_platform().is_cdna4:
-        pytest.skip("gfx950 KDA fusion dispatch test")
+    if not (current_platform().is_cdna4 or current_platform().is_cdna5):
+        pytest.skip("gfx950/gfx1250 KDA fusion dispatch test")
 
     tensor = torch.empty(1, dtype=torch.bfloat16)
     conv_weights = torch.empty(1, 5, dtype=torch.bfloat16)
@@ -473,3 +539,138 @@ def test_kda_paged_decode_does_not_select_nvidia_kernel_on_amd() -> None:
             _attention_format_signature(q=q, k=k, v=v),
             traits={"indexed_state": True, "single_token": False},
         )
+
+
+def _megafuse_inputs(batch: int, seed: int = 17):
+    """Build K3-shaped megafuse decode inputs (TP8 rank: 12 heads, K=V=128)."""
+    torch.manual_seed(seed)
+    heads, head_dim = 12, 128
+    pages = 2 * batch
+    width = heads * head_dim
+    used = 4 * width + head_dim + heads
+    packed = torch.randn(
+        batch, (used + 15) // 16 * 16, device="cuda", dtype=torch.bfloat16
+    )
+    return {
+        "heads": heads,
+        "head_dim": head_dim,
+        "mixed_qkv": packed[:, : 3 * width],
+        "output_gate": packed[:, 3 * width : 4 * width],
+        "f_a_out": packed[:, 4 * width : 4 * width + head_dim],
+        "beta_logits": packed[:, 4 * width + head_dim : used],
+        "conv_weights": 0.1
+        * torch.randn(3 * width, 4, device="cuda", dtype=torch.bfloat16),
+        "conv_states": 0.1
+        * torch.randn(pages, 3 * width, 3, device="cuda", dtype=torch.bfloat16),
+        "f_b_weight": 0.1
+        * torch.randn(width, head_dim, device="cuda", dtype=torch.bfloat16),
+        "a_log": torch.randn(heads, device="cuda", dtype=torch.float32),
+        "dt_bias": torch.randn(width, device="cuda", dtype=torch.float32),
+        "norm_weight": torch.randn(head_dim, device="cuda", dtype=torch.bfloat16),
+        "state_pool": 0.01
+        * torch.randn(
+            pages, heads, head_dim, head_dim, device="cuda", dtype=torch.float32
+        ),
+        "read_indices": torch.arange(batch, device="cuda", dtype=torch.int32),
+        "write_indices": torch.arange(
+            batch, 2 * batch, device="cuda", dtype=torch.int32
+        ),
+        "cu_seqlens": torch.arange(batch + 1, device="cuda", dtype=torch.int32),
+    }
+
+
+def _run_megafuse(inp, *, fused: bool):
+    """One megafuse decode, with the norm epilogue fused in or applied after."""
+    from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        fused_recurrent_kda_megafuse,
+    )
+
+    heads, head_dim = inp["heads"], inp["head_dim"]
+    # Serving passes a row-strided slice of the packed projection, not a copy.
+    gate = inp["output_gate"]
+    out = fused_recurrent_kda_megafuse(
+        inp["mixed_qkv"],
+        inp["conv_weights"],
+        inp["conv_states"],
+        inp["f_a_out"],
+        inp["f_b_weight"],
+        inp["beta_logits"],
+        inp["a_log"],
+        inp["dt_bias"],
+        h_pool=inp["state_pool"],
+        read_indices=inp["read_indices"],
+        write_indices=inp["write_indices"],
+        num_heads=heads,
+        head_dim=head_dim,
+        cu_seqlens=inp["cu_seqlens"],
+        lower_bound=LOWER_BOUND,
+        output_gate=gate if fused else None,
+        norm_weight=inp["norm_weight"] if fused else None,
+        norm_eps=NORM_EPS if fused else None,
+    )
+    if fused:
+        return out
+    return rmsnorm_gated_sigmoid(
+        out.reshape(-1, heads * head_dim).contiguous(),
+        gate.contiguous(),
+        inp["norm_weight"],
+        NORM_EPS,
+        heads,
+        head_dim,
+    ).view_as(out)
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+def test_kda_megafuse_fused_norm_matches_separate_norm(batch: int) -> None:
+    """The fused epilogue reproduces megafuse followed by rmsnorm_gated_sigmoid."""
+    if not current_platform().is_nvidia:
+        pytest.skip("NVIDIA triton KDA megafusion test")
+
+    inp = _megafuse_inputs(batch)
+    conv0, state0 = inp["conv_states"].clone(), inp["state_pool"].clone()
+
+    expected = _run_megafuse(inp, fused=False)
+    conv_ref, state_ref = inp["conv_states"].clone(), inp["state_pool"].clone()
+
+    inp["conv_states"].copy_(conv0)
+    inp["state_pool"].copy_(state0)
+    fused = _run_megafuse(inp, fused=True)
+
+    torch.testing.assert_close(fused.float(), expected.float(), atol=0.5, rtol=2e-2)
+    # The epilogue must not disturb the state it writes back.
+    torch.testing.assert_close(inp["conv_states"], conv_ref)
+    torch.testing.assert_close(inp["state_pool"], state_ref)
+
+
+def test_kda_megafuse_fused_norm_is_cuda_graph_safe() -> None:
+    """The fused epilogue captures and replays inside a CUDA graph."""
+    if not current_platform().is_nvidia:
+        pytest.skip("NVIDIA triton KDA megafusion test")
+
+    inp = _megafuse_inputs(1)
+    conv0, state0 = inp["conv_states"].clone(), inp["state_pool"].clone()
+
+    # Warm eagerly: the JIT must not compile inside the capture.
+    eager = _run_megafuse(inp, fused=True)
+    inp["conv_states"].copy_(conv0)
+    inp["state_pool"].copy_(state0)
+
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _run_megafuse(inp, fused=True)
+    torch.cuda.current_stream().wait_stream(stream)
+    inp["conv_states"].copy_(conv0)
+    inp["state_pool"].copy_(state0)
+
+    with torch.cuda.graph(graph):
+        captured = _run_megafuse(inp, fused=True)
+
+    inp["conv_states"].copy_(conv0)
+    inp["state_pool"].copy_(state0)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(captured.float(), eager.float(), atol=0.5, rtol=2e-2)

@@ -122,9 +122,8 @@ def test_decode_shape_uses_lean_kernel_and_is_exact(normalize, scale):
 @pytest.mark.parametrize("tokens", [1, 2])
 @pytest.mark.parametrize("map_dtype", [torch.int32, torch.int64])
 def test_static_dispatch_map_and_weights_dtype(tokens, map_dtype):
-    """The optional logical->physical map must translate the selected ids on
-    both the lean decode kernel (tokens=1) and the registry fallback
-    (tokens=2), and bf16 weight output must match the fp32 path."""
+    """The optional logical->physical map must translate the selected ids at
+    both row counts, and bf16 weight output must match the fp32 path."""
     torch.manual_seed(11)
     logits = torch.randn(tokens, 896, dtype=torch.float32, device="cuda")
     bias = torch.randn(896, dtype=torch.float32, device="cuda")

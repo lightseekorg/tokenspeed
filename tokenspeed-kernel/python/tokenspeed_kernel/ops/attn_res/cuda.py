@@ -58,9 +58,12 @@ if _HAS_CUDA_KERNEL:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "has_delta": frozenset({False}),
+            "has_delta": frozenset({False, True}),
+            # The kernel is instantiated at H=7168 only and checks it; without
+            # this the registry picks it for any H and the check aborts.
+            "hidden_size": frozenset({7168}),
             "inputs_on_same_gpu": frozenset({True}),
-            "partial_block_storage": frozenset({False}),
+            "partial_block_storage": frozenset({False, True}),
             "separate_output_eps": frozenset({False}),
             "writes_block": frozenset({False}),
         },
@@ -79,17 +82,14 @@ if _HAS_CUDA_KERNEL:
         num_valid_blocks=None,
         block_write_idx=-1,
     ) -> torch.Tensor:
-        if delta is not None or block_write_idx >= 0:
-            raise ValueError("CUDA AttnRes does not support prefix updates")
-        if num_valid_blocks is not None and num_valid_blocks != block_residual.shape[0]:
-            raise ValueError("CUDA AttnRes requires tightly sliced block storage")
+        if block_write_idx >= 0:
+            raise ValueError("CUDA AttnRes does not write snapshots")
         if (
             out_norm_weight is not None
             and out_norm_eps is not None
             and out_norm_eps != eps
         ):
             raise ValueError("CUDA AttnRes requires matching RMSNorm epsilons")
-        # Kernel contract is [T, 1, H] / [K, T, 1, H] (B=1).
         out = attn_res_fwd_packed(
             layer_residual.unsqueeze(1).contiguous(),
             block_residual.unsqueeze(2).contiguous(),
@@ -99,5 +99,7 @@ if _HAS_CUDA_KERNEL:
             out_norm_weight=(
                 None if out_norm_weight is None else out_norm_weight.contiguous()
             ),
+            delta=None if delta is None else delta.unsqueeze(1).contiguous(),
+            num_blocks=num_valid_blocks,
         )
         return out.squeeze(1)  # [T, H]

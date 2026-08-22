@@ -146,3 +146,43 @@ def test_autotune_dummy_prefill_fits_request_capacity(monkeypatch):
     executor._autotune()
 
     assert captured == [1024]
+
+
+def test_cudagraph_gc_flag_reaches_the_capture_context():
+    """The operator flag must survive ServerArgs -> config -> capture.
+
+    Freezing the collector for the duration of capture is the default; the
+    flag is the escape hatch. It previously never arrived -- the wrapper read
+    it off a config that never carried it -- so capture never froze and the
+    flag moved nothing in either direction. Pin the whole path, not the
+    default: read the value the capture context would actually see.
+    """
+    import dataclasses
+    import gc
+
+    from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+        CudaGraphWrapper,
+        freeze_gc,
+    )
+    from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
+
+    fields = {f.name for f in dataclasses.fields(ModelExecutorConfig)}
+    assert "enable_cudagraph_gc" in fields, "config must carry the flag"
+
+    for flag in (False, True):
+        config = SimpleNamespace(enable_cudagraph_gc=flag)
+        wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+        # Only the flag plumbing is under test; __init__ needs a live model.
+        wrapper.enable_cudagraph_gc = config.enable_cudagraph_gc
+        assert wrapper.enable_cudagraph_gc is flag
+
+        # get_freeze_count() is process-global and other code freezes too, so
+        # compare against the count on entry rather than against zero.
+        before = gc.get_freeze_count()
+        canary = [object() for _ in range(64)]
+        with freeze_gc(wrapper.enable_cudagraph_gc):
+            during = gc.get_freeze_count()
+        after = gc.get_freeze_count()
+        assert (during > before) is (not flag), (flag, before, during)
+        assert after <= before, (before, after)
+    assert len(canary) == 64

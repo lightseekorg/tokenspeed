@@ -71,6 +71,12 @@ class BaseTransformerModel(nn.Module):
         self.layers = self.resolve_layers(config, quant_config, prefix)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture: list[int] = []
+        # DFLASH incremental projection, populated by
+        # set_dflash_layers_to_capture().
+        self._dflash_capture_idx_map: dict[int, int] = {}
+        self._dflash_incremental_callback = None
+        self._dflash_slot_bufs: list[torch.Tensor] | None = None
+        self._dflash_incr_active = False
 
         self._compile_decoder_stack()
 
@@ -154,6 +160,25 @@ class BaseTransformerModel(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
 
+    def _notify_dflash_capture(
+        self, layer_idx: int, aux_hidden_states: list[torch.Tensor]
+    ) -> None:
+        """Hand the capture layer ``layer_idx`` just appended to the drafter.
+
+        An idle forward skips the attention block, so nothing was appended.
+        """
+        callback = self._dflash_incremental_callback
+        slot_bufs = self._dflash_slot_bufs
+        capture_idx = self._dflash_capture_idx_map.get(layer_idx)
+        if callback is None or slot_bufs is None or capture_idx is None:
+            return
+        if len(aux_hidden_states) != capture_idx + 1:
+            return
+        captured = aux_hidden_states[capture_idx]
+        num_tokens = captured.shape[0]
+        slot_bufs[capture_idx][:num_tokens].copy_(captured)
+        callback(capture_idx, num_tokens)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -193,6 +218,8 @@ class BaseTransformerModel(nn.Module):
 
         for i, layer in enumerate(self.layers):
 
+            capture = i in self.layers_to_capture
+
             with get_global_expert_distribution_recorder().with_current_layer(i):
 
                 hidden_states, residual = layer(
@@ -201,10 +228,11 @@ class BaseTransformerModel(nn.Module):
                     ctx,
                     out_cache_loc,
                     residual,
-                    aux_hidden_states=(
-                        aux_hidden_states if i in self.layers_to_capture else None
-                    ),
+                    aux_hidden_states=aux_hidden_states if capture else None,
                 )
+
+            if capture and self._dflash_incr_active:
+                self._notify_dflash_capture(i, aux_hidden_states)
 
         if not ctx.forward_mode.is_idle():
 

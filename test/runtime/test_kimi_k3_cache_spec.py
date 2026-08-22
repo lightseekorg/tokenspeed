@@ -79,17 +79,115 @@ def test_lcm_geometry_packs_two_kda_pages_at_tp16() -> None:
     assert conv.shape[0] == 3 * 96 * 128 // 16
 
 
+def test_speculative_verify_workspace_is_reserved_outside_the_arena(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda_replay_commit_supported",
+        lambda dtype: False,
+    )
+    recipe, _, layout = kimi_tp8_layout(
+        draft_layers=5,
+        max_bs=4,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=8,
+    )
+
+    # Four requests, each with one committed seed row and eight candidate rows,
+    # across all 69 target KDA layers.
+    expected_workspace_bytes = 2_022_174_720
+    assert recipe.workspace_bytes() == expected_workspace_bytes
+
+    setup = recipe.setup()
+    assert setup.fixed_workspace_bytes == expected_workspace_bytes
+    expected_parents = (
+        recipe.cache_budget_bytes - expected_workspace_bytes
+    ) // layout.lcm_block_bytes - 1
+    assert setup.spec.memory_plan.num_lcm_blocks == expected_parents
+
+
+def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda_replay_commit_supported",
+        lambda dtype: True,
+    )
+    recipe, groups, layout = kimi_tp8_layout(
+        draft_layers=5,
+        max_bs=4,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=8,
+    )
+    conv_row_bytes = 4 * sum(
+        field.payload_bytes
+        for spec, fields in groups
+        if spec.group_id != "full_attention"
+        for field in fields
+        if field.field_id.endswith(".conv_state")
+    )
+    # 69 KDA layers x (4 requests x 8 draft tokens) rows, each one bf16
+    # qkv/f_a/beta row (4608 + 128 + 12 channels) plus an fp32 gate row
+    # (12 x 128), per rank at TP8.
+    expected_payload_bytes = 69 * 4 * 8 * ((4608 + 128 + 12) * 2 + 12 * 128 * 4)
+    expected_workspace_bytes = conv_row_bytes + expected_payload_bytes
+
+    setup = recipe.setup()
+
+    assert recipe.workspace_bytes() == expected_workspace_bytes
+    assert setup.fixed_workspace_bytes == expected_workspace_bytes
+    expected_parents = (
+        recipe.cache_budget_bytes - expected_workspace_bytes
+    ) // layout.lcm_block_bytes - 1
+    assert setup.spec.memory_plan.num_lcm_blocks == expected_parents
+
+
+def test_non_speculative_kimi_reserves_no_verify_workspace() -> None:
+    recipe, _, _ = kimi_tp8_layout(
+        draft_layers=5,
+        max_bs=4,
+        speculative_algorithm=None,
+        speculative_num_draft_tokens=8,
+    )
+
+    assert recipe.workspace_bytes() == 0
+
+
 def test_lcm_parent_demand_uses_per_group_packing() -> None:
     recipe, _, layout = kimi_tp8_layout(max_bs=1, max_scheduled_tokens=8_192)
 
-    # 131_072 tokens at this concurrency needs exactly 284 parents; the search
-    # inverts that demand -- what 284 parents admit needs no more than 284,
+    # Non-overlap sparse state prefill needs one input and one output block per
+    # KDA group; the next decode allocates its destination after completion.
+    # The search inverts that demand -- what 92 parents admit needs no more,
     # and one parent fewer admits strictly less.
-    assert recipe.parents_needed(layout, 131_072) == 284
-    admitted = recipe.token_capacity(layout, 284)
+    assert recipe.parents_needed(layout, 131_072) == 92
+    admitted = recipe.token_capacity(layout, 92)
     assert admitted >= 131_072
-    assert recipe.parents_needed(layout, admitted) <= 284
-    assert recipe.token_capacity(layout, 283) < admitted
+    assert recipe.parents_needed(layout, admitted) <= 92
+    assert recipe.token_capacity(layout, 91) < admitted
+
+
+def test_sparse_state_parent_demand_tracks_decode_and_overlap_width() -> None:
+    baseline, _, layout = kimi_tp8_layout(
+        max_bs=3,
+        max_scheduled_tokens=8_192,
+        decode_input_tokens=128,
+        overlap_schedule_depth=0,
+    )
+    overlapped, _, _ = kimi_tp8_layout(
+        max_bs=3,
+        max_scheduled_tokens=8_192,
+        decode_input_tokens=128,
+        overlap_schedule_depth=1,
+    )
+
+    # KDA state uses the same two rolling pages with or without overlap. The
+    # small full-attention protection term still fits in the same packed parent.
+    assert (
+        overlapped.parents_needed(layout, 131_072)
+        - baseline.parents_needed(layout, 131_072)
+        == 0
+    )
 
 
 def test_k3_merged_solve_with_draft_shares_page_ids():

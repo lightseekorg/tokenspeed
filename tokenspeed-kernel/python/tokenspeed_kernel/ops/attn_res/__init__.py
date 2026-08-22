@@ -29,9 +29,9 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 __all__ = ["attn_res_fwd", "attn_res_fwd_available"]
 
 # The Blackwell launcher instantiates aligned hidden sizes in [4096, 8192].
-# gfx950 currently specializes Kimi K3's H=7168 fused-output-norm path.
+# AMD Gluon currently specializes Kimi K3's H=7168 fused-output-norm path.
 _MAX_BLACKWELL_TOKENS = 16384
-_MAX_GFX950_TOKENS = 65536
+_MAX_AMD_GLUON_TOKENS = 65536
 _MAX_N = 12
 
 
@@ -88,11 +88,11 @@ def _select_attn_res_kernel(
         and delta.stride(-1) == 1
     )
     platform = Platform.get()
-    if platform.is_cdna4:
+    if platform.is_cdna4 or platform.is_cdna5:
         eligible = (
             hidden_size == 7168
             and out_norm_weight is not None
-            and 1 <= tokens <= _MAX_GFX950_TOKENS
+            and 1 <= tokens <= _MAX_AMD_GLUON_TOKENS
         )
     else:
         eligible = (

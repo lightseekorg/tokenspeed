@@ -25,6 +25,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes import plan
 Retention = Literal["full_history", "sliding_window"]
 Family = Literal["history", "state"]
 TransferPolicy = Literal["full_suffix", "latest_snapshot"]
+# How a caller spells sliding windows: one window broadcast to every sliding
+# layer (today's HF scalar), one entry per layer (multi-window models, with
+# None at full-history positions), or None for a model with no sliding layers.
+SlidingWindowTokens = int | Sequence[int | None] | None
 
 
 @dataclass(frozen=True)
@@ -216,24 +220,7 @@ def compute_cache_group_page_counts(
         # (the C++ side keys it the same way); V4's sliding-window state tail
         # buffers keep the sliding-window formula below.
         if spec.family == "state" and spec.retention == "full_history":
-            # State group: 2 live pages/request (the W=2 write window) +
-            # floor(T/P) snapshot pages (snapshots are bounded by the shared
-            # page-id space), capped at the full-history count.
-            full_history_total = (
-                _ceil_div(max_total_tokens, block_granularity)
-                + max_live_requests
-                + protected_pages
-                + _CACHE_GROUP_DUMMY_PAGES
-                + safety_margin
-            )
-            state_total = (
-                max_live_requests * 2
-                + max_total_tokens // block_granularity
-                + protected_pages
-                + _CACHE_GROUP_DUMMY_PAGES
-                + safety_margin
-            )
-            total = min(state_total, full_history_total)
+            total = max_live_requests * 2 + _CACHE_GROUP_DUMMY_PAGES + safety_margin
         elif spec.retention == "full_history":
             full_pages = _ceil_div(max_total_tokens, block_granularity)
             total = (
@@ -367,10 +354,53 @@ def _retention_for_label(label: str) -> Retention | None:
     return None
 
 
+def _is_window_int(value: object) -> bool:
+    """True for a real int; a bool is never a window, however int-like it is."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _windows_per_layer(
+    sliding_window_tokens: SlidingWindowTokens, num_layers: int
+) -> tuple[list[int | None], bool]:
+    """Normalize either window spelling to one entry per layer.
+
+    Args:
+        sliding_window_tokens: A scalar window to broadcast, one entry per
+            layer, or None.
+        num_layers: How many layers the windows must cover.
+
+    Returns:
+        ``(windows, broadcast)`` -- the per-layer windows, and whether they
+        came from a scalar. Callers need that second half: a broadcast scalar
+        reaches full-history layers too, which must then ignore it, while a
+        window written at a full-history position in a sequence is a
+        mislabeled layer.
+
+    Raises:
+        ValueError: Not a window spelling, or a sequence of the wrong length.
+    """
+    if sliding_window_tokens is None or _is_window_int(sliding_window_tokens):
+        return [sliding_window_tokens] * num_layers, True
+    if isinstance(sliding_window_tokens, str) or not isinstance(
+        sliding_window_tokens, Sequence
+    ):
+        raise ValueError(  # noqa: TRY004 - preserve the existing API contract
+            "sliding_window_tokens must be None, an int, or a sequence of "
+            f"int/None, got {sliding_window_tokens!r}"
+        )
+    windows = list(sliding_window_tokens)
+    if len(windows) != num_layers:
+        raise ValueError(
+            f"sliding_window_tokens has {len(windows)} entries but "
+            f"layer_types has {num_layers}"
+        )
+    return windows, False
+
+
 def hybrid_slab_group_size(
     layer_types: Sequence[str] | None,
     *,
-    sliding_window_tokens: int | Sequence[int | None] | None = None,
+    sliding_window_tokens: SlidingWindowTokens = None,
 ) -> int | None:
     """Slab count for the hybrid slab KV layout (the i-th layer of EACH
     group shares slab i), or None when the model cannot share slabs.
@@ -402,57 +432,30 @@ def hybrid_slab_group_size(
         counts[label] = counts.get(label, 0) + 1
     if len(counts) < 2:
         return None
-    if sliding_window_tokens is not None and not isinstance(sliding_window_tokens, int):
-        if not isinstance(sliding_window_tokens, Sequence) or len(
-            sliding_window_tokens
-        ) != len(layer_types):
-            return None
-        distinct = {
-            w
-            for label, w in zip(layer_types, sliding_window_tokens)
-            if _retention_for_label(label) == "sliding_window"
-            and isinstance(w, int)
-            and not isinstance(w, bool)
-            and w > 0
-        }
-        if len(distinct) > 1:
-            return None
-    return max(counts.values())
+    windows = sliding_window_tokens
+    if windows is None or isinstance(windows, int):
+        # One window for every sliding layer: pairing per raw label holds.
+        return max(counts.values())
+    if not isinstance(windows, Sequence) or len(windows) != len(layer_types):
+        return None
+    distinct = {
+        window
+        for label, window in zip(layer_types, windows)
+        if _retention_for_label(label) == "sliding_window"
+        and _is_window_int(window)
+        and window > 0
+    }
+    return None if len(distinct) > 1 else max(counts.values())
 
 
 def _layer_retention_windows(
     layer_types: Sequence[str],
-    sliding_window_tokens: int | Sequence[int | None] | None,
+    sliding_window_tokens: SlidingWindowTokens,
 ) -> list[tuple[Retention, int | None]]:
     """Validate the per-layer labels/windows and return (retention, window)
     per layer. A scalar window broadcasts to sliding layers; a sequence
     lines up 1:1 (full-history positions must be None)."""
-    if isinstance(sliding_window_tokens, str):
-        raise ValueError(  # noqa: TRY004 - preserve the existing API contract
-            "sliding_window_tokens must be None, an int, or a "
-            f"sequence of int/None, got {sliding_window_tokens!r}"
-        )
-    if sliding_window_tokens is None or isinstance(sliding_window_tokens, int):
-        if isinstance(sliding_window_tokens, bool):
-            raise ValueError(
-                "sliding_window_tokens must be None, an int, or "
-                f"a sequence of int/None, got {sliding_window_tokens!r}"
-            )
-        windows: list[int | None] = [sliding_window_tokens] * len(layer_types)
-        scalar = True
-    elif not isinstance(sliding_window_tokens, Sequence):
-        raise ValueError(
-            "sliding_window_tokens must be None, an int, or a "
-            f"sequence of int/None, got {sliding_window_tokens!r}"
-        )
-    else:
-        windows = list(sliding_window_tokens)
-        scalar = False
-        if len(windows) != len(layer_types):
-            raise ValueError(
-                f"sliding_window_tokens has {len(windows)} "
-                f"entries but layer_types has {len(layer_types)}"
-            )
+    windows, broadcast = _windows_per_layer(sliding_window_tokens, len(layer_types))
     rows: list[tuple[Retention, int | None]] = []
     for i, (label, raw) in enumerate(zip(layer_types, windows)):
         retention = _retention_for_label(label)
@@ -462,32 +465,34 @@ def _layer_retention_windows(
                 f"expected one of {sorted(_LAYER_TYPE_RETENTION)} or a "
                 f"sliding sub-group label '{_SLIDING_SUBGROUP_PREFIX}<k>'"
             )
-        if raw is not None and (isinstance(raw, bool) or not isinstance(raw, int)):
+        if raw is not None and not _is_window_int(raw):
             raise ValueError(
-                f"layer {i} ({label!r}) window must be None or " f"an int, got {raw!r}"
+                f"layer {i} ({label!r}) window must be None or an int, got {raw!r}"
             )
-        window = raw
         if retention == "sliding_window":
-            if window is None or window <= 0:
+            if raw is None or raw <= 0:
                 raise ValueError(
                     f"layer {i} ({label!r}) is sliding but its "
                     f"window is not a positive int (got {raw!r})"
                 )
-        else:
-            if not scalar and window is not None and window > 0:
-                raise ValueError(
-                    f"layer {i} ({label!r}) is full-history but "
-                    f"carries sliding window {window}; mislabeled layer_type?"
-                )
-            window = None
-        rows.append((retention, window))
+            rows.append((retention, raw))
+            continue
+        # A broadcast scalar reaches full-history layers too and they ignore
+        # it; a window written at this position by hand means the label is
+        # wrong. Either way the group carries no window.
+        if not broadcast and raw is not None and raw > 0:
+            raise ValueError(
+                f"layer {i} ({label!r}) is full-history but "
+                f"carries sliding window {raw}; mislabeled layer_type?"
+            )
+        rows.append((retention, None))
     return rows
 
 
 def layer_group_ids(
     *,
     layer_types: Sequence[str],
-    sliding_window_tokens: int | Sequence[int | None] | None,
+    sliding_window_tokens: SlidingWindowTokens,
 ) -> list[str]:
     """Per-layer cache group id — the single derivation the recipes
     and multi-window models assign ``PagedAttention(group_id=...)`` from
@@ -534,7 +539,7 @@ def group(
     *,
     layer_types: Sequence[str],
     group_ids: Sequence[str],
-    sliding_window_tokens: int | Sequence[int | None] | None,
+    sliding_window_tokens: SlidingWindowTokens,
     prefix_granularity: int,
     fields_for_layer,
     page_sizes: Mapping[str, int] | None = None,
@@ -594,8 +599,7 @@ def group(
         raise ValueError(
             "group requires per-layer group_ids; the "
             "cache recipe is their single source: derive them with "
-            "layer_group_ids(...) and carry them via "
-            "CachePoolSpec.layer_group_ids"
+            "layer_group_ids(...)"
         )
     resolved_layer_types = tuple(layer_types) or (FULL_ATTENTION,) * len(
         resolved_group_ids
@@ -726,6 +730,7 @@ __all__ = [
     "LINEAR_ATTENTION",
     "CacheGroupSpec",
     "Retention",
+    "SlidingWindowTokens",
     "STATE_LAYER_TYPES",
     "apply_pd_transfer_policies",
     "group",

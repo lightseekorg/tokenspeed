@@ -192,6 +192,244 @@ TEST_F(MambaChunkAlignmentSuite, PartialPrefillEndsAtStatePageBoundary) {
     }
 }
 
+class MambaStateCheckpointSplitSuite : public MambaChunkAlignmentSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = MambaChunkAlignmentSuite::MakeConfig();
+        cfg.max_scheduled_tokens = 64;
+        cfg.disable_prefix_cache = false;
+        return cfg;
+    }
+};
+
+TEST_F(MambaStateCheckpointSplitSuite, ReservesAndBatchesDependentTails) {
+    RequestSpec first = MakeRequestSpec("a", /*num_pages=*/3);
+    RequestSpec second = MakeRequestSpec("b", /*num_pages=*/3, /*start=*/100);
+    first.tokens.resize(10);
+    second.tokens.resize(10);
+    Submit({first, second});
+
+    ExecutionPlan bodies = PlanOnce();
+    const ForwardBatch* body_op = FindForwardBatch(bodies);
+    ASSERT_NE(body_op, nullptr);
+    EXPECT_EQ(body_op->request_ids, (std::vector<std::string>{"a", "b"}));
+    EXPECT_EQ(body_op->input_lengths, (std::vector<std::int32_t>{8, 8}));
+    for (const auto& row : body_op->block_tables.at("state")) {
+        EXPECT_EQ(row.size(), 3u);
+    }
+
+    ExecutionPlan tails = PlanOnce();
+    const ForwardBatch* tail_op = FindForwardBatch(tails);
+    ASSERT_NE(tail_op, nullptr);
+    EXPECT_EQ(tail_op->request_ids, (std::vector<std::string>{"a", "b"}));
+    EXPECT_EQ(tail_op->extend_prefix_lens, (std::vector<std::int32_t>{8, 8}));
+    EXPECT_EQ(tail_op->input_lengths, (std::vector<std::int32_t>{2, 2}));
+}
+
+TEST(MambaStateCheckpointCapacityTest, CountsInputBodyAndReservedTailCheckpoints) {
+    SchedulerConfig cfg{};
+    cfg.prefix_granularity = 4;
+    cfg.device_allocator.total_pages = 3;  // null + two usable state blocks
+    cfg.host_allocator.total_pages = 0;
+    cfg.max_scheduled_tokens = 8;
+    cfg.max_batch_size = 1;
+    cfg.disable_l2_cache = true;
+    cfg.cache_groups = {
+        MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages,
+                  CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
+    };
+
+    Scheduler scheduler{std::move(cfg)};
+
+    // Up to eight prompt tokens plus the decode reservation fit in two
+    // blocks. A longer prompt can reuse one input checkpoint while exposing an
+    // aligned body and reserving its sub-page tail, which needs three.
+    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 9);
+    RequestSpec too_long{
+        .request_id = "too-long",
+        .tokens = std::vector<std::int32_t>(14, 1),
+    };
+    EXPECT_THROW(scheduler.SubmitRequests({too_long}), std::invalid_argument);
+}
+
+TEST(MambaStateCheckpointCapacityTest, CountsFirstChunkBodyAndSubPageTail) {
+    SchedulerConfig cfg{};
+    cfg.prefix_granularity = 4;
+    cfg.device_allocator.total_pages = 4;  // null + three usable state blocks
+    cfg.host_allocator.total_pages = 0;
+    cfg.max_scheduled_tokens = 8;
+    cfg.max_batch_size = 1;
+    cfg.disable_l2_cache = true;
+    cfg.cache_groups = {
+        MakeGroup("state", /*block_granularity=*/1, cfg.device_allocator.total_pages,
+                  CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
+    };
+
+    Scheduler scheduler{std::move(cfg)};
+
+    // A seven-token prompt would split into a four-token body and a
+    // three-token tail. The body checkpoint plus the reserved tail need four
+    // state blocks, so three usable blocks cannot admit it and its decode.
+    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 7);
+    RequestSpec too_long{
+        .request_id = "too-long",
+        .tokens = std::vector<std::int32_t>(7, 1),
+    };
+    EXPECT_THROW(scheduler.SubmitRequests({too_long}), std::invalid_argument);
+}
+
+class MambaStateCheckpointNoPrefixCacheSuite : public MambaStateCheckpointSplitSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = MambaStateCheckpointSplitSuite::MakeConfig();
+        cfg.disable_prefix_cache = true;
+        return cfg;
+    }
+};
+
+TEST_F(MambaStateCheckpointNoPrefixCacheSuite, KeepsSingleFinalChunk) {
+    RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/3);
+    spec.tokens.resize(10);
+    Submit(spec);
+
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->input_lengths, std::vector<std::int32_t>{10});
+}
+
+class MambaStateCheckpointPrefillRoleSuite : public MambaStateCheckpointSplitSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = MambaStateCheckpointSplitSuite::MakeConfig();
+        cfg.role = Role::kP;
+        cfg.enable_pd_cache = true;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.transfer_policy =
+                group.IsSnapshotStateGroup() ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
+        }
+        return cfg;
+    }
+
+    void SendBootstrapped(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::BootstrappedEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+};
+
+TEST_F(MambaStateCheckpointPrefillRoleSuite, SplitsLocalPrefillOnPrefillWorker) {
+    RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/3);
+    spec.tokens.resize(10);
+    Submit(spec);
+    SendBootstrapped("r1");
+
+    ExecutionPlan body_plan = PlanOnce();
+    const ForwardBatch* body = FindForwardBatch(body_plan);
+    ASSERT_NE(body, nullptr);
+    EXPECT_TRUE(body->IsLocalPrefill());
+    EXPECT_EQ(body->extend_prefix_lens, std::vector<std::int32_t>{0});
+    EXPECT_EQ(body->input_lengths, std::vector<std::int32_t>{8});
+
+    ExecutionPlan tail_plan = PlanOnce();
+    const ForwardBatch* tail = FindForwardBatch(tail_plan);
+    ASSERT_NE(tail, nullptr);
+    EXPECT_TRUE(tail->IsLocalPrefill());
+    EXPECT_EQ(tail->extend_prefix_lens, std::vector<std::int32_t>{8});
+    EXPECT_EQ(tail->input_lengths, std::vector<std::int32_t>{2});
+}
+
+class MambaStateCheckpointDecodeRoleSuite : public MambaStateCheckpointPrefillRoleSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = MambaStateCheckpointPrefillRoleSuite::MakeConfig();
+        cfg.role = Role::kD;
+        return cfg;
+    }
+};
+
+TEST_F(MambaStateCheckpointDecodeRoleSuite, KeepsRemoteAdmissionWhole) {
+    RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/3);
+    spec.tokens.resize(10);
+    Submit(spec);
+    SendBootstrapped("r1");
+
+    ExecutionPlan admission_plan = PlanOnce();
+    const ForwardBatch* admission = FindForwardBatch(admission_plan);
+    ASSERT_NE(admission, nullptr);
+    EXPECT_FALSE(admission->IsLocalPrefill());
+    EXPECT_EQ(admission->extend_prefix_lens, std::vector<std::int32_t>{0});
+    EXPECT_EQ(admission->input_lengths, std::vector<std::int32_t>{10});
+}
+
+class MambaSparsePrefillSuite : public MambaChunkAlignmentSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = MambaChunkAlignmentSuite::MakeConfig();
+        cfg.max_scheduled_tokens = 12;
+        return cfg;
+    }
+};
+
+TEST_F(MambaSparsePrefillSuite, LocalChunkDefersStateDecodeReservationUntilCompletion) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/3));  // 12 tokens
+
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->input_lengths, std::vector<std::int32_t>{12});
+
+    EXPECT_EQ(RealPages(op->block_tables.at("full")).size(), 4u);
+
+    const auto& state = op->block_tables.at("state").at(0);
+    ASSERT_EQ(state.size(), 3u);
+    EXPECT_EQ(state[0], 0);
+    EXPECT_EQ(state[1], 0);
+    EXPECT_GT(state[2], 0);  // final prefill checkpoint
+    EXPECT_EQ(RealPages(op->block_tables.at("state")).size(), 1u);
+
+    ASSERT_EQ(plan.pages_to_zero.count("state"), 1u);
+    EXPECT_EQ(plan.pages_to_zero.at("state").size(), 1u);
+
+    SendForwardDone("r1", {42});
+    ExecutionPlan decode_plan = PlanOnce();
+    const ForwardBatch* decode = FindForwardBatch(decode_plan);
+    ASSERT_NE(decode, nullptr);
+    const auto& decode_state = decode->block_tables.at("state").at(0);
+    ASSERT_EQ(decode_state.size(), 4u);
+    EXPECT_GT(decode_state[2], 0);
+    EXPECT_GT(decode_state[3], 0);
+    ASSERT_EQ(decode_plan.pages_to_zero.count("state"), 1u);
+    EXPECT_EQ(decode_plan.pages_to_zero.at("state").size(), 1u);
+}
+
+class MambaOverlapRollingStateSuite : public MambaSparsePrefillSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = MambaSparsePrefillSuite::MakeConfig();
+        cfg.overlap_schedule_depth = 1;
+        return cfg;
+    }
+};
+
+TEST_F(MambaOverlapRollingStateSuite, FinalPrefillUsesInputAndOutputWithoutDecodeReserve) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/4));  // 16 tokens
+
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    ExecutionPlan final_prefill = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(final_prefill);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->input_lengths, std::vector<std::int32_t>{4});
+
+    const auto& state = op->block_tables.at("state").at(0);
+    ASSERT_EQ(state.size(), 4u);
+    EXPECT_EQ(state[0], 0);
+    EXPECT_EQ(state[1], 0);
+    EXPECT_GT(state[2], 0);  // rolling input
+    EXPECT_GT(state[3], 0);  // final prefill output
+    EXPECT_EQ(RealPages(op->block_tables.at("state")).size(), 2u);
+}
+
 class MambaMixedBudgetSuite : public MambaChunkAlignmentSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -1169,6 +1407,58 @@ TEST_F(CapacityBlockSuite, RetractsLargestRunningRequestImmediately) {
     SendFinish("r1");
     PlanOnce();
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), 12);
+}
+
+class MambaFusedRetractionDrainSuite : public MambaSparsePrefillSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = MambaSparsePrefillSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 9;
+        cfg.host_allocator.total_pages = 9;
+        cfg.max_scheduled_tokens = 64;
+        for (auto& group : cfg.cache_groups) {
+            group.total_pages = cfg.device_allocator.total_pages;
+        }
+        return cfg;
+    }
+};
+
+TEST_F(MambaFusedRetractionDrainSuite, RetractionDrainsResidentBeforeReadmittingVictim) {
+    ASSERT_EQ(scheduler_->PoolFreeBlocks(), 8);
+
+    Submit(MakeRequestSpec("a", /*num_pages=*/2));
+    Submit(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101));
+    Submit(MakeRequestSpec("c", /*num_pages=*/2, /*start=*/201));
+
+    ExecutionPlan prefill = PlanOnce();
+    const ForwardBatch* prefill_op = FindForwardBatch(prefill);
+    ASSERT_NE(prefill_op, nullptr);
+    ASSERT_EQ(prefill_op->request_ids, (std::vector<std::string>{"a", "b"}));
+    SendForwardDone("a", {42});
+    SendForwardDone("b", {142});
+
+    ExecutionPlan retract_round = PlanOnce();
+    const ForwardBatch* retract_op = FindForwardBatch(retract_round);
+    ASSERT_NE(retract_op, nullptr);
+    ASSERT_TRUE(retract_op->request_ids.empty());
+    ASSERT_EQ(scheduler_->WaitingSize(), 2u);
+    ASSERT_EQ(scheduler_->DecodingSize(), 0u);
+    ASSERT_EQ(scheduler_->PrefillSize(), 1u);
+
+    ExecutionPlan drain_round = PlanOnce();
+    const ForwardBatch* drain_op = FindForwardBatch(drain_round);
+    ASSERT_NE(drain_op, nullptr);
+    ASSERT_EQ(drain_op->request_ids, (std::vector<std::string>{"b"}))
+        << "the resident survivor must decode before the victim re-prefills";
+
+    SendForwardDone("b", {143});
+    SendFinish("b");
+    ExecutionPlan resumed_admission = PlanOnce();
+    const ForwardBatch* resumed_op = FindForwardBatch(resumed_admission);
+    ASSERT_NE(resumed_op, nullptr);
+    EXPECT_EQ(resumed_op->request_ids, (std::vector<std::string>{"a", "c"}));
+    EXPECT_EQ(resumed_op->input_lengths, (std::vector<std::int32_t>{9, 8}));
+    EXPECT_EQ(resumed_op->prefill_lengths, (std::vector<std::int32_t>{9, 8}));
 }
 
 class FusedRetractionL2TestSuite : public CapacityBlockSuite {

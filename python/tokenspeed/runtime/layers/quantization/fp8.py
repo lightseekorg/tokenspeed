@@ -39,6 +39,17 @@ class Fp8Config(QuantizationConfig):
 
     weight_scale_dtype = torch.float32
 
+    # Excluded from online quantization: linear-attention (GDN/mamba)
+    # projections, plus wo_a, whose is_bmm runtime path only accepts the
+    # deep_gemm ue8m0 block-scale layout that online quantization never emits.
+    ONLINE_IGNORED_LAYERS = [
+        "re:.*linear_attn.*",
+        "re:.*conv1d.*",
+        "re:.*in_proj.*",
+        "re:.*out_proj.*",
+        "re:.*wo_a.*",
+    ]
+
     def __init__(
         self,
         is_checkpoint_fp8_serialized: bool = False,
@@ -47,6 +58,8 @@ class Fp8Config(QuantizationConfig):
         weight_block_size: list[int] = None,
         scale_fmt: str | None = None,
     ) -> None:
+        if not is_checkpoint_fp8_serialized:
+            ignored_layers = (ignored_layers or []) + self.ONLINE_IGNORED_LAYERS
         super().__init__(ignored_layers=ignored_layers)
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
@@ -54,11 +67,9 @@ class Fp8Config(QuantizationConfig):
         if activation_scheme not in ACTIVATION_SCHEMES:
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
+        if weight_block_size is None and not is_checkpoint_fp8_serialized:
+            weight_block_size = [128, 128]
         if weight_block_size is not None:
-            if not is_checkpoint_fp8_serialized:
-                raise ValueError(
-                    "The block-wise quantization only supports fp8-serialized checkpoint for now."
-                )
             if len(weight_block_size) != 2:
                 raise ValueError(
                     f"The quantization block size of weight must have 2 dimensions, but got {len(weight_block_size)} dimensions."

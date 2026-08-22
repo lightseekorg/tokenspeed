@@ -59,6 +59,8 @@ from tokenspeed.runtime.layers.moe.utils import (
     use_deepep_low_latency,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
+from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
@@ -75,6 +77,31 @@ def _is_moe_layer(layer_id: int, config) -> bool:
     if layer_id in mlp_only_layers:
         return False
     return config.num_experts > 0 and (layer_id + 1) % config.decoder_sparse_step == 0
+
+
+_GATE_UP_CHECKPOINT_MEMBERS = ("gate_proj", "up_proj")
+
+
+def _gate_up_quant_config(
+    quant_config: QuantizationConfig | None, prefix: str
+) -> QuantizationConfig | None:
+    """Drop the quant config when the checkpoint keeps this MLP's weights bf16.
+
+    Args:
+        quant_config: Quantization config the caller would otherwise pass.
+        prefix: Full runtime prefix of the fused ``gate_up_proj`` module.
+
+    Returns:
+        ``None`` when either checkpoint member is excluded, else ``quant_config``.
+    """
+    if not isinstance(quant_config, Nvfp4Config) or not prefix:
+        return quant_config
+    parent = prefix.rpartition(".")[0]
+    for member in _GATE_UP_CHECKPOINT_MEMBERS:
+        member_prefix = f"{parent}.{member}" if parent else member
+        if should_exclude_quant_module(member_prefix, quant_config.exclude_modules):
+            return None
+    return quant_config
 
 
 class Qwen3_5MoeMLP(nn.Module):
@@ -109,6 +136,9 @@ class Qwen3_5MoeMLP(nn.Module):
         """
         super().__init__()
         self.mapping = mapping
+        gate_up_quant_config = _gate_up_quant_config(
+            quant_config, add_prefix("gate_up_proj", prefix)
+        )
         if mapping.dense.has_tp and not replicate_weights:
             tp_size = mapping.dense.tp_size
             tp_rank = mapping.dense.tp_rank
@@ -120,7 +150,7 @@ class Qwen3_5MoeMLP(nn.Module):
                 tp_size=tp_size,
                 tp_rank=tp_rank,
                 tp_group=tp_group,
-                quant_config=quant_config,
+                quant_config=gate_up_quant_config,
                 prefix=add_prefix("gate_up_proj", prefix),
             )
             self.down_proj = RowParallelLinear(
@@ -139,7 +169,7 @@ class Qwen3_5MoeMLP(nn.Module):
                 hidden_size,
                 intermediate_size * 2,
                 bias=False,
-                quant_config=quant_config,
+                quant_config=gate_up_quant_config,
                 prefix=add_prefix("gate_up_proj", prefix),
             )
             self.down_proj = ReplicatedLinear(

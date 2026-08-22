@@ -111,13 +111,12 @@ for fork PRs where repository variables are unavailable. To temporarily remove
 additional unavailable GPU runners from PR test matrices, set the
 `TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS` repository variable to comma-separated,
 case-insensitive substrings such as `gb200, mi355`. Matching uses the resolved
-runner label after applying `TOKENSPEED_B200_RUNNER_LABEL`; the built-in `b300`
-baseline therefore matches both `b300-*` and `gb300-*`, while `mi355` matches
-`amd-mi355-*`. Empty entries are ignored. If every runner in a workflow group
-is excluded, its matrix job is skipped while the workflow still finishes.
-This variable applies only to the three PR test workflows. Clear or unset it to
-restore all runner labels except the NVIDIA workflow's `h100` and `b300`
-baselines.
+runner label after applying `TOKENSPEED_B200_RUNNER_LABEL`; `mi355` therefore
+matches `amd-mi355-*`. Empty entries are ignored. If every runner in a workflow
+group is excluded, its matrix job is skipped while the workflow still
+finishes. This variable applies only to the three PR test workflows. Clear or
+unset it to restore all runner labels except the NVIDIA workflow's `h100` and
+`b300` baselines.
 
 The CI system derives `SM` from common runner label prefixes by default:
 `h100`/`h200` use `sm90`, `b200`/`gb200` use `sm100`, and `b300`/`gb300` use
@@ -126,7 +125,8 @@ override or extend the defaults for a single runner label.
 
 PR workflows split runner labels by vendor and host architecture. `PR Test
 NVIDIA` uses the `nvidia-x86` runner group, while `PR Test NVIDIA ARM` uses
-the `nvidia-arm` runner group for `gb200` labels.
+the `nvidia-arm` runner group. GB300 is classified as NVIDIA ARM, but is not
+declared in task YAMLs and therefore does not enter default CI matrices.
 
 ## Slurm with Pyxis/Enroot
 
@@ -224,8 +224,71 @@ python3 test/ci_system/slurm_submit.py \
 matching tasks are submitted before `--follow` starts, so their Slurm jobs can
 run concurrently.
 
-On the GB200 Slurm coordinator, use the shell launcher for manual scheduling.
-It supplies the cluster's shared artifact/cache paths and pinned runner image:
+On a Slurm coordinator, use the shell launcher for manual scheduling. It
+supplies the cluster's shared artifact/cache paths and pinned runner image.
+The defaults target GB200; on GB300 set the shared paths under
+`/data/home/$USER`:
+
+```bash
+TS_CI_ARTIFACT_ROOT=/data/home/$USER/tokenspeed-slurm \
+TS_CI_CACHE_DIR=/data/home/$USER/tokenspeed-cache \
+TS_CI_LOCAL_MODEL_ROOT=/scratch/$USER-models \
+test/ci/run_slurm.sh \
+  test/ci/eval/kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml \
+  --runner slurm-gb300-4gpu \
+  --type eval \
+  --wait
+```
+
+GB300 server containers mount `TS_CI_LOCAL_MODEL_ROOT` read-only at `/models`.
+It defaults to `/scratch/$USER-models`, the node-local RAID path. The Kimi-K3
+GB300 tasks use pinned snapshots below that mount so weight loading does not
+read the shared Hugging Face cache. Synchronize these directories to every
+eligible GB300 node before enabling the tasks:
+
+```text
+moonshotai--Kimi-K3/9f62e4e9fffbd0a83ddd60e1c209d828994b3569
+nvidia--Kimi-K3-NVFP4/f8c5234a0a880bcc6cbf779a315e7ee2f405b812
+Inferact--Kimi-K3-DSpark/cf6b8244620e7ea4b0651d214f28e89eac75bed6
+```
+
+The `Slurm Dispatch` workflow exposes a `cluster` input. `gb200` keeps the
+existing `slurm-dispatch` coordinator and runner defaults. `gb300` is an
+explicit opt-in: select one YAML that declares exactly one `gb300-Ngpu` or
+`slurm-gb300-Ngpu` label. The workflow passes that label through unchanged and
+validates any explicit runner selection against it. Five
+`slurm-dispatch-gb300` coordinators form one shared pool for manual and
+per-commit submissions. GB300 perf tasks are disabled until GB300-specific
+reference values are measured.
+
+The `GB300 Slurm Per Commit` workflow selects only multi-node model tasks with
+the `per-commit` trigger and submits them through the same
+`slurm-dispatch-gb300` coordinator pool used by manual dispatch. It runs for
+pushes to `main` and for non-draft pull requests whose head branch belongs to
+this repository. Pull-request runs execute the merge commit's dispatcher, so
+dispatcher changes are covered before merge. Fork pull requests remain skipped
+until the coordinator pool uses ephemeral runners with a protected approval
+environment; use the manual `Slurm Dispatch` workflow after review. New commits
+cancel the older run for the same pull request or the `main` branch.
+
+Submission is fail-closed and requires the repository variable
+`TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED` to equal `true`. The dedicated
+switch is separate from `TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS`: this workflow
+does not pass that variable to its matrix scan, so entries such as `gb300`
+cannot filter the multi-node matrix here. During this workflow's
+bootstrap only, leave the switch unset; after dispatcher support reaches
+`main`, set it to `true` and re-run the merge commit's workflow.
+
+The two-node Kimi K3 tasks declare `slurm-gb300-4gpu`, `slurm.nodes: 2`, and
+`slurm.gpus_per_node: 4`. The runner label describes GPUs per node, while the
+Slurm topology fields describe the allocation. The NVFP4 DSpark task pairs the
+pinned `nvidia/Kimi-K3-NVFP4` target with `Inferact/Kimi-K3-DSpark` and
+preserves the draft checkpoint's required `attn_res` auxiliary stream.
+The MXFP4 DSpark OCRBench and MMMU-Pro Vision tasks are manual-only baselines
+that use a pinned Kimi Vendor Verifier revision; select either YAML through
+`Slurm Dispatch` with the `gb300` cluster.
+
+GB200 examples:
 
 ```bash
 # One existing YAML:
@@ -268,6 +331,10 @@ worktree. The original checkout is not modified, and submitted jobs use an
 immutable archive of that merged commit. A merge conflict stops before any job
 is submitted.
 
+`--source-pr` accepts the same values but only labels the report; it neither
+fetches nor merges, and is for callers that already checked out the pull
+request's merge commit.
+
 Repeat `--runner` to select multiple exact labels. Repeat `--type` to select
 from `ut`, `server_smoke`, `eval`, and `perf`; without `--type`, the
 backward-compatible default is `eval` plus `perf`. Repeat `--match` to select
@@ -300,10 +367,11 @@ run that YAML independently of the bulk runner, type, match, trigger, and MMLU
 filters. Every B200 or GB200 runner label declared by the selected YAML is
 submitted as its own Slurm job.
 
-The dispatcher checkout is trusted control-plane code. The requested PR is
-merged only in the submitter's temporary worktree and runs from its immutable
-archive inside Pyxis; do not configure the coordinator runner to execute
-arbitrary PR scripts directly.
+The manual workflow keeps the dispatcher checkout on trusted `main` and merges
+the requested PR only in the submitter's temporary worktree. The per-commit
+workflow instead executes a same-repository PR's merge commit so dispatcher
+changes can be validated before merge. Fork PRs must not use that path while
+the coordinator pool is persistent.
 
 For a YAML with multiple runner labels, select one or more explicitly with
 repeated `--runner`.

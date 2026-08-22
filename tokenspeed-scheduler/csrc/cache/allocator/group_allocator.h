@@ -78,12 +78,17 @@ public:
     void ClaimHitBlocks(BlockTable& table, PrefixMatch&& hit) {
         _assert(table.blocks_.empty(), "ClaimHitBlocks requires a fresh (empty) table");
         table.blocks_ = std::move(hit.blocks);
+        while (table.reclaimed_prefix_blocks_ < table.NumBlocks() &&
+               !table.blocks_[static_cast<std::size_t>(table.reclaimed_prefix_blocks_)]) {
+            ++table.reclaimed_prefix_blocks_;
+        }
     }
 
     // Executes a GroupGeometry plan: acquires plan.num_blocks fresh blocks,
     // places them (dense append or sparse suffix), and stores the planned
     // bookkeeping. Returns false without mutation when the pool is short.
     bool Acquire(BlockPool& pool, BlockTable& table, const AcquirePlan& plan) {
+        const std::int32_t old_num_blocks = table.NumBlocks();
         std::vector<CacheBlockRef> block_refs;
         if (plan.num_blocks > 0) {
             block_refs = pool.AcquireBlocks(group_id_, cache_blocks_per_lcm_block_, plan.num_blocks);
@@ -101,6 +106,9 @@ public:
             _assert(plan.suffix_start + plan.num_blocks <= plan.table_blocks_after,
                     "sparse suffix exceeds the planned table size");
             table.blocks_.resize(static_cast<std::size_t>(plan.table_blocks_after));
+            if (old_num_blocks == 0) {
+                table.reclaimed_prefix_blocks_ = plan.suffix_start;
+            }
             for (std::size_t i = 0; i < block_refs.size(); ++i) {
                 table.blocks_[static_cast<std::size_t>(plan.suffix_start) + i] = std::move(block_refs[i]);
             }
@@ -142,12 +150,10 @@ public:
     // How many blocks expired is retention policy (GroupGeometry).
     void ReclaimExpired(BlockPool& /*pool*/, BlockTable& table, std::int32_t num_expired_blocks) {
         const std::int32_t expired = std::min(num_expired_blocks, table.NumBlocks());
-        for (std::int32_t i = expired - 1; i >= 0; --i) {
-            CacheBlockRef old = table.EvictToNull(i);
-            if (!old) {
-                break;  // already null -> earlier slots are null too
-            }
+        for (std::int32_t i = table.reclaimed_prefix_blocks_; i < expired; ++i) {
+            table.EvictToNull(i).reset();
         }
+        table.reclaimed_prefix_blocks_ = std::max(table.reclaimed_prefix_blocks_, expired);
     }
 
     // Only blocks uniquely owned by this table reach the free list, so shared ones don't count.
@@ -155,10 +161,10 @@ public:
                                      std::int32_t num_expired_blocks, bool count_uncached) const {
         const std::int32_t expired = std::min(num_expired_blocks, table.NumBlocks());
         std::int32_t freed = 0;
-        for (std::int32_t i = expired - 1; i >= 0; --i) {
+        for (std::int32_t i = table.ReclaimedPrefixBlocks(); i < expired; ++i) {
             const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
             if (!block) {
-                break;  // already null -> earlier slots are null too
+                continue;
             }
             const bool cached = index.Contains(block);
             const bool only_table_and_cache_owners = cached && block.use_count() == 2;
@@ -174,10 +180,10 @@ public:
         std::span<const CacheBlockLocation> released_locations) const {
         const std::int32_t expired = std::min(num_expired_blocks, table.NumBlocks());
         std::vector<CacheBlockLocation> locations;
-        for (std::int32_t i = expired - 1; i >= 0; --i) {
+        for (std::int32_t i = table.ReclaimedPrefixBlocks(); i < expired; ++i) {
             const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
             if (!block) {
-                break;
+                continue;
             }
             const bool cached = index.Contains(block);
             const std::uint32_t released_owners =
@@ -203,6 +209,7 @@ public:
         }
         table.blocks_.clear();
         table.available_tokens_ = 0;
+        table.reclaimed_prefix_blocks_ = 0;
     }
 
 private:

@@ -55,7 +55,6 @@ class MHATokenToKVPool(CachePool):
         rank: int,
         *,
         layer_types: tuple[str, ...] = (),
-        layer_group_ids: tuple[str, ...] = (),
         layer_kv_head_counts: tuple[int, ...] | None = None,
         kv_alloc_head_count: int | None = None,
         field_layer_offset: int = 0,
@@ -87,17 +86,6 @@ class MHATokenToKVPool(CachePool):
             int(kv_alloc_head_count) if kv_alloc_head_count else None
         )
         self._layer_types = tuple(layer_types or ())
-        # Physical group id per layer, from the cache recipe
-        # (CachePoolSpec.layer_group_ids) — the single source the scheduler
-        # groups are published from.
-        self.layer_cache_group_ids = tuple(layer_group_ids)
-        if len(self.layer_cache_group_ids) != layer_num:
-            raise ValueError(
-                f"layer_group_ids has {len(self.layer_cache_group_ids)} "
-                f"entries but the pool has {layer_num} layers; the cache "
-                "recipe must supply one group id per layer "
-                "(CachePoolSpec.layer_group_ids)"
-            )
         self._bind_layer_planes()
 
         k_size, v_size = self.get_kv_size_bytes()

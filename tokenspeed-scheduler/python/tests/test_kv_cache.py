@@ -199,23 +199,25 @@ def _make_k3_128k_config(num_device_pages: int) -> ts.SchedulerConfig:
 
 
 def test_k3_reports_group_aware_single_request_capacity() -> None:
-    # Each State group peaks at one lookback page plus 64 chunk pages and a
-    # one-token decode reserve: 66 parents. The three groups therefore leave
-    # 86 of the 284 usable parents for Full KV.
-    # K_full=12 and P=128 therefore expose 86 * 12 * 128 tokens.
+    # Each sparse State group needs an input checkpoint, an aligned-body
+    # checkpoint, and its reserved tail. The three groups therefore leave 275
+    # of the 284 usable parents for Full KV. K_full=12 and P=128 expose
+    # 275 * 12 * 128 tokens.
     scheduler = ts.Scheduler(_make_k3_128k_config(285))
-    assert scheduler.max_single_request_tokens() == 132_096
+    assert scheduler.max_single_request_tokens() == 422_400
 
 
 def test_k3_128k_requires_group_aware_shared_pool_geometry() -> None:
     prompt = _spec("128k", list(range(131_072)))
 
-    undersized = ts.Scheduler(_make_k3_128k_config(284))
+    # Nine State parents plus 86 Full parents admit 128K; one fewer Full parent
+    # is 512 tokens short because each Full parent carries 12 * 128 tokens.
+    undersized = ts.Scheduler(_make_k3_128k_config(95))
     assert undersized.max_single_request_tokens() < 131_072
 
-    corrected = ts.Scheduler(_make_k3_128k_config(285))
+    corrected = ts.Scheduler(_make_k3_128k_config(96))
     before = corrected.available_kv_pages()
-    assert before == 284
+    assert before == 95
     corrected.submit_requests([prompt])
     completed_tokens = 0
     for chunk in range(32):
@@ -283,9 +285,7 @@ def _drive_k3_to_retract(scheduler) -> dict[str, dict[int, int]]:
 
 
 def test_k3_readmit_rebuilds_all_four_tables_and_restores_pages() -> None:
-    """Binding-marshalling smoke for readmit: the only python test that reads
-    ``op.prefill_lengths`` through the real nanobind property (the C++ suite
-    covers the retract/readmit scheduler scenarios themselves)."""
+    """Binding smoke for a split readmit and its reserved state tail."""
     scheduler = ts.Scheduler(_make_k3_config())
     before = scheduler.available_kv_pages()
     pre_retract_pages = _drive_k3_to_retract(scheduler)
@@ -293,19 +293,20 @@ def test_k3_readmit_rebuilds_all_four_tables_and_restores_pages() -> None:
     for request_id in ("b", "c", "d"):
         _finish(scheduler, request_id)
 
-    readmit = _find_forward_op(scheduler.next_execution_plan())
-    assert readmit is not None
-    assert tuple(readmit.request_ids) == ("a",)
-    assert tuple(readmit.prefill_lengths) == (11,)
-    assert readmit.extend_prefix_lens[0] + readmit.input_lengths[0] == 11
-    tables = dict(readmit.block_tables)
+    body = _find_forward_op(scheduler.next_execution_plan())
+    assert body is not None
+    assert tuple(body.request_ids) == ("a",)
+    assert tuple(body.prefill_lengths) == (11,)
+    assert tuple(body.extend_prefix_lens) == (8,)
+    assert tuple(body.input_lengths) == (2,)
+    tables = dict(body.block_tables)
     assert tuple(tables) == K3_GROUP_IDS
     prefix_granularity = _make_k3_config().prefix_granularity
-    assert readmit.extend_prefix_lens[0] % prefix_granularity == 0
-    prefix_slots = readmit.extend_prefix_lens[0] // prefix_granularity
+    assert body.extend_prefix_lens[0] % prefix_granularity == 0
+    prefix_slots = body.extend_prefix_lens[0] // prefix_granularity
     assert prefix_slots == 4
     expected_slots = (
-        readmit.prefill_lengths[0] + prefix_granularity - 1
+        body.prefill_lengths[0] + prefix_granularity - 1
     ) // prefix_granularity
     assert expected_slots == 6
 
@@ -329,14 +330,22 @@ def test_k3_readmit_rebuilds_all_four_tables_and_restores_pages() -> None:
 
         tail = row[prefix_slots:]
         assert len(tail) == 2
-        assert all(page > 0 for page in tail)
         group_tail = _positive_pages(tail)
+        # The aligned body materializes its state checkpoint and atomically
+        # reserves the final prompt-tail slot, so every group owns both pages.
+        assert all(page > 0 for page in tail)
         assert len(group_tail) == 2
         fresh_tail_entries.extend(group_tail)
 
     assert len(set(all_positive_entries)) == len(all_positive_entries)
     assert len(set(fresh_tail_entries)) == len(fresh_tail_entries)
     assert set(fresh_tail_entries).isdisjoint(restored_pages)
+
+    tail = _find_forward_op(scheduler.next_execution_plan())
+    assert tail is not None
+    assert tuple(tail.request_ids) == ("a",)
+    assert tuple(tail.extend_prefix_lens) == (10,)
+    assert tuple(tail.input_lengths) == (1,)
 
     _advance_tokens(scheduler, "a", [3000])
     scheduler.next_execution_plan()

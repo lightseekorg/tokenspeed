@@ -427,7 +427,12 @@ def _create_hybrid_linear_attn_backend(
     kda_backend = (getattr(server_args, "kda_backend", None) or "auto").strip().lower()
     if is_kda:
         kda_backend = _resolve_kda_backend(kda_backend)
-        linear_attn_backend = KdaAttnBackend(config, kda_backend=kda_backend)
+        kda_recurrent_layout = "v_major" if current_platform().is_cdna4 else "k_major"
+        linear_attn_backend = KdaAttnBackend(
+            config,
+            kda_backend=kda_backend,
+            kda_recurrent_layout=kda_recurrent_layout,
+        )
     else:
         linear_attn_backend = MambaAttnBackend(config)
 
@@ -559,7 +564,7 @@ def _create_target_components(
         cache_spec,
         config,
         arena,
-        num_layers=len(cache_spec.layer_group_ids),
+        num_layers=len(cache_spec.layer_types),
         rank=rank,
     )
     if is_hybrid_linear:
@@ -667,12 +672,12 @@ def _prepare_verify_workspace(
     config,
     backend,
     draft_backend,
-    is_qwen_gdn: bool,
+    uses_paged_state_verify: bool,
     is_inkling: bool,
     expected_bytes: int,
 ) -> None:
-    if is_qwen_gdn and expected_bytes:
-        model_name = "GDN"
+    if uses_paged_state_verify and expected_bytes:
+        model_name = "paged-state"
         actual_bytes = backend.linear_attn_backend.preallocate_verify_workspace(
             config.max_bs,
             int(server_args.speculative_num_draft_tokens),
@@ -907,7 +912,7 @@ def create_attn_components(
         spec.memory_plan.prefix_granularity,
         spec.memory_plan.num_lcm_blocks,
         spec.token_capacity,
-        len(spec.layer_group_ids),
+        len(spec.layer_types),
         cache_setup.num_draft_layers,
         {
             group.group_id: group.cache_blocks_per_lcm_block
@@ -968,7 +973,7 @@ def create_attn_components(
         config=config,
         backend=backend,
         draft_backend=draft_attn_backend,
-        is_qwen_gdn=use_cache_gdn,
+        uses_paged_state_verify=use_cache_gdn or use_cache_k3,
         is_inkling=use_cache_inkling,
         expected_bytes=fixed_workspace_bytes,
     )

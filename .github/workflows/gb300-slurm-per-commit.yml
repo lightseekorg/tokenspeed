@@ -1,0 +1,179 @@
+name: GB300 Slurm Per Commit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "python/pyproject.toml"
+      - "python/tokenspeed/**"
+      - "tokenspeed-kernel/**"
+      - "tokenspeed-mla/**"
+      - "tokenspeed-scheduler/**"
+      - "test/**"
+      - ".github/workflows/gb300-slurm-per-commit.yml"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+      - "python/pyproject.toml"
+      - "python/tokenspeed/**"
+      - "tokenspeed-kernel/**"
+      - "tokenspeed-mla/**"
+      - "tokenspeed-scheduler/**"
+      - "test/**"
+      - ".github/workflows/gb300-slurm-per-commit.yml"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: gb300-slurm-per-commit-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.changes.outputs.should_run }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      has_tasks: ${{ steps.matrix.outputs.has_tasks }}
+      allowed: ${{ steps.gate.outputs.allowed }}
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - name: Check trusted source
+        id: gate
+        env:
+          ALLOWED: ${{ (github.repository == 'lightseekorg/tokenspeed' || github.repository == vars.TOKENSPEED_CI_REPOSITORY) && (github.event_name != 'pull_request' || (github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository)) }}
+          ENABLED: ${{ vars.TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED == 'true' }}
+        run: |
+          echo "allowed=$ALLOWED" >> "$GITHUB_OUTPUT"
+          echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
+          if [ "$ALLOWED" != true ]; then
+            echo "GB300 Slurm per-commit CI skips draft and fork pull requests; use Slurm Dispatch after review." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$ENABLED" != true ]; then
+            echo "GB300 Slurm per-commit submission is disabled; set TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED=true to enable it." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Checkout code
+        if: steps.gate.outputs.allowed == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed paths
+        if: steps.gate.outputs.allowed == 'true'
+        id: changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          changed_files="$RUNNER_TEMP/tokenspeed-changed-files.txt"
+          case "${{ github.event_name }}" in
+            pull_request)
+              gh api \
+                "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+                --paginate \
+                -q '.[] | .filename, (.previous_filename // empty)' \
+                > "$changed_files"
+              ;;
+            push)
+              gh api \
+                "/repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.event.after }}" \
+                -q '.files[] | .filename, (.previous_filename // empty)' \
+                > "$changed_files"
+              ;;
+          esac
+          python3 test/ci_system/ci_path_filter.py \
+            --runner-group nvidia-gb300-slurm \
+            --event-name "${{ github.event_name }}" \
+            "$changed_files" >> "$GITHUB_OUTPUT"
+
+      - name: Install scan dependency
+        if: steps.changes.outputs.should_run == 'true'
+        run: |
+          for i in 1 2 3 4 5; do
+            python3 -m pip install pyyaml && exit 0
+            echo "pyyaml install attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          exit 1
+
+      - name: Build multi-node task matrix
+        if: steps.changes.outputs.should_run == 'true'
+        id: matrix
+        run: |
+          matrix=$(python3 test/ci_system/pipeline.py scan \
+            --root test/ci \
+            --trigger per-commit \
+            --runner-group nvidia-arm \
+            --workflow-stage model-test \
+            --multi-node only)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          printf '%s' "$matrix" | python3 -c \
+            "import json, sys; print('has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" \
+            >> "$GITHUB_OUTPUT"
+
+  submit:
+    name: ${{ matrix.name }}
+    needs: scan
+    if: |
+      needs.scan.outputs.allowed == 'true' &&
+      needs.scan.outputs.enabled == 'true' &&
+      needs.scan.outputs.should_run == 'true' &&
+      needs.scan.outputs.has_tasks == 'true'
+    runs-on: slurm-dispatch-gb300
+    timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.scan.outputs.matrix || '{"include":[]}') }}
+    steps:
+      - name: Checkout dispatcher
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Submit and wait for GB300 Slurm task
+        env:
+          CONFIG: ${{ matrix.config }}
+          RUNNER: ${{ matrix.runner }}
+          TASK_TYPE: ${{ matrix.type }}
+          PR_NUMBER: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
+        run: |
+          set -euo pipefail
+          unset HF_TOKEN HUGGING_FACE_HUB_TOKEN
+          case "$RUNNER" in
+            slurm-gb300-*) ;;
+            *) echo "Unsupported GB300 Slurm runner: $RUNNER" >&2; exit 2 ;;
+          esac
+          coordinator_user=${USER:-$(id -un)}
+          export TS_CI_ARTIFACT_ROOT="/data/home/$coordinator_user/tokenspeed-slurm"
+          export TS_CI_CACHE_DIR="/data/home/$coordinator_user/tokenspeed-cache"
+          args=(
+            --config "$CONFIG"
+            --runner "$RUNNER"
+            --type "$TASK_TYPE"
+            --wait
+            --report-dir "$RUNNER_TEMP/slurm-report"
+          )
+          [ -z "$PR_NUMBER" ] || args+=(--source-pr "$PR_NUMBER")
+          exec test/ci/run_slurm.sh "${args[@]}"
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/slurm-report/summary.md" ]; then
+            cat "$RUNNER_TEMP/slurm-report/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Slurm dispatcher exited before producing a report." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Slurm results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gb300-slurm-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/slurm-report
+          if-no-files-found: warn

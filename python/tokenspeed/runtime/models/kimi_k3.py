@@ -124,6 +124,10 @@ from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.topk import TopK, TopKOutput, TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
+    preprocess_fp8_pb_wo_weights,
+)
+from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
@@ -358,13 +362,69 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             # effective bandwidth here anyway.)
             self._qkv_a_width = q_lora_rank + kv_lora_rank + qk_rope_head_dim
             self._gate_width = num_heads * v_head_dim // mapping.attn.tp_size
+            fused_prefix = add_prefix("fused_qkv_a_proj_with_mqa", prefix)
+            fused_out = self._qkv_a_width + self._gate_width
+            # FP8_PB_WO (w8a8) fused projection: pad the output rows to the
+            # 128-block grid so Fp8LinearMethod keeps the flashinfer
+            # blockscale GEMM (which requires N % 128 == 0) instead of the
+            # Triton fallback. Rows use the PRIVATE [gate | q_a | kv_a | pad]
+            # order (_FP8_FUSED_QKV_A_ORDER): all boundaries 128-aligned, so
+            # checkpoint codes and scales load verbatim (zero
+            # requantization); the zero pad rows complete kv_a's ragged
+            # trailing block and are sliced off right after the GEMM.
+            # bf16/mxfp4 checkpoints take pad 0, keep the canonical
+            # [q_a | kv_a | gate] order, and construct exactly as before.
+            self._fused_qkv_a_pad_rows = 0
+            self._fused_qkv_a_fp8_layout = False
+            if _fused_qkv_a_uses_fp8(quant_config, prefix):
+                padded_out = ceil_div(fused_out, 128) * 128
+                self._fused_qkv_a_pad_rows = padded_out - fused_out
+                self._fused_qkv_a_fp8_layout = True
+                fused_out = padded_out
             self.fused_qkv_a_proj_with_mqa = DeepseekV3FusedQkvAProjWithMqa(
                 hidden_size,
-                self._qkv_a_width + self._gate_width,
+                fused_out,
                 bias=False,
                 quant_config=quant_config,
-                prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
+                prefix=fused_prefix,
             )
+
+    def _split_fused_qkv_a(
+        self, qkv_gate: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split the fused a-projection output by the active row layout.
+
+        FP8 checkpoints load the PRIVATE [gate | q_a | kv_a] order
+        (_FP8_FUSED_QKV_A_ORDER, 128-aligned boundaries, verbatim scales);
+        bf16/mxfp4 keep the canonical [q_a | kv_a | gate].
+        """
+        if self._fused_qkv_a_fp8_layout:
+            # Locked to the assembly order: a layout change edits the
+            # constant, and this assertion turns any drift into a loud
+            # failure instead of silently mis-splitting the projections.
+            assert _FP8_FUSED_QKV_A_ORDER == (
+                "g_proj",
+                "q_a_proj",
+                "kv_a_proj_with_mqa",
+            )
+            gate, q_a, latent_cache = qkv_gate.split(
+                [
+                    self._gate_width,
+                    self.q_lora_rank,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ],
+                dim=-1,
+            )
+        else:
+            q_a, latent_cache, gate = qkv_gate.split(
+                [
+                    self.q_lora_rank,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    self._gate_width,
+                ],
+                dim=-1,
+            )
+        return q_a, latent_cache, gate
 
     def _project_q_latent_gated(
         self,
@@ -388,15 +448,32 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             )
             if attnres_partial_args is not None:
                 attnres_partial_dual(*attnres_partial_args)
+            if self._fused_qkv_a_pad_rows:
+                # Drop the zero pad rows of the 128-aligned FP8 projection
+                # before anything consumes the output.
+                qkv_gate = qkv_gate[
+                    ..., : self._qkv_a_width + self._gate_width
+                ].contiguous()
             qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
-            q_a, latent_cache, gate = qkv_gate.split(
-                [
-                    self.q_lora_rank,
-                    self.kv_lora_rank + self.qk_rope_head_dim,
-                    self._gate_width,
-                ],
-                dim=-1,
-            )
+            q_a, latent_cache, gate = self._split_fused_qkv_a(qkv_gate)
+        elif self.fused_qkv_a_proj_with_mqa.weight.dtype in _FP8_WEIGHT_DTYPES:
+            # FP8-resident fused projection (FP8_PB_WO w8a8): the bf16 fast
+            # kernels below cannot consume the quantized weight, so run the
+            # quantized module GEMM and keep any hoisted dual-partials as a
+            # standalone kernel — the same recipe as the block_scale branch.
+            # (can_fuse_attnres_partials already returns False for FP8
+            # weights, so args are normally None here.)
+            if attnres_partial_args is not None:
+                attnres_partial_dual(*attnres_partial_args)
+            qkv_gate = self.fused_qkv_a_proj_with_mqa(hidden_states)
+            if self._fused_qkv_a_pad_rows:
+                # Drop the zero pad rows of the 128-aligned FP8 projection
+                # before anything consumes the output.
+                qkv_gate = qkv_gate[
+                    ..., : self._qkv_a_width + self._gate_width
+                ].contiguous()
+            qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
+            q_a, latent_cache, gate = self._split_fused_qkv_a(qkv_gate)
         elif attnres_partial_args is not None:
             blocks, weight_a, weight_b, eps, scratch_a, scratch_b = attnres_partial_args
             qkv_gate = linear_attnres_partials(
@@ -442,6 +519,19 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 )
                 gate = projection.gate
         kv_a = latent_cache[..., : self.kv_lora_rank]
+        if self.q_b_proj.weight.dtype in _FP8_WEIGHT_DTYPES:
+            # FP8-resident q_b (FP8_PB_WO w8a8): mla_normalize_project_query
+            # consumes a raw bf16 weight, so fall back to the unfused parent
+            # recipe — fused q_a/kv_a norms, then the quantized q_b GEMM.
+            # No absorbed-query preparation on this path; forward_absorb
+            # projects the query itself when absorbed_query is None.
+            q_norm = torch.empty_like(q_a)
+            if q_a.size(0) > 0:
+                self.fused_qk_layernorm(
+                    input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm
+                )
+            q = self.q_b_proj(q_norm)[0]
+            return q, latent_cache, gate, None
         projection = mla_normalize_project_query(
             q_a,
             kv_a,
@@ -590,6 +680,106 @@ def _situ_betas(config: KimiLinearConfig) -> tuple[float, float | None]:
     return (config.activation_situ_beta, config.activation_situ_linear_beta)
 
 
+# FP8 storage dtypes accepted by the FP8-resident paths (matches the
+# quantization layers' width: e4m3fn on NVIDIA, e4m3fnuz on older ROCm).
+_FP8_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+
+# FP8_PB_WO fused_qkv_a PRIVATE row layout (FP8 mode only). Segments are
+# REORDERED to [gate | q_a | kv_a | zero tail pad] so that every segment
+# boundary lands on the 128-row scale-block grid: the gate shard
+# (num_heads*v_head_dim/attn_tp) and q_a (q_lora_rank) are 128-multiples,
+# and kv_a (kv_lora_rank + rope = 576) sits last so its ragged half block is
+# completed by the zero pad rows (which dequantize to exact zeros under any
+# scale). Codes and scale rows are copied VERBATIM from the checkpoint — no
+# requantization anywhere. bf16/mxfp4 checkpoints keep the canonical
+# [q_a | kv_a | gate] order; consumers must split through
+# ``KimiLinearMLAAttention._split_fused_qkv_a``, never with checkpoint
+# offsets.
+_FP8_FUSED_QKV_A_ORDER = ("g_proj", "q_a_proj", "kv_a_proj_with_mqa")
+
+
+def _fused_qkv_a_uses_fp8(quant_config, layer_prefix: str) -> bool:
+    """Whether the fused a-projection must be built FP8-resident.
+
+    Real ModelOpt exports carry both the fused aliases and the per-segment
+    entries, but either alone must suffice: the alias
+    (``fused_qkv_a_proj_with_mqa``) or any source segment (q_a / kv_a / MLA
+    g) resolving to FP8_PB_WO selects the FP8 layout. Segments that disagree
+    (some FP8_PB_WO, some unquantized) cannot be fused verbatim — fail with
+    the actual routes instead of a misleading 128-alignment error later.
+    """
+    fp8_pb_wo_route = getattr(quant_config, "fp8_pb_wo_route", None)
+    if fp8_pb_wo_route is None:
+        return False
+    segment_routes = {
+        leaf: fp8_pb_wo_route(add_prefix(leaf, layer_prefix))
+        for leaf in ("q_a_proj", "kv_a_proj_with_mqa", "g_proj")
+    }
+    segment_values = set(segment_routes.values())
+    if "w8a8" in segment_values and None in segment_values:
+        raise ValueError(
+            "fused_qkv_a segments are partially FP8_PB_WO-quantized; all of "
+            f"q_a/kv_a/g must agree to fuse verbatim: {segment_routes}"
+        )
+    alias_route = fp8_pb_wo_route(add_prefix("fused_qkv_a_proj_with_mqa", layer_prefix))
+    return alias_route == "w8a8" or "w8a8" in segment_values
+
+
+def _assemble_fp8_fused_qkv_a(
+    segments: list[tuple[torch.Tensor, torch.Tensor]],
+    total_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stack FP8 segments and their scale grids verbatim, zero tail pad.
+
+    Args:
+        segments: ``(codes_fp8 [n_i, K], scale_f32 [ceil(n_i/128), K/128])``
+            in the fused row order; every segment except the last must be a
+            128-row multiple so the scale grids concatenate 1:1.
+        total_rows: Fused row count (the constructor's 128-padded output).
+
+    Returns:
+        ``(codes_fp8 [total_rows, K], scale_f32 [total_rows/128, K/128])``
+        with bit-identical segment codes/scales and exact-zero pad rows.
+    """
+    k = segments[0][0].shape[1]
+    n_real = sum(weight.shape[0] for weight, _ in segments)
+    if total_rows % 128 or total_rows < n_real:
+        raise ValueError(
+            f"fused rows {total_rows} must be a 128-multiple covering "
+            f"{n_real} segment rows"
+        )
+    device = segments[0][0].device
+    fused_w = torch.zeros(total_rows, k, dtype=torch.float8_e4m3fn, device=device)
+    fused_s = torch.ones(
+        total_rows // 128, (k + 127) // 128, dtype=torch.float32, device=device
+    )
+    row = 0
+    block = 0
+    for index, (weight, scale) in enumerate(segments):
+        if weight.dtype not in _FP8_WEIGHT_DTYPES:
+            raise TypeError(f"fused segment {index} must be FP8, got {weight.dtype}")
+        rows = weight.shape[0]
+        if index < len(segments) - 1 and rows % 128:
+            raise ValueError(
+                f"interior fused segment {index} has {rows} rows; only the "
+                "last segment may be ragged on the 128 grid"
+            )
+        nblocks = (rows + 127) // 128
+        if scale.shape != (nblocks, fused_s.shape[1]):
+            raise ValueError(
+                f"segment {index} scale shape {tuple(scale.shape)} does not "
+                f"match its {rows}x{k} codes"
+            )
+        fused_w[row : row + rows] = weight.to(device)
+        fused_s[block : block + nblocks] = scale.to(device)
+        row += rows
+        block += nblocks
+    # Any remaining scale rows (fully-pad blocks) keep the 1.0 guard: their
+    # zero codes dequantize to exact zeros under any scale.
+    return fused_w, fused_s
+
+
 def _shard_k3_up_projection(mapping: Mapping, hidden_size: int) -> bool:
     """Whether to column-shard K3's routed up projection on NVIDIA."""
     return (
@@ -599,23 +789,49 @@ def _shard_k3_up_projection(mapping: Mapping, hidden_size: int) -> bool:
     )
 
 
+def _k3_trtllm_situ_internal_activation_dtype(
+    quant_config: QuantizationConfig | None, prefix: str
+) -> str:
+    """Activation trait for FlashInfer TRT-LLM SiTU MoE by expert weight dtype.
+
+    MXFP4 SiTU cubins are w4a8 (activations quantized to MXFP8 -> ``"fp8"``);
+    NVFP4 SiTU runs w4a4 with the kernel wrapper quantizing the bf16 input to
+    NVFP4 itself, which the kernel registry models as ``"input"``.
+    """
+    if quant_config is not None and quant_config.moe_weight_dtype(prefix) == "nvfp4":
+        return "input"
+    return "fp8"
+
+
 # ===----------------------------------------------------------------------=== #
 # Text decoder layers
 # ===----------------------------------------------------------------------=== #
 
 
 class KimiKDAMergedProj(nn.Module):
-    """Merged bf16 KDA input projections: ``[q | k | v | g | f_a | b]``, one GEMM.
+    """Merged KDA input projections: ``[q | k | v | g | f_a | b]``, one GEMM.
 
-    All six consume the post-norm hidden states (``self_attn`` is on the
-    quantization ignore list, so everything is plain bf16). q/k/v/g/b shard
-    per-head over the attention TP group; ``f_a`` (low-rank decay-gate down
+    All six consume the post-norm hidden states. q/k/v/g/b shard per-head
+    over the attention TP group; ``f_a`` (low-rank decay-gate down
     projection) is replicated, so each rank carries a full copy. The ``q|k|v``
     slice reproduces the layout the hybrid backend's conv expects; ``g``,
     ``f_a`` and ``b`` (beta logits) ride along as strided slices, replacing two
-    extra latency-bound GEMVs per layer. Rows are padded to a multiple of 16:
-    off-multiple row counts fall off cublasLt's fast M=1 tactic (30us vs 13us
-    at 6284 vs 6288 x 7168). Loader ``shard_id`` in {"q","k","v","g","f_a","b"}.
+    extra latency-bound GEMVs per layer. Loader ``shard_id`` in
+    {"q","k","v","g","f_a","b"}.
+
+    bf16 checkpoints (mxfp4 recipe): rows pad to a multiple of 16
+    (off-multiple row counts fall off cublasLt's fast M=1 tactic, 30us vs
+    13us at 6284 vs 6288 x 7168) and the GEMM is plain bf16 — unchanged.
+
+    FP8_PB_WO checkpoints (``fp8_block_quant=True``): the buffer stays
+    FP8-resident with a per-[128, 128]-block f32 dequant scale grid, and the
+    used rows pad straight to the 128 grid (3206 -> 3328 @tp16,
+    6284 -> 6400 @tp8; the bf16 16-row alignment does not apply here) so the
+    w8a8 blockscale GEMM keeps the flashinfer kernel (N % 128 == 0). Every
+    segment offset (0/p/2p/3p/4p/4p+head_dim) is 128-aligned, so the
+    checkpoint's per-segment scale grids concatenate directly with no
+    requantization; the zero pad rows share ``b``'s trailing block scale and
+    dequantize to exact zeros (pad lemma).
     """
 
     _ROW_ALIGN = 16
@@ -628,12 +844,14 @@ class KimiKDAMergedProj(nn.Module):
         head_dim: int,
         tp_rank: int,
         tp_size: int,
+        fp8_block_quant: bool = False,
     ) -> None:
         super().__init__()
         self.proj_local = proj // tp_size
         self.local_num_heads = num_heads // tp_size
         self.head_dim = head_dim
         self.tp_rank = tp_rank
+        self.fp8_block_quant = fp8_block_quant
         p = self.proj_local
         self._offsets = {
             "q": 0,
@@ -652,19 +870,51 @@ class KimiKDAMergedProj(nn.Module):
             "b": self.local_num_heads,
         }
         used = 4 * p + head_dim + self.local_num_heads
-        total = ceil_div(used, self._ROW_ALIGN) * self._ROW_ALIGN
         self.used_rows = used
-        # Explicit bf16: default-dtype fp32 would cost +6 GiB/rank and starve the KV budget.
-        self.weight = nn.Parameter(
-            torch.empty(total, hidden_size, dtype=torch.bfloat16)
-        )
-        # Padding rows are never read back, but keep them finite.
-        self.weight.data[used:].zero_()
+        if fp8_block_quant:
+            if p % 128 or head_dim % 128 or hidden_size % 128:
+                raise ValueError(
+                    "FP8 merged KDA projection requires 128-aligned segment "
+                    f"offsets, got proj_local={p} head_dim={head_dim} "
+                    f"hidden_size={hidden_size}"
+                )
+            total = ceil_div(used, 128) * 128
+            # Zero codes: the pad rows (and any unwritten row) dequantize to
+            # exact zeros under any scale.
+            self.weight = nn.Parameter(
+                torch.zeros(total, hidden_size, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.weight_scale_inv = nn.Parameter(
+                torch.ones(total // 128, hidden_size // 128, dtype=torch.float32),
+                requires_grad=False,
+            )
+            self.weight_scale_inv.weight_loader = self._load_scale
+            # flashinfer MN-major prepacked scales, prepared post-load.
+            self._flashinfer_scales_mn: torch.Tensor | None = None
+            # Zero-initialized buffers make a missing shard silently read as
+            # zeros; track loads explicitly and verify at post_load_weights.
+            self._loaded_weight_shards: set[str] = set()
+            self._loaded_scale_shards: set[str] = set()
+        else:
+            total = ceil_div(used, self._ROW_ALIGN) * self._ROW_ALIGN
+            # Explicit bf16: default-dtype fp32 would cost +6 GiB/rank and starve the KV budget.
+            self.weight = nn.Parameter(
+                torch.empty(total, hidden_size, dtype=torch.bfloat16)
+            )
+            # Padding rows are never read back, but keep them finite.
+            self.weight.data[used:].zero_()
         self.weight.weight_loader = self._load_weight
 
     def _load_weight(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: str
     ) -> None:
+        if self.fp8_block_quant and loaded_weight.dtype not in _FP8_WEIGHT_DTYPES:
+            raise TypeError(
+                "FP8-resident merged KDA projection cannot load a "
+                f"{loaded_weight.dtype} shard (bf16 refit of FP8 KDA weights "
+                "is unsupported)."
+            )
         rows = self._rows[shard_id]
         # f_a is replicated (full copy per rank); the rest are row-sharded.
         src = (
@@ -674,17 +924,64 @@ class KimiKDAMergedProj(nn.Module):
         )
         start = self._offsets[shard_id]
         param.data[start : start + rows].copy_(src)
+        if self.fp8_block_quant:
+            self._loaded_weight_shards.add(shard_id)
+
+    def _load_scale(
+        self, param: nn.Parameter, loaded_scale: torch.Tensor, shard_id: str
+    ) -> None:
+        """Concatenate the checkpoint's per-segment scale grids in place.
+
+        Segment offsets are all 128-aligned, so each shard's scale rows map
+        1:1 onto the merged grid. ``f_a`` is replicated; ``b``'s <=96-row
+        shard lives inside the checkpoint's single scale block regardless of
+        rank, and the zero pad rows in the trailing block dequantize to
+        exact zeros under it.
+        """
+        block_start = self._offsets[shard_id] // 128
+        if shard_id in ("f_a", "b"):
+            src = loaded_scale[:1]
+            nblocks = 1
+        else:
+            nblocks = self._rows[shard_id] // 128
+            src = loaded_scale.narrow(0, self.tp_rank * nblocks, nblocks)
+        param.data[block_start : block_start + nblocks].copy_(src)
+        self._loaded_scale_shards.add(shard_id)
+
+    def verify_fp8_load_complete(self) -> None:
+        """Raise if any FP8 segment or scale shard never loaded.
+
+        The FP8 buffers are zero-initialized, so a dropped shard would
+        otherwise silently project to zeros.
+        """
+        if not self.fp8_block_quant:
+            return
+        expected = set(self._rows)
+        missing_weights = expected - self._loaded_weight_shards
+        missing_scales = expected - self._loaded_scale_shards
+        if missing_weights or missing_scales:
+            raise RuntimeError(
+                "FP8 merged KDA projection incompletely loaded: missing "
+                f"weight shards {sorted(missing_weights)}, scale shards "
+                f"{sorted(missing_scales)}."
+            )
 
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.fp8_block_quant:
+            # Fail fast instead of feeding FP8 codes to the bf16 GEMV:
+            # FP8-resident KDA projections must run through the quantized
+            # w8a8 branch of kimi3_qkvfab_projection (KimiLinearKDA
+            # _project_qkvfab), which consumes the weight + scale directly.
+            raise RuntimeError(
+                "KimiKDAMergedProj.forward does not support the FP8-resident "
+                "buffer; use kimi3_qkvfab_projection with weight_scale."
+            )
         # Registry-dispatched: rowcta at M=1, cublasLt otherwise.
         out = decode_gemv(x, self.weight)
         p = self.proj_local
         mixed_qkv = out[:, : 3 * p]
-        # No-op at decode (single row); prefill pays a small copy for the conv.
-        if not mixed_qkv.is_contiguous():
-            mixed_qkv = mixed_qkv.contiguous()
         f_a_end = 4 * p + self.head_dim
         return (
             mixed_qkv,
@@ -759,6 +1056,13 @@ class KimiLinearKDA(nn.Module):
             )
 
         # One merged GEMM replaces four per-head-sharded projections + the qkv concat.
+        # FP8_PB_WO checkpoints keep the merged buffer FP8-resident (w8a8
+        # blockscale GEMM); everything else stays bf16 exactly as before.
+        fp8_pb_wo_route = getattr(quant_config, "fp8_pb_wo_route", None)
+        merged_fp8 = (
+            fp8_pb_wo_route is not None
+            and fp8_pb_wo_route(add_prefix("q_proj", prefix)) == "w8a8"
+        )
         self.qkvgb_proj = KimiKDAMergedProj(
             hidden_size=hidden,
             proj=proj,
@@ -766,6 +1070,7 @@ class KimiLinearKDA(nn.Module):
             head_dim=self.head_dim,
             tp_rank=tp_rank,
             tp_size=tp_size,
+            fp8_block_quant=merged_fp8,
         )
         # Decay-gate up projection (f_a and beta ride in the merged GEMM).
         self.f_b_proj = _col(self.head_dim, proj, "f_b_proj")
@@ -831,6 +1136,11 @@ class KimiLinearKDA(nn.Module):
             output = kimi3_qkvfab_projection(
                 hidden_states,
                 self.qkvgb_proj.weight,
+                weight_scale=getattr(self.qkvgb_proj, "weight_scale_inv", None),
+                prepacked_scales=getattr(
+                    self.qkvgb_proj, "_flashinfer_scales_mn", None
+                ),
+                enable_pdl=pdl_enabled(),
             )
         else:
             blocks, weight_a, weight_b, eps, scratch_a, scratch_b = attnres_partial_args
@@ -846,8 +1156,6 @@ class KimiLinearKDA(nn.Module):
             )
         f_a_end = 4 * proj_local + self.head_dim
         mixed_qkv = output[:, : 3 * proj_local]
-        if not mixed_qkv.is_contiguous():
-            mixed_qkv = mixed_qkv.contiguous()
         return (
             mixed_qkv,
             output[:, 3 * proj_local : 4 * proj_local],
@@ -902,6 +1210,10 @@ class KimiLinearKDA(nn.Module):
         mixed_qkv, out_gate, f_a_out, beta = self._project_qkvfab(
             h, attnres_partial_args
         )
+        # Prefill consumes compact QKV; perform this copy in the captured
+        # projection segment rather than inside the eager attention break.
+        if not ctx.forward_mode.is_decode():
+            mixed_qkv = mixed_qkv.contiguous()
         # f_b runs inside the backend: fused into the decode scan kernel, a
         # plain GEMV on the prefill path.
         # Fused [3*proj, k] conv kernel bank, built once in post_load_weights.
@@ -945,7 +1257,7 @@ class KimiLinearKDA(nn.Module):
             # per-head norm implementation.
             core_out = rmsnorm_gated_sigmoid(
                 core_out.contiguous(),
-                out_gate.contiguous(),
+                out_gate,
                 self.o_norm.weight,
                 self.o_norm.variance_epsilon,
                 hn,
@@ -1171,12 +1483,19 @@ class KimiLinearMoE(nn.Module):
                 "activation_situ_linear_beta": situ_linear_beta,
             },
             routing_mode="precomputed_topk",
-            # Native gfx950 and Hopper Marlin both run A16W4 (bf16 activations);
-            # FlashInfer's SiTU cubins require MXFP4 weights with MXFP8 acts.
+            # Native gfx950 and Hopper Marlin both run A16W4 (bf16 activations).
+            # FlashInfer TRT-LLM SiTU depends on the expert weight dtype:
+            # MXFP4 cubins are w4a8 (MXFP8 activations -> "fp8"), NVFP4 SiTU
+            # runs w4a4 with the kernel wrapper quantizing the bf16 input
+            # itself, which the registry models as "input".
             internal_activation_dtype_override=(
                 "input"
                 if self.execution_plan.use_native or self.execution_plan.use_marlin
-                else "fp8" if self.execution_plan.use_trtllm else None
+                else (
+                    _k3_trtllm_situ_internal_activation_dtype(quant_config, prefix)
+                    if self.execution_plan.use_trtllm
+                    else None
+                )
             ),
         )
         if self.experts.support_routing:
@@ -1288,6 +1607,14 @@ class KimiLinearMoE(nn.Module):
             routed_norm=self.routed_expert_norm,
             up_proj=self.routed_expert_up_proj,
             execution_plan=self.execution_plan,
+            # The experts kernel plan's capability bit (rank-uniform):
+            # both SiTU variants register the deferred capability, while a
+            # kernel without it (e.g. mxfp4 SwiGLU) arms the
+            # materialized-input tail instead.
+            # self.experts is constructed above, before this comm object.
+            experts_supports_deferred_finalize=(
+                self.experts.supports_deferred_finalize
+            ),
         )
 
     def pack_input_projection_weights(self) -> None:
@@ -1746,6 +2073,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_norm.variance_epsilon,
                 _sliced_scratch(prefix_sum, 1, n_tok),
                 torch.empty_like(prefix_sum),
+                enable_pdl=pdl_enabled(),
             )
         else:
             h = _apply_attn_res(
@@ -1764,7 +2092,7 @@ class KimiLinearDecoderLayer(nn.Module):
     def _fused_attnres_graph_available(
         self, hidden_states: torch.Tensor, block_residual: torch.Tensor
     ) -> bool:
-        # B1 already fuses the post-attention mix into the all-reduce.
+        # Split beats fused at decode: 47 us/step faster at bs = 8 (aux-stream partial).
         if hidden_states.shape[0] == 1:
             return False
 
@@ -1841,6 +2169,8 @@ class KimiLinearDecoderLayer(nn.Module):
             delta=delta,
         )
 
+        # Before the MoE: the next layer's PDL combine prefetches this scratch early.
+        self._prepare_next_fallback_attnres_partial(prefix_sum, block_residual)
         if self.is_moe_layer:
             num_global_tokens, max_num_tokens_per_gpu = (
                 self.comm_manager.get_num_tokens(ctx)
@@ -1855,7 +2185,6 @@ class KimiLinearDecoderLayer(nn.Module):
             )
         else:
             prefix_sum = prefix_sum + self.mlp(h)
-        self._prepare_next_fallback_attnres_partial(prefix_sum, block_residual)
         return prefix_sum, block_residual
 
     def _prepare_next_fallback_attnres_partial(
@@ -2084,7 +2413,9 @@ class KimiLinearModel(nn.Module):
         self.mapping = mapping
         self.quant_config = quant_config
 
-        alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        alt_stream = (
+            torch.cuda.Stream(priority=-1) if torch.cuda.is_available() else None
+        )
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -2313,7 +2644,18 @@ class KimiLinearForCausalLM(BaseCausalLM):
         KDA layers' remaining ``self_attn.*`` weights (conv + A_log / dt_bias /
         f_b / o_norm / o_proj) load directly through the default path — their
         names match ``KimiLinearKDA``'s modules 1:1 (no fusion).
+
+        ModelOpt FP8_PB_WO checkpoints (nvidia/Kimi-K3-NVFP4) are adapted by
+        ``preprocess_fp8_pb_wo_weights`` before any of the above: only f_b
+        (raw GEMV inside the KDA attention backend) arrives block-dequantized
+        to bf16; every other attention projection stays FP8-resident with its
+        scale renamed to ``weight_scale_inv`` — o_proj / kv_b / q_b flow to
+        their w8a8 LinearBase params, the KDA merged q/k/v/g/f_a/b shards
+        stack into the FP8 qkvgb buffer (segment-concatenated scale grid),
+        and the MLA q_a/kv_a/g segments are reassembled verbatim into the
+        fused_qkv_a private layout below.
         """
+        weights = preprocess_fp8_pb_wo_weights(weights, self.quant_config)
         config = self.config
         stacked_params_mapping = [
             # KDA q/k/v/g/f_a/b stack into qkvgb_proj; MLA's g_proj falls
@@ -2330,6 +2672,80 @@ class KimiLinearForCausalLM(BaseCausalLM):
         fuse_qkv_a_proj = config.q_lora_rank is not None
 
         params_dict = dict(self.named_parameters())
+
+        # ModelOpt FP8_PB_WO fused_qkv_a assembly: MLA q_a / kv_a / g_proj
+        # arrive FP8-resident with per-segment block scales. The canonical
+        # [q_a | kv_a | gate] order is not 128-block aligned (the gate would
+        # start at row q_lora+kv_lora+rope = 2112), so collect the six
+        # tensors per MLA layer and stack them VERBATIM in the private
+        # [gate | q_a | kv_a | pad] order (_FP8_FUSED_QKV_A_ORDER) — zero
+        # requantization. KDA g_proj (FP8 too, but stacked into the merged
+        # qkvgb buffer) and bf16 checkpoints skip this path entirely.
+        fp8_fused_pending: dict[str, dict[str, torch.Tensor]] = {}
+        fp8_fused_segments = frozenset(_FP8_FUSED_QKV_A_ORDER)
+
+        def _try_fp8_fused_assembly(name: str, loaded_weight: torch.Tensor) -> bool:
+            is_scale = name.endswith(".weight_scale_inv")
+            if not (is_scale or name.endswith(".weight")):
+                return False
+            module_name = name.rsplit(".", 1)[0]
+            leaf = module_name.rsplit(".", 1)[-1]
+            if leaf not in fp8_fused_segments:
+                return False
+            base = module_name.rsplit(".", 1)[0]
+            fused_weight_name = f"{base}.fused_qkv_a_proj_with_mqa.weight"
+            if fused_weight_name not in params_dict:
+                return False  # KDA layers (g_proj) or unfused configs
+            if not is_scale and loaded_weight.dtype not in _FP8_WEIGHT_DTYPES:
+                return False  # bf16 checkpoints keep the existing fused path
+            entry = fp8_fused_pending.setdefault(base, {})
+            entry[f"{leaf}.{'scale' if is_scale else 'weight'}"] = loaded_weight
+            if len(entry) < 2 * len(fp8_fused_segments):
+                return True
+            pieces = fp8_fused_pending.pop(base)
+            # The checkpoint gate is globally head-sharded; take this
+            # attention rank's rows (its scale grid slices with it as long
+            # as the shard is block-aligned).
+            gate_w = pieces["g_proj.weight"]
+            gate_s = pieces["g_proj.scale"]
+            gate_rows = gate_w.shape[0] // self.mapping.attn.tp_size
+            if gate_rows % 128 != 0:
+                raise ValueError(
+                    f"FP8 fused_qkv_a gate shard ({gate_rows} rows) must "
+                    "align to the 128-row scale-block grid; adjust the "
+                    "attention TP size."
+                )
+            gate_start = self.mapping.attn.tp_rank * gate_rows
+            blocks_per_shard = gate_rows // 128
+            block_start = self.mapping.attn.tp_rank * blocks_per_shard
+            weight_param = params_dict[fused_weight_name]
+            # Verbatim stack in the private [gate | q_a | kv_a | pad] order:
+            # every boundary is 128-aligned, so codes and scale rows copy
+            # bit-identically — zero requantization; consumers split via
+            # _split_fused_qkv_a. The segment order is derived from
+            # _FP8_FUSED_QKV_A_ORDER so loader and consumers cannot drift.
+            ordered = {
+                "g_proj": (
+                    gate_w[gate_start : gate_start + gate_rows],
+                    gate_s[block_start : block_start + blocks_per_shard],
+                ),
+                "q_a_proj": (pieces["q_a_proj.weight"], pieces["q_a_proj.scale"]),
+                "kv_a_proj_with_mqa": (
+                    pieces["kv_a_proj_with_mqa.weight"],
+                    pieces["kv_a_proj_with_mqa.scale"],
+                ),
+            }
+            fused_w, fused_s = _assemble_fp8_fused_qkv_a(
+                [ordered[leaf] for leaf in _FP8_FUSED_QKV_A_ORDER],
+                total_rows=weight_param.shape[0],
+            )
+            weight_param.weight_loader(weight_param, fused_w)
+            scale_param = params_dict[
+                f"{base}.fused_qkv_a_proj_with_mqa.weight_scale_inv"
+            ]
+            scale_param.weight_loader(scale_param, fused_s)
+            return True
+
         moe_loader = build_moe_checkpoint_loader(
             params_dict=params_dict,
             expert_schema=ExpertCheckpointSchema(
@@ -2358,6 +2774,10 @@ class KimiLinearForCausalLM(BaseCausalLM):
             # KDA conv weights are plain params named ``<qkv>_conv1d_weight``.
             if "_conv1d.weight" in name:
                 name = name.replace("_conv1d.weight", "_conv1d_weight")
+
+            # FP8-resident fused_qkv_a segments (verbatim reorder), see above.
+            if _try_fp8_fused_assembly(name, loaded_weight):
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -2424,23 +2844,81 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
+        if fp8_fused_pending:
+            raise RuntimeError(
+                "FP8 fused_qkv_a layers missing segments at end of checkpoint "
+                f"stream: { {k: sorted(v) for k, v in fp8_fused_pending.items()} }"
+            )
         self.post_load_weights()
+        # Return the loader's transient allocator blocks (block-dequant
+        # intermediates for the dequant-routed weights, fused-assembly
+        # segment buffers) to the device before the KV pool sizes itself
+        # from free memory; otherwise the reserved-but-free slack shrinks
+        # the pool by up to ~1 GiB per rank.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def post_load_weights(self) -> None:
         """Prepare the absorbed MLA weights (``w_kc``/``w_vc``) per MLA layer.
 
-        Kimi-K3's attention is unquantized (MXFP4 ignores ``self_attn.*``), so
-        ``kv_b_proj.weight`` is bf16 and no block dequant is needed. KDA layers
-        have no ``kv_b_proj`` (not ``KimiLinearMLAAttention``) and are skipped.
+        With FP8_PB_WO checkpoints ``kv_b_proj.weight`` stays FP8 for the
+        w8a8 prefill GEMM; the absorbed ``w_kc``/``w_vc`` copies follow the
+        DeepSeek R1 precedent and block-dequantize to the activation dtype
+        (``DeepseekV3ForCausalLM.post_load_weights``). bf16 checkpoints (e.g.
+        moonshotai/Kimi-K3, whose MXFP4 config ignores ``self_attn.*``) skip
+        the dequant. KDA layers have no ``kv_b_proj`` (not
+        ``KimiLinearMLAAttention``) and are skipped.
         """
         for layer in self.model.layers:
             self_attn = layer.self_attn
             if isinstance(self_attn, KimiLinearMLAAttention):
+                w = self_attn.kv_b_proj.weight
+                if w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+                    if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
+                        raise RuntimeError(
+                            "kv_b_proj.weight_scale_inv is required for block "
+                            "FP8 dequant of the absorbed MLA weights."
+                        )
+                    weight_block_size = (
+                        self_attn.kv_b_proj.quant_method.quant_config.weight_block_size
+                    )
+                    w = block_dequant(
+                        w,
+                        self_attn.kv_b_proj.weight_scale_inv,
+                        weight_block_size,
+                    ).to(torch.get_default_dtype())
                 self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
-                    self_attn.kv_b_proj.weight, self_attn
+                    w, self_attn
                 )
             elif isinstance(self_attn, KimiLinearKDA):
                 self_attn.fuse_conv_weights()
+                merged = self_attn.qkvgb_proj
+                if getattr(merged, "fp8_block_quant", False):
+                    merged.verify_fp8_load_complete()
+                    # Prepack the block scales for the flashinfer w8a8 GEMM
+                    # (the same preparation Fp8LinearMethod does for
+                    # LinearBase layers); rows are 128-padded at construction
+                    # so the shape gate always holds on this path.
+                    from tokenspeed.runtime.layers.dense.fp8 import (
+                        has_flashinfer_fp8_blockscale,
+                        prepare_flashinfer_fp8_blockscale_weight_scales,
+                    )
+
+                    n_rows, n_cols = merged.weight.shape
+                    if (
+                        merged._flashinfer_scales_mn is None
+                        and has_flashinfer_fp8_blockscale is not None
+                        and has_flashinfer_fp8_blockscale()
+                        and n_rows % 128 == 0
+                        and n_cols % 128 == 0
+                    ):
+                        # Build once: rebinding after a refit would leave any
+                        # captured CUDA graph holding the stale buffer.
+                        merged._flashinfer_scales_mn = (
+                            prepare_flashinfer_fp8_blockscale_weight_scales(
+                                merged.weight_scale_inv.data
+                            )
+                        )
 
         # Fold the AttnRes rms_w * res_w products once; the split kernels take a single wp pointer.
         for layer in self.model.layers:

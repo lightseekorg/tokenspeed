@@ -219,7 +219,6 @@ class _Harness:
             head_dim=text.head_dim,
             layer_num=text.num_hidden_layers,
             rank=0,
-            layer_group_ids=("full_attention",) * text.num_hidden_layers,
         )
         conv_pool = InklingConvStatePool(
             num_layers=text.num_hidden_layers,

@@ -22,10 +22,14 @@
 
 from __future__ import annotations
 
+from functools import cached_property
 from typing import ClassVar
 
 import torch
 
+from tokenspeed.runtime.layers.attention.kv_cache.base import (
+    derive_state_groups_by_layer,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.mha import (
     MHATokenToKVPool,
     MHATokenToKVPoolMXFP8,
@@ -38,14 +42,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 class HybridMHATokenToKVPool(MHATokenToKVPool):
     """MHA compute interface whose history and state share one buffer."""
 
-    def __init__(
-        self,
-        *,
-        layer_group_ids: tuple[str, ...],
-        **kwargs,
-    ):
-        group_ids = tuple(layer_group_ids)
-        self._group_ids_by_layer = dict(enumerate(group_ids))
+    def __init__(self, **kwargs):
         layer_types = tuple(kwargs.get("layer_types", ()))
         self._state_layer_ids = tuple(
             layer_id
@@ -55,13 +52,10 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
         self._state_buffers_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.requires_page_zeroing = True
 
-        if len(group_ids) != kwargs["layer_num"]:
-            raise ValueError("cache group ids must cover every model layer")
+        if len(layer_types) != kwargs["layer_num"]:
+            raise ValueError("cache layer types must cover every model layer")
 
-        super().__init__(
-            layer_group_ids=group_ids,
-            **kwargs,
-        )
+        super().__init__(**kwargs)
 
     # A state layer has no k/v field planned and an attention layer has no
     # conv/ssm, so the plan's field list decides which planes a layer has.
@@ -90,11 +84,15 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
             self._state_buffers_by_layer[layer_id] for layer_id in self._state_layer_ids
         ]
 
-    def group_id_for_layer(self, layer_id: int) -> str:
-        try:
-            return self._group_ids_by_layer[layer_id]
-        except KeyError as exc:
-            raise ValueError(f"layer {layer_id} has no cache group") from exc
+    @cached_property
+    def state_group_by_layer(self) -> dict[int, str]:
+        """View-local state layer id -> its state-family cache group id."""
+        return derive_state_groups_by_layer(
+            self.arena,
+            first_layer=self._field_layer_offset,
+            num_layers=self.layer_num,
+            state_layer_ids=self._state_layer_ids,
+        )
 
     def get_state_buffers(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         if layer_id not in self._state_layer_ids:

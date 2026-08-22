@@ -3282,6 +3282,44 @@ TEST(DecodeDestinationTest, AdmitMaterializesOnlyRequestedStateSuffix) {
     coordinator.Free(tables);
 }
 
+TEST(SnapshotStateSparsePrefillTest, ReclaimsOldInputAcrossIntermediateHoles) {
+    BlockPool pool(/*num_lcm_blocks=*/4);
+    std::vector<CacheGroupSpec> specs = {
+        {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, pool);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+
+    auto admit_endpoint = [&](std::int32_t before, std::int32_t after) {
+        std::vector<GroupDemand> demands{{
+            .table = &tables[0],
+            .num_tokens = after,
+            .num_computed_tokens = before,
+            .materialized_suffix_start = (after - 1) / 2,
+        }};
+        ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands));
+    };
+
+    admit_endpoint(/*before=*/0, /*after=*/8);
+    ASSERT_EQ(tables[0].NumBlocks(), 4);
+    EXPECT_EQ(tables[0].ReclaimedPrefixBlocks(), 3);
+    EXPECT_TRUE(tables[0].Blocks()[3]);
+
+    admit_endpoint(/*before=*/8, /*after=*/16);
+    ASSERT_EQ(tables[0].NumBlocks(), 8);
+    EXPECT_TRUE(tables[0].Blocks()[3]);
+    EXPECT_TRUE(tables[0].Blocks()[7]);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
+
+    admit_endpoint(/*before=*/16, /*after=*/24);
+    ASSERT_EQ(tables[0].NumBlocks(), 12);
+    EXPECT_FALSE(tables[0].Blocks()[3]);
+    EXPECT_TRUE(tables[0].Blocks()[7]);
+    EXPECT_TRUE(tables[0].Blocks()[11]);
+    EXPECT_EQ(tables[0].ReclaimedPrefixBlocks(), 7);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
+}
+
 TEST(DecodeDestinationTest, HistoryGroupsDeterminePrefixAndStateGetsAlignedHoles) {
     BlockPool pool(/*num_lcm_blocks=*/8);
     std::vector<CacheGroupSpec> specs = {

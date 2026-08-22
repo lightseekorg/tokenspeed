@@ -1,38 +1,37 @@
 api_version: ci.tokenspeed.io/v1
-name: eval-inkling-mxfp4-mtp-gsm8k
+name: eval-minimax-m3-nvfp4-dspark-aime26
 type: eval
 workflow_stage: model-test
 triggers:
-  - per-commit
   - manual
+  - nightly
 runner:
   labels:
-    - amd-mi35x-4gpu-test
+    - b200-4gpu
 env:
   CI: "true"
 install:
-  - bash test/ci_system/install_deps_rocm.sh
+  - bash test/ci_system/install_deps.sh
 server:
   command: >-
     ts serve
-    --model lightseekorg/Inkling-MXFP4
+    --model nvidia/MiniMax-M3-NVFP4
     --attn-tp-size 4
     --moe-tp-size 4
-    --max-model-len 81920
-    --max-num-seqs 16
-    --max-prefill-tokens 8192
-    --chunked-prefill-size 8192
+    --max-model-len 262144
     --gpu-memory-utilization 0.95
-    --disable-cuda-graph-padding
-    --trust-remote-code
-    --enable-prefix-caching
+    --attention-backend trtllm
+    --kv-cache-dtype fp8
+    --moe-backend flashinfer_trtllm
+    --speculative-algorithm DSPARK
+    --speculative-draft-model-path nvidia/MiniMax-M3-DSpark
+    --speculative-num-steps 7
+    --speculative-eagle-topk 1
+    --speculative-num-draft-tokens 8
     --disable-kvstore
     --block-size 128
+    --trust-remote-code
     --enable-cache-report
-    --speculative-algorithm MTP
-    --speculative-num-steps 3
-    --speculative-eagle-topk 1
-    --speculative-num-draft-tokens 4
     --host 127.0.0.1
     --port 8000
   ready:
@@ -45,14 +44,15 @@ eval:
   command: >-
     HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
-    --model lightseekorg/Inkling-MXFP4
+    --model nvidia/MiniMax-M3-NVFP4
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
-    --datasets gsm8k
+    --datasets aime26
     --dataset-hub huggingface
-    --dataset-args '{"gsm8k":{"dataset_id":"openai/gsm8k"}}'
+    --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
     --eval-batch-size 16
-    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":8192}'
+    --stream
+    --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"max_tokens":163840,"timeout":1800}'
 report:
   github_step_summary: true
-score_threshold: 0.90
+score_threshold: 0.86

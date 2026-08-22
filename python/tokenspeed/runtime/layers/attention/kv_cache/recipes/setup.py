@@ -68,7 +68,6 @@ class CachePoolSpec:
     family: CacheModelFamily
     memory_plan: CacheMemoryPlan
     layer_types: tuple[str, ...]
-    layer_group_ids: tuple[str, ...]
     # Scheduler group specs, declared next to the fields the plan was packed
     # from (CacheRecipe.groups), so the plan and the specs name one group set.
     cache_group_specs: tuple[CacheGroupSpec, ...]
@@ -90,7 +89,7 @@ class CachePoolSpec:
         metadata is sliced. The arena publishes the contract once, from the
         merged spec, so no view can republish or diverge from it.
         """
-        total_layers = len(self.layer_group_ids)
+        total_layers = len(self.layer_types)
         if first_layer < 0 or num_layers < 0:
             raise ValueError("cache layer view bounds must be non-negative")
         last_layer = first_layer + num_layers
@@ -99,8 +98,6 @@ class CachePoolSpec:
                 f"cache layer view [{first_layer}, {last_layer}) exceeds "
                 f"the merged {total_layers}-layer spec"
             )
-        if self.layer_types and len(self.layer_types) != total_layers:
-            raise ValueError("cache layer types must be empty or cover every layer")
         if self.layer_kv_head_counts is not None and (
             len(self.layer_kv_head_counts) != total_layers
         ):
@@ -112,10 +109,7 @@ class CachePoolSpec:
         return replace(
             self,
             family=family or self.family,
-            layer_types=(
-                self.layer_types[first_layer:last_layer] if self.layer_types else ()
-            ),
-            layer_group_ids=self.layer_group_ids[first_layer:last_layer],
+            layer_types=self.layer_types[first_layer:last_layer],
             layer_kv_head_counts=(
                 self.layer_kv_head_counts[first_layer:last_layer]
                 if self.layer_kv_head_counts is not None
@@ -149,7 +143,7 @@ class CacheSetup:
 
     @property
     def num_target_layers(self) -> int:
-        return len(self.spec.layer_group_ids) - self.num_draft_layers
+        return len(self.spec.layer_types) - self.num_draft_layers
 
 
 # family -> how to build its recipe. Every family runs the one pipeline in
