@@ -507,7 +507,24 @@ class KimiK3LatentTailOp:
         shared_partial: torch.Tensor,
         rms_weight: torch.Tensor,
     ) -> torch.Tensor:
-        """Run the shared ReduceScatter into stable split-mode staging."""
+        """Run the shared ReduceScatter into stable split-mode staging.
+
+        Args:
+            shared_partial: This rank's contiguous CUDA BF16 shared-expert
+                partial ``[M, hidden_size]``, where
+                ``1 <= M <= max_num_tokens``.
+            rms_weight: Contiguous CUDA BF16 latent RMSNorm weight
+                ``[latent_size]`` required by the collective signature.
+
+        Returns:
+            The rank-local BF16 shard view
+            ``[max_num_tokens, hidden_size / tp_size]`` with stride
+            ``(hidden_size, 1)``. Only the first ``M`` rows contain this
+            launch's output. The view aliases the pooled split staging and is
+            valid until the next shared ReduceScatter using the same pool
+            slot. A consumer on another stream must wait for this launch's
+            stream before reading it.
+        """
         if not self.supports_split_collective:
             raise RuntimeError("shared-only ReduceScatter is not initialized")
         m = shared_partial.shape[0]
