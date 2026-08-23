@@ -22,13 +22,22 @@ conversation (~8% of requests, ~75% of prefill compute); cached prefill =
 
 ## P-sim: prefill-node simulation
 
+The P sweep covers the TP configs only — DP is a decode-side scaling
+choice, not a P-node candidate (a P node runs few huge prefills, so DP
+ranks would idle while one rank computes); the DP config stays in D-sim.
+
 Batch contains prefill only (`max_tokens 1` kills the decode phase and
 reproduces a P node's scheduling profile). Sampling needs no pinning at 1
 output token. One boot per config, fresh phase then cached phase.
 
-**P-fresh (compute-bound):** send the 71 unique first turns cold.
+**P-fresh (compute-bound):** send unique first turns cold. The frozen
+artifact contains exact duplicate first-turn pairs (7 pairs in the current
+file: 64 unique of 71), so pd_client deduplicates by first-turn content and
+all offsets index into the deduplicated list — a duplicate reaching a later
+rung would score as a cache hit and break this phase's guard.
 Ladder: parallel 1/2/4/8/16, number = 2 x parallel (62 unique prompts
-consumed, within the 71 budget; no prompt reused).
+consumed plus 2 for warmup, exactly the 64-unique budget; no prompt
+reused — the bench scripts assert the unique count at dataset check time).
 Ranking: **prefill tok/s / GPU**; secondary TTFT p50/p99.
 Validity guard: cache hit <= 5%.
 
@@ -111,6 +120,12 @@ verifies this empirically instead of trusting the argument.
   VOIDed by collect instead of aborting the sweep). pd_sim has its OWN
   collect script — its summaries are deliberately NOT column-compatible
   with the parent bench's collect.
+- Summaries record Requested next to Requests: a twice-failed p-cached
+  prime silently drops its conversation before the measured wave, so the
+  two can diverge with zero Failed Requests — collect VOIDs the mismatch
+  (`short`). Retried Requests is informational only: retries keep their
+  full latency (a hiccup is real), so a nonzero Retried column means the
+  latency percentiles carry retry time.
 - Every summary and collect report carries the boundaries statement: no
   KV-transfer cost modeled; prime-as-transfer is the core approximation;
   single machine; TTFT is approximated by full-request latency at

@@ -70,6 +70,12 @@ def collect(sweep_dir: Path):
             problems.append("hit")
         if failed:
             problems.append(f"{failed}failed")
+        # A rung that measured fewer requests than asked (twice-failed
+        # p-cached primes drop their conversation before the measured wave)
+        # is a shrunken sample with zero Failed Requests — VOID it.
+        requested = s.get("Requested")
+        if requested is not None and s.get("Requests") != requested:
+            problems.append("short")
 
         row = {
             "phase": phase,
@@ -77,6 +83,10 @@ def collect(sweep_dir: Path):
             "Conc.": conc,
             f"{METRIC[phase]} /gpu": round(metric / num_gpus(config), 2),
             "Cache Hit (%)": round(hit, 2),
+            # Informational, not a guard: retries keep their full latency
+            # (a hiccup is real), so nonzero here means the percentile
+            # columns carry retry time.
+            "Retried": s.get("Retried Requests", 0),
             "Requests/s": s.get("Requests/s"),
             "Latency p50 (s)": s.get("Latency p50 (s)"),
             "Latency p99 (s)": s.get("Latency p99 (s)"),

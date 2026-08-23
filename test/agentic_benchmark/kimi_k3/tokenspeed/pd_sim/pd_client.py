@@ -56,6 +56,24 @@ def first_turn_messages(conv):
     return conv[0]["messages"]
 
 
+def unique_first_turn_conversations(convs):
+    """Drop conversations whose first turn duplicates an earlier one.
+
+    The frozen artifact contains exact duplicate first-turn pairs (7 in the
+    current file, 64 unique of 71). P-fresh's <=5% hit guard assumes every
+    ladder rung prefills content never seen before, so --offset/--number
+    index into this deduplicated, order-preserving list for ALL phases.
+    """
+    seen = set()
+    out = []
+    for conv in convs:
+        key = json.dumps(first_turn_messages(conv), sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            out.append(conv)
+    return out
+
+
 class Runner:
     def __init__(self, args):
         self.args = args
@@ -75,12 +93,17 @@ class Runner:
             self.args.url, data=body, headers={"Content-Type": "application/json"}
         )
         t0 = time.monotonic()
+        retried = False
         try:
             with urllib.request.urlopen(req, timeout=self.args.timeout) as r:
                 out = json.load(r)
         except Exception:
             # One retry; a request that fails twice is recorded, not fatal —
-            # the rung completes and collect VOIDs it on failures.
+            # the rung completes and collect VOIDs it on failures. The retry
+            # deliberately stays inside the t0..t1 window (a hiccup is part of
+            # the request's real latency); 'Retried Requests' in the summary
+            # flags rungs whose percentiles carry retry time.
+            retried = True
             try:
                 with urllib.request.urlopen(
                     urllib.request.Request(
@@ -99,6 +122,7 @@ class Runner:
         msg = out["choices"][0]["message"]
         return {
             "latency_s": t1 - t0,
+            "retried": retried,
             "prompt_tokens": usage.get("prompt_tokens", 0),
             "completion_tokens": usage.get("completion_tokens", 0),
             "cached_tokens": details.get("cached_tokens") or 0,
@@ -191,8 +215,13 @@ def summarize(args, results, wall_s):
     summary = {
         "Phase": args.phase,
         "Concurrency": args.parallel,
+        # Requested vs Requests: a p-cached prime that fails twice silently
+        # drops its conversation from the measured wave, so the two can
+        # diverge with zero Failed Requests. collect VOIDs the mismatch.
+        "Requested": args.number,
         "Requests": n,
         "Failed Requests": len(failed),
+        "Retried Requests": sum(1 for r in ok if r.get("retried")),
         "Wall (s)": round(wall_s, 3),
         "Prompt Tokens": prompt,
         "Cached Tokens": cached,
@@ -218,8 +247,9 @@ def summarize(args, results, wall_s):
 
 def main():
     args = parse_args()
-    data = json.load(open(args.dataset))
-    convs = data["conversations"]
+    with open(args.dataset) as f:
+        data = json.load(f)
+    convs = unique_first_turn_conversations(data["conversations"])
 
     runner = Runner(args)
     wall = runner.run(convs)

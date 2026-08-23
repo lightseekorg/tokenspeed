@@ -25,13 +25,16 @@ m = d.get("metadata", {})
 assert n >= 70, f"agentic_dataset.json has only {n} conversations; need >= 70"
 recipe = (m.get("first_turn_length"), m.get("subsequent_turn_length"), m.get("min_turns"), m.get("max_turns"))
 assert recipe == (50000, 800, 10, 15), f"unexpected dataset recipe {recipe}; delete agentic_dataset.json"
-print(f"dataset ok: {n} conversations, recipe {recipe}")
+# pd_client dedups by first-turn content (the frozen artifact has duplicate
+# pairs); the ladder consumes 62 unique conversations + 2 for warmup.
+uniq = len({json.dumps(c[0]["messages"], sort_keys=True) for c in d["conversations"]})
+assert uniq >= 64, f"only {uniq} unique first turns; ladder + warmup need 64"
+print(f"dataset ok: {n} conversations ({uniq} unique first turns), recipe {recipe}")
 PYEOF
 
 CONFIGS=(
     attn_tp8_moe_ep8
     attn_tp8_moe_tp8
-    attn_dp8_moe_ep8
 )
 
 SERVER_PID=
