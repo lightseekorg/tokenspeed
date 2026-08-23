@@ -32,15 +32,16 @@ import psutil
 import setproctitle
 import zmq
 
-from tokenspeed.runtime.engine.event_loop import run_event_loop
 from tokenspeed.runtime.engine.io_struct import (
     BlockReqInput,
+    GetLoadReqOutput,
     IpcReceiver,
     IpcSender,
+    LoadSnapshot,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    WatchLoadUpdateReq,
 )
+from tokenspeed.runtime.engine.load_snapshot import LoadSnapshotStore
 from tokenspeed.runtime.engine.request import Req
 from tokenspeed.runtime.utils import (
     configure_logger,
@@ -79,7 +80,7 @@ class DPBudget:
         self.method = method
         self.budget_queue = deque()
 
-    def update_budget(self, load_update: WatchLoadUpdateReq):
+    def update_budget(self, loads: list[GetLoadReqOutput]):
         """Update the budget queue.
 
         For SHORTEST_QUEUE, use num_reqs instead of num_waiting_reqs to balance decode running batch.
@@ -88,7 +89,6 @@ class DPBudget:
         # method update_budget and method dispatch happen in the same thread, so clearing budget_queue is safe
         self.budget_queue.clear()
 
-        loads = load_update.loads
         if not loads:
             return
 
@@ -115,6 +115,9 @@ class DPBudget:
         if self.budget_queue:
             return self.budget_queue.popleft()
         return None
+
+    def clear(self):
+        self.budget_queue.clear()
 
 
 class DataParallelController:
@@ -159,6 +162,7 @@ class DataParallelController:
 
         # Load balance budget
         self.dp_budget = DPBudget(self.load_balance_method)
+        self.load_snapshot_store = LoadSnapshotStore(server_args.mapping.attn.dp_size)
 
         # Launch data parallel workers
         self.scheduler_procs = []
@@ -185,8 +189,15 @@ class DataParallelController:
         for worker in self.workers:
             worker.send_pyobj(obj)
 
-    def handle_load_update_req(self, obj):
-        self.dp_budget.update_budget(obj)
+    def handle_load_snapshot(self, snapshot: LoadSnapshot):
+        if not self.load_snapshot_store.accept(snapshot):
+            return
+
+        loads = self.load_snapshot_store.project_loads()
+        if loads:
+            self.dp_budget.update_budget(loads)
+        else:
+            self.dp_budget.clear()
 
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -194,7 +205,7 @@ class DataParallelController:
                 (TokenizedGenerateReqInput, self.dispatching),
                 (TokenizedEmbeddingReqInput, self.dispatching),
                 (BlockReqInput, self.send_to_all_workers),
-                (WatchLoadUpdateReq, self.handle_load_update_req),
+                (LoadSnapshot, self.handle_load_snapshot),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -280,6 +291,8 @@ class DataParallelController:
         port_args: PortArgs,
         dp_rank: int,
     ):
+        from tokenspeed.runtime.engine.event_loop import run_event_loop
+
         scheduler_pipe_readers = []
         mapping_template = server_args.mapping
         attn_tp_size = mapping_template.attn.tp_size
@@ -342,6 +355,11 @@ class DataParallelController:
         self.workers[worker_id].send_pyobj(req)
 
     def budget_scheduler(self, req):
+        if not self.load_snapshot_store.is_complete_fresh():
+            self.dp_budget.clear()
+            self.round_robin_scheduler(req)
+            return
+
         target_worker = self.dp_budget.dispatch()
         if target_worker is None:
             self.round_robin_scheduler(req)

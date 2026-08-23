@@ -1048,10 +1048,6 @@ class RpcReqOutput(BaseReq, kw_only=True):
     message: str
 
 
-class GetLoadReqInput(BaseReq, kw_only=True):
-    pass
-
-
 class GetLoadReqOutput(BaseReq, kw_only=True):
     dp_rank: int = 0
     num_reqs: int = 0
@@ -1077,10 +1073,6 @@ class LoadSnapshot(
     num_used_pages: int
     max_total_pages: int
     valid_for_ms: int
-
-
-class WatchLoadUpdateReq(BaseReq, kw_only=True):
-    loads: list[GetLoadReqOutput] = []
 
 
 class BlockReqType(Enum):

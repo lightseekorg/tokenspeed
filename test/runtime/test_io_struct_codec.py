@@ -54,7 +54,6 @@ from tokenspeed.runtime.engine.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadReqInput,
     GetLoadReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
@@ -97,7 +96,6 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    WatchLoadUpdateReq,
     ipc_message_union,
 )
 from tokenspeed.runtime.sampling.sampling_params import (
@@ -227,9 +225,7 @@ _MESSAGES = [
     HealthCheckOutput(),
     RpcReqInput(method="save", parameters={"p": 1}),
     RpcReqOutput(success=True, message=""),
-    GetLoadReqInput(),
     GetLoadReqOutput(dp_rank=1, num_reqs=2, num_waiting_reqs=1, num_pages=3),
-    WatchLoadUpdateReq(loads=[GetLoadReqOutput(dp_rank=0, num_reqs=5)]),
     BlockReqInput(type=BlockReqType.UNBLOCK),
     _batch_token_id_out(),
     BatchStrOut(

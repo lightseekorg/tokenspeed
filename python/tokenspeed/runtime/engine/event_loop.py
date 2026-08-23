@@ -546,7 +546,6 @@ class EventLoop:
             vocab_size=self.model_config.vocab_size,
             recv_func=self.recv_from_tokenizer,
             send_func=self.send_to_tokenizer,
-            get_load_fn=self._get_load,
             clear_cache_fn=self.scheduler.clear_cache,
             architectures=self.model_config.hf_config.architectures,
             pause_controller=self._pause,
@@ -1446,22 +1445,6 @@ class EventLoop:
                         abort.request_id = req_id
                         processed.append(abort)
         return processed
-
-    def _get_load(self):
-        """Return load metrics for the DP load balancer."""
-        from tokenspeed.runtime.engine.io_struct import GetLoadReqOutput
-
-        available = self.scheduler.available_kv_pages()
-        num_used_pages = self._scheduler_cache_geometry.num_usable_pages - available
-        num_waiting = self.scheduler.waiting_size()
-        # num_reqs: running + waiting (used by SHORTEST_QUEUE balancing)
-        num_running = len(self.output_processor.rid_to_state)
-        return GetLoadReqOutput(
-            dp_rank=self.dp_rank,
-            num_reqs=num_running + num_waiting,
-            num_waiting_reqs=num_waiting,
-            num_pages=num_used_pages,
-        )
 
     def _dp_sync_and_check(self, forward_op) -> DpForwardMetadata:
         """Synchronize DP ranks with CPU-only metadata.
