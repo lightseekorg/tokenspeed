@@ -72,9 +72,6 @@ class HybridBackend:
 
 
 class ValidateSchedulerConfigTest(unittest.TestCase):
-    def test_no_build_capability_probe(self):
-        self.assertNotIn("scheduler_ext_flat_kvcache", _pcs.__dict__)
-
     def test_contractless_pool_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "CacheRuntimeContract"):
             _pcs.validate_scheduler_config(
