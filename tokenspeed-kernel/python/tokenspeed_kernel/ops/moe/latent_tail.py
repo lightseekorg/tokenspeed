@@ -158,6 +158,7 @@ class _SymmetricPoolSlot:
 
     collective: CollectiveKernel
     up_projection: AdaptiveUpProjectionKernel
+    split_shared_output: torch.Tensor | None
     scratch_allocator_key: object
 
 
@@ -211,7 +212,7 @@ class KimiK3LatentTailOp:
                 the standalone finalize kernel and its ``[M, latent]``
                 intermediate. The standard mode stays available.
             split_collective: Precompile independent shared-ReduceScatter and
-                routed-AllReduce roles for multistream M16 execution.
+                routed-AllReduce roles for multistream execution.
         """
         contract = _Contract(
             group_name=group.group_name,
@@ -298,6 +299,15 @@ class KimiK3LatentTailOp:
                         cluster_shape_mn=_GEMM_CLUSTER_MN,
                         b_prime_stages=_B_PRIME_STAGES,
                     ),
+                    split_shared_output=(
+                        torch.empty(
+                            (_MAX_NUM_TOKENS, contract.hidden_size),
+                            dtype=torch.bfloat16,
+                            device=contract.device,
+                        )
+                        if contract.split_collective
+                        else None
+                    ),
                     scratch_allocator_key=allocator_key,
                 )
                 type(self)._symmetric_pools[pool_key] = slot
@@ -308,15 +318,7 @@ class KimiK3LatentTailOp:
                 )
             self._collective = slot.collective
             self._up_projection = slot.up_projection
-            self._split_shared_output = (
-                torch.empty(
-                    (_MAX_NUM_TOKENS, contract.hidden_size),
-                    dtype=torch.bfloat16,
-                    device=contract.device,
-                )
-                if contract.split_collective
-                else None
-            )
+            self._split_shared_output = slot.split_shared_output
             self._lamport_copy = LamportCopyKernel(
                 hidden_dim=contract.hidden_size,
                 max_m=_MAX_NUM_TOKENS,
@@ -336,6 +338,11 @@ class KimiK3LatentTailOp:
     @property
     def supports_split_collective(self) -> bool:
         return self.contract.split_collective
+
+    @property
+    def split_collective_min_tokens(self) -> int:
+        """First M whose token work spans more than one collective CTA wave."""
+        return _COLLECTIVE_TOKEN_CTAS + 1
 
     def __call__(
         self,
@@ -381,7 +388,7 @@ class KimiK3LatentTailOp:
             self._validate_prepared_shared_shard(prepared_shared_shard)
             latent, _ = self._collective(
                 routed_partial,
-                self._collective._shared_output[:m],
+                self._collective.shared_output[:m],
                 rms_weight,
                 include_reduce_scatter=False,
                 include_routed=True,
@@ -424,6 +431,8 @@ class KimiK3LatentTailOp:
             num_tokens: Token count M for this step.
             prefix: Optional residual stream ``[M, 7168]``, as in
                 :meth:`__call__`.
+            prepared_shared_shard: Shared ReduceScatter output produced by
+                :meth:`reduce_scatter_shared` on an auxiliary stream.
 
         Returns:
             ``[M, 7168]`` post-communication hidden, as in :meth:`__call__`.
@@ -484,7 +493,7 @@ class KimiK3LatentTailOp:
             gemm2_output,
             expert_weights,
             expanded_idx_to_permuted_idx,
-            (self._collective._shared_output[:m] if split_shared else shared_partial),
+            (self._collective.shared_output[:m] if split_shared else shared_partial),
             rms_weight,
             num_tokens=m,
             include_reduce_scatter=not split_shared,
@@ -503,7 +512,7 @@ class KimiK3LatentTailOp:
             raise RuntimeError("shared-only ReduceScatter is not initialized")
         m = shared_partial.shape[0]
         _, shared_shard = self._collective(
-            self._collective._latent_output[:m],
+            self._collective.latent_output[:m],
             shared_partial,
             rms_weight,
             include_reduce_scatter=True,

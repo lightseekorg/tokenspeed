@@ -59,7 +59,7 @@ from tokenspeed_kernel.ops.moe.latent_tail import (
     KimiK3LatentTailOp,
     latent_tail_supported,
 )
-from tokenspeed_kernel.platform import ArchVersion, current_platform
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
@@ -551,7 +551,6 @@ class K3MoeTailComm:
         # Derived from the projection itself (built with a shard group iff
         # _shard_k3_up_projection held), so comm and module cannot disagree.
         self._shard_up_projection = up_proj.shard_group is not None
-        self._split_shared_rs = current_platform().arch_version == ArchVersion(10, 0)
         self.latent_tail = None
         if self.state.latent_tail_ok:
             # Deferred-finalize arming (rank-uniform). The gate is the
@@ -585,7 +584,7 @@ class K3MoeTailComm:
                 # mailbox must remain private.
                 scratch_allocator=workspace_pool(_device).allocate,
                 finalize_top_k=tail_finalize_top_k,
-                split_collective=self._split_shared_rs,
+                split_collective=current_platform().is_blackwell,
             )
             logger.info(
                 "multicast latent tail engaged "
@@ -628,10 +627,10 @@ class K3MoeTailComm:
                     and self.latent_tail.supports_deferred_finalize
                 ),
                 split_shared_rs=(
-                    num_tokens > 8
-                    and get_is_capture_mode()
-                    and self.latent_tail is not None
+                    self.latent_tail is not None
                     and self.latent_tail.supports_split_collective
+                    and num_tokens >= self.latent_tail.split_collective_min_tokens
+                    and get_is_capture_mode()
                 ),
             )
         # Shard mode splits the joined reduction, so it cannot use the packed lane.
@@ -745,7 +744,7 @@ class K3MoeTailComm:
         routed_out: torch.Tensor,
         shared_partial: torch.Tensor,
         prefix_sum: torch.Tensor,
-        prepared_shared_shard: torch.Tensor | None,
+        prepared_shared_shard: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.latent_tail(
             routed_out,
@@ -764,7 +763,7 @@ class K3MoeTailComm:
         shared_partial: torch.Tensor,
         prefix_sum: torch.Tensor,
         num_tokens: int,
-        prepared_shared_shard: torch.Tensor | None,
+        prepared_shared_shard: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """TAIL_FUSION over the deferred-finalize triple (finalize in-kernel)."""
         return self.latent_tail.call_deferred(

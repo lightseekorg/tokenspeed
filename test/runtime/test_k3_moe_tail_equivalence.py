@@ -370,6 +370,7 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
             max_num_tokens=64,
             supports_deferred_finalize=supports_deferred,
             supports_split_collective=True,
+            split_collective_min_tokens=9,
         )
         comm.execution_plan = SimpleNamespace(fused_moe_ar=fused_ar)
         comm.state = SimpleNamespace(multimem_ar_ok=False)
@@ -389,7 +390,7 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
     assert not plan.defer_finalize
     assert plan.split_shared_rs
 
-    # Split at the measured second-wave boundary, not at one exact graph size.
+    # Split once token work enters a second collective-CTA wave.
     comm = build(supports_deferred=True, fused_ar=True)
     assert not comm.plan(8, None).split_shared_rs
     assert comm.plan(9, None).split_shared_rs
@@ -484,6 +485,7 @@ def test_fused_tail_deferred_finalize_matches_reference(m):
         layer_index=0,
         model_scope="test-deferred",
         finalize_top_k=TOP_K,
+        split_collective=True,
     )
     assert tail.supports_deferred_finalize
     comm = _build_comm(dev, latent_tail=tail)
@@ -502,6 +504,21 @@ def test_fused_tail_deferred_finalize_matches_reference(m):
     scale = out_materialized.float().abs().max().item()
     diff = (out.float() - out_materialized.float()).abs().max().item()
     assert diff / max(scale, 1e-6) < 0.02
+
+    if m >= tail.split_collective_min_tokens:
+        prepared = tail.reduce_scatter_shared(shared, comm.routed_norm.weight)
+        out_split = comm._tail_fusion_deferred(
+            gemm2,
+            weights,
+            idx,
+            shared,
+            prefix,
+            m,
+            prepared,
+        )
+        torch.cuda.synchronize()
+        split_diff = (out.float() - out_split.float()).abs().max().item()
+        assert split_diff / max(scale, 1e-6) < 0.02
 
 
 @collective

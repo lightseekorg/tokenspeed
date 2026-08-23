@@ -1021,10 +1021,6 @@ class CollectiveKernel:
             self._latent_output, self._shared_output = scratch_allocator(
                 *self._scratch_specs
             )
-        shard_start = rank * self.shard_dim
-        shard_end = shard_start + self.shard_dim
-        self._shared_shard = self._shared_output[:, shard_start:shard_end]
-
         self._shared_workspace = symm_mem.empty(
             (NUM_LAMPORT_BUFFERS, max_m, tp_size, self.shard_dim),
             dtype=torch.bfloat16,
@@ -1145,7 +1141,6 @@ class CollectiveKernel:
         num_tokens: int,
         *,
         include_reduce_scatter: bool = True,
-        shared_output_override: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fused collective over the MoE kernel's deferred-finalize triple.
 
@@ -1224,7 +1219,7 @@ class CollectiveKernel:
             finalize_top_k=self.finalize_top_k,
             include_reduce_scatter=include_reduce_scatter,
             include_routed=True,
-            shared_output_override=shared_output_override,
+            shared_output_override=None,
         )
 
     def _dispatch(
@@ -1247,10 +1242,6 @@ class CollectiveKernel:
             self._latent_output, self._shared_output = self._scratch_allocator(
                 *self._scratch_specs
             )
-            shard_start = self.rank * self.shard_dim
-            self._shared_shard = self._shared_output[
-                :, shard_start : shard_start + self.shard_dim
-            ]
 
         shared_output = (
             self._shared_output
