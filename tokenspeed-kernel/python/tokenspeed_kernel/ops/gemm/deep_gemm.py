@@ -77,6 +77,22 @@ _DEEPSEEK_V4_GROUPED_SIGNATURES = frozenset(
 )
 
 
+def _warmup_deep_gemm_fp8_linears(plans: list[object], max_tokens: int) -> None:
+    from tokenspeed_kernel.thirdparty.deep_gemm.warmup import warmup_fp8_gemm_nt
+
+    by_device: dict[torch.device, set[tuple[int, int]]] = {}
+    for plan in plans:
+        warmup_key = getattr(plan, "warmup_key")
+        prepared_weight_scales = getattr(plan, "prepared_weight_scales")
+        assert warmup_key is not None
+        assert prepared_weight_scales is not None
+        n, k = warmup_key
+        device = prepared_weight_scales.device
+        by_device.setdefault(device, set()).add((n, k))
+    for device, shapes in by_device.items():
+        warmup_fp8_gemm_nt(list(shapes), max_tokens, device)
+
+
 def _deep_gemm_dsv4_grouped_output_projection_weights(
     *,
     weight: torch.Tensor,

@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.activation.triton import silu_and_mul as triton_silu_
 from tokenspeed_kernel.ops.activation.triton import (
     situ_and_mul,
 )
+from tokenspeed_kernel.ops.gemm import _fp8_linear_activation
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import error_fn
 
@@ -83,8 +84,6 @@ def prepare_fp8_linear_activation(
         Prepared FP8 values and scales, or ``None`` when no fused contract is
         available.
     """
-    from tokenspeed_kernel.ops.gemm.fp8_linear import _fp8_linear_activation
-
     return _fp8_linear_activation(
         plan,
         x,

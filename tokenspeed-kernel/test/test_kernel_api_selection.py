@@ -50,7 +50,6 @@ import tokenspeed_kernel.ops.attention.triton as _attention_triton
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.cuda as _gemm_cuda
 import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
-import tokenspeed_kernel.ops.gemm.dsv4 as _gemm_dsv4
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
@@ -143,7 +142,6 @@ _RELOAD_MODULES = [
     _gemm_reference,
     _gemm_cuda,
     _gemm_deep_gemm,
-    _gemm_dsv4,
     _gemm_flashinfer,
     _gemm_gluon,
     _gemm_triton,
