@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
     KdaPrefillResult,
     _nvidia_kda_prefill,
 )
+from tokenspeed_kernel.selection import SelectedKernel
 
 H, HV, K, V, T = 2, 2, 128, 128, 32
 
@@ -183,7 +184,8 @@ def test_facade_forwards_hint_only_when_set(monkeypatch):
             out=torch.zeros(1, T, HV, V), final_state=torch.zeros(1, HV, K, V)
         )
 
-    monkeypatch.setattr(attn, "select_kernel", lambda *a, **kw: fake_kernel)
+    selected = SelectedKernel("fake_kda_prefill", fake_kernel)
+    monkeypatch.setattr(attn, "select_kernel", lambda *a, **kw: selected)
 
     q, k, v, g, beta, a_log, dt_bias = _inputs()
     cu = torch.tensor([0, T], dtype=torch.int32)

@@ -946,6 +946,7 @@ class CollectiveKernel:
         fp32_internal: bool,
         scratch_allocator=None,
         finalize_top_k: int | None = None,
+        precompile_split: bool = False,
     ) -> None:
         validate_shape(
             tp_size=tp_size,
@@ -963,6 +964,7 @@ class CollectiveKernel:
         self.max_token_ctas = max_token_ctas
         self.rms_eps = float(rms_eps)
         self.fp32_internal = fp32_internal
+        self.precompile_split = precompile_split
         # When set, ``call_deferred`` additionally accepts the MoE kernel's
         # deferred-finalize triple; the standard materialized-input mode
         # stays available on the same instance.
@@ -1019,10 +1021,6 @@ class CollectiveKernel:
             self._latent_output, self._shared_output = scratch_allocator(
                 *self._scratch_specs
             )
-        shard_start = rank * self.shard_dim
-        shard_end = shard_start + self.shard_dim
-        self._shared_shard = self._shared_output[:, shard_start:shard_end]
-
         self._shared_workspace = symm_mem.empty(
             (NUM_LAMPORT_BUFFERS, max_m, tp_size, self.shard_dim),
             dtype=torch.bfloat16,
@@ -1051,11 +1049,19 @@ class CollectiveKernel:
         dist.barrier(group=group, device_ids=[device.index])
         for owner in range(tp_size):
             if rank == owner:
-                # Compile the standard variant always and the deferred-input
-                # variant when armed; both must exist before graph capture.
-                for variant_top_k in (
-                    (None,) if finalize_top_k is None else (None, finalize_top_k)
-                ):
+                variants = [(True, True, None)]
+                if finalize_top_k is not None:
+                    variants.append((True, True, finalize_top_k))
+                if precompile_split:
+                    variants.extend(
+                        [
+                            (True, False, None),
+                            (False, True, None),
+                        ]
+                    )
+                    if finalize_top_k is not None:
+                        variants.append((False, True, finalize_top_k))
+                for include_reduce_scatter, include_routed, variant_top_k in variants:
                     compile_kernel(
                         rank=rank,
                         tp_size=tp_size,
@@ -1073,6 +1079,8 @@ class CollectiveKernel:
                         shared_peer_ptrs=self._shared_peer_ptrs,
                         rms_eps=self.rms_eps,
                         fp32_internal=fp32_internal,
+                        include_reduce_scatter=include_reduce_scatter,
+                        include_routed=include_routed,
                         finalize_top_k=variant_top_k,
                     )
             dist.barrier(group=group, device_ids=[device.index])
@@ -1082,7 +1090,15 @@ class CollectiveKernel:
         latent_source: torch.Tensor,
         shared_source: torch.Tensor,
         gamma: torch.Tensor,
+        *,
+        include_reduce_scatter: bool = True,
+        include_routed: bool = True,
+        shared_output_override: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not include_reduce_scatter and not include_routed:
+            raise ValueError("at least one collective role must be enabled")
+        if include_reduce_scatter != include_routed and not self.precompile_split:
+            raise RuntimeError("split collective roles require precompile_split=True")
         if latent_source.ndim != 2 or shared_source.ndim != 2:
             raise ValueError("latent_source and shared_source must be rank-2")
         m = latent_source.shape[0]
@@ -1110,6 +1126,9 @@ class CollectiveKernel:
             finalize_weights=self._finalize_dummy_weights,
             finalize_idx=self._finalize_dummy_idx,
             finalize_top_k=None,
+            include_reduce_scatter=include_reduce_scatter,
+            include_routed=include_routed,
+            shared_output_override=shared_output_override,
         )
 
     def call_deferred(
@@ -1120,6 +1139,8 @@ class CollectiveKernel:
         shared_source: torch.Tensor,
         gamma: torch.Tensor,
         num_tokens: int,
+        *,
+        include_reduce_scatter: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fused collective over the MoE kernel's deferred-finalize triple.
 
@@ -1144,6 +1165,8 @@ class CollectiveKernel:
                 "CollectiveKernel was constructed without finalize_top_k; "
                 "the deferred-finalize variant is not compiled"
             )
+        if not include_reduce_scatter and not self.precompile_split:
+            raise RuntimeError("split collective roles require precompile_split=True")
         m = int(num_tokens)
         if not 1 <= m <= self.max_m:
             raise ValueError(f"runtime M={m} must be in [1, {self.max_m}]")
@@ -1194,6 +1217,9 @@ class CollectiveKernel:
             finalize_weights=expert_weights,
             finalize_idx=expanded_idx_to_permuted_idx,
             finalize_top_k=self.finalize_top_k,
+            include_reduce_scatter=include_reduce_scatter,
+            include_routed=True,
+            shared_output_override=None,
         )
 
     def _dispatch(
@@ -1206,6 +1232,9 @@ class CollectiveKernel:
         finalize_weights: torch.Tensor,
         finalize_idx: torch.Tensor,
         finalize_top_k: int | None,
+        include_reduce_scatter: bool,
+        include_routed: bool,
+        shared_output_override: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = self._routed_workspace.device
         if self._scratch_allocator is not None:
@@ -1213,10 +1242,24 @@ class CollectiveKernel:
             self._latent_output, self._shared_output = self._scratch_allocator(
                 *self._scratch_specs
             )
-            shard_start = self.rank * self.shard_dim
-            self._shared_shard = self._shared_output[
-                :, shard_start : shard_start + self.shard_dim
-            ]
+
+        shared_output = (
+            self._shared_output
+            if shared_output_override is None
+            else shared_output_override
+        )
+        if (
+            shared_output.shape != (self.max_m, self.hidden_dim)
+            or shared_output.dtype != torch.bfloat16
+            or shared_output.device != device
+            or not shared_output.is_contiguous()
+        ):
+            raise ValueError(
+                "shared_output_override must be contiguous CUDA BF16 "
+                f"[{self.max_m}, {self.hidden_dim}]"
+            )
+        shard_start = self.rank * self.shard_dim
+        shared_shard = shared_output[:, shard_start : shard_start + self.shard_dim]
 
         with torch.accelerator.device_index(device.index):
             launch(
@@ -1227,7 +1270,7 @@ class CollectiveKernel:
                 self._routed_flags,
                 self._routed_multicast_ptr,
                 shared_source,
-                self._shared_output,
+                shared_output,
                 self._shared_workspace,
                 self._shared_flags,
                 self._shared_peer_ptrs,
@@ -1242,11 +1285,13 @@ class CollectiveKernel:
                 max_m=self.max_m,
                 max_token_ctas=self.max_token_ctas,
                 fp32_internal=self.fp32_internal,
+                include_reduce_scatter=include_reduce_scatter,
+                include_routed=include_routed,
                 finalize_top_k=finalize_top_k,
             )
         return (
             self._latent_output[:m],
-            self._shared_shard,
+            shared_shard,
         )
 
     @property

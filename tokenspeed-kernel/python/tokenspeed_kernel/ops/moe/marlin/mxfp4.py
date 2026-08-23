@@ -218,7 +218,9 @@ def marlin_mxfp4_precomputed_moe_apply(
     if is_ep:
         # Global -> local id remap: [expert_start, +num_local) -> [0, num_local),
         # everything else -> -1 (the align kernel parks these in the extra lane
-        # and the EP GEMM skips those blocks).
+        # and the EP GEMM skips those blocks). Inputs may already carry -1 in
+        # masked slots (DeepEP recv layout); clamp before the gather so the
+        # negative index cannot wrap to the mapping's last entry, then restore.
         expert_start = ep_rank * num_local_experts
         mapping = torch.full(
             (global_num_experts,), -1, dtype=torch.int32, device=topk_ids.device
@@ -226,7 +228,9 @@ def marlin_mxfp4_precomputed_moe_apply(
         mapping[expert_start : expert_start + num_local_experts] = torch.arange(
             num_local_experts, dtype=torch.int32, device=topk_ids.device
         )
-        local_topk_ids = mapping[topk_ids.long()]
+        local_topk_ids = torch.where(
+            topk_ids < 0, topk_ids, mapping[topk_ids.long().clamp_(min=0)]
+        )
         align_num_experts = num_local_experts
     else:
         local_topk_ids = topk_ids

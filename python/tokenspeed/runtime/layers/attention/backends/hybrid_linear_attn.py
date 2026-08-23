@@ -40,6 +40,9 @@ from tokenspeed_kernel.ops.attention.triton.linear.index import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
 )
+from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
+    verify_state_blocks,
+)
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
@@ -476,13 +479,6 @@ class MambaAttnBackend(AttentionBackend):
         pages, the committed lengths, and the per-group group tables (kept
         for the commit's dynamic page resolve).
         """
-        committed = (seq_lens[:bs].to(torch.int64) - draft_token_num).clamp_min(0)
-        in_slots = torch.div(
-            (committed - 1).clamp_min(0),
-            self._checkpoint_granularity,
-            rounding_mode="floor",
-        )
-        has_history = committed > 0
         state_in_blocks: dict[str, torch.Tensor] = {}
         tables: dict[str, torch.Tensor] = {}
         cache_metadata = kwargs.get("cache_metadata")
@@ -497,11 +493,23 @@ class MambaAttnBackend(AttentionBackend):
             )
             for group_id in self._state_groups()
         }
+        if not rows_by_group:
+            return (
+                {},
+                (seq_lens[:bs].to(torch.int64) - draft_token_num).clamp_min(0),
+                {},
+            )
+        committed = torch.empty(bs, dtype=torch.int64, device=seq_lens.device)
         for group_id, rows in rows_by_group.items():
-            slots_safe = in_slots.clamp(min=0, max=rows.shape[1] - 1)
-            pages = rows[:bs].gather(1, slots_safe.unsqueeze(1)).squeeze(1)
-            pages = torch.where(has_history, pages, torch.full_like(pages, -1)).to(
-                torch.int32
+            pages = torch.empty(bs, dtype=torch.int32, device=seq_lens.device)
+            verify_state_blocks(
+                seq_lens,
+                rows,
+                batch_size=bs,
+                draft_tokens=draft_token_num,
+                granularity=self._checkpoint_granularity,
+                pages_out=pages,
+                committed_out=committed,
             )
             state_in_blocks[group_id] = pages
             tables[group_id] = rows

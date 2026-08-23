@@ -63,9 +63,9 @@ def test_mtp_matches_stepped_pool(B, T, lower_bound, recurrent_layout):
     n_pages = B * (T + 2)
     init = torch.randn(B, HV, K, V, dtype=torch.float32, device=dev)
 
-    # --- reference: pool kernel, one token at a time ---
-    pool_ref = torch.zeros(n_pages, HV, K, V, dtype=torch.float32, device=dev)
-    pool_ref[:B] = init
+    # --- reference: the V-major pool kernel, one token at a time ---
+    pool_ref = torch.zeros(n_pages, HV, V, K, dtype=torch.float32, device=dev)
+    pool_ref[:B] = init.transpose(-1, -2)
     ref_out = torch.empty(B, T, HV, V, dtype=v.dtype, device=dev)
     ref_states = []
     read = torch.arange(B, dtype=torch.int64, device=dev)
@@ -85,7 +85,7 @@ def test_mtp_matches_stepped_pool(B, T, lower_bound, recurrent_layout):
             lower_bound=lower_bound,
         )
         ref_out[:, t] = o_t[:, 0]
-        ref_states.append(pool_ref[write].clone())
+        ref_states.append(pool_ref[write].transpose(-1, -2).clone())
         read = write
 
     # --- MTP: one call, per-step write grid ---

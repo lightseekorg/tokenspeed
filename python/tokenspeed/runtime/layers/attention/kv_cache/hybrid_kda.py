@@ -74,10 +74,13 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         if self.quant_method == "per_token_head":
             raise ValueError("KDA cache does not support per-token-head KV")
         super()._bind_layer_planes()
+        # A state layer with no planned planes belongs to another pipeline
+        # stage (the PP-narrowed plan drops its fields); this view never
+        # executes it, so it gets no entry.
         self._state_buffers_by_layer = {
             layer_id: (self._conv_state[layer_id], self._recurrent_state[layer_id])
             for layer_id, label in enumerate(self._layer_types)
-            if label in STATE_LAYER_TYPES
+            if label in STATE_LAYER_TYPES and self._conv_state[layer_id] is not None
         }
 
     @property

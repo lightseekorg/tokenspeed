@@ -551,9 +551,13 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         mapping shared across layers. Returns 0 when no SWA buffers exist;
         callers must then mask all slots rather than skip the bounds check.
         """
-        if not self.swa_kv_buffer:
-            return 0
-        return int(self.swa_kv_buffer[0].shape[0]) * int(self.swa_block_size)
+        # Under a pipeline-parallel layer window only this stage's layers'
+        # buffers are bound (the rest stay None), so probe the first bound
+        # one — every layer's SWA plane shares the same page count.
+        for buffer in self.swa_kv_buffer or ():
+            if buffer is not None:
+                return int(buffer.shape[0]) * int(self.swa_block_size)
+        return 0
 
     def get_compressed_kv_buffer_2d(self, layer_id: int) -> torch.Tensor:
         return self._require(self.compressed_kv_buffer, layer_id, "compressed KV")

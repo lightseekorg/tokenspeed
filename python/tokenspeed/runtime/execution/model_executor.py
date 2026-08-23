@@ -178,6 +178,11 @@ class ModelExecutorConfig:
     world_size: int = 1
     world_group: list[int] | None = None
 
+    # ====== PP (prefill chunk pipeline) =========
+    pp_size: int = 1
+    pp_rank: int = 0
+    pp_group: tuple[int, ...] | None = None
+
     # ====== SPEC =========
     spec_algo: str | None = None
     spec_num_steps: int | None = None
@@ -282,6 +287,11 @@ class ModelExecutorConfig:
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
+            pp_size=server_args.mapping.pp_size,
+            pp_rank=(server_args.mapping.pp_rank if server_args.mapping.has_pp else 0),
+            pp_group=(
+                server_args.mapping.pp_group if server_args.mapping.has_pp else None
+            ),
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
@@ -597,6 +607,17 @@ class ModelExecutor:
         )
         if num_tokens <= 0 or self.model_runner is None:
             return
+        if self.config.pp_size > 1:
+            # The tuning forward drives the model directly (no stage recv/send
+            # threading), which a mid-pipeline stage cannot run. Fall back to
+            # heuristic tactics on every rank so the world-averaged tactic
+            # collective is skipped consistently.
+            set_autotune_max_num_tokens(num_tokens)
+            logger.info(
+                "Kernel tuning skipped under pipeline parallelism; tunable "
+                "kernels use heuristic tactics"
+            )
+            return
 
         # The bucket mapper keys serving-time tactic lookups, so it must match
         # any pre-swept table loaded earlier even when tuning itself is off.
@@ -679,6 +700,62 @@ class ModelExecutor:
             block_tables, bs=bs, padded_bs=self.draft_page_table.shape[0]
         )
 
+    def _pp_recv_stage_state(self, num_tokens: int):
+        """Receive the upstream stage's boundary bundle (mid-pipeline ranks).
+
+        Geometry comes from the model's wire spec — both sides derive it from
+        config + token count, so no metadata crosses the wire. Runs on the
+        current (execution) stream; NCCL P2P ops on one communicator match in
+        issue order against the upstream sends.
+        """
+        from tokenspeed.runtime.distributed.comm_ops import pp_recv
+        from tokenspeed.runtime.distributed.pp_stage import PPStageState
+
+        spec = self.model_runner.model.model.pp_stage_state_spec(
+            num_tokens, torch.device(self.device)
+        )
+        if not getattr(self, "_pp_wire_logged", False):
+            self._pp_wire_logged = True
+            logger.info(
+                "PP stage %d recv wire: %s",
+                self.config.pp_rank,
+                [(tuple(shape), str(dtype)) for _, shape, dtype in spec],
+            )
+        tensors = [
+            pp_recv(
+                shape,
+                dtype,
+                torch.device(self.device),
+                self.config.pp_rank - 1,
+                self.config.pp_group,
+            )
+            for _, shape, dtype in spec
+        ]
+        return PPStageState.from_tensors(tensors, [name for name, _, _ in spec])
+
+    def _pp_send_stage_state(self, state) -> None:
+        """Send this stage's boundary bundle downstream (non-last ranks)."""
+        from tokenspeed.runtime.distributed.comm_ops import pp_send
+
+        tensors = state.tensors()
+        if not getattr(self, "_pp_wire_logged", False):
+            self._pp_wire_logged = True
+            logger.info(
+                "PP stage %d send wire: %s",
+                self.config.pp_rank,
+                [(tuple(t.shape), str(t.dtype)) for t in tensors],
+            )
+        for tensor in tensors:
+            pp_send(tensor, self.config.pp_rank + 1, self.config.pp_group)
+
+    @property
+    def _pp_is_last_stage(self) -> bool:
+        return self.config.pp_rank == self.config.pp_size - 1
+
+    @property
+    def _pp_is_first_stage(self) -> bool:
+        return self.config.pp_rank == 0
+
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
         positions = self._active_positions_override
@@ -689,6 +766,24 @@ class ModelExecutor:
                 ]
             else:
                 positions = self.input_buffers.positions_buf[: ctx.input_num_tokens]
+        # PP mid-pipeline: receive the upstream boundary state and thread it
+        # through the model's pp_inbound channel. The P role forces eager, so
+        # neither graph path below can be active alongside PP.
+        if self.config.pp_size > 1 and not self._pp_is_first_stage:
+            pp_inbound = self._pp_recv_stage_state(ctx.input_num_tokens)
+            output = self.model_runner.forward(
+                ctx,
+                self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
+                positions,
+                self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
+                req_pool_indices=req_pool_indices,
+                seq_lens=self.input_buffers.seq_lens_buf[:bs],
+                extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
+                    : ctx.num_extends
+                ],
+                pp_inbound=pp_inbound,
+            )
+            return output
         # Prefill-graph replay when captured for this forward (the decode graph
         # replays one level up: it captures the whole _forward_step).
         mode = ctx.forward_mode
@@ -851,6 +946,15 @@ class ModelExecutor:
             )
 
         logits_output = self._run_target_forward(bs, ctx, req_pool_indices)
+
+        if self.config.pp_size > 1 and not self._pp_is_last_stage:
+            # Mid-pipeline stage: the model returned the boundary bundle, not
+            # logits. Ship it downstream and return placeholder outputs — the
+            # commit path recognizes a PP placeholder and emits no tokens.
+            self._pp_send_stage_state(logits_output)
+            output_tokens = torch.zeros(bs, dtype=torch.int32, device=self.device)
+            accept_lengths = torch.ones(bs, dtype=torch.int32, device=self.device)
+            return output_tokens, accept_lengths, None
 
         if self.drafter is not None and getattr(
             self.drafter, "_incremental_proj_enabled", False

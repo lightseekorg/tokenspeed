@@ -427,12 +427,7 @@ def _create_hybrid_linear_attn_backend(
     kda_backend = (getattr(server_args, "kda_backend", None) or "auto").strip().lower()
     if is_kda:
         kda_backend = _resolve_kda_backend(kda_backend)
-        kda_recurrent_layout = "v_major" if current_platform().is_cdna4 else "k_major"
-        linear_attn_backend = KdaAttnBackend(
-            config,
-            kda_backend=kda_backend,
-            kda_recurrent_layout=kda_recurrent_layout,
-        )
+        linear_attn_backend = KdaAttnBackend(config, kda_backend=kda_backend)
     else:
         linear_attn_backend = MambaAttnBackend(config)
 
@@ -922,11 +917,33 @@ def create_attn_components(
 
     # One model, one arena: the merged plan's single allocation, which every
     # compute view below (target, draft) is a layer window onto.
+    pp_logical_plan = None
+    if server_args.mapping.has_pp:
+        # Chunk-pipeline stage: physically allocate only this stage's layers'
+        # planes. The logical geometry (parents, packing, page math) stays
+        # the full model's so every rank's scheduler plans identically; keep
+        # the full plan for the PD wire contract (every stage registers the
+        # same logical layout, Decode plans stage windows against it).
+        from dataclasses import replace as _dc_replace
+
+        from tokenspeed.runtime.distributed.pp_stage import pp_layer_window
+
+        stage_start, stage_end = pp_layer_window(
+            len(spec.layer_types), server_args.mapping
+        )
+        pp_logical_plan = spec.memory_plan
+        spec = _dc_replace(
+            spec,
+            memory_plan=spec.memory_plan.narrow_to_layers(stage_start, stage_end),
+        )
+        target_spec = spec
     arena = create_cache_arena(
         spec,
         device=config.device,
         enable_memory_saver=enable_memory_saver,
     )
+    if pp_logical_plan is not None:
+        arena.pp_logical_plan = pp_logical_plan
     backend, pool = _create_target_components(
         server_args=server_args,
         model_config=model_config,

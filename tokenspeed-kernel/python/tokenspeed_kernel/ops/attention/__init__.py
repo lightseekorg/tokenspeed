@@ -150,6 +150,7 @@ __all__ = [
     "gdn_replay_commit",
     "gdn_replay_commit_supported",
     "kda_paged_prefill",
+    "kda_recurrent_layout",
     "kda_paged_decode",
     "try_kda_fused_paged_decode",
     "try_kda_fused_paged_verify",
@@ -1481,6 +1482,18 @@ def gdn_replay_commit_supported(
     return True
 
 
+def kda_recurrent_layout() -> str:
+    """Return the recurrent state layout this platform's KDA kernels consume.
+
+    Returns:
+        ``"v_major"`` where the paged slab is ``[pages, HV, V, K]``, else
+        ``"k_major"``. K equals V for the supported head geometry, so the two
+        differ only in which axis is contiguous.
+    """
+    platform = current_platform()
+    return "v_major" if platform.is_nvidia or platform.is_cdna4 else "k_major"
+
+
 def kda_paged_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1496,6 +1509,7 @@ def kda_paged_prefill(
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
+    recurrent_layout: str | None = None,
 ) -> KdaPrefillResult:
     """Run packed KDA prefill through capability-based kernel selection.
 
@@ -1514,12 +1528,13 @@ def kda_paged_prefill(
         lower_bound: Optional safe lower bound for log decay.
         override: Optional exact kernel name.
         solution: Optional registered solution name.
+        recurrent_layout: Layout of the backend-owned recurrent state; the
+            platform default when omitted.
 
     Returns:
-        Packed output and final state.
-
-    Recurrent states use the canonical ``[N,H,K,V]`` layout across backends.
+        Packed output and final state, in the caller's ``recurrent_layout``.
     """
+    recurrent_layout = recurrent_layout or kda_recurrent_layout()
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("KDA q must be [1, total_tokens, heads, key_dim]")
     if k.shape != q.shape or g_raw.shape != q.shape:
@@ -1540,10 +1555,16 @@ def kda_paged_prefill(
         solution=solution,
         override=override,
     )
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    supported = None if spec is None else spec.traits.get("recurrent_layout")
+    # Kernels that declare no layout consume the caller's state as it is.
+    relayout = supported is not None and recurrent_layout not in supported
+    if relayout:
+        initial_state = initial_state.transpose(-1, -2).contiguous()
     # Forwarded only when set so registered kernels without the
     # host-boundary hint parameter keep working unchanged.
     hint = {} if cu_seqlens_cpu is None else {"cu_seqlens_cpu": cu_seqlens_cpu}
-    return kernel(
+    result = kernel(
         q=q,
         k=k,
         v=v,
@@ -1556,6 +1577,10 @@ def kda_paged_prefill(
         lower_bound=lower_bound,
         **hint,
     )
+    if relayout:
+        # Hand the final state back in the caller's layout (a view; no copy).
+        return KdaPrefillResult(result.out, result.final_state.transpose(-1, -2))
+    return result
 
 
 def kda_paged_decode(
@@ -1574,6 +1599,7 @@ def kda_paged_decode(
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
+    recurrent_layout: str | None = None,
 ) -> torch.Tensor:
     """Run post-convolution KDA decode against an indexed state pool.
 
@@ -1588,10 +1614,13 @@ def kda_paged_decode(
         lower_bound: Optional safe lower bound for log decay.
         override: Optional exact kernel name.
         solution: Optional registered solution name.
+        recurrent_layout: Layout of the state pool; the platform default
+            when omitted.
 
     Returns:
         KDA output with the same shape as ``v``.
     """
+    recurrent_layout = recurrent_layout or kda_recurrent_layout()
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("KDA decode q must be [1, batch, heads, key_dim]")
     if k.shape != q.shape or g_raw.shape != q.shape:
@@ -1613,6 +1642,7 @@ def kda_paged_decode(
         traits={
             "indexed_state": True,
             "single_token": q.shape[1] == num_sequences,
+            "recurrent_layout": recurrent_layout,
         },
         solution=solution,
         override=override,
@@ -1653,7 +1683,7 @@ def try_kda_fused_paged_decode(
     output_gate: torch.Tensor | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
-    recurrent_layout: str = "k_major",
+    recurrent_layout: str | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> KdaFusedDecodeResult | None:
@@ -1668,6 +1698,7 @@ def try_kda_fused_paged_decode(
     platform. Otherwise, returns the output and whether output normalization
     was applied. Invalid inputs and execution failures remain visible.
     """
+    recurrent_layout = recurrent_layout or kda_recurrent_layout()
     if (output_gate is None) != (norm_weight is None):
         raise ValueError("output_gate and norm_weight must be provided together")
     if output_gate is not None and norm_eps is None:
@@ -1771,6 +1802,7 @@ def try_kda_fused_paged_verify(
     head_dim: int,
     draft_token_num: int,
     lower_bound: float | None = -5.0,
+    recurrent_layout: str | None = None,
     override: str | None = None,
     solution: str | None = None,
     store_states: bool = True,
@@ -1779,9 +1811,15 @@ def try_kda_fused_paged_verify(
 
     Mirrors ``try_kda_fused_paged_decode`` for the speculative verify batch:
     per-position conv windows and recurrent states land in the verify
-    scratches for partial-accept commit. Returns ``None`` only when no
-    implementation supports the current platform.
+    scratches for partial-accept commit. ``store_states`` selects the
+    rollback-tape variant and ``recurrent_layout`` defaults to the
+    platform's state layout; which producer arrangement runs is the
+    registry's choice. Returns ``None`` only when no implementation
+    supports the current platform.
     """
+    recurrent_layout = recurrent_layout or kda_recurrent_layout()
+    if recurrent_layout not in ("k_major", "v_major"):
+        raise ValueError(f"unsupported KDA recurrent layout {recurrent_layout!r}")
     signature = _attention_format_signature(
         q=mixed_qkv,
         k=mixed_qkv,
@@ -1792,7 +1830,11 @@ def try_kda_fused_paged_verify(
             "attention",
             "kda_fused_paged_verify",
             signature,
-            traits={"paged_state": True, "store_states": store_states},
+            traits={
+                "paged_state": True,
+                "store_states": store_states,
+                "recurrent_layout": recurrent_layout,
+            },
             solution=solution,
             override=override,
         )
@@ -1842,6 +1884,7 @@ def try_kda_replay_commit(
     override: str | None = None,
     solution: str | None = None,
     gate_scratch: torch.Tensor | None = None,
+    recurrent_layout: str | None = None,
 ) -> bool:
     """Try a registered KDA speculative replay-commit.
 
@@ -1850,12 +1893,14 @@ def try_kda_replay_commit(
     position. Pass the SAME projections the verify pass consumed.
     ``gate_scratch`` is transient fp32 scratch for the hoisted gate
     (``[>= N*T, num_heads*head_dim]``); ``None`` falls back to a
-    kernel-module buffer.
+    kernel-module buffer. ``recurrent_layout`` defaults to the platform's
+    state layout.
 
     Returns:
         ``True`` when a kernel ran, ``False`` when none supports the current
         platform (the caller must then fall back to a scratch-based commit).
     """
+    recurrent_layout = recurrent_layout or kda_recurrent_layout()
     signature = _attention_format_signature(
         q=mixed_qkv,
         k=mixed_qkv,
@@ -1866,7 +1911,7 @@ def try_kda_replay_commit(
             "attention",
             "kda_replay_commit",
             signature,
-            traits={"flat_state": True},
+            traits={"flat_state": True, "recurrent_layout": recurrent_layout},
             solution=solution,
             override=override,
         )
@@ -1896,9 +1941,7 @@ def try_kda_replay_commit(
     return True
 
 
-def resolve_kda_batched_replay_commit(
-    dtype: torch.dtype = torch.bfloat16,
-):
+def resolve_kda_batched_replay_commit(dtype: torch.dtype = torch.bfloat16):
     """Resolve the all-layer replay kernel once, or return ``None``.
 
     ``None`` for any dtype but bfloat16: the batched kernels dereference raw
@@ -1931,6 +1974,7 @@ def kda_replay_commit_supported(
     dtype: torch.dtype = torch.bfloat16,
     *,
     solution: str | None = None,
+    recurrent_layout: str | None = None,
 ) -> bool:
     """Whether this platform can run the KDA speculative replay path.
 
@@ -1942,10 +1986,14 @@ def kda_replay_commit_supported(
     Args:
         dtype: activation dtype the verify batch will use.
         solution: restrict to one registered solution, as in ``select_kernel``.
+        recurrent_layout: Layout of the committed state; the platform default
+            when omitted. It must match what the caller stores, or the probe
+            answers for kernels the backend will not select.
 
     Returns:
         ``True`` when both kernels are registered for the current platform.
     """
+    recurrent_layout = recurrent_layout or kda_recurrent_layout()
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
     try:
@@ -1953,14 +2001,18 @@ def kda_replay_commit_supported(
             "attention",
             "kda_replay_commit",
             signature,
-            traits={"flat_state": True},
+            traits={"flat_state": True, "recurrent_layout": recurrent_layout},
             solution=solution,
         )
         select_kernel(
             "attention",
             "kda_fused_paged_verify",
             signature,
-            traits={"paged_state": True, "store_states": False},
+            traits={
+                "paged_state": True,
+                "store_states": False,
+                "recurrent_layout": recurrent_layout,
+            },
             solution=solution,
         )
     except NoKernelFoundError:
