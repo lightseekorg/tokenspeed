@@ -42,7 +42,7 @@ DATASETS = {
         "dataset_args": json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)["gpqa_diamond"],
     },
     "gsm8k": {
-        "count": 6,
+        "count": 4,
         "dataset_args": {"dataset_id": "openai/gsm8k"},
     },
     "mmlu": {
@@ -67,20 +67,8 @@ KVV_CONFIGS = {
     ),
 }
 
-AMD_DEEPSEEK_V4_MTP_CONFIGS = {
-    "deepseek-v4-flash-mtp-evalscope-gsm8k-amd.yaml": (
-        "deepseek-ai/DeepSeek-V4-Flash",
-        "amd-mi35x-2gpu-test",
-        "2",
-        "3",
-    ),
-    "deepseek-v4-pro-mtp-evalscope-gsm8k-amd.yaml": (
-        "deepseek-ai/DeepSeek-V4-Pro",
-        "amd-mi35x-8gpu-test",
-        "8",
-        "2",
-    ),
-}
+DEEPSEEK_V4_FLASH_CONFIG = "deepseek-v4-flash-evalscope-gsm8k.yaml"
+DEEPSEEK_V4_PRO_AMD_CONFIG = "deepseek-v4-pro-evalscope-gsm8k-amd.yaml"
 
 
 def flag_value(tokens: list[str], flag: str) -> str:
@@ -149,40 +137,75 @@ def test_evalscope_configs_use_expected_dataset_sources():
     assert counts == expected_counts, f"expected {expected_counts}, found {counts}"
 
 
-def test_amd_deepseek_v4_mtp_configs_use_supported_defaults():
+def test_deepseek_v4_flash_config_uses_platform_specific_backends():
+    path = EVAL_CONFIG_DIR / DEEPSEEK_V4_FLASH_CONFIG
+    task = yaml.safe_load(path.read_text(encoding="utf-8"))
+    command = shlex.split(task["server"]["command"])
+
+    assert task["triggers"] == ["per-commit", "manual"]
+    assert task["runner"]["labels"] == ["b200-4gpu", "amd-mi35x-2gpu-test"]
+    assert task["install"] == ["bash test/ci_system/install_deps.sh"]
+    assert flag_value(command, "--model") == "deepseek-ai/DeepSeek-V4-Flash"
+    assert flag_value(command, "--tensor-parallel-size") == "${DEEPSEEK_V4_TP_SIZE}"
+    assert flag_value(command, "--max-model-len") == "4096"
+    assert flag_value(command, "--max-total-tokens") == "16384"
+    assert flag_value(command, "--chunked-prefill-size") == "8192"
+    assert task["server"]["ready"]["timeout"] == 1800
+
+    runner_env = task["runner"]["env"]
+    nvidia_args = shlex.split(runner_env["b200-4gpu"]["DEEPSEEK_V4_PLATFORM_ARGS"])
+    assert runner_env["b200-4gpu"]["DEEPSEEK_V4_TP_SIZE"] == "4"
+    assert "--enable-expert-parallel" in nvidia_args
+    assert flag_value(nvidia_args, "--moe-backend") == "mega_moe"
+    assert "--attention-use-fp4-indexer-cache" in nvidia_args
+
+    amd_args = shlex.split(
+        runner_env["amd-mi35x-2gpu-test"]["DEEPSEEK_V4_PLATFORM_ARGS"]
+    )
+    assert runner_env["amd-mi35x-2gpu-test"]["DEEPSEEK_V4_TP_SIZE"] == "2"
+    assert flag_value(amd_args, "--prefill-graph-max-tokens") == "8192"
+    assert not {
+        "--enable-expert-parallel",
+        "--moe-backend",
+        "--attention-use-fp4-indexer-cache",
+    }.intersection(amd_args)
+
+    assert not {
+        "--max-num-seqs",
+        "--speculative-algorithm",
+        "--speculative-num-steps",
+    }.intersection(command)
+
+
+def test_deepseek_v4_pro_amd_config_uses_supported_defaults():
     omitted_flags = {
         "--attention-use-fp4-indexer-cache",
         "--enable-mixed-batch",
         "--enable-prefix-caching",
         "--no-enable-prefix-caching",
+        "--enable-expert-parallel",
+        "--max-num-seqs",
+        "--moe-backend",
+        "--speculative-algorithm",
         "--speculative-draft-model-path",
+        "--speculative-num-steps",
     }
+    path = EVAL_CONFIG_DIR / DEEPSEEK_V4_PRO_AMD_CONFIG
+    task = yaml.safe_load(path.read_text(encoding="utf-8"))
+    command = shlex.split(task["server"]["command"])
 
-    for filename, (
-        model,
-        runner,
-        tp_size,
-        mtp_steps,
-    ) in AMD_DEEPSEEK_V4_MTP_CONFIGS.items():
-        path = EVAL_CONFIG_DIR / filename
-        task = yaml.safe_load(path.read_text(encoding="utf-8"))
-        command = shlex.split(task["server"]["command"])
-
-        assert task["triggers"] == ["per-commit", "manual"]
-        assert task["runner"]["labels"] == [runner]
-        assert task["install"] == ["bash test/ci_system/install_deps_rocm.sh"]
-        assert flag_value(command, "--model") == model
-        assert flag_value(command, "--tensor-parallel-size") == tp_size
-        assert flag_value(command, "--speculative-algorithm") == "MTP"
-        assert flag_value(command, "--speculative-num-steps") == mtp_steps
-        assert flag_value(command, "--moe-backend") == "gluon"
-        assert flag_value(command, "--kv-cache-dtype") == "fp8_e4m3"
-        assert flag_value(command, "--max-model-len") == "8192"
-        assert flag_value(command, "--max-num-seqs") == "16"
-        assert flag_value(command, "--max-total-tokens") == "16384"
-        assert flag_value(command, "--chunked-prefill-size") == "8192"
-        assert flag_value(command, "--prefill-graph-max-tokens") == "8192"
-        assert not omitted_flags.intersection(command)
+    assert task["triggers"] == ["per-commit", "manual"]
+    assert task["runner"]["labels"] == ["amd-mi35x-8gpu-test"]
+    assert task["install"] == ["bash test/ci_system/install_deps.sh"]
+    assert flag_value(command, "--model") == "deepseek-ai/DeepSeek-V4-Pro"
+    assert flag_value(command, "--tensor-parallel-size") == "8"
+    assert flag_value(command, "--kv-cache-dtype") == "fp8_e4m3"
+    assert flag_value(command, "--max-model-len") == "4096"
+    assert flag_value(command, "--max-total-tokens") == "16384"
+    assert flag_value(command, "--chunked-prefill-size") == "8192"
+    assert flag_value(command, "--prefill-graph-max-tokens") == "8192"
+    assert task["server"]["ready"]["timeout"] == 1800
+    assert not omitted_flags.intersection(command)
 
 
 def test_kvv_configs_use_pinned_upstream_and_local_api():
