@@ -196,13 +196,28 @@ def _get_dsv4_tile_meta(q: torch.Tensor, selected_width: int) -> object:
 def _fp8_page_planar_cache_view(
     cache: torch.Tensor,
     page_size: int,
+    row_bytes: int,
 ) -> torch.Tensor:
-    row_bytes = cache.shape[1] // int(page_size)
+    required_width = int(page_size) * int(row_bytes)
+    if cache.ndim != 2 or cache.shape[1] < required_width:
+        raise ValueError(
+            "DSV4 FP8 cache page is smaller than its logical row layout: "
+            f"shape={tuple(cache.shape)}, required_width={required_width}"
+        )
     return torch.as_strided(
         cache,
         (cache.shape[0], int(page_size), 1, row_bytes),
         (cache.stride(0), row_bytes, row_bytes, 1),
     )
+
+
+def _dsv4_fp8_row_bytes(head_dim: int, rope_dim: int = 64) -> int:
+    nope_dim = int(head_dim) - int(rope_dim)
+    if nope_dim <= 0 or nope_dim % 64:
+        raise ValueError(
+            f"DSV4 FP8 cache requires a positive 64-aligned NoPE dim, got {nope_dim}"
+        )
+    return nope_dim + 2 * int(rope_dim) + nope_dim // 64 + 1
 
 
 if (
@@ -344,6 +359,7 @@ if (
     ) -> torch.Tensor:
         q_kernel = q.unsqueeze(1)
         swa_indices = swa_slots.reshape(q.shape[0], 1, -1)
+        row_bytes = _dsv4_fp8_row_bytes(q.shape[-1])
         extra_cache = None
         extra_indices = None
         if extra_kv_cache is not None:
@@ -352,11 +368,16 @@ if (
             extra_cache = _fp8_page_planar_cache_view(
                 extra_kv_cache,
                 extra_page_size,
+                row_bytes,
             )
             extra_indices = extra_slots.reshape(q.shape[0], 1, -1)
         result, _ = flash_mla_with_kvcache(
             q=q_kernel,
-            k_cache=_fp8_page_planar_cache_view(swa_kv_cache, swa_page_size),
+            k_cache=_fp8_page_planar_cache_view(
+                swa_kv_cache,
+                swa_page_size,
+                row_bytes,
+            ),
             block_table=None,
             cache_seqlens=None,
             head_dim_v=q.shape[-1],
