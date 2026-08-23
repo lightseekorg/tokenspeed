@@ -196,6 +196,16 @@ def _get_dsv4_tile_meta(
         int(extra_selected_width),
     )
     meta = _dsv4_tile_meta_cache.get(key)
+    if meta is not None and getattr(meta, "have_initialized", False):
+        config = meta.config
+        if (
+            config.page_block_size != int(page_size)
+            or config.extra_page_block_size
+            != (None if extra_page_size is None else int(extra_page_size))
+            or config.extra_topk
+            != (None if extra_selected_width == 0 else int(extra_selected_width))
+        ):
+            meta = None
     if meta is None:
         meta = get_mla_metadata()[0]
         _dsv4_tile_meta_cache[key] = meta
