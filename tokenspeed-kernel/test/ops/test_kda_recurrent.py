@@ -113,21 +113,28 @@ def test_kda_verify_bv_routing(batch_size, value_dim, store_states, expected) ->
     assert _kda_verify_bv(batch_size, value_dim, store_states) == expected
 
 
-@pytest.mark.parametrize("batch_size,expected_bv", [(1, 8), (15, 8), (16, 16)])
-def test_kda_verify_split_launch_routing(batch_size, expected_bv) -> None:
+@pytest.mark.parametrize(
+    ("batch_size", "expected"),
+    [(1, (8, 4, 3)), (3, (8, 4, 3)), (4, (8, 1, 3)), (15, (8, 1, 3)), (16, (16, 1, 3))],
+)
+def test_kda_verify_split_launch_routing(batch_size, expected) -> None:
+    """Both routed knobs, including where the wide-block window closes."""
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
         _kda_verify_launch_config,
     )
 
-    assert _kda_verify_launch_config(
-        batch_size,
-        128,
-        False,
-        split_producers=True,
-        bv=None,
-        num_warps=None,
-        num_stages=None,
-    ) == (expected_bv, 1, 3)
+    assert (
+        _kda_verify_launch_config(
+            batch_size,
+            128,
+            False,
+            split_producers=True,
+            bv=None,
+            num_warps=None,
+            num_stages=None,
+        )
+        == expected
+    )
 
 
 def test_kda_verify_split_launch_requires_both_hoists_and_honors_overrides() -> None:

@@ -925,9 +925,14 @@ def _kda_verify_launch_config(
     """Route measured verify launch defaults while preserving overrides."""
     if split_producers and value_dim == 128 and not store_states:
         routed_bv = 8 if batch_size < 16 else 16
+        # Under four requests the grid is only a couple of blocks per SM, so
+        # widening them pays: 8-11% at 1..3, bit-identical, and swept as the
+        # boundary rather than assumed -- four warps loses from four requests
+        # up and is 49% slower by eight.
+        routed_warps = 4 if batch_size < 4 else 1
         return (
             routed_bv if bv is None else bv,
-            1 if num_warps is None else num_warps,
+            routed_warps if num_warps is None else num_warps,
             3 if num_stages is None else num_stages,
         )
     return (
