@@ -182,6 +182,7 @@ def _get_dsv4_tile_meta(
     selected_width: int,
     page_size: int,
     extra_page_size: int | None,
+    extra_selected_width: int,
 ) -> object:
     phase = "graph" if torch.cuda.is_current_stream_capturing() else "eager"
     key = (
@@ -192,6 +193,7 @@ def _get_dsv4_tile_meta(
         int(selected_width),
         int(page_size),
         int(extra_page_size or 0),
+        int(extra_selected_width),
     )
     meta = _dsv4_tile_meta_cache.get(key)
     if meta is None:
@@ -393,6 +395,7 @@ if (
                 swa_indices.shape[-1],
                 swa_page_size,
                 extra_page_size,
+                0 if extra_slots is None else extra_slots.shape[-1],
             ),
             softmax_scale=float(softmax_scale),
             is_fp8_kvcache=True,

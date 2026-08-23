@@ -136,7 +136,8 @@ if platform.is_nvidia:
                 f"captured={actual}, refreshed={tuple(refreshed.shape)} "
                 f"{refreshed.dtype} {refreshed.device}"
             )
-        out.copy_(refreshed)
+        with torch.inference_mode():
+            out.copy_(refreshed)
         return out
 
     @register_kernel(
