@@ -20,7 +20,6 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel import (
     dsv4_compute_global_topk_indices_and_lens,
-    dsv4_select_experts,
 )
 from tokenspeed_kernel.ops.attention.cuda.dsv4 import (
     has_indexer_topk_prefill,
@@ -124,6 +123,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_routed_expert_quant_config,
     _DeepseekV4TopKBuffer,
     deepseek_v4_rope_config,
+    dsv4_select_experts,
     hc_head,
     mhc_post,
     mhc_pre,

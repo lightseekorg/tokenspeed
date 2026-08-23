@@ -418,37 +418,14 @@ def dsv4_select_experts(
         router_logits.dtype,
         shape_params,
     )
-    try:
-        with kernel_scope(
-            "moe",
-            "dsv4_select_experts",
-            router_logits.dtype,
-            kernel_name=kernel.name,
-            **shape_params,
-        ):
-            return kernel(
-                router_logits,
-                top_k,
-                renormalize,
-                correction_bias,
-                hash_indices_table,
-                input_ids,
-                need_scores,
-            )
-    except (AttributeError, RuntimeError):
-        spec = KernelRegistry.get().get_by_name(kernel.name)
-        if override is not None or solution is not None or spec is None:
-            raise
-        if spec.solution == "torch":
-            raise
-        fallback = select_kernel(
-            "moe",
-            "dsv4_select_experts",
-            signature,
-            traits=traits,
-            solution="torch",
-        )
-        return fallback(
+    with kernel_scope(
+        "moe",
+        "dsv4_select_experts",
+        router_logits.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
             router_logits,
             top_k,
             renormalize,

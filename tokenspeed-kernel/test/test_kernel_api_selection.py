@@ -120,7 +120,6 @@ from tokenspeed_kernel.registry import KernelRegistry, error_fn
 from tokenspeed_kernel.selection import SelectedKernel, spec_matches_traits
 
 _gemm_pytorch = importlib.import_module("tokenspeed_kernel.ops.gemm.pytorch")
-_moe_pytorch = importlib.import_module("tokenspeed_kernel.ops.moe.pytorch")
 
 _RELOAD_MODULES = [
     # Attention registration modules.
@@ -177,7 +176,6 @@ _RELOAD_MODULES = [
     _moe_gluon_dsv4,
     _moe_gluon_mxfp4,
     _moe_gluon,
-    _moe_pytorch,
     _moe_triton_bf16,
     _moe_triton_mxfp4,
     _moe_triton,
