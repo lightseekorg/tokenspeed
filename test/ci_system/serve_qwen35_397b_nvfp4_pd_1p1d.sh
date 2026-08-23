@@ -216,6 +216,7 @@ python3 -m smg launch \
   --request-timeout-secs 1800 \
   --log-level info \
   --disable-retries \
+  --disable-load-monitoring \
   --disable-circuit-breaker \
   --disable-health-check \
   --prometheus-port "$PROMETHEUS_PORT" \

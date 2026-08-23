@@ -17,6 +17,9 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.attention.triton.page_table import (
+    expand_page_table as fused_expand_page_table,
+)
 
 
 def _page_ratio(block_granularity: int, kernel_page_size: int) -> int:
@@ -55,8 +58,11 @@ def expand_page_table(
     if ratio == 1 and out is None and max_kernel_pages <= page_table.shape[1]:
         return page_table[:, :max_kernel_pages]
 
+    # The fused kernel writes every column it is handed, zeros included.
+    fused = ratio != 1 and rows > 0 and page_table.is_cuda
     if out is None:
-        out = torch.zeros(
+        alloc = torch.empty if fused else torch.zeros
+        out = alloc(
             (rows, max_kernel_pages),
             dtype=page_table.dtype,
             device=page_table.device,
@@ -68,9 +74,14 @@ def expand_page_table(
             )
         if out.dtype != page_table.dtype or out.device != page_table.device:
             raise ValueError("out must have the same dtype and device as page_table")
-        out[:rows].zero_()
+        if not fused:
+            out[:rows].zero_()
 
     result = out[:rows, :max_kernel_pages]
+    if fused:
+        return fused_expand_page_table(
+            page_table, out, ratio=ratio, max_kernel_pages=max_kernel_pages
+        )
     if ratio == 1:
         copy_columns = min(max_kernel_pages, page_table.shape[1])
         result[:, :copy_columns].copy_(page_table[:, :copy_columns])
