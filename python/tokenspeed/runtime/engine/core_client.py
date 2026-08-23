@@ -20,7 +20,7 @@
 
 """Frontend-side scheduler IPC client for ``AsyncLLM``.
 
-``EngineCoreClient`` owns the ZMQ context and the two sockets that
+``EngineCoreClient`` owns the ZMQ context and the three sockets that
 ``AsyncLLM`` uses to talk to the scheduler subprocess:
 
 * ``send_to_scheduler`` — ``PUSH`` socket on
@@ -31,6 +31,9 @@
   ``PortArgs.tokenizer_ipc_name``; receives ``BatchStrOut`` /
   ``BatchTokenIDOut`` / ``BatchEmbeddingOut`` and control-plane replies from
   the scheduler.
+* ``recv_load_snapshot`` — ``PULL`` socket on
+  ``PortArgs.metrics_ipc_name``; receives the newest immutable load snapshot
+  published independently by each scheduler rank.
 
 Concrete (not ABC): tokenspeed has a single transport (ZMQ in-proc
 over ``PortArgs``-provided names) and a single caller (``AsyncLLM``),
@@ -66,3 +69,10 @@ class EngineCoreClient:
                 self.context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
             )
         )
+        # Metrics are published by multiple scheduler ranks. Keep only one
+        # outstanding snapshot per frontend receiver without conflating the
+        # independent publisher streams.
+        recv_load_snapshot = self.context.socket(zmq.PULL)
+        recv_load_snapshot.setsockopt(zmq.RCVHWM, 1)
+        recv_load_snapshot.bind(port_args.metrics_ipc_name)
+        self.recv_load_snapshot = AsyncIpcReceiver(recv_load_snapshot)

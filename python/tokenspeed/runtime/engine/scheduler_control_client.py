@@ -37,7 +37,6 @@ from tokenspeed.runtime.engine.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadReqInput,
     GetLoadReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
@@ -131,12 +130,6 @@ class SchedulerControlClient:
         self.expert_distribution_communicator = _Communicator(
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
-        self.get_load_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler,
-            server_args.mapping.attn.dp_size,
-            mode="watching",
-        )
-
         self._result_dispatcher += self._get_communicator_dispatcher()
 
     def _get_communicator_dispatcher(self: AsyncLLM):
@@ -205,10 +198,6 @@ class SchedulerControlClient:
                 (
                     ExpertDistributionReqOutput,
                     self.expert_distribution_communicator.handle_recv,
-                ),
-                (
-                    GetLoadReqOutput,
-                    self.get_load_communicator.handle_recv,
                 ),
             ]
         )
@@ -404,5 +393,17 @@ class SchedulerControlClient:
         return [res.updated for res in responses]
 
     async def get_load(self: AsyncLLM) -> list[GetLoadReqOutput]:
-        req = GetLoadReqInput()
-        return await self.get_load_communicator(req)
+        self.auto_create_handle_loop()
+        return self.load_snapshot_store.project_loads()
+
+    async def load_snapshot_loop(self: AsyncLLM) -> None:
+        """Cache scheduler-published snapshots and relay accepted updates to DP."""
+        while True:
+            snapshot = await self.engine_core_client.recv_load_snapshot.recv_pyobj()
+            if not self.load_snapshot_store.accept(snapshot):
+                continue
+            if (
+                self.server_args.mapping.attn.has_dp
+                and self.server_args.load_balance_method != "round_robin"
+            ):
+                self.engine_core_client.send_to_scheduler.send_pyobj(snapshot)
