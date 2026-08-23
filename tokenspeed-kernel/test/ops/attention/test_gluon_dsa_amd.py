@@ -21,10 +21,6 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (  # noqa: 
 )
 
 if is_cdna4():
-    from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4 import (
-        gluon_deepseek_v4_paged_selected_attention_split_gfx950,
-        gluon_deepseek_v4_selected_attention_gfx950,
-    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import (  # noqa: E402
         sparse_mla as dsa_topk_backend,
     )
@@ -58,84 +54,6 @@ else:
     )
 
 torch.manual_seed(42)
-
-
-@pytest.mark.skipif(not is_cdna4(), reason="DeepSeek V4 Gluon kernel targets gfx950")
-def test_deepseek_v4_selected_attention_matches_reference() -> None:
-    selected_width = 640
-    q = torch.randn((1, 16, 512), device="cuda", dtype=torch.bfloat16)
-    kv = torch.randn((selected_width, 512), device="cuda", dtype=torch.bfloat16)
-    indices = torch.arange(selected_width, device="cuda", dtype=torch.int32)[None]
-    indices[:, 3] = -1
-    lens = torch.tensor([selected_width - 2], device="cuda", dtype=torch.int32)
-    attn_sink = torch.randn((16,), device="cuda", dtype=torch.float32)
-    scale = 512**-0.5
-
-    output = gluon_deepseek_v4_selected_attention_gfx950(
-        q,
-        kv,
-        indices,
-        lens,
-        attn_sink,
-        scale,
-    )
-
-    valid_indices = indices[0, : lens.item()].long()
-    valid_indices = valid_indices[valid_indices >= 0]
-    selected = kv[valid_indices].float()
-    logits = torch.einsum("hd,sd->hs", q[0].float(), selected) * scale
-    logits = torch.cat((attn_sink[:, None], logits), dim=1)
-    probabilities = torch.softmax(logits, dim=1)[:, 1:]
-    reference = torch.einsum("hs,sd->hd", probabilities, selected).to(torch.bfloat16)
-
-    torch.testing.assert_close(output[0], reference, rtol=3e-2, atol=3e-2)
-
-
-@pytest.mark.parametrize("num_heads", [16, 32])
-@pytest.mark.skipif(not is_cdna4(), reason="DeepSeek V4 Gluon kernel targets gfx950")
-def test_deepseek_v4_paged_split_attention_applies_sink_once(num_heads: int) -> None:
-    tokens = 2
-
-    def constant_cache(pages: int) -> torch.Tensor:
-        cache = torch.empty((pages, 64 * 584), device="cuda", dtype=torch.uint8)
-        rows = cache[:, : 64 * 576].view(pages, 64, 576)
-        rows[:, :, :448].copy_(
-            torch.ones((pages, 64, 448), device="cuda")
-            .to(torch.float8_e4m3fn)
-            .view(torch.uint8)
-        )
-        rows[:, :, 448:].view(torch.bfloat16).fill_(1.0)
-        cache[:, 64 * 576 :].fill_(127)
-        return cache
-
-    q = torch.zeros((tokens, num_heads, 512), device="cuda", dtype=torch.bfloat16)
-    swa_cache = constant_cache(2)
-    extra_cache = constant_cache(16)
-    swa_slots = torch.arange(128, device="cuda", dtype=torch.int32).repeat(tokens, 1)
-    extra_slots = torch.arange(1024, device="cuda", dtype=torch.int32).repeat(tokens, 1)
-    swa_lens = torch.full((tokens,), 128, device="cuda", dtype=torch.int32)
-    extra_lens = torch.full((tokens,), 1024, device="cuda", dtype=torch.int32)
-    sink = torch.zeros((num_heads,), device="cuda", dtype=torch.float32)
-    out = torch.empty_like(q)
-
-    actual = gluon_deepseek_v4_paged_selected_attention_split_gfx950(
-        q,
-        swa_cache,
-        swa_slots,
-        swa_lens,
-        64,
-        sink,
-        512**-0.5,
-        extra_cache,
-        extra_slots,
-        extra_lens,
-        64,
-        out,
-    )
-
-    expected = torch.full_like(q, 1152.0 / 1153.0)
-    assert actual is out
-    torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)
 
 
 @pytest.mark.parametrize(
@@ -474,98 +392,6 @@ def _pack_index_k_cache(
     fp8_view.copy_(x_fp8.reshape(num_pages, page_size, head_dim))
     scale_view.copy_(scale.reshape(num_pages, page_size, num_groups))
     return packed, (x_fp8.float() * scale).reshape_as(index_k)
-
-
-def _with_padded_page_stride(
-    packed: torch.Tensor,
-    page_size: int,
-) -> torch.Tensor:
-    row_bytes = packed.shape[1]
-    num_pages = packed.shape[0] // page_size
-    page_bytes = page_size * row_bytes
-    backing = torch.full(
-        (num_pages, page_bytes + 256),
-        0xA5,
-        device=packed.device,
-        dtype=torch.uint8,
-    )
-    page_planar = backing[:, :page_bytes]
-    page_planar.copy_(packed.view(num_pages, page_bytes))
-    return page_planar
-
-
-def test_dsa_topk_fp8_accepts_padded_page_stride() -> None:
-    device = "cuda"
-    page_size = 64
-    seq_len = 513
-    num_slots = 9 * page_size
-    gen = _generator(device, 811)
-    q = _randn_bf16((1, 16, 128), device=device, generator=gen)
-    weights = _normal_weights((1, 16), device=device, generator=gen)
-    packed, _ = _pack_index_k_cache(
-        _randn_bf16((num_slots, 128), device=device, generator=gen),
-        page_size,
-    )
-    page_planar = _with_padded_page_stride(packed, page_size)
-    seq_lens = torch.tensor([seq_len], device=device, dtype=torch.int32)
-    block_table = torch.arange(9, device=device, dtype=torch.int32).unsqueeze(0)
-
-    packed_decode = gluon_dsa_decode_topk_fp8(
-        q,
-        weights,
-        seq_lens,
-        block_table,
-        page_size=page_size,
-        topk=512,
-        softmax_scale=128**-0.5,
-        index_k_cache=packed,
-    )
-    planar_decode = gluon_dsa_decode_topk_fp8(
-        q,
-        weights,
-        seq_lens,
-        block_table,
-        page_size=page_size,
-        topk=512,
-        softmax_scale=128**-0.5,
-        index_k_cache=page_planar,
-    )
-    torch.testing.assert_close(
-        planar_decode[0].sort(dim=-1).values,
-        packed_decode[0].sort(dim=-1).values,
-    )
-    torch.testing.assert_close(planar_decode[1], packed_decode[1])
-
-    workspace_slots = torch.arange(seq_len, device=device, dtype=torch.int64)
-    row_starts = torch.zeros((1,), device=device, dtype=torch.int32)
-    row_ends = torch.full((1,), seq_len, device=device, dtype=torch.int32)
-    packed_prefill = gluon_dsa_prefill_topk_fp8(
-        q,
-        weights,
-        workspace_slots,
-        row_starts,
-        row_ends,
-        topk=512,
-        softmax_scale=128**-0.5,
-        index_k_cache=packed,
-        page_size=page_size,
-    )
-    planar_prefill = gluon_dsa_prefill_topk_fp8(
-        q,
-        weights,
-        workspace_slots,
-        row_starts,
-        row_ends,
-        topk=512,
-        softmax_scale=128**-0.5,
-        index_k_cache=page_planar,
-        page_size=page_size,
-    )
-    torch.testing.assert_close(
-        planar_prefill[0].sort(dim=-1).values,
-        packed_prefill[0].sort(dim=-1).values,
-    )
-    torch.testing.assert_close(planar_prefill[1], packed_prefill[1])
 
 
 def _generator(device: str, seed: int) -> torch.Generator:

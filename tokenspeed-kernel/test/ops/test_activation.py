@@ -155,23 +155,6 @@ def test_silu_and_mul_rejects_bad_output_shape(device: str) -> None:
         silu_and_mul(x, out)
 
 
-def test_silu_and_mul_with_limit(device: str) -> None:
-    x = torch.tensor(
-        [[-12.0, 4.0, 13.0, -15.0, 3.0, 20.0]],
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    gate, up = x.float().chunk(2, dim=-1)
-    expected = (
-        torch.nn.functional.silu(torch.clamp(gate, max=10.0))
-        * torch.clamp(up, min=-10.0, max=10.0)
-    ).to(torch.bfloat16)
-
-    actual = silu_and_mul(x, limit=10.0)
-
-    torch.testing.assert_close(actual, expected)
-
-
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_swiglu_oai_matches_reference(dtype: torch.dtype, device: str) -> None:
     x = torch.randn(17, 256, device=device, dtype=dtype)

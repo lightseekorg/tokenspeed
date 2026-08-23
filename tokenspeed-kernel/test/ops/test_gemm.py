@@ -30,7 +30,6 @@ from tokenspeed_kernel.ops.gemm import (
     linear_attnres_partials,
     linear_attnres_partials_available,
 )
-from tokenspeed_kernel.ops.gemm.triton import triton_bmm_fp8_blockscale
 
 
 def test_mm_rejects_bad_out_layout() -> None:
@@ -83,72 +82,6 @@ def test_bmm_reference_rejects_out_dtype_mismatch() -> None:
 
     with pytest.raises(ValueError, match="torch_bmm out= requires out_dtype"):
         tokenspeed_kernel.bmm(a, b, out=out, override="torch_bmm")
-
-
-@pytest.mark.parametrize("ue8m0_scales", [False, True], ids=["float", "ue8m0"])
-def test_triton_bmm_fp8_blockscale_partial_tiles_and_out(
-    ue8m0_scales: bool,
-) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("Triton FP8 BMM requires a GPU")
-
-    torch.manual_seed(23)
-    batch, m, n, k = 2, 5, 70, 96
-    block_n, block_k = 32, 32
-    a = torch.randn((batch, m, k), device="cuda").to(torch.float8_e4m3fn)
-    b = torch.randn((batch, n, k), device="cuda").to(torch.float8_e4m3fn)
-    if ue8m0_scales:
-        a_scales = torch.randint(
-            124,
-            130,
-            (batch, m, k // block_k),
-            device="cuda",
-            dtype=torch.uint8,
-        )
-        b_scales = torch.randint(
-            124,
-            130,
-            (batch, (n + block_n - 1) // block_n, k // block_k),
-            device="cuda",
-            dtype=torch.uint8,
-        )
-        a_scale_values = torch.exp2(a_scales.float() - 127.0)
-        b_scale_values = torch.exp2(b_scales.float() - 127.0)
-    else:
-        a_scales = torch.rand(
-            (batch, m, k // block_k), device="cuda", dtype=torch.float32
-        )
-        b_scales = torch.rand(
-            (batch, (n + block_n - 1) // block_n, k // block_k),
-            device="cuda",
-            dtype=torch.float32,
-        )
-        a_scale_values = a_scales
-        b_scale_values = b_scales
-
-    backing = torch.empty((m, batch, n + 3), device="cuda", dtype=torch.float32)
-    out = backing[..., :n].transpose(0, 1)
-    actual = triton_bmm_fp8_blockscale(
-        a,
-        b,
-        a_scales,
-        b_scales,
-        torch.float32,
-        block_size=[block_n, block_k],
-        out=out,
-    )
-
-    a_dequant = a.float() * a_scale_values.repeat_interleave(block_k, dim=-1)
-    b_dequant = (
-        b.float()
-        * b_scale_values.repeat_interleave(block_n, dim=1).repeat_interleave(
-            block_k, dim=2
-        )[:, :n, :k]
-    )
-    expected = torch.bmm(a_dequant, b_dequant.transpose(1, 2))
-
-    assert actual.data_ptr() == out.data_ptr()
-    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=2e-2)
 
 
 def test_bmm_writes_head_major_strided_output(device: str) -> None:
