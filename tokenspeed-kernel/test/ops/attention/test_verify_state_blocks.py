@@ -279,3 +279,107 @@ def test_commit_rejects_a_group_row_outside_the_buffer():
             out_row=2,
             steps_out=steps,
         )
+
+
+def test_commit_honours_a_destination_row_stride_wider_than_the_batch():
+    """A group buffer wider than the batch is inside the contract; a row offset
+    that assumes packing shifts every later group's write indices."""
+    bs = 8
+    accepted = torch.randint(0, 5, (bs,), device="cuda", dtype=torch.int32)
+    committed = torch.randint(0, 4096, (bs,), device="cuda", dtype=torch.int64)
+    table = torch.randint(1, 900, (bs, 24), device="cuda", dtype=torch.int32)
+    wide = torch.full((3, bs + 1), -9, dtype=torch.int32, device="cuda")
+    steps = torch.empty(bs, dtype=torch.int32, device="cuda")
+    commit_state_pages(
+        accepted,
+        committed,
+        table,
+        batch_size=bs,
+        draft_tokens=4,
+        granularity=64,
+        pages_out=wide,
+        out_row=1,
+        steps_out=steps,
+    )
+    want_p, _ = _commit_reference(
+        accepted, committed, table, bs=bs, draft_tokens=4, granularity=64
+    )
+    assert torch.equal(wide[1, :bs], want_p)
+    assert (wide[0] == -9).all() and (wide[2] == -9).all()
+    assert wide[1, bs].item() == -9
+
+
+def test_a_table_without_slots_is_rejected_by_both_resolves():
+    """The torch chain raised on the gather; an unchecked kernel reads past the
+    table instead."""
+    bs = 4
+    empty = torch.empty((bs, 0), dtype=torch.int32, device="cuda")
+    pages = torch.empty(bs, dtype=torch.int32, device="cuda")
+    committed = torch.zeros(bs, dtype=torch.int64, device="cuda")
+    with pytest.raises(ValueError, match="no page to resolve"):
+        verify_state_blocks(
+            torch.zeros(bs, dtype=torch.int32, device="cuda"),
+            empty,
+            batch_size=bs,
+            draft_tokens=4,
+            granularity=64,
+            pages_out=pages,
+            committed_out=committed,
+        )
+    with pytest.raises(ValueError, match="no page to resolve"):
+        commit_state_pages(
+            torch.zeros(bs, dtype=torch.int32, device="cuda"),
+            committed,
+            empty,
+            batch_size=bs,
+            draft_tokens=4,
+            granularity=64,
+            pages_out=torch.empty((1, bs), dtype=torch.int32, device="cuda"),
+            out_row=0,
+            steps_out=torch.empty(bs, dtype=torch.int32, device="cuda"),
+        )
+
+
+def test_cpu_callers_get_the_portable_path():
+    """The backends' metadata tests build these tensors on CPU, where the torch
+    spelling this replaces worked; the wrapper must not demand a GPU."""
+    bs = 6
+    seq_lens = torch.randint(0, 4096, (bs,), dtype=torch.int32)
+    table = torch.randint(0, 900, (bs, 24), dtype=torch.int32)
+    pages = torch.empty(bs, dtype=torch.int32)
+    committed = torch.empty(bs, dtype=torch.int64)
+    verify_state_blocks(
+        seq_lens,
+        table,
+        batch_size=bs,
+        draft_tokens=4,
+        granularity=64,
+        pages_out=pages,
+        committed_out=committed,
+    )
+    want_p, want_c = _reference(
+        seq_lens, table, batch_size=bs, draft_tokens=4, granularity=64
+    )
+    assert torch.equal(pages, want_p)
+    assert torch.equal(committed, want_c)
+
+    accepted = torch.randint(0, 5, (bs,), dtype=torch.int32)
+    stack = torch.full((2, bs), -9, dtype=torch.int32)
+    steps = torch.empty(bs, dtype=torch.int32)
+    commit_state_pages(
+        accepted,
+        committed,
+        table,
+        batch_size=bs,
+        draft_tokens=4,
+        granularity=64,
+        pages_out=stack,
+        out_row=1,
+        steps_out=steps,
+    )
+    want_wp, want_s = _commit_reference(
+        accepted, committed, table, bs=bs, draft_tokens=4, granularity=64
+    )
+    assert torch.equal(stack[1], want_wp)
+    assert torch.equal(steps, want_s)
+    assert (stack[0] == -9).all()

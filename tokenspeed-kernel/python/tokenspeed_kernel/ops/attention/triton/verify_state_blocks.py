@@ -53,6 +53,21 @@ def _verify_state_blocks_kernel(
     tl.store(committed_out + row, committed, mask=live)
 
 
+def _torch_verify_state_blocks(
+    seq_lens, table, batch_size, draft_tokens, granularity, pages_out, committed_out
+):
+    """Portable spelling, kept for non-CUDA callers (the backends' CPU tests)."""
+    committed = (seq_lens[:batch_size].to(torch.int64) - draft_tokens).clamp_min(0)
+    slots = torch.div(
+        (committed - 1).clamp_min(0), granularity, rounding_mode="floor"
+    ).clamp(min=0, max=table.shape[1] - 1)
+    pages = table[:batch_size].gather(1, slots.unsqueeze(1)).squeeze(1)
+    pages_out[:batch_size].copy_(
+        torch.where(committed > 0, pages, torch.full_like(pages, -1)).to(torch.int32)
+    )
+    committed_out[:batch_size].copy_(committed)
+
+
 def verify_state_blocks(
     seq_lens: torch.Tensor,
     table: torch.Tensor,
@@ -80,18 +95,35 @@ def verify_state_blocks(
             no committed history.
         committed_out: INT64 destination ``[>=batch_size]``.
     """
-    if seq_lens.stride(0) != 1 or table.stride(1) != 1:
-        raise ValueError("verify state blocks need unit-stride seq_lens and table rows")
+    if (
+        seq_lens.stride(0) != 1
+        or table.stride(1) != 1
+        or pages_out.stride(0) != 1
+        or committed_out.stride(0) != 1
+    ):
+        raise ValueError("verify state blocks need unit-stride rows")
     if granularity < 1:
         raise ValueError(f"granularity must be positive, got {granularity}")
     if batch_size > table.shape[0] or batch_size > seq_lens.shape[0]:
         raise ValueError("batch_size exceeds the seq_lens or table rows")
+    if table.shape[1] < 1:
+        raise ValueError("a table without slots has no page to resolve")
     if pages_out.dtype != torch.int32 or committed_out.dtype != torch.int64:
         raise ValueError("pages_out must be INT32 and committed_out INT64")
     if pages_out.numel() < batch_size or committed_out.numel() < batch_size:
         raise ValueError("outputs cannot hold batch_size rows")
     if batch_size == 0:
         return
+    if not table.is_cuda:
+        return _torch_verify_state_blocks(
+            seq_lens,
+            table,
+            batch_size,
+            draft_tokens,
+            granularity,
+            pages_out,
+            committed_out,
+        )
 
     block = 256
     _verify_state_blocks_kernel[(triton.cdiv(batch_size, block),)](
@@ -116,6 +148,7 @@ def verify_state_blocks(
         "granularity",
         "table_stride",
         "out_row",
+        "out_stride",
     ]
 )
 def _commit_state_pages_kernel(
@@ -130,6 +163,7 @@ def _commit_state_pages_kernel(
     granularity,
     table_stride,
     out_row,
+    out_stride,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -142,8 +176,30 @@ def _commit_state_pages_kernel(
     last = tl.load(committed + row, mask=live, other=0) + steps - 1
     slot = tl.minimum(tl.maximum(last, 0) // granularity, num_slots - 1)
     page = tl.load(table + row * table_stride + slot, mask=live, other=0)
-    tl.store(pages_out + out_row * bs + row, page.to(tl.int32), mask=live)
+    tl.store(pages_out + out_row * out_stride + row, page.to(tl.int32), mask=live)
     tl.store(steps_out + row, steps.to(tl.int32), mask=live)
+
+
+def _torch_commit_state_pages(
+    accepted_length,
+    committed,
+    table,
+    batch_size,
+    draft_tokens,
+    granularity,
+    pages_out,
+    out_row,
+    steps_out,
+):
+    """Portable spelling, kept for non-CUDA callers (the backends' CPU tests)."""
+    steps = accepted_length[:batch_size].to(torch.int64).clamp(min=1, max=draft_tokens)
+    last = committed[:batch_size] + steps - 1
+    slots = torch.div(last.clamp_min(0), granularity, rounding_mode="floor").clamp(
+        min=0, max=table.shape[1] - 1
+    )
+    pages = table[:batch_size].gather(1, slots.unsqueeze(1)).squeeze(1)
+    pages_out[out_row, :batch_size].copy_(pages.to(torch.int32))
+    steps_out[:batch_size].copy_(steps.to(torch.int32))
 
 
 def commit_state_pages(
@@ -175,8 +231,14 @@ def commit_state_pages(
         out_row: Which group row to fill.
         steps_out: INT32 destination ``[>=batch_size]`` for the clamped steps.
     """
-    if accepted_length.stride(0) != 1 or table.stride(1) != 1:
-        raise ValueError("commit state pages need unit-stride inputs")
+    if (
+        accepted_length.stride(0) != 1
+        or committed.stride(0) != 1
+        or table.stride(1) != 1
+        or pages_out.stride(1) != 1
+        or steps_out.stride(0) != 1
+    ):
+        raise ValueError("commit state pages need unit-stride rows")
     if granularity < 1:
         raise ValueError(f"granularity must be positive, got {granularity}")
     if pages_out.dtype != torch.int32 or steps_out.dtype != torch.int32:
@@ -185,8 +247,24 @@ def commit_state_pages(
         raise ValueError(f"out_row {out_row} outside {pages_out.shape[0]} groups")
     if pages_out.shape[1] < batch_size or steps_out.numel() < batch_size:
         raise ValueError("outputs cannot hold batch_size rows")
+    if batch_size > table.shape[0] or batch_size > committed.shape[0]:
+        raise ValueError("batch_size exceeds the committed or table rows")
+    if table.shape[1] < 1:
+        raise ValueError("a table without slots has no page to resolve")
     if batch_size == 0:
         return
+    if not table.is_cuda:
+        return _torch_commit_state_pages(
+            accepted_length,
+            committed,
+            table,
+            batch_size,
+            draft_tokens,
+            granularity,
+            pages_out,
+            out_row,
+            steps_out,
+        )
 
     block = 256
     _commit_state_pages_kernel[(triton.cdiv(batch_size, block),)](
@@ -201,5 +279,6 @@ def commit_state_pages(
         granularity,
         table.stride(0),
         out_row,
+        pages_out.stride(0),
         BLOCK=block,
     )
