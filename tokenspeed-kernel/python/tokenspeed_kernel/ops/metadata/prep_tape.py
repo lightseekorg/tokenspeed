@@ -90,9 +90,12 @@ def _ref(v: "int | Reg") -> int:
     return (_REG_FLAG | int(v)) if isinstance(v, Reg) else int(v)
 
 
-def _check(t: torch.Tensor, name: str) -> torch.Tensor:
-    if t.dtype != torch.int32:
-        raise TypeError(f"{name} must be int32, got {t.dtype}")
+def _check(t: torch.Tensor, name: str, *, wide: bool = False) -> torch.Tensor:
+    allowed = (torch.int32, torch.int64) if wide else (torch.int32,)
+    if t.dtype not in allowed:
+        raise TypeError(
+            f"{name} must be {' or '.join(str(d) for d in allowed)}, got {t.dtype}"
+        )
     if t.stride(-1) != 1:
         raise ValueError(f"{name} must be unit-stride in the last dim")
     return t
@@ -219,8 +222,11 @@ class PrepTape:
         total: "int | Reg",
         value: "int | Reg",
     ) -> None:
-        """``dst[live:total] = value`` (padding rows)."""
-        self._row(_OP_FILLTAIL, _check(dst, "dst"), None, None, live, total, 0, value)
+        """``dst[live:total] = value`` (padding rows). Accepts int64 ``dst``:
+        graph input buffers that index a pool are 64-bit."""
+        dst = _check(dst, "dst", wide=True)
+        wide = 1 if dst.dtype == torch.int64 else 0
+        self._row(_OP_FILLTAIL, dst, None, None, live, total, wide, value)
 
     def state_pages(
         self,

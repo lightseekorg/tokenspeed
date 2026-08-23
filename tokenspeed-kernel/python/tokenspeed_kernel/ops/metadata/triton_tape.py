@@ -84,7 +84,11 @@ def _prep_tape_kernel(descs_ptr, regs_ptr, BLOCK: tl.constexpr):
         for base in range(0, m, BLOCK):
             o = base + offs
             mask = (o >= n) & (o < m)
-            tl.store(dst + o, tl.full([BLOCK], 0, tl.int32) + scalar, mask=mask)
+            if stride == 0:
+                tl.store(dst + o, tl.full([BLOCK], 0, tl.int32) + scalar, mask=mask)
+            else:
+                dst64 = tl.cast(dst, tl.pointer_type(tl.int64))
+                tl.store(dst64 + o, tl.full([BLOCK], 0, tl.int64) + scalar, mask=mask)
     elif opcode == 5:  # STATE_PAGES (decode: before = after - 1)
         rows = src  # [n, m] page table
         state_out = idx  # second output rides the idx slot
