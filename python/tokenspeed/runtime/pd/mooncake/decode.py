@@ -47,10 +47,17 @@ class PrefillParallelInfo:
     tp_size: int
     dp_size: int
     cache_layout: CacheTransferContract | None = None
+    # Prefill chunk-pipeline stage count; each stage sends only its own
+    # layers' KV, so Decode plans per stage and unions the routes.
+    pp_size: int = 1
+    # Optional explicit per-stage layer counts the Prefill split with; None
+    # means the even split. Decode must derive the SAME stage windows.
+    pp_layer_partition: tuple[int, ...] | None = None
 
     @property
     def prefill_tp_size_per_dp_rank(self):
-        return self.tp_size // self.dp_size
+        # Intra-stage TP width: the registered world spans pp stages.
+        return self.tp_size // (self.dp_size * self.pp_size)
 
 
 def parse_prefill_status_message(

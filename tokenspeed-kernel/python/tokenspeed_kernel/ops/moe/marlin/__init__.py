@@ -18,4 +18,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed_kernel.ops.moe.marlin import mxfp4  # noqa: F401
+from tokenspeed_kernel.ops.moe.marlin import deepep_mxfp4, mxfp4  # noqa: F401

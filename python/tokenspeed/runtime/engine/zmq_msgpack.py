@@ -289,3 +289,61 @@ def connect_msgpack_engine(
         MsgpackRecvSocket(input_socket, vocab_size, enable_output_logprobs),
         MsgpackSendSocket(output_socket, engine_index=engine_index),
     )
+
+
+def _tokenspeed_version() -> str:
+    try:
+        from tokenspeed.version import __version__
+
+        return __version__
+    except Exception:
+        return "unknown"
+
+
+def connect_msgpack_engine_for_loop(
+    context: zmq.Context, loop
+) -> tuple[MsgpackRecvSocket, MsgpackSendSocket]:
+    """Build the engine's ready response from an event loop's state and run
+    the SMG startup handshake (see ``connect_msgpack_engine``).
+
+    Args:
+        context: The loop's ZMQ context.
+        loop: The scheduler EventLoop; supplies the model/cache geometry and
+            parallel layout the ready response reports to the frontend.
+
+    Returns:
+        The wrapped msgpack (input, output) sockets.
+
+    Each DP rank dials SMG with its own engine identity (zmq_engine_index +
+    dp_rank): the frontend's grouped worker awaits dp_size engines on one
+    socket set and tells the ranks apart — and routes inputs back — by this
+    index. The ready response carries the true dp rank/size alongside.
+    """
+    server_args = loop.server_args
+    geometry = loop._scheduler_cache_geometry
+    ready_response = zmq_wire.WireEngineCoreReadyResponse(
+        max_model_len=loop.model_config.context_len,
+        num_gpu_blocks=geometry.num_device_pages,
+        prefix_granularity=geometry.prefix_granularity,
+        dtype=zmq_wire.wire_dtype(loop.model_config.dtype),
+        multimodal_encoder_dtype=loop.multimodal_encoder_dtype,
+        vllm_version=f"tokenspeed-{_tokenspeed_version()}",
+        world_size=loop.world_size,
+        data_parallel_size=loop.dp_size,
+        tensor_parallel_size=loop.attn_tp_size,
+        data_parallel_rank=loop.dp_rank,
+        max_num_seqs=server_args.max_num_seqs,
+        # chunked_prefill_size=-1 means "disabled"; the wire field is a
+        # non-negative integer for the frontend, so clamp to 0 (= no cap).
+        max_num_batched_tokens=max(0, server_args.chunked_prefill_size),
+        instance_id=server_args.served_model_name or server_args.model,
+        kv_cache_size_tokens=loop.max_total_num_tokens,
+    )
+    return connect_msgpack_engine(
+        context,
+        server_args.zmq_handshake_endpoint(),
+        server_args.zmq_engine_index + loop.dp_rank,
+        ready_response,
+        loop.model_config.vocab_size,
+        enable_output_logprobs=server_args.enable_output_logprobs,
+    )

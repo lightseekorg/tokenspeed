@@ -129,10 +129,22 @@ class RequestHandler:
         self.attn_tp_size = mapping.attn.tp_size
         self.attn_tp_rank = mapping.attn.tp_rank
         self.attn_global_rank = mapping.attn.rank
-        self.attn_tp_cpu_group = pg_manager.get_process_group(
-            "gloo", mapping.attn.tp_group
-        )
-        self.attn_tp_src_rank = mapping.attn.tp_group[0]
+        if mapping.has_pp:
+            # Chunk-pipeline: every stage's scheduler runs the same
+            # deterministic plan, so every rank in the WORLD must see the
+            # same request stream. Only global rank 0 owns the ZMQ input;
+            # the broadcast fans out across stages, not just one TP group.
+            self.attn_tp_size = mapping.world_size
+            self.attn_tp_rank = mapping.rank
+            self.attn_tp_cpu_group = pg_manager.get_process_group(
+                "gloo", mapping.world_group
+            )
+            self.attn_tp_src_rank = mapping.world_group[0]
+        else:
+            self.attn_tp_cpu_group = pg_manager.get_process_group(
+                "gloo", mapping.attn.tp_group
+            )
+            self.attn_tp_src_rank = mapping.attn.tp_group[0]
         self.profile_rank_tag = _profile_rank_tag(mapping.attn)
 
         self.hf_eos_token_id = hf_eos_token_id

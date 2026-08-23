@@ -395,20 +395,11 @@ def test_event_loop_observation_projects_the_sampled_scheduler_values():
     ]
 
 
-@pytest.mark.parametrize(
-    "has_overlap_result",
-    [False, True],
-    ids=["non_overlap_post_finish", "overlap_commit"],
-)
-def test_paused_idle_step_refreshes_load_after_optional_overlap_commit(
-    monkeypatch, has_overlap_result
-):
-    """The first paused step observes post-finish CPU scheduler state once."""
+def _paused_observation_loop(trace, scheduler_state):
+    """An EventLoop shell with just the state _maybe_observe_paused_load reads."""
     pytest.importorskip("tokenspeed_scheduler")
     from tokenspeed.runtime.engine import event_loop as event_loop_module
 
-    trace = []
-    scheduler_state = {"available": 20, "active": 0, "waiting": 0}
     loop = event_loop_module.EventLoop.__new__(event_loop_module.EventLoop)
     loop.scheduler = SimpleNamespace(
         available_kv_pages=lambda: (
@@ -431,62 +422,56 @@ def test_paused_idle_step_refreshes_load_after_optional_overlap_commit(
     loop.load_snapshot_publisher = SimpleNamespace(
         observe=lambda values: trace.append(("observe", values))
     )
-    loop.has_dp = False
-    loop._pause = SimpleNamespace(
-        maybe_finish_drain=lambda scheduler: trace.append("drain")
-    )
-    loop._publish_scheduler_kv_events = lambda: trace.append("kv_events")
-    monkeypatch.setattr(
-        event_loop_module,
-        "advance_forward",
-        lambda scheduler, changes: trace.append(("advance", changes)),
-    )
-    monkeypatch.setattr(
-        event_loop_module.time, "sleep", lambda seconds: trace.append("sleep")
-    )
+    return loop
 
-    prev_forward_op = None
-    prev_results = None
-    if has_overlap_result:
-        loop.output_processor.rid_to_state["finished"] = object()
-        scheduler_state.update(available=16, active=4, waiting=1)
 
-        def commit_results(forward_op, results):
-            trace.append("commit")
-            loop.output_processor.rid_to_state.clear()
-            scheduler_state.update(available=20, active=0, waiting=0)
-            return ["finished"]
+def test_paused_load_observation_samples_once_until_marked_dirty():
+    """While frozen, the loop tail samples the load once per pause — and again
+    only after a round that changed scheduler state: committed request changes
+    or a dirty mark (new requests / cache-op completions). The sample is taken
+    at the tail, after the round's advance, so it reflects applied changes."""
+    trace = []
+    scheduler_state = {"available": 20, "active": 0, "waiting": 0}
+    loop = _paused_observation_loop(trace, scheduler_state)
 
-        loop._commit_forward_results = commit_results
-        prev_forward_op = object()
-        prev_results = object()
+    # First paused round observes; the latch suppresses the idle spin after it.
+    loop._maybe_observe_paused_load(had_changes=False)
+    loop._maybe_observe_paused_load(had_changes=False)
 
-    loop._paused_idle_step(prev_forward_op, prev_results)
-    loop._paused_idle_step()
+    # A dirty mark (e.g. control traffic or a cache-op advance) forces one
+    # fresh sample of the mutated scheduler state.
     scheduler_state.update(available=18, active=2, waiting=1)
     loop._mark_load_snapshot_dirty()
-    loop._paused_idle_step()
+    loop._maybe_observe_paused_load(had_changes=False)
 
-    expected_prefix = (
-        ["commit", ("advance", ["finished"]), "kv_events"] if has_overlap_result else []
-    )
+    # A round that committed request changes re-samples even while latched.
+    scheduler_state.update(available=17, active=3, waiting=2)
+    loop._maybe_observe_paused_load(had_changes=True)
+
     assert trace == [
-        *expected_prefix,
         "available",
         "active",
         "waiting",
         ("observe", (0, 0, 0, 0, 20)),
-        "drain",
-        "sleep",
-        "drain",
-        "sleep",
         "available",
         "active",
         "waiting",
         ("observe", (0, 1, 2, 2, 20)),
-        "drain",
-        "sleep",
+        "available",
+        "active",
+        "waiting",
+        ("observe", (0, 2, 3, 3, 20)),
     ]
+
+
+def test_paused_load_observation_is_rank0_only():
+    trace = []
+    loop = _paused_observation_loop(trace, {"available": 20, "active": 0, "waiting": 0})
+    loop.attn_tp_rank = 1
+
+    loop._maybe_observe_paused_load(had_changes=True)
+
+    assert trace == []
 
 
 @pytest.mark.parametrize(

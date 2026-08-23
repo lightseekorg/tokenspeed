@@ -1284,6 +1284,16 @@ def ipc_message_union():
     return Union[types]  # noqa: UP007 — dynamic union over a runtime tuple
 
 
+class NullSender:
+    """No-op stand-in for the engine's reply sender on ranks that don't own
+    request I/O (non-rank-0 workers), so control-reply call sites are safe to
+    run on every rank."""
+
+    @staticmethod
+    def send_pyobj(x):
+        return None
+
+
 class IpcSender:
     """Engine-IPC sender wrapping a ZMQ PUSH/DEALER socket.
 

@@ -68,6 +68,17 @@ class _EventLoopHarness:
         self.has_dp = False
         self.kv_transfer = None
         self._pd_cache_enabled = False
+        self.in_flight_depth = 0
+        self._epd_hooks = SimpleNamespace(
+            drain_ready_embeddings=lambda: self.trace.append("drain_epd")
+        )
+        self._cache_hooks = SimpleNamespace(
+            poll_ready_events=lambda: (self.trace.append("poll_cache"), [])[1],
+            submit=lambda _plan: self.trace.append("submit_cache"),
+        )
+        self._pd_hooks = SimpleNamespace(
+            poll_transfer_events=lambda: (self.trace.append("poll_pd"), [])[1]
+        )
 
     def _shutdown_complete(self) -> bool:
         return EventLoop._shutdown_complete(self)
@@ -78,17 +89,8 @@ class _EventLoopHarness:
         # iteration: finish this scheduler step, then stop at the next head.
         self.shutdown_event.set()
 
-    def _drain_ready_epd_embeddings(self) -> None:
-        self.trace.append("drain_epd")
-
-    def _commit_cache_results(self) -> None:
-        self.trace.append("commit_cache")
-
     def _publish_scheduler_kv_events(self) -> None:
         self.trace.append("publish_kv")
-
-    def _submit_cache_ops(self, _execution_plan) -> None:
-        self.trace.append("submit_cache")
 
     def _get_forward_op(self, _execution_plan):
         self.trace.append("get_forward")
@@ -123,16 +125,17 @@ def test_event_loop_finishes_current_iteration_then_observes_shutdown() -> None:
     assert loop.trace == [
         "process_requests",
         "drain_epd",
-        "commit_cache",
+        "poll_cache",
         "next_plan",
-        "publish_kv",
         "zero_pages",
         "submit_cache",
         "get_forward",
         "stats",
         "observe_load",
-        "pause_finish",
         "metrics",
+        "poll_pd",
+        "publish_kv",
+        "pause_finish",
     ]
 
 

@@ -69,6 +69,7 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
+from tokenspeed.runtime.distributed.pp_stage import PPStageState, pp_layer_window
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -145,6 +146,7 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
     set_weight_attrs,
 )
+from tokenspeed.runtime.utils.common import PPMissingLayer
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.custom_ops import direct_register_custom_op
 from tokenspeed.runtime.utils.env import global_server_args_dict, pdl_enabled
@@ -4133,29 +4135,45 @@ class DeepseekV4Model(nn.Module):
         self.rms_norm_eps = config.rms_norm_eps
         self.aux_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self.topk_indices_buffer = _DeepseekV4TopKBuffer(int(config.index_topk))
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
-            prefix=add_prefix("embed_tokens", prefix),
+        # Pipeline stage layer window: [pp_start_layer, pp_end_layer). Global
+        # layer numbering everywhere; other stages' slots hold PPMissingLayer.
+        self.pp_start_layer, self.pp_end_layer = pp_layer_window(
+            config.num_hidden_layers, mapping
         )
+        if mapping.is_first_pp_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                tp_rank=mapping.attn.tp_rank,
+                tp_size=mapping.attn.tp_size,
+                tp_group=mapping.attn.tp_group,
+                prefix=add_prefix("embed_tokens", prefix),
+            )
+        else:
+            self.embed_tokens = None
         self.layers = nn.ModuleList(
             [
-                DeepseekV4DecoderLayer(
-                    config,
-                    layer_id,
-                    mapping,
-                    quant_config,
-                    add_prefix(f"layers.{layer_id}", prefix),
-                    aux_stream=self.aux_stream,
-                    topk_buffer=self.topk_indices_buffer,
+                (
+                    DeepseekV4DecoderLayer(
+                        config,
+                        layer_id,
+                        mapping,
+                        quant_config,
+                        add_prefix(f"layers.{layer_id}", prefix),
+                        aux_stream=self.aux_stream,
+                        topk_buffer=self.topk_indices_buffer,
+                    )
+                    if self.pp_start_layer <= layer_id < self.pp_end_layer
+                    else PPMissingLayer()
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = (
+            RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if mapping.is_last_pp_rank
+            else None
+        )
         hc_dim = config.hc_mult * config.hidden_size
         self.hc_head_fn = nn.Parameter(
             torch.empty(config.hc_mult, hc_dim, dtype=torch.float32),
@@ -4168,6 +4186,47 @@ class DeepseekV4Model(nn.Module):
             torch.empty(1, dtype=torch.float32), requires_grad=False
         )
         self.dspark_layers_to_capture: tuple[int, ...] = ()
+
+    def pp_stage_state_spec(
+        self, num_tokens: int, device: torch.device
+    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+        """Wire spec (name, shape, dtype) of the inter-stage boundary bundle.
+
+        Matches the PPStageState this model's forward returns on a non-last
+        stage: the raw mHC thread state after the stage's final layer. Both
+        the sender and the receiver derive this from config + token count, so
+        no shape metadata crosses the wire.
+        """
+        del device
+        hc = self.hc_mult
+        hidden = self.config.hidden_size
+        # The activation dtype. get_default_dtype() would be wrong here: the
+        # model-dtype context only wraps weight loading, and the serving-time
+        # default is float32 — a recv sized off it would expect twice the
+        # bytes the sender ships and the NCCL P2P pair would spin forever.
+        dtype = None
+        if self.norm is not None:
+            dtype = self.norm.weight.dtype
+        else:
+            for param in self.parameters():
+                if param.is_floating_point() and param.dtype in (
+                    torch.bfloat16,
+                    torch.float16,
+                ):
+                    dtype = param.dtype
+                    break
+        if dtype is None:
+            dtype = torch.bfloat16
+        # Careful with the thread-state shapes: the model loop's variables are
+        # crosswired relative to the layer's return order — the loop's
+        # ``hidden_states`` carries the residual [t, hc, hidden] while
+        # ``hc_x_prev`` carries the layer's FFN output [t, hidden].
+        return [
+            ("hidden_states", (num_tokens, hc, hidden), dtype),
+            ("hc_x", (num_tokens, hidden), dtype),
+            ("hc_post", (num_tokens, hc, 1), torch.float32),
+            ("hc_comb", (num_tokens, hc, hc), torch.float32),
+        ]
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         normalized = tuple(int(layer_id) for layer_id in layer_ids)
@@ -4198,23 +4257,32 @@ class DeepseekV4Model(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
-        hidden_states = input_embeds
-        if hidden_states is None:
-            with nvtx_range("embed_tokens"):
-                hidden_states = self.embed_tokens(input_ids)
-        with nvtx_range("hc_repeat"):
-            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        pp_inbound: PPStageState | None = None,
+    ) -> tuple[torch.Tensor | PPStageState, list[torch.Tensor] | None]:
         # Layer-invariant DSA memos: computing them HERE (graphed scope) would bake
         # dummy addresses; the first attention break computes them LIVE onto ctx.
         ctx.dsa_swa_slot_mapping = None
         ctx.dsa_compressor_slot_cache = None
-        hc_x_prev = None
-        hc_post_prev = None
-        hc_comb_prev = None
+        if pp_inbound is not None:
+            # Mid-pipeline stage: resume the mHC thread state received from
+            # the upstream stage instead of embedding.
+            hidden_states = pp_inbound.hidden_states
+            hc_x_prev = pp_inbound.hc_x
+            hc_post_prev = pp_inbound.hc_post
+            hc_comb_prev = pp_inbound.hc_comb
+        else:
+            hidden_states = input_embeds
+            if hidden_states is None:
+                with nvtx_range("embed_tokens"):
+                    hidden_states = self.embed_tokens(input_ids)
+            with nvtx_range("hc_repeat"):
+                hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            hc_x_prev = None
+            hc_post_prev = None
+            hc_comb_prev = None
         dspark_captures = []
         dspark_capture_set = frozenset(self.dspark_layers_to_capture)
-        for layer in self.layers:
+        for layer in self.layers[self.pp_start_layer : self.pp_end_layer]:
             hidden_states, hc_x_prev, hc_post_prev, hc_comb_prev = layer(
                 positions,
                 hidden_states,
@@ -4235,6 +4303,19 @@ class DeepseekV4Model(nn.Module):
                     hc_comb_prev,
                 )
                 dspark_captures.append(resolved_hidden_states.mean(dim=1))
+        if not self.mapping.is_last_pp_rank:
+            # Hand the raw mHC thread state to the next stage; it resumes the
+            # layer loop exactly where this stage stopped (the deferred
+            # post-mapping folds into the next layer's fused_hc downstream).
+            return (
+                PPStageState(
+                    hidden_states=hidden_states,
+                    hc_x=hc_x_prev,
+                    hc_post=hc_post_prev,
+                    hc_comb=hc_comb_prev,
+                ),
+                None,
+            )
         with nvtx_range("hc_ffn_post_final"):
             hidden_states = mhc_post(
                 hc_x_prev, hidden_states, hc_post_prev, hc_comb_prev
@@ -4345,9 +4426,26 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
         )
+        pp_start = self.model.pp_start_layer
+        pp_end = self.model.pp_end_layer
+        pp_windowed = not (pp_start == 0 and pp_end == self.config.num_hidden_layers)
+
+        def _pp_owns(name: str) -> bool:
+            """Skip weights for layers another pipeline stage owns.
+
+            The MoE loader raises on a matched-but-unloadable expert weight,
+            so out-of-window layers must be dropped before it sees them.
+            """
+            if not name.startswith("model.layers."):
+                return True
+            layer_id = int(name.split(".", 3)[2])
+            return pp_start <= layer_id < pp_end
+
         for raw_name, loaded_weight in weights:
             name = self._map_weight_name(raw_name)
             if name.startswith("mtp."):
+                continue
+            if pp_windowed and not _pp_owns(name):
                 continue
             if (
                 name.endswith("attn.wo_a.weight")

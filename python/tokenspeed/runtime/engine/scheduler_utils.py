@@ -361,10 +361,18 @@ def make_update_reserve_tokens_event(request_id: str, new_reserve_num_tokens: in
     return fe
 
 
-def advance_forward(scheduler, forward_events: list) -> None:
+def advance_scheduler(scheduler, events: list) -> None:
+    """Feed completion events (forward results or cache-op results) back into
+    the C++ scheduler. The ONLY caller of ``scheduler.advance``.
+
+    Design principle: this is only invoked explicitly and directly from the
+    ``EventLoop.event_loop`` body — never from helpers. Helpers RETURN their
+    events; the loop applies them, so every scheduler state change is visible
+    by reading the loop alone.
+    """
     ec = ExecutionEvent()
-    for fe in forward_events:
-        ec.add_event(fe)
+    for event in events:
+        ec.add_event(event)
     scheduler.advance(ec)
 
 
