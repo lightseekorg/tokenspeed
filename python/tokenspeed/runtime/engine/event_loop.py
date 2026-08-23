@@ -1516,16 +1516,32 @@ class EventLoop:
         }
 
     def _observe_load_snapshot(self, stats: dict) -> None:
-        """Copy the already-sampled scheduler scalars into the publisher mailbox."""
+        """Project the latest pre-forward planning sample onto each load sink."""
+        num_running = len(self.output_processor.rid_to_state)
+        num_waiting = stats["num_queue_reqs"]
+        num_active_pages = stats["num_active_pages"]
+        max_total_pages = self._scheduler_cache_geometry.num_usable_pages
         self.load_snapshot_publisher.observe(
             (
-                len(self.output_processor.rid_to_state),
-                stats["num_queue_reqs"],
-                stats["num_active_pages"],
+                num_running,
+                num_waiting,
+                num_active_pages,
                 stats["num_cached_pages"],
-                self._scheduler_cache_geometry.num_usable_pages,
+                max_total_pages,
             )
         )
+        # Only direct-ZMQ attention TP0 exposes this setter. Its observation
+        # and output send run on this scheduler thread, so the adapter merely
+        # replaces a tuple; the snapshot rides the next ordinary output batch.
+        output_sink = getattr(self, "send_to_tokenizer", None)
+        set_direct_snapshot = getattr(output_sink, "set_load_snapshot", None)
+        if set_direct_snapshot is not None:
+            set_direct_snapshot(
+                num_running,
+                num_waiting,
+                num_active_pages,
+                max_total_pages,
+            )
 
     def _record_scheduler_iteration_metrics(
         self, stats: dict, num_iteration_tokens: int

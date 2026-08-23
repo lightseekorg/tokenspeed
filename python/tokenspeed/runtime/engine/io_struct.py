@@ -712,10 +712,23 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # DP the batch itself names its rank. Appended field: defaults to 0 so
     # older peers on either side stay compatible.
     engine_index: int = 0
+    # Latest scheduler load observed before the output is forwarded. Appended
+    # wire tail: older 9- and 10-element prefixes decode all four values as 0.
+    num_running: int = 0
+    num_waiting: int = 0
+    kv_active_pages: int = 0
+    kv_total_pages: int = 0
 
     @classmethod
     def from_full(
-        cls, out: BatchTokenIDOut, engine_index: int = 0
+        cls,
+        out: BatchTokenIDOut,
+        engine_index: int = 0,
+        *,
+        num_running: int = 0,
+        num_waiting: int = 0,
+        kv_active_pages: int = 0,
+        kv_total_pages: int = 0,
     ) -> "BatchTokenIDOutSlim":
         # Token source: ``out.output_ids`` — the not-yet-sent slice of each
         # request's generated ids. NOT ``out.decode_ids``: that is the
@@ -731,6 +744,10 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
             )
         return cls(
             engine_index=engine_index,
+            num_running=num_running,
+            num_waiting=num_waiting,
+            kv_active_pages=kv_active_pages,
+            kv_total_pages=kv_total_pages,
             rids=list(out.rids),
             output_ids=[list(ids) for ids in out.output_ids],
             finished_reasons=[_finish_type(fr) for fr in out.finished_reasons],

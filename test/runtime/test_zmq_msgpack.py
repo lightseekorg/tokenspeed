@@ -32,6 +32,7 @@ import struct
 import tempfile
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import msgspec
 import pytest
@@ -251,6 +252,10 @@ def test_slim_out_from_full_roundtrip():
     assert rt.output_token_logprobs_val == [[]]
     assert rt.output_token_logprobs_idx == [[]]
     assert rt.engine_index == 0
+    assert rt.num_running == 0
+    assert rt.num_waiting == 0
+    assert rt.kv_active_pages == 0
+    assert rt.kv_total_pages == 0
 
 
 def test_slim_out_carries_the_producing_engine_index():
@@ -261,14 +266,21 @@ def test_slim_out_carries_the_producing_engine_index():
     assert rt.engine_index == 3
 
 
-def test_slim_out_engine_index_defaults_for_older_senders():
-    # Appended field: a 9-element array from an older sender must still decode.
-    slim = BatchTokenIDOutSlim.from_full(_make_batch_out())
+@pytest.mark.parametrize(("prefix_length", "expected_engine_index"), [(9, 0), (10, 7)])
+def test_slim_out_load_tail_defaults_for_older_senders(
+    prefix_length: int, expected_engine_index: int
+):
+    # Pre-DP 9-element and pre-load 10-element senders both omit the load tail.
+    slim = BatchTokenIDOutSlim.from_full(_make_batch_out(), engine_index=7)
     raw = msgspec.msgpack.decode(_encode_payload(slim))
     rt = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(
-        msgspec.msgpack.encode(raw[:9])
+        msgspec.msgpack.encode(raw[:prefix_length])
     )
-    assert rt.engine_index == 0
+    assert rt.engine_index == expected_engine_index
+    assert rt.num_running == 0
+    assert rt.num_waiting == 0
+    assert rt.kv_active_pages == 0
+    assert rt.kv_total_pages == 0
 
 
 def test_slim_out_sources_output_ids_not_the_detok_window():
@@ -305,22 +317,32 @@ def test_slim_out_carries_logprob_columns():
 
 
 def test_slim_out_is_tagged_positional_tuple():
-    """The wire form must be a 10-element tagged array (the frontend's codec
-    depends on the tag and column order; engine_index is the appended tail)."""
+    """The wire form pins SMG's exact 14-element positional contract."""
     out = _make_batch_out(
         output_token_logprobs_val=[[-0.5]], output_token_logprobs_idx=[[10]]
     )
-    slim = BatchTokenIDOutSlim.from_full(out, engine_index=1)
+    slim = BatchTokenIDOutSlim.from_full(
+        out,
+        engine_index=1,
+        num_running=2,
+        num_waiting=3,
+        kv_active_pages=4,
+        kv_total_pages=20,
+    )
     raw = msgspec.msgpack.decode(_encode_payload(slim))
     assert isinstance(raw, list)
     assert raw[0] == "BatchTokenIDOutSlim"
-    assert len(raw) == 10
+    assert len(raw) == 14
     assert raw[1] == ["r1"]  # rids
     assert raw[2] == [[10, 11]]  # output_ids
     assert raw[3] == ["length"]  # finished_reasons
     assert raw[7] == [[pytest.approx(-0.5)]]
     assert raw[8] == [[10]]
     assert raw[9] == 1  # engine_index (appended)
+    assert raw[10] == 2  # num_running
+    assert raw[11] == 3  # num_waiting
+    assert raw[12] == 4  # kv_active_pages
+    assert raw[13] == 20  # kv_total_pages
 
 
 def test_slim_out_finish_reason_none_maps_to_empty():
@@ -460,6 +482,77 @@ class _FakeOutputSocket:
 
     def close(self) -> None:
         pass
+
+
+def _decode_last_slim_output(socket: _FakeOutputSocket) -> BatchTokenIDOutSlim:
+    return msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(socket.sent[-1][-1])
+
+
+def test_send_socket_uses_zero_load_tail_before_observation():
+    socket = _FakeOutputSocket()
+    sender = zmq_msgpack.MsgpackSendSocket(socket, engine_index=5)
+
+    sender.send_pyobj(_make_batch_out())
+
+    output = _decode_last_slim_output(socket)
+    assert output.engine_index == 5
+    assert (
+        output.num_running,
+        output.num_waiting,
+        output.kv_active_pages,
+        output.kv_total_pages,
+    ) == (0, 0, 0, 0)
+
+
+def test_send_socket_load_snapshot_setter_sends_no_frame():
+    socket = _FakeOutputSocket()
+    sender = zmq_msgpack.MsgpackSendSocket(socket)
+
+    sender.set_load_snapshot(1, 2, 3, 4)
+
+    assert socket.sent == []
+
+
+def test_send_socket_next_output_uses_latest_load_snapshot():
+    socket = _FakeOutputSocket()
+    sender = zmq_msgpack.MsgpackSendSocket(socket)
+    sender.set_load_snapshot(1, 2, 3, 4)
+    sender.set_load_snapshot(5, 6, 7, 8)
+
+    sender.send_pyobj(_make_batch_out())
+
+    output = _decode_last_slim_output(socket)
+    assert (
+        output.num_running,
+        output.num_waiting,
+        output.kv_active_pages,
+        output.kv_total_pages,
+    ) == (5, 6, 7, 8)
+
+
+def test_event_loop_load_snapshot_projects_active_pages_to_direct_output():
+    """The direct tail carries active pages, not cached/used pages."""
+    pytest.importorskip("tokenspeed_scheduler")
+    from tokenspeed.runtime.engine.event_loop import EventLoop
+
+    published = []
+    projected = []
+    loop = EventLoop.__new__(EventLoop)
+    loop.load_snapshot_publisher = SimpleNamespace(
+        observe=lambda values: published.append(values)
+    )
+    loop.send_to_tokenizer = SimpleNamespace(
+        set_load_snapshot=lambda *values: projected.append(values)
+    )
+    loop.output_processor = SimpleNamespace(rid_to_state={"a": object(), "b": object()})
+    loop._scheduler_cache_geometry = SimpleNamespace(num_usable_pages=20)
+
+    loop._observe_load_snapshot(
+        {"num_queue_reqs": 3, "num_active_pages": 4, "num_cached_pages": 17}
+    )
+
+    assert published == [(2, 3, 4, 17, 20)]
+    assert projected == [(2, 3, 4, 20)]
 
 
 def test_send_socket_engine_dead_sentinel():
