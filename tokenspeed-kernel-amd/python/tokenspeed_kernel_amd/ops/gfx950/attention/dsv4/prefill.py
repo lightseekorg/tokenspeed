@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""DeepSeek V4 selected-attention kernel optimized for AMD GFX950."""
+"""DeepSeek V4 prefill selected-attention kernel for AMD GFX950."""
 
 from __future__ import annotations
 

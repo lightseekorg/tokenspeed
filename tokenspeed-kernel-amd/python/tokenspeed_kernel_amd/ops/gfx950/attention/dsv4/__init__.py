@@ -20,11 +20,11 @@
 
 """DeepSeek V4 attention kernels for AMD GFX950."""
 
-from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.attention import (
-    gluon_dsv4_selected_attention_gfx950,
-)
-from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.paged_attention import (
+from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.decode import (
     gluon_dsv4_paged_selected_attention_split_gfx950,
+)
+from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.prefill import (
+    gluon_dsv4_selected_attention_gfx950,
 )
 
 __all__ = [

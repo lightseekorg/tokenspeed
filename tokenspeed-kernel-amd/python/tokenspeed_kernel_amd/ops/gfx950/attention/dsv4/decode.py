@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Direct page-planar DeepSeek V4 selected attention for AMD GFX950."""
+"""DeepSeek V4 decode selected-attention kernel for AMD GFX950."""
 
 from __future__ import annotations
 
