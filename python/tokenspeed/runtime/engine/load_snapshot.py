@@ -262,6 +262,7 @@ class LoadSnapshotStore:
         if not self._is_valid(snapshot):
             return False
 
+        now = self._clock()
         rank = snapshot.dp_rank
         if snapshot.epoch in self._retired_epochs[rank]:
             return False
@@ -272,6 +273,8 @@ class LoadSnapshotStore:
                 if snapshot.sequence <= previous.snapshot.sequence:
                     return False
             else:
+                if self._is_fresh(previous, now):
+                    return False
                 self._retired_epochs[rank].add(previous.snapshot.epoch)
 
         copied = LoadSnapshot(
@@ -285,7 +288,7 @@ class LoadSnapshotStore:
             snapshot.max_total_pages,
             snapshot.valid_for_ms,
         )
-        self._snapshots[rank] = _StoredSnapshot(copied, self._clock())
+        self._snapshots[rank] = _StoredSnapshot(copied, now)
         return True
 
     def fresh_snapshots(self) -> list[LoadSnapshot]:

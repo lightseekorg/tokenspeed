@@ -26,7 +26,7 @@
 * ``send_to_scheduler`` — ``PUSH`` socket on
   ``PortArgs.scheduler_input_ipc_name``; carries tokenized requests,
   weight-sync / session / memory-occupation control messages, and the
-  load-update watcher.
+  accepted load snapshots forwarded to the DP controller.
 * ``recv_from_detokenizer`` — ``PULL`` socket on
   ``PortArgs.tokenizer_ipc_name``; receives ``BatchStrOut`` /
   ``BatchTokenIDOut`` / ``BatchEmbeddingOut`` and control-plane replies from

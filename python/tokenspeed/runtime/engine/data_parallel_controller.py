@@ -25,7 +25,6 @@ import multiprocessing as mp
 import os
 import signal
 import threading
-from collections import deque
 from enum import Enum, auto
 
 import psutil
@@ -78,46 +77,79 @@ class DPBudget:
         # - SHORTEST_QUEUE: by num_reqs (running + waiting)
         # - MINIMUM_CACHE_USAGE: by num_pages (page usage)
         self.method = method
-        self.budget_queue = deque()
+        self.reported_metrics: dict[int, int] = {}
+        self.reported_request_counts: dict[int, int] = {}
+        self.reservations: dict[int, int] = {}
+        self.rank_order: list[int] = []
 
-    def update_budget(self, loads: list[GetLoadReqOutput]):
-        """Update the budget queue.
+    def update_budget(
+        self,
+        loads: list[GetLoadReqOutput],
+        reset_rank: int | None = None,
+    ):
+        """Reconcile reported load while retaining speculative reservations.
 
         For SHORTEST_QUEUE, use num_reqs instead of num_waiting_reqs to balance decode running batch.
         For MINIMUM_CACHE_USAGE, use num_pages as cache usage metric.
         """
-        # method update_budget and method dispatch happen in the same thread, so clearing budget_queue is safe
-        self.budget_queue.clear()
-
         if not loads:
+            self.clear()
             return
 
         if self.method == LoadBalanceMethod.MINIMUM_CACHE_USAGE:
-            metrics = [load.num_pages for load in loads]
+            metrics = {load.dp_rank: load.num_pages for load in loads}
         else:
-            metrics = [load.num_reqs for load in loads]
+            metrics = {load.dp_rank: load.num_reqs for load in loads}
+        request_counts = {load.dp_rank: load.num_reqs for load in loads}
+        rank_order = [load.dp_rank for load in loads]
 
-        max_metric = max(metrics)
-        if all(x == max_metric for x in metrics):
+        if rank_order != self.rank_order:
+            self.rank_order = rank_order
+            self.reported_metrics = metrics
+            self.reported_request_counts = request_counts
+            self.reservations = {rank: 0 for rank in rank_order}
             return
 
-        while any(x != metrics[0] for x in metrics):
-            min_load = min(metrics)
-            min_indices = [i for i, x in enumerate(metrics) if x == min_load]
-            second_min_load = min(x for x in metrics if x > min_load)
-            self.budget_queue.extend(
-                [loads[i].dp_rank for i in min_indices] * (second_min_load - min_load)
+        # Reservations count controller-dispatched requests. Only growth in the
+        # scheduler's request count can acknowledge them; cache-page growth is
+        # an independent signal used solely by MINIMUM_CACHE_USAGE scoring.
+        for rank in rank_order:
+            if rank == reset_rank:
+                self.reservations[rank] = 0
+                continue
+
+            reflected_reservations = (
+                request_counts[rank] - self.reported_request_counts[rank]
             )
-            for idx in min_indices:
-                metrics[idx] = second_min_load
+            if reflected_reservations > 0:
+                self.reservations[rank] = max(
+                    0,
+                    self.reservations[rank] - reflected_reservations,
+                )
+        self.reported_metrics = metrics
+        self.reported_request_counts = request_counts
 
     def dispatch(self):
-        if self.budget_queue:
-            return self.budget_queue.popleft()
-        return None
+        if not self.rank_order:
+            return None
+
+        effective_metrics = [
+            self.reported_metrics[rank] + self.reservations[rank]
+            for rank in self.rank_order
+        ]
+        minimum = min(effective_metrics)
+        if all(metric == minimum for metric in effective_metrics):
+            return None
+
+        target_rank = self.rank_order[effective_metrics.index(minimum)]
+        self.reservations[target_rank] += 1
+        return target_rank
 
     def clear(self):
-        self.budget_queue.clear()
+        self.reported_metrics.clear()
+        self.reported_request_counts.clear()
+        self.reservations.clear()
+        self.rank_order.clear()
 
 
 class DataParallelController:
@@ -163,6 +195,9 @@ class DataParallelController:
         # Load balance budget
         self.dp_budget = DPBudget(self.load_balance_method)
         self.load_snapshot_store = LoadSnapshotStore(server_args.mapping.attn.dp_size)
+        self.load_snapshot_epochs: list[str | None] = [
+            None
+        ] * server_args.mapping.attn.dp_size
 
         # Launch data parallel workers
         self.scheduler_procs = []
@@ -190,12 +225,24 @@ class DataParallelController:
             worker.send_pyobj(obj)
 
     def handle_load_snapshot(self, snapshot: LoadSnapshot):
+        previous_epoch = (
+            self.load_snapshot_epochs[snapshot.dp_rank]
+            if 0 <= snapshot.dp_rank < len(self.load_snapshot_epochs)
+            else None
+        )
         if not self.load_snapshot_store.accept(snapshot):
             return
+        self.load_snapshot_epochs[snapshot.dp_rank] = snapshot.epoch
 
         loads = self.load_snapshot_store.project_loads()
         if loads:
-            self.dp_budget.update_budget(loads)
+            epoch_changed = (
+                previous_epoch is not None and previous_epoch != snapshot.epoch
+            )
+            self.dp_budget.update_budget(
+                loads,
+                reset_rank=snapshot.dp_rank if epoch_changed else None,
+            )
         else:
             self.dp_budget.clear()
 

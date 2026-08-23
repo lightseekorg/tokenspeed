@@ -49,6 +49,18 @@ class FakeClock:
         self.now += seconds
 
 
+class CountingClock(FakeClock):
+    """A controllable clock that records each monotonic-time read."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads = 0
+
+    def __call__(self) -> float:
+        self.reads += 1
+        return super().__call__()
+
+
 class RecordingContext:
     """Record publisher lifecycle calls and the threads that made them."""
 
@@ -384,6 +396,100 @@ def test_event_loop_observation_projects_the_sampled_scheduler_values():
 
 
 @pytest.mark.parametrize(
+    "has_overlap_result",
+    [False, True],
+    ids=["non_overlap_post_finish", "overlap_commit"],
+)
+def test_paused_idle_step_refreshes_load_after_optional_overlap_commit(
+    monkeypatch, has_overlap_result
+):
+    """The first paused step observes post-finish CPU scheduler state once."""
+    pytest.importorskip("tokenspeed_scheduler")
+    from tokenspeed.runtime.engine import event_loop as event_loop_module
+
+    trace = []
+    scheduler_state = {"available": 20, "active": 0, "waiting": 0}
+    loop = event_loop_module.EventLoop.__new__(event_loop_module.EventLoop)
+    loop.scheduler = SimpleNamespace(
+        available_kv_pages=lambda: (
+            trace.append("available"),
+            scheduler_state["available"],
+        )[1],
+        active_kv_pages=lambda: (
+            trace.append("active"),
+            scheduler_state["active"],
+        )[1],
+        waiting_size=lambda: (
+            trace.append("waiting"),
+            scheduler_state["waiting"],
+        )[1],
+    )
+    loop.output_processor = SimpleNamespace(rid_to_state={})
+    loop._scheduler_cache_geometry = SimpleNamespace(num_usable_pages=20)
+    loop.attn_tp_rank = 0
+    loop._load_snapshot_observed_while_paused = False
+    loop.load_snapshot_publisher = SimpleNamespace(
+        observe=lambda values: trace.append(("observe", values))
+    )
+    loop.has_dp = False
+    loop._pause = SimpleNamespace(
+        maybe_finish_drain=lambda scheduler: trace.append("drain")
+    )
+    loop._publish_scheduler_kv_events = lambda: trace.append("kv_events")
+    monkeypatch.setattr(
+        event_loop_module,
+        "advance_forward",
+        lambda scheduler, changes: trace.append(("advance", changes)),
+    )
+    monkeypatch.setattr(
+        event_loop_module.time, "sleep", lambda seconds: trace.append("sleep")
+    )
+
+    prev_forward_op = None
+    prev_results = None
+    if has_overlap_result:
+        loop.output_processor.rid_to_state["finished"] = object()
+        scheduler_state.update(available=16, active=4, waiting=1)
+
+        def commit_results(forward_op, results):
+            trace.append("commit")
+            loop.output_processor.rid_to_state.clear()
+            scheduler_state.update(available=20, active=0, waiting=0)
+            return ["finished"]
+
+        loop._commit_forward_results = commit_results
+        prev_forward_op = object()
+        prev_results = object()
+
+    loop._paused_idle_step(prev_forward_op, prev_results)
+    loop._paused_idle_step()
+    scheduler_state.update(available=18, active=2, waiting=1)
+    loop._mark_load_snapshot_dirty()
+    loop._paused_idle_step()
+
+    expected_prefix = (
+        ["commit", ("advance", ["finished"]), "kv_events"] if has_overlap_result else []
+    )
+    assert trace == [
+        *expected_prefix,
+        "available",
+        "active",
+        "waiting",
+        ("observe", (0, 0, 0, 0, 20)),
+        "drain",
+        "sleep",
+        "drain",
+        "sleep",
+        "available",
+        "active",
+        "waiting",
+        ("observe", (0, 1, 2, 2, 20)),
+        "drain",
+        "sleep",
+    ]
+
+
+@pytest.mark.parametrize(
     ("attn_tp_rank", "zmq_msgpack", "expected_sink"),
     [
         (0, False, "publisher"),
@@ -455,16 +561,42 @@ def test_load_snapshot_is_immutable_and_positional():
         snapshot.sequence = 2
 
 
-def test_store_rejects_duplicate_and_retired_epoch_without_refreshing_age():
-    """Duplicate and retired messages cannot revive stale rank state."""
+def test_store_switches_epoch_only_after_expiry_and_rejects_delayed_epochs():
+    """A fresh live epoch cannot be rolled back by delayed producer messages."""
     clock = FakeClock()
     store = LoadSnapshotStore(dp_size=1, clock=clock)
 
     assert store.accept(make_snapshot(epoch="a", sequence=1))
     clock.advance(0.1)
     assert not store.accept(make_snapshot(epoch="a", sequence=1))
+    assert not store.accept(make_snapshot(epoch="b", sequence=1))
+
+    clock.advance(0.901)
+
     assert store.accept(make_snapshot(epoch="b", sequence=1))
+    assert not store.accept(make_snapshot(epoch="c", sequence=1))
+    assert store.accept(make_snapshot(epoch="b", sequence=2))
     assert not store.accept(make_snapshot(epoch="a", sequence=2))
+    assert [(item.epoch, item.sequence) for item in store.fresh_snapshots()] == [
+        ("b", 2)
+    ]
+
+
+def test_store_epoch_expiry_boundary_uses_one_clock_read_per_accept():
+    """Epoch takeover and receipt use one deterministic local-time sample."""
+    clock = CountingClock()
+    store = LoadSnapshotStore(dp_size=1, clock=clock)
+
+    assert store.accept(make_snapshot(epoch="a", sequence=1))
+    assert clock.reads == 1
+
+    clock.advance(VALID_FOR_SECONDS)
+    assert not store.accept(make_snapshot(epoch="b", sequence=1))
+    assert clock.reads == 2
+
+    clock.advance(0.001)
+    assert store.accept(make_snapshot(epoch="b", sequence=1))
+    assert clock.reads == 3
 
 
 def test_store_rejects_non_increasing_sequence_in_current_epoch():
