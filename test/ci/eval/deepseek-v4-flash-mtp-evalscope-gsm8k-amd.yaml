@@ -1,5 +1,5 @@
 api_version: ci.tokenspeed.io/v1
-name: eval-deepseek-v4-flash-gsm8k-amd
+name: eval-deepseek-v4-flash-mtp-gsm8k-amd
 type: eval
 workflow_stage: model-test
 triggers:
@@ -25,6 +25,8 @@ server:
     --gpu-memory-utilization 0.9
     --disable-kvstore
     --trust-remote-code
+    --speculative-algorithm MTP
+    --speculative-num-steps 3
     --host 127.0.0.1
     --port 8000
   ready:
