@@ -158,12 +158,6 @@ value out of TokenSpeed-kernel; but one can also directly call into a
 specific solution under `ops/<family>/`, or manually `select_kernel` with
 targeted filters:
 
-Composite operations may expose opaque plans when backend selection must also
-pin one-time preprocessing. For example,
-`deepseek_v4_grouped_output_projection_plan` selects the portable Triton or
-DeepGEMM implementation; its companion process, execute, and warmup APIs keep
-scale layouts and backend recipes inside TokenSpeed-kernel.
-
 ```python
 from tokenspeed_kernel.selection import select_kernel, kernel_override
 ```
