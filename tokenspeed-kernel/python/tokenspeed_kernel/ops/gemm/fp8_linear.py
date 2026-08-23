@@ -276,10 +276,6 @@ def _fp8_linear_activation(
     )
 
 
-def _fp8_linear_supports_activation(plan: object, activation: str) -> bool:
-    return _require_fp8_linear_plan(plan).activation == activation
-
-
 def warmup_prepared_fp8_linears(plans: Iterable[object], max_tokens: int) -> None:
     """Warm backend implementations selected by prepared FP8 linear plans.
 

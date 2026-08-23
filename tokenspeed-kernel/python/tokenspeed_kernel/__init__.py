@@ -23,7 +23,12 @@ from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 
 bootstrap_profiling_from_env()
 
-from tokenspeed_kernel.ops.activation import add3, silu_and_mul, situ_and_mul
+from tokenspeed_kernel.ops.activation import (
+    add3,
+    prepare_fp8_linear_activation,
+    silu_and_mul,
+    situ_and_mul,
+)
 from tokenspeed_kernel.ops.attention import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
@@ -86,6 +91,7 @@ from tokenspeed_kernel.ops.gemm import (
     dsv4_grouped_output_projection_warmup,
     dsv4_grouped_output_projection_warmup_model,
     dsv4_linear_fp32,
+    fp8_linear,
     kimi3_latent_projection,
     kimi3_latent_projection_add3,
     kimi3_mla_qkv_gate_projection,
@@ -94,7 +100,8 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_down_projection,
     kimi3_shared_situ_projection,
     mm,
-    supports_deep_gemm,
+    prepare_fp8_linear,
+    warmup_prepared_fp8_linears,
 )
 from tokenspeed_kernel.ops.mhc import mhc_fused_hc, mhc_post, mhc_pre
 from tokenspeed_kernel.ops.moe import (
@@ -135,6 +142,7 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup",
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
+    "fp8_linear",
     "kimi3_latent_projection",
     "kimi3_mla_qkv_gate_projection",
     "kimi3_latent_projection_add3",
@@ -143,7 +151,8 @@ __all__ = [
     "kimi3_shared_down_projection",
     "kimi3_shared_situ_projection",
     "mm",
-    "supports_deep_gemm",
+    "prepare_fp8_linear",
+    "warmup_prepared_fp8_linears",
     # attention
     "mha_plan",
     "mha_prefill",
@@ -199,6 +208,7 @@ __all__ = [
     "GdnChunkPrefillResult",
     # activation
     "add3",
+    "prepare_fp8_linear_activation",
     "silu_and_mul",
     "situ_and_mul",
     # moe

@@ -1625,7 +1625,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         process_group = (
             None
             if mapping is None
-            else pg_manager.get_process_group("nccl", mapping.moe.tp_ep_group)
+            else pg_manager.get_device_process_group(mapping.moe.tp_ep_group)
         )
         self._plan = dsv4_mega_moe_plan(
             num_experts=num_experts,
@@ -3337,7 +3337,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             padded[input_ids.shape[0] :].zero_()
 
         gathered = [torch.empty_like(padded) for _ in token_counts]
-        group = pg_manager.get_process_group("nccl", self.mapping.moe.tp_ep_group)
+        group = pg_manager.get_device_process_group(self.mapping.moe.tp_ep_group)
         torch.distributed.all_gather(gathered, padded, group=group)
         return torch.cat(
             [tokens[:count] for tokens, count in zip(gathered, token_counts)], dim=0

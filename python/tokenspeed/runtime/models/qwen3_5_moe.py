@@ -26,7 +26,6 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
-    fused_swiglu_fp8_ue8m0,
 )
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
     nvfp4_gemm_swiglu_nvfp4_quant,
@@ -197,14 +196,6 @@ class Qwen3_5MoeMLP(nn.Module):
             self._use_nvfp4_gemm_swiglu_nvfp4_quant
         )
 
-    def _uses_deep_gemm_fp8_mlp(self) -> bool:
-        """Whether both projections can consume packed UE8M0 activations."""
-        return bool(
-            _is_blackwell
-            and getattr(self.gate_up_proj, "_use_deep_gemm_fp8", False)
-            and getattr(self.down_proj, "_use_deep_gemm_fp8", False)
-        )
-
     def forward(self, x):
         if x.shape[0] == 0:
             return x
@@ -226,25 +217,7 @@ class Qwen3_5MoeMLP(nn.Module):
             x, _ = self.down_proj((x_fp4, x_scale))
             return x
         gate_up, _ = self.gate_up_proj(x)
-        if self._uses_deep_gemm_fp8_mlp():
-            x_fp8, x_scale = fused_swiglu_fp8_ue8m0(
-                gate_up,
-                enable_pdl=pdl_enabled(),
-            )
-            if isinstance(self.down_proj, RowParallelLinear):
-                x, _ = self.down_proj(x_fp8, x_scale)
-            else:
-                # Replicated shared-expert projections do not have the
-                # RowParallelLinear scale shortcut, so request BF16 explicitly
-                # instead of inheriting the FP8 activation dtype.
-                x, _ = self.down_proj(
-                    x_fp8,
-                    block_scale=x_scale,
-                    output_dtype=torch.bfloat16,
-                )
-            return x
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj.forward_with_activation(gate_up, self.act_fn)
         return x
 
 

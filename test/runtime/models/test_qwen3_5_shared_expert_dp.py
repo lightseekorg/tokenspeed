@@ -9,7 +9,6 @@ tokens, so its weights have to be replicated instead.
 from __future__ import annotations
 
 import unittest
-from unittest import mock
 
 import torch
 from torch import nn
@@ -20,7 +19,6 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from tokenspeed.runtime.models import qwen3_5_moe
 from tokenspeed.runtime.models.qwen3_5_moe import Qwen3_5MoeMLP
 
 HIDDEN = 256
@@ -67,10 +65,8 @@ class TestSharedExpertReplication(unittest.TestCase):
             mlp = _mlp(world_size=world_size, replicate=True)
             self.assertEqual(mlp.gate_up_proj.weight.shape, (2 * INTERMEDIATE, HIDDEN))
 
-    def test_replicated_deep_gemm_fuses_swiglu_quant_with_pdl(self):
+    def test_replicated_mlp_delegates_activation_to_down_projection(self):
         class FakeGateUp(nn.Module):
-            _use_deep_gemm_fp8 = True
-
             def __init__(self):
                 super().__init__()
                 self.output = None
@@ -82,46 +78,23 @@ class TestSharedExpertReplication(unittest.TestCase):
                 return self.output, None
 
         class FakeDown(nn.Module):
-            _use_deep_gemm_fp8 = True
-
             def __init__(self):
                 super().__init__()
                 self.call = None
 
-            def forward(self, x, block_scale=None, output_dtype=None):
-                self.call = (x, block_scale, output_dtype)
-                return torch.ones((x.shape[0], HIDDEN), dtype=output_dtype), None
-
-        class UnexpectedActivation(nn.Module):
-            def forward(self, x):
-                raise AssertionError("standalone SiLU must be bypassed")
+            def forward_with_activation(self, x, activation):
+                self.call = (x, activation)
+                return torch.ones((x.shape[0], HIDDEN), dtype=x.dtype), None
 
         mlp = _mlp(world_size=4, replicate=True)
         gate_up = FakeGateUp()
         down = FakeDown()
         mlp.gate_up_proj = gate_up
         mlp.down_proj = down
-        mlp.act_fn = UnexpectedActivation()
+        output = mlp(torch.randn((3, HIDDEN), dtype=torch.bfloat16))
 
-        quantized = torch.empty((3, INTERMEDIATE), dtype=torch.float32)
-        scales = torch.empty((3, INTERMEDIATE // 512), dtype=torch.int32)
-        with (
-            mock.patch.object(qwen3_5_moe, "_is_blackwell", True),
-            mock.patch.object(qwen3_5_moe, "pdl_enabled", return_value=True),
-            mock.patch.object(
-                qwen3_5_moe,
-                "fused_swiglu_fp8_ue8m0",
-                return_value=(quantized, scales),
-            ) as fused,
-        ):
-            output = mlp(torch.randn((3, HIDDEN), dtype=torch.bfloat16))
-
-        fused_args, fused_kwargs = fused.call_args
-        self.assertIs(fused_args[0], gate_up.output)
-        self.assertEqual(fused_kwargs, {"enable_pdl": True})
-        self.assertIs(down.call[0], quantized)
-        self.assertIs(down.call[1], scales)
-        self.assertIs(down.call[2], torch.bfloat16)
+        self.assertIs(down.call[0], gate_up.output)
+        self.assertIs(down.call[1], mlp.act_fn)
         self.assertEqual(output.shape, (3, HIDDEN))
 
 

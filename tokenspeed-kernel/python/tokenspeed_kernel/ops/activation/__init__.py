@@ -96,27 +96,9 @@ def prepare_fp8_linear_activation(
     )
 
 
-def prepared_fp8_linear_supports_activation(plan: object, activation: str) -> bool:
-    """Return whether a prepared FP8 linear accepts an activation boundary.
-
-    Args:
-        plan: Opaque plan returned by the GEMM layer's ``prepare_fp8_linear``.
-        activation: Semantic activation name, such as ``"swiglu"``.
-
-    Returns:
-        Whether the prepared implementation supports fused activation input.
-    """
-    from tokenspeed_kernel.ops.gemm.fp8_linear import (
-        _fp8_linear_supports_activation,
-    )
-
-    return _fp8_linear_supports_activation(plan, activation)
-
-
 __all__ = [
     "add3",
     "prepare_fp8_linear_activation",
-    "prepared_fp8_linear_supports_activation",
     "silu_and_mul",
     "situ_and_mul",
 ]

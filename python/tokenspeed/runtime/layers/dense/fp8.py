@@ -27,12 +27,7 @@ import logging
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.activation import prepared_fp8_linear_supports_activation
-from tokenspeed_kernel.ops.gemm.flashinfer import (  # noqa: F401
-    has_flashinfer_fp8_blockscale,
-    has_flashinfer_mxfp8,
-)
-from tokenspeed_kernel.ops.gemm.fp8_linear import fp8_linear, prepare_fp8_linear
+from tokenspeed_kernel import fp8_linear, prepare_fp8_linear
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_block_quant_fp8,
     per_token_group_quant_fp8,
@@ -222,11 +217,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.weight_scale_inv.data,
                 self.quant_config.weight_block_size,
                 scale_format=getattr(self.quant_config, "scale_fmt", None),
-            )
-            # Retain the capability marker consumed by the existing Qwen MLP
-            # path until that model adopts the semantic linear boundary.
-            layer._use_deep_gemm_fp8 = prepared_fp8_linear_supports_activation(
-                layer._prepared_fp8_linear, "swiglu"
             )
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)

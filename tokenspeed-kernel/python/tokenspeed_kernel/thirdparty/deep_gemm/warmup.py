@@ -459,32 +459,3 @@ def warmup_fp8_gemm_nt(
 
     logger.info("Warmed up fp8_gemm_nt for %d weight shapes", len(seen))
     torch.cuda.synchronize()
-
-
-def warmup_fp8_gemm_nt_from_model(
-    model: torch.nn.Module,
-    max_tokens: int = 8192,
-) -> None:
-    """Scan a model for deep_gemm FP8 linear layers and warm their JIT tiles.
-
-    Plain projections marked ``_use_deep_gemm_fp8`` are warmed via
-    ``fp8_gemm_nt``. Grouped output projections use their backend-neutral
-    public warmup API separately.
-
-    Call after ``quant_method.process_weights_after_loading()`` has run on all
-    modules so the ``_use_deep_gemm_fp8`` flag is set.
-    """
-    if torch.cuda.get_device_capability()[0] < 10:
-        return
-    shapes: set[tuple[int, int]] = set()
-    for module in model.modules():
-        if not getattr(module, "_use_deep_gemm_fp8", False):
-            continue
-        n, k = module.weight.shape
-        shapes.add((n, k))
-    if not shapes:
-        return
-    device = next(model.parameters()).device
-    if shapes:
-        logger.info("Pre-compiling %d deep_gemm FP8 GEMM shapes...", len(shapes))
-        warmup_fp8_gemm_nt(list(shapes), max_tokens, device)

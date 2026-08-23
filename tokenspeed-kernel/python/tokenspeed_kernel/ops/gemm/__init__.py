@@ -93,17 +93,11 @@ __all__ = [
     "kimi3_shared_situ_projection",
     "mm",
     "prepare_fp8_linear",
-    "supports_deep_gemm",
     "warmup_prepared_fp8_linears",
 ]
 
 _platform = Platform.get()
 _fp8_dtype = torch.float8_e4m3fn
-
-
-def supports_deep_gemm() -> bool:
-    """Return whether this platform may use DeepGEMM weight layouts."""
-    return _platform.is_nvidia
 
 
 # Kernels that accept and own bias application inside their GEMM wrapper.
