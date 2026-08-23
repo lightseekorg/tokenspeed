@@ -712,10 +712,23 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # DP the batch itself names its rank. Appended field: defaults to 0 so
     # older peers on either side stay compatible.
     engine_index: int = 0
+    # Latest scheduler load observed before the output is forwarded. Appended
+    # wire tail: older 9- and 10-element prefixes decode all four values as 0.
+    num_running: int = 0
+    num_waiting: int = 0
+    kv_active_pages: int = 0
+    kv_total_pages: int = 0
 
     @classmethod
     def from_full(
-        cls, out: BatchTokenIDOut, engine_index: int = 0
+        cls,
+        out: BatchTokenIDOut,
+        engine_index: int = 0,
+        *,
+        num_running: int = 0,
+        num_waiting: int = 0,
+        kv_active_pages: int = 0,
+        kv_total_pages: int = 0,
     ) -> "BatchTokenIDOutSlim":
         # Token source: ``out.output_ids`` — the not-yet-sent slice of each
         # request's generated ids. NOT ``out.decode_ids``: that is the
@@ -731,6 +744,10 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
             )
         return cls(
             engine_index=engine_index,
+            num_running=num_running,
+            num_waiting=num_waiting,
+            kv_active_pages=kv_active_pages,
+            kv_total_pages=kv_total_pages,
             rids=list(out.rids),
             output_ids=[list(ids) for ids in out.output_ids],
             finished_reasons=[_finish_type(fr) for fr in out.finished_reasons],
@@ -1048,10 +1065,6 @@ class RpcReqOutput(BaseReq, kw_only=True):
     message: str
 
 
-class GetLoadReqInput(BaseReq, kw_only=True):
-    pass
-
-
 class GetLoadReqOutput(BaseReq, kw_only=True):
     dp_rank: int = 0
     num_reqs: int = 0
@@ -1059,8 +1072,24 @@ class GetLoadReqOutput(BaseReq, kw_only=True):
     num_pages: int = 0
 
 
-class WatchLoadUpdateReq(BaseReq, kw_only=True):
-    loads: list[GetLoadReqOutput] = []
+class LoadSnapshot(
+    msgspec.Struct, frozen=True, tag=True, tag_field="_tag", array_like=True
+):
+    """Immutable scheduler load replica sent over engine IPC.
+
+    Fields are positional on the wire. Append any future fields only at the
+    end so older decoders can retain their prefix compatibility.
+    """
+
+    epoch: str
+    sequence: int
+    dp_rank: int
+    num_running_reqs: int
+    num_waiting_reqs: int
+    num_active_pages: int
+    num_used_pages: int
+    max_total_pages: int
+    valid_for_ms: int
 
 
 class BlockReqType(Enum):
@@ -1247,7 +1276,9 @@ def ipc_message_union():
     """
     types = tuple(
         dict.fromkeys(
-            _walk_subclasses(BaseReq) + _walk_subclasses(BaseBatchReq) + [PickleWrapper]
+            _walk_subclasses(BaseReq)
+            + _walk_subclasses(BaseBatchReq)
+            + [LoadSnapshot, PickleWrapper]
         )
     )
     return Union[types]  # noqa: UP007 — dynamic union over a runtime tuple

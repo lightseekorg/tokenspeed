@@ -64,6 +64,7 @@ class _EventLoopHarness:
         self._pause = _PauseHarness(self.trace)
         self.scheduler = _SchedulerHarness(self.trace)
         self.model_executor = _ModelExecutorHarness(self.trace)
+        self.output_processor = SimpleNamespace(rid_to_state={})
         self.has_dp = False
         self.kv_transfer = None
         self._pd_cache_enabled = False
@@ -97,6 +98,9 @@ class _EventLoopHarness:
         self.trace.append("stats")
         return object()
 
+    def _observe_load_snapshot(self, _stats) -> None:
+        self.trace.append("observe_load")
+
     def _record_scheduler_iteration_metrics(
         self, _stats, _num_iter_tokens: int
     ) -> None:
@@ -126,6 +130,7 @@ def test_event_loop_finishes_current_iteration_then_observes_shutdown() -> None:
         "submit_cache",
         "get_forward",
         "stats",
+        "observe_load",
         "pause_finish",
         "metrics",
     ]

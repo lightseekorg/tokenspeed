@@ -39,6 +39,11 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
 from tokenspeed.runtime.engine.io_struct import IpcReceiver, IpcSender
+from tokenspeed.runtime.engine.load_snapshot import (
+    DirectLoadSnapshotSink,
+    LoadSnapshotPublisher,
+    NullLoadSnapshotPublisher,
+)
 from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
 from tokenspeed.runtime.engine.pause import PauseController
 from tokenspeed.runtime.engine.request_handler import RequestHandler
@@ -494,6 +499,7 @@ class EventLoop:
             self.kv_event_publisher = NullEventPublisher(attn_dp_rank=dp_rank)
 
         self._init_interprocess_comm()
+        self._init_load_snapshot_publisher()
 
         # Pause/resume control state. Shared with the request handler, which
         # drives the control-request side; the event loop reads the gate.
@@ -541,7 +547,6 @@ class EventLoop:
             vocab_size=self.model_config.vocab_size,
             recv_func=self.recv_from_tokenizer,
             send_func=self.send_to_tokenizer,
-            get_load_fn=self._get_load,
             clear_cache_fn=self.scheduler.clear_cache,
             architectures=self.model_config.hf_config.architectures,
             pause_controller=self._pause,
@@ -787,6 +792,7 @@ class EventLoop:
             )
             ec.add_event(e)
         self.scheduler.advance(ec)
+        self._mark_load_snapshot_dirty()
         logger.debug("[cache_poll] scheduler.advance() done")
         self._publish_scheduler_kv_events()
 
@@ -1089,6 +1095,21 @@ class EventLoop:
             self.recv_from_tokenizer = None
             self.send_to_tokenizer = _NullSender()
 
+    def _init_load_snapshot_publisher(self) -> None:
+        self._load_snapshot_observed_while_paused = False
+        if self.attn_tp_rank != 0:
+            self.load_snapshot_publisher = NullLoadSnapshotPublisher()
+        elif self.server_args.zmq_msgpack:
+            self.load_snapshot_publisher = DirectLoadSnapshotSink(
+                self.send_to_tokenizer.set_load_snapshot
+            )
+        else:
+            self.load_snapshot_publisher = LoadSnapshotPublisher(
+                self.port_args.metrics_ipc_name,
+                self.dp_rank,
+                self.server_args.load_watch_interval,
+            )
+
     def _init_msgpack_transport(self, context):
         """Complete the SMG startup handshake and return the wrapped msgpack
         input/output sockets."""
@@ -1165,6 +1186,11 @@ class EventLoop:
 
     def _process_new_requests(self):
         recv_reqs = self.request_handler.recv_reqs()
+        if recv_reqs:
+            # A paused loop still accepts control messages and registers new
+            # requests into its Python-side buffers. Re-sample once after that
+            # batch instead of heartbeating the pre-mutation tuple forever.
+            self._mark_load_snapshot_dirty()
         # Snapshot the pause state before dispatch: process_requests may flip it
         # mid-batch. If it was not blocked before but is after, a pause control
         # message was processed in this very batch — which is what makes the
@@ -1430,22 +1456,6 @@ class EventLoop:
                         processed.append(abort)
         return processed
 
-    def _get_load(self):
-        """Return load metrics for the DP load balancer."""
-        from tokenspeed.runtime.engine.io_struct import GetLoadReqOutput
-
-        available = self.scheduler.available_kv_pages()
-        num_used_pages = self._scheduler_cache_geometry.num_usable_pages - available
-        num_waiting = self.scheduler.waiting_size()
-        # num_reqs: running + waiting (used by SHORTEST_QUEUE balancing)
-        num_running = len(self.output_processor.rid_to_state)
-        return GetLoadReqOutput(
-            dp_rank=self.dp_rank,
-            num_reqs=num_running + num_waiting,
-            num_waiting_reqs=num_waiting,
-            num_pages=num_used_pages,
-        )
-
     def _dp_sync_and_check(self, forward_op) -> DpForwardMetadata:
         """Synchronize DP ranks with CPU-only metadata.
 
@@ -1515,6 +1525,26 @@ class EventLoop:
             "num_queue_reqs": self.scheduler.waiting_size(),
         }
 
+    def _observe_load_snapshot(self, stats: dict) -> None:
+        """Project the latest pre-forward planning sample onto each load sink."""
+        num_running = len(self.output_processor.rid_to_state)
+        num_waiting = stats["num_queue_reqs"]
+        num_active_pages = stats["num_active_pages"]
+        max_total_pages = self._scheduler_cache_geometry.num_usable_pages
+        self.load_snapshot_publisher.observe(
+            (
+                num_running,
+                num_waiting,
+                num_active_pages,
+                stats["num_cached_pages"],
+                max_total_pages,
+            )
+        )
+
+    def _mark_load_snapshot_dirty(self) -> None:
+        """Request one fresh scheduler sample on the next paused iteration."""
+        self._load_snapshot_observed_while_paused = False
+
     def _record_scheduler_iteration_metrics(
         self, stats: dict, num_iteration_tokens: int
     ) -> None:
@@ -1576,6 +1606,13 @@ class EventLoop:
             advance_forward(self.scheduler, request_changes)
             self._publish_scheduler_kv_events()
 
+        if self.attn_tp_rank == 0 and (
+            prev_results is not None or not self._load_snapshot_observed_while_paused
+        ):
+            stats = self._get_scheduler_stats()
+            self._observe_load_snapshot(stats)
+            self._load_snapshot_observed_while_paused = True
+
         if self.has_dp:
             dp_metadata = self._dp_sync_and_check(None)
             # While memory is released the weights region is unmapped; an idle
@@ -1602,7 +1639,10 @@ class EventLoop:
     def event_loop(self):
         """Non-overlapping scheduler loop."""
         while not self._shutdown_complete():
+            num_tracked_reqs = len(self.output_processor.rid_to_state)
             self._process_new_requests()
+            if len(self.output_processor.rid_to_state) != num_tracked_reqs:
+                self._mark_load_snapshot_dirty()
             # EPD prefill: admit requests whose async embedding receives completed
             # this cycle (rank-synced). Fixed position right after
             # _process_new_requests so the drain's TP collective ordering is
@@ -1612,6 +1652,7 @@ class EventLoop:
             if self._pause.forward_blocked:
                 self._paused_idle_step()
                 continue
+            self._load_snapshot_observed_while_paused = False
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
             cache_zero_event = self.model_executor.zero_cache_pages(
@@ -1621,6 +1662,7 @@ class EventLoop:
 
             forward_op = self._get_forward_op(execution_plan)
             stats = self._get_scheduler_stats()
+            self._observe_load_snapshot(stats)
             num_iter_tokens = (
                 sum(forward_op.input_lengths) if forward_op is not None else 0
             )
@@ -1755,7 +1797,10 @@ class EventLoop:
             torch.cuda.default_stream().wait_stream(
                 self.model_executor.execution_stream
             )
+            num_tracked_reqs = len(self.output_processor.rid_to_state)
             self._process_new_requests()
+            if len(self.output_processor.rid_to_state) != num_tracked_reqs:
+                self._mark_load_snapshot_dirty()
             self._commit_cache_results()
             if self._pause.forward_blocked:
                 # Freeze: commit any in-flight (overlapped) step — a forward
@@ -1764,6 +1809,7 @@ class EventLoop:
                 prev_results = None
                 prev_forward_op = None
                 continue
+            self._load_snapshot_observed_while_paused = False
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
 
@@ -1774,6 +1820,7 @@ class EventLoop:
 
             forward_op = self._get_forward_op(execution_plan)
             stats = self._get_scheduler_stats()
+            self._observe_load_snapshot(stats)
             num_iter_tokens = (
                 sum(forward_op.input_lengths) if forward_op is not None else 0
             )
@@ -1877,6 +1924,7 @@ class EventLoop:
             prev_forward_op = forward_op
 
     def close(self) -> None:
+        self.load_snapshot_publisher.close()
         # Best-effort: tell an attached SMG frontend this engine is going away
         # (msgpack mode only; the pickle sender has no such helper) so the
         # worker is marked dead instead of staying healthy-idle.

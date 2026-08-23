@@ -1354,7 +1354,8 @@ class ServerArgs:
             "--load-watch-interval",
             type=float,
             default=ServerArgs.load_watch_interval,
-            help="The interval of load watching in seconds.",
+            help="Heartbeat compatibility interval for load snapshots in seconds. "
+            "Changed load values publish immediately without debounce.",
         )
 
         # Expert parallelism

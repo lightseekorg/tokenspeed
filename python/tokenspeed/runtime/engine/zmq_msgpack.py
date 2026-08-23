@@ -144,13 +144,46 @@ class MsgpackSendSocket:
         self._socket = socket
         self._engine_index = engine_index
         self._encoder = MsgpackEncoder()
+        self._load_snapshot = (0, 0, 0, 0)
+
+    def set_load_snapshot(
+        self,
+        num_running: int,
+        num_waiting: int,
+        kv_active_pages: int,
+        kv_total_pages: int,
+    ) -> None:
+        """Replace the load tail for the next ordinary output batch.
+
+        Observation and output forwarding share the scheduler thread, so this
+        latest-wins assignment needs neither a lock nor a standalone send.
+        """
+        self._load_snapshot = (
+            num_running,
+            num_waiting,
+            kv_active_pages,
+            kv_total_pages,
+        )
 
     def send_pyobj(self, obj) -> None:
         if isinstance(obj, BatchTokenIDOut):
             # The PULL side carries no routing identity, so the batch itself
             # names its producing rank; the frontend attributes per-rank
             # outputs and load by this index under DP.
-            slim = BatchTokenIDOutSlim.from_full(obj, engine_index=self._engine_index)
+            (
+                num_running,
+                num_waiting,
+                kv_active_pages,
+                kv_total_pages,
+            ) = self._load_snapshot
+            slim = BatchTokenIDOutSlim.from_full(
+                obj,
+                engine_index=self._engine_index,
+                num_running=num_running,
+                num_waiting=num_waiting,
+                kv_active_pages=kv_active_pages,
+                kv_total_pages=kv_total_pages,
+            )
             self._socket.send_multipart(self._encoder.encode(slim), copy=False)
         else:
             logger.warning(

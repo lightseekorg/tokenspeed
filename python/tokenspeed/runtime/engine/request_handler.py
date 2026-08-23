@@ -48,8 +48,6 @@ from tokenspeed.runtime.engine.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadReqInput,
-    GetLoadReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
     IsSchedulerPausedReqInput,
@@ -109,7 +107,6 @@ class RequestHandler:
         vocab_size: int,
         recv_func,
         send_func,
-        get_load_fn=None,
         clear_cache_fn=None,
         architectures: list[str] | None = None,
         pause_controller=None,
@@ -141,7 +138,6 @@ class RequestHandler:
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
         self.vocab_size = vocab_size
-        self.get_load_fn = get_load_fn
         self.clear_cache_fn = clear_cache_fn
 
         self.tokenizer = get_tokenizer(
@@ -235,11 +231,6 @@ class RequestHandler:
                 self.send_func.send_pyobj(
                     SetInternalStateReqOutput(updated=False, server_args={})
                 )
-            elif isinstance(recv_req, GetLoadReqInput):
-                if self.get_load_fn is not None:
-                    self.send_func.send_pyobj(self.get_load_fn())
-                else:
-                    self.send_func.send_pyobj(GetLoadReqOutput())
             elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
                 # RL weight sync: join the trainer's NCCL group on this worker.
                 ok, msg = self.model_runner.init_weights_update_group(recv_req)
