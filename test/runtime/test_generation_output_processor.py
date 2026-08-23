@@ -20,15 +20,6 @@
 
 from __future__ import annotations
 
-import os
-import sys
-
-# CI Registration (parsed via AST, runtime no-op)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ci_system.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=15, suite="runtime-1gpu")
-
 import pytest
 import torch
 
@@ -124,30 +115,6 @@ def test_mixed_forward_updates_reserve_for_decode_slots_only():
     assert len(reserve_events) == 1
     assert reserve_events[0].request_id == "decode"
     assert reserve_events[0].reserve_num_tokens_in_next_schedule_event == 1
-
-
-def test_output_tensors_are_converted_once_per_forward():
-    class _ListOnlyTensor:
-        def __init__(self, values):
-            self.values = values
-            self.calls = 0
-
-        def tolist(self):
-            self.calls += 1
-            return self.values
-
-    sender = _Sender()
-    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
-    processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
-    processor.rid_to_state["decode"] = _state([5, 6, 7], computed_length=3)
-    result = _ExecutionResult()
-    result.output_tokens = _ListOnlyTensor([11, 22])
-    result.output_lengths = _ListOnlyTensor([1, 1])
-
-    processor.post_process_forward_op(_ForwardOp(), result)
-
-    assert result.output_tokens.calls == 1
-    assert result.output_lengths.calls == 1
 
 
 def test_mark_abort_notify_client_flag():

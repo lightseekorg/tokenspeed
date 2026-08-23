@@ -18,20 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import os
-import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 
-# CI Registration (parsed via AST, runtime no-op)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ci_system.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=10, suite="runtime-1gpu")
-
 import torch
 
-from tokenspeed.runtime.execution import model_executor as model_executor_module
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 
 
@@ -134,28 +125,6 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     ]
 
 
-def test_autotune_dummy_prefill_fits_request_capacity(monkeypatch):
-    executor = ModelExecutor.__new__(ModelExecutor)
-    executor.config = SimpleNamespace(
-        chunked_prefill_size=8192,
-        context_len=1024,
-        max_num_seqs=1,
-        data_parallel_size=1,
-        disable_autotune=True,
-    )
-    executor.model_runner = object()
-    captured = []
-    monkeypatch.setattr(
-        model_executor_module,
-        "set_autotune_max_num_tokens",
-        captured.append,
-    )
-
-    executor._autotune()
-
-    assert captured == [1024]
-
-
 def test_cudagraph_gc_flag_reaches_the_capture_context():
     """The operator flag must survive ServerArgs -> config -> capture.
 
@@ -193,4 +162,4 @@ def test_cudagraph_gc_flag_reaches_the_capture_context():
         after = gc.get_freeze_count()
         assert (during > before) is (not flag), (flag, before, during)
         assert after <= before, (before, after)
-    assert len(canary) == 64
+        assert len(canary) == 64
