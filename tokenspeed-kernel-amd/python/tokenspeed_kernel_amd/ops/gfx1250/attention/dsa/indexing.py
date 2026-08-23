@@ -60,7 +60,6 @@ def _dsa_decode_logits_fp8_kernel(
     logits_stride: gl.constexpr,
     page_size: gl.constexpr,
     row_bytes: gl.constexpr,
-    page_stride_bytes: gl.constexpr,
     max_seq_len: gl.constexpr,
     num_heads: gl.constexpr,
     head_dim: gl.constexpr,
@@ -92,9 +91,10 @@ def _dsa_decode_logits_fp8_kernel(
         mask=valid,
         other=0,
     ).to(gl.int64)
-    fp8_base = page * page_stride_bytes + block_offset.to(gl.int64) * head_dim
+    page_bytes: gl.constexpr = page_size * row_bytes
+    fp8_base = page * page_bytes + block_offset.to(gl.int64) * head_dim
     scale_base = (
-        page * (page_stride_bytes // 4)
+        page * (page_bytes // 4)
         + (page_size * head_dim) // 4
         + block_offset.to(gl.int64) * num_groups
     )
@@ -151,7 +151,6 @@ def _dsa_prefill_logits_fp8_kernel(
     seq_len_sum: gl.constexpr,
     page_size: gl.constexpr,
     row_bytes: gl.constexpr,
-    page_stride_bytes: gl.constexpr,
     num_heads: gl.constexpr,
     head_dim: gl.constexpr,
     num_groups: gl.constexpr,
@@ -177,9 +176,10 @@ def _dsa_prefill_logits_fp8_kernel(
     ).to(gl.int64)
     page = slots // page_size
     block_offset = slots - page * page_size
-    fp8_base = page * page_stride_bytes + block_offset * head_dim
+    page_bytes: gl.constexpr = page_size * row_bytes
+    fp8_base = page * page_bytes + block_offset * head_dim
     scale_base = (
-        page * (page_stride_bytes // 4)
+        page * (page_bytes // 4)
         + (page_size * head_dim) // 4
         + block_offset * num_groups
     )
@@ -221,7 +221,7 @@ def _check_packed_fp8_inputs(
     index_k_cache: torch.Tensor,
     weights: torch.Tensor,
     page_size: int,
-) -> tuple[int, int]:
+) -> int:
     if q.dtype != torch.bfloat16:
         raise TypeError(f"DSA Gluon top-k expects BF16 q, got {q.dtype}")
     if weights.dtype not in (torch.bfloat16, torch.float32):
@@ -245,30 +245,11 @@ def _check_packed_fp8_inputs(
         )
     num_groups = q.shape[2] // 128
     row_bytes = q.shape[2] + num_groups * 4
-    if index_k_cache.dim() != 2:
+    if index_k_cache.dim() != 2 or index_k_cache.shape[1] != row_bytes:
         raise ValueError(
-            "index_k_cache must be a packed slot matrix or page-planar matrix, "
-            f"got shape {tuple(index_k_cache.shape)}"
+            "packed index_k_cache must have shape [slots, row_bytes="
+            f"{row_bytes}], got {tuple(index_k_cache.shape)}"
         )
-    page_bytes = page_size * row_bytes
-    if index_k_cache.shape[1] == row_bytes:
-        if not index_k_cache.is_contiguous():
-            raise ValueError("packed index_k_cache must be contiguous")
-        if index_k_cache.shape[0] % page_size != 0:
-            raise ValueError("packed index_k_cache slot count must be page aligned")
-        page_stride_bytes = page_bytes
-    elif (
-        index_k_cache.shape[1] >= page_bytes
-        and index_k_cache.stride(1) == 1
-        and index_k_cache.stride(0) >= page_bytes
-    ):
-        page_stride_bytes = index_k_cache.stride(0)
-    else:
-        raise ValueError(
-            "index_k_cache must be contiguous [slots, row_bytes] or page-planar "
-            f"[pages, at least {page_bytes} bytes], got "
-            f"shape={tuple(index_k_cache.shape)}, stride={index_k_cache.stride()}"
-        )
-    if index_k_cache.storage_offset() % 4 or page_stride_bytes % 4:
-        raise ValueError("index_k_cache page storage must be float32 aligned")
-    return row_bytes, page_stride_bytes
+    if index_k_cache.shape[0] % page_size != 0:
+        raise ValueError("packed index_k_cache slot count must be page aligned")
+    return row_bytes

@@ -345,8 +345,8 @@ def _check_score_input_contract(
         raise ValueError("q, weights, and index_k_cache must be on the same device")
     if q.stride(-1) != 1 or weights.stride(-1) != 1:
         raise ValueError("q and weights must have contiguous innermost dimensions")
-    if index_k_cache.stride(-1) != 1:
-        raise ValueError("index_k_cache pages must contain contiguous bytes")
+    if not index_k_cache.is_contiguous():
+        raise ValueError("index_k_cache must be contiguous")
 
 
 def _check_topk_contract(topk: int) -> None:
@@ -423,10 +423,8 @@ def gluon_dsa_decode_topk_fp8_gfx1250(
             f"DSA Gluon top-k supports q_len_per_req=1..6, got {q_len_per_req}"
         )
     if index_k_cache is None:
-        raise RuntimeError("Gluon DSA paged top-k requires an FP8 index_k_cache")
-    row_bytes, page_stride_bytes = _check_packed_fp8_inputs(
-        q, index_k_cache, weights, int(page_size)
-    )
+        raise RuntimeError("Gluon DSA paged top-k requires packed FP8 index_k_cache")
+    row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, int(page_size))
     _check_score_input_contract(q, weights, index_k_cache)
     if seq_lens.dim() != 1:
         raise ValueError(
@@ -491,7 +489,6 @@ def gluon_dsa_decode_topk_fp8_gfx1250(
         logits.stride(0),
         page_size=int(page_size),
         row_bytes=row_bytes,
-        page_stride_bytes=page_stride_bytes,
         max_seq_len=max_seq_len,
         num_heads=q.shape[1],
         head_dim=q.shape[2],
@@ -538,11 +535,9 @@ def gluon_dsa_prefill_topk_fp8_gfx1250(
     _check_topk_contract(topk)
     if index_k_cache is None or page_size is None:
         raise RuntimeError(
-            "Gluon DSA top-k requires an FP8 index_k_cache and page_size"
+            "Gluon DSA top-k requires packed FP8 index_k_cache and page_size"
         )
-    row_bytes, page_stride_bytes = _check_packed_fp8_inputs(
-        q, index_k_cache, weights, int(page_size)
-    )
+    row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, int(page_size))
     _check_score_input_contract(q, weights, index_k_cache)
     if kv_workspace_slots.dim() != 1:
         raise ValueError(
@@ -619,7 +614,6 @@ def gluon_dsa_prefill_topk_fp8_gfx1250(
             seq_len_sum=seq_len_sum,
             page_size=int(page_size),
             row_bytes=row_bytes,
-            page_stride_bytes=page_stride_bytes,
             num_heads=q.shape[1],
             head_dim=q.shape[2],
             num_groups=q.shape[2] // 128,
