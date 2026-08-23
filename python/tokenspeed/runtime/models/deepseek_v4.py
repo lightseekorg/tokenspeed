@@ -45,7 +45,9 @@ from tokenspeed_kernel import (
     dsv4_indexer_decode_metadata_compute,
     dsv4_indexer_decode_topk,
     dsv4_indexer_prefill_topk,
-    dsv4_linear_fp32,
+)
+from tokenspeed_kernel import dsv4_linear_fp32 as _kernel_dsv4_linear_fp32
+from tokenspeed_kernel import (
     dsv4_mega_moe_apply,
     dsv4_mega_moe_plan,
     dsv4_mega_moe_process_weights,
@@ -1615,6 +1617,22 @@ def dsv4_select_experts(
             keepdim=True,
         ).clamp_min(torch.finfo(topk_weights.dtype).tiny)
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32), scores
+
+
+def dsv4_linear_fp32(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Use the registered accelerator projection or an eager FP32 fallback."""
+    try:
+        return _kernel_dsv4_linear_fp32(
+            hidden_states,
+            weight,
+            enable_pdl=enable_pdl,
+        )
+    except NoKernelFoundError:
+        return F.linear(hidden_states.float(), weight.float())
 
 
 class DeepseekV4MoEGate(nn.Module):

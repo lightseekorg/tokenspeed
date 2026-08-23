@@ -118,8 +118,6 @@ from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, error_fn
 from tokenspeed_kernel.selection import SelectedKernel, spec_matches_traits
 
-_gemm_pytorch = importlib.import_module("tokenspeed_kernel.ops.gemm.pytorch")
-
 _RELOAD_MODULES = [
     # Attention registration modules.
     _attention_cuda_dsv4,
@@ -148,7 +146,6 @@ _RELOAD_MODULES = [
     _gemm_dsv4,
     _gemm_flashinfer,
     _gemm_gluon,
-    _gemm_pytorch,
     _gemm_triton,
     _gemm_trtllm,
     _gemm_pkg,
@@ -365,30 +362,6 @@ def _dsv4_linear_fp32() -> torch.Tensor:
     hidden_states = torch.empty((2, 4096), dtype=torch.bfloat16)
     weight = torch.empty((256, 4096), dtype=torch.bfloat16)
     return tokenspeed_kernel.dsv4_linear_fp32(hidden_states, weight)
-
-
-@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16])
-def test_dsv4_linear_fp32_torch_accumulates_in_fp32(
-    weight_dtype: torch.dtype,
-) -> None:
-    hidden_states = torch.tensor(
-        [[1.25, -0.5, 3.0], [-2.0, 0.75, 0.125]],
-        dtype=torch.bfloat16,
-    )
-    weight = torch.tensor(
-        [[0.5, 2.0, -1.0], [1.5, -0.25, 0.75]],
-        dtype=weight_dtype,
-    )
-
-    actual = tokenspeed_kernel.dsv4_linear_fp32(
-        hidden_states,
-        weight,
-        override="torch_dsv4_linear_fp32",
-    )
-    expected = hidden_states.float() @ weight.float().T
-
-    assert actual.dtype == torch.float32
-    torch.testing.assert_close(actual, expected)
 
 
 def _mm_mxfp8() -> torch.Tensor:
@@ -3531,14 +3504,6 @@ _CASES = [
         "gemm",
         "dsv4_linear_fp32",
         "cuda_dsv3_dsv4_linear_fp32",
-        _dsv4_linear_fp32,
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "gemm",
-        "dsv4_linear_fp32",
-        "torch_dsv4_linear_fp32",
         _dsv4_linear_fp32,
     ),
     # Quantization API x architecture golden cases.
