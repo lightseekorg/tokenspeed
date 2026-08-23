@@ -112,6 +112,53 @@ def test_online_v2_matches_reference(
         torch.testing.assert_close(layer, original_layer, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize(
+    ("tokens", "target_block"),
+    [(16_385, 0), (65_536, 5)],
+)
+def test_online_v2_long_sequence_regression(tokens: int, target_block: int) -> None:
+    """Exercise the post-16K path and the widened source address arithmetic."""
+    hidden_size = 7168
+    block_capacity = target_block + 1
+    layer = torch.zeros(tokens, 1, hidden_size, device="cuda", dtype=torch.bfloat16)
+    blocks = torch.zeros(
+        block_capacity,
+        tokens,
+        1,
+        hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    blocks[target_block].fill_(1)
+    res_weight = torch.ones(hidden_size, device="cuda", dtype=torch.bfloat16)
+    rms_weight = torch.ones(hidden_size, device="cuda", dtype=torch.bfloat16)
+
+    expected, _ = _reference(
+        layer[:1],
+        None,
+        blocks[:, :1],
+        res_weight,
+        rms_weight,
+        None,
+        block_capacity,
+        1e-5,
+    )
+    actual = attn_res_fwd_packed(
+        layer,
+        blocks,
+        res_weight,
+        rms_weight,
+        1e-5,
+        num_blocks=block_capacity,
+    )
+
+    # At T=65536, source 5 makes source * (T * H) exceed int32.
+    step = max(1, tokens // 8)
+    actual_sample = actual[::step, :, :16]
+    expected_sample = expected[:, :, :16].expand_as(actual_sample)
+    torch.testing.assert_close(actual_sample, expected_sample, atol=0.05, rtol=0.05)
+
+
 @pytest.mark.parametrize("with_out_norm", [False, True])
 def test_online_v2_cuda_graph_capture(with_out_norm: bool) -> None:
     torch.manual_seed(23)
