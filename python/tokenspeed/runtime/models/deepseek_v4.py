@@ -18,7 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Inference-only DeepSeek V4 Flash and Pro model implementation."""
+"""Inference-only DeepSeek V4 model skeleton.
+
+This module intentionally registers only architecture pieces that map to the
+DeepSeek V4 Flash checkpoint. The sparse MLA forward path still fails loudly
+until the HCA/CSA cache kernels are wired into TokenSpeed.
+"""
 
 from __future__ import annotations
 
