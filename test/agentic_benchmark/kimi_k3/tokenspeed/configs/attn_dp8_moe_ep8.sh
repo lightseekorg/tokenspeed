@@ -31,8 +31,6 @@ exec ts serve \
     --moe-tp-size 1 \
     --max-model-len 80000 \
     --max-num-seqs 16 \
-    --max-prefill-tokens 2048 \
-    --chunked-prefill-size 2048 \
     --gpu-memory-utilization 0.92 \
     --trust-remote-code \
     --attention-backend tokenspeed_mla \
