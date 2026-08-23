@@ -45,14 +45,32 @@ _SEND_RETRY_INTERVAL_S = 0.01
 _CLOSE_TIMEOUT_S = 1.0
 
 
+def _close_snapshot_socket(context: object | None, socket: object | None) -> None:
+    """Close a partially or fully acquired socket before terminating its context."""
+    try:
+        if socket is not None:
+            socket.close(linger=0)
+    finally:
+        if context is not None:
+            context.term()
+
+
 def _open_snapshot_socket(endpoint: str) -> tuple[zmq.Context, zmq.Socket]:
     """Create the publisher's private context and configured PUSH socket."""
     context = zmq.Context()
-    socket = context.socket(zmq.PUSH)
-    socket.setsockopt(zmq.SNDHWM, 1)
-    socket.setsockopt(zmq.CONFLATE, 1)
-    socket.connect(endpoint)
-    return context, socket
+    socket = None
+    try:
+        socket = context.socket(zmq.PUSH)
+        socket.setsockopt(zmq.SNDHWM, 1)
+        socket.setsockopt(zmq.CONFLATE, 1)
+        socket.connect(endpoint)
+        return context, socket
+    except Exception:
+        try:
+            _close_snapshot_socket(context, socket)
+        except Exception:
+            logger.exception("Failed to clean up load snapshot socket setup")
+        raise
 
 
 class NullLoadSnapshotPublisher:
@@ -184,10 +202,10 @@ class LoadSnapshotPublisher:
         except Exception:
             logger.exception("Load snapshot publisher stopped unexpectedly")
         finally:
-            if socket is not None:
-                socket.close(linger=0)
-            if context is not None:
-                context.term()
+            try:
+                _close_snapshot_socket(context, socket)
+            except Exception:
+                logger.exception("Failed to clean up load snapshot publisher")
 
     def _new_snapshot(self, values: _LoadValues) -> LoadSnapshot:
         self._sequence += 1

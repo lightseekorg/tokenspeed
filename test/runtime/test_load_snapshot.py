@@ -68,10 +68,16 @@ class RecordingSocket:
     """A minimal PUSH socket double that decodes successfully sent frames."""
 
     def __init__(
-        self, failures: int = 0, failure_gate: threading.Event | None = None
+        self,
+        failures: int = 0,
+        failure_gate: threading.Event | None = None,
+        connect_error: Exception | None = None,
+        close_error: Exception | None = None,
     ) -> None:
         self.failures = failures
         self.failure_gate = failure_gate
+        self.connect_error = connect_error
+        self.close_error = close_error
         self.calls = []
         self.decoded_snapshots = []
         self.send_attempted = threading.Event()
@@ -82,6 +88,8 @@ class RecordingSocket:
 
     def connect(self, endpoint: str) -> None:
         self.calls.append(("connect", threading.get_ident(), endpoint))
+        if self.connect_error is not None:
+            raise self.connect_error
 
     def send(self, frame, flags=0) -> None:
         self.calls.append(("send", threading.get_ident(), flags))
@@ -95,6 +103,8 @@ class RecordingSocket:
 
     def close(self, linger=None) -> None:
         self.calls.append(("close", threading.get_ident(), linger))
+        if self.close_error is not None:
+            raise self.close_error
 
 
 def wait_until(predicate, timeout: float = 2.0) -> None:
@@ -299,6 +309,42 @@ def test_publisher_default_socket_has_bounded_thread_owned_lifecycle(monkeypatch
     assert ("setsockopt", owner, zmq.CONFLATE, 1) in socket.calls
     assert ("connect", owner, "tcp://load-snapshots") in socket.calls
     assert ("send", owner, zmq.NOBLOCK) in socket.calls
+    assert ("close", owner, 0) in socket.calls
+    assert ("term", owner) in context.calls
+
+
+def test_publisher_setup_failure_cleans_partial_resources_on_owner_thread(
+    monkeypatch,
+):
+    """A failed socket setup still closes and terminates every acquired resource."""
+    caller_thread = threading.get_ident()
+    socket = RecordingSocket(
+        connect_error=RuntimeError("connect failed"),
+        close_error=RuntimeError("close failed"),
+    )
+    context = RecordingContext(socket)
+    context_created_on = []
+
+    def make_context():
+        context_created_on.append(threading.get_ident())
+        return context
+
+    monkeypatch.setattr(load_snapshot_module.zmq, "Context", make_context)
+    publisher = load_snapshot_module.LoadSnapshotPublisher(
+        "tcp://load-snapshots", dp_rank=0, heartbeat_interval=60.0
+    )
+    wait_until(lambda: any(call[0] == "connect" for call in socket.calls))
+
+    close_started = time.monotonic()
+    publisher.close()
+    close_elapsed = time.monotonic() - close_started
+
+    owner = publisher.socket_owner_thread
+    assert owner != caller_thread
+    assert close_elapsed < 0.5
+    assert context_created_on == [owner]
+    assert ("socket", owner, zmq.PUSH) in context.calls
+    assert ("connect", owner, "tcp://load-snapshots") in socket.calls
     assert ("close", owner, 0) in socket.calls
     assert ("term", owner) in context.calls
 
