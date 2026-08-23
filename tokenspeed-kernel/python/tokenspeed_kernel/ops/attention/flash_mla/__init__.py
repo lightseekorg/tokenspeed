@@ -177,7 +177,12 @@ def _get_decode_sched_meta(
     return meta
 
 
-def _get_dsv4_tile_meta(q: torch.Tensor, selected_width: int) -> object:
+def _get_dsv4_tile_meta(
+    q: torch.Tensor,
+    selected_width: int,
+    page_size: int,
+    extra_page_size: int | None,
+) -> object:
     phase = "graph" if torch.cuda.is_current_stream_capturing() else "eager"
     key = (
         phase,
@@ -185,6 +190,8 @@ def _get_dsv4_tile_meta(q: torch.Tensor, selected_width: int) -> object:
         q.dtype,
         tuple(q.shape),
         int(selected_width),
+        int(page_size),
+        int(extra_page_size or 0),
     )
     meta = _dsv4_tile_meta_cache.get(key)
     if meta is None:
@@ -384,6 +391,8 @@ if (
             tile_scheduler_metadata=_get_dsv4_tile_meta(
                 q_kernel,
                 swa_indices.shape[-1],
+                swa_page_size,
+                extra_page_size,
             ),
             softmax_scale=float(softmax_scale),
             is_fp8_kvcache=True,
