@@ -51,6 +51,11 @@ _dsv4_tile_meta_cache: dict[tuple, object] = {}
 _query_workspace_cache: dict[tuple, torch.Tensor] = {}
 
 
+def reset_dsv4_tile_metadata() -> None:
+    """Discard value-dependent DSV4 FlashMLA schedules before a new forward."""
+    _dsv4_tile_meta_cache.clear()
+
+
 def _flashmla_sparse_prefill_head_multiple() -> int:
     return 128 if platform.is_nvidia and platform.is_blackwell_plus else 64
 

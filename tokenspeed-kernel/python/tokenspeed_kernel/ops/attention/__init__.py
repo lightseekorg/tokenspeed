@@ -192,6 +192,7 @@ __all__ = [
     "dsv4_indexer_prefill_topk",
     "dsv4_padded_heads",
     "dsv4_paged_selected_attention",
+    "dsv4_reset_attention_state",
     "dsv4_save_compressor_state",
     "dsv4_selected_attention",
     "dsv4_swa_cache_insert",
@@ -248,6 +249,13 @@ def dsv4_padded_heads(num_local_heads: int) -> int:
     raise ValueError(
         f"DeepSeek V4 attention supports at most 128 local heads, got {num_local_heads}"
     )
+
+
+def dsv4_reset_attention_state() -> None:
+    """Reset backend-owned value-dependent state before a DSV4 forward."""
+    from tokenspeed_kernel.ops.attention.flash_mla import reset_dsv4_tile_metadata
+
+    reset_dsv4_tile_metadata()
 
 
 def _dsv4_indexer_selection(

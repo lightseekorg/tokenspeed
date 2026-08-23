@@ -26,6 +26,7 @@ from tokenspeed_kernel import (
     dsv4_indexer_decode_metadata_compute,
     dsv4_paged_selected_attention,
     dsv4_plan,
+    dsv4_reset_attention_state,
     dsv4_selected_attention,
 )
 
@@ -838,6 +839,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         extend_prefix_lens: torch.Tensor | None = None,
         **kwargs,
     ) -> None:
+        dsv4_reset_attention_state()
         cache_metadata = kwargs.pop("cache_metadata", None)
         forward_batch = kwargs.pop("forward_batch", None)
         incoming_block_tables = kwargs.pop("block_tables", None) or {}
@@ -2041,6 +2043,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         max_tokens_per_req: int = 1,
         overlap_schedule_depth: int = 0,
     ):
+        dsv4_reset_attention_state()
         self._cuda_graph_max_tokens_per_req = max(
             1,
             int(max_tokens_per_req),
@@ -2260,6 +2263,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         forward_mode: ForwardMode,
         **kwargs,
     ):
+        dsv4_reset_attention_state()
         block_tables = kwargs.pop("block_tables", None) or {}
         block_table_base_offsets = kwargs.pop("block_table_base_offsets", None) or {}
         num_tokens_arg = kwargs.pop("num_tokens", None)
@@ -2386,6 +2390,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         page_table: torch.Tensor = None,
         **kwargs,
     ):
+        dsv4_reset_attention_state()
         cache_metadata = kwargs.pop("cache_metadata", None)
         forward_batch = kwargs.pop("forward_batch", None)
         block_tables = kwargs.pop("block_tables", None) or {}

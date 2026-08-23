@@ -117,7 +117,8 @@ if platform.is_nvidia:
             deep_gemm.get_num_sms(),
         )
         if out is None:
-            return refreshed.clone()
+            with torch.inference_mode(False):
+                return refreshed.clone()
 
         if (
             not isinstance(out, torch.Tensor)
