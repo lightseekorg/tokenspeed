@@ -45,9 +45,34 @@ change.
 import zmq
 import zmq.asyncio
 
-from tokenspeed.runtime.engine.io_struct import AsyncIpcReceiver, IpcSender
+from tokenspeed.runtime.engine.io_struct import (
+    AsyncIpcReceiver,
+    IpcSender,
+    LoadSnapshot,
+    MsgpackDecoder,
+)
 from tokenspeed.runtime.utils import get_zmq_socket
 from tokenspeed.runtime.utils.server_args import PortArgs
+
+
+class AsyncLoadSnapshotReceiver:
+    """Decode the scheduler's fixed one-frame msgpack load snapshot wire."""
+
+    def __init__(self, socket) -> None:
+        self._socket = socket
+        self._decoder = MsgpackDecoder(LoadSnapshot)
+
+    async def recv_pyobj(self, flags: int = 0) -> LoadSnapshot:
+        frames = await self._socket.recv_multipart(flags)
+        if len(frames) != 1:
+            raise RuntimeError("LoadSnapshot must arrive as exactly one frame")
+        return self._decoder.decode(frames[0])
+
+    def close(self, linger: int | None = None) -> None:
+        self._socket.close(linger=linger)
+
+    def __getattr__(self, name: str):
+        return getattr(self._socket, name)
 
 
 class EngineCoreClient:
@@ -75,4 +100,4 @@ class EngineCoreClient:
         recv_load_snapshot = self.context.socket(zmq.PULL)
         recv_load_snapshot.setsockopt(zmq.RCVHWM, 1)
         recv_load_snapshot.bind(port_args.metrics_ipc_name)
-        self.recv_load_snapshot = AsyncIpcReceiver(recv_load_snapshot)
+        self.recv_load_snapshot = AsyncLoadSnapshotReceiver(recv_load_snapshot)

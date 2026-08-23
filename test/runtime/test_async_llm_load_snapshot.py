@@ -21,7 +21,12 @@ import pytest
 import zmq
 
 from tokenspeed.runtime.engine import core_client as core_client_module
-from tokenspeed.runtime.engine.io_struct import GetLoadReqOutput, LoadSnapshot
+from tokenspeed.runtime.engine import io_struct as io_struct_module
+from tokenspeed.runtime.engine.io_struct import (
+    GetLoadReqOutput,
+    LoadSnapshot,
+    MsgpackEncoder,
+)
 from tokenspeed.runtime.engine.load_snapshot import LoadSnapshotStore
 from tokenspeed.runtime.engine.scheduler_control_client import SchedulerControlClient
 
@@ -56,12 +61,25 @@ class _QueueReceiver:
         return self.values.pop(0)
 
 
+class _RawFrameSocket:
+    def __init__(self, frames) -> None:
+        self.frames = frames
+
+    async def recv_multipart(self, flags=0):
+        return self.frames
+
+
 class _RecordingSender:
     def __init__(self) -> None:
         self.sent = []
 
-    def send_pyobj(self, value) -> None:
+    async def send_pyobj(self, value) -> None:
         self.sent.append(value)
+
+
+class _FailingSender:
+    async def send_pyobj(self, value) -> None:
+        raise RuntimeError("snapshot forwarding failed")
 
 
 def _snapshot(**overrides) -> LoadSnapshot:
@@ -104,6 +122,17 @@ def test_engine_core_metrics_pull_keeps_only_the_newest_snapshot(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_metrics_receiver_decodes_msgpack_when_pickle_ipc_is_enabled(monkeypatch):
+    snapshot = _snapshot()
+    monkeypatch.setattr(io_struct_module, "USE_PICKLE_IPC", True)
+    receiver = core_client_module.AsyncLoadSnapshotReceiver(
+        _RawFrameSocket(MsgpackEncoder().encode(snapshot))
+    )
+
+    assert await receiver.recv_pyobj() == snapshot
+
+
+@pytest.mark.asyncio
 async def test_load_snapshot_loop_caches_and_forwards_only_accepted_snapshots():
     accepted = _snapshot()
     duplicate = _snapshot()
@@ -128,6 +157,25 @@ async def test_load_snapshot_loop_caches_and_forwards_only_accepted_snapshots():
         GetLoadReqOutput(dp_rank=0, num_reqs=5, num_waiting_reqs=3, num_pages=5)
     ]
     assert sender.sent == [accepted]
+    assert sender.sent[0] is accepted
+
+
+@pytest.mark.asyncio
+async def test_load_snapshot_loop_propagates_forwarding_failure():
+    llm = SimpleNamespace(
+        load_snapshot_store=LoadSnapshotStore(dp_size=1),
+        engine_core_client=SimpleNamespace(
+            recv_load_snapshot=_QueueReceiver([_snapshot()]),
+            send_to_scheduler=_FailingSender(),
+        ),
+        server_args=SimpleNamespace(
+            mapping=SimpleNamespace(attn=SimpleNamespace(has_dp=True)),
+            load_balance_method="shortest_queue",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="snapshot forwarding failed"):
+        await SchedulerControlClient.load_snapshot_loop(llm)
 
 
 @pytest.mark.asyncio

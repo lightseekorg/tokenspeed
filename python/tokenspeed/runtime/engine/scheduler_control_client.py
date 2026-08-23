@@ -406,4 +406,4 @@ class SchedulerControlClient:
                 self.server_args.mapping.attn.has_dp
                 and self.server_args.load_balance_method != "round_robin"
             ):
-                self.engine_core_client.send_to_scheduler.send_pyobj(snapshot)
+                await self.engine_core_client.send_to_scheduler.send_pyobj(snapshot)
