@@ -50,9 +50,6 @@ here first. tp4 layouts are omitted: the checkpoint does not fit 4 GPUs.
 | `attn_tp8_moe_tp8` | MoE TP variant |
 | `attn_dp8_moe_ep8` | attention DP; DP x DSpark validated on-machine (2026-08-21: boots in 1067s and completes the full 5-rung sweep with zero exceptions); never pass `--dense-tp-size`; chunked prefill pinned to 2048 (trtllm MoE workspace scales with chunk x 8 gathered tokens) |
 
-**Merge order**: the DP row needs #1152 (dynamic MLA packing, boot) and
-#1185 (merge_state head tiling, runtime) merged first.
-
 Run-to-run noise: sampling is deliberately NOT pinned (matching the
 kimi_k2.5/inkling convention — no seed, no greedy), so speculative
 acceptance drifts between runs. Measured across identical-config runs:
