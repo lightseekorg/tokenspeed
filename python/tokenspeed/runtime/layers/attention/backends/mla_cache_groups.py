@@ -39,6 +39,9 @@ must also define ``self._cache_contract_bound`` / ``self._cache_groups_bound``
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.attention.triton.mla_write_locations import (
+    mla_write_locations,
+)
 
 
 class MlaCacheGroupMixin:
@@ -145,26 +148,21 @@ class MlaCacheGroupMixin:
         layout the verify read path builds.
         """
         page_size = self.kernel_page_size
-        last = (seq_lens[:batch_size].to(torch.int64) - 1).clamp_min(0)
-        if q_len_per_req == 1:
-            positions = last.unsqueeze(1)
-        else:
-            steps = torch.arange(
-                1 - q_len_per_req, 1, device=seq_lens.device, dtype=torch.int64
-            )
-            positions = (last.unsqueeze(1) + steps).clamp_min(0)
-        page_indices = torch.div(positions, page_size, rounding_mode="floor")
-        pages = table[:batch_size].gather(1, page_indices)
-        if validate_pages and pages.numel() and not bool((pages > 0).all().item()):
-            raise RuntimeError(
-                "MLA write location resolves to the null page 0 or a " "-1 table hole"
-            )
-        locations = (
-            pages.clamp_min(0).to(torch.int64) * page_size + (positions % page_size)
-        ).reshape(-1)
-        if out is not None:
-            out[: batch_size * q_len_per_req].copy_(locations)
-            return out
+        locations = mla_write_locations(
+            seq_lens,
+            table,
+            page_size=page_size,
+            q_len_per_req=q_len_per_req,
+            batch_size=batch_size,
+            out=out,
+        )
+        if validate_pages and locations.numel():
+            # Page 0 is the null page, so a write there lands below one page.
+            if not bool((locations >= page_size).all().item()):
+                raise RuntimeError(
+                    "MLA write location resolves to the null page 0 or a "
+                    "-1 table hole"
+                )
         return locations
 
     def _verify_q_len(self, forward_mode) -> int:

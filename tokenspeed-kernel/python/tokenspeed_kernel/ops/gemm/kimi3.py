@@ -26,7 +26,11 @@ KIMI3_HIDDEN_SIZE = 7168
 KIMI3_LATENT_SIZE = 3584
 KIMI3_QKVFAB_SIZE = 6288
 KIMI3_ROUTER_SIZE = 896
+from tokenspeed_kernel.ops.gemm.routed_gemv import decode_gemv_routed
+
 KIMI3_SHARED_LOCAL_SIZE = 768
+
+
 KIMI3_SHARED_GATE_UP_LOCAL_SIZE = 2 * KIMI3_SHARED_LOCAL_SIZE
 _KIMI3_SHAPES = {
     (KIMI3_HIDDEN_SIZE, KIMI3_LATENT_SIZE),
@@ -304,6 +308,7 @@ def kimi3_latent_projection(
         and weight.is_contiguous()
         and (k, n) in _KIMI3_SHAPES
     )
+    routed = solution == "auto"
     if solution == "auto":
         if Platform.get().is_cdna4 and specialized and m == 1:
             solution = "triton_gemv"
@@ -352,6 +357,10 @@ def kimi3_latent_projection(
                 "Kimi K3 Gluon latent projection requires an aligned large-M shape"
             )
         return output
+    if routed and decode_gemv_routed(hidden_states, weight):
+        from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+
+        return decode_gemv(hidden_states, weight, out)
     if out is None:
         return torch.nn.functional.linear(hidden_states, weight)
     return torch.mm(hidden_states, weight.T, out=out)
@@ -623,6 +632,7 @@ def kimi3_shared_situ_projection(
         )
     if solution not in {"auto", "triton_gemv", "torch"}:
         raise ValueError(f"unknown Kimi K3 shared SiTU solution {solution!r}")
+    routed = solution == "auto"
     specialized = (
         hidden_states.is_cuda
         and hidden_states.dtype == torch.bfloat16
@@ -661,7 +671,12 @@ def kimi3_shared_situ_projection(
         )
         return out
 
-    gate_up = torch.nn.functional.linear(hidden_states, gate_up_weight)
+    if routed and decode_gemv_routed(hidden_states, gate_up_weight):
+        from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+
+        gate_up = decode_gemv(hidden_states, gate_up_weight)
+    else:
+        gate_up = torch.nn.functional.linear(hidden_states, gate_up_weight)
     if gate_up.is_cuda:
         from tokenspeed_kernel.ops.activation import situ_and_mul
 
@@ -720,8 +735,13 @@ def kimi3_shared_down_projection(
         and input_width == KIMI3_SHARED_LOCAL_SIZE
         and output_width == KIMI3_HIDDEN_SIZE
     )
+    routed = solution == "auto"
     if solution == "auto":
         solution = "triton_gemv" if Platform.get().is_cdna4 and specialized else "torch"
+    if routed and decode_gemv_routed(hidden_states, weight):
+        from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+
+        return decode_gemv(hidden_states, weight, out)
     if solution == "triton_gemv":
         if not specialized:
             raise ValueError(

@@ -248,7 +248,16 @@ Notes:
   it must not be padded with an eighth, unused mask row.
 - Target features are captured from K3's completed-layer prefix stream before
   the model-level AttnRes mix and final norm, matching the DSpark checkpoint's
-  vLLM training and inference contract.
+  vLLM training and inference contract. A draft trained instead against the
+  pre-norm AttnRes mixture declares `"aux_hidden_stream": "attn_res"` in its
+  config and is served that stream. Feeding a draft the other stream raises nothing
+  and shows up only as a lower acceptance rate, so the choice is logged next to
+  the tap ids at startup.
+- A draft whose config sets `"fc_norm": true` normalizes each target tap on its
+  own before the taps are concatenated and projected, and ships one
+  `fc_norm.N.weight` per tap. Declaring it without the weights (or shipping the
+  weights without declaring it) fails the load rather than serving an
+  identity-weight norm.
 - Under tensor parallelism, the draft's final row-parallel MLP output is reduced
   across TP ranks before `final_norm` and shared target-head sampling.
 - The vision encoder has 12 attention heads. For an 8-way text TP deployment,

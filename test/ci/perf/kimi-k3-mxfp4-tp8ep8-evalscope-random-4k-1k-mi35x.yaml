@@ -7,7 +7,7 @@ triggers:
   - manual
 runner:
   labels:
-    - amd-mi35x-8gpu-test
+    - amd-mi350-8gpu-bench
 env:
   CI: "true"
 install:
