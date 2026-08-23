@@ -62,7 +62,6 @@ import tokenspeed_kernel.ops.mhc.triton as _mhc_triton
 import tokenspeed_kernel.ops.moe as _moe_pkg
 import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
 import tokenspeed_kernel.ops.moe.deep_gemm as _moe_deep_gemm
-import tokenspeed_kernel.ops.moe.dsv4 as _moe_dsv4
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
 import tokenspeed_kernel.ops.moe.gluon.dsv4 as _moe_gluon_dsv4
@@ -162,7 +161,6 @@ _RELOAD_MODULES = [
     _moe_cuda,
     _moe_deep_gemm_deepep_fp8,
     _moe_deep_gemm,
-    _moe_dsv4,
     _moe_cutedsl_deepep_nvfp4,
     _moe_cutlass_fp8,
     _moe_cutlass_nvfp4,
