@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from tokenspeed_kernel.platform import create_device_stream, release_device_memory_cache
 from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 
 bootstrap_profiling_from_env()
@@ -47,13 +48,15 @@ from tokenspeed_kernel.ops.attention import (
     dsv4_fused_sparse_compress_cache_insert,
     dsv4_indexer_cache_format,
     dsv4_indexer_decode_metadata_compute,
+    dsv4_indexer_decode_topk,
+    dsv4_indexer_prefill_topk,
     dsv4_padded_heads,
     dsv4_paged_selected_attention,
     dsv4_plan,
     dsv4_save_compressor_state,
     dsv4_selected_attention,
-    dsv4_supports_deep_gemm,
     dsv4_swa_cache_insert,
+    dsv4_warmup,
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
@@ -95,6 +98,10 @@ from tokenspeed_kernel.ops.gemm import (
 )
 from tokenspeed_kernel.ops.mhc import mhc_fused_hc, mhc_post, mhc_pre
 from tokenspeed_kernel.ops.moe import (
+    dsv4_mega_moe_apply,
+    dsv4_mega_moe_plan,
+    dsv4_mega_moe_process_weights,
+    dsv4_mega_moe_warmup,
     dsv4_select_experts,
     moe_apply,
     moe_plan,
@@ -117,6 +124,9 @@ from tokenspeed_kernel.selection import NoKernelFoundError
 __all__ = [
     # exceptions
     "NoKernelFoundError",
+    # platform
+    "create_device_stream",
+    "release_device_memory_cache",
     # gemm
     "bmm",
     "dsv4_grouped_output_projection",
@@ -172,13 +182,15 @@ __all__ = [
     "dsv4_fused_inv_rope_fp8_quant",
     "dsv4_fused_sparse_compress_cache_insert",
     "dsv4_indexer_decode_metadata_compute",
+    "dsv4_indexer_decode_topk",
+    "dsv4_indexer_prefill_topk",
     "dsv4_indexer_cache_format",
     "dsv4_padded_heads",
     "dsv4_paged_selected_attention",
     "dsv4_save_compressor_state",
     "dsv4_selected_attention",
-    "dsv4_supports_deep_gemm",
     "dsv4_swa_cache_insert",
+    "dsv4_warmup",
     "write_dsv4_indexer_mxfp4_cache_cuda",
     "gdn_chunk_prefill",
     "gdn_decode_step",
@@ -190,6 +202,10 @@ __all__ = [
     "silu_and_mul",
     "situ_and_mul",
     # moe
+    "dsv4_mega_moe_apply",
+    "dsv4_mega_moe_plan",
+    "dsv4_mega_moe_process_weights",
+    "dsv4_mega_moe_warmup",
     "dsv4_select_experts",
     "native_latent_moe_available",
     "moe_apply",

@@ -42,6 +42,11 @@ from tokenspeed_kernel.ops.gemm.dsv4 import (
     dsv4_grouped_output_projection_warmup_model,
     dsv4_linear_fp32,
 )
+from tokenspeed_kernel.ops.gemm.fp8_linear import (
+    fp8_linear,
+    prepare_fp8_linear,
+    warmup_prepared_fp8_linears,
+)
 from tokenspeed_kernel.ops.gemm.kimi3 import (
     kimi3_latent_projection,
     kimi3_latent_projection_add3,
@@ -76,6 +81,7 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup",
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
+    "fp8_linear",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
     "kimi3_latent_projection",
@@ -86,7 +92,9 @@ __all__ = [
     "kimi3_shared_down_projection",
     "kimi3_shared_situ_projection",
     "mm",
+    "prepare_fp8_linear",
     "supports_deep_gemm",
+    "warmup_prepared_fp8_linears",
 ]
 
 _platform = Platform.get()

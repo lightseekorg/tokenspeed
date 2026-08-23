@@ -100,6 +100,7 @@ def _check_out(
 
 
 if platform.is_nvidia:
+    import tokenspeed_kernel.ops.attention.deep_gemm.dsv4_indexer  # noqa: F401
     from tokenspeed_kernel.thirdparty import deep_gemm
     from tokenspeed_kernel.thirdparty import trtllm as _trtllm  # noqa: F401
 

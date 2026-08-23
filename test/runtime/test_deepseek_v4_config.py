@@ -119,7 +119,6 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_indexer_prefill_request_chunks,
     _deepseek_v4_indexer_prefill_request_gather_plan,
     _deepseek_v4_indexer_token_split,
-    _deepseek_v4_indexer_topk_from_logits,
     _deepseek_v4_mega_moe_max_num_tokens,
     _deepseek_v4_reorder_c4_ape_2604,
     _deepseek_v4_routed_expert_quant_config,
@@ -714,11 +713,11 @@ class TestDeepseekV4Config(unittest.TestCase):
                 None,
             )
 
-        def routed_experts(states, topk_weights, topk_ids, activation_clamp=None):
-            del topk_weights, activation_clamp
+        def routed_experts(states, topk_weights, topk_ids):
+            del topk_weights
             calls.append("routed")
             self.assertIs(states, hidden_states)
-            self.assertEqual(topk_ids.dtype, torch.int64)
+            self.assertEqual(topk_ids.dtype, torch.int32)
             return hidden_states + 1
 
         moe = SimpleNamespace(
@@ -5348,72 +5347,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 4112,
             )
 
-    def test_deepseek_v4_indexer_topk_requires_cuda_logits(self):
-        logits = torch.tensor(
-            [[0.0, 3.0, 1.0, -float("inf")]],
-            dtype=torch.float32,
-        )
-        lengths = torch.tensor([3], dtype=torch.int32)
-
-        with self.assertRaisesRegex(RuntimeError, "requires CUDA float32 logits"):
-            _deepseek_v4_indexer_topk_from_logits(
-                logits,
-                lengths,
-                topk_tokens=2,
-            )
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_deepseek_v4_indexer_topk_rejects_unsupported_decode_topk(self):
-        logits = torch.tensor(
-            [[0.0, 3.0, 1.0, -float("inf")]],
-            device="cuda",
-            dtype=torch.float32,
-        )
-        lengths = torch.tensor([3], device="cuda", dtype=torch.int32)
-
-        with self.assertRaisesRegex(RuntimeError, "supports topk_tokens"):
-            _deepseek_v4_indexer_topk_from_logits(
-                logits,
-                lengths,
-                topk_tokens=4,
-            )
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_deepseek_v4_indexer_topk_uses_local_prefill_op(self):
-        logits = torch.tensor(
-            [
-                [0.0, 3.0, 1.0, -float("inf"), -float("inf"), -float("inf")],
-                [-float("inf"), -float("inf"), -float("inf"), 2.0, 8.0, 5.0],
-            ],
-            device="cuda",
-            dtype=torch.float32,
-        )
-        row_starts = torch.tensor([0, 3], device="cuda", dtype=torch.int32)
-        row_ends = torch.tensor([3, 6], device="cuda", dtype=torch.int32)
-        out = torch.empty((2, 4), device="cuda", dtype=torch.int32)
-
-        try:
-            actual = _deepseek_v4_indexer_topk_from_logits(
-                logits,
-                row_ends - row_starts,
-                topk_tokens=4,
-                use_prefill_topk_op=True,
-                row_starts=row_starts,
-                row_ends=row_ends,
-                out=out,
-            )
-        except RuntimeError as exc:
-            if "requires the CUDA prefill top-k op" not in str(exc):
-                raise
-            self.skipTest(str(exc))
-
-        self.assertEqual(actual.data_ptr(), out.data_ptr())
-        expected = torch.tensor(
-            [[0, 1, 2, -1], [0, 1, 2, -1]],
-            dtype=torch.int32,
-        )
-        self.assertTrue(torch.equal(actual.cpu(), expected))
-
     def test_deepseek_v4_topk_buffer_grows_and_reuses(self):
         buffer = _DeepseekV4TopKBuffer(topk_tokens=3)
 
@@ -5538,22 +5471,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         with (
-            # deep_gemm is unavailable on AMD runners; the guard only checks
-            # for None and every consumer below is patched out.
-            patch.object(
-                deepseek_v4_model,
-                "deep_gemm",
-                deepseek_v4_model.deep_gemm or SimpleNamespace(),
-            ),
             patch.object(
                 deepseek_v4_model,
                 "deepseek_v4_prepare_indexer_q_mxfp4",
                 side_effect=fake_prepare_mxfp4,
-            ),
-            patch.object(
-                deepseek_v4_model,
-                "_deepseek_v4_deepgemm_fp4_indexer_available",
-                return_value=True,
             ),
             patch.object(
                 deepseek_v4_model,

@@ -18,15 +18,277 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""DeepSeek V4 expert selection."""
+"""DeepSeek V4 expert selection and MegaMoE APIs."""
 
 from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.selection import SelectedKernel, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+
+@dataclass(frozen=True)
+class _MegaMoEPlan:
+    kernel: SelectedKernel
+    weight_preprocessor: Callable
+    warmup: Callable | None
+    input_dtype: torch.dtype
+    num_experts: int
+    num_local_experts: int
+    top_k: int
+    hidden_size: int
+    intermediate_size: int
+    max_num_tokens: int
+    process_group: object | None
+    activation_clamp: float | None
+
+
+@dataclass(frozen=True)
+class _MegaMoEState:
+    plan: _MegaMoEPlan
+    backend_state: object
+
+
+def dsv4_mega_moe_plan(
+    *,
+    num_experts: int,
+    num_local_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    max_num_tokens: int,
+    process_group: object | None = None,
+    activation_clamp: float | None = None,
+    input_dtype: torch.dtype = torch.bfloat16,
+    solution: str | None = None,
+) -> object:
+    """Create an opaque DeepSeek V4 MegaMoE execution plan.
+
+    Kernel selection applies registry capability requirements. The currently
+    registered implementation requires NVIDIA SM100 and optional DeepGEMM
+    MegaMoE symbols, so planning fails cleanly when either is unavailable.
+
+    Args:
+        num_experts: Total number of routed experts across the EP group.
+        num_local_experts: Number of checkpoint experts held by this rank.
+        top_k: Number of experts selected per token.
+        hidden_size: Model hidden dimension.
+        intermediate_size: Per-expert intermediate dimension.
+        max_num_tokens: Per-rank token capacity of the symmetric input buffer.
+        process_group: Optional expert-parallel process group. When omitted, the
+            backend uses the default initialized distributed process group.
+        activation_clamp: Optional SwiGLU activation clamp compiled into the
+            MegaMoE kernel. The same value is used for execution and warmup.
+        input_dtype: Hidden-state dtype consumed by the implementation.
+        solution: Optional implementation family selected through the registry.
+
+    Returns:
+        An opaque plan accepted by the related process, apply, and warmup APIs.
+    """
+    dimensions = {
+        "num_experts": num_experts,
+        "num_local_experts": num_local_experts,
+        "top_k": top_k,
+        "hidden_size": hidden_size,
+        "intermediate_size": intermediate_size,
+        "max_num_tokens": max_num_tokens,
+    }
+    invalid = [name for name, value in dimensions.items() if int(value) <= 0]
+    if invalid:
+        raise ValueError(f"MegaMoE dimensions must be positive: {', '.join(invalid)}")
+    if num_local_experts > num_experts:
+        raise ValueError("num_local_experts cannot exceed num_experts")
+    if top_k > num_experts:
+        raise ValueError("top_k cannot exceed num_experts")
+    if hidden_size % 128 or intermediate_size % 128:
+        raise ValueError(
+            "DeepSeek V4 MegaMoE hidden and intermediate sizes must be "
+            "multiples of 128"
+        )
+
+    kernel = select_kernel(
+        "moe",
+        "dsv4_mega_moe",
+        format_signature(hidden_states=dense_tensor_format(input_dtype)),
+        traits={
+            "weight_dtype": "mxfp4",
+            "scale_format": "ue8m0",
+            "scale_block_size": 32,
+            "supports_ep": True,
+        },
+        solution=solution,
+    )
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    if spec is None or spec.weight_preprocessor is None:
+        raise RuntimeError(f"MegaMoE kernel {kernel.name!r} has no weight preprocessor")
+    return _MegaMoEPlan(
+        kernel=kernel,
+        weight_preprocessor=spec.weight_preprocessor,
+        warmup=getattr(kernel.impl, "_tokenspeed_warmup", None),
+        input_dtype=input_dtype,
+        num_experts=int(num_experts),
+        num_local_experts=int(num_local_experts),
+        top_k=int(top_k),
+        hidden_size=int(hidden_size),
+        intermediate_size=int(intermediate_size),
+        max_num_tokens=int(max_num_tokens),
+        process_group=process_group,
+        activation_clamp=activation_clamp,
+    )
+
+
+def _require_mega_moe_plan(plan: object) -> _MegaMoEPlan:
+    if not isinstance(plan, _MegaMoEPlan):
+        raise TypeError("plan must be returned by dsv4_mega_moe_plan")
+    return plan
+
+
+def _require_mega_moe_state(plan: _MegaMoEPlan, state: object) -> _MegaMoEState:
+    if not isinstance(state, _MegaMoEState):
+        raise TypeError("state must be returned by dsv4_mega_moe_process_weights")
+    if state.plan is not plan:
+        raise ValueError("MegaMoE state was created by a different plan")
+    return state
+
+
+def dsv4_mega_moe_process_weights(
+    plan: object,
+    w13_weight: torch.Tensor,
+    w13_weight_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+) -> object:
+    """Process canonical checkpoint tensors into opaque MegaMoE state.
+
+    Callers may retain ordinary checkpoint tensors while loading and replace
+    them with the returned state only after all shards are populated. Scale
+    conversion and implementation-specific weight layouts are backend-owned.
+
+    Args:
+        plan: Opaque plan returned by :func:`dsv4_mega_moe_plan`.
+        w13_weight: Packed canonical gate/up weight tensor.
+        w13_weight_scale: Canonical gate/up UE8M0 scale tensor.
+        w2_weight: Packed canonical down-projection weight tensor.
+        w2_weight_scale: Canonical down-projection UE8M0 scale tensor.
+
+    Returns:
+        Opaque processed state accepted by apply and warmup.
+    """
+    typed_plan = _require_mega_moe_plan(plan)
+    backend_state = typed_plan.weight_preprocessor(
+        w13_weight=w13_weight,
+        w13_weight_scale=w13_weight_scale,
+        w2_weight=w2_weight,
+        w2_weight_scale=w2_weight_scale,
+        num_local_experts=typed_plan.num_local_experts,
+        hidden_size=typed_plan.hidden_size,
+        intermediate_size=typed_plan.intermediate_size,
+    )
+    return _MegaMoEState(plan=typed_plan, backend_state=backend_state)
+
+
+def dsv4_mega_moe_apply(
+    plan: object,
+    state: object,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    fast_math: bool = True,
+) -> torch.Tensor:
+    """Execute DeepSeek V4 MegaMoE using opaque processed state.
+
+    Args:
+        plan: Opaque plan returned by :func:`dsv4_mega_moe_plan`.
+        state: Opaque state returned by
+            :func:`dsv4_mega_moe_process_weights` for the same plan.
+        hidden_states: Input activations shaped ``[tokens, hidden_size]``.
+        topk_weights: Routing weights shaped ``[tokens, top_k]``.
+        topk_ids: Global expert ids shaped ``[tokens, top_k]``.
+        fast_math: Whether the backend may use its fast-math execution path.
+
+    Returns:
+        BF16 routed-expert output shaped like ``hidden_states``.
+    """
+    typed_plan = _require_mega_moe_plan(plan)
+    typed_state = _require_mega_moe_state(typed_plan, state)
+    if hidden_states.ndim != 2 or hidden_states.shape[1] != typed_plan.hidden_size:
+        raise ValueError(
+            "MegaMoE hidden_states must have shape "
+            f"[tokens, {typed_plan.hidden_size}], got {tuple(hidden_states.shape)}"
+        )
+    if hidden_states.dtype != typed_plan.input_dtype:
+        raise ValueError(
+            f"MegaMoE expected hidden dtype {typed_plan.input_dtype}, "
+            f"got {hidden_states.dtype}"
+        )
+    expected_routing_shape = (hidden_states.shape[0], typed_plan.top_k)
+    if tuple(topk_weights.shape) != expected_routing_shape:
+        raise ValueError(
+            f"topk_weights must have shape {expected_routing_shape}, "
+            f"got {tuple(topk_weights.shape)}"
+        )
+    if tuple(topk_ids.shape) != expected_routing_shape:
+        raise ValueError(
+            f"topk_ids must have shape {expected_routing_shape}, "
+            f"got {tuple(topk_ids.shape)}"
+        )
+    if hidden_states.shape[0] > typed_plan.max_num_tokens:
+        raise ValueError(
+            f"DeepSeek V4 MegaMoE got {hidden_states.shape[0]} tokens, but the "
+            f"symmetric buffer was sized for {typed_plan.max_num_tokens}"
+        )
+
+    return typed_plan.kernel(
+        hidden_states=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        state=typed_state.backend_state,
+        process_group=typed_plan.process_group,
+        num_experts=typed_plan.num_experts,
+        top_k=typed_plan.top_k,
+        hidden_size=typed_plan.hidden_size,
+        intermediate_size=typed_plan.intermediate_size,
+        max_num_tokens=typed_plan.max_num_tokens,
+        activation_clamp=typed_plan.activation_clamp,
+        fast_math=fast_math,
+    )
+
+
+def dsv4_mega_moe_warmup(plan: object, state: object) -> None:
+    """Warm all serving token shapes for an opaque MegaMoE plan and state.
+
+    The backend performs the EP barrier, reuses its symmetric buffer, and uses
+    the plan's token capacity and activation clamp so compiled variants match
+    serving.
+
+    Args:
+        plan: Opaque plan returned by :func:`dsv4_mega_moe_plan`.
+        state: Opaque state returned by
+            :func:`dsv4_mega_moe_process_weights` for the same plan.
+
+    Returns:
+        None.
+    """
+    typed_plan = _require_mega_moe_plan(plan)
+    typed_state = _require_mega_moe_state(typed_plan, state)
+    if typed_plan.warmup is None:
+        return
+    typed_plan.warmup(
+        state=typed_state.backend_state,
+        process_group=typed_plan.process_group,
+        num_experts=typed_plan.num_experts,
+        top_k=typed_plan.top_k,
+        hidden_size=typed_plan.hidden_size,
+        intermediate_size=typed_plan.intermediate_size,
+        max_num_tokens=typed_plan.max_num_tokens,
+        activation_clamp=typed_plan.activation_clamp,
+    )
 
 
 def _assert_indices_in_range(
@@ -197,4 +459,10 @@ def dsv4_select_experts(
         )
 
 
-__all__ = ["dsv4_select_experts"]
+__all__ = [
+    "dsv4_mega_moe_apply",
+    "dsv4_mega_moe_plan",
+    "dsv4_mega_moe_process_weights",
+    "dsv4_mega_moe_warmup",
+    "dsv4_select_experts",
+]

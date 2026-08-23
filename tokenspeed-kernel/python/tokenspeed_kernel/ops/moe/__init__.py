@@ -29,12 +29,22 @@ import tokenspeed_kernel.ops.moe.marlin  # noqa: F401
 import tokenspeed_kernel.ops.moe.pytorch  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
-from tokenspeed_kernel.ops.moe.dsv4 import dsv4_select_experts
+from tokenspeed_kernel.ops.moe.dsv4 import (
+    dsv4_mega_moe_apply,
+    dsv4_mega_moe_plan,
+    dsv4_mega_moe_process_weights,
+    dsv4_mega_moe_warmup,
+    dsv4_select_experts,
+)
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
+    "dsv4_mega_moe_apply",
+    "dsv4_mega_moe_plan",
+    "dsv4_mega_moe_process_weights",
+    "dsv4_mega_moe_warmup",
     "dsv4_select_experts",
     "native_latent_moe_available",
     "latent_moe_decode_pipeline_available",

@@ -253,7 +253,7 @@ def deepseek_v4_prepare_indexer_q_mxfp4(
     softmax_scale: float,
     head_scale: float,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
-    """Apply indexer Q RoPE and return DeepGEMM-ready MXFP4 values/scales."""
+    """Apply indexer Q RoPE and return packed MXFP4 values and scales."""
 
     if index_q.dim() != 3:
         raise ValueError(f"index_q must be [tokens, heads, dim], got {index_q.shape}")

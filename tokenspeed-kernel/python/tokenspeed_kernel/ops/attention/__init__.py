@@ -186,14 +186,16 @@ __all__ = [
     "dsv4_fused_indexer_q_rope_hadamard_mxfp4",
     "dsv4_fused_inv_rope_fp8_quant",
     "dsv4_fused_sparse_compress_cache_insert",
-    "dsv4_indexer_decode_metadata_compute",
     "dsv4_indexer_cache_format",
+    "dsv4_indexer_decode_metadata_compute",
+    "dsv4_indexer_decode_topk",
+    "dsv4_indexer_prefill_topk",
     "dsv4_padded_heads",
     "dsv4_paged_selected_attention",
     "dsv4_save_compressor_state",
     "dsv4_selected_attention",
-    "dsv4_supports_deep_gemm",
     "dsv4_swa_cache_insert",
+    "dsv4_warmup",
     "write_dsv4_indexer_mxfp4_cache_cuda",
     "msa_decode_with_kvcache",
     "msa_extend_with_kvcache",
@@ -248,10 +250,38 @@ def dsv4_padded_heads(num_local_heads: int) -> int:
     )
 
 
-def dsv4_supports_deep_gemm() -> bool:
-    """Return whether V4 may select its optional DeepGEMM implementations."""
-
-    return current_platform().is_nvidia
+def _dsv4_indexer_selection(
+    index_q: torch.Tensor,
+    *,
+    index_k_format: str,
+    page_size: int,
+    topk: int,
+) -> tuple[object, dict[str, object]]:
+    if index_k_format not in ("mxfp4", "fp8_scaled"):
+        raise ValueError(
+            "index_k_format must be 'mxfp4' or 'fp8_scaled', got " f"{index_k_format!r}"
+        )
+    if index_q.ndim < 3:
+        raise ValueError(
+            "index_q values must have at least 3 dimensions, got "
+            f"{tuple(index_q.shape)}"
+        )
+    logical_head_dim = (
+        index_q.shape[-1] * 2 if index_k_format == "mxfp4" else index_q.shape[-1]
+    )
+    signature = format_signature(
+        q=dense_tensor_format(index_q.dtype),
+        weights=dense_tensor_format(torch.float32),
+        index_k_cache=dense_tensor_format(torch.uint8),
+    )
+    traits = {
+        "index_heads": int(index_q.shape[-2]),
+        "head_dim": int(logical_head_dim),
+        "topk": int(topk),
+        "page_size": int(page_size),
+        "index_k_format": index_k_format,
+    }
+    return signature, traits
 
 
 def mla_project_value_prefers_contiguous_weight(
@@ -3739,6 +3769,218 @@ def dsv4_paged_selected_attention(
         )
 
 
+def dsv4_indexer_prefill_topk(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    cu_seqlen_k_start: torch.Tensor,
+    cu_seqlen_k_end: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    max_seqlen_k: int,
+    index_k_format: str = "mxfp4",
+    gathered_k: tuple[torch.Tensor, torch.Tensor] | None = None,
+    gather_workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+    """Compute DSV4 prefill sparse-indexer top-k over packed cache rows.
+
+    Args:
+        index_q: Prepared ``(values, scales)`` query pair. MXFP4 values are
+            packed uint8; scaled-FP8 values use ``float8_e4m3fn``.
+        weights: Contiguous FP32 per-token index-head weights.
+        index_k_cache: Page-backed uint8 index-K cache.
+        block_table: Logical-to-physical page table for the gathered requests.
+        cu_seq_lens: Cumulative packed key-row lengths for those requests.
+        cu_seqlen_k_start: Inclusive packed-key start for every query row.
+        cu_seqlen_k_end: Exclusive packed-key end for every query row.
+        seq_lens: Candidate count for every query row.
+        page_size: Number of index-K rows in each cache page.
+        topk: Number of local candidate offsets to select.
+        max_seqlen_k: Maximum candidate count represented by the logits.
+        index_k_format: ``"mxfp4"`` or ``"fp8_scaled"``.
+        gathered_k: Optional previously gathered ``(values, scales)`` pair to
+            reuse instead of gathering index_k_cache again.
+        gather_workspace: Optional caller-owned MXFP4 value/scale buffers. The
+            returned gathered_k aliases these buffers.
+        out: Optional caller-owned int32 output with shape ``[tokens, topk]``
+            (or a larger first dimension).
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution to force through selection.
+
+    Returns:
+        A pair ``(indices, gathered_k)``. Indices are local offsets within each
+        query row's packed candidate range, with invalid entries set to -1.
+    """
+    q_values, _ = index_q
+    signature, traits = _dsv4_indexer_selection(
+        q_values,
+        index_k_format=index_k_format,
+        page_size=page_size,
+        topk=topk,
+    )
+    if weights.dtype != torch.float32:
+        raise TypeError(f"weights must be float32, got {weights.dtype}")
+    signature = _attention_format_signature(
+        q=q_values, weights=weights, index_k_cache=index_k_cache
+    )
+    kernel = select_kernel(
+        "attention",
+        "dsv4_indexer_prefill_topk",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": int(q_values.shape[0]),
+        "index_heads": int(q_values.shape[-2]),
+        "head_dim": int(traits["head_dim"]),
+        "page_size": int(page_size),
+        "topk": int(topk),
+        "max_seqlen_k": int(max_seqlen_k),
+        "index_k_format": index_k_format,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "dsv4_indexer_prefill_topk",
+        kernel.name,
+        q_values.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "dsv4_indexer_prefill_topk",
+        q_values.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            index_q=index_q,
+            weights=weights,
+            index_k_cache=index_k_cache,
+            block_table=block_table,
+            cu_seq_lens=cu_seq_lens,
+            cu_seqlen_k_start=cu_seqlen_k_start,
+            cu_seqlen_k_end=cu_seqlen_k_end,
+            seq_lens=seq_lens,
+            page_size=page_size,
+            topk=topk,
+            max_seqlen_k=max_seqlen_k,
+            index_k_format=index_k_format,
+            gathered_k=gathered_k,
+            gather_workspace=gather_workspace,
+            out=out,
+        )
+
+
+def dsv4_indexer_decode_topk(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    max_context_len: int,
+    plan: object,
+    index_k_format: str = "mxfp4",
+    out: torch.Tensor | None = None,
+    persistent_topk_workspace: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Compute DSV4 decode sparse-indexer top-k over a paged index-K cache.
+
+    Args:
+        index_q: Prepared ``(values, scales)`` query pair. MXFP4 values are
+            packed uint8; scaled-FP8 values use ``float8_e4m3fn``.
+        weights: Contiguous FP32 per-token index-head weights.
+        index_k_cache: Page-backed uint8 index-K cache.
+        context_lens: Int32 context lengths shaped ``[tokens, 1]``.
+        block_table: Int32 page table with one row per query token.
+        page_size: Number of index-K rows in each cache page.
+        topk: Number of local candidate offsets to select.
+        max_context_len: Maximum context represented by block_table.
+        plan: Opaque schedule returned by :func:`dsv4_plan`.
+        index_k_format: ``"mxfp4"`` or ``"fp8_scaled"``.
+        out: Optional caller-owned int32 output with shape ``[tokens, topk]``
+            (or a larger first dimension).
+        persistent_topk_workspace: Optional caller-owned uint8 workspace of at
+            least 1 MiB for the persistent local top-k implementation.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution to force through selection.
+
+    Returns:
+        Int32 local offsets into each token's logical index-K context. Invalid
+        entries are -1; the return aliases out when out is provided.
+    """
+    q_values, _ = index_q
+    signature, traits = _dsv4_indexer_selection(
+        q_values,
+        index_k_format=index_k_format,
+        page_size=page_size,
+        topk=topk,
+    )
+    if weights.dtype != torch.float32:
+        raise TypeError(f"weights must be float32, got {weights.dtype}")
+    signature = _attention_format_signature(
+        q=q_values, weights=weights, index_k_cache=index_k_cache
+    )
+    kernel = select_kernel(
+        "attention",
+        "dsv4_indexer_decode_topk",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": int(q_values.shape[0]),
+        "index_heads": int(q_values.shape[-2]),
+        "head_dim": int(traits["head_dim"]),
+        "page_size": int(page_size),
+        "topk": int(topk),
+        "max_context_len": int(max_context_len),
+        "index_k_format": index_k_format,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "dsv4_indexer_decode_topk",
+        kernel.name,
+        q_values.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "dsv4_indexer_decode_topk",
+        q_values.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            index_q=index_q,
+            weights=weights,
+            index_k_cache=index_k_cache,
+            context_lens=context_lens,
+            block_table=block_table,
+            page_size=page_size,
+            topk=topk,
+            max_context_len=max_context_len,
+            plan=plan,
+            index_k_format=index_k_format,
+            out=out,
+            persistent_topk_workspace=persistent_topk_workspace,
+        )
+
+
 def dsa_decode(
     q: torch.Tensor,
     kv_cache: torch.Tensor | None,
@@ -4369,6 +4611,56 @@ def dsv4_plan(
         out=out,
         override=override,
         solution=solution,
+    )
+
+
+def dsv4_warmup(
+    *,
+    hidden_size: int,
+    num_attention_heads: int,
+    head_dim: int,
+    hc_mult: int,
+    kv_lora_rank: int,
+    index_n_heads: int,
+    index_head_dim: int,
+    indexer_cache_block_size: int,
+    max_decode_tokens: int,
+    mxfp4_block_size: int,
+    tp_size: int,
+    max_tokens: int,
+    device: torch.device,
+    solution: str | None = None,
+) -> None:
+    """Warm selected DeepSeek V4 kernels for serving shapes.
+
+    Runtime provides only model geometry and serving bounds. Vendor and
+    architecture selection, optional-library behavior, and synchronization are
+    owned by the selected kernel implementation.
+    """
+    try:
+        kernel = select_kernel(
+            "attention",
+            "dsv4_warmup",
+            format_signature(),
+            traits={},
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return
+    kernel(
+        hidden_size=hidden_size,
+        num_attention_heads=num_attention_heads,
+        head_dim=head_dim,
+        hc_mult=hc_mult,
+        kv_lora_rank=kv_lora_rank,
+        index_n_heads=index_n_heads,
+        index_head_dim=index_head_dim,
+        indexer_cache_block_size=indexer_cache_block_size,
+        max_decode_tokens=max_decode_tokens,
+        mxfp4_block_size=mxfp4_block_size,
+        tp_size=tp_size,
+        max_tokens=max_tokens,
+        device=device,
     )
 
 

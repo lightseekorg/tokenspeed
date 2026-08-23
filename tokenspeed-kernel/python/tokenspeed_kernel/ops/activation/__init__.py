@@ -54,4 +54,69 @@ def silu_and_mul(
     return flashinfer_silu_and_mul(x, out, enable_pdl=enable_pdl)
 
 
-__all__ = ["add3", "silu_and_mul", "situ_and_mul"]
+def prepare_fp8_linear_activation(
+    plan: object,
+    x: torch.Tensor,
+    *,
+    activation: str,
+    limit: float | None = None,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Prepare an activation for a compatible block-FP8 linear plan.
+
+    The prepared linear implementation decides whether it can fuse activation
+    and quantization. ``None`` means the caller must evaluate the activation
+    normally and invoke the linear operation through its ordinary path.
+
+    Args:
+        plan: Opaque plan returned by the GEMM layer's ``prepare_fp8_linear``.
+        x: Input to the activation.
+        activation: Semantic activation name, currently ``"swiglu"``.
+        limit: Optional activation clamp limit.
+        alpha: Sigmoid multiplier for SwiGLU.
+        beta: Value added to SwiGLU's up branch.
+        enable_pdl: Join a Programmatic Dependent Launch chain when supported.
+
+    Returns:
+        Prepared FP8 values and scales, or ``None`` when no fused contract is
+        available.
+    """
+    from tokenspeed_kernel.ops.gemm.fp8_linear import _fp8_linear_activation
+
+    return _fp8_linear_activation(
+        plan,
+        x,
+        activation=activation,
+        limit=limit,
+        alpha=alpha,
+        beta=beta,
+        enable_pdl=enable_pdl,
+    )
+
+
+def prepared_fp8_linear_supports_activation(plan: object, activation: str) -> bool:
+    """Return whether a prepared FP8 linear accepts an activation boundary.
+
+    Args:
+        plan: Opaque plan returned by the GEMM layer's ``prepare_fp8_linear``.
+        activation: Semantic activation name, such as ``"swiglu"``.
+
+    Returns:
+        Whether the prepared implementation supports fused activation input.
+    """
+    from tokenspeed_kernel.ops.gemm.fp8_linear import (
+        _fp8_linear_supports_activation,
+    )
+
+    return _fp8_linear_supports_activation(plan, activation)
+
+
+__all__ = [
+    "add3",
+    "prepare_fp8_linear_activation",
+    "prepared_fp8_linear_supports_activation",
+    "silu_and_mul",
+    "situ_and_mul",
+]
