@@ -63,7 +63,9 @@ from tokenspeed_kernel_amd._triton import gl, gluon, triton
 _CHUNK_SIZE = 64
 _SUBCHUNK_SIZE = 16
 _FUSED_PREPROCESS_WARPS = 8
-_SCAN_OUTPUT_BLOCK = 8
+# The scan accumulator is [BO, BT], so BO below the 16-row WMMA tile leaves
+# half of every instruction idle.
+_SCAN_OUTPUT_BLOCK = 16
 _SCAN_WAVES_PER_EU = 2
 _OUTPUT_WAVES_PER_EU = 4
 gfx1250 = gl.amd.gfx1250
