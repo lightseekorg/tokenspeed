@@ -54,7 +54,7 @@ _ScratchAllocator = Callable[..., list[torch.Tensor]]
 
 logger = logging.getLogger(__name__)
 
-_MAX_NUM_TOKENS = 16
+_MAX_NUM_TOKENS = 64
 _SKINNY_MAX_NUM_TOKENS = 5
 _MMA_TILER_MN = (64, 32)
 _GEMM_CLUSTER_MN = (1, 8)
