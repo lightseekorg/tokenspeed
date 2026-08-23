@@ -85,6 +85,26 @@ class NullLoadSnapshotPublisher:
         return None
 
 
+class DirectLoadSnapshotSink:
+    """Project shared observations onto the next direct-ZMQ output batch."""
+
+    def __init__(self, set_load_snapshot: Callable[[int, int, int, int], None]) -> None:
+        self._set_load_snapshot = set_load_snapshot
+
+    def observe(self, values: _LoadValues) -> None:
+        num_running, num_waiting, num_active_pages, _, max_total_pages = values
+        self._set_load_snapshot(
+            num_running,
+            num_waiting,
+            num_active_pages,
+            max_total_pages,
+        )
+
+    @staticmethod
+    def close() -> None:
+        return None
+
+
 class LoadSnapshotPublisher:
     """Publish the newest scheduler load tuple from a private transport thread.
 

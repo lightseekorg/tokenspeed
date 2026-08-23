@@ -32,12 +32,12 @@ import struct
 import tempfile
 import threading
 from pathlib import Path
-from types import SimpleNamespace
 
 import msgspec
 import pytest
 import zmq
 
+from tokenspeed.runtime.engine import load_snapshot as load_snapshot_module
 from tokenspeed.runtime.engine import zmq_msgpack, zmq_wire
 from tokenspeed.runtime.engine.io_struct import (
     AbortReq,
@@ -530,29 +530,24 @@ def test_send_socket_next_output_uses_latest_load_snapshot():
     ) == (5, 6, 7, 8)
 
 
-def test_event_loop_load_snapshot_projects_active_pages_to_direct_output():
-    """The direct tail carries active pages, not cached/used pages."""
-    pytest.importorskip("tokenspeed_scheduler")
-    from tokenspeed.runtime.engine.event_loop import EventLoop
+def test_direct_load_snapshot_sink_maps_active_pages_without_transport():
+    """The direct sink ignores used pages and only updates the next batch."""
+    socket = _FakeOutputSocket()
+    sender = zmq_msgpack.MsgpackSendSocket(socket)
+    sink = load_snapshot_module.DirectLoadSnapshotSink(sender.set_load_snapshot)
 
-    published = []
-    projected = []
-    loop = EventLoop.__new__(EventLoop)
-    loop.load_snapshot_publisher = SimpleNamespace(
-        observe=lambda values: published.append(values)
-    )
-    loop.send_to_tokenizer = SimpleNamespace(
-        set_load_snapshot=lambda *values: projected.append(values)
-    )
-    loop.output_processor = SimpleNamespace(rid_to_state={"a": object(), "b": object()})
-    loop._scheduler_cache_geometry = SimpleNamespace(num_usable_pages=20)
+    sink.observe((5, 6, 7, 18, 20))
+    sink.close()
 
-    loop._observe_load_snapshot(
-        {"num_queue_reqs": 3, "num_active_pages": 4, "num_cached_pages": 17}
-    )
-
-    assert published == [(2, 3, 4, 17, 20)]
-    assert projected == [(2, 3, 4, 20)]
+    assert socket.sent == []
+    sender.send_pyobj(_make_batch_out())
+    output = _decode_last_slim_output(socket)
+    assert (
+        output.num_running,
+        output.num_waiting,
+        output.kv_active_pages,
+        output.kv_total_pages,
+    ) == (5, 6, 7, 20)
 
 
 def test_send_socket_engine_dead_sentinel():

@@ -350,12 +350,18 @@ def test_publisher_setup_failure_cleans_partial_resources_on_owner_thread(
 
 
 def test_event_loop_observation_projects_the_sampled_scheduler_values():
-    """The shared helper maps the existing sample without another query."""
+    """The shared helper makes one observation without consulting an adapter."""
     pytest.importorskip("tokenspeed_scheduler")
     from tokenspeed.runtime.engine.event_loop import EventLoop
 
+    class StandardObservationLoop(EventLoop):
+        def __getattribute__(self, name):
+            if name == "send_to_tokenizer":
+                raise AssertionError("standard observation consulted output adapter")
+            return super().__getattribute__(name)
+
     observed = []
-    loop = EventLoop.__new__(EventLoop)
+    loop = StandardObservationLoop.__new__(StandardObservationLoop)
     loop.load_snapshot_publisher = SimpleNamespace(
         observe=lambda values: observed.append(values)
     )
@@ -378,29 +384,46 @@ def test_event_loop_observation_projects_the_sampled_scheduler_values():
 
 
 @pytest.mark.parametrize(
-    ("attn_tp_rank", "zmq_msgpack", "should_publish"),
-    [(0, False, True), (1, False, False), (0, True, False)],
+    ("attn_tp_rank", "zmq_msgpack", "expected_sink"),
+    [
+        (0, False, "publisher"),
+        (1, False, "null"),
+        (0, True, "direct"),
+        (1, True, "null"),
+    ],
 )
-def test_event_loop_publisher_is_gated_to_standard_serving_tp0(
-    monkeypatch, attn_tp_rank, zmq_msgpack, should_publish
+def test_event_loop_selects_load_snapshot_sink_once_for_each_mode(
+    monkeypatch, attn_tp_rank, zmq_msgpack, expected_sink
 ):
-    """Non-TP0 and direct-ZMQ engines never open the internal PUSH socket."""
+    """Only standard TP0 opens PUSH; direct TP0 binds its output setter."""
     pytest.importorskip("tokenspeed_scheduler")
     from tokenspeed.runtime.engine import event_loop as event_loop_module
 
-    created = []
+    created_publishers = []
+    direct_setters = []
 
     class FakePublisher:
         def __init__(self, endpoint, dp_rank, heartbeat_interval):
-            created.append((endpoint, dp_rank, heartbeat_interval))
+            created_publishers.append((endpoint, dp_rank, heartbeat_interval))
 
         def observe(self, values):
-            raise AssertionError(values)
+            return None
 
         def close(self):
-            raise AssertionError("unused fake publisher was closed")
+            return None
+
+    class FakeDirectSink:
+        def __init__(self, setter):
+            direct_setters.append(setter)
+
+        def observe(self, values):
+            return None
+
+        def close(self):
+            return None
 
     monkeypatch.setattr(event_loop_module, "LoadSnapshotPublisher", FakePublisher)
+    monkeypatch.setattr(event_loop_module, "DirectLoadSnapshotSink", FakeDirectSink)
     loop = event_loop_module.EventLoop.__new__(event_loop_module.EventLoop)
     loop.attn_tp_rank = attn_tp_rank
     loop.dp_rank = 4
@@ -408,13 +431,20 @@ def test_event_loop_publisher_is_gated_to_standard_serving_tp0(
         zmq_msgpack=zmq_msgpack, load_watch_interval=0.25
     )
     loop.port_args = SimpleNamespace(metrics_ipc_name="tcp://metrics")
+    set_load_snapshot = lambda *values: None
+    loop.send_to_tokenizer = SimpleNamespace(set_load_snapshot=set_load_snapshot)
 
     loop._init_load_snapshot_publisher()
 
-    assert created == ([("tcp://metrics", 4, 0.25)] if should_publish else [])
-    if not should_publish:
-        loop.load_snapshot_publisher.observe(observed_tuple())
-        loop.load_snapshot_publisher.close()
+    assert created_publishers == (
+        [("tcp://metrics", 4, 0.25)] if expected_sink == "publisher" else []
+    )
+    assert direct_setters == ([set_load_snapshot] if expected_sink == "direct" else [])
+    if expected_sink == "null":
+        assert isinstance(
+            loop.load_snapshot_publisher,
+            event_loop_module.NullLoadSnapshotPublisher,
+        )
 
 
 def test_load_snapshot_is_immutable_and_positional():

@@ -40,6 +40,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
 from tokenspeed.runtime.engine.io_struct import IpcReceiver, IpcSender
 from tokenspeed.runtime.engine.load_snapshot import (
+    DirectLoadSnapshotSink,
     LoadSnapshotPublisher,
     NullLoadSnapshotPublisher,
 )
@@ -1094,16 +1095,18 @@ class EventLoop:
             self.send_to_tokenizer = _NullSender()
 
     def _init_load_snapshot_publisher(self) -> None:
-        if self.attn_tp_rank == 0 and not self.server_args.zmq_msgpack:
+        if self.attn_tp_rank != 0:
+            self.load_snapshot_publisher = NullLoadSnapshotPublisher()
+        elif self.server_args.zmq_msgpack:
+            self.load_snapshot_publisher = DirectLoadSnapshotSink(
+                self.send_to_tokenizer.set_load_snapshot
+            )
+        else:
             self.load_snapshot_publisher = LoadSnapshotPublisher(
                 self.port_args.metrics_ipc_name,
                 self.dp_rank,
                 self.server_args.load_watch_interval,
             )
-        else:
-            # Direct-ZMQ will project the observation onto ordinary output
-            # batches; it must not create this standard-serving PUSH socket.
-            self.load_snapshot_publisher = NullLoadSnapshotPublisher()
 
     def _init_msgpack_transport(self, context):
         """Complete the SMG startup handshake and return the wrapped msgpack
@@ -1530,18 +1533,6 @@ class EventLoop:
                 max_total_pages,
             )
         )
-        # Only direct-ZMQ attention TP0 exposes this setter. Its observation
-        # and output send run on this scheduler thread, so the adapter merely
-        # replaces a tuple; the snapshot rides the next ordinary output batch.
-        output_sink = getattr(self, "send_to_tokenizer", None)
-        set_direct_snapshot = getattr(output_sink, "set_load_snapshot", None)
-        if set_direct_snapshot is not None:
-            set_direct_snapshot(
-                num_running,
-                num_waiting,
-                num_active_pages,
-                max_total_pages,
-            )
 
     def _record_scheduler_iteration_metrics(
         self, stats: dict, num_iteration_tokens: int
