@@ -32,7 +32,7 @@ export C_INCLUDE_PATH="/usr/local/cuda/include/cccl"
 
 WORKSPACE=${WORKSPACE:-$(pwd)}
 CUDA_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda.txt"
-configure_b200v2_package_cache
+configure_package_cache
 
 # Wrap pip install in a retry loop. PyPI's CDN occasionally returns a
 # bad Content-Type for /simple/<pkg>/ pages (most recently observed for
@@ -221,6 +221,10 @@ fi
 FLASHINFER_PYTHON_SPEC="$(pin_version flashinfer-python)"
 if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
     FLASHINFER_VERSION="${FLASHINFER_PYTHON_SPEC##*==}"
+    case "${FLASHINFER_VERSION}" in
+        0.6.16) FLASHINFER_CUBIN_SHA256="6af91f9fdae7b6fd0282f891cbcae3416afdd2c4c14783649d04d1dd83cddee5" ;;
+        *) echo "No SHA256 pinned for flashinfer-cubin ${FLASHINFER_VERSION}" >&2; exit 1 ;;
+    esac
     # Nightlies version as X.Y.Z.devYYYYMMDD but tag as nightly-vX.Y.Z-YYYYMMDD,
     # and never reach PyPI, so their python wheel also comes from the release.
     FLASHINFER_RELEASE_BASE="https://github.com/flashinfer-ai/flashinfer/releases/download"
@@ -231,7 +235,7 @@ if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
         FLASHINFER_RELEASE_TAG="v${FLASHINFER_VERSION}"
     fi
     FLASHINFER_CUBIN_WHEEL_URL="${FLASHINFER_RELEASE_BASE}/${FLASHINFER_RELEASE_TAG}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl"
-    FLASHINFER_CUBIN_WHEEL_SOURCE="$(cache_remote_wheel "${FLASHINFER_CUBIN_WHEEL_URL}")"
+    FLASHINFER_CUBIN_WHEEL_SOURCE="$(cache_remote_wheel "${FLASHINFER_CUBIN_WHEEL_URL}" "${FLASHINFER_CUBIN_SHA256}")"
     echo "Force-reinstalling pinned FlashInfer Python: ${FLASHINFER_PYTHON_SPEC}"
     pip_install_with_retry pip3 install --break-system-packages \
         --force-reinstall --no-deps "${FLASHINFER_PYTHON_SPEC}"

@@ -41,6 +41,9 @@ from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
     tokenspeed_mla_prefill,
     warmup_compile_prefill,
 )
+from tokenspeed_kernel.ops.attention.triton.mla_write_locations import (
+    mla_write_locations,
+)
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -288,6 +291,17 @@ class CuteDSLMLABackend(AttentionBackend):
                 "MLA write location resolves to the null page 0 or a " "-1 table hole"
             )
 
+    def _maybe_debug_check_write_locations(
+        self, locations: torch.Tensor, page_size: int
+    ) -> None:
+        """Same check on absolute locations: the null page lies below one page."""
+        if not cache_debug_enabled() or locations.numel() == 0:
+            return
+        if not bool((locations >= page_size).all().item()):
+            raise RuntimeError(
+                "MLA write location resolves to the null page 0 or a " "-1 table hole"
+            )
+
     def _cache_decode_out_cache_loc(
         self,
         bs: int,
@@ -306,24 +320,16 @@ class CuteDSLMLABackend(AttentionBackend):
         of allocating a fresh tensor. No host sync on either path.
         """
         page_size = self.kernel_page_size
-        last = (seq_lens[:bs].to(torch.int64) - 1).clamp_min(0)
-        if q_len_per_req == 1:
-            pos = last.unsqueeze(1)
-        else:
-            steps = torch.arange(
-                1 - q_len_per_req, 1, device=seq_lens.device, dtype=torch.int64
-            )
-            pos = (last.unsqueeze(1) + steps).clamp_min(0)  # [bs, q_len]
-        page_idx = torch.div(pos, page_size, rounding_mode="floor")
-        pages = group_table[:bs].gather(1, page_idx)
-        self._maybe_debug_check_write_pages(pages)
-        locs = (
-            pages.clamp_min(0).to(torch.int64) * page_size + (pos % page_size)
-        ).reshape(-1)
-        if out is not None:
-            out[: bs * q_len_per_req].copy_(locs)
-            return out
-        return locs
+        locations = mla_write_locations(
+            seq_lens,
+            group_table,
+            page_size=page_size,
+            q_len_per_req=q_len_per_req,
+            batch_size=bs,
+            out=out,
+        )
+        self._maybe_debug_check_write_locations(locations, page_size)
+        return locations
 
     def _extend_out_cache_loc(
         self,

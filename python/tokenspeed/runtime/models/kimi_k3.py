@@ -1857,7 +1857,7 @@ class KimiLinearMoE(nn.Module):
                         else None
                     ),
                 )
-            routed_in = decode_gemv(hidden_states, self.routed_expert_down_proj.weight)
+            routed_in, _ = self.routed_expert_down_proj(hidden_states)
             if self._topk_ready is not None and fork._active:
                 self._topk_ready.wait(torch.cuda.current_stream())
             routed_partial = self._routed_experts(
@@ -2020,6 +2020,7 @@ class KimiLinearDecoderLayer(nn.Module):
         self._attn_split = False
         # True when the PREVIOUS layer precomputes our mlp-side block partial.
         self._mlp_split = False
+        self._dflash_attnres_capture_fallback = False
         # True when the NEXT layer folds our routed+shared residual accumulate
         # into its attn-side combine (we return the parts unsummed).
         self.comm_manager = CommManager(
@@ -2093,6 +2094,10 @@ class KimiLinearDecoderLayer(nn.Module):
         self, hidden_states: torch.Tensor, block_residual: torch.Tensor
     ) -> bool:
         # Split beats fused at decode: 47 us/step faster at bs = 8 (aux-stream partial).
+        if getattr(self, "_dflash_attnres_capture_fallback", False):
+            return False
+
+        # B1 already fuses the post-attention mix into the all-reduce.
         if hidden_states.shape[0] == 1:
             return False
 
@@ -2478,9 +2483,19 @@ class KimiLinearModel(nn.Module):
         # stream is captured for the draft. Populated by
         # ``set_dflash_layers_to_capture``; empty means no capture.
         self.layers_to_capture: list[int] = []
+        self.dflash_aux_stream: str = "prefix"
         self._dflash_incremental_callback = None
         self._dflash_slot_bufs = None
         self._dflash_capture_idx_map: dict[int, int] = {}
+
+    def _refresh_dflash_capture_fallback(self) -> None:
+        """Mark AttnRes consumers that need split execution."""
+        captured = set(self.layers_to_capture)
+        use_fallback = self.dflash_aux_stream == "attn_res"
+        for layer_idx, layer in enumerate(self.layers):
+            layer._dflash_attnres_capture_fallback = use_fallback and (
+                layer_idx - 1 in captured
+            )
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -2491,16 +2506,24 @@ class KimiLinearModel(nn.Module):
         prefix_sum: torch.Tensor,
         block_residual: torch.Tensor,
     ) -> torch.Tensor:
-        """Capture vLLM's completed-layer DSpark target stream.
+        """Capture the configured target stream after layer_idx."""
+        if self.dflash_aux_stream != "attn_res":
+            return prefix_sum.clone()
 
-        vLLM captures ``prefix_sum + hidden_states`` immediately after the
-        named layer. This implementation accumulates the layer output into
-        ``prefix_sum`` before returning from the layer, so that sum is already
-        represented by ``prefix_sum``. Clone because later layers may update
-        the same storage in place.
-        """
-        del layer_idx, block_residual
-        return prefix_sum.clone()
+        if layer_idx + 1 < len(self.layers):
+            consumer = self.layers[layer_idx + 1]
+            proj = consumer.self_attention_res_proj
+            norm = consumer.self_attention_res_norm
+            num_blocks = consumer.prev_valid_blocks
+        else:
+            proj = self.output_attn_res_proj
+            norm = self.output_attn_res_norm
+            num_blocks = ceil_div(
+                self.config.num_hidden_layers, self.config.attn_res_block_size
+            )
+
+        mixed = _apply_attn_res(prefix_sum, block_residual, proj, norm, num_blocks)
+        return prefix_sum.clone() if mixed is prefix_sum else mixed
 
     @torch.no_grad()
     def forward(
@@ -2632,6 +2655,29 @@ class KimiLinearForCausalLM(BaseCausalLM):
         }
         self.model._dflash_incremental_callback = incremental_callback
         self.model._dflash_slot_bufs = slot_bufs
+        self.model._refresh_dflash_capture_fallback()
+
+    def set_dflash_aux_hidden_stream(self, stream: str) -> None:
+        """Select which K3 residual stream the DFLASH/DSpark taps read."""
+        if stream not in ("prefix", "attn_res"):
+            raise ValueError(
+                f"Unknown DFLASH aux hidden stream {stream!r}; "
+                "expected 'prefix' or 'attn_res'."
+            )
+        if stream == "attn_res" and not getattr(
+            self.config, "attn_res_block_size", None
+        ):
+            raise ValueError(
+                "The 'attn_res' aux hidden stream needs a target with AttnRes "
+                "enabled (config.attn_res_block_size); this target has none."
+            )
+        self.model.dflash_aux_stream = stream
+        self.model._refresh_dflash_capture_fallback()
+        logger.info(
+            "DFLASH/DSpark target capture: layers=%s stream=%s",
+            tuple(self.model.layers_to_capture),
+            stream,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         """Load the ``model.*`` / ``lm_head.*`` text weights.
@@ -3019,6 +3065,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
             incremental_callback=incremental_callback,
             slot_bufs=slot_bufs,
         )
+
+    def set_dflash_aux_hidden_stream(self, stream: str) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "Kimi-K3 encoder-only mode cannot capture target hidden states."
+            )
+        self.language_model.set_dflash_aux_hidden_stream(stream)
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         if self.language_model is None:
