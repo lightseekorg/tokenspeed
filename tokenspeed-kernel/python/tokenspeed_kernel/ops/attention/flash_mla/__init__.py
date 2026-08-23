@@ -47,7 +47,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
 
 
 _decode_sched_meta_cache: dict[tuple, object] = {}
-_deepseek_v4_tile_meta_cache: dict[tuple, object] = {}
+_dsv4_tile_meta_cache: dict[tuple, object] = {}
 _query_workspace_cache: dict[tuple, torch.Tensor] = {}
 
 
@@ -177,7 +177,7 @@ def _get_decode_sched_meta(
     return meta
 
 
-def _get_deepseek_v4_tile_meta(q: torch.Tensor, selected_width: int) -> object:
+def _get_dsv4_tile_meta(q: torch.Tensor, selected_width: int) -> object:
     phase = "graph" if torch.cuda.is_current_stream_capturing() else "eager"
     key = (
         phase,
@@ -186,10 +186,10 @@ def _get_deepseek_v4_tile_meta(q: torch.Tensor, selected_width: int) -> object:
         tuple(q.shape),
         int(selected_width),
     )
-    meta = _deepseek_v4_tile_meta_cache.get(key)
+    meta = _dsv4_tile_meta_cache.get(key)
     if meta is None:
         meta = get_mla_metadata()[0]
-        _deepseek_v4_tile_meta_cache[key] = meta
+        _dsv4_tile_meta_cache[key] = meta
     return meta
 
 
@@ -302,8 +302,8 @@ if (
 
     @register_kernel(
         "attention",
-        "deepseek_v4_paged_selected_attention",
-        name="flashmla_deepseek_v4_paged_selected_attention",
+        "dsv4_paged_selected_attention",
+        name="flashmla_dsv4_paged_selected_attention",
         solution="flashmla",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
@@ -328,7 +328,7 @@ if (
         priority=Priority.PERFORMANT,
         tags={"nvidia", "paged_cache", "selected_attention"},
     )
-    def flashmla_deepseek_v4_paged_selected_attention(
+    def flashmla_dsv4_paged_selected_attention(
         q: torch.Tensor,
         swa_kv_cache: torch.Tensor,
         swa_slots: torch.Tensor,
@@ -360,7 +360,7 @@ if (
             block_table=None,
             cache_seqlens=None,
             head_dim_v=q.shape[-1],
-            tile_scheduler_metadata=_get_deepseek_v4_tile_meta(
+            tile_scheduler_metadata=_get_dsv4_tile_meta(
                 q_kernel,
                 swa_indices.shape[-1],
             ),
@@ -460,8 +460,8 @@ if (
 
     @register_kernel(
         "attention",
-        "deepseek_v4_selected_attention",
-        name="flashmla_deepseek_v4_selected_attention",
+        "dsv4_selected_attention",
+        name="flashmla_dsv4_selected_attention",
         solution="flashmla",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
@@ -483,7 +483,7 @@ if (
         },
         priority=Priority.PERFORMANT,
     )
-    def flashmla_deepseek_v4_selected_attention(
+    def flashmla_dsv4_selected_attention(
         q: torch.Tensor,
         kv: torch.Tensor,
         indices: torch.Tensor,

@@ -30,8 +30,8 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 @register_kernel(
     "moe",
-    "deepseek_v4_select_experts",
-    name="torch_deepseek_v4_select_experts",
+    "dsv4_select_experts",
+    name="torch_dsv4_select_experts",
     solution="torch",
     signatures=frozenset(
         format_signature(router_logits=dense_tensor_format(dtype))
@@ -40,7 +40,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
     priority=Priority.PORTABLE,
     tags={"portability", "reference", "routing"},
 )
-def torch_deepseek_v4_select_experts(
+def torch_dsv4_select_experts(
     router_logits: torch.Tensor,
     top_k: int,
     renormalize: bool,
@@ -80,4 +80,4 @@ def torch_deepseek_v4_select_experts(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32), scores
 
 
-__all__ = ["torch_deepseek_v4_select_experts"]
+__all__ = ["torch_dsv4_select_experts"]

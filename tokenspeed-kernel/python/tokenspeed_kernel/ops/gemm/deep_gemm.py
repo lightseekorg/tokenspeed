@@ -77,7 +77,7 @@ _DEEPSEEK_V4_GROUPED_SIGNATURES = frozenset(
 )
 
 
-def _deep_gemm_deepseek_v4_grouped_output_projection_weights(
+def _deep_gemm_dsv4_grouped_output_projection_weights(
     *,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -114,7 +114,7 @@ def _deep_gemm_deepseek_v4_grouped_output_projection_weights(
     )
 
 
-def _warmup_deep_gemm_deepseek_v4_grouped_output_projection(
+def _warmup_deep_gemm_dsv4_grouped_output_projection(
     *,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -172,8 +172,8 @@ if fp8_einsum is not None:
 
     @register_kernel(
         "gemm",
-        "deepseek_v4_grouped_output_projection",
-        name="deep_gemm_deepseek_v4_grouped_output_projection",
+        "dsv4_grouped_output_projection",
+        name="deep_gemm_dsv4_grouped_output_projection",
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
@@ -187,9 +187,9 @@ if fp8_einsum is not None:
         },
         priority=Priority.SPECIALIZED + 2,
         tags={"throughput"},
-        weight_preprocessor=_deep_gemm_deepseek_v4_grouped_output_projection_weights,
+        weight_preprocessor=_deep_gemm_dsv4_grouped_output_projection_weights,
     )
-    def deep_gemm_deepseek_v4_grouped_output_projection(
+    def deep_gemm_dsv4_grouped_output_projection(
         *,
         attention: torch.Tensor,
         positions: torch.Tensor,
@@ -205,11 +205,11 @@ if fp8_einsum is not None:
         tma_aligned_scales: bool,
         recipe: tuple[int, int, int],
     ) -> torch.Tensor:
-        from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
-            deepseek_v4_fused_inv_rope_fp8_quant,
+        from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+            dsv4_fused_inv_rope_fp8_quant,
         )
 
-        values, scales = deepseek_v4_fused_inv_rope_fp8_quant(
+        values, scales = dsv4_fused_inv_rope_fp8_quant(
             attention,
             positions,
             cos_sin_cache,
@@ -236,8 +236,8 @@ if fp8_einsum is not None:
         )
         return output
 
-    deep_gemm_deepseek_v4_grouped_output_projection._tokenspeed_warmup = (  # type: ignore[attr-defined]
-        _warmup_deep_gemm_deepseek_v4_grouped_output_projection
+    deep_gemm_dsv4_grouped_output_projection._tokenspeed_warmup = (  # type: ignore[attr-defined]
+        _warmup_deep_gemm_dsv4_grouped_output_projection
     )
 
 if fp8_gemm_nt is not None:

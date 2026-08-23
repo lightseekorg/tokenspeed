@@ -15,8 +15,8 @@ except ImportError:
 
 @register_kernel(
     "gemm",
-    "deepseek_v4_linear_fp32",
-    name="cuda_dsv3_deepseek_v4_linear_fp32",
+    "dsv4_linear_fp32",
+    name="cuda_dsv3_dsv4_linear_fp32",
     solution="cuda",
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(9, 0),
@@ -39,7 +39,7 @@ except ImportError:
     priority=Priority.SPECIALIZED,
     tags={"nvidia", "latency"},
 )
-def cuda_dsv3_deepseek_v4_linear_fp32(
+def cuda_dsv3_dsv4_linear_fp32(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
     enable_pdl: bool = False,
@@ -53,4 +53,4 @@ def cuda_dsv3_deepseek_v4_linear_fp32(
     )
 
 
-__all__ = ["cuda_dsv3_deepseek_v4_linear_fp32", "dsv3_router_gemm"]
+__all__ = ["cuda_dsv3_dsv4_linear_fp32", "dsv3_router_gemm"]

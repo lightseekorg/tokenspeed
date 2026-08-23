@@ -33,7 +33,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from functools import cached_property
 
-from tokenspeed_kernel import deepseek_v4_indexer_cache_format
+from tokenspeed_kernel import dsv4_indexer_cache_format
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
@@ -437,4 +437,4 @@ class DeepseekV4Recipe(CacheRecipe):
         else:
             configured = getattr(attention_config, "use_fp4_indexer_cache", None)
         requested = forced if forced is not None else configured
-        return deepseek_v4_indexer_cache_format(requested) == "mxfp4"
+        return dsv4_indexer_cache_format(requested) == "mxfp4"

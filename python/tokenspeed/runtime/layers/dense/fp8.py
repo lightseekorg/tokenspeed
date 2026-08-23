@@ -222,13 +222,15 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
                 layer.input_scale = None
             grouped_output_projection_plan = getattr(
-                layer, "_deepseek_v4_grouped_output_projection_plan", None
+                layer, "_dsv4_grouped_output_projection_plan", None
             )
             if grouped_output_projection_plan is not None:
-                layer.weight_scale_inv.data = tokenspeed_kernel.deepseek_v4_grouped_output_projection_process_weights(
-                    grouped_output_projection_plan,
-                    layer.weight.data,
-                    layer.weight_scale_inv.data,
+                layer.weight_scale_inv.data = (
+                    tokenspeed_kernel.dsv4_grouped_output_projection_process_weights(
+                        grouped_output_projection_plan,
+                        layer.weight.data,
+                        layer.weight_scale_inv.data,
+                    )
                 )
                 return
             layer._use_deep_gemm_fp8 = False

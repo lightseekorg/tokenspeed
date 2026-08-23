@@ -26,21 +26,14 @@ import math
 
 import torch
 from tokenspeed_kernel import (
-    deepseek_v4_build_dense_prefill_local_compressed_indices,
-    deepseek_v4_combine_dense_swa_indices,
-    deepseek_v4_combine_topk_swa_indices,
-    deepseek_v4_compressed_slot_mapping,
-    deepseek_v4_compute_global_topk_indices_and_lens,
-    deepseek_v4_csa_indexer_fp8_cache_insert,
-    deepseek_v4_decode_swa_indices_and_lens,
-    deepseek_v4_dequantize_and_gather_k_cache,
-    deepseek_v4_fused_csa_indexer_mxfp4_cache_insert,
-    deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4,
-    deepseek_v4_fused_inv_rope_fp8_quant,
-    deepseek_v4_fused_sparse_compress_cache_insert,
-    deepseek_v4_save_compressor_state,
-    deepseek_v4_swa_cache_insert,
-    write_deepseek_v4_indexer_mxfp4_cache_cuda,
+    dsv4_csa_indexer_fp8_cache_insert,
+    dsv4_fused_csa_indexer_mxfp4_cache_insert,
+    dsv4_fused_indexer_q_rope_hadamard_mxfp4,
+    dsv4_fused_inv_rope_fp8_quant,
+    dsv4_fused_sparse_compress_cache_insert,
+    dsv4_save_compressor_state,
+    dsv4_swa_cache_insert,
+    write_dsv4_indexer_mxfp4_cache_cuda,
 )
 from tokenspeed_kernel.ops.transform import hadamard_transform
 
@@ -60,14 +53,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
 )
 
 __all__ = (
-    "deepseek_v4_build_dense_prefill_local_compressed_indices",
-    "deepseek_v4_combine_dense_swa_indices",
-    "deepseek_v4_combine_topk_swa_indices",
-    "deepseek_v4_compressed_slot_mapping",
-    "deepseek_v4_compute_global_topk_indices_and_lens",
-    "deepseek_v4_decode_swa_indices_and_lens",
-    "deepseek_v4_dequantize_and_gather_k_cache",
-    "deepseek_v4_fused_inv_rope_fp8_quant",
+    "dsv4_fused_inv_rope_fp8_quant",
     "deepseek_v4_csa_compress_kv_cache_insert",
     "deepseek_v4_csa_indexer_cache_insert",
     "deepseek_v4_hca_compress_kv_cache_insert",
@@ -137,7 +123,7 @@ def fused_qnorm_rope_kv_insert(
     - positions: absolute token positions
     """
 
-    deepseek_v4_swa_cache_insert(
+    dsv4_swa_cache_insert(
         q=q,
         kv=kv,
         swa_kv_cache=swa_kv_cache_2d,
@@ -289,7 +275,7 @@ def deepseek_v4_prepare_indexer_q_mxfp4(
         raise ValueError(
             "deepseek_v4_prepare_indexer_q_mxfp4 only supports CUDA tensors."
         )
-    return deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4(
+    return dsv4_fused_indexer_q_rope_hadamard_mxfp4(
         index_q=index_q,
         positions=positions,
         cos_sin_cache=cos_sin_cache,
@@ -639,7 +625,7 @@ def save_deepseek_v4_compressor_state(
             "save_deepseek_v4_compressor_state only supports CUDA tensors."
         )
 
-    deepseek_v4_save_compressor_state(
+    dsv4_save_compressor_state(
         kv=kv,
         score=score,
         ape=ape,
@@ -719,7 +705,7 @@ def write_deepseek_v4_indexer_mxfp4_cache(
             "write_deepseek_v4_indexer_mxfp4_cache only supports CUDA tensors."
         )
     valid = torch.ones(num_actual, device=index_k.device, dtype=torch.bool)
-    write_deepseek_v4_indexer_mxfp4_cache_cuda(
+    write_dsv4_indexer_mxfp4_cache_cuda(
         index_k[:num_actual],
         cache_2d,
         slot_mapping[:num_actual],
@@ -1047,7 +1033,7 @@ def deepseek_v4_hca_compress_kv_cache_insert(
             "deepseek_v4_hca_compress_kv_cache_insert only supports CUDA tensors."
         )
 
-    deepseek_v4_fused_sparse_compress_cache_insert(
+    dsv4_fused_sparse_compress_cache_insert(
         state_cache=state_cache,
         token_to_req_indices=token_to_req_indices,
         positions=positions,
@@ -1125,7 +1111,7 @@ def deepseek_v4_csa_compress_kv_cache_insert(
             "deepseek_v4_csa_compress_kv_cache_insert only supports CUDA tensors."
         )
 
-    deepseek_v4_fused_sparse_compress_cache_insert(
+    dsv4_fused_sparse_compress_cache_insert(
         state_cache=state_cache,
         token_to_req_indices=token_to_req_indices,
         positions=positions,
@@ -1185,7 +1171,7 @@ def deepseek_v4_csa_indexer_cache_insert(
             "deepseek_v4_csa_indexer_cache_insert only supports CUDA tensors."
         )
     if use_fp4_cache:
-        deepseek_v4_fused_csa_indexer_mxfp4_cache_insert(
+        dsv4_fused_csa_indexer_mxfp4_cache_insert(
             state_cache=state_cache,
             token_to_req_indices=token_to_req_indices,
             positions=positions,
@@ -1203,7 +1189,7 @@ def deepseek_v4_csa_indexer_cache_insert(
         )
         return
 
-    deepseek_v4_csa_indexer_fp8_cache_insert(
+    dsv4_csa_indexer_fp8_cache_insert(
         state_cache=state_cache,
         token_to_req_indices=token_to_req_indices,
         positions=positions,

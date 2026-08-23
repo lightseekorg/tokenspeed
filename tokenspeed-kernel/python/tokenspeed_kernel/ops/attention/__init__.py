@@ -42,21 +42,21 @@ from tokenspeed_kernel.ops.attention.kda_utils import (
     KdaFusedDecodeResult,
     KdaPrefillResult,
 )
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
-    deepseek_v4_build_dense_prefill_local_compressed_indices,
-    deepseek_v4_combine_dense_swa_indices,
-    deepseek_v4_combine_topk_swa_indices,
-    deepseek_v4_compressed_slot_mapping,
-    deepseek_v4_compute_global_topk_indices_and_lens,
-    deepseek_v4_decode_swa_indices_and_lens,
-    deepseek_v4_dequantize_and_gather_k_cache,
-    deepseek_v4_fused_csa_indexer_mxfp4_cache_insert,
-    deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4,
-    deepseek_v4_fused_inv_rope_fp8_quant,
-    deepseek_v4_fused_sparse_compress_cache_insert,
-    deepseek_v4_indexer_decode_metadata_compute,
-    deepseek_v4_save_compressor_state,
-    write_deepseek_v4_indexer_mxfp4_cache_cuda,
+from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+    dsv4_build_dense_prefill_local_compressed_indices,
+    dsv4_combine_dense_swa_indices,
+    dsv4_combine_topk_swa_indices,
+    dsv4_compressed_slot_mapping,
+    dsv4_compute_global_topk_indices_and_lens,
+    dsv4_decode_swa_indices_and_lens,
+    dsv4_dequantize_and_gather_k_cache,
+    dsv4_fused_csa_indexer_mxfp4_cache_insert,
+    dsv4_fused_indexer_q_rope_hadamard_mxfp4,
+    dsv4_fused_inv_rope_fp8_quant,
+    dsv4_fused_sparse_compress_cache_insert,
+    dsv4_indexer_decode_metadata_compute,
+    dsv4_save_compressor_state,
+    write_dsv4_indexer_mxfp4_cache_cuda,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
@@ -173,27 +173,28 @@ __all__ = [
     "dsa_prefill_topk",
     "dsa_decode_topk",
     "dsa_plan",
-    "deepseek_v4_csa_indexer_fp8_cache_insert",
-    "deepseek_v4_build_dense_prefill_local_compressed_indices",
-    "deepseek_v4_combine_dense_swa_indices",
-    "deepseek_v4_combine_topk_swa_indices",
-    "deepseek_v4_compressed_slot_mapping",
-    "deepseek_v4_compute_global_topk_indices_and_lens",
-    "deepseek_v4_decode_swa_indices_and_lens",
-    "deepseek_v4_dequantize_and_gather_k_cache",
-    "deepseek_v4_fused_csa_indexer_mxfp4_cache_insert",
-    "deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4",
-    "deepseek_v4_fused_inv_rope_fp8_quant",
-    "deepseek_v4_fused_sparse_compress_cache_insert",
-    "deepseek_v4_indexer_decode_metadata_compute",
-    "deepseek_v4_indexer_cache_format",
-    "deepseek_v4_padded_heads",
-    "deepseek_v4_paged_selected_attention",
-    "deepseek_v4_save_compressor_state",
-    "deepseek_v4_selected_attention",
-    "deepseek_v4_supports_deep_gemm",
-    "deepseek_v4_swa_cache_insert",
-    "write_deepseek_v4_indexer_mxfp4_cache_cuda",
+    "dsv4_plan",
+    "dsv4_csa_indexer_fp8_cache_insert",
+    "dsv4_build_dense_prefill_local_compressed_indices",
+    "dsv4_combine_dense_swa_indices",
+    "dsv4_combine_topk_swa_indices",
+    "dsv4_compressed_slot_mapping",
+    "dsv4_compute_global_topk_indices_and_lens",
+    "dsv4_decode_swa_indices_and_lens",
+    "dsv4_dequantize_and_gather_k_cache",
+    "dsv4_fused_csa_indexer_mxfp4_cache_insert",
+    "dsv4_fused_indexer_q_rope_hadamard_mxfp4",
+    "dsv4_fused_inv_rope_fp8_quant",
+    "dsv4_fused_sparse_compress_cache_insert",
+    "dsv4_indexer_decode_metadata_compute",
+    "dsv4_indexer_cache_format",
+    "dsv4_padded_heads",
+    "dsv4_paged_selected_attention",
+    "dsv4_save_compressor_state",
+    "dsv4_selected_attention",
+    "dsv4_supports_deep_gemm",
+    "dsv4_swa_cache_insert",
+    "write_dsv4_indexer_mxfp4_cache_cuda",
     "msa_decode_with_kvcache",
     "msa_extend_with_kvcache",
     "attn_merge_state",
@@ -203,7 +204,7 @@ __all__ = [
 LSE_LN = math.log2(math.e)
 
 
-def deepseek_v4_indexer_cache_format(use_fp4: bool | None = None) -> str:
+def dsv4_indexer_cache_format(use_fp4: bool | None = None) -> str:
     """Resolve the DeepSeek V4 indexer cache format for this kernel platform.
 
     Args:
@@ -224,7 +225,7 @@ def deepseek_v4_indexer_cache_format(use_fp4: bool | None = None) -> str:
     )
 
 
-def deepseek_v4_padded_heads(num_local_heads: int) -> int:
+def dsv4_padded_heads(num_local_heads: int) -> int:
     """Return the local head extent required by DeepSeek V4 kernels.
 
     Args:
@@ -247,7 +248,7 @@ def deepseek_v4_padded_heads(num_local_heads: int) -> int:
     )
 
 
-def deepseek_v4_supports_deep_gemm() -> bool:
+def dsv4_supports_deep_gemm() -> bool:
     """Return whether V4 may select its optional DeepGEMM implementations."""
 
     return current_platform().is_nvidia
@@ -3205,7 +3206,7 @@ def mla_decode_with_kvcache(
 # ===-----------------------------------------------------------------------===#
 
 
-def deepseek_v4_swa_cache_insert(
+def dsv4_swa_cache_insert(
     q: torch.Tensor,
     kv: torch.Tensor,
     swa_kv_cache: torch.Tensor,
@@ -3312,7 +3313,7 @@ def deepseek_v4_swa_cache_insert(
     }
     kernel = select_kernel(
         "attention",
-        "deepseek_v4_swa_cache_insert",
+        "dsv4_swa_cache_insert",
         signature,
         traits=traits,
         override=override,
@@ -3330,14 +3331,14 @@ def deepseek_v4_swa_cache_insert(
     }
     ShapeCapture.get().record(
         "attention",
-        "deepseek_v4_swa_cache_insert",
+        "dsv4_swa_cache_insert",
         kernel.name,
         q.dtype,
         shape_params,
     )
     with kernel_scope(
         "attention",
-        "deepseek_v4_swa_cache_insert",
+        "dsv4_swa_cache_insert",
         q.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -3355,7 +3356,7 @@ def deepseek_v4_swa_cache_insert(
         )
 
 
-def deepseek_v4_csa_indexer_fp8_cache_insert(
+def dsv4_csa_indexer_fp8_cache_insert(
     state_cache: torch.Tensor,
     token_to_req_indices: torch.Tensor,
     positions: torch.Tensor,
@@ -3409,7 +3410,7 @@ def deepseek_v4_csa_indexer_fp8_cache_insert(
     }
     kernel = select_kernel(
         "attention",
-        "deepseek_v4_csa_indexer_fp8_cache_insert",
+        "dsv4_csa_indexer_fp8_cache_insert",
         signature,
         traits=traits,
         override=override,
@@ -3425,14 +3426,14 @@ def deepseek_v4_csa_indexer_fp8_cache_insert(
     }
     ShapeCapture.get().record(
         "attention",
-        "deepseek_v4_csa_indexer_fp8_cache_insert",
+        "dsv4_csa_indexer_fp8_cache_insert",
         kernel.name,
         state_cache.dtype,
         shape_params,
     )
     with kernel_scope(
         "attention",
-        "deepseek_v4_csa_indexer_fp8_cache_insert",
+        "dsv4_csa_indexer_fp8_cache_insert",
         state_cache.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -3455,7 +3456,7 @@ def deepseek_v4_csa_indexer_fp8_cache_insert(
         )
 
 
-def deepseek_v4_selected_attention(
+def dsv4_selected_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -3518,7 +3519,7 @@ def deepseek_v4_selected_attention(
     }
     kernel = select_kernel(
         "attention",
-        "deepseek_v4_selected_attention",
+        "dsv4_selected_attention",
         signature,
         traits=traits,
         solution=solution,
@@ -3533,14 +3534,14 @@ def deepseek_v4_selected_attention(
     }
     ShapeCapture.get().record(
         "attention",
-        "deepseek_v4_selected_attention",
+        "dsv4_selected_attention",
         kernel.name,
         q.dtype,
         shape_params,
     )
     with kernel_scope(
         "attention",
-        "deepseek_v4_selected_attention",
+        "dsv4_selected_attention",
         q.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -3556,7 +3557,7 @@ def deepseek_v4_selected_attention(
         )
 
 
-def deepseek_v4_paged_selected_attention(
+def dsv4_paged_selected_attention(
     q: torch.Tensor,
     swa_kv_cache: torch.Tensor,
     swa_slots: torch.Tensor,
@@ -3692,7 +3693,7 @@ def deepseek_v4_paged_selected_attention(
     }
     kernel = select_kernel(
         "attention",
-        "deepseek_v4_paged_selected_attention",
+        "dsv4_paged_selected_attention",
         signature,
         traits=traits,
         solution=solution,
@@ -3710,14 +3711,14 @@ def deepseek_v4_paged_selected_attention(
     }
     ShapeCapture.get().record(
         "attention",
-        "deepseek_v4_paged_selected_attention",
+        "dsv4_paged_selected_attention",
         kernel.name,
         q.dtype,
         shape_params,
     )
     with kernel_scope(
         "attention",
-        "deepseek_v4_paged_selected_attention",
+        "dsv4_paged_selected_attention",
         q.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -4259,6 +4260,55 @@ def dsa_decode_topk(
         return kernel(**kernel_kwargs)
 
 
+def _attention_plan(
+    operation: str,
+    *,
+    page_size: int,
+    seq_lens_2d: torch.Tensor,
+    out: object | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> object | None:
+    if seq_lens_2d.dtype != torch.int32:
+        seq_lens_2d = seq_lens_2d.to(torch.int32)
+    traits = {
+        "page_size": int(page_size),
+    }
+    signature = format_signature()
+    try:
+        kernel = select_kernel(
+            "attention",
+            operation,
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return None
+
+    shape_params = {
+        "batch_size": int(seq_lens_2d.shape[0]),
+        "tokens": int(seq_lens_2d.numel()),
+        "page_size": int(page_size),
+    }
+    ShapeCapture.get().record(
+        "attention", operation, kernel.name, seq_lens_2d.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        operation,
+        seq_lens_2d.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            seq_lens_2d=seq_lens_2d,
+            page_size=page_size,
+            out=out,
+        )
+
+
 def dsa_plan(
     *,
     page_size: int,
@@ -4281,44 +4331,45 @@ def dsa_plan(
         Opaque backend-owned plan object, or None when no selected backend needs
         an explicit plan.
     """
-    if seq_lens_2d.dtype != torch.int32:
-        seq_lens_2d = seq_lens_2d.to(torch.int32)
-    traits = {
-        "page_size": int(page_size),
-    }
-    signature = format_signature()
-    try:
-        kernel = select_kernel(
-            "attention",
-            "dsa_plan",
-            signature,
-            traits=traits,
-            solution=solution,
-            override=override,
-        )
-    except NoKernelFoundError:
-        return None
-
-    shape_params = {
-        "batch_size": int(seq_lens_2d.shape[0]),
-        "tokens": int(seq_lens_2d.numel()),
-        "page_size": int(page_size),
-    }
-    ShapeCapture.get().record(
-        "attention", "dsa_plan", kernel.name, seq_lens_2d.dtype, shape_params
-    )
-    with kernel_scope(
-        "attention",
+    return _attention_plan(
         "dsa_plan",
-        seq_lens_2d.dtype,
-        kernel_name=kernel.name,
-        **shape_params,
-    ):
-        return kernel(
-            seq_lens_2d=seq_lens_2d,
-            page_size=page_size,
-            out=out,
-        )
+        page_size=page_size,
+        seq_lens_2d=seq_lens_2d,
+        out=out,
+        override=override,
+        solution=solution,
+    )
+
+
+def dsv4_plan(
+    *,
+    page_size: int,
+    seq_lens_2d: torch.Tensor,
+    out: object | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> object | None:
+    """Build or refresh an opaque DeepSeek V4 decode-indexer plan.
+
+    Args:
+        page_size: Indexer KV-cache page size.
+        seq_lens_2d: Per-token context lengths shaped ``[tokens, 1]``.
+        out: Optional previously allocated plan object to refresh in place.
+        override: Optional exact kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Opaque backend-owned plan object, or None when the selected backend does
+        not require an explicit plan.
+    """
+    return _attention_plan(
+        "dsv4_plan",
+        page_size=page_size,
+        seq_lens_2d=seq_lens_2d,
+        out=out,
+        override=override,
+        solution=solution,
+    )
 
 
 # ===-----------------------------------------------------------------------===#

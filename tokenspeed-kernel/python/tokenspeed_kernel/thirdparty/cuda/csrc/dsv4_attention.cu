@@ -427,7 +427,7 @@ void launch_fused_qnorm_rope_kv_insert(
 
 }  // namespace
 
-void deepseek_v4_gather_paged_indexer_mxfp4_cache(TensorView kv_cache,
+void dsv4_gather_paged_indexer_mxfp4_cache(TensorView kv_cache,
                                                   TensorView values_out,
                                                   TensorView scales_out,
                                                   TensorView block_table,
@@ -519,11 +519,11 @@ void deepseek_v4_gather_paged_indexer_mxfp4_cache(TensorView kv_cache,
 
   cudaError_t status = cudaGetLastError();
   TVM_FFI_ICHECK(status == cudaSuccess)
-      << "deepseek_v4_gather_paged_indexer_mxfp4_cache failed: "
+      << "dsv4_gather_paged_indexer_mxfp4_cache failed: "
       << cudaGetErrorString(status);
 }
 
-void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+void fused_dsv4_qnorm_rope_kv_rope_quant_insert(
     TensorView q,
     TensorView kv,
     TensorView k_cache,
@@ -606,6 +606,6 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
 
   cudaError_t status = cudaGetLastError();
   TVM_FFI_ICHECK(status == cudaSuccess)
-      << "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert failed: "
+      << "fused_dsv4_qnorm_rope_kv_rope_quant_insert failed: "
       << cudaGetErrorString(status);
 }

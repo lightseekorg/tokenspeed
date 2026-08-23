@@ -1002,7 +1002,7 @@ def triton_bmm_fp8_blockscale(
     return C
 
 
-def _triton_deepseek_v4_grouped_output_projection_weights(
+def _triton_dsv4_grouped_output_projection_weights(
     *,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -1028,8 +1028,8 @@ def _triton_deepseek_v4_grouped_output_projection_weights(
 
 @register_kernel(
     "gemm",
-    "deepseek_v4_grouped_output_projection",
-    name="triton_deepseek_v4_grouped_output_projection",
+    "dsv4_grouped_output_projection",
+    name="triton_dsv4_grouped_output_projection",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
     signatures=frozenset(
@@ -1042,9 +1042,9 @@ def _triton_deepseek_v4_grouped_output_projection_weights(
     traits={},
     priority=Priority.PERFORMANT + 3,
     tags={"portability"},
-    weight_preprocessor=_triton_deepseek_v4_grouped_output_projection_weights,
+    weight_preprocessor=_triton_dsv4_grouped_output_projection_weights,
 )
-def triton_deepseek_v4_grouped_output_projection(
+def triton_dsv4_grouped_output_projection(
     *,
     attention: torch.Tensor,
     positions: torch.Tensor,
@@ -1064,11 +1064,11 @@ def triton_deepseek_v4_grouped_output_projection(
     del recipe
     if tma_aligned_scales:
         raise ValueError("the portable projection requires canonical scales")
-    from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
-        deepseek_v4_fused_inv_rope_fp8_quant,
+    from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+        dsv4_fused_inv_rope_fp8_quant,
     )
 
-    values, scales = deepseek_v4_fused_inv_rope_fp8_quant(
+    values, scales = dsv4_fused_inv_rope_fp8_quant(
         attention,
         positions,
         cos_sin_cache,

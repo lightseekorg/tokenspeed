@@ -30,8 +30,8 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 @register_kernel(
     "gemm",
-    "deepseek_v4_linear_fp32",
-    name="torch_deepseek_v4_linear_fp32",
+    "dsv4_linear_fp32",
+    name="torch_dsv4_linear_fp32",
     solution="torch",
     signatures=frozenset(
         format_signature(
@@ -44,7 +44,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
     priority=Priority.PORTABLE,
     tags={"portability", "reference"},
 )
-def torch_deepseek_v4_linear_fp32(
+def torch_dsv4_linear_fp32(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
     enable_pdl: bool = False,
@@ -54,4 +54,4 @@ def torch_deepseek_v4_linear_fp32(
     return F.linear(hidden_states.float(), weight.float())
 
 
-__all__ = ["torch_deepseek_v4_linear_fp32"]
+__all__ = ["torch_dsv4_linear_fp32"]

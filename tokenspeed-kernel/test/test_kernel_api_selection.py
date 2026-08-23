@@ -40,7 +40,7 @@ import tokenspeed_kernel
 import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
-import tokenspeed_kernel.ops.attention.cuda.deepseek_v4 as _attention_cuda_deepseek_v4
+import tokenspeed_kernel.ops.attention.cuda.dsv4 as _attention_cuda_dsv4
 import tokenspeed_kernel.ops.attention.flash_attn as _attention_flash_attn
 import tokenspeed_kernel.ops.attention.flash_mla as _attention_flash_mla
 import tokenspeed_kernel.ops.attention.flashinfer as _attention_flashinfer
@@ -50,7 +50,7 @@ import tokenspeed_kernel.ops.attention.triton as _attention_triton
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.cuda as _gemm_cuda
 import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
-import tokenspeed_kernel.ops.gemm.deepseek_v4 as _gemm_deepseek_v4
+import tokenspeed_kernel.ops.gemm.dsv4 as _gemm_dsv4
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
@@ -62,10 +62,10 @@ import tokenspeed_kernel.ops.mhc.triton as _mhc_triton
 import tokenspeed_kernel.ops.moe as _moe_pkg
 import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
 import tokenspeed_kernel.ops.moe.deep_gemm as _moe_deep_gemm
-import tokenspeed_kernel.ops.moe.deepseek_v4 as _moe_deepseek_v4
+import tokenspeed_kernel.ops.moe.dsv4 as _moe_dsv4
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
-import tokenspeed_kernel.ops.moe.gluon.deepseek_v4 as _moe_gluon_deepseek_v4
+import tokenspeed_kernel.ops.moe.gluon.dsv4 as _moe_gluon_dsv4
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
@@ -76,13 +76,11 @@ import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
 import torch
 from tokenspeed_kernel.ops.attention.gdn_utils import GdnChunkPrefillResult
-from tokenspeed_kernel.ops.attention.triton import (
-    deepseek_v4 as _attention_triton_deepseek_v4,
-)
 from tokenspeed_kernel.ops.attention.triton import dsa as _attention_triton_dsa
 from tokenspeed_kernel.ops.attention.triton import (
     dsa_topk as _attention_triton_dsa_topk,
 )
+from tokenspeed_kernel.ops.attention.triton import dsv4 as _attention_triton_dsv4
 from tokenspeed_kernel.ops.attention.triton import (
     gated_delta_rule as _attention_triton_gdn,
 )
@@ -126,7 +124,7 @@ _moe_pytorch = importlib.import_module("tokenspeed_kernel.ops.moe.pytorch")
 
 _RELOAD_MODULES = [
     # Attention registration modules.
-    _attention_cuda_deepseek_v4,
+    _attention_cuda_dsv4,
     _attention_cuda,
     _attention_flash_attn,
     _attention_flash_mla,
@@ -139,7 +137,7 @@ _RELOAD_MODULES = [
     _attention_triton_mla_decode,
     _attention_triton_rel_mha,
     _attention_triton_merge_state,
-    _attention_triton_deepseek_v4,
+    _attention_triton_dsv4,
     _attention_triton_dsa,
     _attention_triton_dsa_topk,
     _attention_triton_gdn,
@@ -149,7 +147,7 @@ _RELOAD_MODULES = [
     _gemm_reference,
     _gemm_cuda,
     _gemm_deep_gemm,
-    _gemm_deepseek_v4,
+    _gemm_dsv4,
     _gemm_flashinfer,
     _gemm_gluon,
     _gemm_pytorch,
@@ -165,7 +163,7 @@ _RELOAD_MODULES = [
     _moe_cuda,
     _moe_deep_gemm_deepep_fp8,
     _moe_deep_gemm,
-    _moe_deepseek_v4,
+    _moe_dsv4,
     _moe_cutedsl_deepep_nvfp4,
     _moe_cutlass_fp8,
     _moe_cutlass_nvfp4,
@@ -176,7 +174,7 @@ _RELOAD_MODULES = [
     _moe_trtllm_nvfp4,
     _moe_trtllm_unquant,
     _moe_flashinfer,
-    _moe_gluon_deepseek_v4,
+    _moe_gluon_dsv4,
     _moe_gluon_mxfp4,
     _moe_gluon,
     _moe_pytorch,
@@ -219,18 +217,18 @@ def test_builtin_moe_preprocessor_links_are_callables():
     assert errors == []
 
 
-def test_deepseek_v4_padded_heads_platform_policy(
+def test_dsv4_padded_heads_platform_policy(
     mi350_platform: PlatformInfo,
     h100_platform: PlatformInfo,
 ) -> None:
     host_platform = Platform.get()
     try:
         Platform.override(mi350_platform)
-        assert tokenspeed_kernel.deepseek_v4_padded_heads(16) == 16
-        assert tokenspeed_kernel.deepseek_v4_padded_heads(32) == 32
+        assert tokenspeed_kernel.dsv4_padded_heads(16) == 16
+        assert tokenspeed_kernel.dsv4_padded_heads(32) == 32
         Platform.override(h100_platform)
-        assert tokenspeed_kernel.deepseek_v4_padded_heads(16) == 64
-        assert tokenspeed_kernel.deepseek_v4_padded_heads(65) == 128
+        assert tokenspeed_kernel.dsv4_padded_heads(16) == 64
+        assert tokenspeed_kernel.dsv4_padded_heads(65) == 128
     finally:
         Platform.override(host_platform)
 
@@ -310,11 +308,8 @@ def _is_nvidia(platform: PlatformInfo) -> bool:
     return platform.is_nvidia
 
 
-def _is_nvidia_with_deepseek_v4_cuda(platform: PlatformInfo) -> bool:
-    return (
-        platform.is_nvidia
-        and _attention_cuda_deepseek_v4.has_fused_qnorm_rope_kv_insert()
-    )
+def _is_nvidia_with_dsv4_cuda(platform: PlatformInfo) -> bool:
+    return platform.is_nvidia and _attention_cuda_dsv4.has_fused_qnorm_rope_kv_insert()
 
 
 def _is_nvidia_with_cute_dsl(platform: PlatformInfo) -> bool:
@@ -370,14 +365,14 @@ def _bmm_dense() -> torch.Tensor:
     return tokenspeed_kernel.bmm(a, b)
 
 
-def _deepseek_v4_linear_fp32() -> torch.Tensor:
+def _dsv4_linear_fp32() -> torch.Tensor:
     hidden_states = torch.empty((2, 4096), dtype=torch.bfloat16)
     weight = torch.empty((256, 4096), dtype=torch.bfloat16)
-    return tokenspeed_kernel.deepseek_v4_linear_fp32(hidden_states, weight)
+    return tokenspeed_kernel.dsv4_linear_fp32(hidden_states, weight)
 
 
 @pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16])
-def test_deepseek_v4_linear_fp32_torch_accumulates_in_fp32(
+def test_dsv4_linear_fp32_torch_accumulates_in_fp32(
     weight_dtype: torch.dtype,
 ) -> None:
     hidden_states = torch.tensor(
@@ -389,10 +384,10 @@ def test_deepseek_v4_linear_fp32_torch_accumulates_in_fp32(
         dtype=weight_dtype,
     )
 
-    actual = tokenspeed_kernel.deepseek_v4_linear_fp32(
+    actual = tokenspeed_kernel.dsv4_linear_fp32(
         hidden_states,
         weight,
-        override="torch_deepseek_v4_linear_fp32",
+        override="torch_dsv4_linear_fp32",
     )
     expected = hidden_states.float() @ weight.float().T
 
@@ -1215,13 +1210,13 @@ def _attention_dsa_decode() -> object:
     )
 
 
-def _attention_deepseek_v4_selected(width: int = 640) -> object:
+def _attention_dsv4_selected(width: int = 640) -> object:
     q = torch.empty((1, 16, 512), dtype=torch.bfloat16)
     kv = torch.empty((width, 512), dtype=torch.bfloat16)
     indices = torch.arange(width, dtype=torch.int32).unsqueeze(0)
     lens = torch.tensor([width], dtype=torch.int32)
     attn_sink = torch.empty((16,), dtype=torch.float32)
-    return tokenspeed_kernel.deepseek_v4_selected_attention(
+    return tokenspeed_kernel.dsv4_selected_attention(
         q,
         kv,
         indices,
@@ -1231,14 +1226,14 @@ def _attention_deepseek_v4_selected(width: int = 640) -> object:
     )
 
 
-def _attention_deepseek_v4_selected_short() -> object:
-    return _attention_deepseek_v4_selected(128)
+def _attention_dsv4_selected_short() -> object:
+    return _attention_dsv4_selected(128)
 
 
-def _attention_deepseek_v4_selected_i64() -> object:
+def _attention_dsv4_selected_i64() -> object:
     q = torch.empty((1, 16, 512), dtype=torch.bfloat16)
     kv = torch.empty((640, 512), dtype=torch.bfloat16)
-    return tokenspeed_kernel.deepseek_v4_selected_attention(
+    return tokenspeed_kernel.dsv4_selected_attention(
         q,
         kv,
         torch.arange(640, dtype=torch.int32).unsqueeze(0),
@@ -1248,7 +1243,7 @@ def _attention_deepseek_v4_selected_i64() -> object:
     )
 
 
-def _attention_deepseek_v4_paged_selected(with_extra: bool = True) -> object:
+def _attention_dsv4_paged_selected(with_extra: bool = True) -> object:
     q = torch.empty((2, 16, 512), dtype=torch.bfloat16)
     swa_cache = torch.empty((2, 64 * 584), dtype=torch.uint8)
     swa_slots = torch.empty((2, 256), dtype=torch.int32)
@@ -1262,7 +1257,7 @@ def _attention_deepseek_v4_paged_selected(with_extra: bool = True) -> object:
             "extra_lens": torch.empty((2,), dtype=torch.int32),
             "extra_page_size": 64,
         }
-    return tokenspeed_kernel.deepseek_v4_paged_selected_attention(
+    return tokenspeed_kernel.dsv4_paged_selected_attention(
         q=q,
         swa_kv_cache=swa_cache,
         swa_slots=swa_slots,
@@ -1274,11 +1269,11 @@ def _attention_deepseek_v4_paged_selected(with_extra: bool = True) -> object:
     )
 
 
-def _attention_deepseek_v4_paged_selected_swa_only() -> object:
-    return _attention_deepseek_v4_paged_selected(with_extra=False)
+def _attention_dsv4_paged_selected_swa_only() -> object:
+    return _attention_dsv4_paged_selected(with_extra=False)
 
 
-def _attention_deepseek_v4_paged_selected_pro_tp8() -> object:
+def _attention_dsv4_paged_selected_pro_tp8() -> object:
     tokens = 6
     q = torch.empty((tokens, 16, 512), dtype=torch.bfloat16)
     swa_cache = torch.empty((2, 64 * 584), dtype=torch.uint8)
@@ -1288,7 +1283,7 @@ def _attention_deepseek_v4_paged_selected_pro_tp8() -> object:
     extra_slots = torch.empty((tokens, 1024), dtype=torch.int32)
     extra_lens = torch.empty((tokens,), dtype=torch.int32)
     attn_sink = torch.empty((16,), dtype=torch.float32)
-    return tokenspeed_kernel.deepseek_v4_paged_selected_attention(
+    return tokenspeed_kernel.dsv4_paged_selected_attention(
         q=q,
         swa_kv_cache=swa_cache,
         swa_slots=swa_slots,
@@ -1303,9 +1298,9 @@ def _attention_deepseek_v4_paged_selected_pro_tp8() -> object:
     )
 
 
-def _attention_deepseek_v4_paged_selected_pro_tp8_i64() -> object:
+def _attention_dsv4_paged_selected_pro_tp8_i64() -> object:
     tokens = 6
-    return tokenspeed_kernel.deepseek_v4_paged_selected_attention(
+    return tokenspeed_kernel.dsv4_paged_selected_attention(
         q=torch.empty((tokens, 16, 512), dtype=torch.bfloat16),
         swa_kv_cache=torch.empty((2, 64 * 584), dtype=torch.uint8),
         swa_slots=torch.empty((tokens, 128), dtype=torch.int32),
@@ -1320,7 +1315,7 @@ def _attention_deepseek_v4_paged_selected_pro_tp8_i64() -> object:
     )
 
 
-def _attention_deepseek_v4_swa_cache_insert() -> object:
+def _attention_dsv4_swa_cache_insert() -> object:
     q = torch.empty((1, 2, 512), dtype=torch.bfloat16)
     kv = torch.empty((1, 512), dtype=torch.bfloat16)
     cache = torch.empty((1, 64 * 584), dtype=torch.uint8)
@@ -1328,7 +1323,7 @@ def _attention_deepseek_v4_swa_cache_insert() -> object:
     positions = torch.zeros((1,), dtype=torch.int64)
     cos_sin_cache = torch.empty((1, 64), dtype=torch.float32)
     q_out = torch.empty_like(q)
-    return tokenspeed_kernel.deepseek_v4_swa_cache_insert(
+    return tokenspeed_kernel.dsv4_swa_cache_insert(
         q,
         kv,
         cache,
@@ -2402,10 +2397,10 @@ def _moe_apply_unquant_trtllm() -> object:
     )
 
 
-def _deepseek_v4_select_experts_bias() -> object:
+def _dsv4_select_experts_bias() -> object:
     router_logits = torch.empty((2, 256), dtype=torch.float32)
     correction_bias = torch.empty((256,), dtype=torch.float32)
-    return tokenspeed_kernel.deepseek_v4_select_experts(
+    return tokenspeed_kernel.dsv4_select_experts(
         router_logits,
         6,
         True,
@@ -2414,11 +2409,11 @@ def _deepseek_v4_select_experts_bias() -> object:
     )
 
 
-def _deepseek_v4_select_experts_hash() -> object:
+def _dsv4_select_experts_hash() -> object:
     router_logits = torch.empty((2, 384), dtype=torch.bfloat16)
     hash_indices_table = torch.zeros((8, 6), dtype=torch.int32)
     input_ids = torch.zeros((2,), dtype=torch.int64)
-    return tokenspeed_kernel.deepseek_v4_select_experts(
+    return tokenspeed_kernel.dsv4_select_experts(
         router_logits,
         6,
         True,
@@ -2847,9 +2842,9 @@ _CASES = [
         _is_hopper_plus_with_flashmla,
         "hopper-plus",
         "attention",
-        "deepseek_v4_paged_selected_attention",
-        "flashmla_deepseek_v4_paged_selected_attention",
-        _attention_deepseek_v4_paged_selected,
+        "dsv4_paged_selected_attention",
+        "flashmla_dsv4_paged_selected_attention",
+        _attention_dsv4_paged_selected,
         id_suffix="extra-segment",
     ),
     _case(
@@ -2885,12 +2880,12 @@ _CASES = [
         _attention_merge_state,
     ),
     _case(
-        _is_nvidia_with_deepseek_v4_cuda,
+        _is_nvidia_with_dsv4_cuda,
         "hopper",
         "attention",
-        "deepseek_v4_swa_cache_insert",
-        "cuda_deepseek_v4_swa_cache_insert",
-        _attention_deepseek_v4_swa_cache_insert,
+        "dsv4_swa_cache_insert",
+        "cuda_dsv4_swa_cache_insert",
+        _attention_dsv4_swa_cache_insert,
     ),
     _case(
         _is_blackwell_sm100,
@@ -2960,72 +2955,72 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
-        "deepseek_v4_paged_selected_attention",
-        "gluon_deepseek_v4_paged_selected_attention_split_gfx950",
-        _attention_deepseek_v4_paged_selected_pro_tp8,
+        "dsv4_paged_selected_attention",
+        "gluon_dsv4_paged_selected_attention_split_gfx950",
+        _attention_dsv4_paged_selected_pro_tp8,
         id_suffix="pro-tp8",
     ),
     _case(
         _is_cdna4,
         "cdna4",
         "attention",
-        "deepseek_v4_paged_selected_attention",
-        "triton_deepseek_v4_paged_selected_attention",
-        _attention_deepseek_v4_paged_selected_pro_tp8_i64,
+        "dsv4_paged_selected_attention",
+        "triton_dsv4_paged_selected_attention",
+        _attention_dsv4_paged_selected_pro_tp8_i64,
         id_suffix="pro-tp8-int64-metadata",
     ),
     _case(
         _is_cdna4,
         "cdna4",
         "attention",
-        "deepseek_v4_paged_selected_attention",
-        "triton_deepseek_v4_paged_selected_attention",
-        _attention_deepseek_v4_paged_selected,
+        "dsv4_paged_selected_attention",
+        "triton_dsv4_paged_selected_attention",
+        _attention_dsv4_paged_selected,
         id_suffix="extra-segment",
     ),
     _case(
         _is_cdna4,
         "cdna4",
         "attention",
-        "deepseek_v4_paged_selected_attention",
-        "triton_deepseek_v4_paged_selected_attention",
-        _attention_deepseek_v4_paged_selected_swa_only,
+        "dsv4_paged_selected_attention",
+        "triton_dsv4_paged_selected_attention",
+        _attention_dsv4_paged_selected_swa_only,
         id_suffix="swa-only",
     ),
     _case(
         _is_cdna4,
         "cdna4",
         "attention",
-        "deepseek_v4_selected_attention",
-        "gluon_deepseek_v4_selected_attention_gfx950",
-        _attention_deepseek_v4_selected,
+        "dsv4_selected_attention",
+        "gluon_dsv4_selected_attention_gfx950",
+        _attention_dsv4_selected,
         id_suffix="width640",
     ),
     _case(
         _is_cdna4,
         "cdna4",
         "attention",
-        "deepseek_v4_selected_attention",
-        "triton_deepseek_v4_selected_attention",
-        _attention_deepseek_v4_selected_i64,
+        "dsv4_selected_attention",
+        "triton_dsv4_selected_attention",
+        _attention_dsv4_selected_i64,
         id_suffix="width640-int64-metadata",
     ),
     _case(
         _is_cdna4,
         "cdna4",
         "attention",
-        "deepseek_v4_selected_attention",
-        "triton_deepseek_v4_selected_attention",
-        _attention_deepseek_v4_selected_short,
+        "dsv4_selected_attention",
+        "triton_dsv4_selected_attention",
+        _attention_dsv4_selected_short,
         id_suffix="width128",
     ),
     _case(
         _is_cdna4,
         "cdna4",
         "attention",
-        "deepseek_v4_swa_cache_insert",
-        "triton_deepseek_v4_swa_cache_insert",
-        _attention_deepseek_v4_swa_cache_insert,
+        "dsv4_swa_cache_insert",
+        "triton_dsv4_swa_cache_insert",
+        _attention_dsv4_swa_cache_insert,
     ),
     _case(
         _is_cdna4,
@@ -3538,17 +3533,17 @@ _CASES = [
         _is_hopper_plus,
         "hopper-plus",
         "gemm",
-        "deepseek_v4_linear_fp32",
-        "cuda_dsv3_deepseek_v4_linear_fp32",
-        _deepseek_v4_linear_fp32,
+        "dsv4_linear_fp32",
+        "cuda_dsv3_dsv4_linear_fp32",
+        _dsv4_linear_fp32,
     ),
     _case(
         _is_cdna4,
         "cdna4",
         "gemm",
-        "deepseek_v4_linear_fp32",
-        "torch_deepseek_v4_linear_fp32",
-        _deepseek_v4_linear_fp32,
+        "dsv4_linear_fp32",
+        "torch_dsv4_linear_fp32",
+        _dsv4_linear_fp32,
     ),
     # Quantization API x architecture golden cases.
     _case(
@@ -3597,27 +3592,27 @@ _CASES = [
         _is_hopper_plus,
         "hopper-plus",
         "moe",
-        "deepseek_v4_select_experts",
-        "cuda_deepseek_v4_select_experts",
-        _deepseek_v4_select_experts_bias,
+        "dsv4_select_experts",
+        "cuda_dsv4_select_experts",
+        _dsv4_select_experts_bias,
         id_suffix="bias",
     ),
     _case(
         _is_hopper_plus,
         "hopper-plus",
         "moe",
-        "deepseek_v4_select_experts",
-        "cuda_deepseek_v4_select_experts",
-        _deepseek_v4_select_experts_hash,
+        "dsv4_select_experts",
+        "cuda_dsv4_select_experts",
+        _dsv4_select_experts_hash,
         id_suffix="hash",
     ),
     _case(
         _is_cdna4,
         "cdna4",
         "moe",
-        "deepseek_v4_select_experts",
-        "gluon_deepseek_v4_select_experts_gfx950",
-        _deepseek_v4_select_experts_bias,
+        "dsv4_select_experts",
+        "gluon_dsv4_select_experts_gfx950",
+        _dsv4_select_experts_bias,
     ),
     _case(
         _is_hopper,
@@ -3785,7 +3780,7 @@ def selected_kernel_spy(monkeypatch):
         calls.append(self.name)
 
         if case.family == "gemm":
-            if case.mode == "deepseek_v4_linear_fp32":
+            if case.mode == "dsv4_linear_fp32":
                 hidden_states, weight = args[:2]
                 return torch.empty(
                     (*hidden_states.shape[:-1], weight.shape[0]),
@@ -3835,7 +3830,7 @@ def selected_kernel_spy(monkeypatch):
             )
 
         if case.family == "moe":
-            if case.mode == "deepseek_v4_select_experts":
+            if case.mode == "dsv4_select_experts":
                 router_logits, top_k = args[:2]
                 shape = (router_logits.shape[0], top_k)
                 return (

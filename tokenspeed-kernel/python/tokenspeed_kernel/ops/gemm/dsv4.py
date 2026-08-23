@@ -54,7 +54,7 @@ class _GroupedOutputProjectionPlan:
     execution_recipe: tuple[int, int, int]
 
 
-def deepseek_v4_grouped_output_projection_plan(
+def dsv4_grouped_output_projection_plan(
     *,
     input_dtype: torch.dtype,
     weight_dtype: torch.dtype,
@@ -126,7 +126,7 @@ def deepseek_v4_grouped_output_projection_plan(
     }
     kernel = select_kernel(
         "gemm",
-        "deepseek_v4_grouped_output_projection",
+        "dsv4_grouped_output_projection",
         signature,
         traits=traits,
         solution=solution,
@@ -169,13 +169,11 @@ def _require_grouped_output_projection_plan(
     plan: object,
 ) -> _GroupedOutputProjectionPlan:
     if not isinstance(plan, _GroupedOutputProjectionPlan):
-        raise TypeError(
-            "plan must be returned by deepseek_v4_grouped_output_projection_plan"
-        )
+        raise TypeError("plan must be returned by dsv4_grouped_output_projection_plan")
     return plan
 
 
-def deepseek_v4_grouped_output_projection_process_weights(
+def dsv4_grouped_output_projection_process_weights(
     plan: object,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -212,7 +210,7 @@ def deepseek_v4_grouped_output_projection_process_weights(
     )
 
 
-def deepseek_v4_grouped_output_projection(
+def dsv4_grouped_output_projection(
     plan: object,
     attention: torch.Tensor,
     positions: torch.Tensor,
@@ -264,14 +262,14 @@ def deepseek_v4_grouped_output_projection(
     kernel = typed_plan.kernel
     ShapeCapture.get().record(
         "gemm",
-        "deepseek_v4_grouped_output_projection",
+        "dsv4_grouped_output_projection",
         kernel.name,
         attention.dtype,
         shape_params,
     )
     with kernel_scope(
         "gemm",
-        "deepseek_v4_grouped_output_projection",
+        "dsv4_grouped_output_projection",
         attention.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -293,7 +291,7 @@ def deepseek_v4_grouped_output_projection(
         )
 
 
-def deepseek_v4_grouped_output_projection_warmup(
+def dsv4_grouped_output_projection_warmup(
     plan: object,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -326,7 +324,7 @@ def deepseek_v4_grouped_output_projection_warmup(
     )
 
 
-def deepseek_v4_grouped_output_projection_warmup_model(
+def dsv4_grouped_output_projection_warmup_model(
     model: torch.nn.Module,
     max_tokens: int,
 ) -> None:
@@ -341,14 +339,14 @@ def deepseek_v4_grouped_output_projection_warmup_model(
     """
     seen: set[_GroupedOutputProjectionPlan] = set()
     for module in model.modules():
-        plan = getattr(module, "_deepseek_v4_grouped_output_projection_plan", None)
+        plan = getattr(module, "_dsv4_grouped_output_projection_plan", None)
         if plan is None:
             continue
         typed_plan = _require_grouped_output_projection_plan(plan)
         if typed_plan in seen:
             continue
         seen.add(typed_plan)
-        deepseek_v4_grouped_output_projection_warmup(
+        dsv4_grouped_output_projection_warmup(
             typed_plan,
             module.weight,
             module.weight_scale_inv,
@@ -356,7 +354,7 @@ def deepseek_v4_grouped_output_projection_warmup_model(
         )
 
 
-def deepseek_v4_linear_fp32(
+def dsv4_linear_fp32(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
     enable_pdl: bool = False,
@@ -399,7 +397,7 @@ def deepseek_v4_linear_fp32(
     )
     kernel = select_kernel(
         "gemm",
-        "deepseek_v4_linear_fp32",
+        "dsv4_linear_fp32",
         signature,
         traits=traits,
         override=override,
@@ -414,14 +412,14 @@ def deepseek_v4_linear_fp32(
     }
     ShapeCapture.get().record(
         "gemm",
-        "deepseek_v4_linear_fp32",
+        "dsv4_linear_fp32",
         kernel.name,
         hidden_states.dtype,
         shape_params,
     )
     with kernel_scope(
         "gemm",
-        "deepseek_v4_linear_fp32",
+        "dsv4_linear_fp32",
         hidden_states.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -430,10 +428,10 @@ def deepseek_v4_linear_fp32(
 
 
 __all__ = [
-    "deepseek_v4_grouped_output_projection",
-    "deepseek_v4_grouped_output_projection_plan",
-    "deepseek_v4_grouped_output_projection_process_weights",
-    "deepseek_v4_grouped_output_projection_warmup",
-    "deepseek_v4_grouped_output_projection_warmup_model",
-    "deepseek_v4_linear_fp32",
+    "dsv4_grouped_output_projection",
+    "dsv4_grouped_output_projection_plan",
+    "dsv4_grouped_output_projection_process_weights",
+    "dsv4_grouped_output_projection_warmup",
+    "dsv4_grouped_output_projection_warmup_model",
+    "dsv4_linear_fp32",
 ]

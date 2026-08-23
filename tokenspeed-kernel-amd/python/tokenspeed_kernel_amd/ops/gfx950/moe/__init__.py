@@ -20,8 +20,8 @@
 
 """gfx950 mixture-of-experts kernels."""
 
-from tokenspeed_kernel_amd.ops.gfx950.moe.deepseek_v4 import (
-    gluon_deepseek_v4_select_experts_gfx950,
+from tokenspeed_kernel_amd.ops.gfx950.moe.dsv4 import (
+    gluon_dsv4_select_experts_gfx950,
 )
 
-__all__ = ["gluon_deepseek_v4_select_experts_gfx950"]
+__all__ = ["gluon_dsv4_select_experts_gfx950"]

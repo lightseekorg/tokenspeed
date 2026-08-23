@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import tokenspeed_kernel.ops.attention.cuda.deepseek_v4  # noqa: F401
+import tokenspeed_kernel.ops.attention.cuda.dsv4  # noqa: F401
 import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,

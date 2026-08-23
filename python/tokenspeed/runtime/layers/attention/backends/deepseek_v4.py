@@ -17,19 +17,17 @@ from collections.abc import Mapping
 
 import torch
 from tokenspeed_kernel import (
-    deepseek_v4_indexer_decode_metadata_compute,
-    deepseek_v4_paged_selected_attention,
-    deepseek_v4_selected_attention,
-    deepseek_v4_supports_deep_gemm,
+    dsv4_build_dense_prefill_local_compressed_indices,
+    dsv4_combine_dense_swa_indices,
+    dsv4_combine_topk_swa_indices,
+    dsv4_compute_global_topk_indices_and_lens,
+    dsv4_decode_swa_indices_and_lens,
+    dsv4_dequantize_and_gather_k_cache,
+    dsv4_indexer_decode_metadata_compute,
+    dsv4_paged_selected_attention,
+    dsv4_plan,
+    dsv4_selected_attention,
 )
-
-try:
-    from tokenspeed_kernel.thirdparty import deep_gemm
-except Exception:
-    deep_gemm = None  # type: ignore[assignment]
-
-if not deepseek_v4_supports_deep_gemm():
-    deep_gemm = None  # type: ignore[assignment]
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -42,14 +40,6 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     V4_KERNEL_BLOCK_ROWS,
     first_v4_compressed_kv_group_id,
     v4_compressed_kv_group_id,
-)
-from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
-    deepseek_v4_build_dense_prefill_local_compressed_indices,
-    deepseek_v4_combine_dense_swa_indices,
-    deepseek_v4_combine_topk_swa_indices,
-    deepseek_v4_compute_global_topk_indices_and_lens,
-    deepseek_v4_decode_swa_indices_and_lens,
-    deepseek_v4_dequantize_and_gather_k_cache,
 )
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
@@ -153,7 +143,7 @@ def _refresh_decode_indexer_plan_cache(
             )
         if plan.max_context_len != derived_max_len:
             plan.max_context_len = derived_max_len
-        deepseek_v4_indexer_decode_metadata_compute(
+        dsv4_indexer_decode_metadata_compute(
             positions=positions,
             token_to_req_indices=token_to_req_indices,
             block_table=page_table,
@@ -183,11 +173,6 @@ def _refresh_decode_indexer_schedule_metadata(
 ) -> None:
     indexer_metadata = metadata.indexer
     if not indexer_metadata.decode_schedule_metadata_cache:
-        return
-    if deep_gemm is None:
-        return
-    get_metadata = getattr(deep_gemm, "get_paged_mqa_logits_metadata", None)
-    if get_metadata is None:
         return
     for (
         compress_ratio,
@@ -225,19 +210,12 @@ def _refresh_decode_indexer_schedule_metadata(
                     torch.zeros_like(compressed_lens),
                 )
             context_lens = compressed_lens.view(num_tokens, 1).contiguous()
-        refreshed = get_metadata(
-            context_lens,
-            cache_block_size,
-            deep_gemm.get_num_sms(),
+        refreshed = dsv4_plan(
+            seq_lens_2d=context_lens,
+            page_size=cache_block_size,
+            out=schedule_metadata,
         )
-        if (
-            schedule_metadata.shape == refreshed.shape
-            and schedule_metadata.device == refreshed.device
-            and schedule_metadata.dtype == refreshed.dtype
-        ):
-            with torch.inference_mode():
-                schedule_metadata.copy_(refreshed)
-        else:
+        if refreshed is not None and refreshed is not schedule_metadata:
             indexer_metadata.decode_schedule_metadata_cache[key] = refreshed
 
 
@@ -1194,7 +1172,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if cache_metadata.swa_page_table is None:
             raise RuntimeError("DeepSeek V4 missing cache-group block table for SWA KV")
         swa_page_table = cache_metadata.swa_page_table
-        indices, lens = deepseek_v4_decode_swa_indices_and_lens(
+        indices, lens = dsv4_decode_swa_indices_and_lens(
             query_start_loc=metadata.query_start_loc,
             seq_lens=metadata.seq_lens,
             token_to_req_indices=metadata.token_to_req_indices,
@@ -1256,7 +1234,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     topk_i64 - base_slots[:, None],
                     topk_i64,
                 ).to(topk_indices.dtype)
-            indices_2d, lens = deepseek_v4_compute_global_topk_indices_and_lens(
+            indices_2d, lens = dsv4_compute_global_topk_indices_and_lens(
                 topk_indices=topk_local,
                 token_to_req_indices=metadata.token_to_req_indices[:num_tokens],
                 block_table=page_table,
@@ -1361,7 +1339,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 device=positions.device,
             )
         out = self._prefill_dense_compressed_indices_buffer[: shape[0], : shape[1]]
-        return deepseek_v4_build_dense_prefill_local_compressed_indices(
+        return dsv4_build_dense_prefill_local_compressed_indices(
             positions=positions,
             compress_ratio=compress_ratio,
             width=width,
@@ -1441,7 +1419,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if compress_ratio > 1:
             compressed_cache_2d = token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id)
 
-        out = deepseek_v4_paged_selected_attention(
+        out = dsv4_paged_selected_attention(
             q=q_padded,
             swa_kv_cache=token_to_kv_pool.get_swa_kv_buffer(layer_id),
             swa_slots=swa_indices,
@@ -1620,7 +1598,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             compressed_table_capacity = (
                 compressed_page_table.shape[1] * compressed_block_size
             )
-            deepseek_v4_dequantize_and_gather_k_cache(
+            dsv4_dequantize_and_gather_k_cache(
                 out=kv_workspace,
                 cache_2d=compressed_cache,
                 seq_lens=compressed_lens,
@@ -1631,7 +1609,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 offset=0,
                 max_gather_len=compressed_base,
             )
-            deepseek_v4_dequantize_and_gather_k_cache(
+            dsv4_dequantize_and_gather_k_cache(
                 out=kv_workspace,
                 cache_2d=token_to_kv_pool.get_swa_kv_buffer(layer_id),
                 seq_lens=metadata.seq_lens,
@@ -1642,7 +1620,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 offset=compressed_base,
                 max_gather_len=max_gather_len,
             )
-            indices, lens = deepseek_v4_combine_topk_swa_indices(
+            indices, lens = dsv4_combine_topk_swa_indices(
                 topk_indices=topk_indices,
                 query_start_loc=metadata.query_start_loc,
                 seq_lens=metadata.seq_lens,
@@ -1682,7 +1660,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             compressed_table_capacity = (
                 compressed_page_table.shape[1] * compressed_block_size
             )
-            deepseek_v4_dequantize_and_gather_k_cache(
+            dsv4_dequantize_and_gather_k_cache(
                 out=kv_workspace,
                 cache_2d=compressed_cache,
                 seq_lens=compressed_lens,
@@ -1693,7 +1671,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 offset=0,
                 max_gather_len=compressed_base,
             )
-        deepseek_v4_dequantize_and_gather_k_cache(
+        dsv4_dequantize_and_gather_k_cache(
             out=kv_workspace,
             cache_2d=swa_cache,
             seq_lens=metadata.seq_lens,
@@ -1714,7 +1692,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compressed_block_size=compressed_block_size,
                 compressed_table_capacity=compressed_table_capacity,
             )
-            indices, lens = deepseek_v4_combine_topk_swa_indices(
+            indices, lens = dsv4_combine_topk_swa_indices(
                 topk_indices=dense_compressed_indices,
                 query_start_loc=metadata.query_start_loc,
                 seq_lens=metadata.seq_lens,
@@ -1730,7 +1708,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
             return kv_workspace, indices, lens
 
-        indices, lens = deepseek_v4_combine_dense_swa_indices(
+        indices, lens = dsv4_combine_dense_swa_indices(
             positions=positions,
             token_to_req_indices=metadata.token_to_req_indices[: positions.numel()],
             seq_lens=metadata.seq_lens,
@@ -1928,7 +1906,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 topk_indices=topk_indices,
             )
         with nvtx_range(f"attn_{kind}_prefill_selected_attention"):
-            out = deepseek_v4_selected_attention(
+            out = dsv4_selected_attention(
                 q=q_padded,
                 kv=kv_workspace,
                 indices=indices,

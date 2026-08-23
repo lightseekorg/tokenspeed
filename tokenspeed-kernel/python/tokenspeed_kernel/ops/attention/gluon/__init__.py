@@ -40,12 +40,6 @@ if current_platform().is_amd:
     _DSA_FULL_TOPK_WIDTHS = frozenset({512, 1024, 2048})
     _DSA_PREFILL_TOPK_WIDTHS = _DSA_FULL_TOPK_WIDTHS
 
-    from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4 import (
-        gluon_deepseek_v4_paged_selected_attention_split_gfx950 as _deepseek_v4_paged_selected_attention_split_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.deepseek_v4 import (
-        gluon_deepseek_v4_selected_attention_gfx950 as _deepseek_v4_selected_attention_impl,
-    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
         gluon_dsa_decode_gfx950 as _dsa_decode_impl,
     )
@@ -63,6 +57,12 @@ if current_platform().is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
         gluon_dsa_prefill_topk_standard_gfx950 as _dsa_prefill_topk_standard_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
+        gluon_dsv4_paged_selected_attention_split_gfx950 as _dsv4_paged_selected_attention_split_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
+        gluon_dsv4_selected_attention_gfx950 as _dsv4_selected_attention_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
         gluon_kda_fused_decode_gfx950 as _kda_fused_decode_impl,
@@ -169,8 +169,8 @@ if current_platform().is_amd:
 
     @register_kernel(
         "attention",
-        "deepseek_v4_paged_selected_attention",
-        name="gluon_deepseek_v4_paged_selected_attention_split_gfx950",
+        "dsv4_paged_selected_attention",
+        name="gluon_dsv4_paged_selected_attention_split_gfx950",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -203,13 +203,13 @@ if current_platform().is_amd:
         },
         tags={"amd", "gfx950", "paged_cache", "selected_attention"},
     )
-    def gluon_deepseek_v4_paged_selected_attention_split_gfx950(*args, **kwargs):
-        return _deepseek_v4_paged_selected_attention_split_impl(*args, **kwargs)
+    def gluon_dsv4_paged_selected_attention_split_gfx950(*args, **kwargs):
+        return _dsv4_paged_selected_attention_split_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
-        "deepseek_v4_selected_attention",
-        name="gluon_deepseek_v4_selected_attention_gfx950",
+        "dsv4_selected_attention",
+        name="gluon_dsv4_selected_attention_gfx950",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -234,8 +234,8 @@ if current_platform().is_amd:
         },
         tags={"amd", "gfx950", "selected_attention"},
     )
-    def gluon_deepseek_v4_selected_attention_gfx950(*args, **kwargs):
-        return _deepseek_v4_selected_attention_impl(*args, **kwargs)
+    def gluon_dsv4_selected_attention_gfx950(*args, **kwargs):
+        return _dsv4_selected_attention_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",

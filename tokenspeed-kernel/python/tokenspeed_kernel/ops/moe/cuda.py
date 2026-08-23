@@ -20,8 +20,8 @@ except ImportError:
 
 @register_kernel(
     "moe",
-    "deepseek_v4_select_experts",
-    name="cuda_deepseek_v4_select_experts",
+    "dsv4_select_experts",
+    name="cuda_dsv4_select_experts",
     solution="cuda",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=frozenset(
@@ -37,7 +37,7 @@ except ImportError:
     priority=Priority.SPECIALIZED,
     tags={"nvidia", "routing", "latency"},
 )
-def cuda_deepseek_v4_select_experts(
+def cuda_dsv4_select_experts(
     router_logits: torch.Tensor,
     top_k: int,
     renormalize: bool,
@@ -95,4 +95,4 @@ def cuda_deepseek_v4_select_experts(
     return topk_weights, topk_ids, scores
 
 
-__all__ = ["cuda_deepseek_v4_select_experts", "moe_finalize_fuse_shared"]
+__all__ = ["cuda_dsv4_select_experts", "moe_finalize_fuse_shared"]

@@ -18,7 +18,11 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
+from tokenspeed_kernel import (
+    dsv4_compute_global_topk_indices_and_lens,
+    dsv4_select_experts,
+)
+from tokenspeed_kernel.ops.attention.cuda.dsv4 import (
     has_indexer_topk_prefill,
     indexer_topk_prefill,
 )
@@ -74,9 +78,6 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     v4_compressed_kv_group_id,
     v4_compressor_state_group_id,
 )
-from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
-    deepseek_v4_compute_global_topk_indices_and_lens,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
     HybridDeepseekV4TokenToKVPool,
@@ -124,7 +125,6 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_routed_expert_quant_config,
     _DeepseekV4TopKBuffer,
     deepseek_v4_rope_config,
-    deepseek_v4_select_experts,
     hc_head,
     mhc_post,
     mhc_pre,
@@ -4717,7 +4717,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.equal(hca_lens, torch.tensor([2, 0], dtype=torch.int32)))
 
     def test_deepseek_v4_global_topk_cpu_masks_invalid_req_before_indexing(self):
-        indices, lens = deepseek_v4_compute_global_topk_indices_and_lens(
+        indices, lens = dsv4_compute_global_topk_indices_and_lens(
             topk_indices=torch.tensor([[0, 4], [0, 1]], dtype=torch.int32),
             token_to_req_indices=torch.tensor([0, 99], dtype=torch.int32),
             block_table=torch.tensor([[10]], dtype=torch.int32),
@@ -4870,7 +4870,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         with patch.object(
             deepseek_v4_backend,
-            "deepseek_v4_indexer_decode_metadata_compute",
+            "dsv4_indexer_decode_metadata_compute",
             side_effect=fake_compute,
         ):
             deepseek_v4_backend._refresh_decode_indexer_plan_cache(
@@ -4912,7 +4912,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         with patch.object(
             deepseek_v4_model,
-            "deepseek_v4_indexer_decode_metadata_compute",
+            "dsv4_indexer_decode_metadata_compute",
             side_effect=fake_compute,
         ):
             plan = _deepseek_v4_indexer_decode_plan(
@@ -4941,16 +4941,13 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_indexer_schedule_refresh_uses_decode_plan_lens(self):
         captured = {}
 
-        def fake_get_metadata(context_lens, cache_block_size, num_sms):
-            captured["context_lens"] = context_lens.clone()
-            captured["cache_block_size"] = cache_block_size
-            captured["num_sms"] = num_sms
-            return torch.full((2, 1), 9, dtype=torch.int32)
+        def fake_dsv4_plan(*, seq_lens_2d, page_size, out):
+            captured["context_lens"] = seq_lens_2d.clone()
+            captured["cache_block_size"] = page_size
+            captured["out"] = out
+            out.fill_(9)
+            return out
 
-        fake_deep_gemm = SimpleNamespace(
-            get_paged_mqa_logits_metadata=fake_get_metadata,
-            get_num_sms=lambda: 123,
-        )
         key = (4, 4, 2)
         metadata = _make_deepseek_v4_forward_metadata(
             page_size=64,
@@ -4972,7 +4969,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             dtype=torch.int32,
         )
 
-        with patch.object(deepseek_v4_backend, "deep_gemm", fake_deep_gemm):
+        with patch.object(deepseek_v4_backend, "dsv4_plan", side_effect=fake_dsv4_plan):
             deepseek_v4_backend._refresh_decode_indexer_schedule_metadata(metadata)
 
         self.assertTrue(
@@ -4981,7 +4978,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
         self.assertEqual(captured["cache_block_size"], 4)
-        self.assertEqual(captured["num_sms"], 123)
+        self.assertIs(
+            captured["out"], metadata.indexer.decode_schedule_metadata_cache[key]
+        )
         self.assertTrue(
             torch.equal(
                 metadata.indexer.decode_schedule_metadata_cache[key],
@@ -5297,7 +5296,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             patch.dict(global_server_args_dict, {"max_model_len": None}),
             patch.object(
                 deepseek_v4_model,
-                "deepseek_v4_indexer_decode_metadata_compute",
+                "dsv4_indexer_decode_metadata_compute",
                 fake_decode_metadata_compute,
             ),
         ):
@@ -5993,7 +5992,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         bias = torch.tensor([0.0, -0.4, 0.6, 0.0], dtype=torch.float32)
 
-        topk_weights, topk_ids, scores = deepseek_v4_select_experts(
+        topk_weights, topk_ids, scores = dsv4_select_experts(
             logits,
             top_k=2,
             renormalize=True,
@@ -6028,7 +6027,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             dtype=torch.int32,
         )
 
-        topk_weights, topk_ids, _ = deepseek_v4_select_experts(
+        topk_weights, topk_ids, _ = dsv4_select_experts(
             logits,
             top_k=2,
             renormalize=True,
@@ -6120,7 +6119,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         ).repeat(2, 1)
         bias = torch.linspace(0.25, -0.25, 256, device="cuda", dtype=torch.float32)
 
-        topk_weights, topk_ids, scores = deepseek_v4_select_experts(
+        topk_weights, topk_ids, scores = dsv4_select_experts(
             logits,
             top_k=6,
             renormalize=True,

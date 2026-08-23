@@ -26,10 +26,10 @@ from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 try:
-    from tokenspeed_kernel.thirdparty.cuda.deepseek_v4_attention import (
+    from tokenspeed_kernel.thirdparty.cuda.dsv4_attention import (
         fused_qnorm_rope_kv_insert as _fused_qnorm_rope_kv_insert,
     )
-    from tokenspeed_kernel.thirdparty.cuda.deepseek_v4_attention import (
+    from tokenspeed_kernel.thirdparty.cuda.dsv4_attention import (
         has_fused_qnorm_rope_kv_insert,
         has_indexer_mxfp4_paged_gather,
         has_indexer_topk_prefill,
@@ -62,8 +62,8 @@ if current_platform().is_nvidia and has_fused_qnorm_rope_kv_insert():
 
     @register_kernel(
         "attention",
-        "deepseek_v4_swa_cache_insert",
-        name="cuda_deepseek_v4_swa_cache_insert",
+        "dsv4_swa_cache_insert",
+        name="cuda_dsv4_swa_cache_insert",
         solution="cuda",
         capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
         signatures=frozenset(
@@ -84,7 +84,7 @@ if current_platform().is_nvidia and has_fused_qnorm_rope_kv_insert():
         priority=Priority.SPECIALIZED,
         tags={"nvidia", "cache_insert", "latency"},
     )
-    def cuda_deepseek_v4_swa_cache_insert(
+    def cuda_dsv4_swa_cache_insert(
         q: torch.Tensor,
         kv: torch.Tensor,
         swa_kv_cache: torch.Tensor,

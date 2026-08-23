@@ -28,7 +28,7 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl
 
 __all__ = [
-    "gluon_deepseek_v4_paged_selected_attention_split_gfx950",
+    "gluon_dsv4_paged_selected_attention_split_gfx950",
 ]
 
 
@@ -93,7 +93,7 @@ def _load_page_planar_tile(
 
 
 @gluon.jit
-def _deepseek_v4_paged_split_stage_kernel(
+def _dsv4_paged_split_stage_kernel(
     q,
     swa_cache_u8,
     swa_cache_fp8,
@@ -380,7 +380,7 @@ def _deepseek_v4_paged_split_stage_kernel(
 
 
 @gluon.jit
-def _deepseek_v4_paged_split_reduce_kernel(
+def _dsv4_paged_split_reduce_kernel(
     partial_out,
     partial_lse,
     attn_sink,
@@ -630,7 +630,7 @@ def _validate_paged_attention_inputs(
     return output, has_extra, scale
 
 
-def gluon_deepseek_v4_paged_selected_attention_split_gfx950(
+def gluon_dsv4_paged_selected_attention_split_gfx950(
     q: torch.Tensor,
     swa_kv_cache: torch.Tensor,
     swa_slots: torch.Tensor,
@@ -715,7 +715,7 @@ def gluon_deepseek_v4_paged_selected_attention_split_gfx950(
         dtype=torch.float32,
         device=q.device,
     )
-    _deepseek_v4_paged_split_stage_kernel[(tokens, num_heads // 16, 18)](
+    _dsv4_paged_split_stage_kernel[(tokens, num_heads // 16, 18)](
         q,
         swa_kv_cache,
         swa_kv_cache.view(torch.float8_e4m3fn),
@@ -754,7 +754,7 @@ def gluon_deepseek_v4_paged_selected_attention_split_gfx950(
         num_stages=1,
         waves_per_eu=1,
     )
-    _deepseek_v4_paged_split_reduce_kernel[(tokens, num_heads)](
+    _dsv4_paged_split_reduce_kernel[(tokens, num_heads)](
         partial_out,
         partial_lse,
         attn_sink,

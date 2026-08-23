@@ -34,13 +34,13 @@ import tokenspeed_kernel.ops.gemm.routed_gemv  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import torch
-from tokenspeed_kernel.ops.gemm.deepseek_v4 import (
-    deepseek_v4_grouped_output_projection,
-    deepseek_v4_grouped_output_projection_plan,
-    deepseek_v4_grouped_output_projection_process_weights,
-    deepseek_v4_grouped_output_projection_warmup,
-    deepseek_v4_grouped_output_projection_warmup_model,
-    deepseek_v4_linear_fp32,
+from tokenspeed_kernel.ops.gemm.dsv4 import (
+    dsv4_grouped_output_projection,
+    dsv4_grouped_output_projection_plan,
+    dsv4_grouped_output_projection_process_weights,
+    dsv4_grouped_output_projection_warmup,
+    dsv4_grouped_output_projection_warmup_model,
+    dsv4_linear_fp32,
 )
 from tokenspeed_kernel.ops.gemm.kimi3 import (
     kimi3_latent_projection,
@@ -70,12 +70,12 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "bmm",
-    "deepseek_v4_grouped_output_projection",
-    "deepseek_v4_grouped_output_projection_plan",
-    "deepseek_v4_grouped_output_projection_process_weights",
-    "deepseek_v4_grouped_output_projection_warmup",
-    "deepseek_v4_grouped_output_projection_warmup_model",
-    "deepseek_v4_linear_fp32",
+    "dsv4_grouped_output_projection",
+    "dsv4_grouped_output_projection_plan",
+    "dsv4_grouped_output_projection_process_weights",
+    "dsv4_grouped_output_projection_warmup",
+    "dsv4_grouped_output_projection_warmup_model",
+    "dsv4_linear_fp32",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
     "kimi3_latent_projection",

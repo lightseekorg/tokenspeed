@@ -54,7 +54,7 @@ def _routing_kind(
     return "plain"
 
 
-def deepseek_v4_select_experts(
+def dsv4_select_experts(
     router_logits: torch.Tensor,
     top_k: int,
     renormalize: bool,
@@ -135,7 +135,7 @@ def deepseek_v4_select_experts(
     signature = format_signature(router_logits=dense_tensor_format(router_logits.dtype))
     kernel = select_kernel(
         "moe",
-        "deepseek_v4_select_experts",
+        "dsv4_select_experts",
         signature,
         traits=traits,
         override=override,
@@ -151,7 +151,7 @@ def deepseek_v4_select_experts(
     }
     ShapeCapture.get().record(
         "moe",
-        "deepseek_v4_select_experts",
+        "dsv4_select_experts",
         kernel.name,
         router_logits.dtype,
         shape_params,
@@ -159,7 +159,7 @@ def deepseek_v4_select_experts(
     try:
         with kernel_scope(
             "moe",
-            "deepseek_v4_select_experts",
+            "dsv4_select_experts",
             router_logits.dtype,
             kernel_name=kernel.name,
             **shape_params,
@@ -181,7 +181,7 @@ def deepseek_v4_select_experts(
             raise
         fallback = select_kernel(
             "moe",
-            "deepseek_v4_select_experts",
+            "dsv4_select_experts",
             signature,
             traits=traits,
             solution="torch",
@@ -197,4 +197,4 @@ def deepseek_v4_select_experts(
         )
 
 
-__all__ = ["deepseek_v4_select_experts"]
+__all__ = ["dsv4_select_experts"]

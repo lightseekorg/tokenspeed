@@ -51,28 +51,28 @@ DEEPSEEK_V4_INDEXER_MXFP4_SCALE_DIM = (
 DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT = 128
 
 __all__ = [
-    "deepseek_v4_build_dense_prefill_local_compressed_indices",
-    "deepseek_v4_combine_dense_swa_indices",
-    "deepseek_v4_combine_topk_swa_indices",
-    "deepseek_v4_compressed_slot_mapping",
-    "deepseek_v4_compute_global_topk_indices_and_lens",
-    "deepseek_v4_decode_swa_indices_and_lens",
-    "deepseek_v4_dequantize_and_gather_k_cache",
-    "deepseek_v4_fused_csa_indexer_fp8_cache_insert",
-    "deepseek_v4_fused_csa_indexer_mxfp4_cache_insert",
-    "deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4",
-    "deepseek_v4_fused_qnorm_rope_kv_insert",
-    "deepseek_v4_fused_sparse_compress_cache_insert",
-    "deepseek_v4_gather_indexer_mxfp4_cache",
-    "deepseek_v4_indexer_decode_metadata_compute",
-    "deepseek_v4_save_compressor_state",
-    "deepseek_v4_sparse_attention",
-    "write_deepseek_v4_indexer_mxfp4_cache_cuda",
+    "dsv4_build_dense_prefill_local_compressed_indices",
+    "dsv4_combine_dense_swa_indices",
+    "dsv4_combine_topk_swa_indices",
+    "dsv4_compressed_slot_mapping",
+    "dsv4_compute_global_topk_indices_and_lens",
+    "dsv4_decode_swa_indices_and_lens",
+    "dsv4_dequantize_and_gather_k_cache",
+    "dsv4_fused_csa_indexer_fp8_cache_insert",
+    "dsv4_fused_csa_indexer_mxfp4_cache_insert",
+    "dsv4_fused_indexer_q_rope_hadamard_mxfp4",
+    "dsv4_fused_qnorm_rope_kv_insert",
+    "dsv4_fused_sparse_compress_cache_insert",
+    "dsv4_gather_indexer_mxfp4_cache",
+    "dsv4_indexer_decode_metadata_compute",
+    "dsv4_save_compressor_state",
+    "dsv4_sparse_attention",
+    "write_dsv4_indexer_mxfp4_cache_cuda",
 ]
 
 
 @triton.jit
-def _deepseek_v4_qnorm_rope_kv_insert_kernel(
+def _dsv4_qnorm_rope_kv_insert_kernel(
     q_ptr,
     q_out_ptr,
     kv_ptr,
@@ -235,8 +235,8 @@ def _deepseek_v4_qnorm_rope_kv_insert_kernel(
 
 @register_kernel(
     "attention",
-    "deepseek_v4_swa_cache_insert",
-    name="triton_deepseek_v4_swa_cache_insert",
+    "dsv4_swa_cache_insert",
+    name="triton_dsv4_swa_cache_insert",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=frozenset(
@@ -257,7 +257,7 @@ def _deepseek_v4_qnorm_rope_kv_insert_kernel(
     priority=Priority.PORTABLE,
     tags={"portability", "cache_insert"},
 )
-def deepseek_v4_fused_qnorm_rope_kv_insert(
+def dsv4_fused_qnorm_rope_kv_insert(
     q: torch.Tensor,
     kv: torch.Tensor,
     swa_kv_cache: torch.Tensor,
@@ -281,7 +281,7 @@ def deepseek_v4_fused_qnorm_rope_kv_insert(
     grid_tokens = max(num_q_tokens, num_insert)
     if grid_tokens == 0:
         return
-    _deepseek_v4_qnorm_rope_kv_insert_kernel[(grid_tokens, num_heads + 1)](
+    _dsv4_qnorm_rope_kv_insert_kernel[(grid_tokens, num_heads + 1)](
         q,
         q_destination,
         kv,
@@ -315,7 +315,7 @@ def deepseek_v4_fused_qnorm_rope_kv_insert(
 
 
 @triton.jit
-def _deepseek_v4_sparse_attention_kernel(
+def _dsv4_sparse_attention_kernel(
     q_ptr,
     kv_ptr,
     indices_ptr,
@@ -390,8 +390,8 @@ def _deepseek_v4_sparse_attention_kernel(
 
 @register_kernel(
     "attention",
-    "deepseek_v4_selected_attention",
-    name="triton_deepseek_v4_selected_attention",
+    "dsv4_selected_attention",
+    name="triton_dsv4_selected_attention",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=frozenset(
@@ -411,7 +411,7 @@ def _deepseek_v4_sparse_attention_kernel(
     priority=Priority.PORTABLE,
     tags={"portability"},
 )
-def deepseek_v4_sparse_attention(
+def dsv4_sparse_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -435,7 +435,7 @@ def deepseek_v4_sparse_attention(
         raise ValueError("attention sink must provide one value per query head")
 
     output = out if out is not None else torch.empty_like(q)
-    _deepseek_v4_sparse_attention_kernel[(q.shape[0], q.shape[1])](
+    _dsv4_sparse_attention_kernel[(q.shape[0], q.shape[1])](
         q,
         kv_2d,
         indices_2d,
@@ -461,7 +461,7 @@ def deepseek_v4_sparse_attention(
 
 
 @triton.jit
-def _deepseek_v4_dequantize_selected_cache_rows_kernel(
+def _dsv4_dequantize_selected_cache_rows_kernel(
     cache_ptr,
     slots_ptr,
     lens_ptr,
@@ -538,7 +538,7 @@ def _deepseek_v4_dequantize_selected_cache_rows_kernel(
         )
 
 
-def _deepseek_v4_dequantize_selected_cache_segment(
+def _dsv4_dequantize_selected_cache_segment(
     cache_2d: torch.Tensor,
     slots: torch.Tensor,
     lens: torch.Tensor,
@@ -558,9 +558,7 @@ def _deepseek_v4_dequantize_selected_cache_segment(
         raise ValueError("selected cache segment exceeds the output workspace")
     if slots_2d.numel() == 0:
         return
-    _deepseek_v4_dequantize_selected_cache_rows_kernel[
-        (slots_2d.shape[0], slots_2d.shape[1])
-    ](
+    _dsv4_dequantize_selected_cache_rows_kernel[(slots_2d.shape[0], slots_2d.shape[1])](
         cache_2d,
         slots_2d,
         lens_1d,
@@ -591,8 +589,8 @@ def _deepseek_v4_dequantize_selected_cache_segment(
 
 @register_kernel(
     "attention",
-    "deepseek_v4_paged_selected_attention",
-    name="triton_deepseek_v4_paged_selected_attention",
+    "dsv4_paged_selected_attention",
+    name="triton_dsv4_paged_selected_attention",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=frozenset(
@@ -614,7 +612,7 @@ def _deepseek_v4_dequantize_selected_cache_segment(
     priority=Priority.PORTABLE,
     tags={"portability", "paged_cache", "selected_attention"},
 )
-def triton_deepseek_v4_paged_selected_attention(
+def triton_dsv4_paged_selected_attention(
     q: torch.Tensor,
     swa_kv_cache: torch.Tensor,
     swa_slots: torch.Tensor,
@@ -629,7 +627,7 @@ def triton_deepseek_v4_paged_selected_attention(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compose page-planar dequantization with registered dense attention."""
-    from tokenspeed_kernel.ops.attention import deepseek_v4_selected_attention
+    from tokenspeed_kernel.ops.attention import dsv4_selected_attention
 
     tokens = q.shape[0]
     swa_width = swa_slots.numel() // tokens
@@ -644,7 +642,7 @@ def triton_deepseek_v4_paged_selected_attention(
         (tokens, workspace_width), dtype=torch.int32, device=q.device
     )
     selected_lens = torch.empty((tokens,), dtype=torch.int32, device=q.device)
-    _deepseek_v4_dequantize_selected_cache_segment(
+    _dsv4_dequantize_selected_cache_segment(
         swa_kv_cache,
         swa_slots,
         swa_lens,
@@ -659,7 +657,7 @@ def triton_deepseek_v4_paged_selected_attention(
         assert extra_slots is not None
         assert extra_lens is not None
         assert extra_page_size is not None
-        _deepseek_v4_dequantize_selected_cache_segment(
+        _dsv4_dequantize_selected_cache_segment(
             extra_kv_cache,
             extra_slots,
             extra_lens,
@@ -670,7 +668,7 @@ def triton_deepseek_v4_paged_selected_attention(
             swa_width,
             workspace_width,
         )
-    return deepseek_v4_selected_attention(
+    return dsv4_selected_attention(
         q=q,
         kv=kv_workspace,
         indices=selected_indices,
@@ -691,7 +689,7 @@ def _as_int32_block_table(block_table: torch.Tensor) -> torch.Tensor:
 
 
 @triton.jit
-def _deepseek_v4_mxfp4_e2m1_nibble(x):
+def _dsv4_mxfp4_e2m1_nibble(x):
     abs_x = tl.minimum(tl.abs(x), 6.0)
     code = tl.where(
         abs_x <= 0.25,
@@ -720,7 +718,7 @@ def _deepseek_v4_mxfp4_e2m1_nibble(x):
 
 
 @triton.jit
-def _deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4_kernel(
+def _dsv4_fused_indexer_q_rope_hadamard_mxfp4_kernel(
     positions_ptr,
     index_q_ptr,
     index_q_stride0,
@@ -794,8 +792,8 @@ def _deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4_kernel(
     exponent = tl.ceil(tl.log2(amax / 6.0))
     exponent = tl.minimum(tl.maximum(exponent, -127.0), 127.0)
     inv_scale = tl.exp2(-exponent)
-    lo = _deepseek_v4_mxfp4_e2m1_nibble(x_lo * inv_scale)
-    hi = _deepseek_v4_mxfp4_e2m1_nibble(x_hi * inv_scale)
+    lo = _dsv4_mxfp4_e2m1_nibble(x_lo * inv_scale)
+    hi = _dsv4_mxfp4_e2m1_nibble(x_hi * inv_scale)
     packed = lo | (hi << 4)
     scale = (exponent + 127.0).to(tl.uint8)
 
@@ -825,7 +823,7 @@ def _deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4_kernel(
     )
 
 
-def deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4(
+def dsv4_fused_indexer_q_rope_hadamard_mxfp4(
     *,
     index_q: torch.Tensor,
     positions: torch.Tensor,
@@ -849,7 +847,7 @@ def deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4(
     if num_tokens == 0:
         return (q_packed, q_scale_bytes.view(torch.int32).squeeze(-1)), weights_out
 
-    _deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4_kernel[
+    _dsv4_fused_indexer_q_rope_hadamard_mxfp4_kernel[
         (num_tokens, num_heads, head_dim // DEEPSEEK_V4_MXFP4_BLOCK_SIZE)
     ](
         positions,
@@ -885,7 +883,7 @@ def deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4(
 
 
 @triton.jit(do_not_specialize=["block_table_stride", "block_table_width"])
-def _deepseek_v4_fused_sparse_compress_cache_kernel(
+def _dsv4_fused_sparse_compress_cache_kernel(
     state_cache_ptr,
     state_cache_stride0,
     state_cache_stride1,
@@ -1051,7 +1049,7 @@ def _wide_compress_launch_supported(device: torch.device | int | None) -> bool:
         return False
 
 
-def deepseek_v4_fused_sparse_compress_cache_insert(
+def dsv4_fused_sparse_compress_cache_insert(
     *,
     state_cache: torch.Tensor,
     token_to_req_indices: torch.Tensor,
@@ -1077,7 +1075,7 @@ def deepseek_v4_fused_sparse_compress_cache_insert(
     if num_actual == 0:
         return
     block_table_i32 = _as_int32_block_table(block_table)
-    _deepseek_v4_fused_sparse_compress_cache_kernel[(num_actual,)](
+    _dsv4_fused_sparse_compress_cache_kernel[(num_actual,)](
         state_cache,
         state_cache.stride(0),
         state_cache.stride(1),
@@ -1121,7 +1119,7 @@ def deepseek_v4_fused_sparse_compress_cache_insert(
 
 
 @triton.jit(do_not_specialize=["block_table_stride", "block_table_width"])
-def _deepseek_v4_fused_csa_indexer_fp8_cache_kernel(
+def _dsv4_fused_csa_indexer_fp8_cache_kernel(
     state_cache_ptr,
     state_cache_stride0,
     state_cache_stride1,
@@ -1272,8 +1270,8 @@ def _deepseek_v4_fused_csa_indexer_fp8_cache_kernel(
 
 @register_kernel(
     "attention",
-    "deepseek_v4_csa_indexer_fp8_cache_insert",
-    name="triton_deepseek_v4_csa_indexer_fp8_cache_insert",
+    "dsv4_csa_indexer_fp8_cache_insert",
+    name="triton_dsv4_csa_indexer_fp8_cache_insert",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=frozenset(
@@ -1293,7 +1291,7 @@ def _deepseek_v4_fused_csa_indexer_fp8_cache_kernel(
     priority=Priority.PORTABLE,
     tags={"portability", "cache_insert"},
 )
-def deepseek_v4_fused_csa_indexer_fp8_cache_insert(
+def dsv4_fused_csa_indexer_fp8_cache_insert(
     *,
     state_cache: torch.Tensor,
     token_to_req_indices: torch.Tensor,
@@ -1354,7 +1352,7 @@ def deepseek_v4_fused_csa_indexer_fp8_cache_insert(
     if num_actual == 0:
         return
     block_table_i32 = _as_int32_block_table(block_table)
-    _deepseek_v4_fused_csa_indexer_fp8_cache_kernel[(num_actual,)](
+    _dsv4_fused_csa_indexer_fp8_cache_kernel[(num_actual,)](
         state_cache,
         state_cache.stride(0),
         state_cache.stride(1),
@@ -1396,7 +1394,7 @@ def deepseek_v4_fused_csa_indexer_fp8_cache_insert(
 
 
 @triton.jit(do_not_specialize=["block_table_stride", "block_table_width"])
-def _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel(
+def _dsv4_fused_csa_indexer_mxfp4_cache_kernel(
     state_cache_ptr,
     state_cache_stride0,
     state_cache_stride1,
@@ -1524,8 +1522,8 @@ def _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel(
     exponent = tl.ceil(tl.log2(amax / 6.0))
     exponent = tl.minimum(tl.maximum(exponent, -127.0), 127.0)
     inv_scale = tl.exp2(-exponent)
-    lo = _deepseek_v4_mxfp4_e2m1_nibble(x_lo * inv_scale)
-    hi = _deepseek_v4_mxfp4_e2m1_nibble(x_hi * inv_scale)
+    lo = _dsv4_mxfp4_e2m1_nibble(x_lo * inv_scale)
+    hi = _dsv4_mxfp4_e2m1_nibble(x_hi * inv_scale)
     packed = lo | (hi << 4)
     scale = (exponent + 127.0).to(tl.uint8)
 
@@ -1540,7 +1538,7 @@ def _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel(
     tl.store(scale_ptr + quant_block_idx, scale)
 
 
-def deepseek_v4_fused_csa_indexer_mxfp4_cache_insert(
+def dsv4_fused_csa_indexer_mxfp4_cache_insert(
     *,
     state_cache: torch.Tensor,
     token_to_req_indices: torch.Tensor,
@@ -1565,7 +1563,7 @@ def deepseek_v4_fused_csa_indexer_mxfp4_cache_insert(
     if num_actual == 0:
         return
     block_table_i32 = _as_int32_block_table(block_table)
-    _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel[
+    _dsv4_fused_csa_indexer_mxfp4_cache_kernel[
         (num_actual, DEEPSEEK_V4_INDEXER_MXFP4_SCALE_DIM)
     ](
         state_cache,
@@ -1606,7 +1604,7 @@ def deepseek_v4_fused_csa_indexer_mxfp4_cache_insert(
 
 
 @triton.jit
-def _deepseek_v4_save_compressor_state_kernel(
+def _dsv4_save_compressor_state_kernel(
     kv_ptr,
     kv_stride,
     score_ptr,
@@ -1662,7 +1660,7 @@ def _deepseek_v4_save_compressor_state_kernel(
     tl.store(base_ptr + STATE_WIDTH + offsets, score + ape, mask=mask)
 
 
-def deepseek_v4_save_compressor_state(
+def dsv4_save_compressor_state(
     kv: torch.Tensor,
     score: torch.Tensor,
     ape: torch.Tensor,
@@ -1676,7 +1674,7 @@ def deepseek_v4_save_compressor_state(
     if num_actual == 0:
         return
     state_width = kv.shape[-1]
-    _deepseek_v4_save_compressor_state_kernel[(num_actual,)](
+    _dsv4_save_compressor_state_kernel[(num_actual,)](
         kv,
         kv.stride(0),
         score,
@@ -1699,7 +1697,7 @@ def deepseek_v4_save_compressor_state(
 
 
 @triton.jit
-def _deepseek_v4_indexer_mxfp4_cache_write_kernel(
+def _dsv4_indexer_mxfp4_cache_write_kernel(
     rows_ptr,
     row_stride,
     cache_ptr,
@@ -1734,8 +1732,8 @@ def _deepseek_v4_indexer_mxfp4_cache_write_kernel(
     exponent = tl.ceil(tl.log2(amax / 6.0))
     exponent = tl.minimum(tl.maximum(exponent, -127.0), 127.0)
     inv_scale = tl.exp2(-exponent)
-    lo = _deepseek_v4_mxfp4_e2m1_nibble(x_lo * inv_scale)
-    hi = _deepseek_v4_mxfp4_e2m1_nibble(x_hi * inv_scale)
+    lo = _dsv4_mxfp4_e2m1_nibble(x_lo * inv_scale)
+    hi = _dsv4_mxfp4_e2m1_nibble(x_hi * inv_scale)
     packed = lo | (hi << 4)
     scale = (exponent + 127.0).to(tl.uint8)
 
@@ -1748,7 +1746,7 @@ def _deepseek_v4_indexer_mxfp4_cache_write_kernel(
     tl.store(scale_base + block_idx, scale)
 
 
-def write_deepseek_v4_indexer_mxfp4_cache_cuda(
+def write_dsv4_indexer_mxfp4_cache_cuda(
     index_k: torch.Tensor,
     cache_2d: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -1761,7 +1759,7 @@ def write_deepseek_v4_indexer_mxfp4_cache_cuda(
     index_k = index_k[:num_rows]
     if index_k.stride(-1) != 1:
         index_k = index_k.contiguous()
-    _deepseek_v4_indexer_mxfp4_cache_write_kernel[
+    _dsv4_indexer_mxfp4_cache_write_kernel[
         (num_rows, DEEPSEEK_V4_INDEXER_MXFP4_SCALE_DIM)
     ](
         index_k,
@@ -1781,7 +1779,7 @@ def write_deepseek_v4_indexer_mxfp4_cache_cuda(
 
 
 @triton.jit
-def _deepseek_v4_gather_indexer_mxfp4_cache_kernel(
+def _dsv4_gather_indexer_mxfp4_cache_kernel(
     cache_ptr,
     slot_mapping_ptr,
     values_out_ptr,
@@ -1835,7 +1833,7 @@ def _deepseek_v4_gather_indexer_mxfp4_cache_kernel(
     )
 
 
-def deepseek_v4_gather_indexer_mxfp4_cache(
+def dsv4_gather_indexer_mxfp4_cache(
     *,
     cache_2d: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -1849,9 +1847,9 @@ def deepseek_v4_gather_indexer_mxfp4_cache(
     if rows == 0:
         return
     if not cache_2d.is_cuda:
-        raise ValueError("deepseek_v4_gather_indexer_mxfp4_cache requires CUDA cache")
+        raise ValueError("dsv4_gather_indexer_mxfp4_cache requires CUDA cache")
     if not slot_mapping.is_cuda:
-        raise ValueError("deepseek_v4_gather_indexer_mxfp4_cache requires CUDA slots")
+        raise ValueError("dsv4_gather_indexer_mxfp4_cache requires CUDA slots")
     if values_out.dtype != torch.uint8 or scales_out.dtype != torch.uint8:
         raise TypeError("MXFP4 gather workspaces must be uint8 tensors")
     if values_out.stride(1) != 1 or scales_out.stride(1) != 1:
@@ -1864,7 +1862,7 @@ def deepseek_v4_gather_indexer_mxfp4_cache(
         raise ValueError("scales_out has insufficient scale bytes")
 
     block_rows = 16
-    _deepseek_v4_gather_indexer_mxfp4_cache_kernel[(triton.cdiv(rows, block_rows),)](
+    _dsv4_gather_indexer_mxfp4_cache_kernel[(triton.cdiv(rows, block_rows),)](
         cache_2d,
         slot_mapping,
         values_out,
@@ -1883,7 +1881,7 @@ def deepseek_v4_gather_indexer_mxfp4_cache(
 
 
 @triton.jit(do_not_specialize=["block_table_stride", "max_blocks_per_seq"])
-def _deepseek_v4_dequantize_and_gather_k_kernel(
+def _dsv4_dequantize_and_gather_k_kernel(
     out_ptr,
     out_stride0,
     out_stride1,
@@ -1966,7 +1964,7 @@ def _deepseek_v4_dequantize_and_gather_k_kernel(
             tl.store(out_row + bf16_out_offset + chunk_offsets, values)
 
 
-def _deepseek_v4_gather_launch_config(
+def _dsv4_gather_launch_config(
     num_reqs: int,
     max_rows: int,
 ) -> tuple[int, int]:
@@ -1984,7 +1982,7 @@ def _deepseek_v4_gather_launch_config(
     return 2048, 1
 
 
-def deepseek_v4_dequantize_and_gather_k_cache(
+def dsv4_dequantize_and_gather_k_cache(
     *,
     out: torch.Tensor,
     cache_2d: torch.Tensor,
@@ -2012,11 +2010,11 @@ def deepseek_v4_dequantize_and_gather_k_cache(
         else int(max_gather_len)
     )
     if current_platform().is_blackwell:
-        num_workers, num_warps = _deepseek_v4_gather_launch_config(num_reqs, max_rows)
+        num_workers, num_warps = _dsv4_gather_launch_config(num_reqs, max_rows)
     else:
         num_workers, num_warps = 128, 4
     block_table_i32 = _as_int32_block_table(block_table)
-    _deepseek_v4_dequantize_and_gather_k_kernel[(num_reqs, num_workers)](
+    _dsv4_dequantize_and_gather_k_kernel[(num_reqs, num_workers)](
         out,
         out.stride(0),
         out.stride(1),
@@ -2046,7 +2044,7 @@ def deepseek_v4_dequantize_and_gather_k_cache(
 
 
 @triton.jit
-def _deepseek_v4_compute_global_topk_indices_and_lens_kernel(
+def _dsv4_compute_global_topk_indices_and_lens_kernel(
     global_topk_indices_ptr,
     global_topk_indices_stride,
     topk_lens_ptr,
@@ -2098,7 +2096,7 @@ def _deepseek_v4_compute_global_topk_indices_and_lens_kernel(
     tl.store(topk_lens_ptr + token_idx, count)
 
 
-def deepseek_v4_compute_global_topk_indices_and_lens(
+def dsv4_compute_global_topk_indices_and_lens(
     *,
     topk_indices: torch.Tensor,
     token_to_req_indices: torch.Tensor,
@@ -2154,7 +2152,7 @@ def deepseek_v4_compute_global_topk_indices_and_lens(
     if is_valid_token is None:
         is_valid_token = torch.empty(0, dtype=torch.bool, device=topk_indices.device)
 
-    _deepseek_v4_compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
+    _dsv4_compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
         global_topk_indices,
         global_topk_indices.stride(0),
         topk_lens,
@@ -2173,7 +2171,7 @@ def deepseek_v4_compute_global_topk_indices_and_lens(
 
 
 @triton.jit
-def _deepseek_v4_combine_topk_swa_indices_kernel(
+def _dsv4_combine_topk_swa_indices_kernel(
     combined_indices_ptr,
     combined_indices_stride,
     combined_lens_ptr,
@@ -2257,7 +2255,7 @@ def _deepseek_v4_combine_topk_swa_indices_kernel(
         tl.store(combined_lens_ptr + token_idx, topk_len + swa_len)
 
 
-def deepseek_v4_combine_topk_swa_indices(
+def dsv4_combine_topk_swa_indices(
     *,
     topk_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -2297,7 +2295,7 @@ def deepseek_v4_combine_topk_swa_indices(
     if compressed_table_capacity is None:
         compressed_table_capacity = compressed_base
 
-    _deepseek_v4_combine_topk_swa_indices_kernel[(num_reqs, 128)](
+    _dsv4_combine_topk_swa_indices_kernel[(num_reqs, 128)](
         combined_indices,
         combined_indices.stride(0),
         combined_lens,
@@ -2325,7 +2323,7 @@ def deepseek_v4_combine_topk_swa_indices(
 
 
 @triton.jit
-def _deepseek_v4_build_dense_prefill_local_compressed_indices_kernel(
+def _dsv4_build_dense_prefill_local_compressed_indices_kernel(
     out_ptr,
     out_stride,
     positions_ptr,
@@ -2358,7 +2356,7 @@ def _deepseek_v4_build_dense_prefill_local_compressed_indices_kernel(
         tl.store(out_ptr + token_idx * out_stride + offsets, values, mask=mask)
 
 
-def deepseek_v4_build_dense_prefill_local_compressed_indices(
+def dsv4_build_dense_prefill_local_compressed_indices(
     *,
     positions: torch.Tensor,
     compress_ratio: int,
@@ -2389,9 +2387,7 @@ def deepseek_v4_build_dense_prefill_local_compressed_indices(
         positions if block_table_base_offsets is None else block_table_base_offsets
     )
     if positions.is_cuda:
-        _deepseek_v4_build_dense_prefill_local_compressed_indices_kernel[
-            (positions.numel(),)
-        ](
+        _dsv4_build_dense_prefill_local_compressed_indices_kernel[(positions.numel(),)](
             result,
             result.stride(0),
             positions,
@@ -2428,7 +2424,7 @@ def deepseek_v4_build_dense_prefill_local_compressed_indices(
 
 
 @triton.jit
-def _deepseek_v4_combine_dense_swa_indices_kernel(
+def _dsv4_combine_dense_swa_indices_kernel(
     combined_indices_ptr,
     combined_indices_stride,
     combined_lens_ptr,
@@ -2484,7 +2480,7 @@ def _deepseek_v4_combine_dense_swa_indices_kernel(
     tl.store(combined_lens_ptr + token_idx, total_len, mask=block_idx == 0)
 
 
-def deepseek_v4_combine_dense_swa_indices(
+def dsv4_combine_dense_swa_indices(
     *,
     positions: torch.Tensor,
     token_to_req_indices: torch.Tensor,
@@ -2519,7 +2515,7 @@ def deepseek_v4_combine_dense_swa_indices(
         return combined_indices, combined_lens
 
     candidate_block = 128
-    _deepseek_v4_combine_dense_swa_indices_kernel[
+    _dsv4_combine_dense_swa_indices_kernel[
         (num_tokens, triton.cdiv(combined_topk, candidate_block))
     ](
         combined_indices,
@@ -2541,7 +2537,7 @@ def deepseek_v4_combine_dense_swa_indices(
 
 
 @triton.jit(do_not_specialize=["block_table_stride", "max_blocks_per_seq"])
-def _deepseek_v4_decode_swa_indices_and_lens_kernel(
+def _dsv4_decode_swa_indices_and_lens_kernel(
     swa_indices_ptr,
     swa_indices_stride,
     swa_lens_ptr,
@@ -2602,7 +2598,7 @@ def _deepseek_v4_decode_swa_indices_and_lens_kernel(
         )
 
 
-def deepseek_v4_decode_swa_indices_and_lens(
+def dsv4_decode_swa_indices_and_lens(
     *,
     query_start_loc: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -2638,7 +2634,7 @@ def deepseek_v4_decode_swa_indices_and_lens(
 
     candidate_block = min(1024, triton.next_power_of_2(window_size))
     block_table_i32 = _as_int32_block_table(block_table)
-    _deepseek_v4_decode_swa_indices_and_lens_kernel[(num_tokens,)](
+    _dsv4_decode_swa_indices_and_lens_kernel[(num_tokens,)](
         out_indices,
         out_indices.stride(0),
         out_lens,
@@ -2663,7 +2659,7 @@ def deepseek_v4_decode_swa_indices_and_lens(
 
 
 @triton.jit
-def _deepseek_v4_compressed_slot_mapping_kernel(
+def _dsv4_compressed_slot_mapping_kernel(
     slot_mapping_ptr,
     query_start_loc_ptr,
     seq_lens_ptr,
@@ -2698,7 +2694,7 @@ def _deepseek_v4_compressed_slot_mapping_kernel(
         tl.store(slot_mapping_ptr + query_start + offsets, values, mask=mask)
 
 
-def deepseek_v4_compressed_slot_mapping(
+def dsv4_compressed_slot_mapping(
     *,
     num_tokens: int,
     query_start_loc: torch.Tensor,
@@ -2717,7 +2713,7 @@ def deepseek_v4_compressed_slot_mapping(
     if num_tokens == 0:
         return slot_mapping
 
-    _deepseek_v4_compressed_slot_mapping_kernel[(block_table.shape[0],)](
+    _dsv4_compressed_slot_mapping_kernel[(block_table.shape[0],)](
         slot_mapping,
         query_start_loc.to(torch.int32),
         seq_lens.to(torch.int32),
@@ -2732,7 +2728,7 @@ def deepseek_v4_compressed_slot_mapping(
 
 
 @triton.jit
-def _deepseek_v4_indexer_decode_metadata_kernel(
+def _dsv4_indexer_decode_metadata_kernel(
     out_block_tables_ptr,
     out_block_tables_stride,
     out_context_lens_ptr,
@@ -2789,7 +2785,7 @@ def _deepseek_v4_indexer_decode_metadata_kernel(
     tl.store(out_context_lens_ptr + token_idx, context_len_val.to(tl.int32))
 
 
-def deepseek_v4_indexer_decode_metadata_compute(
+def dsv4_indexer_decode_metadata_compute(
     *,
     positions: torch.Tensor,
     token_to_req_indices: torch.Tensor,
@@ -2813,7 +2809,7 @@ def deepseek_v4_indexer_decode_metadata_compute(
     rows = int(block_table.shape[0]) if block_table.ndim >= 1 else 0
     cols = int(block_table.shape[1]) if block_table.ndim >= 2 else 0
     candidate_block = min(1024, max(16, triton.next_power_of_2(max_blocks)))
-    _deepseek_v4_indexer_decode_metadata_kernel[(num_tokens,)](
+    _dsv4_indexer_decode_metadata_kernel[(num_tokens,)](
         out_block_tables,
         out_block_tables.stride(0),
         out_context_lens,
@@ -2839,7 +2835,7 @@ def deepseek_v4_indexer_decode_metadata_compute(
 # projection. The caller selects either canonical FP32 scales for portable BMM
 # and Hopper DeepGEMM or packed, TMA-aligned UE8M0 scales for Blackwell.
 @triton.jit(do_not_specialize=["num_tokens"])
-def _deepseek_v4_fused_inv_rope_fp8_quant_per_head(
+def _dsv4_fused_inv_rope_fp8_quant_per_head(
     o_ptr,
     positions_ptr,
     cos_sin_cache_ptr,
@@ -2948,7 +2944,7 @@ def _deepseek_v4_fused_inv_rope_fp8_quant_per_head(
         tl.store(scale_addrs, scales)
 
 
-def deepseek_v4_fused_inv_rope_fp8_quant(
+def dsv4_fused_inv_rope_fp8_quant(
     o: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
@@ -2984,7 +2980,7 @@ def deepseek_v4_fused_inv_rope_fp8_quant(
         (scale_inner * tma_aligned_t, 1, tma_aligned_t),
     )
     grid = (tma_aligned_t, n_groups * heads_per_group)
-    _deepseek_v4_fused_inv_rope_fp8_quant_per_head[grid](
+    _dsv4_fused_inv_rope_fp8_quant_per_head[grid](
         o,
         positions,
         cos_sin_cache,

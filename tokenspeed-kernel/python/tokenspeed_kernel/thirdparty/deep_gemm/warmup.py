@@ -276,7 +276,7 @@ def _warmup_fp8_fp4_mqa_logits(
 ) -> None:
     """Pre-compile the ragged prefill sparse-indexer ``fp8_fp4_mqa_logits``.
 
-    Mirrors the prefill call (deepseek_v4.py:1392): q = (int8 values, int32
+    Mirrors the prefill call (dsv4.py:1392): q = (int8 values, int32
     scales), kv = (gathered int8 values, int32 scales), ragged ``cu_seq_len``
     of length ``num_tokens`` (not +1). FP4 packs 2 values per byte, so the
     per-head value dim is ``index_head_dim // 2``. Batch and kv length are not

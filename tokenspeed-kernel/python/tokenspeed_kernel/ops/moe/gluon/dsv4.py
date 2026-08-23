@@ -33,13 +33,13 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.moe import (
-        gluon_deepseek_v4_select_experts_gfx950 as _select_experts_impl,
+        gluon_dsv4_select_experts_gfx950 as _select_experts_impl,
     )
 
     @register_kernel(
         "moe",
-        "deepseek_v4_select_experts",
-        name="gluon_deepseek_v4_select_experts_gfx950",
+        "dsv4_select_experts",
+        name="gluon_dsv4_select_experts_gfx950",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -60,5 +60,5 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         tags={"amd", "gfx950", "routing", "latency"},
     )
-    def gluon_deepseek_v4_select_experts_gfx950(*args, **kwargs):
+    def gluon_dsv4_select_experts_gfx950(*args, **kwargs):
         return _select_experts_impl(*args, **kwargs)
