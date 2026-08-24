@@ -1,6 +1,6 @@
 #!/usr/bin/bash
 
-# Aligned to TokenSpeed PR #1187 head 97690af405321f4b7e586e37d632513e338c5b92.
+# Aligned to TokenSpeed PR #1187 head 00634ced7bd331c96d3cb3f54c940bf8a553b99a.
 # Tested per row on one OCI GB300 NVL72 segment (2 Slurm nodes x 4 GPUs) with
 # vLLM f8e060271381e352a4eabec97f1839a32e41ec41, CUDA 13.0, and FlashInfer
 # 0.6.17. Both TP8 rows completed the full five-rung sweep with FP8 KV cache,
