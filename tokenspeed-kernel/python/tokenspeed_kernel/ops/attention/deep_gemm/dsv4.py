@@ -270,6 +270,44 @@ def _decode_topk(
     return out
 
 
+def _add_topk_base_rows(
+    result: torch.Tensor,
+    block_table_base_offsets: torch.Tensor | None,
+    *,
+    page_size: int,
+    request_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if block_table_base_offsets is None:
+        return result
+    if (
+        block_table_base_offsets.ndim != 1
+        or block_table_base_offsets.device != result.device
+    ):
+        raise ValueError(
+            "block_table_base_offsets must be one-dimensional and colocated with out"
+        )
+    if request_indices is None:
+        if block_table_base_offsets.numel() < result.shape[0]:
+            raise ValueError(
+                "block_table_base_offsets must contain one entry per output row"
+            )
+        base_pages = block_table_base_offsets[: result.shape[0]]
+    else:
+        if block_table_base_offsets.numel() == 0:
+            raise ValueError("block_table_base_offsets must not be empty")
+        request_indices = request_indices.to(torch.int64)
+        request_indices.clamp_max_(block_table_base_offsets.numel() - 1)
+        base_pages = block_table_base_offsets[request_indices]
+    selected = result.to(torch.int64)
+    base_rows = base_pages.to(torch.int64) * int(page_size)
+    result.copy_(
+        torch.where(selected >= 0, selected + base_rows[:, None], selected).to(
+            torch.int32
+        )
+    )
+    return result
+
+
 def _dsv4_indexer_prefill_topk(
     index_q: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
@@ -284,6 +322,7 @@ def _dsv4_indexer_prefill_topk(
     topk: int,
     max_seqlen_k: int,
     index_k_format: str,
+    block_table_base_offsets: torch.Tensor | None = None,
     gathered_k: tuple[torch.Tensor, torch.Tensor] | None = None,
     gather_workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
     out: torch.Tensor | None = None,
@@ -330,7 +369,20 @@ def _dsv4_indexer_prefill_topk(
             clean_logits=False,
             max_seqlen_k=max_seqlen_k,
         )
-    return _prefill_topk(logits, seq_lens, topk, result), gathered_k
+    result = _prefill_topk(logits, seq_lens, topk, result)
+    if block_table_base_offsets is not None:
+        request_indices = torch.searchsorted(
+            cu_seq_lens[1:].contiguous(),
+            cu_seqlen_k_start,
+            right=True,
+        )
+        _add_topk_base_rows(
+            result,
+            block_table_base_offsets,
+            page_size=page_size,
+            request_indices=request_indices,
+        )
+    return result, gathered_k
 
 
 def _dsv4_indexer_decode_topk(
@@ -345,6 +397,7 @@ def _dsv4_indexer_decode_topk(
     max_context_len: int,
     plan: object,
     index_k_format: str,
+    block_table_base_offsets: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     persistent_topk_workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -387,7 +440,12 @@ def _dsv4_indexer_decode_topk(
             max_context_len,
             clean_logits=False,
         )
-    return _decode_topk(logits, context_lens, topk, result, persistent_topk_workspace)
+    result = _decode_topk(logits, context_lens, topk, result, persistent_topk_workspace)
+    return _add_topk_base_rows(
+        result,
+        block_table_base_offsets,
+        page_size=page_size,
+    )
 
 
 _SIGNATURES = {

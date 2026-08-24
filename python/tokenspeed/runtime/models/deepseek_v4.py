@@ -508,8 +508,6 @@ def _deepseek_v4_indexer_prefill_request_gather_plan(
     seq_lens_list = [max(0, int(x)) for x in seq_lens_list]
     query_lens_list = [max(0, int(x)) for x in query_lens_list]
     compressed_lens_list = [seq_len // ratio for seq_len in seq_lens_list]
-    total_k = sum(compressed_lens_list)
-
     query_offsets: list[int] = [0]
     for query_len in query_lens_list:
         query_offsets.append(query_offsets[-1] + query_len)
@@ -525,12 +523,11 @@ def _deepseek_v4_indexer_prefill_request_gather_plan(
         prefix_len = max(0, seq_lens_list[req_local] - query_lens_list[req_local])
         row_lens_list.append((prefix_len + local_query_offset + 1) // ratio)
         req_local_list.append(req_local)
+    total_k = sum(compressed_lens_list)
     max_len = max(row_lens_list) if row_lens_list else 0
 
     compressed_lens = torch.tensor(
-        compressed_lens_list,
-        dtype=torch.int64,
-        device=device,
+        compressed_lens_list, dtype=torch.int64, device=device
     )
     request_ids = torch.arange(req_start, req_end, device=device, dtype=torch.int64)
     if block_table_base_offsets is None:
@@ -538,8 +535,13 @@ def _deepseek_v4_indexer_prefill_request_gather_plan(
     else:
         if block_table_base_offsets.ndim != 1:
             raise ValueError("block_table_base_offsets must be one-dimensional")
+        if block_table_base_offsets.numel() < req_end:
+            raise ValueError(
+                "block_table_base_offsets must contain one entry per request"
+            )
         request_base_pages = block_table_base_offsets.to(
-            device=device, dtype=torch.int64
+            device=device,
+            dtype=torch.int64,
         )[request_ids]
     request_base_rows = request_base_pages * int(cache_block_size)
     request_capacity_ends = request_base_rows + int(block_table.shape[1]) * int(
@@ -558,11 +560,11 @@ def _deepseek_v4_indexer_prefill_request_gather_plan(
     torch.cumsum(compressed_lens.to(torch.int32), dim=0, out=cu_seq_lens[1:])
 
     req_local_tensor = torch.tensor(req_local_list, dtype=torch.int64, device=device)
-    row_lens = torch.tensor(row_lens_list, dtype=torch.int32, device=device)
     group_starts = cu_seq_lens[:-1][req_local_tensor]
     logical_starts = request_starts[req_local_tensor]
     logical_ends = torch.minimum(
-        row_lens.to(torch.int64), request_ends[req_local_tensor]
+        torch.tensor(row_lens_list, dtype=torch.int64, device=device),
+        request_ends[req_local_tensor],
     )
     logical_ends = torch.maximum(logical_ends, logical_starts)
     cu_start = group_starts + logical_starts.to(torch.int32)
@@ -574,7 +576,7 @@ def _deepseek_v4_indexer_prefill_request_gather_plan(
         return empty_i64, cu_start, cu_end, row_lens, max_len
 
     req_ids = torch.repeat_interleave(
-        torch.arange(req_start, req_end, device=device, dtype=torch.int64),
+        request_ids,
         compressed_lens,
         output_size=total_k,
     )
@@ -583,11 +585,7 @@ def _deepseek_v4_indexer_prefill_request_gather_plan(
     local = torch.arange(total_k, device=device, dtype=torch.int64) - group_bases
     pages = torch.div(local, cache_block_size, rounding_mode="floor")
     page_offsets = local % cache_block_size
-    base_pages = block_table_base_offsets
-    if base_pages is None:
-        base_pages_for_k = torch.zeros_like(req_ids)
-    else:
-        base_pages_for_k = base_pages.to(device=device, dtype=torch.int64)[req_ids]
+    base_pages_for_k = request_base_pages[req_local_for_k]
     table_pages = pages - base_pages_for_k
     valid_pages = (table_pages >= 0) & (table_pages < block_table.shape[1])
     safe_pages = table_pages.clamp(0, max(int(block_table.shape[1]) - 1, 0))
@@ -670,20 +668,24 @@ def _deepseek_v4_indexer_prefill_metadata(
     cu_seq_offset = 0
     row_offset = 0
     for chunk in chunks:
-        slots, cu_seqlen_k_start, cu_seqlen_k_end, seq_lens_k, max_seqlen_k = (
-            _deepseek_v4_indexer_prefill_request_gather_plan(
-                seq_lens_cpu=seq_lens_cpu,
-                query_lens_cpu=query_lens_cpu,
-                block_table=block_table,
-                cache_block_size=cache_block_size,
-                compress_ratio=compress_ratio,
-                req_start=chunk.req_start,
-                req_end=chunk.req_end,
-                query_start=chunk.query_start,
-                query_end=chunk.query_end,
-                block_table_base_offsets=block_table_base_offsets,
-                build_slots=True,
-            )
+        (
+            slots,
+            cu_seqlen_k_start,
+            cu_seqlen_k_end,
+            seq_lens_k,
+            max_seqlen_k,
+        ) = _deepseek_v4_indexer_prefill_request_gather_plan(
+            seq_lens_cpu=seq_lens_cpu,
+            query_lens_cpu=query_lens_cpu,
+            block_table=block_table,
+            cache_block_size=cache_block_size,
+            compress_ratio=compress_ratio,
+            req_start=chunk.req_start,
+            req_end=chunk.req_end,
+            query_start=chunk.query_start,
+            query_end=chunk.query_end,
+            block_table_base_offsets=block_table_base_offsets,
+            build_slots=True,
         )
         slot_count = _deepseek_v4_indexer_prefill_chunk_total_rows(
             seq_lens_cpu=seq_lens_cpu,
@@ -973,6 +975,7 @@ def _deepseek_v4_sparse_attn_indexer_native(
     positions: torch.Tensor,
     token_to_req_indices: torch.Tensor,
     block_table: torch.Tensor,
+    block_table_base_offsets: torch.Tensor | None = None,
     seq_lens_cpu: torch.Tensor,
     query_lens_cpu: torch.Tensor,
     prefill_chunk_specs: torch.Tensor,
@@ -1073,6 +1076,11 @@ def _deepseek_v4_sparse_attn_indexer_native(
                     topk=topk_tokens,
                     max_seqlen_k=max_seqlen_k,
                     index_k_format="mxfp4" if use_fp4_cache else "fp8_scaled",
+                    block_table_base_offsets=(
+                        None
+                        if block_table_base_offsets is None
+                        else block_table_base_offsets[req_start:req_end]
+                    ),
                     gathered_k=reuse_k,
                     gather_workspace=gather_workspace,
                     out=topk_out[token_start:token_end],
@@ -1096,6 +1104,18 @@ def _deepseek_v4_sparse_attn_indexer_native(
         ):
             raise RuntimeError("DeepSeek V4 decode indexer metadata is incomplete")
         with nvtx_range("indexer_topk_decode"):
+            decode_base_offsets = None
+            if block_table_base_offsets is not None:
+                decode_req_indices = token_to_req_indices[decode_start:decode_end].to(
+                    torch.int64
+                )
+                safe_req_indices = decode_req_indices.clamp(
+                    0, block_table_base_offsets.shape[0] - 1
+                )
+                decode_base_offsets = block_table_base_offsets.to(
+                    device=decode_block_table.device,
+                    dtype=torch.int32,
+                )[safe_req_indices]
             dsv4_indexer_decode_topk(
                 index_q=(
                     packed_q_values[decode_start:decode_end],
@@ -1110,6 +1130,7 @@ def _deepseek_v4_sparse_attn_indexer_native(
                 max_context_len=decode_max_context_len,
                 plan=decode_schedule_metadata,
                 index_k_format="mxfp4" if use_fp4_cache else "fp8_scaled",
+                block_table_base_offsets=decode_base_offsets,
                 out=decode_out,
                 persistent_topk_workspace=persistent_topk_workspace,
             )
@@ -1124,6 +1145,7 @@ def _deepseek_v4_sparse_attn_indexer_op(
     positions: torch.Tensor,
     token_to_req_indices: torch.Tensor,
     block_table: torch.Tensor,
+    block_table_base_offsets: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
     query_lens_cpu: torch.Tensor,
     prefill_chunk_specs: torch.Tensor,
@@ -1156,11 +1178,15 @@ def _deepseek_v4_sparse_attn_indexer_op(
     )
     context_lens = decode_context_lens if decode_context_lens.numel() > 0 else None
     decode_blocks = decode_block_table if decode_block_table.numel() > 0 else None
+    base_offsets = (
+        block_table_base_offsets if block_table_base_offsets.numel() > 0 else None
+    )
     return _deepseek_v4_sparse_attn_indexer_native(
         cache_2d=cache_2d,
         positions=positions,
         token_to_req_indices=token_to_req_indices,
         block_table=block_table,
+        block_table_base_offsets=base_offsets,
         seq_lens_cpu=seq_lens_cpu,
         query_lens_cpu=query_lens_cpu,
         prefill_chunk_specs=prefill_chunk_specs,
@@ -1195,6 +1221,7 @@ def _deepseek_v4_sparse_attn_indexer_fake(
     positions: torch.Tensor,
     token_to_req_indices: torch.Tensor,
     block_table: torch.Tensor,
+    block_table_base_offsets: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
     query_lens_cpu: torch.Tensor,
     prefill_chunk_specs: torch.Tensor,
@@ -1227,6 +1254,7 @@ def _deepseek_v4_sparse_attn_indexer_fake(
         positions,
         token_to_req_indices,
         block_table,
+        block_table_base_offsets,
         seq_lens_cpu,
         query_lens_cpu,
         prefill_chunk_specs,
@@ -1274,6 +1302,7 @@ def _deepseek_v4_sparse_attn_indexer(
     indexer_metadata: DeepseekV4SparseIndexerMetadata,
     indexer_cache: torch.Tensor,
     indexer_page_table: torch.Tensor,
+    indexer_block_table_base_offsets: torch.Tensor | None,
     indexer_block_size: int,
     compress_ratio: int,
     packed_q_values: torch.Tensor,
@@ -1315,11 +1344,23 @@ def _deepseek_v4_sparse_attn_indexer(
             dtype=indexer_page_table.dtype,
             device=indexer_page_table.device,
         )
+    if indexer_block_table_base_offsets is None:
+        indexer_block_table_base_offsets = torch.empty(
+            0,
+            dtype=torch.int32,
+            device=indexer_page_table.device,
+        )
+    else:
+        indexer_block_table_base_offsets = indexer_block_table_base_offsets.to(
+            device=indexer_page_table.device,
+            dtype=torch.int32,
+        ).contiguous()
     return torch.ops.tokenspeed.deepseek_v4_sparse_attn_indexer(
         indexer_cache,
         positions,
         batch_metadata.token_to_req_indices,
         indexer_page_table,
+        indexer_block_table_base_offsets,
         batch_metadata.seq_lens_cpu,
         batch_metadata.query_lens_cpu,
         prefill_metadata.chunk_specs,
@@ -2678,9 +2719,7 @@ class DeepseekV4Indexer(nn.Module):
             cache_block_size=indexer_block_size,
             compress_ratio=self.compress_ratio,
             num_prefill_tokens=num_prefill_tokens,
-            block_table_base_offsets=(
-                None if self.use_fp4_cache else indexer_page_table_base_offsets
-            ),
+            block_table_base_offsets=indexer_page_table_base_offsets,
         )
 
         decode_schedule_metadata = None
@@ -2761,6 +2800,7 @@ class DeepseekV4Indexer(nn.Module):
             indexer_metadata=indexer_metadata,
             indexer_cache=indexer_cache,
             indexer_page_table=indexer_page_table,
+            indexer_block_table_base_offsets=indexer_page_table_base_offsets,
             indexer_block_size=indexer_block_size,
             compress_ratio=self.compress_ratio,
             packed_q_values=packed_index_q[0],

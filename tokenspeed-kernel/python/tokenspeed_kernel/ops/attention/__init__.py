@@ -3844,6 +3844,7 @@ def dsv4_indexer_prefill_topk(
     topk: int,
     max_seqlen_k: int,
     index_k_format: str = "mxfp4",
+    block_table_base_offsets: torch.Tensor | None = None,
     gathered_k: tuple[torch.Tensor, torch.Tensor] | None = None,
     gather_workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
     out: torch.Tensor | None = None,
@@ -3858,14 +3859,18 @@ def dsv4_indexer_prefill_topk(
         weights: Contiguous FP32 per-token index-head weights.
         index_k_cache: Page-backed uint8 index-K cache.
         block_table: Logical-to-physical page table for the gathered requests.
-        cu_seq_lens: Cumulative packed key-row lengths for those requests.
-        cu_seqlen_k_start: Inclusive packed-key start for every query row.
-        cu_seqlen_k_end: Exclusive packed-key end for every query row.
+        cu_seq_lens: Cumulative gathered key-row lengths for those requests.
+            With a compact table these lengths cover retained rows only.
+        cu_seqlen_k_start: Inclusive gathered-key start for every query row.
+        cu_seqlen_k_end: Exclusive gathered-key end for every query row.
         seq_lens: Candidate count for every query row.
         page_size: Number of index-K rows in each cache page.
         topk: Number of local candidate offsets to select.
         max_seqlen_k: Maximum candidate count represented by the logits.
         index_k_format: ``"mxfp4"`` or ``"fp8_scaled"``.
+        block_table_base_offsets: Optional logical base page for each row of a
+            compact ``block_table``. Returned indices are absolute logical
+            offsets when provided.
         gathered_k: Optional previously gathered ``(values, scales)`` pair to
             reuse instead of gathering index_k_cache again.
         gather_workspace: Optional caller-owned MXFP4 value/scale buffers. The
@@ -3877,7 +3882,9 @@ def dsv4_indexer_prefill_topk(
 
     Returns:
         A pair ``(indices, gathered_k)``. Indices are local offsets within each
-        query row's packed candidate range, with invalid entries set to -1.
+        query row's packed candidate range when ``block_table_base_offsets`` is
+        absent, or absolute logical offsets when it is present. Invalid entries
+        are set to -1.
     """
     q_values, _ = index_q
     signature, traits = _dsv4_indexer_selection(
@@ -3935,6 +3942,7 @@ def dsv4_indexer_prefill_topk(
             topk=topk,
             max_seqlen_k=max_seqlen_k,
             index_k_format=index_k_format,
+            block_table_base_offsets=block_table_base_offsets,
             gathered_k=gathered_k,
             gather_workspace=gather_workspace,
             out=out,
@@ -3953,6 +3961,7 @@ def dsv4_indexer_decode_topk(
     max_context_len: int,
     plan: object,
     index_k_format: str = "mxfp4",
+    block_table_base_offsets: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     persistent_topk_workspace: torch.Tensor | None = None,
     override: str | None = None,
@@ -3972,6 +3981,8 @@ def dsv4_indexer_decode_topk(
         max_context_len: Maximum context represented by block_table.
         plan: Opaque schedule returned by :func:`dsv4_plan`.
         index_k_format: ``"mxfp4"`` or ``"fp8_scaled"``.
+        block_table_base_offsets: Optional logical base page for each decode
+            row. Returned indices are absolute logical offsets when provided.
         out: Optional caller-owned int32 output with shape ``[tokens, topk]``
             (or a larger first dimension).
         persistent_topk_workspace: Optional caller-owned uint8 workspace of at
@@ -3980,8 +3991,10 @@ def dsv4_indexer_decode_topk(
         solution: Optional registered solution to force through selection.
 
     Returns:
-        Int32 local offsets into each token's logical index-K context. Invalid
-        entries are -1; the return aliases out when out is provided.
+        Int32 local offsets into each token's logical index-K context when
+        ``block_table_base_offsets`` is absent, or absolute logical offsets when
+        it is present. Invalid entries are -1; the return aliases out when out
+        is provided.
     """
     q_values, _ = index_q
     signature, traits = _dsv4_indexer_selection(
@@ -4037,6 +4050,7 @@ def dsv4_indexer_decode_topk(
             max_context_len=max_context_len,
             plan=plan,
             index_k_format=index_k_format,
+            block_table_base_offsets=block_table_base_offsets,
             out=out,
             persistent_topk_workspace=persistent_topk_workspace,
         )
