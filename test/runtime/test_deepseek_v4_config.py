@@ -6166,9 +6166,16 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         if out is None:
             self.skipTest("fused DeepSeek V4 router op unavailable")
-        topk_weights, topk_ids = out
+        # The selector also hands back the score matrix when it computed one,
+        # so callers that need scores do not recompute sqrt(softplus(logits));
+        # the vendor path leaves it None.
+        topk_weights, topk_ids, scores = out
         self.assertEqual(tuple(topk_weights.shape), (2, 6))
         self.assertEqual(tuple(topk_ids.shape), (2, 6))
+        if scores is not None:
+            self.assertEqual(tuple(scores.shape), (2, 256))
+        # Logits are uniform, so the descending bias alone decides the order.
+        self.assertEqual(topk_ids[0].tolist(), [0, 1, 2, 3, 4, 5])
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_deepseek_v4_fused_hash_topk_matches_reference(self):

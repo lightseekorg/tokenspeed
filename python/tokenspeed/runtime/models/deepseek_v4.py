@@ -55,6 +55,9 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_indexer_mqa_logits,
     deepseek_v4_indexer_select_all,
 )
+from tokenspeed_kernel.ops.moe.triton.deepseek_v4_softplus_sqrt_topk import (
+    deepseek_v4_softplus_sqrt_topk,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda import (
     dsv3_router_gemm,
@@ -295,7 +298,7 @@ def _deepseek_v4_fused_select_experts(
     correction_bias: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
     if (
         not router_logits.is_cuda
         or router_logits.dim() != 2
@@ -354,9 +357,21 @@ def _deepseek_v4_fused_select_experts(
         else:
             return None
     except (AttributeError, RuntimeError):
-        return None
+        # No vendor routing library (ROCm). The same routing runs as one
+        # Triton kernel; hash-routed layers have no portable kernel yet and
+        # still take the tensor-op path.
+        if hash_indices_table is not None or correction_bias is None:
+            return None
+        weights, ids, scores = deepseek_v4_softplus_sqrt_topk(
+            logits_f32,
+            top_k,
+            renormalize,
+            correction_bias=correction_bias,
+            return_scores=True,
+        )
+        return weights, ids, scores
 
-    return topk_weights, topk_ids
+    return topk_weights, topk_ids, None
 
 
 def _deepseek_v4_reorder_c4_ape_2604(ape: torch.Tensor) -> torch.Tensor:
@@ -470,11 +485,13 @@ def deepseek_v4_select_experts(
         input_ids=input_ids,
     )
     if fused_topk is not None:
-        topk_weights, topk_ids = fused_topk
-        if need_scores:
-            scores = torch.sqrt(F.softplus(router_logits.float()))
-        else:
+        topk_weights, topk_ids, fused_scores = fused_topk
+        if not need_scores:
             scores = router_logits
+        elif fused_scores is not None:
+            scores = fused_scores
+        else:
+            scores = torch.sqrt(F.softplus(router_logits.float()))
         return topk_weights, topk_ids, scores
 
     scores = torch.sqrt(F.softplus(router_logits.float()))
@@ -2716,6 +2733,14 @@ class DeepseekV4MoE(nn.Module):
                 activation="swiglu",
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 with_bias=not is_block_fp8,
+                # V4 scores experts with sqrt(softplus(logits)), which no fused
+                # backend routing reproduces. Left unconstrained, the backend
+                # advertises routing, the runtime hands it logits, and the
+                # already-selected top-k has to be re-encoded as log-probs for
+                # the backend's own TopK to recover -- a scatter, a second
+                # top-k and a second renormalize per layer, all to arrive back
+                # where routing already was.
+                routing_mode="precomputed_topk",
                 routing_config={
                     "routed_scaling_factor": self.routed_scaling_factor,
                     "normalize_topk_weights": config.norm_topk_prob,
@@ -2763,6 +2788,13 @@ class DeepseekV4MoE(nn.Module):
             return BypassedTopKOutput(
                 hidden_states, router_logits, self.topk.topk_config
             )
+        # Backends consume precomputed weights verbatim -- every branch that
+        # derives weights itself folds in routed_scaling_factor, so the
+        # precomputed branch expects the caller to have done it. V4's own
+        # routing renormalizes but does not scale, so apply it here, the way
+        # forward_mega_moe does before handing weights to its experts.
+        if self.routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * self.routed_scaling_factor
         return StandardTopKOutput(topk_weights, topk_ids, router_scores)
 
     def _forward_shared_experts(
