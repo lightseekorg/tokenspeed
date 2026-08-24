@@ -581,16 +581,30 @@ class ModelExecutor:
         logger.info("ModelExecutor initialized")
 
     def _autotune(self) -> None:
-        """Profile tunable kernels over one dummy prefill, before graph capture.
+        """Profile tunable kernels over one dummy prefill before graph capture.
 
-        Runs a single extend forward at the largest token count a forward can
-        carry; the tuner enumerates every smaller shape bucket from it, so no
-        decode-sized pass is needed. Must precede capture: a captured graph
-        records the tactic chosen while it was recorded, so tuning afterwards
-        cannot change a replay. On distributed boots, per-tactic timings are
-        averaged over the world so every rank picks the same tactic.
+        The dummy batch is capped by both the chunked-prefill token budget and
+        rank-local request capacity. ``make_dummy_batch`` splits tokens into
+        requests of at most ``context_len``, while request-indexed buffers
+        contain only ``max_num_seqs // data_parallel_size`` rows. Keeping the
+        token count within their product prevents autotuning from constructing
+        a batch that cannot fit those buffers.
+
+        The tuner enumerates every smaller shape bucket from this pass, so a
+        separate decode-sized pass is unnecessary. This must run before graph
+        capture because a captured graph retains the tactic selected during
+        capture. On distributed boots, per-tactic timings are averaged across
+        ranks so every rank selects the same tactic.
         """
-        num_tokens = int(self.config.chunked_prefill_size)
+        per_rank_max_batch = max(
+            1,
+            int(self.config.max_num_seqs)
+            // max(int(self.config.data_parallel_size), 1),
+        )
+        num_tokens = min(
+            int(self.config.chunked_prefill_size),
+            int(self.config.context_len) * per_rank_max_batch,
+        )
         if num_tokens <= 0 or self.model_runner is None:
             return
         if self.config.pp_size > 1:

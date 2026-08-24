@@ -17,6 +17,87 @@
 
 """Activation kernel entry points."""
 
-from tokenspeed_kernel.ops.activation.triton import add3, situ_and_mul
+from __future__ import annotations
 
-__all__ = ["add3", "situ_and_mul"]
+import torch
+from tokenspeed_kernel.ops.activation.flashinfer import (
+    silu_and_mul as flashinfer_silu_and_mul,
+)
+from tokenspeed_kernel.ops.activation.triton import (
+    add3,
+)
+from tokenspeed_kernel.ops.activation.triton import silu_and_mul as triton_silu_and_mul
+from tokenspeed_kernel.ops.activation.triton import (
+    situ_and_mul,
+)
+from tokenspeed_kernel.ops.gemm import _fp8_linear_activation
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import error_fn
+
+
+def silu_and_mul(
+    x: torch.Tensor,
+    out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
+    limit: float | None = None,
+) -> torch.Tensor:
+    """Apply SwiGLU through the platform implementation.
+
+    Positive ``limit`` values use the portable Triton implementation because
+    the CUDA implementation does not expose the checkpoint's clamp semantics.
+    """
+    if (
+        limit is not None
+        or current_platform().is_amd
+        or flashinfer_silu_and_mul is error_fn
+    ):
+        return triton_silu_and_mul(x, out, enable_pdl=enable_pdl, limit=limit)
+    return flashinfer_silu_and_mul(x, out, enable_pdl=enable_pdl)
+
+
+def prepare_fp8_linear_activation(
+    plan: object,
+    x: torch.Tensor,
+    *,
+    activation: str,
+    limit: float | None = None,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Prepare an activation for a compatible block-FP8 linear plan.
+
+    The prepared linear implementation decides whether it can fuse activation
+    and quantization. ``None`` means the caller must evaluate the activation
+    normally and invoke the linear operation through its ordinary path.
+
+    Args:
+        plan: Opaque plan returned by the GEMM layer's ``prepare_fp8_linear``.
+        x: Input to the activation.
+        activation: Semantic activation name, currently ``"swiglu"``.
+        limit: Optional activation clamp limit.
+        alpha: Sigmoid multiplier for SwiGLU.
+        beta: Value added to SwiGLU's up branch.
+        enable_pdl: Join a Programmatic Dependent Launch chain when supported.
+
+    Returns:
+        Prepared FP8 values and scales, or ``None`` when no fused contract is
+        available.
+    """
+    return _fp8_linear_activation(
+        plan,
+        x,
+        activation=activation,
+        limit=limit,
+        alpha=alpha,
+        beta=beta,
+        enable_pdl=enable_pdl,
+    )
+
+
+__all__ = [
+    "add3",
+    "prepare_fp8_linear_activation",
+    "silu_and_mul",
+    "situ_and_mul",
+]

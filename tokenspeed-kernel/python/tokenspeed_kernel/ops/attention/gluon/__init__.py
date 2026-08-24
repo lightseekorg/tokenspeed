@@ -58,6 +58,12 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
         gluon_dsa_prefill_topk_standard_gfx950 as _dsa_prefill_topk_standard_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
+        gluon_dsv4_paged_selected_attention_split_gfx950 as _dsv4_paged_selected_attention_split_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
+        gluon_dsv4_selected_attention_gfx950 as _dsv4_selected_attention_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
         gluon_kda_fused_decode_gfx950 as _kda_fused_decode_impl,
     )
@@ -163,6 +169,76 @@ if current_platform().is_amd:
 
     @register_kernel(
         "attention",
+        "dsv4_paged_selected_attention",
+        name="gluon_dsv4_paged_selected_attention_split_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    swa_kv_cache=dense_tensor_format(torch.uint8),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "tokens": frozenset({1, 2, 3, 4, 5, 6}),
+            "head_dim": frozenset({512}),
+            "num_heads": frozenset({16, 32}),
+            "cache_layout": frozenset({"fp8_swa_page_planar"}),
+            "topk_layout": frozenset({"global_slots"}),
+            "support_sink": frozenset({True}),
+            "has_extra": frozenset({True}),
+            "has_extra_segment": frozenset({True}),
+            "swa_selected_width": frozenset({128}),
+            "extra_selected_width": frozenset({1024}),
+            "swa_page_size": frozenset({64}),
+            "extra_page_size": frozenset({64}),
+            "metadata_dtypes": frozenset({torch.int32}),
+        },
+        tags={"amd", "gfx950", "paged_cache", "selected_attention"},
+    )
+    def gluon_dsv4_paged_selected_attention_split_gfx950(*args, **kwargs):
+        return _dsv4_paged_selected_attention_split_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsv4_selected_attention",
+        name="gluon_dsv4_selected_attention_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    kv=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": frozenset({512}),
+            "cache_layout": frozenset({"dense_workspace"}),
+            "support_sink": frozenset({True}),
+            "selected_width": frozenset({384, 512, 640, 768, 1024, 1152}),
+            "metadata_dtypes": frozenset({torch.int32}),
+        },
+        tags={"amd", "gfx950", "selected_attention"},
+    )
+    def gluon_dsv4_selected_attention_gfx950(*args, **kwargs):
+        return _dsv4_selected_attention_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
         "kda_paged_prefill",
         name="gluon_kda_paged_prefill_gfx950",
         solution="gluon",
@@ -205,7 +281,7 @@ if current_platform().is_amd:
         tags={"amd", "gfx1250", "paged_cache"},
     )
     def gluon_kda_paged_prefill_gfx1250(**kwargs) -> KdaPrefillResult:
-        """Run specialized gfx1250 KDA prefill with canonical K-major state."""
+        """Run specialized gfx1250 KDA prefill with V-major state."""
         # Host-boundary hint is consumed only by the CuteDSL wrapper.
         kwargs.pop("cu_seqlens_cpu", None)
         output, final_state = _kda_prefill_gfx1250_impl(**kwargs)
@@ -328,17 +404,18 @@ if current_platform().is_amd:
         traits={
             "indexed_state": frozenset({True}),
             "single_token": frozenset({True}),
+            "recurrent_layout": frozenset({"v_major"}),
         },
         tags={"amd", "gfx1250", "paged_cache", "cuda_graph"},
     )
     def gluon_kda_paged_decode_gfx1250(**kwargs):
-        """Run specialized gfx1250 KDA decode against the canonical K-major pool."""
+        """Run specialized gfx1250 KDA decode against the physical V-major pool."""
         return _kda_decode_gfx1250_impl(**kwargs)
 
     @register_kernel(
         "attention",
         "kda_fused_paged_decode",
-        name="gluon_kda_fused_paged_decode_gfx1250",
+        name="gluon_kda_fused_paged_decode_vmajor_gfx1250",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(12, 5),
@@ -357,10 +434,11 @@ if current_platform().is_amd:
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "conv_kernel_size": frozenset({4}),
+            "recurrent_layout": frozenset({"v_major"}),
         },
         tags={"amd", "gfx1250", "paged_cache", "cuda_graph", "fusion"},
     )
-    def gluon_kda_fused_paged_decode_gfx1250(
+    def gluon_kda_fused_paged_decode_vmajor_gfx1250(
         mixed_qkv: torch.Tensor,
         conv_weights: torch.Tensor,
         conv_states: torch.Tensor,
@@ -381,7 +459,7 @@ if current_platform().is_amd:
         norm_weight: torch.Tensor | None,
         norm_eps: float | None,
     ):
-        """Run the decay projection and fused gfx1250 KDA decode epilogue."""
+        """Run the decay projection and V-major gfx1250 fused decode."""
         if output_gate is None or norm_weight is None or norm_eps is None:
             raise ValueError("gfx1250 fused KDA decode requires output normalization")
         raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
@@ -1143,6 +1221,7 @@ if current_platform().is_amd:
             "page_size": frozenset({64}),
             "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
             "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
     )
     def gluon_dsa_decode_topk_standard_gfx950(*args, **kwargs):
@@ -1175,6 +1254,7 @@ if current_platform().is_amd:
             "topk": frozenset({512, 1024, 2048}),
             "page_size": frozenset({64}),
             "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
     )
     def gluon_dsa_prefill_topk_standard_gfx950(*args, **kwargs):
@@ -1209,6 +1289,7 @@ if current_platform().is_amd:
             "page_size": frozenset({64}),
             "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
             "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
     )
     def gluon_dsa_decode_topk_fp8_gfx950(*args, **kwargs):
@@ -1242,6 +1323,7 @@ if current_platform().is_amd:
             "topk": frozenset({512, 1024, 2048}),
             "page_size": frozenset({64}),
             "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
     )
     def gluon_dsa_prefill_topk_fp8_gfx950(*args, **kwargs):
@@ -1378,6 +1460,7 @@ if current_platform().is_amd:
             "page_size": frozenset({64}),
             "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
             "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
         tags={"amd", "gfx1250"},
     )
@@ -1412,6 +1495,7 @@ if current_platform().is_amd:
             "topk": _DSA_PREFILL_TOPK_WIDTHS,
             "page_size": frozenset({64}),
             "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed", "page_planar"}),
         },
         tags={"amd", "gfx1250"},
     )

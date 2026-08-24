@@ -41,11 +41,14 @@ def _local_topk_to_global_slots_kernel(
     local_topk_offsets_stride,
     seq_lens_ptr,
     block_table_ptr,
+    block_table_base_offsets_ptr,
     block_table_stride,
     block_table_cols: tl.constexpr,
     block_size: tl.constexpr,
     topk: tl.constexpr,
     has_seq_lens: tl.constexpr,
+    has_block_table_base_offsets: tl.constexpr,
+    return_logical_offsets: tl.constexpr,
     q_len_per_req: tl.constexpr,
     block: tl.constexpr,
 ):
@@ -70,12 +73,18 @@ def _local_topk_to_global_slots_kernel(
         block_idx = local_idx // block_size
         block_offset = local_idx % block_size
         valid = valid & (block_idx >= 0) & (block_idx < block_table_cols)
-        page = tl.load(
-            block_table_ptr + req_idx * block_table_stride + block_idx,
-            mask=mask & valid,
-            other=0,
-        )
-        slot = page * block_size + block_offset
+        if return_logical_offsets:
+            base_page = tl.zeros((), dtype=tl.int64)
+            if has_block_table_base_offsets:
+                base_page = tl.load(block_table_base_offsets_ptr + req_idx).to(tl.int64)
+            slot = local_idx.to(tl.int64) + base_page * block_size
+        else:
+            page = tl.load(
+                block_table_ptr + req_idx * block_table_stride + block_idx,
+                mask=mask & valid,
+                other=0,
+            )
+            slot = page * block_size + block_offset
         tl.store(
             global_topk_slots_ptr + token_idx * global_topk_slots_stride + offsets,
             tl.where(valid, slot, -1),
@@ -93,6 +102,8 @@ def local_topk_to_global_slots(
     block_size: int,
     seq_lens: torch.Tensor | None = None,
     q_len_per_req: int = 1,
+    topk_layout: str = "global_slots",
+    block_table_base_offsets: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -112,6 +123,11 @@ def local_topk_to_global_slots(
     if block_table.shape[1] == 0:
         raise ValueError("block_table must have at least one page column")
     num_tokens, topk = local_topk_offsets.shape
+    if topk_layout not in ("global_slots", "logical_offsets"):
+        raise ValueError(
+            "topk_layout must be 'global_slots' or 'logical_offsets', got "
+            f"{topk_layout!r}"
+        )
     q_len_per_req = int(q_len_per_req)
     if q_len_per_req < 1 or num_tokens % q_len_per_req != 0:
         raise ValueError(
@@ -129,6 +145,13 @@ def local_topk_to_global_slots(
         raise ValueError(
             "seq_lens must have at least one entry per request: "
             f"lens={seq_lens.numel()}, reqs={num_reqs}"
+        )
+    if block_table_base_offsets is not None and (
+        block_table_base_offsets.dim() != 1
+        or block_table_base_offsets.numel() < num_reqs
+    ):
+        raise ValueError(
+            "block_table_base_offsets must have at least one entry per request"
         )
 
     if out is None:
@@ -174,7 +197,16 @@ def local_topk_to_global_slots(
     block_table = block_table.to(device=local_topk_offsets.device, dtype=torch.int32)
     if seq_lens is not None:
         seq_lens = seq_lens.to(device=local_topk_offsets.device, dtype=torch.int32)
+    if block_table_base_offsets is not None:
+        block_table_base_offsets = block_table_base_offsets.to(
+            device=local_topk_offsets.device, dtype=torch.int32
+        )
     seq_lens_arg = block_table[:, 0] if seq_lens is None else seq_lens
+    base_offsets_arg = (
+        block_table[:, 0]
+        if block_table_base_offsets is None
+        else block_table_base_offsets
+    )
     _local_topk_to_global_slots_kernel[(num_tokens,)](
         global_slots,
         global_slots.stride(0),
@@ -183,11 +215,14 @@ def local_topk_to_global_slots(
         local_topk_offsets.stride(0),
         seq_lens_arg,
         block_table,
+        base_offsets_arg,
         block_table.stride(0),
         block_table.shape[1],
         block_size=int(block_size),
         topk=topk,
         has_seq_lens=seq_lens is not None,
+        has_block_table_base_offsets=block_table_base_offsets is not None,
+        return_logical_offsets=topk_layout == "logical_offsets",
         q_len_per_req=q_len_per_req,
         block=1024,
     )
@@ -356,6 +391,7 @@ def _dsa_decode_logits_fp8_kernel(
     logits_stride: tl.constexpr,
     page_size: tl.constexpr,
     row_bytes: tl.constexpr,
+    page_stride_bytes: tl.constexpr,
     max_seq_len: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -381,10 +417,9 @@ def _dsa_decode_logits_fp8_kernel(
         mask=valid,
         other=0,
     ).to(tl.int64)
-    page_bytes = page_size * row_bytes
-    fp8_base = page * page_bytes + block_offset * head_dim
+    fp8_base = page * page_stride_bytes + block_offset * head_dim
     scale_base = (
-        page * (page_bytes // 4)
+        page * (page_stride_bytes // 4)
         + (page_size * head_dim) // 4
         + block_offset * num_groups
     )
@@ -439,6 +474,7 @@ def _dsa_prefill_logits_fp8_kernel(
     seq_len_sum: tl.constexpr,
     page_size: tl.constexpr,
     row_bytes: tl.constexpr,
+    page_stride_bytes: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     num_groups: tl.constexpr,
@@ -459,10 +495,9 @@ def _dsa_prefill_logits_fp8_kernel(
     ).to(tl.int64)
     page = slots // page_size
     block_offset = slots - page * page_size
-    page_bytes = page_size * row_bytes
-    fp8_base = page * page_bytes + block_offset * head_dim
+    fp8_base = page * page_stride_bytes + block_offset * head_dim
     scale_base = (
-        page * (page_bytes // 4)
+        page * (page_stride_bytes // 4)
         + (page_size * head_dim) // 4
         + block_offset * num_groups
     )
@@ -526,7 +561,7 @@ def _check_packed_fp8_inputs(
     index_k_cache: torch.Tensor,
     weights: torch.Tensor,
     page_size: int,
-) -> int:
+) -> tuple[int, int]:
     _check_q_weights(q, weights)
     if q.shape[2] % 128 != 0:
         raise ValueError(
@@ -538,18 +573,36 @@ def _check_packed_fp8_inputs(
             f"{index_k_cache.dtype}"
         )
     row_bytes = q.shape[2] + q.shape[2] // 128 * 4
-    if index_k_cache.dim() != 2 or index_k_cache.shape[1] != row_bytes:
+    if index_k_cache.dim() != 2:
         raise ValueError(
-            "index_k_cache must be [slots, row_bytes] matching q dim, got "
-            f"index_k_cache={tuple(index_k_cache.shape)}, "
-            f"expected row_bytes={row_bytes}, q={tuple(q.shape)}"
+            "index_k_cache must be a packed slot matrix or page-planar matrix, "
+            f"got shape {tuple(index_k_cache.shape)}"
         )
-    if index_k_cache.shape[0] % int(page_size) != 0:
+    page_bytes = int(page_size) * row_bytes
+    if index_k_cache.shape[1] == row_bytes:
+        if not index_k_cache.is_contiguous():
+            raise ValueError("packed index_k_cache must be contiguous")
+        if index_k_cache.shape[0] % int(page_size) != 0:
+            raise ValueError(
+                "index_k_cache slot count must be divisible by page_size, got "
+                f"slots={index_k_cache.shape[0]}, page_size={page_size}"
+            )
+        page_stride_bytes = page_bytes
+    elif (
+        index_k_cache.shape[1] >= page_bytes
+        and index_k_cache.stride(1) == 1
+        and index_k_cache.stride(0) >= page_bytes
+    ):
+        page_stride_bytes = index_k_cache.stride(0)
+    else:
         raise ValueError(
-            "index_k_cache slot count must be divisible by page_size, got "
-            f"slots={index_k_cache.shape[0]}, page_size={page_size}"
+            "index_k_cache must be contiguous [slots, row_bytes] or page-planar "
+            f"[pages, at least {page_bytes} bytes], got "
+            f"shape={tuple(index_k_cache.shape)}, stride={index_k_cache.stride()}"
         )
-    return row_bytes
+    if index_k_cache.storage_offset() % 4 or page_stride_bytes % 4:
+        raise ValueError("index_k_cache page storage must be float32 aligned")
+    return row_bytes, page_stride_bytes
 
 
 @triton.jit
@@ -917,10 +970,14 @@ def dsa_decode_topk_fp8(
     topk: int,
     softmax_scale: float,
     q_len_per_req: int = 1,
+    topk_layout: str = "global_slots",
+    block_table_base_offsets: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, page_size)
+    row_bytes, page_stride_bytes = _check_packed_fp8_inputs(
+        q, index_k_cache, weights, page_size
+    )
     q_len_per_req = int(q_len_per_req)
     if q_len_per_req < 1 or q.shape[0] % q_len_per_req != 0:
         raise ValueError(
@@ -957,7 +1014,6 @@ def dsa_decode_topk_fp8(
         raise RuntimeError("DSA Triton FP8 decode top-k requires CUDA tensors")
 
     q = q.contiguous()
-    index_k_cache = index_k_cache.contiguous()
     weights = weights.contiguous()
     seq_lens = seq_lens.to(device=q.device, dtype=torch.int32).contiguous()
     block_table = block_table.to(device=q.device, dtype=torch.int32).contiguous()
@@ -979,6 +1035,7 @@ def dsa_decode_topk_fp8(
         logits.stride(0),
         page_size=int(page_size),
         row_bytes=row_bytes,
+        page_stride_bytes=page_stride_bytes,
         max_seq_len=max_seq_len,
         num_heads=q.shape[1],
         head_dim=q.shape[2],
@@ -997,6 +1054,8 @@ def dsa_decode_topk_fp8(
         block_size=int(page_size),
         seq_lens=seq_lens,
         q_len_per_req=q_len_per_req,
+        topk_layout=topk_layout,
+        block_table_base_offsets=block_table_base_offsets,
         out=out,
         lens_out=lens_out,
     )
@@ -1017,7 +1076,9 @@ def dsa_prefill_topk_fp8(
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, page_size)
+    row_bytes, page_stride_bytes = _check_packed_fp8_inputs(
+        q, index_k_cache, weights, page_size
+    )
     if kv_workspace_slots.dim() != 1:
         raise ValueError(
             f"kv_workspace_slots must be 1-D, got {tuple(kv_workspace_slots.shape)}"
@@ -1042,7 +1103,6 @@ def dsa_prefill_topk_fp8(
         raise RuntimeError("DSA Triton FP8 prefill top-k requires CUDA tensors")
 
     q = q.contiguous()
-    index_k_cache = index_k_cache.contiguous()
     weights = weights.contiguous()
     kv_workspace_slots = kv_workspace_slots.to(
         device=q.device, dtype=torch.int64
@@ -1081,6 +1141,7 @@ def dsa_prefill_topk_fp8(
             seq_len_sum=seq_len_sum,
             page_size=int(page_size),
             row_bytes=row_bytes,
+            page_stride_bytes=page_stride_bytes,
             num_heads=q.shape[1],
             head_dim=q.shape[2],
             num_groups=q.shape[2] // 128,
@@ -1145,7 +1206,9 @@ def triton_dsa_plan(
         "topk": frozenset({512, 1024, 2048}),
         "page_size": frozenset({64}),
         "index_k_format": frozenset({"fp8_scaled"}),
+        "index_k_layout": frozenset({"packed", "page_planar"}),
     },
+    features={"logical_offsets"},
     priority=Priority.PORTABLE,
     tags={"portability"},
 )
@@ -1159,6 +1222,8 @@ def triton_dsa_decode_topk_fp8(
     topk: int,
     softmax_scale: float,
     q_len_per_req: int = 1,
+    topk_layout: str = "global_slots",
+    block_table_base_offsets: torch.Tensor | None = None,
     index_k_cache: torch.Tensor | None = None,
     seq_lens_2d: torch.Tensor | None = None,
     plan: object | None = None,
@@ -1179,6 +1244,8 @@ def triton_dsa_decode_topk_fp8(
         topk=topk,
         softmax_scale=softmax_scale,
         q_len_per_req=q_len_per_req,
+        topk_layout=topk_layout,
+        block_table_base_offsets=block_table_base_offsets,
         out=out,
         lens_out=lens_out,
     )
@@ -1207,6 +1274,7 @@ def triton_dsa_decode_topk_fp8(
         "head_dim": frozenset({128}),
         "topk": frozenset({512, 1024, 2048}),
         "index_k_format": frozenset({"fp8_scaled"}),
+        "index_k_layout": frozenset({"packed", "page_planar"}),
     },
     priority=Priority.PORTABLE,
     tags={"portability"},

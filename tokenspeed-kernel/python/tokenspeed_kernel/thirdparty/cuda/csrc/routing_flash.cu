@@ -141,7 +141,7 @@ void softmax_topk_flash(TensorView input, TensorView correction_bias, TensorView
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(softmax_topk_flash, softmax_topk_flash);
 
-namespace deepseek_v4_routing {
+namespace dsv4_routing {
 
 template <typename T>
 __device__ __forceinline__ float to_float(T value) {
@@ -305,7 +305,7 @@ __global__ void gate_forward_kernel(
   }
 }
 
-}  // namespace deepseek_v4_routing
+}  // namespace dsv4_routing
 
 #define DSV4_DISPATCH_INPUT(DTYPE_CODE, InputT, ...)                                      \
   [&] {                                                                                   \
@@ -346,12 +346,12 @@ void launch_gate_forward(
   constexpr int threads_per_block = warps_per_block * 32;
   int const blocks = (batch_size + warps_per_block - 1) / warps_per_block;
   if (is_hash) {
-    deepseek_v4_routing::gate_forward_kernel<nExperts, kTopK, true, TokenIdT>
+    dsv4_routing::gate_forward_kernel<nExperts, kTopK, true, TokenIdT>
         <<<blocks, threads_per_block, 0, stream>>>(
             scores_in, nullptr, input_ids, tid2eid,
             out_weights, out_indices, batch_size, route_scale);
   } else {
-    deepseek_v4_routing::gate_forward_kernel<nExperts, kTopK, false, TokenIdT>
+    dsv4_routing::gate_forward_kernel<nExperts, kTopK, false, TokenIdT>
         <<<blocks, threads_per_block, 0, stream>>>(
             scores_in, bias, nullptr, nullptr,
             out_weights, out_indices, batch_size, route_scale);

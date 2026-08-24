@@ -1491,10 +1491,10 @@ def _check_score_input_contract(
 ) -> None:
     if weights.device != q.device or index_k_cache.device != q.device:
         raise ValueError("q, weights, and index_k_cache must be on the same device")
-    if not (
-        q.is_contiguous() and weights.is_contiguous() and index_k_cache.is_contiguous()
-    ):
-        raise ValueError("q, weights, and index_k_cache must be contiguous")
+    if not q.is_contiguous() or not weights.is_contiguous():
+        raise ValueError("q and weights must be contiguous")
+    if index_k_cache.stride(-1) != 1:
+        raise ValueError("index_k_cache pages must contain contiguous bytes")
 
 
 def _check_topk_contract(topk: int) -> None:
@@ -1925,8 +1925,10 @@ def gluon_dsa_decode_topk_fp8_gfx950(
             f"DSA Gluon top-k supports q_len_per_req=1..6, got {q_len_per_req}"
         )
     if index_k_cache is None:
-        raise RuntimeError("Gluon DSA paged top-k requires packed FP8 index_k_cache")
-    row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, int(page_size))
+        raise RuntimeError("Gluon DSA paged top-k requires an FP8 index_k_cache")
+    row_bytes, page_stride_bytes = _check_packed_fp8_inputs(
+        q, index_k_cache, weights, int(page_size)
+    )
     if not weights.is_contiguous():
         weights = weights.contiguous()
     _check_score_input_contract(q, weights, index_k_cache)
@@ -1986,6 +1988,7 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         logits.stride(0),
         page_size=int(page_size),
         row_bytes=row_bytes,
+        page_stride_bytes=page_stride_bytes,
         max_seq_len=max_seq_len,
         num_heads=q.shape[1],
         head_dim=q.shape[2],
@@ -2031,9 +2034,11 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
     _check_topk_contract(topk)
     if index_k_cache is None or page_size is None:
         raise RuntimeError(
-            "Gluon DSA top-k requires packed FP8 index_k_cache and page_size"
+            "Gluon DSA top-k requires an FP8 index_k_cache and page_size"
         )
-    row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, int(page_size))
+    row_bytes, page_stride_bytes = _check_packed_fp8_inputs(
+        q, index_k_cache, weights, int(page_size)
+    )
     if not weights.is_contiguous():
         weights = weights.contiguous()
     _check_score_input_contract(q, weights, index_k_cache)
@@ -2104,6 +2109,7 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
             seq_len_sum=seq_len_sum,
             page_size=int(page_size),
             row_bytes=row_bytes,
+            page_stride_bytes=page_stride_bytes,
             num_heads=q.shape[1],
             head_dim=q.shape[2],
             num_groups=q.shape[2] // 128,
@@ -2129,7 +2135,7 @@ def _check_standard_scorer_inputs(
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
     page_size: int,
-) -> tuple[int, bool]:
+) -> tuple[int, int, bool]:
     if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise TypeError(
             f"standard-cache DSA scorer expects BF16 or FP8 q, got {q.dtype}"
@@ -2151,16 +2157,35 @@ def _check_standard_scorer_inputs(
         raise ValueError(
             f"standard-cache DSA scorer requires page_size=64, got {page_size}"
         )
-    if index_k_cache.dtype != torch.uint8 or not index_k_cache.is_contiguous():
-        raise TypeError("index_k_cache must be a contiguous uint8 tensor")
+    if index_k_cache.dtype != torch.uint8:
+        raise TypeError("index_k_cache must be a uint8 tensor")
     row_bytes = 128 + 4
-    if index_k_cache.dim() != 2 or index_k_cache.shape[1] != row_bytes:
+    if index_k_cache.dim() != 2:
         raise ValueError(
-            f"index_k_cache must have shape [slots, {row_bytes}], got "
-            f"{tuple(index_k_cache.shape)}"
+            "index_k_cache must be a packed slot matrix or page-planar matrix, "
+            f"got shape {tuple(index_k_cache.shape)}"
         )
-    if index_k_cache.shape[0] % page_size:
-        raise ValueError("index_k_cache slot count must be page aligned")
+    page_bytes = page_size * row_bytes
+    if index_k_cache.shape[1] == row_bytes:
+        if not index_k_cache.is_contiguous():
+            raise ValueError("packed index_k_cache must be contiguous")
+        if index_k_cache.shape[0] % page_size:
+            raise ValueError("index_k_cache slot count must be page aligned")
+        page_stride_bytes = page_bytes
+    elif (
+        index_k_cache.shape[1] >= page_bytes
+        and index_k_cache.stride(1) == 1
+        and index_k_cache.stride(0) >= page_bytes
+    ):
+        page_stride_bytes = index_k_cache.stride(0)
+    else:
+        raise ValueError(
+            "index_k_cache must be contiguous [slots, row_bytes] or page-planar "
+            f"[pages, at least {page_bytes} bytes], got "
+            f"shape={tuple(index_k_cache.shape)}, stride={index_k_cache.stride()}"
+        )
+    if index_k_cache.storage_offset() % 4 or page_stride_bytes % 4:
+        raise ValueError("index_k_cache page storage must be float32 aligned")
     if weights.device != q.device or index_k_cache.device != q.device:
         raise ValueError("q, weights, and index_k_cache must be on the same device")
     q_is_fp8 = q.dtype == torch.float8_e4m3fn
@@ -2178,7 +2203,7 @@ def _check_standard_scorer_inputs(
             )
     elif q_scales is not None:
         raise ValueError("q_scales is only valid with FP8 q")
-    return row_bytes, q_is_fp8
+    return row_bytes, page_stride_bytes, q_is_fp8
 
 
 def gluon_dsa_decode_topk_standard_gfx950(
@@ -2207,7 +2232,7 @@ def gluon_dsa_decode_topk_standard_gfx950(
         raise ValueError(f"q_len_per_req must be in 1..6, got {q_len_per_req}")
     if index_k_cache is None:
         raise RuntimeError("standard-cache DSA scorer requires index_k_cache")
-    row_bytes, q_is_fp8 = _check_standard_scorer_inputs(
+    row_bytes, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
         q, q_scales, weights, index_k_cache, int(page_size)
     )
     if seq_lens.dtype != torch.int32 or block_table.dtype != torch.int32:
@@ -2268,13 +2293,18 @@ def gluon_dsa_decode_topk_standard_gfx950(
         q_len_per_req,
         PAGE_SIZE=int(page_size),
         ROW_BYTES=row_bytes,
+        PAGE_STRIDE_BYTES=page_stride_bytes,
         NUM_HEADS=q.shape[1],
         HEAD_DIM=q.shape[2],
         BLOCK_N=block_n,
         CHUNK_N=chunk_n,
         NUM_WARPS=num_warps,
         Q_IS_FP8=q_is_fp8,
-        USE_BUFFER_LOAD=index_k_cache.nbytes < 2**31,
+        USE_BUFFER_LOAD=(
+            (index_k_cache.shape[0] - 1) * index_k_cache.stride(0)
+            + index_k_cache.shape[1]
+            < 2**31
+        ),
         USE_BUFFER_STORE=logits.nbytes < 2**31,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
@@ -2316,7 +2346,7 @@ def gluon_dsa_prefill_topk_standard_gfx950(
     _check_topk_contract(topk)
     if index_k_cache is None or page_size is None:
         raise RuntimeError("standard-cache DSA scorer requires cache and page_size")
-    row_bytes, q_is_fp8 = _check_standard_scorer_inputs(
+    row_bytes, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
         q, q_scales, weights, index_k_cache, int(page_size)
     )
     if (
@@ -2389,12 +2419,17 @@ def gluon_dsa_prefill_topk_standard_gfx950(
             workspace_rows,
             PAGE_SIZE=int(page_size),
             ROW_BYTES=row_bytes,
+            PAGE_STRIDE_BYTES=page_stride_bytes,
             NUM_HEADS=q.shape[1],
             HEAD_DIM=q.shape[2],
             BLOCK_N=block_n,
             NUM_WARPS=num_warps,
             Q_IS_FP8=q_is_fp8,
-            USE_BUFFER_LOAD=index_k_cache.nbytes < 2**31,
+            USE_BUFFER_LOAD=(
+                (index_k_cache.shape[0] - 1) * index_k_cache.stride(0)
+                + index_k_cache.shape[1]
+                < 2**31
+            ),
             USE_BUFFER_STORE=logits.nbytes < 2**31,
             num_warps=num_warps,
             waves_per_eu=waves_per_eu,

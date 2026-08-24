@@ -39,6 +39,8 @@ requires_registered_replay = pytest.mark.skipif(
 )
 
 from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (  # noqa: E402
+    _gate_tiling,
+    batched_kda_commit_conv_window_kernel,
     batched_recurrent_kda_replay_commit,
     fused_recurrent_kda_replay_commit,
     fused_recurrent_kda_verify_megafuse,
@@ -134,6 +136,60 @@ def _batched_static_args(x, layers_per_group):
         layers_per_group=layers_per_group,
         lower_bound=LOWER_BOUND,
     )
+
+
+def test_gate_tiling_counts_every_layer_in_the_grid():
+    """The batched launch tiles for its own grid, which spans all layers."""
+    dev = torch.device(DEV)
+    rows = 8
+    one = _gate_tiling(rows, HV, K, dev)
+    many = _gate_tiling(rows, HV, K, dev, layers=69)
+    # More programs can only let an earlier, wider rung clear the threshold.
+    assert many[0] >= one[0] and many[1] >= one[1]
+    assert _gate_tiling(rows, HV, K, dev, layers=10**6) == (8, 32)
+    # A rung wider than the row count spends most of its lanes on rows that
+    # do not exist, so the ladder skips it however wide the grid looks.
+    for narrow in (1, 2, 4):
+        assert _gate_tiling(narrow, HV, K, dev, layers=10**6)[0] <= narrow
+
+
+@pytest.mark.parametrize("block", [64, 128, 256, 512, 2048])
+def test_batched_conv_window_is_independent_of_its_column_block(block):
+    """Splitting the window publish across columns must not move a byte."""
+    layers, n, t = 3, 4, 4
+    source = [_window(n, t, seed=700 + layer) for layer in range(layers)]
+    reads = torch.stack([source[0]["read_indices"]] * layers).to(torch.int32)
+    writes = torch.stack(
+        [torch.arange(9, 9 + n, device=DEV, dtype=torch.int32)] * layers
+    )
+    accepted = torch.tensor([0, t, 1, 3], device=DEV, dtype=torch.int32)
+    conv_dim = 3 * HV * K
+
+    def publish(block_size):
+        xs = [
+            {k: (v.clone() if torch.is_tensor(v) else v) for k, v in x.items()}
+            for x in source
+        ]
+        batched_kda_commit_conv_window_kernel[
+            (layers, n, (conv_dim + block_size - 1) // block_size)
+        ](
+            _batched_descriptor(xs),
+            reads,
+            writes,
+            accepted,
+            n,
+            T=t,
+            STRIDE_QKV=xs[0]["qkv_raw"].stride(0),
+            STRIDE_CONV=xs[0]["conv_pool"].stride(0),
+            CONV_DIM=conv_dim,
+            LAYERS_PER_GROUP=1,
+            BLOCK=block_size,
+            num_warps=min(8, max(1, block_size // 128)),
+        )
+        return [x["conv_pool"] for x in xs]
+
+    for narrow, wide in zip(publish(block), publish(4096), strict=True):
+        torch.testing.assert_close(narrow, wide, atol=0, rtol=0)
 
 
 def test_batched_replay_is_bit_identical_and_descriptor_sensitive():

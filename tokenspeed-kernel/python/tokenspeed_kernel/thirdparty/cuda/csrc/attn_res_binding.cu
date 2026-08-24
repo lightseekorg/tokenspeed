@@ -26,6 +26,7 @@
  * the final candidate. Caller allocates the output.
  */
 #include <cstdint>
+#include <limits>
 
 #include "attn_res/attn_res.cuh"
 #include "tvm_ffi_utils.h"
@@ -81,9 +82,9 @@ static void attn_res_fwd_impl(TensorView layer_residual, TensorView block_residu
   TVM_FFI_ICHECK_EQ(layer_residual.ndim(), 3) << "attn_res_fwd: layer_residual must be [T, B, H]";
   TVM_FFI_ICHECK_EQ(block_residual.ndim(), 4) << "attn_res_fwd: block_residual must be [K, T, B, H]";
 
-  const int T = static_cast<int>(layer_residual.size(0));
-  const int B = static_cast<int>(layer_residual.size(1));
-  const int H = static_cast<int>(layer_residual.size(2));
+  const int64_t T64 = layer_residual.size(0);
+  const int64_t B64 = layer_residual.size(1);
+  const int64_t H64 = layer_residual.size(2);
   const int N = num_blocks + 1;
 
   TVM_FFI_ICHECK(num_blocks >= 0 && num_blocks <= block_residual.size(0))
@@ -94,10 +95,17 @@ static void attn_res_fwd_impl(TensorView layer_residual, TensorView block_residu
                   block_write_idx < block_residual.size(0)))
       << "attn_res_fwd: block_write_idx must append within block_residual";
 
-  TVM_FFI_ICHECK_EQ(B, 1) << "attn_res_fwd: only B=1 supported, got " << B;
+  TVM_FFI_ICHECK_EQ(B64, 1) << "attn_res_fwd: only B=1 supported, got " << B64;
   TVM_FFI_ICHECK(N >= 1 && N <= 12) << "attn_res_fwd: N=" << N << " must be in [1, 12]";
-  TVM_FFI_ICHECK(T >= 1 && T <= 16384) << "attn_res_fwd: T=" << T << " must be in [1, 16384]";
-  TVM_FFI_ICHECK_EQ(H, 7168) << "attn_res_fwd: H must be 7168";
+  constexpr int64_t kMaxTokens = std::numeric_limits<int>::max() / 7168;
+  TVM_FFI_ICHECK(T64 >= 1 && T64 <= kMaxTokens)
+      << "attn_res_fwd: T=" << T64 << " must be in [1, " << kMaxTokens
+      << "] so the block-residual stride fits in int32";
+  TVM_FFI_ICHECK_EQ(H64, 7168) << "attn_res_fwd: H must be 7168";
+
+  const int T = static_cast<int>(T64);
+  const int B = static_cast<int>(B64);
+  const int H = static_cast<int>(H64);
 
   TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(layer_residual.dtype()), bfloat16_code)
       << "attn_res_fwd: layer_residual must be bf16";

@@ -20,7 +20,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "deepseek_v4_persistent_topk.cuh"
+#include "dsv4_persistent_topk.cuh"
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::TensorView;
@@ -401,7 +401,7 @@ void launch_indexer_topk_prefill(const TensorView& logits,
 }  // namespace prefill_topk
 }  // namespace
 
-void deepseek_v4_indexer_topk_prefill(TensorView logits, TensorView row_starts,
+void dsv4_indexer_topk_prefill(TensorView logits, TensorView row_starts,
                                       TensorView row_ends, TensorView output,
                                       int64_t k) {
   CHECK_CUDA(logits);
@@ -437,7 +437,7 @@ void deepseek_v4_indexer_topk_prefill(TensorView logits, TensorView row_starts,
                                             k, stream);
   cudaError_t err = cudaGetLastError();
   TVM_FFI_ICHECK(err == cudaSuccess)
-      << "deepseek_v4_indexer_topk_prefill failed: "
+      << "dsv4_indexer_topk_prefill failed: "
       << cudaGetErrorString(err);
 }
 
@@ -601,12 +601,12 @@ void launch_persistent_topk(const TensorView& logits,
 
   err = cudaGetLastError();
   TVM_FFI_ICHECK(err == cudaSuccess)
-      << "deepseek_v4_persistent_topk failed: " << cudaGetErrorString(err);
+      << "dsv4_persistent_topk failed: " << cudaGetErrorString(err);
 }
 
 }  // namespace
 
-void deepseek_v4_persistent_topk(TensorView logits,
+void dsv4_persistent_topk(TensorView logits,
                                  TensorView lengths,
                                  TensorView output,
                                  TensorView workspace,
