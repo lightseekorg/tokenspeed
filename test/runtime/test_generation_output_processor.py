@@ -632,6 +632,48 @@ def test_pd_one_token_request_finishes_at_remote_prefill_done():
     assert output.finished_reasons[0] == {"type": "length", "length": 1}
 
 
+class _Matcher:
+    """A matcher that records the tokens it was asked to accept."""
+
+    def __init__(self) -> None:
+        self.accepted = []
+
+    def accept_token(self, token_id: int) -> None:
+        self.accepted.append(token_id)
+
+    def is_terminated(self) -> bool:
+        return False
+
+
+def test_pd_decode_matcher_accepts_the_prefill_nodes_token():
+    """The decode node compiled its own matcher; the prefill node's token is
+    the one token it never samples, so it must be accepted here or every
+    decode step would mask from a state one token behind."""
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    state = _state([1, 2, 3], computed_length=3)
+    state.grammar = _Matcher()
+    processor.rid_to_state["decode"] = state
+
+    processor.on_remote_prefill_done("decode", 101)
+
+    assert state.output_ids == [101]
+    assert state.grammar.accepted == [101]
+
+
+def test_pd_decode_drops_the_grammar_when_the_bootstrap_token_is_lost():
+    """Nothing can bring the matcher in sync without that token, and masking
+    from a stale state corrupts the output more quietly than not masking."""
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    state = _state([1, 2, 3], computed_length=3)
+    state.grammar = _Matcher()
+    processor.rid_to_state["decode"] = state
+
+    processor.on_remote_prefill_done("decode", -1)
+
+    assert state.output_ids == []
+    assert state.grammar is None
+
+
 def test_pd_multi_token_request_continues_after_remote_prefill_done():
     sender = _Sender()
     processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())

@@ -119,14 +119,16 @@ def test_decode_node_triggers_the_receive_for_a_remote_prefill_batch():
     assert trace == ["run", ("slots", [3]), "reset", "zero-sync", "rdma"]
 
 
-def test_decode_node_runs_local_batches_without_grammar():
+def test_decode_node_masks_local_batches_with_the_batch_grammar():
+    """The matcher was advanced past the prefill node's token when the
+    RemotePrefillDoneEvent landed, so decode masks from the right state."""
     trace = []
     pending, on_first_token = DecodeDispatcher(
         _executor(trace), SimpleNamespace(), pd_cache_enabled=False
     ).dispatch(_planned(num_extends=0))
 
     assert pending is not None and on_first_token is None
-    assert trace[1][1] is None
+    assert trace[1][1] == "GRAMMAR"
 
 
 def test_prefill_node_hands_the_kv_off_when_no_chunk_is_left():

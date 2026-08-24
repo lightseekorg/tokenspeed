@@ -849,20 +849,38 @@ class OutputProcesser:
         It is appended to output_ids so the decode side starts generation from the
         correct position.
 
+        A constrained request also advances its matcher here. Prefill and decode
+        each compiled their own matcher for the request, and this token is the
+        only one the decode node never samples itself: without accepting it here
+        the matcher would mask every decode step from a state one token behind
+        the text it is constraining.
+
         bootstrap_token == -1 means the prefill side did not (or could not) supply a
         token (e.g. it was generated on a rank whose ZMQ message arrived after the
         success barrier had already been satisfied).
         """
         if req_id not in self.rid_to_state:
             return
+        state = self.rid_to_state[req_id]
         if bootstrap_token == -1:
             logger.warning(
                 "[on_remote_prefill_done] rid=%s received bootstrap_token=-1, skipping append to output_ids",
                 req_id,
             )
+            if state.grammar is not None:
+                # Nothing will ever bring this matcher in sync, and masking
+                # from a stale state corrupts the output more quietly than
+                # not masking at all. Drop it, loudly.
+                logger.warning(
+                    "[on_remote_prefill_done] rid=%s lost its bootstrap token; "
+                    "structured output is no longer enforced for it",
+                    req_id,
+                )
+                state.grammar = None
             return
-        state = self.rid_to_state[req_id]
         state.output_ids.append(bootstrap_token)
+        if state.grammar is not None:
+            state.grammar.accept_token(bootstrap_token)
         state.check_finished()
 
     def finish_remote_prefill_only_request(self, req_id: str) -> list:
