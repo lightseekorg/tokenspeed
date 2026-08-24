@@ -14,8 +14,8 @@ def _objs_dir() -> Path:
 
 
 @functools.cache
-def _load_deepseek_v4_attention_module():
-    so_path = _objs_dir() / "deepseek_v4_attention" / "deepseek_v4_attention.so"
+def _load_dsv4_attention_module():
+    so_path = _objs_dir() / "dsv4_attention" / "dsv4_attention.so"
     if not so_path.exists():
         raise RuntimeError(
             f"tokenspeed_kernel DeepSeek V4 attention library not found at {so_path}. "
@@ -26,34 +26,34 @@ def _load_deepseek_v4_attention_module():
 
 def has_fused_qnorm_rope_kv_insert() -> bool:
     try:
-        module = _load_deepseek_v4_attention_module()
+        module = _load_dsv4_attention_module()
     except Exception:
         return False
-    return hasattr(module, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert")
+    return hasattr(module, "fused_dsv4_qnorm_rope_kv_rope_quant_insert")
 
 
 def has_indexer_topk_prefill() -> bool:
     try:
-        module = _load_deepseek_v4_attention_module()
+        module = _load_dsv4_attention_module()
     except Exception:
         return False
-    return hasattr(module, "deepseek_v4_indexer_topk_prefill")
+    return hasattr(module, "dsv4_indexer_topk_prefill")
 
 
 def has_indexer_mxfp4_paged_gather() -> bool:
     try:
-        module = _load_deepseek_v4_attention_module()
+        module = _load_dsv4_attention_module()
     except Exception:
         return False
-    return hasattr(module, "deepseek_v4_gather_paged_indexer_mxfp4_cache")
+    return hasattr(module, "dsv4_gather_paged_indexer_mxfp4_cache")
 
 
 def has_persistent_topk() -> bool:
     try:
-        module = _load_deepseek_v4_attention_module()
+        module = _load_dsv4_attention_module()
     except Exception:
         return False
-    return hasattr(module, "deepseek_v4_persistent_topk")
+    return hasattr(module, "dsv4_persistent_topk")
 
 
 def fused_qnorm_rope_kv_insert(
@@ -80,7 +80,7 @@ def fused_qnorm_rope_kv_insert(
     if positions.dtype != torch.int64:
         positions = positions.to(torch.int64)
 
-    _load_deepseek_v4_attention_module().fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+    _load_dsv4_attention_module().fused_dsv4_qnorm_rope_kv_rope_quant_insert(
         q,
         kv,
         k_cache,
@@ -108,7 +108,7 @@ def indexer_topk_prefill(
         row_ends = row_ends.to(torch.int32)
     if output.dtype != torch.int32:
         raise TypeError(f"output must be int32, got {output.dtype}")
-    _load_deepseek_v4_attention_module().deepseek_v4_indexer_topk_prefill(
+    _load_dsv4_attention_module().dsv4_indexer_topk_prefill(
         logits.contiguous(),
         row_starts.contiguous(),
         row_ends.contiguous(),
@@ -140,7 +140,7 @@ def indexer_mxfp4_paged_gather(
             "DeepSeek V4 paged gather output value/scale rows must match, "
             f"got values={values_out.shape[0]}, scales={scales_out.shape[0]}"
         )
-    _load_deepseek_v4_attention_module().deepseek_v4_gather_paged_indexer_mxfp4_cache(
+    _load_dsv4_attention_module().dsv4_gather_paged_indexer_mxfp4_cache(
         kv_cache,
         values_out,
         scales_out,
@@ -171,7 +171,7 @@ def persistent_topk(
         logits = logits.contiguous()
     if not lengths.is_contiguous():
         lengths = lengths.contiguous()
-    _load_deepseek_v4_attention_module().deepseek_v4_persistent_topk(
+    _load_dsv4_attention_module().dsv4_persistent_topk(
         logits,
         lengths,
         output,

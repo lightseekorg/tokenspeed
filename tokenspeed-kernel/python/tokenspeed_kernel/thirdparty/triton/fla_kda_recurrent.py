@@ -925,9 +925,14 @@ def _kda_verify_launch_config(
     """Route measured verify launch defaults while preserving overrides."""
     if split_producers and value_dim == 128 and not store_states:
         routed_bv = 8 if batch_size < 16 else 16
+        # Under four requests the grid is only a couple of blocks per SM, so
+        # widening them pays: 8-11% at 1..3, bit-identical, and swept as the
+        # boundary rather than assumed -- four warps loses from four requests
+        # up and is 49% slower by eight.
+        routed_warps = 4 if batch_size < 4 else 1
         return (
             routed_bv if bv is None else bv,
-            1 if num_warps is None else num_warps,
+            routed_warps if num_warps is None else num_warps,
             3 if num_stages is None else num_stages,
         )
     return (
@@ -1697,23 +1702,40 @@ def kda_gate_precompute_kernel(
 _SM_COUNT: dict[int, int] = {}
 
 
-def _gate_tiling(rows: int, num_heads: int, head_dim: int, device):
-    """Rows and gate channels per program, widest grid that still fills the GPU.
-
-    Both knobs only decide which rows a program owns -- every row still
-    reduces over the whole D_FA axis -- so this never moves a result. What it
-    does move is whether the weight-tile load has any parallelism to hide
-    behind: small batches need a narrower tiling to cover the machine, and at
-    large row counts the choices converge.
-    """
+def _sm_count(device) -> int:
+    """Multiprocessor count for the device, memoized per index."""
     index = device.index if device.index is not None else torch.cuda.current_device()
     sms = _SM_COUNT.get(index)
     if sms is None:
         sms = torch.cuda.get_device_properties(index).multi_processor_count
         _SM_COUNT[index] = sms
+    return sms
+
+
+def _gate_tiling(rows: int, num_heads: int, head_dim: int, device, layers: int = 1):
+    """Rows and gate channels per program: the widest tile the grid can afford.
+
+    Both knobs only decide which rows a program owns -- every row still
+    reduces over the whole D_FA axis -- but the tile shape does pick the
+    reduction tree, so two tilings agree to a few ulp rather than bit for bit.
+    What the choice really moves is the ``[BK, D_FA]`` weight traffic, which
+    scales with ``cdiv(rows, block_t)``: a narrower row block buys parallelism
+    by reading that tile again in every program, so taking one the grid did
+    not need is pure amplification.
+
+    ``layers`` is the batched caller's outer grid dimension. Omitting it made
+    the estimate short by that factor and drove the all-layer launch to the
+    narrowest tiling at every batch size.
+    """
+    sms = _sm_count(device)
     for block_t, block_k in ((8, 32), (4, 32), (2, 16), (1, 16)):
+        if block_t > rows:
+            continue
         programs = (
-            num_heads * triton.cdiv(rows, block_t) * triton.cdiv(head_dim, block_k)
+            layers
+            * num_heads
+            * triton.cdiv(rows, block_t)
+            * triton.cdiv(head_dim, block_k)
         )
         if programs >= 4 * sms:
             return block_t, min(block_k, triton.next_power_of_2(head_dim))
@@ -2264,7 +2286,9 @@ def batched_recurrent_kda_replay_commit(
     layers = addresses.shape[0]
     batch = accepted_length.numel()
     rows = batch * draft_token_num
-    block_t, block_k = _gate_tiling(rows, num_heads, head_dim, addresses.device)
+    block_t, block_k = _gate_tiling(
+        rows, num_heads, head_dim, addresses.device, layers=layers
+    )
     batched_kda_gate_precompute_kernel[
         (
             layers * num_heads,
@@ -2307,7 +2331,15 @@ def batched_recurrent_kda_replay_commit(
         num_warps=1,
         num_stages=2,
     )
-    batched_kda_commit_conv_window_kernel[(layers, batch, 1)](
+    # Swept 8192..64 at every batch size: 128 wins from batch 8 up (3x the
+    # whole-row block at 32) and ties the best within noise at batch 1, while
+    # 64 falls off a cliff. A fixed block beats sizing to the grid, which
+    # stopped narrowing while the wins were still there.
+    conv_dim = 3 * num_heads * head_dim
+    conv_block = 128
+    batched_kda_commit_conv_window_kernel[
+        (layers, batch, triton.cdiv(conv_dim, conv_block))
+    ](
         addresses,
         read_indices,
         write_indices,
@@ -2316,10 +2348,10 @@ def batched_recurrent_kda_replay_commit(
         T=draft_token_num,
         STRIDE_QKV=qkv_stride,
         STRIDE_CONV=conv_stride,
-        CONV_DIM=3 * num_heads * head_dim,
+        CONV_DIM=conv_dim,
         LAYERS_PER_GROUP=layers_per_group,
-        BLOCK=triton.next_power_of_2(3 * num_heads * head_dim),
-        num_warps=8,
+        BLOCK=conv_block,
+        num_warps=1,
     )
 
 
@@ -2416,13 +2448,7 @@ def kda_commit_conv_window(
     )
     # Narrow the column block until the grid covers the machine: at one
     # request the widest block leaves 18 programs for 4608 channels.
-    index = write_indices.device.index
-    if index is None:
-        index = torch.cuda.current_device()
-    sms = _SM_COUNT.get(index)
-    if sms is None:
-        sms = torch.cuda.get_device_properties(index).multi_processor_count
-        _SM_COUNT[index] = sms
+    sms = _sm_count(write_indices.device)
     # Narrowing past 64 stops paying: the columns each program owns get too
     # few to amortize its own setup.
     block = 256

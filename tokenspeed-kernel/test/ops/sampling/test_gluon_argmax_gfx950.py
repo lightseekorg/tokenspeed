@@ -25,7 +25,7 @@ import torch
 from utils import is_cdna4
 
 MODEL_VOCABS = {
-    "deepseek_v4": 129280,
+    "dsv4": 129280,
     "qwen3_5": 151936,
     "minimax_m2": 200064,
 }
@@ -50,10 +50,10 @@ def test_argmax_matches_torch_for_dtypes(dtype):
 @pytest.mark.parametrize(
     "M,N",
     [
-        (1, MODEL_VOCABS["deepseek_v4"]),
-        (2, MODEL_VOCABS["deepseek_v4"]),
-        (3, MODEL_VOCABS["deepseek_v4"]),
-        (4, MODEL_VOCABS["deepseek_v4"]),
+        (1, MODEL_VOCABS["dsv4"]),
+        (2, MODEL_VOCABS["dsv4"]),
+        (3, MODEL_VOCABS["dsv4"]),
+        (4, MODEL_VOCABS["dsv4"]),
         (16, MODEL_VOCABS["qwen3_5"]),
         (64, MODEL_VOCABS["minimax_m2"]),
         (128, MODEL_VOCABS["qwen3_5"]),
@@ -69,10 +69,10 @@ def test_argmax_matches_torch_for_model_shapes(M, N):
 @pytest.mark.parametrize(
     "M,N,dtype",
     [
-        (1, MODEL_VOCABS["deepseek_v4"], torch.float32),
-        (4, MODEL_VOCABS["deepseek_v4"], torch.float32),
-        (8, MODEL_VOCABS["deepseek_v4"], torch.float16),
-        (128, MODEL_VOCABS["deepseek_v4"], torch.bfloat16),
+        (1, MODEL_VOCABS["dsv4"], torch.float32),
+        (4, MODEL_VOCABS["dsv4"], torch.float32),
+        (8, MODEL_VOCABS["dsv4"], torch.float16),
+        (128, MODEL_VOCABS["dsv4"], torch.bfloat16),
     ],
 )
 def test_argmax_all_nan_rows_return_sentinel(M, N, dtype):
@@ -84,7 +84,7 @@ def test_argmax_all_nan_rows_return_sentinel(M, N, dtype):
 
 @pytest.mark.parametrize("M", [4, 128])
 def test_argmax_ignores_nan_but_preserves_valid_negative_infinity(M):
-    N = MODEL_VOCABS["deepseek_v4"]
+    N = MODEL_VOCABS["dsv4"]
     x = torch.full((M, N), float("nan"), device="cuda", dtype=torch.float32)
     x[0, 123] = 0.5
     x[0, 456] = 1.0
@@ -127,7 +127,7 @@ def test_argmax_writes_into_strided_caller_buffer(out_dtype):
 
 
 def test_argmax_out_buffer_under_cuda_graph():
-    M, N = 16, MODEL_VOCABS["deepseek_v4"]
+    M, N = 16, MODEL_VOCABS["dsv4"]
     torch.manual_seed(M ^ N ^ 0xC0DE)
     x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
     out = torch.empty(M, dtype=torch.int32, device="cuda")

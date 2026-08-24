@@ -62,7 +62,7 @@ def attn_res_fwd_packed(
 
     Candidates are ``block_residual[0..num_blocks-1]`` then ``layer_residual``
     (N = num_blocks + 1). All inputs must be contiguous bf16 CUDA tensors;
-    supports B = 1, N in [1, 12], T in [1, 16384], H = 7168.
+    supports B = 1, N in [1, 12], T in [1, 299593], H = 7168.
 
     Args:
         layer_residual: bf16 ``[T, B, H]`` current residual stream; updated in

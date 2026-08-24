@@ -91,6 +91,10 @@ class ProcessGroupManager:
     def get_process_group(self, backend: str, group: Group):
         return self._process_groups[backend][group]
 
+    def get_device_process_group(self, group: Group):
+        """Return the accelerator collective group for the requested ranks."""
+        return self.get_process_group("nccl", group)
+
     def has_process_group(self, backend: str, group: Group) -> bool:
         if backend not in self._process_groups:
             return False

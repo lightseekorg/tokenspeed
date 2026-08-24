@@ -12,30 +12,29 @@
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
 import math
-import os
-import sys
 import unittest
 
 import torch
-
-# CI Registration (parsed via AST, runtime no-op)
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ci_system.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=90, suite="runtime-1gpu")
-
-from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
+from tokenspeed_kernel import (
+    dsv4_combine_dense_swa_indices,
+    dsv4_combine_topk_swa_indices,
+    dsv4_compressed_slot_mapping,
+    dsv4_compute_global_topk_indices_and_lens,
+    dsv4_decode_swa_indices_and_lens,
+    dsv4_dequantize_and_gather_k_cache,
+)
+from tokenspeed_kernel.ops.attention.cuda.dsv4 import (
     has_indexer_mxfp4_paged_gather,
     has_persistent_topk,
     indexer_mxfp4_paged_gather,
     persistent_topk,
 )
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
-    _deepseek_v4_decode_swa_indices_and_lens_kernel,
-    _deepseek_v4_dequantize_and_gather_k_kernel,
-    _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel,
-    _deepseek_v4_fused_sparse_compress_cache_kernel,
-    _deepseek_v4_gather_launch_config,
+from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+    _dsv4_decode_swa_indices_and_lens_kernel,
+    _dsv4_dequantize_and_gather_k_kernel,
+    _dsv4_fused_csa_indexer_mxfp4_cache_kernel,
+    _dsv4_fused_sparse_compress_cache_kernel,
+    _dsv4_gather_launch_config,
 )
 from tokenspeed_kernel.ops.transform import hadamard_transform
 
@@ -44,14 +43,8 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     deepseek_v4_swa_token_stride,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
-    deepseek_v4_combine_dense_swa_indices,
-    deepseek_v4_combine_topk_swa_indices,
-    deepseek_v4_compressed_slot_mapping,
-    deepseek_v4_compute_global_topk_indices_and_lens,
     deepseek_v4_csa_compress_kv_cache_insert,
     deepseek_v4_csa_indexer_cache_insert,
-    deepseek_v4_decode_swa_indices_and_lens,
-    deepseek_v4_dequantize_and_gather_k_cache,
     deepseek_v4_hca_compress_kv_cache_insert,
     deepseek_v4_prepare_indexer_q_mxfp4,
     dequantize_deepseek_v4_fp8_ds_mla_cache,
@@ -306,19 +299,19 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
     def test_v4_table_kernels_do_not_specialize_runtime_geometry(self):
         cases = (
             (
-                _deepseek_v4_fused_sparse_compress_cache_kernel,
+                _dsv4_fused_sparse_compress_cache_kernel,
                 ("block_table_stride", "block_table_width"),
             ),
             (
-                _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel,
+                _dsv4_fused_csa_indexer_mxfp4_cache_kernel,
                 ("block_table_stride", "block_table_width"),
             ),
             (
-                _deepseek_v4_dequantize_and_gather_k_kernel,
+                _dsv4_dequantize_and_gather_k_kernel,
                 ("block_table_stride", "max_blocks_per_seq"),
             ),
             (
-                _deepseek_v4_decode_swa_indices_and_lens_kernel,
+                _dsv4_decode_swa_indices_and_lens_kernel,
                 ("block_table_stride", "max_blocks_per_seq"),
             ),
         )
@@ -348,7 +341,7 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
         for num_reqs, max_rows, expected in cases:
             with self.subTest(num_reqs=num_reqs, max_rows=max_rows):
                 self.assertEqual(
-                    _deepseek_v4_gather_launch_config(num_reqs, max_rows),
+                    _dsv4_gather_launch_config(num_reqs, max_rows),
                     expected,
                 )
 
@@ -1500,7 +1493,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         compressed_base = 3
         workspace_width = 9
 
-        actual, actual_lens = deepseek_v4_combine_topk_swa_indices(
+        actual, actual_lens = dsv4_combine_topk_swa_indices(
             topk_indices=topk_indices,
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
@@ -1567,7 +1560,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         compressed_base = 2
         workspace_width = 8
 
-        actual, actual_lens = deepseek_v4_combine_dense_swa_indices(
+        actual, actual_lens = dsv4_combine_dense_swa_indices(
             positions=positions,
             token_to_req_indices=token_to_req_indices,
             seq_lens=seq_lens,
@@ -1627,7 +1620,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         out_indices = torch.empty((2, 4), device=device, dtype=torch.int32)
         out_lens = torch.empty((2,), device=device, dtype=torch.int32)
 
-        actual, actual_lens = deepseek_v4_decode_swa_indices_and_lens(
+        actual, actual_lens = dsv4_decode_swa_indices_and_lens(
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
             token_to_req_indices=token_to_req_indices,
@@ -1656,7 +1649,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         self.assertTrue(
             torch.equal(actual_lens.cpu(), torch.tensor([4, 3], dtype=torch.int32))
         )
-        compact_actual, compact_lens = deepseek_v4_decode_swa_indices_and_lens(
+        compact_actual, compact_lens = dsv4_decode_swa_indices_and_lens(
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
             token_to_req_indices=token_to_req_indices,
@@ -1688,7 +1681,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         out_indices = torch.full((2, 4), -123, device=device, dtype=torch.int32)
         out_lens = torch.empty((2,), device=device, dtype=torch.int32)
 
-        actual, actual_lens = deepseek_v4_decode_swa_indices_and_lens(
+        actual, actual_lens = dsv4_decode_swa_indices_and_lens(
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
             token_to_req_indices=token_to_req_indices,
@@ -1735,7 +1728,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             dtype=torch.int32,
         )
 
-        actual, actual_lens = deepseek_v4_compute_global_topk_indices_and_lens(
+        actual, actual_lens = dsv4_compute_global_topk_indices_and_lens(
             topk_indices=topk_indices,
             token_to_req_indices=token_to_req_indices,
             block_table=block_table,
@@ -1787,7 +1780,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             dtype=torch.int32,
         )
 
-        actual, actual_lens = deepseek_v4_compute_global_topk_indices_and_lens(
+        actual, actual_lens = dsv4_compute_global_topk_indices_and_lens(
             topk_indices=topk_indices,
             token_to_req_indices=token_to_req_indices,
             block_table=block_table,
@@ -1820,7 +1813,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         )
         out = torch.empty(8, device=device, dtype=torch.int64)
 
-        actual = deepseek_v4_compressed_slot_mapping(
+        actual = dsv4_compressed_slot_mapping(
             num_tokens=5,
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
@@ -1882,7 +1875,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             [1, 1], device=device, dtype=torch.int32
         )
         out = torch.zeros(2, 5, HEAD_DIM, device=device, dtype=torch.bfloat16)
-        deepseek_v4_dequantize_and_gather_k_cache(
+        dsv4_dequantize_and_gather_k_cache(
             out=out,
             cache_2d=cache,
             seq_lens=seq_lens,

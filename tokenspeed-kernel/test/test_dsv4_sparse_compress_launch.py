@@ -26,7 +26,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.triton import deepseek_v4 as ops
+from tokenspeed_kernel.ops.attention.triton import dsv4 as ops
 
 
 @pytest.fixture(autouse=True)
@@ -49,12 +49,12 @@ def _launch(compress_ratio, overlap=False, wide_supported=True):
 
     m = 8
     with (
-        patch.object(ops, "_deepseek_v4_fused_sparse_compress_cache_kernel", _Grid()),
+        patch.object(ops, "_dsv4_fused_sparse_compress_cache_kernel", _Grid()),
         patch.object(
             ops, "_wide_compress_launch_supported", return_value=wide_supported
         ),
     ):
-        ops.deepseek_v4_fused_sparse_compress_cache_insert(
+        ops.dsv4_fused_sparse_compress_cache_insert(
             state_cache=torch.zeros(4, 8),
             token_to_req_indices=torch.zeros(m, dtype=torch.int32),
             positions=torch.zeros(m, dtype=torch.int32),
@@ -91,8 +91,8 @@ def test_sparse_compress_grid_is_one_program_per_token():
 
 def test_sparse_compress_skips_empty_batch():
     mock = MagicMock()
-    with patch.object(ops, "_deepseek_v4_fused_sparse_compress_cache_kernel", mock):
-        ops.deepseek_v4_fused_sparse_compress_cache_insert(
+    with patch.object(ops, "_dsv4_fused_sparse_compress_cache_kernel", mock):
+        ops.dsv4_fused_sparse_compress_cache_insert(
             state_cache=torch.zeros(4, 8),
             token_to_req_indices=torch.zeros(0, dtype=torch.int32),
             positions=torch.zeros(0, dtype=torch.int32),

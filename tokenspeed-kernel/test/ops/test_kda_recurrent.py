@@ -113,21 +113,28 @@ def test_kda_verify_bv_routing(batch_size, value_dim, store_states, expected) ->
     assert _kda_verify_bv(batch_size, value_dim, store_states) == expected
 
 
-@pytest.mark.parametrize("batch_size,expected_bv", [(1, 8), (15, 8), (16, 16)])
-def test_kda_verify_split_launch_routing(batch_size, expected_bv) -> None:
+@pytest.mark.parametrize(
+    ("batch_size", "expected"),
+    [(1, (8, 4, 3)), (3, (8, 4, 3)), (4, (8, 1, 3)), (15, (8, 1, 3)), (16, (16, 1, 3))],
+)
+def test_kda_verify_split_launch_routing(batch_size, expected) -> None:
+    """Both routed knobs, including where the wide-block window closes."""
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
         _kda_verify_launch_config,
     )
 
-    assert _kda_verify_launch_config(
-        batch_size,
-        128,
-        False,
-        split_producers=True,
-        bv=None,
-        num_warps=None,
-        num_stages=None,
-    ) == (expected_bv, 1, 3)
+    assert (
+        _kda_verify_launch_config(
+            batch_size,
+            128,
+            False,
+            split_producers=True,
+            bv=None,
+            num_warps=None,
+            num_stages=None,
+        )
+        == expected
+    )
 
 
 def test_kda_verify_split_launch_requires_both_hoists_and_honors_overrides() -> None:
@@ -500,7 +507,6 @@ def test_kda_paged_prefill_preserves_native_state_layout() -> None:
     if not (platform.is_cdna4 or platform.is_cdna5):
         pytest.skip("gfx950/gfx1250 KDA dispatch test")
 
-    use_vmajor = platform.is_cdna4
     device = "cuda"
     torch.manual_seed(3)
     tokens, heads, key_dim, value_dim = 65, 2, 128, 128
@@ -518,8 +524,8 @@ def test_kda_paged_prefill_preserves_native_state_layout() -> None:
     state = torch.randn(
         1,
         heads,
-        value_dim if use_vmajor else key_dim,
-        key_dim if use_vmajor else value_dim,
+        value_dim,
+        key_dim,
         device=device,
         dtype=torch.float32,
     )
@@ -527,16 +533,13 @@ def test_kda_paged_prefill_preserves_native_state_layout() -> None:
     dt_bias = torch.randn(heads, key_dim, device=device, dtype=torch.float32)
     cu_seqlens = torch.tensor([0, tokens], device=device, dtype=torch.int32)
 
-    reference_state = (
-        state[0] if use_vmajor else state[0].transpose(-1, -2).contiguous()
-    )
     expected_out, expected_state = reference_kda_recurrent(
         q,
         k,
         v,
         raw_g,
         beta,
-        reference_state,
+        state[0],
         a_log,
         dt_bias,
     )
@@ -555,9 +558,7 @@ def test_kda_paged_prefill_preserves_native_state_layout() -> None:
     torch.testing.assert_close(
         result.out[0].float(), expected_out.float(), atol=6e-2, rtol=6e-2
     )
-    expected_final_state = (
-        expected_state if use_vmajor else expected_state.transpose(-1, -2)
-    ).unsqueeze(0)
+    expected_final_state = expected_state.unsqueeze(0)
     torch.testing.assert_close(
         result.final_state,
         expected_final_state,
@@ -584,7 +585,6 @@ def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
     if not (platform.is_cdna4 or platform.is_cdna5):
         pytest.skip("gfx950/gfx1250 KDA dispatch test")
 
-    use_vmajor = platform.is_cdna4
     device = "cuda"
     torch.manual_seed(13)
     tokens = 3
@@ -627,8 +627,8 @@ def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
     state_pool = torch.randn(
         6,
         heads,
-        value_dim if use_vmajor else key_dim,
-        key_dim if use_vmajor else value_dim,
+        value_dim,
+        key_dim,
         device=device,
         dtype=torch.float32,
     )
@@ -655,22 +655,19 @@ def test_kda_paged_decode_defaults_to_specialized_kernel_on_amd(
 
     expected_out = []
     for row in range(tokens):
-        physical_state = initial_pool[read_indices[row].long()]
         out, final_state = reference_kda_recurrent(
             q[0, row : row + 1],
             k[0, row : row + 1],
             v[0, row : row + 1],
             raw_g[0, row : row + 1],
             beta[0, row : row + 1],
-            physical_state if use_vmajor else physical_state.transpose(-1, -2),
+            initial_pool[read_indices[row].long()],
             a_log,
             dt_bias,
             lower_bound=lower_bound,
         )
         expected_out.append(out[0])
-        expected_pool[write_indices[row].long()] = (
-            final_state if use_vmajor else final_state.transpose(-1, -2)
-        )
+        expected_pool[write_indices[row].long()] = final_state
     expected_out = torch.stack(expected_out).unsqueeze(0)
     actual_out = kda_paged_decode(
         q,
@@ -700,14 +697,13 @@ def test_kda_paged_decode_graph_padding_and_page_stride() -> None:
 
     torch.manual_seed(23)
     batch, active, heads, key_dim, value_dim = 4, 2, 2, 8, 5
-    use_vmajor = current_platform().is_cdna4
     state_elements = heads * key_dim * value_dim
     raw_pool = torch.randn(7, state_elements + 11, device="cuda", dtype=torch.float32)
     state_pool = raw_pool[:, :state_elements].view(
         7,
         heads,
-        value_dim if use_vmajor else key_dim,
-        key_dim if use_vmajor else value_dim,
+        value_dim,
+        key_dim,
     )
     q = torch.randn(1, batch, heads, key_dim, device="cuda", dtype=torch.bfloat16)
     k = torch.randn_like(q)
