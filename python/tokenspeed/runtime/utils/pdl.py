@@ -20,8 +20,6 @@
 
 from functools import lru_cache
 
-from tokenspeed_kernel.platform import current_platform
-
 
 @lru_cache(maxsize=1)
 def pdl_enabled() -> bool:
@@ -31,6 +29,8 @@ def pdl_enabled() -> bool:
     if global_server_args_dict.get("disable_pdl", False):
         return False
     try:
+        from tokenspeed_kernel.platform import current_platform
+
         return current_platform().is_hopper_plus
     except Exception:
         return False

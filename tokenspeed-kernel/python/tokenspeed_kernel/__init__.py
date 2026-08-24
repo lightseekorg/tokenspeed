@@ -104,6 +104,7 @@ from tokenspeed_kernel.ops.gemm import (
     prepare_fp8_linear,
     warmup_prepared_fp8_linears,
 )
+from tokenspeed_kernel.ops.gemm.deep_gemm import _set_deep_gemm_pdl
 from tokenspeed_kernel.ops.mhc import mhc_fused_hc, mhc_post, mhc_pre
 from tokenspeed_kernel.ops.moe import (
     dsv4_mega_moe_apply,

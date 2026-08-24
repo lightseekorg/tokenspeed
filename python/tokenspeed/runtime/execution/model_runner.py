@@ -24,6 +24,7 @@ import inspect
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel import _set_deep_gemm_pdl
 
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
@@ -121,6 +122,7 @@ class ModelRunner:
                     )
 
         global_server_args_dict_update(server_args)
+        _set_deep_gemm_pdl(not server_args.disable_pdl)
         initialize_moe_config(server_args)
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -130,6 +132,7 @@ class ModelRunner:
         if draft_moe_override:
             server_args.moe_backend = saved_moe_backend
             global_server_args_dict_update(server_args)
+            _set_deep_gemm_pdl(not server_args.disable_pdl)
             initialize_moe_config(server_args)
 
     def load_model(self):

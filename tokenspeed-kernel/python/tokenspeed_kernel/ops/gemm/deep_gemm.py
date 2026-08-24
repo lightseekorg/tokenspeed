@@ -40,6 +40,12 @@ _MXFP8_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_SCALE
 )
 
+
+def _set_deep_gemm_pdl(enable_pdl: bool) -> None:
+    if get_pdl is not None and set_pdl is not None and get_pdl() != enable_pdl:
+        set_pdl(enable_pdl)
+
+
 try:
     from tokenspeed_kernel.thirdparty.deep_gemm import (
         ceil_to_ue8m0,
@@ -312,9 +318,7 @@ if fp8_gemm_nt is not None:
         ), "A_scales is required; online quantization should be done by the caller"
         if A_scales.dtype == torch.float32:
             A_scales = get_mn_major_tma_aligned_tensor(A_scales)
-        requested_pdl = bool(enable_pdl)
-        if get_pdl() != requested_pdl:
-            set_pdl(requested_pdl)
+        _set_deep_gemm_pdl(bool(enable_pdl))
         N = B.shape[0]
         C = A.new_empty(A.shape[0], N, dtype=torch.bfloat16)
         fp8_gemm_nt((A, A_scales), (B, B_scales), C)

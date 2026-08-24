@@ -72,6 +72,12 @@ def global_server_args_dict_update(server_args: ServerArgs):
     # Export the PDL kill-switch: tokenspeed_kernel cannot import runtime modules.
     if server_args.disable_pdl:
         os.environ["TOKENSPEED_DISABLE_PDL"] = "1"
+        os.environ["TORCHINDUCTOR_ENABLE_PDL"] = "0"
+        os.environ["TRTLLM_ENABLE_PDL"] = "0"
+    else:
+        os.environ.pop("TOKENSPEED_DISABLE_PDL", None)
+        os.environ.setdefault("TORCHINDUCTOR_ENABLE_PDL", "1")
+        os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
     global_server_args_dict.update(
         {
             "attention_backend": server_args.attention_backend,
