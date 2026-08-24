@@ -55,6 +55,7 @@ def flash_kda_chunk_prefill(
     *,
     initial_state: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
     lower_bound: float | None = None,
     beta_is_logit: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -74,6 +75,9 @@ def flash_kda_chunk_prefill(
             zero.
         cu_seqlens: Cumulative sequence boundaries ``[N + 1]`` (``B`` must
             be 1); ``None`` treats each batch row as one sequence.
+        cu_seqlens_cpu: Host copy of ``cu_seqlens`` (unified prefill-op
+            signature). FlashKDA plans entirely on device and does not read
+            it.
         lower_bound: Safe-gate lower bound; required (FlashKDA applies the
             safe gate unconditionally).
         beta_is_logit: Must be True; FlashKDA always applies sigmoid.
