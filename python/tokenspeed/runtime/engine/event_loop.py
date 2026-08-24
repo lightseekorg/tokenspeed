@@ -871,7 +871,8 @@ class EventLoop:
                 raise ValueError(
                     "Paged cache PD request is missing bootstrap information"
                 )
-            if isinstance(self.kv_transfer, DisaggDecodeExecutor):
+            if self._forward_dispatcher.is_decode_role:
+                # The prompt was computed on the prefill node.
                 state.computed_length = state.input_length
             self.output_processor.register(spec.request_id, state)
             # EPD prefill: an encode-routed request is staged OUT of the
@@ -943,7 +944,7 @@ class EventLoop:
         self.request_handler._profile_batch_predicate(forward_mode)
         self._pp_broadcast_output_tokens(forward_op, results)
 
-        is_prefill_instance = isinstance(self.kv_transfer, DisaggPrefillExecutor)
+        is_prefill_instance = self._forward_dispatcher.is_prefill_role
         request_changes = self.output_processor.post_process_forward_op(
             forward_op,
             results,
@@ -979,15 +980,10 @@ class EventLoop:
         # request into decode. Treating those EXTEND ops as model work makes
         # idle DP ranks enter dummy collectives that the active rank will not
         # match.
-        is_disagg_decode = isinstance(self.kv_transfer, DisaggDecodeExecutor)
         executes_model_forward = (
             forward_op is not None
             and sum(forward_op.input_lengths) > 0
-            and not (
-                is_disagg_decode
-                and forward_op.num_extends() > 0
-                and not forward_op.is_local_prefill()
-            )
+            and self._forward_dispatcher.produces_model_output(forward_op)
         )
         num_tokens = sum(forward_op.input_lengths) if executes_model_forward else 0
         batch_size = len(forward_op.request_ids) if executes_model_forward else 0
@@ -1081,17 +1077,16 @@ class EventLoop:
         The single registry of overlap-breaking dependencies — add new rules
         here, not in ``event_loop``:
 
-        - P-side PD handoff batch: ``kv_transfer.execute`` needs the final
-          chunk's bootstrap token, which only lands at commit.
+        - The role's own rule, which the dispatcher answers (the P-side PD
+          handoff batch needs the final chunk's bootstrap token, and that
+          only lands at commit).
         - Eager grammar: ``setup_grammar_step`` reads each matcher's current
           state to fill the bitmask, and the matcher only advances at the
           pending step's commit (``accept_token``). Capturable grammar dodges
           this with an in-graph hostfunc; eager has no equivalent, so trade
           the overlap away for grammar batches.
         """
-        if forward_op.num_extends() == 0 and isinstance(
-            self.kv_transfer, DisaggPrefillExecutor
-        ):
+        if self._forward_dispatcher.needs_pending_commit(forward_op):
             return True
         return (
             grammar_inputs is not None

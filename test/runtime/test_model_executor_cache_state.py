@@ -68,6 +68,40 @@ def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
     assert executor.runtime_states.valid_cache_lengths[4].item() == 4
 
 
+def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
+    """A PD decode destination never runs the prompt, so no forward of its own
+    can establish these lengths: they come from the prefill node's complete
+    prompt, not from the local extend prefix."""
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.device = "cpu"
+    executor.execution_stream = _ExecutionStream()
+    executor.runtime_states = _RuntimeStates()
+
+    forward_op = SimpleNamespace(
+        request_pool_indices=[7, 11, 13],
+        prefill_lengths=[15, 17, 19],
+        extend_prefix_lens=[0, 0],
+        num_extends=lambda: 2,
+    )
+
+    torch_tensor = torch.tensor
+
+    def tensor_without_pinning(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return torch_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", tensor_without_pinning)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+
+    executor.reset_remote_prefill_cache_lengths(forward_op)
+
+    assert executor.runtime_states.valid_cache_lengths[7].item() == 15
+    assert executor.runtime_states.valid_cache_lengths[11].item() == 17
+    # Only the extend rows are seeded; the third row is not part of this op.
+    assert executor.runtime_states.valid_cache_lengths[13].item() == 13
+
+
 def test_draft_final_step_follows_the_complete_drafter_run():
     events = []
 

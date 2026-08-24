@@ -1226,34 +1226,51 @@ class ModelExecutor:
 
         A forward's prologue, not a caller step: ``execute_forward_op`` runs
         it on the forward thread so the state writes land on the execution
-        stream ahead of the model launches. (The PD-decode RDMA path has its
-        own variant on ``DisaggDecodeExecutor``, for batches that trigger a
-        remote receive instead of a forward.)
+        stream ahead of the model launches.
         """
         num_extends = forward_op.num_extends()
         if num_extends == 0:
             return
+        self._write_valid_cache_lengths(
+            forward_op.request_pool_indices[:num_extends],
+            forward_op.extend_prefix_lens,
+        )
 
+    @nvtx_range("reset_remote_prefill_cache_lengths", color="orange")
+    def reset_remote_prefill_cache_lengths(self, forward_op) -> None:
+        """Seed rows whose prompt was computed on another node.
+
+        A PD decode destination never executes the prompt locally, so no
+        forward of its own can establish these lengths — they come from the
+        complete remotely-computed prompt instead, before the first local
+        decode. Paged cache additionally selects the transferred
+        recurrent-state snapshot block from the resulting sequence length.
+        """
+        num_extends = forward_op.num_extends()
+        if num_extends <= 0:
+            return
+        self._write_valid_cache_lengths(
+            forward_op.request_pool_indices[:num_extends],
+            forward_op.prefill_lengths[:num_extends],
+        )
+
+    def _write_valid_cache_lengths(self, pool_indices, lengths) -> None:
+        """Publish per-row valid cache lengths on the execution stream."""
         self.execution_stream.wait_stream(torch.cuda.current_stream())
-
         with torch.cuda.stream(self.execution_stream):
-            extend_request_pool_indices = torch.tensor(
-                forward_op.request_pool_indices[:num_extends],
+            rows = torch.tensor(
+                pool_indices,
                 dtype=torch.int64,
                 device="cpu",
                 pin_memory=True,
             ).to(self.device, non_blocking=True)
-
-            extend_prefix_lens = torch.tensor(
-                forward_op.extend_prefix_lens,
+            values = torch.tensor(
+                lengths,
                 dtype=torch.int32,
                 device="cpu",
                 pin_memory=True,
             ).to(self.device, non_blocking=True)
-
-            self.runtime_states.reset_states(
-                extend_request_pool_indices, extend_prefix_lens
-            )
+            self.runtime_states.reset_states(rows, values)
 
     def execute_forward_op(
         self,

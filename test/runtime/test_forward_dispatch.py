@@ -59,9 +59,7 @@ def _executor(trace):
         forward_thread=_ForwardThread(trace),
         execute_forward_op=execute_forward_op,
         prepare_remote_cache_slots=lambda rows: trace.append(("slots", rows)),
-        runtime_states=object(),
-        execution_stream=object(),
-        device="cpu",
+        reset_remote_prefill_cache_lengths=lambda op: trace.append("seed-lengths"),
     )
 
 
@@ -100,10 +98,7 @@ def test_decode_node_triggers_the_receive_for_a_remote_prefill_batch():
     zero_event = SimpleNamespace(synchronize=lambda: trace.append("zero-sync"))
     cache_zero_future: Future = Future()
     cache_zero_future.set_result(zero_event)
-    kv_transfer = SimpleNamespace(
-        reset_valid_cache_length=lambda *a: trace.append("reset"),
-        execute=lambda op: trace.append("rdma"),
-    )
+    kv_transfer = SimpleNamespace(execute=lambda op: trace.append("rdma"))
 
     pending, on_first_token = DecodeDispatcher(
         _executor(trace), kv_transfer, pd_cache_enabled=True
@@ -116,7 +111,7 @@ def test_decode_node_triggers_the_receive_for_a_remote_prefill_batch():
     # No model output this round, and the whole path ran as one unit on the
     # data plane, with the zeroing barrier before the manifest is published.
     assert (pending, on_first_token) == (None, None)
-    assert trace == ["run", ("slots", [3]), "reset", "zero-sync", "rdma"]
+    assert trace == ["run", ("slots", [3]), "seed-lengths", "zero-sync", "rdma"]
 
 
 def test_decode_node_masks_local_batches_with_the_batch_grammar():
@@ -166,3 +161,46 @@ def test_prefill_node_captures_next_input_ids_and_returns_the_token_hook():
     # Control-plane bookkeeping first, GPU work after.
     assert trace[:3] == ["prepare", ("epd", "MM"), "submit"]
     assert trace[3][2]["capture_next_input_ids"] is True
+
+
+def test_only_the_prefill_role_needs_the_pending_commit_drained():
+    """The handoff batch reads the final chunk's bootstrap token, which only
+    lands at commit; no other role has a rule of its own."""
+    handoff = _planned(num_extends=0).forward_op
+    chunk = _planned(num_extends=1).forward_op
+    prefill = PrefillDispatcher(
+        _executor([]), SimpleNamespace(), epd_hooks=SimpleNamespace()
+    )
+
+    assert prefill.needs_pending_commit(handoff) is True
+    assert prefill.needs_pending_commit(chunk) is False
+    assert ForwardDispatcher(_executor([])).needs_pending_commit(handoff) is False
+
+
+def test_only_a_remote_prefill_batch_skips_the_model_forward_path():
+    """DP ranks size their collectives from this, so it has to answer for the
+    same op the role would dispatch — one rule, not two copies."""
+    decode = DecodeDispatcher(_executor([]), SimpleNamespace(), pd_cache_enabled=False)
+    remote = _planned(num_extends=1, is_local_prefill=False).forward_op
+    local = _planned(num_extends=1, is_local_prefill=True).forward_op
+
+    assert decode.produces_model_output(remote) is False
+    assert decode.produces_model_output(local) is True
+    # A plain engine always forwards, whatever the op looks like.
+    assert ForwardDispatcher(_executor([])).produces_model_output(remote) is True
+
+
+def test_each_role_declares_itself():
+    executor = _executor([])
+    assert (ForwardDispatcher(executor).is_prefill_role) is False
+    assert (ForwardDispatcher(executor).is_decode_role) is False
+    assert (
+        PrefillDispatcher(
+            executor, SimpleNamespace(), epd_hooks=SimpleNamespace()
+        ).is_prefill_role
+    ) is True
+    assert (
+        DecodeDispatcher(
+            executor, SimpleNamespace(), pd_cache_enabled=False
+        ).is_decode_role
+    ) is True

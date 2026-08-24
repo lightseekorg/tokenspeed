@@ -72,13 +72,41 @@ DispatchResult = tuple[PendingExecution | None, Callable | None]
 
 
 class ForwardDispatcher:
-    """Submit forwards for a plain (non-disaggregated) engine."""
+    """Submit forwards for a plain (non-disaggregated) engine.
+
+    The class attributes and predicates below are what the loop asks instead
+    of re-deriving the role from ``kv_transfer``: the role decides them and
+    knows them exactly once.
+    """
+
+    #: This engine hands its KV to a decode node after prefill.
+    is_prefill_role = False
+    #: This engine decodes requests whose prompt ran on another node.
+    is_decode_role = False
 
     def __init__(self, executor) -> None:
         self._executor = executor
 
     def dispatch(self, planned: PlannedForward) -> DispatchResult:
         return self._submit(planned, grammar_inputs=planned.grammar_inputs), None
+
+    def produces_model_output(self, forward_op) -> bool:
+        """Whether dispatching this op enters the model forward path.
+
+        DP ranks size their collectives from this, so it must answer for the
+        same op the role would dispatch — hence the role answers, rather than
+        the loop keeping a second copy of the rule.
+        """
+        return True
+
+    def needs_pending_commit(self, forward_op) -> bool:
+        """Whether this dispatch reads state only a pending commit produces.
+
+        The loop drains its in-flight queue first when so; see
+        ``EventLoop._dispatch_depends_on_pending_commit``, which folds this
+        in with the role-independent rules.
+        """
+        return False
 
     def _submit(
         self,
@@ -112,14 +140,24 @@ class DecodeDispatcher(ForwardDispatcher):
     transfer completes and the scheduler advances the request into decode.
     """
 
+    is_decode_role = True
+
     def __init__(self, executor, kv_transfer, *, pd_cache_enabled: bool) -> None:
         super().__init__(executor)
         self._kv_transfer = kv_transfer
         self._pd_cache_enabled = pd_cache_enabled
 
+    def produces_model_output(self, forward_op) -> bool:
+        return not self._receives_remote_kv(forward_op)
+
+    @staticmethod
+    def _receives_remote_kv(forward_op) -> bool:
+        """An extend op whose prompt ran on the prefill node."""
+        return forward_op.num_extends() > 0 and not forward_op.is_local_prefill()
+
     def dispatch(self, planned: PlannedForward) -> DispatchResult:
         forward_op = planned.forward_op
-        if forward_op.num_extends() > 0 and not forward_op.is_local_prefill():
+        if self._receives_remote_kv(forward_op):
             self._trigger_remote_receive(planned)
             return None, None
         # Decode and local recovery-prefill batches execute normally. The
@@ -146,12 +184,7 @@ class DecodeDispatcher(ForwardDispatcher):
             executor.prepare_remote_cache_slots(
                 list(forward_op.request_pool_indices[: forward_op.num_extends()])
             )
-            kv_transfer.reset_valid_cache_length(
-                forward_op,
-                executor.runtime_states,
-                executor.execution_stream,
-                executor.device,
-            )
+            executor.reset_remote_prefill_cache_lengths(forward_op)
             if pd_cache_enabled and cache_zero_future is not None:
                 # Page zeroing runs asynchronously on a CUDA stream, while
                 # Mooncake/GPUDirect writes are not ordered by that stream.
@@ -173,10 +206,17 @@ class PrefillDispatcher(ForwardDispatcher):
     means every chunk is done, so the KV goes to the decode side.
     """
 
+    is_prefill_role = True
+
     def __init__(self, executor, kv_transfer, *, epd_hooks) -> None:
         super().__init__(executor)
         self._kv_transfer = kv_transfer
         self._epd_hooks = epd_hooks
+
+    def needs_pending_commit(self, forward_op) -> bool:
+        # The handoff batch needs the final chunk's bootstrap token, which
+        # only lands at commit.
+        return forward_op.num_extends() == 0
 
     def dispatch(self, planned: PlannedForward) -> DispatchResult:
         kv_transfer = self._kv_transfer
