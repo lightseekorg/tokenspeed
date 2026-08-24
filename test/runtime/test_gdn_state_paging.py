@@ -244,9 +244,11 @@ class CacheContractMetadataTest(unittest.TestCase):
         md = backend.forward_metadata
         self.assertEqual(md.state_in_blocks_by_group["linear_attention"].tolist(), [0])
         self.assertEqual(md.state_out_blocks_by_group["linear_attention"].tolist(), [2])
-        # The metadata builds the host boundary tuple once, next to
+        # The metadata builds the host boundary tensor once, next to
         # query_start_loc, and keeps the raw lengths for the conv kernel.
-        self.assertEqual(md.cu_extend_seq_lens_cpu, (0, 8))
+        self.assertEqual(md.cu_extend_seq_lens_cpu.tolist(), [0, 8])
+        self.assertEqual(md.cu_extend_seq_lens_cpu.dtype, self.torch.int64)
+        self.assertFalse(md.cu_extend_seq_lens_cpu.is_cuda)
         self.assertEqual(md.extend_seq_lens_cpu.tolist(), [8])
         self.assertEqual(md.query_start_loc.tolist(), [0, 8])
 
@@ -283,7 +285,7 @@ class CacheContractMetadataTest(unittest.TestCase):
         md = backend.forward_metadata
         # One extend row (5 tokens) plus one decode row padded to
         # spec_num_tokens (= 1): boundaries and the raw cat agree.
-        self.assertEqual(md.cu_extend_seq_lens_cpu, (0, 5, 6))
+        self.assertEqual(md.cu_extend_seq_lens_cpu.tolist(), [0, 5, 6])
         self.assertEqual(md.extend_seq_lens_cpu.tolist(), [5, 1])
         self.assertEqual(md.query_start_loc.tolist(), [0, 5, 6])
 

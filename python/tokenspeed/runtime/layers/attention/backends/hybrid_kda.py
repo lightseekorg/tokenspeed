@@ -761,7 +761,7 @@ class KdaAttnBackend(MambaAttnBackend):
         seq_len: int,
         num_real_tokens: int,
         lower_bound: float | None,
-        cu_seqlens_cpu: tuple[int, ...] | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run only the real-token prefix through the KDA prefill kernel.
 
@@ -770,15 +770,15 @@ class KdaAttnBackend(MambaAttnBackend):
         unwritten and feed padding into its final full-tile loads. The graph
         handoff clears and restores the bucket tail afterward.
 
-        ``cu_seqlens_cpu`` is the metadata-built host copy of
+        ``cu_seqlens_cpu`` is the metadata-built host int64 copy of
         ``query_start_loc``'s contents (``init_forward_metadata`` constructs
         and validates it once per extend batch, mirroring MHA's
-        ``cu_extend_seq_lens_cpu``). Forwarding it lets the CuteDSL wrapper
-        plan on the host without a stream-synchronizing D2H read of the
-        boundaries — otherwise that read recurs on every KDA layer of every
-        prefill chunk (the wrapper's identity memo cannot hit across layers
-        because the op casts ``cu_seqlens`` to a fresh int64 tensor per
-        call).
+        ``cu_extend_seq_lens_cpu``). It is REQUIRED by the kda_paged_prefill
+        op: every solution plans its chunk indices from it on the host —
+        otherwise the boundary read recurs as a stream-synchronizing D2H on
+        every KDA layer of every prefill chunk, stalling the launch thread
+        behind all queued GPU work (which serializes the chunk pipeline's
+        stages).
         """
         head_k_dim = query.shape[3]
         num_value_heads = value.shape[2]

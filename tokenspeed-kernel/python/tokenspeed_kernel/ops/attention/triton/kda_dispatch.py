@@ -394,10 +394,9 @@ def _nvidia_kda_prefill(
     *,
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: torch.Tensor,
     lower_bound: float | None,
-    cu_seqlens_cpu: torch.Tensor | None = None,
 ) -> KdaPrefillResult:
-    hint = {} if cu_seqlens_cpu is None else {"cu_seqlens_cpu": cu_seqlens_cpu}
     out, final_state = implementation(
         q,
         k,
@@ -408,9 +407,9 @@ def _nvidia_kda_prefill(
         dt_bias,
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
         lower_bound=lower_bound,
         beta_is_logit=True,
-        **hint,
     )
     return KdaPrefillResult(out, final_state)
 
@@ -556,8 +555,8 @@ def triton_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
         kda_chunk_prefill,
     )
 
-    # Host-boundary hint is consumed only by the CuteDSL wrapper.
-    kwargs.pop("cu_seqlens_cpu", None)
+    # The host boundaries feed FLA's chunk-index prep so it plans without a
+    # stream-synchronizing D2H read of the varlen boundaries.
     return _nvidia_kda_prefill(kda_chunk_prefill, **kwargs)
 
 
@@ -575,8 +574,6 @@ def triton_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
 def flashkda_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     from tokenspeed_kernel.ops.attention.flash_kda import flash_kda_chunk_prefill
 
-    # Host-boundary hint is consumed only by the CuteDSL wrapper.
-    kwargs.pop("cu_seqlens_cpu", None)
     return _nvidia_kda_prefill(flash_kda_chunk_prefill, **kwargs)
 
 

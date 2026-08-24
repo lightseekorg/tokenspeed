@@ -53,10 +53,10 @@ eval:
     --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
     --eval-batch-size 16
     --stream
-    --generation-config '{"do_sample":true,"temperature":1.0,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'
+    --generation-config '{"do_sample":true,"temperature":1.0,"max_tokens":63488,"extra_body":{"reasoning_effort":"high"}}'
 report:
   github_step_summary: true
 # Same bar as the mxfp4 sibling gate. NVFP4 measured 0.9333-0.9667 on the
-# 65536-token evalscope protocol (tp16, PR #1128); the mxfp4 sibling records
-# 0.9333 on this exact 32768-token CI protocol.
+# 65536-token evalscope protocol (tp16, PR #1128); the mxfp4 sibling recorded
+# 0.9333 under the earlier 32768-token cap this protocol no longer uses.
 score_threshold: 0.90
