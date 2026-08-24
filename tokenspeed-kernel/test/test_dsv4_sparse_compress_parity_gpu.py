@@ -25,7 +25,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel._triton import triton
-from tokenspeed_kernel.ops.attention.triton import deepseek_v4 as ops
+from tokenspeed_kernel.ops.attention.triton import dsv4 as ops
 
 
 def _is_sm100() -> bool:
@@ -71,7 +71,7 @@ def _run(m, num_warps, seed, base_offsets=None):
         dtype=torch.uint8,
         device=dev,
     )
-    ops._deepseek_v4_fused_sparse_compress_cache_kernel[(m,)](
+    ops._dsv4_fused_sparse_compress_cache_kernel[(m,)](
         state,
         state.stride(0),
         width,

@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import ctypes
+import gc
 import json
 import logging
 import math
@@ -46,8 +47,24 @@ __all__ = [
     "PlatformInfo",
     "CapabilityRequirement",
     "Platform",
+    "create_device_stream",
     "current_platform",
+    "release_device_memory_cache",
 ]
+
+
+def create_device_stream(*, priority: int = 0) -> object | None:
+    """Create an accelerator stream when the active backend supports one."""
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.Stream(priority=priority)
+
+
+def release_device_memory_cache() -> None:
+    """Release unreachable tensors and cached accelerator allocations."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------

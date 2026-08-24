@@ -324,7 +324,7 @@ def test_selector_boundaries():
         select_k3_moe_tail_tier,
     )
 
-    def pick(num_tokens, *, graph_phase=True, fused_max=16, fused_ar=True, mm=True):
+    def pick(num_tokens, *, graph_phase=True, fused_max=64, fused_ar=True, mm=True):
         return select_k3_moe_tail_tier(
             num_tokens=num_tokens,
             graph_phase=graph_phase,
@@ -334,9 +334,9 @@ def test_selector_boundaries():
         )
 
     assert pick(1) is K3MoETailTier.TAIL_FUSION
-    assert pick(16) is K3MoETailTier.TAIL_FUSION
+    assert pick(64) is K3MoETailTier.TAIL_FUSION
     # One past capacity must leave the fused tail rather than truncate.
-    assert pick(17) is not K3MoETailTier.TAIL_FUSION
+    assert pick(65) is not K3MoETailTier.TAIL_FUSION
     # Outside the graph phase the fused tail is unreachable at any size.
     assert pick(1, graph_phase=False) is not K3MoETailTier.TAIL_FUSION
     # No fused tail compiled: capacity is 0 and the join tier takes decode.
@@ -349,7 +349,7 @@ def test_selector_boundaries():
     # The fused tail owns its own multicast collective, so it outranks the
     # flag rather than being gated by it; every other size falls to portable.
     assert pick(1, fused_ar=False) is K3MoETailTier.TAIL_FUSION
-    for n in (17, 64, 256, 100_000):
+    for n in (65, 256, 100_000):
         assert pick(n, fused_ar=False) is K3MoETailTier.SEPARATE_REDUCE
 
 
@@ -362,12 +362,15 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
     from tokenspeed.runtime.models import kimi_k3_comm as mod
 
     monkeypatch.setattr(mod, "get_is_cuda_graph_phase", lambda: True)
+    monkeypatch.setattr(mod, "get_is_capture_mode", lambda: True)
 
     def build(*, supports_deferred, fused_ar):
         comm = object.__new__(mod.K3MoeTailComm)
         comm.latent_tail = SimpleNamespace(
-            max_num_tokens=16,
+            max_num_tokens=64,
             supports_deferred_finalize=supports_deferred,
+            supports_split_collective=True,
+            split_collective_min_tokens=9,
         )
         comm.execution_plan = SimpleNamespace(fused_moe_ar=fused_ar)
         comm.state = SimpleNamespace(multimem_ar_ok=False)
@@ -378,12 +381,19 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
     plan = build(supports_deferred=True, fused_ar=True).plan(1, None)
     assert plan.tier is mod.K3MoETailTier.TAIL_FUSION
     assert plan.defer_finalize
+    assert not plan.split_shared_rs
     assert plan.lane is None and not plan.routed_in_fork
 
     # A tail op without the deferred variant must keep the materialized mode.
-    plan = build(supports_deferred=False, fused_ar=True).plan(16, None)
+    plan = build(supports_deferred=False, fused_ar=True).plan(64, None)
     assert plan.tier is mod.K3MoETailTier.TAIL_FUSION
     assert not plan.defer_finalize
+    assert plan.split_shared_rs
+
+    # Split once token work enters a second collective-CTA wave.
+    comm = build(supports_deferred=True, fused_ar=True)
+    assert not comm.plan(8, None).split_shared_rs
+    assert comm.plan(9, None).split_shared_rs
 
     # Without the fused-AR (trtllm) plan the experts kernel cannot defer.
     plan = build(supports_deferred=True, fused_ar=False).plan(1, None)
@@ -475,6 +485,7 @@ def test_fused_tail_deferred_finalize_matches_reference(m):
         layer_index=0,
         model_scope="test-deferred",
         finalize_top_k=TOP_K,
+        split_collective=True,
     )
     assert tail.supports_deferred_finalize
     comm = _build_comm(dev, latent_tail=tail)
@@ -493,6 +504,21 @@ def test_fused_tail_deferred_finalize_matches_reference(m):
     scale = out_materialized.float().abs().max().item()
     diff = (out.float() - out_materialized.float()).abs().max().item()
     assert diff / max(scale, 1e-6) < 0.02
+
+    if m >= tail.split_collective_min_tokens:
+        prepared = tail.reduce_scatter_shared(shared, comm.routed_norm.weight)
+        out_split = comm._tail_fusion_deferred(
+            gemm2,
+            weights,
+            idx,
+            shared,
+            prefix,
+            m,
+            prepared,
+        )
+        torch.cuda.synchronize()
+        split_diff = (out.float() - out_split.float()).abs().max().item()
+        assert split_diff / max(scale, 1e-6) < 0.02
 
 
 @collective

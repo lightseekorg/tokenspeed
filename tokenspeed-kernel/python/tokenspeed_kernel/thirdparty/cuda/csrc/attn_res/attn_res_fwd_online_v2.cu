@@ -50,7 +50,7 @@ __device__ __forceinline__ const bf16_t* residual_addr(
     int token, int block_stride_m, int block_stride_r, int H) {
   if (source < N - 1) {
     return block_res + static_cast<long long>(token) * block_stride_m +
-           source * block_stride_r;
+           static_cast<long long>(source) * block_stride_r;
   }
   return layer_res + static_cast<long long>(token) * H;
 }

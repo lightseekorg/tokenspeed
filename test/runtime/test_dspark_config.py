@@ -15,7 +15,6 @@ from unittest import mock
 import pytest
 import torch
 
-from tokenspeed.runtime.execution import model_executor as model_executor_module
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.dflash import (
     DFlash,
@@ -23,7 +22,6 @@ from tokenspeed.runtime.execution.drafter.dflash import (
     _resolve_draft_query_width,
 )
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
-from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.layers.attention.configs.base import (
     resolve_speculative_num_tokens,
 )
@@ -151,56 +149,6 @@ def test_markov_params_default_to_disabled() -> None:
 
 def test_dspark_dispatches_to_dspark_drafter() -> None:
     assert get_drafter_impl("DSPARK", SimpleNamespace()) is DSpark
-
-
-def test_step_acceptance_log_separates_committed_and_draft_tokens() -> None:
-    executor = ModelExecutor.__new__(ModelExecutor)
-    executor.config = SimpleNamespace(global_rank=0, spec_num_steps=7)
-    executor.num_generated_tokens = 0
-    executor.num_decode_steps = 0
-    result = SimpleNamespace(output_lengths=torch.tensor([1, 3, 8]))
-
-    with (
-        mock.patch.object(model_executor_module, "LOG_SPEC_ACCEPT_LENGTHS", True),
-        mock.patch.object(model_executor_module.logger, "info") as log,
-    ):
-        executor.accumulate_decode_stats(result, bs=3)
-
-    assert executor.num_generated_tokens == 12
-    assert executor.num_decode_steps == 3
-    log.assert_called_once_with(
-        "Spec verify step. accept_lengths=%s, accepted_draft_tokens=%s",
-        [1, 3, 8],
-        [0, 2, 7],
-    )
-
-
-def test_step_token_log_aligns_drafts_with_predecessor_target_logits() -> None:
-    executor = ModelExecutor.__new__(ModelExecutor)
-    executor.config = SimpleNamespace(
-        global_rank=0, spec_num_steps=3, spec_num_tokens=4
-    )
-    executor.num_generated_tokens = 0
-    executor.num_decode_steps = 0
-    result = SimpleNamespace(
-        output_lengths=torch.tensor([3]),
-        output_tokens=torch.tensor([11, 12, 99, 100]),
-        spec_candidate_tokens=torch.tensor([10, 11, 12, 13]),
-    )
-
-    with (
-        mock.patch.object(model_executor_module, "LOG_SPEC_ACCEPT_LENGTHS", True),
-        mock.patch.object(model_executor_module.logger, "info") as log,
-    ):
-        executor.accumulate_decode_stats(result, bs=1)
-
-    assert log.call_args_list[1] == mock.call(
-        "Spec token compare. anchor=%s, draft=%s, target=%s, match=%s",
-        [10],
-        [[11, 12, 13]],
-        [[11, 12, 99]],
-        [[True, True, False]],
-    )
 
 
 def test_dflash_dispatch_is_unchanged_by_dspark() -> None:

@@ -51,6 +51,7 @@ def kda_chunk_prefill(
     *,
     initial_state: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
     lower_bound: float | None = None,
     beta_is_logit: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -60,6 +61,11 @@ def kda_chunk_prefill(
     beta: ``[B, T, HV]`` (raw logits if ``beta_is_logit``); returns
     ``(o [B, T, HV, V], final_state [N, HV, K, V])``. QK are L2-normalized and the
     safe gate is applied inside the kernel (``use_gate_in_kernel``).
+
+    ``cu_seqlens_cpu`` is a host copy of ``cu_seqlens``. Without it, FLA's
+    chunk-index prep reads the device boundaries onto the host (a
+    stream-synchronizing D2H per KDA layer per chunk); with queued work ahead
+    on the stream, that sync stalls the launch thread until the queue drains.
     """
     # ``use_beta_sigmoid_in_kernel`` is a backend-extension kwarg that FLA's
     # native chunk_kda silently swallows via **kwargs — passing raw logits
@@ -84,6 +90,7 @@ def kda_chunk_prefill(
         safe_gate=lower_bound is not None,
         lower_bound=lower_bound,
         cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
     )
 
 

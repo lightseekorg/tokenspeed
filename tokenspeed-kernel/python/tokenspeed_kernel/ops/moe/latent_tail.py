@@ -54,7 +54,7 @@ _ScratchAllocator = Callable[..., list[torch.Tensor]]
 
 logger = logging.getLogger(__name__)
 
-_MAX_NUM_TOKENS = 16
+_MAX_NUM_TOKENS = 64
 _SKINNY_MAX_NUM_TOKENS = 5
 _MMA_TILER_MN = (64, 32)
 _GEMM_CLUSTER_MN = (1, 8)
@@ -149,6 +149,7 @@ class _Contract:
     # inlines the MoE finalize); part of the pool identity because it selects
     # which kernel variants the pooled slot compiles.
     finalize_top_k: int | None = None
+    split_collective: bool = False
 
 
 @dataclass
@@ -157,6 +158,7 @@ class _SymmetricPoolSlot:
 
     collective: CollectiveKernel
     up_projection: AdaptiveUpProjectionKernel
+    split_shared_output: torch.Tensor | None
     scratch_allocator_key: object
 
 
@@ -169,7 +171,7 @@ class KimiK3LatentTailOp:
     """
 
     _symmetric_pools: dict[
-        tuple[str, int, torch.device, int, int, float, int | None, str, int],
+        tuple[str, int, torch.device, int, int, float, int | None, bool, str, int],
         _SymmetricPoolSlot,
     ] = {}
 
@@ -186,6 +188,7 @@ class KimiK3LatentTailOp:
         model_scope: str,
         scratch_allocator: _ScratchAllocator | None = None,
         finalize_top_k: int | None = None,
+        split_collective: bool = False,
     ) -> "KimiK3LatentTailOp":
         """Construct this caller's tail op with a statically bound pool slot.
 
@@ -208,6 +211,8 @@ class KimiK3LatentTailOp:
                 weights, expanded->permuted index)`` triple directly, skipping
                 the standalone finalize kernel and its ``[M, latent]``
                 intermediate. The standard mode stays available.
+            split_collective: Precompile independent shared-ReduceScatter and
+                routed-AllReduce roles for multistream execution.
         """
         contract = _Contract(
             group_name=group.group_name,
@@ -217,6 +222,7 @@ class KimiK3LatentTailOp:
             latent_size=latent_size,
             rms_eps=float(rms_eps),
             finalize_top_k=finalize_top_k,
+            split_collective=split_collective,
         )
         return cls(
             contract,
@@ -251,11 +257,17 @@ class KimiK3LatentTailOp:
             contract.latent_size,
             contract.rms_eps,
             contract.finalize_top_k,
+            contract.split_collective,
             model_scope,
             slot_index,
         )
 
-        allocator_key = _allocator_identity(scratch_allocator)
+        # Split output lives across two streams, so it cannot borrow storage
+        # from the moving workspace pool.
+        effective_scratch_allocator = (
+            None if contract.split_collective else scratch_allocator
+        )
+        allocator_key = _allocator_identity(effective_scratch_allocator)
         with torch.accelerator.device_index(contract.device.index):
             slot = type(self)._symmetric_pools.get(pool_key)
             if slot is None:
@@ -271,8 +283,9 @@ class KimiK3LatentTailOp:
                         max_token_ctas=_COLLECTIVE_TOKEN_CTAS,
                         rms_eps=contract.rms_eps,
                         fp32_internal=True,
-                        scratch_allocator=scratch_allocator,
+                        scratch_allocator=effective_scratch_allocator,
                         finalize_top_k=contract.finalize_top_k,
+                        precompile_split=contract.split_collective,
                     ),
                     up_projection=AdaptiveUpProjectionKernel(
                         group=group,
@@ -286,6 +299,15 @@ class KimiK3LatentTailOp:
                         cluster_shape_mn=_GEMM_CLUSTER_MN,
                         b_prime_stages=_B_PRIME_STAGES,
                     ),
+                    split_shared_output=(
+                        torch.empty(
+                            (_MAX_NUM_TOKENS, contract.hidden_size),
+                            dtype=torch.bfloat16,
+                            device=contract.device,
+                        )
+                        if contract.split_collective
+                        else None
+                    ),
                     scratch_allocator_key=allocator_key,
                 )
                 type(self)._symmetric_pools[pool_key] = slot
@@ -296,6 +318,7 @@ class KimiK3LatentTailOp:
                 )
             self._collective = slot.collective
             self._up_projection = slot.up_projection
+            self._split_shared_output = slot.split_shared_output
             self._lamport_copy = LamportCopyKernel(
                 hidden_dim=contract.hidden_size,
                 max_m=_MAX_NUM_TOKENS,
@@ -312,6 +335,15 @@ class KimiK3LatentTailOp:
         """Whether :meth:`call_deferred` may consume the deferred triple."""
         return self.contract.finalize_top_k is not None
 
+    @property
+    def supports_split_collective(self) -> bool:
+        return self.contract.split_collective
+
+    @property
+    def split_collective_min_tokens(self) -> int:
+        """First M whose token work spans more than one collective CTA wave."""
+        return _COLLECTIVE_TOKEN_CTAS + 1
+
     def __call__(
         self,
         routed_partial: torch.Tensor,
@@ -319,6 +351,7 @@ class KimiK3LatentTailOp:
         rms_weight: torch.Tensor,
         up_weight: torch.Tensor,
         prefix: torch.Tensor | None = None,
+        prepared_shared_shard: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Fused tail for one decode step.
 
@@ -335,6 +368,8 @@ class KimiK3LatentTailOp:
             prefix: Optional residual stream ``[M, 7168]``; when given the
                 lamport gather fuses ``+ prefix`` (same rounding as an eager
                 add) and the caller's accumulate disappears.
+            prepared_shared_shard: Shared ReduceScatter output produced by
+                :meth:`reduce_scatter_shared` on an auxiliary stream.
 
         Returns:
             ``[M, 7168]`` post-communication hidden (up-projection + shared,
@@ -343,11 +378,22 @@ class KimiK3LatentTailOp:
         # Same-slot calls are stream-ordered, preserving Lamport buffer rotation.
         m = routed_partial.shape[0]
         self._assert_capture_compiled(m)
-        latent, shared_shard = self._collective(
-            routed_partial,
-            shared_partial,
-            rms_weight,
-        )
+        if prepared_shared_shard is None:
+            latent, shared_shard = self._collective(
+                routed_partial,
+                shared_partial,
+                rms_weight,
+            )
+        else:
+            self._validate_prepared_shared_shard(prepared_shared_shard)
+            latent, _ = self._collective(
+                routed_partial,
+                self._collective.shared_output[:m],
+                rms_weight,
+                include_reduce_scatter=False,
+                include_routed=True,
+            )
+            shared_shard = prepared_shared_shard
         return self._project_and_gather(latent, shared_shard, m, up_weight, prefix)
 
     def call_deferred(
@@ -361,6 +407,7 @@ class KimiK3LatentTailOp:
         *,
         num_tokens: int,
         prefix: torch.Tensor | None = None,
+        prepared_shared_shard: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Fused tail consuming the MoE kernel's deferred-finalize triple.
 
@@ -384,6 +431,8 @@ class KimiK3LatentTailOp:
             num_tokens: Token count M for this step.
             prefix: Optional residual stream ``[M, 7168]``, as in
                 :meth:`__call__`.
+            prepared_shared_shard: Shared ReduceScatter output produced by
+                :meth:`reduce_scatter_shared` on an auxiliary stream.
 
         Returns:
             ``[M, 7168]`` post-communication hidden, as in :meth:`__call__`.
@@ -437,15 +486,74 @@ class KimiK3LatentTailOp:
                 dtype=torch.bfloat16,
                 device=gemm2_output.device,
             )
+        split_shared = prepared_shared_shard is not None
+        if split_shared:
+            self._validate_prepared_shared_shard(prepared_shared_shard)
         latent, shared_shard = self._collective.call_deferred(
             gemm2_output,
             expert_weights,
             expanded_idx_to_permuted_idx,
-            shared_partial,
+            (self._collective.shared_output[:m] if split_shared else shared_partial),
             rms_weight,
             num_tokens=m,
+            include_reduce_scatter=not split_shared,
         )
+        if split_shared:
+            shared_shard = prepared_shared_shard
         return self._project_and_gather(latent, shared_shard, m, up_weight, prefix)
+
+    def reduce_scatter_shared(
+        self,
+        shared_partial: torch.Tensor,
+        rms_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the shared ReduceScatter into stable split-mode staging.
+
+        Args:
+            shared_partial: This rank's contiguous CUDA BF16 shared-expert
+                partial ``[M, hidden_size]``, where
+                ``1 <= M <= max_num_tokens``.
+            rms_weight: Contiguous CUDA BF16 latent RMSNorm weight
+                ``[latent_size]`` required by the collective signature.
+
+        Returns:
+            The rank-local BF16 shard view
+            ``[max_num_tokens, hidden_size / tp_size]`` with stride
+            ``(hidden_size, 1)``. Only the first ``M`` rows contain this
+            launch's output. The view aliases the pooled split staging and is
+            valid until the next shared ReduceScatter using the same pool
+            slot. A consumer on another stream must wait for this launch's
+            stream before reading it.
+        """
+        if not self.supports_split_collective:
+            raise RuntimeError("shared-only ReduceScatter is not initialized")
+        m = shared_partial.shape[0]
+        _, shared_shard = self._collective(
+            self._collective.latent_output[:m],
+            shared_partial,
+            rms_weight,
+            include_reduce_scatter=True,
+            include_routed=False,
+            shared_output_override=self._split_shared_output,
+        )
+        return shared_shard
+
+    def _validate_prepared_shared_shard(self, shared_shard: torch.Tensor) -> None:
+        expected = (
+            _MAX_NUM_TOKENS,
+            self.contract.hidden_size // self.contract.tp_size,
+        )
+        if (
+            not self.supports_split_collective
+            or shared_shard.shape != expected
+            or shared_shard.dtype != torch.bfloat16
+            or shared_shard.device != self.contract.device
+            or shared_shard.stride() != (self.contract.hidden_size, 1)
+        ):
+            raise ValueError(
+                "prepared shared shard must be the split collective's "
+                f"BF16 {list(expected)} output view"
+            )
 
     def _assert_capture_compiled(self, m: int) -> None:
         # JIT compilation launches kernels; under capture they would be

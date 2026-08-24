@@ -54,7 +54,6 @@ from tokenspeed.runtime.engine.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadReqInput,
     GetLoadReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
@@ -67,6 +66,7 @@ from tokenspeed.runtime.engine.io_struct import (
     IsSchedulerPausedReqOutput,
     IsSleepingReqInput,
     IsSleepingReqOutput,
+    LoadSnapshot,
     MsgpackDecoder,
     MsgpackEncoder,
     OpenSessionReqInput,
@@ -96,7 +96,6 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    WatchLoadUpdateReq,
     ipc_message_union,
 )
 from tokenspeed.runtime.sampling.sampling_params import (
@@ -118,6 +117,16 @@ def _roundtrip(obj):
     enc = MsgpackEncoder()
     dec = MsgpackDecoder(ipc_message_union())
     return dec.decode(enc.encode(obj))
+
+
+def test_load_snapshot_round_trips_as_one_tagged_frame():
+    """The scheduler snapshot stays a standalone, single-frame IPC message."""
+    snapshot = LoadSnapshot("boot-a", 1, 0, 2, 3, 4, 5, 6, 1_000)
+
+    frames = MsgpackEncoder().encode(snapshot)
+
+    assert len(frames) == 1
+    assert _roundtrip(snapshot) == snapshot
 
 
 def _batch_token_id_out(**overrides) -> BatchTokenIDOut:
@@ -216,9 +225,7 @@ _MESSAGES = [
     HealthCheckOutput(),
     RpcReqInput(method="save", parameters={"p": 1}),
     RpcReqOutput(success=True, message=""),
-    GetLoadReqInput(),
     GetLoadReqOutput(dp_rank=1, num_reqs=2, num_waiting_reqs=1, num_pages=3),
-    WatchLoadUpdateReq(loads=[GetLoadReqOutput(dp_rank=0, num_reqs=5)]),
     BlockReqInput(type=BlockReqType.UNBLOCK),
     _batch_token_id_out(),
     BatchStrOut(

@@ -41,6 +41,12 @@ from tokenspeed_kernel.ops.attention import (
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
 )
+from tokenspeed_kernel.ops.attention.triton.capture_payload import (
+    capture_replay_payload,
+)
+from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
+    commit_state_pages,
+)
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
@@ -521,9 +527,15 @@ class KdaAttnBackend(MambaAttnBackend):
                 )
             qkv, f_a, beta, _ = self._replay_payload(layer_id)
             rows = batch_size * draft_token_num
-            qkv[:rows, : mixed_qkv.shape[-1]].copy_(mixed_qkv[:rows])
-            f_a[:rows, : f_a_out.shape[-1]].copy_(f_a_out[:rows])
-            beta[:rows, : beta_raw.shape[-1]].copy_(beta_raw[:rows])
+            capture_replay_payload(
+                (mixed_qkv[:rows], f_a_out[:rows], beta_raw[:rows]),
+                (
+                    qkv[:rows, : mixed_qkv.shape[-1]],
+                    f_a[:rows, : f_a_out.shape[-1]],
+                    beta[:rows, : beta_raw.shape[-1]],
+                ),
+                rows,
+            )
             num_value_heads = value_dim // attn_tp_size // head_v_dim
             if layer_id not in self._replay_weights:
                 # Parameters are stable objects; model weight updates copy into
@@ -668,19 +680,22 @@ class KdaAttnBackend(MambaAttnBackend):
         bs = accepted_length.shape[0]
         # Runtime accept lengths count draft matches; the target token itself
         # always advances state, matching the established scratch commit.
-        steps = accepted_length.to(torch.int64).clamp(min=1, max=draft_token_num)
-        new_last = committed[:bs] + steps - 1
-        slot = torch.div(
-            new_last.clamp_min(0),
-            self._checkpoint_granularity,
-            rounding_mode="floor",
+        group_ids = list(self._replay_group_ids or self._state_groups())
+        write_stack = torch.empty(
+            (len(group_ids), bs), dtype=torch.int32, device=accepted_length.device
         )
-        pages_by_group = {}
-        for group_id in self._state_groups():
-            rows = tables[group_id]
-            safe = slot.clamp(max=rows.shape[1] - 1)
-            pages_by_group[group_id] = (
-                rows[:bs].gather(1, safe.unsqueeze(1)).squeeze(1).to(torch.int32)
+        steps = torch.empty(bs, dtype=torch.int32, device=accepted_length.device)
+        for out_row, group_id in enumerate(group_ids):
+            commit_state_pages(
+                accepted_length,
+                committed,
+                tables[group_id],
+                batch_size=bs,
+                draft_tokens=draft_token_num,
+                granularity=self._checkpoint_granularity,
+                pages_out=write_stack,
+                out_row=out_row,
+                steps_out=steps,
             )
         rows = bs * draft_token_num
         if self._batched_replay_ready:
@@ -690,12 +705,10 @@ class KdaAttnBackend(MambaAttnBackend):
                     for group_id in self._replay_group_ids
                 ]
             ).to(torch.int32)
-            write_pages = torch.stack(
-                [pages_by_group[group_id] for group_id in self._replay_group_ids]
-            )
-            self._batched_replay_launch(read_pages, write_pages, steps.to(torch.int32))
+            self._batched_replay_launch(read_pages, write_stack, steps)
             self._verify_commit_ctx = None
             return
+        pages_by_group = {g: write_stack[i] for i, g in enumerate(group_ids)}
         for layer_id, weights in self._replay_weights.items():
             conv_w, f_b, A_log, dt_bias, num_heads, head_dim, lower_bound = weights
             group_id = self._state_group_for(layer_id)
@@ -715,7 +728,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 state_out=state,
                 read_indices=read_pages_by_group[group_id][:bs],
                 write_indices=pages_by_group[group_id],
-                accepted_length=steps.to(torch.int32),
+                accepted_length=steps,
                 num_heads=num_heads,
                 head_dim=head_dim,
                 draft_token_num=draft_token_num,
@@ -748,7 +761,7 @@ class KdaAttnBackend(MambaAttnBackend):
         seq_len: int,
         num_real_tokens: int,
         lower_bound: float | None,
-        cu_seqlens_cpu: tuple[int, ...] | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run only the real-token prefix through the KDA prefill kernel.
 
@@ -757,15 +770,15 @@ class KdaAttnBackend(MambaAttnBackend):
         unwritten and feed padding into its final full-tile loads. The graph
         handoff clears and restores the bucket tail afterward.
 
-        ``cu_seqlens_cpu`` is the metadata-built host copy of
+        ``cu_seqlens_cpu`` is the metadata-built host int64 copy of
         ``query_start_loc``'s contents (``init_forward_metadata`` constructs
         and validates it once per extend batch, mirroring MHA's
-        ``cu_extend_seq_lens_cpu``). Forwarding it lets the CuteDSL wrapper
-        plan on the host without a stream-synchronizing D2H read of the
-        boundaries — otherwise that read recurs on every KDA layer of every
-        prefill chunk (the wrapper's identity memo cannot hit across layers
-        because the op casts ``cu_seqlens`` to a fresh int64 tensor per
-        call).
+        ``cu_extend_seq_lens_cpu``). It is REQUIRED by the kda_paged_prefill
+        op: every solution plans its chunk indices from it on the host —
+        otherwise the boundary read recurs as a stream-synchronizing D2H on
+        every KDA layer of every prefill chunk, stalling the launch thread
+        behind all queued GPU work (which serializes the chunk pipeline's
+        stages).
         """
         head_k_dim = query.shape[3]
         num_value_heads = value.shape[2]

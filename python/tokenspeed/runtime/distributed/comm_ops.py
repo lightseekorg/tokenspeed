@@ -410,3 +410,54 @@ def token_reduce_scatter(
     if backend is None:
         backend = get_global_backend()
     return backend.token_reduce_scatter(tensor, group, scattered_num_tokens)
+
+
+def pp_send(
+    tensor: torch.Tensor,
+    dst_group_index: int,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> None:
+    """Send a tensor to another pipeline stage (P2P over the PP group).
+
+    Args:
+        tensor: Contiguous device tensor to send.
+        dst_group_index: Destination position within ``group`` (the PP rank of
+            the receiving stage), not a global rank.
+        group: The PP group (one rank per stage, same intra-stage position).
+        backend: Communication backend; defaults to the global backend.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    backend.send(tensor.contiguous(), dst_group_index, group)
+
+
+def pp_recv(
+    size: torch.Size | tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    src_group_index: int,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> torch.Tensor:
+    """Receive a tensor from another pipeline stage (P2P over the PP group).
+
+    The shape/dtype are supplied by the caller: every PP rank runs the same
+    deterministic scheduler, so the receiver derives the payload geometry from
+    its own forward op without a metadata exchange.
+
+    Args:
+        size: Shape of the incoming tensor.
+        dtype: Element type of the incoming tensor.
+        device: Device to allocate the receive buffer on.
+        src_group_index: Source position within ``group`` (the PP rank of the
+            sending stage), not a global rank.
+        group: The PP group (one rank per stage, same intra-stage position).
+        backend: Communication backend; defaults to the global backend.
+
+    Returns:
+        The received tensor.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.recv(torch.Size(size), dtype, device, src_group_index, group)

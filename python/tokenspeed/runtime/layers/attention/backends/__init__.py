@@ -27,9 +27,9 @@ from tokenspeed_kernel.platform import current_platform
 platform = current_platform()
 logger = logging.getLogger(__name__)
 
+from tokenspeed.runtime.layers.attention.backends import deepseek_v4  # noqa: F401
 
 if platform.is_nvidia:
-    from tokenspeed.runtime.layers.attention.backends import deepseek_v4  # noqa: F401
     from tokenspeed.runtime.layers.attention.backends import flashmla  # noqa: F401
     from tokenspeed.runtime.layers.attention.backends import trtllm  # noqa: F401
     from tokenspeed.runtime.layers.attention.backends import trtllm_mla  # noqa: F401

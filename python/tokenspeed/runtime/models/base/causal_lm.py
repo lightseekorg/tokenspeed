@@ -70,8 +70,13 @@ class BaseCausalLM(nn.Module):
             self.logits_processor = None
         else:
             self.model = self.resolve_model(config, mapping, quant_config, prefix)
-            self.lm_head = self.resolve_lm_head(config, quant_config, prefix)
-            self.logits_processor = self.resolve_logits_processor(config)
+            if mapping.is_last_pp_rank:
+                self.lm_head = self.resolve_lm_head(config, quant_config, prefix)
+                self.logits_processor = self.resolve_logits_processor(config)
+            else:
+                # Mid-pipeline stages emit hidden states, never logits.
+                self.lm_head = None
+                self.logits_processor = None
         self.post_init()
 
     def resolve_model(
@@ -195,6 +200,10 @@ class BaseCausalLM(nn.Module):
             out_cache_loc,
             **model_kwargs,
         )
+        if not self.mapping.is_last_pp_rank:
+            # Mid-pipeline stage: the executor sends this boundary state to
+            # the next stage; there are no logits here.
+            return hidden_states
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
 
         return self.logits_processor(
@@ -210,7 +219,7 @@ class BaseCausalLM(nn.Module):
     ) -> dict:
         """Hook for subclasses to pass model-specific tensors."""
         model_kwargs = {}
-        for key in ("input_embeds", "inputs_embeds"):
+        for key in ("input_embeds", "inputs_embeds", "pp_inbound"):
             if kwargs.get(key) is not None:
                 model_kwargs[key] = kwargs[key]
         return model_kwargs

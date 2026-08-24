@@ -1008,6 +1008,27 @@ def extract_accept_rates(output: str) -> List[float]:
     return [float(value) for value in _ACCEPT_RATE_RE.findall(output)]
 
 
+def parse_evalscope_score_cell(cell: str) -> float | None:
+    """Read one Score cell as a fraction of 1, or None when it is not a score.
+
+    evalscope reports the score as a bare fraction ("0.9667") up to 1.10 and
+    as a percentage ("96.67%") from 1.11. Both mean the same thing, and the
+    thresholds in the task configs are fractions, so normalize percentages
+    back to fractions here rather than teaching every caller two formats.
+    """
+    text = cell.strip()
+    if not text:
+        return None
+    percent = text.endswith("%")
+    if percent:
+        text = text[:-1].strip()
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value / 100.0 if percent else value
+
+
 def extract_evalscope_score(report_table: str) -> float | None:
     score_index: int | None = None
     score: float | None = None
@@ -1028,10 +1049,9 @@ def extract_evalscope_score(report_table: str) -> float | None:
             continue
         if score_index is None or len(cells) <= score_index:
             continue
-        try:
-            score = float(cells[score_index])
-        except ValueError:
-            continue
+        parsed = parse_evalscope_score_cell(cells[score_index])
+        if parsed is not None:
+            score = parsed
 
     return score
 

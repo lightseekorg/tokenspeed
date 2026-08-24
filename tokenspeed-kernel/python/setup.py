@@ -329,11 +329,11 @@ KERNEL_GROUPS = [
         [],
     ),
     (
-        "deepseek_v4_attention",
+        "dsv4_attention",
         [
-            CUDA_CSRC_DIR / "deepseek_v4_attention.cu",
-            CUDA_CSRC_DIR / "deepseek_v4_topk.cu",
-            CUDA_CSRC_DIR / "deepseek_v4_attention_binding.cu",
+            CUDA_CSRC_DIR / "dsv4_attention.cu",
+            CUDA_CSRC_DIR / "dsv4_topk.cu",
+            CUDA_CSRC_DIR / "dsv4_attention_binding.cu",
         ],
         [],
     ),

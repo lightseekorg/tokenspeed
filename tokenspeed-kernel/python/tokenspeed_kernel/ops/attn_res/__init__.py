@@ -29,8 +29,9 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 __all__ = ["attn_res_fwd", "attn_res_fwd_available"]
 
 # The Blackwell launcher instantiates aligned hidden sizes in [4096, 8192].
+# Its block-residual source stride is passed to CUDA as a signed 32-bit int.
 # AMD Gluon currently specializes Kimi K3's H=7168 fused-output-norm path.
-_MAX_BLACKWELL_TOKENS = 16384
+_MAX_BLACKWELL_TOKENS = ((1 << 31) - 1) // 7168
 _MAX_AMD_GLUON_TOKENS = 65536
 _MAX_N = 12
 

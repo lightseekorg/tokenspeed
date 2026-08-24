@@ -319,6 +319,7 @@ def gluon_mxfp_combine(
     num_ctas: int | None = None,
     w_preshuffle: bool = False,
     x_scale_ragged_padded: bool = False,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert w.ndim == 3
     M = x.shape[-2]
@@ -445,7 +446,23 @@ def gluon_mxfp_combine(
     # tiling/W-scale reads, but store only the caller-visible width.
     logical_n = int(getattr(w, "original_n", N))
     y_n = logical_n if logical_n < N else N
-    y = torch.empty((n_rows, y_n), device=x.device, dtype=out_dtype)
+    expected_out_shape = (n_tokens_eff, y_n)
+    if out is not None and (
+        out.shape != expected_out_shape
+        or out.dtype != out_dtype
+        or out.device != x.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            f"MXFP4 combine output must be contiguous {expected_out_shape} "
+            f"{out_dtype} on {x.device}, got {tuple(out.shape)} {out.dtype} "
+            f"on {out.device}"
+        )
+    y = (
+        out
+        if out is not None and n_act_eff == 1
+        else torch.empty((n_rows, y_n), device=x.device, dtype=out_dtype)
+    )
     # GEMM2 X is already in expert-sorted ragged order. Store through
     # scatter_indx to recover flat token/top-k row order before reduction.
     _launch_kernel(
@@ -489,8 +506,10 @@ def gluon_mxfp_combine(
         if medium_decode_combine_eligible:
             # Fused top-k reduction over the scatter rows (graph-capturable).
             # The TOPK partials for a token are consecutive rows of y.
-            y_reduced = torch.empty(
-                (n_tokens_eff, y_n), device=x.device, dtype=out_dtype
+            y_reduced = (
+                out
+                if out is not None
+                else torch.empty((n_tokens_eff, y_n), device=x.device, dtype=out_dtype)
             )
             R_BLOCK_N = 256
             r_grid = (n_tokens_eff * ((y_n + R_BLOCK_N - 1) // R_BLOCK_N),)
@@ -510,7 +529,12 @@ def gluon_mxfp_combine(
             )
             y = y_reduced
         else:
-            y = y.view(n_tokens_eff, n_act_eff, y_n).sum(dim=1)
+            y_rows = y.view(n_tokens_eff, n_act_eff, y_n)
+            y = (
+                torch.sum(y_rows, dim=1, out=out)
+                if out is not None
+                else y_rows.sum(dim=1)
+            )
     # Unpad N if the caller padded W for w_preshuffle. Padded W bytes
     # are 0 and padded scales are 127 so acc[:, N:N_padded] == 0.
     if logical_n != y.shape[-1]:
@@ -525,7 +549,7 @@ _TUNING_KW = frozenset(
 
 # Gluon-only kwargs; explicitly stripped before forwarding upstream.
 _GLUON_PRIVATE_KW = frozenset(
-    {"out_quant_format", "out_quant_scale", "x_scale_ragged_padded"}
+    {"out", "out_quant_format", "out_quant_scale", "x_scale_ragged_padded"}
 )
 
 
@@ -604,6 +628,7 @@ def gluon_mxfp_ragged_matmul(
     out_quant_scale = extra_kwargs.get("out_quant_scale")
     out_quant_format = extra_kwargs.get("out_quant_format")
     x_scale_ragged_padded = bool(extra_kwargs.get("x_scale_ragged_padded", False))
+    output = extra_kwargs.get("out")
     scale_load_mode = extra_kwargs.get("scale_load_mode", "swizzle")
     launch_kwargs = {
         key: extra_kwargs[key]
@@ -641,6 +666,7 @@ def gluon_mxfp_ragged_matmul(
             w_transpose=True,
             w_preshuffle=w_preshuffle,
             x_scale_ragged_padded=x_scale_ragged_padded,
+            out=output,
             **launch_kwargs,
         )
         return out

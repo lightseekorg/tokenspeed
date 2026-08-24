@@ -503,6 +503,7 @@ def test_standard_cache_decode_logits_cover_empty_and_short_spans() -> None:
         1,
         PAGE_SIZE=_PAGE_SIZE,
         ROW_BYTES=132,
+        PAGE_STRIDE_BYTES=_PAGE_SIZE * cache.stride(0),
         NUM_HEADS=32,
         HEAD_DIM=_HEAD_DIM,
         BLOCK_N=64,

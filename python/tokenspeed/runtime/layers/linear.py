@@ -81,6 +81,25 @@ WEIGHT_LOADER_V2_SUPPORTED = [
 ]
 
 
+def warmup_prepared_fp8_linears(model: torch.nn.Module, max_tokens: int) -> None:
+    """Warm the backend implementations prepared by block-FP8 linear layers."""
+    plans: list[object] = []
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is None:
+            continue
+        prepared_linear_plan = getattr(quant_method, "prepared_linear_plan", None)
+        if prepared_linear_plan is None:
+            continue
+        plan = prepared_linear_plan(module)
+        if plan is not None:
+            plans.append(plan)
+
+    from tokenspeed_kernel import warmup_prepared_fp8_linears as warmup
+
+    warmup(plans, max_tokens)
+
+
 def adjust_marlin_shard(param, shard_size, shard_offset):
     marlin_tile_size = getattr(param, "marlin_tile_size", None)
     if marlin_tile_size is None:
@@ -296,6 +315,23 @@ class ReplicatedLinear(LinearBase):
             output = self.quant_method.apply(self, x, bias, block_scale, output_dtype)
         else:
             output = self.quant_method.apply(self, x, bias)
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
+    def forward_with_activation(
+        self, input_: torch.Tensor, activation: torch.nn.Module
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply ``activation`` before this linear, fusing when prepared."""
+        bias = self.bias if not self.skip_bias_add else None
+        assert self.quant_method is not None
+        apply_with_activation = getattr(
+            self.quant_method, "apply_with_activation", None
+        )
+        output = (
+            apply_with_activation(self, input_, activation, bias=bias)
+            if apply_with_activation is not None
+            else self.quant_method.apply(self, activation(input_), bias=bias)
+        )
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
@@ -1254,6 +1290,31 @@ class RowParallelLinear(LinearBase):
 
         output_bias = self.bias if self.skip_bias_add else None
 
+        return output, output_bias
+
+    def forward_with_activation(
+        self, input_: torch.Tensor, activation: torch.nn.Module
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply ``activation`` before this linear, fusing when prepared."""
+        if not self.input_is_parallel:
+            return self.forward(activation(input_))
+        input_parallel = input_
+
+        assert self.quant_method is not None
+        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        apply_with_activation = getattr(
+            self.quant_method, "apply_with_activation", None
+        )
+        output_parallel = (
+            apply_with_activation(self, input_parallel, activation, bias=bias_)
+            if apply_with_activation is not None
+            else self.quant_method.apply(self, activation(input_parallel), bias=bias_)
+        )
+        if self.reduce_results and self.tp_size > 1:
+            output = all_reduce(output_parallel, self.tp_group)
+        else:
+            output = output_parallel
+        output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
     def extra_repr(self) -> str:

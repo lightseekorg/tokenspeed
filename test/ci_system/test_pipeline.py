@@ -606,6 +606,29 @@ def test_extract_evalscope_score_from_box_table():
     assert extract_evalscope_score(report_table) == 0.9667
 
 
+def test_extract_evalscope_score_from_percentage_table():
+    """evalscope 1.11 renames the metric and reports Score as a percentage."""
+    report_table = """
+┌─────────────────┬───────────┬────────────┬──────────┬───────┬─────────┬─────────┐
+│ Model           │ Dataset   │ Metric     │ Subset   │   Num │   Score │ Cat.0   │
+├─────────────────┼───────────┼────────────┼──────────┼───────┼─────────┼─────────┤
+│ Kimi-K3         │ aime25    │ Accuracy ↑ │ default  │    30 │   93.3% │ default │
+└─────────────────┴───────────┴────────────┴──────────┴───────┴─────────┴─────────┘
+"""
+
+    assert extract_evalscope_score(report_table) == pytest.approx(0.933)
+
+
+def test_extract_evalscope_score_ignores_non_numeric_cells():
+    report_table = """
+| Model   | Dataset | Metric     | Subset  | Num | Score | Cat.0   |
+|---------|---------|------------|---------|-----|-------|---------|
+| Kimi-K3 | aime25  | Accuracy ↑ | default | 30  | n/a   | default |
+"""
+
+    assert extract_evalscope_score(report_table) is None
+
+
 def test_extract_inspect_score_from_accuracy_summary():
     output = """
 ocrbench_scorer

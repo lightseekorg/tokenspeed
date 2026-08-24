@@ -165,6 +165,10 @@ class DistributedInitializer:
         pg_manager.init_process_group(config.mapping.attn.dp_group)
         pg_manager.init_process_group(config.mapping.dense.tp_group)
         pg_manager.init_process_group(config.mapping.moe.tp_ep_group)
+        if config.mapping.has_pp:
+            # Cross-stage group for hidden-state P2P (nccl) and small control
+            # broadcasts like the sampled first token (gloo).
+            pg_manager.init_process_group(config.mapping.pp_group)
 
         # Register the trtllm one-shot all-reduce workspaces for the TP
         # groups. AutoBackend routes small SUM all-reduces (<= 2 MB payload,

@@ -222,12 +222,12 @@ def test_padded_fused_assembly_selects_flashinfer_blockscale() -> None:
     """The 128-padded fused_qkv_a assembly must keep the flashinfer GEMM.
 
     Kimi-K3's fused_qkv_a has 2880 real rows per rank at tp16; without tail
-    padding (N % 128 == 64) Fp8LinearMethod falls back to the Triton
-    blockscale GEMM. Assert the padded verbatim assembly flips the layer onto
-    the flashinfer path (the method's own selection flag) and that the pad
-    rows produce exact-zero GEMM outputs.
+    padding (N % 128 == 64) Fp8LinearMethod falls back to the portable
+    blockscale GEMM. Assert the padded verbatim assembly prepares a native
+    kernel plan and that the pad rows produce exact-zero GEMM outputs.
     """
-    from tokenspeed.runtime.layers.dense.fp8 import has_flashinfer_fp8_blockscale
+    from tokenspeed_kernel.ops.gemm.flashinfer import has_flashinfer_fp8_blockscale
+
     from tokenspeed.runtime.models.kimi_k3 import _assemble_fp8_fused_qkv_a
 
     if has_flashinfer_fp8_blockscale is None or not has_flashinfer_fp8_blockscale():
@@ -281,13 +281,12 @@ def test_padded_fused_assembly_selects_flashinfer_blockscale() -> None:
     ctrl_w = torch.cat([w for w, _ in segments])
     ctrl_s = torch.cat([segments[0][1], segments[1][1], segments[2][1]])
     _, layer_ctrl = _build(n_real, ctrl_w, ctrl_s)
-    assert layer_ctrl._use_flashinfer_fp8_blockscale is False
+    assert layer_ctrl.weight_scale_inv.dim() == 2
 
     # Padded assembly: 768 % 128 == 0 selects the flashinfer blockscale GEMM.
     fused_w, fused_s = _assemble_fp8_fused_qkv_a(segments, total_rows=768)
     method, layer = _build(768, fused_w, fused_s)
-    assert layer._use_flashinfer_fp8_blockscale is True
-    assert layer._use_deep_gemm_fp8 is False
+    assert method.prepared_linear_plan(layer) is not None
 
     x = torch.randn(9, k, device="cuda", dtype=torch.bfloat16)
     out = method.apply(layer, x)
