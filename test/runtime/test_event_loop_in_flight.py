@@ -41,21 +41,25 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.engine.event_loop import EventLoop  # noqa: E402
-from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor  # noqa: E402
+from tokenspeed.runtime.engine.forward_dispatch import (  # noqa: E402
+    ForwardDispatcher,
+    PrefillDispatcher,
+)
 
 
-def _predicate_loop(*, kv_transfer=None, eager_grammar_buffers=None):
+def _predicate_loop(*, dispatcher=None, eager_grammar_buffers=None):
     return SimpleNamespace(
-        kv_transfer=kv_transfer,
+        _forward_dispatcher=dispatcher or ForwardDispatcher(executor=None),
         model_executor=SimpleNamespace(eager_grammar_buffers=eager_grammar_buffers),
     )
 
 
-def test_pd_handoff_batch_depends_on_pending_commit() -> None:
-    # kv_transfer.execute needs the final chunk's bootstrap token, which only
-    # lands at commit — but only for the P-side handoff batch (no extends).
-    prefill_executor = object.__new__(DisaggPrefillExecutor)
-    loop = _predicate_loop(kv_transfer=prefill_executor)
+def test_the_roles_own_rule_reaches_the_registry() -> None:
+    # The P-side handoff batch needs the final chunk's bootstrap token, which
+    # only lands at commit. The rule lives on the role; the registry folds it
+    # in with the role-independent ones.
+    prefill = PrefillDispatcher(None, None, epd_hooks=None)
+    loop = _predicate_loop(dispatcher=prefill)
     handoff_op = SimpleNamespace(num_extends=lambda: 0)
     extend_op = SimpleNamespace(num_extends=lambda: 1)
 
@@ -64,7 +68,7 @@ def test_pd_handoff_batch_depends_on_pending_commit() -> None:
 
 
 def test_handoff_shaped_batch_without_pd_keeps_overlap() -> None:
-    loop = _predicate_loop(kv_transfer=None)
+    loop = _predicate_loop()
     op = SimpleNamespace(num_extends=lambda: 0)
 
     assert not EventLoop._dispatch_depends_on_pending_commit(loop, op, None)
