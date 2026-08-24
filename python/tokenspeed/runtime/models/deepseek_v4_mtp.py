@@ -27,6 +27,7 @@ import re
 from collections.abc import Iterable
 
 import torch
+from tokenspeed_kernel import mhc_post
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -52,7 +53,6 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4MegaMoEExperts,
     _deepseek_v4_swa_slot_mapping,
     hc_head,
-    mhc_post,
 )
 from tokenspeed.runtime.utils import add_prefix
 

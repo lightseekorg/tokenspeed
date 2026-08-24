@@ -23,7 +23,7 @@ import signal
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from functools import partial
 
 import psutil
 import setproctitle
@@ -37,14 +37,17 @@ from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
+from tokenspeed.runtime.engine.batch_log import BatchLogger
 from tokenspeed.runtime.engine.cache_hooks import L2CacheHooks
+from tokenspeed.runtime.engine.forward_dispatch import (
+    DecodeDispatcher,
+    ForwardDispatcher,
+    PlannedForward,
+    PrefillDispatcher,
+)
 from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
 from tokenspeed.runtime.engine.io_struct import IpcReceiver, IpcSender, NullSender
-from tokenspeed.runtime.engine.load_snapshot import (
-    DirectLoadSnapshotSink,
-    LoadSnapshotPublisher,
-    NullLoadSnapshotPublisher,
-)
+from tokenspeed.runtime.engine.load_snapshot import create_load_reporter
 from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
 from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
 from tokenspeed.runtime.engine.request_handler import RequestHandler
@@ -69,7 +72,10 @@ from tokenspeed.runtime.execution.factory import (
     create_model_runner,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.types import ModelExecutionResult
+from tokenspeed.runtime.execution.types import (
+    DpForwardMetadata,
+    PendingExecution,
+)
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
 from tokenspeed.runtime.layers.attention.registry import create_attn_components
 from tokenspeed.runtime.metrics.collector import EngineMetrics
@@ -104,16 +110,6 @@ from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
-
-
-@dataclass(frozen=True)
-class DpForwardMetadata:
-    global_num_tokens: list[int]
-    global_batch_size: list[int]
-    global_forward_mode: list[int]
-    all_decode_or_idle: bool
-    all_extend: bool
-    need_idle_forward: bool
 
 
 class EventLoop:
@@ -213,7 +209,6 @@ class EventLoop:
         geometry = self._scheduler_cache_geometry
         # The contract is the one source of admitted capacity.
         self.max_total_num_tokens = geometry.token_capacity
-        num_total_pages = geometry.num_device_pages
         cache_groups = pool_to_cache_groups(token_to_kv_pool)
         # Resolve the scheduler limit before ModelExecutorConfig sizes input
         # buffers. Lowering the limit is safe; a configured chunk smaller than
@@ -247,7 +242,6 @@ class EventLoop:
             max_req_pool_size=req_pool_padding_index,
             gpu_id=gpu_id,
             global_rank=global_rank,
-            num_total_pages=num_total_pages,
             prefix_granularity=geometry.prefix_granularity,
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
@@ -260,6 +254,20 @@ class EventLoop:
             token_to_kv_pool=token_to_kv_pool,
             draft_attn_backend=draft_attn_backend,
             draft_token_to_kv_pool=draft_token_to_kv_pool,
+        )
+
+        # Per-round batch logging lives here, not in the executor: it reports
+        # scheduler quantities (queue depth, page usage) that the loop already
+        # samples, and its counters stay on this thread.
+        self._batch_logger = BatchLogger(
+            enabled=global_rank == 0,
+            decode_log_interval=server_args.decode_log_interval,
+            # Usable pages, the same total the load snapshot and the
+            # Prometheus gauge publish, so the three never disagree.
+            num_total_pages=geometry.num_usable_pages,
+            spec_num_steps=model_executor_config.spec_num_steps or 0,
+            spec_num_tokens=model_executor_config.spec_num_tokens or 0,
+            token_to_kv_pool=token_to_kv_pool,
         )
 
         # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
@@ -440,7 +448,7 @@ class EventLoop:
             self.kv_event_publisher = NullEventPublisher(attn_dp_rank=dp_rank)
 
         self._init_interprocess_comm()
-        self._init_load_snapshot_publisher()
+        self._init_load_reporter()
 
         # Pause/resume control state. Shared with the request handler, which
         # drives the control-request side; the event loop reads the gate.
@@ -599,6 +607,29 @@ class EventLoop:
         # PD transfer-event integration (see pd/transfer_hooks.py); a no-op
         # when PD is disabled.
         self._pd_hooks = PdTransferHooks(self)
+        self._forward_dispatcher = self._make_forward_dispatcher()
+
+    def _make_forward_dispatcher(self) -> ForwardDispatcher:
+        """Pick the dispatch rules for the role this engine was started in.
+
+        The role is fixed for the process's lifetime, so this resolves once
+        instead of re-deriving it from ``kv_transfer`` on every round.
+        """
+        if self.kv_transfer is None:
+            return ForwardDispatcher(self.model_executor)
+        if isinstance(self.kv_transfer, DisaggDecodeExecutor):
+            return DecodeDispatcher(
+                self.model_executor,
+                self.kv_transfer,
+                pd_cache_enabled=self._pd_cache_enabled,
+            )
+        if not isinstance(self.kv_transfer, DisaggPrefillExecutor):
+            raise TypeError("kv_transfer must be a Disagg{Prefill,Decode}Executor.")
+        return PrefillDispatcher(
+            self.model_executor,
+            self.kv_transfer,
+            epd_hooks=self._epd_hooks,
+        )
 
     def _publish_scheduler_kv_events(self) -> None:
         """Drain the KV events the C++ scheduler accumulated and publish them.
@@ -627,130 +658,35 @@ class EventLoop:
         self,
         forward_op,
         sampling_params_list,
-        dp_metadata=None,
-        stats=None,
-        grammar_inputs=None,
-        cache_zero_event=None,
+        dp_metadata,
+        grammar_inputs,
+        cache_zero_future,
     ):
-        """Execute one forward step; return (results, on_first_token).
+        """Submit one forward step; return (pending, on_first_token).
 
-        results is None when the step produces no model output (Path 2/3);
-        otherwise the loop queues (results, on_first_token) in ``in_flight``
-        and commits them later (post_process at the queue head).
-
-        Path 1 — no PD:              run forward, return (results, None)
-        Path 2 — decode, extend:     trigger RDMA receive, return (None, None)
-        Path 3 — prefill, decode:    send KV to decode side, return (None, None)
-        Path 4 — prefill, extend:    run prefill forward, return (results, on_first_token)
+        The role's dispatcher decides what the round actually does (see
+        forward_dispatch.py). ``pending`` is None for rounds that produce no
+        model output — a PD prefill node's KV handoff, a PD decode node's
+        RDMA receive trigger. Otherwise it is a ``PendingExecution`` whose
+        GPU work was SUBMITTED to the forward thread: the loop queues it in
+        ``in_flight`` and resolves it at commit (queue head).
         """
-        if stats is None:
-            stats = {}
-        dp_global_num_tokens = (
-            dp_metadata.global_num_tokens if dp_metadata is not None else None
-        )
-        dp_global_bs = (
-            dp_metadata.global_batch_size if dp_metadata is not None else None
-        )
-        dp_all_decode_or_idle = (
-            dp_metadata.all_decode_or_idle if dp_metadata is not None else False
-        )
-        dp_all_extend = dp_metadata.all_extend if dp_metadata is not None else False
-        multimodal_context = (
-            multimodal_context_for_forward(
-                forward_op, self.output_processor.rid_to_state
-            )
-            if self.model_config.is_multimodal_active
-            else None
-        )
-
-        if self.kv_transfer is None:
-            # Path 1: normal (no disaggregation)
-            self.model_executor.reset_valid_cache_length(forward_op)
-            return (
-                self.model_executor.execute_forward_op_with_log(
-                    forward_op,
-                    sampling_params_list,
-                    dp_global_num_tokens=dp_global_num_tokens,
-                    dp_global_bs=dp_global_bs,
-                    dp_all_decode_or_idle=dp_all_decode_or_idle,
-                    dp_all_extend=dp_all_extend,
-                    grammar_inputs=grammar_inputs,
-                    multimodal_context=multimodal_context,
-                    **stats,
+        return self._forward_dispatcher.dispatch(
+            PlannedForward(
+                forward_op=forward_op,
+                sampling_params_list=sampling_params_list,
+                dp_metadata=dp_metadata,
+                grammar_inputs=grammar_inputs,
+                multimodal_context=(
+                    multimodal_context_for_forward(
+                        forward_op, self.output_processor.rid_to_state
+                    )
+                    if self.model_config.is_multimodal_active
+                    else None
                 ),
-                None,
+                cache_zero_future=cache_zero_future,
             )
-
-        elif isinstance(self.kv_transfer, DisaggDecodeExecutor):
-            # Decode node
-            if forward_op.num_extends() > 0 and not forward_op.is_local_prefill():
-                # Path 2: new requests waiting for remote KV — trigger RDMA receive
-                self.model_executor.prepare_remote_cache_slots(
-                    list(forward_op.request_pool_indices[: forward_op.num_extends()])
-                )
-                self.kv_transfer.reset_valid_cache_length(
-                    forward_op,
-                    self.model_executor.runtime_states,
-                    self.model_executor.execution_stream,
-                    self.model_executor.device,
-                )
-                if self._pd_cache_enabled and cache_zero_event is not None:
-                    # Page zeroing runs asynchronously on a CUDA stream,
-                    # while Mooncake/GPUDirect writes are not ordered by that
-                    # stream. Do not publish the destination manifest until the
-                    # newly assigned pages are fully sanitized.
-                    cache_zero_event.synchronize()
-                self.kv_transfer.execute(forward_op)
-                return None, None
-            else:
-                # Decode and local recovery-prefill batches execute normally.
-                self.model_executor.reset_valid_cache_length(forward_op)
-                return (
-                    self.model_executor.execute_forward_op_with_log(
-                        forward_op,
-                        sampling_params_list,
-                        dp_global_num_tokens=dp_global_num_tokens,
-                        dp_global_bs=dp_global_bs,
-                        dp_all_decode_or_idle=dp_all_decode_or_idle,
-                        dp_all_extend=dp_all_extend,
-                        multimodal_context=multimodal_context,
-                        **stats,
-                    ),
-                    None,
-                )
-
-        else:
-            # Prefill node (the overlap schedule is disabled for the P role;
-            # under PP the in-flight depth is the chunk-pipeline depth instead)
-            if not isinstance(self.kv_transfer, DisaggPrefillExecutor):
-                raise TypeError("kv_transfer must be a DisaggPrefillExecutor.")
-            if forward_op.num_extends() == 0:
-                # Path 3: all prefill done — send KV to decode side
-                self.kv_transfer.execute(forward_op)
-                return None, None
-            else:
-                # Path 4: extend batch — run prefill forward
-                self.model_executor.reset_valid_cache_length(forward_op)
-                self.kv_transfer.prepare_prefill(forward_op)
-                # EPD invariant: handshaked items are filled by the async
-                # EPD admission drain before admission; assert none reached
-                # the forward un-received (no-op for non-EPD / text-only requests).
-                self._epd_hooks.assert_embeddings_received(multimodal_context)
-                return (
-                    self.model_executor.execute_forward_op_with_log(
-                        forward_op,
-                        sampling_params_list,
-                        dp_global_num_tokens=dp_global_num_tokens,
-                        dp_global_bs=dp_global_bs,
-                        dp_all_decode_or_idle=dp_all_decode_or_idle,
-                        dp_all_extend=dp_all_extend,
-                        grammar_inputs=grammar_inputs,
-                        multimodal_context=multimodal_context,
-                        capture_next_input_ids=True,
-                        **stats,
-                    ),
-                    self.kv_transfer.store_prefill_token,
-                )
+        )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -834,20 +770,23 @@ class EventLoop:
             self.recv_from_tokenizer = None
             self.send_to_tokenizer = NullSender()
 
-    def _init_load_snapshot_publisher(self) -> None:
-        self._load_snapshot_observed_while_paused = False
-        if self.attn_tp_rank != 0:
-            self.load_snapshot_publisher = NullLoadSnapshotPublisher()
-        elif self.server_args.zmq_msgpack:
-            self.load_snapshot_publisher = DirectLoadSnapshotSink(
+    def _init_load_reporter(self) -> None:
+        reports_load = self.attn_tp_rank == 0
+        self.load_reporter = create_load_reporter(
+            enabled=reports_load,
+            # Bound only in direct-ZMQ mode, and only where it is used: other
+            # ranks send through a NullSender that has no such setter.
+            direct_setter=(
                 self.send_to_tokenizer.set_load_snapshot
-            )
-        else:
-            self.load_snapshot_publisher = LoadSnapshotPublisher(
-                self.port_args.metrics_ipc_name,
-                self.dp_rank,
-                self.server_args.load_watch_interval,
-            )
+                if reports_load and self.server_args.zmq_msgpack
+                else None
+            ),
+            endpoint=self.port_args.metrics_ipc_name,
+            dp_rank=self.dp_rank,
+            heartbeat_interval=self.server_args.load_watch_interval,
+            num_total_pages=self._scheduler_cache_geometry.num_usable_pages,
+            sample_stats=self._get_scheduler_stats,
+        )
 
     # ------------------------------------------------------------------
     # Shared step helpers
@@ -864,11 +803,6 @@ class EventLoop:
 
     def _process_new_requests(self):
         recv_reqs = self.request_handler.recv_reqs()
-        if recv_reqs:
-            # A paused loop still accepts control messages and registers new
-            # requests into its Python-side buffers. Re-sample once after that
-            # batch instead of heartbeating the pre-mutation tuple forever.
-            self._mark_load_snapshot_dirty()
         # Pause-state snapshot for withhold_admissions below: it must be
         # taken before process_requests, which may flip the state mid-batch.
         pause_blocked_before = self._pause.admit_blocked
@@ -937,7 +871,8 @@ class EventLoop:
                 raise ValueError(
                     "Paged cache PD request is missing bootstrap information"
                 )
-            if isinstance(self.kv_transfer, DisaggDecodeExecutor):
+            if self._forward_dispatcher.is_decode_role:
+                # The prompt was computed on the prefill node.
                 state.computed_length = state.input_length
             self.output_processor.register(spec.request_id, state)
             # EPD prefill: an encode-routed request is staged OUT of the
@@ -972,18 +907,15 @@ class EventLoop:
             return
         group = pg_manager.get_process_group("gloo", mapping.pp_group)
         src_global_rank = mapping.pp_group[-1]
-        results.sync()
+        # Host tensors already: the result was synced before commit, and the
+        # executor issues every output as a D2H copy.
         payload = [None]
         if mapping.is_last_pp_rank:
             payload = [
                 (
-                    results.output_tokens.cpu(),
-                    results.output_lengths.cpu(),
-                    (
-                        results.next_input_ids
-                        if results.next_input_ids is None
-                        else results.next_input_ids.cpu()
-                    ),
+                    results.output_tokens,
+                    results.output_lengths,
+                    results.next_input_ids,
                 )
             ]
         dist.broadcast_object_list(payload, src=src_global_rank, group=group)
@@ -996,9 +928,14 @@ class EventLoop:
     def _commit_forward_results(
         self,
         forward_op,
-        results: ModelExecutionResult,
-        on_first_token=None,
+        pending: PendingExecution,
+        on_first_token,
     ):
+        # The only place the control plane waits for the GPU: join the
+        # forward thread's future (launches done) + the copy event (D2H
+        # landed). Everything below reads host tensors.
+        with nvtx_range("commit:sync", color="red"):
+            results = pending.result()
         self.request_handler.forward_ct += 1
         forward_mode = ForwardMode.from_num_extends(
             forward_op.num_extends(),
@@ -1007,8 +944,7 @@ class EventLoop:
         self.request_handler._profile_batch_predicate(forward_mode)
         self._pp_broadcast_output_tokens(forward_op, results)
 
-        # post_process_forward_op calls sync() — after this, CPU tensors are ready
-        is_prefill_instance = isinstance(self.kv_transfer, DisaggPrefillExecutor)
+        is_prefill_instance = self._forward_dispatcher.is_prefill_role
         request_changes = self.output_processor.post_process_forward_op(
             forward_op,
             results,
@@ -1016,10 +952,11 @@ class EventLoop:
             on_first_token=on_first_token,
         )
 
-        # Accumulate decode stats from synced results (no GPU sync)
+        # Fold committed tokens into the decode throughput window (host-side
+        # reads of the already-synced result; no GPU sync).
         if forward_op.num_extends() <= 0:
             bs = len(forward_op.request_ids)
-            self.model_executor.accumulate_decode_stats(results, bs)
+            self._batch_logger.record_decode(results, bs)
 
         return request_changes
 
@@ -1043,15 +980,10 @@ class EventLoop:
         # request into decode. Treating those EXTEND ops as model work makes
         # idle DP ranks enter dummy collectives that the active rank will not
         # match.
-        is_disagg_decode = isinstance(self.kv_transfer, DisaggDecodeExecutor)
         executes_model_forward = (
             forward_op is not None
             and sum(forward_op.input_lengths) > 0
-            and not (
-                is_disagg_decode
-                and forward_op.num_extends() > 0
-                and not forward_op.is_local_prefill()
-            )
+            and self._forward_dispatcher.produces_model_output(forward_op)
         )
         num_tokens = sum(forward_op.input_lengths) if executes_model_forward else 0
         batch_size = len(forward_op.request_ids) if executes_model_forward else 0
@@ -1097,6 +1029,9 @@ class EventLoop:
             need_idle_forward=need_idle_forward,
         )
 
+    def _num_running(self) -> int:
+        return len(self.output_processor.rid_to_state)
+
     def _get_scheduler_stats(self):
         """Query scheduler for page usage and queue depth."""
         available = self.scheduler.available_kv_pages()
@@ -1109,44 +1044,11 @@ class EventLoop:
             "num_queue_reqs": self.scheduler.waiting_size(),
         }
 
-    def _observe_load_snapshot(self, stats: dict) -> None:
-        """Project the latest pre-forward planning sample onto each load sink."""
-        num_running = len(self.output_processor.rid_to_state)
-        num_waiting = stats["num_queue_reqs"]
-        num_active_pages = stats["num_active_pages"]
-        max_total_pages = self._scheduler_cache_geometry.num_usable_pages
-        self.load_snapshot_publisher.observe(
-            (
-                num_running,
-                num_waiting,
-                num_active_pages,
-                stats["num_cached_pages"],
-                max_total_pages,
-            )
-        )
-
-    def _mark_load_snapshot_dirty(self) -> None:
-        """Request one fresh scheduler sample on the next paused iteration."""
-        self._load_snapshot_observed_while_paused = False
-
-    def _maybe_observe_paused_load(self, had_changes: bool) -> None:
-        """Frozen rounds: sample the load once per pause — and again after any
-        round that changed scheduler state (committed changes, or a dirty mark
-        from new requests / cache-op completions) — instead of on every idle
-        spin. Called at the loop tail, after the advance, so the sample
-        reflects the applied changes.
-        """
-        if self.attn_tp_rank != 0:
-            return
-        if had_changes or not self._load_snapshot_observed_while_paused:
-            self._observe_load_snapshot(self._get_scheduler_stats())
-            self._load_snapshot_observed_while_paused = True
-
     def _record_scheduler_iteration_metrics(
         self, stats: dict, num_iteration_tokens: int
     ) -> None:
         self.metrics.record_scheduler_iteration(
-            running=len(self.output_processor.rid_to_state),
+            running=self._num_running(),
             waiting=stats["num_queue_reqs"],
             num_active_pages=stats["num_active_pages"],
             num_total_pages=self._scheduler_cache_geometry.num_usable_pages,
@@ -1175,17 +1077,16 @@ class EventLoop:
         The single registry of overlap-breaking dependencies — add new rules
         here, not in ``event_loop``:
 
-        - P-side PD handoff batch: ``kv_transfer.execute`` needs the final
-          chunk's bootstrap token, which only lands at commit.
+        - The role's own rule, which the dispatcher answers (the P-side PD
+          handoff batch needs the final chunk's bootstrap token, and that
+          only lands at commit).
         - Eager grammar: ``setup_grammar_step`` reads each matcher's current
           state to fill the bitmask, and the matcher only advances at the
           pending step's commit (``accept_token``). Capturable grammar dodges
           this with an in-graph hostfunc; eager has no equivalent, so trade
           the overlap away for grammar batches.
         """
-        if forward_op.num_extends() == 0 and isinstance(
-            self.kv_transfer, DisaggPrefillExecutor
-        ):
+        if self._forward_dispatcher.needs_pending_commit(forward_op):
             return True
         return (
             grammar_inputs is not None
@@ -1202,8 +1103,8 @@ class EventLoop:
           so the CPU post-processes step N-1 while the GPU runs step N (the
           overlap schedule).
         - pp_size: the prefill chunk pipeline — consecutive chunks occupy
-          different pipeline stages; the head's copy_event sync is the
-          backpressure.
+          different pipeline stages; committing the queue head (join the
+          forward thread, then its copy event) is the backpressure.
 
         Correctness never depends on the depth: any dispatch whose inputs
         depend on a pending commit's side effects drains the queue first
@@ -1220,18 +1121,8 @@ class EventLoop:
         in_flight: deque = deque()
         depth = self.in_flight_depth
         while not self._shutdown_complete():
-            if depth > 0:
-                # Order this iter's default-stream writes (prefix_cache
-                # page-table writes) after the pending forwards on
-                # execution_stream that read the same tensors. Non-blocking
-                # on host; a no-op when nothing is in flight.
-                torch.cuda.default_stream().wait_stream(
-                    self.model_executor.execution_stream
-                )
-            num_tracked_reqs = len(self.output_processor.rid_to_state)
             self._process_new_requests()
-            if len(self.output_processor.rid_to_state) != num_tracked_reqs:
-                self._mark_load_snapshot_dirty()
+
             # EPD prefill: admit requests whose async embedding receives completed
             # this cycle (rank-synced). Fixed position right after
             # _process_new_requests so the drain's TP collective ordering is
@@ -1245,7 +1136,6 @@ class EventLoop:
                 # round's next_execution_plan — deferring them would delay
                 # cache-gated admissions by a full round.
                 advance_scheduler(self.scheduler, cache_events)
-                self._mark_load_snapshot_dirty()
 
             # Every path in this round appends its committed results here;
             # they feed back into the scheduler through the single
@@ -1263,16 +1153,27 @@ class EventLoop:
                 self._pause_hooks.paused_idle_step()
                 idle_round = True
             else:
-                self._load_snapshot_observed_while_paused = False
                 execution_plan = self.scheduler.next_execution_plan()
-                cache_zero_event = self.model_executor.zero_cache_pages(
-                    execution_plan.pages_to_zero
+                pages_to_zero = execution_plan.pages_to_zero
+                # Submitted, not awaited: the forward thread's FIFO order
+                # already places the zeroing before this round's forward.
+                # Only the PD-decode RDMA barrier needs the completion event;
+                # it resolves the future inside the thread (Path 2).
+                # ``partial`` binds the pages eagerly — a lambda would read
+                # ``pages_to_zero`` at execution time, after a later round may
+                # have rebound it.
+                cache_zero_future = (
+                    self.model_executor.forward_thread.submit(
+                        partial(self.model_executor.zero_cache_pages, pages_to_zero)
+                    )
+                    if pages_to_zero
+                    else None
                 )
                 self._cache_hooks.submit(execution_plan)
 
                 forward_op = self._get_forward_op(execution_plan)
                 stats = self._get_scheduler_stats()
-                self._observe_load_snapshot(stats)
+                self.load_reporter.observe(stats, self._num_running())
                 num_iter_tokens = (
                     sum(forward_op.input_lengths) if forward_op is not None else 0
                 )
@@ -1292,16 +1193,17 @@ class EventLoop:
                     dp_metadata = self._dp_sync_and_check(forward_op)
                     if dp_metadata.need_idle_forward:
                         request_changes.extend(self._drain_in_flight(in_flight))
-                        self.model_executor.execute_idle_forward(
-                            dp_metadata.global_num_tokens,
-                            dp_metadata.global_batch_size,
-                            dp_metadata.all_decode_or_idle,
+                        self.model_executor.forward_thread.run(
+                            partial(
+                                self.model_executor.execute_idle_forward,
+                                dp_metadata,
+                            )
                         )
                         idle_round = True
 
             if not idle_round:
-                grammar_inputs = None
-                sampling_params_list = None
+                # Nothing to dispatch (an empty plan) still reaches the drain
+                # below — only this dispatch half is skipped.
                 if forward_op is not None:
                     # Gather sampling params and grammar state BEFORE any
                     # pending commit below — a commit can finish requests and
@@ -1310,27 +1212,22 @@ class EventLoop:
                     sampling_params_list = self._gather_sampling_params(forward_op)
                     grammar_inputs = self._gather_grammar_state(forward_op)
 
-                if (
-                    in_flight
-                    and forward_op is not None
-                    and self._dispatch_depends_on_pending_commit(
+                    if in_flight and self._dispatch_depends_on_pending_commit(
                         forward_op, grammar_inputs
-                    )
-                ):
-                    request_changes.extend(self._drain_in_flight(in_flight))
+                    ):
+                        request_changes.extend(self._drain_in_flight(in_flight))
 
-                if forward_op is not None:
                     self._mark_stats_scheduled(forward_op)
-                    results, on_first_token = self._dispatch_forward(
+                    self._batch_logger.log_dispatch(forward_op, stats)
+                    pending, on_first_token = self._dispatch_forward(
                         forward_op,
                         sampling_params_list,
                         dp_metadata=dp_metadata,
-                        stats=stats,
                         grammar_inputs=grammar_inputs,
-                        cache_zero_event=cache_zero_event,
+                        cache_zero_future=cache_zero_future,
                     )
-                    if results is not None:
-                        in_flight.append((forward_op, results, on_first_token))
+                    if pending is not None:
+                        in_flight.append((forward_op, pending, on_first_token))
 
                 # Commit from the head once the queue exceeds the depth
                 # (immediately at depth 0; one step behind at depth 1; a full
@@ -1357,7 +1254,9 @@ class EventLoop:
             self._publish_scheduler_kv_events()
 
             if self._pause.forward_blocked:
-                self._maybe_observe_paused_load(had_changes=bool(request_changes))
+                # Frozen rounds take no planning sample of their own; the
+                # idle sleep bounds this to one sample per millisecond.
+                self.load_reporter.sample_and_observe(self._num_running())
 
             # Resolve a deferred abort/wait pause reply once in-flight work drains.
             self._pause.maybe_finish_drain(self.scheduler)
@@ -1417,7 +1316,7 @@ class EventLoop:
         return GrammarStepInputs(grammars=grammars, advance_mask=advance_mask)
 
     def close(self) -> None:
-        self.load_snapshot_publisher.close()
+        self.load_reporter.close()
         # Best-effort: tell an attached SMG frontend this engine is going away
         # (msgpack mode only; the pickle sender has no such helper) so the
         # worker is marked dead instead of staying healthy-idle.
@@ -1477,6 +1376,18 @@ def run_event_loop(
                 lambda _signum, _frame: shutdown_event.set(),
             )
 
+        if torch.cuda.is_available():
+            # Warm up CUPTI before EventLoop init captures any CUDA graph
+            # (decode/prefill/encoder). A profiler that first attaches AFTER
+            # capture invalidates the captured graphs — every later replay
+            # dies with cudaErrorLaunchFailure — which would forbid runtime
+            # /start_profile on graph-mode servers. One empty profiler
+            # session loads CUPTI ahead of every capture, making runtime
+            # attach/detach safe.
+            from torch.profiler._utils import _init_for_cuda_graphs
+
+            _init_for_cuda_graphs()
+
         event_loop = EventLoop(
             server_args,
             port_args,
@@ -1507,7 +1418,7 @@ def run_event_loop(
 
         event_loop.event_loop()
 
-    except Exception:
+    except Exception:  # noqa: BLE001 - process boundary; report and signal parent
         traceback = get_exception_traceback()
         logger.error("Scheduler hit an exception: %s", traceback)
         parent_process.send_signal(signal.SIGUSR1)
@@ -1515,7 +1426,7 @@ def run_event_loop(
         if event_loop is not None:
             try:
                 event_loop.close()
-            except Exception:
+            except Exception:  # noqa: BLE001 - best-effort teardown; signal parent
                 logger.error(
                     "Scheduler transport shutdown failed: %s",
                     get_exception_traceback(),

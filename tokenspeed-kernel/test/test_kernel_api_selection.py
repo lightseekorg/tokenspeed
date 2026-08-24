@@ -40,6 +40,7 @@ import tokenspeed_kernel
 import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
+import tokenspeed_kernel.ops.attention.cuda.dsv4 as _attention_cuda_dsv4
 import tokenspeed_kernel.ops.attention.flash_attn as _attention_flash_attn
 import tokenspeed_kernel.ops.attention.flash_mla as _attention_flash_mla
 import tokenspeed_kernel.ops.attention.flashinfer as _attention_flashinfer
@@ -47,15 +48,22 @@ import tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule as _attention
 import tokenspeed_kernel.ops.attention.gluon as _attention_gluon
 import tokenspeed_kernel.ops.attention.triton as _attention_triton
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
+import tokenspeed_kernel.ops.gemm.cuda as _gemm_cuda
 import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
 import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
+import tokenspeed_kernel.ops.mhc as _mhc_pkg
+import tokenspeed_kernel.ops.mhc.deep_gemm as _mhc_deep_gemm
+import tokenspeed_kernel.ops.mhc.gluon as _mhc_gluon
+import tokenspeed_kernel.ops.mhc.triton as _mhc_triton
 import tokenspeed_kernel.ops.moe as _moe_pkg
+import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
 import tokenspeed_kernel.ops.moe.deep_gemm as _moe_deep_gemm
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
+import tokenspeed_kernel.ops.moe.gluon.dsv4 as _moe_gluon_dsv4
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
@@ -70,6 +78,7 @@ from tokenspeed_kernel.ops.attention.triton import dsa as _attention_triton_dsa
 from tokenspeed_kernel.ops.attention.triton import (
     dsa_topk as _attention_triton_dsa_topk,
 )
+from tokenspeed_kernel.ops.attention.triton import dsv4 as _attention_triton_dsv4
 from tokenspeed_kernel.ops.attention.triton import (
     gated_delta_rule as _attention_triton_gdn,
 )
@@ -105,11 +114,12 @@ from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
 from tokenspeed_kernel.ops.moe.triton import bf16 as _moe_triton_bf16
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
-from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.registry import KernelRegistry, error_fn
 from tokenspeed_kernel.selection import SelectedKernel, spec_matches_traits
 
 _RELOAD_MODULES = [
     # Attention registration modules.
+    _attention_cuda_dsv4,
     _attention_cuda,
     _attention_flash_attn,
     _attention_flash_mla,
@@ -122,6 +132,7 @@ _RELOAD_MODULES = [
     _attention_triton_mla_decode,
     _attention_triton_rel_mha,
     _attention_triton_merge_state,
+    _attention_triton_dsv4,
     _attention_triton_dsa,
     _attention_triton_dsa_topk,
     _attention_triton_gdn,
@@ -129,13 +140,20 @@ _RELOAD_MODULES = [
     _attention_pkg,
     # GEMM registration modules.
     _gemm_reference,
+    _gemm_cuda,
     _gemm_deep_gemm,
     _gemm_flashinfer,
     _gemm_gluon,
     _gemm_triton,
     _gemm_trtllm,
     _gemm_pkg,
+    # mHC registration modules.
+    _mhc_deep_gemm,
+    _mhc_gluon,
+    _mhc_triton,
+    _mhc_pkg,
     # MoE registration modules.
+    _moe_cuda,
     _moe_deep_gemm_deepep_fp8,
     _moe_deep_gemm,
     _moe_cutedsl_deepep_nvfp4,
@@ -148,6 +166,7 @@ _RELOAD_MODULES = [
     _moe_trtllm_nvfp4,
     _moe_trtllm_unquant,
     _moe_flashinfer,
+    _moe_gluon_dsv4,
     _moe_gluon_mxfp4,
     _moe_gluon,
     _moe_triton_bf16,
@@ -187,6 +206,22 @@ def test_builtin_moe_preprocessor_links_are_callables():
     assert process_weight_kernels == []
 
     assert errors == []
+
+
+def test_dsv4_padded_heads_platform_policy(
+    mi350_platform: PlatformInfo,
+    h100_platform: PlatformInfo,
+) -> None:
+    host_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        assert tokenspeed_kernel.dsv4_padded_heads(16) == 16
+        assert tokenspeed_kernel.dsv4_padded_heads(32) == 32
+        Platform.override(h100_platform)
+        assert tokenspeed_kernel.dsv4_padded_heads(16) == 64
+        assert tokenspeed_kernel.dsv4_padded_heads(65) == 128
+    finally:
+        Platform.override(host_platform)
 
 
 def test_moe_process_weights_returns_for_no_preprocessing_plan():
@@ -253,8 +288,19 @@ def _is_hopper_plus(platform: PlatformInfo) -> bool:
     return platform.is_nvidia and platform.arch_version >= ArchVersion(9, 0)
 
 
+def _is_hopper_plus_with_flashmla(platform: PlatformInfo) -> bool:
+    return (
+        _is_hopper_plus(platform)
+        and _attention_flash_mla.flash_mla_with_kvcache is not error_fn
+    )
+
+
 def _is_nvidia(platform: PlatformInfo) -> bool:
     return platform.is_nvidia
+
+
+def _is_nvidia_with_dsv4_cuda(platform: PlatformInfo) -> bool:
+    return platform.is_nvidia and _attention_cuda_dsv4.has_fused_qnorm_rope_kv_insert()
 
 
 def _is_nvidia_with_cute_dsl(platform: PlatformInfo) -> bool:
@@ -308,6 +354,12 @@ def _bmm_dense() -> torch.Tensor:
     a = torch.empty((4, 2, 16), dtype=torch.bfloat16)
     b = torch.empty((4, 32, 16), dtype=torch.bfloat16)
     return tokenspeed_kernel.bmm(a, b)
+
+
+def _dsv4_linear_fp32() -> torch.Tensor:
+    hidden_states = torch.empty((2, 4096), dtype=torch.bfloat16)
+    weight = torch.empty((256, 4096), dtype=torch.bfloat16)
+    return tokenspeed_kernel.dsv4_linear_fp32(hidden_states, weight)
 
 
 def _mm_mxfp8() -> torch.Tensor:
@@ -1125,6 +1177,132 @@ def _attention_dsa_decode() -> object:
     )
 
 
+def _attention_dsv4_selected(width: int = 640) -> object:
+    q = torch.empty((1, 16, 512), dtype=torch.bfloat16)
+    kv = torch.empty((width, 512), dtype=torch.bfloat16)
+    indices = torch.arange(width, dtype=torch.int32).unsqueeze(0)
+    lens = torch.tensor([width], dtype=torch.int32)
+    attn_sink = torch.empty((16,), dtype=torch.float32)
+    return tokenspeed_kernel.dsv4_selected_attention(
+        q,
+        kv,
+        indices,
+        lens,
+        attn_sink,
+        512**-0.5,
+    )
+
+
+def _attention_dsv4_selected_short() -> object:
+    return _attention_dsv4_selected(128)
+
+
+def _attention_dsv4_selected_i64() -> object:
+    q = torch.empty((1, 16, 512), dtype=torch.bfloat16)
+    kv = torch.empty((640, 512), dtype=torch.bfloat16)
+    return tokenspeed_kernel.dsv4_selected_attention(
+        q,
+        kv,
+        torch.arange(640, dtype=torch.int32).unsqueeze(0),
+        torch.tensor([640], dtype=torch.int64),
+        torch.empty((16,), dtype=torch.float32),
+        512**-0.5,
+    )
+
+
+def _attention_dsv4_paged_selected(with_extra: bool = True) -> object:
+    q = torch.empty((2, 16, 512), dtype=torch.bfloat16)
+    swa_cache = torch.empty((2, 64 * 584), dtype=torch.uint8)
+    swa_slots = torch.empty((2, 256), dtype=torch.int32)
+    swa_lens = torch.empty((2,), dtype=torch.int32)
+    attn_sink = torch.empty((16,), dtype=torch.float32)
+    kwargs = {}
+    if with_extra:
+        kwargs = {
+            "extra_kv_cache": torch.empty((2, 64 * 584), dtype=torch.uint8),
+            "extra_slots": torch.empty((2, 1, 128), dtype=torch.int32),
+            "extra_lens": torch.empty((2,), dtype=torch.int32),
+            "extra_page_size": 64,
+        }
+    return tokenspeed_kernel.dsv4_paged_selected_attention(
+        q=q,
+        swa_kv_cache=swa_cache,
+        swa_slots=swa_slots,
+        swa_lens=swa_lens,
+        swa_page_size=64,
+        attn_sink=attn_sink,
+        softmax_scale=512**-0.5,
+        **kwargs,
+    )
+
+
+def _attention_dsv4_paged_selected_swa_only() -> object:
+    return _attention_dsv4_paged_selected(with_extra=False)
+
+
+def _attention_dsv4_paged_selected_pro_tp8() -> object:
+    tokens = 6
+    q = torch.empty((tokens, 16, 512), dtype=torch.bfloat16)
+    swa_cache = torch.empty((2, 64 * 584), dtype=torch.uint8)
+    swa_slots = torch.empty((tokens, 128), dtype=torch.int32)
+    swa_lens = torch.empty((tokens,), dtype=torch.int32)
+    extra_cache = torch.empty((16, 64 * 584), dtype=torch.uint8)
+    extra_slots = torch.empty((tokens, 1024), dtype=torch.int32)
+    extra_lens = torch.empty((tokens,), dtype=torch.int32)
+    attn_sink = torch.empty((16,), dtype=torch.float32)
+    return tokenspeed_kernel.dsv4_paged_selected_attention(
+        q=q,
+        swa_kv_cache=swa_cache,
+        swa_slots=swa_slots,
+        swa_lens=swa_lens,
+        swa_page_size=64,
+        attn_sink=attn_sink,
+        softmax_scale=512**-0.5,
+        extra_kv_cache=extra_cache,
+        extra_slots=extra_slots,
+        extra_lens=extra_lens,
+        extra_page_size=64,
+    )
+
+
+def _attention_dsv4_paged_selected_pro_tp8_i64() -> object:
+    tokens = 6
+    return tokenspeed_kernel.dsv4_paged_selected_attention(
+        q=torch.empty((tokens, 16, 512), dtype=torch.bfloat16),
+        swa_kv_cache=torch.empty((2, 64 * 584), dtype=torch.uint8),
+        swa_slots=torch.empty((tokens, 128), dtype=torch.int32),
+        swa_lens=torch.empty((tokens,), dtype=torch.int32),
+        swa_page_size=64,
+        attn_sink=torch.empty((16,), dtype=torch.float32),
+        softmax_scale=512**-0.5,
+        extra_kv_cache=torch.empty((16, 64 * 584), dtype=torch.uint8),
+        extra_slots=torch.empty((tokens, 1024), dtype=torch.int32),
+        extra_lens=torch.empty((tokens,), dtype=torch.int64),
+        extra_page_size=64,
+    )
+
+
+def _attention_dsv4_swa_cache_insert() -> object:
+    q = torch.empty((1, 2, 512), dtype=torch.bfloat16)
+    kv = torch.empty((1, 512), dtype=torch.bfloat16)
+    cache = torch.empty((1, 64 * 584), dtype=torch.uint8)
+    slot_mapping = torch.zeros((1,), dtype=torch.int64)
+    positions = torch.zeros((1,), dtype=torch.int64)
+    cos_sin_cache = torch.empty((1, 64), dtype=torch.float32)
+    q_out = torch.empty_like(q)
+    return tokenspeed_kernel.dsv4_swa_cache_insert(
+        q,
+        kv,
+        cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        1e-6,
+        64,
+        q_out=q_out,
+    )
+
+
 def _attention_dsa_decode_fp8_dense_rank128_q4(
     dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> object:
@@ -1354,6 +1532,22 @@ def _attention_dsa_decode_topk_bf16_weights() -> object:
     return _attention_dsa_decode_topk(weights_dtype=torch.bfloat16)
 
 
+def _attention_dsa_decode_topk_logical() -> object:
+    q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
+    return tokenspeed_kernel.dsa_decode_topk(
+        q,
+        torch.empty((2, 2), dtype=torch.float32),
+        torch.tensor([64, 64], dtype=torch.int32),
+        torch.zeros((2, 1), dtype=torch.int32),
+        page_size=64,
+        topk=512,
+        softmax_scale=1.0,
+        index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
+        topk_layout="logical_offsets",
+        block_table_base_offsets=torch.tensor([3, 5], dtype=torch.int32),
+    )
+
+
 def _attention_dsa_prefill_topk(
     *,
     page_size: int = 64,
@@ -1490,6 +1684,68 @@ def test_dsa_topk_selection_receives_index_heads(
     assert captured["index_heads"] == index_heads
 
 
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+@pytest.mark.parametrize(
+    ("cache", "expected"),
+    [
+        (torch.empty((64, 132), dtype=torch.uint8), "packed"),
+        (torch.empty((1, 64 * 132), dtype=torch.uint8), "page_planar"),
+    ],
+)
+def test_dsa_topk_selection_receives_cache_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    cache: torch.Tensor,
+    expected: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _SelectedKernel:
+        name = "test_dsa_topk"
+
+        def __call__(self, **kwargs):
+            tokens = kwargs["q"].shape[0]
+            topk = int(kwargs["topk"])
+            return (
+                torch.full((tokens, topk), -1, dtype=torch.int32),
+                torch.zeros((tokens,), dtype=torch.int32),
+            )
+
+    def select_dsa_topk(*args, **kwargs):
+        captured.update(kwargs["traits"])
+        return _SelectedKernel()
+
+    monkeypatch.setattr(_attention_pkg, "select_kernel", select_dsa_topk)
+    q = torch.empty((1, 32, 128), dtype=torch.bfloat16)
+    weights = torch.empty((1, 32), dtype=torch.float32)
+
+    if mode == "decode":
+        tokenspeed_kernel.dsa_decode_topk(
+            q,
+            weights,
+            torch.tensor([1], dtype=torch.int32),
+            torch.zeros((1, 1), dtype=torch.int32),
+            page_size=64,
+            topk=1,
+            softmax_scale=1.0,
+            index_k_cache=cache,
+        )
+    else:
+        tokenspeed_kernel.dsa_prefill_topk(
+            q,
+            weights,
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([1], dtype=torch.int32),
+            topk=1,
+            softmax_scale=1.0,
+            index_k_cache=cache,
+            page_size=64,
+        )
+
+    assert captured["index_k_layout"] == expected
+
+
 @pytest.mark.parametrize("missing", ["values", "scales"])
 def test_dsa_prefill_topk_rejects_incomplete_workspace_rows(missing: str) -> None:
     inputs = {
@@ -1523,6 +1779,30 @@ def _attention_merge_state() -> object:
     lse_a = torch.empty((4, 16), dtype=torch.float32)
     lse_b = torch.empty((4, 16), dtype=torch.float32)
     return tokenspeed_kernel.attn_merge_state(out_a, lse_a, out_b, lse_b)
+
+
+def _mhc_pre() -> object:
+    residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    fn = torch.empty((24, 64), dtype=torch.float32)
+    hc_scale = torch.empty((3,), dtype=torch.float32)
+    hc_base = torch.empty((24,), dtype=torch.float32)
+    return tokenspeed_kernel.mhc_pre(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        1e-6,
+        1e-6,
+        2,
+    )
+
+
+def _mhc_post() -> object:
+    hidden_states = torch.empty((1, 16), dtype=torch.bfloat16)
+    residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    post = torch.empty((1, 4, 1), dtype=torch.float32)
+    comb = torch.empty((1, 4, 4), dtype=torch.float32)
+    return tokenspeed_kernel.mhc_post(hidden_states, residual, post, comb)
 
 
 def _attention_gdn_chunk_prefill() -> object:
@@ -2084,6 +2364,31 @@ def _moe_apply_unquant_trtllm() -> object:
     )
 
 
+def _dsv4_select_experts_bias() -> object:
+    router_logits = torch.empty((2, 256), dtype=torch.float32)
+    correction_bias = torch.empty((256,), dtype=torch.float32)
+    return tokenspeed_kernel.dsv4_select_experts(
+        router_logits,
+        6,
+        True,
+        correction_bias=correction_bias,
+        need_scores=False,
+    )
+
+
+def _dsv4_select_experts_hash() -> object:
+    router_logits = torch.empty((2, 384), dtype=torch.bfloat16)
+    hash_indices_table = torch.zeros((8, 6), dtype=torch.int32)
+    input_ids = torch.zeros((2,), dtype=torch.int64)
+    return tokenspeed_kernel.dsv4_select_experts(
+        router_logits,
+        6,
+        True,
+        hash_indices_table=hash_indices_table,
+        input_ids=input_ids,
+    )
+
+
 def _moe_apply_unquant_cutlass() -> object:
     plan = tokenspeed_kernel.moe_plan(
         "unquant",
@@ -2501,6 +2806,15 @@ def _case(
 _CASES = [
     # Attention API x architecture golden cases.
     _case(
+        _is_hopper_plus_with_flashmla,
+        "hopper-plus",
+        "attention",
+        "dsv4_paged_selected_attention",
+        "flashmla_dsv4_paged_selected_attention",
+        _attention_dsv4_paged_selected,
+        id_suffix="extra-segment",
+    ),
+    _case(
         _is_hopper,
         "hopper",
         "attention",
@@ -2531,6 +2845,14 @@ _CASES = [
         "attn_merge_state",
         "cuda_attn_merge_state",
         _attention_merge_state,
+    ),
+    _case(
+        _is_nvidia_with_dsv4_cuda,
+        "hopper",
+        "attention",
+        "dsv4_swa_cache_insert",
+        "cuda_dsv4_swa_cache_insert",
+        _attention_dsv4_swa_cache_insert,
     ),
     _case(
         _is_blackwell_sm100,
@@ -2595,6 +2917,77 @@ _CASES = [
         "rel_mha_decode_with_kvcache",
         "fa4_rel_mha_decode_with_kvcache",
         _attention_rel_decode_multiquery_sliding,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsv4_paged_selected_attention",
+        "gluon_dsv4_paged_selected_attention_split_gfx950",
+        _attention_dsv4_paged_selected_pro_tp8,
+        id_suffix="pro-tp8",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsv4_paged_selected_attention",
+        "triton_dsv4_paged_selected_attention",
+        _attention_dsv4_paged_selected_pro_tp8_i64,
+        id_suffix="pro-tp8-int64-metadata",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsv4_paged_selected_attention",
+        "triton_dsv4_paged_selected_attention",
+        _attention_dsv4_paged_selected,
+        id_suffix="extra-segment",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsv4_paged_selected_attention",
+        "triton_dsv4_paged_selected_attention",
+        _attention_dsv4_paged_selected_swa_only,
+        id_suffix="swa-only",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsv4_selected_attention",
+        "gluon_dsv4_selected_attention_gfx950",
+        _attention_dsv4_selected,
+        id_suffix="width640",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsv4_selected_attention",
+        "triton_dsv4_selected_attention",
+        _attention_dsv4_selected_i64,
+        id_suffix="width640-int64-metadata",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsv4_selected_attention",
+        "triton_dsv4_selected_attention",
+        _attention_dsv4_selected_short,
+        id_suffix="width128",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsv4_swa_cache_insert",
+        "triton_dsv4_swa_cache_insert",
+        _attention_dsv4_swa_cache_insert,
     ),
     _case(
         _is_cdna4,
@@ -2852,6 +3245,15 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
+        "dsa_decode_topk",
+        "triton_dsa_decode_topk_fp8",
+        _attention_dsa_decode_topk_logical,
+        id_suffix="logical-offsets",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
         "dsa_prefill_topk",
         "gluon_dsa_prefill_topk_fp8_gfx950",
         _attention_dsa_prefill_topk,
@@ -3094,6 +3496,14 @@ _CASES = [
         "triton_mm_fp8_blockscale",
         _mm_mxfp8,
     ),
+    _case(
+        _is_hopper_plus,
+        "hopper-plus",
+        "gemm",
+        "dsv4_linear_fp32",
+        "cuda_dsv3_dsv4_linear_fp32",
+        _dsv4_linear_fp32,
+    ),
     # Quantization API x architecture golden cases.
     _case(
         _is_hopper,
@@ -3137,6 +3547,32 @@ _CASES = [
         _sampling_argmax,
     ),
     # MoE API x architecture golden cases.
+    _case(
+        _is_hopper_plus,
+        "hopper-plus",
+        "moe",
+        "dsv4_select_experts",
+        "cuda_dsv4_select_experts",
+        _dsv4_select_experts_bias,
+        id_suffix="bias",
+    ),
+    _case(
+        _is_hopper_plus,
+        "hopper-plus",
+        "moe",
+        "dsv4_select_experts",
+        "cuda_dsv4_select_experts",
+        _dsv4_select_experts_hash,
+        id_suffix="hash",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "dsv4_select_experts",
+        "gluon_dsv4_select_experts_gfx950",
+        _dsv4_select_experts_bias,
+    ),
     _case(
         _is_hopper,
         "hopper",
@@ -3244,6 +3680,22 @@ _CASES = [
     _case(
         _is_cdna4,
         "cdna4",
+        "mhc",
+        "pre",
+        "triton_mhc_pre",
+        _mhc_pre,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "mhc",
+        "post",
+        "triton_mhc_post",
+        _mhc_post,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
         "moe",
         "apply",
         "triton_mxfp4_precomputed_moe_apply",
@@ -3287,6 +3739,13 @@ def selected_kernel_spy(monkeypatch):
         calls.append(self.name)
 
         if case.family == "gemm":
+            if case.mode == "dsv4_linear_fp32":
+                hidden_states, weight = args[:2]
+                return torch.empty(
+                    (*hidden_states.shape[:-1], weight.shape[0]),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
             a, b, _a_scales, _b_scales, out_dtype = args[:5]
             if case.mode == "bmm":
                 n = b.shape[-2]
@@ -3330,7 +3789,34 @@ def selected_kernel_spy(monkeypatch):
             )
 
         if case.family == "moe":
+            if case.mode == "dsv4_select_experts":
+                router_logits, top_k = args[:2]
+                shape = (router_logits.shape[0], top_k)
+                return (
+                    torch.empty(shape, dtype=torch.float32),
+                    torch.empty(shape, dtype=torch.int32),
+                    torch.empty_like(router_logits, dtype=torch.float32),
+                )
             return torch.empty_like(kwargs["x"])
+
+        if case.family == "mhc":
+            if case.mode == "pre":
+                residual = args[0]
+                return (
+                    torch.empty(
+                        (*residual.shape[:-2], residual.shape[-1]),
+                        dtype=residual.dtype,
+                    ),
+                    torch.empty(
+                        (*residual.shape[:-1], 1),
+                        dtype=torch.float32,
+                    ),
+                    torch.empty(
+                        (*residual.shape[:-2], residual.shape[-2], residual.shape[-2]),
+                        dtype=torch.float32,
+                    ),
+                )
+            return torch.empty_like(args[1])
 
         return None
 

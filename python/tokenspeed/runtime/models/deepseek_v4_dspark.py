@@ -13,6 +13,7 @@ import re
 from collections.abc import Iterable
 
 import torch
+from tokenspeed_kernel import mhc_fused_hc, mhc_post, mhc_pre
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -39,9 +40,6 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4MegaMoEExperts,
     _deepseek_v4_expert_scale_parameter_name,
     hc_head,
-    mhc_fused_hc,
-    mhc_post,
-    mhc_pre,
 )
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.attention import (
     _dspark_fp8_linear,

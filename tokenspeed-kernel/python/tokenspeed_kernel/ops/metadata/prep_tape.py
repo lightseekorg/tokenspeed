@@ -90,9 +90,12 @@ def _ref(v: "int | Reg") -> int:
     return (_REG_FLAG | int(v)) if isinstance(v, Reg) else int(v)
 
 
-def _check(t: torch.Tensor, name: str) -> torch.Tensor:
-    if t.dtype != torch.int32:
-        raise TypeError(f"{name} must be int32, got {t.dtype}")
+def _check(t: torch.Tensor, name: str, *, wide: bool = False) -> torch.Tensor:
+    allowed = (torch.int32, torch.int64) if wide else (torch.int32,)
+    if t.dtype not in allowed:
+        raise TypeError(
+            f"{name} must be {' or '.join(str(d) for d in allowed)}, got {t.dtype}"
+        )
     if t.stride(-1) != 1:
         raise ValueError(f"{name} must be unit-stride in the last dim")
     return t
@@ -111,7 +114,9 @@ class PrepTape:
         self._keepalive: list[torch.Tensor] = []
         self._descs: torch.Tensor | tuple[torch.Tensor, ...] | None = None
         self._regs_dev = torch.zeros(32, dtype=torch.int64, device=self._device)
-        self._regs_pinned = torch.zeros(32, dtype=torch.int64, pin_memory=True)
+        # Sticky register values live here; the host block the async copy reads
+        # from is allocated per run (see run()).
+        self._regs_host = torch.zeros(32, dtype=torch.int64)
 
     # -- recording ---------------------------------------------------------
 
@@ -219,8 +224,11 @@ class PrepTape:
         total: "int | Reg",
         value: "int | Reg",
     ) -> None:
-        """``dst[live:total] = value`` (padding rows)."""
-        self._row(_OP_FILLTAIL, _check(dst, "dst"), None, None, live, total, 0, value)
+        """``dst[live:total] = value`` (padding rows). Accepts int64 ``dst``:
+        graph input buffers that index a pool are 64-bit."""
+        dst = _check(dst, "dst", wide=True)
+        wide = 1 if dst.dtype == torch.int64 else 0
+        self._row(_OP_FILLTAIL, dst, None, None, live, total, wide, value)
 
     def state_pages(
         self,
@@ -274,14 +282,22 @@ class PrepTape:
 
         Uses one pinned write and async H2D upload. Operations in a stage run
         in one parallel kernel launch; explicit barriers add ordered launches.
+
+        The staging block is allocated per call and never reused directly. A
+        caller dispatches step N+1 before step N commits, so a persistent
+        pinned block would let the CPU rewrite an upload still queued behind
+        the previous step's work, and the in-flight tape would read the newer
+        registers -- the wrong row count, or a pointer to a freed table. The
+        caching host allocator only hands a block back once the copy's stream
+        event has completed, which is the fence this needs.
         """
         from tokenspeed_kernel.ops.metadata.triton_tape import run_tape
 
         if self._descs is None:
             raise RuntimeError("finalize() the tape before run()")
         for k, v in regs.items():
-            self._regs_pinned[int(k)] = (
-                v.data_ptr() if isinstance(v, torch.Tensor) else v
-            )
-        self._regs_dev.copy_(self._regs_pinned, non_blocking=True)
+            self._regs_host[int(k)] = v.data_ptr() if isinstance(v, torch.Tensor) else v
+        staging = torch.empty(32, dtype=torch.int64, pin_memory=True)
+        staging.copy_(self._regs_host)
+        self._regs_dev.copy_(staging, non_blocking=True)
         run_tape(self._descs, self._regs_dev)

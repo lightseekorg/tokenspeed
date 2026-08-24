@@ -3044,7 +3044,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
                     # (the same preparation Fp8LinearMethod does for
                     # LinearBase layers); rows are 128-padded at construction
                     # so the shape gate always holds on this path.
-                    from tokenspeed.runtime.layers.dense.fp8 import (
+                    from tokenspeed_kernel.ops.gemm.flashinfer import (
                         has_flashinfer_fp8_blockscale,
                         prepare_flashinfer_fp8_blockscale_weight_scales,
                     )
