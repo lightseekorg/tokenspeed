@@ -298,9 +298,16 @@ class KimiK3Recipe(CacheRecipe):
         """Whether verify commits by replaying from one conv checkpoint row."""
         if self.server_args.speculative_algorithm is None:
             return False
-        from tokenspeed_kernel.ops.attention import kda_replay_commit_supported
+        from tokenspeed_kernel.ops.attention import (
+            kda_recurrent_layout,
+            kda_replay_commit_supported,
+        )
 
-        return bool(kda_replay_commit_supported(self.attn_config.dtype))
+        return bool(
+            kda_replay_commit_supported(
+                self.attn_config.dtype, recurrent_layout=kda_recurrent_layout()
+            )
+        )
 
     @override
     def workspace_bytes(self) -> int:

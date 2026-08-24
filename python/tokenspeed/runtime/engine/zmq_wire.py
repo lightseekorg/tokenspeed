@@ -100,6 +100,43 @@ _DEC_INIT = msgspec.msgpack.Decoder(WireHandshakeInitMessage)
 _DEC_ADD = MsgpackDecoder(TokenizedGenerateReqInput)
 
 
+# SMG decodes the ready response's dtype into a fixed enum of these strings, so
+# map tokenspeed's dtype onto the nearest one.
+_WIRE_DTYPE_MAP = {
+    "bfloat16": "bfloat16",
+    "bf16": "bfloat16",
+    "float16": "float16",
+    "half": "float16",
+    "fp16": "float16",
+    "float32": "float32",
+    "float": "float32",
+    "fp32": "float32",
+}
+
+
+def wire_dtype(dtype) -> str:
+    """Map a tokenspeed/torch dtype onto SMG's wire dtype enum string.
+
+    Args:
+        dtype: A torch dtype or its string form (e.g. ``torch.bfloat16``,
+            ``"bf16"``).
+
+    Returns:
+        The wire enum string (``"bfloat16"`` / ``"float16"`` / ``"float32"``).
+
+    Raises:
+        ValueError: for unmapped dtypes — fail at handshake time: misreporting
+            the dtype to the frontend is worse than refusing to start.
+    """
+    key = str(dtype).lower().replace("torch.", "")
+    mapped = _WIRE_DTYPE_MAP.get(key)
+    if mapped is None:
+        raise ValueError(
+            f"dtype {dtype!r} has no SMG wire mapping; extend _WIRE_DTYPE_MAP"
+        )
+    return mapped
+
+
 def encode(obj: msgspec.Struct) -> bytes:
     """Encode a handshake struct to a msgpack payload."""
     return _ENC.encode(obj)

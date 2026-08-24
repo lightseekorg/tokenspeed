@@ -648,7 +648,7 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     Headless: no in-process tokenizer_manager and no AsyncLLM detokenizer (SMG
     owns both). This process only spawns and
     supervises the scheduler workers, which connect out to the SMG-bound
-    handshake/input/output sockets (see engine.event_loop._init_msgpack_transport),
+    handshake/input/output sockets (see zmq_msgpack.connect_msgpack_engine_for_loop),
     then blocks until they exit.
 
     Forces ``--zmq-msgpack`` + ``--skip-tokenizer-init`` since SMG passes
@@ -660,7 +660,7 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     server_args.zmq_msgpack = True
     server_args.skip_tokenizer_init = True
     # DP > 1: each rank dials the frontend with its own engine identity
-    # (zmq_engine_index + dp_rank) in event_loop._init_msgpack_transport, the
+    # (zmq_engine_index + dp_rank) in zmq_msgpack.connect_msgpack_engine_for_loop, the
     # choke point shared with the non-headless --zmq-msgpack launch path.
 
     configure_logger(server_args)

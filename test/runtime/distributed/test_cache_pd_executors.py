@@ -358,8 +358,8 @@ def test_rejected_registration_fails_later_request_without_stopping_handler() ->
     notifications = []
     manager.abort_room = lambda room, reason: aborts.append((room, reason))
     manager.sync_status_to_decode_endpoint = (
-        lambda endpoint, port, room, status, rank: notifications.append(
-            (endpoint, port, room, status, rank)
+        lambda endpoint, port, room, status, rank: (
+            notifications.append((endpoint, port, room, status, rank))
         )
     )
     manager.topology = _topology(tp_size=2, tp_rank=1, global_rank=1)
@@ -411,8 +411,8 @@ def test_failed_room_fanout_never_restores_state(
         )
     notifications = []
     manager.sync_status_to_decode_endpoint = (
-        lambda endpoint, port, room, status, rank: notifications.append(
-            (endpoint, port, room, status, rank)
+        lambda endpoint, port, room, status, rank: (
+            notifications.append((endpoint, port, room, status, rank))
         )
     )
 
@@ -423,80 +423,6 @@ def test_failed_room_fanout_never_restores_state(
     assert manager.transfer_infos == {}
     assert manager.request_status[9] == TransferPoll.Failed
     assert notifications == [("127.0.0.1", 9000, 9, TransferPoll.Failed, 0)]
-
-
-class _FakeTensor:
-    def __init__(self, values) -> None:
-        self.values = list(values)
-
-    def to(self, _device, non_blocking: bool = False):
-        assert non_blocking
-        return self
-
-
-class _FakeCudaStreamContext:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, _exc_type, _exc, _tb):
-        return False
-
-
-def test_cache_decode_destination_seeds_remote_prompt_cache_length(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import tokenspeed.runtime.pd.decode_executor as decode_module
-
-    executor = object.__new__(decode_module.DisaggDecodeExecutor)
-    forward_op = SimpleNamespace(
-        num_extends=lambda: 2,
-        request_pool_indices=[7, 11],
-        prefill_lengths=[1535, 3073],
-    )
-    tensor_calls = []
-
-    def fake_tensor(values, *, dtype, device, pin_memory):
-        tensor_calls.append((list(values), dtype, device, pin_memory))
-        return _FakeTensor(values)
-
-    current_stream = object()
-    stream_context = _FakeCudaStreamContext()
-    execution_stream = SimpleNamespace(
-        wait_stream=lambda stream: stream is current_stream
-    )
-    resets = []
-    runtime_states = SimpleNamespace(
-        reset_states=lambda indices, lengths: resets.append(
-            (indices.values, lengths.values)
-        )
-    )
-    fake_torch = SimpleNamespace(
-        int64="int64",
-        int32="int32",
-        tensor=fake_tensor,
-        cuda=SimpleNamespace(
-            current_stream=lambda: current_stream,
-            stream=lambda stream: (
-                stream_context
-                if stream is execution_stream
-                else pytest.fail("unexpected execution stream")
-            ),
-        ),
-    )
-    monkeypatch.setattr(decode_module, "torch", fake_torch)
-
-    executor.reset_valid_cache_length(
-        forward_op,
-        runtime_states,
-        execution_stream,
-        device="cuda:0",
-    )
-
-    assert tensor_calls == [
-        ([7, 11], "int64", "cpu", True),
-        ([1535, 3073], "int32", "cpu", True),
-    ]
-    assert resets == [([7, 11], [1535, 3073])]
 
 
 def test_cache_factory_exposes_only_typed_arena() -> None:

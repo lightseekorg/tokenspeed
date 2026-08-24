@@ -1,0 +1,63 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-kimi-k3-mxfp4-dspark-tp8-two-node-mmmu-pro-vision-gb300-slurm
+type: eval
+workflow_stage: model-test
+triggers:
+  - slurm
+runner:
+  labels:
+    - slurm-gb300-4gpu
+slurm:
+  nodes: 2
+  gpus_per_node: 4
+env:
+  CI: "true"
+  TOKENSPEED_DFLASH_AUX_STREAM: attn_res
+install:
+  - bash test/ci_system/install_deps.sh
+  - python3 -m pip install flash-linear-attention
+server:
+  command: >-
+    ts serve /models/moonshotai--Kimi-K3/9f62e4e9fffbd0a83ddd60e1c209d828994b3569
+    --served-model-name kimi-k3
+    --speculative-algorithm DSPARK
+    --speculative-draft-model-path /models/Inferact--Kimi-K3-DSpark/cf6b8244620e7ea4b0651d214f28e89eac75bed6
+    --speculative-num-draft-tokens 8
+    --drafter-attention-backend mla
+    --trust-remote-code
+    --max-model-len 131072
+    --kv-cache-dtype fp8
+    --tensor-parallel-size 8
+    --mm-encoder-tp-mode data
+    --moe-backend flashinfer_trtllm
+    --gpu-memory-utilization 0.92
+    --max-num-seqs 16
+    --disable-prefill-graph
+    --disable-kvstore
+    --host 0.0.0.0
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 7200
+    interval: 10
+eval:
+  install:
+    - git init -q /tmp/kvv && git -C /tmp/kvv fetch --depth 1 https://github.com/MoonshotAI/Kimi-Vendor-Verifier.git 3dad65a760a8867cda72f6dd8848d876a4e851b4 && git -C /tmp/kvv checkout --detach FETCH_HEAD && python3 -m uv sync --project /tmp/kvv --frozen
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    INSPECT_LOG_DIR=${RUNNER_TEMP:-/tmp}/kvv-logs
+    KIMI_API_KEY=EMPTY_TOKEN
+    KIMI_BASE_URL=http://127.0.0.1:8000/v1
+    /tmp/kvv/.venv/bin/python /tmp/kvv/eval.py mmmu
+    --model opensource/kimi-k3
+    --max-tokens 98304
+    --thinking
+    --think-mode opensource
+    --stream
+    --max-connections 16
+    --temperature 1.0
+    --top-p 0.95
+    --thinking-effort max
+report:
+  github_step_summary: true
+score_threshold: 0.82

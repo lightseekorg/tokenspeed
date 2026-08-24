@@ -196,6 +196,24 @@ class LinearMethodBase(QuantizeMethodBase):
         Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
 
+    def apply_with_activation(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        activation: nn.Module,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply an activation followed by the linear operation.
+
+        Quantized methods may override this semantic boundary when their
+        prepared kernel supports fused activation and input quantization.
+        """
+        return self.apply(layer, activation(x), bias)
+
+    def prepared_linear_plan(self, layer: nn.Module) -> object | None:
+        """Return an opaque backend warmup plan, if this layer prepared one."""
+        return None
+
 
 def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> bool:
     return "embedding" in method_class.__dict__

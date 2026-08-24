@@ -98,6 +98,19 @@ TEST(AlignPrefillChunkTest, ReachedPromotionUsesOrdinaryPageAlignment) {
               8);
 }
 
+TEST(FinalAlignedTailTokensTest, FindsSubPageTailAfterAlignedBody) {
+    const std::optional<std::int32_t> tail =
+        FinalAlignedTailTokens(/*first_pos=*/16, /*unscheduled=*/11, /*token_budget=*/16,
+                               /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/0);
+    EXPECT_EQ(tail, 3);
+}
+
+TEST(FinalAlignedTailTokensTest, LeavesAStandaloneSubPageWhole) {
+    EXPECT_EQ(FinalAlignedTailTokens(/*first_pos=*/24, /*unscheduled=*/3, /*token_budget=*/16,
+                                     /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/0),
+              std::nullopt);
+}
+
 TEST(ForwardCacheOpsPrefill, FirstChunkAcquiresPagesForTokens) {
     BlockPool pool(/*num_lcm_blocks=*/32);
     CacheCoordinator coordinator = MakeTwoGroup(pool);

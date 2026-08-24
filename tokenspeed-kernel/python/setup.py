@@ -329,11 +329,11 @@ KERNEL_GROUPS = [
         [],
     ),
     (
-        "deepseek_v4_attention",
+        "dsv4_attention",
         [
-            CUDA_CSRC_DIR / "deepseek_v4_attention.cu",
-            CUDA_CSRC_DIR / "deepseek_v4_topk.cu",
-            CUDA_CSRC_DIR / "deepseek_v4_attention_binding.cu",
+            CUDA_CSRC_DIR / "dsv4_attention.cu",
+            CUDA_CSRC_DIR / "dsv4_topk.cu",
+            CUDA_CSRC_DIR / "dsv4_attention_binding.cu",
         ],
         [],
     ),
@@ -477,7 +477,7 @@ KERNEL_GROUPS = [
     (
         "attn_res",
         [
-            CUDA_CSRC_DIR / "attn_res" / "attn_res_fwd_tma.cu",
+            CUDA_CSRC_DIR / "attn_res" / "attn_res_fwd_online_v2.cu",
             CUDA_CSRC_DIR / "attn_res_binding.cu",
         ],
         [],

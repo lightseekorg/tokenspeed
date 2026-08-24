@@ -51,15 +51,21 @@ def kda_chunk_prefill(
     *,
     initial_state: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
     lower_bound: float | None = None,
     beta_is_logit: bool = True,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Chunked prefill KDA scan (varlen via ``cu_seqlens``).
 
     q/k: ``[B, T, H, K]``; v: ``[B, T, HV, V]``; g_raw: ``[B, T, HV, K]``;
     beta: ``[B, T, HV]`` (raw logits if ``beta_is_logit``); returns
     ``(o [B, T, HV, V], final_state [N, HV, K, V])``. QK are L2-normalized and the
     safe gate is applied inside the kernel (``use_gate_in_kernel``).
+
+    ``cu_seqlens_cpu`` is a host copy of ``cu_seqlens``. Without it, FLA's
+    chunk-index prep reads the device boundaries onto the host (a
+    stream-synchronizing D2H per KDA layer per chunk); with queued work ahead
+    on the stream, that sync stalls the launch thread until the queue drains.
     """
     # ``use_beta_sigmoid_in_kernel`` is a backend-extension kwarg that FLA's
     # native chunk_kda silently swallows via **kwargs — passing raw logits
@@ -84,6 +90,7 @@ def kda_chunk_prefill(
         safe_gate=lower_bound is not None,
         lower_bound=lower_bound,
         cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
     )
 
 
@@ -107,7 +114,7 @@ def kda_recurrent_decode_pool(
     Same math as :func:`kda_recurrent_decode`, but reads ``h_pool[read_indices]``
     and writes ``h_pool[write_indices]`` inside the kernel (negative write ids
     skip the store), eliminating the python-side gather/scatter round-trip.
-    ``h_pool`` is ``[num_pages, HV, K, V]`` fp32 and is updated in place.
+    ``h_pool`` is ``[num_pages, HV, V, K]`` fp32 and is updated in place.
     Returns ``o [B, T, HV, V]``.
     """
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (

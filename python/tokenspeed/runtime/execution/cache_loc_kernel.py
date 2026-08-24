@@ -33,7 +33,7 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_pages"])
 def compute_out_cache_loc_kernel(
     # Input pointers
     input_lengths_ptr,  # [batch_size] or None for uniform mode
@@ -45,7 +45,7 @@ def compute_out_cache_loc_kernel(
     # Scalars
     uniform_input_length,  # used when input_lengths_ptr is None
     page_size: tl.constexpr,
-    max_pages: tl.constexpr,
+    max_pages,  # runtime: constexpr here recompiles per page-table width
     window_pages: tl.constexpr,  # 0 = full history; >0 = sliding ring width
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -79,6 +79,11 @@ def compute_out_cache_loc_kernel(
     IS the construction that makes addressing a slid-out column
     impossible. Columns the scheduler punched to the null page read as
     page 0 and route to slot 0 either way.
+
+    ``max_pages``, by contrast, is a runtime scalar: the page table's width
+    grows with context, so specializing on it recompiles the kernel once per
+    distinct width. It only feeds the overflow test, the clamp and the row
+    stride, none of which need a compile-time constant.
     """
     # Program ID represents which request we're processing
     req_idx = tl.program_id(0)
@@ -167,7 +172,7 @@ def compute_out_cache_loc(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_pages"])
 def fused_decode_input_prep_kernel(
     # Inputs
     req_pool_indices_ptr,  # [batch_size]
@@ -180,7 +185,7 @@ def fused_decode_input_prep_kernel(
     # Scalars
     uniform_input_length,
     page_size: tl.constexpr,
-    max_pages: tl.constexpr,
+    max_pages,  # runtime: constexpr here recompiles per page-table width
     BLOCK_SIZE: tl.constexpr,
 ):
     """One launch fuses the decode-uniform path's four small kernels.
@@ -268,7 +273,7 @@ def fused_decode_input_prep(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_pages"])
 def dflash_prepare_decode_kernel(
     output_tokens_ptr,
     accept_lengths_ptr,
@@ -282,7 +287,7 @@ def dflash_prepare_decode_kernel(
     verify_width: tl.constexpr,
     draft_query_width: tl.constexpr,
     page_size: tl.constexpr,
-    max_pages: tl.constexpr,
+    max_pages,  # runtime: constexpr here recompiles per page-table width
     max_draft_prefix,
     block_ids_stride: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,

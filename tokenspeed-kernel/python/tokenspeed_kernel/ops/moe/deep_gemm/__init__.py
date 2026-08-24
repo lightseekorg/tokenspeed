@@ -19,5 +19,6 @@
 # SOFTWARE.
 
 import tokenspeed_kernel.ops.moe.deep_gemm.deepep_fp8  # noqa: F401
+import tokenspeed_kernel.ops.moe.deep_gemm.dsv4_mega_moe  # noqa: F401
 
 __all__ = []

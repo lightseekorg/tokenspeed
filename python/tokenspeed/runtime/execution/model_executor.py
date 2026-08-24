@@ -48,13 +48,17 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.forward_thread import ForwardThread
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
-from tokenspeed.runtime.execution.types import ModelExecutionResult
+from tokenspeed.runtime.execution.types import (
+    DpForwardMetadata,
+    ModelExecutionResult,
+)
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.grammar.capturable_grammar import (
     create_grammar_runtime,
@@ -163,8 +167,6 @@ class ModelExecutorConfig:
     device: str
     gpu_id: int
     global_rank: int
-    num_total_pages: int
-    decode_log_interval: int
     cudagraph_capture_sizes: list[int] | None
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
@@ -177,6 +179,11 @@ class ModelExecutorConfig:
     data_parallel_size: int = 1
     world_size: int = 1
     world_group: list[int] | None = None
+
+    # ====== PP (prefill chunk pipeline) =========
+    pp_size: int = 1
+    pp_rank: int = 0
+    pp_group: tuple[int, ...] | None = None
 
     # ====== SPEC =========
     spec_algo: str | None = None
@@ -210,7 +217,6 @@ class ModelExecutorConfig:
         max_req_pool_size: int,
         gpu_id: int,
         global_rank: int,
-        num_total_pages: int,
         prefix_granularity: int,
         overlap_schedule_depth: int = 0,
     ) -> ModelExecutorConfig:
@@ -268,8 +274,6 @@ class ModelExecutorConfig:
             device=server_args.device,
             gpu_id=gpu_id,
             global_rank=global_rank,
-            num_total_pages=num_total_pages,
-            decode_log_interval=server_args.decode_log_interval,
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
             disable_autotune=server_args.disable_autotune,
@@ -282,6 +286,11 @@ class ModelExecutorConfig:
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
+            pp_size=server_args.mapping.pp_size,
+            pp_rank=(server_args.mapping.pp_rank if server_args.mapping.has_pp else 0),
+            pp_group=(
+                server_args.mapping.pp_group if server_args.mapping.has_pp else None
+            ),
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
@@ -552,8 +561,14 @@ class ModelExecutor:
         )
 
         self.execution_stream = torch.cuda.Stream()
+        # The data plane: every CUDA-touching operation after startup is
+        # submitted here and runs in FIFO order on one thread. The event loop
+        # (control plane) never blocks on the GPU, so its cross-rank gloo
+        # collectives always find every rank promptly regardless of GPU depth.
+        self.forward_thread = ForwardThread(self.device)
+        # Throttles the mm_timing line inside execute_forward_op; the
+        # per-round batch lines have their own counter on the control plane.
         self.log_step = 0
-        self._seen_prefill_ids: set[str] = set()
         self._prev_decode_bs: int = 0
         self._sentinel_neg1 = torch.tensor(-1, device=self.device, dtype=torch.int64)
         self.mm_runtime = MultimodalRuntime(
@@ -561,27 +576,48 @@ class ModelExecutor:
             input_buffers=self.input_buffers,
             device=self.device,
         )
-        # Decode stats — accumulated from synced results (no GPU sync needed)
-        self.num_generated_tokens = 0
-        self.num_decode_steps = 0
-        self.last_decode_stats_tic = time.time()
 
         set_random_seed(48)
 
         logger.info("ModelExecutor initialized")
 
     def _autotune(self) -> None:
-        """Profile tunable kernels over one dummy prefill, before graph capture.
+        """Profile tunable kernels over one dummy prefill before graph capture.
 
-        Runs a single extend forward at the largest token count a forward can
-        carry; the tuner enumerates every smaller shape bucket from it, so no
-        decode-sized pass is needed. Must precede capture: a captured graph
-        records the tactic chosen while it was recorded, so tuning afterwards
-        cannot change a replay. On distributed boots, per-tactic timings are
-        averaged over the world so every rank picks the same tactic.
+        The dummy batch is capped by both the chunked-prefill token budget and
+        rank-local request capacity. ``make_dummy_batch`` splits tokens into
+        requests of at most ``context_len``, while request-indexed buffers
+        contain only ``max_num_seqs // data_parallel_size`` rows. Keeping the
+        token count within their product prevents autotuning from constructing
+        a batch that cannot fit those buffers.
+
+        The tuner enumerates every smaller shape bucket from this pass, so a
+        separate decode-sized pass is unnecessary. This must run before graph
+        capture because a captured graph retains the tactic selected during
+        capture. On distributed boots, per-tactic timings are averaged across
+        ranks so every rank selects the same tactic.
         """
-        num_tokens = int(self.config.chunked_prefill_size)
+        per_rank_max_batch = max(
+            1,
+            int(self.config.max_num_seqs)
+            // max(int(self.config.data_parallel_size), 1),
+        )
+        num_tokens = min(
+            int(self.config.chunked_prefill_size),
+            int(self.config.context_len) * per_rank_max_batch,
+        )
         if num_tokens <= 0 or self.model_runner is None:
+            return
+        if self.config.pp_size > 1:
+            # The tuning forward drives the model directly (no stage recv/send
+            # threading), which a mid-pipeline stage cannot run. Fall back to
+            # heuristic tactics on every rank so the world-averaged tactic
+            # collective is skipped consistently.
+            set_autotune_max_num_tokens(num_tokens)
+            logger.info(
+                "Kernel tuning skipped under pipeline parallelism; tunable "
+                "kernels use heuristic tactics"
+            )
             return
 
         # The bucket mapper keys serving-time tactic lookups, so it must match
@@ -665,6 +701,62 @@ class ModelExecutor:
             block_tables, bs=bs, padded_bs=self.draft_page_table.shape[0]
         )
 
+    def _pp_recv_stage_state(self, num_tokens: int):
+        """Receive the upstream stage's boundary bundle (mid-pipeline ranks).
+
+        Geometry comes from the model's wire spec — both sides derive it from
+        config + token count, so no metadata crosses the wire. Runs on the
+        current (execution) stream; NCCL P2P ops on one communicator match in
+        issue order against the upstream sends.
+        """
+        from tokenspeed.runtime.distributed.comm_ops import pp_recv
+        from tokenspeed.runtime.distributed.pp_stage import PPStageState
+
+        spec = self.model_runner.model.model.pp_stage_state_spec(
+            num_tokens, torch.device(self.device)
+        )
+        if not getattr(self, "_pp_wire_logged", False):
+            self._pp_wire_logged = True
+            logger.info(
+                "PP stage %d recv wire: %s",
+                self.config.pp_rank,
+                [(tuple(shape), str(dtype)) for _, shape, dtype in spec],
+            )
+        tensors = [
+            pp_recv(
+                shape,
+                dtype,
+                torch.device(self.device),
+                self.config.pp_rank - 1,
+                self.config.pp_group,
+            )
+            for _, shape, dtype in spec
+        ]
+        return PPStageState.from_tensors(tensors, [name for name, _, _ in spec])
+
+    def _pp_send_stage_state(self, state) -> None:
+        """Send this stage's boundary bundle downstream (non-last ranks)."""
+        from tokenspeed.runtime.distributed.comm_ops import pp_send
+
+        tensors = state.tensors()
+        if not getattr(self, "_pp_wire_logged", False):
+            self._pp_wire_logged = True
+            logger.info(
+                "PP stage %d send wire: %s",
+                self.config.pp_rank,
+                [(tuple(t.shape), str(t.dtype)) for t in tensors],
+            )
+        for tensor in tensors:
+            pp_send(tensor, self.config.pp_rank + 1, self.config.pp_group)
+
+    @property
+    def _pp_is_last_stage(self) -> bool:
+        return self.config.pp_rank == self.config.pp_size - 1
+
+    @property
+    def _pp_is_first_stage(self) -> bool:
+        return self.config.pp_rank == 0
+
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
         positions = self._active_positions_override
@@ -675,6 +767,24 @@ class ModelExecutor:
                 ]
             else:
                 positions = self.input_buffers.positions_buf[: ctx.input_num_tokens]
+        # PP mid-pipeline: receive the upstream boundary state and thread it
+        # through the model's pp_inbound channel. The P role forces eager, so
+        # neither graph path below can be active alongside PP.
+        if self.config.pp_size > 1 and not self._pp_is_first_stage:
+            pp_inbound = self._pp_recv_stage_state(ctx.input_num_tokens)
+            output = self.model_runner.forward(
+                ctx,
+                self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
+                positions,
+                self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
+                req_pool_indices=req_pool_indices,
+                seq_lens=self.input_buffers.seq_lens_buf[:bs],
+                extend_prefix_lens=self.input_buffers.extend_prefix_lens_buf[
+                    : ctx.num_extends
+                ],
+                pp_inbound=pp_inbound,
+            )
+            return output
         # Prefill-graph replay when captured for this forward (the decode graph
         # replays one level up: it captures the whole _forward_step).
         mode = ctx.forward_mode
@@ -838,6 +948,15 @@ class ModelExecutor:
 
         logits_output = self._run_target_forward(bs, ctx, req_pool_indices)
 
+        if self.config.pp_size > 1 and not self._pp_is_last_stage:
+            # Mid-pipeline stage: the model returned the boundary bundle, not
+            # logits. Ship it downstream and return placeholder outputs — the
+            # commit path recognizes a PP placeholder and emits no tokens.
+            self._pp_send_stage_state(logits_output)
+            output_tokens = torch.zeros(bs, dtype=torch.int32, device=self.device)
+            accept_lengths = torch.ones(bs, dtype=torch.int32, device=self.device)
+            return output_tokens, accept_lengths, None
+
         if self.drafter is not None and getattr(
             self.drafter, "_incremental_proj_enabled", False
         ):
@@ -937,162 +1056,7 @@ class ModelExecutor:
             device=self.device,
         )
 
-    def accumulate_decode_stats(self, results: ModelExecutionResult, bs: int):
-        """Accumulate decode stats from already-synced results. No GPU sync."""
-        accept_lengths = results.output_lengths
-        self.num_generated_tokens += int(accept_lengths.sum().item())
-        self.num_decode_steps += bs
-        if (
-            LOG_SPEC_ACCEPT_LENGTHS
-            and self.config.global_rank == 0
-            and self.config.spec_num_steps
-        ):
-            accepted_widths = [int(value) for value in accept_lengths.tolist()]
-            accepted_draft_tokens = [max(0, value - 1) for value in accepted_widths]
-            logger.info(
-                "Spec verify step. accept_lengths=%s, accepted_draft_tokens=%s",
-                accepted_widths,
-                accepted_draft_tokens,
-            )
-            candidates = getattr(results, "spec_candidate_tokens", None)
-            if candidates is not None:
-                verify_width = int(self.config.spec_num_tokens)
-                candidate_rows = candidates.view(bs, verify_width)
-                target_rows = results.output_tokens.view(bs, verify_width)
-                # Candidate column j+1 is verified by the target token sampled
-                # from column j. The final target column is the bonus token.
-                draft_rows = candidate_rows[:, 1:]
-                target_draft_rows = target_rows[:, :-1]
-                logger.info(
-                    "Spec token compare. anchor=%s, draft=%s, target=%s, match=%s",
-                    candidate_rows[:, 0].tolist(),
-                    draft_rows.tolist(),
-                    target_draft_rows.tolist(),
-                    draft_rows.eq(target_draft_rows).tolist(),
-                )
-
-    def execute_forward_op_with_log(
-        self,
-        forward_op,
-        sampling_params_list: list[SamplingParams],
-        num_active_pages: int = 0,
-        num_cached_pages: int = 0,
-        num_queue_reqs: int = 0,
-        dp_global_num_tokens=None,
-        dp_global_bs=None,
-        dp_all_decode_or_idle: bool = False,
-        dp_all_extend: bool = False,
-        grammar_inputs=None,
-        multimodal_context=None,
-        capture_next_input_ids: bool = False,
-    ) -> ModelExecutionResult:
-        self.log_step += 1
-
-        num_extends = forward_op.num_extends()
-        bs = len(forward_op.request_ids)
-        is_decode = num_extends <= 0
-
-        if not is_decode and self.config.global_rank == 0:
-            mode = "Prefill" if num_extends == bs else "Mix"
-            total_tokens = sum(forward_op.input_lengths)
-            cached_tokens = sum(
-                pl
-                for rid, pl in zip(
-                    forward_op.request_ids[:num_extends],
-                    forward_op.extend_prefix_lens,
-                )
-                if rid not in self._seen_prefill_ids
-            )
-            if len(self._seen_prefill_ids) > 100_000:
-                self._seen_prefill_ids.clear()  # log-dedup only; bound the growth
-            self._seen_prefill_ids.update(forward_op.request_ids[:num_extends])
-            logger.info(
-                "%s batch. #new-seq: %s, #new-token: %s, #cached-token: %s, "
-                "#running-req: %s, #queue-req: %s",
-                mode,
-                num_extends,
-                total_tokens,
-                cached_tokens,
-                bs,
-                num_queue_reqs,
-            )
-
-        result = self.execute_forward_op(
-            forward_op,
-            sampling_params_list,
-            dp_global_num_tokens,
-            dp_global_bs,
-            dp_all_decode_or_idle,
-            dp_all_extend,
-            grammar_inputs=grammar_inputs,
-            multimodal_context=multimodal_context,
-            capture_next_input_ids=capture_next_input_ids,
-        )
-
-        if is_decode and (
-            self.config.global_rank == 0
-            and self.log_step % self.config.decode_log_interval == 0
-        ):
-            now = time.time()
-            gap = now - self.last_decode_stats_tic
-            gen_throughput = self.num_generated_tokens / gap if gap > 0 else 0
-            avg_accept = (
-                self.num_generated_tokens / self.num_decode_steps
-                if self.num_decode_steps > 0
-                else 0
-            )
-            accept_rate = (
-                (avg_accept - 1) / self.config.spec_num_steps
-                if self.config.spec_num_steps
-                else 0
-            )
-            num_total_pages = self.config.num_total_pages
-            page_ratio = (
-                num_active_pages / num_total_pages if num_total_pages > 0 else 0
-            )
-            if self.config.spec_num_steps:
-                logger.info(
-                    "Decode batch. #running-req: %s, "
-                    "#pages(active/cached/total): %s/%s/%s, "
-                    "page ratio: %.2f, gen throughput (token/s): %.2f, "
-                    "avg_accept_len: %.2f, accept_rate: %.2f, #queue-req: %s",
-                    bs,
-                    num_active_pages,
-                    num_cached_pages,
-                    num_total_pages,
-                    page_ratio,
-                    gen_throughput,
-                    avg_accept,
-                    accept_rate,
-                    num_queue_reqs,
-                )
-            else:
-                logger.info(
-                    "Decode batch. #running-req: %s, "
-                    "#pages(active/cached/total): %s/%s/%s, "
-                    "page ratio: %.2f, gen throughput (token/s): %.2f, "
-                    "#queue-req: %s",
-                    bs,
-                    num_active_pages,
-                    num_cached_pages,
-                    num_total_pages,
-                    page_ratio,
-                    gen_throughput,
-                    num_queue_reqs,
-                )
-            self.token_to_kv_pool.maybe_log_cache_group_pages()
-            self.num_generated_tokens = 0
-            self.num_decode_steps = 0
-            self.last_decode_stats_tic = now
-
-        return result
-
-    def execute_idle_forward(
-        self,
-        global_num_tokens: list[int],
-        global_bs: list[int],
-        all_decode_or_idle: bool,
-    ):
+    def execute_idle_forward(self, dp_metadata: DpForwardMetadata):
         """Run a zero-token forward so this rank participates in NCCL collectives.
 
         Called by the EventLoop when this DP rank has no work but other
@@ -1107,9 +1071,9 @@ class ModelExecutor:
             num_extends=0,
             input_num_tokens=0,
             forward_mode=graph_forward_mode,
-            global_num_tokens=global_num_tokens,
-            global_bs=global_bs,
-            all_decode_or_idle=all_decode_or_idle,
+            global_num_tokens=dp_metadata.global_num_tokens,
+            global_bs=dp_metadata.global_batch_size,
+            all_decode_or_idle=dp_metadata.all_decode_or_idle,
         )
         sampling_info = SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
@@ -1171,8 +1135,8 @@ class ModelExecutor:
                 # are decoding, step 0 sizes collectives from bs/global_bs.
                 draft_global_num_tokens = _draft_idle_global_num_tokens_for_step(
                     step_idx,
-                    global_num_tokens,
-                    global_bs,
+                    dp_metadata.global_num_tokens,
+                    dp_metadata.global_batch_size,
                 )
                 draft_ctx = ForwardContext(
                     attn_backend=self.drafter.attn_backend,
@@ -1182,8 +1146,8 @@ class ModelExecutor:
                     input_num_tokens=0,
                     forward_mode=ForwardMode.IDLE,
                     global_num_tokens=draft_global_num_tokens,
-                    global_bs=global_bs,
-                    all_decode_or_idle=all_decode_or_idle,
+                    global_bs=dp_metadata.global_batch_size,
+                    all_decode_or_idle=dp_metadata.all_decode_or_idle,
                 )
                 self.drafter.draft_model_runner.forward(
                     draft_ctx,
@@ -1257,44 +1221,68 @@ class ModelExecutor:
         return done
 
     @nvtx_range("reset_valid_cache_length", color="orange")
-    def reset_valid_cache_length(self, forward_op) -> None:
+    def _reset_valid_cache_length(self, forward_op) -> None:
+        """Rewind the prefill rows' valid cache lengths before a forward.
+
+        A forward's prologue, not a caller step: ``execute_forward_op`` runs
+        it on the forward thread so the state writes land on the execution
+        stream ahead of the model launches.
+        """
         num_extends = forward_op.num_extends()
         if num_extends == 0:
             return
+        self._write_valid_cache_lengths(
+            forward_op.request_pool_indices[:num_extends],
+            forward_op.extend_prefix_lens,
+        )
 
+    @nvtx_range("reset_remote_prefill_cache_lengths", color="orange")
+    def reset_remote_prefill_cache_lengths(self, forward_op) -> None:
+        """Seed rows whose prompt was computed on another node.
+
+        A PD decode destination never executes the prompt locally, so no
+        forward of its own can establish these lengths — they come from the
+        complete remotely-computed prompt instead, before the first local
+        decode. Paged cache additionally selects the transferred
+        recurrent-state snapshot block from the resulting sequence length.
+        """
+        num_extends = forward_op.num_extends()
+        if num_extends <= 0:
+            return
+        self._write_valid_cache_lengths(
+            forward_op.request_pool_indices[:num_extends],
+            forward_op.prefill_lengths[:num_extends],
+        )
+
+    def _write_valid_cache_lengths(self, pool_indices, lengths) -> None:
+        """Publish per-row valid cache lengths on the execution stream."""
         self.execution_stream.wait_stream(torch.cuda.current_stream())
-
         with torch.cuda.stream(self.execution_stream):
-            extend_request_pool_indices = torch.tensor(
-                forward_op.request_pool_indices[:num_extends],
+            rows = torch.tensor(
+                pool_indices,
                 dtype=torch.int64,
                 device="cpu",
                 pin_memory=True,
             ).to(self.device, non_blocking=True)
-
-            extend_prefix_lens = torch.tensor(
-                forward_op.extend_prefix_lens,
+            values = torch.tensor(
+                lengths,
                 dtype=torch.int32,
                 device="cpu",
                 pin_memory=True,
             ).to(self.device, non_blocking=True)
-
-            self.runtime_states.reset_states(
-                extend_request_pool_indices, extend_prefix_lens
-            )
+            self.runtime_states.reset_states(rows, values)
 
     def execute_forward_op(
         self,
         forward_op,
         sampling_params_list: list[SamplingParams],
-        dp_global_num_tokens=None,
-        dp_global_bs=None,
-        dp_all_decode_or_idle: bool = False,
-        dp_all_extend: bool = False,
+        dp_metadata: DpForwardMetadata | None = None,
         grammar_inputs=None,
         multimodal_context=None,
         capture_next_input_ids: bool = False,
     ) -> ModelExecutionResult:
+        self._reset_valid_cache_length(forward_op)
+        self.log_step += 1
         num_extends = forward_op.num_extends()
         total_tokens = sum(forward_op.input_lengths)
         self._active_multimodal_context = multimodal_context
@@ -1434,15 +1422,15 @@ class ModelExecutor:
                     decode_input_ids=decode_input_ids,
                 )
                 if self.config.data_parallel_size > 1:
-                    if dp_global_num_tokens is None:
+                    if dp_metadata is None:
                         raise RuntimeError(
                             "DP forward metadata must be gathered on CPU by "
                             "the event loop before model execution."
                         )
-                    ctx.global_num_tokens = dp_global_num_tokens
-                    ctx.global_bs = dp_global_bs
-                    ctx.all_decode_or_idle = dp_all_decode_or_idle
-                    ctx.all_extend = dp_all_extend
+                    ctx.global_num_tokens = dp_metadata.global_num_tokens
+                    ctx.global_bs = dp_metadata.global_batch_size
+                    ctx.all_decode_or_idle = dp_metadata.all_decode_or_idle
+                    ctx.all_extend = dp_metadata.all_extend
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_start = time.perf_counter() if timing_enabled else 0.0
                     sampling_info = self._build_sampling_info(bs, sampling_params_list)

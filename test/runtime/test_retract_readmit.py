@@ -93,9 +93,6 @@ class _Results:
         self.grammar_completion = None
         self.next_input_ids = None
 
-    def sync(self):
-        pass
-
 
 class _ForwardOp:
     """Forward-op stub exposing per-slot ``prefill_lengths``."""
@@ -152,7 +149,9 @@ def test_mid_chunk_readmit_slot_emits_nothing():
         num_extends=1,
         prefill_lengths=[9],
     )
-    changes = proc.post_process_forward_op(op, _Results([777], [1]))
+    changes = proc.post_process_forward_op(
+        op, _Results([777], [1]), is_prefill_instance=False, on_first_token=None
+    )
 
     # The old prompt-length gate saw computed(8) >= prompt(3) and emitted an
     # ExtendResultEvent (C++ Prefilling FSM throws) plus one garbage token.
@@ -179,7 +178,9 @@ def test_final_chunk_readmit_slot_emits_result():
         num_extends=1,
         prefill_lengths=[9],
     )
-    changes = proc.post_process_forward_op(op, _Results([777], [1]))
+    changes = proc.post_process_forward_op(
+        op, _Results([777], [1]), is_prefill_instance=False, on_first_token=None
+    )
 
     assert "ExtendResult" in _kinds(changes)
     assert state.output_ids == [777]
@@ -201,7 +202,9 @@ def test_decode_slot_unaffected_by_prefill_lengths():
         num_extends=0,
         prefill_lengths=[],
     )
-    changes = proc.post_process_forward_op(op, _Results([555], [1]))
+    changes = proc.post_process_forward_op(
+        op, _Results([555], [1]), is_prefill_instance=False, on_first_token=None
+    )
 
     kinds = _kinds(changes)
     assert "ExtendResult" in kinds

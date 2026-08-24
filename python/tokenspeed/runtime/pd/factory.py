@@ -41,6 +41,7 @@ def get_kv_args(
     *,
     model_config,
     draft_model_config=None,
+    pp_layer_window: tuple[int, int] | None = None,
 ):
     # One big model, one arena: a draft's continuation-layer planes live in
     # the target pool's merged plan, so exactly one typed slab registration is
@@ -53,11 +54,31 @@ def get_kv_args(
     producer_schedule = build_cache_fields_by_producer_step(
         token_to_kv_pool.arena.plan,
         num_target_layers=model_config.num_attention_layers,
+        pp_layer_window=pp_layer_window,
     )
     layout, base_addr = build_arena_cache_transfer_contract(
         token_to_kv_pool.arena,
         transfer_schema=transfer_schema,
     )
+    # Chunk-pipeline: the arena holds only this stage's layers (narrowed
+    # plan), which is what local source addressing must use. The WIRE
+    # contract, however, must be the full logical plan: every stage
+    # registers the same layout, and Decode validates + plans stage windows
+    # against the complete field set.
+    wire_layout = None
+    logical_plan = getattr(token_to_kv_pool.arena, "pp_logical_plan", None)
+    if logical_plan is not None:
+        from tokenspeed.runtime.pd.cache_protocol import CacheTransferContract
+
+        wire_layout = CacheTransferContract(
+            plan=logical_plan,
+            group_specs=token_to_kv_pool.arena.cache_group_specs,
+            transfer_schema=build_cache_transfer_schema(
+                logical_plan,
+                model_config=model_config,
+                draft_model_config=draft_model_config,
+            ),
+        )
     return KVArgs(
         engine_rank=engine_rank,
         kv_data_ptr=base_addr,
@@ -65,6 +86,8 @@ def get_kv_args(
         gpu_id=gpu_id,
         cache_layout=layout,
         cache_producer_schedule=producer_schedule,
+        pp_layer_window=pp_layer_window,
+        wire_cache_layout=wire_layout,
     )
 
 

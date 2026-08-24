@@ -136,12 +136,26 @@ def test_slurm_dispatch_lists_every_supported_cluster():
 
 def test_slurm_dispatch_routes_gb300_to_its_coordinator():
     workflow = load_yaml(REPO_ROOT / ".github/workflows/slurm-dispatch.yml")
+    checkout = next(
+        step
+        for step in workflow["jobs"]["dispatch"]["steps"]
+        if step.get("name") == "Checkout trusted dispatcher"
+    )
+    dispatch_script = next(
+        step["run"]
+        for step in workflow["jobs"]["dispatch"]["steps"]
+        if step.get("name") == "Submit and wait for Slurm tasks"
+    )
 
     assert workflow["jobs"]["dispatch"]["runs-on"] == (
         "${{ inputs.cluster == 'gb300' && "
         "'slurm-dispatch-gb300' || 'slurm-dispatch' }}"
     )
     assert "${{ inputs.cluster }}" in workflow["concurrency"]["group"]
+    assert checkout["with"]["ref"] == "main"
+    assert 'python3 - "$YAML_SELECTION" "$CLUSTER" "$PR"' in dispatch_script
+    assert "from slurm_submit import pr_worktree" in dispatch_script
+    assert "with pr_worktree(repo, pr) as checkout:" in dispatch_script
 
 
 @pytest.mark.parametrize("runners", ["b200-4gpu,gb200-4gpu", "b200-4gpu, gb200-4gpu"])
@@ -304,6 +318,8 @@ def test_only_dedicated_tasks_declare_gb300():
             configs.append(path.name)
 
     assert sorted(configs) == [
+        "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-mmmu-pro-vision-gb300-slurm.yaml",
+        "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-ocr-bench-gb300-slurm.yaml",
         "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-dspark-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",

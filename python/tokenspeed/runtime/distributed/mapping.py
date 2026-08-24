@@ -329,28 +329,49 @@ class Mapping(MappingBase):
         moe_dp_size: int | None = None,
         vision_tp_size: int | None = None,
         vision_dp_size: int | None = None,
+        pp_size: int = 1,
+        pp_layer_partition: tuple[int, ...] | None = None,
         nprocs_per_node: int | None = None,
         nnodes: int | None = None,
         base_gpu_id: int = 0,
         gpu_id_step: int = 1,
     ):
         super().__init__(rank, world_size)
+        # Pipeline parallelism is the outermost dimension: the world splits
+        # into pp_size contiguous stages and every per-layer-type mapping
+        # resolves inside one stage. Sub-mappings keep the GLOBAL rank — the
+        # stride arithmetic stays correct because a stage base is a multiple
+        # of every intra-stage stride.
+        assert pp_size > 0
+        assert (
+            world_size % pp_size == 0
+        ), f"world_size {world_size} must be divisible by pp_size {pp_size}"
+        self.pp_size = pp_size
+        # Optional explicit per-stage layer counts (front to back); validated
+        # against the model's layer count where the split is resolved
+        # (pp_stage_windows).
+        self.pp_layer_partition = (
+            tuple(int(count) for count in pp_layer_partition)
+            if pp_layer_partition
+            else None
+        )
+        stage_world_size = world_size // pp_size
         self.attn = AttentionLayerMapping(
             rank=rank,
-            world_size=world_size,
+            world_size=stage_world_size,
             tp_size=attn_tp_size,
             cp_size=attn_cp_size,
             dp_size=attn_dp_size,
         )
         self.dense = DenseLayerMapping(
             rank=rank,
-            world_size=world_size,
+            world_size=stage_world_size,
             tp_size=dense_tp_size,
             dp_size=dense_dp_size,
         )
         self.moe = MoeLayerMapping(
             rank=rank,
-            world_size=world_size,
+            world_size=stage_world_size,
             tp_size=moe_tp_size,
             ep_size=moe_ep_size,
             dp_size=moe_dp_size,
@@ -376,6 +397,46 @@ class Mapping(MappingBase):
         self.dense.rank = rank
         self.moe.rank = rank
         self.vision.rank = rank
+
+    @cached_property
+    def has_pp(self) -> bool:
+        return self.pp_size > 1
+
+    @cached_property
+    def stage_world_size(self) -> int:
+        return self.world_size // self.pp_size
+
+    @cached_property
+    def pp_rank(self) -> int:
+        return _make_parallelism_rank(
+            self.rank, self.pp_size, stride=self.stage_world_size
+        )
+
+    @cached_property
+    def pp_group(self) -> Group:
+        return _make_parallelism_group(
+            self.rank, self.pp_size, stride=self.stage_world_size
+        )
+
+    @cached_property
+    def is_first_pp_rank(self) -> bool:
+        return self.pp_rank == 0
+
+    @cached_property
+    def is_last_pp_rank(self) -> bool:
+        return self.pp_rank == self.pp_size - 1
+
+    @cached_property
+    def pp_prev_rank(self) -> int:
+        """Global rank of the same intra-stage position one stage upstream."""
+        assert not self.is_first_pp_rank
+        return self.rank - self.stage_world_size
+
+    @cached_property
+    def pp_next_rank(self) -> int:
+        """Global rank of the same intra-stage position one stage downstream."""
+        assert not self.is_last_pp_rank
+        return self.rank + self.stage_world_size
 
     @cached_property
     def has_attn_tp(self) -> bool:
@@ -406,6 +467,7 @@ class Mapping(MappingBase):
         lines = [
             f"Mapping(rank={rank_str}, world_size={self.world_size})",
             f"  Cluster : {self.nnodes} node(s) x {self.nprocs_per_node} proc(s)",
+            f"  Pipeline: pp={self.pp_size}",
             f"  Attention: tp={self.attn.tp_size}  cp={self.attn.cp_size}  dp={self.attn.dp_size}",
             f"    Vision: tp={self.vision.tp_size}  item_dp={self.vision.dp_size}",
             f"  Dense   : tp={self.dense.tp_size}  dp={self.dense.dp_size}",

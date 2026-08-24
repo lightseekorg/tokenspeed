@@ -810,12 +810,15 @@ def result_detail(path: Path) -> str:
     for command_result in reversed(command_results):
         if not isinstance(command_result, dict):
             continue
-        score = command_result.get("evalscope_score")
-        if score is not None:
-            try:
-                return f"score={float(score):g}"
-            except (TypeError, ValueError):
-                continue
+        if command_result.get("stage") != "eval":
+            continue
+        for key in ("evalscope_score", "inspect_score"):
+            score = command_result.get(key)
+            if score is not None:
+                try:
+                    return f"score={float(score):g}"
+                except (TypeError, ValueError):
+                    continue
     if command_results and command_results[-1].get("pytest_summary"):
         return str(command_results[-1]["pytest_summary"])
     return str(data.get("error", ""))
