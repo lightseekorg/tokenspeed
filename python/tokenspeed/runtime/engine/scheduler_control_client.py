@@ -253,7 +253,7 @@ class SchedulerControlClient:
     ):
         self.auto_create_handle_loop()
         env_with_stack = envs.TOKENSPEED_PROFILE_WITH_STACK.get()
-        with_stack = False if with_stack is False or env_with_stack is False else True
+        with_stack = not (with_stack is False or env_with_stack is False)
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,

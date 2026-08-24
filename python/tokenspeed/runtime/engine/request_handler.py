@@ -380,6 +380,29 @@ class RequestHandler:
         if activities is None:
             activities = ["CPU", "GPU"]
 
+        # CUPTI GPU-activity tracing of CUDA graphs whose nodes include NCCL
+        # kernels is unstable on this stack (torch 2.11 / NCCL 2.28: replays
+        # hang or die with cudaErrorLaunchFailure once CUPTI attaches).
+        # Single-GPU graphs are safe — run_event_loop pre-warms CUPTI before
+        # capture. On multi-rank graph-mode servers, drop the GPU activity
+        # (CPU timeline, NVTX and python stacks still record) instead of
+        # crashing the engine. TOKENSPEED_PROFILE_GPU_WITH_GRAPHS=1 overrides
+        # for stacks where the combination is known-good.
+        if (
+            "GPU" in activities
+            and not self.server_args.enforce_eager
+            and self.server_args.mapping.world_size > 1
+            and os.environ.get("TOKENSPEED_PROFILE_GPU_WITH_GRAPHS") != "1"
+        ):
+            activities = [a for a in activities if a != "GPU"]
+            logger.warning(
+                "Dropping the GPU activity from this profile: CUPTI tracing "
+                "of graph-captured NCCL kernels is unstable (replays hang or "
+                "fail after attach). Use --enforce-eager for a full GPU "
+                "timeline, nsys attached at launch, or set "
+                "TOKENSPEED_PROFILE_GPU_WITH_GRAPHS=1 to override."
+            )
+
         # All validation must precede any state mutation: the event loop runs
         # _profile_batch_predicate on every batch, so a rejected request that
         # left partial profiler state behind would crash the scheduler.
