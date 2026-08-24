@@ -48,7 +48,7 @@ perf:
     --url http://127.0.0.1:21000/v1/completions
     --api openai
     --dataset random
-    --tokenizer-path "$MODEL"
+    --tokenizer-path amd/gpt-oss-120b-w-mxfp4-a-fp8
     --min-prompt-length "$input_len"
     --max-prompt-length "$input_len"
     --prefix-length 0
