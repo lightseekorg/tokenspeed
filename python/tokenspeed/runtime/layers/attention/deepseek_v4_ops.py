@@ -63,6 +63,9 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     write_deepseek_v4_indexer_mxfp4_cache_cuda as _triton_write_indexer_mxfp4_cache_cuda,
 )
+from tokenspeed_kernel.ops.attention.triton.deepseek_v4_compress_windows import (
+    deepseek_v4_compress_state_windows,
+)
 from tokenspeed_kernel.ops.transform import hadamard_transform
 
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
@@ -1217,7 +1220,9 @@ def deepseek_v4_csa_indexer_cache_insert(
         )
         return
 
-    normed, valid = _compress_v4_state_windows_capturable(
+    # One Triton launch instead of the ~25-op window reduction below it; the
+    # tensor-op version stays as the reference the kernel is tested against.
+    normed, valid = deepseek_v4_compress_state_windows(
         state_cache=state_cache,
         token_to_req_indices=token_to_req_indices,
         positions=positions,
