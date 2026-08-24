@@ -72,6 +72,8 @@ def global_server_args_dict_update(server_args: ServerArgs):
     # Export the PDL kill-switch: tokenspeed_kernel cannot import runtime modules.
     if server_args.disable_pdl:
         os.environ["TOKENSPEED_DISABLE_PDL"] = "1"
+    else:
+        os.environ.pop("TOKENSPEED_DISABLE_PDL", None)
     global_server_args_dict.update(
         {
             "attention_backend": server_args.attention_backend,

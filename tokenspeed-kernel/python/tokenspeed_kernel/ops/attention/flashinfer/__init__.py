@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule  # noqa: F401
 import torch
@@ -76,6 +77,10 @@ if platform.is_blackwell or platform.is_hopper:
 _workspace_buffer: torch.Tensor | None = None
 _dsa_sparse_workspace_buffers: dict[torch.device, torch.Tensor] = {}
 _DSA_SPARSE_WORKSPACE_BYTES = 384 * 1024 * 1024
+
+
+def _pdl_enabled() -> bool:
+    return os.environ.get("TOKENSPEED_DISABLE_PDL") != "1"
 
 
 def _get_dsa_sparse_workspace(device: torch.device | str) -> torch.Tensor:
@@ -204,6 +209,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             sinks=sinks,
             out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
             causal=is_causal,
+            enable_pdl=_pdl_enabled(),
         )
 
     @register_kernel(
@@ -275,6 +281,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             sinks=sinks,
             out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
             q_len_per_req=max_seqlen_q,
+            enable_pdl=_pdl_enabled(),
         )
 
     @register_kernel(

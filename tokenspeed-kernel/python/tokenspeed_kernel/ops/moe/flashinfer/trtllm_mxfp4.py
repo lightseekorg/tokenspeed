@@ -395,6 +395,7 @@ if platform.is_nvidia:
         x_quant: torch.Tensor,
         x_scale: torch.Tensor | None,
         output: torch.Tensor,
+        enable_pdl: bool,
     ) -> torch.Tensor:
         routing_logits = router_logits.to(torch.float32)
         local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
@@ -429,6 +430,7 @@ if platform.is_nvidia:
             do_finalize=True,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
             output=output,
+            enable_pdl=enable_pdl,
         )[0]
 
     def _call_mxfp4_situ_routed_moe(
@@ -562,7 +564,9 @@ if platform.is_nvidia:
                     value=0.0,
                 )
         elif precision == "default":
-            x_quant, x_scale = mxfp8_quantize(x, False, alignment=hidden_padded)
+            x_quant, x_scale = mxfp8_quantize(
+                x, False, enable_pdl=enable_pdl, alignment=hidden_padded
+            )
             x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
         else:
             raise NotImplementedError(
@@ -581,7 +585,7 @@ if platform.is_nvidia:
             x_quant.shape[0], h_dim, dtype=torch.bfloat16, device=x_quant.device
         )
 
-        result = _call_mxfp4_moe(w, router_logits, x_quant, x_scale, output)
+        result = _call_mxfp4_moe(w, router_logits, x_quant, x_scale, output, enable_pdl)
         if hidden_original != hidden_padded:
             result = result[:, :hidden_original].contiguous()
         return result
