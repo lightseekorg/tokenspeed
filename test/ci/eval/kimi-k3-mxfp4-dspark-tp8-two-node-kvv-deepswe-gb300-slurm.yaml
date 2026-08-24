@@ -1,0 +1,92 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-kimi-k3-mxfp4-dspark-tp8-two-node-deepswe-gb300-slurm
+type: eval
+workflow_stage: model-test
+triggers:
+  - slurm
+runner:
+  labels:
+    - slurm-gb300-4gpu
+slurm:
+  nodes: 2
+  gpus_per_node: 4
+  client: coordinator
+env:
+  CI: "true"
+  TOKENSPEED_DFLASH_AUX_STREAM: attn_res
+install:
+  - bash test/ci_system/install_deps.sh
+  - python3 -m pip install flash-linear-attention
+server:
+  command: >-
+    ts serve /models/moonshotai--Kimi-K3/9f62e4e9fffbd0a83ddd60e1c209d828994b3569
+    --served-model-name kimi-k3
+    --speculative-algorithm DSPARK
+    --speculative-draft-model-path /models/Inferact--Kimi-K3-DSpark/cf6b8244620e7ea4b0651d214f28e89eac75bed6
+    --speculative-num-draft-tokens 8
+    --drafter-attention-backend mla
+    --trust-remote-code
+    --max-model-len 262144
+    --kv-cache-dtype fp8
+    --tensor-parallel-size 8
+    --mm-encoder-tp-mode data
+    --moe-backend flashinfer_trtllm
+    --gpu-memory-utilization 0.92
+    --max-num-seqs 16
+    --disable-prefill-graph
+    --disable-kvstore
+    --host 0.0.0.0
+    --port 8000
+  ready:
+    url: ${TS_CI_SERVER_READY_URL}
+    timeout: 7200
+    interval: 10
+eval:
+  install:
+    - python3 -m venv "$RUNNER_TEMP/deepswe-venv" && "$RUNNER_TEMP/deepswe-venv/bin/pip" install datacurve-pier==0.3.1
+    - git init -q "$RUNNER_TEMP/deep-swe" && git -C "$RUNNER_TEMP/deep-swe" fetch --depth 1 https://github.com/datacurve-ai/deep-swe.git 435ee89ec2f2e2289f33b0da4f992f0b7b7266b9 && git -C "$RUNNER_TEMP/deep-swe" checkout --detach FETCH_HEAD
+    - |
+      cache_dir="$TS_CI_CACHE_DIR/kimi-code/0.23.6"
+      archive="$cache_dir/kimi-code-linux-x64.zip"
+      binary="$cache_dir/kimi"
+      mkdir -p "$cache_dir"
+      exec 9>"$cache_dir/cache.lock"
+      flock 9
+      if ! echo "38b30cad44667c8c95df1423570c0c2f569c56956ad4416711fc853d71808e8c  $archive" | sha256sum -c --status; then
+        curl -fL --retry 3 -o "$archive.tmp" https://github.com/MoonshotAI/kimi-code/releases/download/%40moonshot-ai%2Fkimi-code%400.23.6/kimi-code-linux-x64.zip
+        echo "38b30cad44667c8c95df1423570c0c2f569c56956ad4416711fc853d71808e8c  $archive.tmp" | sha256sum -c -
+        mv "$archive.tmp" "$archive"
+      fi
+      if ! echo "1f9264cadeba98579d7b106ac1f1b54fdaba15e9186818d80da0368b119a0a5f  $binary" | sha256sum -c --status; then
+        unzip -p "$archive" kimi > "$binary.tmp"
+        echo "1f9264cadeba98579d7b106ac1f1b54fdaba15e9186818d80da0368b119a0a5f  $binary.tmp" | sha256sum -c -
+        chmod 0755 "$binary.tmp"
+        mv "$binary.tmp" "$binary"
+      fi
+  command: >-
+    PYTHONPATH="$PWD/test/ci/eval"
+    "$RUNNER_TEMP/deepswe-venv/bin/pier" run
+    --path "$RUNNER_TEMP/deep-swe/tasks"
+    --job-name kimi-k3-deepswe
+    --jobs-dir "$RUNNER_TEMP/deepswe-jobs"
+    --agent-import-path pier_kimi_code:KimiCodeAgent
+    --model opensource/kimi-k3
+    --agent-env KIMI_MODEL_NAME=kimi-k3
+    --agent-env KIMI_MODEL_API_KEY=EMPTY_TOKEN
+    --agent-env KIMI_MODEL_PROVIDER_TYPE=kimi
+    --agent-env KIMI_MODEL_BASE_URL=${TS_CI_SERVER_BASE_URL}
+    --agent-env KIMI_MODEL_MAX_CONTEXT_SIZE=262144
+    --agent-env KIMI_MODEL_CAPABILITIES=thinking
+    --agent-env KIMI_MODEL_THINKING_EFFORT=max
+    --agent-env KIMI_MODEL_THINKING_KEEP=all
+    --agent-env KIMI_MODEL_TEMPERATURE=1.0
+    --agent-env KIMI_MODEL_TOP_P=0.95
+    --environment-import-path pier_kimi_code:KimiCodeEnvironment
+    --environment-kwarg kimi_binary_path="$TS_CI_CACHE_DIR/kimi-code/0.23.6/kimi"
+    --n-concurrent 6
+    --yes
+    && python3 test/ci/eval/report_deepswe.py
+    "$RUNNER_TEMP/deepswe-jobs/kimi-k3-deepswe/result.json"
+report:
+  github_step_summary: true
+score_threshold: 0.675

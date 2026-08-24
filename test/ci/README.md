@@ -287,6 +287,9 @@ preserves the draft checkpoint's required `attn_res` auxiliary stream.
 The MXFP4 DSpark OCRBench and MMMU-Pro Vision tasks are manual-only baselines
 that use a pinned Kimi Vendor Verifier revision; select either YAML through
 `Slurm Dispatch` with the `gb300` cluster.
+The DeepSWE baseline is also manual-only. Its K3 server runs on GB300, while
+Pier and the amd64 task containers run on the x86_64 Slurm coordinator, which
+must provide a working Docker daemon to the dispatcher account.
 
 GB200 examples:
 

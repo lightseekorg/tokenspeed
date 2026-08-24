@@ -247,7 +247,7 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
         slurm = data["slurm"]
         if not isinstance(slurm, dict):
             raise ValueError(f"{path}: slurm must be a mapping")
-        unknown = sorted(set(slurm) - {"nodes", "gpus_per_node"})
+        unknown = sorted(set(slurm) - {"nodes", "gpus_per_node", "client"})
         if unknown:
             raise ValueError(f"{path}: unsupported slurm keys: {unknown}")
         missing_slurm = sorted({"nodes", "gpus_per_node"} - set(slurm))
@@ -257,6 +257,13 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
             value = slurm[key]
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{path}: slurm.{key} must be a positive integer")
+        client = slurm.get("client", "compute")
+        if client not in {"compute", "coordinator"}:
+            raise ValueError(f"{path}: slurm.client must be 'compute' or 'coordinator'")
+        if client == "coordinator" and slurm["nodes"] == 1:
+            raise ValueError(
+                f"{path}: slurm.client='coordinator' requires a multi-node task"
+            )
         if slurm["nodes"] > 1:
             if data["type"] not in {"eval", "perf"}:
                 raise ValueError(
@@ -1506,7 +1513,7 @@ def poll_readiness(
     process: subprocess.Popen[str] | None = None,
     log_path: Path | None = None,
 ) -> None:
-    url = str(ready["url"])
+    url = os.path.expandvars(str(ready["url"]))
     timeout_seconds = int(ready.get("timeout", 600))
     interval_seconds = int(ready.get("interval", 10))
     expected_status = int(ready.get("expected_status", 200))

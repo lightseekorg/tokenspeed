@@ -18,7 +18,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, TextIO
 
 from pipeline import build_matrix, normalize_task
 
@@ -56,6 +56,7 @@ class Task:
     runner: str
     gpus: int
     nodes: int = 1
+    client: str = "compute"
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,14 @@ class Submission:
     task: Task
     job_id: str
     log: Path
+
+
+@dataclass
+class CoordinatorEval:
+    submission: Submission
+    process: subprocess.Popen[str]
+    output: TextIO
+    done: Path
 
 
 def gpu_count(runner: str) -> int:
@@ -96,12 +105,21 @@ def load_task(
     slurm = data.get("slurm", {})
     nodes = int(slurm.get("nodes", 1))
     gpus_per_node = int(slurm.get("gpus_per_node", gpus))
+    client = str(slurm.get("client", "compute"))
     if gpus_per_node != gpus:
         raise ValueError(
             f"{relative}: slurm.gpus_per_node={gpus_per_node} does not match "
             f"runner {runner!r} ({gpus} GPUs)"
         )
-    return Task(relative, str(data["name"]), str(data["type"]), runner, gpus, nodes)
+    return Task(
+        relative,
+        str(data["name"]),
+        str(data["type"]),
+        runner,
+        gpus,
+        nodes,
+        client,
+    )
 
 
 def task_matches(repo: Path, task: Task, patterns: list[str]) -> bool:
@@ -255,10 +273,11 @@ def pr_worktree(repo: Path, value: str):
 
 
 def print_tasks(tasks: list[Task]) -> None:
-    print("TYPE\tRUNNER\tNODES\tGPUS/NODE\tCONFIG\tNAME")
+    print("TYPE\tRUNNER\tNODES\tGPUS/NODE\tCLIENT\tCONFIG\tNAME")
     for task in tasks:
         print(
             f"{task.task_type}\t{task.runner}\t{task.nodes}\t{task.gpus}\t"
+            f"{task.client}\t"
             f"{task.config}\t{task.name}"
         )
 
@@ -519,6 +538,71 @@ srun "${{srun_args[@]}}" "${{container_command[@]}}"
         *pipeline,
         "--serve-only",
     ]
+    if task.client == "coordinator":
+        return common + f"""
+{shell_array("prepare_args", prepare_args)}
+{shell_array("image_prepare_args", image_prepare_args)}
+{shell_array("cleanup_args", cleanup_args)}
+
+server_src="$scratch/server-src"
+server_tmp="$scratch/server-tmp"
+server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" "${{gpu_mounts[@]}}" "${{model_mounts[@]}}" "${{mounts[@]}}")
+server_container_mounts="$(IFS=,; printf '%s' "${{server_mounts[*]}}")"
+head_node="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n '1p')"
+image_prepare_args+=(--nodelist="$head_node")
+
+server_step_pid=""
+cleanup() {{
+  status=$?
+  trap - EXIT INT TERM
+  if [ -n "$server_step_pid" ] && kill -0 "$server_step_pid" 2>/dev/null; then
+    kill -TERM "$server_step_pid" 2>/dev/null || true
+  fi
+  [ -z "$server_step_pid" ] || wait "$server_step_pid" 2>/dev/null || true
+  srun "${{cleanup_args[@]}}" bash -c 'rm -rf -- "$1"' tokenspeed-cleanup "$scratch" || true
+  exit "$status"
+}}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+srun "${{image_prepare_args[@]}}" true
+srun "${{prepare_args[@]}}" \
+  bash -c 'set -euo pipefail; mkdir -p "$1/.ci-artifacts" "$2"; tar -xf "$3" -C "$1"' \
+  tokenspeed-prepare "$server_src" "$server_tmp" "$source_archive"
+
+{shell_array("server_srun_args", server_srun)}
+server_srun_args+=(--container-mounts="$server_container_mounts")
+{shell_array("server_command", server_command)}
+srun "${{server_srun_args[@]}}" "${{server_command[@]}}" &
+server_step_pid=$!
+
+printf '%s\\n' "$head_node" > "$run/server-host.tmp"
+mv "$run/server-host.tmp" "$run/server-host"
+
+while kill -0 "$server_step_pid" 2>/dev/null && [ ! -e "$run/coordinator.done" ]; do
+  sleep 2
+done
+
+if [ ! -e "$run/coordinator.done" ]; then
+  set +e
+  wait "$server_step_pid"
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || status=1
+  echo "multi-node server step exited before coordinator evaluation" >&2
+  exit "$status"
+fi
+
+python3 - "$run/result.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    result = json.load(handle)
+raise SystemExit(0 if result.get("ok") else 1)
+PY
+"""
     client_command = [
         "bash",
         "-c",
@@ -933,16 +1017,174 @@ def write_report(
     (report_dir / "summary.md").write_text("\n".join(summary) + "\n")
 
 
+def check_coordinator_runtime() -> None:
+    if shutil.which("docker") is None:
+        raise ValueError("coordinator evaluation requires Docker on the dispatcher")
+    daemon = subprocess.run(
+        ["docker", "info"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if daemon.returncode:
+        raise ValueError("coordinator evaluation requires a working Docker daemon")
+    compose = subprocess.run(
+        ["docker", "compose", "version"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if compose.returncode:
+        raise ValueError("coordinator evaluation requires Docker Compose")
+
+
+def wait_for_server_host(submission: Submission, run_root: Path) -> str:
+    host_path = run_root / submission.job_id / "server-host"
+    deadline = time.monotonic() + 12 * 60 * 60
+    last_update = 0.0
+    while time.monotonic() < deadline:
+        if host_path.exists():
+            host = host_path.read_text().strip()
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", host):
+                raise ValueError(
+                    f"Slurm job {submission.job_id} wrote an invalid server host"
+                )
+            return host
+        active = queued_states([submission.job_id])
+        if submission.job_id not in active:
+            state = slurm_states([submission.job_id]).get(submission.job_id)
+            if state is None:
+                state = scontrol_states([submission.job_id]).get(submission.job_id)
+            if state is not None:
+                raise RuntimeError(
+                    f"Slurm job {submission.job_id} reached {state['state']} "
+                    "before publishing its server host"
+                )
+        now = time.monotonic()
+        if now - last_update >= 60:
+            state = active.get(submission.job_id, {})
+            print(
+                f"Waiting for coordinator endpoint from {submission.job_id}: "
+                f"{state.get('state', 'UNKNOWN')}",
+                flush=True,
+            )
+            last_update = now
+        time.sleep(2)
+    raise TimeoutError(
+        f"timed out waiting for Slurm job {submission.job_id} server host"
+    )
+
+
+def start_coordinator_evals(
+    submissions: list[Submission], repo: Path, run_root: Path
+) -> list[CoordinatorEval]:
+    evaluations = []
+    for submission in submissions:
+        if submission.task.client != "coordinator":
+            continue
+        host = wait_for_server_host(submission, run_root)
+        run_dir = run_root / submission.job_id
+        result = run_dir / "result.json"
+        done = run_dir / "coordinator.done"
+        env = os.environ.copy()
+        env.update(
+            {
+                "SLURM_JOB_ID": f"coordinator-{submission.job_id}",
+                "TS_CI_SERVER_HOST": host,
+                "TS_CI_SERVER_BASE_URL": f"http://{host}:8000/v1",
+                "TS_CI_SERVER_READY_URL": f"http://{host}:8000/readiness",
+            }
+        )
+        command = [
+            sys.executable,
+            str(repo / "test/ci_system/pipeline.py"),
+            "execute",
+            f"--config={submission.task.config}",
+            f"--runner={submission.task.runner}",
+            f"--work-dir={repo}",
+            "--setup-mode=slurm",
+            "--external-server",
+            "--skip-stage=install",
+            "--print-plan",
+            f"--result-json={result}",
+        ]
+        output = submission.log.open("a", encoding="utf-8")
+        print(
+            f"Starting coordinator evaluation for {submission.job_id} "
+            f"against {host}:8000",
+            flush=True,
+        )
+        process = subprocess.Popen(
+            command,
+            cwd=repo,
+            env=env,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        evaluations.append(CoordinatorEval(submission, process, output, done))
+    return evaluations
+
+
+def finish_coordinator_eval(evaluation: CoordinatorEval, run_root: Path) -> None:
+    if evaluation.done.exists():
+        return
+    returncode = evaluation.process.poll()
+    if returncode is None:
+        return
+    evaluation.output.close()
+    result = run_root / evaluation.submission.job_id / "result.json"
+    if not result.exists():
+        result.write_text(
+            json.dumps(
+                {
+                    "ok": False,
+                    "task": evaluation.submission.task.name,
+                    "type": evaluation.submission.task.task_type,
+                    "runner": evaluation.submission.task.runner,
+                    "error": f"coordinator pipeline exited with status {returncode}",
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+    evaluation.done.touch()
+
+
+def stop_coordinator_evals(evaluations: list[CoordinatorEval], run_root: Path) -> None:
+    for evaluation in evaluations:
+        if evaluation.process.poll() is None:
+            try:
+                os.killpg(evaluation.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    for evaluation in evaluations:
+        if evaluation.process.poll() is None:
+            try:
+                evaluation.process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(evaluation.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                evaluation.process.wait(timeout=5)
+        finish_coordinator_eval(evaluation, run_root)
+
+
 def wait_all(
     submissions: list[Submission],
     run_root: Path,
     report_dir: Path,
     source_pr: str | None = None,
+    coordinator_evals: list[CoordinatorEval] | None = None,
 ) -> bool:
     job_ids = [submission.job_id for submission in submissions]
+    coordinator_evals = coordinator_evals or []
     previous_handlers = {}
 
     def cancel_jobs(signum, _frame):
+        stop_coordinator_evals(coordinator_evals, run_root)
         subprocess.run(["scancel", *job_ids], check=False)
         raise SystemExit(128 + signum)
 
@@ -952,6 +1194,8 @@ def wait_all(
         previous_snapshot = None
         last_update = 0.0
         while True:
+            for evaluation in coordinator_evals:
+                finish_coordinator_eval(evaluation, run_root)
             active = queued_states(job_ids)
             accounting = slurm_states(job_ids)
             states = {
@@ -974,6 +1218,7 @@ def wait_all(
             if not active:
                 break
             time.sleep(10)
+        stop_coordinator_evals(coordinator_evals, run_root)
         states = {}
         for _ in range(6):
             states = slurm_states(job_ids)
@@ -1060,6 +1305,13 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
     if args.list:
         print_tasks(tasks)
         return 0
+    coordinator_tasks = [task for task in tasks if task.client == "coordinator"]
+    if coordinator_tasks and not args.render:
+        if not args.wait:
+            raise ValueError("coordinator evaluation requires --wait")
+        if len(coordinator_tasks) > 1:
+            raise ValueError("submit one coordinator evaluation at a time")
+        check_coordinator_runtime()
     commit = git(repo, "rev-parse", "HEAD")
     source_pr = args.pr or args.source_pr
     print_target(repo, source_pr, commit)
@@ -1093,8 +1345,21 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
             if args.report_dir
             else artifact_root / "reports" / f"{commit[:12]}-{time.time_ns()}"
         )
+        try:
+            coordinator_evals = start_coordinator_evals(
+                submitted, repo, artifact_root / "runs"
+            )
+        except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError):
+            subprocess.run(
+                ["scancel", *[item.job_id for item in submitted]], check=False
+            )
+            raise
         completed = wait_all(
-            submitted, artifact_root / "runs", report_dir, source_pr=source_pr
+            submitted,
+            artifact_root / "runs",
+            report_dir,
+            source_pr=source_pr,
+            coordinator_evals=coordinator_evals,
         )
         print(f"Report: {report_dir}", flush=True)
         return 0 if completed else 1

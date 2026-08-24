@@ -72,7 +72,10 @@ def test_poll_readiness_fails_when_server_process_exits(monkeypatch, tmp_path):
             self.calls += 1
             return None if self.calls == 1 else 7
 
-    def unavailable(*_args, **_kwargs):
+    monkeypatch.setenv("TEST_READY_URL", "http://127.0.0.1:8000/readiness")
+
+    def unavailable(url, **_kwargs):
+        assert url == "http://127.0.0.1:8000/readiness"
         raise pipeline.URLError("not ready")
 
     log = tmp_path / "server.log"
@@ -81,7 +84,7 @@ def test_poll_readiness_fails_when_server_process_exits(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="exit code 7") as exc_info:
         poll_readiness(
-            {"url": "http://127.0.0.1:8000/readiness", "interval": 10},
+            {"url": "${TEST_READY_URL}", "interval": 10},
             False,
             process=ServerProcess(),
             log_path=log,
@@ -254,6 +257,28 @@ def test_multi_node_slurm_task_validation():
 
     task["triggers"] = ["per-commit", "slurm"]
     with pytest.raises(ValueError, match="exactly one"):
+        validate_task(task, Path("task.yaml"))
+
+
+def test_coordinator_client_requires_multi_node_slurm_task():
+    task = {
+        "api_version": "ci.tokenspeed.io/v1",
+        "name": "coordinator-eval",
+        "type": "eval",
+        "workflow_stage": "model-test",
+        "triggers": ["slurm"],
+        "runner": {"labels": ["slurm-gb300-4gpu"]},
+        "slurm": {"nodes": 2, "gpus_per_node": 4, "client": "coordinator"},
+        "server": {
+            "command": "ts serve --model example/model",
+            "ready": {"url": "${TS_CI_SERVER_READY_URL}"},
+        },
+        "eval": {"command": "run eval"},
+    }
+
+    validate_task(task, Path("task.yaml"))
+    task["slurm"]["nodes"] = 1
+    with pytest.raises(ValueError, match="requires a multi-node task"):
         validate_task(task, Path("task.yaml"))
 
 

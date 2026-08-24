@@ -36,6 +36,7 @@ def write_task(
     model: str = "example/model",
     nodes: int | None = None,
     gpus_per_node: int | None = None,
+    client: str | None = None,
 ) -> str:
     workflow_stage = "unit-test" if task_type == "ut" else "model-test"
     trigger = "slurm" if nodes and nodes > 1 else "manual"
@@ -57,6 +58,8 @@ def write_task(
                 f"  gpus_per_node: {gpus_per_node}",
             ]
         )
+        if client is not None:
+            lines.append(f"  client: {client}")
     lines.extend(
         [
             "runner:",
@@ -96,6 +99,20 @@ def test_load_task_reads_multi_node_topology(tmp_path):
 
     assert load_task(tmp_path, config) == Task(
         config, "example", "eval", "slurm-gb200-4node-4gpu", 4, 4
+    )
+
+
+def test_load_task_reads_coordinator_client(tmp_path):
+    config = write_task(
+        tmp_path,
+        runner="slurm-gb300-4gpu",
+        nodes=2,
+        gpus_per_node=4,
+        client="coordinator",
+    )
+
+    assert load_task(tmp_path, config) == Task(
+        config, "example", "eval", "slurm-gb300-4gpu", 4, 2, "coordinator"
     )
 
 
@@ -507,6 +524,30 @@ def test_render_script_orchestrates_multi_node_server_and_head_client():
     assert script.index('srun "${image_prepare_args[@]}" true') < script.index(
         'srun "${server_srun_args[@]}"'
     )
+    subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def test_render_script_delegates_client_to_coordinator():
+    script = render_script(
+        Task(
+            "test/ci/eval/example.yaml",
+            "example",
+            "eval",
+            "slurm-gb300-4gpu",
+            4,
+            2,
+            "coordinator",
+        ),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    assert 'mv "$run/server-host.tmp" "$run/server-host"' in script
+    assert '"$run/coordinator.done"' in script
+    assert "client_srun_args" not in script
+    assert "--external-server" not in script
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
 
