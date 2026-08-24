@@ -106,10 +106,7 @@ def _deepseek_v4_compress_windows_kernel(
 
         table_idx = window_pos // CACHE_BLOCK - base_page
         live = (
-            in_window
-            & (window_pos >= 0)
-            & (table_idx >= 0)
-            & (table_idx < max_pages)
+            in_window & (window_pos >= 0) & (table_idx >= 0) & (table_idx < max_pages)
         )
         block_number = tl.load(
             block_table_ptr + req * block_table_stride + table_idx,
@@ -130,9 +127,10 @@ def _deepseek_v4_compress_windows_kernel(
         # columns, which is what the reference's head_offsets encodes.
         col = offs_d
         if OVERLAP:
-            col = tl.where(offs_w >= COMPRESS_RATIO, HEAD_DIM, 0)[:, None] + offs_d[
-                None, :
-            ]
+            col = (
+                tl.where(offs_w >= COMPRESS_RATIO, HEAD_DIM, 0)[:, None]
+                + offs_d[None, :]
+            )
         else:
             col = tl.zeros((BLOCK_W, 1), tl.int32) + offs_d[None, :]
 

@@ -2748,6 +2748,8 @@ class DeepseekV4MoE(nn.Module):
                     "routing_method_type": RoutingMethodType.Renormalize,
                 },
             )
+            # The kernel must not re-derive routing; V4's own top-k is the plan.
+            assert not self.experts.support_routing
             self.topk = TopK(
                 top_k=config.num_experts_per_tok,
                 renormalize=config.norm_topk_prob,
