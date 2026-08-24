@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Route-direct gfx950 A16W4 SiTU MoE kernels for small-batch decode.
+"""Route-direct gfx950 A16W4 gated MoE kernels for small-batch decode.
 
 The Triton MXFP4 weight preprocessor stores values as ``(E, K / 2, N)`` and
 CDNA4-swizzles their ``(E, K / 32, N)`` scales.  Decode can consume those
@@ -31,7 +31,7 @@ Kimi K3's 1792-byte packed hidden dimension uses a masked 1024-byte W13 tile.
 The 14.3% padded tail is cheaper than five additional loop iterations on
 gfx950; masked values and scales are zero-filled before the reduction.
 
-Stage 1 writes one BF16 SiTU row per local route.  Stage 2 visits the original
+Stage 1 writes one BF16 activated row per local route. Stage 2 visits the original
 top-k slots, skips remote EP ids (``-1``), preserves the per-route BF16 W2
 boundary, and combines all local routes directly into the rank's output.
 """
@@ -93,6 +93,9 @@ def _stage1_a16w4_situ_warp_gemv(
     SITU_BETA: gl.constexpr,
     SITU_LINEAR_BETA: gl.constexpr,
     HAS_LINEAR_BETA: gl.constexpr,
+    SWIGLU_LIMIT: gl.constexpr,
+    HAS_SWIGLU_LIMIT: gl.constexpr,
+    USE_SWIGLU: gl.constexpr,
     EXPERT_START: gl.constexpr,
     NUM_LOCAL_EXPERTS: gl.constexpr,
     LINEAR_WEIGHTS: gl.constexpr,
@@ -246,16 +249,22 @@ def _stage1_a16w4_situ_warp_gemv(
         gate_acc += gl.sum(gate_w.to(gl.float32) * x_tile, axis=1)
         up_acc += gl.sum(up_w.to(gl.float32) * x_tile, axis=1)
 
-    # Match Kimi's BF16 W13 output before evaluating SiTU in FP32.
+    # Preserve the BF16 W13 boundary before evaluating the activation in FP32.
     gate = gate_acc.to(gl.bfloat16).to(gl.float32)
     up = up_acc.to(gl.bfloat16).to(gl.float32)
-    gate = (
-        SITU_BETA
-        * gl.extra.libdevice.tanh(gate / SITU_BETA)
-        * (1.0 / (1.0 + gl.exp(-gate)))
-    )
-    if HAS_LINEAR_BETA:
-        up = SITU_LINEAR_BETA * gl.extra.libdevice.tanh(up / SITU_LINEAR_BETA)
+    if USE_SWIGLU:
+        if HAS_SWIGLU_LIMIT:
+            gate = gl.minimum(gate, SWIGLU_LIMIT)
+            up = gl.clamp(up, -SWIGLU_LIMIT, SWIGLU_LIMIT)
+        gate = gate * (1.0 / (1.0 + gl.exp(-gate)))
+    else:
+        gate = (
+            SITU_BETA
+            * gl.extra.libdevice.tanh(gate / SITU_BETA)
+            * (1.0 / (1.0 + gl.exp(-gate)))
+        )
+        if HAS_LINEAR_BETA:
+            up = SITU_LINEAR_BETA * gl.extra.libdevice.tanh(up / SITU_LINEAR_BETA)
     activated = (gate * up).to(inter_ptr.dtype.element_ty)
     gl.store(
         inter_ptr + route.to(gl.int64) * stride_im + expanded_offs_n * stride_in,
@@ -449,6 +458,8 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
     *,
     situ_beta: float,
     situ_linear_beta: float | None,
+    activation: str = "situ",
+    swiglu_limit: float | None = None,
     expert_start: int = 0,
     linear_weights: bool = False,
     w13_interleaved: bool = False,
@@ -464,7 +475,8 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
     plan's original contiguous ``[E, N, K / 2]`` values and linear scales.
     Kimi K3's W13 packed-K size uses a tuned masked tail; W2 and other
     supported widths retain unmasked execution by stepping down to an exact
-    tile.
+    tile. ``activation="swiglu"`` selects standard alpha=1, beta=0 SwiGLU
+    with an optional symmetric clamp on the gate/up inputs.
     """
     if hidden_states.dtype != torch.bfloat16 or hidden_states.ndim != 2:
         raise ValueError("gfx950 warp decode requires rank-2 BF16 activations")
@@ -474,10 +486,15 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         raise ValueError("top-k weights and local ids must have the same rank-2 shape")
     if local_topk_ids.shape[0] != hidden_states.shape[0]:
         raise ValueError("top-k token count must match hidden states")
-    if situ_beta <= 0.0:
-        raise ValueError("SiTU beta must be positive")
-    if situ_linear_beta is not None and situ_linear_beta <= 0.0:
-        raise ValueError("SiTU linear beta must be positive")
+    if activation not in {"situ", "swiglu"}:
+        raise ValueError(f"unsupported A16W4 activation: {activation}")
+    if activation == "situ":
+        if situ_beta <= 0.0:
+            raise ValueError("SiTU beta must be positive")
+        if situ_linear_beta is not None and situ_linear_beta <= 0.0:
+            raise ValueError("SiTU linear beta must be positive")
+    elif swiglu_limit is not None and swiglu_limit <= 0.0:
+        raise ValueError("SwiGLU limit must be positive when set")
     if expert_start < 0:
         raise ValueError("expert_start must be non-negative")
     fuse_shared_down = shared_input is not None or shared_weight is not None
@@ -619,6 +636,9 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         SITU_BETA=float(situ_beta),
         SITU_LINEAR_BETA=(1.0 if situ_linear_beta is None else float(situ_linear_beta)),
         HAS_LINEAR_BETA=situ_linear_beta is not None,
+        SWIGLU_LIMIT=(1.0 if swiglu_limit is None else float(swiglu_limit)),
+        HAS_SWIGLU_LIMIT=swiglu_limit is not None,
+        USE_SWIGLU=activation == "swiglu",
         EXPERT_START=int(expert_start),
         NUM_LOCAL_EXPERTS=num_experts,
         LINEAR_WEIGHTS=linear_weights,
@@ -713,4 +733,10 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
     return out
 
 
-__all__ = ["gluon_a16w4_situ_warp_decode_ep_gfx950"]
+gluon_a16w4_warp_decode_ep_gfx950 = gluon_a16w4_situ_warp_decode_ep_gfx950
+
+
+__all__ = [
+    "gluon_a16w4_situ_warp_decode_ep_gfx950",
+    "gluon_a16w4_warp_decode_ep_gfx950",
+]

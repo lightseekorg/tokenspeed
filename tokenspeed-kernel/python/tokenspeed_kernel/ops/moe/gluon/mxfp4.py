@@ -33,6 +33,16 @@ platform = current_platform()
 
 # TP8/EP8 model measurements favor warp GEMV through M=16.
 _ROUTE_DIRECT_DECODE_MAX_TOKENS = 16
+_BUFFER_LOAD_OFFSET_LIMIT = 1 << 31
+
+
+def _buffer_load_offsets_fit_int32(*tensors: torch.Tensor) -> bool:
+    return all(
+        tensor.numel() * tensor.element_size() < _BUFFER_LOAD_OFFSET_LIMIT
+        for tensor in tensors
+    )
+
+
 _GFX1250_DECODE_MAX_AVERAGE_BPE = 16
 
 
@@ -51,6 +61,7 @@ if platform.is_amd:
         gluon_mxfp_precomputed_mxfp4_fused_moe,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_grouped import (
+        gluon_a16w4_grouped_ep_gfx950,
         gluon_a16w4_situ_grouped_ep_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (
@@ -94,6 +105,107 @@ if platform.is_amd:
             1.0 if swiglu_arg.alpha is None else swiglu_arg.alpha,
             0.0 if swiglu_arg.limit is None else swiglu_arg.limit,
             0.0 if swiglu_beta is None else swiglu_beta,
+        )
+
+    def _gluon_mxfp4_a16w4_ep_precomputed_moe_apply(
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        topk_weights: torch.Tensor | None,
+        topk_ids: torch.Tensor | None,
+        *,
+        activation: str,
+        do_finalize: bool,
+    ) -> torch.Tensor:
+        if not do_finalize:
+            raise ValueError("gfx950 A16W4 Gluon MoE cannot defer finalization")
+        if topk_weights is None or topk_ids is None:
+            raise ValueError("gfx950 A16W4 Gluon MoE requires precomputed top-k")
+        if x.ndim != 2 or x.shape[1] % 256:
+            raise ValueError(
+                "gfx950 A16W4 Gluon MoE requires rank-2 activations with "
+                "hidden size divisible by 256"
+            )
+
+        activation_kwargs: dict[str, object]
+        if activation == "situ":
+            activation_kwargs = {
+                "situ_beta": float(getattr(w, "activation_situ_beta", 1.0)),
+                "situ_linear_beta": getattr(w, "activation_situ_linear_beta", None),
+            }
+        elif activation == "swiglu":
+            swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
+            if swiglu_alpha != 1.0 or swiglu_beta != 0.0:
+                raise ValueError(
+                    "gfx950 A16W4 EP supports SwiGLU alpha=1 and beta=0 only"
+                )
+            activation_kwargs = {
+                "situ_beta": 1.0,
+                "situ_linear_beta": None,
+                "activation": "swiglu",
+                "swiglu_limit": swiglu_limit if swiglu_limit > 0.0 else None,
+            }
+        else:
+            raise ValueError(f"unsupported gfx950 A16W4 activation: {activation}")
+
+        two_intermediate = int(w.w13_weight.shape[1])
+        intermediate = two_intermediate // 2
+        num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
+        expert_start = int(getattr(w, "ep_rank", 0)) * num_local_experts
+        buffer_load_safe = _buffer_load_offsets_fit_int32(
+            w.w13_weight,
+            w.w13_weight_scale,
+            w.w2_weight,
+            w.w2_weight_scale,
+        )
+        use_route_direct_decode = (
+            0 < x.shape[0] <= _ROUTE_DIRECT_DECODE_MAX_TOKENS
+            and x.is_contiguous()
+            and buffer_load_safe
+            and x.shape[1] % 256 == 0
+            and two_intermediate % 2 == 0
+            and intermediate % 256 == 0
+            and int(w.w13_weight.shape[2]) * 2 == x.shape[1]
+        )
+        output = getattr(w, "_situ_output_buffer", None)
+        if use_route_direct_decode:
+            from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
+                gluon_a16w4_warp_decode_ep_gfx950,
+            )
+
+            # Both stages localize global expert IDs while consuming the linear
+            # checkpoint layout, avoiding four pointwise localization kernels.
+            return gluon_a16w4_warp_decode_ep_gfx950(
+                x,
+                w.w13_weight,
+                w.w13_weight_scale,
+                w.w2_weight,
+                w.w2_weight_scale,
+                topk_weights,
+                topk_ids,
+                expert_start=expert_start,
+                linear_weights=True,
+                w13_interleaved=(
+                    getattr(w, "w13_input_layout", "concatenated") == "interleaved"
+                ),
+                routed_out=output,
+                **activation_kwargs,
+            )
+        grouped_kernel = (
+            gluon_a16w4_situ_grouped_ep_gfx950
+            if activation == "situ"
+            else gluon_a16w4_grouped_ep_gfx950
+        )
+        return grouped_kernel(
+            x,
+            w.w13_weight,
+            w.w13_weight_scale,
+            w.w2_weight,
+            w.w2_weight_scale,
+            topk_weights,
+            topk_ids,
+            expert_start=expert_start,
+            out=output,
+            **activation_kwargs,
         )
 
     @register_kernel(
@@ -145,61 +257,67 @@ if platform.is_amd:
     ):
         del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
         del enable_pdl
-        if not do_finalize:
-            raise ValueError("gfx950 A16W4 Gluon MoE cannot defer finalization")
-        if topk_weights is None or topk_ids is None:
-            raise ValueError("gfx950 A16W4 Gluon MoE requires precomputed top-k")
-        two_intermediate = int(w.w13_weight.shape[1])
-        intermediate = two_intermediate // 2
-        num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
-        expert_start = int(getattr(w, "ep_rank", 0)) * num_local_experts
-        use_route_direct_decode = (
-            0 < x.shape[0] <= _ROUTE_DIRECT_DECODE_MAX_TOKENS
-            and x.is_contiguous()
-            and x.shape[1] % 256 == 0
-            and two_intermediate % 2 == 0
-            and intermediate % 256 == 0
-            and int(w.w13_weight.shape[2]) * 2 == x.shape[1]
-        )
-        output = getattr(w, "_situ_output_buffer", None)
-        if use_route_direct_decode:
-            from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
-                gluon_a16w4_situ_warp_decode_ep_gfx950,
-            )
-
-            # Consume the Gluon plan's linear checkpoint layout directly. EP
-            # localization stays inside both route-direct stages, avoiding the
-            # four pointwise kernels in ``_local_topk_for_ep``. Larger batches
-            # retain the grouped MFMA path below.
-            return gluon_a16w4_situ_warp_decode_ep_gfx950(
-                x,
-                w.w13_weight,
-                w.w13_weight_scale,
-                w.w2_weight,
-                w.w2_weight_scale,
-                topk_weights,
-                topk_ids,
-                situ_beta=float(getattr(w, "activation_situ_beta", 1.0)),
-                situ_linear_beta=getattr(w, "activation_situ_linear_beta", None),
-                expert_start=expert_start,
-                linear_weights=True,
-                w13_interleaved=(
-                    getattr(w, "w13_input_layout", "concatenated") == "interleaved"
-                ),
-                routed_out=output,
-            )
-        return gluon_a16w4_situ_grouped_ep_gfx950(
+        return _gluon_mxfp4_a16w4_ep_precomputed_moe_apply(
             x,
-            w.w13_weight,
-            w.w13_weight_scale,
-            w.w2_weight,
-            w.w2_weight_scale,
+            w,
             topk_weights,
             topk_ids,
-            situ_beta=float(getattr(w, "activation_situ_beta", 1.0)),
-            situ_linear_beta=getattr(w, "activation_situ_linear_beta", None),
-            expert_start=expert_start,
-            out=output,
+            activation="situ",
+            do_finalize=do_finalize,
+        )
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_mxfp4_a16w4_swiglu_ep_precomputed_moe_apply",
+        solution="gluon",
+        weight_preprocessor=validate_linear_mxfp4_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures(
+            "x",
+            "dense",
+            {torch.bfloat16},
+        ),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"swiglu"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ep_size": frozenset({2, 4, 8}),
+            "ispp_alignment": frozenset({128}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({False}),
+        },
+        priority=Priority.SPECIALIZED + 1,
+        tags={"amd", "gfx950", "ep", "latency", "throughput"},
+    )
+    def gluon_mxfp4_a16w4_swiglu_ep_precomputed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ):
+        del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
+        del enable_pdl
+        return _gluon_mxfp4_a16w4_ep_precomputed_moe_apply(
+            x,
+            w,
+            topk_weights,
+            topk_ids,
+            activation="swiglu",
+            do_finalize=do_finalize,
         )
 
     @register_kernel(

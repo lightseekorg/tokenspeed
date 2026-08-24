@@ -18,13 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Grouped gfx950 A16W4 SiTU MoE for contiguous expert parallelism.
+"""Grouped gfx950 A16W4 gated MoE for contiguous expert parallelism.
 
 The route list is aligned entirely on-device.  Both GEMMs consume packed MXFP4
 weights directly; activations are staged through LDS while gfx950's native
 scaled upcast converts only the active weight tile into the register dot
 layout.  This avoids both the Python expert loop and model-sized BF16 weight
-traffic.  Stage 1 fuses the BF16 boundary and SiTU activation.  Stage 2
+traffic. Stage 1 fuses the BF16 boundary and gated activation. Stage 2
 scatters BF16 route outputs and a final masked FP32 reduction combines only
 locally-owned EP slots.
 """
@@ -184,6 +184,9 @@ def _grouped_a16w4_situ_stage1_kernel(
     SITU_BETA: gl.constexpr,
     SITU_LINEAR_BETA: gl.constexpr,
     HAS_LINEAR_BETA: gl.constexpr,
+    SWIGLU_LIMIT: gl.constexpr,
+    HAS_SWIGLU_LIMIT: gl.constexpr,
+    USE_SWIGLU: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
@@ -394,16 +397,22 @@ def _grouped_a16w4_situ_stage1_kernel(
     gate_acc = gl.amd.cdna4.mfma(a_next, bg_dot, gate_acc)
     up_acc = gl.amd.cdna4.mfma(a_next, bu_dot, up_acc)
 
-    # Preserve Kimi's BF16 tensor boundary before the FP32 SiTU math.
+    # Preserve the BF16 W13 boundary before evaluating the activation in FP32.
     gate = gate_acc.to(gl.bfloat16).to(gl.float32)
     up = up_acc.to(gl.bfloat16).to(gl.float32)
-    gate = (
-        SITU_BETA
-        * gl.extra.libdevice.tanh(gate / SITU_BETA)
-        * (1.0 / (1.0 + gl.exp(-gate)))
-    )
-    if HAS_LINEAR_BETA:
-        up = SITU_LINEAR_BETA * gl.extra.libdevice.tanh(up / SITU_LINEAR_BETA)
+    if USE_SWIGLU:
+        if HAS_SWIGLU_LIMIT:
+            gate = gl.minimum(gate, SWIGLU_LIMIT)
+            up = gl.clamp(up, -SWIGLU_LIMIT, SWIGLU_LIMIT)
+        gate = gate * (1.0 / (1.0 + gl.exp(-gate)))
+    else:
+        gate = (
+            SITU_BETA
+            * gl.extra.libdevice.tanh(gate / SITU_BETA)
+            * (1.0 / (1.0 + gl.exp(-gate)))
+        )
+        if HAS_LINEAR_BETA:
+            up = SITU_LINEAR_BETA * gl.extra.libdevice.tanh(up / SITU_LINEAR_BETA)
     inter = (gate * up).to(c_ptr.dtype.element_ty)
 
     cm_layout: gl.constexpr = gl.SliceLayout(1, mfma_layout)
@@ -708,6 +717,8 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
     *,
     situ_beta: float,
     situ_linear_beta: float | None,
+    activation: str = "situ",
+    swiglu_limit: float | None = None,
     block_m: int | None = None,
     expert_start: int = 0,
     out: torch.Tensor | None = None,
@@ -716,7 +727,8 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
 
     ``local_topk_ids`` may contain global expert IDs. ``expert_start`` marks
     the first expert represented by the local weight tensors; non-local routes
-    are discarded by alignment and reduction kernels.
+    are discarded by alignment and reduction kernels. ``activation="swiglu"``
+    selects standard alpha=1, beta=0 SwiGLU with an optional clamp.
     """
     if hidden_states.dtype != torch.bfloat16 or hidden_states.ndim != 2:
         raise ValueError("grouped gfx950 A16W4 requires rank-2 BF16 activations")
@@ -726,10 +738,15 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
         raise ValueError("top-k token count must match hidden states")
     if not (w13_weight.ndim == w13_scale.ndim == w2_weight.ndim == w2_scale.ndim == 3):
         raise ValueError("local MXFP4 expert tensors must be rank-3")
-    if situ_beta <= 0.0:
-        raise ValueError("SiTU beta must be positive")
-    if situ_linear_beta is not None and situ_linear_beta <= 0.0:
-        raise ValueError("SiTU linear beta must be positive")
+    if activation not in {"situ", "swiglu"}:
+        raise ValueError(f"unsupported A16W4 activation: {activation}")
+    if activation == "situ":
+        if situ_beta <= 0.0:
+            raise ValueError("SiTU beta must be positive")
+        if situ_linear_beta is not None and situ_linear_beta <= 0.0:
+            raise ValueError("SiTU linear beta must be positive")
+    elif swiglu_limit is not None and swiglu_limit <= 0.0:
+        raise ValueError("SwiGLU limit must be positive when set")
     if expert_start < 0:
         raise ValueError("expert_start must be non-negative")
 
@@ -820,6 +837,9 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
         SITU_BETA=float(situ_beta),
         SITU_LINEAR_BETA=(1.0 if situ_linear_beta is None else float(situ_linear_beta)),
         HAS_LINEAR_BETA=situ_linear_beta is not None,
+        SWIGLU_LIMIT=(1.0 if swiglu_limit is None else float(swiglu_limit)),
+        HAS_SWIGLU_LIMIT=swiglu_limit is not None,
+        USE_SWIGLU=activation == "swiglu",
         BLOCK_M=block_m,
         BLOCK_N=s1_block_n,
         BLOCK_K=s1_block_k,
@@ -921,4 +941,10 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
     return out
 
 
-__all__ = ["gluon_a16w4_situ_grouped_ep_gfx950"]
+gluon_a16w4_grouped_ep_gfx950 = gluon_a16w4_situ_grouped_ep_gfx950
+
+
+__all__ = [
+    "gluon_a16w4_grouped_ep_gfx950",
+    "gluon_a16w4_situ_grouped_ep_gfx950",
+]

@@ -1527,18 +1527,22 @@ class DeepseekV4MLP(nn.Module):
         prefix: str,
         swiglu_limit: float | None = None,
         reduce_results: bool = False,
+        is_shared_expert: bool = False,
     ) -> None:
         super().__init__()
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}")
-        tp = mapping.dense
+        tp = mapping.moe if is_shared_expert else mapping.dense
+        tp_rank = tp.tp_ep_rank if is_shared_expert else tp.tp_rank
+        tp_size = tp.tp_ep_size if is_shared_expert else tp.tp_size
+        tp_group = tp.tp_ep_group if is_shared_expert else tp.tp_group
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
-            tp_rank=tp.tp_rank,
-            tp_size=tp.tp_size,
-            tp_group=tp.tp_group,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            tp_group=tp_group,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
         )
@@ -1547,18 +1551,18 @@ class DeepseekV4MLP(nn.Module):
             hidden_size,
             bias=False,
             reduce_results=reduce_results,
-            tp_rank=tp.tp_rank,
-            tp_size=tp.tp_size,
-            tp_group=tp.tp_group,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            tp_group=tp_group,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
         )
         self.swiglu_limit = swiglu_limit
         self.act_fn = SiluAndMul(swiglu_limit)
         self.reduce_results = reduce_results
-        self.tp_rank = tp.tp_rank
-        self.tp_size = tp.tp_size
-        self.tp_group = tp.tp_group
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.tp_group = tp_group
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[0] == 0:
@@ -1886,6 +1890,19 @@ class DeepseekV4MoE(nn.Module):
         self.stream_fork = StreamFork(aux_stream)
 
         self.use_mega_moe = get_moe_backend().is_mega_moe()
+        if mapping.moe.ep_size > 1:
+            if global_server_args_dict.get("enable_eplb", False):
+                raise ValueError(
+                    "DeepSeek V4 EP does not support EPLB with precomputed routing."
+                )
+            if global_server_args_dict.get("init_expert_location", "trivial") not in (
+                None,
+                "trivial",
+            ):
+                raise ValueError(
+                    "DeepSeek V4 EP requires trivial expert placement with "
+                    "precomputed routing."
+                )
         if self.use_mega_moe:
             if mapping.moe.ep_size <= 1:
                 raise ValueError("DeepSeek V4 MegaMoE requires expert parallelism.")
@@ -1899,6 +1916,21 @@ class DeepseekV4MoE(nn.Module):
                 raise ValueError(
                     "DeepSeek V4 MegaMoE requires n_routed_experts divisible by "
                     "EP size."
+                )
+        elif mapping.moe.ep_size > 1:
+            if global_server_args_dict.get("ep_num_redundant_experts", 0):
+                raise ValueError(
+                    "DeepSeek V4 normal EP does not support redundant experts "
+                    "with precomputed routing."
+                )
+            if mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size):
+                raise ValueError(
+                    "DeepSeek V4 normal EP requires attention TP size 1 or "
+                    "attention TP size equal to the MoE TPxEP size."
+                )
+            if config.hidden_size % 256:
+                raise ValueError(
+                    "DeepSeek V4 normal EP requires hidden_size divisible by 256."
                 )
         self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
         self.gate = DeepseekV4MoEGate(
@@ -1917,6 +1949,10 @@ class DeepseekV4MoE(nn.Module):
                 add_prefix("shared_experts", prefix),
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 reduce_results=False,
+                # Normal EP sums routed and shared partials over the same TPxEP
+                # group. MegaMoE retains its existing dense placement and
+                # CommManager-owned shared-expert communication.
+                is_shared_expert=not self.use_mega_moe,
             )
         else:
             self.shared_experts = None
@@ -1934,7 +1970,7 @@ class DeepseekV4MoE(nn.Module):
             )
             self.topk = None
         else:
-            routed_quant_config, is_block_fp8 = _deepseek_v4_routed_expert_quant_config(
+            routed_quant_config, _ = _deepseek_v4_routed_expert_quant_config(
                 config, quant_config
             )
             self.experts = MoELayer(
@@ -1952,7 +1988,7 @@ class DeepseekV4MoE(nn.Module):
                 ep_size=mapping.moe.ep_size,
                 activation="swiglu",
                 swiglu_limit=getattr(config, "swiglu_limit", None),
-                with_bias=not is_block_fp8,
+                with_bias=False,
                 routing_mode="precomputed_topk",
                 routing_config={
                     "routed_scaling_factor": self.routed_scaling_factor,
