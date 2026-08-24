@@ -275,22 +275,23 @@ def _prepare_gdn_decode_state_path(
 
 def _build_cu_extend_seq_lens_cpu(
     extend_seq_lens_cpu: torch.Tensor | None, expected_len: int
-) -> tuple[int, ...]:
-    """Host prefix sum of the scheduler's extend lengths.
+) -> torch.Tensor:
+    """Host prefix sum of the scheduler's extend lengths, as an int64 tensor.
 
-    The tuple must equal the contents of ``query_start_loc`` — a wrong hint
-    silently corrupts the CuteDSL host chunk plan. Both are built together
-    here in ``init_forward_metadata`` (mirroring MHA's
-    ``cu_extend_seq_lens_cpu``), so absence or length misalignment can only
-    mean a caller broke that contract: fail loudly instead of silently
-    degrading to the wrapper's boundary re-read.
+    The contents must equal ``query_start_loc`` — a wrong copy silently
+    corrupts the kernels' host chunk plans. Both are built together here in
+    ``init_forward_metadata`` (mirroring MHA's ``cu_extend_seq_lens_cpu``),
+    so absence or length misalignment can only mean a caller broke that
+    contract: fail loudly instead of silently degrading to a
+    stream-synchronizing boundary re-read inside the kernel.
 
     Args:
         extend_seq_lens_cpu: CPU per-sequence extend lengths.
         expected_len: ``query_start_loc.numel()`` of the batch.
 
     Returns:
-        ``(0, lens[0], lens[0]+lens[1], ...)`` with ``expected_len`` entries.
+        Host int64 tensor ``[0, lens[0], lens[0]+lens[1], ...]`` with
+        ``expected_len`` entries.
 
     Raises:
         RuntimeError: the lengths are absent or disagree with
@@ -301,16 +302,15 @@ def _build_cu_extend_seq_lens_cpu(
             "extend metadata requires the scheduler's host extend lengths; "
             "the executor provides them for every extend batch"
         )
-    bounds = [0]
-    for n in extend_seq_lens_cpu.tolist():
-        bounds.append(bounds[-1] + int(n))
-    if len(bounds) != expected_len:
+    if extend_seq_lens_cpu.numel() + 1 != expected_len:
         raise RuntimeError(
             "host extend lengths disagree with query_start_loc on the "
-            f"sequence count: {len(bounds)} boundaries vs {expected_len} "
-            "entries"
+            f"sequence count: {extend_seq_lens_cpu.numel() + 1} boundaries "
+            f"vs {expected_len} entries"
         )
-    return tuple(bounds)
+    bounds = torch.zeros(expected_len, dtype=torch.int64)
+    torch.cumsum(extend_seq_lens_cpu.to(torch.int64), dim=0, out=bounds[1:])
+    return bounds
 
 
 @dataclass
@@ -319,12 +319,12 @@ class MambaForwardMetadata:
     mamba_output_indices: torch.Tensor | None = None
     extend_prefix_lens: torch.Tensor | None = None
     extend_seq_lens_cpu: torch.Tensor | None = None
-    # Host prefix sum of extend_seq_lens_cpu, equal to query_start_loc's
-    # contents; built once per extend batch (mirroring MHA's field of the
-    # same name) and reused by every layer's prefill scan. A tuple, unlike
-    # MHA's list: it crosses into the CuteDSL wheel, which seeds a memo from
-    # it, so immutability rules out stale-aliasing.
-    cu_extend_seq_lens_cpu: tuple[int, ...] | None = None
+    # Host int64 prefix sum of extend_seq_lens_cpu, equal to
+    # query_start_loc's contents; built once per extend batch (mirroring
+    # MHA's field of the same name) and reused by every layer's prefill scan
+    # so no kernel re-reads the device boundaries (a stream-synchronizing
+    # D2H per layer per chunk). Fresh per batch — never mutated in place.
+    cu_extend_seq_lens_cpu: torch.Tensor | None = None
     # Per-state-group metadata is gathered once per group and batch;
     # layers select their entry via ``pool.state_group_by_layer[layer_id]``.
     state_in_blocks_by_group: dict[str, torch.Tensor] | None = None
@@ -2058,7 +2058,7 @@ class MambaAttnBackend(AttentionBackend):
         seq_len: int,
         num_real_tokens: int,
         lower_bound: float | None,
-        cu_seqlens_cpu: tuple[int, ...] | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Chunked scan of an extend/prefill batch, from the gathered state.
 
@@ -2086,11 +2086,12 @@ class MambaAttnBackend(AttentionBackend):
             seq_len: Padded token extent of the batch.
             num_real_tokens: Token extent excluding the graph padding tail.
             lower_bound: KDA decay clamp.
-            cu_seqlens_cpu: Metadata-built host copy of ``query_start_loc``'s
-                contents (see ``MambaForwardMetadata.cu_extend_seq_lens_cpu``). The
-                KDA override forwards it so the CuteDSL wrapper can plan
-                without a D2H read; the GDN scan plans on device and ignores
-                it.
+            cu_seqlens_cpu: Metadata-built host int64 copy of
+                ``query_start_loc``'s contents (see
+                ``MambaForwardMetadata.cu_extend_seq_lens_cpu``). The KDA
+                override forwards it so every prefill solution plans its
+                chunk indices on the host without a stream-synchronizing D2H
+                read; the GDN scan plans on device and ignores it.
 
         Returns:
             ``(core_attn_out, last_recurrent_state)``.

@@ -19,7 +19,6 @@
 # SOFTWARE.
 
 
-import torch
 from tokenspeed_scheduler import PD, Forward
 
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
@@ -183,37 +182,3 @@ class DisaggDecodeExecutor:
 
     def pop_remote_cache_slot(self, request_id: str) -> int | None:
         return self._remote_cache_slots.pop(request_id, None)
-
-    def reset_valid_cache_length(
-        self, forward_op, runtime_states, execution_stream, device
-    ):
-        num_extends = forward_op.num_extends()
-        if num_extends <= 0:
-            return
-
-        # A decode destination never executes the prompt locally, so the
-        # model executor cannot infer this state from a forward pass.  Seed
-        # the runtime row with the complete remotely-computed prompt length
-        # before the first local decode.  This is required for both cache
-        # layouts: Paged cache additionally uses the resulting sequence length to
-        # select the transferred recurrent-state snapshot block.
-        extend_request_pool_indices = torch.tensor(
-            forward_op.request_pool_indices[:num_extends],
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=True,
-        ).to(device, non_blocking=True)
-        extend_prefix_lens = torch.tensor(
-            forward_op.prefill_lengths[:num_extends],
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=True,
-        ).to(device, non_blocking=True)
-        # HostTodevice segment ends
-
-        execution_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(execution_stream):
-            if num_extends > 0:
-                runtime_states.reset_states(
-                    extend_request_pool_indices, extend_prefix_lens
-                )
