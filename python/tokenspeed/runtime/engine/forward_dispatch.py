@@ -122,10 +122,11 @@ class DecodeDispatcher(ForwardDispatcher):
         if forward_op.num_extends() > 0 and not forward_op.is_local_prefill():
             self._trigger_remote_receive(planned)
             return None, None
-        # Decode and local recovery-prefill batches execute normally.
-        # Constrained decoding is not wired through the D role, so no
-        # grammar inputs reach the forward here.
-        return self._submit(planned, grammar_inputs=None), None
+        # Decode and local recovery-prefill batches execute normally. The
+        # matcher of a constrained request was advanced past the prefill
+        # node's token when its RemotePrefillDoneEvent landed, so masking
+        # here continues from the right state.
+        return self._submit(planned, grammar_inputs=planned.grammar_inputs), None
 
     def _trigger_remote_receive(self, planned: PlannedForward) -> None:
         """Pull the remote KV in for requests admitted this round.
