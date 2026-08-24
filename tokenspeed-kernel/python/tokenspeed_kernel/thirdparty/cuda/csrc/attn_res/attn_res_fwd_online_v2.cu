@@ -469,7 +469,7 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
                     if constexpr (WRITE_BLOCK) {
                       *reinterpret_cast<int2*>(
                           block_res + (long long)tb * block_stride_m +
-                          block_write_idx * block_stride_r + h_base) = vp;
+                          (long long)block_write_idx * block_stride_r + h_base) = vp;
                     }
                   }
                   float2 f[2] = {__bfloat1622float2(v2[0]),
@@ -511,7 +511,7 @@ __global__ void __launch_bounds__(BLK, 1) attn_res_fwd_online_v2_kernel(
                 if constexpr (WRITE_BLOCK) {
                   *reinterpret_cast<int4*>(
                       block_res + (long long)tb * block_stride_m +
-                      block_write_idx * block_stride_r + h_base) = vp;
+                      (long long)block_write_idx * block_stride_r + h_base) = vp;
                 }
               }
               float2 f[4] = {
