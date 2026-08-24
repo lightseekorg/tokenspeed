@@ -61,7 +61,7 @@ def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
     monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
 
-    executor.reset_valid_cache_length(forward_op)
+    executor._reset_valid_cache_length(forward_op)
 
     assert executor.runtime_states.valid_cache_lengths[2].item() == 10
     assert executor.runtime_states.valid_cache_lengths[3].item() == 3

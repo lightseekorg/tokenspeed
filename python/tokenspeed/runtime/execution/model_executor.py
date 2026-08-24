@@ -48,13 +48,17 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.forward_thread import ForwardThread
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
-from tokenspeed.runtime.execution.types import ModelExecutionResult
+from tokenspeed.runtime.execution.types import (
+    DpForwardMetadata,
+    ModelExecutionResult,
+)
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.grammar.capturable_grammar import (
     create_grammar_runtime,
@@ -163,8 +167,6 @@ class ModelExecutorConfig:
     device: str
     gpu_id: int
     global_rank: int
-    num_total_pages: int
-    decode_log_interval: int
     cudagraph_capture_sizes: list[int] | None
     disable_cuda_graph_padding: bool
     max_cudagraph_capture_size: int
@@ -215,7 +217,6 @@ class ModelExecutorConfig:
         max_req_pool_size: int,
         gpu_id: int,
         global_rank: int,
-        num_total_pages: int,
         prefix_granularity: int,
         overlap_schedule_depth: int = 0,
     ) -> ModelExecutorConfig:
@@ -273,8 +274,6 @@ class ModelExecutorConfig:
             device=server_args.device,
             gpu_id=gpu_id,
             global_rank=global_rank,
-            num_total_pages=num_total_pages,
-            decode_log_interval=server_args.decode_log_interval,
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
             disable_autotune=server_args.disable_autotune,
@@ -562,8 +561,14 @@ class ModelExecutor:
         )
 
         self.execution_stream = torch.cuda.Stream()
+        # The data plane: every CUDA-touching operation after startup is
+        # submitted here and runs in FIFO order on one thread. The event loop
+        # (control plane) never blocks on the GPU, so its cross-rank gloo
+        # collectives always find every rank promptly regardless of GPU depth.
+        self.forward_thread = ForwardThread(self.device)
+        # Throttles the mm_timing line inside execute_forward_op; the
+        # per-round batch lines have their own counter on the control plane.
         self.log_step = 0
-        self._seen_prefill_ids: set[str] = set()
         self._prev_decode_bs: int = 0
         self._sentinel_neg1 = torch.tensor(-1, device=self.device, dtype=torch.int64)
         self.mm_runtime = MultimodalRuntime(
@@ -571,10 +576,6 @@ class ModelExecutor:
             input_buffers=self.input_buffers,
             device=self.device,
         )
-        # Decode stats — accumulated from synced results (no GPU sync needed)
-        self.num_generated_tokens = 0
-        self.num_decode_steps = 0
-        self.last_decode_stats_tic = time.time()
 
         set_random_seed(48)
 
@@ -1041,162 +1042,7 @@ class ModelExecutor:
             device=self.device,
         )
 
-    def accumulate_decode_stats(self, results: ModelExecutionResult, bs: int):
-        """Accumulate decode stats from already-synced results. No GPU sync."""
-        accept_lengths = results.output_lengths
-        self.num_generated_tokens += int(accept_lengths.sum().item())
-        self.num_decode_steps += bs
-        if (
-            LOG_SPEC_ACCEPT_LENGTHS
-            and self.config.global_rank == 0
-            and self.config.spec_num_steps
-        ):
-            accepted_widths = [int(value) for value in accept_lengths.tolist()]
-            accepted_draft_tokens = [max(0, value - 1) for value in accepted_widths]
-            logger.info(
-                "Spec verify step. accept_lengths=%s, accepted_draft_tokens=%s",
-                accepted_widths,
-                accepted_draft_tokens,
-            )
-            candidates = getattr(results, "spec_candidate_tokens", None)
-            if candidates is not None:
-                verify_width = int(self.config.spec_num_tokens)
-                candidate_rows = candidates.view(bs, verify_width)
-                target_rows = results.output_tokens.view(bs, verify_width)
-                # Candidate column j+1 is verified by the target token sampled
-                # from column j. The final target column is the bonus token.
-                draft_rows = candidate_rows[:, 1:]
-                target_draft_rows = target_rows[:, :-1]
-                logger.info(
-                    "Spec token compare. anchor=%s, draft=%s, target=%s, match=%s",
-                    candidate_rows[:, 0].tolist(),
-                    draft_rows.tolist(),
-                    target_draft_rows.tolist(),
-                    draft_rows.eq(target_draft_rows).tolist(),
-                )
-
-    def execute_forward_op_with_log(
-        self,
-        forward_op,
-        sampling_params_list: list[SamplingParams],
-        num_active_pages: int = 0,
-        num_cached_pages: int = 0,
-        num_queue_reqs: int = 0,
-        dp_global_num_tokens=None,
-        dp_global_bs=None,
-        dp_all_decode_or_idle: bool = False,
-        dp_all_extend: bool = False,
-        grammar_inputs=None,
-        multimodal_context=None,
-        capture_next_input_ids: bool = False,
-    ) -> ModelExecutionResult:
-        self.log_step += 1
-
-        num_extends = forward_op.num_extends()
-        bs = len(forward_op.request_ids)
-        is_decode = num_extends <= 0
-
-        if not is_decode and self.config.global_rank == 0:
-            mode = "Prefill" if num_extends == bs else "Mix"
-            total_tokens = sum(forward_op.input_lengths)
-            cached_tokens = sum(
-                pl
-                for rid, pl in zip(
-                    forward_op.request_ids[:num_extends],
-                    forward_op.extend_prefix_lens,
-                )
-                if rid not in self._seen_prefill_ids
-            )
-            if len(self._seen_prefill_ids) > 100_000:
-                self._seen_prefill_ids.clear()  # log-dedup only; bound the growth
-            self._seen_prefill_ids.update(forward_op.request_ids[:num_extends])
-            logger.info(
-                "%s batch. #new-seq: %s, #new-token: %s, #cached-token: %s, "
-                "#running-req: %s, #queue-req: %s",
-                mode,
-                num_extends,
-                total_tokens,
-                cached_tokens,
-                bs,
-                num_queue_reqs,
-            )
-
-        result = self.execute_forward_op(
-            forward_op,
-            sampling_params_list,
-            dp_global_num_tokens,
-            dp_global_bs,
-            dp_all_decode_or_idle,
-            dp_all_extend,
-            grammar_inputs=grammar_inputs,
-            multimodal_context=multimodal_context,
-            capture_next_input_ids=capture_next_input_ids,
-        )
-
-        if is_decode and (
-            self.config.global_rank == 0
-            and self.log_step % self.config.decode_log_interval == 0
-        ):
-            now = time.time()
-            gap = now - self.last_decode_stats_tic
-            gen_throughput = self.num_generated_tokens / gap if gap > 0 else 0
-            avg_accept = (
-                self.num_generated_tokens / self.num_decode_steps
-                if self.num_decode_steps > 0
-                else 0
-            )
-            accept_rate = (
-                (avg_accept - 1) / self.config.spec_num_steps
-                if self.config.spec_num_steps
-                else 0
-            )
-            num_total_pages = self.config.num_total_pages
-            page_ratio = (
-                num_active_pages / num_total_pages if num_total_pages > 0 else 0
-            )
-            if self.config.spec_num_steps:
-                logger.info(
-                    "Decode batch. #running-req: %s, "
-                    "#pages(active/cached/total): %s/%s/%s, "
-                    "page ratio: %.2f, gen throughput (token/s): %.2f, "
-                    "avg_accept_len: %.2f, accept_rate: %.2f, #queue-req: %s",
-                    bs,
-                    num_active_pages,
-                    num_cached_pages,
-                    num_total_pages,
-                    page_ratio,
-                    gen_throughput,
-                    avg_accept,
-                    accept_rate,
-                    num_queue_reqs,
-                )
-            else:
-                logger.info(
-                    "Decode batch. #running-req: %s, "
-                    "#pages(active/cached/total): %s/%s/%s, "
-                    "page ratio: %.2f, gen throughput (token/s): %.2f, "
-                    "#queue-req: %s",
-                    bs,
-                    num_active_pages,
-                    num_cached_pages,
-                    num_total_pages,
-                    page_ratio,
-                    gen_throughput,
-                    num_queue_reqs,
-                )
-            self.token_to_kv_pool.maybe_log_cache_group_pages()
-            self.num_generated_tokens = 0
-            self.num_decode_steps = 0
-            self.last_decode_stats_tic = now
-
-        return result
-
-    def execute_idle_forward(
-        self,
-        global_num_tokens: list[int],
-        global_bs: list[int],
-        all_decode_or_idle: bool,
-    ):
+    def execute_idle_forward(self, dp_metadata: DpForwardMetadata):
         """Run a zero-token forward so this rank participates in NCCL collectives.
 
         Called by the EventLoop when this DP rank has no work but other
@@ -1211,9 +1057,9 @@ class ModelExecutor:
             num_extends=0,
             input_num_tokens=0,
             forward_mode=graph_forward_mode,
-            global_num_tokens=global_num_tokens,
-            global_bs=global_bs,
-            all_decode_or_idle=all_decode_or_idle,
+            global_num_tokens=dp_metadata.global_num_tokens,
+            global_bs=dp_metadata.global_batch_size,
+            all_decode_or_idle=dp_metadata.all_decode_or_idle,
         )
         sampling_info = SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
@@ -1275,8 +1121,8 @@ class ModelExecutor:
                 # are decoding, step 0 sizes collectives from bs/global_bs.
                 draft_global_num_tokens = _draft_idle_global_num_tokens_for_step(
                     step_idx,
-                    global_num_tokens,
-                    global_bs,
+                    dp_metadata.global_num_tokens,
+                    dp_metadata.global_batch_size,
                 )
                 draft_ctx = ForwardContext(
                     attn_backend=self.drafter.attn_backend,
@@ -1286,8 +1132,8 @@ class ModelExecutor:
                     input_num_tokens=0,
                     forward_mode=ForwardMode.IDLE,
                     global_num_tokens=draft_global_num_tokens,
-                    global_bs=global_bs,
-                    all_decode_or_idle=all_decode_or_idle,
+                    global_bs=dp_metadata.global_batch_size,
+                    all_decode_or_idle=dp_metadata.all_decode_or_idle,
                 )
                 self.drafter.draft_model_runner.forward(
                     draft_ctx,
@@ -1361,7 +1207,15 @@ class ModelExecutor:
         return done
 
     @nvtx_range("reset_valid_cache_length", color="orange")
-    def reset_valid_cache_length(self, forward_op) -> None:
+    def _reset_valid_cache_length(self, forward_op) -> None:
+        """Rewind the prefill rows' valid cache lengths before a forward.
+
+        A forward's prologue, not a caller step: ``execute_forward_op`` runs
+        it on the forward thread so the state writes land on the execution
+        stream ahead of the model launches. (The PD-decode RDMA path has its
+        own variant on ``DisaggDecodeExecutor``, for batches that trigger a
+        remote receive instead of a forward.)
+        """
         num_extends = forward_op.num_extends()
         if num_extends == 0:
             return
@@ -1391,14 +1245,13 @@ class ModelExecutor:
         self,
         forward_op,
         sampling_params_list: list[SamplingParams],
-        dp_global_num_tokens=None,
-        dp_global_bs=None,
-        dp_all_decode_or_idle: bool = False,
-        dp_all_extend: bool = False,
+        dp_metadata: DpForwardMetadata | None = None,
         grammar_inputs=None,
         multimodal_context=None,
         capture_next_input_ids: bool = False,
     ) -> ModelExecutionResult:
+        self._reset_valid_cache_length(forward_op)
+        self.log_step += 1
         num_extends = forward_op.num_extends()
         total_tokens = sum(forward_op.input_lengths)
         self._active_multimodal_context = multimodal_context
@@ -1538,15 +1391,15 @@ class ModelExecutor:
                     decode_input_ids=decode_input_ids,
                 )
                 if self.config.data_parallel_size > 1:
-                    if dp_global_num_tokens is None:
+                    if dp_metadata is None:
                         raise RuntimeError(
                             "DP forward metadata must be gathered on CPU by "
                             "the event loop before model execution."
                         )
-                    ctx.global_num_tokens = dp_global_num_tokens
-                    ctx.global_bs = dp_global_bs
-                    ctx.all_decode_or_idle = dp_all_decode_or_idle
-                    ctx.all_extend = dp_all_extend
+                    ctx.global_num_tokens = dp_metadata.global_num_tokens
+                    ctx.global_bs = dp_metadata.global_batch_size
+                    ctx.all_decode_or_idle = dp_metadata.all_decode_or_idle
+                    ctx.all_extend = dp_metadata.all_extend
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_start = time.perf_counter() if timing_enabled else 0.0
                     sampling_info = self._build_sampling_info(bs, sampling_params_list)

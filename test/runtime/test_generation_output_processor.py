@@ -82,9 +82,6 @@ class _ExecutionResult:
     grammar_completion = None
     next_input_ids = None
 
-    def sync(self):
-        return None
-
 
 def _state(input_ids: list[int], *, computed_length: int = 0) -> RequestState:
     state = RequestState(
@@ -107,7 +104,9 @@ def test_mixed_forward_updates_reserve_for_decode_slots_only():
     processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
     processor.rid_to_state["decode"] = _state([5, 6, 7], computed_length=3)
 
-    events = processor.post_process_forward_op(_ForwardOp(), _ExecutionResult())
+    events = processor.post_process_forward_op(
+        _ForwardOp(), _ExecutionResult(), is_prefill_instance=False, on_first_token=None
+    )
 
     reserve_events = [
         event for event in events if type(event).__name__ == "UpdateReserveNumTokens"
@@ -154,7 +153,9 @@ def test_nan_flag_finishes_request_with_numerical_error():
     # Flag only the decode slot.
     result.output_nan_flags = torch.tensor([0, 1], dtype=torch.int32)
 
-    events = processor.post_process_forward_op(_ForwardOp(), result)
+    events = processor.post_process_forward_op(
+        _ForwardOp(), result, is_prefill_instance=False, on_first_token=None
+    )
 
     # Flagged request: aborted with NumericalError, removed from tracking.
     # The scheduler gets an Abort (NOT Finish) event — AbortEvent skips the
@@ -210,7 +211,9 @@ def test_nan_flag_keeps_single_sanitized_token():
     result.output_lengths = torch.tensor([3], dtype=torch.int32)
     result.output_nan_flags = torch.tensor([1], dtype=torch.int32)
 
-    events = processor.post_process_forward_op(_SpecForwardOp(), result)
+    events = processor.post_process_forward_op(
+        _SpecForwardOp(), result, is_prefill_instance=False, on_first_token=None
+    )
 
     assert decode_state.finished
     # Only the first of the 3 accepted tokens is kept.
@@ -237,6 +240,7 @@ def test_nan_flag_skips_first_token_pd_handoff():
     processor.post_process_forward_op(
         _ForwardOp(),
         result,
+        is_prefill_instance=False,
         on_first_token=lambda rid, *a: handoffs.append(rid),
     )
 
@@ -281,7 +285,12 @@ def test_log_request_stats_disabled_by_default():
             def num_extends(self):
                 return 0
 
-        processor.post_process_forward_op(_DecodeOp(), _ExecutionResult())
+        processor.post_process_forward_op(
+            _DecodeOp(),
+            _ExecutionResult(),
+            is_prefill_instance=False,
+            on_first_token=None,
+        )
     finally:
         gop.logger = gop_logger
 
@@ -449,7 +458,12 @@ def test_log_request_stats_records_timestamps_through_forward():
             def num_extends(self):
                 return 0
 
-        processor.post_process_forward_op(_DecodeOp(), _ExecutionResult())
+        processor.post_process_forward_op(
+            _DecodeOp(),
+            _ExecutionResult(),
+            is_prefill_instance=False,
+            on_first_token=None,
+        )
     finally:
         gop.logger = gop_logger
 
@@ -514,9 +528,6 @@ class _PrefillExecutionResult:
     output_nan_flags = None
     grammar_completion = None
     next_input_ids = torch.tensor([[101, 102, 103]], dtype=torch.int32)
-
-    def sync(self):
-        return None
 
 
 class _EmptyPrefillExecutionResult(_PrefillExecutionResult):
