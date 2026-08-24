@@ -500,9 +500,9 @@ void resolveWorkspace(int batchSize, int vocabSize, void* workspace,
 // (e.g. by the fused kernel's unifiedInitKernel).
 template <typename T>
 void launchRadixOnly(Counter<T>* counters, HisT<T>* histograms, IdxT* countHistograms,
-                     T* buf1, T* buf2, int batchSize, int vocabSize,
-                     cudaStream_t stream) {
-    auto launchPDL = [&](auto kernel, dim3 grid, dim3 block, size_t smem, auto... args) {
+                      T* buf1, T* buf2, int batchSize, int vocabSize,
+                      cudaStream_t stream, bool enablePDL) {
+    auto launch = [&](auto kernel, dim3 grid, dim3 block, size_t smem, auto... args) {
         cudaLaunchAttribute attr[1];
         attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
         attr[0].val.programmaticStreamSerializationAllowed = 1;
@@ -511,8 +511,8 @@ void launchRadixOnly(Counter<T>* counters, HisT<T>* histograms, IdxT* countHisto
         config.blockDim = block;
         config.dynamicSmemBytes = smem;
         config.stream = stream;
-        config.attrs = attr;
-        config.numAttrs = 1;
+        config.attrs = enablePDL ? attr : nullptr;
+        config.numAttrs = enablePDL ? 1 : 0;
         cudaLaunchKernelEx(&config, kernel, args...);
     };
 
@@ -523,8 +523,8 @@ void launchRadixOnly(Counter<T>* counters, HisT<T>* histograms, IdxT* countHisto
     dim3 grid(blockNum, batchSize);
     constexpr int numPasses = NUM_PASSES<T>;
     for (int pass = 0; pass < numPasses; ++pass) {
-        launchPDL(AirTopPRadixKernel<T>, grid, dim3(BLOCK_SIZE), 0, counters, histograms,
-                  countHistograms, pass, buf1, buf2);
+        launch(AirTopPRadixKernel<T>, grid, dim3(BLOCK_SIZE), 0, counters, histograms,
+               countHistograms, pass, buf1, buf2);
     }
 }
 
