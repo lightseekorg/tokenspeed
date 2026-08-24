@@ -20,6 +20,7 @@ server:
   command: >-
     ts serve
     --disable-kvstore
+    --disable-pdl
     --model nvidia/Kimi-K2.5-NVFP4
     --attn-tp-size 4
     --moe-tp-size 4
