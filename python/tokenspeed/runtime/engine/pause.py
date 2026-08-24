@@ -466,10 +466,8 @@ class PauseHooks:
             # release together, so skipping the idle forward stays consistent
             # across ranks (the small DP sync above still runs to keep lockstep).
             if dp_metadata.need_idle_forward and not self._pause.released:
-                loop.model_executor.execute_idle_forward(
-                    dp_metadata.global_num_tokens,
-                    dp_metadata.global_batch_size,
-                    dp_metadata.all_decode_or_idle,
+                loop.model_executor.forward_thread.run(
+                    lambda: loop.model_executor.execute_idle_forward(dp_metadata)
                 )
 
         time.sleep(_PAUSED_IDLE_SLEEP_S)

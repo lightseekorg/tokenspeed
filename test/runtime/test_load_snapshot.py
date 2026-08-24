@@ -361,135 +361,92 @@ def test_publisher_setup_failure_cleans_partial_resources_on_owner_thread(
     assert ("term", owner) in context.calls
 
 
-def test_event_loop_observation_projects_the_sampled_scheduler_values():
-    """The shared helper makes one observation without consulting an adapter."""
-    pytest.importorskip("tokenspeed_scheduler")
-    from tokenspeed.runtime.engine.event_loop import EventLoop
+def _reporter(trace, scheduler_state, *, enabled=True):
+    """A LoadReporter whose sink and scheduler sampler record every call."""
 
-    class StandardObservationLoop(EventLoop):
-        def __getattribute__(self, name):
-            if name == "send_to_tokenizer":
-                raise AssertionError("standard observation consulted output adapter")
-            return super().__getattribute__(name)
+    def sample_stats():
+        trace.append("sample")
+        return {
+            "num_queue_reqs": scheduler_state["waiting"],
+            "num_active_pages": scheduler_state["active"],
+            "num_cached_pages": scheduler_state["used"],
+        }
 
-    observed = []
-    loop = StandardObservationLoop.__new__(StandardObservationLoop)
-    loop.load_snapshot_publisher = SimpleNamespace(
-        observe=lambda values: observed.append(values)
-    )
-    loop.output_processor = SimpleNamespace(rid_to_state={"a": object(), "b": object()})
-    loop._scheduler_cache_geometry = SimpleNamespace(num_usable_pages=20)
-
-    loop._observe_load_snapshot(
-        {"num_queue_reqs": 3, "num_active_pages": 4, "num_cached_pages": 5}
+    return load_snapshot_module.LoadReporter(
+        SimpleNamespace(observe=lambda values: trace.append(("observe", values))),
+        num_total_pages=20,
+        sample_stats=sample_stats,
+        enabled=enabled,
     )
 
-    assert observed == [
-        observed_tuple(
-            num_running_reqs=2,
-            num_waiting_reqs=3,
-            num_active_pages=4,
-            num_used_pages=5,
-            max_total_pages=20,
+
+def test_running_round_publishes_the_sample_the_loop_already_took():
+    """The active path never samples again: the loop passes its own stats."""
+    trace = []
+    reporter = _reporter(trace, {"waiting": 3, "active": 4, "used": 5})
+
+    reporter.observe(
+        {"num_queue_reqs": 3, "num_active_pages": 4, "num_cached_pages": 5},
+        num_running=2,
+    )
+
+    assert trace == [
+        (
+            "observe",
+            observed_tuple(
+                num_running_reqs=2,
+                num_waiting_reqs=3,
+                num_active_pages=4,
+                num_used_pages=5,
+                max_total_pages=20,
+            ),
         )
     ]
 
 
-def _paused_observation_loop(trace, scheduler_state):
-    """An EventLoop shell with just the state _maybe_observe_paused_load reads."""
-    pytest.importorskip("tokenspeed_scheduler")
-    from tokenspeed.runtime.engine import event_loop as event_loop_module
-
-    loop = event_loop_module.EventLoop.__new__(event_loop_module.EventLoop)
-    loop.scheduler = SimpleNamespace(
-        available_kv_pages=lambda: (
-            trace.append("available"),
-            scheduler_state["available"],
-        )[1],
-        active_kv_pages=lambda: (
-            trace.append("active"),
-            scheduler_state["active"],
-        )[1],
-        waiting_size=lambda: (
-            trace.append("waiting"),
-            scheduler_state["waiting"],
-        )[1],
-    )
-    loop.output_processor = SimpleNamespace(rid_to_state={})
-    loop._scheduler_cache_geometry = SimpleNamespace(num_usable_pages=20)
-    loop.attn_tp_rank = 0
-    loop._load_snapshot_observed_while_paused = False
-    loop.load_snapshot_publisher = SimpleNamespace(
-        observe=lambda values: trace.append(("observe", values))
-    )
-    return loop
-
-
-def test_paused_load_observation_samples_once_until_marked_dirty():
-    """While frozen, the loop tail samples the load once per pause — and again
-    only after a round that changed scheduler state: committed request changes
-    or a dirty mark (new requests / cache-op completions). The sample is taken
-    at the tail, after the round's advance, so it reflects applied changes."""
+def test_frozen_rounds_sample_for_themselves():
+    """A frozen round has no planning sample of its own, so the reporter takes
+    one. Repeats are cheap: the sink dedups unchanged tuples (see
+    test_unchanged_values_only_emit_a_heartbeat), and the idle sleep bounds
+    the rate to one sample per millisecond."""
     trace = []
-    scheduler_state = {"available": 20, "active": 0, "waiting": 0}
-    loop = _paused_observation_loop(trace, scheduler_state)
+    scheduler_state = {"waiting": 0, "active": 0, "used": 0}
+    reporter = _reporter(trace, scheduler_state)
 
-    # First paused round observes; the latch suppresses the idle spin after it.
-    loop._maybe_observe_paused_load(had_changes=False)
-    loop._maybe_observe_paused_load(had_changes=False)
-
-    # A dirty mark (e.g. control traffic or a cache-op advance) forces one
-    # fresh sample of the mutated scheduler state.
-    scheduler_state.update(available=18, active=2, waiting=1)
-    loop._mark_load_snapshot_dirty()
-    loop._maybe_observe_paused_load(had_changes=False)
-
-    # A round that committed request changes re-samples even while latched.
-    scheduler_state.update(available=17, active=3, waiting=2)
-    loop._maybe_observe_paused_load(had_changes=True)
+    reporter.sample_and_observe(num_running=0)
+    scheduler_state.update(waiting=1, active=2, used=2)
+    reporter.sample_and_observe(num_running=0)
 
     assert trace == [
-        "available",
-        "active",
-        "waiting",
+        "sample",
         ("observe", (0, 0, 0, 0, 20)),
-        "available",
-        "active",
-        "waiting",
+        "sample",
         ("observe", (0, 1, 2, 2, 20)),
-        "available",
-        "active",
-        "waiting",
-        ("observe", (0, 2, 3, 3, 20)),
     ]
 
 
-def test_paused_load_observation_is_rank0_only():
+def test_non_reporting_rank_never_samples_the_scheduler():
     trace = []
-    loop = _paused_observation_loop(trace, {"available": 20, "active": 0, "waiting": 0})
-    loop.attn_tp_rank = 1
+    reporter = _reporter(trace, {"waiting": 0, "active": 0, "used": 0}, enabled=False)
 
-    loop._maybe_observe_paused_load(had_changes=True)
+    reporter.sample_and_observe(num_running=0)
 
     assert trace == []
 
 
 @pytest.mark.parametrize(
-    ("attn_tp_rank", "zmq_msgpack", "expected_sink"),
+    ("enabled", "direct", "expected_sink"),
     [
-        (0, False, "publisher"),
-        (1, False, "null"),
-        (0, True, "direct"),
-        (1, True, "null"),
+        (True, False, "publisher"),
+        (False, False, "null"),
+        (True, True, "direct"),
+        (False, True, "null"),
     ],
 )
-def test_event_loop_selects_load_snapshot_sink_once_for_each_mode(
-    monkeypatch, attn_tp_rank, zmq_msgpack, expected_sink
+def test_reporter_factory_selects_the_sink_for_each_mode(
+    monkeypatch, enabled, direct, expected_sink
 ):
-    """Only standard TP0 opens PUSH; direct TP0 binds its output setter."""
-    pytest.importorskip("tokenspeed_scheduler")
-    from tokenspeed.runtime.engine import event_loop as event_loop_module
-
+    """Only a reporting rank opens PUSH; direct mode binds its output setter."""
     created_publishers = []
     direct_setters = []
 
@@ -497,35 +454,23 @@ def test_event_loop_selects_load_snapshot_sink_once_for_each_mode(
         def __init__(self, endpoint, dp_rank, heartbeat_interval):
             created_publishers.append((endpoint, dp_rank, heartbeat_interval))
 
-        def observe(self, values):
-            return None
-
-        def close(self):
-            return None
-
     class FakeDirectSink:
         def __init__(self, setter):
             direct_setters.append(setter)
 
-        def observe(self, values):
-            return None
-
-        def close(self):
-            return None
-
-    monkeypatch.setattr(event_loop_module, "LoadSnapshotPublisher", FakePublisher)
-    monkeypatch.setattr(event_loop_module, "DirectLoadSnapshotSink", FakeDirectSink)
-    loop = event_loop_module.EventLoop.__new__(event_loop_module.EventLoop)
-    loop.attn_tp_rank = attn_tp_rank
-    loop.dp_rank = 4
-    loop.server_args = SimpleNamespace(
-        zmq_msgpack=zmq_msgpack, load_watch_interval=0.25
-    )
-    loop.port_args = SimpleNamespace(metrics_ipc_name="tcp://metrics")
+    monkeypatch.setattr(load_snapshot_module, "LoadSnapshotPublisher", FakePublisher)
+    monkeypatch.setattr(load_snapshot_module, "DirectLoadSnapshotSink", FakeDirectSink)
     set_load_snapshot = lambda *values: None
-    loop.send_to_tokenizer = SimpleNamespace(set_load_snapshot=set_load_snapshot)
 
-    loop._init_load_snapshot_publisher()
+    reporter = load_snapshot_module.create_load_reporter(
+        enabled=enabled,
+        direct_setter=set_load_snapshot if enabled and direct else None,
+        endpoint="tcp://metrics",
+        dp_rank=4,
+        heartbeat_interval=0.25,
+        num_total_pages=20,
+        sample_stats=dict,
+    )
 
     assert created_publishers == (
         [("tcp://metrics", 4, 0.25)] if expected_sink == "publisher" else []
@@ -533,9 +478,33 @@ def test_event_loop_selects_load_snapshot_sink_once_for_each_mode(
     assert direct_setters == ([set_load_snapshot] if expected_sink == "direct" else [])
     if expected_sink == "null":
         assert isinstance(
-            loop.load_snapshot_publisher,
-            event_loop_module.NullLoadSnapshotPublisher,
+            reporter._publisher, load_snapshot_module.NullLoadSnapshotPublisher
         )
+
+
+def test_event_loop_binds_the_output_setter_only_where_it_exists():
+    """Non-reporting ranks send through a NullSender with no snapshot setter,
+    so the loop must not reach for it while wiring the reporter."""
+    pytest.importorskip("tokenspeed_scheduler")
+    from tokenspeed.runtime.engine import event_loop as event_loop_module
+
+    class TrapSender:
+        def __getattr__(self, name):
+            raise AssertionError(f"non-reporting rank consulted the sender: {name}")
+
+    loop = event_loop_module.EventLoop.__new__(event_loop_module.EventLoop)
+    loop.attn_tp_rank = 1
+    loop.dp_rank = 4
+    loop.server_args = SimpleNamespace(zmq_msgpack=True, load_watch_interval=0.25)
+    loop.port_args = SimpleNamespace(metrics_ipc_name="tcp://metrics")
+    loop.send_to_tokenizer = TrapSender()
+    loop._scheduler_cache_geometry = SimpleNamespace(num_usable_pages=20)
+
+    loop._init_load_reporter()
+
+    assert isinstance(
+        loop.load_reporter._publisher, load_snapshot_module.NullLoadSnapshotPublisher
+    )
 
 
 def test_load_snapshot_is_immutable_and_positional():

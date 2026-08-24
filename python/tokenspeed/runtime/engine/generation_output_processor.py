@@ -55,7 +55,6 @@ if TYPE_CHECKING:
     )
 
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 logger = get_colorful_logger(__name__)
 
@@ -588,16 +587,13 @@ class OutputProcesser:
         self,
         forward_op,
         model_execution_results: ModelExecutionResult,
-        is_prefill_instance: bool = False,
-        on_first_token=None,
+        is_prefill_instance: bool,
+        on_first_token,
     ):
         self.add_cached_tokens(
             forward_op.request_ids,
             forward_op.extend_prefix_lens,
         )
-        with nvtx_range("commit:sync", color="red"):
-            model_execution_results.sync()
-
         self._emit_spec_decode_metrics(forward_op, model_execution_results)
 
         # Wait briefly for the next step's build hostfunc to advance

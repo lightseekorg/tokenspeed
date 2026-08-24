@@ -90,7 +90,11 @@ class PdTransferHooks:
                         and not remaining_state.to_abort
                         and not remaining_state.finished
                     ):
-                        loop.model_executor.mark_remote_cache_ready(remote_cache_slot)
+                        loop.model_executor.forward_thread.run(
+                            lambda slot=remote_cache_slot: (
+                                loop.model_executor.mark_remote_cache_ready(slot)
+                            )
+                        )
             elif isinstance(event, PD.FailedEvent):
                 # A PD/EPD transfer failed: the decode KV receiver timed out (e.g. the
                 # prefill aborted on embedding timeout so the KV never arrives), or a
