@@ -299,6 +299,10 @@ def current_platform() -> PlatformInfo:
     return Platform.get()
 
 
+def _pdl_enabled(requested: bool = True) -> bool:
+    return requested and os.environ.get("TOKENSPEED_DISABLE_PDL") != "1"
+
+
 # ---------------------------------------------------------------------------
 # Detection implementation
 # ---------------------------------------------------------------------------

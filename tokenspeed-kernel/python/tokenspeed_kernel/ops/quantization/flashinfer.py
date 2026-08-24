@@ -20,6 +20,7 @@ import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
+    _pdl_enabled,
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
@@ -62,7 +63,7 @@ if platform.is_nvidia:
         x: torch.Tensor,
         enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return mxfp8_quantize(x, False)
+        return mxfp8_quantize(x, False, enable_pdl=_pdl_enabled(enable_pdl))
 
 
 if platform.is_nvidia and platform.is_blackwell:
@@ -100,7 +101,7 @@ if platform.is_nvidia and platform.is_blackwell:
             global_scale=scale_inv,
             sf_vec_size=16,
             is_sf_swizzled_layout=scale_layout == "swizzled",
-            enable_pdl=enable_pdl,
+            enable_pdl=_pdl_enabled(enable_pdl),
         )
 
 

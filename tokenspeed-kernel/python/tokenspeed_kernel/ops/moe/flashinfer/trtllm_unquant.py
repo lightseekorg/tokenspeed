@@ -25,6 +25,7 @@ from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
+    _pdl_enabled,
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -109,6 +110,7 @@ if platform.is_nvidia:
         topk_weights: torch.Tensor | None,
         topk_ids: torch.Tensor | None,
         do_finalize: bool,
+        enable_pdl: bool,
         routed: bool,
     ):
         """Shared body for the in-kernel-routing and precomputed-topk variants.
@@ -141,6 +143,7 @@ if platform.is_nvidia:
             local_expert_offset=getattr(w, "ep_rank", 0) * local_experts,
             local_num_experts=local_experts,
             do_finalize=do_finalize,
+            enable_pdl=enable_pdl,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
         )
 
@@ -245,6 +248,7 @@ if platform.is_nvidia:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ):
+        enable_pdl = _pdl_enabled(enable_pdl)
         return _flashinfer_trtllm_unquant_moe_apply(
             x,
             w,
@@ -252,6 +256,7 @@ if platform.is_nvidia:
             topk_weights,
             topk_ids,
             do_finalize,
+            enable_pdl,
             routed=False,
         )
 
@@ -300,6 +305,7 @@ if platform.is_nvidia:
         assert (
             topk_weights is not None and topk_ids is not None
         ), "precomputed_topk plan requires topk_weights and topk_ids"
+        enable_pdl = _pdl_enabled(enable_pdl)
         return _flashinfer_trtllm_unquant_moe_apply(
             x,
             w,
@@ -307,5 +313,6 @@ if platform.is_nvidia:
             topk_weights,
             topk_ids,
             do_finalize,
+            enable_pdl,
             routed=True,
         )

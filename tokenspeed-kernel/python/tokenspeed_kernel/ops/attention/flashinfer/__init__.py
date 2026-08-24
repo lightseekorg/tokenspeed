@@ -27,6 +27,7 @@ import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
+    _pdl_enabled,
     current_platform,
 )
 from tokenspeed_kernel.registry import ErrorClass, Priority, error_fn, register_kernel
@@ -204,6 +205,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             sinks=sinks,
             out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
             causal=is_causal,
+            enable_pdl=_pdl_enabled(),
         )
 
     @register_kernel(
@@ -275,6 +277,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             sinks=sinks,
             out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
             q_len_per_req=max_seqlen_q,
+            enable_pdl=_pdl_enabled(),
         )
 
     @register_kernel(
@@ -359,6 +362,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             sparse_mla_top_k=topk_slots.shape[-1],
             bmm1_scale=float(k_scale) * float(softmax_scale),
             backend="trtllm-gen",
+            enable_pdl=_pdl_enabled(),
         )
         result = result.reshape(num_tokens, q_kernel.shape[2], int(kv_lora_rank))
         if out is not None:

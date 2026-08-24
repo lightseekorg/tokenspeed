@@ -58,6 +58,7 @@ from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.common import fp8_cast_contiguous
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -362,6 +363,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             sinks=attention_sink,
             out_dtype=self.dtype,
             q_len_per_req=metadata.max_seq_len_q,
+            enable_pdl=pdl_enabled(),
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -405,6 +407,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
             out_dtype=self.dtype,
+            enable_pdl=pdl_enabled(),
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
