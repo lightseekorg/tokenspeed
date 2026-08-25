@@ -712,7 +712,6 @@ def gluon_dsv4_indexer_prefill_topk_mxfp4_gfx950(
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
     """Score page-planar MXFP4 keys and return logical prefill offsets."""
 
-    del cu_seqlen_k_end, gathered_k, gather_workspace
     if index_k_format != "mxfp4":
         raise ValueError("GFX950 DSV4 indexer only supports index_k_format='mxfp4'")
     q = index_q[0]
@@ -779,7 +778,6 @@ def gluon_dsv4_indexer_decode_topk_mxfp4_gfx950(
 ) -> torch.Tensor:
     """Score page-planar MXFP4 keys and return logical decode offsets."""
 
-    del plan, persistent_topk_workspace
     if index_k_format != "mxfp4":
         raise ValueError("GFX950 DSV4 indexer only supports index_k_format='mxfp4'")
     q = index_q[0]

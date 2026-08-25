@@ -309,8 +309,6 @@ if platform.is_amd:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ):
-        del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
-        del enable_pdl
         return _gluon_mxfp4_a16w4_ep_precomputed_moe_apply(
             x,
             w,
