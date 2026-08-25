@@ -51,7 +51,9 @@ LD_LIBRARY_PATH="${rocm_root}/lib:${LD_LIBRARY_PATH:-}" \
         -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=OFF
-cmake --build "${ROCJITSU_BUILD_DIR}" --target rocjitsu_bin --parallel 4
+cmake --build "${ROCJITSU_BUILD_DIR}" \
+    --target rocjitsu_bin rocjitsu_shared \
+    --parallel 4
 
 test -x "${ROCJITSU_BUILD_DIR}/tools/rocjitsu/rocjitsu"
 test -f "${ROCJITSU_SOURCE_DIR}/configs/gfx1250_mi455x.json"

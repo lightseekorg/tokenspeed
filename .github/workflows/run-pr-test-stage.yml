@@ -66,7 +66,8 @@ jobs:
 
       - name: Restore MI450 simulator cache
         if: matrix.runner == 'amd-mi450-sim'
-        uses: actions/cache@v4
+        id: mi450-simulator-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cache/pip
@@ -97,6 +98,16 @@ jobs:
             --only-stage install \
             --keep-runner-state \
             --result-json .ci-artifacts/result.json
+
+      - name: Save MI450 simulator cache
+        if: matrix.runner == 'amd-mi450-sim' && steps.mi450-simulator-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/uv
+            ${{ runner.temp }}/tokenspeed-mi450-sim
+          key: ${{ steps.mi450-simulator-cache.outputs.cache-primary-key }}
 
       - name: Execute CI task
         run: |
