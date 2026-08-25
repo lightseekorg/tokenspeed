@@ -51,6 +51,14 @@ Consequences:
   cannot proceed without the result. A new blocking method on the per-round
   path is a bug.
 
+The rule is also mechanically enforceable: ``TOKENSPEED_GUARD_CONTROL_PLANE=1``
+pushes a thread-local dispatch mode over the loop that raises on any CUDA
+tensor op run from the control thread, while event waits — the inbound
+channel — pass untouched (they are not dispatch ops). Opt-in for now: EPD
+prefill admission still allocates CUDA receive buffers and runs NCCL
+reassembly on the control plane, a known pre-existing violation to route
+through the handle before the guard can be always-on.
+
 ### The capture contract
 
 Information crosses to the data plane **only** inside the submitted closure,

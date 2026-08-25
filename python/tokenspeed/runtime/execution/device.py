@@ -66,10 +66,15 @@ See ``forward_thread.py`` for the capture contract each closure must satisfy.
 
 from __future__ import annotations
 
+import contextlib
+import os
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any
+
+import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from tokenspeed.runtime.execution.types import DpForwardMetadata, PendingExecution
 
@@ -669,6 +674,70 @@ def build_device_side(
         wiring=DeviceWiring(executor),
         handle=DeviceHandle(executor, l2_cache_executor=l2_cache_executor),
     )
+
+
+class _NoDeviceWork(TorchDispatchMode):
+    """Raise on any torch op that touches a CUDA tensor or device.
+
+    Thread-local by construction (dispatch modes are per-thread stacks), so
+    pushing it on the control-plane thread bans device work THERE while the
+    forward thread runs free — the per-thread "no CUDA context" that CUDA's
+    process-wide primary context cannot give us.
+
+    Deliberately porous in exactly the shape of the contract:
+
+    - ``cuda.Event`` create/record/query/synchronize are not dispatch ops, so
+      the inbound channel (``PendingExecution.result``, cache-result polling)
+      passes untouched. The flip side: raw stream/event API misuse is not
+      caught — this guard covers tensor ops (launches, copies, allocations),
+      the dominant accident class.
+    - Classic ``torch.distributed`` collectives bypass ``__torch_dispatch__``;
+      a CUDA collective on the control plane would only be caught via the
+      tensor ops that prepare it.
+
+    Known flagged path: EPD prefill admission allocates CUDA receive buffers
+    and runs NCCL reassembly on the control plane today, so the guard stays
+    opt-in until that work is routed through the device handle.
+    """
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        stack = list(args) + list(kwargs.values())
+        while stack:
+            value = stack.pop()
+            if isinstance(value, torch.Tensor):
+                if value.device.type == "cuda":
+                    raise RuntimeError(
+                        f"control-plane thread ran {func} on a CUDA tensor; "
+                        "device work crosses only through DeviceHandle — see "
+                        "docs/design/event-loop.md Principle 1"
+                    )
+            elif isinstance(value, torch.device):
+                if value.type == "cuda":
+                    raise RuntimeError(
+                        f"control-plane thread ran CUDA factory {func}; "
+                        "device work crosses only through DeviceHandle — see "
+                        "docs/design/event-loop.md Principle 1"
+                    )
+            elif isinstance(value, (list, tuple)):
+                stack.extend(value)
+        return func(*args, **kwargs)
+
+
+def maybe_control_plane_guard():
+    """The event loop's opt-in enforcement of Principle 1, or a no-op.
+
+    Enabled with ``TOKENSPEED_GUARD_CONTROL_PLANE=1`` (dev / CI / e2e runs);
+    off by default because EPD admission still does device work on the
+    control plane (see ``_NoDeviceWork``) and because every control-plane
+    CPU tensor op pays the dispatch-mode hook (~10us) while enabled.
+
+    Returns:
+        A context manager: the guard mode when enabled, else a null context.
+    """
+    if os.environ.get("TOKENSPEED_GUARD_CONTROL_PLANE") == "1":
+        return _NoDeviceWork()
+    return contextlib.nullcontext()
 
 
 def _clear_kv_buffers(executor) -> None:

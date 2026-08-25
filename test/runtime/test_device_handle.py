@@ -347,6 +347,45 @@ def test_a_request_with_no_pending_features_releases_inline():
 
 
 # ----------------------------------------------------------------------
+# The opt-in dispatch guard: device work on the control thread raises.
+# ----------------------------------------------------------------------
+
+
+def test_the_guard_rejects_cuda_factories_before_they_run():
+    """Caught at dispatch, so this holds even on a CUDA-less machine."""
+    from tokenspeed.runtime.execution.device import _NoDeviceWork
+
+    with _NoDeviceWork():
+        cpu = torch.zeros(3)
+        cpu += 1  # CPU work passes
+        with pytest.raises(RuntimeError, match="Principle 1"):
+            torch.empty(2, device="cuda")
+
+
+def test_the_guard_scans_tensor_lists():
+    from tokenspeed.runtime.execution.device import _NoDeviceWork
+
+    with _NoDeviceWork():
+        # aten::cat takes a List[Tensor]; the scan must descend into it.
+        out = torch.cat([torch.ones(2), torch.ones(2)])
+        assert out.numel() == 4
+
+
+def test_the_guard_is_opt_in(monkeypatch):
+    import contextlib
+
+    from tokenspeed.runtime.execution.device import (
+        _NoDeviceWork,
+        maybe_control_plane_guard,
+    )
+
+    monkeypatch.delenv("TOKENSPEED_GUARD_CONTROL_PLANE", raising=False)
+    assert isinstance(maybe_control_plane_guard(), contextlib.nullcontext)
+    monkeypatch.setenv("TOKENSPEED_GUARD_CONTROL_PLANE", "1")
+    assert isinstance(maybe_control_plane_guard(), _NoDeviceWork)
+
+
+# ----------------------------------------------------------------------
 # Visibility: the loop cannot name a device object, so it cannot keep one.
 # ----------------------------------------------------------------------
 

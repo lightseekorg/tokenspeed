@@ -57,7 +57,10 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     should_use_overlap_schedule,
 )
 from tokenspeed.runtime.epd.prefill_hooks import EpdPrefillHooks
-from tokenspeed.runtime.execution.device import build_device_side
+from tokenspeed.runtime.execution.device import (
+    build_device_side,
+    maybe_control_plane_guard,
+)
 from tokenspeed.runtime.execution.distributed_initializer import (
     DistributedConfig,
     DistributedInitializer,
@@ -1028,133 +1031,139 @@ class EventLoop:
         """
         in_flight: deque = deque()
         depth = self.in_flight_depth
-        while not self._shutdown_complete():
-            self._process_new_requests()
+        # Opt-in Principle-1 enforcement (TOKENSPEED_GUARD_CONTROL_PLANE=1):
+        # a thread-local dispatch mode that raises on any CUDA tensor op run
+        # from this thread. Event waits pass; they are the inbound channel.
+        with maybe_control_plane_guard():
+            while not self._shutdown_complete():
+                self._process_new_requests()
 
-            # EPD prefill: admit requests whose async embedding receives completed
-            # this cycle (rank-synced). Fixed position right after
-            # _process_new_requests so the drain's TP collective ordering is
-            # rank-identical every cycle. A no-op without an EPD admission
-            # controller (every non-EPD deployment).
-            self._epd_hooks.drain_ready_embeddings()
-            cache_events = self._cache_hooks.poll_ready_events()
-            if cache_events:
-                # Advanced at the HEAD of the round (not funneled into the
-                # tail advance) so completed cache ops are visible to this
-                # round's next_execution_plan — deferring them would delay
-                # cache-gated admissions by a full round.
-                advance_scheduler(self.scheduler, cache_events)
+                # EPD prefill: admit requests whose async embedding receives completed
+                # this cycle (rank-synced). Fixed position right after
+                # _process_new_requests so the drain's TP collective ordering is
+                # rank-identical every cycle. A no-op without an EPD admission
+                # controller (every non-EPD deployment).
+                self._epd_hooks.drain_ready_embeddings()
+                cache_events = self._cache_hooks.poll_ready_events()
+                if cache_events:
+                    # Advanced at the HEAD of the round (not funneled into the
+                    # tail advance) so completed cache ops are visible to this
+                    # round's next_execution_plan — deferring them would delay
+                    # cache-gated admissions by a full round.
+                    advance_scheduler(self.scheduler, cache_events)
 
-            # Every path in this round appends its committed results here;
-            # they feed back into the scheduler through the single
-            # advance_scheduler call at the tail.
-            request_changes = []
-            forward_op = None
-            # An idle round (freeze or DP idle) runs no dispatch and — as
-            # before the paths were unified — no kv-transfer event poll.
-            idle_round = False
+                # Every path in this round appends its committed results here;
+                # they feed back into the scheduler through the single
+                # advance_scheduler call at the tail.
+                request_changes = []
+                forward_op = None
+                # An idle round (freeze or DP idle) runs no dispatch and — as
+                # before the paths were unified — no kv-transfer event poll.
+                idle_round = False
 
-            if self._pause.forward_blocked:
-                # Freeze: dispatched forwards can't be un-launched; commit them
-                # all before idling.
-                request_changes.extend(self._drain_in_flight(in_flight))
-                self._pause_hooks.paused_idle_step()
-                idle_round = True
-            else:
-                execution_plan = self.scheduler.next_execution_plan()
-                # Submitted, not awaited: the forward thread's FIFO order
-                # already places the zeroing before this round's forward. Only
-                # the PD-decode RDMA barrier needs the completion event, and
-                # it resolves the future from inside the thread.
-                cache_zero_future = self._device.submit_page_zeroing(
-                    execution_plan.pages_to_zero
-                )
-                self._cache_hooks.submit(execution_plan)
-
-                forward_op = self._get_forward_op(execution_plan)
-                stats = self._get_scheduler_stats()
-                self.load_reporter.observe(stats, self._num_running())
-                num_iter_tokens = (
-                    sum(forward_op.input_lengths) if forward_op is not None else 0
-                )
-                # Record once per iteration, from the same pre-dispatch
-                # snapshot as ``stats`` (the running gauge counts requests
-                # admitted but not yet committed-finished this round —
-                # consistent with waiting/pages).
-                self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
-
-                # DP sync: all ranks must participate even when idle. Checked
-                # right after forward_op is derived so an idle round commits
-                # pending steps and skips the per-batch work below (the
-                # gathers are local and read-only, so ordering them after the
-                # collective is rank-safe).
-                dp_metadata = None
-                if self.has_dp:
-                    dp_metadata = self._dp_sync_and_check(forward_op)
-                    if dp_metadata.need_idle_forward:
-                        request_changes.extend(self._drain_in_flight(in_flight))
-                        self._device.run_idle_forward(dp_metadata)
-                        idle_round = True
-
-            if not idle_round:
-                # Nothing to dispatch (an empty plan) still reaches the drain
-                # below — only this dispatch half is skipped.
-                if forward_op is not None:
-                    # Gather sampling params and grammar state BEFORE any
-                    # pending commit below — a commit can finish requests and
-                    # pop them from output_processor.rid_to_state, which would
-                    # KeyError on rids still present in the current forward_op.
-                    sampling_params_list = self._gather_sampling_params(forward_op)
-                    grammar_inputs = self._gather_grammar_state(forward_op)
-
-                    if in_flight and self._dispatch_depends_on_pending_commit(
-                        forward_op, grammar_inputs
-                    ):
-                        request_changes.extend(self._drain_in_flight(in_flight))
-
-                    self._mark_stats_scheduled(forward_op)
-                    self._batch_logger.log_dispatch(forward_op, stats)
-                    pending, on_first_token = self._dispatch_forward(
-                        forward_op,
-                        sampling_params_list,
-                        dp_metadata=dp_metadata,
-                        grammar_inputs=grammar_inputs,
-                        cache_zero_future=cache_zero_future,
+                if self._pause.forward_blocked:
+                    # Freeze: dispatched forwards can't be un-launched; commit them
+                    # all before idling.
+                    request_changes.extend(self._drain_in_flight(in_flight))
+                    self._pause_hooks.paused_idle_step()
+                    idle_round = True
+                else:
+                    execution_plan = self.scheduler.next_execution_plan()
+                    # Submitted, not awaited: the forward thread's FIFO order
+                    # already places the zeroing before this round's forward. Only
+                    # the PD-decode RDMA barrier needs the completion event, and
+                    # it resolves the future from inside the thread.
+                    cache_zero_future = self._device.submit_page_zeroing(
+                        execution_plan.pages_to_zero
                     )
-                    if pending is not None:
-                        in_flight.append((forward_op, pending, on_first_token))
+                    self._cache_hooks.submit(execution_plan)
 
-                # Commit from the head once the queue exceeds the depth
-                # (immediately at depth 0; one step behind at depth 1; a full
-                # pipeline behind under PP). A round with no new work drains
-                # fully so results never wait on future traffic.
-                effective_depth = depth if forward_op is not None else 0
-                while len(in_flight) > effective_depth:
-                    fo, res, oft = in_flight.popleft()
-                    request_changes.extend(self._commit_forward_results(fo, res, oft))
+                    forward_op = self._get_forward_op(execution_plan)
+                    stats = self._get_scheduler_stats()
+                    self.load_reporter.observe(stats, self._num_running())
+                    num_iter_tokens = (
+                        sum(forward_op.input_lengths) if forward_op is not None else 0
+                    )
+                    # Record once per iteration, from the same pre-dispatch
+                    # snapshot as ``stats`` (the running gauge counts requests
+                    # admitted but not yet committed-finished this round —
+                    # consistent with waiting/pages).
+                    self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
 
-                request_changes.extend(self._pd_hooks.poll_transfer_events())
+                    # DP sync: all ranks must participate even when idle. Checked
+                    # right after forward_op is derived so an idle round commits
+                    # pending steps and skips the per-batch work below (the
+                    # gathers are local and read-only, so ordering them after the
+                    # collective is rank-safe).
+                    dp_metadata = None
+                    if self.has_dp:
+                        dp_metadata = self._dp_sync_and_check(forward_op)
+                        if dp_metadata.need_idle_forward:
+                            request_changes.extend(self._drain_in_flight(in_flight))
+                            self._device.run_idle_forward(dp_metadata)
+                            idle_round = True
 
-            # The forward-result feedback point: everything this round
-            # committed reaches the scheduler here, before the next round
-            # plans. (Cache-op completions advance at the head instead — see
-            # _cache_hooks.poll_ready_events — but through the same advance_scheduler,
-            # the only caller of scheduler.advance.)
-            if request_changes:
-                advance_scheduler(self.scheduler, request_changes)
+                if not idle_round:
+                    # Nothing to dispatch (an empty plan) still reaches the drain
+                    # below — only this dispatch half is skipped.
+                    if forward_op is not None:
+                        # Gather sampling params and grammar state BEFORE any
+                        # pending commit below — a commit can finish requests and
+                        # pop them from output_processor.rid_to_state, which would
+                        # KeyError on rids still present in the current forward_op.
+                        sampling_params_list = self._gather_sampling_params(forward_op)
+                        grammar_inputs = self._gather_grammar_state(forward_op)
 
-            # Publish KV events once per round, after the last scheduler
-            # mutation: the drain empties everything the round accumulated
-            # (head cache advance, plan, tail advance) in order, as one batch.
-            self._publish_scheduler_kv_events()
+                        if in_flight and self._dispatch_depends_on_pending_commit(
+                            forward_op, grammar_inputs
+                        ):
+                            request_changes.extend(self._drain_in_flight(in_flight))
 
-            if self._pause.forward_blocked:
-                # Frozen rounds take no planning sample of their own; the
-                # idle sleep bounds this to one sample per millisecond.
-                self.load_reporter.sample_and_observe(self._num_running())
+                        self._mark_stats_scheduled(forward_op)
+                        self._batch_logger.log_dispatch(forward_op, stats)
+                        pending, on_first_token = self._dispatch_forward(
+                            forward_op,
+                            sampling_params_list,
+                            dp_metadata=dp_metadata,
+                            grammar_inputs=grammar_inputs,
+                            cache_zero_future=cache_zero_future,
+                        )
+                        if pending is not None:
+                            in_flight.append((forward_op, pending, on_first_token))
 
-            # Resolve a deferred abort/wait pause reply once in-flight work drains.
-            self._pause.maybe_finish_drain(self.scheduler)
+                    # Commit from the head once the queue exceeds the depth
+                    # (immediately at depth 0; one step behind at depth 1; a full
+                    # pipeline behind under PP). A round with no new work drains
+                    # fully so results never wait on future traffic.
+                    effective_depth = depth if forward_op is not None else 0
+                    while len(in_flight) > effective_depth:
+                        fo, res, oft = in_flight.popleft()
+                        request_changes.extend(
+                            self._commit_forward_results(fo, res, oft)
+                        )
+
+                    request_changes.extend(self._pd_hooks.poll_transfer_events())
+
+                # The forward-result feedback point: everything this round
+                # committed reaches the scheduler here, before the next round
+                # plans. (Cache-op completions advance at the head instead — see
+                # _cache_hooks.poll_ready_events — but through the same advance_scheduler,
+                # the only caller of scheduler.advance.)
+                if request_changes:
+                    advance_scheduler(self.scheduler, request_changes)
+
+                # Publish KV events once per round, after the last scheduler
+                # mutation: the drain empties everything the round accumulated
+                # (head cache advance, plan, tail advance) in order, as one batch.
+                self._publish_scheduler_kv_events()
+
+                if self._pause.forward_blocked:
+                    # Frozen rounds take no planning sample of their own; the
+                    # idle sleep bounds this to one sample per millisecond.
+                    self.load_reporter.sample_and_observe(self._num_running())
+
+                # Resolve a deferred abort/wait pause reply once in-flight work drains.
+                self._pause.maybe_finish_drain(self.scheduler)
 
     def _mark_stats_scheduled(self, forward_op) -> None:
         # Stamp the pre-forward "scheduled" time on each request's stats tracker
