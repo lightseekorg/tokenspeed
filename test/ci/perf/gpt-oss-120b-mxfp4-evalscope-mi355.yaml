@@ -1,5 +1,5 @@
 api_version: ci.tokenspeed.io/v1
-name: perf-gpt-oss-120b-mxfp4-mi35x
+name: perf-gpt-oss-120b-mxfp4-mi355
 type: perf
 workflow_stage: model-test
 triggers:
@@ -59,7 +59,7 @@ perf:
     --max-tokens 1024
     --parallel 1 2 4 8 16
     --number 5 10 20 40 80
-    --warmup-num 16
+    --warmup-num 4
     --rate -1
     --seed 1
     --temperature 0
