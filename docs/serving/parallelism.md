@@ -43,6 +43,26 @@ Kimi-K3 TP8 deployments must combine `--tensor-parallel-size 8` with
 `--mm-encoder-tp-mode data`. This keeps the text model at TP8 while running the
 wide-QKV MoonViT encoder at TP1 with whole-item DP8.
 
+### Pinning a request to an attention-DP rank
+
+Each attention-DP rank owns a private prefix cache, so multi-turn requests
+only reuse their cache when every turn lands on the same rank. The
+`data_parallel_rank` request field (`Engine.generate` / `async_generate`, or
+the gateway's gRPC protocol) pins a request to one rank: it dispatches
+straight there, bypassing load balancing — overload spill is the router's
+job. An invalid pin fails that request; the engine keeps serving. Engines
+without attention DP drop the pin.
+
+Disaggregation engines ignore the pin: the `bootstrap_room` residue
+(`room % dp_size`) governs prefill placement (and decode placement under
+`round_robin`), so steer placement by minting the room instead. A
+conflicting pin is logged and ignored, never rejected.
+
+With the bundled gateway, pass `--policy cache_aware --dp-aware` to
+`ts serve` to enable per-rank affinity routing. This requires bundled smg
+releases that carry the TokenSpeed dp-affinity support; see the lockstep
+note in `serve_smg.py`.
+
 ## MoE Deployments
 
 Large MoE models usually choose one of these shapes:

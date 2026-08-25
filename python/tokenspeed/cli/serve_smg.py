@@ -163,10 +163,35 @@ def _gateway_args_with_default_reasoning_parser(gateway_args: list[str]) -> list
     return [*gateway_args, "--reasoning-parser", DEFAULT_REASONING_PARSER]
 
 
+def _operator_policy(gateway_args: list[str]) -> str | None:
+    """The operator's explicit ``--policy`` value (last-wins), or None.
+
+    Call before ``_gateway_args_with_default_policy`` injects a default.
+    """
+    policy = None
+    for i, arg in enumerate(gateway_args):
+        if arg == "--policy" and i + 1 < len(gateway_args):
+            policy = gateway_args[i + 1]
+        elif arg.startswith("--policy="):
+            policy = arg.split("=", 1)[1]
+    return policy
+
+
 def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str]:
-    """Append smg reliability and load-monitoring disable switches when absent."""
+    """Append smg reliability and load-monitoring disable switches when absent.
+
+    ``--policy cache_aware`` keeps load monitoring: its imbalance/overload
+    triggers feed on the worker load monitor.
+
+    NOTE: ``--dp-aware`` is deliberately NOT auto-injected — rank pinning
+    needs smg releases with TokenSpeed dp-affinity support; bump the
+    tokenspeed-smg* pins in lockstep before enabling it.
+    """
+    keep_load_monitoring = _operator_policy(gateway_args) == "cache_aware"
     result = list(gateway_args)
     for flag in _DEFAULT_SMG_DISABLE_FLAGS:
+        if flag == "--disable-load-monitoring" and keep_load_monitoring:
+            continue
         if flag not in result:
             result.append(flag)
     return result
@@ -192,7 +217,7 @@ def _gateway_args_with_default_policy(gateway_args: list[str]) -> list[str]:
     the pin in ``python/pyproject.toml`` must be bumped to such a release in
     lockstep with this default.
     """
-    if "--policy" in gateway_args:
+    if _operator_policy(gateway_args) is not None:
         return gateway_args
     return [*gateway_args, "--policy", DEFAULT_SMG_POLICY]
 

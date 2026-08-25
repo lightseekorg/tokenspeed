@@ -129,7 +129,16 @@ class DPBudget:
         self.reported_metrics = metrics
         self.reported_request_counts = request_counts
 
-    def dispatch(self):
+    def dispatch(self, pinned_rank: int | None = None):
+        """Pick the least-loaded rank and reserve it.
+
+        ``pinned_rank`` skips the choice and only records the reservation,
+        keeping hard-pinned dispatches visible to update_budget's accounting.
+        """
+        if pinned_rank is not None:
+            if pinned_rank in self.reservations:
+                self.reservations[pinned_rank] += 1
+            return pinned_rank
         if not self.rank_order:
             return None
 
@@ -249,7 +258,7 @@ class DataParallelController:
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
-                (TokenizedGenerateReqInput, self.dispatching),
+                (TokenizedGenerateReqInput, self.dispatch_generate_request),
                 (TokenizedEmbeddingReqInput, self.dispatching),
                 (BlockReqInput, self.send_to_all_workers),
                 (LoadSnapshot, self.handle_load_snapshot),
@@ -386,6 +395,33 @@ class DataParallelController:
         )
         self.cache_storage = scheduler_info[0]["cache_storage"]
 
+    def dispatch_generate_request(self, req):
+        """Route one tokenized request, honoring an attention-DP hard pin.
+
+        Validation lives upstream (InputProcessor.validate_request); the check
+        here is a defensive backstop — this fire-and-forget loop must fall
+        back to the normal policy on a bad pin, never raise.
+        """
+        rank = getattr(req, "data_parallel_rank", None)
+        if rank is not None and self.server_args.disaggregation_mode == "null":
+            # bool/float/list must degrade here, not raise mid-comparison.
+            if (
+                isinstance(rank, int)
+                and not isinstance(rank, bool)
+                and 0 <= rank < len(self.workers)
+            ):
+                self.workers[rank].send_pyobj(req)
+                self.dp_budget.dispatch(pinned_rank=rank)
+                return
+            logger.warning(
+                "data_parallel_rank=%r invalid (need an int in [0, %d)); "
+                "falling back to the %s policy",
+                rank,
+                len(self.workers),
+                self.load_balance_method.name,
+            )
+        self.dispatching(req)
+
     def round_robin_scheduler(self, req: Req):
         if self.server_args.disaggregation_mode == "null":
             self.workers[self.round_robin_counter].send_pyobj(req)
@@ -397,7 +433,7 @@ class DataParallelController:
 
     def single_robin_scheduler(self, req):
         worker_id = int(os.environ.get("SINGLE_WORKER_ID", "-1"))
-        if not 0 <= worker_id < self.server_args.mapping.attn.dp_size - 1:
+        if not 0 <= worker_id < self.server_args.mapping.attn.dp_size:
             raise ValueError(f"Invalid SINGLE_WORKER_ID:{worker_id}")
         self.workers[worker_id].send_pyobj(req)
 
