@@ -42,6 +42,7 @@ from __future__ import annotations
 import ast
 from types import SimpleNamespace
 
+import pytest
 import torch
 from tokenspeed_scheduler import PD
 
@@ -169,6 +170,45 @@ def test_an_aborted_request_still_lands_its_candidates_but_is_not_armed():
     hooks.poll_transfer_events()
 
     assert trace == ["run", ("candidates", 3, [11, 12])]
+
+
+# ----------------------------------------------------------------------
+# L2 cache plans: transfers launch on the data plane, behind the zeroing.
+# ----------------------------------------------------------------------
+
+
+def test_cache_plan_submission_rides_the_fifo_behind_page_zeroing():
+    """The FIFO order zero-then-load is what keeps a reused page from being
+    zeroed after the load already overwrote it; submitting the plan from the
+    control plane would race that."""
+    trace: list = []
+    l2 = SimpleNamespace(
+        submit_plan=lambda plan: trace.append(("cache_plan", plan)),
+        poll_results=lambda: ["done"],
+    )
+    handle = DeviceHandle(
+        SimpleNamespace(
+            forward_thread=_ForwardThread(trace),
+            zero_cache_pages=lambda pages: trace.append(("zero", tuple(pages))),
+        ),
+        l2_cache_executor=l2,
+    )
+
+    handle.submit_page_zeroing([3, 4])
+    handle.submit_cache_plan("PLAN")
+
+    assert trace == ["submit", ("zero", (3, 4)), "submit", ("cache_plan", "PLAN")]
+    # Polling never touches the FIFO — the round head must not wait on it.
+    assert handle.poll_cache_results() == ["done"]
+    assert trace[-1] != "submit"
+
+
+def test_cache_ops_without_kvstore_refuse_loudly():
+    handle = _handle([])
+    with pytest.raises(RuntimeError, match="enable-kvstore"):
+        handle.submit_cache_plan("PLAN")
+    with pytest.raises(RuntimeError, match="enable-kvstore"):
+        handle.poll_cache_results()
 
 
 # ----------------------------------------------------------------------

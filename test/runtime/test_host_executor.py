@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -153,6 +154,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
         tracker = Mock()
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ack_lock = threading.Lock()
         executor._load_trackers = [(tracker, 1)]
 
         executor.submit_plan(SimpleNamespace(cache=[]))
@@ -188,6 +190,7 @@ class GroupAwareWireTest(unittest.TestCase):
             self.skipTest(f"needs runtime dependencies: {exc}")
 
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ack_lock = threading.Lock()
         executor._ready_write_op_ids = []
         executor.layout = SimpleNamespace(buffers=("device",))
         executor.host_storage = SimpleNamespace(host_buffer="host")
@@ -228,6 +231,7 @@ class GroupAwareWireTest(unittest.TestCase):
             self.skipTest(f"needs runtime dependencies: {exc}")
 
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor._ack_lock = threading.Lock()
         executor._ready_load_op_ids = []
         executor._load_acks = []
         executor.load_stream = object()

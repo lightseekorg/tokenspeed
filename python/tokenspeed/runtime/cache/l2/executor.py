@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterable, Sequence
 from typing import NamedTuple
 
@@ -158,6 +159,10 @@ class L2CacheExecutor:
         self.write_stream = _new_cache_stream(write_priority)
         self.load_stream = _new_cache_stream(load_priority)
 
+        # Submission runs on the forward thread and polling on the control
+        # plane (event queries only), so the completion queues below are the
+        # cross-thread handoff; the lock covers every mutation of them.
+        self._ack_lock = threading.Lock()
         self._write_acks: list[_Ack] = []
         self._load_acks: list[_Ack] = []
         self._ready_write_op_ids: list[int] = []
@@ -257,7 +262,8 @@ class L2CacheExecutor:
             return
         op_ids = _ordered_unique(op_ids)
         if not transfers:
-            self._ready_write_op_ids.extend(op_ids)
+            with self._ack_lock:
+                self._ready_write_op_ids.extend(op_ids)
             return
         logger.info(
             "[L2] writeback started: operations=%d blocks=%d",
@@ -280,7 +286,8 @@ class L2CacheExecutor:
         )
         finish = torch.cuda.Event()
         finish.record(self.write_stream)
-        self._write_acks.append(_Ack(finish, op_ids))
+        with self._ack_lock:
+            self._write_acks.append(_Ack(finish, op_ids))
 
     def _start_loading(
         self,
@@ -293,7 +300,8 @@ class L2CacheExecutor:
             raise RuntimeError("Host cache load must run outside CUDA Graph capture")
         op_ids = _ordered_unique(op_ids)
         if not transfers:
-            self._ready_load_op_ids.extend(op_ids)
+            with self._ack_lock:
+                self._ready_load_op_ids.extend(op_ids)
             return None
         logger.info(
             "[L2] load started: operations=%d blocks=%d",
@@ -333,16 +341,20 @@ class L2CacheExecutor:
             consumer_offset += consumer_count
         if load_index is None or finish is None:
             raise RuntimeError("cache transfer layout has no layer consumers")
-        self._load_acks.append(_Ack(finish, op_ids))
+        with self._ack_lock:
+            self._load_acks.append(_Ack(finish, op_ids))
         return load_index
 
     def poll_results(self) -> list:
-        results = [self._write_done(op_id) for op_id in self._ready_write_op_ids]
-        self._ready_write_op_ids.clear()
-        results.extend(self._load_done(op_id) for op_id in self._ready_load_op_ids)
-        self._ready_load_op_ids.clear()
-        self._write_acks[:] = self._drain(self._write_acks, self._write_done, results)
-        self._load_acks[:] = self._drain(self._load_acks, self._load_done, results)
+        with self._ack_lock:
+            results = [self._write_done(op_id) for op_id in self._ready_write_op_ids]
+            self._ready_write_op_ids.clear()
+            results.extend(self._load_done(op_id) for op_id in self._ready_load_op_ids)
+            self._ready_load_op_ids.clear()
+            self._write_acks[:] = self._drain(
+                self._write_acks, self._write_done, results
+            )
+            self._load_acks[:] = self._drain(self._load_acks, self._load_done, results)
         return results
 
     @staticmethod

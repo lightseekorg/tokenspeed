@@ -214,25 +214,12 @@ class EventLoop:
             )
             self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
             self._dp_global_info = torch.zeros(mapping.world_size, 3, dtype=torch.int32)
-        if server_args.enable_kvstore:
-            if server_args.kvstore_storage_backend is not None:
-                raise NotImplementedError(
-                    "the cache-group scheduler has no L3 storage tier; unset "
-                    "--kvstore-storage-backend"
-                )
-            l2_cache_executor = device.wiring.create_l2_cache_executor(
-                host_ratio=server_args.kvstore_ratio,
-                host_size_gb=server_args.kvstore_size,
-                io_backend=server_args.kvstore_io_backend,
-            )
-            num_host_pages = l2_cache_executor.num_host_pages
-        else:
-            l2_cache_executor = None
-            num_host_pages = 0
+        num_host_pages = specs.num_host_pages
         # L2 cache-op submission + rank-synced completion tracking (see
-        # cache_hooks.py); a no-op shell when kvstore is disabled.
+        # cache_hooks.py); a no-op shell when kvstore is disabled. The hooks
+        # get the handle, not the L2 executor: submission is GPU work.
         self._cache_hooks = L2CacheHooks(
-            l2_cache_executor,
+            self._device if server_args.enable_kvstore else None,
             speculative_algorithm=server_args.speculative_algorithm,
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=self.attn_tp_size,

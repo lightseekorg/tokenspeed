@@ -24,7 +24,7 @@ long the caller may hold them:
 | | what it is | lifetime |
 | --- | --- | --- |
 | `DeviceSpecs` | plain values the loop plans with: cache geometry, cache groups, speculation widths, capability flags | keep forever |
-| `DeviceWiring` | the startup steps that need a real device object: build the host cache tier, describe the KV to a PD peer, install the layerwise step counter, read the encoder's model facts | a local of `__init__`, dropped when it returns |
+| `DeviceWiring` | the startup steps that need a real device object: describe the KV to a PD peer, install the layerwise step counter, read the encoder's model facts | a local of `__init__`, dropped when it returns |
 | `DeviceHandle` | the running handle: the complete list of what the loop may ask of the device side | the only one stored (`self._device`) |
 
 Consequences:
@@ -159,7 +159,7 @@ Current inventory:
 | `_pause_hooks` | `PauseHooks` — `engine/pause.py`              | glue (PauseController is the state machine) | `apply_transitions`, `withhold_admissions`, `paused_idle_step` |
 | `_epd_hooks`   | `EpdPrefillHooks` — `epd/prefill_hooks.py`    | glue (EpdPrefillAdmission decides)          | `try_stage`, `drain_ready_embeddings` (and `assert_embeddings_received`, from the P-role dispatcher) |
 | `_pd_hooks`    | `PdTransferHooks` — `pd/transfer_hooks.py`    | glue (transfer executors decide)            | `poll_transfer_events` |
-| `_cache_hooks` | `L2CacheHooks` — `engine/cache_hooks.py`      | self-contained (static config only)         | `submit`, `poll_ready_events` |
+| `_cache_hooks` | `L2CacheHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission is GPU work; polling stays control-side event queries) | `submit`, `poll_ready_events` |
 
 `_pause_hooks` and `_pd_hooks` are also handed the `DeviceHandle`: both have
 work that must land on the data plane — the DP idle forward and the KV repair
@@ -195,9 +195,11 @@ For orientation, one iteration of `event_loop`:
    this round's plan sees them.
 3. Frozen (`PAUSED_ALL`)? Drain the in-flight queue and run the paused idle
    step. Otherwise: plan (`next_execution_plan`), submit the round's page
-   zeroing to the data plane (submitted, not awaited — the FIFO already orders
-   it before this round's forward), derive the forward op, record metrics, and
-   DP-sync (running an idle forward on idle ranks).
+   zeroing and then its L2 cache transfers to the data plane (submitted, not
+   awaited — the FIFO orders the zeroing before this round's forward, and
+   before the host-cache loads that may overwrite the same pages), derive the
+   forward op, record metrics, and DP-sync (running an idle forward on idle
+   ranks).
 4. Non-idle rounds: gather per-batch state, drain the in-flight queue if the
    dispatch depends on a pending commit (Principle 4), dispatch, commit from
    the queue head down to the effective depth, and poll PD transfer events.

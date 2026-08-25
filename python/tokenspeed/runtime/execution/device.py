@@ -49,9 +49,9 @@ What comes back is split three ways, by how long the caller may hold it:
   geometry, speculation widths, capability flags). No device object, safe to
   keep forever, and reading one never goes through the handle.
 - ``DeviceWiring`` — the startup steps that need a real device object:
-  building the host cache tier, describing the KV to a PD peer, installing
-  the layerwise step counter, reading the encoder's model facts. A local of
-  ``EventLoop.__init__``, dropped when it returns.
+  describing the KV to a PD peer, installing the layerwise step counter,
+  reading the encoder's model facts. A local of ``EventLoop.__init__``,
+  dropped when it returns.
 - ``DeviceHandle`` — the running handle, and the only one the loop keeps.
 
 The split exists because the wiring list is the one that grows: every new
@@ -120,6 +120,9 @@ class DeviceSpecs:
         cache_state_group_ids: Group ids of the state-family cache groups,
             for the per-group page-usage debug line. Empty for pools with no
             recurrent/conv state.
+        num_host_pages: The L2 host tier's page count (incl. the null page),
+            sized here because it depends on the pools' transfer layout; 0
+            without ``--enable-kvstore``. The scheduler is configured from it.
     """
 
     cache_geometry: Any
@@ -132,6 +135,7 @@ class DeviceSpecs:
     supports_disaggregation: bool
     supports_pd_layerwise_finalization: bool
     cache_state_group_ids: tuple[str, ...]
+    num_host_pages: int
 
 
 @dataclass(frozen=True)
@@ -157,10 +161,14 @@ class DeviceHandle:
     then use to bypass the rest.
     """
 
-    def __init__(self, executor) -> None:
+    def __init__(self, executor, *, l2_cache_executor=None) -> None:
         # Private by convention AND by absence: nothing below returns it.
         self._executor = executor
         self._thread = executor.forward_thread
+        # The host cache tier, or None without --enable-kvstore. Behind the
+        # handle for the same reason the pools are: its submit path launches
+        # transfers and records events.
+        self._l2 = l2_cache_executor
 
     # ------------------------------------------------------------------
     # Per-round work
@@ -220,6 +228,41 @@ class DeviceHandle:
         # Bound now, not read at execution time: by then a later round may
         # have rebound the caller's variable.
         return self._thread.submit(lambda pages=pages: executor.zero_cache_pages(pages))
+
+    def submit_cache_plan(self, execution_plan) -> None:
+        """Queue the plan's L2 host-cache transfers; never blocks.
+
+        The FIFO position is load-bearing twice over. Launching here (not on
+        the control plane) keeps a full CUDA launch queue from stalling the
+        scheduler round at its cross-rank collectives. And running AFTER this
+        round's page-zeroing closure on the same thread and stream is what
+        actually orders "zero, then load" for a page in both sets — the
+        load's start event can only capture zeroing that is already enqueued.
+
+        Args:
+            execution_plan: The round's plan (a per-round value copy out of
+                C++); its cache ops are read on the data plane.
+        """
+        l2 = self._l2
+        if l2 is None:
+            raise RuntimeError("cache plan submitted without --enable-kvstore")
+        self._thread.submit(lambda: l2.submit_plan(execution_plan))
+
+    def poll_cache_results(self) -> list:
+        """Collect completed L2 cache ops; never blocks.
+
+        Stays on the control plane deliberately: completion is CUDA event
+        queries plus queue drains (serialized against the data-plane submit
+        by the executor's own lock). Routing it through the FIFO would park
+        the round head behind every queued forward.
+
+        Returns:
+            The completed ops' scheduler events; empty when nothing finished.
+        """
+        l2 = self._l2
+        if l2 is None:
+            raise RuntimeError("cache results polled without --enable-kvstore")
+        return l2.poll_results()
 
     def run_idle_forward(self, dp_metadata: DpForwardMetadata) -> None:
         """Run a zero-token forward so this DP rank joins the round's collectives.
@@ -382,28 +425,6 @@ class DeviceWiring:
             hidden=model.config.hidden_size,
             num_deepstack=getattr(model, "num_deepstack_embeddings", 0),
             dtype=(getattr(model, "visual", None) or model.vision_tower).dtype,
-        )
-
-    def create_l2_cache_executor(self, *, host_ratio, host_size_gb, io_backend):
-        """Build the host-tier KV cache executor over this engine's pools.
-
-        Args:
-            host_ratio: Host cache size as a multiple of the device pool.
-            host_size_gb: Absolute host cache size, when set.
-            io_backend: Host<->device transfer backend name.
-
-        Returns:
-            The configured ``L2CacheExecutor``.
-        """
-        from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
-
-        executor = self._executor
-        return L2CacheExecutor(
-            device_pool=executor.token_to_kv_pool,
-            draft_pool=executor.draft_token_to_kv_pool,
-            host_ratio=host_ratio,
-            host_size_gb=host_size_gb,
-            io_backend=io_backend,
         )
 
     def pd_kv_args(
@@ -605,6 +626,23 @@ def build_device_side(
             draft_kv_pool=draft_token_to_kv_pool,
         )
 
+    l2_cache_executor = None
+    if server_args.enable_kvstore:
+        if server_args.kvstore_storage_backend is not None:
+            raise NotImplementedError(
+                "the cache-group scheduler has no L3 storage tier; unset "
+                "--kvstore-storage-backend"
+            )
+        from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+
+        l2_cache_executor = L2CacheExecutor(
+            token_to_kv_pool,
+            draft_pool=draft_token_to_kv_pool,
+            host_ratio=server_args.kvstore_ratio,
+            host_size_gb=server_args.kvstore_size,
+            io_backend=server_args.kvstore_io_backend,
+        )
+
     specs = DeviceSpecs(
         cache_geometry=cache_geometry,
         cache_groups=cache_groups,
@@ -622,11 +660,14 @@ def build_device_side(
             for spec in token_to_kv_pool.arena.cache_group_specs
             if spec.family == "state"
         ),
+        num_host_pages=(
+            l2_cache_executor.num_host_pages if l2_cache_executor is not None else 0
+        ),
     )
     return DeviceBuild(
         specs=specs,
         wiring=DeviceWiring(executor),
-        handle=DeviceHandle(executor),
+        handle=DeviceHandle(executor, l2_cache_executor=l2_cache_executor),
     )
 
 

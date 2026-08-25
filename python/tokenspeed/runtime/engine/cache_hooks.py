@@ -21,16 +21,18 @@
 """L2 cache-op submission and rank-synchronized completion tracking.
 
 Owns everything between an execution plan's cache ops and the scheduler
-events their completions eventually produce: submit ops to the L2 executor,
-count what is in flight, poll completions, and agree across attn-tp ranks on
+events their completions eventually produce: submit ops through the device
+handle (the transfers launch on the data plane; see
+``DeviceHandle.submit_cache_plan``), count what is in flight, poll
+completions (control-side event queries), and agree across attn-tp ranks on
 which completions EVERY rank has seen (the C++ scheduler is mirrored, so an
 event may only advance once all ranks hold it). ``poll_ready_events`` returns
 events for the event loop to apply — feedback into the scheduler stays an
 explicit ``advance_scheduler`` call in the loop body.
 
-Standalone by construction: depends only on static parallel-layout config,
-not on live event-loop state. ``executor=None`` (kvstore disabled) makes
-every method a cheap no-op.
+Depends only on the device handle and static parallel-layout config, not on
+live event-loop state. ``device=None`` (kvstore disabled) makes every method
+a cheap no-op.
 """
 
 from __future__ import annotations
@@ -58,7 +60,7 @@ class L2CacheHooks:
 
     def __init__(
         self,
-        executor,
+        device,
         *,
         speculative_algorithm: str | None,
         attn_tp_rank: int,
@@ -66,7 +68,7 @@ class L2CacheHooks:
         attn_tp_cpu_group,
         global_rank: int,
     ) -> None:
-        self._executor = executor
+        self._device = device
         self._speculative_algorithm = speculative_algorithm
         self._attn_tp_rank = attn_tp_rank
         self._attn_tp_size = attn_tp_size
@@ -80,10 +82,10 @@ class L2CacheHooks:
         self._num_inflight = 0
 
     def submit(self, execution_plan) -> None:
-        """Hand the plan's cache ops to the L2 executor and count them in flight."""
-        if self._executor is None:
+        """Queue the plan's cache ops on the data plane; count them in flight."""
+        if self._device is None:
             return
-        self._executor.submit_plan(execution_plan)
+        self._device.submit_cache_plan(execution_plan)
         for op in execution_plan.cache:
             if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
                 self._num_inflight += len(op.op_ids)
@@ -94,9 +96,9 @@ class L2CacheHooks:
         """Poll completed L2 cache ops and return their rank-synchronized
         scheduler events. Returns an empty list when there is nothing ready.
         """
-        if self._executor is None:
+        if self._device is None:
             return []
-        cache_results = self._executor.poll_results()
+        cache_results = self._device.poll_cache_results()
         self._num_inflight -= len(cache_results)
         for event in cache_results:
             payload = cache_event_to_payload(event)
