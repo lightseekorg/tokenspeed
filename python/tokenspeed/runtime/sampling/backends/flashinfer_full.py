@@ -42,6 +42,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gather_and_expand_scalars,
     min_p_renorm_prob,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -54,7 +55,6 @@ from tokenspeed.runtime.sampling.backends.flashinfer import (
 )
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput

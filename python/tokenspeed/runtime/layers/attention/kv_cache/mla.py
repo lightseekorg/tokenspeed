@@ -24,6 +24,7 @@ from typing import ClassVar
 
 import numpy as np
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.cache.utils import (
     get_mla_kv_buffer_triton,
@@ -33,7 +34,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
 

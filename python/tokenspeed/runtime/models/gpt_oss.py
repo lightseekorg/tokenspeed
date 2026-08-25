@@ -30,6 +30,7 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -66,7 +67,6 @@ from tokenspeed.runtime.models.utils import (
 )
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
 

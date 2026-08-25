@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
     selected_token_logprobs,
     verify_chain_target_sampled,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.sampling.backends.base import (
     CUDA_GRAPH_VARIANT_DEFAULT,
@@ -51,7 +52,6 @@ from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.sampling_params import _SAMPLING_EPS, _TOP_K_DISABLED
 from tokenspeed.runtime.sampling.utils import nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput

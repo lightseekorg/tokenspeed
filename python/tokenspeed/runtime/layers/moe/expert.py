@@ -23,6 +23,7 @@ from collections.abc import Callable
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -43,7 +44,6 @@ from tokenspeed.runtime.layers.quantization.utils import (
     should_ignore_quant_layer,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 class MoELayer(torch.nn.Module):

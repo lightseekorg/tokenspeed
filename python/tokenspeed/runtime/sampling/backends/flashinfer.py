@@ -42,6 +42,7 @@ from tokenspeed_kernel.ops.sampling.flashinfer import (
     top_p_renorm_prob,
 )
 from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
@@ -61,7 +62,6 @@ from tokenspeed.runtime.sampling.utils import (
     gather_token_logprobs_torch,
 )
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput

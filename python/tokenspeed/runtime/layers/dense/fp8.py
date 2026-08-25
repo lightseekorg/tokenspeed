@@ -38,6 +38,8 @@ from torch.nn.parameter import Parameter
 
 logger = logging.getLogger(__name__)
 
+from tokenspeed_kernel.platform import pdl_enabled
+
 from tokenspeed.runtime.layers.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,
@@ -46,7 +48,6 @@ from tokenspeed.runtime.layers.parameter import (
 from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.utils import convert_to_channelwise
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 class Fp8LinearMethod(LinearMethodBase):

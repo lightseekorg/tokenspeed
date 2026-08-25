@@ -337,7 +337,7 @@ def rel_mha_varlen_tsmha(
     window). Returns the packed (total_q, num_q_heads, head_dim) output.
 
     ``enable_pdl`` launches the fwd kernel with Programmatic Dependent
-    Launch (Hopper+); pass ``tokenspeed.runtime.utils.pdl.pdl_enabled()``
+    Launch (Hopper+); pass ``tokenspeed_kernel.platform.pdl_enabled()``
     from the runtime.
     """
     total_q, H, D = q.shape

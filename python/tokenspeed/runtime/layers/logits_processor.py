@@ -34,7 +34,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
     is_available as dist_argmax_available,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
@@ -57,7 +57,6 @@ from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutPlan,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
 

@@ -59,7 +59,7 @@ from tokenspeed_kernel.ops.moe.latent_tail import (
     KimiK3LatentTailOp,
     latent_tail_supported,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
@@ -74,7 +74,6 @@ from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.layers.layernorm import RMSNorm, _get_process_group
 from tokenspeed.runtime.layers.moe.latent import kimi3_join_reduce_moe
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = logging.getLogger(__name__)
 

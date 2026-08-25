@@ -27,6 +27,7 @@ from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     verify_chain_greedy as _verify_chain_greedy_cuda,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.registry import error_fn
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -36,7 +37,6 @@ from tokenspeed.runtime.sampling.backends.base import (
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import gather_token_logprobs_torch
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
 

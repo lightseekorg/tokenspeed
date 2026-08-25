@@ -42,6 +42,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gumbel_sample_top_p_parallel_from_pools,
     verify_chain_target_sampled,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.sampling.backends.base import (
     CUDA_GRAPH_VARIANT_DEFAULT,
@@ -65,7 +66,6 @@ from tokenspeed.runtime.sampling.backends.triton import (
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput

@@ -29,7 +29,7 @@ from tokenspeed_kernel.ops.attention import (
 from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
     workspace_topk_to_global_slots,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -41,7 +41,6 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DSA_SPARSE_PAGE_SIZE,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 def _make_dense_backend(config: DSAConfig, platform) -> AttentionBackend:

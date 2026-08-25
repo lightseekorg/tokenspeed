@@ -436,7 +436,7 @@ def rel_mha_decode_tsmha(
 
     ``enable_pdl`` launches the shear, fwd, and combine kernels with
     Programmatic Dependent Launch (Hopper+); pass
-    ``tokenspeed.runtime.utils.pdl.pdl_enabled()`` from the runtime.
+    ``tokenspeed_kernel.platform.pdl_enabled()`` from the runtime.
     """
     P = max(prediction, 1)
     rows, H, D = q.shape

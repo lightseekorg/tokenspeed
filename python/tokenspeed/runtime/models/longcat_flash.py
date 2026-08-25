@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as _F
 from tokenspeed_kernel.platform import current_platform as _current_platform
+from tokenspeed_kernel.platform import pdl_enabled as _pdl_enabled
 from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as _dsv3_router_gemm
 from tokenspeed_kernel.thirdparty.cuda import (
     moe_finalize_fuse_shared as _moe_finalize_fuse_shared,
@@ -82,7 +83,6 @@ from tokenspeed.runtime.moe.expert_location import (
 from tokenspeed.runtime.utils import LazyValue, add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.cuda_stream import StreamFork as _StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled as _pdl_enabled
 
 _longcat_logger = get_colorful_logger(__name__)
 _longcat_platform = _current_platform()

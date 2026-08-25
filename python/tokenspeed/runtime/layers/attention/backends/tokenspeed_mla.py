@@ -44,6 +44,7 @@ from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
 from tokenspeed_kernel.ops.attention.triton.mla_write_locations import (
     mla_write_locations,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -66,7 +67,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention

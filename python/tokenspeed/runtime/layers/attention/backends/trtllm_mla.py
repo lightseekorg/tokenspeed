@@ -37,6 +37,7 @@ from tokenspeed_kernel.ops.attention.flashinfer import (
     trtllm_batch_decode_with_kv_cache_mla,
     trtllm_ragged_attention_deepseek,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -57,7 +58,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import envs
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention

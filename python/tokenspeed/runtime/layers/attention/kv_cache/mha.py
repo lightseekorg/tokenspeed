@@ -28,6 +28,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     store_kv_cache,
     store_sf_interleaved,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -36,7 +37,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
 

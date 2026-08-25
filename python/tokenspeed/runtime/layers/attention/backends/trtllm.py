@@ -39,6 +39,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
     gather_page_table_with_padding,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -58,7 +59,6 @@ from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.common import fp8_cast_contiguous
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention

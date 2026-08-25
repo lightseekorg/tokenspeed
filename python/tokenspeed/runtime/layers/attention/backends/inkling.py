@@ -55,6 +55,7 @@ from tokenspeed_kernel import (
     rel_mha_prefill,
 )
 from tokenspeed_kernel.ops.conv import seq_idx_from_cu_seqlens
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
@@ -66,7 +67,6 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     init_backend_cuda_graph_state,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
 

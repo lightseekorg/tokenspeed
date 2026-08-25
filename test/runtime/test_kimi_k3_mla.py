@@ -433,8 +433,7 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
     backend_factory, gpu_pool
 ) -> None:
     from tokenspeed_kernel.ops.attention import attn_merge_state
-
-    from tokenspeed.runtime.utils.pdl import pdl_enabled
+    from tokenspeed_kernel.platform import pdl_enabled
 
     pool = gpu_pool
     page_size = pool.arena.prefix_granularity

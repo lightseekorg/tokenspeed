@@ -34,7 +34,7 @@ from tokenspeed_kernel.ops.communication.trtllm import (
     trtllm_create_ipc_workspace_for_minimax,
 )
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 from torch import nn
 
@@ -78,7 +78,6 @@ from tokenspeed.runtime.utils import (
     set_weight_attrs,
 )
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = logging.getLogger(__name__)
 

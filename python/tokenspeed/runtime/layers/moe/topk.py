@@ -27,13 +27,13 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk, moe_softmax_topk
 from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
 from tokenspeed_kernel.thirdparty.triton import minimax_biased_grouped_topk
 
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
 )
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 class TopKOutputFormat(Enum):

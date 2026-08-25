@@ -44,6 +44,7 @@ from tokenspeed_kernel.ops.communication import (
 from tokenspeed_kernel.ops.communication import (
     reducescatter_residual_rmsnorm,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.distributed.comm_backend import (
     CommBackend,
@@ -59,7 +60,6 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (  # no
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 def _get_process_group(group: Group):

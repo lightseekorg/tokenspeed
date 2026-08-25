@@ -31,6 +31,7 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 from transformers import LlamaConfig
 
@@ -60,7 +61,6 @@ from tokenspeed.runtime.models.utils import (
     validate_attention_partition,
 )
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 class LlamaMLP(nn.Module):
