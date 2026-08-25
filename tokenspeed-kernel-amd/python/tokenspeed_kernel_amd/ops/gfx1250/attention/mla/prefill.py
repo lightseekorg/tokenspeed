@@ -484,7 +484,7 @@ class AttentionProgram:
 
 
 @gluon.jit
-def process_query_block(program: AttentionProgram, num_tiles):
+def process_query_block(program: AttentionProgram, num_tiles, main_end):
     cfg = program.cfg
     q = program.load_q_nope()
     q_rope = program.load_q_rope()
@@ -508,12 +508,16 @@ def process_query_block(program: AttentionProgram, num_tiles):
         v = program.shared_load_v(buffer_index)
         kv_start = tile_idx * cfg.BLOCK_N
         qk = program.compute_qk(q, k, q_rope, k_rope)
-        qk = program.apply_mask(qk, kv_start)
+        # Tiles below main_end are visible to every row of this query block, so
+        # they need neither the causal mask nor the out-of-range value guard.
+        if tile_idx >= main_end:
+            qk = program.apply_mask(qk, kv_start)
         p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
-        v_n = kv_start + gl.arange(
-            0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.v_layout)
-        )
-        v = gl.where((v_n < program.kv_len)[:, None], v, 0.0)
+        if tile_idx >= main_end:
+            v_n = kv_start + gl.arange(
+                0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.v_layout)
+            )
+            v = gl.where((v_n < program.kv_len)[:, None], v, 0.0)
         acc = program.compute_pv(p, v, acc)
 
         if tile_idx + 2 < num_tiles:
@@ -602,11 +606,17 @@ def _mla_prefill_gfx1250_kernel(
             kv_end = program.kv_len - program.q_len + program.q_start + cfg.BLOCK_M
             kv_end = gl.minimum(kv_end, program.kv_len)
             kv_end = gl.maximum(kv_end, 0)
+            # Tiles strictly below the first query row's causal limit are fully
+            # visible, so they can skip masking entirely.
+            main_end = program.kv_len - program.q_len + program.q_start
+            main_end = gl.maximum(main_end, 0) // cfg.BLOCK_N
+            main_end = gl.minimum(main_end, program.kv_len // cfg.BLOCK_N)
         else:
             kv_end = program.kv_len
+            main_end = program.kv_len // cfg.BLOCK_N
         num_tiles = (kv_end + cfg.BLOCK_N - 1) // cfg.BLOCK_N
         if num_tiles > 0:
-            process_query_block(program, num_tiles)
+            process_query_block(program, num_tiles, main_end)
         else:
             store_empty_query_block(program)
 
