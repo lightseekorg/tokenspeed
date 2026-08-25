@@ -175,16 +175,21 @@ def test_prefill_node_captures_next_input_ids_and_returns_the_token_hook():
     assert trace[4][2]["capture_next_input_ids"] is True
 
 
-def test_only_the_prefill_role_needs_the_pending_commit_drained():
-    """The handoff batch reads the final chunk's bootstrap token, which only
-    lands at commit; no other role has a rule of its own."""
+def test_no_role_breaks_overlap_for_the_handoff_batch():
+    """The handoff needs the final chunk's bootstrap token, but the C++
+    scheduler holds a request out of the handoff batch until its forward
+    result lands — so the token is already stored and no role has to drain.
+
+    Draining for it emptied the whole chunk pipeline under PP on every
+    finished prompt; see DefersHandoffUntilTheFinalChunkResultLands in
+    tokenspeed-scheduler/tests/cpp/test_cache_scenarios.cpp."""
     handoff = _planned(num_extends=0).forward_op
     chunk = _planned(num_extends=1).forward_op
     prefill = PrefillDispatcher(
         _handle([]), store_prefill_token=None, epd_hooks=SimpleNamespace()
     )
 
-    assert prefill.needs_pending_commit(handoff) is True
+    assert prefill.needs_pending_commit(handoff) is False
     assert prefill.needs_pending_commit(chunk) is False
     assert ForwardDispatcher(_handle([])).needs_pending_commit(handoff) is False
 

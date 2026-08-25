@@ -139,9 +139,17 @@ new work, so results never wait on future traffic).
 The depth is a performance knob only. Any dispatch whose inputs depend on a
 pending commit's side effects must drain the queue first, and
 `_dispatch_depends_on_pending_commit` is the **single registry** of those
-overlap-breaking dependencies (currently: the P-side PD handoff batch and
-eager-grammar batches). New rules go there, not into `event_loop`. Rounds
-that run no real forward (pause/freeze, DP idle) drain the queue fully.
+overlap-breaking dependencies (currently: eager-grammar batches). New rules go
+there, not into `event_loop`. Rounds that run no real forward (pause/freeze,
+DP idle) drain the queue fully.
+
+Prefer removing a dependency over registering one. The P-side PD handoff was
+registered here until the C++ scheduler learned to hold a request out of the
+handoff batch until its forward result lands: a request turns `PrefillDone`
+when its last chunk is *scheduled*, so the handoff was being planned while
+that chunk was still in flight, and satisfying it meant draining the whole
+queue — under PP, emptying the chunk pipeline every time a prompt finished
+prefill. The dependency was real; the right fix was upstream, not a drain.
 
 Depth ≥ 1 also means a round is planned *before* the previous round's commit,
 so a batch can contain a request that commit is about to finish. Anything the

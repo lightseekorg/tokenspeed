@@ -995,9 +995,11 @@ class EventLoop:
         The single registry of overlap-breaking dependencies — add new rules
         here, not in ``event_loop``:
 
-        - The role's own rule, which the dispatcher answers (the P-side PD
-          handoff batch needs the final chunk's bootstrap token, and that
-          only lands at commit).
+        - The role's own rule, which the dispatcher answers. No role declares
+          one today: the P-side handoff used to, until the C++ scheduler
+          learned to hold a request out of the handoff batch until its
+          forward result lands (draining for it emptied the PP chunk
+          pipeline on every finished prompt).
         - Eager grammar: ``setup_grammar_step`` reads each matcher's current
           state to fill the bitmask, and the matcher only advances at the
           pending step's commit (``accept_token``). Capturable grammar dodges

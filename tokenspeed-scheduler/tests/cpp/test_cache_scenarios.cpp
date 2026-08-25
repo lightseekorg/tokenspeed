@@ -339,6 +339,43 @@ TEST_F(MambaStateCheckpointPrefillRoleSuite, SplitsLocalPrefillOnPrefillWorker) 
     EXPECT_EQ(tail->input_lengths, std::vector<std::int32_t>{2});
 }
 
+TEST_F(MambaStateCheckpointPrefillRoleSuite, DefersHandoffUntilTheFinalChunkResultLands) {
+    // A request turns PrefillDone when its last chunk is SCHEDULED, so the
+    // handoff batch would otherwise be planned while that chunk is still in
+    // flight -- forcing the runtime to drain its whole in-flight queue for the
+    // bootstrap token, which under PP empties the chunk pipeline.  The plan
+    // must keep making prefill progress until the result lands.
+    RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/3);
+    first.tokens.resize(10);
+    Submit(first);
+    SendBootstrapped("r1");
+
+    PlanOnce();  // r1 body chunk
+    ExecutionPlan tail_plan = PlanOnce();
+    const ForwardBatch* tail = FindForwardBatch(tail_plan);
+    ASSERT_NE(tail, nullptr);
+    EXPECT_TRUE(tail->IsLocalPrefill());  // r1 is PrefillDone from here on
+
+    // Its ExtendResult has not arrived, so the next plan must NOT be the
+    // all-zero-extend handoff batch the runtime keys the KV send off.
+    ExecutionPlan while_pending = PlanOnce();
+    const ForwardBatch* pending = FindForwardBatch(while_pending);
+    ASSERT_NE(pending, nullptr);
+    EXPECT_EQ(pending->NumExtends(), 0u);
+    EXPECT_TRUE(pending->request_ids.empty());
+
+    ExecutionEvent result;
+    result.With(forward::ExtendResult{.request_id = "r1", .tokens = {}});
+    scheduler_->Advance(std::move(result));
+
+    // Result in hand: now the handoff batch appears.
+    ExecutionPlan handoff_plan = PlanOnce();
+    const ForwardBatch* handoff = FindForwardBatch(handoff_plan);
+    ASSERT_NE(handoff, nullptr);
+    EXPECT_EQ(handoff->NumExtends(), 0u);
+    EXPECT_EQ(handoff->request_ids, std::vector<std::string>{"r1"});
+}
+
 class MambaStateCheckpointDecodeRoleSuite : public MambaStateCheckpointPrefillRoleSuite {
 protected:
     SchedulerConfig MakeConfig() override {

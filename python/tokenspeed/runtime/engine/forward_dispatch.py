@@ -177,6 +177,14 @@ class PrefillDispatcher(ForwardDispatcher):
     The overlap schedule is disabled for this role; under PP the in-flight
     depth is the chunk-pipeline depth instead. A round with no extend work
     means every chunk is done, so the KV goes to the decode side.
+
+    This role has no overlap-breaking rule of its own. The handoff needs the
+    final chunk's bootstrap token, which lands at that chunk's commit — but
+    the C++ scheduler holds a request out of the handoff batch until its
+    forward result arrives, so by the time a handoff batch is planned the
+    token is already stored. Draining the in-flight queue for it, as this
+    role used to, emptied the whole chunk pipeline under PP every time a
+    prompt finished prefill.
     """
 
     is_prefill_role = True
@@ -187,11 +195,6 @@ class PrefillDispatcher(ForwardDispatcher):
         # the handoff — control-plane work, so the callback lives here.
         self._store_prefill_token = store_prefill_token
         self._epd_hooks = epd_hooks
-
-    def needs_pending_commit(self, forward_op) -> bool:
-        # The handoff batch needs the final chunk's bootstrap token, which
-        # only lands at commit.
-        return forward_op.num_extends() == 0
 
     def dispatch(self, planned: PlannedForward) -> DispatchResult:
         if planned.forward_op.num_extends() == 0:

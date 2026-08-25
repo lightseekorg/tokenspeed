@@ -55,16 +55,30 @@ def _predicate_loop(*, dispatcher=None, eager_grammar_buffers=None):
 
 
 def test_the_roles_own_rule_reaches_the_registry() -> None:
-    # The P-side handoff batch needs the final chunk's bootstrap token, which
-    # only lands at commit. The rule lives on the role; the registry folds it
-    # in with the role-independent ones.
-    prefill = PrefillDispatcher(None, store_prefill_token=None, epd_hooks=None)
-    loop = _predicate_loop(dispatcher=prefill)
+    # The registry asks the role first. No role declares a rule today (the
+    # P-side handoff's was removed once the C++ scheduler learned to defer the
+    # handoff batch), so a role that starts declaring one must reach the
+    # registry through this path.
+    class _DemandingRole(ForwardDispatcher):
+        def needs_pending_commit(self, forward_op) -> bool:
+            return forward_op.num_extends() == 0
+
+    loop = _predicate_loop(dispatcher=_DemandingRole(device=None))
     handoff_op = SimpleNamespace(num_extends=lambda: 0)
     extend_op = SimpleNamespace(num_extends=lambda: 1)
 
     assert EventLoop._dispatch_depends_on_pending_commit(loop, handoff_op, None)
     assert not EventLoop._dispatch_depends_on_pending_commit(loop, extend_op, None)
+
+
+def test_the_prefill_role_no_longer_drains_for_its_handoff() -> None:
+    # Draining emptied the whole chunk pipeline under PP on every finished
+    # prompt; the scheduler now defers the handoff batch instead.
+    prefill = PrefillDispatcher(None, store_prefill_token=None, epd_hooks=None)
+    loop = _predicate_loop(dispatcher=prefill)
+    handoff_op = SimpleNamespace(num_extends=lambda: 0)
+
+    assert not EventLoop._dispatch_depends_on_pending_commit(loop, handoff_op, None)
 
 
 def test_handoff_shaped_batch_without_pd_keeps_overlap() -> None:

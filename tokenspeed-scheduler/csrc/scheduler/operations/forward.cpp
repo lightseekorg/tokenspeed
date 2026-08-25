@@ -618,7 +618,9 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
         if (config_.role == Role::kP && request->Is<fsm::PrefillDone>()) {
             // Completed P-side prefills hold their KV pages until the remote
             // transfer finishes, so start their handoffs before admitting
-            // more prompt tokens.
+            // more prompt tokens.  (One still awaiting its final chunk's
+            // forward result keeps priority 0 but is skipped below, so it
+            // neither leads a handoff batch nor is mistaken for decode work.)
             return 0;
         }
         if (config_.role == Role::kD && (local_decode_prefill || request->Is<fsm::PrefillDone>() ||
@@ -656,8 +658,9 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
     // kind, collect every consecutive PrefillDone candidate but do not mix in
     // local prefill work.  PrefillDone candidates are contiguous because they
     // all have priority zero above.
-    const bool build_prefill_handoff_batch =
-        config_.role == Role::kP && !candidates.empty() && candidates.front()->Is<fsm::PrefillDone>();
+    const bool build_prefill_handoff_batch = config_.role == Role::kP && !candidates.empty() &&
+                                             candidates.front()->Is<fsm::PrefillDone>() &&
+                                             !pending_forward_results_.contains(candidates.front()->Id());
 
     const bool has_local_prefill = std::ranges::any_of(candidates, [this](const Request* request) {
         return (request->Is<fsm::Prefilling>() && request->PrefillSource() == fsm::PrefillSource::kLocal) ||
@@ -704,6 +707,19 @@ std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Schedul
             break;
         }
         if (fused_capacity_drain_ && request->Is<fsm::Submitted>()) {
+            continue;
+        }
+        if (config_.role == Role::kP && request->Is<fsm::PrefillDone>() &&
+            pending_forward_results_.contains(request->Id())) {
+            // A request turns PrefillDone when its LAST CHUNK IS SCHEDULED,
+            // not when that chunk's result comes back -- and the handoff needs
+            // the bootstrap token that lands with the result.  Planning its
+            // handoff now would force the runtime to drain its whole in-flight
+            // queue for that token, which under PP empties the chunk pipeline
+            // every time a prompt finishes.  Skip it and keep scheduling real
+            // prefill work; the handoff follows once the result lands.
+            // Rank-safe: pending_forward_results_ is driven by the same
+            // deterministic event stream on every rank.
             continue;
         }
         if (build_prefill_handoff_batch && !request->Is<fsm::PrefillDone>()) {
