@@ -39,7 +39,6 @@ from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
-    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -278,7 +277,7 @@ if platform.is_nvidia:
             local_num_experts=local_experts,
             routed_scaling_factor=w._routed_scaling_factor,
             routing_method_type=w._routing_method_type,
-            enable_pdl=enable_pdl and pdl_enabled(),
+            enable_pdl=enable_pdl,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
         )
         return result[0]

@@ -114,7 +114,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         if use_pdl is None:
             self.use_pdl = pdl_enabled()
         else:
-            self.use_pdl = use_pdl and pdl_enabled()
+            self.use_pdl = use_pdl
         validate_shape(
             tp_size=tp_size,
             latent_dim=latent_dim,

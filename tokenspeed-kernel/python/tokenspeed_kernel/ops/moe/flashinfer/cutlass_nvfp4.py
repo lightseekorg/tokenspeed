@@ -26,7 +26,6 @@ from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
-    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -212,5 +211,5 @@ if platform.is_nvidia:
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=getattr(w, "swiglu_beta_t", None),
             swiglu_limit=getattr(w, "swiglu_limit_t", None),
-            enable_pdl=enable_pdl and pdl_enabled(),
+            enable_pdl=enable_pdl,
         )[0]

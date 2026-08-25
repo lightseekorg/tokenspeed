@@ -319,8 +319,8 @@ if fp8_gemm_nt is not None:
         ), "A_scales is required; online quantization should be done by the caller"
         if A_scales.dtype == torch.float32:
             A_scales = get_mn_major_tma_aligned_tensor(A_scales)
-        if get_pdl() != (enable_pdl and pdl_enabled()):
-            set_pdl(enable_pdl and pdl_enabled())
+        if get_pdl() != enable_pdl:
+            set_pdl(enable_pdl)
         N = B.shape[0]
         C = A.new_empty(A.shape[0], N, dtype=torch.bfloat16)
         fp8_gemm_nt((A, A_scales), (B, B_scales), C)

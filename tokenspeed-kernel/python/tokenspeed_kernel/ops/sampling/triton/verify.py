@@ -77,9 +77,10 @@ def verify_chain_target_sampled(
     candidates: torch.Tensor,
     target_sampled: torch.Tensor,
     *,
-    enable_pdl: bool = True,
+    enable_pdl: bool | None = None,
 ) -> None:
     """Verify a speculative chain against already-sampled target tokens."""
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     if candidates.ndim != 2:
         raise ValueError(f"candidates must be 2D, got {candidates.ndim}D")
     if accept_index.shape != candidates.shape:
@@ -118,7 +119,6 @@ def verify_chain_target_sampled(
         return
 
     target_sampled = target_sampled.reshape(-1)
-    enable_pdl = enable_pdl and pdl_enabled()
     extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _verify_chain_target_sampled_kernel[(bs,)](
         predicts,

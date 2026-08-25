@@ -49,8 +49,9 @@ def verify_chain_greedy(
     target_predict: torch.Tensor,
     batch_size: int,
     num_draft_tokens: int,
-    enable_pdl: bool = True,
+    enable_pdl: bool | None = None,
 ) -> None:
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     _load_sampling_chain_module().verify_chain_greedy(
         predicts,
         accept_index,
@@ -59,7 +60,7 @@ def verify_chain_greedy(
         target_predict,
         int(batch_size),
         int(num_draft_tokens),
-        bool(enable_pdl and pdl_enabled()),
+        enable_pdl,
     )
 
 
@@ -75,13 +76,14 @@ def chain_speculative_sampling_target_only(
     threshold_single: float = 1.0,
     threshold_acc: float = 1.0,
     deterministic: bool = True,
-    enable_pdl: bool = True,
+    enable_pdl: bool | None = None,
 ) -> None:
     """Target-only chain speculative sampling.
 
     When ``draft_probs`` is ``None``, the kernel treats draft probabilities as
     all zeros and avoids the corresponding GMEM traffic.
     """
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     _load_sampling_chain_module().chain_speculative_sampling_target_only(
         predicts,
         accept_index,
@@ -94,5 +96,5 @@ def chain_speculative_sampling_target_only(
         float(threshold_single),
         float(threshold_acc),
         bool(deterministic),
-        bool(enable_pdl and pdl_enabled()),
+        enable_pdl,
     )

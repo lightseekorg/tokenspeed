@@ -79,7 +79,7 @@ def min_p_renorm_prob(
     probs: torch.Tensor,
     min_p: torch.Tensor,
     *,
-    enable_pdl: bool = True,
+    enable_pdl: bool | None = None,
 ) -> torch.Tensor:
     """Renormalize probabilities after applying a per-row min-p cutoff.
 
@@ -87,6 +87,7 @@ def min_p_renorm_prob(
     zeros probabilities below the threshold, and renormalizes the surviving
     probabilities so the row sums to one.
     """
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     if probs.ndim != 2:
         raise ValueError(f"min_p_renorm_prob expects 2D probs, got {probs.ndim}D")
     if min_p.ndim != 1:
@@ -112,7 +113,6 @@ def min_p_renorm_prob(
 
     block_size = min(4096, triton.next_power_of_2(vocab_size))
     num_warps = 4 if block_size <= 1024 else 8
-    enable_pdl = enable_pdl and pdl_enabled()
     extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _min_p_renorm_prob_kernel[(rows,)](
         probs,

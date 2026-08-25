@@ -93,7 +93,7 @@ def gather_and_expand_scalars(
     seed: torch.Tensor | None = None,
     offsets: torch.Tensor | None = None,
     n: int = 1,
-    enable_pdl: bool = True,
+    enable_pdl: bool | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -114,14 +114,15 @@ def gather_and_expand_scalars(
 
     Args:
         ...
-        enable_pdl: whether to use Programmatic Dependent Launch when supported.
-            Lets downstream flashinfer softmax/renorm kernels start their
-            preamble while our writes drain.
+        enable_pdl: whether to use Programmatic Dependent Launch. ``None`` uses
+            the global platform default. Lets downstream flashinfer
+            softmax/renorm kernels start their preamble while our writes drain.
 
     Returns ``(temperatures, top_ks, top_ps, min_ps_or_None, seeds_or_None,
     offsets_or_None)``, each shape ``[bs * n]`` (or ``None`` when the
     corresponding pool was omitted).
     """
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     bs = index.size(0)
     total = bs * n
     device = index.device
@@ -155,7 +156,6 @@ def gather_and_expand_scalars(
             out_offsets,
         )
 
-    enable_pdl = enable_pdl and pdl_enabled()
     extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _gather_and_expand_scalars_kernel[(bs,)](
         index,

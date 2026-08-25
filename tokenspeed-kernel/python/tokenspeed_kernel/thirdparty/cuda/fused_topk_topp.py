@@ -94,7 +94,7 @@ def fused_topk_topp_renorm(
     top_ps: torch.Tensor,
     workspace: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
-    enable_pdl: bool = True,
+    enable_pdl: bool | None = None,
 ) -> torch.Tensor:
     """Fused TopK + TopP renormalization.
 
@@ -108,11 +108,13 @@ def fused_topk_topp_renorm(
         out: optional pre-allocated ``[bs, V]`` float32 output; if omitted, a
              fresh one is allocated.
         enable_pdl: whether to use Programmatic Dependent Launch attributes.
+                    ``None`` uses the global platform default.
 
     Returns:
         ``[bs, V]`` float32. Non-kept positions are 0; kept positions are
         renormalized so each row sums to 1.
     """
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     if out is None:
         out = torch.empty_like(probs)
     if workspace is None:
@@ -126,6 +128,6 @@ def fused_topk_topp_renorm(
         out,
         workspace,
         side_handle,
-        bool(enable_pdl and pdl_enabled()),
+        enable_pdl,
     )
     return out
