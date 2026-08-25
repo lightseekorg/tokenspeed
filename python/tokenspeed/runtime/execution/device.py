@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -174,6 +175,11 @@ class DeviceHandle:
         # handle for the same reason the pools are: its submit path launches
         # transfers and records events.
         self._l2 = l2_cache_executor
+        # Cache-plan submission futures, drained by poll_cache_results: a
+        # submission that raised must surface, or its ops stay counted
+        # in flight forever and the cache-gated requests hang silently.
+        # Appended and drained on the control-plane thread only.
+        self._l2_submissions: deque = deque()
 
     # ------------------------------------------------------------------
     # Per-round work
@@ -251,7 +257,9 @@ class DeviceHandle:
         l2 = self._l2
         if l2 is None:
             raise RuntimeError("cache plan submitted without --enable-kvstore")
-        self._thread.submit(lambda: l2.submit_plan(execution_plan))
+        self._l2_submissions.append(
+            self._thread.submit(lambda: l2.submit_plan(execution_plan))
+        )
 
     def poll_cache_results(self) -> list:
         """Collect completed L2 cache ops; never blocks.
@@ -261,12 +269,28 @@ class DeviceHandle:
         by the executor's own lock). Routing it through the FIFO would park
         the round head behind every queued forward.
 
+        Also settles finished submission futures first: a submission that
+        raised produces no completion acks, so swallowing it would leave its
+        ops counted in flight forever — the failure re-raises here, at the
+        round head, with the data-plane traceback chained.
+
         Returns:
             The completed ops' scheduler events; empty when nothing finished.
+
+        Raises:
+            RuntimeError: A queued ``submit_plan`` raised on the data plane.
         """
         l2 = self._l2
         if l2 is None:
             raise RuntimeError("cache results polled without --enable-kvstore")
+        while self._l2_submissions and self._l2_submissions[0].done():
+            exc = self._l2_submissions.popleft().exception()
+            if exc is not None:
+                raise RuntimeError(
+                    "L2 cache-plan submission failed on the data plane; its "
+                    "ops have no completion events and would hang their "
+                    "cache-gated requests"
+                ) from exc
         return l2.poll_results()
 
     def run_idle_forward(self, dp_metadata: DpForwardMetadata) -> None:

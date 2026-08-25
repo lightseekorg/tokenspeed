@@ -404,6 +404,8 @@ def test_mm_struct_field_order_is_pinned():
         "mrope_positions",
         "mrope_position_delta",
         "mrope_position_delta_scalar",
+        # Reserved wire slot (retired cache field); see MultimodalInputs.
+        "mrope_position_delta_repeated_cache",
     ]
 
 

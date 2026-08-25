@@ -245,6 +245,11 @@ class MultimodalInputs(msgspec.Struct, eq=False, kw_only=True, array_like=True):
     mrope_positions: torch.Tensor | None = None
     mrope_position_delta: torch.Tensor | None = None
     mrope_position_delta_scalar: int | None = None
+    # Retired scheduler-local cache, kept as a reserved trailing slot: this
+    # struct is ``array_like`` and its element ORDER/ARITY is a wire contract
+    # with peers we cannot audit for fixed-arity decoding (an upstream
+    # preprocessor may pre-build these). Always None; never read in-process.
+    mrope_position_delta_repeated_cache: torch.Tensor | None = None
 
     def ensure_pad_values(self) -> None:
         for item in self.mm_items:
@@ -345,7 +350,11 @@ def multimodal_context_for_forward(forward_op, rid_to_state):
             # Snapshot. The struct is small and its tensors are shared by
             # reference; what the copy buys is that this batch's view of
             # ``mrope_positions`` cannot be swapped out from under an
-            # in-flight forward by the next round's extension above.
+            # in-flight forward by the next round's extension above. The
+            # ``mm_items`` stay shared and mutable by DESIGN — the data plane
+            # writes ``encoded``/``feature`` through them mid-forward; that
+            # is the registered multimodal exception to the capture contract
+            # (see forward_thread.py, rule 5).
             item = copy.copy(item)
         mm_inputs.append(item)
         has_mm = has_mm or item is not None

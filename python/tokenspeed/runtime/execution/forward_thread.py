@@ -85,16 +85,31 @@ this becomes a process the interface is already the whole interface.
    enforced by that shape rather than by anyone remembering them: what the
    loop cannot see, it cannot pass implicitly or mutate afterwards.
 
-5. One registered exception: grammar matchers. ``GrammarStepInputs.grammars``
-   holds the control plane's live matcher objects, and ownership is split by
-   path. Under capturable grammar the side-stream hostfunc advances them and
-   the commit path deliberately does not; under eager grammar the data plane
-   reads them during the fill and the commit path advances them, so the loop
-   drains its in-flight queue before dispatching a grammar batch
-   (``EventLoop._dispatch_depends_on_pending_commit`` is the registry of
-   those drain rules). Copying a matcher per round is not free, which is why
-   this stays an exception rather than becoming rule 2 — but it is the only
-   one, and new ones belong in this list, not in a comment at the call site.
+5. Two registered exceptions — and new ones belong in this list, not in a
+   comment at the call site:
+
+   - Grammar matchers. ``GrammarStepInputs.grammars`` holds the control
+     plane's live matcher objects, and ownership is split by path. Under
+     capturable grammar the side-stream hostfunc advances them and the
+     commit path deliberately does not; under eager grammar the data plane
+     reads them during the fill and the commit path advances them, so the
+     loop drains its in-flight queue before dispatching a grammar batch
+     (``EventLoop._dispatch_depends_on_pending_commit`` is the registry of
+     those drain rules). Copying a matcher per round is not free, which is
+     why this stays an exception rather than becoming rule 2.
+
+   - Multimodal items. The gather's snapshot is shallow on purpose: the
+     ``MultimodalDataItem`` objects stay shared, and the data plane WRITES
+     through them mid-forward — the embedder fills ``item.encoded`` and
+     drops the raw ``feature``/``feature_shm`` it no longer needs, and EPD
+     publishes ``encoded`` via the handle's embedding slot. The discipline
+     is ordering, not freezing: mutations happen on the FIFO (inside the
+     forward, or a submitted closure), the control plane only reads them at
+     commit time or later, and the release of the shared SHM handles rides
+     the FIFO too (``submit_release``) so it lands behind any forward still
+     reading them. What the shallow copy does freeze is the OUTER struct —
+     ``mrope_positions`` and its siblings, which the control plane rebinds
+     every round.
 """
 
 from __future__ import annotations

@@ -40,6 +40,7 @@ than walk to it.
 from __future__ import annotations
 
 import ast
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
@@ -58,14 +59,24 @@ from tokenspeed.runtime.pd.transfer_hooks import PdTransferHooks
 
 
 class _ForwardThread:
-    """Records what crossed to the data plane, and in what order."""
+    """Records what crossed to the data plane, and in what order.
+
+    Mirrors the real contract: ``submit`` returns a future resolved with the
+    callable's result or exception (never raising at the call site), ``run``
+    blocks and re-raises.
+    """
 
     def __init__(self, trace) -> None:
         self._trace = trace
 
     def submit(self, fn):
         self._trace.append("submit")
-        fn()
+        future: Future = Future()
+        try:
+            future.set_result(fn())
+        except BaseException as exc:  # noqa: BLE001 — mirrored to the future
+            future.set_exception(exc)
+        return future
 
     def run(self, fn):
         self._trace.append("run")
@@ -201,6 +212,36 @@ def test_cache_plan_submission_rides_the_fifo_behind_page_zeroing():
     # Polling never touches the FIFO — the round head must not wait on it.
     assert handle.poll_cache_results() == ["done"]
     assert trace[-1] != "submit"
+
+
+def test_a_failed_cache_plan_submission_surfaces_at_the_next_poll():
+    """A submission that raised produces no completion acks; swallowing it
+    would leave its ops counted in flight forever."""
+    trace: list = []
+
+    def exploding_submit_plan(plan):
+        raise ValueError("bad cache op")
+
+    handle = DeviceHandle(
+        SimpleNamespace(forward_thread=_ForwardThread(trace)),
+        l2_cache_executor=SimpleNamespace(
+            submit_plan=exploding_submit_plan,
+            poll_results=lambda: [],
+        ),
+    )
+
+    # Submission itself never raises (fire-and-forget)...
+    handle.submit_cache_plan("PLAN")
+    # ...the failure re-raises at the round head, data-plane cause chained.
+    with pytest.raises(RuntimeError, match="cache-plan submission failed") as info:
+        handle.poll_cache_results()
+    assert isinstance(info.value.__cause__, ValueError)
+
+    # A clean submission is settled and dropped; polling keeps working.
+    handle._l2.submit_plan = lambda plan: trace.append(("plan", plan))
+    handle.submit_cache_plan("PLAN2")
+    assert handle.poll_cache_results() == []
+    assert not handle._l2_submissions
 
 
 def test_cache_ops_without_kvstore_refuse_loudly():
