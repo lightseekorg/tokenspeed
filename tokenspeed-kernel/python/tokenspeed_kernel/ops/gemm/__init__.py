@@ -64,6 +64,7 @@ from tokenspeed_kernel.platform import (
     ArchVersion,
     Platform,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -1082,6 +1083,7 @@ def mm(
         "n_min_128": N >= 128,
         "k_min_128": K >= 128,
         "block_scale_layout": block_scale_layout,
+        "pdl_enabled": pdl_enabled(),
     }
 
     signature = _gemm_format_signature(
@@ -1096,14 +1098,6 @@ def mm(
         traits=traits,
         override=override,
     )
-    if kernel.name == "flashinfer_mm_mxfp8" and not pdl_enabled():
-        kernel = select_kernel(
-            "gemm",
-            "mm",
-            signature,
-            traits=traits,
-            override="triton_mm_fp8_blockscale",
-        )
     if prepacked_scales and kernel.name != "flashinfer_mm_fp8_blockscale":
         raise ValueError(
             "prepacked_scales is only supported by "

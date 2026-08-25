@@ -314,6 +314,7 @@ if mm_mxfp8 is not error_fn:
             "k_align_32": frozenset({True}),
             "n_min_128": frozenset({True}),
             "k_min_128": frozenset({True}),
+            "pdl_enabled": frozenset({True}),
         },
         priority=Priority.SPECIALIZED + 2,
     )

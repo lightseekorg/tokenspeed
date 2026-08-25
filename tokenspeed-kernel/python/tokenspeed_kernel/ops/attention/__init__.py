@@ -2243,11 +2243,6 @@ def mha_extend_with_kvcache(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        pdl_kwargs = (
-            {"enable_pdl": enable_pdl}
-            if kernel.name == "flashinfer_trtllm_mha_extend_with_kvcache"
-            else {}
-        )
         return kernel(
             q=q,
             cu_seqlens_q=cu_seqlens_q,
@@ -2264,8 +2259,8 @@ def mha_extend_with_kvcache(
             softmax_scale=softmax_scale,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            enable_pdl=enable_pdl,
             **scale_kwargs,
-            **pdl_kwargs,
         )
 
 
@@ -2373,11 +2368,6 @@ def mha_decode_with_kvcache(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        pdl_kwargs = (
-            {"enable_pdl": enable_pdl}
-            if kernel.name == "flashinfer_trtllm_mha_decode_with_kvcache"
-            else {}
-        )
         return kernel(
             q=q,
             k_cache=k_cache,
@@ -2391,8 +2381,8 @@ def mha_decode_with_kvcache(
             softmax_scale=softmax_scale,
             max_seqlen_k=max_seqlen_k,
             max_seqlen_q=max_seqlen_q,
+            enable_pdl=enable_pdl,
             **scale_kwargs,
-            **pdl_kwargs,
         )
 
 
@@ -4160,11 +4150,6 @@ def dsa_decode(
     with kernel_scope(
         "attention", "dsa_decode", q.dtype, kernel_name=kernel.name, **shape_params
     ):
-        pdl_kwargs = (
-            {"enable_pdl": enable_pdl}
-            if kernel.name == "flashinfer_trtllm_dsa_decode"
-            else {}
-        )
         return kernel(
             q=q,
             kv_cache=kv_cache,
@@ -4182,7 +4167,7 @@ def dsa_decode(
             k_scale=k_scale,
             return_lse=return_lse,
             out=out,
-            **pdl_kwargs,
+            enable_pdl=enable_pdl,
         )
 
 
@@ -4253,11 +4238,6 @@ def dsa_prefill(
     with kernel_scope(
         "attention", "dsa_prefill", q.dtype, kernel_name=kernel.name, **shape_params
     ):
-        pdl_kwargs = (
-            {"enable_pdl": enable_pdl}
-            if kernel.name == "flashinfer_trtllm_dsa_prefill"
-            else {}
-        )
         return kernel(
             q=q,
             kv_cache=kv_cache,
@@ -4275,7 +4255,7 @@ def dsa_prefill(
             k_scale=k_scale,
             return_lse=return_lse,
             out=out,
-            **pdl_kwargs,
+            enable_pdl=enable_pdl,
         )
 
 
