@@ -331,7 +331,7 @@ def render_script(
         "--no-container-mount-home",
         "--container-writable",
         "--container-remap-root",
-        "--container-env=SLURM_JOB_ID,RUNNER_NAME,HF_TOKEN,"
+        "--container-env=SLURM_JOB_ID,RUNNER_NAME,HF_TOKEN,OPENAI_API_KEY,"
         "HUGGING_FACE_HUB_TOKEN,HF_HOME,XDG_CACHE_HOME,"
         "SLURM_STEP_ID,SLURM_STEP_NUM_NODES,SLURM_STEP_NODELIST,SLURM_NODEID,"
         "SLURM_PROCID,SLURM_LOCALID",

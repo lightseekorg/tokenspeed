@@ -35,6 +35,7 @@ on:
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-mmlu.yaml
           - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-ocr-bench.yaml
           - test/ci/eval/kimi-k3-mxfp4-tp16-four-node-evalscope-aime26-slurm.yaml
+          - test/ci/eval/kimi-k3-mxfp4-dspark-tp8-two-node-kvv-beam-1m-gb300-slurm.yaml
           - test/ci/eval/kimi-k3-mxfp4-dspark-tp8-two-node-kvv-mmmu-pro-vision-gb300-slurm.yaml
           - test/ci/eval/kimi-k3-mxfp4-dspark-tp8-two-node-kvv-ocr-bench-gb300-slurm.yaml
           - test/ci/eval/kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml
@@ -112,6 +113,7 @@ jobs:
 
       - name: Submit and wait for Slurm tasks
         env:
+          OPENAI_API_KEY: ${{ inputs.yaml == 'test/ci/eval/kimi-k3-mxfp4-dspark-tp8-two-node-kvv-beam-1m-gb300-slurm.yaml' && secrets.OPENAI_API_KEY || '' }}
           PR: ${{ inputs.pr }}
           CLUSTER: ${{ inputs.cluster }}
           YAML_SELECTION: ${{ inputs.yaml }}

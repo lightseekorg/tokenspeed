@@ -1,0 +1,109 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-kimi-k3-mxfp4-dspark-tp8-two-node-beam-1m-gb300-slurm
+type: eval
+workflow_stage: model-test
+triggers:
+  - slurm
+runner:
+  labels:
+    - slurm-gb300-4gpu
+slurm:
+  nodes: 2
+  gpus_per_node: 4
+env:
+  CI: "true"
+  TOKENSPEED_DFLASH_AUX_STREAM: attn_res
+install:
+  - bash test/ci_system/install_deps.sh
+  - python3 -m pip install flash-linear-attention
+server:
+  command: >-
+    ts serve /models/moonshotai--Kimi-K3/9f62e4e9fffbd0a83ddd60e1c209d828994b3569
+    --served-model-name kimi-k3
+    --speculative-algorithm DSPARK
+    --speculative-draft-model-path /models/Inferact--Kimi-K3-DSpark/cf6b8244620e7ea4b0651d214f28e89eac75bed6
+    --speculative-num-draft-tokens 8
+    --drafter-attention-backend mla
+    --trust-remote-code
+    --max-model-len 1048576
+    --kv-cache-dtype fp8
+    --tensor-parallel-size 8
+    --mm-encoder-tp-mode data
+    --moe-backend flashinfer_trtllm
+    --gpu-memory-utilization 0.92
+    --max-num-seqs 1
+    --enable-prefix-caching
+    --disable-prefill-graph
+    --disable-kvstore
+    --host 0.0.0.0
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 7200
+    interval: 10
+eval:
+  install:
+    - |
+      set -eu
+      [ -n "${OPENAI_API_KEY:-}" ] || { echo "OPENAI_API_KEY is required" >&2; exit 2; }
+      kvv_sha=3dad65a760a8867cda72f6dd8848d876a4e851b4
+      kvv_dir=/tmp/kvv
+      cache_dir=${XDG_CACHE_HOME:-/home/runner/.cache}/kvv-beam/$kvv_sha
+      git init -q "$kvv_dir"
+      git -C "$kvv_dir" fetch --depth 1 https://github.com/MoonshotAI/Kimi-Vendor-Verifier.git "$kvv_sha"
+      GIT_LFS_SKIP_SMUDGE=1 git -C "$kvv_dir" checkout --detach FETCH_HEAD
+      mkdir -p "$cache_dir"
+      (
+        flock -x 9
+        download() {
+          name=$1
+          sha=$2
+          url=$3
+          target=$cache_dir/$name
+          if [ -f "$target" ] && printf '%s  %s\n' "$sha" "$target" | sha256sum -c - >/dev/null 2>&1; then
+            return
+          fi
+          tmp=$target.tmp.$$
+          trap 'rm -f "$tmp"' EXIT
+          curl -fL --retry 5 --retry-delay 2 "$url" -o "$tmp"
+          printf '%s  %s\n' "$sha" "$tmp" | sha256sum -c -
+          mv -f "$tmp" "$target"
+          trap - EXIT
+        }
+        download beam_1m_chats.jsonl.gz 878eefe2b90273b52ad1b0ddd29e72568a6b218567c0a8cdba78696099cba2ad https://media.githubusercontent.com/media/MoonshotAI/Kimi-Vendor-Verifier/$kvv_sha/beam/data/beam_1m_chats.jsonl.gz
+        download beam_1m_questions.jsonl 0882ca1ea1dfffa4645463b94c44156277e4da082fb9a1a68ceeca852b4fc2f4 https://media.githubusercontent.com/media/MoonshotAI/Kimi-Vendor-Verifier/$kvv_sha/beam/data/beam_1m_questions.jsonl
+      ) 9>"$cache_dir/.lock"
+      install -m 0644 "$cache_dir/beam_1m_chats.jsonl.gz" "$kvv_dir/beam/data/beam_1m_chats.jsonl.gz"
+      install -m 0644 "$cache_dir/beam_1m_questions.jsonl" "$kvv_dir/beam/data/beam_1m_questions.jsonl"
+      python3 -m uv sync --project "$kvv_dir" --frozen
+  command: |
+    set -eu
+    output_dir=${XDG_CACHE_HOME:-/home/runner/.cache}/kvv-beam/results/${SLURM_JOB_ID:-local}
+    mkdir -p "$output_dir"
+    BEAM_API_KEY=EMPTY_TOKEN /tmp/kvv/.venv/bin/python /tmp/kvv/beam/beam_generate.py \
+      --model kimi-k3 \
+      --base-url http://127.0.0.1:8000/v1 \
+      --concurrency 1 \
+      --temperature 1.0 \
+      --top-p 0.95 \
+      --max-tokens 32768 \
+      --max-context-tokens 1048576 \
+      --thinking-json '{"chat_template_kwargs":{"thinking":true,"preserve_thinking":true,"thinking_effort":"max"}}' \
+      --output "$output_dir/answers.jsonl"
+    answer_count=$(wc -l < "$output_dir/answers.jsonl")
+    [ "$answer_count" -eq 700 ] || { echo "expected 700 answers, got $answer_count" >&2; exit 1; }
+    JUDGE_API_KEY="$OPENAI_API_KEY" /tmp/kvv/.venv/bin/python /tmp/kvv/beam/beam_judge.py \
+      --answers "$output_dir/answers.jsonl" \
+      --output "$output_dir/scores.jsonl" \
+      --judge-model gpt-4.1-mini-2025-04-14 \
+      --judge-base-url https://api.openai.com/v1 \
+      --judge-temperature 0.3 \
+      --judge-max-tokens 16384 \
+      --concurrency 16 > "$output_dir/summary.txt"
+    cat "$output_dir/summary.txt"
+    score=$(awk '$1 == "overall:" { value=$2 } END { print value }' "$output_dir/summary.txt")
+    [ -n "$score" ] || { echo "BEAM overall score is missing" >&2; exit 1; }
+    printf 'accuracy         %s\n' "$score"
+report:
+  github_step_summary: true
+score_threshold: 0.29
