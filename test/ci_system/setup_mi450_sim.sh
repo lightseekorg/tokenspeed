@@ -25,7 +25,7 @@ sudo "$(command -v uv)" pip install --system --break-system-packages --prereleas
     --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ \
     "rocm[devel,libraries]==${ROCM_SDK_VERSION}" \
     "rocm-sdk-device-gfx1250==${ROCM_SDK_VERSION}"
-rocm-sdk init
+sudo "$(command -v rocm-sdk)" init
 
 mkdir -p "${SIM_ROOT}"
 if [ ! -d "${SOURCE_ROOT}/.git" ]; then
