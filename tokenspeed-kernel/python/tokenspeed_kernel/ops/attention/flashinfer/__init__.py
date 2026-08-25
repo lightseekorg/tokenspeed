@@ -21,6 +21,8 @@
 from __future__ import annotations
 
 import math
+from functools import wraps
+from inspect import signature
 
 import tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule  # noqa: F401
 import torch
@@ -49,25 +51,66 @@ trtllm_batch_decode_with_kv_cache = error_fn
 trtllm_batch_decode_with_kv_cache_mla = error_fn
 trtllm_ragged_attention_deepseek = error_fn
 
+
+def _resolve_enable_pdl(enable_pdl: bool | None) -> bool:
+    return pdl_enabled() if enable_pdl is None else enable_pdl
+
+
+def _with_pdl_default(function):
+    enable_pdl_index = tuple(signature(function).parameters).index("enable_pdl")
+
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        if len(args) > enable_pdl_index:
+            args = (
+                *args[:enable_pdl_index],
+                _resolve_enable_pdl(args[enable_pdl_index]),
+                *args[enable_pdl_index + 1 :],
+            )
+        else:
+            kwargs["enable_pdl"] = _resolve_enable_pdl(kwargs.get("enable_pdl"))
+        return function(*args, **kwargs)
+
+    return wrapper
+
+
 if platform.is_nvidia:
     from flashinfer.decode import (
         BatchDecodeWithPagedKVCacheWrapper,
-        trtllm_batch_decode_with_kv_cache,
-        trtllm_batch_decode_with_kv_cache_mla,
+    )
+    from flashinfer.decode import (
+        trtllm_batch_decode_with_kv_cache as _trtllm_batch_decode_with_kv_cache,
+    )
+    from flashinfer.decode import (
+        trtllm_batch_decode_with_kv_cache_mla as _trtllm_batch_decode_with_kv_cache_mla,
     )
     from flashinfer.prefill import (
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
         cudnn_batch_prefill_with_kv_cache,
-        trtllm_batch_context_with_kv_cache,
-        trtllm_ragged_attention_deepseek,
+    )
+    from flashinfer.prefill import (
+        trtllm_batch_context_with_kv_cache as _trtllm_batch_context_with_kv_cache,
+    )
+    from flashinfer.prefill import (
+        trtllm_ragged_attention_deepseek as _trtllm_ragged_attention_deepseek,
+    )
+
+    trtllm_batch_context_with_kv_cache = _with_pdl_default(
+        _trtllm_batch_context_with_kv_cache
+    )
+    trtllm_batch_decode_with_kv_cache = _with_pdl_default(
+        _trtllm_batch_decode_with_kv_cache
+    )
+    trtllm_batch_decode_with_kv_cache_mla = _with_pdl_default(
+        _trtllm_batch_decode_with_kv_cache_mla
+    )
+    trtllm_ragged_attention_deepseek = _with_pdl_default(
+        _trtllm_ragged_attention_deepseek
     )
 
 if platform.is_blackwell or platform.is_hopper:
-    from flashinfer.mla import (
-        BatchMLAPagedAttentionWrapper,
-        trtllm_batch_decode_with_kv_cache_mla,
-    )
+    from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
 
 # ------------------------------------------------------------------------------
@@ -171,7 +214,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         q_scale: torch.Tensor | None = None,
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
-        enable_pdl: bool = False,
+        enable_pdl: bool | None = None,
     ) -> torch.Tensor:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -206,7 +249,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             sinks=sinks,
             out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
             causal=is_causal,
-            enable_pdl=enable_pdl and pdl_enabled(),
+            enable_pdl=_resolve_enable_pdl(enable_pdl),
         )
 
     @register_kernel(
@@ -247,7 +290,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         q_scale: torch.Tensor | None = None,
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
-        enable_pdl: bool = False,
+        enable_pdl: bool | None = None,
     ) -> torch.Tensor:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -279,7 +322,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             sinks=sinks,
             out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
             q_len_per_req=max_seqlen_q,
-            enable_pdl=enable_pdl and pdl_enabled(),
+            enable_pdl=_resolve_enable_pdl(enable_pdl),
         )
 
     @register_kernel(
@@ -329,7 +372,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         k_scale: float = 1.0,
         return_lse: bool = False,
         out: torch.Tensor | None = None,
-        enable_pdl: bool = False,
+        enable_pdl: bool | None = None,
     ) -> torch.Tensor:
         if kv_cache is None:
             raise RuntimeError("FlashInfer/TRTLLM sparse MLA requires kv_cache")
@@ -365,7 +408,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             sparse_mla_top_k=topk_slots.shape[-1],
             bmm1_scale=float(k_scale) * float(softmax_scale),
             backend="trtllm-gen",
-            enable_pdl=enable_pdl and pdl_enabled(),
+            enable_pdl=_resolve_enable_pdl(enable_pdl),
         )
         result = result.reshape(num_tokens, q_kernel.shape[2], int(kv_lora_rank))
         if out is not None:
@@ -420,7 +463,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         k_scale: float = 1.0,
         return_lse: bool = False,
         out: torch.Tensor | None = None,
-        enable_pdl: bool = False,
+        enable_pdl: bool | None = None,
     ) -> torch.Tensor:
         return flashinfer_trtllm_dsa_decode(
             q=q,

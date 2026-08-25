@@ -31,6 +31,10 @@ from tokenspeed_kernel.ops.embedding import (
     apply_rope_mla,
     apply_rope_mla_set_kv,
 )
+from tokenspeed_kernel.ops.kvcache.triton import (
+    get_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton,
+)
 
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.models.utils import (
@@ -43,11 +47,6 @@ sys.path.insert(
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=15, suite="runtime-1gpu")
-
-from tokenspeed.runtime.cache.utils import (  # noqa: E402
-    get_mla_kv_buffer_triton,
-    set_mla_kv_buffer_triton,
-)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

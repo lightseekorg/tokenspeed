@@ -30,7 +30,6 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -108,7 +107,7 @@ class TinyGemmLinear(ReplicatedLinear):
             and x.dtype == torch.bfloat16
         ):
             out = x.new_empty((x.shape[0], self.output_size))
-            tinygemm_bf16(x, self.weight, out, self.bias, use_pdl=pdl_enabled())
+            tinygemm_bf16(x, self.weight, out, self.bias)
             return out, None
 
         return super().forward(x)

@@ -16,6 +16,9 @@
 # SOFTWARE.
 from __future__ import annotations
 
+from functools import wraps
+from inspect import signature
+
 import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -35,8 +38,33 @@ mxfp8_quantize = error_fn
 nvfp4_block_scale_interleave = error_fn
 fp8_blockscale_quantize_runner_sm90 = error_fn
 
+
+def _resolve_enable_pdl(enable_pdl: bool | None) -> bool:
+    return pdl_enabled() if enable_pdl is None else enable_pdl
+
+
+def _with_pdl_default(function):
+    enable_pdl_index = tuple(signature(function).parameters).index("enable_pdl")
+
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        if len(args) > enable_pdl_index:
+            args = (
+                *args[:enable_pdl_index],
+                _resolve_enable_pdl(args[enable_pdl_index]),
+                *args[enable_pdl_index + 1 :],
+            )
+        else:
+            kwargs["enable_pdl"] = _resolve_enable_pdl(kwargs.get("enable_pdl"))
+        return function(*args, **kwargs)
+
+    return wrapper
+
+
 if platform.is_nvidia:
-    from flashinfer import mxfp8_quantize
+    from flashinfer import mxfp8_quantize as _mxfp8_quantize
+
+    mxfp8_quantize = _with_pdl_default(_mxfp8_quantize)
 
     if platform.is_hopper:
         from flashinfer.gemm.gemm_base import (
@@ -61,16 +89,18 @@ if platform.is_nvidia:
     )
     def flashinfer_quantize_mxfp8(
         x: torch.Tensor,
-        enable_pdl: bool = False,
+        enable_pdl: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return mxfp8_quantize(x, False, enable_pdl=enable_pdl and pdl_enabled())
+        return mxfp8_quantize(x, False, enable_pdl=_resolve_enable_pdl(enable_pdl))
 
 
 if platform.is_nvidia and platform.is_blackwell:
+    from flashinfer import fp4_quantize as _fp4_quantize
     from flashinfer import (
-        fp4_quantize,
         nvfp4_block_scale_interleave,
     )
+
+    fp4_quantize = _with_pdl_default(_fp4_quantize)
 
     @register_kernel(
         "quantization",
@@ -91,7 +121,7 @@ if platform.is_nvidia and platform.is_blackwell:
         x: torch.Tensor,
         scale: float | torch.Tensor | None = None,
         scale_layout: str = "swizzled",
-        enable_pdl: bool = False,
+        enable_pdl: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # The public quantization API uses the actual scale; FlashInfer's FP4
         # helper expects the inverse scale used before packing.
@@ -101,7 +131,7 @@ if platform.is_nvidia and platform.is_blackwell:
             global_scale=scale_inv,
             sf_vec_size=16,
             is_sf_swizzled_layout=scale_layout == "swizzled",
-            enable_pdl=enable_pdl and pdl_enabled(),
+            enable_pdl=_resolve_enable_pdl(enable_pdl),
         )
 
 

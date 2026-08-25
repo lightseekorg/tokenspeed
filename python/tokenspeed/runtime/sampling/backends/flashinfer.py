@@ -328,13 +328,11 @@ class FlashInferSamplingBackend(SamplingBackend):
                 top_p=self._top_p_pool,
                 seed=self._seed_pool,
                 offsets=sampling_info.valid_cache_lengths,
-                enable_pdl=pdl_enabled(),
             )
 
             probs = softmax(
                 logits,
                 temperature=temperatures.view(-1, 1),
-                enable_pdl=pdl_enabled(),
             )
             batch_next_token_ids = top_k_top_p_sampling_from_probs(
                 probs,
@@ -476,7 +474,6 @@ class FlashInferSamplingBackend(SamplingBackend):
                 target_predict=target_predict,
                 batch_size=bs,
                 num_draft_tokens=num_tokens_per_req,
-                enable_pdl=pdl_enabled(),
             )
 
         else:
@@ -490,13 +487,11 @@ class FlashInferSamplingBackend(SamplingBackend):
                 top_k=self._top_k_pool,
                 top_p=self._top_p_pool,
                 n=n,
-                enable_pdl=pdl_enabled(),
             )
 
             target_probs = softmax(
                 logits,
                 temperature=temperatures,
-                enable_pdl=pdl_enabled(),
             )
             if _FUSED_TOPK_TOPP_AVAILABLE:
                 # Fused replacement for the back-to-back top_k_renorm_prob +
@@ -508,7 +503,6 @@ class FlashInferSamplingBackend(SamplingBackend):
                     target_probs,
                     top_ks,
                     top_ps,
-                    enable_pdl=pdl_enabled(),
                 )
             else:
                 target_probs = top_k_renorm_prob(target_probs, top_ks)
@@ -529,7 +523,6 @@ class FlashInferSamplingBackend(SamplingBackend):
                 threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
                 threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
                 deterministic=not dp_sampling,
-                enable_pdl=pdl_enabled(),
             )
 
         accept_length += 1

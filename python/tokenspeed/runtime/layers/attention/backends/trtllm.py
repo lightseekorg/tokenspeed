@@ -39,7 +39,6 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
     gather_page_table_with_padding,
 )
-from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -363,7 +362,6 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             sinks=attention_sink,
             out_dtype=self.dtype,
             q_len_per_req=metadata.max_seq_len_q,
-            enable_pdl=pdl_enabled(),
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -407,7 +405,6 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
             out_dtype=self.dtype,
-            enable_pdl=pdl_enabled(),
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

@@ -41,7 +41,6 @@ from tokenspeed_kernel.ops.sampling.triton import (
     selected_token_logprobs,
     verify_chain_target_sampled,
 )
-from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.sampling.backends.base import (
     CUDA_GRAPH_VARIANT_DEFAULT,
@@ -571,7 +570,6 @@ class TritonSamplingBackend(SamplingBackend):
                 accept_token_num=accept_length,
                 candidates=candidates,
                 target_sampled=target_sampled,
-                enable_pdl=pdl_enabled(),
             )
         else:
             offsets_pool = (
@@ -686,7 +684,6 @@ class TritonSamplingBackend(SamplingBackend):
                 accept_token_num=accept_length,
                 candidates=candidates,
                 target_sampled=target_sampled,
-                enable_pdl=pdl_enabled(),
             )
 
         accept_length += 1

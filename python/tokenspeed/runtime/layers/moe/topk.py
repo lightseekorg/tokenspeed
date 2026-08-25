@@ -27,7 +27,6 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk, moe_softmax_topk
 from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
-from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
 from tokenspeed_kernel.thirdparty.triton import minimax_biased_grouped_topk
 
@@ -485,7 +484,6 @@ def select_experts(
             top_k=top_k,
             n_routed=router_logits.shape[1] - topk_config.num_sink_experts,
             route_scale=routed_scaling_factor,
-            enable_pdl=pdl_enabled(),
         )
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     elif use_grouped_topk:
@@ -594,7 +592,6 @@ def select_experts(
             num_real_experts,
             routed_scaling_factor,
             renormalize,
-            pdl_enabled(),
         )
     elif custom_routing_function is None:
         assert (

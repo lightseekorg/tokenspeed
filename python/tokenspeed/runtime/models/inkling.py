@@ -88,7 +88,7 @@ from tokenspeed_kernel.ops.conv import inkling_ring_sconv
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.configs.inkling_config import (
@@ -618,7 +618,6 @@ class InklingAttention(nn.Module):
                 self.q_norm.weight,
                 self.k_norm.weight,
                 self.q_norm.variance_epsilon,
-                enable_pdl=pdl_enabled(),
             )
 
         attn_output = self.attn(
@@ -753,9 +752,7 @@ class InklingGate(nn.Module):
         and the shared sink gammas (last ``S`` columns) from one joint
         normalization; callers slice as needed."""
         if self.use_dsv3_router_gemm and x.size(0) > 0:
-            logits = dsv3_router_gemm(
-                x, self.weight, out_dtype=torch.float32, enable_pdl=pdl_enabled()
-            )
+            logits = dsv3_router_gemm(x, self.weight, out_dtype=torch.float32)
         else:
             logits = F.linear(x, self.weight, None)
 
@@ -963,7 +960,6 @@ class InklingSparseMoeBlock(nn.Module):
                 weights,
                 shared_out,
                 top_k=top_k,
-                enable_pdl=pdl_enabled(),
             )
         else:
             weights, topk_ids, router_logits = self.gate(x)

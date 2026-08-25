@@ -42,7 +42,6 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gumbel_sample_top_p_parallel_from_pools,
     verify_chain_target_sampled,
 )
-from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.sampling.backends.base import (
     CUDA_GRAPH_VARIANT_DEFAULT,
@@ -538,7 +537,6 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             accept_token_num=accept_length,
             candidates=candidates.to(torch.int32),
             target_sampled=target_sampled,
-            enable_pdl=pdl_enabled(),
         )
 
         accept_length += 1

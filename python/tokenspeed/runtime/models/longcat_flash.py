@@ -26,7 +26,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as _F
 from tokenspeed_kernel.platform import current_platform as _current_platform
-from tokenspeed_kernel.platform import pdl_enabled as _pdl_enabled
 from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as _dsv3_router_gemm
 from tokenspeed_kernel.thirdparty.cuda import (
     moe_finalize_fuse_shared as _moe_finalize_fuse_shared,
@@ -192,7 +191,6 @@ class _RuntimeLongcatRouter(nn.Module):
                 hidden_states,
                 self.classifier.weight,
                 out_dtype=torch.float32,
-                enable_pdl=_pdl_enabled(),
             )
         return _F.linear(hidden_states.float(), self.classifier.weight.float(), None)
 
@@ -345,7 +343,6 @@ class _RuntimeLongcatMoE(nn.Module):
                 expert_weights,
                 zero_expert_output,
                 top_k=self.topk.topk_config.top_k,
-                enable_pdl=_pdl_enabled(),
             )
 
         if zero_expert_output is not None:

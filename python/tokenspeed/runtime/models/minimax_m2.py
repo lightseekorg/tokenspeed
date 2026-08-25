@@ -34,7 +34,7 @@ from tokenspeed_kernel.ops.communication.trtllm import (
     trtllm_create_ipc_workspace_for_minimax,
 )
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 from torch import nn
 
@@ -189,7 +189,6 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
                 hidden_states,
                 self.gate.weight,
                 out_dtype=torch.float32,
-                enable_pdl=pdl_enabled(),
             )
         else:
             router_logits, _ = self.gate(hidden_states.to(torch.float32))
@@ -473,7 +472,6 @@ def fused_qk_rmsnorm(
                 nranks=tp_size,
                 eps=eps,
                 trigger_completion_at_end=True,
-                launch_with_pdl=pdl_enabled(),
             )
 
     return fused_qk_rmsnorm_triton(

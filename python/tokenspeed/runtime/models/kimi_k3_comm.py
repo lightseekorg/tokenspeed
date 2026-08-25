@@ -59,7 +59,7 @@ from tokenspeed_kernel.ops.moe.latent_tail import (
     KimiK3LatentTailOp,
     latent_tail_supported,
 )
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
@@ -402,7 +402,6 @@ class K3AttnComm:
                     group=_get_process_group(self.mapping.attn.tp_group),
                     eps=eps,
                     max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
-                    launch_with_pdl=pdl_enabled(),
                 )
                 return residual_out, h
             _, residual_out, *_ = self.state.dummy_norm.forward_with_allreduce_fusion(

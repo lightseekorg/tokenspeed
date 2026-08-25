@@ -34,7 +34,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
     is_available as dist_argmax_available,
 )
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
@@ -185,7 +185,7 @@ def _lm_head_matmul(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.
     cast_hidden = hidden_states.to(weight.dtype)
     should_use_fused, lm_head_gemm = _get_fused_lm_head_gemm()
     if should_use_fused is not None and should_use_fused(cast_hidden, weight):
-        return lm_head_gemm(cast_hidden, weight, enable_pdl=pdl_enabled())
+        return lm_head_gemm(cast_hidden, weight)
     return torch.matmul(cast_hidden, weight.T)
 
 

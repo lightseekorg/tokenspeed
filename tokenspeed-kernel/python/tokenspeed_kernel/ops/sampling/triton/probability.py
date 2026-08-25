@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 @triton.jit
@@ -78,7 +79,7 @@ def min_p_renorm_prob(
     probs: torch.Tensor,
     min_p: torch.Tensor,
     *,
-    enable_pdl: bool = False,
+    enable_pdl: bool = True,
 ) -> torch.Tensor:
     """Renormalize probabilities after applying a per-row min-p cutoff.
 
@@ -111,6 +112,7 @@ def min_p_renorm_prob(
 
     block_size = min(4096, triton.next_power_of_2(vocab_size))
     num_warps = 4 if block_size <= 1024 else 8
+    enable_pdl = enable_pdl and pdl_enabled()
     extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _min_p_renorm_prob_kernel[(rows,)](
         probs,

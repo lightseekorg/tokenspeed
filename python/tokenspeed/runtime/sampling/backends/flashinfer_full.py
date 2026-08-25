@@ -42,7 +42,6 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gather_and_expand_scalars,
     min_p_renorm_prob,
 )
-from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -306,13 +305,10 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 min_p=self._min_p_pool,
                 seed=self._seed_pool,
                 offsets=sampling_info.valid_cache_lengths,
-                enable_pdl=pdl_enabled(),
             )
         )
 
-        probs = softmax(
-            logits, temperature=temperatures.view(-1, 1), enable_pdl=pdl_enabled()
-        )
+        probs = softmax(logits, temperature=temperatures.view(-1, 1))
 
         if _FUSED_TOPK_TOPP_AVAILABLE:
             # Fused replacement for the back-to-back top_k_renorm_prob +
@@ -323,7 +319,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 probs,
                 top_ks,
                 top_ps,
-                enable_pdl=pdl_enabled(),
             )
         else:
             probs = top_k_renorm_prob(probs, top_ks)
@@ -415,12 +410,9 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             top_p=self._top_p_pool,
             min_p=self._min_p_pool,
             n=num_tokens_per_req,
-            enable_pdl=pdl_enabled(),
         )
 
-        target_probs = softmax(
-            logits, temperature=temperatures.view(-1, 1), enable_pdl=pdl_enabled()
-        )
+        target_probs = softmax(logits, temperature=temperatures.view(-1, 1))
         if _FUSED_TOPK_TOPP_AVAILABLE:
             # Fused replacement for the back-to-back top_k_renorm_prob +
             # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
@@ -430,7 +422,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 target_probs,
                 top_ks,
                 top_ps,
-                enable_pdl=pdl_enabled(),
             )
         else:
             target_probs = top_k_renorm_prob(target_probs, top_ks)
@@ -438,7 +429,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 target_probs, top_ps, is_deterministic=True
             )
 
-        target_probs = min_p_renorm_prob(target_probs, min_ps, enable_pdl=pdl_enabled())
+        target_probs = min_p_renorm_prob(target_probs, min_ps)
 
         target_probs = target_probs.reshape(bs, num_tokens_per_req, -1)
 
@@ -457,7 +448,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
             threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
             deterministic=True,
-            enable_pdl=pdl_enabled(),
         )
 
         accept_length += 1

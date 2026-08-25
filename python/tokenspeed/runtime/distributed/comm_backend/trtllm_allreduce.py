@@ -258,7 +258,6 @@ class TrtllmAllReduceBackend(CommBackend):
         from tokenspeed_kernel.ops.communication.trtllm import (
             MNNVL_PREFER_IPC_BYTES,
         )
-        from tokenspeed_kernel.platform import pdl_enabled
 
         allreduce_out = torch.empty_like(tensor_2d)
 
@@ -297,7 +296,6 @@ class TrtllmAllReduceBackend(CommBackend):
             token_num=token_num,
             hidden_dim=hidden_dim,
             workspace_ptrs=workspace,
-            launch_with_pdl=pdl_enabled(),
             use_oneshot=True,
             trigger_completion_at_end=True,
             fp32_acc=False,

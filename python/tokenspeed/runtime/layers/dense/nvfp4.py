@@ -23,7 +23,6 @@ import logging
 import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-from tokenspeed_kernel.platform import pdl_enabled
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.quantization.base_config import QuantizeMethodBase
@@ -187,9 +186,7 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
             output_dtype = torch.bfloat16
 
         else:
-            x_fp4, x_scale = fp4_quantize(
-                x, layer.input_scale_inv, enable_pdl=pdl_enabled()
-            )
+            x_fp4, x_scale = fp4_quantize(x, layer.input_scale_inv)
             output_dtype = x.dtype
 
         kernel_override = layer.override_kernel_name

@@ -31,7 +31,7 @@ from tokenspeed_kernel.ops.activation.triton import swiglu_oai
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda.minimax_m3_fused import (
     fused_qknorm_rope_kv_insert,
 )
@@ -261,7 +261,6 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
                     hidden_states,
                     self.gate.weight,
                     out_dtype=torch.float32,
-                    enable_pdl=pdl_enabled(),
                 )
             else:
                 router_logits, _ = self.gate(hidden_states.to(torch.float32))
@@ -297,7 +296,6 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
                 expert_weights,
                 shared_output,
                 top_k=self.topk.topk_config.top_k,
-                enable_pdl=pdl_enabled(),
             )
         else:
             output = (
@@ -704,7 +702,6 @@ class MiniMaxM3Attention(nn.Module):
             self.q_norm.gemma_weight,
             self.k_norm.gemma_weight,
             self.q_norm.variance_epsilon,
-            enable_pdl=pdl_enabled(),
         )
         q, k = self.rotary_emb(positions, q, k)
         q = q.view(-1, self.num_heads, self.head_dim)
@@ -736,7 +733,6 @@ class MiniMaxM3Attention(nn.Module):
             num_index_heads=self.indexer.num_index_heads,
             q_out=q_out,
             index_q_out=index_q_out,
-            enable_pdl=pdl_enabled(),
         )
         _, k, v, _, index_k = qkv.split(
             [

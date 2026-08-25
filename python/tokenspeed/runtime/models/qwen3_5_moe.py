@@ -32,7 +32,7 @@ from tokenspeed_kernel.ops.gemm.cute_dsl import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextConfig
@@ -211,7 +211,6 @@ class Qwen3_5MoeMLP(nn.Module):
             x_fc1_fp4, x_fc1_scale = fp4_quantize(
                 x,
                 self.gate_up_proj.input_scale_inv,
-                enable_pdl=pdl_enabled(),
             )
             x_fp4, x_scale = nvfp4_gemm_swiglu_nvfp4_quant(
                 x_fc1_fp4,
@@ -220,16 +219,12 @@ class Qwen3_5MoeMLP(nn.Module):
                 self.gate_up_proj.weight_scale_swiglu_interleaved,
                 self.gate_up_proj.alpha,
                 self.down_proj.input_scale_inv,
-                enable_pdl=pdl_enabled(),
             )
             x, _ = self.down_proj((x_fp4, x_scale))
             return x
         gate_up, _ = self.gate_up_proj(x)
         if self._uses_deep_gemm_fp8_mlp():
-            x_fp8, x_scale = fused_swiglu_fp8_ue8m0(
-                gate_up,
-                enable_pdl=pdl_enabled(),
-            )
+            x_fp8, x_scale = fused_swiglu_fp8_ue8m0(gate_up)
             if isinstance(self.down_proj, RowParallelLinear):
                 x, _ = self.down_proj(x_fp8, x_scale)
             else:

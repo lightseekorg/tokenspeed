@@ -37,7 +37,6 @@ from tokenspeed_kernel.ops.attention.flashinfer import (
     trtllm_batch_decode_with_kv_cache_mla,
     trtllm_ragged_attention_deepseek,
 )
-from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -675,7 +674,6 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
             bmm1_scale=bmm1_scale,
-            enable_pdl=pdl_enabled(),
         )
 
         return raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -742,7 +740,6 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             window_left=-1,
             cum_seq_lens_q=cum_seq_lens_q,
             cum_seq_lens_kv=cum_seq_lens_kv,
-            enable_pdl=pdl_enabled(),
             is_causal=causal,
             return_lse=True,
             out=out,

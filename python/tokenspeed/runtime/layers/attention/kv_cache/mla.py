@@ -24,12 +24,11 @@ from typing import ClassVar
 
 import numpy as np
 import torch
-from tokenspeed_kernel.platform import pdl_enabled
-
-from tokenspeed.runtime.cache.utils import (
+from tokenspeed_kernel.ops.kvcache.triton import (
     get_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton,
 )
+
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -196,7 +195,6 @@ class MLATokenToKVPool(CachePool):
                 loc,
                 cache_k_nope,
                 cache_k_rope,
-                enable_pdl=pdl_enabled(),
                 sanitize=sanitize,
             )
 
@@ -229,7 +227,5 @@ class MLATokenToKVPool(CachePool):
             dtype=dst_dtype,
             device=kv_buffer.device,
         )
-        get_mla_kv_buffer_triton(
-            kv_buffer, loc, cache_k_nope, cache_k_rope, enable_pdl=pdl_enabled()
-        )
+        get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return cache_k_nope, cache_k_rope

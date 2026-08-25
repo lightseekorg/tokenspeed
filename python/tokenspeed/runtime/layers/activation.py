@@ -30,7 +30,7 @@ import torch
 import triton
 import triton.language as tl
 from tokenspeed_kernel import prepare_fp8_linear_activation, silu_and_mul
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
@@ -86,9 +86,7 @@ class SiluAndMul(torch.nn.Module):
                     silu_and_mul_fuse_block_quant,
                 )
 
-                out, scale = silu_and_mul_fuse_block_quant(
-                    x, scale, out, enable_pdl=pdl_enabled()
-                )
+                out, scale = silu_and_mul_fuse_block_quant(x, scale, out)
                 return out, scale
             out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
             return silu_and_mul(

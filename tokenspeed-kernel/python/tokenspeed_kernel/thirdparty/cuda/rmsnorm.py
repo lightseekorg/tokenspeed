@@ -24,6 +24,7 @@ import functools
 from pathlib import Path
 
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 @functools.cache
@@ -48,8 +49,9 @@ def rmsnorm_fused_parallel(
     weight2: torch.Tensor,
     output2: torch.Tensor,
     eps: float = 1e-6,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> None:
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     _load_rmsnorm_module().rmsnorm_fused_parallel(
         input1,
         weight1,

@@ -69,7 +69,6 @@ _is_blackwell = _platform.is_blackwell
 _is_hopper_plus = _platform.is_hopper_plus
 _device_sm = _platform.arch_version.major * 10 + _platform.arch_version.minor
 
-from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
@@ -220,7 +219,8 @@ class DeepseekV3MLP(nn.Module):
 
         if self._use_nvfp4_gemm_swiglu_nvfp4_quant:
             x_fc1_fp4, x_fc1_scale = fp4_quantize(
-                x, self.gate_up_proj.input_scale_inv, enable_pdl=pdl_enabled()
+                x,
+                self.gate_up_proj.input_scale_inv,
             )
             x_fp4, x_scale = nvfp4_gemm_swiglu_nvfp4_quant(
                 x_fc1_fp4,
@@ -229,7 +229,6 @@ class DeepseekV3MLP(nn.Module):
                 self.gate_up_proj.weight_scale_swiglu_interleaved,
                 self.gate_up_proj.alpha,
                 self.down_proj.input_scale_inv,
-                enable_pdl=pdl_enabled(),
             )
             x, _ = self.down_proj((x_fp4, x_scale))
             return x
@@ -267,7 +266,6 @@ class MoEGate(nn.Module):
                 hidden_states,
                 self.weight,
                 out_dtype=torch.float32,
-                enable_pdl=pdl_enabled(),
             )
         else:
             logits = F.linear(hidden_states, self.weight, None)
@@ -398,7 +396,6 @@ class DeepseekV3MoE(nn.Module):
                 expert_weights,
                 shared_output,
                 top_k=self.topk.topk_config.top_k,
-                enable_pdl=pdl_enabled(),
             )
         else:
             final_hidden_states = (
@@ -1131,11 +1128,11 @@ class DeepseekV3AttentionMLA(nn.Module):
                 quant_scale_kv=k_scale,
             )
 
-            v_fp8 = fp8_quantize(v, enable_pdl=pdl_enabled())
+            v_fp8 = fp8_quantize(v)
 
             # Write FP8 KV cache directly (skip BF16→FP8 conversion in pool)
             k_pe_for_cache = k_fp8[:, 0:1, self.qk_nope_head_dim :]
-            kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=pdl_enabled())
+            kv_a_fp8 = fp8_quantize(kv_a)
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mha,
                 out_cache_loc,
@@ -1233,7 +1230,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             if q.dtype == torch.float8_e4m3fn:
                 # FP8 Attention
                 k, v = mla_kv_pack_quantize_fp8(
-                    k_nope, k_pe, v, k_scale_inv=1.0 / k_scale, enable_pdl=pdl_enabled()
+                    k_nope, k_pe, v, k_scale_inv=1.0 / k_scale
                 )
             else:
                 # BF16 Attention

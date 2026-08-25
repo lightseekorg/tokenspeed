@@ -35,7 +35,6 @@ from tokenspeed_kernel import (
 from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
 )
-from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -689,7 +688,6 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 k_scale=layer.k_scale,
                 v_scale=layer.v_scale,
                 page_size=self.kernel_page_size,
-                enable_pdl=pdl_enabled(),
             )
         else:
             token_to_kv_pool.set_kv_buffer(
