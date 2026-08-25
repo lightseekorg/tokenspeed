@@ -58,7 +58,7 @@ def test_the_roles_own_rule_reaches_the_registry() -> None:
     # The P-side handoff batch needs the final chunk's bootstrap token, which
     # only lands at commit. The rule lives on the role; the registry folds it
     # in with the role-independent ones.
-    prefill = PrefillDispatcher(None, None, epd_hooks=None)
+    prefill = PrefillDispatcher(None, store_prefill_token=None, epd_hooks=None)
     loop = _predicate_loop(dispatcher=prefill)
     handoff_op = SimpleNamespace(num_extends=lambda: 0)
     extend_op = SimpleNamespace(num_extends=lambda: 1)

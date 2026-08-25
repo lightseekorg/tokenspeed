@@ -165,6 +165,14 @@ def test_wire_drafter_sets_pad_ids_only_when_supported():
             self.ids = ids
 
     # A config with no mm pad ids resolves to falsy -> drafter untouched.
+    # Text-only, so the multimodal branch that would raise is not taken.
     drafter = _Drafter()
-    MultimodalRuntime.wire_drafter(drafter, SimpleNamespace())
+    MultimodalRuntime.wire_drafter(
+        drafter,
+        SimpleNamespace(
+            hf_config=SimpleNamespace(),
+            vocab_size=32000,
+            is_multimodal_active=False,
+        ),
+    )
     assert drafter.ids is None

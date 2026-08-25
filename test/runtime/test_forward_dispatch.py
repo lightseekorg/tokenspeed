@@ -51,7 +51,7 @@ class _ForwardThread:
         return fn()
 
 
-def _handle(trace):
+def _handle(trace, kv_transfer=None):
     """A real DeviceHandle over a fake executor: the dispatchers can only reach
     the GPU through it, so the trace is the complete crossing."""
 
@@ -59,7 +59,7 @@ def _handle(trace):
         trace.append(("forward", kwargs["grammar_inputs"], kwargs))
         return SimpleNamespace(sync=lambda: trace.append("sync"))
 
-    return DeviceHandle(
+    handle = DeviceHandle(
         SimpleNamespace(
             forward_thread=_ForwardThread(trace),
             execute_forward_op=execute_forward_op,
@@ -67,6 +67,11 @@ def _handle(trace):
             reset_remote_prefill_cache_lengths=lambda op: trace.append("seed-lengths"),
         )
     )
+    if kv_transfer is not None:
+        # The handle owns the RDMA trigger, so a D-role test attaches it the
+        # way startup does rather than handing it to the dispatcher.
+        handle.attach_kv_transfer(kv_transfer)
+    return handle
 
 
 def _planned(*, num_extends=0, is_local_prefill=True, cache_zero_future=None):
@@ -107,7 +112,7 @@ def test_decode_node_triggers_the_receive_for_a_remote_prefill_batch():
     kv_transfer = SimpleNamespace(execute=lambda op: trace.append("rdma"))
 
     pending, on_first_token = DecodeDispatcher(
-        _handle(trace), kv_transfer, pd_cache_enabled=True
+        _handle(trace, kv_transfer), pd_cache_enabled=True
     ).dispatch(
         _planned(
             num_extends=1, is_local_prefill=False, cache_zero_future=cache_zero_future
@@ -125,7 +130,7 @@ def test_decode_node_masks_local_batches_with_the_batch_grammar():
     RemotePrefillDoneEvent landed, so decode masks from the right state."""
     trace = []
     pending, on_first_token = DecodeDispatcher(
-        _handle(trace), SimpleNamespace(), pd_cache_enabled=False
+        _handle(trace), pd_cache_enabled=False
     ).dispatch(_planned(num_extends=0))
 
     assert pending is not None and on_first_token is None
@@ -134,39 +139,40 @@ def test_decode_node_masks_local_batches_with_the_batch_grammar():
 
 def test_prefill_node_hands_the_kv_off_when_no_chunk_is_left():
     trace = []
-    kv_transfer = SimpleNamespace(
-        execute=lambda op: trace.append("send-kv"),
-        store_prefill_token=lambda *a: None,
-    )
+    kv_transfer = SimpleNamespace(execute=lambda op: trace.append("send-kv"))
 
     result = PrefillDispatcher(
-        _handle(trace), kv_transfer, epd_hooks=SimpleNamespace()
+        _handle(trace, kv_transfer),
+        store_prefill_token=lambda *a: None,
+        epd_hooks=SimpleNamespace(),
     ).dispatch(_planned(num_extends=0))
 
+    # The send reads KV the round's forwards wrote, so it rides the FIFO
+    # rather than racing them from the control plane.
     assert result == (None, None)
-    assert trace == ["send-kv"]
+    assert trace == ["run", "send-kv"]
 
 
 def test_prefill_node_captures_next_input_ids_and_returns_the_token_hook():
     trace = []
     store_prefill_token = lambda *a: None  # noqa: E731 - identity asserted below
-    kv_transfer = SimpleNamespace(
-        prepare_prefill=lambda op: trace.append("prepare"),
-        store_prefill_token=store_prefill_token,
-    )
+    kv_transfer = SimpleNamespace(prepare_prefill=lambda op: trace.append("prepare"))
     epd_hooks = SimpleNamespace(
         assert_embeddings_received=lambda ctx: trace.append(("epd", ctx))
     )
 
     pending, on_first_token = PrefillDispatcher(
-        _handle(trace), kv_transfer, epd_hooks=epd_hooks
+        _handle(trace, kv_transfer),
+        store_prefill_token=store_prefill_token,
+        epd_hooks=epd_hooks,
     ).dispatch(_planned(num_extends=1))
 
     assert pending is not None
     assert on_first_token is store_prefill_token
-    # Control-plane bookkeeping first, GPU work after.
-    assert trace[:3] == ["prepare", ("epd", "MM"), "submit"]
-    assert trace[3][2]["capture_next_input_ids"] is True
+    # The layerwise arming is enqueued BEFORE the forward it arms; the
+    # pure-CPU EPD check stays on the control plane between them.
+    assert trace[:4] == ["run", "prepare", ("epd", "MM"), "submit"]
+    assert trace[4][2]["capture_next_input_ids"] is True
 
 
 def test_only_the_prefill_role_needs_the_pending_commit_drained():
@@ -175,7 +181,7 @@ def test_only_the_prefill_role_needs_the_pending_commit_drained():
     handoff = _planned(num_extends=0).forward_op
     chunk = _planned(num_extends=1).forward_op
     prefill = PrefillDispatcher(
-        _handle([]), SimpleNamespace(), epd_hooks=SimpleNamespace()
+        _handle([]), store_prefill_token=None, epd_hooks=SimpleNamespace()
     )
 
     assert prefill.needs_pending_commit(handoff) is True
@@ -186,7 +192,7 @@ def test_only_the_prefill_role_needs_the_pending_commit_drained():
 def test_only_a_remote_prefill_batch_skips_the_model_forward_path():
     """DP ranks size their collectives from this, so it has to answer for the
     same op the role would dispatch — one rule, not two copies."""
-    decode = DecodeDispatcher(_handle([]), SimpleNamespace(), pd_cache_enabled=False)
+    decode = DecodeDispatcher(_handle([]), pd_cache_enabled=False)
     remote = _planned(num_extends=1, is_local_prefill=False).forward_op
     local = _planned(num_extends=1, is_local_prefill=True).forward_op
 
@@ -202,11 +208,7 @@ def test_each_role_declares_itself():
     assert (ForwardDispatcher(executor).is_decode_role) is False
     assert (
         PrefillDispatcher(
-            executor, SimpleNamespace(), epd_hooks=SimpleNamespace()
+            executor, store_prefill_token=None, epd_hooks=SimpleNamespace()
         ).is_prefill_role
     ) is True
-    assert (
-        DecodeDispatcher(
-            executor, SimpleNamespace(), pd_cache_enabled=False
-        ).is_decode_role
-    ) is True
+    assert (DecodeDispatcher(executor, pd_cache_enabled=False).is_decode_role) is True

@@ -27,6 +27,16 @@ long the caller may hold them:
 | `DeviceWiring` | the startup steps that need a real device object: describe the KV to a PD peer, install the layerwise step counter, read the encoder's model facts | a local of `__init__`, dropped when it returns |
 | `DeviceHandle` | the running handle: the complete list of what the loop may ask of the device side | the only one stored (`self._device`) |
 
+The handle owns BOTH executors of a scheduler `ForwardBatch`. The C++ side
+emits one operation and `IsLocalPrefill()` decides who runs it: the model
+executor (a local prefill or decode) or the PD transfer peer (a remote KV
+pull, or the handoff that sends this prompt's KV out). The transfer moves
+KV-pool device memory over RDMA rather than through a CUDA kernel, but it
+needs the same ordering against forwards and page zeroing — so its execution
+face lives behind the handle too, attached once at startup. Its control face
+(bootstrap register/abort, event polling, `pop_*`) stays on the control
+plane, where it feeds Principle 3's tail advance.
+
 Consequences:
 
 * The loop cannot **name** a model runner, backend or KV pool, so it cannot

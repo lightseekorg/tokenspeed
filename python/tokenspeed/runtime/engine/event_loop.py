@@ -482,6 +482,11 @@ class EventLoop:
                 kv_args=kv_args,
                 gloo_group=kv_sync_group,
             )
+            # The transfer executor is the model executor's PEER at running
+            # ForwardBatches (see DeviceHandle.attach_kv_transfer): its
+            # execution face goes behind the handle, its control face
+            # (register/abort/events) stays on this side.
+            self._device.attach_kv_transfer(self.kv_transfer)
             if isinstance(self.kv_transfer, DisaggPrefillExecutor):
                 # P-side layerwise KV streaming: wire the step counter between
                 # the attn backends and the KV sender (a no-op for interval<=0).
@@ -534,15 +539,13 @@ class EventLoop:
             return ForwardDispatcher(self._device)
         if isinstance(self.kv_transfer, DisaggDecodeExecutor):
             return DecodeDispatcher(
-                self._device,
-                self.kv_transfer,
-                pd_cache_enabled=self._pd_cache_enabled,
+                self._device, pd_cache_enabled=self._pd_cache_enabled
             )
         if not isinstance(self.kv_transfer, DisaggPrefillExecutor):
             raise TypeError("kv_transfer must be a Disagg{Prefill,Decode}Executor.")
         return PrefillDispatcher(
             self._device,
-            self.kv_transfer,
+            store_prefill_token=self.kv_transfer.store_prefill_token,
             epd_hooks=self._epd_hooks,
         )
 

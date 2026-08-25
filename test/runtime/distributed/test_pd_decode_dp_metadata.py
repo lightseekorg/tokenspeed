@@ -33,6 +33,10 @@ import torch
 import torch.distributed
 
 from tokenspeed.runtime.engine.event_loop import EventLoop
+from tokenspeed.runtime.engine.forward_dispatch import (
+    DecodeDispatcher,
+    ForwardDispatcher,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 
@@ -65,6 +69,14 @@ class _FakeLoop:
         self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
         self._dp_global_info = torch.zeros(world_size, 3, dtype=torch.int32)
         self.world_cpu_group = None
+        # The "does this op enter the model forward" rule lives on the role's
+        # dispatcher, so use the real one rather than restating it here; that
+        # is what keeps this test honest about the decode-side PD behaviour.
+        self._forward_dispatcher = (
+            DecodeDispatcher(None, pd_cache_enabled=False)
+            if disagg_decode
+            else ForwardDispatcher(None)
+        )
 
 
 def _sync(loop, forward_op, monkeypatch, other_rank_rows=()):

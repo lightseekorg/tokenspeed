@@ -34,9 +34,12 @@ Every dispatcher returns the same pair:
 - ``on_first_token``: a callback the commit path runs for the round's
   first sampled token, or None when the role does not need one.
 
-Dispatchers are control plane. They decide WHAT this round does; the GPU work
-itself they can only ask ``DeviceHandle`` for, by name — they hold that handle,
-not the executor behind it.
+Dispatchers are control plane: they decide WHAT this round does, and can only
+ask ``DeviceHandle`` for the work itself, by name. Note that "the work" spans
+both executors of a ``ForwardBatch`` — the model runs a local prefill or
+decode, the PD transfer peer runs a remote one (the C++ scheduler's
+``IsLocalPrefill()`` is the switch) — and the handle owns both. What stays here
+is role policy and the control-plane callbacks.
 """
 
 from __future__ import annotations
@@ -136,9 +139,8 @@ class DecodeDispatcher(ForwardDispatcher):
 
     is_decode_role = True
 
-    def __init__(self, device, kv_transfer, *, pd_cache_enabled: bool) -> None:
+    def __init__(self, device, *, pd_cache_enabled: bool) -> None:
         super().__init__(device)
-        self._kv_transfer = kv_transfer
         self._pd_cache_enabled = pd_cache_enabled
 
     def produces_model_output(self, forward_op) -> bool:
@@ -152,14 +154,14 @@ class DecodeDispatcher(ForwardDispatcher):
     def dispatch(self, planned: PlannedForward) -> DispatchResult:
         forward_op = planned.forward_op
         if self._receives_remote_kv(forward_op):
-            # Not the engine's forward path: the round only pulls the KV in.
-            # The zeroing barrier applies to the paged-cache manifest only.
+            # Not the engine's forward path: this ForwardBatch is executed
+            # by the transfer peer instead (IsLocalPrefill() is false). The
+            # zeroing barrier applies to the paged-cache manifest only.
             self._device.run_remote_receive(
                 forward_op,
                 cache_zero_future=(
                     planned.cache_zero_future if self._pd_cache_enabled else None
                 ),
-                trigger=self._kv_transfer.execute,
             )
             return None, None
         # Decode and local recovery-prefill batches execute normally. The
@@ -179,9 +181,11 @@ class PrefillDispatcher(ForwardDispatcher):
 
     is_prefill_role = True
 
-    def __init__(self, device, kv_transfer, *, epd_hooks) -> None:
+    def __init__(self, device, *, store_prefill_token, epd_hooks) -> None:
         super().__init__(device)
-        self._kv_transfer = kv_transfer
+        # The commit-side hook recording the round's first sampled token for
+        # the handoff — control-plane work, so the callback lives here.
+        self._store_prefill_token = store_prefill_token
         self._epd_hooks = epd_hooks
 
     def needs_pending_commit(self, forward_op) -> bool:
@@ -190,19 +194,18 @@ class PrefillDispatcher(ForwardDispatcher):
         return forward_op.num_extends() == 0
 
     def dispatch(self, planned: PlannedForward) -> DispatchResult:
-        kv_transfer = self._kv_transfer
         if planned.forward_op.num_extends() == 0:
-            kv_transfer.execute(planned.forward_op)
+            # Every chunk is done: this ForwardBatch is executed by the
+            # transfer peer, which reads the KV the round's forwards wrote.
+            self._device.run_kv_handoff(planned.forward_op)
             return None, None
 
-        # prepare_prefill is CPU-side transfer bookkeeping and must complete
-        # before the forward's layerwise events are armed; the EPD assertion
-        # is a pure-CPU invariant check. Both stay on the control plane; the
-        # GPU work is submitted after.
-        kv_transfer.prepare_prefill(planned.forward_op)
+        # Arms the forward's layerwise events, so it must be enqueued ahead
+        # of the forward itself — same FIFO, submitted first.
+        self._device.prepare_kv_handoff(planned.forward_op)
         # EPD invariant: handshaked items are filled by the async EPD
         # admission drain before admission; assert none reached the forward
         # un-received (no-op for non-EPD / text-only requests).
         self._epd_hooks.assert_embeddings_received(planned.multimodal_context)
         pending = self._device.submit_forward(planned, capture_next_input_ids=True)
-        return pending, kv_transfer.store_prefill_token
+        return pending, self._store_prefill_token

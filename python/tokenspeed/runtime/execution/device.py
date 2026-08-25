@@ -175,6 +175,8 @@ class DeviceHandle:
         # handle for the same reason the pools are: its submit path launches
         # transfers and records events.
         self._l2 = l2_cache_executor
+        # The PD transfer executor's EXECUTION face; see attach_kv_transfer.
+        self._kv_transfer = None
         # Cache-plan submission futures, drained by poll_cache_results: a
         # submission that raised must surface, or its ops stay counted
         # in flight forever and the cache-gated requests hang silently.
@@ -303,17 +305,14 @@ class DeviceHandle:
         self._thread.run(lambda: executor.execute_idle_forward(dp_metadata))
 
     def run_remote_receive(
-        self,
-        forward_op,
-        *,
-        cache_zero_future: Future | None,
-        trigger: Callable[[Any], None],
+        self, forward_op, *, cache_zero_future: Future | None
     ) -> None:
-        """Pull a PD decode request's KV in from the prefill node.
+        """Execute a remote-prefill ForwardBatch: pull its KV from the peer.
 
-        Slot preparation and the cache-length reset touch the execution
-        stream; the RDMA trigger is CPU-side but must follow them and the
-        zeroing barrier. One ordered unit, so one submission.
+        The D-role half of ``IsLocalPrefill()``. Slot preparation and the
+        cache-length reset touch the execution stream; the RDMA trigger is
+        CPU-issued but writes the same device pages, so it must follow them
+        and the zeroing barrier. One ordered unit, so one submission.
 
         Args:
             forward_op: The round's op; supplies the admitted rows.
@@ -321,9 +320,9 @@ class DeviceHandle:
                 Page zeroing runs on a CUDA stream while Mooncake/GPUDirect
                 writes are not ordered by it, so the destination manifest is
                 published only after the new pages are fully sanitized.
-            trigger: The KV transfer executor's ``execute``, run last.
         """
         executor = self._executor
+        kv_transfer = self._require_kv_transfer()
         num_extends = forward_op.num_extends()
 
         def _receive():
@@ -335,9 +334,74 @@ class DeviceHandle:
                 cache_zero_event = cache_zero_future.result()
                 if cache_zero_event is not None:
                     cache_zero_event.synchronize()
-            trigger(forward_op)
+            kv_transfer.execute(forward_op)
 
         self._thread.run(_receive)
+
+    def run_kv_handoff(self, forward_op) -> None:
+        """Execute a P-role handoff ForwardBatch: send this prompt's KV out.
+
+        The RDMA read walks KV-pool device memory the round's forwards just
+        wrote, so it rides the FIFO behind them. The loop also drains its
+        in-flight queue before dispatching a handoff (the batch needs the
+        final chunk's bootstrap token, which lands at commit) — but that is
+        a scheduling rule, and this ordering should not depend on it.
+
+        Args:
+            forward_op: The handoff batch (no extends left to run).
+        """
+        kv_transfer = self._require_kv_transfer()
+        self._thread.run(lambda: kv_transfer.execute(forward_op))
+
+    def prepare_kv_handoff(self, forward_op) -> None:
+        """Arm this chunk's layerwise KV streaming before its forward runs.
+
+        Pure CPU transfer bookkeeping, but it must be enqueued ahead of the
+        forward whose per-layer events it arms — so it goes over the same
+        FIFO rather than racing it from the control plane.
+
+        Args:
+            forward_op: The chunk about to be dispatched.
+        """
+        kv_transfer = self._require_kv_transfer()
+        self._thread.run(lambda: kv_transfer.prepare_prefill(forward_op))
+
+    def attach_kv_transfer(self, kv_transfer) -> None:
+        """Hand the handle the PD transfer executor. Startup only, once.
+
+        A peer of the model executor, not a subordinate of it: the C++
+        scheduler emits one ``ForwardBatch`` and ``IsLocalPrefill()`` decides
+        which of the two runs it — a local forward, or a remote KV pull. Its
+        transfers move KV-pool device memory over RDMA, so they need the same
+        ordering against forwards and page zeroing that everything else behind
+        this handle needs.
+
+        Only the EXECUTION face lands here. The transport's CONTROL face —
+        ``register``/``abort``/``generate_events``/``pop_*`` — stays on the
+        control plane, where it drives bootstrap lifecycle and feeds scheduler
+        events (Principle 3).
+
+        A setter rather than a constructor argument because the transfer
+        executor needs PD topology, bootstrap args and a gloo group, all built
+        after the device side; dragging those into ``build_device_side`` would
+        invert the dependency. Refuses a second attach so this cannot become a
+        channel the running loop swaps things through.
+
+        Args:
+            kv_transfer: The role's ``Disagg{Prefill,Decode}Executor``.
+
+        Raises:
+            RuntimeError: A transfer executor is already attached.
+        """
+        if self._kv_transfer is not None:
+            raise RuntimeError("the PD transfer executor is attached once, at startup")
+        self._kv_transfer = kv_transfer
+
+    def _require_kv_transfer(self):
+        kv_transfer = self._kv_transfer
+        if kv_transfer is None:
+            raise RuntimeError("PD transfer requested on a non-disaggregated engine")
+        return kv_transfer
 
     def run_remote_prefill_landing(
         self,

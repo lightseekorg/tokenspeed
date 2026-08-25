@@ -253,6 +253,49 @@ def test_cache_ops_without_kvstore_refuse_loudly():
 
 
 # ----------------------------------------------------------------------
+# The transfer peer: a ForwardBatch the model does not run.
+# ----------------------------------------------------------------------
+
+
+def test_the_transfer_executor_is_attached_once():
+    """A startup handoff, not a channel the running loop can swap through."""
+    handle = _handle([])
+    handle.attach_kv_transfer(SimpleNamespace())
+    with pytest.raises(RuntimeError, match="attached once"):
+        handle.attach_kv_transfer(SimpleNamespace())
+
+
+def test_pd_execution_without_a_transfer_peer_refuses_loudly():
+    handle = _handle([])
+    for call in (
+        lambda: handle.run_kv_handoff("OP"),
+        lambda: handle.prepare_kv_handoff("OP"),
+        lambda: handle.run_remote_receive("OP", cache_zero_future=None),
+    ):
+        with pytest.raises(RuntimeError, match="non-disaggregated"):
+            call()
+
+
+def test_the_kv_handoff_rides_the_fifo_behind_the_round_s_forwards():
+    """The send walks KV-pool device memory the forwards just wrote. The loop
+    also drains in-flight before a handoff, but that is a scheduling rule —
+    the ordering must not depend on it."""
+    trace: list = []
+    handle = _handle(trace)
+    handle.attach_kv_transfer(
+        SimpleNamespace(
+            execute=lambda op: trace.append(("send", op)),
+            prepare_prefill=lambda op: trace.append(("arm", op)),
+        )
+    )
+
+    handle.prepare_kv_handoff("CHUNK")
+    handle.run_kv_handoff("HANDOFF")
+
+    assert trace == ["run", ("arm", "CHUNK"), "run", ("send", "HANDOFF")]
+
+
+# ----------------------------------------------------------------------
 # EPD admission: encoder facts resolve past the gate, never before.
 # ----------------------------------------------------------------------
 
