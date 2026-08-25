@@ -27,6 +27,7 @@ import threading
 from typing import Any
 
 import torch
+from tokenspeed_kernel.platform import _pdl_enabled
 
 MAX_M_DOTPROD = 4
 MAX_M = 32
@@ -88,7 +89,7 @@ class LLBf16Router:
 
     @staticmethod
     def _use_pdl(device: torch.device) -> bool:
-        return torch.cuda.get_device_capability(device)[0] >= 9
+        return _pdl_enabled(torch.cuda.get_device_capability(device)[0] >= 9)
 
     def supports(self, a: torch.Tensor, b: torch.Tensor, m: int) -> bool:
         """Whether either backend can serve the given operands.

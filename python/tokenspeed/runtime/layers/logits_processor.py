@@ -57,6 +57,7 @@ from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutPlan,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
 
@@ -185,7 +186,7 @@ def _lm_head_matmul(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.
     cast_hidden = hidden_states.to(weight.dtype)
     should_use_fused, lm_head_gemm = _get_fused_lm_head_gemm()
     if should_use_fused is not None and should_use_fused(cast_hidden, weight):
-        return lm_head_gemm(cast_hidden, weight, enable_pdl=True)
+        return lm_head_gemm(cast_hidden, weight, enable_pdl=pdl_enabled())
     return torch.matmul(cast_hidden, weight.T)
 
 

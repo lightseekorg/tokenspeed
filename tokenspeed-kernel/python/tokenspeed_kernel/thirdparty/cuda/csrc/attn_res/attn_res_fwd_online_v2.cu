@@ -27,6 +27,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <type_traits>
 
@@ -911,8 +912,10 @@ static void launch_fwd(const bf16_t* block_residual, bf16_t* layer_residual,
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = 1;
-  config.attrs = attrs;
-  config.numAttrs = 1;
+  const char* disable_pdl = std::getenv("TOKENSPEED_DISABLE_PDL");
+  const bool enable_pdl = disable_pdl == nullptr || std::atoi(disable_pdl) == 0;
+  config.attrs = enable_pdl ? attrs : nullptr;
+  config.numAttrs = enable_pdl ? 1 : 0;
   cudaLaunchKernelEx(&config, kernel, block_residual, layer_residual, delta,
                      res_weight, rms_weight, output, T, block_stride_m,
                      block_stride_r, rms_eps, output_norm_weight,

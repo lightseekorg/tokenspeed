@@ -26,6 +26,7 @@
 #include <cooperative_groups/reduce.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cstdlib>
 #include <limits>
 #include <type_traits>
 
@@ -93,8 +94,10 @@ void softmax_topk_flash(TensorView input, TensorView correction_bias, TensorView
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[0].val.programmaticStreamSerializationAllowed = true;
-    config.numAttrs = 1;
-    config.attrs = attrs;
+    const char* disable_pdl = std::getenv("TOKENSPEED_DISABLE_PDL");
+    const bool enable_pdl = disable_pdl == nullptr || std::atoi(disable_pdl) == 0;
+    config.numAttrs = enable_pdl ? 1 : 0;
+    config.attrs = enable_pdl ? attrs : nullptr;
     int64_t indices_dtype_code = encode_dlpack_dtype(topk_indices.dtype());
 
     IDTYPE_SWITCH(indices_dtype_code, IndexT, [&] {

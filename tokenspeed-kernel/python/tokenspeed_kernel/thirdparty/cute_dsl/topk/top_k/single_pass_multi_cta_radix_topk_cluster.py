@@ -41,9 +41,9 @@ from cutlass.utils.hardware_info import HardwareInfo
 from cutlass.utils.smem_allocator import SmemAllocator
 
 from ..utils import (
-    TRTLLM_ENABLE_PDL,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
+    trtllm_pdl_enabled,
 )
 from .single_pass_multi_cta_radix_topk import (
     SinglePassMultiCTARadixTopKKernel,
@@ -622,5 +622,5 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
                 else None
             ),
             stream=stream,
-            use_pdl=TRTLLM_ENABLE_PDL,
+            use_pdl=trtllm_pdl_enabled(),
         )

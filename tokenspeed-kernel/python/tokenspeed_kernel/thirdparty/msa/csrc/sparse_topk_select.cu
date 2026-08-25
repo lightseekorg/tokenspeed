@@ -4,6 +4,8 @@
 #include "sparse_topk_select.cuh"
 #include "tvm_ffi_utils.h"
 
+#include <cstdlib>
+
 using namespace flashinfer;
 using tvm::ffi::Optional;
 
@@ -129,6 +131,8 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
   }
 
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  const char* disable_pdl = std::getenv("TOKENSPEED_DISABLE_PDL");
+  const bool enable_pdl = disable_pdl == nullptr || std::atoi(disable_pdl) == 0;
 
   cudaError_t status = sparse_topk::SparseTopKSelect(
       TensorDataPtrConst<float>(max_score),
@@ -145,7 +149,7 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
       static_cast<uint32_t>(max_k_tiles), static_cast<uint32_t>(num_valid_pages),
       num_valid_pages_per_token, layout,
       static_cast<uint32_t>(force_begin_blocks), static_cast<uint32_t>(force_end_blocks),
-      stream, /*enable_pdl=*/true);
+      stream, enable_pdl);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "sparse_topk_select failed: " << cudaGetErrorString(status);
