@@ -55,6 +55,10 @@ def _use_gluon_mediumm(m: int, k: int, n: int) -> bool:
     return False
 
 
+def _use_gluon_smallm(m: int, k: int, n: int) -> bool:
+    return m in (2, 4) and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
+
+
 def _use_gluon_largem(m: int, k: int, n: int) -> bool:
     if (k, n) == (KIMI3_HIDDEN_SIZE, KIMI3_LATENT_SIZE):
         min_m = 4096
@@ -280,10 +284,11 @@ def kimi3_latent_projection(
 
     ``solution='torch'`` uses the vendor BLAS selected by PyTorch;
     ``solution='triton_gemv'`` forces the decode kernel,
+    ``solution='gluon_smallm'`` forces the split-K small-M gfx950 kernel,
     ``solution='gluon_mediumm'`` forces the middle-M gfx950 kernel, and
-    ``solution='gluon_largem'`` forces the large-M gfx950 kernel. ``auto`` uses
-    their measured gfx950 crossovers for canonical K3 shapes and retains the
-    vendor GEMM for other shapes and architectures.
+    ``solution='gluon_largem'`` forces the large-M gfx950 kernel. ``auto``
+    uses their measured gfx950 crossovers for canonical K3 shapes and retains
+    the vendor GEMM for other shapes and architectures.
     """
 
     m, n, k = _validate_fallback_projection(
@@ -296,6 +301,7 @@ def kimi3_latent_projection(
         "auto",
         "torch",
         "triton_gemv",
+        "gluon_smallm",
         "gluon_mediumm",
         "gluon_largem",
     }:
@@ -312,6 +318,8 @@ def kimi3_latent_projection(
     if solution == "auto":
         if Platform.get().is_cdna4 and specialized and m == 1:
             solution = "triton_gemv"
+        elif Platform.get().is_cdna4 and specialized and _use_gluon_smallm(m, k, n):
+            solution = "gluon_smallm"
         elif Platform.get().is_cdna4 and specialized and _use_gluon_mediumm(m, k, n):
             solution = "gluon_mediumm"
         elif Platform.get().is_cdna4 and specialized and _use_gluon_largem(m, k, n):
@@ -329,6 +337,17 @@ def kimi3_latent_projection(
             weight,
             out=out,
             validate=False,
+        )
+    if solution == "gluon_smallm":
+        from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+            gluon_mm_a16w16_mfma_lds_smallm_gfx950,
+        )
+
+        return gluon_mm_a16w16_mfma_lds_smallm_gfx950(
+            hidden_states,
+            weight,
+            hidden_states.dtype,
+            out=out,
         )
     if solution == "gluon_mediumm":
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
@@ -491,7 +510,20 @@ def kimi3_latent_projection_add3(
         if (
             solution == "auto"
             and Platform.get().is_cdna4
-            and m == 1
+            and 3 <= m <= 16
+            and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
+            and specialized
+        ):
+            from tokenspeed_kernel.ops.activation.triton import add3
+            from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
+
+            normalized = rmsnorm(hidden_states, norm_weight, eps)
+            projected = torch.nn.functional.linear(normalized, weight)
+            return add3(prefix, projected, shared_output)
+        if (
+            solution == "auto"
+            and Platform.get().is_cdna4
+            and m <= 2
             and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
             and specialized
         ):
@@ -1028,14 +1060,14 @@ def kimi3_router_projection(
 __all__ = [
     "KIMI3_HIDDEN_SIZE",
     "KIMI3_LATENT_SIZE",
-    "Kimi3MLAQKVGateProjection",
     "KIMI3_QKVFAB_SIZE",
     "KIMI3_ROUTER_SIZE",
     "KIMI3_SHARED_GATE_UP_LOCAL_SIZE",
     "KIMI3_SHARED_LOCAL_SIZE",
+    "Kimi3MLAQKVGateProjection",
     "kimi3_latent_projection",
-    "kimi3_mla_qkv_gate_projection",
     "kimi3_latent_projection_add3",
+    "kimi3_mla_qkv_gate_projection",
     "kimi3_qkvfab_projection",
     "kimi3_router_projection",
     "kimi3_shared_down_projection",
