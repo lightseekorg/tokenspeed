@@ -55,18 +55,23 @@ path.write_text(json.dumps(config, indent=2) + "\n")
 PY
 
 rocm_root="$(rocm-sdk path --root)"
-ROCM_HOME="${rocm_root}" \
-ROCM_PATH="${rocm_root}" \
-LD_LIBRARY_PATH="${rocm_root}/lib:${LD_LIBRARY_PATH:-}" \
-    cmake \
-        -S "${ROCJITSU_SOURCE_DIR}" \
-        -B "${ROCJITSU_BUILD_DIR}" \
-        -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DBUILD_TESTING=OFF
-cmake --build "${ROCJITSU_BUILD_DIR}" \
-    --target rocjitsu_bin rocjitsu_shared \
-    --parallel 4
+if [ -x "${ROCJITSU_BUILD_DIR}/tools/rocjitsu/rocjitsu" ] \
+    && [ -f "${ROCJITSU_BUILD_DIR}/librocjitsu.so" ]; then
+    echo "Reusing cached rocJITsu launcher and runtime"
+else
+    ROCM_HOME="${rocm_root}" \
+    ROCM_PATH="${rocm_root}" \
+    LD_LIBRARY_PATH="${rocm_root}/lib:${LD_LIBRARY_PATH:-}" \
+        cmake \
+            -S "${ROCJITSU_SOURCE_DIR}" \
+            -B "${ROCJITSU_BUILD_DIR}" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF
+    cmake --build "${ROCJITSU_BUILD_DIR}" \
+        --target rocjitsu_bin rocjitsu_shared \
+        --parallel 4
+fi
 
 test -x "${ROCJITSU_BUILD_DIR}/tools/rocjitsu/rocjitsu"
 test -f "${ROCJITSU_SOURCE_DIR}/configs/gfx1250_mi455x.json"
