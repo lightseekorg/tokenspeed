@@ -33,20 +33,27 @@ import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
 import torch
 from tokenspeed_kernel.ops.gemm.routed_gemv import MEASURED_ROUTE
 from tokenspeed_kernel.ops.gemm.triton_gemv import _select, decode_gemv
+from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 def _is_routed_arch() -> bool:
     # Mirrors _CAPABILITY in routed_gemv: sm100 and up, not sm103 exactly.
-    return torch.cuda.get_device_capability() >= (10, 0)
+    return (
+        current_platform().vendor == "nvidia"
+        and torch.cuda.get_device_capability() >= (10, 0)
+    )
 
 
 def _is_add3_arch() -> bool:
     # ADD3_ROUTE stores sm103-tuned TILE CONFIGS, not just a backend choice, so
     # it stays gated where it was swept -- mirrors _is_measured_arch. Widening
     # it would run another architecture's tuning parameters unmeasured.
-    return torch.cuda.get_device_capability() >= (10, 3)
+    return (
+        current_platform().vendor == "nvidia"
+        and torch.cuda.get_device_capability() >= (10, 3)
+    )
 
 
 def _routed_cases():
@@ -308,8 +315,9 @@ def test_route_predicate_admits_the_registered_arch_floor():
     nvidia = type("P", (), {"vendor": "nvidia"})()
     for capability, expected in (((10, 0), True), ((9, 0), False)):
         routed_gemv._is_routed_arch.cache_clear()
-        with patch("torch.cuda.get_device_capability", return_value=capability), patch(
-            "tokenspeed_kernel.platform.current_platform", return_value=nvidia
+        with (
+            patch("torch.cuda.get_device_capability", return_value=capability),
+            patch("tokenspeed_kernel.platform.current_platform", return_value=nvidia),
         ):
             assert routed_gemv.decode_gemv_routed(x, w) is expected
     routed_gemv._is_routed_arch.cache_clear()
