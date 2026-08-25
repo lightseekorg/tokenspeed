@@ -62,9 +62,21 @@ class _FakeLoop:
         self.kv_transfer = (
             object.__new__(DisaggDecodeExecutor) if disagg_decode else None
         )
-        self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
-        self._dp_global_info = torch.zeros(world_size, 3, dtype=torch.int32)
+        self._forward_dispatcher = _FakeForwardDispatcher(disagg_decode=disagg_decode)
+        self._dp_local_info = torch.zeros(1, 4, dtype=torch.int32)
+        self._dp_global_info = torch.zeros(world_size, 4, dtype=torch.int32)
         self.world_cpu_group = None
+
+
+class _FakeForwardDispatcher:
+    def __init__(self, *, disagg_decode: bool):
+        self.disagg_decode = disagg_decode
+
+    def produces_model_output(self, forward_op):
+        remote_prefill = (
+            forward_op.num_extends() > 0 and not forward_op.is_local_prefill()
+        )
+        return not (self.disagg_decode and remote_prefill)
 
 
 def _sync(loop, forward_op, monkeypatch, other_rank_rows=()):
@@ -138,7 +150,7 @@ def test_zero_token_forward_op_is_not_model_work(monkeypatch):
 def test_idle_rank_joins_dummy_forward_only_when_a_peer_has_work(monkeypatch):
     # Two ranks: this one idle, the peer running a 4-token decode batch.
     loop = _FakeLoop(world_size=2)
-    busy_peer = (4, 4, int(ForwardMode.DECODE))
+    busy_peer = (4, 4, int(ForwardMode.DECODE), 0)
 
     meta = _sync(loop, None, monkeypatch, other_rank_rows=[busy_peer])
 
@@ -147,6 +159,6 @@ def test_idle_rank_joins_dummy_forward_only_when_a_peer_has_work(monkeypatch):
     assert meta.global_num_tokens == [0, 4]
 
     # Fully idle world: nothing to keep in lockstep with.
-    idle_peer = (0, 0, int(ForwardMode.IDLE))
+    idle_peer = (0, 0, int(ForwardMode.IDLE), 0)
     meta = _sync(loop, None, monkeypatch, other_rank_rows=[idle_peer])
     assert not meta.need_idle_forward
