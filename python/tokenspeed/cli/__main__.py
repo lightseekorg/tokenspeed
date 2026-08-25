@@ -30,12 +30,6 @@ def _serve(args: argparse.Namespace, raw_argv: list[str]) -> None:
     run_smg_from_args(args, raw_argv)
 
 
-def _bench(args: argparse.Namespace) -> None:
-    from tokenspeed.bench import main as bench_main
-
-    bench_main(args.bench_args)
-
-
 def _env(args: argparse.Namespace) -> None:
     from tokenspeed.env import main as env_main
 
@@ -83,13 +77,6 @@ def main() -> None:
     )
     serve_parser.set_defaults(func=_serve)
 
-    bench_parser = subparsers.add_parser(
-        "bench",
-        add_help=False,
-        help="Run TokenSpeed benchmark commands.",
-    )
-    bench_parser.set_defaults(func=_bench, bench_args=[])
-
     env_parser = subparsers.add_parser(
         "env",
         help="Check environment configurations and dependency versions.",
@@ -115,11 +102,6 @@ def main() -> None:
     if args.command is None:
         parser.print_help()
         sys.exit(1)
-
-    if args.func is _bench:
-        args.bench_args = extra_args
-        args.func(args)
-        return
 
     if args.func is _merge_traces:
         args.merge_args = extra_args

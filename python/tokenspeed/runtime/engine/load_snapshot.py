@@ -183,11 +183,14 @@ class LoadSnapshotPublisher:
 
                         generation = self._generation
                         values = self._latest_values
-                        if values is not None and generation != pending_generation:
-                            if pending is not None or generation != sent_generation:
-                                pending = self._new_snapshot(values)
-                                pending_generation = generation
-                                break
+                        if (
+                            values is not None
+                            and generation != pending_generation
+                            and (pending is not None or generation != sent_generation)
+                        ):
+                            pending = self._new_snapshot(values)
+                            pending_generation = generation
+                            break
 
                         if pending is not None:
                             break
@@ -236,6 +239,91 @@ class LoadSnapshotPublisher:
             *values,
             self._valid_for_ms,
         )
+
+
+class LoadReporter:
+    """The event loop's whole load-reporting side: a sink and how to feed it.
+
+    Running rounds sample the scheduler anyway (the loop needs the same
+    numbers for its own metrics), so ``observe`` just projects that sample.
+    Frozen rounds have no sample of their own and call ``sample_and_observe``.
+    Neither path tracks whether anything changed: the sinks already dedup
+    (``LoadSnapshotPublisher.observe`` compares the tuple and returns, and a
+    frozen round only comes around once per idle sleep), so a change latch
+    here would only buy three scheduler getters per millisecond.
+
+    Args:
+        publisher: The sink; see ``create_load_reporter`` for the choices.
+        num_total_pages: Device KV pages, published as the capacity bound.
+        sample_stats: Scheduler sampler for rounds that have no sample of
+            their own. Returns the dict shape ``observe`` takes.
+        enabled: False on ranks that do not report, which also keeps the
+            frozen path from sampling into a no-op sink.
+    """
+
+    def __init__(
+        self,
+        publisher,
+        *,
+        num_total_pages: int,
+        sample_stats: Callable[[], dict],
+        enabled: bool,
+    ) -> None:
+        self._publisher = publisher
+        self._num_total_pages = num_total_pages
+        self._sample_stats = sample_stats
+        self._enabled = enabled
+
+    def observe(self, stats: dict, num_running: int) -> None:
+        """Publish a sample the caller already took."""
+        self._publisher.observe(
+            (
+                num_running,
+                stats["num_queue_reqs"],
+                stats["num_active_pages"],
+                stats["num_cached_pages"],
+                self._num_total_pages,
+            )
+        )
+
+    def sample_and_observe(self, num_running: int) -> None:
+        """Take a fresh scheduler sample and publish it."""
+        if not self._enabled:
+            return
+        self.observe(self._sample_stats(), num_running)
+
+    def close(self) -> None:
+        self._publisher.close()
+
+
+def create_load_reporter(
+    *,
+    enabled: bool,
+    direct_setter: Callable[[int, int, int, int], None] | None,
+    endpoint: str,
+    dp_rank: int,
+    heartbeat_interval: float,
+    num_total_pages: int,
+    sample_stats: Callable[[], dict],
+) -> LoadReporter:
+    """Build the reporter with the sink this rank and mode call for.
+
+    Ranks that do not report get the no-op sink; direct-ZMQ deployments
+    (``direct_setter`` bound) fold the snapshot into the next output batch;
+    everything else opens the private PUSH transport.
+    """
+    if not enabled:
+        publisher = NullLoadSnapshotPublisher()
+    elif direct_setter is not None:
+        publisher = DirectLoadSnapshotSink(direct_setter)
+    else:
+        publisher = LoadSnapshotPublisher(endpoint, dp_rank, heartbeat_interval)
+    return LoadReporter(
+        publisher,
+        num_total_pages=num_total_pages,
+        sample_stats=sample_stats,
+        enabled=enabled,
+    )
 
 
 @dataclass(frozen=True)

@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import sys
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -32,6 +33,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.backends import (
+    tokenspeed_mla as tokenspeed_mla_module,
+)
 from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.mla_cache_groups import (
     MlaCacheGroupMixin,
@@ -45,6 +49,8 @@ from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 _PAGE_SIZE = 64  # kernel page
+_KV_LORA = 4
+_ROPE = 4
 _LOGICAL_P = 128  # logical block size (ratio 2 kernel pages per logical page)
 _MAX_CTX = 256
 
@@ -54,6 +60,7 @@ def _bare_mla_backend(
     cache_contract: bool,
     is_draft: bool = False,
     spec_num_tokens: int = 1,
+    draft_block_decode: bool = False,
 ) -> CuteDSLMLABackend:
     """A CuteDSLMLABackend with only the attributes the CUDA-graph metadata
     paths touch — the full ctor JIT-compiles CuteDSL kernels (GPU only)."""
@@ -63,6 +70,12 @@ def _bare_mla_backend(
     backend.max_context_len = _MAX_CTX
     backend.is_draft = is_draft
     backend.spec_num_tokens = spec_num_tokens
+    backend.draft_block_decode = draft_block_decode
+    backend.kv_lora_rank = _KV_LORA
+    backend.qk_rope_head_dim = _ROPE
+    backend.kv_cache_dim = _KV_LORA + _ROPE
+    backend.data_type = torch.bfloat16
+    backend.cutedsl_workspace = None
     backend._block_table_aliased = False
     backend._cache_groups_bound = False
     backend._cache_contract_bound = False
@@ -441,3 +454,175 @@ def test_amd_mla_eager_prefill_derives_group_write_locations(monkeypatch) -> Non
         ).tolist()
         == expected.tolist()
     )
+
+
+def test_block_decode_expands_one_row_per_block_position() -> None:
+    """A block draft's rows all carry the block-end length, which is what makes
+    the block non-causal: the kernel masks each row by its own cache length."""
+    spec = 4
+    backend = _bare_mla_backend(
+        cache_contract=False,
+        is_draft=True,
+        spec_num_tokens=spec,
+        draft_block_decode=True,
+    )
+    assert backend._block_decode_active
+    table = torch.tensor([[3, 4], [7, 8]], dtype=torch.int32)
+    seq_lens = torch.tensor([9, 130], dtype=torch.int32)
+
+    rows, lens = backend._expand_block_decode_metadata(table, seq_lens, 2)
+
+    assert rows.tolist() == [[3, 4]] * spec + [[7, 8]] * spec
+    assert lens.tolist() == [9] * spec + [130] * spec
+
+
+def test_block_decode_clamps_a_length_below_the_block() -> None:
+    """A request shorter than the block would ask the kernel for keys it has
+    no page for."""
+    spec = 8
+    backend = _bare_mla_backend(
+        cache_contract=False,
+        is_draft=True,
+        spec_num_tokens=spec,
+        draft_block_decode=True,
+    )
+    _, lens = backend._expand_block_decode_metadata(
+        torch.zeros((2, 2), dtype=torch.int32),
+        torch.tensor([1, _MAX_CTX * 4], dtype=torch.int32),
+        2,
+    )
+    assert lens[:spec].tolist() == [spec] * spec
+    assert lens[spec:].tolist() == [_MAX_CTX] * spec
+
+
+def test_block_decode_graph_buffers_hold_every_block_row() -> None:
+    spec, max_bs = 4, 3
+    backend = _bare_mla_backend(
+        cache_contract=False,
+        is_draft=True,
+        spec_num_tokens=spec,
+        draft_block_decode=True,
+    )
+    backend.init_cuda_graph_state(max_bs)
+    assert backend.cuda_graph_seq_lens_buf.shape[0] == max_bs * spec
+    assert backend.decode_cuda_graph_kv_indices.shape[0] == max_bs * spec
+
+
+def test_block_decode_replay_broadcasts_pages_and_scrubs_padding() -> None:
+    """Padded rows must reach the null page, not another request's pages."""
+    spec, max_bs, bs = 4, 3, 3
+    backend = _bare_mla_backend(
+        cache_contract=False,
+        is_draft=True,
+        spec_num_tokens=spec,
+        draft_block_decode=True,
+    )
+    backend.init_cuda_graph_state(max_bs)
+    backend.decode_cuda_graph_kv_indices.fill_(-9)
+    page_table = torch.tensor([[5, 6], [7, 8]], dtype=torch.int32)
+
+    backend._replay_block_decode_page_table(bs, page_table)
+
+    rows = backend.decode_cuda_graph_kv_indices[: bs * spec]
+    assert rows[:spec, :2].tolist() == [[5, 6]] * spec
+    assert rows[spec : 2 * spec, :2].tolist() == [[7, 8]] * spec
+    assert rows[2 * spec :].eq(0).all(), "padded request kept live pages"
+    assert rows[: 2 * spec, 2:].eq(0).all(), "columns past the table were not scrubbed"
+
+
+def test_block_decode_lengths_are_rewritten_per_replay() -> None:
+    """The drafter calls this inside the captured graph, so two replays with
+    different live draft lengths must not share the first one's rows."""
+    spec, max_bs = 4, 2
+    backend = _bare_mla_backend(
+        cache_contract=False,
+        is_draft=True,
+        spec_num_tokens=spec,
+        draft_block_decode=True,
+    )
+    backend.init_cuda_graph_state(max_bs)
+    buf = backend.cuda_graph_seq_lens_buf
+
+    backend.fill_block_decode_seq_lens(2, torch.tensor([40, 50], dtype=torch.int32))
+    assert buf[: 2 * spec].tolist() == [40] * spec + [50] * spec
+    backend.fill_block_decode_seq_lens(2, torch.tensor([41, 99], dtype=torch.int32))
+    assert buf[: 2 * spec].tolist() == [41] * spec + [99] * spec
+
+
+def test_block_decode_stays_off_for_target_and_single_token_drafts() -> None:
+    """The expansion must be unreachable on every path it was not written for."""
+    target = _bare_mla_backend(cache_contract=False, spec_num_tokens=8)
+    assert not target._block_decode_active
+    one = _bare_mla_backend(
+        cache_contract=False,
+        is_draft=True,
+        spec_num_tokens=1,
+        draft_block_decode=True,
+    )
+    assert not one._block_decode_active
+
+
+def test_block_decode_hands_the_kernel_one_query_per_block_row() -> None:
+    """The expansion is only worth anything if it reaches the kernel: keeping
+    the block on the query axis would restore exactly the causal order the
+    draft must not have, and every other case here would still pass."""
+    spec, bs, heads, dim = 4, 2, 3, 8
+    backend = _bare_mla_backend(
+        cache_contract=False,
+        is_draft=True,
+        spec_num_tokens=spec,
+        draft_block_decode=True,
+    )
+    rows, block_lens = backend._expand_block_decode_metadata(
+        torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
+        torch.tensor([40, 50], dtype=torch.int32),
+        bs,
+    )
+    backend.forward_decode_metadata = CuteDSLMLADecodeMetadata(
+        block_kv_indices=rows,
+        max_seq_len_k=_MAX_CTX,
+        seq_lens_k=block_lens,
+        num_extends=0,
+        group_out_cache_loc=None,
+        group_q_len_per_req=1,
+    )
+    layer = SimpleNamespace(
+        tp_q_head_num=heads,
+        head_dim=dim,
+        layer_id=0,
+        scaling=1.0,
+        v_head_dim=_KV_LORA,
+        k_scale_float=None,
+    )
+    pool = SimpleNamespace(
+        get_key_buffer=lambda _lid: torch.zeros(
+            4 * backend.kernel_page_size, backend.kv_cache_dim, dtype=torch.bfloat16
+        )
+    )
+
+    seen: dict = {}
+
+    def _spy(**kw):
+        seen.update(kw)
+        return torch.zeros(bs * spec, 1, heads, _KV_LORA)
+
+    # The real workspace sizing wants a CUDA device; the kernel itself is spied.
+    with mock.patch.object(
+        tokenspeed_mla_module, "tokenspeed_mla_decode", _spy
+    ), mock.patch.object(
+        type(backend), "_cutedsl_workspace", lambda _self, _q_len: None
+    ):
+        backend.forward_decode(
+            q=torch.zeros(bs * spec, heads, dim, dtype=torch.bfloat16),
+            k=None,
+            v=None,
+            layer=layer,
+            out_cache_loc=torch.zeros(bs * spec, dtype=torch.int64),
+            token_to_kv_pool=pool,
+            bs=bs,
+            save_kv_cache=False,
+        )
+
+    assert seen["query"].shape == (bs * spec, 1, heads, dim)
+    assert seen["block_tables"].shape[0] == bs * spec
+    assert seen["seq_lens"].tolist() == [40] * spec + [50] * spec

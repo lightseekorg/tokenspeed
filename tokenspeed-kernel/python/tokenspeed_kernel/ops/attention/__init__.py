@@ -1506,7 +1506,7 @@ def kda_paged_prefill(
     *,
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    cu_seqlens_cpu=None,
+    cu_seqlens_cpu: torch.Tensor,
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
@@ -1521,11 +1521,12 @@ def kda_paged_prefill(
         A_log/dt_bias: FP32 gate parameters.
         initial_state: One backend-owned recurrent state per sequence.
         cu_seqlens: Device sequence boundaries ``[num_sequences + 1]``.
-        cu_seqlens_cpu: Optional host copy of ``cu_seqlens`` (tuple, list, or
-            CPU tensor) whose contents must equal ``cu_seqlens``.
-            Host-planning kernels (CuteDSL) use it to skip the
-            stream-synchronizing D2H boundary read; device-planning kernels
-            ignore it.
+        cu_seqlens_cpu: REQUIRED host int64 copy of ``cu_seqlens`` with equal
+            contents. Every solution plans its chunk indices from it on the
+            host; reading the device boundaries instead would issue a
+            stream-synchronizing D2H per KDA layer per chunk, which stalls
+            the launch thread behind all queued work (and serializes the
+            chunk pipeline's stages).
         lower_bound: Optional safe lower bound for log decay.
         override: Optional exact kernel name.
         solution: Optional registered solution name.
@@ -1547,6 +1548,16 @@ def kda_paged_prefill(
     num_sequences = cu_seqlens.numel() - 1
     if initial_state.ndim != 4 or initial_state.shape[0] != num_sequences:
         raise ValueError("KDA initial_state must contain one row per sequence")
+    if (
+        not isinstance(cu_seqlens_cpu, torch.Tensor)
+        or cu_seqlens_cpu.is_cuda
+        or cu_seqlens_cpu.dtype != torch.int64
+        or cu_seqlens_cpu.numel() != cu_seqlens.numel()
+    ):
+        raise ValueError(
+            "KDA cu_seqlens_cpu must be a host int64 tensor with one entry "
+            f"per cu_seqlens boundary; got {type(cu_seqlens_cpu).__name__}"
+        )
     if solution == "fla":
         solution = "triton"
     kernel = select_kernel(
@@ -1562,9 +1573,6 @@ def kda_paged_prefill(
     relayout = supported is not None and recurrent_layout not in supported
     if relayout:
         initial_state = initial_state.transpose(-1, -2).contiguous()
-    # Forwarded only when set so registered kernels without the
-    # host-boundary hint parameter keep working unchanged.
-    hint = {} if cu_seqlens_cpu is None else {"cu_seqlens_cpu": cu_seqlens_cpu}
     result = kernel(
         q=q,
         k=k,
@@ -1575,8 +1583,8 @@ def kda_paged_prefill(
         dt_bias=dt_bias,
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
         lower_bound=lower_bound,
-        **hint,
     )
     if relayout:
         # Hand the final state back in the caller's layout (a view; no copy).

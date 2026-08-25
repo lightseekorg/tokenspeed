@@ -54,7 +54,8 @@ void trtllm_mnnvl_allreduce_fusion(
     TensorView allreduce_in, int64_t world_size, int64_t world_rank, int64_t token_num,
     int64_t hidden_size, int64_t multicast_ptr, int64_t buffer_ptr_local,
     TensorView peer_ptrs, TensorView buffer_flags,
-    bool launch_with_pdl, bool trigger_completion_at_end, bool fp32_acc, int64_t pattern_code,
+    bool launch_with_pdl, bool use_oneshot, bool trigger_completion_at_end, bool fp32_acc,
+    int64_t pattern_code,
     Optional<TensorView> allreduce_out, Optional<TensorView> residual_in,
     Optional<TensorView> residual_out, Optional<TensorView> norm_out,
     Optional<TensorView> rms_gamma, Optional<double> rms_eps, Optional<TensorView> attnres_m,
@@ -107,7 +108,7 @@ void trtllm_mnnvl_allreduce_fusion(
             : nullptr;
     params.latent_width = latent_width.has_value() ? static_cast<int>(latent_width.value()) : 0;
     params.scale_factor = nullptr;
-    params.use_oneshot = true;
+    params.use_oneshot = use_oneshot;
     params.pattern = static_cast<AllReduceFusionPattern>(pattern_code);
     params.trigger_completion_at_end = trigger_completion_at_end;
     params.residual_reduce_scattered = false;

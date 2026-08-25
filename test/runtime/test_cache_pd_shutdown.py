@@ -49,7 +49,8 @@ class _ModelExecutorHarness:
         self._trace = trace
 
     def zero_cache_pages(self, page_ids) -> None:
-        assert tuple(page_ids) == ()
+        # Unreached while the harness plans no page; kept so a plan that
+        # does would trace the submission rather than fail on a missing attr.
         self._trace.append("zero_pages")
 
 
@@ -79,6 +80,11 @@ class _EventLoopHarness:
         self._pd_hooks = SimpleNamespace(
             poll_transfer_events=lambda: (self.trace.append("poll_pd"), [])[1]
         )
+        self.load_reporter = SimpleNamespace(
+            observe=lambda _stats, _running: self.trace.append("observe_load"),
+            sample_and_observe=lambda _running: self.trace.append("sample_load"),
+            close=lambda: self.trace.append("close_load"),
+        )
 
     def _shutdown_complete(self) -> bool:
         return EventLoop._shutdown_complete(self)
@@ -100,8 +106,8 @@ class _EventLoopHarness:
         self.trace.append("stats")
         return object()
 
-    def _observe_load_snapshot(self, _stats) -> None:
-        self.trace.append("observe_load")
+    def _num_running(self) -> int:
+        return 0
 
     def _record_scheduler_iteration_metrics(
         self, _stats, _num_iter_tokens: int
@@ -127,7 +133,8 @@ def test_event_loop_finishes_current_iteration_then_observes_shutdown() -> None:
         "drain_epd",
         "poll_cache",
         "next_plan",
-        "zero_pages",
+        # No "zero_pages": the round's plan plans no page, so the loop
+        # submits no zeroing work to the forward thread.
         "submit_cache",
         "get_forward",
         "stats",
