@@ -170,7 +170,7 @@ class DraftTreeMaskMetadataIsolationTest(_TorchCase):
         captured = {"target": [], "draft": []}
 
         class FakeBackend:
-            uses_paged_cache_groups = False
+            needs_group_block_tables = False
 
             def __init__(self, key):
                 self.key = key
