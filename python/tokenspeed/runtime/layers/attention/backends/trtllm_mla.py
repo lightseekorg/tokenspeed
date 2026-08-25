@@ -675,6 +675,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
             bmm1_scale=bmm1_scale,
+            enable_pdl=pdl_enabled(),
         )
 
         return raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
