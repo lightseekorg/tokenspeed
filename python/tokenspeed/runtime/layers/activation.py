@@ -94,7 +94,6 @@ class SiluAndMul(torch.nn.Module):
             return silu_and_mul(
                 x,
                 out,
-                enable_pdl=pdl_enabled(),
                 limit=self.swiglu_limit,
             )
 
@@ -105,7 +104,6 @@ class SiluAndMul(torch.nn.Module):
         return silu_and_mul(
             x,
             out,
-            enable_pdl=pdl_enabled(),
             limit=self.swiglu_limit,
         )
 
@@ -127,7 +125,6 @@ class SiluAndMul(torch.nn.Module):
             x,
             activation="swiglu",
             limit=self.swiglu_limit,
-            enable_pdl=pdl_enabled(),
         )
 
 
@@ -170,7 +167,6 @@ class SituAndMul(torch.nn.Module):
                 x,
                 beta=self.beta,
                 linear_beta=self.linear_beta,
-                enable_pdl=pdl_enabled(),
             )
         return self.forward_native(x)
 

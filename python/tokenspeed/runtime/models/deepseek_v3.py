@@ -919,7 +919,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                     k_rope=k_pe_raw,
                     fused_mla_set_kv_buffer_arg=fused_kv_arg,
                     q_rope_out=query_fp8,
-                    enable_pdl=pdl_enabled(),
                 )
                 return query_fp8, None
 
@@ -941,7 +940,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                 ),
                 quant_scale_q=1.0,
                 quant_scale_kv=k_scale,
-                enable_pdl=pdl_enabled(),
             )
 
             # Write FP8 KV cache (single write, no double-write)
@@ -980,7 +978,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                     k_rope=K[..., self.kv_lora_rank :],
                     fused_mla_set_kv_buffer_arg=fused_mla_kv_arg,
                     q_rope_out=Q[..., self.kv_lora_rank :],
-                    enable_pdl=pdl_enabled(),
                 )
                 K = None
             else:
@@ -1132,7 +1129,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                 is_neox=is_neox,
                 quant_scale_q=1.0,
                 quant_scale_kv=k_scale,
-                enable_pdl=pdl_enabled(),
             )
 
             v_fp8 = fp8_quantize(v, enable_pdl=pdl_enabled())
@@ -1266,7 +1262,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                 chunk_output,
                 lse,
                 inplace=True,
-                enable_pdl=pdl_enabled(),
             )
 
         return output

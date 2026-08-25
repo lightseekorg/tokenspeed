@@ -206,7 +206,6 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
         out_dtype=torch.bfloat16,
         alpha=fc1_alpha,
         quant="nvfp4",
-        enable_pdl=True,
     ).view(m, 2 * i)
 
     silu_out = (
@@ -245,7 +244,6 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
         out_dtype=torch.bfloat16,
         alpha=fc2_alpha,
         quant="nvfp4",
-        enable_pdl=True,
     ).view(m, k)
     actual = tokenspeed_kernel.mm(
         fused_fp4,
@@ -255,7 +253,6 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
         out_dtype=torch.bfloat16,
         alpha=fc2_alpha,
         quant="nvfp4",
-        enable_pdl=True,
     ).view(m, k)
     torch.cuda.synchronize()
 

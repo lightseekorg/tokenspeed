@@ -433,7 +433,6 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
     backend_factory, gpu_pool
 ) -> None:
     from tokenspeed_kernel.ops.attention import attn_merge_state
-    from tokenspeed_kernel.platform import pdl_enabled
 
     pool = gpu_pool
     page_size = pool.arena.prefix_granularity
@@ -525,9 +524,7 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
                 batch_size=bs,
                 causal=False,
             )
-            attn_merge_state(
-                out, lse, chunk_out, chunk_lse, inplace=True, enable_pdl=pdl_enabled()
-            )
+            attn_merge_state(out, lse, chunk_out, chunk_lse, inplace=True)
         return out
 
     out_grouped = run(grouped_backend)

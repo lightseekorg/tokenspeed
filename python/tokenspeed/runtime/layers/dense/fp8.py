@@ -38,8 +38,6 @@ from torch.nn.parameter import Parameter
 
 logger = logging.getLogger(__name__)
 
-from tokenspeed_kernel.platform import pdl_enabled
-
 from tokenspeed.runtime.layers.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,
@@ -218,7 +216,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.weight_scale_inv.data,
                 self.quant_config.weight_block_size,
                 scale_format=getattr(self.quant_config, "scale_fmt", None),
-                enable_pdl=pdl_enabled(),
             )
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
@@ -296,7 +293,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     out_dtype=output_dtype,
                     quant="mxfp8",
                     block_size=self.quant_config.weight_block_size,
-                    enable_pdl=pdl_enabled(),
                 )
             else:
                 output = fp8_linear(
@@ -307,7 +303,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     input_scales=block_scale,
                     bias=bias,
                     out_dtype=output_dtype,
-                    enable_pdl=pdl_enabled(),
                 )
             return output.to(dtype=output_dtype).view(*output_shape)
         else:

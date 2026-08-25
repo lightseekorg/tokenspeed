@@ -31,7 +31,6 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 from transformers import LlamaConfig
 
@@ -292,7 +291,6 @@ class LlamaAttention(nn.Module):
             k,
             fused_set_kv_buffer_arg=fused_kv_arg,
             output_q_rope=q_rope,
-            enable_pdl=pdl_enabled(),
         )
         return q_rope
 

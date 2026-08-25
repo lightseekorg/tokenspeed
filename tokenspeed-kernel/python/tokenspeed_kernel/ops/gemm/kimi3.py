@@ -16,7 +16,7 @@ from functools import lru_cache
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
-from tokenspeed_kernel.platform import Platform
+from tokenspeed_kernel.platform import Platform, pdl_enabled
 
 # FP8 storage dtypes served by the w8a8 projection branch (matches the
 # runtime quantization layers' width: e4m3fn on NVIDIA, e4m3fnuz on ROCm).
@@ -764,7 +764,6 @@ def kimi3_qkvfab_projection(
     *,
     weight_scale: torch.Tensor | None = None,
     prepacked_scales: torch.Tensor | None = None,
-    enable_pdl: bool = False,
     out: torch.Tensor | None = None,
     solution: str = "auto",
 ) -> torch.Tensor:
@@ -790,7 +789,6 @@ def kimi3_qkvfab_projection(
             (FP8 weights only).
         prepacked_scales: Optional flashinfer MN-major prepacked scales; when
             given the flashinfer blockscale kernel is pinned.
-        enable_pdl: Programmatic Dependent Launch for the FP8 path.
         out: Optional contiguous BF16 output buffer shaped ``[M, N]``.
         solution: ``"auto"`` selects the gfx950 Triton GEMV and otherwise
             falls back to Torch; ``"triton_gemv"`` and ``"torch"`` force one.
@@ -825,7 +823,6 @@ def kimi3_qkvfab_projection(
                 "flashinfer_mm_fp8_blockscale" if prepacked_scales is not None else None
             ),
             prepacked_scales=prepacked_scales is not None,
-            enable_pdl=enable_pdl,
         )
         if out is None:
             return result
@@ -915,7 +912,6 @@ def kimi3_router_projection(
     *,
     out: torch.Tensor | None = None,
     solution: str = "auto",
-    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Compute K3's BF16-input/BF16-weight router logits directly in FP32.
 
@@ -933,8 +929,6 @@ def kimi3_router_projection(
             grows linearly with M (4.0us at M=1 -> 34.8us at M=32 on B300)
             while the tensor-core GEMM stays flat (~7.3us), crossing between
             M=4 and M=8.
-        enable_pdl: Enable programmatic dependent launch for the CUDA kernel.
-
     Returns:
         FP32 router logits shaped ``[M, 896]``.
     """
@@ -1018,7 +1012,7 @@ def kimi3_router_projection(
             hidden_states,
             weight,
             out_dtype=torch.float32,
-            enable_pdl=enable_pdl,
+            enable_pdl=pdl_enabled(),
         )
         if out is None:
             return logits

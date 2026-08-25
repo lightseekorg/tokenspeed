@@ -578,7 +578,6 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
             k_scale=layer.k_scale if self.is_fp8 else None,
             v_scale=layer.v_scale if self.is_fp8 else None,
             score_out=metadata.score_out,
-            enable_pdl=pdl_enabled(),
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 

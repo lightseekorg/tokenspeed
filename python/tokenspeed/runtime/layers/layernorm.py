@@ -451,7 +451,6 @@ class FusedRMSNorm(nn.Module):
                 weight2=self.weight_kv_a,
                 output2=output_kv_a if output_kv_a is not None else input_kv_a,
                 eps=self.q_a_norm.variance_epsilon,
-                enable_pdl=pdl_enabled(),
             )
         else:
             rmsnorm_fused_parallel(

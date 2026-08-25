@@ -62,7 +62,6 @@ from tokenspeed_kernel import (
 from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed_kernel import mhc_post as fast_mhc_post
 from tokenspeed_kernel import mhc_pre as fast_mhc_pre
-from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -1622,14 +1621,12 @@ def dsv4_select_experts(
 def dsv4_linear_fp32(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
-    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Use the registered accelerator projection or an eager FP32 fallback."""
     try:
         return _kernel_dsv4_linear_fp32(
             hidden_states,
             weight,
-            enable_pdl=enable_pdl,
         )
     except NoKernelFoundError:
         return F.linear(hidden_states.float(), weight.float())
@@ -1671,7 +1668,6 @@ class DeepseekV4MoEGate(nn.Module):
         return dsv4_linear_fp32(
             hidden_states,
             self.weight,
-            enable_pdl=pdl_enabled(),
         )
 
 

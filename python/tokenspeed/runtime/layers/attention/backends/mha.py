@@ -36,7 +36,6 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
 )
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8
-from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import slice_to_real_tokens
@@ -690,7 +689,6 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,
-            enable_pdl=pdl_enabled(),
             solution=self.kernel_solution,
             **scale_kwargs,
         )
@@ -734,7 +732,6 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             sinks=sinks,
             max_seqlen_k=self.max_context_len,
             max_seqlen_q=max_seqlen_q,
-            enable_pdl=pdl_enabled(),
             solution=self.kernel_solution,
             **scale_kwargs,
         )

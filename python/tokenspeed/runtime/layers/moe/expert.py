@@ -23,7 +23,6 @@ from collections.abc import Callable
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -322,7 +321,6 @@ class MoELayer(torch.nn.Module):
                 num_tokens_global=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 do_finalize=do_finalize,
-                enable_pdl=pdl_enabled(),
                 low_latency=low_latency,
                 overlap_fn=overlap_fn,
             )
@@ -337,7 +335,6 @@ class MoELayer(torch.nn.Module):
                 num_tokens_global=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 do_finalize=do_finalize,
-                enable_pdl=pdl_enabled(),
                 low_latency=low_latency,
                 overlap_fn=overlap_fn,
             )

@@ -695,7 +695,6 @@ class MiniMaxM2Attention(nn.Module):
                 k,
                 fused_set_kv_buffer_arg=fused_kv_arg,
                 output_q_rope=q_rope,
-                enable_pdl=pdl_enabled(),
             )
             attn_output = self.attn(
                 q_rope,

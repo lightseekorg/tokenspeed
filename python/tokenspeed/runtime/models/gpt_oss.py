@@ -251,7 +251,6 @@ class GptOssAttention(nn.Module):
                 k,
                 fused_set_kv_buffer_arg=fused_kv_arg,
                 output_q_rope=q_rope,
-                enable_pdl=pdl_enabled(),
             )
             inner_state = q_rope, None, None
         else:

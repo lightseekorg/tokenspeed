@@ -55,7 +55,6 @@ from tokenspeed_kernel import (
     rel_mha_prefill,
 )
 from tokenspeed_kernel.ops.conv import seq_idx_from_cu_seqlens
-from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
@@ -697,7 +696,6 @@ class InklingAttnBackend(AttentionBackend):
             window_left=layer.sliding_window_size,
             softmax_scale=layer.scaling,
             tau=tau,
-            enable_pdl=pdl_enabled(),
             solution=inner.kernel_solution,
             **scale_kwargs,
         )
@@ -763,7 +761,6 @@ class InklingAttnBackend(AttentionBackend):
                 window_left=layer.sliding_window_size,
                 softmax_scale=layer.scaling,
                 tau=tau,
-                enable_pdl=pdl_enabled(),
                 solution=inner.kernel_solution,
             )
             output = output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -796,7 +793,6 @@ class InklingAttnBackend(AttentionBackend):
             window_left=layer.sliding_window_size,
             softmax_scale=layer.scaling,
             tau=tau,
-            enable_pdl=pdl_enabled(),
             solution=inner.kernel_solution,
             **scale_kwargs,
         )

@@ -607,7 +607,6 @@ def select_experts(
             routed_scaling_factor=(
                 1.0 if routed_scaling_factor is None else routed_scaling_factor
             ),
-            enable_pdl=pdl_enabled(),
         )
         topk_ids = topk_ids_logical_to_physical(
             topk_ids,

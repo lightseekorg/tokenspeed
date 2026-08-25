@@ -227,7 +227,6 @@ def test_qkvfab_fp8_w8a8_matches_dequant_reference_and_pins_flashinfer() -> None
             x,
             module.weight,
             weight_scale=module.weight_scale_inv,
-            enable_pdl=False,
         )
         torch.cuda.synchronize()
         assert out.shape == (m, n) and out.dtype == torch.bfloat16
@@ -250,7 +249,6 @@ def test_qkvfab_fp8_w8a8_matches_dequant_reference_and_pins_flashinfer() -> None
         module.weight,
         weight_scale=module.weight_scale_inv,
         prepacked_scales=prepacked,
-        enable_pdl=False,
     )
     torch.cuda.synchronize()
     ref32 = x.float() @ w_dq.t()

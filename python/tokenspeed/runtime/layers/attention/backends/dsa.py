@@ -29,7 +29,7 @@ from tokenspeed_kernel.ops.attention import (
 from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
     workspace_topk_to_global_slots,
 )
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -467,7 +467,6 @@ class DSABackend(AttentionBackend):
             page_size=self.kernel_page_size,
             logit_cap=layer.logit_cap,
             k_scale=k_scale,
-            enable_pdl=pdl_enabled(),
         )
         # GLM's sparse-prefill path writes both the latent KV and index_k before
         # entering this method, but bypasses AttentionBackend.forward and its
@@ -608,7 +607,6 @@ class DSABackend(AttentionBackend):
             q_len_per_req=q_len_per_req,
             logit_cap=layer.logit_cap,
             k_scale=k_scale,
-            enable_pdl=pdl_enabled(),
         )
         return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 

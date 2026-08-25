@@ -344,10 +344,7 @@ def test_mla_rope_set_kv_buffer_matches_reference(is_neox, loc_dtype):
     torch.testing.assert_close(kv[loc.long()], kv_ref[loc.long()], atol=0.01, rtol=0.01)
 
 
-@pytest.mark.parametrize("enable_pdl", [False, True])
-def test_mla_rope_set_kv_buffer_fp8_matches_two_kernel_path(
-    enable_pdl: bool,
-) -> None:
+def test_mla_rope_set_kv_buffer_fp8_matches_two_kernel_path() -> None:
     torch.manual_seed(0)
     n_loc = 17
     num_heads = 3
@@ -387,7 +384,6 @@ def test_mla_rope_set_kv_buffer_fp8_matches_two_kernel_path(
             q_nope=q_nope,
         ),
         q_rope_out=query,
-        enable_pdl=enable_pdl,
     )
     torch.cuda.synchronize()
 
@@ -396,8 +392,7 @@ def test_mla_rope_set_kv_buffer_fp8_matches_two_kernel_path(
 
 
 @pytest.mark.parametrize("n_loc", [1, 17, 600])
-@pytest.mark.parametrize("enable_pdl", [False, True])
-def test_mla_set_kv_nope_matches_two_kernel_path(n_loc: int, enable_pdl: bool) -> None:
+def test_mla_set_kv_nope_matches_two_kernel_path(n_loc: int) -> None:
     """The NoPE form, through the entry point the model actually calls.
 
     A model with no rotary embedding hands the write no RoPE tables, so the
@@ -439,7 +434,6 @@ def test_mla_set_kv_nope_matches_two_kernel_path(n_loc: int, enable_pdl: bool) -
             cos_sin_cache=None,
         ),
         q_rope_out=query,
-        enable_pdl=enable_pdl,
     )
     torch.cuda.synchronize()
 

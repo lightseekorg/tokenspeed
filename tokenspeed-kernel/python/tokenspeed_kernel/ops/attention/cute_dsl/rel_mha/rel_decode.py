@@ -435,8 +435,8 @@ def rel_mha_decode_tsmha(
     is the bias dtype (bf16/fp16).
 
     ``enable_pdl`` launches the shear, fwd, and combine kernels with
-    Programmatic Dependent Launch (Hopper+); pass
-    ``tokenspeed_kernel.platform.pdl_enabled()`` from the runtime.
+    Programmatic Dependent Launch (Hopper+); public attention wrappers supply
+    the platform policy.
     """
     P = max(prediction, 1)
     rows, H, D = q.shape

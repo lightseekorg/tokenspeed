@@ -1140,7 +1140,6 @@ class KimiLinearKDA(nn.Module):
                 prepacked_scales=getattr(
                     self.qkvgb_proj, "_flashinfer_scales_mn", None
                 ),
-                enable_pdl=pdl_enabled(),
             )
         else:
             blocks, weight_a, weight_b, eps, scratch_a, scratch_b = attnres_partial_args
@@ -1289,7 +1288,6 @@ class KimiLinearMoEGate(nn.Module):
         return kimi3_router_projection(
             hidden_states,
             self.weight,
-            enable_pdl=pdl_enabled(),
         )
 
 

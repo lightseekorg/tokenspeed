@@ -411,7 +411,6 @@ def _sconv_apply(
         checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
         num_extends=md.num_extends,
         page_size=backend.conv_columns["block_tokens"],
-        enable_pdl=pdl_enabled(),
     )
     if md.num_extends > 0 and backend.conv_columns.get("pd_endpoint_snapshots", False):
         # The fused kernel already publishes aligned boundaries. CachePD also

@@ -202,7 +202,6 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
             out_dtype=output_dtype,
             alpha=layer.alpha,
             quant="nvfp4",
-            enable_pdl=pdl_enabled(),
             override=kernel_override,
         )
         return out.view(x_fp4.size(0), w_n)
