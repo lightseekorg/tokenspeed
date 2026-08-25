@@ -61,11 +61,45 @@ def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
     monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
 
-    executor.reset_valid_cache_length(forward_op)
+    executor._reset_valid_cache_length(forward_op)
 
     assert executor.runtime_states.valid_cache_lengths[2].item() == 10
     assert executor.runtime_states.valid_cache_lengths[3].item() == 3
     assert executor.runtime_states.valid_cache_lengths[4].item() == 4
+
+
+def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
+    """A PD decode destination never runs the prompt, so no forward of its own
+    can establish these lengths: they come from the prefill node's complete
+    prompt, not from the local extend prefix."""
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.device = "cpu"
+    executor.execution_stream = _ExecutionStream()
+    executor.runtime_states = _RuntimeStates()
+
+    forward_op = SimpleNamespace(
+        request_pool_indices=[7, 11, 13],
+        prefill_lengths=[15, 17, 19],
+        extend_prefix_lens=[0, 0],
+        num_extends=lambda: 2,
+    )
+
+    torch_tensor = torch.tensor
+
+    def tensor_without_pinning(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return torch_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", tensor_without_pinning)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+
+    executor.reset_remote_prefill_cache_lengths(forward_op)
+
+    assert executor.runtime_states.valid_cache_lengths[7].item() == 15
+    assert executor.runtime_states.valid_cache_lengths[11].item() == 17
+    # Only the extend rows are seeded; the third row is not part of this op.
+    assert executor.runtime_states.valid_cache_lengths[13].item() == 13
 
 
 def test_draft_final_step_follows_the_complete_drafter_run():
@@ -93,7 +127,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     )
     executor.grammar_runtime = None
     executor.drafter = _Drafter()
-    executor.config = SimpleNamespace(spec_algo="EAGLE3")
+    executor.config = SimpleNamespace(spec_algo="EAGLE3", pp_size=1)
     executor.runtime_states = SimpleNamespace(
         future_input_map=_FutureInputMap(),
         vocab_size=32,
@@ -123,3 +157,43 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         "future-input",
         "draft-final",
     ]
+
+
+def test_cudagraph_gc_flag_reaches_the_capture_context():
+    """The operator flag must survive ServerArgs -> config -> capture.
+
+    Freezing the collector for the duration of capture is the default; the
+    flag is the escape hatch. It previously never arrived -- the wrapper read
+    it off a config that never carried it -- so capture never froze and the
+    flag moved nothing in either direction. Pin the whole path, not the
+    default: read the value the capture context would actually see.
+    """
+    import dataclasses
+    import gc
+
+    from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+        CudaGraphWrapper,
+        freeze_gc,
+    )
+    from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
+
+    fields = {f.name for f in dataclasses.fields(ModelExecutorConfig)}
+    assert "enable_cudagraph_gc" in fields, "config must carry the flag"
+
+    for flag in (False, True):
+        config = SimpleNamespace(enable_cudagraph_gc=flag)
+        wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+        # Only the flag plumbing is under test; __init__ needs a live model.
+        wrapper.enable_cudagraph_gc = config.enable_cudagraph_gc
+        assert wrapper.enable_cudagraph_gc is flag
+
+        # get_freeze_count() is process-global and other code freezes too, so
+        # compare against the count on entry rather than against zero.
+        before = gc.get_freeze_count()
+        canary = [object() for _ in range(64)]
+        with freeze_gc(wrapper.enable_cudagraph_gc):
+            during = gc.get_freeze_count()
+        after = gc.get_freeze_count()
+        assert (during > before) is (not flag), (flag, before, during)
+        assert after <= before, (before, after)
+        assert len(canary) == 64

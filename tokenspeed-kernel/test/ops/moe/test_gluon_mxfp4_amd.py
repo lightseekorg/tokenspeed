@@ -34,6 +34,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # no
     preprocess_gluon_mxfp4_gfx950_moe_weights,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (  # noqa: E402
+    _resolve_block_m,
+)
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (  # noqa: E402
     gluon_mxfp_precomputed_mxfp4_fused_moe as _gfx1250_static_moe,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (  # noqa: E402
@@ -378,12 +381,73 @@ def test_static_fp8_activation_moe_gfx950_smoke() -> None:
 
 
 @pytest.mark.parametrize(
-    "decode,num_tokens",
-    [(False, 4), (True, 1), (True, 2), (True, 4), (True, 8), (True, 16)],
+    "tokens,expected_block_m",
+    [
+        (64, 16),
+        (128, 16),
+        (256, 16),
+        (512, 16),
+        (1024, 16),
+        (2048, 32),
+        (4096, 64),
+        (16384, 128),
+    ],
+)
+def test_gfx1250_resolve_block_m_tracks_decode_occupancy(
+    tokens: int,
+    expected_block_m: int,
+) -> None:
+    num_experts, top_k = 256, 4
+    assert (
+        _resolve_block_m(
+            True,
+            tokens * top_k,
+            num_experts,
+            is_combine=False,
+        )
+        == expected_block_m
+    )
+
+
+@pytest.mark.parametrize(
+    "decode,num_experts,is_combine,expected_block_m",
+    [
+        (False, None, False, 128),
+        (False, None, True, 256),
+    ],
+)
+def test_gfx1250_resolve_block_m_defaults(
+    decode: bool,
+    num_experts: int | None,
+    is_combine: bool,
+    expected_block_m: int,
+) -> None:
+    assert (
+        _resolve_block_m(
+            decode,
+            256,
+            num_experts,
+            is_combine=is_combine,
+        )
+        == expected_block_m
+    )
+
+
+@pytest.mark.parametrize(
+    "decode,num_tokens,block_m",
+    [
+        pytest.param(False, 4, None, id="prefill-default"),
+        *[
+            pytest.param(True, num_tokens, None, id=f"decode-m{num_tokens}-adaptive")
+            for num_tokens in (1, 2, 4, 8, 16)
+        ],
+        pytest.param(True, 4, 128, id="decode-explicit-bm128"),
+    ],
 )
 def test_static_fp8_activation_moe_gfx1250(
     decode: bool,
     num_tokens: int,
+    block_m: int | None,
 ) -> None:
     if not is_cdna5():
         pytest.skip("gfx1250 is required for the CDNA5 static FP8 MoE kernel")
@@ -447,6 +511,7 @@ def test_static_fp8_activation_moe_gfx1250(
         w13_mx_scale=module.w13_precision_config.b_mx_scale,
         w2_mx_scale=module.w2_precision_config.b_mx_scale,
         decode=decode,
+        block_m=block_m,
     )
     expected = _fp8_mxfp4_swiglu_moe_reference(
         hidden_states,

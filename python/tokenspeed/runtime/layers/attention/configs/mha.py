@@ -82,6 +82,12 @@ class MHAConfig(BaseAttnConfig):
             # Target-stack labels don't fit the draft depth; drop so the pool falls back to full attn
             layer_types = ()
         sliding_window_tokens = getattr(hf_config, "sliding_window", None)
+        if draft_block_decode:
+            # A block drafter writes its KV at the target's cache locations, so
+            # it cannot carry a retention policy of its own; its window is an
+            # attention mask the draft applies in its own layers.
+            layer_types = ()
+            sliding_window_tokens = None
         return cls(
             device=server_args.device,
             context_len=model_config.context_len + server_args.spec_context_pad,

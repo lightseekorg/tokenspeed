@@ -190,9 +190,66 @@ class CacheMemoryPlan:
     planes: tuple[CachePlaneLayout, ...] = ()
     fields: tuple[CacheFieldLayout, ...] = ()
 
+    # Sum of the RETAINED planes' per-parent bytes. Equals lcm_block_bytes
+    # unless the plan was narrowed to a layer window (pipeline parallelism),
+    # where dropped layers' planes are physically excluded from the arena
+    # while the logical geometry (lcm_block_bytes, packing, parent count)
+    # stays the full model's so every rank's scheduler plans identically.
+    resident_block_bytes: int | None = None
+
     @property
     def arena_bytes(self) -> int:
-        return (self.num_lcm_blocks + 1) * self.lcm_block_bytes
+        per_parent = (
+            self.resident_block_bytes
+            if self.resident_block_bytes is not None
+            else self.lcm_block_bytes
+        )
+        return (self.num_lcm_blocks + 1) * per_parent
+
+    def narrow_to_layers(self, first_layer: int, last_layer: int) -> "CacheMemoryPlan":
+        """Physically drop layers outside ``[first_layer, last_layer)``.
+
+        For pipeline parallelism: a stage only writes/reads its own layers'
+        KV, so the other layers' planes need no memory. The logical geometry
+        (prefix_granularity, lcm_block_bytes, num_lcm_blocks, groups) is kept
+        untouched — the scheduler's page math must agree across ranks — while
+        the plane list is filtered to the window's fields and re-packed onto
+        fresh arena offsets. Fields without a ``layer.<id>.`` prefix (none
+        today) are retained.
+        """
+
+        def owned(field: CacheFieldLayout) -> bool:
+            try:
+                layer_id = cache_field_layer_id(field.field_id)
+            except ValueError:
+                return True
+            return first_layer <= layer_id < last_layer
+
+        kept_fields = tuple(field for field in self.fields if owned(field))
+        kept_plane_ids = {field.plane_id for field in kept_fields}
+        planes = []
+        arena_offset = 0
+        for plane in self.planes:
+            if plane.plane_id not in kept_plane_ids:
+                continue
+            planes.append(
+                CachePlaneLayout(
+                    plane_id=plane.plane_id,
+                    bytes_per_lcm_block=plane.bytes_per_lcm_block,
+                    arena_offset_bytes=arena_offset,
+                )
+            )
+            arena_offset += (self.num_lcm_blocks + 1) * plane.bytes_per_lcm_block
+        resident = sum(plane.bytes_per_lcm_block for plane in planes)
+        return CacheMemoryPlan(
+            prefix_granularity=self.prefix_granularity,
+            lcm_block_bytes=self.lcm_block_bytes,
+            num_lcm_blocks=self.num_lcm_blocks,
+            groups=self.groups,
+            planes=tuple(planes),
+            fields=kept_fields,
+            resident_block_bytes=resident,
+        )
 
     def group(self, group_id: str) -> CacheGroupLayout:
         for group in self.groups:

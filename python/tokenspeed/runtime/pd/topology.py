@@ -51,10 +51,17 @@ class PDParallelTopology:
     dp_rank: int
     world_size: int
     global_rank: int
+    # Prefill chunk-pipeline coordinates. tp/cp/dp are INTRA-stage; the world
+    # is pp stages of tp*cp*dp ranks each.
+    pp_size: int = 1
+    pp_rank: int = 0
+    # Optional explicit per-stage layer counts (front to back). Registered
+    # with the bootstrap so the Decode side plans over the same windows.
+    pp_layer_partition: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         """Validate parallel sizes and rank coordinates."""
-        for name in ("tp", "cp", "dp"):
+        for name in ("tp", "cp", "dp", "pp"):
             size = getattr(self, f"{name}_size")
             rank = getattr(self, f"{name}_rank")
             if size <= 0:
@@ -62,10 +69,10 @@ class PDParallelTopology:
             if not 0 <= rank < size:
                 raise ValueError(f"{name}_rank must be in [0, {size}), got {rank}")
 
-        expected_world_size = self.tp_size * self.cp_size * self.dp_size
+        expected_world_size = self.tp_size * self.cp_size * self.dp_size * self.pp_size
         if self.world_size != expected_world_size:
             raise ValueError(
-                "world_size must equal tp_size * cp_size * dp_size: "
+                "world_size must equal tp_size * cp_size * dp_size * pp_size: "
                 f"expected {expected_world_size}, got {self.world_size}"
             )
         if not 0 <= self.global_rank < self.world_size:
@@ -95,6 +102,9 @@ class PDParallelTopology:
             dp_rank=attention.dp_rank,
             world_size=mapping.world_size,
             global_rank=mapping.rank,
+            pp_size=getattr(mapping, "pp_size", 1),
+            pp_rank=(mapping.pp_rank if getattr(mapping, "pp_size", 1) > 1 else 0),
+            pp_layer_partition=getattr(mapping, "pp_layer_partition", None),
         )
 
     def require_cache_pd_supported(self) -> None:

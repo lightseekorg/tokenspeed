@@ -20,19 +20,12 @@
 
 from __future__ import annotations
 
-import asyncio
-import copy
 import logging
 import time
-from collections import deque
 from typing import (
     TYPE_CHECKING,
     Any,
-    Generic,
-    TypeVar,
 )
-
-import zmq
 
 from tokenspeed.runtime.engine.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
@@ -44,7 +37,6 @@ from tokenspeed.runtime.engine.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadReqInput,
     GetLoadReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
@@ -73,6 +65,7 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from tokenspeed.runtime.engine.scheduler_communicator import _Communicator
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -80,72 +73,7 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.async_llm import AsyncLLM
 
-T = TypeVar("T")
-
 logger = logging.getLogger(__name__)
-
-
-class _Communicator(Generic[T]):
-    """Note: The communicator now only run up to 1 in-flight request at any time."""
-
-    def __init__(self, sender: zmq.Socket, fan_out: int, mode="queueing"):
-        self._sender = sender
-        self._fan_out = fan_out
-        self._mode = mode
-        self._result_event: asyncio.Event | None = None
-        self._result_values: list[T] | None = None
-        self._ready_queue: deque[asyncio.Future] = deque()
-
-        if mode not in ("queueing", "watching"):
-            raise ValueError(f"Invalid communicator mode: {mode}")
-
-    async def queueing_call(self, obj: T):
-        ready_event = asyncio.Event()
-        if self._result_event is not None or len(self._ready_queue) > 0:
-            self._ready_queue.append(ready_event)
-            await ready_event.wait()
-            if self._result_event is not None or self._result_values is not None:
-                raise RuntimeError("Communicator result state was not reset.")
-
-        if obj:
-            self._sender.send_pyobj(obj)
-
-        self._result_event = asyncio.Event()
-        self._result_values = []
-        await self._result_event.wait()
-        result_values = self._result_values
-        self._result_event = self._result_values = None
-
-        if len(self._ready_queue) > 0:
-            self._ready_queue.popleft().set()
-
-        return result_values
-
-    async def watching_call(self, obj):
-        if self._result_event is None:
-            if self._result_values is not None:
-                raise RuntimeError("Communicator result values were not reset.")
-            self._result_values = []
-            self._result_event = asyncio.Event()
-
-            if obj:
-                self._sender.send_pyobj(obj)
-
-        await self._result_event.wait()
-        result_values = copy.deepcopy(self._result_values)
-        self._result_event = self._result_values = None
-        return result_values
-
-    async def __call__(self, obj):
-        if self._mode == "queueing":
-            return await self.queueing_call(obj)
-        else:
-            return await self.watching_call(obj)
-
-    def handle_recv(self, recv_obj: T):
-        self._result_values.append(recv_obj)
-        if len(self._result_values) == self._fan_out:
-            self._result_event.set()
 
 
 class SchedulerControlClient:
@@ -202,12 +130,6 @@ class SchedulerControlClient:
         self.expert_distribution_communicator = _Communicator(
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
-        self.get_load_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler,
-            server_args.mapping.attn.dp_size,
-            mode="watching",
-        )
-
         self._result_dispatcher += self._get_communicator_dispatcher()
 
     def _get_communicator_dispatcher(self: AsyncLLM):
@@ -277,10 +199,6 @@ class SchedulerControlClient:
                     ExpertDistributionReqOutput,
                     self.expert_distribution_communicator.handle_recv,
                 ),
-                (
-                    GetLoadReqOutput,
-                    self.get_load_communicator.handle_recv,
-                ),
             ]
         )
 
@@ -335,7 +253,7 @@ class SchedulerControlClient:
     ):
         self.auto_create_handle_loop()
         env_with_stack = envs.TOKENSPEED_PROFILE_WITH_STACK.get()
-        with_stack = False if with_stack is False or env_with_stack is False else True
+        with_stack = not (with_stack is False or env_with_stack is False)
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
@@ -475,5 +393,17 @@ class SchedulerControlClient:
         return [res.updated for res in responses]
 
     async def get_load(self: AsyncLLM) -> list[GetLoadReqOutput]:
-        req = GetLoadReqInput()
-        return await self.get_load_communicator(req)
+        self.auto_create_handle_loop()
+        return self.load_snapshot_store.project_loads()
+
+    async def load_snapshot_loop(self: AsyncLLM) -> None:
+        """Cache scheduler-published snapshots and relay accepted updates to DP."""
+        while True:
+            snapshot = await self.engine_core_client.recv_load_snapshot.recv_pyobj()
+            if not self.load_snapshot_store.accept(snapshot):
+                continue
+            if (
+                self.server_args.mapping.attn.has_dp
+                and self.server_args.load_balance_method != "round_robin"
+            ):
+                await self.engine_core_client.send_to_scheduler.send_pyobj(snapshot)

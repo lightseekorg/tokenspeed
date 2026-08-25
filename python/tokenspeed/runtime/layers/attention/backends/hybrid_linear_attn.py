@@ -40,6 +40,9 @@ from tokenspeed_kernel.ops.attention.triton.linear.index import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
 )
+from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
+    verify_state_blocks,
+)
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
@@ -270,14 +273,60 @@ def _prepare_gdn_decode_state_path(
     return initial_state_indices, output_state_indices, solution
 
 
+def _build_cu_extend_seq_lens_cpu(
+    extend_seq_lens_cpu: torch.Tensor | None, expected_len: int
+) -> torch.Tensor:
+    """Host prefix sum of the scheduler's extend lengths, as an int64 tensor.
+
+    The contents must equal ``query_start_loc`` — a wrong copy silently
+    corrupts the kernels' host chunk plans. Both are built together here in
+    ``init_forward_metadata`` (mirroring MHA's ``cu_extend_seq_lens_cpu``),
+    so absence or length misalignment can only mean a caller broke that
+    contract: fail loudly instead of silently degrading to a
+    stream-synchronizing boundary re-read inside the kernel.
+
+    Args:
+        extend_seq_lens_cpu: CPU per-sequence extend lengths.
+        expected_len: ``query_start_loc.numel()`` of the batch.
+
+    Returns:
+        Host int64 tensor ``[0, lens[0], lens[0]+lens[1], ...]`` with
+        ``expected_len`` entries.
+
+    Raises:
+        RuntimeError: the lengths are absent or disagree with
+            ``query_start_loc`` on the sequence count.
+    """
+    if extend_seq_lens_cpu is None:
+        raise RuntimeError(
+            "extend metadata requires the scheduler's host extend lengths; "
+            "the executor provides them for every extend batch"
+        )
+    if extend_seq_lens_cpu.numel() + 1 != expected_len:
+        raise RuntimeError(
+            "host extend lengths disagree with query_start_loc on the "
+            f"sequence count: {extend_seq_lens_cpu.numel() + 1} boundaries "
+            f"vs {expected_len} entries"
+        )
+    bounds = torch.zeros(expected_len, dtype=torch.int64)
+    torch.cumsum(extend_seq_lens_cpu.to(torch.int64), dim=0, out=bounds[1:])
+    return bounds
+
+
 @dataclass
 class MambaForwardMetadata:
     query_start_loc: torch.Tensor | None
     mamba_output_indices: torch.Tensor | None = None
     extend_prefix_lens: torch.Tensor | None = None
     extend_seq_lens_cpu: torch.Tensor | None = None
+    # Host int64 prefix sum of extend_seq_lens_cpu, equal to
+    # query_start_loc's contents; built once per extend batch (mirroring
+    # MHA's field of the same name) and reused by every layer's prefill scan
+    # so no kernel re-reads the device boundaries (a stream-synchronizing
+    # D2H per layer per chunk). Fresh per batch — never mutated in place.
+    cu_extend_seq_lens_cpu: torch.Tensor | None = None
     # Per-state-group metadata is gathered once per group and batch;
-    # layers select their entry via ``pool.group_id_for_layer(layer_id)``.
+    # layers select their entry via ``pool.state_group_by_layer[layer_id]``.
     state_in_blocks_by_group: dict[str, torch.Tensor] | None = None
     state_out_blocks_by_group: dict[str, torch.Tensor] | None = None
 
@@ -300,6 +349,7 @@ class MambaAttnBackend(AttentionBackend):
     # The hybrid wrapper unions the sub-backends' declarations, so a Kimi-K3
     # contract (history + state) is covered once both consumers exist.
     cache_consumer_families = frozenset({"state"})
+    _replay_active: bool = False
 
     def __init__(self, config: BaseAttnConfig):
         super().__init__(config)
@@ -322,6 +372,8 @@ class MambaAttnBackend(AttentionBackend):
         self.state_out_by_group: dict[str, list[torch.Tensor]] = {}
         self.replay_ssm = bool(getattr(config, "replay_ssm", False))
         self._gdn_replay: _GDNReplayWorkspace | None = None
+        self._verify_scratch = None
+        self._verify_commit_ctx = None
 
     def set_kv_pool(self, kv_pool) -> None:
         """Bind a unified pool that publishes state groups and component views."""
@@ -338,11 +390,11 @@ class MambaAttnBackend(AttentionBackend):
             raise RuntimeError(
                 "MambaAttnBackend requires at least one state-family cache group"
             )
-        if not callable(getattr(kv_pool, "group_id_for_layer", None)) or not callable(
+        if getattr(kv_pool, "state_group_by_layer", None) is None or not callable(
             getattr(kv_pool, "get_component", None)
         ):
             raise RuntimeError(
-                "MambaAttnBackend requires group_id_for_layer() and get_component()"
+                "MambaAttnBackend requires state_group_by_layer and get_component()"
             )
         self._state_group_ids = state_group_ids
         self.state_paging_active = True
@@ -392,18 +444,18 @@ class MambaAttnBackend(AttentionBackend):
 
     def _state_layer_ids(self) -> list[int]:
         """Recurrent layer ids backed by the unified cache pool."""
-        state_groups = set(self._state_group_ids)
-        return sorted(
-            layer_id
-            for layer_id, group_id in self.kv_pool._group_ids_by_layer.items()
-            if group_id in state_groups
-        )
+        return sorted(self.kv_pool.state_group_by_layer)
 
     def _state_groups(self) -> tuple[str, ...]:
         return self._state_group_ids
 
     def _state_group_for(self, layer_id: int) -> str:
-        return self.kv_pool.group_id_for_layer(layer_id)
+        try:
+            return self.kv_pool.state_group_by_layer[layer_id]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"layer {layer_id} has no state-family cache group"
+            ) from exc
 
     def _state_components(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         return (
@@ -427,13 +479,6 @@ class MambaAttnBackend(AttentionBackend):
         pages, the committed lengths, and the per-group group tables (kept
         for the commit's dynamic page resolve).
         """
-        committed = (seq_lens[:bs].to(torch.int64) - draft_token_num).clamp_min(0)
-        in_slots = torch.div(
-            (committed - 1).clamp_min(0),
-            self._checkpoint_granularity,
-            rounding_mode="floor",
-        )
-        has_history = committed > 0
         state_in_blocks: dict[str, torch.Tensor] = {}
         tables: dict[str, torch.Tensor] = {}
         cache_metadata = kwargs.get("cache_metadata")
@@ -448,11 +493,23 @@ class MambaAttnBackend(AttentionBackend):
             )
             for group_id in self._state_groups()
         }
+        if not rows_by_group:
+            return (
+                {},
+                (seq_lens[:bs].to(torch.int64) - draft_token_num).clamp_min(0),
+                {},
+            )
+        committed = torch.empty(bs, dtype=torch.int64, device=seq_lens.device)
         for group_id, rows in rows_by_group.items():
-            slots_safe = in_slots.clamp(min=0, max=rows.shape[1] - 1)
-            pages = rows[:bs].gather(1, slots_safe.unsqueeze(1)).squeeze(1)
-            pages = torch.where(has_history, pages, torch.full_like(pages, -1)).to(
-                torch.int32
+            pages = torch.empty(bs, dtype=torch.int32, device=seq_lens.device)
+            verify_state_blocks(
+                seq_lens,
+                rows,
+                batch_size=bs,
+                draft_tokens=draft_token_num,
+                granularity=self._checkpoint_granularity,
+                pages_out=pages,
+                committed_out=committed,
             )
             state_in_blocks[group_id] = pages
             tables[group_id] = rows
@@ -525,12 +582,16 @@ class MambaAttnBackend(AttentionBackend):
         if not self.state_paging_active or self.is_draft:
             return 0
         self._ensure_verify_scratch(max_bs, draft_token_num)
-        return sum(
+        total = sum(
             tensor.nbytes
             for layer_scratch in self._verify_scratch.values()
             for tensor in layer_scratch
             if tensor is not None
         )
+        if self._gdn_replay is not None:
+            total += self._gdn_replay.payload.nbytes
+            total += self._gdn_replay.parameters.nbytes
+        return total
 
     def _verify_copy_tables_get(self) -> dict:
         """Pointer tables for the batched verify state copies and replay:
@@ -768,7 +829,7 @@ class MambaAttnBackend(AttentionBackend):
 
         The dual-index gather runs ONCE per state group per batch — never per
         layer. State layers select their group's entry via
-        ``pool.group_id_for_layer(layer_id)`` at forward time.
+        ``pool.state_group_by_layer[layer_id]`` at forward time.
 
         validate: explicit True/False wins; None (the hot-path default)
         validates only under TOKENSPEED_CACHE_DEBUG=1 (the checks host-sync).
@@ -840,6 +901,7 @@ class MambaAttnBackend(AttentionBackend):
         if not 0 <= num_extends <= bs:
             raise ValueError("num_extends must be between 0 and bs")
         mamba_output_indices = None
+        cu_extend_seq_lens_cpu: tuple[int, ...] | None = None
         extend_seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
         if extend_seq_lens_cpu is not None:
             extend_seq_lens_cpu = extend_seq_lens_cpu[:num_extends]
@@ -861,10 +923,16 @@ class MambaAttnBackend(AttentionBackend):
                 )
                 set_total_chunks_hint_uniform(bs, tokens_per_req, query_start_loc)
             else:
+                if extend_seq_lens_cpu is None:
+                    raise RuntimeError(
+                        "extend metadata requires the scheduler's host extend "
+                        "lengths; the executor provides them for every extend "
+                        "batch"
+                    )
                 extend_start_loc = kwargs.get("extend_start_loc")
                 extend_seq_lens = kwargs.get("extend_seq_lens")
                 if forward_mode.is_mixed():
-                    if extend_seq_lens is None or extend_seq_lens_cpu is None:
+                    if extend_seq_lens is None:
                         raise RuntimeError(
                             "mixed GDN metadata requires extend sequence lengths"
                         )
@@ -895,10 +963,6 @@ class MambaAttnBackend(AttentionBackend):
                     )
                     query_start_loc[:bs] = extend_start_loc
                     query_start_loc[bs] = extend_start_loc[-1] + extend_seq_lens[-1]
-                    if extend_seq_lens_cpu is None:
-                        extend_seq_lens_cpu = extend_seq_lens[:bs].to(
-                            device="cpu", dtype=torch.int32
-                        )
                 else:
                     extend_prefix_lens = kwargs.get("extend_prefix_lens")
                     if extend_prefix_lens is not None:
@@ -912,9 +976,10 @@ class MambaAttnBackend(AttentionBackend):
                         bs + 1, dtype=torch.int32, device=self.device
                     )
                     torch.cumsum(extend_lens, dim=0, out=query_start_loc[1:])
-                    if extend_seq_lens_cpu is None:
-                        extend_seq_lens_cpu = extend_lens.to(device="cpu")
                 set_total_chunks_hint(extend_seq_lens_cpu, query_start_loc)
+                cu_extend_seq_lens_cpu = _build_cu_extend_seq_lens_cpu(
+                    extend_seq_lens_cpu, query_start_loc.numel()
+                )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
@@ -958,6 +1023,7 @@ class MambaAttnBackend(AttentionBackend):
             mamba_output_indices=mamba_output_indices,
             extend_prefix_lens=kwargs.get("extend_prefix_lens"),
             extend_seq_lens_cpu=extend_seq_lens_cpu,
+            cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
             state_in_blocks_by_group=state_in_blocks_by_group,
             state_out_blocks_by_group=state_out_blocks_by_group,
         )
@@ -1653,6 +1719,7 @@ class MambaAttnBackend(AttentionBackend):
                 ssm_scratch,
                 state_in_blocks,
                 output_indices,
+                layer_id=layer_id,
                 bias=bias,
                 f_a_out=f_a_out,
                 f_b_weight=f_b_weight,
@@ -1672,9 +1739,8 @@ class MambaAttnBackend(AttentionBackend):
             # verify scratch. The accepted position is committed afterward.
             if layer_id == self._state_layer_ids()[0]:
                 self._seed_verify_scratch_batched(batch_size, draft_token_num)
-            init_rows = output_indices[:batch_size, 0] - 1
             conv_states = conv_scratch
-            conv_read = init_rows
+            conv_read = output_indices[:batch_size, 0] - 1
             conv_out = output_indices[:batch_size]
             # shouldn't use contiguous here, because causal_conv1d_update
             # support input non-contiguous
@@ -1802,7 +1868,7 @@ class MambaAttnBackend(AttentionBackend):
                 seq_len=seq_len,
                 num_real_tokens=num_real_tokens,
                 lower_bound=gate_lower_bound,
-                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                cu_seqlens_cpu=self.forward_metadata.cu_extend_seq_lens_cpu,
             )
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             # Extend indices never carry pad(-1), so this write is unguarded.
@@ -1821,6 +1887,7 @@ class MambaAttnBackend(AttentionBackend):
         state_in_blocks: torch.Tensor,
         output_indices: torch.Tensor,
         *,
+        layer_id: int,
         bias: torch.Tensor | None,
         f_a_out: torch.Tensor | None,
         f_b_weight: torch.Tensor | None,
@@ -1854,6 +1921,7 @@ class MambaAttnBackend(AttentionBackend):
             ssm_scratch: Per-position recurrent verify scratch.
             state_in_blocks: Per-request committed-state page ids.
             output_indices: ``[bs, T]`` verify scratch row grid.
+            layer_id: Model layer whose verify payload is being processed.
             bias: Conv bias; a fused path requires the bias-free conv.
             f_a_out: Low-rank gate activation (KDA); None on GDN.
             f_b_weight: Second gate projection consumed inside the fusion.
@@ -1990,7 +2058,7 @@ class MambaAttnBackend(AttentionBackend):
         seq_len: int,
         num_real_tokens: int,
         lower_bound: float | None,
-        extend_seq_lens_cpu: torch.Tensor | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Chunked scan of an extend/prefill batch, from the gathered state.
 
@@ -2018,9 +2086,11 @@ class MambaAttnBackend(AttentionBackend):
             seq_len: Padded token extent of the batch.
             num_real_tokens: Token extent excluding the graph padding tail.
             lower_bound: KDA decay clamp.
-            extend_seq_lens_cpu: Host-side per-sequence extend lengths whose
-                prefix sum equals ``query_start_loc``. The KDA override
-                forwards it so the CuteDSL wrapper can plan without a D2H
+            cu_seqlens_cpu: Metadata-built host int64 copy of
+                ``query_start_loc``'s contents (see
+                ``MambaForwardMetadata.cu_extend_seq_lens_cpu``). The KDA
+                override forwards it so every prefill solution plans its
+                chunk indices on the host without a stream-synchronizing D2H
                 read; the GDN scan plans on device and ignores it.
 
         Returns:

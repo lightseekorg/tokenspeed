@@ -225,3 +225,114 @@ def test_composite_partition_on_inner_axis_keeps_full_parent_row_stride():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---- prefill chunk-pipeline (PP) layer-window routing ----
+
+
+def test_pp_layer_window_filters_fragments():
+    """A stage's planner only routes fields inside its layer window."""
+    layout = _paged_layout(
+        local_heads=4, global_heads=4, page_stride=4096, page_zero_offset=128
+    )
+    stage0 = CacheTransferPlanner(
+        prefill_tp_size=1,
+        decode_tp_size=1,
+        prefill_layout=layout,
+        decode_layout=layout,
+        prefill_layer_window=(0, 1),
+    )
+    stage1 = CacheTransferPlanner(
+        prefill_tp_size=1,
+        decode_tp_size=1,
+        prefill_layout=layout,
+        decode_layout=layout,
+        prefill_layer_window=(1, 2),
+    )
+    frags0 = stage0.plan_for_decode_rank(0).fragments_by_prefill_rank[0]
+    frags1 = stage1.plan_for_decode_rank(0).fragments_by_prefill_rank[0]
+    assert {f.field_id for f in frags0} == {"layer.0.k"}
+    assert {f.field_id for f in frags1} == {"layer.1.latent"}
+    # The stage union covers exactly the plan's full field set.
+    all_fields = {field.field_id for field in layout.plan.fields}
+    assert {f.field_id for f in frags0} | {f.field_id for f in frags1} == all_fields
+
+
+def test_pp_receiver_calc_merges_stage_routes():
+    """Decode's route plan spans pp*tp source ranks with disjoint fields."""
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.pd.mooncake.decode import PrefillParallelInfo
+    from tokenspeed.runtime.pd.mooncake.receiver import _calc
+
+    layout = _paged_layout(
+        local_heads=4, global_heads=4, page_stride=4096, page_zero_offset=128
+    )
+    kv_mgr = SimpleNamespace(
+        topology=SimpleNamespace(tp_size=1, tp_rank=0),
+        kv_args=SimpleNamespace(cache_layout=layout),
+    )
+    info = PrefillParallelInfo(
+        tp_size=2,  # registered world = pp(2) x tp(1)
+        dp_size=1,
+        cache_layout=layout,
+        pp_size=2,
+    )
+    assert info.prefill_tp_size_per_dp_rank == 1
+    plan = _calc(kv_mgr, info)
+    frags = plan.transfer_plan.fragments_by_prefill_rank
+    # Stage-major dense ranks: stage0 -> rank 0 (layer.0), stage1 -> rank 1 (layer.1).
+    assert set(frags) == {0, 1}
+    assert {f.field_id for f in frags[0]} == {"layer.0.k"}
+    assert {f.field_id for f in frags[1]} == {"layer.1.latent"}
+
+
+def test_pp_receiver_calc_honors_layer_partition():
+    """An explicit prefill layer partition moves fields between stage routes."""
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.pd.mooncake.decode import PrefillParallelInfo
+    from tokenspeed.runtime.pd.mooncake.receiver import _calc
+
+    # Three layers so partition (1, 2) differs from the even split (2, 1).
+    layout = make_layout(
+        group(
+            "history",
+            segment(
+                "layer.0.latent", dtype="bfloat16", shape=(2, 1), offset=0, stride=16
+            ),
+            segment(
+                "layer.1.latent", dtype="bfloat16", shape=(2, 1), offset=512, stride=16
+            ),
+            segment(
+                "layer.2.latent", dtype="bfloat16", shape=(2, 1), offset=1024, stride=16
+            ),
+        ),
+        page_bytes=128,
+    )
+    kv_mgr = SimpleNamespace(
+        topology=SimpleNamespace(tp_size=1, tp_rank=0),
+        kv_args=SimpleNamespace(cache_layout=layout),
+    )
+
+    def stage_fields(partition):
+        info = PrefillParallelInfo(
+            tp_size=2,
+            dp_size=1,
+            cache_layout=layout,
+            pp_size=2,
+            pp_layer_partition=partition,
+        )
+        frags = _calc(kv_mgr, info).transfer_plan.fragments_by_prefill_rank
+        return {rank: {f.field_id for f in fields} for rank, fields in frags.items()}
+
+    # Even split (partition None): stage0 gets layers 0-1, stage1 layer 2.
+    assert stage_fields(None) == {
+        0: {"layer.0.latent", "layer.1.latent"},
+        1: {"layer.2.latent"},
+    }
+    # Explicit (1, 2): stage0 gets layer 0 only, stage1 layers 1-2.
+    assert stage_fields((1, 2)) == {
+        0: {"layer.0.latent"},
+        1: {"layer.1.latent", "layer.2.latent"},
+    }

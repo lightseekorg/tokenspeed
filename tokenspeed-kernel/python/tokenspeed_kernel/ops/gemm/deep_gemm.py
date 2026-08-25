@@ -23,7 +23,12 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import ScaleFormat, format_signatures
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 _fp8_dtype = torch.float8_e4m3fn
 _MXFP8_SCALE = ScaleFormat(
@@ -37,6 +42,8 @@ _MXFP8_FORMAT_SIGNATURES = format_signatures(
 
 try:
     from tokenspeed_kernel.thirdparty.deep_gemm import (
+        ceil_to_ue8m0,
+        fp8_einsum,
         fp8_gemm_nt,
         get_mn_major_tma_aligned_tensor,
         get_num_sms,
@@ -45,8 +52,11 @@ try:
         m_grouped_fp8_gemm_nt_masked,
         set_num_sms,
         set_pdl,
+        transform_sf_into_required_layout,
     )
 except ImportError:
+    ceil_to_ue8m0 = None  # type: ignore[assignment]
+    fp8_einsum = None  # type: ignore[assignment]
     fp8_gemm_nt = None  # type: ignore[assignment]
     get_pdl = None  # type: ignore[assignment]
     get_mn_major_tma_aligned_tensor = None  # type: ignore[assignment]
@@ -55,6 +65,196 @@ except ImportError:
     m_grouped_fp8_gemm_nt_masked = None  # type: ignore[assignment]
     set_num_sms = None  # type: ignore[assignment]
     set_pdl = None  # type: ignore[assignment]
+    transform_sf_into_required_layout = None  # type: ignore[assignment]
+
+
+_DEEPSEEK_V4_GROUPED_SIGNATURES = frozenset(
+    format_signature(
+        attention=dense_tensor_format(input_dtype),
+        weight=dense_tensor_format(_fp8_dtype),
+    )
+    for input_dtype in (torch.float16, torch.bfloat16)
+)
+
+
+def _warmup_deep_gemm_fp8_linears(plans: list[object], max_tokens: int) -> None:
+    from tokenspeed_kernel.thirdparty.deep_gemm.warmup import warmup_fp8_gemm_nt
+
+    by_device: dict[torch.device, set[tuple[int, int]]] = {}
+    for plan in plans:
+        warmup_key = getattr(plan, "warmup_key")
+        prepared_weight_scales = getattr(plan, "prepared_weight_scales")
+        assert warmup_key is not None
+        assert prepared_weight_scales is not None
+        n, k = warmup_key
+        device = prepared_weight_scales.device
+        by_device.setdefault(device, set()).add((n, k))
+    for device, shapes in by_device.items():
+        warmup_fp8_gemm_nt(list(shapes), max_tokens, device)
+
+
+def _deep_gemm_dsv4_grouped_output_projection_weights(
+    *,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    num_groups: int,
+    output_dim: int,
+    input_dim: int,
+    block_size: tuple[int, int],
+    recipe: tuple[int, int, int],
+) -> torch.Tensor:
+    """Transform grouped scales into DeepGEMM's architecture-specific layout."""
+    del weight
+    block_n, block_k = block_size
+    expected_shape = (
+        num_groups * (output_dim // block_n),
+        input_dim // block_k,
+    )
+    if tuple(weight_scale.shape) != expected_shape:
+        raise ValueError(
+            "grouped output projection scale shape mismatch: "
+            f"expected {expected_shape}, got {tuple(weight_scale.shape)}"
+        )
+    sf = ceil_to_ue8m0(weight_scale).view(
+        num_groups,
+        output_dim // block_n,
+        input_dim // block_k,
+    )
+    return transform_sf_into_required_layout(
+        sf=sf,
+        mn=output_dim,
+        k=input_dim,
+        recipe=recipe,
+        num_groups=num_groups,
+        is_sfa=False,
+    )
+
+
+def _warmup_deep_gemm_dsv4_grouped_output_projection(
+    *,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    num_groups: int,
+    output_dim: int,
+    input_dim: int,
+    block_size: tuple[int, int],
+    tma_aligned_scales: bool,
+    recipe: tuple[int, int, int],
+    max_tokens: int,
+) -> None:
+    from tokenspeed_kernel.thirdparty.deep_gemm.warmup import _warmup_m_values
+
+    num_scale_blocks = input_dim // block_size[1]
+    grouped_weight = weight.view(num_groups, output_dim, input_dim)
+    for num_tokens in _warmup_m_values(max_tokens):
+        fp8_values = torch.zeros(
+            (num_groups, num_tokens, input_dim),
+            dtype=torch.float8_e4m3fn,
+            device=weight.device,
+        ).transpose(0, 1)
+        aligned_tokens = ((num_tokens + 3) // 4) * 4
+        scale_inner = (
+            (num_scale_blocks + 3) // 4 if tma_aligned_scales else num_scale_blocks
+        )
+        scale_dtype = torch.int32 if tma_aligned_scales else torch.float32
+        scales = (
+            torch.ones(
+                num_groups * scale_inner * aligned_tokens,
+                dtype=scale_dtype,
+                device=weight.device,
+            )
+            .as_strided(
+                (num_groups, num_tokens, scale_inner),
+                (scale_inner * aligned_tokens, 1, aligned_tokens),
+            )
+            .transpose(0, 1)
+        )
+        output = torch.empty(
+            (num_tokens, num_groups, output_dim),
+            dtype=torch.bfloat16,
+            device=weight.device,
+        )
+        fp8_einsum(
+            "bhr,hdr->bhd",
+            (fp8_values, scales),
+            (grouped_weight, weight_scale),
+            output,
+            recipe=recipe,
+        )
+    torch.cuda.synchronize()
+
+
+if fp8_einsum is not None:
+
+    @register_kernel(
+        "gemm",
+        "dsv4_grouped_output_projection",
+        name="deep_gemm_dsv4_grouped_output_projection",
+        solution="deep_gemm",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=_DEEPSEEK_V4_GROUPED_SIGNATURES,
+        traits={
+            "block_size": frozenset({(128, 128)}),
+            "scale_format": frozenset({"ue8m0"}),
+            "weight_scale_dtype": frozenset({torch.float32}),
+        },
+        priority=Priority.SPECIALIZED + 2,
+        tags={"throughput"},
+        weight_preprocessor=_deep_gemm_dsv4_grouped_output_projection_weights,
+    )
+    def deep_gemm_dsv4_grouped_output_projection(
+        *,
+        attention: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        num_groups: int,
+        heads_per_group: int,
+        output_dim: int,
+        nope_dim: int,
+        rope_dim: int,
+        block_size: tuple[int, int],
+        tma_aligned_scales: bool,
+        recipe: tuple[int, int, int],
+    ) -> torch.Tensor:
+        from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+            dsv4_fused_inv_rope_fp8_quant,
+        )
+
+        values, scales = dsv4_fused_inv_rope_fp8_quant(
+            attention,
+            positions,
+            cos_sin_cache,
+            n_groups=num_groups,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            quant_group_size=block_size[1],
+            tma_aligned_scales=tma_aligned_scales,
+        )
+        input_dim = heads_per_group * attention.shape[-1]
+        grouped_weight = weight.view(num_groups, output_dim, input_dim)
+        output = torch.empty(
+            (attention.shape[0], num_groups, output_dim),
+            dtype=torch.bfloat16,
+            device=attention.device,
+        )
+        fp8_einsum(
+            "bhr,hdr->bhd",
+            (values, scales),
+            (grouped_weight, weight_scale),
+            output,
+            recipe=recipe,
+        )
+        return output
+
+    deep_gemm_dsv4_grouped_output_projection._tokenspeed_warmup = (  # type: ignore[attr-defined]
+        _warmup_deep_gemm_dsv4_grouped_output_projection
+    )
 
 if fp8_gemm_nt is not None:
 

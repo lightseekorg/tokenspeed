@@ -226,21 +226,32 @@ async def _served_model() -> str | None:
     return _served_model_id
 
 
-async def _inject_default_model(body: bytes) -> bytes:
-    """Return ``body`` with ``model`` set to the served model when the JSON
-    body omits it. Non-JSON or already-populated bodies pass through."""
+async def _prepare_sglang_generate_body(body: bytes) -> bytes:
+    """Translate SGLang request aliases and add the default model."""
     if not body:
         return body
     try:
         data = json.loads(body)
     except ValueError:
         return body
-    if not isinstance(data, dict) or data.get("model"):
+    if not isinstance(data, dict):
         return body
-    model_id = await _served_model()
-    if not model_id:
-        return body
-    data["model"] = model_id
+
+    # Slime uses SGLang's sampling_seed name; TokenSpeed's native parameter is
+    # seed. Preserve an explicit native seed when both are present.
+    sampling_params = data.get("sampling_params")
+    params_list = (
+        sampling_params if isinstance(sampling_params, list) else [sampling_params]
+    )
+    for params in params_list:
+        if isinstance(params, dict) and "sampling_seed" in params:
+            params.setdefault("seed", params["sampling_seed"])
+            params.pop("sampling_seed")
+
+    if not data.get("model"):
+        model_id = await _served_model()
+        if model_id:
+            data["model"] = model_id
     return json.dumps(data).encode()
 
 
@@ -304,7 +315,7 @@ def _add_output_token_logprobs(obj: dict) -> bool:
 async def generate(request: Request):
     if request.method != "POST":
         return await _proxy_request(request)
-    body = await _inject_default_model(await request.body())
+    body = await _prepare_sglang_generate_body(await request.body())
     resp = await _proxy_request(request, body_override=body)
     if not (isinstance(resp, Response) and resp.body):
         return resp  # streaming or empty: pass through
@@ -377,13 +388,8 @@ async def stop_profile(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# RL weight transfer — proxied to the in-engine control plane
-#
-# The weight-update HTTP API that RL trainers drive. The heavy weight payloads
-# travel out-of-band (NCCL / CUDA-IPC); only metadata flows through here. The
-# control plane runs inside the engine process next to AsyncLLM (see
-# runtime/entrypoints/vllm_compat_http.py); the sidecar proxies to it on
-# _rl_control_url.
+# SGLang-compatible RL control, proxied to the in-engine control app.
+# Heavy distributed weight payloads travel out-of-band; HTTP carries metadata.
 # ---------------------------------------------------------------------------
 
 
@@ -394,56 +400,6 @@ async def _proxy_to_rl_control(request: Request) -> StreamingResponse | Response
             status_code=503,
         )
     return await _proxy_request(request, base_url=_rl_control_url)
-
-
-@app.post("/init_weight_transfer_engine")
-async def init_weight_transfer_engine(request: Request):
-    return await _proxy_to_rl_control(request)
-
-
-@app.post("/start_weight_update")
-async def start_weight_update(request: Request):
-    return await _proxy_to_rl_control(request)
-
-
-@app.post("/update_weights")
-async def update_weights(request: Request):
-    return await _proxy_to_rl_control(request)
-
-
-@app.post("/finish_weight_update")
-async def finish_weight_update(request: Request):
-    return await _proxy_to_rl_control(request)
-
-
-@app.post("/pause")
-async def pause(request: Request):
-    return await _proxy_to_rl_control(request)
-
-
-@app.post("/resume")
-async def resume(request: Request):
-    return await _proxy_to_rl_control(request)
-
-
-@app.get("/get_world_size")
-async def get_world_size(request: Request):
-    return await _proxy_to_rl_control(request)
-
-
-@app.get("/is_paused")
-async def is_paused(request: Request):
-    return await _proxy_to_rl_control(request)
-
-
-# ---------------------------------------------------------------------------
-# RL weight transfer — SGLang dialect, proxied to the same in-engine control app
-#
-# These routes are mounted on the same in-engine RL control app as the
-# SGLang-compatible handlers (runtime/entrypoints/sglang_compat_http.py), so they
-# proxy to the same _rl_control_url. Endpoint names/fields match SGLang so
-# slime/miles and verl's SGLang rollout drive tokenspeed unchanged.
-# ---------------------------------------------------------------------------
 
 
 @app.post("/init_weights_update_group")
@@ -508,6 +464,11 @@ async def health_generate(request: Request):
     return await _proxy_to_rl_control(request)
 
 
+@app.get("/v1/loads")
+async def get_loads(request: Request):
+    return await _proxy_to_rl_control(request)
+
+
 @app.get("/get_weight_version")
 async def get_weight_version(request: Request):
     return await _proxy_to_rl_control(request)
@@ -544,9 +505,8 @@ def build_control_server(
     Args:
         gateway_url: Base URL of the smg gateway for generation passthrough.
         engine_grpc_addr: ``host:port`` of the gRPC engine for direct calls.
-        rl_control_url: Base URL of the in-engine RL control plane (vLLM-compatible
-            + SGLang-compatible weight sync). Empty disables those routes (they
-            return 503).
+        rl_control_url: Base URL of the in-engine SGLang-compatible RL control
+            app. Empty makes those routes return 503.
         host: Bind address.
         port: Bind port.
     """

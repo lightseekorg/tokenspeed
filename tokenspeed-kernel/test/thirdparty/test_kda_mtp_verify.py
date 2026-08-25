@@ -48,7 +48,8 @@ H, HV, K, V = 4, 4, 128, 128
 
 @pytest.mark.parametrize("B,T", [(1, 2), (3, 4), (8, 4)])
 @pytest.mark.parametrize("lower_bound", [None, -1.5])
-def test_mtp_matches_stepped_pool(B, T, lower_bound):
+@pytest.mark.parametrize("recurrent_layout", ["k_major", "v_major"])
+def test_mtp_matches_stepped_pool(B, T, lower_bound, recurrent_layout):
     torch.manual_seed(B * 10 + T)
     dev = "cuda"
     q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=dev)
@@ -62,9 +63,9 @@ def test_mtp_matches_stepped_pool(B, T, lower_bound):
     n_pages = B * (T + 2)
     init = torch.randn(B, HV, K, V, dtype=torch.float32, device=dev)
 
-    # --- reference: pool kernel, one token at a time ---
-    pool_ref = torch.zeros(n_pages, HV, K, V, dtype=torch.float32, device=dev)
-    pool_ref[:B] = init
+    # --- reference: the V-major pool kernel, one token at a time ---
+    pool_ref = torch.zeros(n_pages, HV, V, K, dtype=torch.float32, device=dev)
+    pool_ref[:B] = init.transpose(-1, -2)
     ref_out = torch.empty(B, T, HV, V, dtype=v.dtype, device=dev)
     ref_states = []
     read = torch.arange(B, dtype=torch.int64, device=dev)
@@ -84,12 +85,14 @@ def test_mtp_matches_stepped_pool(B, T, lower_bound):
             lower_bound=lower_bound,
         )
         ref_out[:, t] = o_t[:, 0]
-        ref_states.append(pool_ref[write].clone())
+        ref_states.append(pool_ref[write].transpose(-1, -2).clone())
         read = write
 
     # --- MTP: one call, per-step write grid ---
-    pool_mtp = torch.zeros(n_pages, HV, K, V, dtype=torch.float32, device=dev)
-    pool_mtp[:B] = init
+    v_major = recurrent_layout == "v_major"
+    state_shape = (HV, V, K) if v_major else (HV, K, V)
+    pool_mtp = torch.zeros(n_pages, *state_shape, dtype=torch.float32, device=dev)
+    pool_mtp[:B] = init.transpose(-1, -2) if v_major else init
     write_grid = (
         B
         + torch.arange(T, dtype=torch.int64, device=dev)[None, :] * B
@@ -107,11 +110,14 @@ def test_mtp_matches_stepped_pool(B, T, lower_bound):
         torch.arange(B, dtype=torch.int64, device=dev),
         write_grid,
         lower_bound=lower_bound,
+        recurrent_layout=recurrent_layout,
     )
 
     torch.testing.assert_close(mtp_out.float(), ref_out.float(), atol=1e-3, rtol=1e-3)
     for t in range(T):
         got = pool_mtp[write_grid[:, t]]
+        if v_major:
+            got = got.transpose(-1, -2)
         torch.testing.assert_close(got, ref_states[t], atol=1e-4, rtol=1e-4)
 
 

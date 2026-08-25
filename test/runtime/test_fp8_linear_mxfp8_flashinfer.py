@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.gemm.flashinfer import has_flashinfer_mxfp8
 from torch.nn.parameter import Parameter
 
-from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod, has_flashinfer_mxfp8
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.quantization.fp8 import Mxfp8Config
 
 pytestmark = pytest.mark.skipif(
@@ -44,15 +45,15 @@ def test_process_weights_swizzles_and_pins_flashinfer() -> None:
     ref_weight = layer.weight.data.clone()
     ref_scales = layer.weight_scale_inv.data.clone()
 
-    _method().process_weights_after_loading(layer)
+    method = _method()
+    method.process_weights_after_loading(layer)
 
-    assert layer._use_flashinfer_mxfp8
-    assert not layer._use_deep_gemm_fp8
-    assert layer.weight_scale_inv.dim() == 1
+    assert method.prepared_linear_plan(layer) is not None
+    assert layer.weight_scale_inv.dim() == 2
     assert torch.equal(layer.weight.data, ref_weight)
 
     x = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)
-    out = _method().apply(layer, x)
+    out = method.apply(layer, x)
 
     dequant = ref_weight.float() * torch.exp2(
         ref_scales.float() - 127.0
@@ -68,7 +69,6 @@ def test_small_layers_keep_triton_fallback() -> None:
     layer = _make_layer(64, 512)
     _method().process_weights_after_loading(layer)
 
-    assert not layer._use_flashinfer_mxfp8
     assert layer.weight_scale_inv.dim() == 2
 
     x = torch.randn(8, 512, device="cuda", dtype=torch.bfloat16)

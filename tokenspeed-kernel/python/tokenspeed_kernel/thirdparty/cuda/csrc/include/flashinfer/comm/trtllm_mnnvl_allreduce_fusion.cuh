@@ -99,9 +99,6 @@ using trtllm_allreduce_fusion::remove_neg_zero;
 
 namespace details {
 using trtllm_allreduce_fusion::details::kBytesPerAccess;
-// Mirror of the vendored one-shot cap: the MNNVL path is a decode-latency
-// kernel; larger payloads use the lamport/twoshot fallback.
-static constexpr int kMnnvlOneShotMaxToken = 128;
 // Two-shot serves the prefill-sized calls one-shot cannot; bounded by the
 // workspace allocation (two stages of ceil(T/NRanks)*NRanks vectors per slot).
 static constexpr int kMnnvlTwoShotMaxToken = 2048;
@@ -473,7 +470,8 @@ __global__ void __launch_bounds__(1024)
     vec_t<T, VEC_SIZE> chunk[kRankChunk];
     // Accumulator width follows Fp32Acc so two-shot reduces in exactly the
     // same arithmetic as one-shot (allreduce_sum): otherwise a batch crossing
-    // the 128-token dispatch boundary would change the answer's bits.
+    // switching strategies at the traffic-based dispatch boundary would
+    // change the answer's bits.
     using AccT = std::conditional_t<Fp32Acc, float, T>;
     AccT accum[VEC_SIZE];
 #pragma unroll
@@ -608,7 +606,7 @@ cudaError_t mnnvl_allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> cons
   static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
   FLASHINFER_CHECK(params.size % params.hidden_dim == 0, "params.size % params.hidden_dim != 0");
   int token_num = params.size / params.hidden_dim;
-  bool const use_twoshot = token_num > details::kMnnvlOneShotMaxToken;
+  bool const use_twoshot = !params.use_oneshot;
   FLASHINFER_CHECK(token_num <= details::kMnnvlTwoShotMaxToken,
                    "mnnvl allreduce supports at most ", details::kMnnvlTwoShotMaxToken, " tokens");
   static int SM = trtllm_allreduce_fusion::utils::getSMVersion();

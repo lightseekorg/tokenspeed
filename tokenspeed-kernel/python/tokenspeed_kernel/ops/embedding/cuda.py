@@ -47,6 +47,7 @@ if platform.is_nvidia:
             "is_neox": frozenset({True, False}),
             "has_fused_kv": frozenset({True, False}),
             "has_fused_mla_kv": frozenset({False}),
+            "fused_mla_full_query": frozenset({False}),
             "has_q_out": frozenset({True, False}),
             "has_k_out": frozenset({True, False}),
         },

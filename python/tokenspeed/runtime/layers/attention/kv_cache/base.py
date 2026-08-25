@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
@@ -54,6 +55,53 @@ def _layer_plane(
     if not 0 <= local_layer < num_layers:
         return None
     return local_layer, match.group(2)
+
+
+def derive_state_groups_by_layer(
+    arena: CacheArena,
+    *,
+    first_layer: int,
+    num_layers: int,
+    state_layer_ids: Iterable[int],
+) -> dict[int, str]:
+    """Map each recurrent layer to the state-family group holding its fields.
+
+    The memory plan is the single record of which group a layer's fields were
+    declared in, so the mapping is read back from the planned fields rather
+    than carried as a parallel per-layer tuple.
+
+    Args:
+        arena: The cache arena whose plan and group specs to read.
+        first_layer: This view's first layer in the merged plan.
+        num_layers: Number of layers in this view's window.
+        state_layer_ids: View-local ids of the recurrent (state) layers.
+
+    Returns:
+        View-local layer id -> state-family group id, one entry per state
+        layer whose fields the plan declares inside this view's window.
+
+    Raises:
+        ValueError: a state layer's fields span more than one state group.
+    """
+    state_groups = {
+        spec.group_id for spec in arena.cache_group_specs if spec.family == "state"
+    }
+    wanted = set(state_layer_ids)
+    mapping: dict[int, str] = {}
+    for field in arena.plan.fields:
+        located = _layer_plane(field.field_id, first_layer, num_layers)
+        if located is None:
+            continue
+        layer_id, _ = located
+        if layer_id not in wanted or field.group_id not in state_groups:
+            continue
+        existing = mapping.setdefault(layer_id, field.group_id)
+        if existing != field.group_id:
+            raise ValueError(
+                f"layer {layer_id} has state fields in more than one cache "
+                f"group: {existing!r} and {field.group_id!r}"
+            )
+    return mapping
 
 
 class CachePool(ABC):

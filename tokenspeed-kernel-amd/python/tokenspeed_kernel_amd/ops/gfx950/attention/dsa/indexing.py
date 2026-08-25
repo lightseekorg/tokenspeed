@@ -24,10 +24,10 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd.ops.gfx950.attention._common import maximum
 
 __all__ = [
     "_check_packed_fp8_inputs",
-    "_combine_scoring_query_heads_kernel",
     "_dsa_decode_logits_fp8_kernel",
     "_dsa_prefill_logits_fp8_kernel",
 ]
@@ -43,41 +43,6 @@ def _score_layout(
 
 
 @gluon.jit
-def _combine_scoring_query_heads_kernel(
-    q,
-    weights,
-    out,
-    num_heads: gl.constexpr,
-    head_dim: gl.constexpr,
-    BLOCK_D: gl.constexpr,
-):
-    token = gl.program_id(0)
-    layout: gl.constexpr = _score_layout(1, BLOCK_D, gl.num_warps())
-    dim_layout: gl.constexpr = gl.SliceLayout(0, layout)
-    dims = gl.arange(0, BLOCK_D, layout=dim_layout)
-    combined = gl.full(
-        [BLOCK_D],
-        value=0.0,
-        dtype=gl.float32,
-        layout=dim_layout,
-    )
-    for head in gl.static_range(0, num_heads):
-        head_weight = gl.load(weights + token * num_heads + head).to(gl.float32)
-        q_vals = gl.amd.cdna4.buffer_load(
-            ptr=q,
-            offsets=((token * num_heads + head) * head_dim + dims).to(gl.int32),
-            mask=dims < head_dim,
-            other=0.0,
-        ).to(gl.float32)
-        combined += q_vals * head_weight
-    gl.store(
-        out + token * head_dim + dims,
-        combined,
-        mask=dims < head_dim,
-    )
-
-
-@gluon.jit
 def _dsa_decode_logits_fp8_kernel(
     q,
     index_k_fp8,
@@ -90,13 +55,13 @@ def _dsa_decode_logits_fp8_kernel(
     logits_stride: gl.constexpr,
     page_size: gl.constexpr,
     row_bytes: gl.constexpr,
+    page_stride_bytes: gl.constexpr,
     max_seq_len: gl.constexpr,
     num_heads: gl.constexpr,
     head_dim: gl.constexpr,
     num_groups: gl.constexpr,
     softmax_scale: gl.constexpr,
     q_len_per_req: gl.constexpr,
-    FOLD_WEIGHTED_HEADS: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_D: gl.constexpr,
 ):
@@ -121,10 +86,9 @@ def _dsa_decode_logits_fp8_kernel(
         mask=valid,
         other=0,
     ).to(gl.int64)
-    page_bytes = page_size * row_bytes
-    fp8_base = page * page_bytes + block_offset.to(gl.int64) * head_dim
+    fp8_base = page * page_stride_bytes + block_offset.to(gl.int64) * head_dim
     scale_base = (
-        page * (page_bytes // 4)
+        page * (page_stride_bytes // 4)
         + (page_size * head_dim) // 4
         + block_offset.to(gl.int64) * num_groups
     )
@@ -134,24 +98,22 @@ def _dsa_decode_logits_fp8_kernel(
         dtype=gl.float32,
         layout=row_layout,
     )
-    if FOLD_WEIGHTED_HEADS:
+    for head in gl.static_range(0, num_heads):
+        head_score = gl.full(
+            [BLOCK_N],
+            value=0.0,
+            dtype=gl.float32,
+            layout=row_layout,
+        )
+        head_weight = gl.load(weights + token * num_heads + head).to(gl.float32)
         for dim_start in gl.static_range(0, head_dim, BLOCK_D):
             dims = dim_start + dim_offsets
-            weighted_q = gl.full(
-                [BLOCK_D],
-                value=0.0,
-                dtype=gl.float32,
-                layout=dim_layout,
-            )
-            for head in gl.static_range(0, num_heads):
-                head_weight = gl.load(weights + token * num_heads + head).to(gl.float32)
-                q_vals = gl.amd.cdna4.buffer_load(
-                    ptr=q,
-                    offsets=((token * num_heads + head) * head_dim + dims).to(gl.int32),
-                    mask=dims < head_dim,
-                    other=0.0,
-                ).to(gl.float32)
-                weighted_q += q_vals * head_weight
+            q_vals = gl.amd.cdna4.buffer_load(
+                ptr=q,
+                offsets=((token * num_heads + head) * head_dim + dims).to(gl.int32),
+                mask=dims < head_dim,
+                other=0.0,
+            ).to(gl.float32)
             k_vals = gl.amd.cdna4.buffer_load(
                 ptr=index_k_fp8,
                 offsets=(fp8_base[:, None] + dims[None, :]).to(gl.int32),
@@ -164,40 +126,8 @@ def _dsa_decode_logits_fp8_kernel(
                 mask=valid,
                 other=0.0,
             ).to(gl.float32)
-            scores += gl.sum(k_vals * k_scale[:, None] * weighted_q[None, :], axis=1)
-    else:
-        head_weight: gl.constexpr = 1.0
-        for head in gl.static_range(0, num_heads):
-            head_score = gl.full(
-                [BLOCK_N],
-                value=0.0,
-                dtype=gl.float32,
-                layout=row_layout,
-            )
-            for dim_start in gl.static_range(0, head_dim, BLOCK_D):
-                dims = dim_start + dim_offsets
-                q_vals = gl.amd.cdna4.buffer_load(
-                    ptr=q,
-                    offsets=((token * num_heads + head) * head_dim + dims).to(gl.int32),
-                    mask=dims < head_dim,
-                    other=0.0,
-                ).to(gl.float32)
-                k_vals = gl.amd.cdna4.buffer_load(
-                    ptr=index_k_fp8,
-                    offsets=(fp8_base[:, None] + dims[None, :]).to(gl.int32),
-                    mask=valid[:, None] & (dims[None, :] < head_dim),
-                    other=0.0,
-                ).to(gl.float32)
-                k_scale = gl.amd.cdna4.buffer_load(
-                    ptr=index_k_scale,
-                    offsets=(scale_base + dim_start // 128).to(gl.int32),
-                    mask=valid,
-                    other=0.0,
-                ).to(gl.float32)
-                head_score += gl.sum(
-                    k_vals * k_scale[:, None] * q_vals[None, :], axis=1
-                )
-            scores += head_score * head_weight
+            head_score += gl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
+        scores += maximum(head_score, 0.0) * head_weight
 
     scores *= softmax_scale
     scores = gl.where(valid, scores, -float("inf"))
@@ -213,6 +143,7 @@ def _dsa_prefill_logits_fp8_kernel(
     q,
     index_k_fp8,
     index_k_scale,
+    weights,
     kv_workspace_slots,
     row_starts,
     row_ends,
@@ -221,6 +152,7 @@ def _dsa_prefill_logits_fp8_kernel(
     seq_len_sum: gl.constexpr,
     page_size: gl.constexpr,
     row_bytes: gl.constexpr,
+    page_stride_bytes: gl.constexpr,
     num_heads: gl.constexpr,
     head_dim: gl.constexpr,
     num_groups: gl.constexpr,
@@ -246,10 +178,9 @@ def _dsa_prefill_logits_fp8_kernel(
     )
     page = slots // page_size
     block_offset = slots - page * page_size
-    page_bytes = page_size * row_bytes
-    fp8_base = page * page_bytes + block_offset * head_dim
+    fp8_base = page * page_stride_bytes + block_offset * head_dim
     scale_base = (
-        page * (page_bytes // 4)
+        page * (page_stride_bytes // 4)
         + (page_size * head_dim) // 4
         + block_offset * num_groups
     )
@@ -259,9 +190,8 @@ def _dsa_prefill_logits_fp8_kernel(
         dtype=gl.float32,
         layout=row_layout,
     )
-    head_weight: gl.constexpr = 1.0
-
     for head in gl.static_range(0, num_heads):
+        head_weight = gl.load(weights + token * num_heads + head).to(gl.float32)
         head_score = gl.full(
             [BLOCK_N],
             value=0.0,
@@ -289,7 +219,7 @@ def _dsa_prefill_logits_fp8_kernel(
                 other=0.0,
             ).to(gl.float32)
             head_score += gl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
-        scores += head_score * head_weight
+        scores += maximum(head_score, 0.0) * head_weight
 
     scores *= softmax_scale
     scores = gl.where(valid, scores, -float("inf"))
@@ -303,7 +233,7 @@ def _check_packed_fp8_inputs(
     index_k_cache: torch.Tensor,
     weights: torch.Tensor,
     page_size: int,
-) -> int:
+) -> tuple[int, int]:
     if q.dtype != torch.bfloat16:
         raise TypeError(f"DSA Gluon top-k expects BF16 q, got {q.dtype}")
     if weights.dtype not in (torch.bfloat16, torch.float32):
@@ -327,11 +257,30 @@ def _check_packed_fp8_inputs(
         )
     num_groups = q.shape[2] // 128
     row_bytes = q.shape[2] + num_groups * 4
-    if index_k_cache.dim() != 2 or index_k_cache.shape[1] != row_bytes:
+    if index_k_cache.dim() != 2:
         raise ValueError(
-            "packed index_k_cache must have shape [slots, row_bytes="
-            f"{row_bytes}], got {tuple(index_k_cache.shape)}"
+            "index_k_cache must be a packed slot matrix or page-planar matrix, "
+            f"got shape {tuple(index_k_cache.shape)}"
         )
-    if index_k_cache.shape[0] % page_size != 0:
-        raise ValueError("packed index_k_cache slot count must be page aligned")
-    return row_bytes
+    page_bytes = page_size * row_bytes
+    if index_k_cache.shape[1] == row_bytes:
+        if not index_k_cache.is_contiguous():
+            raise ValueError("packed index_k_cache must be contiguous")
+        if index_k_cache.shape[0] % page_size != 0:
+            raise ValueError("packed index_k_cache slot count must be page aligned")
+        page_stride_bytes = page_bytes
+    elif (
+        index_k_cache.shape[1] >= page_bytes
+        and index_k_cache.stride(1) == 1
+        and index_k_cache.stride(0) >= page_bytes
+    ):
+        page_stride_bytes = index_k_cache.stride(0)
+    else:
+        raise ValueError(
+            "index_k_cache must be contiguous [slots, row_bytes] or page-planar "
+            f"[pages, at least {page_bytes} bytes], got "
+            f"shape={tuple(index_k_cache.shape)}, stride={index_k_cache.stride()}"
+        )
+    if index_k_cache.storage_offset() % 4 or page_stride_bytes % 4:
+        raise ValueError("index_k_cache page storage must be float32 aligned")
+    return row_bytes, page_stride_bytes

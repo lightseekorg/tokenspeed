@@ -26,6 +26,12 @@ The pause gate lives in Python: requests are admitted to the scheduler from the
 event loop (``scheduler.submit_requests``), so withholding new work while paused
 is handled here rather than inside the scheduler itself.
 
+Two classes split the work: :class:`PauseController` owns the state machine and
+is driven by the request handler (control plane); :class:`PauseHooks` is the
+EventLoop-side integration — everything the pause/resume API needs from the
+loop lives there, so the loop's normal scheduling paths carry single-line
+hooks only.
+
 Modes (how a pause treats in-flight requests):
 
 - ``abort``: cancel in-flight requests, then drain and reply.
@@ -41,6 +47,8 @@ and replies immediately.
 from __future__ import annotations
 
 import enum
+import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -52,6 +60,12 @@ from tokenspeed.runtime.engine.io_struct import (
     ResumeSchedulerReqInput,
     ResumeSchedulerReqOutput,
 )
+
+logger = logging.getLogger(__name__)
+
+# Sleep between iterations while frozen (PAUSED_ALL) so the keep-mode pause does
+# not busy-spin a CPU core waiting for /resume.
+_PAUSED_IDLE_SLEEP_S = 0.001
 
 
 @dataclass
@@ -108,7 +122,7 @@ class PauseController:
     iteration to resolve a deferred abort/wait reply.
 
     ``send_func`` is the scheduler→tokenizer reply socket (a no-op
-    ``_NullSender`` on non-rank-0 TP ranks, matching the existing control-reply
+    ``NullSender`` on non-rank-0 TP ranks, matching the existing control-reply
     pattern), so the ``handle_*`` methods are safe to call on every rank.
     """
 
@@ -318,3 +332,179 @@ class PauseController:
             return
         self._pending_drain = None
         action.on_drained()
+
+
+class PauseHooks:
+    """EventLoop-side pause/resume integration.
+
+    Stateless glue: all pause state stays in :class:`PauseController` and the
+    loop's collaborators; this class only holds a loop back-reference and acts
+    on them, so the loop's normal scheduling paths carry single-line hooks
+    only. Attribute access on ``loop`` is lazy, so it may be constructed
+    before the loop's collaborators exist.
+    """
+
+    def __init__(self, loop, controller: PauseController) -> None:
+        self._loop = loop
+        self._pause = controller
+
+    # -- admission-path hooks (called from _process_new_requests) -------------
+
+    def apply_transitions(self, grammar_manager) -> None:
+        """Apply one-shot pause/resume edges to in-flight and queued requests.
+
+        Called once per iteration from ``_process_new_requests``, right after
+        control messages were processed (so a fresh edge is acted on in the
+        same iteration) and before the early ``if not ready: return`` (which
+        would otherwise strand buffered specs until the next inbound request).
+
+        - pause(mode="abort"): cancel every in-flight request through the same
+          marker path as a client abort; they finish on their next scheduled
+          step, then the drain check resolves the pause reply. notify_client:
+          a pause aborts a passive client's request, so it must receive a
+          terminating finish (unlike a client abort).
+        - abort/wait: cancel requests still compiling in the grammar queue —
+          they are not yet in ``rid_to_state`` or the scheduler, so the abort
+          sweep and the drain check both miss them. A finished state makes the
+          next ``get_ready_grammar_requests`` pass publish them instead of
+          admitting, so they never run under post-resume weights or strand the
+          drain.
+        - resume: flush specs buffered while paused, even when no new request
+          arrives this iteration. Specs aborted while paused are reaped in
+          place rather than admitted, so they don't burn a scheduler slot or
+          leak their rid — see ``_reap_or_keep_buffered_spec``.
+        """
+        loop = self._loop
+        if self._pause.consume_abort_all():
+            for rid in list(loop.output_processor.rid_to_state.keys()):
+                loop._request_abort_or_mark(
+                    rid, "request aborted by pause", notify_client=True
+                )
+                grammar_manager.mark_abort(rid)
+
+        if self._pause.consume_cancel_grammar():
+            for _, state, _ in grammar_manager.grammar_queue:
+                state.set_finish_with_abort("Aborted by pause", notify_client=True)
+
+        if not self._pause.admit_blocked and self._pause.buffered_specs:
+            specs = [
+                spec
+                for spec in self._pause.take_buffered_specs()
+                if self._reap_or_keep_buffered_spec(spec)
+            ]
+            if specs:
+                loop.scheduler.submit_requests(specs)
+
+    def _reap_or_keep_buffered_spec(self, spec) -> bool:
+        """Resolve a buffered spec on resume; return True if it should be admitted.
+
+        A buffered spec was already registered in ``rid_to_state`` before it was
+        withheld, so if it was aborted while paused it never reached the
+        scheduler and the forward path can never reap it. Handle that here:
+
+        - state missing  -> already published and reaped; drop silently.
+        - state finished -> aborted in place. Stream a terminating finish for
+          pause-initiated aborts (the passive client is still waiting) and drop
+          the registered state so the rid does not leak; client-initiated aborts
+          already tore down their own state, so just reap.
+        - otherwise      -> still live; admit it.
+        """
+        output_processor = self._loop.output_processor
+        state = output_processor.rid_to_state.get(spec.request_id)
+        if state is None:
+            return False
+        if state.finished:
+            output_processor.reap_finished_orphan(spec.request_id, state)
+            return False
+        return True
+
+    def withhold_admissions(
+        self, admitted_specs: list, pause_blocked_before: bool
+    ) -> bool:
+        """Pause admission gate: while paused, buffer ``admitted_specs`` instead
+        of submitting them (running requests keep stepping) and return True so
+        the caller skips submission. Buffered specs are flushed on resume by
+        ``apply_transitions``, ahead of any newly-admitted ones, preserving
+        FIFO order.
+
+        TODO(pause-fifo): recv_reqs() drains the socket non-blocking, so a
+        generate request that arrived *before* a pause control message can be
+        coalesced into the same batch and reach here after the pause flipped
+        admit_blocked. Such a pre-pause request is buffered as post-pause work
+        instead of running (wait) / being aborted (abort). Correct handling
+        needs the batch processed as an ordered stream that respects the
+        control request's FIFO position. Tracked as a follow-up; until then we
+        warn when the coalescing condition is observed so it is not silent.
+        """
+        if not self._pause.admit_blocked:
+            return False
+        if admitted_specs and not pause_blocked_before:
+            logger.warning(
+                "Pause engaged in the same recv batch as %d generate "
+                "request(s) (rids=%s); their FIFO order relative to the "
+                "pause is not preserved, so a pre-pause request may be "
+                "buffered as post-pause work and run only after resume. "
+                "See TODO(pause-fifo).",
+                len(admitted_specs),
+                [spec.request_id for spec in admitted_specs],
+            )
+        self._pause.buffer_specs(admitted_specs)
+        return True
+
+    # -- freeze-loop hook (called from event_loop) -----------------------------
+
+    def paused_idle_step(self) -> None:
+        """Run one iteration under ``PAUSED_ALL`` (keep mode): no new forward
+        work, but keep DP ranks in lockstep and yield the CPU so the freeze
+        does not busy-spin a core. The drain check runs at the event loop's
+        tail (after the round's results advance the scheduler), not here."""
+        loop = self._loop
+        if loop.has_dp:
+            dp_metadata = loop._dp_sync_and_check(None)
+            # While memory is released the weights region is unmapped; an idle
+            # forward runs the model and would read freed memory. All DP ranks
+            # release together, so skipping the idle forward stays consistent
+            # across ranks (the small DP sync above still runs to keep lockstep).
+            if dp_metadata.need_idle_forward and not self._pause.released:
+                loop.model_executor.forward_thread.run(
+                    lambda: loop.model_executor.execute_idle_forward(dp_metadata)
+                )
+
+        time.sleep(_PAUSED_IDLE_SLEEP_S)
+
+    # -- memory release/wake data plane (wired into MemoryOccupationController) -
+
+    def reset_caches_for_release(self) -> bool:
+        """Invalidate the prefix/single-table cache before KV is discarded on release.
+
+        KV pages are re-mapped + zeroed on wake, so any retained prefix entry
+        would be stale. The unsafe case (prefix caching on with no reset) is
+        rejected up front in ``MemoryOccupationController.handle_release`` via
+        ``kv_cache_release_allowed``, so by the time we get here either a clear
+        exists or prefix caching is off (nothing to invalidate). Returns False
+        while an asynchronous cache transfer still pins L1 so the release can
+        remain pending and retry on the next event-loop iteration.
+        """
+        clear = getattr(self._loop.scheduler, "clear_l1_cache", None)
+        return not callable(clear) or clear()
+
+    def _kv_pools(self) -> list:
+        """All KV pools whose pages are tagged ``kv_cache`` — the target pool and
+        the draft pool in speculative-decoding runs. Release/repair must walk the
+        SAME set, so both derive it here rather than enumerating pools by hand."""
+        pools = []
+        for attr in ("token_to_kv_pool", "draft_token_to_kv_pool"):
+            pool = getattr(self._loop.model_executor, attr, None)
+            if pool is not None:
+                pools.append(pool)
+        return pools
+
+    def kv_repair_after_wake(self) -> None:
+        """Zero re-mapped KV buffers (garbage after re-map) for every KV pool,
+        including the draft pool in spec-decode runs — its allocations are tagged
+        ``kv_cache`` too, so a wake that skipped it would feed the draft model
+        stale KV. FP8 KV scales ride with the weights region, so no scale reset
+        is needed here."""
+        for pool in self._kv_pools():
+            if hasattr(pool, "clear_kv_buffers"):
+                pool.clear_kv_buffers()

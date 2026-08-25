@@ -44,7 +44,8 @@ def _make_inputs(bs, seed=0):
 
 def _reference(q, k, v, g, beta, A_log, dt_bias, cu, pool, read_idx, write_idx):
     """The pre-pool path: python-side gather/scatter around the fla kernel."""
-    state = pool[read_idx.long()]
+    # The pool is V-major; the fla reference reads and writes K-major states.
+    state = pool[read_idx.long()].transpose(-1, -2)
     out, new_state = kda_recurrent_decode(
         q,
         k,
@@ -60,7 +61,9 @@ def _reference(q, k, v, g, beta, A_log, dt_bias, cu, pool, read_idx, write_idx):
     )
     keep = (write_idx >= 0).view(-1, 1, 1, 1)
     out_idx = write_idx.long().clamp_min(0)
-    pool[out_idx] = torch.where(keep, new_state.to(pool.dtype), pool[out_idx])
+    pool[out_idx] = torch.where(
+        keep, new_state.transpose(-1, -2).to(pool.dtype), pool[out_idx]
+    )
     return out
 
 

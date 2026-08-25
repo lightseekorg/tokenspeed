@@ -12,24 +12,29 @@
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
+from tokenspeed.runtime.models import deepseek_v4 as deepseek_v4_model
 from tokenspeed.runtime.models.deepseek_v4 import DeepseekV4MegaMoEExperts
 
 
 class TestDeepseekV4MegaMoE(unittest.TestCase):
     def test_weight_loader_places_expert_shards(self):
-        experts = DeepseekV4MegaMoEExperts(
-            num_experts=4,
-            num_local_experts=2,
-            top_k=2,
-            hidden_size=128,
-            intermediate_size=128,
-            mapping=None,
-            prefix="layers.0.ffn.experts",
-            swiglu_limit=None,
-        )
+        with patch.object(
+            deepseek_v4_model, "dsv4_mega_moe_plan", return_value=object()
+        ):
+            experts = DeepseekV4MegaMoEExperts(
+                num_experts=4,
+                num_local_experts=2,
+                top_k=2,
+                hidden_size=128,
+                intermediate_size=128,
+                mapping=None,
+                prefix="layers.0.ffn.experts",
+                swiglu_limit=None,
+            )
 
         w1 = torch.full((128, 64), 1, dtype=torch.uint8)
         w3 = torch.full((128, 64), 3, dtype=torch.uint8)
@@ -52,21 +57,21 @@ class TestDeepseekV4MegaMoE(unittest.TestCase):
         torch.testing.assert_close(experts.w13_weight_scale[1, 128:], s3)
         torch.testing.assert_close(experts.w2_weight_scale[1], s2)
 
-    def test_init_stores_swiglu_limit(self):
-        # swiglu_limit is a DeepGEMM compile-time template arg; the experts
-        # module must carry the served value so warmup_jit_variants()
-        # pre-compiles the matching mega-MoE tiles (see deepseek_v4.py).
-        experts = DeepseekV4MegaMoEExperts(
-            num_experts=4,
-            num_local_experts=2,
-            top_k=2,
-            hidden_size=128,
-            intermediate_size=128,
-            mapping=None,
-            prefix="layers.0.ffn.experts",
-            swiglu_limit=10.0,
-        )
-        self.assertEqual(experts.swiglu_limit, 10.0)
+    def test_init_passes_swiglu_limit_to_kernel_plan(self):
+        with patch.object(
+            deepseek_v4_model, "dsv4_mega_moe_plan", return_value=object()
+        ) as plan:
+            DeepseekV4MegaMoEExperts(
+                num_experts=4,
+                num_local_experts=2,
+                top_k=2,
+                hidden_size=128,
+                intermediate_size=128,
+                mapping=None,
+                prefix="layers.0.ffn.experts",
+                swiglu_limit=10.0,
+            )
+        self.assertEqual(plan.call_args.kwargs["activation_clamp"], 10.0)
 
 
 if __name__ == "__main__":

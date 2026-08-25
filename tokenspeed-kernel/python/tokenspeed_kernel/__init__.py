@@ -18,11 +18,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from tokenspeed_kernel.platform import create_device_stream, release_device_memory_cache
 from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 
 bootstrap_profiling_from_env()
 
-from tokenspeed_kernel.ops.activation import add3, situ_and_mul
+from tokenspeed_kernel.ops.activation import (
+    add3,
+    prepare_fp8_linear_activation,
+    silu_and_mul,
+    situ_and_mul,
+)
 from tokenspeed_kernel.ops.attention import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
@@ -33,6 +39,30 @@ from tokenspeed_kernel.ops.attention import (
     dsa_plan,
     dsa_prefill,
     dsa_prefill_topk,
+    dsv4_build_dense_prefill_local_compressed_indices,
+    dsv4_combine_dense_swa_indices,
+    dsv4_combine_topk_swa_indices,
+    dsv4_compressed_slot_mapping,
+    dsv4_compute_global_topk_indices_and_lens,
+    dsv4_csa_indexer_fp8_cache_insert,
+    dsv4_decode_swa_indices_and_lens,
+    dsv4_dequantize_and_gather_k_cache,
+    dsv4_fused_csa_indexer_mxfp4_cache_insert,
+    dsv4_fused_indexer_q_rope_hadamard_mxfp4,
+    dsv4_fused_inv_rope_fp8_quant,
+    dsv4_fused_sparse_compress_cache_insert,
+    dsv4_indexer_cache_format,
+    dsv4_indexer_decode_metadata_compute,
+    dsv4_indexer_decode_topk,
+    dsv4_indexer_prefill_topk,
+    dsv4_padded_heads,
+    dsv4_paged_selected_attention,
+    dsv4_plan,
+    dsv4_reset_attention_state,
+    dsv4_save_compressor_state,
+    dsv4_selected_attention,
+    dsv4_swa_cache_insert,
+    dsv4_warmup,
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
@@ -52,9 +82,17 @@ from tokenspeed_kernel.ops.attention import (
     rel_mha_extend_with_kvcache,
     rel_mha_plan,
     rel_mha_prefill,
+    write_dsv4_indexer_mxfp4_cache_cuda,
 )
 from tokenspeed_kernel.ops.gemm import (
     bmm,
+    dsv4_grouped_output_projection,
+    dsv4_grouped_output_projection_plan,
+    dsv4_grouped_output_projection_process_weights,
+    dsv4_grouped_output_projection_warmup,
+    dsv4_grouped_output_projection_warmup_model,
+    dsv4_linear_fp32,
+    fp8_linear,
     kimi3_latent_projection,
     kimi3_latent_projection_add3,
     kimi3_mla_qkv_gate_projection,
@@ -63,8 +101,16 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_down_projection,
     kimi3_shared_situ_projection,
     mm,
+    prepare_fp8_linear,
+    warmup_prepared_fp8_linears,
 )
+from tokenspeed_kernel.ops.mhc import mhc_fused_hc, mhc_post, mhc_pre
 from tokenspeed_kernel.ops.moe import (
+    dsv4_mega_moe_apply,
+    dsv4_mega_moe_plan,
+    dsv4_mega_moe_process_weights,
+    dsv4_mega_moe_warmup,
+    dsv4_select_experts,
     moe_apply,
     moe_plan,
     moe_process_weights,
@@ -86,8 +132,18 @@ from tokenspeed_kernel.selection import NoKernelFoundError
 __all__ = [
     # exceptions
     "NoKernelFoundError",
+    # platform
+    "create_device_stream",
+    "release_device_memory_cache",
     # gemm
     "bmm",
+    "dsv4_grouped_output_projection",
+    "dsv4_grouped_output_projection_plan",
+    "dsv4_grouped_output_projection_process_weights",
+    "dsv4_grouped_output_projection_warmup",
+    "dsv4_grouped_output_projection_warmup_model",
+    "dsv4_linear_fp32",
+    "fp8_linear",
     "kimi3_latent_projection",
     "kimi3_mla_qkv_gate_projection",
     "kimi3_latent_projection_add3",
@@ -96,6 +152,8 @@ __all__ = [
     "kimi3_shared_down_projection",
     "kimi3_shared_situ_projection",
     "mm",
+    "prepare_fp8_linear",
+    "warmup_prepared_fp8_linears",
     # attention
     "mha_plan",
     "mha_prefill",
@@ -117,9 +175,34 @@ __all__ = [
     "dsa_prefill_topk",
     "dsa_decode_topk",
     "dsa_plan",
+    "dsv4_plan",
     "msa_decode_with_kvcache",
     "msa_extend_with_kvcache",
     "attn_merge_state",
+    "dsv4_build_dense_prefill_local_compressed_indices",
+    "dsv4_combine_dense_swa_indices",
+    "dsv4_combine_topk_swa_indices",
+    "dsv4_compressed_slot_mapping",
+    "dsv4_compute_global_topk_indices_and_lens",
+    "dsv4_csa_indexer_fp8_cache_insert",
+    "dsv4_decode_swa_indices_and_lens",
+    "dsv4_dequantize_and_gather_k_cache",
+    "dsv4_fused_csa_indexer_mxfp4_cache_insert",
+    "dsv4_fused_indexer_q_rope_hadamard_mxfp4",
+    "dsv4_fused_inv_rope_fp8_quant",
+    "dsv4_fused_sparse_compress_cache_insert",
+    "dsv4_indexer_decode_metadata_compute",
+    "dsv4_indexer_decode_topk",
+    "dsv4_indexer_prefill_topk",
+    "dsv4_indexer_cache_format",
+    "dsv4_padded_heads",
+    "dsv4_paged_selected_attention",
+    "dsv4_reset_attention_state",
+    "dsv4_save_compressor_state",
+    "dsv4_selected_attention",
+    "dsv4_swa_cache_insert",
+    "dsv4_warmup",
+    "write_dsv4_indexer_mxfp4_cache_cuda",
     "gdn_chunk_prefill",
     "gdn_decode_step",
     "gdn_decode_mtp",
@@ -127,14 +210,25 @@ __all__ = [
     "GdnChunkPrefillResult",
     # activation
     "add3",
+    "prepare_fp8_linear_activation",
+    "silu_and_mul",
     "situ_and_mul",
     # moe
+    "dsv4_mega_moe_apply",
+    "dsv4_mega_moe_plan",
+    "dsv4_mega_moe_process_weights",
+    "dsv4_mega_moe_warmup",
+    "dsv4_select_experts",
     "native_latent_moe_available",
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
     "moe_sigmoid_bias_topk",
     "moe_softmax_topk",
+    # mhc
+    "mhc_fused_hc",
+    "mhc_post",
+    "mhc_pre",
     # quantization
     "quantize_fp8",
     "quantize_fp8_with_scale",

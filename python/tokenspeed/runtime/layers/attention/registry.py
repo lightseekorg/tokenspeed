@@ -559,7 +559,7 @@ def _create_target_components(
         cache_spec,
         config,
         arena,
-        num_layers=len(cache_spec.layer_group_ids),
+        num_layers=len(cache_spec.layer_types),
         rank=rank,
     )
     if is_hybrid_linear:
@@ -907,7 +907,7 @@ def create_attn_components(
         spec.memory_plan.prefix_granularity,
         spec.memory_plan.num_lcm_blocks,
         spec.token_capacity,
-        len(spec.layer_group_ids),
+        len(spec.layer_types),
         cache_setup.num_draft_layers,
         {
             group.group_id: group.cache_blocks_per_lcm_block
@@ -917,11 +917,33 @@ def create_attn_components(
 
     # One model, one arena: the merged plan's single allocation, which every
     # compute view below (target, draft) is a layer window onto.
+    pp_logical_plan = None
+    if server_args.mapping.has_pp:
+        # Chunk-pipeline stage: physically allocate only this stage's layers'
+        # planes. The logical geometry (parents, packing, page math) stays
+        # the full model's so every rank's scheduler plans identically; keep
+        # the full plan for the PD wire contract (every stage registers the
+        # same logical layout, Decode plans stage windows against it).
+        from dataclasses import replace as _dc_replace
+
+        from tokenspeed.runtime.distributed.pp_stage import pp_layer_window
+
+        stage_start, stage_end = pp_layer_window(
+            len(spec.layer_types), server_args.mapping
+        )
+        pp_logical_plan = spec.memory_plan
+        spec = _dc_replace(
+            spec,
+            memory_plan=spec.memory_plan.narrow_to_layers(stage_start, stage_end),
+        )
+        target_spec = spec
     arena = create_cache_arena(
         spec,
         device=config.device,
         enable_memory_saver=enable_memory_saver,
     )
+    if pp_logical_plan is not None:
+        arena.pp_logical_plan = pp_logical_plan
     backend, pool = _create_target_components(
         server_args=server_args,
         model_config=model_config,
