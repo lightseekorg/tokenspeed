@@ -316,14 +316,26 @@ class KimiK3Recipe(CacheRecipe):
             return 0
         if self.replay_kda:
             # Replay starts from the committed convolution checkpoint and
-            # reconstructs the accepted recurrent state.  The backend keeps
-            # one such row per live request, not a state row per candidate.
-            conv_bytes = self.attn_config.max_bs * sum(
-                field.payload_bytes
-                for spec, fields in self.groups()
-                if spec.group_id != FULL_ATTENTION
-                for field in fields
-                if field.field_id.endswith(".conv_state")
+            # reconstructs the accepted recurrent state.
+            from tokenspeed_kernel.ops.attention import (
+                kda_batched_replay_uses_raw_gate,
+            )
+
+            replay_uses_raw_gate = kda_batched_replay_uses_raw_gate(
+                self.attn_config.dtype
+            )
+            # Raw-g replay reuses the committed convolution pool as verify scratch.
+            conv_bytes = (
+                0
+                if replay_uses_raw_gate
+                else self.attn_config.max_bs
+                * sum(
+                    field.payload_bytes
+                    for spec, fields in self.groups()
+                    if spec.group_id != FULL_ATTENTION
+                    for field in fields
+                    if field.field_id.endswith(".conv_state")
+                )
             )
             conv_shape, recurrent_shape = self._kda_shapes
             heads, head_dim, _ = recurrent_shape
@@ -337,11 +349,15 @@ class KimiK3Recipe(CacheRecipe):
                 for field in fields
             )
             payload_bytes_per_row = (
-                conv_shape[0] * torch.bfloat16.itemsize
-                + head_dim * torch.bfloat16.itemsize
-                + heads * torch.bfloat16.itemsize
-                + heads * head_dim * torch.float32.itemsize
+                conv_shape[0] + head_dim + heads
+            ) * torch.bfloat16.itemsize
+            # Fused raw-g capture stores BF16; other replay paths need FP32 scratch.
+            gate_itemsize = (
+                torch.bfloat16.itemsize
+                if replay_uses_raw_gate
+                else torch.float32.itemsize
             )
+            payload_bytes_per_row += heads * head_dim * gate_itemsize
             return conv_bytes + layer_count * rows * payload_bytes_per_row
         verify_rows = self.attn_config.max_bs * (
             int(self.server_args.speculative_num_draft_tokens) + 1
