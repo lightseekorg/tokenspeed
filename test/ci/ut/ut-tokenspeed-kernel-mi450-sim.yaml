@@ -13,6 +13,7 @@ env:
   BUILD_AND_DOWNLOAD_PARALLEL: "4"
   CI: "true"
   GFX_ARCH: gfx1250
+  TOKENSPEED_KERNEL_ONLY: "1"
 install:
   - bash test/ci_system/setup_mi450_sim.sh
   - WORKSPACE="$(pwd)" bash test/ci_system/install_deps_rocm.sh

@@ -9,7 +9,6 @@ SOURCE_ROOT="${SIM_ROOT}/rocm-systems"
 ROCJITSU_SOURCE_DIR="${SOURCE_ROOT}/emulation/rocjitsu"
 ROCJITSU_BUILD_DIR="${SIM_ROOT}/rocjitsu-build"
 
-sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
@@ -50,8 +49,9 @@ LD_LIBRARY_PATH="${rocm_root}/lib:${LD_LIBRARY_PATH:-}" \
         -S "${ROCJITSU_SOURCE_DIR}" \
         -B "${ROCJITSU_BUILD_DIR}" \
         -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release
-cmake --build "${ROCJITSU_BUILD_DIR}" --parallel 4
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING=OFF
+cmake --build "${ROCJITSU_BUILD_DIR}" --target rocjitsu_bin --parallel 4
 
 test -x "${ROCJITSU_BUILD_DIR}/tools/rocjitsu/rocjitsu"
 test -f "${ROCJITSU_SOURCE_DIR}/configs/gfx1250_mi455x.json"

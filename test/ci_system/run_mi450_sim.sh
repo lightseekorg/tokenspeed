@@ -19,5 +19,8 @@ test -f "${config}"
 export ROCM_HOME="${rocm_root}"
 export ROCM_PATH="${rocm_root}"
 export LD_LIBRARY_PATH="${rocm_root}/lib:${LD_LIBRARY_PATH:-}"
+# rocprofiler derives agents from physical KFD sysfs nodes, which do not exist
+# for rocJITsu's synthetic HSA agent. Profiling is not part of this CI lane.
+export ROCPROFILER_REGISTER_ENABLED=0
 
 exec "${launcher}" --daemon --config "${config}" -- "$@"

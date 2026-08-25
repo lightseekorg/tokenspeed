@@ -787,7 +787,7 @@ def setup_runner(
             dry_run=dry_run,
         )
 
-    if is_amd_runner(runner):
+    if is_amd_runner(runner) and resolve_runs_on(runner) == runner:
         # Best-effort: kill any GPU-holding processes left over by a
         # previous pod scheduled on the same node. Cluster admins flagged
         # a known race where the device plugin releases a GPU back to the

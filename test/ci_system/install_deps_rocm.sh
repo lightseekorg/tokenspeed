@@ -6,6 +6,7 @@ set -e
 # ============================================================
 GFX_ARCH=${GFX_ARCH:-gfx950}
 BUILD_AND_DOWNLOAD_PARALLEL=${BUILD_AND_DOWNLOAD_PARALLEL:-16}
+TOKENSPEED_KERNEL_ONLY=${TOKENSPEED_KERNEL_ONLY:-0}
 
 export MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL}
 WORKSPACE=${WORKSPACE:-$(pwd)}
@@ -35,7 +36,11 @@ echo "WORKSPACE=${WORKSPACE}"
 echo "=========================================="
 
 echo "=== Step 1: apt deps ==="
-sudo apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config
+if [ "${TOKENSPEED_KERNEL_ONLY}" != "1" ]; then
+    sudo apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config
+else
+    echo "Kernel-only install: skipping runtime apt dependencies"
+fi
 
 echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
 pip install --upgrade pip "setuptools<82" wheel
@@ -43,10 +48,19 @@ pip install --upgrade pip "setuptools<82" wheel
 echo "=== Step 3: Check PyTorch for ROCm ==="
 if ! pip3 show torch >/dev/null 2>&1; then
     echo "torch is not installed; installing PyTorch for ROCm 7.2"
-    pip3 install torch==2.13.0 torchvision==0.28.0 \
-        --index-url https://download.pytorch.org/whl/rocm7.2
+    if [ "${TOKENSPEED_KERNEL_ONLY}" = "1" ]; then
+        pip3 install torch==2.13.0 \
+            --index-url https://download.pytorch.org/whl/rocm7.2
+    else
+        pip3 install torch==2.13.0 torchvision==0.28.0 \
+            --index-url https://download.pytorch.org/whl/rocm7.2
+    fi
 fi
-python3 -c 'import torch, torchvision; assert torch.__version__.startswith("2.13.0"), torch.__version__; assert torchvision.__version__.startswith("0.28.0"), torchvision.__version__'
+if [ "${TOKENSPEED_KERNEL_ONLY}" = "1" ]; then
+    python3 -c 'import torch; assert torch.__version__.startswith("2.13.0"), torch.__version__'
+else
+    python3 -c 'import torch, torchvision; assert torch.__version__.startswith("2.13.0"), torch.__version__; assert torchvision.__version__.startswith("0.28.0"), torchvision.__version__'
+fi
 
 echo "=== Step 4: Install tokenspeed-kernel packages ==="
 
@@ -63,15 +77,20 @@ TOKENSPEED_KERNEL_BACKEND=rocm \
 pip_install_with_retry pip3 install tokenspeed-kernel/python/ \
     --no-build-isolation -v
 
-echo "=== Step 5: Install TokenSpeed Scheduler ==="
-pip_install_with_retry pip3 install cmake ninja
-pip_install_with_retry pip3 install tokenspeed-scheduler/
+if [ "${TOKENSPEED_KERNEL_ONLY}" = "1" ]; then
+    echo "=== Step 5: Install kernel test dependency ==="
+    pip_install_with_retry pip3 install pytest
+else
+    echo "=== Step 5: Install TokenSpeed Scheduler ==="
+    pip_install_with_retry pip3 install cmake ninja
+    pip_install_with_retry pip3 install tokenspeed-scheduler/
 
-echo "=== Step 6: Install TokenSpeed ==="
-# tokenspeed-smg / -grpc-servicer / -grpc-proto are pinned in
-# python/pyproject.toml; pip resolves them from PyPI as part of the
-# editable install below.
-pip_install_with_retry pip3 install -e ./python --no-build-isolation
+    echo "=== Step 6: Install TokenSpeed ==="
+    # tokenspeed-smg / -grpc-servicer / -grpc-proto are pinned in
+    # python/pyproject.toml; pip resolves them from PyPI as part of the
+    # editable install below.
+    pip_install_with_retry pip3 install -e ./python --no-build-isolation
+fi
 
 echo ""
 echo "=========================================="
