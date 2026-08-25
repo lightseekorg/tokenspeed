@@ -362,6 +362,31 @@ class DeviceHandle:
     # Memory occupation (pause / release / wake)
     # ------------------------------------------------------------------
 
+    def run_embedding_work(self, work: Callable[[], Any]) -> Any:
+        """Run one EPD embedding device step on the data plane; block for it.
+
+        EPD admission's device half — receive-buffer allocation at stage, the
+        publish clone/scatter and the NCCL shard reassembly at drain. Named
+        for EPD rather than generic on purpose: like ``submit_release`` this
+        is a deliberately narrow callable slot, and a second user should add
+        its own named method, not widen this one.
+
+        Blocking is the point twice over. Admission needs the results (buffer
+        addresses to register, ``item.encoded`` set) before it returns, and
+        the P role's round head finds the FIFO empty, so the wait is a thread
+        hop. And issuing the reassembly's NCCL broadcasts from the forward
+        thread — instead of racing them against forward collectives from a
+        second thread — is what keeps the cross-rank launch order identical
+        on every rank, which NCCL requires across communicators.
+
+        Args:
+            work: Zero-argument callable performing the device step.
+
+        Returns:
+            ``work``'s return value; its exception is re-raised here.
+        """
+        return self._thread.run(work)
+
     def run_kv_repair(self) -> None:
         """Zero every KV pool's buffers after a wake re-maps them.
 
@@ -676,8 +701,28 @@ def build_device_side(
     )
 
 
+def _only_aliases_inputs(func) -> bool:
+    """Whether ``func`` is a metadata-only op: every output aliases an input.
+
+    View/slice/alias ops carry non-writing alias annotations in their schema
+    (``Tensor(a) -> Tensor(a)``) and issue no device work at all — no kernel,
+    no CUDA API call — so the guard lets them touch CUDA tensors. Anything
+    that materializes data dispatches a separate non-aliasing op (a lazy
+    ``reshape`` copy arrives as ``aten.clone``) and is still caught. In-place
+    ops alias too but with ``is_write`` set; they launch kernels, so they
+    stay banned.
+    """
+    try:
+        returns = func._schema.returns
+    except AttributeError:
+        return False
+    if not returns:
+        return False
+    return all(r.alias_info is not None and not r.alias_info.is_write for r in returns)
+
+
 class _NoDeviceWork(TorchDispatchMode):
-    """Raise on any torch op that touches a CUDA tensor or device.
+    """Raise on any torch op that puts device work on this thread.
 
     Thread-local by construction (dispatch modes are per-thread stacks), so
     pushing it on the control-plane thread bans device work THERE while the
@@ -686,19 +731,22 @@ class _NoDeviceWork(TorchDispatchMode):
 
     Deliberately porous in exactly the shape of the contract:
 
-    - ``cuda.Event`` create/record/query/synchronize are not dispatch ops, so
-      the inbound channel (``PendingExecution.result``, cache-result polling)
+    - ``cuda.Event`` create/query/synchronize are not dispatch ops, so the
+      inbound channel (``PendingExecution.result``, cache-result polling)
       passes untouched. The flip side: raw stream/event API misuse is not
       caught — this guard covers tensor ops (launches, copies, allocations),
       the dominant accident class.
+    - Metadata-only ops (views, slices) on CUDA tensors pass: they issue no
+      device work (see ``_only_aliases_inputs``). The control plane holds
+      views legitimately — EPD receive-slot leases, for one.
     - Classic ``torch.distributed`` collectives bypass ``__torch_dispatch__``;
       a CUDA collective on the control plane would only be caught via the
       tensor ops that prepare it.
-
-    Known flagged path: EPD prefill admission allocates CUDA receive buffers
-    and runs NCCL reassembly on the control plane today, so the guard stays
-    opt-in until that work is routed through the device handle.
     """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._alias_only: dict = {}
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
@@ -707,6 +755,11 @@ class _NoDeviceWork(TorchDispatchMode):
             value = stack.pop()
             if isinstance(value, torch.Tensor):
                 if value.device.type == "cuda":
+                    allowed = self._alias_only.get(func)
+                    if allowed is None:
+                        allowed = self._alias_only[func] = _only_aliases_inputs(func)
+                    if allowed:
+                        break
                     raise RuntimeError(
                         f"control-plane thread ran {func} on a CUDA tensor; "
                         "device work crosses only through DeviceHandle — see "
@@ -725,19 +778,21 @@ class _NoDeviceWork(TorchDispatchMode):
 
 
 def maybe_control_plane_guard():
-    """The event loop's opt-in enforcement of Principle 1, or a no-op.
+    """The event loop's enforcement of Principle 1, on by default.
 
-    Enabled with ``TOKENSPEED_GUARD_CONTROL_PLANE=1`` (dev / CI / e2e runs);
-    off by default because EPD admission still does device work on the
-    control plane (see ``_NoDeviceWork``) and because every control-plane
-    CPU tensor op pays the dispatch-mode hook (~10us) while enabled.
+    ``TOKENSPEED_GUARD_CONTROL_PLANE=0`` disables it — the escape hatch for a
+    deployment that trips on a control-plane device op we have not routed
+    yet; please report such a trip rather than living with the flag. The
+    cost while enabled is the dispatch-mode hook (~10us) on each of the
+    control plane's few CPU tensor ops per round.
 
     Returns:
-        A context manager: the guard mode when enabled, else a null context.
+        A context manager: the guard mode unless disabled, else a null
+        context.
     """
-    if os.environ.get("TOKENSPEED_GUARD_CONTROL_PLANE") == "1":
-        return _NoDeviceWork()
-    return contextlib.nullcontext()
+    if os.environ.get("TOKENSPEED_GUARD_CONTROL_PLANE", "1") == "0":
+        return contextlib.nullcontext()
+    return _NoDeviceWork()
 
 
 def _clear_kv_buffers(executor) -> None:

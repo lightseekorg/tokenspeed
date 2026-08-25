@@ -51,13 +51,18 @@ Consequences:
   cannot proceed without the result. A new blocking method on the per-round
   path is a bug.
 
-The rule is also mechanically enforceable: ``TOKENSPEED_GUARD_CONTROL_PLANE=1``
-pushes a thread-local dispatch mode over the loop that raises on any CUDA
-tensor op run from the control thread, while event waits — the inbound
-channel — pass untouched (they are not dispatch ops). Opt-in for now: EPD
-prefill admission still allocates CUDA receive buffers and runs NCCL
-reassembly on the control plane, a known pre-existing violation to route
-through the handle before the guard can be always-on.
+The rule is also mechanically enforced, on by default: a thread-local
+dispatch mode over the loop raises on any CUDA tensor op run from the
+control thread. Event waits — the inbound channel — and metadata-only view
+ops pass untouched; neither submits device work.
+``TOKENSPEED_GUARD_CONTROL_PLANE=0`` is the escape hatch for a deployment
+that trips on an unrouted op (report it). EPD prefill admission, the one
+known violator, now crosses through ``DeviceHandle.run_embedding_work``:
+receive-buffer allocation, the publish clone/scatter, and the NCCL shard
+reassembly all run on the forward thread — which also puts the reassembly
+broadcasts on the same issuing thread as the model's collectives, restoring
+the cross-rank launch-order guarantee the old non-overlap-loop assumption
+provided.
 
 ### The capture contract
 

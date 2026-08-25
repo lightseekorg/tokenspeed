@@ -513,6 +513,7 @@ class EventLoop:
                     attn_tp_size=self.attn_tp_size,
                     attn_tp_cpu_group=self.attn_tp_cpu_group,
                     pg_manager=pg_manager,
+                    run_device_work=self._device.run_embedding_work,
                 ),
             )
         else:
@@ -1031,9 +1032,10 @@ class EventLoop:
         """
         in_flight: deque = deque()
         depth = self.in_flight_depth
-        # Opt-in Principle-1 enforcement (TOKENSPEED_GUARD_CONTROL_PLANE=1):
-        # a thread-local dispatch mode that raises on any CUDA tensor op run
-        # from this thread. Event waits pass; they are the inbound channel.
+        # Principle-1 enforcement, on by default (TOKENSPEED_GUARD_CONTROL_PLANE=0
+        # disables): a thread-local dispatch mode that raises on any CUDA
+        # tensor op run from this thread. Event waits and metadata-only views
+        # pass; they submit no device work.
         with maybe_control_plane_guard():
             while not self._shutdown_complete():
                 self._process_new_requests()

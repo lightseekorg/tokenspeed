@@ -233,9 +233,9 @@ def local_topk_to_global_slots(
 def _workspace_topk_to_global_slots_kernel(
     out_ptr,
     workspace_indices_ptr,
-    workspace_indices_stride: tl.constexpr,
+    workspace_indices_stride,
     kv_workspace_slots_ptr,
-    total: tl.constexpr,
+    total,
     topk: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -387,12 +387,12 @@ def _dsa_decode_logits_fp8_kernel(
     seq_lens,
     block_table,
     logits,
-    block_table_stride: tl.constexpr,
-    logits_stride: tl.constexpr,
+    block_table_stride,
+    logits_stride,
     page_size: tl.constexpr,
     row_bytes: tl.constexpr,
     page_stride_bytes: tl.constexpr,
-    max_seq_len: tl.constexpr,
+    max_seq_len,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     num_groups: tl.constexpr,
@@ -470,8 +470,12 @@ def _dsa_prefill_logits_fp8_kernel(
     row_starts,
     row_ends,
     logits,
-    logits_stride: tl.constexpr,
-    seq_len_sum: tl.constexpr,
+    # Both derive from the batch's total KV length, which differs for every
+    # request.  As ``tl.constexpr`` they would key the JIT cache, forcing a
+    # fresh compile per prompt; they are only used for bounds masking and
+    # address arithmetic, so a runtime value is equivalent.
+    logits_stride,
+    seq_len_sum,
     page_size: tl.constexpr,
     row_bytes: tl.constexpr,
     page_stride_bytes: tl.constexpr,
@@ -623,9 +627,12 @@ def _ordered_key_to_fp32(x):
 def _dsa_logits_topk_kernel(
     logits,
     out,
-    logits_stride: tl.constexpr,
-    out_stride: tl.constexpr,
-    n_cols: tl.constexpr,
+    # Runtime values: these track the batch's KV length, so keying the JIT
+    # cache on them recompiles per request.  ``n_cols_padded`` stays a
+    # constexpr -- it is a power of two that drives the unroll below.
+    logits_stride,
+    out_stride,
+    n_cols,
     n_cols_padded: tl.constexpr,
     topk: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -682,9 +689,9 @@ def _dsa_radix_hist_kernel(
     logits,
     prefixes,
     hist,
-    logits_stride: tl.constexpr,
-    hist_tiles: tl.constexpr,
-    n_cols: tl.constexpr,
+    logits_stride,
+    hist_tiles,
+    n_cols,
     shift: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -715,7 +722,7 @@ def _dsa_radix_update_kernel(
     prefixes,
     remaining,
     hist,
-    hist_tiles: tl.constexpr,
+    hist_tiles,
     BLOCK_TILES: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -748,9 +755,9 @@ def _dsa_radix_scatter_kernel(
     remaining,
     out_values,
     out_indices,
-    logits_stride: tl.constexpr,
-    out_stride: tl.constexpr,
-    n_cols: tl.constexpr,
+    logits_stride,
+    out_stride,
+    n_cols,
     topk: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -813,7 +820,7 @@ def _dsa_radix_sort_selected_kernel(
     values,
     indices,
     out,
-    stride: tl.constexpr,
+    stride,
     n_cols_padded: tl.constexpr,
     topk: tl.constexpr,
 ):

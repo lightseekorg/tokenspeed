@@ -371,7 +371,7 @@ def test_the_guard_scans_tensor_lists():
         assert out.numel() == 4
 
 
-def test_the_guard_is_opt_in(monkeypatch):
+def test_the_guard_is_on_by_default(monkeypatch):
     import contextlib
 
     from tokenspeed.runtime.execution.device import (
@@ -380,9 +380,70 @@ def test_the_guard_is_opt_in(monkeypatch):
     )
 
     monkeypatch.delenv("TOKENSPEED_GUARD_CONTROL_PLANE", raising=False)
-    assert isinstance(maybe_control_plane_guard(), contextlib.nullcontext)
-    monkeypatch.setenv("TOKENSPEED_GUARD_CONTROL_PLANE", "1")
     assert isinstance(maybe_control_plane_guard(), _NoDeviceWork)
+    monkeypatch.setenv("TOKENSPEED_GUARD_CONTROL_PLANE", "0")
+    assert isinstance(maybe_control_plane_guard(), contextlib.nullcontext)
+
+
+def test_metadata_only_ops_are_recognized_by_schema():
+    """Views alias without writing; kernels do not. The rule must separate
+    them without an op-by-op allowlist."""
+    from tokenspeed.runtime.execution.device import _only_aliases_inputs
+
+    assert _only_aliases_inputs(torch.ops.aten.view.default)
+    assert _only_aliases_inputs(torch.ops.aten.slice.Tensor)
+    # Data-producing and in-place ops both stay banned.
+    assert not _only_aliases_inputs(torch.ops.aten.add.Tensor)
+    assert not _only_aliases_inputs(torch.ops.aten.clone.default)
+    assert not _only_aliases_inputs(torch.ops.aten.copy_.default)
+
+
+def test_epd_receive_allocation_crosses_through_the_runner(monkeypatch):
+    """The job's device steps run wherever the runner says — the engine
+    passes ``DeviceHandle.run_embedding_work``, so they land on the forward
+    thread; ``None`` (the blocking test wrapper) runs them inline."""
+    from tokenspeed.runtime.epd import prefill_admission
+
+    # Force the legacy path: with no pool, the receive buffer must be
+    # allocated through the runner.
+    monkeypatch.setattr(prefill_admission, "_get_pool", lambda engine, device: None)
+
+    ran: list = []
+
+    def runner(work):
+        ran.append(work)
+        return work()
+
+    item = SimpleNamespace(
+        encode_handshake={
+            "bootstrap_host": "h",
+            "bootstrap_port": 1,
+            "bootstrap_room": 2,
+        },
+        encoded=None,
+        offsets=[(0, 3)],  # 4 encoded tokens
+    )
+
+    class _Receiver:
+        def __init__(self, manager, addr, room) -> None:
+            pass
+
+        def poll(self):  # pragma: no cover — not driven here
+            return "Bootstrapped"
+
+    job = prefill_admission.EmbeddingReceiveJob(
+        [item],
+        SimpleNamespace(engine=SimpleNamespace(register=lambda *a: None)),
+        hidden=8,
+        num_deepstack=0,
+        dtype=torch.float32,
+        device="cpu",
+        receiver_factory=_Receiver,
+        run_device_work=runner,
+    )
+
+    assert len(ran) == 1  # exactly the recv-buffer allocation
+    assert job._items[0].recv_main.shape == (4, 8)
 
 
 # ----------------------------------------------------------------------
