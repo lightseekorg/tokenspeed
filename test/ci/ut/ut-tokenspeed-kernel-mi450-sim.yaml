@@ -14,6 +14,8 @@ env:
   CI: "true"
   GFX_ARCH: gfx1250
   TOKENSPEED_KERNEL_ONLY: "1"
+  TORCH_INDEX_URL: https://rocm.nightlies.amd.com/whl-multi-arch/
+  TORCH_VERSION: 2.13.0+rocm10.1.0a20260812
 install:
   - bash test/ci_system/setup_mi450_sim.sh
   - WORKSPACE="$(pwd)" bash test/ci_system/install_deps_rocm.sh
