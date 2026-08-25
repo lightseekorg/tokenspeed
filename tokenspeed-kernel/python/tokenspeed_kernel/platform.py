@@ -284,15 +284,15 @@ def current_platform() -> PlatformInfo:
     return Platform.get()
 
 
-_PDL_ENABLED: bool | None = None
+_pdl_enabled: bool | None = None
 
 
 def pdl_enabled(overwrite: bool | None = None) -> bool:
-    global _PDL_ENABLED
+    global _pdl_enabled
     if overwrite is not None:
-        _PDL_ENABLED = bool(overwrite) and current_platform().is_hopper_plus
-    elif _PDL_ENABLED is None:
-        _PDL_ENABLED = current_platform().is_hopper_plus
+        _pdl_enabled = bool(overwrite) and current_platform().is_hopper_plus
+    elif _pdl_enabled is None:
+        _pdl_enabled = current_platform().is_hopper_plus
     return _PDL_ENABLED
 
 
