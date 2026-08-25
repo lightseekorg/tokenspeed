@@ -41,6 +41,19 @@ fi
 git -C "${SOURCE_ROOT}" fetch --depth 1 origin "${ROCM_SYSTEMS_REF}"
 git -C "${SOURCE_ROOT}" checkout --detach "${ROCM_SYSTEMS_REF}"
 
+# HIP initialization needs the KMD simulator to remain alive for the full
+# process lifetime. The upstream gfx1250 functional config has a finite limit.
+python3 - "${ROCJITSU_SOURCE_DIR}/configs/gfx1250_mi455x.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+config = json.loads(path.read_text())
+config["max_ticks"] = 0
+path.write_text(json.dumps(config, indent=2) + "\n")
+PY
+
 rocm_root="$(rocm-sdk path --root)"
 ROCM_HOME="${rocm_root}" \
 ROCM_PATH="${rocm_root}" \

@@ -22,8 +22,10 @@ ut:
     - >-
       bash test/ci_system/run_mi450_sim.sh
       python3 -c
-      'import torch; assert torch.cuda.is_available();
-      assert "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName'
+      'import torch; print("HIP", torch.version.hip, "available",
+      torch.cuda.is_available(), "devices", torch.cuda.device_count(), flush=True);
+      torch.cuda.init(); props = torch.cuda.get_device_properties(0);
+      print(props, flush=True); assert "gfx1250" in props.gcnArchName'
     - >-
       timeout 20m bash test/ci_system/run_mi450_sim.sh
       python3 -m pytest
