@@ -202,9 +202,6 @@ class CachePool(ABC):
     ) -> None:
         self.layerwise_load_tracker = layerwise_load_tracker
 
-    def bind_cache_scheduler(self, scheduler: object) -> None:
-        """Optional hook for model-specific cache-group diagnostics."""
-
     def cache_transfer_layout(self):
         """Return the transfer layout consumed by this compute view."""
         from tokenspeed.runtime.cache.transfer.layout import (
@@ -248,9 +245,6 @@ class CachePool(ABC):
         # The event loop visits both target and draft pools; both name the
         # same arena, and zeroing it twice is harmless.
         self.arena.clear()
-
-    def maybe_log_cache_group_pages(self) -> None:
-        return None
 
     # ------------------------------------------------------------------
     # What every cache view owes its kernels. Abstract, so a subclass that

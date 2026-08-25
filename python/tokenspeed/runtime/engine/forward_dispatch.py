@@ -104,10 +104,7 @@ class ForwardDispatcher:
         self._device = device
 
     def dispatch(self, planned: PlannedForward) -> DispatchResult:
-        return (
-            self._device.submit_forward(planned, grammar_inputs=planned.grammar_inputs),
-            None,
-        )
+        return self._device.submit_forward(planned), None
 
     def produces_model_output(self, forward_op) -> bool:
         """Whether dispatching this op enters the model forward path.
@@ -169,10 +166,7 @@ class DecodeDispatcher(ForwardDispatcher):
         # matcher of a constrained request was advanced past the prefill
         # node's token when its RemotePrefillDoneEvent landed, so masking
         # here continues from the right state.
-        return (
-            self._device.submit_forward(planned, grammar_inputs=planned.grammar_inputs),
-            None,
-        )
+        return self._device.submit_forward(planned), None
 
 
 class PrefillDispatcher(ForwardDispatcher):
@@ -210,9 +204,5 @@ class PrefillDispatcher(ForwardDispatcher):
         # admission drain before admission; assert none reached the forward
         # un-received (no-op for non-EPD / text-only requests).
         self._epd_hooks.assert_embeddings_received(planned.multimodal_context)
-        pending = self._device.submit_forward(
-            planned,
-            grammar_inputs=planned.grammar_inputs,
-            capture_next_input_ids=True,
-        )
+        pending = self._device.submit_forward(planned, capture_next_input_ids=True)
         return pending, kv_transfer.store_prefill_token

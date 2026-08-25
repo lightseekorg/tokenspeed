@@ -33,7 +33,7 @@ change.
   scheduler feedback, in-flight depth, the hooks pattern.
 * `docs/design/cache-concepts.md` — KV cache vocabulary and the layering
   between prefix matching, allocation and page geometry.
-  
+
 ## Public pull requests
 
 * Keep PR titles, descriptions, commit messages, diffs, comments, logs, and

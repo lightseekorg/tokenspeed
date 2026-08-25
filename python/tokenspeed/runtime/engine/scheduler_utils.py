@@ -361,6 +361,29 @@ def make_update_reserve_tokens_event(request_id: str, new_reserve_num_tokens: in
     return fe
 
 
+def scheduler_cache_group_pages(scheduler):
+    """Return a ``group_id -> (total, available)`` page-count query.
+
+    Two counter reads, bound to the scheduler once, so the batch logger holds
+    a query rather than a reference to the loop that owns the scheduler.
+
+    Args:
+        scheduler: The engine's C++ scheduler.
+
+    Returns:
+        A callable taking a cache-group id and returning its total and
+        available page counts.
+    """
+
+    def pages(group_id: str) -> tuple[int, int]:
+        return (
+            scheduler.cache_group_total_pages(group_id),
+            scheduler.cache_group_available_pages(group_id),
+        )
+
+    return pages
+
+
 def advance_scheduler(scheduler, events: list) -> None:
     """Feed completion events (forward results or cache-op results) back into
     the C++ scheduler. The ONLY caller of ``scheduler.advance``.

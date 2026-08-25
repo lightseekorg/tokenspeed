@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from typing import ClassVar
 
@@ -441,12 +440,6 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         self._cache_group_specs_by_id = {
             spec.group_id: spec for spec in self.arena.cache_group_specs
         }
-        self._cache_scheduler: object | None = None
-        self._cache_state_group_ids = tuple(
-            str(spec.group_id)
-            for spec in self.arena.cache_group_specs
-            if spec.family == "state"
-        )
         self.requires_page_zeroing = True
 
         def _group_rows(group_id: str, default: int) -> int:
@@ -511,25 +504,6 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
         "indexer_kv": "indexer_kv_buffer",
         "indexer_state": "indexer_state_buffer",
     }
-
-    def bind_cache_scheduler(self, scheduler: object) -> None:
-        self._cache_scheduler = scheduler
-
-    def maybe_log_cache_group_pages(self) -> None:
-        scheduler = self._cache_scheduler
-        if self.rank != 0 or scheduler is None or not self._cache_state_group_ids:
-            return
-        if not logger.isEnabledFor(logging.DEBUG):
-            return
-
-        parts = []
-        for group_id in self._cache_state_group_ids:
-            total = scheduler.cache_group_total_pages(group_id)
-            available = scheduler.cache_group_available_pages(group_id)
-            parts.append(
-                f"{group_id}: used={total - available}/{total}, available={available}"
-            )
-        logger.debug("DeepSeek V4 paged-cache state group pages. %s", "; ".join(parts))
 
     def _require(
         self, buffers: list[torch.Tensor | None], layer_id: int, name: str

@@ -36,6 +36,7 @@ scheduler arguments.
 
 from __future__ import annotations
 
+import logging
 import time
 
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -59,9 +60,10 @@ class BatchLogger:
         num_total_pages: Device KV pages, for the active/total page ratio.
         spec_num_steps: Draft steps per verify, 0 when speculation is off.
         spec_num_tokens: Verify width, used by the accept-length debug log.
-        log_cache_group_pages: Called alongside each decode line to emit the
-            per-group page-usage debug line; the pool it reads lives behind
-            the data plane.
+        cache_state_group_ids: State-family cache-group ids, appended to
+            each decode line at DEBUG. Empty for pools with no such group.
+        cache_group_pages: ``group_id -> (total, available)`` page counts,
+            read from the C++ scheduler. None disables the extra line.
     """
 
     def __init__(
@@ -72,14 +74,16 @@ class BatchLogger:
         num_total_pages: int,
         spec_num_steps: int,
         spec_num_tokens: int,
-        log_cache_group_pages,
+        cache_state_group_ids=(),
+        cache_group_pages=None,
     ) -> None:
         self._enabled = enabled
         self._decode_log_interval = decode_log_interval
         self._num_total_pages = num_total_pages
         self._spec_num_steps = spec_num_steps
         self._spec_num_tokens = spec_num_tokens
-        self._log_cache_group_pages = log_cache_group_pages
+        self._cache_state_group_ids = tuple(cache_state_group_ids)
+        self._cache_group_pages = cache_group_pages
 
         self._step = 0
         self._seen_prefill_ids: set[str] = set()
@@ -173,10 +177,29 @@ class BatchLogger:
                 gen_throughput,
                 stats["num_queue_reqs"],
             )
-        self._log_cache_group_pages()
+        self._log_cache_state_group_pages()
         self._num_generated_tokens = 0
         self._num_decode_steps = 0
         self._last_decode_tic = now
+
+    def _log_cache_state_group_pages(self) -> None:
+        """Append per-group page usage for state-family groups, at DEBUG.
+
+        Recurrent/conv state groups are sized separately from the KV groups,
+        so the decode line's single page ratio does not show when one of them
+        is the binding constraint. Pure scheduler-counter reads.
+        """
+        if self._cache_group_pages is None or not self._cache_state_group_ids:
+            return
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        parts = []
+        for group_id in self._cache_state_group_ids:
+            total, available = self._cache_group_pages(group_id)
+            parts.append(
+                f"{group_id}: used={total - available}/{total}, available={available}"
+            )
+        logger.debug("Cache state group pages. %s", "; ".join(parts))
 
     def record_decode(self, results, bs: int) -> None:
         """Fold one committed decode step into the throughput window.

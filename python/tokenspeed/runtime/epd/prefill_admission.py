@@ -1058,7 +1058,7 @@ def make_epd_prefill_admission(
     global_rank,
     *,
     model_config,
-    model_facts,
+    encoder_model_facts,
     mapping,
     attn_tp_rank,
     attn_tp_size,
@@ -1075,14 +1075,17 @@ def make_epd_prefill_admission(
     if manager is None:
         return None
     # The narrow model facts the controller needs (vision dtype, hidden width,
-    # deepstack width, device), read off the data plane rather than the model:
-    # the controller holds these, never the model itself.
+    # deepstack width, device), read off the device wiring rather than the
+    # model: the controller holds these, never the model itself. Resolved only
+    # past the gate above — reading the vision tower's dtype raises on a
+    # text-only model, and every text-only PD node passes through here.
+    facts = encoder_model_facts()
     return EpdPrefillAdmission(
         manager=manager,
-        device=model_facts.device,
-        hidden=model_facts.hidden,
-        num_deepstack=model_facts.num_deepstack,
-        dtype=model_facts.dtype,
+        device=facts.device,
+        hidden=facts.hidden,
+        num_deepstack=facts.num_deepstack,
+        dtype=facts.dtype,
         attn_tp_rank=attn_tp_rank,
         attn_tp_size=attn_tp_size,
         attn_tp_cpu_group=attn_tp_cpu_group,

@@ -172,6 +172,39 @@ def test_an_aborted_request_still_lands_its_candidates_but_is_not_armed():
 
 
 # ----------------------------------------------------------------------
+# EPD admission: encoder facts resolve past the gate, never before.
+# ----------------------------------------------------------------------
+
+
+def test_text_only_pd_nodes_never_read_the_encoder_facts():
+    """The facts callable must not fire unless the node is an EPD prefill.
+
+    Reading the vision tower's dtype raises on a text-only model, and every
+    text-only PD node passes through this factory — so the facts are handed
+    over as a bound method and resolved only past the manager gate. Passing
+    the VALUE here once crashed every text-only PD deployment at startup.
+    """
+    from tokenspeed.runtime.epd.prefill_admission import make_epd_prefill_admission
+
+    def facts():  # pragma: no cover — reaching this is the failure
+        raise AssertionError("encoder facts read on a non-EPD node")
+
+    admission = make_epd_prefill_admission(
+        SimpleNamespace(disaggregation_mode="decode"),
+        0,
+        model_config=SimpleNamespace(is_multimodal_active=False),
+        encoder_model_facts=facts,
+        mapping=None,
+        attn_tp_rank=0,
+        attn_tp_size=1,
+        attn_tp_cpu_group=None,
+        pg_manager=None,
+    )
+
+    assert admission is None
+
+
+# ----------------------------------------------------------------------
 # Multimodal gather: the forward gets a snapshot, not the live struct.
 # ----------------------------------------------------------------------
 
@@ -371,6 +404,37 @@ def test_the_handle_hands_back_no_device_object():
     public = {name for name in dir(handle) if not name.startswith("_")}
     assert not (public & _RAW_DEVICE_OBJECTS)
     assert not any(getattr(handle, name, None) is handle._executor for name in public)
+
+
+def test_only_the_builder_constructs_the_device_side():
+    """The name denylist above is a proxy; this is the property itself.
+
+    A device object can only reach the loop if someone constructs one there,
+    so pin the constructors: the three factories that produce model runners,
+    attention backends, KV pools and the executor are called from
+    ``execution/device.py`` alone. (``epd/encode_loop.py`` is a different
+    worker — it builds a vision tower and never a ModelExecutor — so it is
+    not in scope for the scheduler loop's invariant.)
+    """
+    import pathlib
+
+    factories = (
+        "create_model_runner(",
+        "create_attn_components(",
+        "create_model_executor(",
+    )
+    allowed = {"execution/device.py", "execution/factory.py", "epd/encode_loop.py"}
+    root = pathlib.Path(__file__).resolve().parents[2] / "python" / "tokenspeed"
+    offenders = []
+    for path in root.rglob("*.py"):
+        rel = path.relative_to(root).as_posix()
+        if any(rel.endswith(suffix) for suffix in allowed):
+            continue
+        text = path.read_text()
+        for factory in factories:
+            if factory in text and f"def {factory}" not in text:
+                offenders.append(f"{rel}: {factory}")
+    assert not offenders, offenders
 
 
 def test_collaborators_hold_the_handle_instead_of_walking_to_it():

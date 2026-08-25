@@ -24,7 +24,7 @@ long the caller may hold them:
 | | what it is | lifetime |
 | --- | --- | --- |
 | `DeviceSpecs` | plain values the loop plans with: cache geometry, cache groups, speculation widths, capability flags | keep forever |
-| `DeviceWiring` | the startup steps that need a real device object: bind the cache scheduler, build the host cache tier, describe the KV to a PD peer, install the layerwise step counter, read the encoder's model facts | a local of `__init__`, dropped when it returns |
+| `DeviceWiring` | the startup steps that need a real device object: build the host cache tier, describe the KV to a PD peer, install the layerwise step counter, read the encoder's model facts | a local of `__init__`, dropped when it returns |
 | `DeviceHandle` | the running handle: the complete list of what the loop may ask of the device side | the only one stored (`self._device`) |
 
 Consequences:

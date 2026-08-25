@@ -49,9 +49,9 @@ What comes back is split three ways, by how long the caller may hold it:
   geometry, speculation widths, capability flags). No device object, safe to
   keep forever, and reading one never goes through the handle.
 - ``DeviceWiring`` — the startup steps that need a real device object:
-  binding the cache scheduler, describing the KV to a PD peer, installing
-  the layerwise step counter. A local of ``EventLoop.__init__``, dropped
-  when it returns.
+  building the host cache tier, describing the KV to a PD peer, installing
+  the layerwise step counter, reading the encoder's model facts. A local of
+  ``EventLoop.__init__``, dropped when it returns.
 - ``DeviceHandle`` — the running handle, and the only one the loop keeps.
 
 The split exists because the wiring list is the one that grows: every new
@@ -117,6 +117,9 @@ class DeviceSpecs:
         supports_disaggregation: The KV arena can hand pages to a peer node.
         supports_pd_layerwise_finalization: The drafter can finalize
             layerwise KV writes, required for PD layerwise transfer.
+        cache_state_group_ids: Group ids of the state-family cache groups,
+            for the per-group page-usage debug line. Empty for pools with no
+            recurrent/conv state.
     """
 
     cache_geometry: Any
@@ -128,6 +131,7 @@ class DeviceSpecs:
     uses_eager_grammar: bool
     supports_disaggregation: bool
     supports_pd_layerwise_finalization: bool
+    cache_state_group_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -148,10 +152,9 @@ class DeviceBuild:
 class DeviceHandle:
     """What the running control plane may ask of the GPU, and nothing else.
 
-    Almost every method packages its arguments into a closure and hands that
-    closure to the forward thread; the two that do not (``log_cache_group_pages``
-    reads scheduler counters, ``shutdown`` stops the thread) say so. None of
-    them returns anything the caller could then use to bypass the rest.
+    Every method packages its arguments into a closure and hands that closure
+    to the forward thread, and none of them returns anything the caller could
+    then use to bypass the rest.
     """
 
     def __init__(self, executor) -> None:
@@ -167,15 +170,15 @@ class DeviceHandle:
         self,
         planned,
         *,
-        grammar_inputs,
         capture_next_input_ids: bool = False,
     ) -> PendingExecution:
         """Queue this round's model forward; never blocks.
 
+        ``planned`` is the single source of everything the round hands over
+        (see ``PlannedForward``'s field-by-field capture notes).
+
         Args:
             planned: The round's ``PlannedForward``.
-            grammar_inputs: Grammar state for this batch, or None. Passed
-                separately because a role may mask differently than planned.
             capture_next_input_ids: Whether to keep the round's sampled rows
                 for a PD prefill handoff.
 
@@ -189,7 +192,7 @@ class DeviceHandle:
                 planned.forward_op,
                 planned.sampling_params_list,
                 dp_metadata=planned.dp_metadata,
-                grammar_inputs=grammar_inputs,
+                grammar_inputs=planned.grammar_inputs,
                 multimodal_context=planned.multimodal_context,
                 capture_next_input_ids=capture_next_input_ids,
             )
@@ -307,15 +310,6 @@ class DeviceHandle:
         """
         self._thread.submit(release)
 
-    def log_cache_group_pages(self) -> None:
-        """Emit the per-group page-usage debug line, if that log is enabled.
-
-        Pure scheduler-counter reads, so it does not go over the FIFO; it is
-        here rather than in ``DeviceWiring`` because the batch logger calls
-        it every decode-log interval, long after startup.
-        """
-        self._executor.token_to_kv_pool.maybe_log_cache_group_pages()
-
     # ------------------------------------------------------------------
     # Memory occupation (pause / release / wake)
     # ------------------------------------------------------------------
@@ -353,14 +347,6 @@ class DeviceHandle:
         runner = self._executor.model_runner
         return self._thread.run(lambda: runner.destroy_weights_update_group(req))
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
-    def shutdown(self) -> None:
-        """Stop the forward thread, draining whatever it still holds."""
-        self._thread.shutdown()
-
 
 class DeviceWiring:
     """Startup-only capabilities: hand the device side to its collaborators.
@@ -385,9 +371,10 @@ class DeviceWiring:
     def encoder_model_facts(self) -> EncoderModelFacts:
         """Extract the four model facts EPD admission needs, as plain values.
 
-        Not a ``DeviceSpecs`` field: reading the vision tower's dtype raises
-        on a text-only model, so it stays a call the EPD path makes and no
-        one else does.
+        Not a ``DeviceSpecs`` field, and handed to the EPD path as a BOUND
+        METHOD rather than a value: reading the vision tower's dtype raises
+        on a text-only model, so this must only run after the EPD admission
+        gate has decided the node is a multimodal prefill node.
         """
         model = self._executor.model_runner.model
         return EncoderModelFacts(
@@ -397,20 +384,13 @@ class DeviceWiring:
             dtype=(getattr(model, "visual", None) or model.vision_tower).dtype,
         )
 
-    def bind_cache_scheduler(self, scheduler) -> None:
-        """Give the KV pool the C++ scheduler it reports page state to.
-
-        Args:
-            scheduler: The engine's C++ scheduler.
-        """
-        self._executor.token_to_kv_pool.bind_cache_scheduler(scheduler)
-
-    def create_l2_cache_executor(self, **options):
+    def create_l2_cache_executor(self, *, host_ratio, host_size_gb, io_backend):
         """Build the host-tier KV cache executor over this engine's pools.
 
         Args:
-            **options: Forwarded to ``L2CacheExecutor`` (host ratio/size, io
-                backend); the device and draft pools are supplied here.
+            host_ratio: Host cache size as a multiple of the device pool.
+            host_size_gb: Absolute host cache size, when set.
+            io_backend: Host<->device transfer backend name.
 
         Returns:
             The configured ``L2CacheExecutor``.
@@ -421,10 +401,20 @@ class DeviceWiring:
         return L2CacheExecutor(
             device_pool=executor.token_to_kv_pool,
             draft_pool=executor.draft_token_to_kv_pool,
-            **options,
+            host_ratio=host_ratio,
+            host_size_gb=host_size_gb,
+            io_backend=io_backend,
         )
 
-    def pd_kv_args(self, *, global_rank: int, ib_device, model_config, **options):
+    def pd_kv_args(
+        self,
+        *,
+        global_rank: int,
+        ib_device,
+        model_config,
+        draft_model_config,
+        pp_layer_window,
+    ):
         """Describe this engine's KV to a PD peer.
 
         Args:
@@ -432,7 +422,8 @@ class DeviceWiring:
                 and the KV-manager rank fields.
             ib_device: The disaggregation InfiniBand device.
             model_config: The target model's config.
-            **options: Forwarded to ``get_kv_args`` (draft config, PP window).
+            draft_model_config: The draft model's config, or None.
+            pp_layer_window: This stage's layer range under PP, else None.
 
         Returns:
             The peer-facing KV argument struct.
@@ -445,7 +436,8 @@ class DeviceWiring:
             ib_device,
             self._executor.token_to_kv_pool,
             model_config=model_config,
-            **options,
+            draft_model_config=draft_model_config,
+            pp_layer_window=pp_layer_window,
         )
 
     def install_pd_step_counter(self, gpu_id: int):
@@ -624,6 +616,11 @@ def build_device_side(
         supports_disaggregation=token_to_kv_pool.arena.supports_disaggregation,
         supports_pd_layerwise_finalization=bool(
             getattr(executor.drafter, "supports_pd_layerwise_finalization", False)
+        ),
+        cache_state_group_ids=tuple(
+            str(spec.group_id)
+            for spec in token_to_kv_pool.arena.cache_group_specs
+            if spec.family == "state"
         ),
     )
     return DeviceBuild(
