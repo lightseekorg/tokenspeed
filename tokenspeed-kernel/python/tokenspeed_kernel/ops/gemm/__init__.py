@@ -60,7 +60,12 @@ from tokenspeed_kernel.ops.gemm.linear_attnres_partials import (
     linear_attnres_partials,
     linear_attnres_partials_available,
 )
-from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    Platform,
+    _pdl_enabled,
+    current_platform,
+)
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import SelectedKernel, select_kernel
@@ -190,19 +195,24 @@ def prepare_fp8_linear(
         )
 
     if (
-        has_flashinfer_mxfp8()
-        and (block_n, block_k) == (1, 32)
+        (block_n, block_k) == (1, 32)
         and weight_scales.dtype == torch.uint8
         and weight_scales.ndim == 2
         and n >= 128
         and k >= 128
         and k % 32 == 0
     ):
-        return _PreparedFp8Linear(
-            override="flashinfer_mm_mxfp8",
-            block_size=(block_n, block_k),
-            prepared_weight_scales=swizzle_mxfp8_scale(weight_scales, n, k),
-        )
+        if has_flashinfer_mxfp8() and _pdl_enabled():
+            return _PreparedFp8Linear(
+                override="flashinfer_mm_mxfp8",
+                block_size=(block_n, block_k),
+                prepared_weight_scales=swizzle_mxfp8_scale(weight_scales, n, k),
+            )
+        if not _pdl_enabled():
+            return _PreparedFp8Linear(
+                override="triton_mm_fp8_blockscale",
+                block_size=(block_n, block_k),
+            )
 
     if (
         has_flashinfer_fp8_blockscale()

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <cstdint>
+#include <cstdlib>
 
 #include "allocator.h"
 #include "fmha_fusion.hpp"
@@ -283,7 +284,9 @@ struct FwdRunner {
       }
       GPUTraceParam _gt_param;
       gpu_trace::setup_from_env(_gt_param, stream);
-      status = op.run(stream);
+      const char* disable_pdl = std::getenv("TOKENSPEED_DISABLE_PDL");
+      const bool enable_pdl = disable_pdl == nullptr || std::atoi(disable_pdl) == 0;
+      status = op.run(stream, enable_pdl);
       if (status != cutlass::Status::kSuccess) {
         cudaError_t err = cudaGetLastError();
         std::cerr << "Failed to launch the CUTLASS kernel. Last CUDA error is: "
