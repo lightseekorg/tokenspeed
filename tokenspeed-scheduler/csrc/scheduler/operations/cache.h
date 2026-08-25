@@ -21,6 +21,7 @@
 #pragma once
 
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -40,6 +41,10 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
 
 std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
                                std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens);
+
+std::optional<std::int32_t> FinalAlignedTailTokens(std::int32_t first_pos, std::int32_t unscheduled,
+                                                   std::int32_t token_budget, std::int32_t prefix_granularity,
+                                                   std::int32_t promotion_boundary_tokens);
 
 void FreeRequest(CacheCoordinator& coordinator, std::vector<BlockTable>& tables);
 

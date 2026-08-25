@@ -289,7 +289,9 @@ def linear_attnres_partials(
                 out=out,
             )
 
-    if tokens == 1 and hidden_states.is_contiguous() and weight.is_contiguous():
+    # decode_gemv falls back to torch.mm for unlisted shapes, so widening this
+    # gate past M == 1 only adds the measured kernels.
+    if tokens <= 8 and hidden_states.is_contiguous() and weight.is_contiguous():
         from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
 
         projected = decode_gemv(hidden_states, weight)

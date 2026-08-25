@@ -422,6 +422,10 @@ class FusedRMSNorm(nn.Module):
         """Expose weight_kv_a from kv_a_norm for backward compatibility."""
         return self.kv_a_norm.weight
 
+    def supports(self, input_q_a: torch.Tensor) -> bool:
+        """Return whether the fused implementation supports this input."""
+        return input_q_a.device.type != "cpu"
+
     def forward(
         self,
         input_q_a: torch.Tensor,

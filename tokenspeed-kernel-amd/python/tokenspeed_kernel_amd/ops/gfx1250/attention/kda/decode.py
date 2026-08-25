@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""GFX1250 Gluon KDA recurrent decode kernel."""
+"""GFX1250 Gluon KDA decode kernels using V-major recurrent state."""
 
 from __future__ import annotations
 
@@ -26,6 +26,8 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 gfx1250 = gl.amd.gfx1250
+
+_GFX1250_NUM_CUS = 256
 
 
 @gluon.jit
@@ -45,6 +47,11 @@ def _kda_recurrent_decode_kernel(
     H: gl.constexpr,
     K: gl.constexpr,
     V: gl.constexpr,
+    Q_TOKEN_STRIDE: gl.constexpr,
+    K_TOKEN_STRIDE: gl.constexpr,
+    V_TOKEN_STRIDE: gl.constexpr,
+    G_TOKEN_STRIDE: gl.constexpr,
+    BETA_TOKEN_STRIDE: gl.constexpr,
     BK: gl.constexpr,
     BV: gl.constexpr,
     NUM_SLOTS: gl.constexpr,
@@ -52,7 +59,7 @@ def _kda_recurrent_decode_kernel(
     HAS_LOWER_BOUND: gl.constexpr,
     LOWER_BOUND: gl.constexpr,
 ):
-    """One-token KDA decode with direct indexed state-pool IO."""
+    """One-token KDA decode with direct V-major indexed state-pool IO."""
     value_block = gl.program_id(0)
     sequence_head = gl.program_id(1)
     sequence_idx = sequence_head // H
@@ -60,27 +67,27 @@ def _kda_recurrent_decode_kernel(
 
     if BK == 128 and BV == 32:
         state_layout: gl.constexpr = gl.BlockedLayout(
-            [8, 4],
-            [8, 4],
+            [4, 8],
+            [4, 8],
             [2, 2],
             [1, 0],
         )
     elif BK == 128 and BV == 8:
         state_layout: gl.constexpr = gl.BlockedLayout(
-            [8, 1],
-            [8, 4],
-            [1, 2],
+            [1, 8],
+            [4, 8],
+            [2, 1],
             [1, 0],
         )
     else:
         state_layout: gl.constexpr = gl.BlockedLayout(
             [1, 1],
-            [1, 32],
-            [1, gl.num_warps()],
+            [32, 1],
+            [gl.num_warps(), 1],
             [1, 0],
         )
-    key_layout: gl.constexpr = gl.SliceLayout(1, state_layout)
-    value_layout: gl.constexpr = gl.SliceLayout(0, state_layout)
+    value_layout: gl.constexpr = gl.SliceLayout(1, state_layout)
+    key_layout: gl.constexpr = gl.SliceLayout(0, state_layout)
 
     begin = gl.load(cu_seqlens + sequence_idx)
     end = gl.load(cu_seqlens + sequence_idx + 1)
@@ -111,17 +118,17 @@ def _kda_recurrent_decode_kernel(
 
     token_idx = begin
     q_value = gl.load(
-        q + (token_idx * H + head_idx) * K + key_offsets,
+        q + token_idx * Q_TOKEN_STRIDE + head_idx * K + key_offsets,
         mask=key_mask,
         other=0.0,
     ).to(gl.float32)
     k_value = gl.load(
-        k + (token_idx * H + head_idx) * K + key_offsets,
+        k + token_idx * K_TOKEN_STRIDE + head_idx * K + key_offsets,
         mask=key_mask,
         other=0.0,
     ).to(gl.float32)
     gate_value = gl.load(
-        raw_g + (token_idx * H + head_idx) * K + key_offsets,
+        raw_g + token_idx * G_TOKEN_STRIDE + head_idx * K + key_offsets,
         mask=key_mask,
         other=0.0,
     ).to(gl.float32)
@@ -138,7 +145,9 @@ def _kda_recurrent_decode_kernel(
             1.0 + gl.exp(-gl.abs(gate_value))
         )
         log_decay = -a_value * softplus
-    beta_value = gl.load(raw_beta + token_idx * H + head_idx).to(gl.float32)
+    beta_value = gl.load(raw_beta + token_idx * BETA_TOKEN_STRIDE + head_idx).to(
+        gl.float32
+    )
     beta_value = 1.0 / (1.0 + gl.exp(-beta_value))
 
     scale: gl.constexpr = K**-0.5
@@ -148,8 +157,8 @@ def _kda_recurrent_decode_kernel(
     safe_write_idx = gl.where(valid_write, write_idx, 0)
     write_base = safe_write_idx * STATE_PAGE_STRIDE + head_idx * K * V
     decay = gl.exp(log_decay)
-    state_mask = key_mask[:, None] & value_mask[None, :]
-    read_offsets = key_offsets[:, None] * V + value_offsets[None, :]
+    state_mask = value_mask[:, None] & key_mask[None, :]
+    read_offsets = value_offsets[:, None] * K + key_offsets[None, :]
     running = gfx1250.buffer_load(
         state_pool + read_base,
         read_offsets.to(gl.int32),
@@ -157,21 +166,21 @@ def _kda_recurrent_decode_kernel(
         other=0.0,
     ).to(gl.float32)
     v_value = gl.load(
-        v + (token_idx * H + head_idx) * V + value_offsets,
+        v + token_idx * V_TOKEN_STRIDE + head_idx * V + value_offsets,
         mask=value_mask,
         other=0.0,
     ).to(gl.float32)
-    running *= decay[:, None]
-    prediction = gl.sum(running * k_value[:, None], axis=0)
+    running *= decay[None, :]
+    prediction = gl.sum(running * k_value[None, :], axis=1)
     delta = beta_value * (v_value - prediction)
-    running += k_value[:, None] * delta[None, :]
-    out_value = gl.sum(running * q_value[:, None], axis=0)
+    running += delta[:, None] * k_value[None, :]
+    out_value = gl.sum(running * q_value[None, :], axis=1)
     gl.store(
         output + (sequence_idx * H + head_idx) * V + value_offsets,
         out_value.to(output.dtype.element_ty),
         mask=value_mask,
     )
-    write_offsets = key_offsets[:, None] * V + value_offsets[None, :]
+    write_offsets = value_offsets[:, None] * K + key_offsets[None, :]
     gfx1250.buffer_store(
         running,
         state_pool + write_base,
@@ -212,162 +221,125 @@ def _kda_fused_decode_kernel(
     HAS_LOWER_BOUND: gl.constexpr,
     LOWER_BOUND: gl.constexpr,
     NORM_EPS: gl.constexpr,
+    PIPELINE_DEPTH: gl.constexpr,
 ):
     """Fuse the K3 decode convolution, recurrence, and gated RMSNorm."""
-    sequence_head = gl.program_id(0)
-    sequence_idx = sequence_head // H
-    head_idx = sequence_head % H
+    head_idx = gl.program_id(0)
+    sequence_idx = gl.program_id(1)
 
+    # Physical state tiles are [V, K]. Giving each wave32 warp two value rows
+    # and the whole key axis keeps the per-panel reductions over keys inside a
+    # wave, which is what makes the panel loop cheap here.
     state_layout: gl.constexpr = gl.BlockedLayout(
-        [8, 8],
-        [8, 4],
-        [2, 4],
+        [1, 8],
+        [2, 16],
+        [8, 1],
         [1, 0],
     )
-    key_layout: gl.constexpr = gl.SliceLayout(1, state_layout)
-    value_layout: gl.constexpr = gl.SliceLayout(0, state_layout)
+    key_layout: gl.constexpr = gl.SliceLayout(0, state_layout)
+    value_layout: gl.constexpr = gl.SliceLayout(1, state_layout)
     key_offsets = gl.arange(0, D, layout=key_layout)
-    value_offsets = gl.arange(0, D, layout=value_layout)
+    compact_layout: gl.constexpr = gl.BlockedLayout([1], [32], [8], [0])
+    output_offsets = gl.arange(0, D, layout=compact_layout)
+    shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
+    # Pack Q, K, V, and decay into one row; keep output in a D-wide allocation.
+    shared_vectors = gl.allocate_shared_memory(gl.float32, [1, 4 * D], shared_layout)
+    output_alloc = gl.allocate_shared_memory(gl.float32, [1, D], shared_layout)
 
     begin = gl.load(cu_seqlens + sequence_idx)
     end = gl.load(cu_seqlens + sequence_idx + 1)
-    output_offsets = (sequence_idx * H + head_idx) * D + value_offsets
+    output_base = (sequence_idx * H + head_idx) * D
     if begin == end:
-        gl.store(output + output_offsets, 0.0)
+        gl.store(output + output_base + output_offsets, 0.0)
         return
 
     read_idx = gl.load(read_indices + sequence_idx)
     write_idx = gl.load(write_indices + sequence_idx)
     valid_read = (read_idx >= 0) & (read_idx < NUM_SLOTS)
     if not valid_read:
-        gl.store(output + output_offsets, 0.0)
+        gl.store(output + output_base + output_offsets, 0.0)
         return
-    read_page_offset = read_idx.to(gl.int64)
-
-    token_idx = begin
-    projection_width: gl.constexpr = H * D
-    q_channel = head_idx * D + key_offsets
-    k_channel = projection_width + q_channel
-    v_channel = 2 * projection_width + head_idx * D + value_offsets
-    q_input = gl.load(mixed_qkv + token_idx * MIXED_ROW_STRIDE + q_channel).to(
-        gl.float32
-    )
-    k_input = gl.load(mixed_qkv + token_idx * MIXED_ROW_STRIDE + k_channel).to(
-        gl.float32
-    )
-    v_input = gl.load(mixed_qkv + token_idx * MIXED_ROW_STRIDE + v_channel).to(
-        gl.float32
-    )
-
-    q_history0 = gl.load(
-        conv_states
-        + read_page_offset * CONV_PAGE_STRIDE
-        + q_channel * CONV_CHANNEL_STRIDE
-    ).to(gl.float32)
-    q_history1 = gl.load(
-        conv_states
-        + read_page_offset * CONV_PAGE_STRIDE
-        + q_channel * CONV_CHANNEL_STRIDE
-        + CONV_HISTORY_STRIDE
-    ).to(gl.float32)
-    q_history2 = gl.load(
-        conv_states
-        + read_page_offset * CONV_PAGE_STRIDE
-        + q_channel * CONV_CHANNEL_STRIDE
-        + 2 * CONV_HISTORY_STRIDE
-    ).to(gl.float32)
-    k_history0 = gl.load(
-        conv_states
-        + read_page_offset * CONV_PAGE_STRIDE
-        + k_channel * CONV_CHANNEL_STRIDE
-    ).to(gl.float32)
-    k_history1 = gl.load(
-        conv_states
-        + read_page_offset * CONV_PAGE_STRIDE
-        + k_channel * CONV_CHANNEL_STRIDE
-        + CONV_HISTORY_STRIDE
-    ).to(gl.float32)
-    k_history2 = gl.load(
-        conv_states
-        + read_page_offset * CONV_PAGE_STRIDE
-        + k_channel * CONV_CHANNEL_STRIDE
-        + 2 * CONV_HISTORY_STRIDE
-    ).to(gl.float32)
-    v_history0 = gl.load(
-        conv_states
-        + read_page_offset * CONV_PAGE_STRIDE
-        + v_channel * CONV_CHANNEL_STRIDE
-    ).to(gl.float32)
-    v_history1 = gl.load(
-        conv_states
-        + read_page_offset * CONV_PAGE_STRIDE
-        + v_channel * CONV_CHANNEL_STRIDE
-        + CONV_HISTORY_STRIDE
-    ).to(gl.float32)
-    v_history2 = gl.load(
-        conv_states
-        + read_page_offset * CONV_PAGE_STRIDE
-        + v_channel * CONV_CHANNEL_STRIDE
-        + 2 * CONV_HISTORY_STRIDE
-    ).to(gl.float32)
-
-    q_weight_base = conv_weights + q_channel * CONV_WEIGHT_ROW_STRIDE
-    k_weight_base = conv_weights + k_channel * CONV_WEIGHT_ROW_STRIDE
-    v_weight_base = conv_weights + v_channel * CONV_WEIGHT_ROW_STRIDE
-    q_value = (
-        q_history0 * gl.load(q_weight_base)
-        + q_history1 * gl.load(q_weight_base + CONV_WEIGHT_COL_STRIDE)
-        + q_history2 * gl.load(q_weight_base + 2 * CONV_WEIGHT_COL_STRIDE)
-        + q_input * gl.load(q_weight_base + 3 * CONV_WEIGHT_COL_STRIDE)
-    ).to(gl.float32)
-    k_value = (
-        k_history0 * gl.load(k_weight_base)
-        + k_history1 * gl.load(k_weight_base + CONV_WEIGHT_COL_STRIDE)
-        + k_history2 * gl.load(k_weight_base + 2 * CONV_WEIGHT_COL_STRIDE)
-        + k_input * gl.load(k_weight_base + 3 * CONV_WEIGHT_COL_STRIDE)
-    ).to(gl.float32)
-    v_value = (
-        v_history0 * gl.load(v_weight_base)
-        + v_history1 * gl.load(v_weight_base + CONV_WEIGHT_COL_STRIDE)
-        + v_history2 * gl.load(v_weight_base + 2 * CONV_WEIGHT_COL_STRIDE)
-        + v_input * gl.load(v_weight_base + 3 * CONV_WEIGHT_COL_STRIDE)
-    ).to(gl.float32)
-    q_value *= 1.0 / (1.0 + gl.exp(-q_value))
-    k_value *= 1.0 / (1.0 + gl.exp(-k_value))
-    v_value *= 1.0 / (1.0 + gl.exp(-v_value))
 
     valid_write = (write_idx >= 0) & (write_idx < NUM_SLOTS)
     safe_write_idx = gl.where(valid_write, write_idx, 0)
+    read_page_offset = read_idx.to(gl.int64)
     write_page_offset = safe_write_idx.to(gl.int64)
-    q_write_base = (
-        conv_states
-        + write_page_offset * CONV_PAGE_STRIDE
-        + q_channel * CONV_CHANNEL_STRIDE
-    )
-    k_write_base = (
-        conv_states
-        + write_page_offset * CONV_PAGE_STRIDE
-        + k_channel * CONV_CHANNEL_STRIDE
-    )
-    v_write_base = (
-        conv_states
-        + write_page_offset * CONV_PAGE_STRIDE
-        + v_channel * CONV_CHANNEL_STRIDE
-    )
-    gl.store(q_write_base, q_history1, mask=valid_write)
-    gl.store(q_write_base + CONV_HISTORY_STRIDE, q_history2, mask=valid_write)
-    gl.store(q_write_base + 2 * CONV_HISTORY_STRIDE, q_input, mask=valid_write)
-    gl.store(k_write_base, k_history1, mask=valid_write)
-    gl.store(k_write_base + CONV_HISTORY_STRIDE, k_history2, mask=valid_write)
-    gl.store(k_write_base + 2 * CONV_HISTORY_STRIDE, k_input, mask=valid_write)
-    gl.store(v_write_base, v_history1, mask=valid_write)
-    gl.store(v_write_base + CONV_HISTORY_STRIDE, v_history2, mask=valid_write)
-    gl.store(v_write_base + 2 * CONV_HISTORY_STRIDE, v_input, mask=valid_write)
+    read_base = read_page_offset * STATE_PAGE_STRIDE + head_idx * D * D
+    panel_value_offsets = gl.arange(0, 16, layout=value_layout)
 
-    gate_value = gl.load(
-        raw_g + token_idx * GATE_ROW_STRIDE + head_idx * D + key_offsets
+    # Keep PIPELINE_DEPTH state panels in flight to balance latency and VGPR use.
+    # static_range permits the unrolled tuple window to change length.
+    off_pipe = ()
+    raw_pipe = ()
+    for _pd in gl.static_range(PIPELINE_DEPTH):
+        _off_pd = (panel_value_offsets[:, None] + _pd * 16) * D + key_offsets[None, :]
+        _raw_pd = gl.load(state_pool + read_base + _off_pd).to(gl.float32)
+        off_pipe = off_pipe + (_off_pd,)
+        raw_pipe = raw_pipe + (_raw_pd,)
+
+    token_idx = begin
+
+    # Process Q/K/V/decay together so Q/K/V share convolution loads.
+    qkvd_layout: gl.constexpr = gl.BlockedLayout([2], [32], [8], [0])
+    qkvd_offsets = gl.arange(0, 4 * D, layout=qkvd_layout)
+    slot_id = qkvd_offsets // D
+    local_offset = qkvd_offsets - slot_id * D
+    is_k = slot_id == 1
+    is_v = slot_id == 2
+    is_decay = slot_id == 3
+    projection_width: gl.constexpr = H * D
+
+    # Decay lanes use Q as an in-bounds dummy address and skip state writes.
+    qkv_channel = (
+        gl.where(is_k, projection_width, gl.where(is_v, 2 * projection_width, 0))
+        + head_idx * D
+        + local_offset
+    )
+
+    qkv_input = gl.load(mixed_qkv + token_idx * MIXED_ROW_STRIDE + qkv_channel).to(
+        gl.float32
+    )
+    qkv_history0 = gl.load(
+        conv_states
+        + read_page_offset * CONV_PAGE_STRIDE
+        + qkv_channel * CONV_CHANNEL_STRIDE
     ).to(gl.float32)
-    gate_value += gl.load(dt_bias + head_idx * D + key_offsets).to(gl.float32)
+    qkv_history1 = gl.load(
+        conv_states
+        + read_page_offset * CONV_PAGE_STRIDE
+        + qkv_channel * CONV_CHANNEL_STRIDE
+        + CONV_HISTORY_STRIDE
+    ).to(gl.float32)
+    qkv_history2 = gl.load(
+        conv_states
+        + read_page_offset * CONV_PAGE_STRIDE
+        + qkv_channel * CONV_CHANNEL_STRIDE
+        + 2 * CONV_HISTORY_STRIDE
+    ).to(gl.float32)
+
+    qkv_weight_base = conv_weights + qkv_channel * CONV_WEIGHT_ROW_STRIDE
+    qkv_value = (
+        qkv_history0 * gl.load(qkv_weight_base)
+        + qkv_history1 * gl.load(qkv_weight_base + CONV_WEIGHT_COL_STRIDE)
+        + qkv_history2 * gl.load(qkv_weight_base + 2 * CONV_WEIGHT_COL_STRIDE)
+        + qkv_input * gl.load(qkv_weight_base + 3 * CONV_WEIGHT_COL_STRIDE)
+    ).to(gl.float32)
+    qkv_value *= 1.0 / (1.0 + gl.exp(-qkv_value))
+
+    qkv_write_base = (
+        conv_states
+        + write_page_offset * CONV_PAGE_STRIDE
+        + qkv_channel * CONV_CHANNEL_STRIDE
+    )
+    write_mask = valid_write & (slot_id != 3)
+    gl.store(qkv_write_base, qkv_history1, mask=write_mask)
+    gl.store(qkv_write_base + CONV_HISTORY_STRIDE, qkv_history2, mask=write_mask)
+    gl.store(qkv_write_base + 2 * CONV_HISTORY_STRIDE, qkv_input, mask=write_mask)
+
+    decay_channel = head_idx * D + local_offset
+    gate_value = gl.load(raw_g + token_idx * GATE_ROW_STRIDE + decay_channel).to(
+        gl.float32
+    ) + gl.load(dt_bias + decay_channel).to(gl.float32)
     a_value = gl.exp(gl.load(a_log + head_idx).to(gl.float32))
     if HAS_LOWER_BOUND:
         log_decay = LOWER_BOUND / (1.0 + gl.exp(-(a_value * gate_value)))
@@ -376,42 +348,95 @@ def _kda_fused_decode_kernel(
             1.0 + gl.exp(-gl.abs(gate_value))
         )
         log_decay = -a_value * softplus
+    decay_value = gl.exp(log_decay)
     beta_value = gl.load(beta_logits + token_idx * BETA_ROW_STRIDE + head_idx).to(
         gl.float32
     )
     beta_value = 1.0 / (1.0 + gl.exp(-beta_value))
 
-    q_value *= gl.rsqrt(gl.sum(q_value * q_value, axis=0) + 1e-6) * (D**-0.5)
-    k_value *= gl.rsqrt(gl.sum(k_value * k_value, axis=0) + 1e-6)
-    state_offsets = key_offsets[:, None] * D + value_offsets[None, :]
-    read_base = read_page_offset * STATE_PAGE_STRIDE + head_idx * D * D
-    running = gfx1250.buffer_load(
-        state_pool + read_base,
-        state_offsets.to(gl.int32),
-    ).to(gl.float32)
-    running *= gl.exp(log_decay)[:, None]
-    prediction = gl.sum(running * k_value[:, None], axis=0)
-    prior_output = gl.sum(running * q_value[:, None], axis=0)
-    key_query = gl.sum(k_value * q_value, axis=0)
-    delta = beta_value * (v_value - prediction)
-    running += k_value[:, None] * delta[None, :]
-    out_value = prior_output + delta * key_query
+    combined = gl.where(is_decay, decay_value, qkv_value)
+    shared_vectors.index(0).store(combined)
 
+    gl.barrier()
+
+    q_value = shared_vectors.index(0).slice(0, D, dim=0).load(key_layout)
+    k_value = shared_vectors.index(0).slice(D, D, dim=0).load(key_layout)
+    decay = shared_vectors.index(0).slice(3 * D, D, dim=0).load(key_layout)
+    q_square = gl.sum(q_value * q_value, axis=0)
+    k_square = gl.sum(k_value * k_value, axis=0)
+    raw_key_query = gl.sum(q_value * k_value, axis=0)
+    q_scale = gl.rsqrt(q_square + 1e-6) * (D**-0.5)
+    k_scale = gl.rsqrt(k_square + 1e-6)
+    q_value *= q_scale
+    k_value *= k_scale
+    key_query = raw_key_query * q_scale * k_scale
     write_base = write_page_offset * STATE_PAGE_STRIDE + head_idx * D * D
-    gfx1250.buffer_store(
-        running,
-        state_pool + write_base,
-        state_offsets.to(gl.int32),
-        mask=valid_write,
+    output_shared = output_alloc.index(0)
+    value_panels = (
+        shared_vectors.index(0).slice(2 * D + 0, 16, dim=0).load(value_layout),
+        shared_vectors.index(0).slice(2 * D + 16, 16, dim=0).load(value_layout),
+        shared_vectors.index(0).slice(2 * D + 32, 16, dim=0).load(value_layout),
+        shared_vectors.index(0).slice(2 * D + 48, 16, dim=0).load(value_layout),
+        shared_vectors.index(0).slice(2 * D + 64, 16, dim=0).load(value_layout),
+        shared_vectors.index(0).slice(2 * D + 80, 16, dim=0).load(value_layout),
+        shared_vectors.index(0).slice(2 * D + 96, 16, dim=0).load(value_layout),
+        shared_vectors.index(0).slice(2 * D + 112, 16, dim=0).load(value_layout),
     )
+    output_panels = (
+        output_shared.slice(0, 16, dim=0),
+        output_shared.slice(16, 16, dim=0),
+        output_shared.slice(32, 16, dim=0),
+        output_shared.slice(48, 16, dim=0),
+        output_shared.slice(64, 16, dim=0),
+        output_shared.slice(80, 16, dim=0),
+        output_shared.slice(96, 16, dim=0),
+        output_shared.slice(112, 16, dim=0),
+    )
+    output_squares = gl.zeros([16], gl.float32, layout=value_layout)
+    for panel_idx in gl.static_range(8):
+        cur_off = off_pipe[0]
+        cur_raw = raw_pipe[0]
+        running = cur_raw * decay[None, :]
+        prediction = gl.sum(running * k_value[None, :], axis=1)
+        prior_output = gl.sum(running * q_value[None, :], axis=1)
+        delta = beta_value * (value_panels[panel_idx] - prediction)
+        running += delta[:, None] * k_value[None, :]
+        panel_out = prior_output + delta * key_query
+        gl.store(
+            state_pool + write_base + cur_off,
+            running,
+            mask=valid_write,
+        )
+        output_panels[panel_idx].store(panel_out)
+        output_squares += panel_out * panel_out
 
-    inverse_rms = gl.rsqrt(gl.sum(out_value * out_value, axis=0) / D + NORM_EPS)
+        next_idx = panel_idx + PIPELINE_DEPTH
+        if next_idx < 8:
+            next_off = (panel_value_offsets[:, None] + next_idx * 16) * D + key_offsets[
+                None, :
+            ]
+            next_raw = gl.load(state_pool + read_base + next_off).to(gl.float32)
+            off_pipe = off_pipe[1:] + (next_off,)
+            raw_pipe = raw_pipe[1:] + (next_raw,)
+        else:
+            off_pipe = off_pipe[1:] + (off_pipe[-1],)
+            raw_pipe = raw_pipe[1:] + (raw_pipe[-1],)
+    output_sumsq = gl.sum(output_squares, axis=0)
+    gl.barrier()
+    out_value = output_shared.load(compact_layout)
+    inverse_rms = gl.rsqrt(output_sumsq / D + NORM_EPS)
     gate = gl.load(
-        output_gate + token_idx * OUTPUT_GATE_ROW_STRIDE + head_idx * D + value_offsets
+        output_gate
+        + token_idx * OUTPUT_GATE_ROW_STRIDE
+        + head_idx * D
+        + output_offsets,
     ).to(gl.float32)
-    weight = gl.load(norm_weight + value_offsets).to(gl.float32)
+    weight = gl.load(norm_weight + output_offsets).to(gl.float32)
     out_value *= inverse_rms * weight * (1.0 / (1.0 + gl.exp(-gate)))
-    gl.store(output + output_offsets, out_value.to(output.dtype.element_ty))
+    gl.store(
+        output + output_base + output_offsets,
+        out_value.to(output.dtype.element_ty),
+    )
 
 
 def gluon_kda_recurrent_decode_gfx1250(
@@ -429,7 +454,7 @@ def gluon_kda_recurrent_decode_gfx1250(
     cu_seqlens: torch.Tensor,
     lower_bound: float | None,
 ) -> torch.Tensor:
-    """Run one-token indexed KDA decode on a K-major recurrent-state pool."""
+    """Run one-token indexed KDA decode on a V-major recurrent-state pool."""
     tensors = (q, k, v, g_raw, beta_logits, A_log, dt_bias, state_pool)
     if not all(tensor.is_cuda for tensor in tensors):
         raise ValueError("gfx1250 Gluon KDA decode requires GPU tensors")
@@ -450,31 +475,40 @@ def gluon_kda_recurrent_decode_gfx1250(
         raise ValueError("beta_logits must have shape [1, batch, heads]")
     if cu_seqlens.ndim != 1 or cu_seqlens.numel() != tokens + 1:
         raise ValueError("cu_seqlens must contain one boundary per decode row")
-    expected_tail = (heads, key_dim, value_dim)
+    expected_tail = (heads, value_dim, key_dim)
     if state_pool.ndim != 4 or state_pool.shape[1:] != expected_tail:
         raise ValueError(
-            f"state_pool must have shape [pages, H, K, V] with tail {expected_tail}"
+            f"state_pool must have physical shape [pages, H, V, K] "
+            f"with tail {expected_tail}"
         )
-    expected_strides = (key_dim * value_dim, value_dim, 1)
+    expected_strides = (value_dim * key_dim, key_dim, 1)
     if state_pool.stride()[1:] != expected_strides:
-        raise ValueError("state_pool inner [H, K, V] dimensions must be contiguous")
+        raise ValueError("state_pool inner [H, V, K] dimensions must be contiguous")
     if state_pool.stride(0) < heads * key_dim * value_dim:
         raise ValueError("state_pool pages must not overlap")
     if A_log.shape != (heads,) or dt_bias.numel() != heads * key_dim:
         raise ValueError("invalid KDA gate parameter shapes")
+    expected_inner_strides = (
+        (q, key_dim),
+        (k, key_dim),
+        (g_raw, key_dim),
+        (v, value_dim),
+    )
+    if any(
+        tensor.stride(-1) != 1 or tensor.stride(-2) != width
+        for tensor, width in expected_inner_strides
+    ):
+        raise ValueError("KDA inputs must have contiguous head vectors")
+    if beta_logits.stride(-1) != 1:
+        raise ValueError("KDA beta logits must have contiguous heads")
 
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-    g_raw = g_raw.contiguous()
-    beta_logits = beta_logits.contiguous()
     A_log = A_log.contiguous()
     dt_bias = dt_bias.view(heads, key_dim).contiguous()
     read_indices = read_indices.to(device=q.device, dtype=torch.int32).contiguous()
     write_indices = write_indices.to(device=q.device, dtype=torch.int32).contiguous()
     cu_seqlens = cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
 
-    output = torch.empty_like(v)
+    output = torch.empty(v.shape, dtype=v.dtype, device=v.device)
     block_key = triton.next_power_of_2(key_dim)
     block_value = min(32, triton.next_power_of_2(value_dim))
     _kda_recurrent_decode_kernel[(triton.cdiv(value_dim, block_value), tokens * heads)](
@@ -493,6 +527,11 @@ def gluon_kda_recurrent_decode_gfx1250(
         H=heads,
         K=key_dim,
         V=value_dim,
+        Q_TOKEN_STRIDE=q.stride(1),
+        K_TOKEN_STRIDE=k.stride(1),
+        V_TOKEN_STRIDE=v.stride(1),
+        G_TOKEN_STRIDE=g_raw.stride(1),
+        BETA_TOKEN_STRIDE=beta_logits.stride(1),
         BK=block_key,
         BV=block_value,
         NUM_SLOTS=state_pool.shape[0],
@@ -545,8 +584,8 @@ def gluon_kda_fused_decode_gfx1250(
             ``[batch, num_heads * head_dim]``.
         norm_weight: Gated-RMSNorm weights with shape ``[head_dim]``.
         norm_eps: Gated-RMSNorm epsilon.
-        state_pool: Mutable FP32 recurrent state with shape
-            ``[pages, num_heads, head_dim, head_dim]``.
+        state_pool: Mutable FP32 recurrent state, physical shape
+            ``[pages, num_heads, head_dim(V), head_dim(K)]`` (V-major).
         read_indices: Source state page per batch row.
         write_indices: Destination state page per batch row.
         num_heads: Number of local heads; this specialization requires 12.
@@ -612,9 +651,7 @@ def gluon_kda_fused_decode_gfx1250(
         head_dim,
         head_dim,
     ):
-        raise ValueError(
-            "state_pool must have shape [pages, heads, head_dim, head_dim]"
-        )
+        raise ValueError("state_pool must have physical shape [pages, heads, V, K]")
     if state_pool.stride()[1:] != (head_dim * head_dim, head_dim, 1):
         raise ValueError("state_pool inner dimensions must be contiguous")
     if conv_states.shape[0] != state_pool.shape[0]:
@@ -637,7 +674,11 @@ def gluon_kda_fused_decode_gfx1250(
         dtype=mixed_qkv.dtype,
         device=mixed_qkv.device,
     )
-    _kda_fused_decode_kernel[(tokens * num_heads,)](
+    # Beyond one CTA per CU, reduce VGPR pressure to favor higher occupancy.
+    # Past two CTAs per CU the state reads saturate memory, so a shallower
+    # window trades prefetch distance for the occupancy that matters there.
+    pipeline_depth = 3 if num_heads * tokens > 2 * _GFX1250_NUM_CUS else 4
+    _kda_fused_decode_kernel[(num_heads, tokens)](
         mixed_qkv,
         conv_weights,
         conv_states,
@@ -668,6 +709,7 @@ def gluon_kda_fused_decode_gfx1250(
         HAS_LOWER_BOUND=lower_bound is not None,
         LOWER_BOUND=0.0 if lower_bound is None else lower_bound,
         NORM_EPS=norm_eps,
+        PIPELINE_DEPTH=pipeline_depth,
         num_warps=8,
         num_stages=2,
     )

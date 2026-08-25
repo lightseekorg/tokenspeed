@@ -51,7 +51,7 @@ ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
 
 # Spec-decode overshoot spans the physical KV extent must absorb past the
 # logical context_len. The overlap scheduler steps a finished request at most
-# ONE extra iteration (event_loop_overlap commits the previous step every
+# ONE extra iteration (the depth-1 event loop commits the previous step every
 # round, so the Finish event reaches the C++ scheduler before the next plan),
 # and termination is checked CPU-side against max_new_tokens, so verify can
 # commit past context_len for exactly that window:
@@ -171,15 +171,9 @@ class ServerArgs:
     enable_cache_report: bool = False
     kv_events_config: str | None = None
 
-    # RL online weight sync (always on / ungated). NOTE: these endpoints can
-    # overwrite model weights, reload checkpoints from disk, and pause/abort
-    # serving, and are exposed on the public control port. See
-    # runtime/engine/weight_transfer/ and runtime/entrypoints/vllm_compat_http.py.
-    weight_transfer_config: str | None = None
-    # Port for the in-engine RL control-plane HTTP app (weight sync + pause/resume
-    # + memory occupation, both the native and SGLang-compatible dialects). Set by
-    # the ``ts serve`` orchestrator (allocated + proxied by the sidecar); None
-    # disables the in-engine app.
+    # Port for the in-engine SGLang-compatible RL control app (weight sync,
+    # pause/resume, and memory occupation). Set by the ``ts serve`` orchestrator;
+    # None disables the in-engine app.
     rl_control_port: int | None = None
     # Version identifier for the model weights. Stamped into every generation
     # response's meta_info so RL trainers know which policy version produced each
@@ -189,6 +183,13 @@ class ServerArgs:
 
     # Data parallelism
     data_parallel_size: int | None = None
+    # Pipeline parallelism (prefill-only): number of stages. Only supported on
+    # PD-disaggregated prefill servers; see resolve_disaggregation.
+    pipeline_parallel_size: int = 1
+    # Optional explicit per-stage layer counts, front to back (e.g.
+    # "8,11,11,8"). Default None = even split, remainder to the front. Use to
+    # lighten the embed (first) and lm_head (last) stages.
+    pp_layer_partition: tuple[int, ...] | None = None
     load_balance_method: str = "shortest_queue"
     load_watch_interval: float = 0.02
 
@@ -564,6 +565,7 @@ class ServerArgs:
         world_size = self.world_size
         nprocs_per_node = self.nprocs_per_node
         nnodes = 1 if self.nnodes is None else self.nnodes
+        pp_size = self.pipeline_parallel_size
 
         attn_tp_size = self.attn_tp_size
         attn_dp_size = self.data_parallel_size
@@ -574,7 +576,7 @@ class ServerArgs:
             attn_cp_size, attn_tp_size = attn_tp_size, 1
 
         if world_size is None:
-            world_size = 1
+            world_size = pp_size
             if attn_tp_size is not None:
                 world_size *= attn_tp_size
             if attn_cp_size is not None:
@@ -582,17 +584,27 @@ class ServerArgs:
             if attn_dp_size is not None:
                 world_size *= attn_dp_size
             logger.info(
-                "Inferred world_size (%s) from attn_tp_size (%s) x attn_cp_size (%s) x attn_dp_size (%s)",
+                "Inferred world_size (%s) from attn_tp_size (%s) x attn_cp_size (%s) x attn_dp_size (%s) x pp_size (%s)",
                 world_size,
                 attn_tp_size,
                 attn_cp_size,
                 attn_dp_size,
+                pp_size,
             )
         else:
             logger.info("Specified world_size (%s)", world_size)
 
+        # Pipeline stages are the outermost split: every per-layer-type
+        # parallelism resolves inside one stage's world.
+        if world_size % pp_size != 0:
+            raise ValueError(
+                f"world_size ({world_size}) must be divisible by "
+                f"--pipeline-parallel-size ({pp_size})"
+            )
+        stage_world_size = world_size // pp_size
+
         attn_tp_size, attn_cp_size, attn_dp_size = _resolve_parallelism_sizes(
-            world_size, attn_tp_size, attn_cp_size, attn_dp_size
+            stage_world_size, attn_tp_size, attn_cp_size, attn_dp_size
         )
 
         # Dense layers default to the attention replica's TP width
@@ -606,16 +618,21 @@ class ServerArgs:
             dense_tp_size = attn_tp_size * attn_cp_size
         dense_dp_size = None
 
-        # --enable-expert-parallel auto-sets ep_size = world_size
+        # --enable-expert-parallel auto-sets ep_size = the stage world (the
+        # whole world when PP is off).
         if self.enable_expert_parallel and self.ep_size == 1:
-            self.ep_size = world_size
-            logger.info("--enable-expert-parallel: auto-setting ep_size=%s", world_size)
+            self.ep_size = stage_world_size
+            logger.info(
+                "--enable-expert-parallel: auto-setting ep_size=%s", stage_world_size
+            )
 
-        # MoE parallel sizes default to consuming the full world size unless
+        # MoE parallel sizes default to consuming the full stage world unless
         # the user overrides them explicitly.
         moe_ep_size = 1 if self.ep_size is None else self.ep_size
         moe_tp_size = (
-            world_size // moe_ep_size if self.moe_tp_size is None else self.moe_tp_size
+            stage_world_size // moe_ep_size
+            if self.moe_tp_size is None
+            else self.moe_tp_size
         )
         moe_dp_size = None
 
@@ -647,6 +664,8 @@ class ServerArgs:
             moe_dp_size=moe_dp_size,
             vision_tp_size=vision_tp_size,
             vision_dp_size=vision_dp_size,
+            pp_size=pp_size,
+            pp_layer_partition=self.pp_layer_partition,
             nprocs_per_node=nprocs_per_node,
             nnodes=nnodes,
             base_gpu_id=self.base_gpu_id,
@@ -750,6 +769,50 @@ class ServerArgs:
             )
 
     def resolve_disaggregation(self):
+        # Pipeline parallelism is a prefill-node-only capability: the chunk
+        # pipeline needs the P role's structural guarantees (no decode token
+        # feedback, eager execution, non-overlap loop).
+        if self.pipeline_parallel_size > 1:
+            # Debug escape hatch: run PP without PD to validate the stage
+            # pipeline numerically (prefill + first token only — decode
+            # autoregression is NOT correct with in-flight depth > 0).
+            pp_debug = os.environ.get("TS_PP_DEBUG_ALLOW_NON_PREFILL") == "1"
+            if self.disaggregation_mode != "prefill" and not pp_debug:
+                raise ValueError(
+                    "--pipeline-parallel-size > 1 requires "
+                    "--disaggregation-mode prefill; PP is a prefill-node "
+                    "chunk-pipeline feature"
+                )
+            if pp_debug and self.disaggregation_mode == "null":
+                logger.warning(
+                    "TS_PP_DEBUG_ALLOW_NON_PREFILL=1: running PP without PD "
+                    "for pipeline validation; only prefill/first-token output "
+                    "is meaningful"
+                )
+                self.enforce_eager = True
+            if self.mapping.has_attn_dp:
+                raise ValueError(
+                    "--pipeline-parallel-size > 1 with attention DP is not "
+                    "supported yet"
+                )
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "--pipeline-parallel-size > 1 does not support "
+                    "speculative decoding"
+                )
+            if (
+                self.pp_layer_partition is not None
+                and len(self.pp_layer_partition) != self.pipeline_parallel_size
+            ):
+                raise ValueError(
+                    f"--pp-layer-partition {self.pp_layer_partition} has "
+                    f"{len(self.pp_layer_partition)} entries but "
+                    f"--pipeline-parallel-size is {self.pipeline_parallel_size}"
+                )
+        elif self.pp_layer_partition is not None:
+            raise ValueError(
+                "--pp-layer-partition requires --pipeline-parallel-size > 1"
+            )
         # PD disaggregation
         if self.disaggregation_mode == "prefill":
             self.enforce_eager = True
@@ -982,6 +1045,7 @@ class ServerArgs:
                 "auto",
                 "pt",
                 "safetensors",
+                "instanttensor",
                 "npcache",
                 "dummy",
                 "extensible",
@@ -992,6 +1056,9 @@ class ServerArgs:
             "is not available. "
             '"pt" will load the weights in the pytorch bin format. '
             '"safetensors" will load the weights in the safetensors format. '
+            '"instanttensor" accelerates safetensors loading on NVIDIA GPUs '
+            "via distributed loading, pipelined prefetching, and direct I/O "
+            "(with optional GPUDirect Storage support). "
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values.',
@@ -1342,6 +1409,24 @@ class ServerArgs:
             help="The data parallelism size. If not set, inferred from world_size and attn_tp_size.",
         )
         parser.add_argument(
+            "--pipeline-parallel-size",
+            metavar="PIPELINE_PARALLEL_SIZE",
+            type=int,
+            default=ServerArgs.pipeline_parallel_size,
+            help="Number of pipeline stages for prefill chunk pipelining. "
+            "Only supported with --disaggregation-mode prefill.",
+        )
+        parser.add_argument(
+            "--pp-layer-partition",
+            metavar="PP_LAYER_PARTITION",
+            type=lambda arg: tuple(int(v) for v in arg.split(",")),
+            default=ServerArgs.pp_layer_partition,
+            help="Explicit per-stage layer counts for pipeline parallelism, "
+            'front to back, e.g. "8,11,11,8". Must have one entry per stage '
+            "and sum to the model's layer count. Default: even split with "
+            "the remainder on the front stages.",
+        )
+        parser.add_argument(
             "--load-balance-method",
             type=str,
             default=ServerArgs.load_balance_method,
@@ -1356,7 +1441,8 @@ class ServerArgs:
             "--load-watch-interval",
             type=float,
             default=ServerArgs.load_watch_interval,
-            help="The interval of load watching in seconds.",
+            help="Heartbeat compatibility interval for load snapshots in seconds. "
+            "Changed load values publish immediately without debounce.",
         )
 
         # Expert parallelism
@@ -2061,14 +2147,7 @@ class ServerArgs:
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
 
-        # RL online weight sync (always on / ungated).
-        parser.add_argument(
-            "--weight-transfer-config",
-            type=str,
-            default=ServerArgs.weight_transfer_config,
-            help='JSON config for weight transfer, e.g. \'{"backend":"nccl"}\'. '
-            "Backend is one of 'nccl' (disaggregated) or 'ipc' (colocated).",
-        )
+        # SGLang-compatible RL control app.
         parser.add_argument(
             "--rl-control-port",
             type=int,
@@ -2130,14 +2209,6 @@ class ServerArgs:
         """The frontend handshake endpoint dialed under ``--zmq-msgpack``,
         composed from ``--data-parallel-address``/``--data-parallel-rpc-port``."""
         return f"tcp://{self.data_parallel_address}:{self.data_parallel_rpc_port}"
-
-    def get_weight_transfer_config(self):
-        """Parse ``--weight-transfer-config`` JSON into a ``WeightTransferConfig``."""
-        from tokenspeed.runtime.engine.weight_transfer.config import (
-            WeightTransferConfig,
-        )
-
-        return WeightTransferConfig.from_json(self.weight_transfer_config)
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:

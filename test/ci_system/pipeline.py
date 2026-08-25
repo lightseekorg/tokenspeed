@@ -983,6 +983,10 @@ def summarize_command_output(command: str, output: str) -> Dict[str, Any]:
     if evalscope_perf_table:
         result["evalscope_perf_table"] = evalscope_perf_table
 
+    inspect_score = extract_inspect_score(output)
+    if inspect_score is not None:
+        result["inspect_score"] = inspect_score
+
     perf_summary_rows = extract_perf_summary_rows(output)
     if perf_summary_rows:
         result["perf_summary_rows"] = perf_summary_rows
@@ -995,6 +999,27 @@ _ACCEPT_RATE_RE = re.compile(r"\baccept_rate:\s*([0-9]+(?:\.[0-9]+)?)")
 
 def extract_accept_rates(output: str) -> List[float]:
     return [float(value) for value in _ACCEPT_RATE_RE.findall(output)]
+
+
+def parse_evalscope_score_cell(cell: str) -> float | None:
+    """Read one Score cell as a fraction of 1, or None when it is not a score.
+
+    evalscope reports the score as a bare fraction ("0.9667") up to 1.10 and
+    as a percentage ("96.67%") from 1.11. Both mean the same thing, and the
+    thresholds in the task configs are fractions, so normalize percentages
+    back to fractions here rather than teaching every caller two formats.
+    """
+    text = cell.strip()
+    if not text:
+        return None
+    percent = text.endswith("%")
+    if percent:
+        text = text[:-1].strip()
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value / 100.0 if percent else value
 
 
 def extract_evalscope_score(report_table: str) -> float | None:
@@ -1017,11 +1042,22 @@ def extract_evalscope_score(report_table: str) -> float | None:
             continue
         if score_index is None or len(cells) <= score_index:
             continue
-        try:
-            score = float(cells[score_index])
-        except ValueError:
-            continue
+        parsed = parse_evalscope_score_cell(cells[score_index])
+        if parsed is not None:
+            score = parsed
 
+    return score
+
+
+def extract_inspect_score(output: str) -> float | None:
+    score: float | None = None
+    for line in output.splitlines():
+        match = re.fullmatch(
+            r"\s*accuracy\s+([0-9]+(?:\.[0-9]+)?)\s*",
+            clean_log_line(line),
+        )
+        if match:
+            score = float(match.group(1))
     return score
 
 
@@ -1109,16 +1145,17 @@ def check_eval_score_threshold(
         )
         return None
 
-    scores = [
-        float(result["evalscope_score"])
-        for result in command_results
-        if "evalscope_score" in result
-    ]
+    scores = []
+    for result in command_results:
+        if result.get("stage") != "eval":
+            continue
+        for key in ("evalscope_score", "inspect_score"):
+            if key in result:
+                scores.append(float(result[key]))
+                break
     if not scores:
-        print("[eval-score] no evalscope score found in command output", flush=True)
-        raise ValueError(
-            "eval.score_threshold is configured but no evalscope score was found"
-        )
+        print("[eval-score] no eval score found in command output", flush=True)
+        raise ValueError("eval.score_threshold is configured but no score was found")
 
     score = scores[-1]
     min_score, max_score = parse_eval_score_threshold(threshold)
@@ -1415,6 +1452,8 @@ def build_step_summary_lines(result: Dict[str, Any]) -> List[str]:
                 lines.append(f"  failed files: `{', '.join(item['failed_files'])}`")
             if "evalscope_score" in item:
                 lines.append(f"  evalscope score: `{item['evalscope_score']:g}`")
+            if "inspect_score" in item:
+                lines.append(f"  inspect score: `{item['inspect_score']:g}`")
             if item.get("evalscope_report_table"):
                 lines.extend(
                     [

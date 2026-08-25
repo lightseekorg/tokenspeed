@@ -62,13 +62,10 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             layer_types=kwargs.get("layer_types", ()),
             sliding_window_tokens=kwargs.get("sliding_window_tokens"),
         )
-        kwargs.setdefault(
-            "layer_group_ids",
-            make_layer_group_ids(
-                layer_num=kwargs["layer_num"],
-                layer_types=kwargs.get("layer_types", ()),
-                sliding_window_tokens=kwargs.get("sliding_window_tokens"),
-            ),
+        group_ids = make_layer_group_ids(
+            layer_num=kwargs["layer_num"],
+            layer_types=kwargs.get("layer_types", ()),
+            sliding_window_tokens=kwargs.get("sliding_window_tokens"),
         )
         from cache_pool_test_utils import specs_for_layers
 
@@ -76,7 +73,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             "cache_group_specs",
             specs_for_layers(
                 layer_types=kwargs.get("layer_types", ()),
-                group_ids=kwargs["layer_group_ids"],
+                group_ids=group_ids,
                 sliding_window_tokens=kwargs.get("sliding_window_tokens"),
                 prefix_granularity=kwargs["prefix_granularity"],
             ),

@@ -79,12 +79,15 @@ DEFAULT_GRPC_MAX_MESSAGE_BYTES = "536870912"
 # which happens to share the "passthrough" string but configures an unrelated
 # flag (--reasoning-parser).
 DEFAULT_SMG_POLICY = "passthrough"
-# smg reliability knobs we always want disabled when launched under
-# ts serve. These are tokenspeed-internal defaults: not surfaced via
-# the ts CLI, not routed through split_argv.
+# smg reliability and background load-monitoring knobs we always want disabled
+# when launched under ts serve. These are tokenspeed-internal defaults: not
+# surfaced via the ts CLI, not routed through split_argv. This is independent
+# from the routing policy below: disabling load monitoring stops smg's
+# background engine-load polling.
 _DEFAULT_SMG_DISABLE_FLAGS = (
     "--disable-circuit-breaker",
     "--disable-retries",
+    "--disable-load-monitoring",
 )
 
 
@@ -161,7 +164,7 @@ def _gateway_args_with_default_reasoning_parser(gateway_args: list[str]) -> list
 
 
 def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str]:
-    """Append the smg reliability-disable switches if they are not already there."""
+    """Append smg reliability and load-monitoring disable switches when absent."""
     result = list(gateway_args)
     for flag in _DEFAULT_SMG_DISABLE_FLAGS:
         if flag not in result:
@@ -178,7 +181,8 @@ def _gateway_args_with_default_policy(gateway_args: list[str]) -> list[str]:
     Against engines that predate that RPC the subscription surfaced as
     ``NotImplementedError: Method not implemented`` (smg#1794). The ``passthrough``
     policy (smg#1797) forwards every request to the single healthy worker with no
-    load balancing, load monitoring, or KV-event subscription.
+    load-aware routing or KV-event subscription. Separately,
+    ``--disable-load-monitoring`` turns off smg's background engine-load polling.
 
     Default-when-unset: an explicit operator ``--policy`` is preserved.
 

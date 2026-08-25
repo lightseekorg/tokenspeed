@@ -203,9 +203,15 @@ def print_target(repo: Path, source_pr: str | None, test_commit: str) -> None:
     url = source_pr_url(source_pr)
     if url is not None:
         print(f"Link: {url}", flush=True)
-    print(f"Target commit: {git(repo, 'rev-parse', 'HEAD^2')}", flush=True)
+    try:
+        target_commit = git(repo, "rev-parse", "HEAD^2")
+        base_commit = git(repo, "rev-parse", "HEAD^1")
+    except subprocess.CalledProcessError:
+        print(f"Target commit: {test_commit}", flush=True)
+        return
+    print(f"Target commit: {target_commit}", flush=True)
     print(f"Merged test commit: {test_commit}", flush=True)
-    print(f"Base commit: {git(repo, 'rev-parse', 'HEAD^1')}", flush=True)
+    print(f"Base commit: {base_commit}", flush=True)
 
 
 @contextlib.contextmanager
@@ -271,13 +277,16 @@ def snapshot(repo: Path, artifact_root: Path, commit: str) -> Path:
         raise ValueError("commit tracked changes before submitting")
     target = artifact_root / "snapshots" / f"{commit}.tar"
     target.parent.mkdir(parents=True, exist_ok=True)
-    if not target.exists():
-        temporary = target.with_suffix(f".{os.getpid()}.tmp")
-        subprocess.run(
-            ["git", "-C", str(repo), "archive", f"--output={temporary}", commit],
-            check=True,
-        )
-        temporary.replace(target)
+    handle, temporary_name = tempfile.mkstemp(
+        dir=target.parent, prefix=f"{commit}.", suffix=".tmp"
+    )
+    os.close(handle)
+    temporary = Path(temporary_name)
+    subprocess.run(
+        ["git", "-C", str(repo), "archive", f"--output={temporary}", commit],
+        check=True,
+    )
+    temporary.replace(target)
     return target
 
 
@@ -328,7 +337,17 @@ def render_script(
         "SLURM_PROCID,SLURM_LOCALID",
     ]
     gpu_device_mounts = ""
+    local_model_mounts = ""
     if task.runner.startswith(("gb300-", "slurm-gb300-")):
+        local_model_mounts = r"""
+# GB300 nodes keep large model snapshots on their local RAID.  Keep the
+# source configurable for other coordinators while exposing one stable path
+# to server containers.
+local_model_root="${TS_CI_LOCAL_MODEL_ROOT:-/scratch/${USER}-models}"
+if [ -d "$local_model_root" ]; then
+  model_mounts+=("$local_model_root:/models:ro")
+fi
+"""
         gpu_device_mounts = r"""
 # The GB300 Pyxis hook does not expose allocated device nodes.
 gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"
@@ -386,8 +405,10 @@ mounts=(
   "$run:/workspace/.ci-artifacts"
   {shlex.quote(str(cache) + ":/home/runner/.cache")}
 )
+model_mounts=()
 gpu_mounts=()
 
+{local_model_mounts}
 {gpu_device_mounts}
 
 # The cluster Pyxis hooks omit driver libraries and tools.
@@ -429,7 +450,7 @@ nvidia_smi="$(command -v nvidia-smi 2>/dev/null || true)"
 trap 'rm -rf -- "$scratch"' EXIT
 mkdir -p "$src/.ci-artifacts" "$tmp"
 tar -xf "$source_archive" -C "$src"
-mounts=("$src:/workspace" "$tmp:/tmp" "${{gpu_mounts[@]}}" "${{mounts[@]}}")
+mounts=("$src:/workspace" "$tmp:/tmp" "${{gpu_mounts[@]}}" "${{model_mounts[@]}}" "${{mounts[@]}}")
 container_mounts="$(IFS=,; printf '%s' "${{mounts[*]}}")"
 {shell_array("srun_args", srun)}
 srun_args+=(--container-mounts="$container_mounts")
@@ -518,7 +539,7 @@ client_src="$scratch/client-src"
 server_tmp="$scratch/server-tmp"
 client_tmp="$scratch/client-tmp"
 # Full-node server allocations use the same GPU device IDs on every node.
-server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" "${{gpu_mounts[@]}}" "${{mounts[@]}}")
+server_mounts=("$server_src:/workspace" "$server_tmp:/tmp" "${{gpu_mounts[@]}}" "${{model_mounts[@]}}" "${{mounts[@]}}")
 client_mounts=("$client_src:/workspace" "$client_tmp:/tmp" "${{mounts[@]}}")
 server_container_mounts="$(IFS=,; printf '%s' "${{server_mounts[*]}}")"
 client_container_mounts="$(IFS=,; printf '%s' "${{client_mounts[*]}}")"
@@ -789,12 +810,15 @@ def result_detail(path: Path) -> str:
     for command_result in reversed(command_results):
         if not isinstance(command_result, dict):
             continue
-        score = command_result.get("evalscope_score")
-        if score is not None:
-            try:
-                return f"score={float(score):g}"
-            except (TypeError, ValueError):
-                continue
+        if command_result.get("stage") != "eval":
+            continue
+        for key in ("evalscope_score", "inspect_score"):
+            score = command_result.get(key)
+            if score is not None:
+                try:
+                    return f"score={float(score):g}"
+                except (TypeError, ValueError):
+                    continue
     if command_results and command_results[-1].get("pytest_summary"):
         return str(command_results[-1]["pytest_summary"])
     return str(data.get("error", ""))
@@ -986,7 +1010,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         action="append",
         help="Exclude a case-insensitive task/config/model substring; repeat for OR.",
     )
-    parser.add_argument("--pr", help="PR number or GitHub pull request URL to merge.")
+    pull_request = parser.add_mutually_exclusive_group()
+    pull_request.add_argument(
+        "--pr", help="PR number or GitHub pull request URL to merge."
+    )
+    pull_request.add_argument(
+        "--source-pr",
+        help="PR number or GitHub pull request URL for the current checkout.",
+    )
     parser.add_argument("--list", action="store_true", help="List matching tasks only.")
     parser.add_argument(
         "--trigger", choices=("per-commit", "manual", "nightly", "debug", "slurm")
@@ -1030,7 +1061,8 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
         print_tasks(tasks)
         return 0
     commit = git(repo, "rev-parse", "HEAD")
-    print_target(repo, args.pr, commit)
+    source_pr = args.pr or args.source_pr
+    print_target(repo, source_pr, commit)
     print(f"Selected tasks: {len(tasks)}", flush=True)
     for task in tasks:
         print(
@@ -1062,7 +1094,7 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
             else artifact_root / "reports" / f"{commit[:12]}-{time.time_ns()}"
         )
         completed = wait_all(
-            submitted, artifact_root / "runs", report_dir, source_pr=args.pr
+            submitted, artifact_root / "runs", report_dir, source_pr=source_pr
         )
         print(f"Report: {report_dir}", flush=True)
         return 0 if completed else 1

@@ -197,8 +197,11 @@ class ModelRunner:
         multimodal_context: MultimodalForwardContext | None = None,
         spec_step_idx: int | None = None,
         kv_sync_event: "torch.cuda.Event | None" = None,
+        pp_inbound=None,
     ) -> LogitsProcessorOutput:
         kwargs = {}
+        if pp_inbound is not None:
+            kwargs["pp_inbound"] = pp_inbound
         if req_pool_indices is not None:
             kwargs["req_pool_indices"] = req_pool_indices
         if seq_lens is not None:

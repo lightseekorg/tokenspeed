@@ -430,14 +430,23 @@ if platform.is_amd:
             topk_ids,
             w.w13_weight_triton_tensor,
             w.w2_weight_triton_tensor,
-            w13_bias=getattr(w, "w13_weight_bias", None),
-            w2_bias=getattr(w, "w2_weight_bias", None),
+            w13_bias=(
+                None
+                if getattr(w, "_gluon_w13_bias_is_zero", False)
+                else getattr(w, "w13_weight_bias", None)
+            ),
+            w2_bias=(
+                None
+                if getattr(w, "_gluon_w2_bias_is_zero", False)
+                else getattr(w, "w2_weight_bias", None)
+            ),
             w13_mx_scale=w13_precision_config.b_mx_scale,
             w2_mx_scale=w2_precision_config.b_mx_scale,
             out_dtype=w2_precision_config.out_dtype or torch.bfloat16,
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
             swiglu_beta=swiglu_beta,
+            out=getattr(w, "_situ_output_buffer", None),
         )
 
     @register_kernel(

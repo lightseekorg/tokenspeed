@@ -36,6 +36,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
     CacheGroupSpec,
     compute_cache_group_page_counts,
     group,
@@ -114,8 +115,8 @@ class CacheRecipe(ABC):
             spec=CachePoolSpec(
                 family=self.family,
                 memory_plan=layout.bind(num_lcm_blocks),
-                layer_types=self.layer_types,
-                layer_group_ids=self.group_ids,
+                layer_types=self.layer_types
+                or (FULL_ATTENTION,) * (self.num_target_layers + self.num_draft_layers),
                 # The same declarations the layout was packed from, so plan and
                 # specs cannot name different groups.
                 cache_group_specs=tuple(spec for spec, _ in groups),
@@ -133,8 +134,8 @@ class CacheRecipe(ABC):
     #
     # Subclasses mark every seam they fill with @override, so a renamed or
     # mistyped seam fails type checking instead of silently falling back to
-    # the default below. The two abstract seams are the exception: ABC
-    # already refuses to instantiate a subclass that misses them.
+    # the default below. The abstract seam is the exception: ABC already
+    # refuses to instantiate a subclass that misses it.
     # ------------------------------------------------------------------
 
     @property
@@ -143,9 +144,18 @@ class CacheRecipe(ABC):
         """Per-layer cache-group label, target layers then draft layers."""
 
     @property
-    @abstractmethod
     def group_ids(self) -> tuple[str, ...]:
-        """Per-layer cache group id, target layers then draft layers."""
+        """Per-layer cache group id, target layers then draft layers.
+
+        Only the default per-layer :meth:`groups` walk consumes this seam:
+        it is the storage policy "layer i's fields go to group_ids[i]".
+        Families that override :meth:`groups` wholesale express that policy
+        directly in their field declarations and need not implement it.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} uses the default per-layer groups() walk "
+            "but does not define group_ids"
+        )
 
     @property
     def num_target_layers(self) -> int:

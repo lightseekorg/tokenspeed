@@ -128,3 +128,36 @@ def test_state_pages_matches_reference():
     assert torch.equal(state_out[:BS], ref_out.int())
     assert (state_in[BS:] == -1).all()
     assert (state_out[BS:] == -1).all()
+
+
+def test_filltail_writes_int64_buffers():
+    """Graph input buffers that index a request pool are int64; a tail written
+    as int32 would leave every other 4 bytes of the pair stale."""
+    dst = torch.arange(16, dtype=torch.int64, device="cuda")
+    before = dst.clone()
+    tape = PrepTape("cuda")
+    tape.filltail(dst, Reg.BS, 16, -7)
+    tape.finalize()
+    tape.run({Reg.BS: 5})
+    assert torch.equal(dst[:5], before[:5])
+    assert dst[5:].tolist() == [-7] * 11
+    assert dst.dtype == torch.int64
+
+
+def test_filltail_int32_and_int64_share_one_launch():
+    """Mixed widths must coexist in a stage: that is what the input buffers are."""
+    a = torch.zeros(12, dtype=torch.int32, device="cuda")
+    b = torch.zeros(12, dtype=torch.int64, device="cuda")
+    tape = PrepTape("cuda")
+    tape.filltail(a, Reg.BS, 12, 3)
+    tape.filltail(b, Reg.BS, 12, 1 << 40)
+    tape.finalize()
+    tape.run({Reg.BS: 4})
+    assert a.tolist() == [0] * 4 + [3] * 8
+    assert b.tolist() == [0] * 4 + [1 << 40] * 8
+
+
+def test_filltail_rejects_a_width_it_cannot_address():
+    tape = PrepTape("cuda")
+    with pytest.raises(TypeError):
+        tape.filltail(torch.zeros(4, dtype=torch.int16, device="cuda"), Reg.BS, 4, 0)

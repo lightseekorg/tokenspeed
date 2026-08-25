@@ -21,8 +21,8 @@
 """Two-shot MNNVL AR fusion: token-sharded reduce (owner reduces its shard and
 multicasts the pre-epilogue sum; every rank re-runs the deterministic epilogue).
 
-Covers what the one-shot suite cannot: token counts above
-``MNNVL_ONESHOT_MAX_TOKEN``, the one-shot/two-shot dispatch boundary, agreement
+Covers what the one-shot suite cannot: token counts above the byte-based
+one-shot threshold, the one-shot/two-shot dispatch boundary, agreement
 between the two paths, cross-rank bitwise identity of the epilogue, repeated
 launches (Lamport 3-slot rotation), and CUDA-graph capture/replay.
 
@@ -43,7 +43,7 @@ import torch
 import torch.distributed as dist
 
 H, EPS = 7168, 1e-6
-# Must cover >128 tokens; the workspace is sized for this many.
+# Covers the full two-shot range and forced one-shot comparisons.
 MAXTOK = 2048
 
 
@@ -159,7 +159,7 @@ def _ref_allreduce(x):
 # --------------------------------------------------------------------------
 @pytest.mark.parametrize("token_num", [129, 256, 1024, 2048])
 def test_twoshot_plain_allreduce_matches_nccl(token_num):
-    """Above the one-shot cap the kernel must still equal a NCCL all-reduce."""
+    """Above the one-shot traffic threshold, two-shot must still match NCCL."""
     from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
 
     ctx = _skip_unless_mnnvl()
@@ -178,23 +178,68 @@ def test_twoshot_plain_allreduce_matches_nccl(token_num):
 
 
 def test_dispatch_boundary_oneshot_vs_twoshot():
-    """128 (one-shot) and 129 (two-shot) must agree with the same reference."""
-    from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
+    """Shapes on either side of the traffic boundary match NCCL."""
+    from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+        MNNVL_ONESHOT_BYTES,
+        AllReduceFusionPattern,
+        _mnnvl_should_use_oneshot,
+    )
 
     ctx = _skip_unless_mnnvl()
-    for token_num in (128, 129):
+    boundary = MNNVL_ONESHOT_BYTES // (H * ctx["world"] * 2)
+    assert boundary > 0
+    for token_num in (boundary, boundary + 1):
+        use_oneshot = _mnnvl_should_use_oneshot(token_num, H, 2, ctx["world"])
+        assert use_oneshot == (token_num == boundary)
         x = _inputs(token_num, ctx["dev"], ctx["rank"], seed=3)
         out = torch.empty_like(x)
         _ar(
             ctx["mnnvl"],
             x,
             token_num,
-            use_oneshot=token_num <= 128,
+            use_oneshot=use_oneshot,
             pattern_code=AllReduceFusionPattern.kAllReduce,
             pattern_kwargs=dict(allreduce_out=out),
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(out.float(), _ref_allreduce(x), atol=3e-2, rtol=3e-2)
+
+
+def test_forced_strategies_agree_at_same_token_count():
+    """The device must honor use_oneshot instead of recomputing dispatch."""
+    from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
+
+    ctx = _skip_unless_mnnvl()
+    token_num = min(4, ctx["mnnvl"].oneshot_token_cap)
+    assert token_num > 0
+    x = _inputs(token_num, ctx["dev"], ctx["rank"], seed=5)
+    outputs = []
+    recorded_stages = []
+    for use_oneshot in (True, False):
+        out = torch.empty_like(x)
+        _ar(
+            ctx["mnnvl"],
+            x,
+            token_num,
+            use_oneshot=use_oneshot,
+            pattern_code=AllReduceFusionPattern.kAllReduce,
+            pattern_kwargs=dict(allreduce_out=out),
+        )
+        torch.cuda.synchronize()
+        outputs.append(out)
+        recorded_stages.append(int(ctx["mnnvl"].buffer_flags[3].item()))
+    assert recorded_stages == [1, 2]
+    torch.testing.assert_close(outputs[0], outputs[1], atol=3e-2, rtol=3e-2)
+
+
+def test_workspace_dispatch_cap_is_frozen(monkeypatch):
+    """A later environment change cannot enlarge an existing one-shot lane."""
+    ctx = _skip_unless_mnnvl()
+    workspace = ctx["mnnvl"]
+    monkeypatch.setenv("TOKENSPEED_MNNVL_ONESHOT_BYTES", str(1 << 40))
+    assert workspace.resolve_use_oneshot(workspace.oneshot_token_cap, None)
+    assert not workspace.resolve_use_oneshot(workspace.oneshot_token_cap + 1, None)
+    assert not workspace.resolve_use_oneshot(workspace.oneshot_token_cap + 1, True)
 
 
 # --------------------------------------------------------------------------

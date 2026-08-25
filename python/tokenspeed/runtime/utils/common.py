@@ -192,18 +192,45 @@ class LayerFn(Protocol):
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
 
+class PPMissingLayer(torch.nn.Identity):
+    """Placeholder for a layer owned by another pipeline stage.
+
+    Keeps global layer numbering intact (KV field names, weight names, and
+    ``layer_id`` all stay global) while contributing no parameters, so the
+    weight loader's skip-unknown semantics leave it untouched.
+    """
+
+
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
     prefix: str = "",
+    pp_start_layer: int = 0,
+    pp_end_layer: int | None = None,
 ) -> torch.nn.ModuleList:
-    """Make a list of layers with the given layer function"""
-    start_layer = 0
-    end_layer = num_hidden_layers
+    """Make a list of layers with the given layer function.
+
+    Args:
+        num_hidden_layers: Total layer count of the model (all stages).
+        layer_fn: Factory called with the GLOBAL layer index.
+        prefix: Parameter-name prefix.
+        pp_start_layer: First global layer index this pipeline stage owns.
+        pp_end_layer: One past the last owned layer; None means all layers.
+
+    Returns:
+        A ModuleList of length ``num_hidden_layers`` where positions outside
+        [pp_start_layer, pp_end_layer) hold :class:`PPMissingLayer`.
+    """
+    if pp_end_layer is None:
+        pp_end_layer = num_hidden_layers
     modules = torch.nn.ModuleList(
         [
-            layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-            for idx in range(start_layer, end_layer)
+            (
+                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                if pp_start_layer <= idx < pp_end_layer
+                else PPMissingLayer()
+            )
+            for idx in range(num_hidden_layers)
         ]
     )
     return modules

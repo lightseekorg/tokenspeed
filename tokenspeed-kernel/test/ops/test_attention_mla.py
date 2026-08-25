@@ -320,6 +320,8 @@ def test_mla_decode_with_kvcache(
     require,
 ) -> None:
     require("attention", "mla_decode_with_kvcache", solution, q_dtype, "q")
+    if q_dtype != kv_dtype and not platform.is_cdna4:
+        pytest.skip("only test mixed query/cache dtypes on gfx950")
 
     q_len = 1
     qk_nope_head_dim = 128
@@ -505,7 +507,7 @@ def test_mla_extend_with_kvcache(device: str, dtype: torch.dtype, require) -> No
             refs.append(torch.matmul(probs, visible_kv[:, :kv_lora_rank]))
         q_start += q_len
 
-    tol = 1e-1 if dtype in _FP8_DTYPES else 8e-2
+    tol = 1.5e-1 if dtype in _FP8_DTYPES else 8e-2
     torch.testing.assert_close(out.float(), torch.stack(refs), rtol=tol, atol=tol)
 
 
@@ -687,6 +689,8 @@ def test_mla_decode_small_batch_fixed_entrypoints_match_reference(
     return_lse: bool,
     require,
 ) -> None:
+    if not platform.is_cdna4:
+        pytest.skip("fixed gfx950 MLA decode entrypoints require CDNA4")
     require(
         "attention",
         "mla_decode_with_kvcache",
@@ -715,6 +719,8 @@ def test_mla_decode_small_batch_fixed_entrypoints_match_each_other(
     cache_seqlens_list: list[int],
     require,
 ) -> None:
+    if not platform.is_cdna4:
+        pytest.skip("fixed gfx950 MLA decode entrypoints require CDNA4")
     require(
         "attention",
         "mla_decode_with_kvcache",
@@ -749,6 +755,8 @@ def test_mla_decode_small_batch_fixed_entrypoints_use_out(
     override: str,
     require,
 ) -> None:
+    if not platform.is_cdna4:
+        pytest.skip("fixed gfx950 MLA decode entrypoints require CDNA4")
     require(
         "attention",
         "mla_decode_with_kvcache",

@@ -27,36 +27,16 @@ import logging
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel import fp8_linear, prepare_fp8_linear
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_block_quant_fp8,
     per_token_group_quant_fp8,
     per_token_quant_fp8,
     static_quant_fp8,
-    swizzle_mxfp8_scale,
 )
 from torch.nn.parameter import Parameter
 
 logger = logging.getLogger(__name__)
-
-try:
-    from tokenspeed_kernel.thirdparty.deep_gemm import ceil_to_ue8m0 as _ceil_to_ue8m0
-    from tokenspeed_kernel.thirdparty.deep_gemm import (
-        transform_sf_into_required_layout as _transform_sf,
-    )
-except ImportError:
-    _ceil_to_ue8m0 = None
-    _transform_sf = None
-
-try:
-    from tokenspeed_kernel.ops.gemm.flashinfer import (
-        has_flashinfer_fp8_blockscale,
-        has_flashinfer_mxfp8,
-        prepare_flashinfer_fp8_blockscale_weight_scales,
-    )
-except ImportError:
-    has_flashinfer_fp8_blockscale = None
-    has_flashinfer_mxfp8 = None
-    prepare_flashinfer_fp8_blockscale_weight_scales = None
 
 from tokenspeed.runtime.layers.parameter import (
     BlockQuantScaleParameter,
@@ -220,110 +200,24 @@ class Fp8LinearMethod(LinearMethodBase):
                     "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
                 )
                 layer.input_scale = None
-            layer._use_deep_gemm_fp8 = False
-            layer._use_flashinfer_fp8_blockscale = False
-            is_bmm = getattr(layer, "is_bmm", False)
-            is_ue8m0 = getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
-            scale_requires_transform = (
-                is_ue8m0 and layer.weight_scale_inv.dtype.is_floating_point
+            grouped_output_projection_plan = getattr(
+                layer, "_dsv4_grouped_output_projection_plan", None
             )
-            if (
-                _transform_sf is not None
-                and _ceil_to_ue8m0 is not None
-                and scale_requires_transform
-            ):
-                N, K = layer.weight.shape
-                block_n, block_k = self.quant_config.weight_block_size
-                if is_bmm:
-                    # Grouped (batched) projection (V4 attention wo_a, weight
-                    # [groups * n, K], consumed per group as [n, K]). Transform
-                    # the block scale into the deep_gemm MN-major layout with the
-                    # group axis so deep_gemm.fp8_einsum("bhr,hdr->bhd") runs the
-                    # output projection as one native FP8 GEMM (no FP32 dequant).
-                    # recipe is (1, block_n, block_k) at load; the runtime einsum
-                    # uses (1, 1, block_n) on SM100.
-                    g = layer.bmm_batch_size
-                    n = N // g
-                    if n % block_n == 0 and K % block_k == 0:
-                        sf = _ceil_to_ue8m0(layer.weight_scale_inv.data).view(
-                            g, n // block_n, K // block_k
-                        )
-                        layer.weight_scale_inv.data = _transform_sf(
-                            sf=sf,
-                            mn=n,
-                            k=K,
-                            recipe=(1, block_n, block_k),
-                            num_groups=g,
-                            is_sfa=False,
-                        )
-                        layer._deep_gemm_block_size = [block_n, block_k]
-                        layer._use_deep_gemm_fp8 = True
-                elif N % 64 == 0 and K % 128 == 0:
-                    sf = _ceil_to_ue8m0(layer.weight_scale_inv.data)
-                    layer.weight_scale_inv.data = _transform_sf(
-                        sf=sf,
-                        mn=N,
-                        k=K,
-                        recipe=(1, block_n, block_k),
-                        is_sfa=False,
+            if grouped_output_projection_plan is not None:
+                layer.weight_scale_inv.data = (
+                    tokenspeed_kernel.dsv4_grouped_output_projection_process_weights(
+                        grouped_output_projection_plan,
+                        layer.weight.data,
+                        layer.weight_scale_inv.data,
                     )
-                    layer._use_deep_gemm_fp8 = True
-            if is_bmm and not layer._use_deep_gemm_fp8:
-                # The is_bmm runtime path (DeepSeek-V4 o_proj) has no FP32
-                # fallback, so fail fast at load with a clear message instead of
-                # a cryptic AttributeError on the first forward.
-                raise RuntimeError(
-                    "is_bmm weight requires the deep_gemm FP8 block-scale path "
-                    "but it could not be prepared (deep_gemm_available="
-                    f"{_transform_sf is not None}, ue8m0={is_ue8m0}, "
-                    f"weight={tuple(layer.weight.shape)}); ensure FP8 block-quant "
-                    "ue8m0 weights with block-aligned dims and deep_gemm installed."
                 )
-            layer._use_flashinfer_mxfp8 = False
-            if (
-                not layer._use_deep_gemm_fp8
-                and not is_bmm
-                and has_flashinfer_mxfp8 is not None
-                and has_flashinfer_mxfp8()
-                and tuple(self.quant_config.weight_block_size) == (1, 32)
-                and layer.weight_scale_inv.dtype == torch.uint8
-                and layer.weight_scale_inv.dim() == 2
-            ):
-                N, K = layer.weight.shape
-                if N >= 128 and K >= 128 and K % 32 == 0:
-                    # Swizzle the e8m0 scales once into the F8_128x4 layout the
-                    # flashinfer cute-dsl GEMM consumes; the Triton fallback
-                    # cannot read this layout, so apply() pins the kernel.
-                    layer.weight_scale_inv.data = swizzle_mxfp8_scale(
-                        layer.weight_scale_inv.data, N, K
-                    )
-                    layer._use_flashinfer_mxfp8 = True
-            if (
-                not layer._use_deep_gemm_fp8
-                and not layer._use_flashinfer_mxfp8
-                and not is_bmm
-                and has_flashinfer_fp8_blockscale is not None
-                and has_flashinfer_fp8_blockscale()
-                and prepare_flashinfer_fp8_blockscale_weight_scales is not None
-                and tuple(self.quant_config.weight_block_size) == (128, 128)
-                and layer.weight_scale_inv.dtype == torch.float32
-                and layer.weight_scale_inv.dim() == 2
-            ):
-                N, K = layer.weight.shape
-                if N % 128 == 0 and K % 128 == 0:
-                    prepared_scales = prepare_flashinfer_fp8_blockscale_weight_scales(
-                        layer.weight_scale_inv.data
-                    )
-                    buffer_name = "_flashinfer_fp8_weight_scales_mn"
-                    if buffer_name in layer._buffers:
-                        layer._buffers[buffer_name] = prepared_scales
-                    else:
-                        layer.register_buffer(
-                            buffer_name,
-                            prepared_scales,
-                            persistent=False,
-                        )
-                    layer._use_flashinfer_fp8_blockscale = True
+                return
+            layer._prepared_fp8_linear = prepare_fp8_linear(
+                layer.weight.data,
+                layer.weight_scale_inv.data,
+                self.quant_config.weight_block_size,
+                scale_format=getattr(self.quant_config, "scale_fmt", None),
+            )
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -389,36 +283,30 @@ class Fp8LinearMethod(LinearMethodBase):
             input_2d = x.view(-1, x.shape[-1])
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
             output_dtype = output_dtype or x.dtype
-
-            if getattr(layer, "_use_deep_gemm_fp8", False):
-                override = "deep_gemm_mm_fp8_blockscale"
-            elif getattr(layer, "_use_flashinfer_mxfp8", False):
-                override = "flashinfer_mm_mxfp8"
-            elif (
-                getattr(layer, "_use_flashinfer_fp8_blockscale", False)
-                and block_scale is None
-            ):
-                override = "flashinfer_mm_fp8_blockscale"
+            plan = getattr(layer, "_prepared_fp8_linear", None)
+            if plan is None:
+                output = tokenspeed_kernel.mm(
+                    input_2d,
+                    layer.weight,
+                    A_scales=block_scale,
+                    B_scales=layer.weight_scale_inv,
+                    bias=bias,
+                    out_dtype=output_dtype,
+                    quant="mxfp8",
+                    block_size=self.quant_config.weight_block_size,
+                    enable_pdl=pdl_enabled(),
+                )
             else:
-                override = None
-            use_flashinfer_fp8_blockscale = override == "flashinfer_mm_fp8_blockscale"
-            output = tokenspeed_kernel.mm(
-                input_2d,
-                layer.weight,
-                A_scales=block_scale,
-                B_scales=(
-                    layer._flashinfer_fp8_weight_scales_mn
-                    if use_flashinfer_fp8_blockscale
-                    else layer.weight_scale_inv
-                ),
-                bias=bias,
-                out_dtype=output_dtype,
-                quant="mxfp8",
-                block_size=self.quant_config.weight_block_size,
-                override=override,
-                enable_pdl=pdl_enabled(),
-                prepacked_scales=use_flashinfer_fp8_blockscale,
-            )
+                output = fp8_linear(
+                    plan,
+                    input_2d,
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    input_scales=block_scale,
+                    bias=bias,
+                    out_dtype=output_dtype,
+                    enable_pdl=pdl_enabled(),
+                )
             return output.to(dtype=output_dtype).view(*output_shape)
         else:
             input = x
@@ -451,3 +339,28 @@ class Fp8LinearMethod(LinearMethodBase):
             if bias is not None:
                 output = output + bias
             return output.view(*output_shape)
+
+    def apply_with_activation(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        activation: torch.nn.Module,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        plan = getattr(layer, "_prepared_fp8_linear", None)
+        prepare_activation = getattr(activation, "prepare_for_fp8_linear", None)
+        if self.block_quant and plan is not None and prepare_activation is not None:
+            prepared = prepare_activation(x, plan)
+            if prepared is not None:
+                values, scales = prepared
+                return self.apply(
+                    layer,
+                    values,
+                    bias=bias,
+                    block_scale=scales,
+                    output_dtype=x.dtype,
+                )
+        return super().apply_with_activation(layer, x, activation, bias)
+
+    def prepared_linear_plan(self, layer: torch.nn.Module) -> object | None:
+        return getattr(layer, "_prepared_fp8_linear", None)

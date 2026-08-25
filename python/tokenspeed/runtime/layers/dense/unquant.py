@@ -21,6 +21,8 @@
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.gemm.routed_gemv import decode_gemv_routed
+from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
@@ -62,6 +64,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
 
+        if bias is None and decode_gemv_routed(x, layer.weight):
+            return decode_gemv(x, layer.weight)
         return tokenspeed_kernel.mm(
             x,
             layer.weight,

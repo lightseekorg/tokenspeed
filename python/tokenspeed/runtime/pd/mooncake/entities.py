@@ -58,6 +58,20 @@ class KVArgs:
     gpu_id: int
     cache_layout: CacheTransferContract
     cache_producer_schedule: CacheProducerSchedule | None = None
+    # Prefill chunk-pipeline: this rank's [start, end) global layer window.
+    # None when PP is off (the rank owns every layer).
+    pp_layer_window: tuple[int, int] | None = None
+    # Full-model logical contract for the PD wire when the local arena/plan
+    # is narrowed to a stage window; None means cache_layout is already it.
+    wire_cache_layout: CacheTransferContract | None = None
+
+    @property
+    def wire_layout(self) -> CacheTransferContract:
+        return (
+            self.wire_cache_layout
+            if self.wire_cache_layout is not None
+            else self.cache_layout
+        )
 
 
 class KVTransferError(Exception):

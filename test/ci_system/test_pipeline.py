@@ -14,6 +14,7 @@ from pipeline import (
     configure_slurm_server_command,
     ensure_ready_port_available,
     extract_evalscope_score,
+    extract_inspect_score,
     extract_perf_summary_rows,
     filter_stage_commands,
     format_perf_reference_markdown_table,
@@ -580,6 +581,39 @@ def test_extract_evalscope_score_from_box_table():
     assert extract_evalscope_score(report_table) == 0.9667
 
 
+def test_extract_evalscope_score_from_percentage_table():
+    """evalscope 1.11 renames the metric and reports Score as a percentage."""
+    report_table = """
+┌─────────────────┬───────────┬────────────┬──────────┬───────┬─────────┬─────────┐
+│ Model           │ Dataset   │ Metric     │ Subset   │   Num │   Score │ Cat.0   │
+├─────────────────┼───────────┼────────────┼──────────┼───────┼─────────┼─────────┤
+│ Kimi-K3         │ aime25    │ Accuracy ↑ │ default  │    30 │   93.3% │ default │
+└─────────────────┴───────────┴────────────┴──────────┴───────┴─────────┴─────────┘
+"""
+
+    assert extract_evalscope_score(report_table) == pytest.approx(0.933)
+
+
+def test_extract_evalscope_score_ignores_non_numeric_cells():
+    report_table = """
+| Model   | Dataset | Metric     | Subset  | Num | Score | Cat.0   |
+|---------|---------|------------|---------|-----|-------|---------|
+| Kimi-K3 | aime25  | Accuracy ↑ | default | 30  | n/a   | default |
+"""
+
+    assert extract_evalscope_score(report_table) is None
+
+
+def test_extract_inspect_score_from_accuracy_summary():
+    output = """
+ocrbench_scorer
+accuracy         0.890
+stderr           0.010
+"""
+
+    assert extract_inspect_score(output) == 0.89
+
+
 PERF_CSV_FIXTURE = """\
 some unrelated log line
 config,Conc.,Latency (tps/user),Throughput (tps/gpu),Approx Cache Hit,Decoded Tok/Iter
@@ -793,6 +827,28 @@ def test_check_eval_score_threshold_still_supports_scalar():
     assert check is not None
     assert check["passed"] is True
     assert check["min"] == 0.7
+
+
+def test_check_eval_score_threshold_supports_inspect_score():
+    task = {"score_threshold": 0.89}
+    results = [{"stage": "eval", "inspect_score": 0.891}]
+    check = check_eval_score_threshold(task, results, ["eval"], "b200-2gpu")
+
+    assert check is not None
+    assert check["passed"] is True
+    assert check["score"] == 0.891
+
+
+def test_check_eval_score_threshold_ignores_non_eval_inspect_score():
+    task = {"score_threshold": 0.89}
+    results = [
+        {"stage": "eval.install", "inspect_score": 0.99},
+        {"stage": "eval", "inspect_score": 0.891},
+    ]
+    check = check_eval_score_threshold(task, results, ["eval"], "b200-2gpu")
+
+    assert check is not None
+    assert check["score"] == 0.891
 
 
 def _write_task_yaml(tmp_path: Path, filename: str, body: str) -> Path:

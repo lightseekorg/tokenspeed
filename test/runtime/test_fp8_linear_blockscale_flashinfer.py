@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.gemm.flashinfer import has_flashinfer_fp8_blockscale
 from torch.nn.parameter import Parameter
 
-from tokenspeed.runtime.layers.dense.fp8 import (
-    Fp8LinearMethod,
-    has_flashinfer_fp8_blockscale,
-)
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 
 pytestmark = pytest.mark.skipif(
@@ -53,26 +50,13 @@ def test_process_weights_prepares_and_uses_native_scales(m: int) -> None:
 
     method.process_weights_after_loading(layer)
 
-    assert layer._use_flashinfer_fp8_blockscale
-    assert not layer._use_deep_gemm_fp8
-    assert not layer._use_flashinfer_mxfp8
+    assert method.prepared_linear_plan(layer) is not None
     assert torch.equal(layer.weight_scale_inv, canonical_scales)
-    assert torch.equal(
-        layer._flashinfer_fp8_weight_scales_mn,
-        canonical_scales.transpose(0, 1).contiguous(),
-    )
-    assert "_flashinfer_fp8_weight_scales_mn" not in layer.state_dict()
 
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     prepared = method.apply(layer, x)
-    reference = tokenspeed_kernel.mm(
-        x,
-        layer.weight,
-        B_scales=layer._flashinfer_fp8_weight_scales_mn,
-        out_dtype=torch.bfloat16,
-        quant="mxfp8",
-        block_size=[128, 128],
-        override="flashinfer_mm_fp8_blockscale",
-        prepacked_scales=True,
-    )
-    torch.testing.assert_close(prepared, reference, atol=5e-4, rtol=2e-3)
+    dequant = layer.weight.float() * canonical_scales.repeat_interleave(
+        128, dim=0
+    ).repeat_interleave(128, dim=1)
+    reference = x.float() @ dequant.t()
+    torch.testing.assert_close(prepared.float(), reference, atol=2e-1, rtol=5e-2)

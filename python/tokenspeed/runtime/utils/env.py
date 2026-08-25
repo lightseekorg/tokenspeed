@@ -283,6 +283,12 @@ class Envs:
     # EPLB
     TOKENSPEED_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
 
+    # Communication
+    # InfiniBand traffic class for NVSHMEM (DeepEP all-to-all). Read in every
+    # inference process entry so the value reaches NVSHMEM regardless of how
+    # the process was spawned; unset leaves NVSHMEM's own default in place.
+    NVSHMEM_IB_TRAFFIC_CLASS = EnvInt(None)
+
     # Runtime behavior
     TOKENSPEED_WORKSPACE_INITIAL_MB = EnvInt(256)
     TOKENSPEED_WORKSPACE_TRTLLM_MHA_MB = EnvInt(512)

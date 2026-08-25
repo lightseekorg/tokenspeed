@@ -89,7 +89,7 @@ def _inputs(rank, dev, m, seed):
     return routed, shared, rms_w, up_w
 
 
-@pytest.mark.parametrize("m", [1, 4, 5, 6, 16])
+@pytest.mark.parametrize("m", [1, 4, 5, 6, 16, 64])
 def test_latent_tail_matches_reference(m):
     from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
 
@@ -146,6 +146,70 @@ def test_latent_tail_graph_replay():
         scale = ref.float().abs().max().item()
         err = (out.float() - ref.float()).abs().max().item()
         assert err < 0.05 * max(scale, 1.0), f"seed={seed}: err {err}"
+
+
+@pytest.mark.parametrize("m", [9, 64])
+def test_latent_tail_split_collective_multistream_graph_replay(m):
+    """Prepared shared shards remain accurate and fresh across graph replays."""
+    from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
+
+    rank, dev = _setup()
+    _require_latent_tail()
+    control = KimiK3LatentTailOp.initialize(
+        group=dist.group.WORLD,
+        hidden_size=H,
+        latent_size=L,
+        rms_eps=EPS,
+        device=dev,
+        layer_index=0,
+        model_scope="test-split-control",
+    )
+    split = KimiK3LatentTailOp.initialize(
+        group=dist.group.WORLD,
+        hidden_size=H,
+        latent_size=L,
+        rms_eps=EPS,
+        device=dev,
+        layer_index=0,
+        model_scope="test-split-candidate",
+        split_collective=True,
+    )
+    routed, shared, rms_w, up_w = _inputs(rank, dev, m, seed=400 + m)
+    auxiliary = torch.cuda.Stream(device=dev)
+
+    def split_call():
+        main = torch.cuda.current_stream(dev)
+        auxiliary.wait_stream(main)
+        with torch.cuda.stream(auxiliary):
+            prepared = split.reduce_scatter_shared(shared, rms_w)
+        main.wait_stream(auxiliary)
+        return split(
+            routed,
+            shared,
+            rms_w,
+            up_w,
+            prepared_shared_shard=prepared,
+        )
+
+    for _ in range(3):
+        split_call()
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = split_call()
+
+    for seed in range(500, 508):
+        torch.manual_seed(seed + rank)
+        routed.copy_(torch.randn_like(routed) * 0.1)
+        shared.copy_(torch.randn_like(shared) * 0.1)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = control(routed, shared, rms_w, up_w)
+        torch.cuda.synchronize()
+        scale = expected.float().abs().max().item()
+        err = (actual.float() - expected.float()).abs().max().item()
+        assert err < 0.02 * max(scale, 1.0), f"seed={seed}: err {err}"
 
 
 @pytest.mark.parametrize("m", [1, 4, 6, 8, 16])
