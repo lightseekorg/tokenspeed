@@ -27,6 +27,7 @@ until the HCA/CSA cache kernels are wired into TokenSpeed.
 
 from __future__ import annotations
 
+import gc
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -35,7 +36,6 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel import (
     NoKernelFoundError,
-    create_device_stream,
     dsa_decode_topk,
     dsa_prefill_topk,
     dsv4_grouped_output_projection,
@@ -62,9 +62,6 @@ from tokenspeed_kernel import (
 from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed_kernel import mhc_post as fast_mhc_post
 from tokenspeed_kernel import mhc_pre as fast_mhc_pre
-from tokenspeed_kernel import (
-    release_device_memory_cache,
-)
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -3539,7 +3536,7 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_eps = config.hc_eps
         self.rms_norm_eps = config.rms_norm_eps
-        self.aux_stream = create_device_stream()
+        self.aux_stream = torch.cuda.Stream()
         self.topk_indices_buffer = _DeepseekV4TopKBuffer(int(config.index_topk))
         # Pipeline stage layer window: [pp_start_layer, pp_end_layer). Global
         # layer numbering everywhere; other stages' slots hold PPMissingLayer.
@@ -3897,7 +3894,8 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
 
     def warmup_kernels(self) -> None:
         """Warm selected DSV4 kernels after model weights are loaded."""
-        release_device_memory_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
         for module in self.modules():
             if isinstance(module, DeepseekV4MegaMoEExperts):
                 module.warmup()
