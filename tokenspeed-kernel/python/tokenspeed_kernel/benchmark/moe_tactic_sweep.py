@@ -180,14 +180,19 @@ def _candidate_tactics(args) -> list[tuple[int, int]]:
     return list(seen)
 
 
-def _run(args, W, tokens, tactic_setter, tactic, iters):
+def _run(args, W, tokens, tactic_setter, tactic, iters, do_finalize=True):
     from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from flashinfer.tllm_enums import ActivationType
 
     x_q, x_scale, topk_ids, topk_weights = tokens
     w13, w13_scale, w2, w2_scale = W
-    output = torch.zeros(
-        x_q.shape[0], args.hidden_size, dtype=torch.bfloat16, device=x_q.device
+    # The cache key carries the output shape, so the modes need separate sweeps.
+    output = (
+        torch.zeros(
+            x_q.shape[0], args.hidden_size, dtype=torch.bfloat16, device=x_q.device
+        )
+        if do_finalize
+        else None
     )
     alpha = torch.full(
         (args.local_experts,), args.situ_alpha, dtype=torch.float32, device=x_q.device
@@ -223,7 +228,7 @@ def _run(args, W, tokens, tactic_setter, tactic, iters):
             local_num_experts=args.local_experts,
             routed_scaling_factor=None,
             routing_method_type=1,
-            do_finalize=True,
+            do_finalize=do_finalize,
             enable_pdl=False,
             activation_type=10,  # ActivationType.Situ; probed at startup
             tune_max_num_tokens=SITU_TUNE_MAX_NUM_TOKENS,
@@ -281,6 +286,17 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_SWEEP_MIN_BUCKET,
         help="Sweep buckets >= this; smaller buckets keep the autotuner's pick",
     )
+    parser.add_argument(
+        "--finalize-modes",
+        default="both",
+        choices=("both", "finalize", "deferred"),
+        help=(
+            "Which finalize modes to sweep. The autotuner keys on the output "
+            "tensor's shape, so a table swept only with do_finalize=True "
+            "misses every deferred-finalize call (K3 decode, where the MoE "
+            "tail owns finalize)"
+        ),
+    )
     parser.add_argument("--coarse-iters", type=int, default=8)
     parser.add_argument("--fine-iters", type=int, default=50)
     args = parser.parse_args(argv)
@@ -306,81 +322,97 @@ def main(argv: list[str] | None = None) -> int:
         args.local_experts, args.hidden_size, args.intermediate_size, device, seed=1
     )
 
-    # One native autotune pass materializes every bucket's cache entry (with
-    # the tuner's own picks -- kept for buckets below --min-bucket) under the
-    # exact key layout the runtime will look up.
-    tuner = AutoTuner.get()
-    tokens_max = _make_tokens(
-        SITU_TUNE_MAX_NUM_TOKENS,
-        args.hidden_size,
-        args.num_experts,
-        args.top_k,
-        device,
-        seed=2,
+    modes = (
+        (True, False)
+        if args.finalize_modes == "both"
+        else (True,) if args.finalize_modes == "finalize" else (False,)
     )
-    with autotune():
-        _run(args, W, tokens_max, lambda _: None, None, iters=1)
-
-    bucket_keys = {}
-    for key, (_tac, profile) in tuner.profiling_cache.items():
-        if profile is None:
-            continue
-        bucket_keys[int(profile.get_opt_shapes()[0][0])] = (key, profile)
-    print(f"materialized buckets: {sorted(bucket_keys)}")
-
+    tuner = AutoTuner.get()
     candidates = _candidate_tactics(args)
     families = sorted({t for t, _ in candidates})
     print(f"candidate tactics: {len(candidates)} across tile_N families {families}")
 
-    for bucket in sorted(b for b in bucket_keys if b >= args.min_bucket):
-        key, profile = bucket_keys[bucket]
-        native_tactic = tuner.profiling_cache[key][0]
+    for do_finalize in modes:
+        label = "finalize" if do_finalize else "deferred"
+        print(f"--- sweeping do_finalize={do_finalize} ({label}) ---")
+        seen = set(tuner.profiling_cache)
 
-        def set_tactic(tac, key=key, profile=profile):
-            if tac is not None:
-                tuner.profiling_cache[key] = (tuple(tac), profile)
-
-        tokens = _make_tokens(
-            bucket,
+        # One native pass materializes every bucket under the runtime's key layout.
+        tokens_max = _make_tokens(
+            SITU_TUNE_MAX_NUM_TOKENS,
             args.hidden_size,
             args.num_experts,
             args.top_k,
             device,
-            seed=100 + bucket,
+            seed=2,
         )
+        with autotune():
+            _run(
+                args,
+                W,
+                tokens_max,
+                lambda _: None,
+                None,
+                iters=1,
+                do_finalize=do_finalize,
+            )
 
-        # Stage 1: a few configs per family picks the family (<3% intra-family
-        # spread measured); stage 2 refines within the winner.
-        stage1: list[tuple[float, tuple[int, int]]] = []
-        for family in families:
-            for tac in [t for t in candidates if t[0] == family][
-                :STAGE1_CONFIGS_PER_FAMILY
-            ]:
-                stage1.append(
-                    (_run(args, W, tokens, set_tactic, tac, args.coarse_iters), tac)
+        bucket_keys = {}
+        for key, (_tac, profile) in tuner.profiling_cache.items():
+            if profile is None or key in seen:
+                continue
+            bucket_keys[int(profile.get_opt_shapes()[0][0])] = (key, profile)
+        print(f"materialized buckets ({label}): {sorted(bucket_keys)}")
+
+        for bucket in sorted(b for b in bucket_keys if b >= args.min_bucket):
+            key, profile = bucket_keys[bucket]
+            native_tactic = tuner.profiling_cache[key][0]
+
+            def set_tactic(tac, key=key, profile=profile):
+                if tac is not None:
+                    tuner.profiling_cache[key] = (tuple(tac), profile)
+
+            tokens = _make_tokens(
+                bucket,
+                args.hidden_size,
+                args.num_experts,
+                args.top_k,
+                device,
+                seed=100 + bucket,
+            )
+
+            def run(tac, iters):
+                return _run(
+                    args, W, tokens, set_tactic, tac, iters, do_finalize=do_finalize
                 )
-        best_family = min(stage1)[1][0]
 
-        stage2 = [
-            (_run(args, W, tokens, set_tactic, tac, args.coarse_iters), tac)
-            for tac in [t for t in candidates if t[0] == best_family][
-                :STAGE2_MAX_CONFIGS
+            # Stage 1 picks the tile_N family, stage 2 refines within it.
+            stage1: list[tuple[float, tuple[int, int]]] = []
+            for family in families:
+                for tac in [t for t in candidates if t[0] == family][
+                    :STAGE1_CONFIGS_PER_FAMILY
+                ]:
+                    stage1.append((run(tac, args.coarse_iters), tac))
+            best_family = min(stage1)[1][0]
+
+            stage2 = [
+                (run(tac, args.coarse_iters), tac)
+                for tac in [t for t in candidates if t[0] == best_family][
+                    :STAGE2_MAX_CONFIGS
+                ]
             ]
-        ]
-        finalists = sorted(stage2)[:3] + [min(stage1)]
-        timed = [
-            (_run(args, W, tokens, set_tactic, tac, args.fine_iters), tac)
-            for _, tac in finalists
-        ]
-        native_time = _run(args, W, tokens, set_tactic, native_tactic, args.fine_iters)
-        best_time, best_tactic = min(timed)
-        if native_time <= best_time:
-            best_time, best_tactic = native_time, tuple(native_tactic)
-        set_tactic(best_tactic)
-        print(
-            f"bucket {bucket:>5}: tactic {best_tactic} {best_time:7.1f}us "
-            f"(native {tuple(native_tactic)} {native_time:7.1f}us)"
-        )
+            finalists = sorted(stage2)[:3] + [min(stage1)]
+            timed = [(run(tac, args.fine_iters), tac) for _, tac in finalists]
+            native_time = run(native_tactic, args.fine_iters)
+            best_time, best_tactic = min(timed)
+            if native_time <= best_time:
+                best_time, best_tactic = native_time, tuple(native_tactic)
+            set_tactic(best_tactic)
+            print(
+                f"bucket {bucket:>5} ({label}): tactic {best_tactic} "
+                f"{best_time:7.1f}us (native {tuple(native_tactic)} "
+                f"{native_time:7.1f}us)"
+            )
 
     tuner.save_configs(output)
     # Round-trip guard: a table this process cannot re-load would be useless

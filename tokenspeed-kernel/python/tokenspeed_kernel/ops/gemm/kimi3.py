@@ -26,7 +26,11 @@ KIMI3_HIDDEN_SIZE = 7168
 KIMI3_LATENT_SIZE = 3584
 KIMI3_QKVFAB_SIZE = 6288
 KIMI3_ROUTER_SIZE = 896
+from tokenspeed_kernel.ops.gemm.routed_gemv import decode_gemv_routed
+
 KIMI3_SHARED_LOCAL_SIZE = 768
+
+
 KIMI3_SHARED_GATE_UP_LOCAL_SIZE = 2 * KIMI3_SHARED_LOCAL_SIZE
 _KIMI3_SHAPES = {
     (KIMI3_HIDDEN_SIZE, KIMI3_LATENT_SIZE),
@@ -49,6 +53,10 @@ def _use_gluon_mediumm(m: int, k: int, n: int) -> bool:
     if (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE):
         return 384 <= m <= 512 and m % 64 == 0
     return False
+
+
+def _use_gluon_smallm(m: int, k: int, n: int) -> bool:
+    return m in (2, 4) and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
 
 
 def _use_gluon_largem(m: int, k: int, n: int) -> bool:
@@ -276,10 +284,11 @@ def kimi3_latent_projection(
 
     ``solution='torch'`` uses the vendor BLAS selected by PyTorch;
     ``solution='triton_gemv'`` forces the decode kernel,
+    ``solution='gluon_smallm'`` forces the split-K small-M gfx950 kernel,
     ``solution='gluon_mediumm'`` forces the middle-M gfx950 kernel, and
-    ``solution='gluon_largem'`` forces the large-M gfx950 kernel. ``auto`` uses
-    their measured gfx950 crossovers for canonical K3 shapes and retains the
-    vendor GEMM for other shapes and architectures.
+    ``solution='gluon_largem'`` forces the large-M gfx950 kernel. ``auto``
+    uses their measured gfx950 crossovers for canonical K3 shapes and retains
+    the vendor GEMM for other shapes and architectures.
     """
 
     m, n, k = _validate_fallback_projection(
@@ -292,6 +301,7 @@ def kimi3_latent_projection(
         "auto",
         "torch",
         "triton_gemv",
+        "gluon_smallm",
         "gluon_mediumm",
         "gluon_largem",
     }:
@@ -304,9 +314,12 @@ def kimi3_latent_projection(
         and weight.is_contiguous()
         and (k, n) in _KIMI3_SHAPES
     )
+    routed = solution == "auto"
     if solution == "auto":
         if Platform.get().is_cdna4 and specialized and m == 1:
             solution = "triton_gemv"
+        elif Platform.get().is_cdna4 and specialized and _use_gluon_smallm(m, k, n):
+            solution = "gluon_smallm"
         elif Platform.get().is_cdna4 and specialized and _use_gluon_mediumm(m, k, n):
             solution = "gluon_mediumm"
         elif Platform.get().is_cdna4 and specialized and _use_gluon_largem(m, k, n):
@@ -324,6 +337,17 @@ def kimi3_latent_projection(
             weight,
             out=out,
             validate=False,
+        )
+    if solution == "gluon_smallm":
+        from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+            gluon_mm_a16w16_mfma_lds_smallm_gfx950,
+        )
+
+        return gluon_mm_a16w16_mfma_lds_smallm_gfx950(
+            hidden_states,
+            weight,
+            hidden_states.dtype,
+            out=out,
         )
     if solution == "gluon_mediumm":
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
@@ -352,6 +376,10 @@ def kimi3_latent_projection(
                 "Kimi K3 Gluon latent projection requires an aligned large-M shape"
             )
         return output
+    if routed and decode_gemv_routed(hidden_states, weight):
+        from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+
+        return decode_gemv(hidden_states, weight, out)
     if out is None:
         return torch.nn.functional.linear(hidden_states, weight)
     return torch.mm(hidden_states, weight.T, out=out)
@@ -482,7 +510,20 @@ def kimi3_latent_projection_add3(
         if (
             solution == "auto"
             and Platform.get().is_cdna4
-            and m == 1
+            and 3 <= m <= 16
+            and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
+            and specialized
+        ):
+            from tokenspeed_kernel.ops.activation.triton import add3
+            from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
+
+            normalized = rmsnorm(hidden_states, norm_weight, eps)
+            projected = torch.nn.functional.linear(normalized, weight)
+            return add3(prefix, projected, shared_output)
+        if (
+            solution == "auto"
+            and Platform.get().is_cdna4
+            and m <= 2
             and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
             and specialized
         ):
@@ -623,6 +664,7 @@ def kimi3_shared_situ_projection(
         )
     if solution not in {"auto", "triton_gemv", "torch"}:
         raise ValueError(f"unknown Kimi K3 shared SiTU solution {solution!r}")
+    routed = solution == "auto"
     specialized = (
         hidden_states.is_cuda
         and hidden_states.dtype == torch.bfloat16
@@ -661,7 +703,12 @@ def kimi3_shared_situ_projection(
         )
         return out
 
-    gate_up = torch.nn.functional.linear(hidden_states, gate_up_weight)
+    if routed and decode_gemv_routed(hidden_states, gate_up_weight):
+        from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+
+        gate_up = decode_gemv(hidden_states, gate_up_weight)
+    else:
+        gate_up = torch.nn.functional.linear(hidden_states, gate_up_weight)
     if gate_up.is_cuda:
         from tokenspeed_kernel.ops.activation import situ_and_mul
 
@@ -720,8 +767,13 @@ def kimi3_shared_down_projection(
         and input_width == KIMI3_SHARED_LOCAL_SIZE
         and output_width == KIMI3_HIDDEN_SIZE
     )
+    routed = solution == "auto"
     if solution == "auto":
         solution = "triton_gemv" if Platform.get().is_cdna4 and specialized else "torch"
+    if routed and decode_gemv_routed(hidden_states, weight):
+        from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+
+        return decode_gemv(hidden_states, weight, out)
     if solution == "triton_gemv":
         if not specialized:
             raise ValueError(
@@ -1014,14 +1066,14 @@ def kimi3_router_projection(
 __all__ = [
     "KIMI3_HIDDEN_SIZE",
     "KIMI3_LATENT_SIZE",
-    "Kimi3MLAQKVGateProjection",
     "KIMI3_QKVFAB_SIZE",
     "KIMI3_ROUTER_SIZE",
     "KIMI3_SHARED_GATE_UP_LOCAL_SIZE",
     "KIMI3_SHARED_LOCAL_SIZE",
+    "Kimi3MLAQKVGateProjection",
     "kimi3_latent_projection",
-    "kimi3_mla_qkv_gate_projection",
     "kimi3_latent_projection_add3",
+    "kimi3_mla_qkv_gate_projection",
     "kimi3_qkvfab_projection",
     "kimi3_router_projection",
     "kimi3_shared_down_projection",

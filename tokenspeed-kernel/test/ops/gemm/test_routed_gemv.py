@@ -249,3 +249,67 @@ def test_unlisted_shapes_keep_the_generic_selection():
     assert "torch" in getattr(impl, "__name__", "")
     impl = _select(1, 2304, 1536, True)
     assert "rowcta" in getattr(impl, "__name__", "")
+
+
+@pytest.mark.parametrize("m", [1, 2, 4])
+def test_shared_projections_route_and_match_torch(m):
+    """The K3 shared gate_up/down call sites take the measured route on
+    covered shapes and stay bit-compatible with the torch composition."""
+    from tokenspeed_kernel.ops.gemm.kimi3 import (
+        kimi3_shared_down_projection,
+        kimi3_shared_situ_projection,
+    )
+
+    torch.manual_seed(m)
+    x = torch.randn(m, 7168, device="cuda", dtype=torch.bfloat16)
+    gate_up_w = torch.randn(1536, 7168, device="cuda", dtype=torch.bfloat16)
+    act = kimi3_shared_situ_projection(x, gate_up_w, beta=4.0, linear_beta=25.0)
+    ref = kimi3_shared_situ_projection(
+        x, gate_up_w, beta=4.0, linear_beta=25.0, solution="torch"
+    )
+    torch.testing.assert_close(act, ref, atol=5e-2, rtol=2e-2)
+
+    y = torch.randn(m, 768, device="cuda", dtype=torch.bfloat16)
+    down_w = torch.randn(7168, 768, device="cuda", dtype=torch.bfloat16)
+    got = kimi3_shared_down_projection(y, down_w)
+    want = kimi3_shared_down_projection(y, down_w, solution="torch")
+    torch.testing.assert_close(got, want, atol=5e-2, rtol=2e-2)
+
+
+def test_forced_torch_solution_is_not_routed():
+    """solution="torch" must stay the vendor-BLAS baseline even for shapes the
+    measured route covers, or A/B comparisons silently measure the route."""
+    from unittest.mock import patch
+
+    from tokenspeed_kernel.ops.gemm import kimi3
+
+    x = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
+    latent_w = torch.randn(3584, 7168, device="cuda", dtype=torch.bfloat16)
+    down_w = torch.randn(7168, 768, device="cuda", dtype=torch.bfloat16)
+    y = torch.randn(1, 768, device="cuda", dtype=torch.bfloat16)
+
+    with patch(
+        "tokenspeed_kernel.ops.gemm.triton_gemv.decode_gemv",
+        side_effect=AssertionError("forced torch path must not route"),
+    ):
+        kimi3.kimi3_latent_projection(x, latent_w, solution="torch")
+        kimi3.kimi3_shared_down_projection(y, down_w, solution="torch")
+
+
+def test_route_predicate_admits_the_registered_arch_floor():
+    """MEASURED_ROUTE registers at sm100 and documents a GB200 re-sweep, so the
+    predicate must not gate on ADD3_ROUTE's stricter sm103 floor."""
+    from unittest.mock import patch
+
+    from tokenspeed_kernel.ops.gemm import routed_gemv
+
+    x = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(3584, 7168, device="cuda", dtype=torch.bfloat16)
+    nvidia = type("P", (), {"vendor": "nvidia"})()
+    for capability, expected in (((10, 0), True), ((9, 0), False)):
+        routed_gemv._is_routed_arch.cache_clear()
+        with patch("torch.cuda.get_device_capability", return_value=capability), patch(
+            "tokenspeed_kernel.platform.current_platform", return_value=nvidia
+        ):
+            assert routed_gemv.decode_gemv_routed(x, w) is expected
+    routed_gemv._is_routed_arch.cache_clear()

@@ -64,7 +64,6 @@ from tokenspeed.runtime.engine.io_struct import (
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GenerateReqInput,
-    GetLoadReqInput,
     HealthCheckOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
@@ -72,8 +71,8 @@ from tokenspeed.runtime.engine.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
-    WatchLoadUpdateReq,
 )
+from tokenspeed.runtime.engine.load_snapshot import LoadSnapshotStore
 from tokenspeed.runtime.engine.output_processor import OutputProcessor, ReqState
 from tokenspeed.runtime.engine.parallel_sampling import (
     prepare_parallel_sampling_replica,
@@ -187,6 +186,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.model_update_lock = RWLock()
         self.model_update_result: Awaitable[UpdateWeightFromDiskReqOutput] | None = None
         self.asyncio_tasks = set()
+        self.load_snapshot_store = LoadSnapshotStore(server_args.mapping.attn.dp_size)
 
         # Frontend admission barrier paired with the scheduler's native pause.
         # It prevents requests buffered by a paused scheduler from holding the
@@ -582,20 +582,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
     async def close_session(self, obj: CloseSessionReqInput) -> None:
         await self.engine_core_client.send_to_scheduler.send_pyobj(obj)
 
-    async def watch_load_thread(self):
-        # Only for dp_controller when dp_size > 1
-        if (
-            not self.server_args.mapping.attn.has_dp
-            or self.server_args.load_balance_method == "round_robin"
-        ):
-            return
-
-        while True:
-            await asyncio.sleep(self.server_args.load_watch_interval)
-            loads = await self.get_load_communicator(GetLoadReqInput())
-            load_udpate_req = WatchLoadUpdateReq(loads=loads)
-            self.engine_core_client.send_to_scheduler.send_pyobj(load_udpate_req)
-
     def get_log_request_metadata(self):
         max_length = None
         skip_names = None
@@ -693,7 +679,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
         self.asyncio_tasks.add(
-            loop.create_task(print_exception_wrapper(self.watch_load_thread))
+            loop.create_task(print_exception_wrapper(self.load_snapshot_loop))
         )
 
     def _maybe_launch_rl_control_plane(self, loop):

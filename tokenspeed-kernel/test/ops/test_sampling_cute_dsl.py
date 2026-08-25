@@ -50,7 +50,7 @@ requires_nvidia = pytest.mark.skipif(
 # Vocab sizes for the models tokenspeed actively serves — same list as
 # ``tmp/integrate_cutedsl_argmax/bench_argmax.py::DEFAULT_N``.
 MODEL_VOCABS = {
-    "deepseek_v4": 129280,
+    "dsv4": 129280,
     "qwen3_5": 151936,
     "kimi_k2_5": 163840,
     "minimax_m2": 200064,
@@ -74,7 +74,7 @@ def _need_cuda():
 _KERNEL_M_VALUES = [1, 4, 16, 64, 128]
 _KERNEL_SHAPES = [(m, n) for n in MODEL_VOCABS.values() for m in _KERNEL_M_VALUES] + [
     # Asymmetric M values to catch row-tail edge cases the powers-of-two miss.
-    (37, MODEL_VOCABS["deepseek_v4"]),
+    (37, MODEL_VOCABS["dsv4"]),
     (199, MODEL_VOCABS["qwen3_5"]),
 ]
 
@@ -95,7 +95,7 @@ def test_argmax_matches_torch_for_kernel_shapes(M, N):
 @pytest.mark.parametrize(
     "M,N",
     [
-        (1, MODEL_VOCABS["deepseek_v4"]),
+        (1, MODEL_VOCABS["dsv4"]),
         (16, MODEL_VOCABS["qwen3_5"]),
         (64, MODEL_VOCABS["kimi_k2_5"]),
         (4, MODEL_VOCABS["minimax_m2"]),
@@ -218,7 +218,7 @@ def test_argmax_falls_back_when_cute_unavailable(monkeypatch):
 
     # argmax: should match torch.argmax across kernel-eligible and ineligible shapes.
     for shape in [
-        (4, MODEL_VOCABS["deepseek_v4"]),
+        (4, MODEL_VOCABS["dsv4"]),
         (1, MODEL_VOCABS["gpt_oss"]),
         (8, 257),
     ]:
@@ -363,7 +363,7 @@ def test_argmax_mtp_pattern():
     within the same process) to keep this test fast — the row pattern is what's
     being verified, not the vocab size."""
     _need_cuda()
-    N = MODEL_VOCABS["deepseek_v4"]
+    N = MODEL_VOCABS["dsv4"]
     x = torch.full((1, N), -100.0, device="cuda", dtype=torch.float32)
     x[0, 1] = 0.0
     out = cute_argmax(x)
@@ -381,7 +381,7 @@ def test_argmax_writes_into_caller_buffer(out_dtype):
     """Caller-provided int32 / int64 buffer: kernel writes indices directly,
     no post-kernel cast on the hot path."""
     _need_cuda()
-    M, N = 8, MODEL_VOCABS["deepseek_v4"]
+    M, N = 8, MODEL_VOCABS["dsv4"]
     torch.manual_seed(M ^ N ^ 1)
     x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
     out = torch.empty(M, dtype=out_dtype, device="cuda")
@@ -408,7 +408,7 @@ def test_argmax_caller_buffer_via_fallback(out_dtype):
 
 def test_argmax_rejects_invalid_out():
     _need_cuda()
-    x = torch.randn(4, MODEL_VOCABS["deepseek_v4"], device="cuda", dtype=torch.float32)
+    x = torch.randn(4, MODEL_VOCABS["dsv4"], device="cuda", dtype=torch.float32)
     with pytest.raises(ValueError, match="shape"):
         cute_argmax(x, out=torch.empty(5, dtype=torch.int32, device="cuda"))
     with pytest.raises(ValueError, match="int32 or int64"):
@@ -425,7 +425,7 @@ def test_argmax_rejects_invalid_out():
 @pytest.mark.parametrize(
     "M,N",
     [
-        (4, MODEL_VOCABS["deepseek_v4"]),
+        (4, MODEL_VOCABS["dsv4"]),
         (16, MODEL_VOCABS["kimi_k2_5"]),
         (64, MODEL_VOCABS["gpt_oss"]),
     ],
@@ -463,7 +463,7 @@ def test_argmax_out_buffer_under_cuda_graph(out_dtype):
     into it. Replay must observe input mutations.
     """
     _need_cuda()
-    M, N = 16, MODEL_VOCABS["deepseek_v4"]
+    M, N = 16, MODEL_VOCABS["dsv4"]
     torch.manual_seed(M ^ N ^ 0xBEEF)
     x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
     buf = torch.empty(M, dtype=out_dtype, device="cuda")

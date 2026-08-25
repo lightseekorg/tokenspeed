@@ -99,6 +99,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     token_all_gather,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.distributed.pp_stage import PPStageState, pp_layer_window
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     get_is_capture_mode,
 )
@@ -1844,6 +1845,7 @@ class KimiLinearMoE(nn.Module):
             self.experts._situ_output_buffer = plan.lane[:, : self.routed_hidden]
         else:
             self.experts._situ_output_buffer = None
+        prepared_shared_shard = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with fork.branch():
                 topk_output = self.topk(hidden_states, router_logits)
@@ -1857,7 +1859,11 @@ class KimiLinearMoE(nn.Module):
                         else None
                     ),
                 )
-            routed_in = decode_gemv(hidden_states, self.routed_expert_down_proj.weight)
+                if plan.split_shared_rs and fork._active:
+                    prepared_shared_shard = self.comm.reduce_scatter_shared(
+                        shared_partial
+                    )
+            routed_in, _ = self.routed_expert_down_proj(hidden_states)
             if self._topk_ready is not None and fork._active:
                 self._topk_ready.wait(torch.cuda.current_stream())
             routed_partial = self._routed_experts(
@@ -1880,6 +1886,7 @@ class KimiLinearMoE(nn.Module):
             prefix_sum,
             num_tokens,
             hidden_size,
+            prepared_shared_shard,
         )
         # Cross-DP-EP: the tail ran on the gathered token set; every DP rank
         # keeps only its slice (a no-op view when no gather happened).
@@ -2020,6 +2027,7 @@ class KimiLinearDecoderLayer(nn.Module):
         self._attn_split = False
         # True when the PREVIOUS layer precomputes our mlp-side block partial.
         self._mlp_split = False
+        self._dflash_attnres_capture_fallback = False
         # True when the NEXT layer folds our routed+shared residual accumulate
         # into its attn-side combine (we return the parts unsummed).
         self.comm_manager = CommManager(
@@ -2073,6 +2081,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_norm.variance_epsilon,
                 _sliced_scratch(prefix_sum, 1, n_tok),
                 torch.empty_like(prefix_sum),
+                enable_pdl=pdl_enabled(),
             )
         else:
             h = _apply_attn_res(
@@ -2091,6 +2100,10 @@ class KimiLinearDecoderLayer(nn.Module):
     def _fused_attnres_graph_available(
         self, hidden_states: torch.Tensor, block_residual: torch.Tensor
     ) -> bool:
+        # Split beats fused at decode: 47 us/step faster at bs = 8 (aux-stream partial).
+        if getattr(self, "_dflash_attnres_capture_fallback", False):
+            return False
+
         # B1 already fuses the post-attention mix into the all-reduce.
         if hidden_states.shape[0] == 1:
             return False
@@ -2168,6 +2181,8 @@ class KimiLinearDecoderLayer(nn.Module):
             delta=delta,
         )
 
+        # Before the MoE: the next layer's PDL combine prefetches this scratch early.
+        self._prepare_next_fallback_attnres_partial(prefix_sum, block_residual)
         if self.is_moe_layer:
             num_global_tokens, max_num_tokens_per_gpu = (
                 self.comm_manager.get_num_tokens(ctx)
@@ -2182,7 +2197,6 @@ class KimiLinearDecoderLayer(nn.Module):
             )
         else:
             prefix_sum = prefix_sum + self.mlp(h)
-        self._prepare_next_fallback_attnres_partial(prefix_sum, block_residual)
         return prefix_sum, block_residual
 
     def _prepare_next_fallback_attnres_partial(
@@ -2415,14 +2429,22 @@ class KimiLinearModel(nn.Module):
             torch.cuda.Stream(priority=-1) if torch.cuda.is_available() else None
         )
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
+        # Pipeline stage layer window: [pp_start_layer, pp_end_layer). Global
+        # layer numbering everywhere; other stages' slots hold PPMissingLayer.
+        self.pp_start_layer, self.pp_end_layer = pp_layer_window(
+            config.num_hidden_layers, mapping
         )
+        if mapping.is_first_pp_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+                tp_rank=mapping.attn.tp_rank,
+                tp_size=mapping.attn.tp_size,
+                tp_group=mapping.attn.tp_group,
+            )
+        else:
+            self.embed_tokens = None
 
         layers_scope = add_prefix("layers", prefix)
 
@@ -2441,11 +2463,16 @@ class KimiLinearModel(nn.Module):
             config.num_hidden_layers,
             get_layer,
             prefix=layers_scope,
+            pp_start_layer=self.pp_start_layer,
+            pp_end_layer=self.pp_end_layer,
         )
         # Cross-layer attn-side mix precompute: a layer's aux stream computes
         # the NEXT layer's block partial alongside its own mlp-side partial
-        # (one dual sweep under attention; blocks are final by then).
-        for i in range(len(self.layers) - 1):
+        # (one dual sweep under attention; blocks are final by then). Under PP
+        # the pair must live on the same stage — the stage boundary severs the
+        # dual sweep there, and the downstream stage's first layer falls back
+        # to its own (non-split) AttnRes mixing.
+        for i in range(self.pp_start_layer, self.pp_end_layer - 1):
             cur, nxt = self.layers[i], self.layers[i + 1]
             if nxt.prev_valid_blocks > 0:
                 assert (
@@ -2459,16 +2486,22 @@ class KimiLinearModel(nn.Module):
                 cur._hoist_next_mlp = not nxt.is_block_write_layer
                 nxt._mlp_split = cur._hoist_next_mlp
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        # Model-level AttnRes output mixing.
-        self.output_attn_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.output_attn_res_proj = ReplicatedLinear(
-            config.hidden_size,
-            1,
-            bias=False,
-            prefix=add_prefix("output_attn_res_proj", prefix),
-        )
+        if mapping.is_last_pp_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            # Model-level AttnRes output mixing.
+            self.output_attn_res_norm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+            self.output_attn_res_proj = ReplicatedLinear(
+                config.hidden_size,
+                1,
+                bias=False,
+                prefix=add_prefix("output_attn_res_proj", prefix),
+            )
+        else:
+            self.norm = None
+            self.output_attn_res_norm = None
+            self.output_attn_res_proj = None
         # One-based completed-layer ids; see set_eagle3_layers_to_capture.
         self.eagle3_layers_to_capture: tuple[int, ...] = ()
 
@@ -2476,12 +2509,55 @@ class KimiLinearModel(nn.Module):
         # stream is captured for the draft. Populated by
         # ``set_dflash_layers_to_capture``; empty means no capture.
         self.layers_to_capture: list[int] = []
+        self.dflash_aux_stream: str = "prefix"
         self._dflash_incremental_callback = None
         self._dflash_slot_bufs = None
         self._dflash_capture_idx_map: dict[int, int] = {}
 
+    def _refresh_dflash_capture_fallback(self) -> None:
+        """Mark AttnRes consumers that need split execution."""
+        captured = set(self.layers_to_capture)
+        use_fallback = self.dflash_aux_stream == "attn_res"
+        for layer_idx, layer in enumerate(self.layers):
+            layer._dflash_attnres_capture_fallback = use_fallback and (
+                layer_idx - 1 in captured
+            )
+
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
+
+    def pp_stage_state_spec(
+        self, num_tokens: int, device: torch.device
+    ) -> list[tuple[str, tuple[int, ...], torch.dtype]]:
+        """Wire spec (name, shape, dtype) of the inter-stage boundary bundle.
+
+        K3's boundary state is the accumulated ``prefix_sum`` stream plus the
+        valid prefix of the AttnRes ``block_residual`` snapshot buffer. The
+        upstream stage ships ``ceil_div(its pp_end_layer, block)`` snapshot
+        rows and this stage expects ``ceil_div(pp_start_layer, block)`` — the
+        two are the same number because the windows abut, so no shape
+        metadata crosses the wire.
+        """
+        del device
+        hidden = self.config.hidden_size
+        valid_blocks = ceil_div(self.pp_start_layer, self.config.attn_res_block_size)
+        # The activation dtype. get_default_dtype() would be wrong here (the
+        # model-dtype context only wraps weight loading); take it from any
+        # floating live parameter — mid-stage ranks have no embed/norm.
+        dtype = None
+        for param in self.parameters():
+            if param.is_floating_point() and param.dtype in (
+                torch.bfloat16,
+                torch.float16,
+            ):
+                dtype = param.dtype
+                break
+        if dtype is None:
+            dtype = torch.bfloat16
+        return [
+            ("hidden_states", (num_tokens, hidden), dtype),
+            ("block_residual", (valid_blocks, num_tokens, hidden), dtype),
+        ]
 
     def _dspark_capture_stream(
         self,
@@ -2489,16 +2565,24 @@ class KimiLinearModel(nn.Module):
         prefix_sum: torch.Tensor,
         block_residual: torch.Tensor,
     ) -> torch.Tensor:
-        """Capture vLLM's completed-layer DSpark target stream.
+        """Capture the configured target stream after layer_idx."""
+        if self.dflash_aux_stream != "attn_res":
+            return prefix_sum.clone()
 
-        vLLM captures ``prefix_sum + hidden_states`` immediately after the
-        named layer. This implementation accumulates the layer output into
-        ``prefix_sum`` before returning from the layer, so that sum is already
-        represented by ``prefix_sum``. Clone because later layers may update
-        the same storage in place.
-        """
-        del layer_idx, block_residual
-        return prefix_sum.clone()
+        if layer_idx + 1 < len(self.layers):
+            consumer = self.layers[layer_idx + 1]
+            proj = consumer.self_attention_res_proj
+            norm = consumer.self_attention_res_norm
+            num_blocks = consumer.prev_valid_blocks
+        else:
+            proj = self.output_attn_res_proj
+            norm = self.output_attn_res_norm
+            num_blocks = ceil_div(
+                self.config.num_hidden_layers, self.config.attn_res_block_size
+            )
+
+        mixed = _apply_attn_res(prefix_sum, block_residual, proj, norm, num_blocks)
+        return prefix_sum.clone() if mixed is prefix_sum else mixed
 
     @torch.no_grad()
     def forward(
@@ -2508,9 +2592,14 @@ class KimiLinearModel(nn.Module):
         ctx: "ForwardContext",
         out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
+        pp_inbound: PPStageState | None = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, list | None]:
-        if input_embeds is not None:
+    ) -> tuple[torch.Tensor | PPStageState, list | None]:
+        if pp_inbound is not None:
+            # Mid-pipeline stage: resume the AttnRes stream received from the
+            # upstream stage instead of embedding.
+            hidden_states = pp_inbound.hidden_states
+        elif input_embeds is not None:
             hidden_states = input_embeds
         else:
             hidden_states = self.embed_tokens(input_ids)
@@ -2524,6 +2613,11 @@ class KimiLinearModel(nn.Module):
         block_residual = hidden_states.new_empty(
             num_blocks, hidden_states.size(0), hidden_states.size(1)
         )
+        if pp_inbound is not None:
+            # Seed the upstream stage's snapshot rows; this stage's own
+            # block-write layers fill the rest.
+            inbound_blocks = pp_inbound.block_residual
+            block_residual[: inbound_blocks.size(0)].copy_(inbound_blocks)
 
         capture_layers = self.layers_to_capture
         capture_dflash = bool(capture_layers)
@@ -2533,7 +2627,8 @@ class KimiLinearModel(nn.Module):
         )
 
         prefix_sum = hidden_states
-        for layer_idx, layer in enumerate(self.layers):
+        for layer_idx in range(self.pp_start_layer, self.pp_end_layer):
+            layer = self.layers[layer_idx]
             prefix_sum, block_residual = layer(
                 positions, prefix_sum, ctx, out_cache_loc, block_residual
             )
@@ -2553,6 +2648,20 @@ class KimiLinearModel(nn.Module):
             elif capture_eagle3 and layer_idx + 1 in self.eagle3_layers_to_capture:
                 assert aux_hidden_states is not None
                 aux_hidden_states.append(prefix_sum.clone())
+
+        if not self.mapping.is_last_pp_rank:
+            # Hand the AttnRes thread state to the next stage: the prefix sum
+            # plus the snapshot rows written so far. The wire count matches
+            # the downstream spec because the windows abut on the same block
+            # arithmetic (ceil_div of the shared boundary layer id).
+            valid_blocks = ceil_div(self.pp_end_layer, self.config.attn_res_block_size)
+            return (
+                PPStageState(
+                    hidden_states=prefix_sum,
+                    block_residual=block_residual[:valid_blocks],
+                ),
+                None,
+            )
 
         hidden_states = _apply_attn_res(
             prefix_sum,
@@ -2630,6 +2739,29 @@ class KimiLinearForCausalLM(BaseCausalLM):
         }
         self.model._dflash_incremental_callback = incremental_callback
         self.model._dflash_slot_bufs = slot_bufs
+        self.model._refresh_dflash_capture_fallback()
+
+    def set_dflash_aux_hidden_stream(self, stream: str) -> None:
+        """Select which K3 residual stream the DFLASH/DSpark taps read."""
+        if stream not in ("prefix", "attn_res"):
+            raise ValueError(
+                f"Unknown DFLASH aux hidden stream {stream!r}; "
+                "expected 'prefix' or 'attn_res'."
+            )
+        if stream == "attn_res" and not getattr(
+            self.config, "attn_res_block_size", None
+        ):
+            raise ValueError(
+                "The 'attn_res' aux hidden stream needs a target with AttnRes "
+                "enabled (config.attn_res_block_size); this target has none."
+            )
+        self.model.dflash_aux_stream = stream
+        self.model._refresh_dflash_capture_fallback()
+        logger.info(
+            "DFLASH/DSpark target capture: layers=%s stream=%s",
+            tuple(self.model.layers_to_capture),
+            stream,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         """Load the ``model.*`` / ``lm_head.*`` text weights.
@@ -2754,6 +2886,10 @@ class KimiLinearForCausalLM(BaseCausalLM):
             ep_size=self.mapping.moe.ep_size,
         )
 
+        pp_start = self.model.pp_start_layer
+        pp_end = self.model.pp_end_layer
+        pp_windowed = not (pp_start == 0 and pp_end == config.num_hidden_layers)
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -2762,6 +2898,15 @@ class KimiLinearForCausalLM(BaseCausalLM):
             if name.startswith("model.layers."):
                 layer_str = name.split(".")[2]
                 if layer_str.isdigit() and int(layer_str) >= config.num_hidden_layers:
+                    continue
+                # Skip layers another pipeline stage owns: the MoE loader
+                # raises on a matched-but-unloadable expert weight, so
+                # out-of-window layers must be dropped before it sees them.
+                if (
+                    pp_windowed
+                    and layer_str.isdigit()
+                    and not pp_start <= int(layer_str) < pp_end
+                ):
                     continue
             # Compressed-tensors MXFP4 routed experts ship the packed weight as
             # ``...w{1,2,3}.weight_packed``; the mxfp4 MoE param is
@@ -2868,7 +3013,9 @@ class KimiLinearForCausalLM(BaseCausalLM):
         ``KimiLinearMLAAttention``) and are skipped.
         """
         for layer in self.model.layers:
-            self_attn = layer.self_attn
+            self_attn = getattr(layer, "self_attn", None)
+            if self_attn is None:
+                continue  # PPMissingLayer: another pipeline stage owns it
             if isinstance(self_attn, KimiLinearMLAAttention):
                 w = self_attn.kv_b_proj.weight
                 if w.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
@@ -2897,7 +3044,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
                     # (the same preparation Fp8LinearMethod does for
                     # LinearBase layers); rows are 128-padded at construction
                     # so the shape gate always holds on this path.
-                    from tokenspeed.runtime.layers.dense.fp8 import (
+                    from tokenspeed_kernel.ops.gemm.flashinfer import (
                         has_flashinfer_fp8_blockscale,
                         prepare_flashinfer_fp8_blockscale_weight_scales,
                     )
@@ -2920,6 +3067,8 @@ class KimiLinearForCausalLM(BaseCausalLM):
 
         # Fold the AttnRes rms_w * res_w products once; the split kernels take a single wp pointer.
         for layer in self.model.layers:
+            if not hasattr(layer, "self_attention_res_norm"):
+                continue  # PPMissingLayer
             layer._attn_wp = (
                 layer.self_attention_res_norm.weight.float()
                 * layer.self_attention_res_proj.weight.reshape(-1).float()
@@ -2982,7 +3131,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
             )
             # Normal serving follows the text embedding dtype. Encoder-only
             # construction uses ModelLoader's configured default dtype.
-            if self.language_model is not None:
+            # Non-first pipeline stages own no embedding (and never run the
+            # vision encoder on live inputs); keep the loader dtype there.
+            if (
+                self.language_model is not None
+                and self.language_model.model.embed_tokens is not None
+            ):
                 target_dtype = self.get_input_embeddings().weight.dtype
                 self.vision = self.vision.to(dtype=target_dtype)
             self.vision_embedder = VisionEmbedder(encoder_mapping=mapping.vision)
@@ -3018,6 +3172,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
             slot_bufs=slot_bufs,
         )
 
+    def set_dflash_aux_hidden_stream(self, stream: str) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "Kimi-K3 encoder-only mode cannot capture target hidden states."
+            )
+        self.language_model.set_dflash_aux_hidden_stream(stream)
+
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         if self.language_model is None:
             raise AttributeError(
@@ -3043,6 +3204,17 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "Kimi-K3 encoder-only mode does not expose an LM head."
             )
         return self.language_model.lm_head
+
+    @property
+    def model(self):
+        """Expose the text backbone under the ``model`` attribute other
+        registered architectures use (the PP executor resolves the stage wire
+        spec via ``model.pp_stage_state_spec``)."""
+        if self.language_model is None:
+            raise AttributeError(
+                "Kimi-K3 encoder-only mode does not expose a text backbone."
+            )
+        return self.language_model.model
 
     @property
     def vision_tower(self):
@@ -3086,6 +3258,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
             or self.vision_embedder is None
             or not multimodal_context.has_extend_inputs()
             or ctx.forward_mode.is_decode_or_idle()
+            # Non-first pipeline stages receive the residual stream from
+            # upstream; they own no embedding to splice vision embeds into.
+            or not self.mapping.is_first_pp_rank
         ):
             return None
         input_embeds, model_kwargs = self.vision_embedder.apply(

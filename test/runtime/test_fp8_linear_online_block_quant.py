@@ -113,13 +113,12 @@ def test_online_quantization_ignores_linear_attention_layers() -> None:
     assert not serialized.ignored_layers
 
 
-def test_online_quantization_ignores_bmm_wo_a() -> None:
+def test_online_quantization_ignores_grouped_wo_a() -> None:
     """Online fp8 must exclude DeepSeek-V4 ``wo_a``.
 
-    It is the only ``is_bmm`` weight, and its runtime path accepts solely the
-    deep_gemm ue8m0 block-scale layout. Online quantization leaves
-    ``scale_fmt`` unset, so quantizing it would raise at load instead of
-    running.
+    Its grouped projection plan requires serialized weights and scales for
+    backend-owned preprocessing. Online quantization does not provide that
+    checkpoint contract.
     """
     from tokenspeed.runtime.layers.quantization.utils import (
         check_equal_or_regex_match,

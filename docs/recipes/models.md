@@ -71,6 +71,8 @@ MiniMax M3 uses 128-token MSA blocks. TokenSpeed configures its dense and sparse
 attention layers automatically; select the dense backend with
 `--attention-backend` and run with `--disable-kvstore`.
 
+### EAGLE3 draft
+
 ```bash
 tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --tensor-parallel-size 4 \
@@ -94,6 +96,60 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --host 0.0.0.0 \
     --port 8000
 ```
+
+### DSpark draft
+
+`nvidia/MiniMax-M3-DSpark` is a six-layer Qwen3-shaped GQA block drafter with a
+vanilla Markov head. Keep the target launch shape and swap the speculative
+options:
+
+```bash
+tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
+    --tensor-parallel-size 4 \
+    --max-model-len 262144 \
+    --max-num-seqs 16 \
+    --max-prefill-tokens 8192 \
+    --chunked-prefill-size 8192 \
+    --gpu-memory-utilization 0.95 \
+    --disable-cuda-graph-padding \
+    --attention-backend trtllm \
+    --kv-cache-dtype fp8 \
+    --moe-backend flashinfer_trtllm \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path nvidia/MiniMax-M3-DSpark \
+    --speculative-num-steps 7 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 8 \
+    --disable-kvstore \
+    --block-size 128 \
+    --trust-remote-code \
+    --host 0.0.0.0 \
+    --port 8000
+```
+
+Notes:
+
+- Launch this checkpoint with `--speculative-num-draft-tokens 8` and
+  `--speculative-num-steps 7`: the verify window is one anchor row plus seven
+  draft queries, and the step count is always the verify width minus one. The
+  width is checked against the checkpoint's `block_size` at startup, so a
+  mismatched launch fails fast instead of drafting a wrong-width block.
+- `--block-size 128` is the target's MSA page size. The draft writes its KV at
+  the target's cache locations and shares the target's page table, so it
+  inherits that page size; do not set a separate draft block size.
+- The draft's 1024-token sliding window is an attention mask its own layers
+  apply. It is deliberately not a cache-retention policy, because the draft's
+  pages are the target's pages.
+- Target features are captured from the residual stream after each layer in
+  `dflash_config.target_layer_ids` (`[1, 12, 23, 35, 46, 57]` of M3's 60
+  layers) and concatenated in ascending layer order to feed the draft's `fc`.
+- The draft checkpoint stores fp32 master weights. It is loaded in the target's
+  dtype rather than the standalone fp32-to-fp16 default, because the two
+  exchange hidden states and share the target's embedding and LM head.
+- Measured on 4x GB200 with the launch above: gsm8k `mean_acc` 0.9727 versus
+  0.9773 without speculative decoding (paired disagreement 3 vs 9, McNemar
+  p ~ 0.15 -- within run-to-run noise), at a mean accepted length of 4.99 of 8
+  and about 1.7x decode throughput at 16 concurrent requests.
 
 ## Kimi K2.5 / K2.6
 
@@ -192,7 +248,16 @@ Notes:
   it must not be padded with an eighth, unused mask row.
 - Target features are captured from K3's completed-layer prefix stream before
   the model-level AttnRes mix and final norm, matching the DSpark checkpoint's
-  vLLM training and inference contract.
+  vLLM training and inference contract. A draft trained instead against the
+  pre-norm AttnRes mixture declares `"aux_hidden_stream": "attn_res"` in its
+  config and is served that stream. Feeding a draft the other stream raises nothing
+  and shows up only as a lower acceptance rate, so the choice is logged next to
+  the tap ids at startup.
+- A draft whose config sets `"fc_norm": true` normalizes each target tap on its
+  own before the taps are concatenated and projected, and ships one
+  `fc_norm.N.weight` per tap. Declaring it without the weights (or shipping the
+  weights without declaring it) fails the load rather than serving an
+  identity-weight norm.
 - Under tensor parallelism, the draft's final row-parallel MLP output is reduced
   across TP ranks before `final_norm` and shared target-head sampling.
 - The vision encoder has 12 attention heads. For an 8-way text TP deployment,

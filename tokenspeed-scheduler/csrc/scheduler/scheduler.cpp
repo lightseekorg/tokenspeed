@@ -116,6 +116,18 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
     const std::int64_t max_prompt_tokens =
         std::max<std::int64_t>(static_cast<std::int64_t>(token_limit) - decode_width, 0);
     const std::int64_t chunk_tokens = config_.max_scheduled_tokens;
+    const std::int64_t prefix_granularity = config_.prefix_granularity;
+    // A final sub-page tail can follow the first aligned body, or a later body
+    // that also retains an input checkpoint. Bound both cases independently.
+    const bool splits_final_state_checkpoint = config_.role != Role::kD && !config_.disable_prefix_cache;
+    const auto max_split_tail_after = [&](std::int64_t minimum_body_end) {
+        return splits_final_state_checkpoint
+                   ? std::max<std::int64_t>(0, std::min({prefix_granularity - 1, chunk_tokens - prefix_granularity,
+                                                         max_prompt_tokens - minimum_body_end}))
+                   : 0;
+    };
+    const std::int64_t max_first_chunk_tail_tokens = max_split_tail_after(prefix_granularity);
+    const std::int64_t max_later_chunk_tail_tokens = max_split_tail_after(2 * prefix_granularity);
 
     std::vector<std::int64_t> group_pages(static_cast<std::size_t>(coordinator_.NumGroups()));
     for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
@@ -126,7 +138,14 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
                 if (token_limit == 0) return std::int64_t{0};
                 const std::int64_t input_lookback =
                     max_prompt_tokens > chunk_tokens ? coordinator_.GroupBoundaryLookbackPages(i) : 0;
-                return std::max<std::int64_t>(2, input_lookback + 1);
+                const std::int64_t first_split_checkpoint_peak =
+                    max_first_chunk_tail_tokens == 0 ? 0 : 1 + ceilDiv(max_first_chunk_tail_tokens, block_granularity);
+                const std::int64_t later_split_checkpoint_peak =
+                    max_later_chunk_tail_tokens == 0 ? 0
+                                                     : coordinator_.GroupBoundaryLookbackPages(i) + 1 +
+                                                           ceilDiv(max_later_chunk_tail_tokens, block_granularity);
+                return std::max(
+                    {std::int64_t{2}, input_lookback + 1, first_split_checkpoint_peak, later_split_checkpoint_peak});
             }
             // Across every prompt up to max_prompt_tokens, retain the largest
             // resident window seen by either the first chunk or a later chunk.

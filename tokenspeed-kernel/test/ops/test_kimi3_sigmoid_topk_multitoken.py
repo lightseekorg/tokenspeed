@@ -35,6 +35,17 @@ import torch
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
+from utils import is_amd  # noqa: E402
+
+if is_amd():
+    pytest.skip(
+        "Packed-kernel row cap (256) and the grouped fallback "
+        "(triton_minimax_sigmoid_bias_topk) pinned here are NVIDIA-tuned; "
+        "AMD/CDNA4 dispatch (row cap 1, gluon fallback) is covered by "
+        "test_kimi3_sigmoid_topk_gfx950.py",
+        allow_module_level=True,
+    )
+
 from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk  # noqa: E402
 from tokenspeed_kernel.ops.moe import sigmoid_topk as sigmoid_topk_mod  # noqa: E402
 from tokenspeed_kernel.ops.moe.triton.kimi3_sigmoid_topk import (  # noqa: E402

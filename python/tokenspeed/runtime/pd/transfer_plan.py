@@ -23,6 +23,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    cache_field_layer_id,
+)
 from tokenspeed.runtime.pd.cache_protocol import (
     CacheTransferContract,
     validate_cache_peer_layout,
@@ -99,7 +102,18 @@ class CacheTransferPlanner:
         decode_tp_size: int,
         prefill_layout: CacheTransferContract,
         decode_layout: CacheTransferContract,
+        prefill_layer_window: tuple[int, int] | None = None,
     ):
+        """Plan fragments between one Prefill rank set and one Decode rank set.
+
+        Args:
+            prefill_layer_window: With prefill chunk-pipeline parallelism, the
+                ``[start, end)`` global layer window whose KV THIS planning
+                context transfers. Fields owned by other pipeline stages are
+                excluded from the route (each stage runs its own planner over
+                its own window, and the union of stages covers the plan).
+                None plans every field (no PP).
+        """
         if prefill_tp_size <= 0 or decode_tp_size <= 0:
             raise UnsupportedPDLayoutError("Paged cache TP sizes must be positive")
         if prefill_tp_size > MAX_CACHE_TP_SIZE or decode_tp_size > MAX_CACHE_TP_SIZE:
@@ -108,7 +122,15 @@ class CacheTransferPlanner:
             )
         self.prefill_tp_size = prefill_tp_size
         self.decode_tp_size = decode_tp_size
+        self._layer_window = prefill_layer_window
         validate_cache_peer_layout(prefill_layout, decode_layout)
+
+        def in_window(field_id: str) -> bool:
+            if prefill_layer_window is None:
+                return True
+            layer_id = cache_field_layer_id(field_id)
+            return prefill_layer_window[0] <= layer_id < prefill_layer_window[1]
+
         self._partitions = {
             field.field_id: prefill_layout.transfer_schema.partition_for(field.field_id)
             for field in prefill_layout.plan.fields
@@ -125,6 +147,7 @@ class CacheTransferPlanner:
                 decode_layout.fields_for_group(decode_spec.group_id),
                 strict=True,
             )
+            if in_window(prefill_segment.field_id)
         )
         for _, prefill_segment, decode_segment in self._segment_pairs:
             self._validate_tp_mapping(prefill_segment, decode_segment)
@@ -140,7 +163,10 @@ class CacheTransferPlanner:
             raise UnsupportedPDLayoutError(
                 f"decode_tp_rank={decode_tp_rank} is out of range"
             )
-        if self.prefill_tp_size == self.decode_tp_size:
+        # Equal-TP fast path: empty fragments mean "copy every field whole".
+        # A PP layer window cannot use it — only the window's fields may be
+        # copied, so the explicit fragment route is mandatory.
+        if self.prefill_tp_size == self.decode_tp_size and self._layer_window is None:
             return RankTransferPlan(
                 fragments_by_prefill_rank={decode_tp_rank: ()},
             )

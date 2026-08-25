@@ -243,9 +243,9 @@ class GlmDsaIndexer(nn.Module):
         return GlmDsaIndexerOutput(
             query=index_q,
             key=index_k,
-            # Raw bf16 weights: the head-norm constant is folded into
-            # weights_softmax_scale and the fp32 upcast into the top-k
-            # kernels' fused combine.
+            # Raw BF16 weights: the head-normalization constant is folded into
+            # weights_softmax_scale, while the top-k scorer upcasts each signed
+            # head weight before the per-head ReLU reduction.
             weights=weights,
         )
 
@@ -663,8 +663,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         topk: int,
     ) -> GlmDsaPrefillTopK:
         q = indexer_output.query[:num_prefill_tokens].contiguous()
-        # Raw bf16 weights view (may be column-split, non-compact); the top-k
-        # kernel's fused combine upcasts and compacts in one launch.
+        # Raw BF16 weights view (may be column-split and noncompact); the top-k
+        # scorer consumes the row/head strides and upcasts weights in-kernel.
         weights = indexer_output.weights[:num_prefill_tokens]
 
         req_ids = torch.arange(

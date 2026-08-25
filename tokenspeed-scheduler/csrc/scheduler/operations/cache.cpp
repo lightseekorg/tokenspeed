@@ -44,6 +44,23 @@ std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled,
     return chunk_size - chunk_size % prefix_granularity;
 }
 
+std::optional<std::int32_t> FinalAlignedTailTokens(std::int32_t first_pos, std::int32_t unscheduled,
+                                                   std::int32_t token_budget, std::int32_t prefix_granularity,
+                                                   std::int32_t promotion_boundary_tokens) {
+    _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
+    _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
+    std::int32_t chunk_size = std::min(unscheduled, token_budget);
+    if (promotion_boundary_tokens > first_pos) {
+        chunk_size = std::min(chunk_size, promotion_boundary_tokens - first_pos);
+    }
+    if (chunk_size != unscheduled) {
+        return std::nullopt;
+    }
+
+    const std::int32_t tail_tokens = (first_pos + chunk_size) % prefix_granularity;
+    return tail_tokens != 0 && chunk_size - tail_tokens > 0 ? std::optional{tail_tokens} : std::nullopt;
+}
+
 std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
     std::vector<CacheGroupSpec> specs;
     specs.reserve(config.cache_groups.size());

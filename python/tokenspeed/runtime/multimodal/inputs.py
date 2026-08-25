@@ -289,3 +289,37 @@ class MultimodalForwardContext:
             mm_input is not None and index < len(self.extend_seq_lens)
             for index, mm_input in enumerate(self.mm_inputs)
         )
+
+
+def multimodal_context_for_forward(forward_op, rid_to_state):
+    """Assemble the batch's :class:`MultimodalForwardContext` from per-request
+    state.
+
+    Args:
+        forward_op: The forward op about to dispatch; supplies the batch's
+            request ids and extend geometry.
+        rid_to_state: The output processor's request-id -> state map, whose
+            states carry each request's ``multimodal_inputs``.
+
+    Returns:
+        A ``MultimodalForwardContext`` aligned to the batch order, or ``None``
+        when no request in the batch carries multimodal inputs.
+    """
+    num_extends = forward_op.num_extends()
+    mm_inputs = []
+    has_mm = False
+    for index, rid in enumerate(forward_op.request_ids):
+        state = rid_to_state.get(rid)
+        if state is not None and index < num_extends:
+            state.maybe_extend_multimodal_mrope_positions()
+        item = getattr(state, "multimodal_inputs", None) if state else None
+        mm_inputs.append(item)
+        has_mm = has_mm or item is not None
+    if not has_mm:
+        return None
+
+    return MultimodalForwardContext(
+        mm_inputs=mm_inputs,
+        extend_prefix_lens=list(forward_op.extend_prefix_lens),
+        extend_seq_lens=list(forward_op.input_lengths[:num_extends]),
+    )

@@ -56,6 +56,7 @@ from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.segmented_rmsnorm import segmented_rmsnorm
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
@@ -315,6 +316,17 @@ class K3DSparkModel(nn.Module):
             prefix=add_prefix("context_proj", prefix),
         )
         self.context_norm = RMSNorm(hidden_size, eps=eps)
+        self.fc_norm = (
+            nn.ModuleList(
+                [
+                    RMSNorm(int(config.target_hidden_size), eps=eps)
+                    for _ in range(self.num_context_features)
+                ]
+            )
+            if bool(getattr(config, "fc_norm", False))
+            else None
+        )
+        self.register_buffer("_fc_norm_weight", None, persistent=False)
 
         self.layers = nn.ModuleList(
             [
@@ -339,6 +351,28 @@ class K3DSparkModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Concatenated target taps -> draft hidden space."""
+        if self.fc_norm is not None:
+            num_segments = len(self.fc_norm)
+            hidden_size = int(self.config.target_hidden_size)
+            expected_width = num_segments * hidden_size
+            if target_hidden.shape[-1] != expected_width:
+                raise ValueError(
+                    f"fc_norm expects {num_segments} target taps ({expected_width} "
+                    f"features), got {target_hidden.shape[-1]} features"
+                )
+            fc_norm_weight = self._fc_norm_weight
+            if fc_norm_weight is None:
+                fc_norm_weight = torch.stack(
+                    [norm.weight.detach() for norm in self.fc_norm], dim=0
+                ).contiguous()
+                self._fc_norm_weight = fc_norm_weight
+            target_hidden = target_hidden.unflatten(-1, (num_segments, hidden_size))
+            target_hidden = segmented_rmsnorm(
+                target_hidden,
+                fc_norm_weight,
+                float(self.fc_norm[0].variance_epsilon),
+            )
+            target_hidden = target_hidden.flatten(-2)
         return self.context_norm(self.context_proj(target_hidden)[0])
 
     def _finalize_hidden(
@@ -526,6 +560,10 @@ class K3DSparkModel(nn.Module):
             self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
                 self_attn.kv_b_proj.weight, self_attn
             )
+        if self.fc_norm is not None:
+            self._fc_norm_weight = torch.stack(
+                [norm.weight.detach() for norm in self.fc_norm], dim=0
+            ).contiguous()
 
 
 EntryClass = [K3DSparkModel]

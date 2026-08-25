@@ -238,6 +238,7 @@ python3 -m smg launch \
   --decode-policy round_robin \
   --request-timeout-secs 1800 \
   --disable-circuit-breaker \
+  --disable-load-monitoring \
   --disable-health-check \
   --log-level info \
   --prometheus-port "$PROMETHEUS_PORT" \
