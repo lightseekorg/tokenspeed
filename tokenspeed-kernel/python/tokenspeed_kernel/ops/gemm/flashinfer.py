@@ -116,32 +116,6 @@ def prepare_flashinfer_fp8_blockscale_weight_scales(
     return scales.transpose(0, 1).contiguous()
 
 
-def _prepare_flashinfer_fp8_blockscale_inputs(
-    A: torch.Tensor,
-    A_scales: torch.Tensor,
-    B_scales: torch.Tensor,
-    original_m: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert canonical values and scales to FlashInfer's native layout."""
-    scale_m = A_scales.shape[0]
-    if original_m % 4 != 0 or scale_m != original_m:
-        padded_m = max(((original_m + 3) // 4) * 4, scale_m)
-        padded_A = A.new_zeros((padded_m, A.shape[1]))
-        padded_A[:original_m] = A
-        A = padded_A
-
-        if scale_m != padded_m:
-            padded_A_scales = A_scales.new_ones((padded_m, A_scales.shape[1]))
-            padded_A_scales[:scale_m] = A_scales
-            A_scales = padded_A_scales
-
-    return (
-        A,
-        A_scales.transpose(0, 1).contiguous(),
-        B_scales.transpose(0, 1).contiguous(),
-    )
-
-
 def _validate_flashinfer_fp8_blockscale_prepacked(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -219,7 +193,7 @@ if gemm_fp8_nt_groupwise is not error_fn:
 
         Set ``prepacked_scales`` only when ``A_scales`` and ``B_scales`` already
         use FlashInfer's contiguous MN-major layout. The default canonical path
-        performs the required padding and transposes for compatibility.
+        passes the native K-major layouts through without copies.
         """
         assert (
             A_scales is not None
@@ -235,23 +209,40 @@ if gemm_fp8_nt_groupwise is not error_fn:
                 orig_m,
                 block_size,
             )
-            gemm_a_scales = A_scales
-            gemm_b_scales = B_scales
-        else:
-            A, gemm_a_scales, gemm_b_scales = _prepare_flashinfer_fp8_blockscale_inputs(
-                A, A_scales, B_scales, orig_m
+            output = gemm_fp8_nt_groupwise(
+                A,
+                B,
+                A_scales,
+                B_scales,
+                scale_major_mode="MN",
+                out_dtype=out_dtype,
             )
+            output = output[:orig_m] if output.shape[0] != orig_m else output
+            if out is not None:
+                out.copy_(output)
+                return out
+            return output
 
+        # K-major mode reads the quant kernel's native (m, k//128) activation
+        # scales and the checkpoint's native (n//128, k//128) weight scales,
+        # so no padding, transposes, or scale copies are needed per call.
+        if A_scales.shape[0] != orig_m:
+            A_scales = A_scales[:orig_m]
+        direct_out = (
+            out is not None
+            and out.is_contiguous()
+            and out.shape == (orig_m, B.shape[0])
+        )
         output = gemm_fp8_nt_groupwise(
             A,
             B,
-            gemm_a_scales,
-            gemm_b_scales,
-            scale_major_mode="MN",
+            A_scales,
+            B_scales,
+            scale_major_mode="K",
+            out=out if direct_out else None,
             out_dtype=out_dtype,
         )
-        output = output[:orig_m] if output.shape[0] != orig_m else output
-        if out is not None:
+        if out is not None and not direct_out:
             out.copy_(output)
             return out
         return output
