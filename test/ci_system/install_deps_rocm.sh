@@ -9,6 +9,7 @@ BUILD_AND_DOWNLOAD_PARALLEL=${BUILD_AND_DOWNLOAD_PARALLEL:-16}
 TOKENSPEED_KERNEL_ONLY=${TOKENSPEED_KERNEL_ONLY:-0}
 TORCH_VERSION=${TORCH_VERSION:-2.13.0}
 TORCH_INDEX_URL=${TORCH_INDEX_URL:-https://download.pytorch.org/whl/rocm7.2}
+TORCH_DEVICE_PACKAGE=${TORCH_DEVICE_PACKAGE:-}
 
 export MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL}
 WORKSPACE=${WORKSPACE:-$(pwd)}
@@ -51,8 +52,11 @@ echo "=== Step 3: Check PyTorch for ROCm ==="
 if ! pip3 show torch >/dev/null 2>&1; then
     echo "torch is not installed; installing torch ${TORCH_VERSION}"
     if [ "${TOKENSPEED_KERNEL_ONLY}" = "1" ]; then
-        pip3 install "torch==${TORCH_VERSION}" \
-            --index-url "${TORCH_INDEX_URL}"
+        torch_packages=("torch==${TORCH_VERSION}")
+        if [ -n "${TORCH_DEVICE_PACKAGE}" ]; then
+            torch_packages+=("${TORCH_DEVICE_PACKAGE}")
+        fi
+        pip3 install "${torch_packages[@]}" --index-url "${TORCH_INDEX_URL}"
     else
         pip3 install "torch==${TORCH_VERSION}" torchvision==0.28.0 \
             --index-url "${TORCH_INDEX_URL}"
