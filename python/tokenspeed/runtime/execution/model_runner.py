@@ -24,7 +24,6 @@ import inspect
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel import _set_deep_gemm_pdl
 
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
@@ -32,7 +31,6 @@ from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
 from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict_update
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -123,7 +121,6 @@ class ModelRunner:
                     )
 
         global_server_args_dict_update(server_args)
-        _set_deep_gemm_pdl(pdl_enabled())
         initialize_moe_config(server_args)
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -133,7 +130,6 @@ class ModelRunner:
         if draft_moe_override:
             server_args.moe_backend = saved_moe_backend
             global_server_args_dict_update(server_args)
-            _set_deep_gemm_pdl(pdl_enabled())
             initialize_moe_config(server_args)
 
     def load_model(self):

@@ -27,8 +27,8 @@ import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
-    _pdl_enabled,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.registry import ErrorClass, Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import (
@@ -171,6 +171,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         q_scale: torch.Tensor | None = None,
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
+        enable_pdl: bool = False,
     ) -> torch.Tensor:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -205,7 +206,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             sinks=sinks,
             out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
             causal=is_causal,
-            enable_pdl=_pdl_enabled(),
+            enable_pdl=enable_pdl and pdl_enabled(),
         )
 
     @register_kernel(
@@ -246,6 +247,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         q_scale: torch.Tensor | None = None,
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
+        enable_pdl: bool = False,
     ) -> torch.Tensor:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -277,7 +279,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             sinks=sinks,
             out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
             q_len_per_req=max_seqlen_q,
-            enable_pdl=_pdl_enabled(),
+            enable_pdl=enable_pdl and pdl_enabled(),
         )
 
     @register_kernel(
@@ -327,6 +329,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         k_scale: float = 1.0,
         return_lse: bool = False,
         out: torch.Tensor | None = None,
+        enable_pdl: bool = False,
     ) -> torch.Tensor:
         if kv_cache is None:
             raise RuntimeError("FlashInfer/TRTLLM sparse MLA requires kv_cache")
@@ -362,7 +365,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             sparse_mla_top_k=topk_slots.shape[-1],
             bmm1_scale=float(k_scale) * float(softmax_scale),
             backend="trtllm-gen",
-            enable_pdl=_pdl_enabled(),
+            enable_pdl=enable_pdl and pdl_enabled(),
         )
         result = result.reshape(num_tokens, q_kernel.shape[2], int(kv_lora_rank))
         if out is not None:
@@ -417,6 +420,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         k_scale: float = 1.0,
         return_lse: bool = False,
         out: torch.Tensor | None = None,
+        enable_pdl: bool = False,
     ) -> torch.Tensor:
         return flashinfer_trtllm_dsa_decode(
             q=q,
@@ -435,6 +439,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             k_scale=k_scale,
             return_lse=return_lse,
             out=out,
+            enable_pdl=enable_pdl,
         )
 
 

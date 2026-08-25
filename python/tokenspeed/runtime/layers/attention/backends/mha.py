@@ -51,6 +51,7 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import build_page_table
 from tokenspeed.runtime.utils.common import ceil_div
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -689,6 +690,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,
+            enable_pdl=pdl_enabled(),
             solution=self.kernel_solution,
             **scale_kwargs,
         )
@@ -732,6 +734,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             sinks=sinks,
             max_seqlen_k=self.max_context_len,
             max_seqlen_q=max_seqlen_q,
+            enable_pdl=pdl_enabled(),
             solution=self.kernel_solution,
             **scale_kwargs,
         )

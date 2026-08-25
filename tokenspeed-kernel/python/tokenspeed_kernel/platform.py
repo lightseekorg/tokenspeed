@@ -290,7 +290,9 @@ class Platform:
     @classmethod
     def reset(cls) -> None:
         """Reset cached platform (for testing)."""
+        global _PDL_ENABLED
         cls._instance = None
+        _PDL_ENABLED = None
         _detect_cuda_nvlink_topology.cache_clear()
 
 
@@ -299,8 +301,16 @@ def current_platform() -> PlatformInfo:
     return Platform.get()
 
 
-def _pdl_enabled(requested: bool = True) -> bool:
-    return requested and os.environ.get("TOKENSPEED_DISABLE_PDL") != "1"
+_PDL_ENABLED: bool | None = None
+
+
+def pdl_enabled(overwrite: bool | None = None) -> bool:
+    global _PDL_ENABLED
+    if overwrite is not None:
+        _PDL_ENABLED = bool(overwrite) and current_platform().is_hopper_plus
+    elif _PDL_ENABLED is None:
+        _PDL_ENABLED = current_platform().is_hopper_plus
+    return _PDL_ENABLED
 
 
 # ---------------------------------------------------------------------------

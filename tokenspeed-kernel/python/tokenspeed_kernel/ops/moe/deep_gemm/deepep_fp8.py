@@ -55,6 +55,7 @@ from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -103,9 +104,8 @@ if platform.is_nvidia and m_grouped_fp8_gemm_nt_masked is not None:
 
     def _configure_deep_gemm_pdl(enable_pdl: bool) -> None:
         """Keep DeepGEMM's process-wide launch mode aligned with this MoE call."""
-        requested = bool(enable_pdl)
-        if get_pdl() != requested:
-            set_pdl(requested)
+        if get_pdl() != (enable_pdl and pdl_enabled()):
+            set_pdl(enable_pdl and pdl_enabled())
 
     def _prepare_routing_tensors(
         topk_weights: torch.Tensor,

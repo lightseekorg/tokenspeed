@@ -28,6 +28,7 @@ import functools
 from pathlib import Path
 
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 @functools.cache
@@ -119,6 +120,12 @@ def fused_topk_topp_renorm(
         workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=probs.device)
     side_handle = _get_side_stream_handle(probs.device)
     _load_fused_topk_topp_module().fused_topk_topp_renorm(
-        probs, top_ks, top_ps, out, workspace, side_handle, bool(enable_pdl)
+        probs,
+        top_ks,
+        top_ps,
+        out,
+        workspace,
+        side_handle,
+        bool(enable_pdl and pdl_enabled()),
     )
     return out

@@ -939,15 +939,10 @@ class ServerArgs:
         from tokenspeed.runtime.utils.env import envs
 
         envs.TOKENSPEED_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
-        if self.disable_pdl:
-            os.environ["TOKENSPEED_DISABLE_PDL"] = "1"
-            os.environ["TORCHINDUCTOR_ENABLE_PDL"] = "0"
-            os.environ["TRTLLM_ENABLE_PDL"] = "0"
-        else:
-            os.environ.pop("TOKENSPEED_DISABLE_PDL", None)
-            os.environ["TORCHINDUCTOR_ENABLE_PDL"] = "1"
+        if not self.disable_pdl:
+            os.environ.setdefault("TORCHINDUCTOR_ENABLE_PDL", "1")
             # Enable PDL for fused attention kernels.
-            os.environ["TRTLLM_ENABLE_PDL"] = "1"
+            os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
         os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
 
     @staticmethod

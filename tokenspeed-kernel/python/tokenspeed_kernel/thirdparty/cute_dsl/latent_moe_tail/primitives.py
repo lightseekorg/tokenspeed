@@ -13,15 +13,11 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
-from tokenspeed_kernel.platform import _pdl_enabled
+from tokenspeed_kernel.platform import pdl_enabled
 
 VEC_BF16 = 8
 PACKED_BYTES = 16
 NUM_LAMPORT_BUFFERS = 3
-
-
-def pdl_enabled() -> bool:
-    return _pdl_enabled()
 
 
 NEG_ZERO_F32_BITS = 0x80000000

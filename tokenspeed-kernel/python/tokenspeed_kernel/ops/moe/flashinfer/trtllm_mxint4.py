@@ -38,8 +38,8 @@ from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
-    _pdl_enabled,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -246,7 +246,6 @@ if platform.is_nvidia:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ):
-        enable_pdl = _pdl_enabled(enable_pdl)
         # Idle DP ranks / dummy warmup issue a 0-token forward; the fused kernel
         # divides by token count on the host and SIGFPEs on empty input. This
         # path is do_finalize-only, and x is already [0, hidden].
@@ -279,7 +278,7 @@ if platform.is_nvidia:
             local_num_experts=local_experts,
             routed_scaling_factor=w._routed_scaling_factor,
             routing_method_type=w._routing_method_type,
-            enable_pdl=enable_pdl,
+            enable_pdl=enable_pdl and pdl_enabled(),
             tune_max_num_tokens=get_autotune_max_num_tokens(),
         )
         return result[0]

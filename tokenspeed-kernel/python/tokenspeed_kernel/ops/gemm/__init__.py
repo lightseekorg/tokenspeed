@@ -63,7 +63,6 @@ from tokenspeed_kernel.ops.gemm.linear_attnres_partials import (
 from tokenspeed_kernel.platform import (
     ArchVersion,
     Platform,
-    _pdl_enabled,
     current_platform,
 )
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
@@ -134,6 +133,8 @@ def prepare_fp8_linear(
     weight_scales: torch.Tensor,
     block_size: tuple[int, int] | list[int],
     scale_format: str | None = None,
+    *,
+    enable_pdl: bool = False,
 ) -> object:
     """Prepare an opaque block-FP8 linear implementation contract.
 
@@ -202,13 +203,13 @@ def prepare_fp8_linear(
         and k >= 128
         and k % 32 == 0
     ):
-        if has_flashinfer_mxfp8() and _pdl_enabled():
+        if has_flashinfer_mxfp8() and enable_pdl:
             return _PreparedFp8Linear(
                 override="flashinfer_mm_mxfp8",
                 block_size=(block_n, block_k),
                 prepared_weight_scales=swizzle_mxfp8_scale(weight_scales, n, k),
             )
-        if not _pdl_enabled():
+        if not enable_pdl:
             return _PreparedFp8Linear(
                 override="triton_mm_fp8_blockscale",
                 block_size=(block_n, block_k),
@@ -1095,6 +1096,14 @@ def mm(
         traits=traits,
         override=override,
     )
+    if kernel.name == "flashinfer_mm_mxfp8" and not pdl_enabled():
+        kernel = select_kernel(
+            "gemm",
+            "mm",
+            signature,
+            traits=traits,
+            override="triton_mm_fp8_blockscale",
+        )
     if prepacked_scales and kernel.name != "flashinfer_mm_fp8_blockscale":
         raise ValueError(
             "prepacked_scales is only supported by "

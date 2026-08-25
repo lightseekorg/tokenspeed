@@ -41,6 +41,7 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DSA_SPARSE_PAGE_SIZE,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 def _make_dense_backend(config: DSAConfig, platform) -> AttentionBackend:
@@ -467,6 +468,7 @@ class DSABackend(AttentionBackend):
             page_size=self.kernel_page_size,
             logit_cap=layer.logit_cap,
             k_scale=k_scale,
+            enable_pdl=pdl_enabled(),
         )
         # GLM's sparse-prefill path writes both the latent KV and index_k before
         # entering this method, but bypasses AttentionBackend.forward and its
@@ -607,6 +609,7 @@ class DSABackend(AttentionBackend):
             q_len_per_req=q_len_per_req,
             logit_cap=layer.logit_cap,
             k_scale=k_scale,
+            enable_pdl=pdl_enabled(),
         )
         return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 

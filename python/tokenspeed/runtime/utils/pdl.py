@@ -18,19 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from functools import lru_cache
 
+from tokenspeed_kernel.platform import pdl_enabled
 
-@lru_cache(maxsize=1)
-def pdl_enabled() -> bool:
-    """Return whether Programmatic Dependent Launch is enabled."""
-    from tokenspeed.runtime.utils.env import global_server_args_dict
-
-    if global_server_args_dict.get("disable_pdl", False):
-        return False
-    try:
-        from tokenspeed_kernel.platform import current_platform
-
-        return current_platform().is_hopper_plus
-    except Exception:
-        return False
+__all__ = ["pdl_enabled"]

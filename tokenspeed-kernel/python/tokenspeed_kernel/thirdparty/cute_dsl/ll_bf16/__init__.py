@@ -27,7 +27,7 @@ import threading
 from typing import Any
 
 import torch
-from tokenspeed_kernel.platform import _pdl_enabled
+from tokenspeed_kernel.platform import pdl_enabled
 
 MAX_M_DOTPROD = 4
 MAX_M = 32
@@ -87,10 +87,6 @@ class LLBf16Router:
 
         return CUstream(torch.cuda.current_stream(device).cuda_stream)
 
-    @staticmethod
-    def _use_pdl(device: torch.device) -> bool:
-        return _pdl_enabled(torch.cuda.get_device_capability(device)[0] >= 9)
-
     def supports(self, a: torch.Tensor, b: torch.Tensor, m: int) -> bool:
         """Whether either backend can serve the given operands.
 
@@ -134,7 +130,11 @@ class LLBf16Router:
         a = make_fake_tensor(BFloat16, (m, k), divisibility=divisibility)
         b = make_fake_tensor(BFloat16, (n, k), divisibility=divisibility)
         c = make_fake_tensor(Float32, (m, n), divisibility=1)
-        gemm = _Kernel(k=k, bs=block_size, use_pdl=self._use_pdl(device))
+        gemm = _Kernel(
+            k=k,
+            bs=block_size,
+            use_pdl=torch.cuda.get_device_capability(device)[0] >= 9 and pdl_enabled(),
+        )
         # cute.compile targets the current device, not the operands'.
         with torch.cuda.device(device):
             self._dotprod[(device.index or 0, m, k, block_size)] = cute.compile(
@@ -168,7 +168,7 @@ class LLBf16Router:
             num_stages=num_stages,
             num_dma_warps=_SPLITK_DMA_WARPS,
             split_k=split_k,
-            use_pdl=self._use_pdl(device),
+            use_pdl=torch.cuda.get_device_capability(device)[0] >= 9 and pdl_enabled(),
         )
         with torch.cuda.device(device):
             self._splitk[(device.index or 0, split_k, num_stages)] = cute.compile(

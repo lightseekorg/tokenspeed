@@ -57,11 +57,6 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 from cutlass.cutlass_dsl import T, dsl_user_op
-from tokenspeed_kernel.platform import _pdl_enabled
-
-
-def trtllm_pdl_enabled() -> bool:
-    return _pdl_enabled()
 
 
 # WAR for CuTeDSL make_ptr implementation

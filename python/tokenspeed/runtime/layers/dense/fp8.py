@@ -217,6 +217,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.weight_scale_inv.data,
                 self.quant_config.weight_block_size,
                 scale_format=getattr(self.quant_config, "scale_fmt", None),
+                enable_pdl=pdl_enabled(),
             )
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)

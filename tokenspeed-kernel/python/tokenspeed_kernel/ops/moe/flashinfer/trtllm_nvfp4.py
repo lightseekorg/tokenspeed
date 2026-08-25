@@ -30,8 +30,8 @@ from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
-    _pdl_enabled,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -321,7 +321,6 @@ if platform.is_nvidia:
         (precomputed ``topk_ids``/``topk_weights``); everything else is
         identical.
         """
-        enable_pdl = _pdl_enabled(enable_pdl)
         _spec = getattr(w, "_spec", None)
 
         num_tokens = x.shape[0]
@@ -341,7 +340,7 @@ if platform.is_nvidia:
             x,
             w.w13_input_scale_quant,
             is_sf_swizzled_layout=False,
-            enable_pdl=enable_pdl,
+            enable_pdl=enable_pdl and pdl_enabled(),
         )
 
         # GEMM and scale arguments shared by both kernel entry points.
@@ -370,7 +369,7 @@ if platform.is_nvidia:
             local_expert_offset=_spec.ep_rank * _spec.num_local_experts,
             local_num_experts=_spec.num_local_experts,
             do_finalize=do_finalize,
-            enable_pdl=enable_pdl,
+            enable_pdl=enable_pdl and pdl_enabled(),
             tune_max_num_tokens=get_autotune_max_num_tokens(),
         )
 

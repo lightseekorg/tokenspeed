@@ -594,6 +594,7 @@ def select_experts(
             num_real_experts,
             routed_scaling_factor,
             renormalize,
+            pdl_enabled(),
         )
     elif custom_routing_function is None:
         assert (

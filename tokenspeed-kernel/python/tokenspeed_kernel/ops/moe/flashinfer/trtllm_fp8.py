@@ -27,8 +27,8 @@ from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
-    _pdl_enabled,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -112,7 +112,6 @@ if platform.is_nvidia:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ):
-        enable_pdl = _pdl_enabled(enable_pdl)
         hidden_size = x.shape[1]
         if x.shape[0] == 0:
             return x.new_empty(0, hidden_size, dtype=torch.bfloat16)
@@ -171,7 +170,7 @@ if platform.is_nvidia:
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=int(routing_method_type),
             do_finalize=True,
-            enable_pdl=enable_pdl,
+            enable_pdl=enable_pdl and pdl_enabled(),
             tune_max_num_tokens=get_autotune_max_num_tokens(),
         )
         if isinstance(result, (list, tuple)):

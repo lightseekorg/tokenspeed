@@ -3,7 +3,6 @@
 
 #include "plan.cuh"
 
-#include <cstdlib>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/dtype.h>
 #include <tvm/ffi/error.h>
@@ -33,7 +32,8 @@ void fmha_sm100_plan_forward(
     int64_t stream_ptr,
     Optional<TensorView> maybe_workspace_lse,
     int64_t lse_total_size,
-    int64_t pack_factor) {
+    int64_t pack_factor,
+    bool enable_pdl) {
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   int batch_size = qo_segment_lens.size(0);
 
@@ -58,8 +58,6 @@ void fmha_sm100_plan_forward(
   float* workspace_lse_ptr = maybe_workspace_lse.has_value()
                                  ? static_cast<float*>(maybe_workspace_lse.value().data_ptr())
                                   : nullptr;
-  const char* disable_pdl = std::getenv("TOKENSPEED_DISABLE_PDL");
-  const bool enable_pdl = disable_pdl == nullptr || std::atoi(disable_pdl) == 0;
 
   auto status = flashinfer::plan_kernel_wrapper(
       static_cast<int*>(qo_segment_offsets.data_ptr()),

@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
@@ -39,11 +39,6 @@ _MXFP8_SCALE = ScaleFormat(
 _MXFP8_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_SCALE
 )
-
-
-def _set_deep_gemm_pdl(enable_pdl: bool) -> None:
-    if get_pdl is not None and set_pdl is not None and get_pdl() != enable_pdl:
-        set_pdl(enable_pdl)
 
 
 try:
@@ -86,6 +81,8 @@ _DEEPSEEK_V4_GROUPED_SIGNATURES = frozenset(
 def _warmup_deep_gemm_fp8_linears(plans: list[object], max_tokens: int) -> None:
     from tokenspeed_kernel.thirdparty.deep_gemm.warmup import warmup_fp8_gemm_nt
 
+    if get_pdl() != pdl_enabled():
+        set_pdl(pdl_enabled())
     by_device: dict[torch.device, set[tuple[int, int]]] = {}
     for plan in plans:
         warmup_key = getattr(plan, "warmup_key")
@@ -150,6 +147,8 @@ def _warmup_deep_gemm_dsv4_grouped_output_projection(
 ) -> None:
     from tokenspeed_kernel.thirdparty.deep_gemm.warmup import _warmup_m_values
 
+    if get_pdl() != pdl_enabled():
+        set_pdl(pdl_enabled())
     num_scale_blocks = input_dim // block_size[1]
     grouped_weight = weight.view(num_groups, output_dim, input_dim)
     for num_tokens in _warmup_m_values(max_tokens):
@@ -231,6 +230,8 @@ if fp8_einsum is not None:
             dsv4_fused_inv_rope_fp8_quant,
         )
 
+        if get_pdl() != pdl_enabled():
+            set_pdl(pdl_enabled())
         values, scales = dsv4_fused_inv_rope_fp8_quant(
             attention,
             positions,
@@ -318,7 +319,8 @@ if fp8_gemm_nt is not None:
         ), "A_scales is required; online quantization should be done by the caller"
         if A_scales.dtype == torch.float32:
             A_scales = get_mn_major_tma_aligned_tensor(A_scales)
-        _set_deep_gemm_pdl(bool(enable_pdl))
+        if get_pdl() != (enable_pdl and pdl_enabled()):
+            set_pdl(enable_pdl and pdl_enabled())
         N = B.shape[0]
         C = A.new_empty(A.shape[0], N, dtype=torch.bfloat16)
         fp8_gemm_nt((A, A_scales), (B, B_scales), C)

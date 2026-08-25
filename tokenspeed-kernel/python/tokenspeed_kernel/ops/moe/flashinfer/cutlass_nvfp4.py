@@ -25,8 +25,8 @@ from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
-    _pdl_enabled,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -172,7 +172,6 @@ if platform.is_nvidia:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ):
-        enable_pdl = _pdl_enabled(enable_pdl)
         if topk_weights is None or topk_ids is None:
             scores = torch.softmax(router_logits.float(), dim=-1)
             topk_weights, topk_ids = torch.topk(
@@ -213,5 +212,5 @@ if platform.is_nvidia:
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=getattr(w, "swiglu_beta_t", None),
             swiglu_limit=getattr(w, "swiglu_limit_t", None),
-            enable_pdl=enable_pdl,
+            enable_pdl=enable_pdl and pdl_enabled(),
         )[0]

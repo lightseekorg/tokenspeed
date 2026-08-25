@@ -28,8 +28,8 @@ from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
-    _pdl_enabled,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -431,7 +431,7 @@ if platform.is_nvidia:
             do_finalize=True,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
             output=output,
-            enable_pdl=enable_pdl,
+            enable_pdl=enable_pdl and pdl_enabled(),
         )[0]
 
     def _call_mxfp4_situ_routed_moe(
@@ -492,7 +492,7 @@ if platform.is_nvidia:
             routed_scaling_factor=None,
             routing_method_type=1,
             do_finalize=do_finalize,
-            enable_pdl=enable_pdl,
+            enable_pdl=enable_pdl and pdl_enabled(),
             activation_type=_SITU_ACTIVATION_TYPE,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
             output=output if do_finalize else None,
@@ -543,7 +543,6 @@ if platform.is_nvidia:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ):
-        enable_pdl = _pdl_enabled(enable_pdl)
         hidden_padded = getattr(w, "hidden_size_padded", w.w2_weight_scale.shape[1])
         hidden_original = getattr(w, "hidden_size_original", hidden_padded)
         if x.shape[0] == 0:
@@ -567,7 +566,10 @@ if platform.is_nvidia:
                 )
         elif precision == "default":
             x_quant, x_scale = mxfp8_quantize(
-                x, False, enable_pdl=enable_pdl, alignment=hidden_padded
+                x,
+                False,
+                enable_pdl=enable_pdl and pdl_enabled(),
+                alignment=hidden_padded,
             )
             x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
         else:
@@ -645,7 +647,6 @@ if platform.is_nvidia:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ):
-        enable_pdl = _pdl_enabled(enable_pdl)
         if topk_weights is None or topk_ids is None:
             raise ValueError("precomputed_topk plan requires topk_weights and topk_ids")
         if x.dtype != torch.bfloat16:
@@ -673,7 +674,7 @@ if platform.is_nvidia:
         x, x_scale = mxfp8_quantize(
             x,
             False,
-            enable_pdl=enable_pdl,
+            enable_pdl=enable_pdl and pdl_enabled(),
             alignment=hidden_padded,
             backend="cute-dsl",
         )

@@ -27,7 +27,6 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cuda_runtime.h>
 #include <type_traits>
 
@@ -883,10 +882,10 @@ template <int H, int N, int NC = N_CHUNK_DEFAULT, bool RELEASE_TMEM = false,
 static void launch_fwd(const bf16_t* block_residual, bf16_t* layer_residual,
                        const bf16_t* delta, const bf16_t* res_weight,
                        const bf16_t* rms_weight, bf16_t* output, int T,
-                       float rms_eps, int num_sm, cudaStream_t stream,
-                       const bf16_t* output_norm_weight = nullptr,
-                       float output_norm_eps = 0.f, int block_stride_m = 0,
-                       int block_stride_r = 0) {
+                        float rms_eps, int num_sm, cudaStream_t stream,
+                        const bf16_t* output_norm_weight = nullptr,
+                        float output_norm_eps = 0.f, int block_stride_m = 0,
+                        int block_stride_r = 0, bool enable_pdl = false) {
   constexpr size_t smem_size =
       ((size_t)CHUNK_DEPTH * (NC + (HAS_DELTA ? 1 : 0)) * H * sizeof(bf16_t) +
        (OUTPUT_NORM_IN_SMEM ? (size_t)H * sizeof(bf16_t) : 0) +
@@ -912,8 +911,6 @@ static void launch_fwd(const bf16_t* block_residual, bf16_t* layer_residual,
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = 1;
-  const char* disable_pdl = std::getenv("TOKENSPEED_DISABLE_PDL");
-  const bool enable_pdl = disable_pdl == nullptr || std::atoi(disable_pdl) == 0;
   config.attrs = enable_pdl ? attrs : nullptr;
   config.numAttrs = enable_pdl ? 1 : 0;
   cudaLaunchKernelEx(&config, kernel, block_residual, layer_residual, delta,
@@ -929,7 +926,7 @@ void run_attn_res_fwd_online_v2(
     const bf16_t* delta, const bf16_t* res_weight, const bf16_t* rms_weight,
     const bf16_t* output_norm_weight, bf16_t* output, int N, int T,
     int block_stride_m, int block_stride_r, float rms_eps, int num_sm,
-    cudaStream_t stream) {
+    cudaStream_t stream, bool enable_pdl) {
   using namespace sm100::fwd_prod_v2;
   auto dispatch_options = [&](auto nsrc_tok, auto delta_tok,
                               auto output_norm_tok) {
@@ -940,7 +937,7 @@ void run_attn_res_fwd_online_v2(
                HAS_OUTPUT_NORM>(
         block_residual, layer_residual, delta, res_weight, rms_weight, output, T,
         rms_eps, num_sm, stream, output_norm_weight, rms_eps, block_stride_m,
-        block_stride_r);
+        block_stride_r, enable_pdl);
   };
   auto dispatch = [&](auto nsrc_tok) {
     if (delta == nullptr && output_norm_weight == nullptr) {
