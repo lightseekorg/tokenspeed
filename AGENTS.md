@@ -20,6 +20,12 @@
   commit any formatter changes it makes.
 * When creating commits, perform sign off on behalf of the author.
 
+## Public pull requests
+
+* Keep PR titles, descriptions, commit messages, diffs, comments, logs, and
+  artifacts limited to public information. Never include private repository
+  names or links, private dates, or any other private or internal information.
+
 ## Dependency boundaries
 
 * `tokenspeed` runtime dependencies should stay vendor-neutral.
