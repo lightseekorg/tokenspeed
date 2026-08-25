@@ -111,7 +111,7 @@ class RequestHandler:
         architectures: list[str] | None = None,
         pause_controller=None,
         memory_controller=None,
-        model_runner=None,
+        device=None,
     ) -> None:
 
         self.forward_ct = 0
@@ -121,9 +121,10 @@ class RequestHandler:
         # Owns release/resume_memory_occupation (data plane). See
         # memory_occupation.py. Shares the pause controller's drain machinery.
         self.memory_controller = memory_controller
-        # ModelRunner for in-place RL weight sync (NCCL group init + receive).
-        # The scheduler worker passes it in; None elsewhere (e.g. unit tests).
-        self.model_runner = model_runner
+        # In-place RL weight sync (NCCL group init + receive) goes over the
+        # data plane so it is ordered against forwards. The scheduler worker
+        # passes the handle in; None elsewhere (e.g. unit tests).
+        self._device = device
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -245,19 +246,19 @@ class RequestHandler:
                 )
             elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
                 # RL weight sync: join the trainer's NCCL group on this worker.
-                ok, msg = self.model_runner.init_weights_update_group(recv_req)
+                ok, msg = self._device.init_weights_update_group(recv_req)
                 self.send_func.send_pyobj(
                     InitWeightsUpdateGroupReqOutput(success=ok, message=msg)
                 )
             elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
                 # RL weight sync: receive broadcast weights + load into the model.
-                ok, msg = self.model_runner.update_weights_from_distributed(recv_req)
+                ok, msg = self._device.update_weights_from_distributed(recv_req)
                 self.send_func.send_pyobj(
                     UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
                 )
             elif isinstance(recv_req, DestroyWeightsUpdateGroupReqInput):
                 # RL weight sync: tear down the trainer's NCCL group on this worker.
-                ok, msg = self.model_runner.destroy_weights_update_group(recv_req)
+                ok, msg = self._device.destroy_weights_update_group(recv_req)
                 self.send_func.send_pyobj(
                     DestroyWeightsUpdateGroupReqOutput(success=ok, message=msg)
                 )

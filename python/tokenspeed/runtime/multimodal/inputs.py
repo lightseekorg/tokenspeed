@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import uuid
 from collections.abc import Mapping
@@ -244,8 +245,6 @@ class MultimodalInputs(msgspec.Struct, eq=False, kw_only=True, array_like=True):
     mrope_positions: torch.Tensor | None = None
     mrope_position_delta: torch.Tensor | None = None
     mrope_position_delta_scalar: int | None = None
-    # Scheduler-local expansion cache; always None on the wire.
-    mrope_position_delta_repeated_cache: torch.Tensor | None = None
 
     def ensure_pad_values(self) -> None:
         for item in self.mm_items:
@@ -275,7 +274,13 @@ class MultimodalInputs(msgspec.Struct, eq=False, kw_only=True, array_like=True):
 
 @dataclasses.dataclass(eq=False)
 class MultimodalForwardContext:
-    """Per-forward multimodal metadata for prefill embedding replacement."""
+    """Per-forward multimodal metadata for prefill embedding replacement.
+
+    A snapshot handed to the data plane inside a forward closure: the
+    ``mm_inputs`` here are shallow copies, so the control plane's later edits
+    to a request's live ``multimodal_inputs`` (M-RoPE position extension as
+    the request generates) are invisible to a forward already in flight.
+    """
 
     mm_inputs: list[MultimodalInputs | None]
     extend_prefix_lens: list[int]
@@ -289,6 +294,24 @@ class MultimodalForwardContext:
             mm_input is not None and index < len(self.extend_seq_lens)
             for index, mm_input in enumerate(self.mm_inputs)
         )
+
+
+def _resolve_mrope_delta_scalar(mm_input: MultimodalInputs) -> None:
+    """Materialize ``mrope_position_delta_scalar`` from the delta tensor.
+
+    Normally the input processor sets it at admission; a decode-only
+    ``MultimodalInputs`` arriving from a PD prefill node may carry only the
+    tensor. Reading it is a host-side ``item()`` on a CPU tensor, so it costs
+    no device sync and belongs on the control plane.
+
+    Args:
+        mm_input: The request's live multimodal inputs, resolved in place.
+    """
+    if mm_input.mrope_position_delta_scalar is not None:
+        return
+    delta = mm_input.mrope_position_delta
+    if delta is not None:
+        mm_input.mrope_position_delta_scalar = int(delta.flatten()[0].item())
 
 
 def multimodal_context_for_forward(forward_op, rid_to_state):
@@ -313,6 +336,17 @@ def multimodal_context_for_forward(forward_op, rid_to_state):
         if state is not None and index < num_extends:
             state.maybe_extend_multimodal_mrope_positions()
         item = getattr(state, "multimodal_inputs", None) if state else None
+        if item is not None:
+            # Resolve the decode delta here rather than letting the forward
+            # write it back: the data plane must not edit a control-plane
+            # object, and resolving on the live struct keeps the value across
+            # rounds, which a per-round snapshot could not.
+            _resolve_mrope_delta_scalar(item)
+            # Snapshot. The struct is small and its tensors are shared by
+            # reference; what the copy buys is that this batch's view of
+            # ``mrope_positions`` cannot be swapped out from under an
+            # in-flight forward by the next round's extension above.
+            item = copy.copy(item)
         mm_inputs.append(item)
         has_mm = has_mm or item is not None
     if not has_mm:

@@ -44,14 +44,16 @@ class _SchedulerHarness:
         return SimpleNamespace(pages_to_zero=())
 
 
-class _ModelExecutorHarness:
+class _DeviceHarness:
     def __init__(self, trace: list[str]) -> None:
         self._trace = trace
 
-    def zero_cache_pages(self, page_ids) -> None:
+    def submit_page_zeroing(self, pages):
         # Unreached while the harness plans no page; kept so a plan that
         # does would trace the submission rather than fail on a missing attr.
-        self._trace.append("zero_pages")
+        if pages:
+            self._trace.append("zero_pages")
+        return None
 
 
 class _EventLoopHarness:
@@ -64,7 +66,7 @@ class _EventLoopHarness:
             self.shutdown_event.set()
         self._pause = _PauseHarness(self.trace)
         self.scheduler = _SchedulerHarness(self.trace)
-        self.model_executor = _ModelExecutorHarness(self.trace)
+        self._device = _DeviceHarness(self.trace)
         self.output_processor = SimpleNamespace(rid_to_state={})
         self.has_dp = False
         self.kv_transfer = None

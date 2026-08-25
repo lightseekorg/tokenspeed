@@ -94,29 +94,25 @@ class DisaggPrefillExecutor:
             step_counter, self._layerwise_interval
         )
 
-    def setup_layerwise_transfer(
-        self, model_executor, gpu_id: int, interval: int
-    ) -> None:
-        """Wire a shared step counter between the attention backends and this
-        executor's KV sender so KV pages stream out layer-by-layer during the
-        prefill forward instead of all at once after it.
+    def setup_layerwise_transfer(self, wiring, gpu_id: int, interval: int) -> None:
+        """Stream KV out layer-by-layer during the prefill forward.
+
+        The shared step counter is ticked by the attention backends as each
+        layer's KV lands and read by this executor's sender. Installing it is
+        backend surgery, so the device wiring does that and hands back the
+        counter — this side never touches a backend.
 
         Args:
-            model_executor: Owner of the attention backend(s) the counter hooks
-                into (and of the draft backend in spec-decode runs).
+            wiring: The engine's startup ``DeviceWiring``.
             gpu_id: Device index the counter is created against.
             interval: Layer interval between sends; ``<= 0`` disables
                 layerwise transfer (this call becomes a no-op).
         """
         if interval <= 0:
             return
-        from tokenspeed.runtime.pd.utils import StepCounter
-
-        step_counter = StepCounter(model_executor.device, gpu_id)
-        model_executor.attn_backend.register_step_counter(step_counter)
-        if model_executor.draft_attn_backend is not None:
-            model_executor.register_draft_final_step_counter(step_counter)
-        self.register_layerwise_step_counter(step_counter, interval)
+        self.register_layerwise_step_counter(
+            wiring.install_pd_step_counter(gpu_id), interval
+        )
 
     def _bootstrap(self, request_id, info):
         self.senders[request_id] = MooncakeKVSender(

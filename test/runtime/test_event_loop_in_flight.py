@@ -49,8 +49,8 @@ from tokenspeed.runtime.engine.forward_dispatch import (  # noqa: E402
 
 def _predicate_loop(*, dispatcher=None, eager_grammar_buffers=None):
     return SimpleNamespace(
-        _forward_dispatcher=dispatcher or ForwardDispatcher(executor=None),
-        model_executor=SimpleNamespace(eager_grammar_buffers=eager_grammar_buffers),
+        _forward_dispatcher=dispatcher or ForwardDispatcher(device=None),
+        _uses_eager_grammar=eager_grammar_buffers is not None,
     )
 
 

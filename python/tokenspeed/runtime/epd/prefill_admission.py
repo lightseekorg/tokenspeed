@@ -1058,7 +1058,7 @@ def make_epd_prefill_admission(
     global_rank,
     *,
     model_config,
-    model_executor,
+    model_facts,
     mapping,
     attn_tp_rank,
     attn_tp_size,
@@ -1074,16 +1074,15 @@ def make_epd_prefill_admission(
     )
     if manager is None:
         return None
-    # Extract the narrow model facts the controller needs (vision dtype, hidden
-    # width, deepstack width, device) here -- the controller holds these, not the
-    # whole model_executor (mirrors how create_kv_transfer takes a kv_args struct).
-    model = model_executor.model_runner.model
+    # The narrow model facts the controller needs (vision dtype, hidden width,
+    # deepstack width, device), read off the data plane rather than the model:
+    # the controller holds these, never the model itself.
     return EpdPrefillAdmission(
         manager=manager,
-        device=model_executor.device,
-        hidden=model.config.hidden_size,
-        num_deepstack=getattr(model, "num_deepstack_embeddings", 0),
-        dtype=(getattr(model, "visual", None) or model.vision_tower).dtype,
+        device=model_facts.device,
+        hidden=model_facts.hidden,
+        num_deepstack=model_facts.num_deepstack,
+        dtype=model_facts.dtype,
         attn_tp_rank=attn_tp_rank,
         attn_tp_size=attn_tp_size,
         attn_tp_cpu_group=attn_tp_cpu_group,

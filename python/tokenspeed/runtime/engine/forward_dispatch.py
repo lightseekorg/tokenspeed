@@ -33,6 +33,10 @@ Every dispatcher returns the same pair:
   that produce no model output (a KV handoff, an RDMA receive trigger).
 - ``on_first_token``: a callback the commit path runs for the round's
   first sampled token, or None when the role does not need one.
+
+Dispatchers are control plane. They decide WHAT this round does; the GPU work
+itself they can only ask ``DeviceHandle`` for, by name — they hold that handle,
+not the executor behind it.
 """
 
 from __future__ import annotations
@@ -49,15 +53,27 @@ from tokenspeed.runtime.execution.types import DpForwardMetadata, PendingExecuti
 class PlannedForward:
     """One round's planned work, as the dispatcher needs to see it.
 
+    Everything the data plane learns about a round arrives through here and
+    is captured into the submitted closure, so every field must be something
+    the control plane will not touch again once the round is dispatched (the
+    capture contract in ``execution/forward_thread.py``). A new field either
+    satisfies that, or it is a new registered exception — not a comment.
+
     Attributes:
-        forward_op: The scheduler's op for this round.
+        forward_op: The scheduler's op for this round. A per-round value copy
+            out of C++ (``rv_policy::copy`` on ``ExecutionPlan.forward``), so
+            no later scheduler activity can reach it.
         sampling_params_list: Per-slot sampling params, gathered by the loop.
-        dp_metadata: CPU-gathered DP metadata, None outside DP.
+            Read-only for the request's lifetime.
+        dp_metadata: CPU-gathered DP metadata, None outside DP. A frozen
+            dataclass of plain lists.
         grammar_inputs: Per-batch grammar state, None when no request in the
-            batch is constrained.
+            batch is constrained. THE registered exception: these are the
+            control plane's live matchers, see the contract's rule 5.
         multimodal_context: Per-batch multimodal state, None for text-only.
+            Its ``mm_inputs`` are shallow copies taken at gather time.
         cache_zero_future: The round's page-zeroing submission, None when
-            no page needed sanitizing.
+            no page needed sanitizing. Resolved on the data plane itself.
     """
 
     forward_op: Any
@@ -84,11 +100,14 @@ class ForwardDispatcher:
     #: This engine decodes requests whose prompt ran on another node.
     is_decode_role = False
 
-    def __init__(self, executor) -> None:
-        self._executor = executor
+    def __init__(self, device) -> None:
+        self._device = device
 
     def dispatch(self, planned: PlannedForward) -> DispatchResult:
-        return self._submit(planned, grammar_inputs=planned.grammar_inputs), None
+        return (
+            self._device.submit_forward(planned, grammar_inputs=planned.grammar_inputs),
+            None,
+        )
 
     def produces_model_output(self, forward_op) -> bool:
         """Whether dispatching this op enters the model forward path.
@@ -108,28 +127,6 @@ class ForwardDispatcher:
         """
         return False
 
-    def _submit(
-        self,
-        planned: PlannedForward,
-        *,
-        grammar_inputs,
-        capture_next_input_ids: bool = False,
-    ) -> PendingExecution:
-        """Queue the forward on the data plane; never blocks."""
-        executor = self._executor
-
-        def _run_forward():
-            return executor.execute_forward_op(
-                planned.forward_op,
-                planned.sampling_params_list,
-                dp_metadata=planned.dp_metadata,
-                grammar_inputs=grammar_inputs,
-                multimodal_context=planned.multimodal_context,
-                capture_next_input_ids=capture_next_input_ids,
-            )
-
-        return PendingExecution(executor.forward_thread.submit(_run_forward))
-
 
 class DecodeDispatcher(ForwardDispatcher):
     """Submit forwards for a PD decode node.
@@ -142,8 +139,8 @@ class DecodeDispatcher(ForwardDispatcher):
 
     is_decode_role = True
 
-    def __init__(self, executor, kv_transfer, *, pd_cache_enabled: bool) -> None:
-        super().__init__(executor)
+    def __init__(self, device, kv_transfer, *, pd_cache_enabled: bool) -> None:
+        super().__init__(device)
         self._kv_transfer = kv_transfer
         self._pd_cache_enabled = pd_cache_enabled
 
@@ -158,44 +155,24 @@ class DecodeDispatcher(ForwardDispatcher):
     def dispatch(self, planned: PlannedForward) -> DispatchResult:
         forward_op = planned.forward_op
         if self._receives_remote_kv(forward_op):
-            self._trigger_remote_receive(planned)
+            # Not the engine's forward path: the round only pulls the KV in.
+            # The zeroing barrier applies to the paged-cache manifest only.
+            self._device.run_remote_receive(
+                forward_op,
+                cache_zero_future=(
+                    planned.cache_zero_future if self._pd_cache_enabled else None
+                ),
+                trigger=self._kv_transfer.execute,
+            )
             return None, None
         # Decode and local recovery-prefill batches execute normally. The
         # matcher of a constrained request was advanced past the prefill
         # node's token when its RemotePrefillDoneEvent landed, so masking
         # here continues from the right state.
-        return self._submit(planned, grammar_inputs=planned.grammar_inputs), None
-
-    def _trigger_remote_receive(self, planned: PlannedForward) -> None:
-        """Pull the remote KV in for requests admitted this round.
-
-        The slot preparation and cache-length reset touch the execution
-        stream, so they run on the forward thread; the RDMA trigger itself
-        is CPU-side but must follow them (and the zeroing barrier), so the
-        whole path is submitted as one unit.
-        """
-        executor = self._executor
-        kv_transfer = self._kv_transfer
-        forward_op = planned.forward_op
-        cache_zero_future = planned.cache_zero_future
-        pd_cache_enabled = self._pd_cache_enabled
-
-        def _trigger_receive():
-            executor.prepare_remote_cache_slots(
-                list(forward_op.request_pool_indices[: forward_op.num_extends()])
-            )
-            executor.reset_remote_prefill_cache_lengths(forward_op)
-            if pd_cache_enabled and cache_zero_future is not None:
-                # Page zeroing runs asynchronously on a CUDA stream, while
-                # Mooncake/GPUDirect writes are not ordered by that stream.
-                # Do not publish the destination manifest until the newly
-                # assigned pages are fully sanitized.
-                cache_zero_event = cache_zero_future.result()
-                if cache_zero_event is not None:
-                    cache_zero_event.synchronize()
-            kv_transfer.execute(forward_op)
-
-        executor.forward_thread.run(_trigger_receive)
+        return (
+            self._device.submit_forward(planned, grammar_inputs=planned.grammar_inputs),
+            None,
+        )
 
 
 class PrefillDispatcher(ForwardDispatcher):
@@ -208,8 +185,8 @@ class PrefillDispatcher(ForwardDispatcher):
 
     is_prefill_role = True
 
-    def __init__(self, executor, kv_transfer, *, epd_hooks) -> None:
-        super().__init__(executor)
+    def __init__(self, device, kv_transfer, *, epd_hooks) -> None:
+        super().__init__(device)
         self._kv_transfer = kv_transfer
         self._epd_hooks = epd_hooks
 
@@ -233,7 +210,7 @@ class PrefillDispatcher(ForwardDispatcher):
         # admission drain before admission; assert none reached the forward
         # un-received (no-op for non-EPD / text-only requests).
         self._epd_hooks.assert_embeddings_received(planned.multimodal_context)
-        pending = self._submit(
+        pending = self._device.submit_forward(
             planned,
             grammar_inputs=planned.grammar_inputs,
             capture_next_input_ids=True,

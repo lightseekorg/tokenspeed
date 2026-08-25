@@ -40,7 +40,7 @@ def _logger(**overrides) -> BatchLogger:
         num_total_pages=100,
         spec_num_steps=0,
         spec_num_tokens=0,
-        token_to_kv_pool=SimpleNamespace(maybe_log_cache_group_pages=lambda: None),
+        log_cache_group_pages=lambda: None,
     )
     kwargs.update(overrides)
     return BatchLogger(**kwargs)

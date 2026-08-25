@@ -214,6 +214,14 @@ class RequestState:
             mm.mrope_positions, target_len - current_len
         )
 
+    def has_pending_multimodal_features(self) -> bool:
+        mm = self.multimodal_inputs
+        return (
+            mm is not None
+            and hasattr(mm, "has_pending_shm_features")
+            and mm.has_pending_shm_features()
+        )
+
     def release_pending_multimodal_features(self) -> None:
         mm = self.multimodal_inputs
         if mm is not None and hasattr(mm, "release_shm_features"):
@@ -322,6 +330,7 @@ class OutputProcesser:
         physical_context_len: int | None = None,
         *,
         metrics: EngineMetrics,
+        defer_to_device=None,
     ) -> None:
         # BatchTokenIDOut is pushed directly to
         # ``send_to_tokenizer`` (AsyncLLM's input socket). The
@@ -355,6 +364,40 @@ class OutputProcesser:
         # handles. Entries for rids that never register are swept by TTL
         # to keep this bounded across a long-running server.
         self.pending_aborts: dict[str, float] = {}
+        # ``DeviceHandle.submit_release``, or None where there is no data plane
+        # (unit tests, CPU-only harnesses). See _release_multimodal_features.
+        self._defer_to_device = defer_to_device
+
+    def _release_multimodal_features(self, request_state: RequestState) -> None:
+        """Release a request's SHM features once no forward can still read them.
+
+        The model's embedder consumes ``feature_shm`` inside the forward, so a
+        request that finishes or aborts while an earlier round's forward is
+        still queued would have its handles released out from under that
+        forward (in-flight depth >= 1 plans the next round before committing
+        the previous one, so a batch can contain a request that this commit
+        finishes). Submitting the release to the data plane puts it behind
+        every forward already in the queue — which is exactly the ordering
+        the FIFO exists to provide.
+
+        Args:
+            request_state: The finished/aborted request's state.
+        """
+        if self._defer_to_device is None or not (
+            request_state.has_pending_multimodal_features()
+        ):
+            request_state.release_pending_multimodal_features()
+            return
+
+        def _release():
+            try:
+                request_state.release_pending_multimodal_features()
+            except Exception:
+                # The future is never observed; a lost handle is a leak, not a
+                # correctness break, so log and keep the data plane running.
+                logger.exception("failed to release multimodal SHM features")
+
+        self._defer_to_device(_release)
 
     def _check_physical_extent(
         self, rid, request_state: RequestState, output_length: int
@@ -471,7 +514,7 @@ class OutputProcesser:
             state.finished_output = False
             self.stream_output([rid], [state])
         finally:
-            state.release_pending_multimodal_features()
+            self._release_multimodal_features(state)
             self.rid_to_state.pop(rid, None)
             # This path replaces register() for grammar-aborted rids —
             # drop any queued abort marker so pending_aborts doesn't leak
@@ -809,7 +852,7 @@ class OutputProcesser:
                     stream_out_rids.append(rid)
                     stream_out_states.append(request_state)
                 self._log_request_stats(rid, request_state, stats_now)
-                request_state.release_pending_multimodal_features()
+                self._release_multimodal_features(request_state)
                 self.rid_to_state.pop(rid)
                 continue
 
@@ -829,7 +872,7 @@ class OutputProcesser:
                     make_abort_event(rid) if nan_detected else make_finish_event(rid)
                 )
                 self._log_request_stats(rid, request_state, stats_now)
-                request_state.release_pending_multimodal_features()
+                self._release_multimodal_features(request_state)
                 self.rid_to_state.pop(rid)
             else:
                 stream_out_rids.append(rid)
@@ -903,7 +946,7 @@ class OutputProcesser:
         self._log_request_stats(req_id, state, now)
         if not state.to_abort or state.abort_notify_client:
             self.stream_output([req_id], [state])
-        state.release_pending_multimodal_features()
+        self._release_multimodal_features(state)
         self.rid_to_state.pop(req_id)
         return [
             make_abort_event(req_id) if state.to_abort else make_finish_event(req_id)
@@ -925,7 +968,7 @@ class OutputProcesser:
         if req_id not in self.rid_to_state:
             return []
         rs = self.rid_to_state.pop(req_id)
-        rs.release_pending_multimodal_features()
+        self._release_multimodal_features(rs)
 
         # Ensure a finish reason is set so TokenizerManager marks the request done.
         if not rs.finished:

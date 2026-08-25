@@ -22,8 +22,8 @@
 
 The KV transfer executors (prefill/decode) DECIDE — they own the senders /
 receivers and surface progress as PD events. ``PdTransferHooks`` here ACTS on
-those events with the event loop's collaborators (output processor, model
-executor) and returns the enriched event list for the loop to advance the
+those events with the event loop's collaborators (output processor, data
+plane) and returns the enriched event list for the loop to advance the
 scheduler with — feedback into the scheduler stays an explicit
 ``advance_scheduler`` call in the loop body.
 """
@@ -41,8 +41,10 @@ class PdTransferHooks:
     back-reference; a cheap no-op when PD is disabled (``kv_transfer=None``).
     """
 
-    def __init__(self, loop) -> None:
+    def __init__(self, loop, device) -> None:
         self._loop = loop
+        # Injected, not reached through the loop — see PauseHooks.
+        self._device = device
 
     def poll_transfer_events(self) -> list:
         """Poll the KV transfer executor, act on its events, and return the
@@ -78,23 +80,19 @@ class PdTransferHooks:
                     candidate_info = loop.kv_transfer.pop_remote_spec_candidate_ids(
                         req_id
                     )
-                    if candidate_info is not None:
-                        req_pool_idx, candidate_ids = candidate_info
-                        loop.model_executor.write_remote_spec_candidate_ids(
-                            req_pool_idx, candidate_ids
-                        )
                     remaining_state = loop.output_processor.rid_to_state.get(req_id)
-                    if (
-                        remote_cache_slot is not None
-                        and remaining_state is not None
+                    still_decoding = (
+                        remaining_state is not None
                         and not remaining_state.to_abort
                         and not remaining_state.finished
-                    ):
-                        loop.model_executor.forward_thread.run(
-                            lambda slot=remote_cache_slot: (
-                                loop.model_executor.mark_remote_cache_ready(slot)
-                            )
-                        )
+                    )
+                    # Both are device writes read by the request's first local
+                    # decode, so they cross as one ordered submission rather
+                    # than as two calls from this handler.
+                    self._device.run_remote_prefill_landing(
+                        candidate_info,
+                        remote_cache_slot if still_decoding else None,
+                    )
             elif isinstance(event, PD.FailedEvent):
                 # A PD/EPD transfer failed: the decode KV receiver timed out (e.g. the
                 # prefill aborted on embedding timeout so the KV never arrives), or a

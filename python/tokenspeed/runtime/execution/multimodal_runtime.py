@@ -94,25 +94,31 @@ class MultimodalRuntime:
     # M-RoPE position overrides
     # ------------------------------------------------------------------
 
-    def _expand_mrope_from_input(self, mm_input, seq_len: int) -> torch.Tensor:
-        # Cache delta expansion for retracted/chunked requests.
-        if mm_input.mrope_position_delta_repeated_cache is None:
-            mm_input.mrope_position_delta_repeated_cache = (
-                (mm_input.mrope_position_delta - 1).flatten().unsqueeze(0).repeat(3, 1)
-            )
-        return mm_input.mrope_position_delta_repeated_cache + seq_len
+    @staticmethod
+    def _expand_mrope_from_input(mm_input, seq_len: int) -> torch.Tensor:
+        # Reached only by the chunked/retracted fallback below, where the
+        # positions table has no row for this chunk. Computed fresh rather
+        # than memoized on ``mm_input``: that struct belongs to the control
+        # plane, and a forward must not write into what it was handed.
+        return (mm_input.mrope_position_delta - 1).flatten().unsqueeze(0).repeat(
+            3, 1
+        ) + seq_len
 
     @staticmethod
     def _mrope_delta_scalar(mm_input) -> int:
+        """Read the request's decode position delta.
+
+        ``multimodal_context_for_forward`` resolves the scalar on the control
+        plane, so this is a plain read for anything the engine dispatched;
+        the tensor branch covers directly-constructed inputs.
+        """
         delta = getattr(mm_input, "mrope_position_delta_scalar", None)
         if delta is not None:
             return int(delta)
         tensor = getattr(mm_input, "mrope_position_delta", None)
         if tensor is None:
             return 0
-        delta = int(tensor.flatten()[0].item())
-        mm_input.mrope_position_delta_scalar = delta
-        return delta
+        return int(tensor.flatten()[0].item())
 
     def _build_decode_mrope_positions_override(
         self,

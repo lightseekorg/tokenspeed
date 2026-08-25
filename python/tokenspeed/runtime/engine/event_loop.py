@@ -23,7 +23,6 @@ import signal
 import threading
 import time
 from collections import deque
-from functools import partial
 
 import psutil
 import setproctitle
@@ -32,7 +31,6 @@ import torch.distributed as dist
 import zmq
 from tokenspeed_scheduler import Scheduler
 
-from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -53,23 +51,15 @@ from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     advance_scheduler,
-    aligned_max_scheduled_tokens,
-    log_gpu_memory_summary,
     make_config,
-    pool_to_cache_groups,
     resolve_dspark_prefix_replay_tokens,
-    scheduler_cache_geometry_from_pool,
     should_use_overlap_schedule,
 )
 from tokenspeed.runtime.epd.prefill_hooks import EpdPrefillHooks
+from tokenspeed.runtime.execution.device import build_device_side
 from tokenspeed.runtime.execution.distributed_initializer import (
     DistributedConfig,
     DistributedInitializer,
-)
-from tokenspeed.runtime.execution.factory import (
-    ModelExecutorConfig,
-    create_model_executor,
-    create_model_runner,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import (
@@ -77,14 +67,10 @@ from tokenspeed.runtime.execution.types import (
     PendingExecution,
 )
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
-from tokenspeed.runtime.layers.attention.registry import create_attn_components
 from tokenspeed.runtime.metrics.collector import EngineMetrics
 from tokenspeed.runtime.multimodal.inputs import multimodal_context_for_forward
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
-from tokenspeed.runtime.pd.factory import (
-    create_kv_transfer,
-    get_kv_args,
-)
+from tokenspeed.runtime.pd.factory import create_kv_transfer
 from tokenspeed.runtime.pd.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
@@ -155,14 +141,6 @@ class EventLoop:
 
         min_per_gpu_mem = self._init_distributed()
 
-        target, draft = create_model_runner(
-            server_args, self.model_config, draft_model_config, gpu_id, global_rank
-        )
-        self.multimodal_encoder_dtype = target.multimodal_encoder_dtype
-        if server_args.disaggregation_mode in ("null", "prefill"):
-            # Keep this after all target/draft weights are loaded and before
-            # create_attn_components profiles memory for the KV-cache budget.
-            target.prepare_multimodal_runtime()
         self.use_overlap_schedule = should_use_overlap_schedule(
             disable_overlap_schedule=server_args.disable_overlap_schedule,
             disaggregation_mode=server_args.disaggregation_mode,
@@ -179,84 +157,48 @@ class EventLoop:
             self.in_flight_depth = server_args.mapping.pp_size
         else:
             self.in_flight_depth = int(self.use_overlap_schedule)
+
         decode_input_tokens = (
             server_args.speculative_num_draft_tokens
             if server_args.speculative_algorithm is not None
             else 1
         )
-
-        (
-            attn_backend,
-            token_to_kv_pool,
-            draft_attn_backend,
-            draft_token_to_kv_pool,
-            self.cache_storage,
-        ) = create_attn_components(
-            server_args,
-            self.model_config,
-            gpu_id,
-            global_rank,
-            min_per_gpu_mem,
-            server_args.enable_memory_saver,
-            draft_model_config,
-            decode_input_tokens=decode_input_tokens,
+        mapping = server_args.mapping
+        # The C++ scheduler's req_pool_idx range is rank-local and 1-based:
+        # real rows are 1..max_batch_size, row 0 is reserved.
+        per_rank_max_batch = server_args.max_num_seqs // max(mapping.attn.dp_size, 1)
+        # The entire device side is built in here: model runners, attention
+        # backends, KV pools and the executor are locals of the builder and
+        # never come back out. ``device`` is a local too — only ``.handle``
+        # outlives this constructor, so the running loop can neither name a
+        # device object nor call a startup hook.
+        device = build_device_side(
+            server_args=server_args,
+            model_config=self.model_config,
+            draft_model_config=draft_model_config,
+            gpu_id=gpu_id,
+            global_rank=global_rank,
+            attn_tp_rank=attn_tp_rank,
+            min_per_gpu_mem=min_per_gpu_mem,
             overlap_schedule_depth=self.overlap_schedule_depth,
+            decode_input_tokens=decode_input_tokens,
+            max_batch_size=per_rank_max_batch,
         )
-
-        self._scheduler_cache_geometry = scheduler_cache_geometry_from_pool(
-            token_to_kv_pool
-        )
+        self._device = device.handle
+        specs = device.specs
+        self.multimodal_encoder_dtype = specs.multimodal_encoder_dtype
+        self.cache_storage = specs.cache_storage
+        self._scheduler_cache_geometry = specs.cache_geometry
         geometry = self._scheduler_cache_geometry
         # The contract is the one source of admitted capacity.
         self.max_total_num_tokens = geometry.token_capacity
-        cache_groups = pool_to_cache_groups(token_to_kv_pool)
-        # Resolve the scheduler limit before ModelExecutorConfig sizes input
-        # buffers. Lowering the limit is safe; a configured chunk smaller than
-        # one state checkpoint block is rejected by aligned_max_scheduled_tokens instead of
-        # silently increasing a frozen buffer limit.
+        # Planning reads this every round; keep the value, not the handle.
+        self._uses_eager_grammar = specs.uses_eager_grammar
+        cache_groups = specs.cache_groups
+        # The builder may have lowered this to the cache-group checkpoint grain.
         max_scheduled_tokens = server_args.chunked_prefill_size
-        if server_args.enable_prefix_caching:
-            max_scheduled_tokens = aligned_max_scheduled_tokens(
-                server_args.chunked_prefill_size,
-                cache_groups,
-            )
-            if max_scheduled_tokens != server_args.chunked_prefill_size:
-                logger.warning(
-                    "chunked_prefill_size=%s is not a multiple of the "
-                    "state-snapshot checkpoint grain; using %s so recurrent-state "
-                    "pages can register for prefix-cache reuse.",
-                    server_args.chunked_prefill_size,
-                    max_scheduled_tokens,
-                )
-                server_args.chunked_prefill_size = max_scheduled_tokens
-        mapping = server_args.mapping
-        # The C++ scheduler's req_pool_idx range is rank-local and 1-based:
-        # real rows are 1..max_batch_size, row 0 is reserved, and CUDA graph
-        # padding needs one non-real sink row after the scheduler-owned range.
-        per_rank_max_batch = server_args.max_num_seqs // max(mapping.attn.dp_size, 1)
-        req_pool_padding_index = per_rank_max_batch + 1
 
-        model_executor_config = ModelExecutorConfig.from_server_args(
-            server_args=server_args,
-            model_config=self.model_config,
-            max_req_pool_size=req_pool_padding_index,
-            gpu_id=gpu_id,
-            global_rank=global_rank,
-            prefix_granularity=geometry.prefix_granularity,
-            overlap_schedule_depth=self.overlap_schedule_depth,
-        )
-        self.model_executor = create_model_executor(
-            server_args=server_args,
-            config=model_executor_config,
-            model_runner=target,
-            draft_model_runner=draft,
-            attn_backend=attn_backend,
-            token_to_kv_pool=token_to_kv_pool,
-            draft_attn_backend=draft_attn_backend,
-            draft_token_to_kv_pool=draft_token_to_kv_pool,
-        )
-
-        # Per-round batch logging lives here, not in the executor: it reports
+        # Per-round batch logging lives on the control plane: it reports
         # scheduler quantities (queue depth, page usage) that the loop already
         # samples, and its counters stay on this thread.
         self._batch_logger = BatchLogger(
@@ -265,23 +207,10 @@ class EventLoop:
             # Usable pages, the same total the load snapshot and the
             # Prometheus gauge publish, so the three never disagree.
             num_total_pages=geometry.num_usable_pages,
-            spec_num_steps=model_executor_config.spec_num_steps or 0,
-            spec_num_tokens=model_executor_config.spec_num_tokens or 0,
-            token_to_kv_pool=token_to_kv_pool,
+            spec_num_steps=specs.spec_num_steps,
+            spec_num_tokens=specs.spec_num_tokens,
+            log_cache_group_pages=self._device.log_cache_group_pages,
         )
-
-        # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
-        # rank0 only; best-effort, never fails startup.
-        if attn_tp_rank == 0:
-            log_gpu_memory_summary(
-                target.model,
-                gpu_id,
-                global_rank,
-                logger,
-                draft_model=draft.model if draft is not None else None,
-                kv_pool=token_to_kv_pool,
-                draft_kv_pool=draft_token_to_kv_pool,
-            )
 
         self.attn_tp_size = server_args.attn_tp_size or mapping.attn.tp_size
         self.world_size = server_args.world_size or mapping.world_size
@@ -304,9 +233,7 @@ class EventLoop:
                     "the cache-group scheduler has no L3 storage tier; unset "
                     "--kvstore-storage-backend"
                 )
-            l2_cache_executor = L2CacheExecutor(
-                device_pool=token_to_kv_pool,
-                draft_pool=draft_token_to_kv_pool,
+            l2_cache_executor = device.wiring.create_l2_cache_executor(
                 host_ratio=server_args.kvstore_ratio,
                 host_size_gb=server_args.kvstore_size,
                 io_backend=server_args.kvstore_io_backend,
@@ -336,7 +263,7 @@ class EventLoop:
             "decode",
         )
         if self._pd_cache_enabled:
-            if not token_to_kv_pool.arena.supports_disaggregation:
+            if not specs.supports_disaggregation:
                 raise RuntimeError(
                     "PD disaggregation requires a unified cache contract"
                 )
@@ -346,11 +273,7 @@ class EventLoop:
             if (
                 server_args.speculative_algorithm is not None
                 and server_args.disaggregation_layerwise_interval > 0
-                and not getattr(
-                    self.model_executor.drafter,
-                    "supports_pd_layerwise_finalization",
-                    False,
-                )
+                and not specs.supports_pd_layerwise_finalization
             ):
                 unsupported.append(
                     f"{server_args.speculative_algorithm} layerwise transfer"
@@ -438,7 +361,7 @@ class EventLoop:
             self.max_model_len,
             self.max_req_input_len,
         )
-        token_to_kv_pool.bind_cache_scheduler(self.scheduler)
+        device.wiring.bind_cache_scheduler(self.scheduler)
         if attn_tp_rank == 0:
             self.kv_event_publisher = EventPublisherFactory.create(
                 server_args.kv_events_config,
@@ -455,7 +378,7 @@ class EventLoop:
         # PauseHooks is the loop-side integration (see pause.py) — the normal
         # scheduling paths below only carry single-line hooks into it.
         self._pause = PauseController(self.send_to_tokenizer)
-        self._pause_hooks = PauseHooks(self, self._pause)
+        self._pause_hooks = PauseHooks(self, self._pause, self._device)
 
         # GPU-memory data plane (release/resume_memory_occupation). Reuses the
         # pause controller's drain machinery; frees memory via the memory-saver
@@ -503,7 +426,7 @@ class EventLoop:
             architectures=self.model_config.hf_config.architectures,
             pause_controller=self._pause,
             memory_controller=self._memory,
-            model_runner=target,
+            device=self._device,
         )
 
         self.output_processor = OutputProcesser(
@@ -521,6 +444,9 @@ class EventLoop:
                 self.model_config.context_len + self.server_args.spec_context_pad
             ),
             metrics=self.metrics,
+            # Resource releases that a queued forward may still be reading go
+            # onto the data plane's FIFO, behind that forward.
+            defer_to_device=self._device.submit_release,
         )
         if server_args.disaggregation_mode != "null":
             assert pd_topology is not None
@@ -533,11 +459,9 @@ class EventLoop:
                 pp_layer_window = resolve_pp_layer_window(
                     self.model_config.num_attention_layers, server_args.mapping
                 )
-            kv_args = get_kv_args(
-                global_rank,
-                global_rank,
-                server_args.disaggregation_ib_device,
-                token_to_kv_pool,
+            kv_args = device.wiring.pd_kv_args(
+                global_rank=global_rank,
+                ib_device=server_args.disaggregation_ib_device,
                 model_config=self.model_config,
                 draft_model_config=draft_model_config,
                 pp_layer_window=pp_layer_window,
@@ -572,7 +496,7 @@ class EventLoop:
                 # P-side layerwise KV streaming: wire the step counter between
                 # the attn backends and the KV sender (a no-op for interval<=0).
                 self.kv_transfer.setup_layerwise_transfer(
-                    self.model_executor,
+                    device.wiring,
                     self.gpu_id,
                     server_args.disaggregation_layerwise_interval,
                 )
@@ -593,7 +517,7 @@ class EventLoop:
                     server_args,
                     global_rank,
                     model_config=self.model_config,
-                    model_executor=self.model_executor,
+                    model_facts=device.wiring.encoder_model_facts(),
                     mapping=mapping,
                     attn_tp_rank=self.attn_tp_rank,
                     attn_tp_size=self.attn_tp_size,
@@ -606,7 +530,7 @@ class EventLoop:
             self._epd_hooks = EpdPrefillHooks(self, None)
         # PD transfer-event integration (see pd/transfer_hooks.py); a no-op
         # when PD is disabled.
-        self._pd_hooks = PdTransferHooks(self)
+        self._pd_hooks = PdTransferHooks(self, self._device)
         self._forward_dispatcher = self._make_forward_dispatcher()
 
     def _make_forward_dispatcher(self) -> ForwardDispatcher:
@@ -616,17 +540,17 @@ class EventLoop:
         instead of re-deriving it from ``kv_transfer`` on every round.
         """
         if self.kv_transfer is None:
-            return ForwardDispatcher(self.model_executor)
+            return ForwardDispatcher(self._device)
         if isinstance(self.kv_transfer, DisaggDecodeExecutor):
             return DecodeDispatcher(
-                self.model_executor,
+                self._device,
                 self.kv_transfer,
                 pd_cache_enabled=self._pd_cache_enabled,
             )
         if not isinstance(self.kv_transfer, DisaggPrefillExecutor):
             raise TypeError("kv_transfer must be a Disagg{Prefill,Decode}Executor.")
         return PrefillDispatcher(
-            self.model_executor,
+            self._device,
             self.kv_transfer,
             epd_hooks=self._epd_hooks,
         )
@@ -1088,10 +1012,7 @@ class EventLoop:
         """
         if self._forward_dispatcher.needs_pending_commit(forward_op):
             return True
-        return (
-            grammar_inputs is not None
-            and self.model_executor.eager_grammar_buffers is not None
-        )
+        return grammar_inputs is not None and self._uses_eager_grammar
 
     def event_loop(self):
         """The one scheduler loop, parameterized by in-flight depth.
@@ -1154,20 +1075,12 @@ class EventLoop:
                 idle_round = True
             else:
                 execution_plan = self.scheduler.next_execution_plan()
-                pages_to_zero = execution_plan.pages_to_zero
                 # Submitted, not awaited: the forward thread's FIFO order
-                # already places the zeroing before this round's forward.
-                # Only the PD-decode RDMA barrier needs the completion event;
-                # it resolves the future inside the thread (Path 2).
-                # ``partial`` binds the pages eagerly — a lambda would read
-                # ``pages_to_zero`` at execution time, after a later round may
-                # have rebound it.
-                cache_zero_future = (
-                    self.model_executor.forward_thread.submit(
-                        partial(self.model_executor.zero_cache_pages, pages_to_zero)
-                    )
-                    if pages_to_zero
-                    else None
+                # already places the zeroing before this round's forward. Only
+                # the PD-decode RDMA barrier needs the completion event, and
+                # it resolves the future from inside the thread.
+                cache_zero_future = self._device.submit_page_zeroing(
+                    execution_plan.pages_to_zero
                 )
                 self._cache_hooks.submit(execution_plan)
 
@@ -1193,12 +1106,7 @@ class EventLoop:
                     dp_metadata = self._dp_sync_and_check(forward_op)
                     if dp_metadata.need_idle_forward:
                         request_changes.extend(self._drain_in_flight(in_flight))
-                        self.model_executor.forward_thread.run(
-                            partial(
-                                self.model_executor.execute_idle_forward,
-                                dp_metadata,
-                            )
-                        )
+                        self._device.run_idle_forward(dp_metadata)
                         idle_round = True
 
             if not idle_round:
@@ -1287,7 +1195,7 @@ class EventLoop:
         """Build ``GrammarStepInputs`` for the current batch, or ``None``.
 
         Returns ``None`` when no request in this batch has a grammar — the
-        model_executor short-circuits then. Otherwise carries the grammars
+        forward short-circuits then. Otherwise carries the grammars
         list + per-EXTEND-slot ``advance_mask`` (False on intermediate
         chunked-prefill chunks, since the sampled token is discarded by
         post_process and must not advance the matcher).

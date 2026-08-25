@@ -563,8 +563,12 @@ class ModelExecutor:
         self.execution_stream = torch.cuda.Stream()
         # The data plane: every CUDA-touching operation after startup is
         # submitted here and runs in FIFO order on one thread. The event loop
-        # (control plane) never blocks on the GPU, so its cross-rank gloo
-        # collectives always find every rank promptly regardless of GPU depth.
+        # (control plane) never waits on the GPU along the per-round path —
+        # dispatch submits and moves on, only commit joins — so a round stays
+        # microseconds and its cross-rank gloo collectives always find every
+        # rank promptly regardless of GPU depth. (A few low-rate paths do
+        # block on purpose: the DP idle forward, the PD receive and landing,
+        # the post-wake KV repair, RL weight updates. See DeviceHandle.)
         self.forward_thread = ForwardThread(self.device)
         # Throttles the mm_timing line inside execute_forward_op; the
         # per-round batch lines have their own counter on the control plane.

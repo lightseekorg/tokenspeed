@@ -31,6 +31,7 @@ from tokenspeed.runtime.engine.forward_dispatch import (
     PlannedForward,
     PrefillDispatcher,
 )
+from tokenspeed.runtime.execution.device import DeviceHandle
 
 
 class _ForwardThread:
@@ -50,16 +51,21 @@ class _ForwardThread:
         return fn()
 
 
-def _executor(trace):
+def _handle(trace):
+    """A real DeviceHandle over a fake executor: the dispatchers can only reach
+    the GPU through it, so the trace is the complete crossing."""
+
     def execute_forward_op(forward_op, sampling_params_list, **kwargs):
         trace.append(("forward", kwargs["grammar_inputs"], kwargs))
         return SimpleNamespace(sync=lambda: trace.append("sync"))
 
-    return SimpleNamespace(
-        forward_thread=_ForwardThread(trace),
-        execute_forward_op=execute_forward_op,
-        prepare_remote_cache_slots=lambda rows: trace.append(("slots", rows)),
-        reset_remote_prefill_cache_lengths=lambda op: trace.append("seed-lengths"),
+    return DeviceHandle(
+        SimpleNamespace(
+            forward_thread=_ForwardThread(trace),
+            execute_forward_op=execute_forward_op,
+            prepare_remote_cache_slots=lambda rows: trace.append(("slots", rows)),
+            reset_remote_prefill_cache_lengths=lambda op: trace.append("seed-lengths"),
+        )
     )
 
 
@@ -81,7 +87,7 @@ def _planned(*, num_extends=0, is_local_prefill=True, cache_zero_future=None):
 
 def test_plain_engine_forwards_with_the_batch_grammar():
     trace = []
-    pending, on_first_token = ForwardDispatcher(_executor(trace)).dispatch(_planned())
+    pending, on_first_token = ForwardDispatcher(_handle(trace)).dispatch(_planned())
 
     assert on_first_token is None
     assert trace[0] == "submit"
@@ -101,7 +107,7 @@ def test_decode_node_triggers_the_receive_for_a_remote_prefill_batch():
     kv_transfer = SimpleNamespace(execute=lambda op: trace.append("rdma"))
 
     pending, on_first_token = DecodeDispatcher(
-        _executor(trace), kv_transfer, pd_cache_enabled=True
+        _handle(trace), kv_transfer, pd_cache_enabled=True
     ).dispatch(
         _planned(
             num_extends=1, is_local_prefill=False, cache_zero_future=cache_zero_future
@@ -119,7 +125,7 @@ def test_decode_node_masks_local_batches_with_the_batch_grammar():
     RemotePrefillDoneEvent landed, so decode masks from the right state."""
     trace = []
     pending, on_first_token = DecodeDispatcher(
-        _executor(trace), SimpleNamespace(), pd_cache_enabled=False
+        _handle(trace), SimpleNamespace(), pd_cache_enabled=False
     ).dispatch(_planned(num_extends=0))
 
     assert pending is not None and on_first_token is None
@@ -134,7 +140,7 @@ def test_prefill_node_hands_the_kv_off_when_no_chunk_is_left():
     )
 
     result = PrefillDispatcher(
-        _executor(trace), kv_transfer, epd_hooks=SimpleNamespace()
+        _handle(trace), kv_transfer, epd_hooks=SimpleNamespace()
     ).dispatch(_planned(num_extends=0))
 
     assert result == (None, None)
@@ -153,7 +159,7 @@ def test_prefill_node_captures_next_input_ids_and_returns_the_token_hook():
     )
 
     pending, on_first_token = PrefillDispatcher(
-        _executor(trace), kv_transfer, epd_hooks=epd_hooks
+        _handle(trace), kv_transfer, epd_hooks=epd_hooks
     ).dispatch(_planned(num_extends=1))
 
     assert pending is not None
@@ -169,29 +175,29 @@ def test_only_the_prefill_role_needs_the_pending_commit_drained():
     handoff = _planned(num_extends=0).forward_op
     chunk = _planned(num_extends=1).forward_op
     prefill = PrefillDispatcher(
-        _executor([]), SimpleNamespace(), epd_hooks=SimpleNamespace()
+        _handle([]), SimpleNamespace(), epd_hooks=SimpleNamespace()
     )
 
     assert prefill.needs_pending_commit(handoff) is True
     assert prefill.needs_pending_commit(chunk) is False
-    assert ForwardDispatcher(_executor([])).needs_pending_commit(handoff) is False
+    assert ForwardDispatcher(_handle([])).needs_pending_commit(handoff) is False
 
 
 def test_only_a_remote_prefill_batch_skips_the_model_forward_path():
     """DP ranks size their collectives from this, so it has to answer for the
     same op the role would dispatch — one rule, not two copies."""
-    decode = DecodeDispatcher(_executor([]), SimpleNamespace(), pd_cache_enabled=False)
+    decode = DecodeDispatcher(_handle([]), SimpleNamespace(), pd_cache_enabled=False)
     remote = _planned(num_extends=1, is_local_prefill=False).forward_op
     local = _planned(num_extends=1, is_local_prefill=True).forward_op
 
     assert decode.produces_model_output(remote) is False
     assert decode.produces_model_output(local) is True
     # A plain engine always forwards, whatever the op looks like.
-    assert ForwardDispatcher(_executor([])).produces_model_output(remote) is True
+    assert ForwardDispatcher(_handle([])).produces_model_output(remote) is True
 
 
 def test_each_role_declares_itself():
-    executor = _executor([])
+    executor = _handle([])
     assert (ForwardDispatcher(executor).is_prefill_role) is False
     assert (ForwardDispatcher(executor).is_decode_role) is False
     assert (

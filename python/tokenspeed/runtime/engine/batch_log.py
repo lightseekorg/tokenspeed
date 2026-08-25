@@ -59,8 +59,9 @@ class BatchLogger:
         num_total_pages: Device KV pages, for the active/total page ratio.
         spec_num_steps: Draft steps per verify, 0 when speculation is off.
         spec_num_tokens: Verify width, used by the accept-length debug log.
-        token_to_kv_pool: Pool asked to log its per-group page usage
-            alongside each decode line.
+        log_cache_group_pages: Called alongside each decode line to emit the
+            per-group page-usage debug line; the pool it reads lives behind
+            the data plane.
     """
 
     def __init__(
@@ -71,14 +72,14 @@ class BatchLogger:
         num_total_pages: int,
         spec_num_steps: int,
         spec_num_tokens: int,
-        token_to_kv_pool,
+        log_cache_group_pages,
     ) -> None:
         self._enabled = enabled
         self._decode_log_interval = decode_log_interval
         self._num_total_pages = num_total_pages
         self._spec_num_steps = spec_num_steps
         self._spec_num_tokens = spec_num_tokens
-        self._token_to_kv_pool = token_to_kv_pool
+        self._log_cache_group_pages = log_cache_group_pages
 
         self._step = 0
         self._seen_prefill_ids: set[str] = set()
@@ -172,7 +173,7 @@ class BatchLogger:
                 gen_throughput,
                 stats["num_queue_reqs"],
             )
-        self._token_to_kv_pool.maybe_log_cache_group_pages()
+        self._log_cache_group_pages()
         self._num_generated_tokens = 0
         self._num_decode_steps = 0
         self._last_decode_tic = now

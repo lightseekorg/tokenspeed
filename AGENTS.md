@@ -20,6 +20,20 @@
   commit any formatter changes it makes.
 * When creating commits, perform sign off on behalf of the author.
 
+## Design principles
+
+`docs/design/` records the deliberate invariants of each subsystem — what
+belongs where, and why. Read the document covering the code you are touching
+before changing it, and review against it: the rules there were established on
+purpose, so a deviation is a bug unless the document is updated in the same
+change.
+
+* `docs/design/event-loop.md` — the scheduler event loop: the control
+  plane / data plane split and what the loop is allowed to hold, centralized
+  scheduler feedback, in-flight depth, the hooks pattern.
+* `docs/design/cache-concepts.md` — KV cache vocabulary and the layering
+  between prefix matching, allocation and page geometry.
+
 ## Dependency boundaries
 
 * `tokenspeed` runtime dependencies should stay vendor-neutral.
