@@ -22,5 +22,7 @@ export LD_LIBRARY_PATH="${rocm_root}/lib:${LD_LIBRARY_PATH:-}"
 # rocprofiler derives agents from physical KFD sysfs nodes, which do not exist
 # for rocJITsu's synthetic HSA agent. Profiling is not part of this CI lane.
 export ROCPROFILER_REGISTER_ENABLED=0
+# Preserve the rejected code-object details when HIP cannot load a kernel.
+export CUDA_LOG_FILE=${CUDA_LOG_FILE:-stderr}
 
 exec "${launcher}" --daemon --config "${config}" -- "$@"
