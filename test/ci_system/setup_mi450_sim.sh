@@ -21,7 +21,7 @@ sudo apt-get install -y --no-install-recommends \
     ninja-build
 
 python3 -m pip install --disable-pip-version-check "uv==${UV_VERSION}"
-uv pip install --system --prerelease allow \
+uv pip install --system --break-system-packages --prerelease allow \
     --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ \
     "rocm[devel,libraries]==${ROCM_SDK_VERSION}" \
     "rocm-sdk-device-gfx1250==${ROCM_SDK_VERSION}"
