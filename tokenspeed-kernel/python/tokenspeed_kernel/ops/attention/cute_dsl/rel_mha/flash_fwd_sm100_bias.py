@@ -20,28 +20,10 @@
 
 import argparse
 import math
-import os
-import sys
 import time
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Literal, Optional, Tuple, Type
-
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_CACHE_ROOT = os.path.join(_SCRIPT_DIR, ".cache", "flash_fwd_sm100_bias")
-# Never touch TMPDIR here: torch's symmetric-memory rendezvous binds a
-# unix socket under it, and this package-relative path exceeds the 108-char
-# sun_path limit -> "Failed to bind socket: Invalid argument" on every rank.
-for _cache_name, _cache_path in (
-    ("CUTE_DSL_CACHE_DIR", os.path.join(_CACHE_ROOT, "cute_dsl")),
-    ("TRITON_CACHE_DIR", os.path.join(_CACHE_ROOT, "triton")),
-    ("TORCHINDUCTOR_CACHE_DIR", os.path.join(_CACHE_ROOT, "torchinductor")),
-):
-    os.environ.setdefault(_cache_name, _cache_path)
-    os.makedirs(os.environ[_cache_name], exist_ok=True)
-
-if _SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPT_DIR)
 
 import cuda.bindings.driver as cuda
 import cutlass
