@@ -945,9 +945,9 @@ class ServerArgs:
             os.environ["TRTLLM_ENABLE_PDL"] = "0"
         else:
             os.environ.pop("TOKENSPEED_DISABLE_PDL", None)
-            os.environ.setdefault("TORCHINDUCTOR_ENABLE_PDL", "1")
+            os.environ["TORCHINDUCTOR_ENABLE_PDL"] = "1"
             # Enable PDL for fused attention kernels.
-            os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
+            os.environ["TRTLLM_ENABLE_PDL"] = "1"
         os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
 
     @staticmethod

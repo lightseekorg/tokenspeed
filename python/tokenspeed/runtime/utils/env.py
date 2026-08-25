@@ -76,8 +76,8 @@ def global_server_args_dict_update(server_args: ServerArgs):
         os.environ["TRTLLM_ENABLE_PDL"] = "0"
     else:
         os.environ.pop("TOKENSPEED_DISABLE_PDL", None)
-        os.environ.setdefault("TORCHINDUCTOR_ENABLE_PDL", "1")
-        os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
+        os.environ["TORCHINDUCTOR_ENABLE_PDL"] = "1"
+        os.environ["TRTLLM_ENABLE_PDL"] = "1"
     global_server_args_dict.update(
         {
             "attention_backend": server_args.attention_backend,
