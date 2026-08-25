@@ -157,6 +157,7 @@ __all__ = [
     "KdaFusedDecodeResult",
     "try_kda_replay_commit",
     "resolve_kda_batched_replay_commit",
+    "kda_batched_replay_uses_raw_gate",
     "kda_replay_commit_supported",
     "KdaPrefillResult",
     "GdnCheckpointLayout",
@@ -1804,7 +1805,7 @@ def try_kda_fused_paged_verify(
     dt_bias: torch.Tensor,
     *,
     state_pool: torch.Tensor,
-    state_scratch: torch.Tensor,
+    state_scratch: torch.Tensor | None,
     read_indices: torch.Tensor,
     write_indices: torch.Tensor,
     num_heads: int,
@@ -1815,6 +1816,9 @@ def try_kda_fused_paged_verify(
     override: str | None = None,
     solution: str | None = None,
     store_states: bool = True,
+    replay_mixed_qkv: torch.Tensor | None = None,
+    replay_gate: torch.Tensor | None = None,
+    replay_beta: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Try a registered pre-convolution KDA target-verify fusion.
 
@@ -1849,6 +1853,13 @@ def try_kda_fused_paged_verify(
         )
     except NoKernelFoundError:
         return None
+    kwargs = {}
+    if replay_mixed_qkv is not None:
+        kwargs = {
+            "replay_mixed_qkv": replay_mixed_qkv,
+            "replay_gate": replay_gate,
+            "replay_beta": replay_beta,
+        }
     return kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
@@ -1867,6 +1878,7 @@ def try_kda_fused_paged_verify(
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
+        **kwargs,
     )
 
 
@@ -1893,6 +1905,7 @@ def try_kda_replay_commit(
     override: str | None = None,
     solution: str | None = None,
     gate_scratch: torch.Tensor | None = None,
+    replay_gate: torch.Tensor | None = None,
     recurrent_layout: str | None = None,
 ) -> bool:
     """Try a registered KDA speculative replay-commit.
@@ -1926,6 +1939,7 @@ def try_kda_replay_commit(
         )
     except NoKernelFoundError:
         return False
+    kwargs = {"replay_gate": replay_gate} if replay_gate is not None else {}
     kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
@@ -1946,6 +1960,7 @@ def try_kda_replay_commit(
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
         gate_scratch=gate_scratch,
+        **kwargs,
     )
     return True
 
@@ -1953,10 +1968,8 @@ def try_kda_replay_commit(
 def resolve_kda_batched_replay_commit(dtype: torch.dtype = torch.bfloat16):
     """Resolve the all-layer replay kernel once, or return ``None``.
 
-    ``None`` for any dtype but bfloat16: the batched kernels dereference raw
-    descriptor addresses as bf16 (an override resolves by name and skips the
-    signature check), so other dtypes must use the per-layer commit, which
-    reads its dtypes from the tensors.
+    Batched kernels dereference descriptor addresses as BF16, so other dtypes
+    use the per-layer commit.
     """
     if dtype is not torch.bfloat16:
         return None
@@ -1968,10 +1981,22 @@ def resolve_kda_batched_replay_commit(dtype: torch.dtype = torch.bfloat16):
             "kda_replay_commit",
             signature,
             traits={"flat_state": True, "batched_layers": True},
-            override="triton_nvidia_kda_batched_replay_commit",
         )
     except NoKernelFoundError:
         return None
+
+
+def kda_batched_replay_uses_raw_gate(
+    dtype: torch.dtype = torch.bfloat16,
+) -> bool:
+    """Whether the selected batched replay consumes persistent BF16 raw-g."""
+    kernel = resolve_kda_batched_replay_commit(dtype)
+    if kernel is None:
+        return False
+    registered = KernelRegistry.get().get_by_name(kernel.name)
+    if registered is None:
+        return False
+    return registered.traits.get("replay_raw_gate") == frozenset({True})
 
 
 # ===-----------------------------------------------------------------------===#
