@@ -1,0 +1,32 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-tokenspeed-kernel-mi450-sim
+type: ut
+workflow_stage: unit-test
+triggers:
+  - per-commit
+  - manual
+  - debug
+runner:
+  labels:
+    - amd-mi450-sim
+env:
+  BUILD_AND_DOWNLOAD_PARALLEL: "4"
+  CI: "true"
+  GFX_ARCH: gfx1250
+install:
+  - bash test/ci_system/setup_mi450_sim.sh
+  - WORKSPACE="$(pwd)" bash test/ci_system/install_deps_rocm.sh
+ut:
+  commands:
+    - >-
+      bash test/ci_system/run_mi450_sim.sh
+      python3 -c
+      'import torch; assert torch.cuda.is_available();
+      assert "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName'
+    - >-
+      timeout 20m bash test/ci_system/run_mi450_sim.sh
+      python3 -m pytest
+      'tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[decode-m1-adaptive]'
+      -v
+report:
+  github_step_summary: true
