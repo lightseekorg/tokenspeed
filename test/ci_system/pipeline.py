@@ -243,6 +243,14 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 f"{path}: optional must be a boolean or a per-label mapping; "
                 f"got {type(optional).__name__}"
             )
+    if "retries" in data:
+        retries = data["retries"]
+        if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+            raise ValueError(f"{path}: retries must be a non-negative integer")
+        if retries > 0 and data["type"] not in {"eval", "perf"}:
+            raise ValueError(
+                f"{path}: retries is only supported for eval and perf tasks"
+            )
     if "slurm" in data:
         slurm = data["slurm"]
         if not isinstance(slurm, dict):
@@ -1787,10 +1795,19 @@ def execute_task(
     server_log_path: Path | None = None
     error: str | None = None
     error_reported = False
+    max_attempts = 1 + int(task.get("retries") or 0)
 
-    try:
-        if enable_perf_diagnostics:
-            run_perf_diagnostics("before stages", runner_env, repo_root, dry_run)
+    def _stop_managed_server() -> None:
+        nonlocal server_process
+        if pgm is not None:
+            pgm.terminate_all(dry_run=dry_run)
+        else:
+            stop_server(server_process)
+        server_process = None
+
+    def _run_task_stages() -> None:
+        nonlocal server_process, server_log_path
+        nonlocal eval_score_check, eval_accept_rate, stages_run, command_results
         for stage_name, stage_payload in stages:
             stages_run.append(stage_name)
             if stage_name == "server":
@@ -1902,15 +1919,34 @@ def execute_task(
                 f"eval score {eval_score_check['score']:g} does not satisfy "
                 f"threshold {eval_score_check['threshold']}"
             )
-    except Exception as exc:
-        error = str(exc)
+
+    try:
+        if enable_perf_diagnostics:
+            run_perf_diagnostics("before stages", runner_env, repo_root, dry_run)
+        for attempt in range(1, max_attempts + 1):
+            stages_run = []
+            command_results = []
+            eval_score_check = None
+            eval_accept_rate = None
+            try:
+                _run_task_stages()
+                error = None
+                break
+            except Exception as exc:
+                error = str(exc)
+                if attempt >= max_attempts:
+                    break
+                print(
+                    f"[CI Retry] {task['name']} failed "
+                    f"(attempt {attempt}/{max_attempts}): {error}",
+                    flush=True,
+                )
+            finally:
+                _stop_managed_server()
     finally:
         if enable_perf_diagnostics:
             run_perf_diagnostics("before cleanup", runner_env, repo_root, dry_run)
-        if pgm is not None:
-            pgm.terminate_all(dry_run=dry_run)
-        else:
-            stop_server(server_process)
+        _stop_managed_server()
         if setup_mode == "ci" and not keep_runner_state:
             cleanup_runner(runner_env, repo_root, dry_run, pgm)
         if enable_perf_diagnostics:
