@@ -13,6 +13,8 @@ from tokenspeed.runtime.configs.glm53_flash_config import (
     Glm53FlashVisionConfig,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.attention import kpool as kpool_runtime
+from tokenspeed.runtime.layers.attention.kpool import KPoolRuntime
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
@@ -118,6 +120,51 @@ def _tiny_config() -> Glm53FlashConfig:
     )
 
 
+def test_kpool_decode_forwards_configured_context_bound(monkeypatch) -> None:
+    captured = {}
+
+    def fake_kpool_decode_topk(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return kwargs["out"], kwargs["lens_out"]
+
+    monkeypatch.setattr(kpool_runtime, "kpool_decode_topk", fake_kpool_decode_topk)
+    index_cache = torch.empty((4, 16, 132), dtype=torch.uint8)
+    ctx = SimpleNamespace(
+        attn_backend=SimpleNamespace(max_context_len=131072),
+        token_to_kv_pool=SimpleNamespace(
+            arena=SimpleNamespace(kv_page_size=64),
+            get_kpool_buffers=lambda _layer_id: (index_cache, None, None),
+        ),
+    )
+    query = torch.zeros((5, 2, 128), dtype=torch.bfloat16)
+    weights = torch.zeros((5, 2), dtype=torch.float32)
+    seq_lens = torch.tensor([1024, 2048], dtype=torch.int32)
+    page_table = torch.zeros((2, 4), dtype=torch.int32)
+    out = torch.empty((5, 2051), dtype=torch.int32)
+    lens_out = torch.empty(5, dtype=torch.int32)
+
+    KPoolRuntime(pool_size=4, index_topk=2048).select_decode(
+        query=query,
+        weights=weights,
+        softmax_scale=0.125,
+        ctx=ctx,
+        layer_id=3,
+        seq_lens=seq_lens,
+        page_table=page_table,
+        q_len_per_req=2,
+        decode_start=1,
+        num_decode_tokens=4,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    assert captured["args"][0].shape == (4, 2, 128)
+    assert captured["kwargs"]["max_seq_len"] == 131072
+    assert captured["kwargs"]["page_size"] == 16
+    assert captured["kwargs"]["kv_page_size"] == 64
+    assert captured["kwargs"]["out"].shape == (4, 2051)
+    assert captured["kwargs"]["lens_out"].shape == (4,)
 def _build_model(monkeypatch) -> Glm53FlashForConditionalGeneration:
     monkeypatch.setattr(glm53_flash, "Glm53FlashForCausalLM", _FakeLanguageModel)
     return Glm53FlashForConditionalGeneration(
