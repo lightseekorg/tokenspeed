@@ -4266,6 +4266,7 @@ def dsa_prefill_topk(
     index_k_scale: torch.Tensor | None = None,
     q_scales: torch.Tensor | None = None,
     max_logits_bytes: int | None = None,
+    candidate_lens_cpu: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
     override: str | None = None,
@@ -4299,6 +4300,9 @@ def dsa_prefill_topk(
             defining ``dequant(q[token, head]) = q[token, head].float() *
             q_scales[token, head]``.
         max_logits_bytes: Optional temporary logits memory cap.
+        candidate_lens_cpu: Optional CPU mirror of ``row_ends - row_starts``.
+            DeepGEMM uses it to select chunk launch bounds without synchronizing
+            the CUDA stream; other implementations ignore it.
         out: Optional contiguous int32 output buffer on q's device with shape
             [tokens, topk].
         lens_out: Optional contiguous int32 output buffer on q's device with
@@ -4316,6 +4320,15 @@ def dsa_prefill_topk(
         Tuple of workspace row ids and valid counts. Returned indices are
         absolute row ids into kv_workspace_slots; invalid entries are -1.
     """
+    if candidate_lens_cpu is not None and (
+        candidate_lens_cpu.device.type != "cpu"
+        or candidate_lens_cpu.shape != (q.shape[0],)
+    ):
+        raise ValueError(
+            "candidate_lens_cpu must be a CPU tensor with shape "
+            f"{(q.shape[0],)}, got device={candidate_lens_cpu.device}, "
+            f"shape={tuple(candidate_lens_cpu.shape)}"
+        )
     if out is not None and out.shape != (q.shape[0], int(topk)):
         raise ValueError(
             f"out must have shape {(q.shape[0], int(topk))}, got {tuple(out.shape)}"
@@ -4390,6 +4403,8 @@ def dsa_prefill_topk(
         }
         if q_scales is not None:
             kernel_kwargs["q_scales"] = q_scales
+        if candidate_lens_cpu is not None and kernel.name.startswith("deep_gemm_"):
+            kernel_kwargs["candidate_lens_cpu"] = candidate_lens_cpu
         return kernel(**kernel_kwargs)
 
 

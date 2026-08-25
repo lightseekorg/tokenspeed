@@ -335,7 +335,10 @@ sigmoid-bias top-k route supports the full scheduled token count.
 GLM5 launches usually need remote code, long context, expert parallelism, FP8 KV
 cache, and the TRTLLM MoE backend. GLM5.2 FP8 is available on Hugging Face as
 `zai-org/GLM-5.2-FP8`. TokenSpeed defaults the reasoning parser to `glm45`;
-pass an explicit parser flag to override it.
+pass an explicit parser flag to override it. GLM5 DSA prefill planning reuses the
+host-side request lengths and the packed page/row plan across full-indexer layers;
+keep the scheduler-provided CPU length mirrors populated when integrating a custom
+attention backend to avoid device synchronization in this path.
 
 ```bash
 tokenspeed serve zai-org/GLM-5.2-FP8 \

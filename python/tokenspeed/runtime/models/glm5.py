@@ -87,6 +87,9 @@ class GlmDsaPrefillTopK:
     seq_lens: torch.Tensor
     max_seq_len: int
     kv_workspace_slots: torch.Tensor
+    row_starts: torch.Tensor
+    row_ends: torch.Tensor
+    candidate_lens_cpu: torch.Tensor
 
 
 @dataclass
@@ -603,29 +606,53 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         ctx: ForwardContext,
         num_prefill_tokens: int,
     ) -> GlmDsaPrefillTopK | None:
+        cached = ctx.dsa_prefill_topk
+        if (
+            isinstance(cached, GlmDsaPrefillTopK)
+            and cached.row_starts.numel() == num_prefill_tokens
+        ):
+            return self._compute_prefill_topk_indices_portable(
+                indexer_output=indexer_output,
+                ctx=ctx,
+                seq_lens=cached.seq_lens,
+                page_table=cached.page_table,
+                kv_workspace_slots=cached.kv_workspace_slots,
+                row_starts=cached.row_starts,
+                row_ends=cached.row_ends,
+                candidate_lens_cpu=cached.candidate_lens_cpu,
+                max_seq_len=cached.max_seq_len,
+                num_prefill_tokens=num_prefill_tokens,
+                topk=self.index_topk,
+            )
+
         chunk_meta = ctx.attn_backend.chunked_prefill_metadata
-        prefix_lens = chunk_meta.extend_prefix_lens[: ctx.num_extends].to(torch.int32)
-        extend_lens = chunk_meta.extend_seq_lens[: ctx.num_extends].to(torch.int32)
-        seq_lens = prefix_lens + extend_lens
-        if seq_lens.numel() == 0:
+        prefix_lens_cpu = chunk_meta.extend_prefix_lens_cpu[: ctx.num_extends].to(
+            torch.int64
+        )
+        extend_lens_cpu = chunk_meta.extend_seq_lens_cpu[: ctx.num_extends].to(
+            torch.int64
+        )
+        if extend_lens_cpu.numel() == 0:
             return None
-        if int(extend_lens.sum().item()) != num_prefill_tokens:
+        metadata_tokens = int(extend_lens_cpu.sum().item())
+        if metadata_tokens != num_prefill_tokens:
             raise RuntimeError(
                 "GLM DSA prefill token count mismatch: "
-                f"metadata={int(extend_lens.sum().item())}, "
-                f"tokens={num_prefill_tokens}"
+                f"metadata={metadata_tokens}, tokens={num_prefill_tokens}"
             )
         if chunk_meta.page_table is None:
             raise RuntimeError(
                 "GLM DSA sparse prefill requires the chunked-prefill block tables"
             )
 
-        topk = self.index_topk
+        device = indexer_output.query.device
+        seq_lens_cpu = prefix_lens_cpu + extend_lens_cpu
+        seq_lens = seq_lens_cpu.to(device=device, dtype=torch.int32)
+        max_seq_len = int(seq_lens_cpu.max().item())
         page_size = ctx.token_to_kv_pool.arena.kv_page_size
-        max_seq_len = int(seq_lens.max().item())
         max_pages = (max_seq_len + page_size - 1) // page_size
         page_table = chunk_meta.page_table[:, :max_pages].to(
-            device=indexer_output.query.device,
+            device=device,
             dtype=torch.int32,
         )
         kv_workspace_slots = build_prefill_kv_workspace_slots(
@@ -633,19 +660,40 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
             page_size=page_size,
-            device=indexer_output.query.device,
+            device=device,
+            num_tokens=int(seq_lens_cpu.sum().item()),
         )
+
+        req_ids_cpu = torch.arange(seq_lens_cpu.numel(), dtype=torch.int64)
+        token_req_cpu = torch.repeat_interleave(
+            req_ids_cpu,
+            extend_lens_cpu,
+            output_size=num_prefill_tokens,
+        )
+        extend_cu_cpu = torch.zeros(extend_lens_cpu.numel() + 1, dtype=torch.int64)
+        torch.cumsum(extend_lens_cpu, dim=0, out=extend_cu_cpu[1:])
+        token_offsets_cpu = torch.arange(num_prefill_tokens, dtype=torch.int64)
+        token_offsets_cpu -= extend_cu_cpu.index_select(0, token_req_cpu)
+        candidate_lens_cpu = (
+            prefix_lens_cpu.index_select(0, token_req_cpu) + token_offsets_cpu + 1
+        )
+        seq_cu_cpu = torch.zeros(seq_lens_cpu.numel() + 1, dtype=torch.int64)
+        torch.cumsum(seq_lens_cpu, dim=0, out=seq_cu_cpu[1:])
+        row_starts_cpu = seq_cu_cpu.index_select(0, token_req_cpu)
+        row_ends_cpu = row_starts_cpu + candidate_lens_cpu
+
         return self._compute_prefill_topk_indices_portable(
             indexer_output=indexer_output,
             ctx=ctx,
-            prefix_lens=prefix_lens,
-            extend_lens=extend_lens,
             seq_lens=seq_lens,
             page_table=page_table,
             kv_workspace_slots=kv_workspace_slots,
+            row_starts=row_starts_cpu.to(device=device, dtype=torch.int32),
+            row_ends=row_ends_cpu.to(device=device, dtype=torch.int32),
+            candidate_lens_cpu=candidate_lens_cpu,
             max_seq_len=max_seq_len,
             num_prefill_tokens=num_prefill_tokens,
-            topk=topk,
+            topk=self.index_topk,
         )
 
     def _compute_prefill_topk_indices_portable(
@@ -653,11 +701,12 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         *,
         indexer_output: GlmDsaIndexerOutput,
         ctx: ForwardContext,
-        prefix_lens: torch.Tensor,
-        extend_lens: torch.Tensor,
         seq_lens: torch.Tensor,
         page_table: torch.Tensor,
         kv_workspace_slots: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        candidate_lens_cpu: torch.Tensor,
         max_seq_len: int,
         num_prefill_tokens: int,
         topk: int,
@@ -666,33 +715,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         # Raw BF16 weights view (may be column-split and noncompact); the top-k
         # scorer consumes the row/head strides and upcasts weights in-kernel.
         weights = indexer_output.weights[:num_prefill_tokens]
-
-        req_ids = torch.arange(
-            seq_lens.numel(),
-            dtype=torch.int64,
-            device=q.device,
-        )
-        token_req = torch.repeat_interleave(req_ids, extend_lens.to(torch.int64))
-        extend_cu = torch.zeros(
-            extend_lens.numel() + 1,
-            dtype=torch.int64,
-            device=q.device,
-        )
-        torch.cumsum(extend_lens.to(torch.int64), dim=0, out=extend_cu[1:])
-        token_offsets = torch.arange(
-            num_prefill_tokens, dtype=torch.int64, device=q.device
-        ) - extend_cu.index_select(0, token_req)
-        causal_lens = (
-            prefix_lens.to(torch.int64).index_select(0, token_req) + token_offsets + 1
-        )
-        seq_cu = torch.zeros(
-            seq_lens.numel() + 1,
-            dtype=torch.int64,
-            device=q.device,
-        )
-        torch.cumsum(seq_lens.to(torch.int64), dim=0, out=seq_cu[1:])
-        row_starts = seq_cu.index_select(0, token_req)
-        row_ends = row_starts + causal_lens
 
         index_k_cache = ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
         if index_k_cache is None:
@@ -710,6 +732,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             index_k_cache=index_k_cache,
             page_size=ctx.token_to_kv_pool.arena.kv_page_size,
             max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
+            candidate_lens_cpu=candidate_lens_cpu,
         )
         return GlmDsaPrefillTopK(
             workspace_indices=workspace_indices,
@@ -718,6 +741,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             seq_lens=seq_lens.to(device=q.device, dtype=torch.int32),
             max_seq_len=max_seq_len,
             kv_workspace_slots=kv_workspace_slots,
+            row_starts=row_starts,
+            row_ends=row_ends,
+            candidate_lens_cpu=candidate_lens_cpu,
         )
 
     @break_point

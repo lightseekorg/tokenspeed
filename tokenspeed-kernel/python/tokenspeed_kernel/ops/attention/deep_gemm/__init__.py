@@ -416,6 +416,7 @@ if platform.is_nvidia:
         index_k_fp8: torch.Tensor | None = None,
         index_k_scale: torch.Tensor | None = None,
         max_logits_bytes: int | None = None,
+        candidate_lens_cpu: torch.Tensor | None = None,
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -490,7 +491,12 @@ if platform.is_nvidia:
         local_starts_i32 = torch.zeros_like(row_starts)
         for start in range(0, tokens, max_query_rows):
             end = min(start + max_query_rows, tokens)
-            max_seqlen_k = int(candidate_lens[start:end].max().item())
+            chunk_candidate_lens = (
+                candidate_lens_cpu[start:end]
+                if candidate_lens_cpu is not None
+                else candidate_lens[start:end]
+            )
+            max_seqlen_k = int(chunk_candidate_lens.max().item())
             logits = deep_gemm.fp8_mqa_logits(
                 q_fp8[start:end].contiguous(),
                 kv_fp8,

@@ -1684,6 +1684,45 @@ def test_dsa_topk_selection_receives_index_heads(
     assert captured["index_heads"] == index_heads
 
 
+def test_dsa_prefill_topk_forwards_cpu_candidate_lens_to_deep_gemm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The optional host mirror reaches DeepGEMM without affecting selection."""
+    captured: dict[str, object] = {}
+
+    class _SelectedKernel:
+        name = "deep_gemm_dsa_prefill_topk"
+
+        def __call__(self, **kwargs):
+            captured.update(kwargs)
+            return (
+                torch.full((2, 1), -1, dtype=torch.int32),
+                torch.zeros((2,), dtype=torch.int32),
+            )
+
+    monkeypatch.setattr(
+        _attention_pkg,
+        "select_kernel",
+        lambda *args, **kwargs: _SelectedKernel(),
+    )
+    candidate_lens_cpu = torch.tensor([8, 16], dtype=torch.int64)
+
+    tokenspeed_kernel.dsa_prefill_topk(
+        torch.empty((2, 2, 128), dtype=torch.bfloat16),
+        torch.empty((2, 2), dtype=torch.float32),
+        torch.arange(16, dtype=torch.int64),
+        torch.tensor([0, 0], dtype=torch.int32),
+        torch.tensor([8, 16], dtype=torch.int32),
+        topk=1,
+        softmax_scale=1.0,
+        index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
+        page_size=64,
+        candidate_lens_cpu=candidate_lens_cpu,
+    )
+
+    assert captured["candidate_lens_cpu"] is candidate_lens_cpu
+
+
 @pytest.mark.parametrize("mode", ["decode", "prefill"])
 @pytest.mark.parametrize(
     ("cache", "expected"),
