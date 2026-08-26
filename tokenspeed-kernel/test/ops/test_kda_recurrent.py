@@ -173,6 +173,131 @@ def test_kda_verify_split_launch_requires_both_hoists_and_honors_overrides() -> 
     ) == (32, 8, 5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_glm53_flash_mtp_graph_shape_matches_baseline_and_replays() -> None:
+    """The tuned TP4 graph shape preserves the established kernel output."""
+    from tokenspeed_kernel._triton import triton
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        fused_recurrent_kda_mtp,
+        fused_recurrent_kda_mtp_fwd_kernel,
+    )
+
+    torch.manual_seed(16)
+    dev = "cuda"
+    batch, steps, heads, key_dim, value_dim = 16, 4, 16, 128, 128
+    q = torch.randn(batch, steps, heads, key_dim, dtype=torch.bfloat16, device=dev)
+    k = torch.randn_like(q)
+    v = torch.randn(batch, steps, heads, value_dim, dtype=torch.bfloat16, device=dev)
+    g = torch.randn_like(q)
+    beta = torch.randn(batch, steps, heads, dtype=torch.bfloat16, device=dev)
+    a_log = torch.randn(heads, dtype=torch.float32, device=dev)
+    dt_bias = torch.randn(heads, key_dim, dtype=torch.float32, device=dev)
+    read_indices = torch.arange(batch, dtype=torch.int32, device=dev)
+    write_indices = batch + torch.arange(
+        batch * steps, dtype=torch.int32, device=dev
+    ).view(batch, steps)
+    pages = batch * (steps + 1)
+    initial = torch.randn(
+        batch,
+        heads,
+        value_dim,
+        key_dim,
+        dtype=torch.float32,
+        device=dev,
+    )
+
+    reference_pool = torch.zeros(
+        pages,
+        heads,
+        value_dim,
+        key_dim,
+        dtype=torch.float32,
+        device=dev,
+    )
+    reference_pool[:batch].copy_(initial)
+    reference_output = torch.empty_like(v)
+    grid = triton.cdiv(value_dim, 32) * batch * heads
+    fused_recurrent_kda_mtp_fwd_kernel[(grid,)](
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=a_log,
+        dt_bias=dt_bias,
+        o=reference_output,
+        h_pool=reference_pool,
+        h_pool_out=reference_pool,
+        read_indices=read_indices,
+        write_indices=write_indices.reshape(-1),
+        lower_bound=-5.0,
+        stride_q_tok=q.stride(1),
+        stride_k_tok=k.stride(1),
+        stride_v_tok=v.stride(1),
+        stride_g_tok=g.stride(1),
+        stride_beta_tok=beta.stride(1),
+        scale=key_dim**-0.5,
+        N=batch,
+        T=steps,
+        H=heads,
+        HV=heads,
+        K=key_dim,
+        V=value_dim,
+        BK=key_dim,
+        BV=32,
+        stride_state_page=reference_pool.stride(0),
+        stride_state_out_page=reference_pool.stride(0),
+        V_MAJOR=True,
+        USE_QK_L2NORM_IN_KERNEL=True,
+        USE_GATE_IN_KERNEL=True,
+        APPLY_BETA_SIGMOID=True,
+        HAS_DT_BIAS=True,
+        USE_LOWER_BOUND=True,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    tuned_pool = torch.zeros_like(reference_pool)
+    tuned_pool[:batch].copy_(initial)
+
+    def run_tuned() -> torch.Tensor:
+        return fused_recurrent_kda_mtp(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            a_log,
+            dt_bias,
+            tuned_pool,
+            read_indices,
+            write_indices,
+            lower_bound=-5.0,
+            recurrent_layout="v_major",
+        )
+
+    tuned_output = run_tuned()
+    torch.testing.assert_close(
+        tuned_output.float(), reference_output.float(), atol=1e-4, rtol=1e-4
+    )
+    torch.testing.assert_close(
+        tuned_pool[batch:], reference_pool[batch:], atol=1e-4, rtol=1e-4
+    )
+
+    run_tuned()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = run_tuned()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(graph_output, tuned_output, atol=0, rtol=0)
+    torch.testing.assert_close(
+        tuned_pool[batch:], reference_pool[batch:], atol=1e-4, rtol=1e-4
+    )
+
+
 @pytest.mark.parametrize(
     "recurrent_layout,store_states",
     [

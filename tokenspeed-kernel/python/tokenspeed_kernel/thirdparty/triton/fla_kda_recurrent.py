@@ -395,6 +395,29 @@ def fused_recurrent_kda_mtp_fwd_kernel(
         p_beta += stride_beta_tok
 
 
+def _kda_mtp_launch_config(
+    batch_size: int,
+    draft_tokens: int,
+    num_heads: int,
+    num_value_heads: int,
+    key_dim: int,
+    value_dim: int,
+    recurrent_layout: str,
+) -> tuple[int, int]:
+    """Choose the measured GLM-5.3-Flash target-verify launch schedule."""
+    if (
+        batch_size,
+        draft_tokens,
+        num_heads,
+        num_value_heads,
+        key_dim,
+        value_dim,
+        recurrent_layout,
+    ) == (16, 4, 16, 16, 128, 128, "v_major"):
+        return 2, 3
+    return 4, 2
+
+
 def fused_recurrent_kda_mtp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -444,6 +467,15 @@ def fused_recurrent_kda_mtp(
     for t, d in ((q, K), (k, K), (v, V), (g, K)):
         assert t.stride(-1) == 1 and t.stride(-2) == d, "inner dims must be dense"
     out = torch.empty(B, T, HV, V, dtype=v.dtype, device=v.device)
+    num_warps, num_stages = _kda_mtp_launch_config(
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        recurrent_layout,
+    )
     grid = (triton.cdiv(V, 32) * B * HV,)
     fused_recurrent_kda_mtp_fwd_kernel[grid](
         q=q,
@@ -481,8 +513,8 @@ def fused_recurrent_kda_mtp(
         APPLY_BETA_SIGMOID=use_beta_sigmoid_in_kernel,
         HAS_DT_BIAS=dt_bias is not None,
         USE_LOWER_BOUND=lower_bound is not None,
-        num_warps=4,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return out
 
