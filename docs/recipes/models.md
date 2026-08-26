@@ -517,7 +517,7 @@ tokenspeed serve Qwen/Qwen3.8-27B-FP8 \
   --disable-kvstore
 ```
 
-## Qwen 3.8 Flash Next
+## Qwen3.8 Flash Next
 
 Qwen3.8-Flash-Next is a multimodal MoE model and an early preview of the
 Qwen4 architecture, playing for Qwen4 the role Qwen3-Next played for Qwen3.5.
