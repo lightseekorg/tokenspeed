@@ -156,6 +156,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         layer = KimiLinearMoE.__new__(KimiLinearMoE)
         torch.nn.Module.__init__(layer)
         layer.execution_plan = SimpleNamespace(use_trtllm=True)
+        layer._gather_dp_tokens_for_moe = False
         layer.experts = SimpleNamespace(
             support_routing=True,
             supports_precomputed_topk=True,

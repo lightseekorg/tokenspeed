@@ -1721,8 +1721,16 @@ class KimiLinearMoE(nn.Module):
             return self.experts.topk_output_format
         # Keep the decode-optimized precomputed path. Extend/mixed forwards use
         # FlashInfer's public routing API, which wins for prefill-sized batches.
-        # A missing context keeps the conservative precomputed behavior.
-        if ctx is None or ctx.forward_mode.is_decode():
+        # Cross-DP-EP gathers the same global batch onto every MoE rank, so use
+        # the replicated phase decision rather than a rank-local IDLE mode.
+        if ctx is None:
+            return TopKOutputFormat.STANDARD
+        is_decode = (
+            ctx.all_decode_or_idle
+            if self._gather_dp_tokens_for_moe
+            else ctx.forward_mode.is_decode()
+        )
+        if is_decode:
             return TopKOutputFormat.STANDARD
         return TopKOutputFormat.BYPASSED
 
