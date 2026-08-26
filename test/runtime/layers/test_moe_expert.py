@@ -1,9 +1,59 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 from tokenspeed.runtime.layers.moe import expert as expert_module
 from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.layers.moe.topk import (
+    BypassedTopKOutput,
+    StandardTopKOutput,
+    TopKConfig,
+)
+
+
+def test_hybrid_moe_dispatches_from_actual_topk_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layer = MoELayer.__new__(MoELayer)
+    torch.nn.Module.__init__(layer)
+    layer.plan = {
+        "support_routing": True,
+        "supports_precomputed_topk": True,
+        "supports_deferred_finalize": False,
+    }
+    calls: list[dict] = []
+
+    def fake_moe_apply(*args, **kwargs):
+        calls.append(kwargs)
+        return args[1]
+
+    monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_apply", fake_moe_apply)
+    monkeypatch.setattr(expert_module, "pdl_enabled", lambda: False)
+
+    hidden_states = torch.empty((2, 4))
+    router_logits = torch.empty((2, 8))
+    layer(
+        hidden_states,
+        BypassedTopKOutput(hidden_states, router_logits, TopKConfig(top_k=2)),
+        num_global_tokens=2,
+        max_num_tokens_per_gpu=2,
+    )
+    layer(
+        hidden_states,
+        StandardTopKOutput(
+            torch.empty((2, 2)),
+            torch.empty((2, 2), dtype=torch.int32),
+            router_logits,
+        ),
+        num_global_tokens=2,
+        max_num_tokens_per_gpu=2,
+    )
+
+    assert "topk_weights" not in calls[0]
+    assert "topk_ids" not in calls[0]
+    assert calls[1]["topk_weights"].shape == (2, 2)
+    assert calls[1]["topk_ids"].shape == (2, 2)
 
 
 @pytest.mark.parametrize(

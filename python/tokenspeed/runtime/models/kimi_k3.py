@@ -1352,7 +1352,8 @@ class KimiLinearMoE(nn.Module):
       ``routed_expert_up_proj``/``routed_expert_norm`` project back (7168).
     * **Routed experts** (MXFP4): AMD uses the native ``MoELayer`` plan wrapped
       by ``LatentMoELayer`` so Triton/Gluon owns EP8 dispatch and SiTU. Non-AMD
-      platforms use flashinfer's TRTLLM-Gen SiTU MoE.
+      platforms use flashinfer's TRTLLM-Gen SiTU MoE. The selected MoE kernel
+      advertises whether it consumes precomputed TopK or routes from logits.
     * **Shared experts**: a plain ``KimiLinearMLP`` (SiTU).
     """
 
@@ -1437,24 +1438,9 @@ class KimiLinearMoE(nn.Module):
                 )
         self.gate = KimiLinearMoEGate(config.hidden_size, config.num_experts)
 
-        self.topk = TopK(
-            top_k=self.top_k,
-            renormalize=config.moe_renormalize,
-            use_grouped_topk=config.use_grouped_topk,
-            num_expert_group=config.num_expert_group,
-            num_fused_shared_experts=0,
-            topk_group=config.topk_group,
-            correction_bias=self.gate.e_score_correction_bias,
-            routed_scaling_factor=self.routed_scaling_factor,
-            output_format=TopKOutputFormat.STANDARD,
-            # bf16 weights out: makes the fused SiTU kernel's cast a no-op.
-            topk_weights_dtype=(
-                torch.bfloat16 if self.execution_plan.use_trtllm else torch.float32
-            ),
-        )
-
-        # AMD native and flashinfer's TRT-LLM SiTU MoE both consume K3's
-        # precomputed sigmoid/noaux_tc TopK.
+        # Leave routing unconstrained: the registry prefers a kernel-routing
+        # implementation when one exists and otherwise selects a precomputed-
+        # TopK fallback (for example NVFP4, AMD-native, or Marlin SiTU).
         self.experts = MoELayer(
             top_k=self.top_k,
             num_experts=self.num_experts,
@@ -1480,7 +1466,7 @@ class KimiLinearMoE(nn.Module):
                 "activation_situ_beta": situ_beta,
                 "activation_situ_linear_beta": situ_linear_beta,
             },
-            routing_mode="precomputed_topk",
+            routing_mode=None,
             # Native gfx950 and Hopper Marlin both run A16W4 (bf16 activations).
             # FlashInfer TRT-LLM SiTU depends on the expert weight dtype:
             # MXFP4 cubins are w4a8 (MXFP8 activations -> "fp8"), NVFP4 SiTU
@@ -1496,11 +1482,30 @@ class KimiLinearMoE(nn.Module):
                 )
             ),
         )
-        if self.experts.support_routing:
-            raise RuntimeError(
-                "Kimi-K3 requires a precomputed-TopK SiTU MoE kernel; the "
-                "selected backend unexpectedly performs internal routing"
-            )
+
+        # Derive the producer contract from the concrete registry selection;
+        # backend family alone is too coarse (TRT-LLM has both kernel-routing
+        # MXFP4 SiTU and precomputed-TopK NVFP4 SiTU implementations).
+        self.topk = TopK(
+            top_k=self.top_k,
+            renormalize=config.moe_renormalize,
+            use_grouped_topk=config.use_grouped_topk,
+            num_expert_group=config.num_expert_group,
+            num_fused_shared_experts=0,
+            topk_group=config.topk_group,
+            correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+            output_format=(
+                TopKOutputFormat.STANDARD
+                if self.experts.supports_precomputed_topk
+                else self.experts.topk_output_format
+            ),
+            # bf16 weights out: makes precomputed TRT-LLM SiTU consume them
+            # without a cast. This setting is unused by kernel-routing plans.
+            topk_weights_dtype=(
+                torch.bfloat16 if self.execution_plan.use_trtllm else torch.float32
+            ),
+        )
 
         self.routed_expert_down_proj = Kimi3LatentProjection(
             config.hidden_size,
@@ -1534,7 +1539,11 @@ class KimiLinearMoE(nn.Module):
             ),
         )
 
-        self._topk_ready = torch.cuda.Event() if alt_stream is not None else None
+        self._topk_ready = (
+            torch.cuda.Event()
+            if alt_stream is not None and self.experts.supports_precomputed_topk
+            else None
+        )
 
         # Shared experts (SiTU dense MLP over the full hidden size).
         self.shared_experts = KimiLinearMLP(
@@ -1684,7 +1693,7 @@ class KimiLinearMoE(nn.Module):
         max_num_tokens_per_gpu: int,
         do_finalize: bool = True,
     ) -> torch.Tensor:
-        """Run the selected precomputed-TopK SiTU MoE kernel."""
+        """Run the selected SiTU MoE (kernel-routing or precomputed-TopK)."""
         plan = self.execution_plan
         if not plan.use_native and not plan.use_trtllm and not plan.use_marlin:
             raise RuntimeError(
@@ -1701,6 +1710,21 @@ class KimiLinearMoE(nn.Module):
         # The kernel returns this rank's pre-reduce partial; the selected
         # tail tier owns the combining reduction.
         return out
+
+    def _routing_output_format(self, ctx: ForwardContext | None) -> TopKOutputFormat:
+        """Choose between the selected kernel's two routing entry points."""
+        if not (
+            self.execution_plan.use_trtllm
+            and self.experts.support_routing
+            and self.experts.supports_precomputed_topk
+        ):
+            return self.experts.topk_output_format
+        # Keep the decode-optimized precomputed path. Extend/mixed forwards use
+        # FlashInfer's public routing API, which wins for prefill-sized batches.
+        # A missing context keeps the conservative precomputed behavior.
+        if ctx is None or ctx.forward_mode.is_decode():
+            return TopKOutputFormat.STANDARD
+        return TopKOutputFormat.BYPASSED
 
     def _forward_fused_decode_pipeline(
         self,
@@ -1837,9 +1861,12 @@ class KimiLinearMoE(nn.Module):
             return prefix_sum
 
         # Router runs uncontended on main (3us; on aux it starves to 14us
-        # under concurrent GEMMs). Topk is a single small CTA, so it overlaps
-        # down_proj from the aux stream, followed by the shared chain.
+        # under concurrent GEMMs). When the selected experts need precomputed
+        # TopK, its single small CTA overlaps down_proj from the aux stream,
+        # followed by the shared chain. Kernel routing bypasses that CTA.
         router_logits = self.gate(hidden_states)
+        routing_output_format = self._routing_output_format(ctx)
+        precompute_topk = routing_output_format.is_standard()
         plan = self.comm.plan(num_tokens, hidden_states)
         if plan.lane is not None:
             self.experts._situ_output_buffer = plan.lane[:, : self.routed_hidden]
@@ -1848,8 +1875,12 @@ class KimiLinearMoE(nn.Module):
         prepared_shared_shard = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with fork.branch():
-                topk_output = self.topk(hidden_states, router_logits)
-                if self._topk_ready is not None and fork._active:
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    output_format=routing_output_format,
+                )
+                if self._topk_ready is not None and precompute_topk and fork._active:
                     self._topk_ready.record(torch.cuda.current_stream())
                 shared_partial = self.shared_experts(
                     hidden_states,
@@ -1864,7 +1895,7 @@ class KimiLinearMoE(nn.Module):
                         shared_partial
                     )
             routed_in, _ = self.routed_expert_down_proj(hidden_states)
-            if self._topk_ready is not None and fork._active:
+            if self._topk_ready is not None and precompute_topk and fork._active:
                 self._topk_ready.wait(torch.cuda.current_stream())
             routed_partial = self._routed_experts(
                 routed_in,

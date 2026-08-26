@@ -2167,6 +2167,7 @@ def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
     # support_routing is True because the selected (dynamic) kernel advertises
     # kernel_routing; precomputed top-k is still forwarded as an optimization.
     assert plan["support_routing"] is True
+    assert plan["supports_precomputed_topk"] is True
 
 
 def test_triton_mxfp4_supports_input_activation_dtype(

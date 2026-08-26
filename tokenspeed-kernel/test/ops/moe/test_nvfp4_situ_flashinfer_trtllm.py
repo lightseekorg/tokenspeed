@@ -324,19 +324,23 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference() -> None:
 
 
 @requires_flashinfer_situ
-def test_moe_plan_selects_nvfp4_situ_routed_kernel() -> None:
+@pytest.mark.parametrize("routing_mode", [None, "precomputed_topk"])
+def test_moe_plan_selects_nvfp4_situ_routed_kernel(
+    routing_mode: str | None,
+) -> None:
     import tokenspeed_kernel
 
     plan = tokenspeed_kernel.moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
-        routing_mode="precomputed_topk",
+        routing_mode=routing_mode,
         ep_size=1,
         ispp=ISPP,
         internal_activation_dtype="input",
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"
+    assert plan["support_routing"] is False
     preprocessor = plan["weight_preprocessor"]
     assert (
         getattr(preprocessor, "__name__", None)

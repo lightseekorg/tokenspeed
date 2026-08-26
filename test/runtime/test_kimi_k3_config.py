@@ -148,6 +148,31 @@ class KimiK3ConfigTests(unittest.TestCase):
 
 
 class KimiK3RegistrationTests(unittest.TestCase):
+    def test_hybrid_moe_precomputes_routing_only_for_decode(self):
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
+        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
+
+        layer = KimiLinearMoE.__new__(KimiLinearMoE)
+        torch.nn.Module.__init__(layer)
+        layer.execution_plan = SimpleNamespace(use_trtllm=True)
+        layer.experts = SimpleNamespace(
+            support_routing=True,
+            supports_precomputed_topk=True,
+            topk_output_format=TopKOutputFormat.BYPASSED,
+        )
+
+        self.assertEqual(layer._routing_output_format(None), TopKOutputFormat.STANDARD)
+        for mode, expected in (
+            (ForwardMode.DECODE, TopKOutputFormat.STANDARD),
+            (ForwardMode.EXTEND, TopKOutputFormat.BYPASSED),
+            (ForwardMode.MIXED, TopKOutputFormat.BYPASSED),
+            (ForwardMode.IDLE, TopKOutputFormat.BYPASSED),
+        ):
+            with self.subTest(mode=mode):
+                ctx = SimpleNamespace(forward_mode=mode)
+                self.assertEqual(layer._routing_output_format(ctx), expected)
+
     def test_mla_mixed_batch_slices_decode_gate_to_live_rows(self):
         from tokenspeed.runtime.execution.context import ForwardContext
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -391,6 +416,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
     def test_native_kimi_moe_uses_direct_ep_and_collective_tp_paths(self):
         import tokenspeed.runtime.models.kimi_k3 as kimi_k3
+        from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
 
         shared_calls = []
         expert_calls = []
@@ -406,6 +432,8 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 super().__init__()
                 expert_calls.append(kwargs)
                 self.support_routing = False
+                self.supports_precomputed_topk = True
+                self.topk_output_format = TopKOutputFormat.STANDARD
                 self.w13_weight = torch.empty(0)
                 self.w13_weight_scale = torch.empty(0)
                 self.w2_weight = torch.empty(0)
@@ -492,7 +520,11 @@ class KimiK3RegistrationTests(unittest.TestCase):
             )
 
         self.assertFalse(shared_calls[0]["reduce_results"])
+        self.assertIsNone(expert_calls[0]["routing_mode"])
         self.assertEqual(expert_calls[0]["internal_activation_dtype_override"], "input")
+        self.assertEqual(
+            layer.topk.topk_config.output_format, TopKOutputFormat.STANDARD
+        )
         self.assertTrue(layer.native_latent_moe.components["joint_reduce"])
         self.assertEqual(
             layer.native_latent_moe.components["expert_parallel_group"], ep_group
