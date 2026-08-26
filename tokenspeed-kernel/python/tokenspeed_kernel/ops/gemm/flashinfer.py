@@ -228,6 +228,12 @@ if gemm_fp8_nt_groupwise is not error_fn:
         # so no padding, transposes, or scale copies are needed per call.
         if A_scales.shape[0] != orig_m:
             A_scales = A_scales[:orig_m]
+        # The kernel reads raw row-major storage; normalize strided views
+        # (a no-op on the hot path, where quant output is contiguous).
+        if not A_scales.is_contiguous():
+            A_scales = A_scales.contiguous()
+        if not B_scales.is_contiguous():
+            B_scales = B_scales.contiguous()
         direct_out = (
             out is not None
             and out.is_contiguous()

@@ -140,6 +140,28 @@ def test_kmajor_out_direct_and_strided_fallback(device: str) -> None:
     assert torch.count_nonzero(backing[:, n:]).item() == 0
 
 
+def test_kmajor_normalizes_strided_scales(device: str) -> None:
+    """Non-contiguous canonical scale views must match the contiguous result."""
+    from tokenspeed_kernel.ops.gemm.flashinfer import flashinfer_mm_fp8_blockscale
+
+    m, n, k = 9, 256, 512
+    quantized, weight, activation_scales, weight_scales = _make_case(m, n, k, device)
+    expected = _mn_reference(quantized, weight, activation_scales, weight_scales)
+
+    strided_a = activation_scales.t().contiguous().t()
+    strided_b = weight_scales.t().contiguous().t()
+    assert not strided_a.is_contiguous() and not strided_b.is_contiguous()
+    result = flashinfer_mm_fp8_blockscale(
+        quantized,
+        weight,
+        strided_a,
+        strided_b,
+        torch.bfloat16,
+        block_size=[128, 128],
+    )
+    torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
 def test_kmajor_slices_padded_activation_scales(device: str) -> None:
     from tokenspeed_kernel.ops.gemm.flashinfer import flashinfer_mm_fp8_blockscale
 
