@@ -52,7 +52,7 @@ from tokenspeed.runtime.distributed.comm_backend import (
 )
 
 # Re-exported for reduce-strategy callers (e.g. kimi3_join_reduce_moe):
-# tensors past the one-shot admission window always take an NCCL path.
+# tensor collections past the one-shot window take an NCCL path.
 from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (  # noqa: F401
     MAX_ONESHOT_BYTES as COMM_ONESHOT_MAX_BYTES,
 )
@@ -324,6 +324,7 @@ def fused_reduce_scatter(
             add_in=fusion_params.add_in,
             fp32_acc=fusion_params.fp32_acc,
             block_quant_fp8=fusion_params.block_quant_fp8,
+            # Shape-derived growth; post-capture grows are refused -- arm before capture.
             max_token_num=fusion_params.max_token_num or tensor.shape[0],
         )
 
@@ -357,6 +358,7 @@ def fused_all_gather(
             rank=rank,
             group=_get_process_group(group),
             total_num_tokens=fusion_params.total_num_tokens,
+            # Shape-derived growth; post-capture grows are refused -- arm before capture.
             max_token_num=fusion_params.max_token_num
             or max(tensor.shape[0], fusion_params.total_num_tokens),
             fp32_acc=fusion_params.fp32_acc,

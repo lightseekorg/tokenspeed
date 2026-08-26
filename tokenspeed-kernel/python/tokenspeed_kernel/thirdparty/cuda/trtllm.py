@@ -561,13 +561,10 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     Tuple[List[List[int]], torch.Tensor],
     Tuple[List[List[int]], torch.Tensor, dict],
 ]:
-    buffer_size = tp_size * max_token_num * hidden_dim * 2
+    elem_size = 4 if use_fp32_lamport else 2
+    buffer_size = tp_size * max_token_num * hidden_dim * elem_size
     flag_size = tp_size * BarrierFlagCount * 4
-    lamport_comm_size = (
-        tp_size * max_token_num * hidden_dim * 2
-        if not use_fp32_lamport
-        else tp_size * max_token_num * hidden_dim * 4
-    )
+    lamport_comm_size = tp_size * max_token_num * hidden_dim * elem_size
 
     ipc_handles, workspace_tensor = _create_ipc_workspace(
         tp_rank,
