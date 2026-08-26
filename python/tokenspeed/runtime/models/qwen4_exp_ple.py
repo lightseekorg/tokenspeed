@@ -28,6 +28,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen4_exp_config import Qwen4ExpTextConfig
@@ -54,7 +55,6 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     get_masked_input_and_mask,
 )
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 def _is_prime(value: int) -> bool:

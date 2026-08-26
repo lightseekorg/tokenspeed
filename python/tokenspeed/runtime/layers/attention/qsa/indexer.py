@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa import (
     qwen4_exp_qsa_stage_draft,
     qwen4_exp_qsa_stage_verify,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -62,7 +63,6 @@ from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.env import envs
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 _DRAFT_INVALID_POSITION = torch.iinfo(torch.int64).min
 

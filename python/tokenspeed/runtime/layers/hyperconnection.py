@@ -28,9 +28,8 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
-
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 @dataclass(frozen=True)
