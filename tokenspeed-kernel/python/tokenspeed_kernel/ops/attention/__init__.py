@@ -3952,7 +3952,7 @@ def dsv4_indexer_prefill_topk(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        return kernel(
+        kernel_kwargs = dict(
             index_q=index_q,
             weights=weights,
             index_k_cache=index_k_cache,
@@ -3965,11 +3965,14 @@ def dsv4_indexer_prefill_topk(
             topk=topk,
             max_seqlen_k=max_seqlen_k,
             index_k_format=index_k_format,
-            block_table_base_offsets=block_table_base_offsets,
             gathered_k=gathered_k,
             gather_workspace=gather_workspace,
             out=out,
         )
+        spec = KernelRegistry.get().get_by_name(kernel.name)
+        if spec is not None and spec.solution == "gluon":
+            kernel_kwargs["block_table_base_offsets"] = block_table_base_offsets
+        return kernel(**kernel_kwargs)
 
 
 def dsv4_indexer_decode_topk(
@@ -4062,7 +4065,7 @@ def dsv4_indexer_decode_topk(
         kernel_name=kernel.name,
         **shape_params,
     ):
-        return kernel(
+        kernel_kwargs = dict(
             index_q=index_q,
             weights=weights,
             index_k_cache=index_k_cache,
@@ -4073,10 +4076,13 @@ def dsv4_indexer_decode_topk(
             max_context_len=max_context_len,
             plan=plan,
             index_k_format=index_k_format,
-            block_table_base_offsets=block_table_base_offsets,
             out=out,
             persistent_topk_workspace=persistent_topk_workspace,
         )
+        spec = KernelRegistry.get().get_by_name(kernel.name)
+        if spec is not None and spec.solution == "gluon":
+            kernel_kwargs["block_table_base_offsets"] = block_table_base_offsets
+        return kernel(**kernel_kwargs)
 
 
 def dsa_decode(
