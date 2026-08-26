@@ -95,6 +95,7 @@ class _ChunkedPrefillMetadata:
     max_extend_seq_len: int
     chunked_loop_num: int
     chunk_kv_indices_list: list
+    chunk_reconstruction_indices_list: list
     chunked_seq_len: torch.Tensor
     cu_chunked_seq_len: torch.Tensor
     max_chunk_len_per_loop: list
@@ -490,6 +491,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         (
             chunked_loop_num,
             chunk_kv_indices_list,
+            chunk_reconstruction_indices_list,
             chunked_seq_len,
             cu_chunked_seq_len,
             max_chunk_len_per_loop,
@@ -510,6 +512,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             max_extend_seq_len=max_extend_seq_len,
             chunked_loop_num=chunked_loop_num,
             chunk_kv_indices_list=chunk_kv_indices_list,
+            chunk_reconstruction_indices_list=chunk_reconstruction_indices_list,
             chunked_seq_len=chunked_seq_len,
             cu_chunked_seq_len=cu_chunked_seq_len,
             max_chunk_len_per_loop=max_chunk_len_per_loop,

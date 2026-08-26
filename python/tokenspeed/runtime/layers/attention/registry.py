@@ -179,6 +179,31 @@ def register_backend(
     _BACKEND_REGISTRY[name] = (archs, cls)
 
 
+def _validate_dcp_target(
+    config: BaseAttnConfig,
+    *,
+    is_deepseek_v4_model: bool,
+    full_attn_backend_name: str,
+) -> None:
+    if type(config) is not MLAConfig:
+        raise ValueError(
+            "decode context parallelism is implemented only for dense MLA "
+            f"targets, got {type(config).__name__}"
+        )
+    if is_deepseek_v4_model:
+        raise ValueError(
+            "DeepSeek V4 decode context parallelism is not supported: its "
+            "cyclic indexer cache requires a distributed global sparse-indexer "
+            "top-k before attention outputs can match TP"
+        )
+    if full_attn_backend_name != "tokenspeed_mla":
+        raise ValueError(
+            "decode context parallelism requires the resolved full-attention "
+            "backend to be 'tokenspeed_mla', got "
+            f"{full_attn_backend_name!r}"
+        )
+
+
 _HYBRID_GDN_ARCHITECTURES = {
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen3_5MoeForConditionalGenerationNextN",
@@ -843,20 +868,11 @@ def create_attn_components(
         else config.backend_name
     )
     if server_args.mapping.attn.dcp_size > 1:
-        if type(config) is not MLAConfig:
-            raise ValueError(
-                "decode context parallelism is implemented only for dense MLA "
-                f"targets, got {type(config).__name__}"
-            )
-        supported_dcp_backend = (
-            "deepseek_v4" if is_deepseek_v4_model else "tokenspeed_mla"
+        _validate_dcp_target(
+            config,
+            is_deepseek_v4_model=is_deepseek_v4_model,
+            full_attn_backend_name=target_full_attn_backend_name,
         )
-        if target_full_attn_backend_name != supported_dcp_backend:
-            raise ValueError(
-                "decode context parallelism requires the resolved full-attention "
-                f"backend to be {supported_dcp_backend!r}, got "
-                f"{target_full_attn_backend_name!r}"
-            )
     draft_attn_config = (
         _create_attn_config(server_args, draft_model_config, is_draft=True)
         if draft_model_config and not is_dspark_draft_model

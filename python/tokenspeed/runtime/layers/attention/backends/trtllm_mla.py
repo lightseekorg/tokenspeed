@@ -106,6 +106,7 @@ class TRTLLMMLAChunkedPrefillMetadata:
     # iteration in _init_prefill_metadata, indexed by loop_idx in the model).
     chunked_loop_num: int
     chunk_kv_indices_list: list  # List[torch.Tensor], one per loop_idx
+    chunk_reconstruction_indices_list: list
     chunked_seq_len: torch.Tensor  # (chunked_loop_num, num_extends) int32 GPU
     cu_chunked_seq_len: torch.Tensor  # (chunked_loop_num, num_extends+1) int32 GPU
     max_chunk_len_per_loop: list  # List[int], one per loop_idx
@@ -389,6 +390,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         (
             chunked_loop_num,
             chunk_kv_indices_list,
+            chunk_reconstruction_indices_list,
             chunked_seq_len,
             cu_chunked_seq_len,
             max_chunk_len_per_loop,
@@ -414,6 +416,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             max_extend_seq_len=max_extend_seq_len,
             chunked_loop_num=chunked_loop_num,
             chunk_kv_indices_list=chunk_kv_indices_list,
+            chunk_reconstruction_indices_list=chunk_reconstruction_indices_list,
             chunked_seq_len=chunked_seq_len,
             cu_chunked_seq_len=cu_chunked_seq_len,
             max_chunk_len_per_loop=max_chunk_len_per_loop,

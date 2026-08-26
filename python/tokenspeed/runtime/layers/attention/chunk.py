@@ -36,9 +36,9 @@ def create_chunked_cache_kv_indices_paged(
     page_table_ptr,  # (max_batch, max_pages)
     req_pool_indices_ptr,  # (batch_size,)
     chunk_start_idx_ptr,  # (batch_size,)
-    chunk_seq_lens_ptr,  # (batch_size,)
-    chunk_cum_seq_lens_ptr,  # (batch_size + 1,)
-    chunk_kv_indices_ptr,  # (num_chunk_tokens,)
+    chunk_seq_lens_ptr,  # rank-local (batch_size,)
+    chunk_cum_seq_lens_ptr,  # rank-local (batch_size + 1,)
+    chunk_kv_indices_ptr,  # (max rank-local tokens,)
     page_table_ptr_stride: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     DCP_SIZE: tl.constexpr,
@@ -57,17 +57,18 @@ def create_chunked_cache_kv_indices_paged(
     for i in range(num_loop):
         offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
         mask = offset < chunk_seq_len
-        token_pos = chunk_start_pos + offset
-        owned = token_pos % DCP_SIZE == DCP_RANK
+        first_owned = (
+            chunk_start_pos + (DCP_RANK - chunk_start_pos % DCP_SIZE) % DCP_SIZE
+        )
+        token_pos = first_owned + offset * DCP_SIZE
         local_pos = token_pos // DCP_SIZE
         page_idx = local_pos // PAGE_SIZE
         page_id = tl.load(
             page_table_ptr + req_pool_index * page_table_ptr_stride + page_idx,
-            mask=mask & owned,
+            mask=mask,
             other=0,
         )
         kv_slot = page_id * PAGE_SIZE + local_pos % PAGE_SIZE
-        kv_slot = tl.where(owned, kv_slot, 0)
         tl.store(
             chunk_kv_indices_ptr + chunk_kv_indices_offset + offset,
             kv_slot,
@@ -80,6 +81,51 @@ def get_max_chunk_capacity():
         global_server_args_dict["chunked_prefill_size"]
         * global_server_args_dict["mla_chunk_multiplier"]
     )
+
+
+def build_dcp_compact_reconstruction_plan(
+    starts: list[int],
+    lengths: list[int],
+    dcp_size: int,
+    dcp_rank: int,
+) -> tuple[list[int], int, list[int]]:
+    """Plan compact local prefix reads and global-order reconstruction.
+
+    Returns this rank's per-request row counts, the common padded row count
+    used by every rank's all-gather input, and indices that restore the
+    gathered rank-major rows to request-major global token order.
+    """
+    counts_by_rank: list[list[int]] = []
+    for rank in range(dcp_size):
+        rank_counts = []
+        for start, length in zip(starts, lengths):
+            first_delta = (rank - int(start)) % dcp_size
+            rank_counts.append(
+                0
+                if first_delta >= int(length)
+                else 1 + (int(length) - 1 - first_delta) // dcp_size
+            )
+        counts_by_rank.append(rank_counts)
+    padded_local_tokens = max(sum(counts) for counts in counts_by_rank)
+
+    rank_req_offsets = []
+    for counts in counts_by_rank:
+        offsets = [0]
+        for count in counts:
+            offsets.append(offsets[-1] + count)
+        rank_req_offsets.append(offsets)
+    reconstruction = []
+    for req, (start, length) in enumerate(zip(starts, lengths)):
+        for token_pos in range(int(start), int(start) + int(length)):
+            owner = token_pos % dcp_size
+            first_owned = int(start) + (owner - int(start)) % dcp_size
+            owner_offset = (token_pos - first_owned) // dcp_size
+            reconstruction.append(
+                owner * padded_local_tokens
+                + rank_req_offsets[owner][req]
+                + owner_offset
+            )
+    return counts_by_rank[dcp_rank], padded_local_tokens, reconstruction
 
 
 # Here we suppose the length of each chunk is equal
@@ -157,16 +203,37 @@ def get_chunks_paged(
     num_tokens_per_forward = chunks_cpu.len_in_chunk.sum(dim=1).tolist()
 
     chunk_kv_indices_list = []
+    chunk_reconstruction_indices_list = []
     for idx in range(num_chunks):
-        chunk_kv_indices = torch.empty(
-            num_tokens_per_forward[idx], dtype=torch.int32, device=device
+        if dcp_size == 1:
+            local_lens_cpu = chunks_cpu.len_in_chunk[idx]
+            padded_local_tokens = num_tokens_per_forward[idx]
+            reconstruction_indices = None
+        else:
+            starts = chunks_cpu.starts[idx].tolist()
+            lengths = chunks_cpu.len_in_chunk[idx].tolist()
+            local_counts, padded_local_tokens, reconstruction = (
+                build_dcp_compact_reconstruction_plan(
+                    starts, lengths, dcp_size, dcp_rank
+                )
+            )
+            local_lens_cpu = torch.tensor(local_counts, dtype=torch.int32)
+            reconstruction_indices = torch.tensor(
+                reconstruction, dtype=torch.int64, device=device
+            )
+
+        local_lens = local_lens_cpu.to(device=device)
+        local_cum_lens = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+        torch.cumsum(local_lens, dim=0, out=local_cum_lens[1:])
+        chunk_kv_indices = torch.zeros(
+            padded_local_tokens, dtype=torch.int32, device=device
         )
         create_chunked_cache_kv_indices_paged[(batch_size,)](
             page_table,
             req_pool_indices,
             chunks.starts[idx],
-            chunks.len_in_chunk[idx],
-            chunks.cum_seq_lens[idx],
+            local_lens,
+            local_cum_lens,
             chunk_kv_indices,
             page_table.shape[1],
             page_size,
@@ -174,8 +241,14 @@ def get_chunks_paged(
             DCP_RANK=dcp_rank,
         )
         chunk_kv_indices_list.append(chunk_kv_indices)
+        chunk_reconstruction_indices_list.append(reconstruction_indices)
 
-    return chunks, chunk_kv_indices_list, chunks_cpu
+    return (
+        chunks,
+        chunk_kv_indices_list,
+        chunks_cpu,
+        chunk_reconstruction_indices_list,
+    )
 
 
 def build_chunked_prefill_metadata_arrays(
@@ -195,6 +268,8 @@ def build_chunked_prefill_metadata_arrays(
 
     - ``chunked_loop_num``: number of prefix loop iterations
     - ``chunk_kv_indices_list``: List[Tensor], paged KV indices per loop_idx
+    - ``chunk_reconstruction_indices_list``: maps gathered compact DCP rows
+      back to global request-major order; ``None`` entries when DCP is off.
     - ``chunked_seq_len``: (chunked_loop_num, num_extends) int32 GPU — per-seq
       KV length within each loop_idx (zero for seqs whose prefix doesn't
       reach this chunk).
@@ -207,7 +282,12 @@ def build_chunked_prefill_metadata_arrays(
     causal pass's ``cum_extend_seq_lens`` / ``max_extend_seq_len``, since
     every prefix-chunk forward sees the same ``q_lens == extend_seq_lens``.
     """
-    chunks, chunk_kv_indices_list, chunks_cpu = get_chunks_paged(
+    (
+        chunks,
+        chunk_kv_indices_list,
+        chunks_cpu,
+        chunk_reconstruction_indices_list,
+    ) = get_chunks_paged(
         extend_prefix_lens,
         extend_prefix_lens_cpu,
         page_table,
@@ -223,6 +303,7 @@ def build_chunked_prefill_metadata_arrays(
     return (
         chunked_loop_num,
         chunk_kv_indices_list,
+        chunk_reconstruction_indices_list,
         chunks.len_in_chunk,
         chunks.cum_seq_lens,
         max_chunk_len_per_loop,

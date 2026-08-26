@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 
 import torch
@@ -1548,32 +1549,33 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             if compressed_cache_2d is not None
             else None
         )
-        out, lse = flash_mla_with_kvcache(
-            q=q_kernel,
-            k_cache=_fp8_page_planar_cache_view(
-                swa_cache_2d,
-                swa_block_size,
-                row_bytes,
-            ),
-            block_table=None,
-            cache_seqlens=None,
-            head_dim_v=head_dim,
-            tile_scheduler_metadata=_get_dsv4_tile_meta(
-                q_kernel,
-                swa_indices.shape[-1],
-                swa_block_size,
-                compressed_block_size if compressed_cache_2d is not None else None,
-                0 if extra_indices is None else extra_indices.shape[-1],
-            ),
-            softmax_scale=float(softmax_scale),
-            is_fp8_kvcache=True,
-            indices=swa_indices.unsqueeze(1),
-            attn_sink=attn_sink,
-            extra_k_cache=extra_cache,
-            extra_indices_in_kvcache=extra_indices,
-            topk_length=swa_lens,
-            extra_topk_length=extra_lens,
-        )
+        with nvtx_range("dcp_attention_kernel", category="dcp"):
+            out, lse = flash_mla_with_kvcache(
+                q=q_kernel,
+                k_cache=_fp8_page_planar_cache_view(
+                    swa_cache_2d,
+                    swa_block_size,
+                    row_bytes,
+                ),
+                block_table=None,
+                cache_seqlens=None,
+                head_dim_v=head_dim,
+                tile_scheduler_metadata=_get_dsv4_tile_meta(
+                    q_kernel,
+                    swa_indices.shape[-1],
+                    swa_block_size,
+                    compressed_block_size if compressed_cache_2d is not None else None,
+                    0 if extra_indices is None else extra_indices.shape[-1],
+                ),
+                softmax_scale=float(softmax_scale),
+                is_fp8_kvcache=True,
+                indices=swa_indices.unsqueeze(1),
+                attn_sink=attn_sink,
+                extra_k_cache=extra_cache,
+                extra_indices_in_kvcache=extra_indices,
+                topk_length=swa_lens,
+                extra_topk_length=extra_lens,
+            )
         if out.dim() == 4:
             out = out.squeeze(1)
         out = out[:, :num_kernel_heads]
@@ -1591,14 +1593,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 out,
                 local_lse,
                 group=self.dcp_group,
-                lse_base=2.718281828459045,
+                lse_base=math.e,
             )
         return reconstruct_and_reduce_scatter(
             out,
             local_lse,
             dcp_rank=self.dcp_rank,
             group=self.dcp_group,
-            lse_base=2.718281828459045,
+            lse_base=math.e,
         )
 
     def forward_deepseek_v4_mixed(

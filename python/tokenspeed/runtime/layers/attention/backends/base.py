@@ -140,6 +140,10 @@ class AttentionBackend(ABC):
         metadata slot for backends that prewrite on extend as well."""
         return out_cache_loc
 
+    def select_out_cache_write_mask(self, layer, out_cache_loc, forward_mode=None):
+        """Return an optional explicit per-token predicate for cache stores."""
+        return None
+
     @property
     def sinks_dtype(self) -> torch.dtype:
         return torch.bfloat16

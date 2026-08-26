@@ -41,6 +41,10 @@ class FusedMLASetKVBufferArg:
     k_nope: torch.Tensor
     kv_buffer: torch.Tensor
     cache_loc: torch.Tensor
+    # Optional per-token cache-store predicate. Query assembly still runs for
+    # every token; only the latent KV store is masked. Cyclic/DCP layouts use
+    # this to make ownership explicit instead of treating slot 0 specially.
+    write_mask: torch.Tensor | None = None
     # Setting the absorbed query half switches the write from updating the
     # query's rotated columns in place to assembling the whole query, which
     # widens the caller's output accordingly. supports_fused_mla_kv_write
@@ -138,7 +142,8 @@ def apply_rope(
         fused_mla_set_kv_buffer_arg: Optional fused MLA KV-cache write
             arguments. When provided, rotated K is written to the MLA cache
             instead of k/k_rope_out because MLA stores [k_nope | k_rope] in a
-            single cache row with different component widths.
+            single cache row with different component widths. ``write_mask``
+            predicates cache stores without suppressing query assembly.
         q_rope_out: Optional output buffer for the rotated query. If omitted,
             q is updated in place.
         k_rope_out: Optional output buffer for the rotated key. If omitted,

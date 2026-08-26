@@ -219,11 +219,13 @@ def _mla_rope_set_kv_buffer_kernel(
     q_out_rope_ptr,
     kv_buffer_ptr,
     loc_ptr,
+    write_mask_ptr,
     cos_sin_cache_ptr,
     positions_ptr,
     q_nope_ptr,
     num_tokens,
     loc_stride: tl.constexpr,
+    write_mask_stride: tl.constexpr,
     q_rope_stride_t: tl.constexpr,
     q_rope_stride_h: tl.constexpr,
     k_nope_stride_t: tl.constexpr,
@@ -247,6 +249,7 @@ def _mla_rope_set_kv_buffer_kernel(
     BLOCK_N: tl.constexpr,
     INDEX_INT64: tl.constexpr,
     SANITIZE: tl.constexpr,
+    HAS_WRITE_MASK: tl.constexpr,
     MAX_FINITE: tl.constexpr,
 ):
     """One launch for the MLA query assembly and the latent KV write.
@@ -346,6 +349,11 @@ def _mla_rope_set_kv_buffer_kernel(
                     tl.store(q_out_base + pair_hi, q2, mask=half_mask)
             else:
                 loc = tl.load(loc_ptr + token_idx * loc_stride).to(tl.int64)
+                write_enabled = True
+                if HAS_WRITE_MASK:
+                    write_enabled = tl.load(
+                        write_mask_ptr + token_idx * write_mask_stride
+                    )
                 kv_base = kv_buffer_ptr + loc * kv_buffer_stride_t
                 k_nope = tl.load(
                     k_nope_ptr + token_idx * k_nope_stride_t + nope_offsets,
@@ -354,7 +362,11 @@ def _mla_rope_set_kv_buffer_kernel(
                 )
                 if SANITIZE:
                     k_nope = _sanitize_for_store(k_nope, MAX_FINITE)
-                tl.store(kv_base + nope_offsets, k_nope, mask=nope_mask)
+                tl.store(
+                    kv_base + nope_offsets,
+                    k_nope,
+                    mask=nope_mask & write_enabled,
+                )
 
                 k_base = k_rope_ptr + token_idx * k_rope_stride_t
                 k1 = tl.load(k_base + pair_lo, mask=half_mask, other=0.0)
@@ -372,8 +384,16 @@ def _mla_rope_set_kv_buffer_kernel(
                     # on input returns through its partner, and inf becomes one.
                     k1_out = _sanitize_for_store(k1_out, MAX_FINITE)
                     k2_out = _sanitize_for_store(k2_out, MAX_FINITE)
-                tl.store(kv_base + nope_dim + pair_lo, k1_out, mask=half_mask)
-                tl.store(kv_base + nope_dim + pair_hi, k2_out, mask=half_mask)
+                tl.store(
+                    kv_base + nope_dim + pair_lo,
+                    k1_out,
+                    mask=half_mask & write_enabled,
+                )
+                tl.store(
+                    kv_base + nope_dim + pair_hi,
+                    k2_out,
+                    mask=half_mask & write_enabled,
+                )
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -421,6 +441,7 @@ def apply_rope_mla_set_kv_buffer_triton(
     k_nope = fused_mla_set_kv_buffer_arg.k_nope
     kv_buffer = fused_mla_set_kv_buffer_arg.kv_buffer
     loc = fused_mla_set_kv_buffer_arg.cache_loc
+    write_mask = fused_mla_set_kv_buffer_arg.write_mask
     q_nope = fused_mla_set_kv_buffer_arg.q_nope
 
     num_tokens = q_rope.shape[0]
@@ -433,6 +454,9 @@ def apply_rope_mla_set_kv_buffer_triton(
     assert k_rope.ndim == 3 and k_rope.shape[1] == 1
     assert kv_buffer.ndim == 2
     assert loc.numel() == num_tokens
+    if write_mask is not None:
+        assert write_mask.dtype == torch.bool
+        assert write_mask.ndim == 1 and write_mask.numel() == num_tokens
     assert positions.numel() == num_tokens
     assert q_rope.dtype == k_nope.dtype == k_rope.dtype
     if q_nope is None:
@@ -490,11 +514,13 @@ def apply_rope_mla_set_kv_buffer_triton(
         q_rope_out,
         kv_buffer,
         loc,
+        loc if write_mask is None else write_mask,
         cos_sin_cache,
         positions,
         q_nope,
         num_tokens,
         loc.stride(0),
+        0 if write_mask is None else write_mask.stride(0),
         q_rope.stride(0),
         q_rope.stride(1),
         k_nope.stride(0),
@@ -518,6 +544,7 @@ def apply_rope_mla_set_kv_buffer_triton(
         BLOCK_N=block_n,
         INDEX_INT64=index_int64,
         SANITIZE=sanitize,
+        HAS_WRITE_MASK=write_mask is not None,
         MAX_FINITE=max_finite,
         num_warps=4,
         **({"launch_pdl": True} if enable_pdl else {}),

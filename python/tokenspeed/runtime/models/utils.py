@@ -120,6 +120,7 @@ def create_fused_mla_set_kv_buffer_arg(
     layer_id: int,
     num_q_heads: int,
     q_nope: torch.Tensor | None = None,
+    write_mask: torch.Tensor | None = None,
 ) -> FusedMLASetKVBufferArg | None:
     """Arguments for the fused MLA RoPE + quantize + KV write, or ``None``.
 
@@ -174,6 +175,7 @@ def create_fused_mla_set_kv_buffer_arg(
         k_nope=k_nope,
         kv_buffer=kv_buffer.view(kv_buffer.shape[0], -1),
         cache_loc=out_cache_loc,
+        write_mask=write_mask,
         q_nope=q_nope,
         cos_sin_cache=None if rotary_emb is None else rotary_emb.cos_sin_cache,
         is_neox=True if rotary_emb is None else rotary_emb.is_neox_style,

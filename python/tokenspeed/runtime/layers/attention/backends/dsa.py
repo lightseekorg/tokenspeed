@@ -143,6 +143,11 @@ class DSABackend(AttentionBackend):
             layer, out_cache_loc, forward_mode
         )
 
+    def select_out_cache_write_mask(self, layer, out_cache_loc, forward_mode=None):
+        return self._dense_backend.select_out_cache_write_mask(
+            layer, out_cache_loc, forward_mode
+        )
+
     def init_cuda_graph_state(self, max_bs: int):
         self._dense_backend.init_cuda_graph_state(max_bs)
 

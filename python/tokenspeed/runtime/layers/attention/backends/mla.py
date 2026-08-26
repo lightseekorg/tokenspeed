@@ -74,6 +74,7 @@ class MLAPrefillMetadata:
     # Per-prefix-chunk arrays consumed by DeepSeek's chunked prefix replay.
     chunked_loop_num: int
     chunk_kv_indices_list: list[torch.Tensor]
+    chunk_reconstruction_indices_list: list[torch.Tensor | None]
     chunked_seq_len: torch.Tensor
     cu_chunked_seq_len: torch.Tensor
     max_chunk_len_per_loop: list[int]
@@ -322,6 +323,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         (
             chunked_loop_num,
             chunk_kv_indices_list,
+            chunk_reconstruction_indices_list,
             chunked_seq_len,
             cu_chunked_seq_len,
             max_chunk_len_per_loop,
@@ -347,6 +349,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             use_absorbed_cached_extend=use_absorbed_cached_extend,
             chunked_loop_num=chunked_loop_num,
             chunk_kv_indices_list=chunk_kv_indices_list,
+            chunk_reconstruction_indices_list=chunk_reconstruction_indices_list,
             chunked_seq_len=chunked_seq_len,
             cu_chunked_seq_len=cu_chunked_seq_len,
             max_chunk_len_per_loop=max_chunk_len_per_loop,

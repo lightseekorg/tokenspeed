@@ -124,6 +124,31 @@ def _msa_config() -> MSAConfig:
     )
 
 
+def test_dcp_accepts_only_dense_tokenspeed_mla_targets() -> None:
+    from tokenspeed.runtime.layers.attention.registry import _validate_dcp_target
+
+    config = _mla_config()
+    _validate_dcp_target(
+        config,
+        is_deepseek_v4_model=False,
+        full_attn_backend_name="tokenspeed_mla",
+    )
+
+    with pytest.raises(ValueError, match="distributed global sparse-indexer top-k"):
+        _validate_dcp_target(
+            config,
+            is_deepseek_v4_model=True,
+            full_attn_backend_name="deepseek_v4",
+        )
+
+    with pytest.raises(ValueError, match="resolved full-attention backend"):
+        _validate_dcp_target(
+            config,
+            is_deepseek_v4_model=False,
+            full_attn_backend_name="trtllm_mla",
+        )
+
+
 class _SyntheticHybridRecipe(CacheRecipe):
     """A minimal hybrid family, expressed the way a real one is.
 

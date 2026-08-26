@@ -431,6 +431,44 @@ class TestCLIConfigCompat(unittest.TestCase):
         sa.resolve_speculative_decoding()
         self.assertIsNone(sa.speculative_draft_model_quantization)
 
+    def test_dcp_rejects_speculative_decoding(self):
+        for algorithm in ("MTP", "EAGLE3", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                args = self._parse_args(
+                    [
+                        "--model",
+                        "test/model",
+                        "--decode-context-parallel-size",
+                        "2",
+                        "--speculative-algorithm",
+                        algorithm,
+                        "--speculative-num-draft-tokens",
+                        "4",
+                    ]
+                )
+                sa = self._from_cli_args_no_init(args)
+                with self.assertRaisesRegex(
+                    ValueError, "cannot currently be combined with speculative"
+                ):
+                    sa.resolve_speculative_decoding()
+
+    def test_dcp_rejects_an_explicit_draft_even_without_algorithm(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--decode-context-parallel-size",
+                "2",
+                "--speculative-draft-model-path",
+                "test/draft",
+            ]
+        )
+        sa = self._from_cli_args_no_init(args)
+        with self.assertRaisesRegex(
+            ValueError, "cannot currently be combined with speculative"
+        ):
+            sa.resolve_speculative_decoding()
+
     def test_replay_ssm_defaults_to_disabled(self):
         args = self._parse_args(["--model", "test/model"])
         self.assertFalse(self._from_cli_args_no_init(args).enable_replay_ssm)

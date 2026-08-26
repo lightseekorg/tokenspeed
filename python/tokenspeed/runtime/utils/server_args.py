@@ -769,6 +769,17 @@ class ServerArgs:
                 "(topk=1) is wired end-to-end."
             )
 
+        if self.decode_context_parallel_size > 1 and (
+            self.speculative_algorithm is not None
+            or self.speculative_draft_model_path is not None
+            or self.draft_model_path_use_base
+        ):
+            raise ValueError(
+                "decode context parallelism cannot currently be combined with "
+                "speculative decoding or MTP: target and draft cache placement "
+                "contracts are not yet compatible"
+            )
+
     def resolve_communication(self):
         # Auto-enable allreduce fusion on supported single-node TP configurations.
         platform = current_platform()

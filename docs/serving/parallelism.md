@@ -63,6 +63,44 @@ With the bundled gateway, pass `--policy cache_aware --dp-aware` to
 releases that carry the TokenSpeed dp-affinity support; see the lockstep
 note in `serve_smg.py`.
 
+## Decode Context Parallelism
+
+`--decode-context-parallel-size D` cyclically shards dense MLA history across
+`D` ranks inside the attention TP group. Use `--dcp-comm-backend a2a` for the
+packed output/LSE exchange. DCP currently rejects speculative decoding and MTP:
+target and draft cache placement do not yet share a validated layout.
+DeepSeek V4 is also rejected: sharding its sparse-indexer cache requires a
+distributed global top-k, and rank-local candidate selection does not preserve
+TP output parity.
+
+The reserved null page is read-only. Cyclic cache writers receive an explicit
+per-token ownership mask, including fused RoPE/NoPE MLA writes; a location of
+zero is not itself the writer contract. Chunked prefill reads only rank-local
+cached-prefix rows, all-gathers the compact rows, and restores global
+request-major order before the latent projection.
+
+For TP-versus-DCP correctness, run
+`test/manual/dcp_activation_parity.py` against the TP server to write a
+reference and then against every DCP degree. It checks exact generated IDs plus
+sampled-token log probabilities for cold prefill/decode and an identical
+prefix-cache replay. It also compares final hidden states when the response
+path provides that optional field.
+
+Enable `--enable-nvtx` when profiling decode. Nsight Systems then reports these
+per-layer DCP ranges separately:
+
+- `dcp_query_pack`
+- `dcp_query_all_gather`
+- `dcp_attention_kernel`
+- `dcp_output_lse_pack`
+- `dcp_output_lse_all_to_all`
+- `dcp_output_lse_unpack_merge`
+- `dcp_prefix_pack`, `dcp_prefix_all_gather`, and `dcp_prefix_reorder`
+
+This breakdown distinguishes packing and launch latency from the attention
+kernel and NCCL payload time; peak link bandwidth alone is not a useful
+explanation for small decode collectives.
+
 ## MoE Deployments
 
 Large MoE models usually choose one of these shapes:

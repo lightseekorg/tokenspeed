@@ -46,7 +46,6 @@ from tokenspeed_kernel.ops.attention.triton.mla_write_locations import (
 )
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -76,6 +75,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -593,6 +593,17 @@ class CuteDSLMLABackend(AttentionBackend):
             )
         return locs
 
+    def select_out_cache_write_mask(self, layer, out_cache_loc, forward_mode=None):
+        """Explicitly predicate cyclic cache stores to rank-owned tokens.
+
+        Location zero remains the reserved null page. The mask is deliberately
+        separate from the locations so fused and split writers share the same
+        ownership contract and never infer store behavior from a sentinel.
+        """
+        if self.dcp_size == 1 or not self._cache_groups_bound:
+            return None
+        return out_cache_loc.ne(0)
+
     def _init_decode_metadata(
         self,
         bs: int,
@@ -804,6 +815,7 @@ class CuteDSLMLABackend(AttentionBackend):
         (
             chunked_loop_num,
             chunk_kv_indices_list,
+            chunk_reconstruction_indices_list,
             chunked_seq_len,
             cu_chunked_seq_len,
             max_chunk_len_per_loop,
@@ -826,6 +838,7 @@ class CuteDSLMLABackend(AttentionBackend):
             max_extend_seq_len=max_extend_seq_len,
             chunked_loop_num=chunked_loop_num,
             chunk_kv_indices_list=chunk_kv_indices_list,
+            chunk_reconstruction_indices_list=chunk_reconstruction_indices_list,
             chunked_seq_len=chunked_seq_len,
             cu_chunked_seq_len=cu_chunked_seq_len,
             max_chunk_len_per_loop=max_chunk_len_per_loop,
@@ -835,18 +848,27 @@ class CuteDSLMLABackend(AttentionBackend):
         self,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        reconstruction_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Reconstruct dense cached-prefix rows from cyclic local shards.
 
-        DCP chunk indices keep the original packed global-token shape and map
-        non-owned positions to the permanently-zero null row. A SUM all-reduce
-        therefore selects exactly one owner per row without variable-size
-        gathers or reordering.
+        Each rank reads only its cyclic local rows (plus at most a small padded
+        tail so NCCL sees equal counts). An all-gather exchanges those disjoint
+        rows once; ``reconstruction_indices`` restores global request-major
+        order without loading the null page for every non-owner token.
         """
         if self.dcp_size == 1 or cache_k_nope.numel() == 0:
             return cache_k_nope, cache_k_rope
-        packed = torch.cat((cache_k_nope, cache_k_rope), dim=-1)
-        packed = all_reduce(packed, self.dcp_group)
+        if reconstruction_indices is None:
+            raise RuntimeError("DCP prefix reconstruction metadata is missing")
+        from tokenspeed.runtime.distributed.comm_ops import all_gather
+
+        with nvtx_range("dcp_prefix_pack", category="dcp"):
+            packed = torch.cat((cache_k_nope, cache_k_rope), dim=-1)
+        with nvtx_range("dcp_prefix_all_gather", category="dcp"):
+            packed = all_gather(packed, self.dcp_group, dim=0)
+        with nvtx_range("dcp_prefix_reorder", category="dcp"):
+            packed = packed.index_select(0, reconstruction_indices)
         return packed.split((self.kv_lora_rank, self.qk_rope_head_dim), dim=-1)
 
     # ---- CUDA Graph ----
@@ -1127,7 +1149,9 @@ class CuteDSLMLABackend(AttentionBackend):
                 out_cache_loc,
                 k[..., : self.kv_lora_rank],
                 k[..., self.kv_lora_rank :],
-                skip_zero=self.dcp_size > 1,
+                write_mask=self.select_out_cache_write_mask(
+                    layer, out_cache_loc, ForwardMode.DECODE
+                ),
             )
 
         metadata = self.forward_decode_metadata
@@ -1168,23 +1192,26 @@ class CuteDSLMLABackend(AttentionBackend):
 
         self.cutedsl_workspace = self._cutedsl_workspace(query.shape[1])
 
-        decode_result = tokenspeed_mla_decode(
-            query=query,
-            kv_cache=kv_cache,
-            workspace_buffer=self.cutedsl_workspace,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=metadata.block_kv_indices[num_extends:],
-            seq_lens=metadata.kernel_seq_lens_k[num_extends:],
-            max_seq_len=metadata.max_seq_len_k,
-            softmax_scale=softmax_scale,
-            return_lse=self.dcp_size > 1,
-            causal_seqs=(
-                metadata.global_seq_lens_k[num_extends:] if self.dcp_size > 1 else None
-            ),
-            cp_world=self.dcp_size,
-            cp_rank=self.dcp_rank,
-        )
+        with nvtx_range("dcp_attention_kernel", category="dcp"):
+            decode_result = tokenspeed_mla_decode(
+                query=query,
+                kv_cache=kv_cache,
+                workspace_buffer=self.cutedsl_workspace,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                block_tables=metadata.block_kv_indices[num_extends:],
+                seq_lens=metadata.kernel_seq_lens_k[num_extends:],
+                max_seq_len=metadata.max_seq_len_k,
+                softmax_scale=softmax_scale,
+                return_lse=self.dcp_size > 1,
+                causal_seqs=(
+                    metadata.global_seq_lens_k[num_extends:]
+                    if self.dcp_size > 1
+                    else None
+                ),
+                cp_world=self.dcp_size,
+                cp_rank=self.dcp_rank,
+            )
         if self.dcp_size == 1:
             return decode_result.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

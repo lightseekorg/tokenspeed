@@ -171,11 +171,22 @@ class MLATokenToKVPool(CachePool):
         cache_k_rope: torch.Tensor,
         sanitize: bool | None = None,
         skip_zero: bool = False,
+        write_mask: torch.Tensor | None = None,
     ):
         if sanitize is None:
             sanitize = self.latent_write_sanitizes
         layer_id = layer.layer_id
         skip_zero = skip_zero or layer_id in self._cyclic_layers
+        if write_mask is not None:
+            if write_mask.dtype != torch.bool or write_mask.shape != loc.shape:
+                raise ValueError(
+                    "MLA write_mask must be bool and match the location shape"
+                )
+            loc = loc[write_mask]
+            cache_k_nope = cache_k_nope[write_mask]
+            cache_k_rope = cache_k_rope[write_mask]
+            # The explicit predicate has already removed non-owner rows.
+            skip_zero = False
         if self.quant_method == "per_token_head":
             # Preserve the writer's sanitization contract for the quantized
             # fallback. The BF16 path below folds this work into Triton.

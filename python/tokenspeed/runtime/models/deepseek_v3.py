@@ -471,6 +471,26 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
         return super().forward(x, block_scale=block_scale, output_dtype=output_dtype)[0]
 
 
+def _normalize_deepseek_rope_scaling(
+    rope_scaling: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Normalize actual YaRN configs without misclassifying plain RoPE.
+
+    Recent Transformers versions may expose ordinary RoPE as a truthy
+    ``rope_type=default`` dictionary without YaRN's ``factor`` fields. Keep
+    that on the plain-RoPE path and copy real scaling dictionaries before
+    adapting their type, so the shared model config is not mutated.
+    """
+    if not rope_scaling:
+        return None
+    normalized = dict(rope_scaling)
+    rope_type = normalized.get("rope_type", normalized.get("type"))
+    if rope_type == "default":
+        return None
+    normalized["rope_type"] = "deepseek_yarn"
+    return normalized
+
+
 class DeepseekV3AttentionMLA(nn.Module):
     # Backends that use non-absorbed MLA kernels (ragged prefill, paged KV decode).
     _MLA_KERNEL_BACKENDS = ("mla", "trtllm_mla", "tokenspeed_mla")
@@ -526,15 +546,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         # Transformers may normalize an absent rope_scaling configuration to a
         # default RoPE dictionary.  That is not a YaRN configuration and does
         # not contain the YaRN-specific factor fields.
-        if rope_scaling:
-            rope_scaling = dict(rope_scaling)
-            rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
-            if rope_type == "default":
-                rope_scaling = None
-            else:
-                # modification to rope_scaling must be done early enough, b/c
-                # e.g. Indexer needs it
-                rope_scaling["rope_type"] = "deepseek_yarn"
+        rope_scaling = _normalize_deepseek_rope_scaling(rope_scaling)
 
         if self.q_lora_rank is not None:
             self.fused_qkv_a_proj_with_mqa = DeepseekV3FusedQkvAProjWithMqa(
@@ -863,6 +875,9 @@ class DeepseekV3AttentionMLA(nn.Module):
         out_cache_loc = ctx.attn_backend.select_out_cache_loc(
             self.attn_mqa, out_cache_loc, ctx.forward_mode
         )
+        write_mask = ctx.attn_backend.select_out_cache_write_mask(
+            self.attn_mqa, out_cache_loc, ctx.forward_mode
+        )
         if absorbed_query is None:
             q = q.view(-1, self.num_local_heads, self.qk_head_dim)
             q_nope, q_pe = q.split(
@@ -907,6 +922,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 layer_id=self.attn_mqa.layer_id,
                 num_q_heads=self.num_local_heads,
                 q_nope=q_nope_absorbed,
+                write_mask=write_mask,
             )
             if fused_kv_arg is not None:
                 # One launch for RoPE (or its absence), the FP8 quantize, and
@@ -954,6 +970,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 out_cache_loc,
                 cache_k_nope=key_fp8[..., : self.kv_lora_rank],
                 cache_k_rope=key_fp8[..., self.kv_lora_rank :],
+                write_mask=write_mask,
             )
             return query_fp8, key_fp8
 
@@ -967,6 +984,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                     token_to_kv_pool=ctx.token_to_kv_pool,
                     layer_id=self.attn_mqa.layer_id,
                     num_q_heads=self.num_local_heads,
+                    write_mask=write_mask,
                 )
                 if self.attention_backend in self._MLA_KERNEL_BACKENDS
                 else None
@@ -1008,6 +1026,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 out_cache_loc,
                 cache_k_nope=K[..., : self.kv_lora_rank],
                 cache_k_rope=K[..., self.kv_lora_rank :],
+                write_mask=write_mask,
             )
 
         return Q, K
@@ -1228,7 +1247,11 @@ class DeepseekV3AttentionMLA(nn.Module):
             )
             reconstruct_prefix_kv = getattr(attn_backend, "reconstruct_prefix_kv", None)
             if reconstruct_prefix_kv is not None:
-                kv_a_normed, k_pe = reconstruct_prefix_kv(kv_a_normed, k_pe)
+                kv_a_normed, k_pe = reconstruct_prefix_kv(
+                    kv_a_normed,
+                    k_pe,
+                    chunk_meta.chunk_reconstruction_indices_list[loop_idx],
+                )
 
             kv_a_normed = kv_a_normed.squeeze(1)
             kv = self.kv_b_proj(kv_a_normed)[0]

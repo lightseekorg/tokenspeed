@@ -14,10 +14,13 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+
+from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.distributed.mapping import Group
@@ -208,48 +211,51 @@ def reconstruct_with_all_to_all(
     )
     recv = torch.empty_like(send)
     value_block = triton.next_power_of_2(head_dim)
-    _pack_dcp_partials_kernel[(batch, heads_per_rank)](
-        flat_output,
-        flat_lse,
-        send,
-        flat_output.stride(0),
-        flat_output.stride(1),
-        flat_output.stride(2),
-        flat_lse.stride(0),
-        flat_lse.stride(1),
-        send.stride(0),
-        send.stride(1),
-        send.stride(2),
-        send.stride(3),
-        world_size=world_size,
-        heads_per_rank=heads_per_rank,
-        head_dim=head_dim,
-        value_block=value_block,
-    )
+    with nvtx_range("dcp_output_lse_pack", category="dcp"):
+        _pack_dcp_partials_kernel[(batch, heads_per_rank)](
+            flat_output,
+            flat_lse,
+            send,
+            flat_output.stride(0),
+            flat_output.stride(1),
+            flat_output.stride(2),
+            flat_lse.stride(0),
+            flat_lse.stride(1),
+            send.stride(0),
+            send.stride(1),
+            send.stride(2),
+            send.stride(3),
+            world_size=world_size,
+            heads_per_rank=heads_per_rank,
+            head_dim=head_dim,
+            value_block=value_block,
+        )
 
     from tokenspeed.runtime.distributed.comm_ops import all_to_all_single
 
-    all_to_all_single(recv.view(-1), send.view(-1), group)
+    with nvtx_range("dcp_output_lse_all_to_all", category="dcp"):
+        all_to_all_single(recv.view(-1), send.view(-1), group)
     output = torch.empty(
         (batch, heads_per_rank, head_dim),
         dtype=local_output.dtype,
         device=local_output.device,
     )
-    _unpack_and_merge_dcp_partials_kernel[(batch, heads_per_rank)](
-        recv,
-        output,
-        recv.stride(0),
-        recv.stride(1),
-        recv.stride(2),
-        recv.stride(3),
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        world_size=world_size,
-        head_dim=head_dim,
-        lse_base_e=lse_base == 2.718281828459045,
-        value_block=value_block,
-    )
+    with nvtx_range("dcp_output_lse_unpack_merge", category="dcp"):
+        _unpack_and_merge_dcp_partials_kernel[(batch, heads_per_rank)](
+            recv,
+            output,
+            recv.stride(0),
+            recv.stride(1),
+            recv.stride(2),
+            recv.stride(3),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            world_size=world_size,
+            head_dim=head_dim,
+            lse_base_e=lse_base == math.e,
+            value_block=value_block,
+        )
     return output.reshape(*leading_shape, heads_per_rank, head_dim)
 
 

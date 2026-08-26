@@ -22,10 +22,13 @@
 
 from __future__ import annotations
 
+import math
 import os
 from typing import TYPE_CHECKING
 
 import torch
+
+from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.distributed.mapping import Group
@@ -43,8 +46,10 @@ def gather_fp8_query_heads(query: torch.Tensor, group: Group) -> torch.Tensor:
         )
     from tokenspeed.runtime.distributed.comm_ops import all_gather
 
-    head_major = query.movedim(-2, 0).contiguous()
-    gathered_bytes = all_gather(head_major.view(torch.uint8), group, dim=0)
+    with nvtx_range("dcp_query_pack", category="dcp"):
+        head_major = query.movedim(-2, 0).contiguous()
+    with nvtx_range("dcp_query_all_gather", category="dcp"):
+        gathered_bytes = all_gather(head_major.view(torch.uint8), group, dim=0)
     return gathered_bytes.view(query.dtype).movedim(0, -2)
 
 
@@ -54,8 +59,11 @@ def gather_query_heads(query: torch.Tensor, group: Group) -> torch.Tensor:
         return query
     from tokenspeed.runtime.distributed.comm_ops import all_gather
 
-    head_major = query.movedim(-2, 0).contiguous()
-    return all_gather(head_major, group, dim=0).movedim(0, -2)
+    with nvtx_range("dcp_query_pack", category="dcp"):
+        head_major = query.movedim(-2, 0).contiguous()
+    with nvtx_range("dcp_query_all_gather", category="dcp"):
+        gathered = all_gather(head_major, group, dim=0)
+    return gathered.movedim(0, -2)
 
 
 def merge_partial_outputs(
@@ -139,7 +147,7 @@ def reconstruct_and_reduce_scatter(
     )
     if lse_base == 2.0:
         masses = torch.exp2(shifted)
-    elif lse_base == 2.718281828459045:
+    elif lse_base == math.e:
         masses = torch.exp(shifted)
     else:
         masses = torch.pow(torch.as_tensor(lse_base, device=shifted.device), shifted)

@@ -2178,11 +2178,16 @@ class HybridLinearAttnBackend(AttentionBackend):
     def forward_extend_chunked(self, *args, **kwargs):
         return self.full_attn_backend.forward_extend_chunked(*args, **kwargs)
 
-    def reconstruct_prefix_kv(self, *args, **kwargs):
+    def reconstruct_prefix_kv(
+        self,
+        cache_k_nope,
+        cache_k_rope,
+        reconstruction_indices=None,
+    ):
         reconstruct = getattr(self.full_attn_backend, "reconstruct_prefix_kv", None)
         if reconstruct is None:
-            return args
-        return reconstruct(*args, **kwargs)
+            return cache_k_nope, cache_k_rope
+        return reconstruct(cache_k_nope, cache_k_rope, reconstruction_indices)
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         # Composite: the full-attention child owns the seq_lens the draft reads.
@@ -2204,6 +2209,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         full-attention sub-backend's write locations must be reachable here.
         """
         return self._backend_for_layer(layer.layer_id).select_out_cache_loc(
+            layer, out_cache_loc, forward_mode
+        )
+
+    def select_out_cache_write_mask(self, layer, out_cache_loc, forward_mode=None):
+        return self._backend_for_layer(layer.layer_id).select_out_cache_write_mask(
             layer, out_cache_loc, forward_mode
         )
 

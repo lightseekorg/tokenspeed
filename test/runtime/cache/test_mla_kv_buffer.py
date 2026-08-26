@@ -390,6 +390,58 @@ def test_mla_rope_set_kv_buffer_fp8_matches_two_kernel_path() -> None:
     assert _bitwise_equal(kv[loc], key_ref[:, 0])
 
 
+def test_fused_mla_write_mask_preserves_null_page_and_query_output() -> None:
+    """DCP non-owner tokens assemble Q but cannot mutate the null page."""
+    torch.manual_seed(0)
+    n_loc = 8
+    num_heads = 3
+    q_rope = torch.randn(
+        n_loc, num_heads, ROPE_DIM, device="cuda", dtype=torch.bfloat16
+    )
+    k_rope = torch.randn(n_loc, 1, ROPE_DIM, device="cuda", dtype=torch.bfloat16)
+    q_nope = torch.randn(
+        n_loc, num_heads, NOPE_DIM, device="cuda", dtype=torch.bfloat16
+    )
+    k_nope = torch.randn(n_loc, 1, NOPE_DIM, device="cuda", dtype=torch.bfloat16)
+    positions = torch.zeros(n_loc, device="cuda", dtype=torch.int64)
+    loc = torch.tensor([1, 0, 2, 0, 3, 0, 4, 0], device="cuda")
+    write_mask = torch.tensor(
+        [True, False, True, False, True, False, True, False], device="cuda"
+    )
+    query_ref, key_ref = apply_rope_mla(
+        positions=positions,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        q_nope=q_nope,
+        k_nope=k_nope,
+        cos_sin_cache=None,
+        is_neox=False,
+    )
+    query = torch.empty_like(query_ref)
+    kv = _empty_kv(torch.float8_e4m3fn)
+    null_before = kv[0].clone()
+
+    apply_rope_mla_set_kv(
+        positions=positions,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        fused_mla_set_kv_buffer_arg=FusedMLASetKVBufferArg(
+            k_nope=k_nope,
+            kv_buffer=kv,
+            cache_loc=loc,
+            write_mask=write_mask,
+            q_nope=q_nope,
+            cos_sin_cache=None,
+        ),
+        q_rope_out=query,
+    )
+    torch.cuda.synchronize()
+
+    assert _bitwise_equal(query, query_ref)
+    assert _bitwise_equal(kv[0], null_before)
+    assert _bitwise_equal(kv[loc[write_mask]], key_ref[write_mask, 0])
+
+
 @pytest.mark.parametrize("n_loc", [1, 17, 600])
 def test_mla_set_kv_nope_matches_two_kernel_path(n_loc: int) -> None:
     """The NoPE form, through the entry point the model actually calls.
