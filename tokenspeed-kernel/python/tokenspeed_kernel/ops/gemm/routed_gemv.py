@@ -39,13 +39,12 @@ literals wholesale.
 from __future__ import annotations
 
 import functools
-import os
 import threading
 from types import MappingProxyType
 
 import torch
 from tokenspeed_kernel.ops.gemm.triton_gemv import _torch_decode_gemv
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -249,9 +248,13 @@ def tgv_gemv(
         return _torch_decode_gemv(x, weight, out)
     bias = _tgv_bias(n, dev)
     # TGV is CuTe DSL inside FlashInfer: same DLPack no-grad rule.
-    pdl = os.environ.get("TOKENSPEED_DISABLE_PDL") != "1"
     result = mm_bf16(
-        x.detach(), weight.detach().t(), bias=bias, pdl=pdl, backend="tgv", out=out
+        x.detach(),
+        weight.detach().t(),
+        bias=bias,
+        pdl=pdl_enabled(),
+        backend="tgv",
+        out=out,
     )
     _mark_warmed("tgv", dev, m, n, k)
     return result

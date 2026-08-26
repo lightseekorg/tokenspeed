@@ -33,6 +33,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._layouts import (
     _load_layout,
     _moe_partial_reduce,
+    _situ_reduce,
     _swiglu_reduce,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.pipelined_program import (
@@ -333,6 +334,7 @@ def _warp_decode_stage1_coop_compute(
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
     SWIGLU_BETA: gl.constexpr,
+    DO_SITU: gl.constexpr = False,
 ):
     """Cooperative gate_up GEMM + bias + SwiGLU + fp8-quant + store for one
     (token, slot, expert).  N runs over the INTERLEAVED gate_up rows (2*I);
@@ -507,14 +509,17 @@ def _warp_decode_stage1_coop_compute(
         )
         acc = acc + bias[None, :].to(gl.float32)
 
-    out = _swiglu_reduce(
-        acc,
-        SWIGLU_ALPHA,
-        SWIGLU_LIMIT,
-        SWIGLU_BETA,
-        OUT_BLOCK_N,
-        cfg.acc_layout,
-    )
+    if DO_SITU:
+        out = _situ_reduce(acc, SWIGLU_ALPHA, SWIGLU_LIMIT, OUT_BLOCK_N)
+    else:
+        out = _swiglu_reduce(
+            acc,
+            SWIGLU_ALPHA,
+            SWIGLU_LIMIT,
+            SWIGLU_BETA,
+            OUT_BLOCK_N,
+            cfg.acc_layout,
+        )
     out_inv_scale = 1.0 / gl.load(out_quant_scale_ptr).to(gl.float32)
     out = (out * out_inv_scale).to(Y.dtype.element_ty)
     STORE_LAYOUT: gl.constexpr = out.type.layout
@@ -661,6 +666,96 @@ def _warp_decode_topk_stage1_coop_kernel(
     )
 
     # fmt: on
+
+
+@gluon.jit
+def _warp_decode_precomputed_situ_stage1_kernel(
+    X,
+    W,
+    WScale,
+    TopkIds,
+    Y,
+    M,
+    D,
+    i_dim,
+    stride_xm,
+    stride_xk,
+    stride_tim,
+    stride_tik,
+    stride_we,
+    stride_wk,
+    stride_wn,
+    stride_wse,
+    stride_wsk,
+    stride_wsn,
+    stride_ym,
+    stride_yn,
+    x_global_scale_ptr,
+    out_quant_scale_ptr,
+    w13_bias,
+    TOPK: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    W_PRESHUFFLED: gl.constexpr,
+    EVEN_K: gl.constexpr,
+    HAS_BIAS: gl.constexpr,
+    SITU_BETA: gl.constexpr,
+    SITU_LINEAR_BETA: gl.constexpr,
+):
+    """Route-direct FP8xMXFP4 W13 with fused SiTU and FP8 store."""
+    pid = gl.program_id(axis=0)
+    num_pid_n = gl.cdiv(2 * i_dim, BLOCK_N)
+    slot = pid % TOPK
+    rest = pid // TOPK
+    pid_n = rest % num_pid_n
+    token = rest // num_pid_n
+    expert = gl.load(
+        TopkIds + token.to(gl.int64) * stride_tim + slot * stride_tik,
+        mask=token < M,
+        other=-1,
+    ).to(gl.int32)
+    _warp_decode_stage1_coop_compute(
+        token,
+        slot,
+        expert,
+        pid_n,
+        X,
+        W,
+        WScale,
+        Y,
+        M,
+        D,
+        i_dim,
+        stride_xm,
+        stride_xk,
+        stride_we,
+        stride_wk,
+        stride_wn,
+        stride_wse,
+        stride_wsk,
+        stride_wsn,
+        stride_ym,
+        stride_yn,
+        x_global_scale_ptr,
+        out_quant_scale_ptr,
+        w13_bias,
+        TOPK,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        NUM_BUFFERS,
+        NUM_WARPS,
+        W_PRESHUFFLED,
+        EVEN_K,
+        HAS_BIAS,
+        SITU_BETA,
+        SITU_LINEAR_BETA,
+        0.0,
+        DO_SITU=True,
+    )
 
 
 @gluon.jit
@@ -850,6 +945,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     W_PRESHUFFLED: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SPLIT_K: gl.constexpr,
+    SPLIT_TOPK: gl.constexpr = False,
 ):
     """Direct top-k stage2: FP8 intermediate x MXFP4 W2 -> BF16 output.
 
@@ -867,13 +963,25 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
             "128-wide shuffled tile and BLOCK_K_PACKED=64 so two stage2 "
             "iterations cover one 128-packed-byte K tile.",
         )
+    gl.static_assert(
+        not (SPLIT_K > 1 and SPLIT_TOPK),
+        "stage2 cannot split K and top-k simultaneously",
+    )
     pid = gl.program_id(axis=0)
     num_n = gl.cdiv(N, BLOCK_N)
-    if SPLIT_K == 1:
+    if SPLIT_TOPK:
         pid_k = 0
+        pid_token = pid // (TOPK * num_n)
+        rem = pid % (TOPK * num_n)
+        pid_slot = rem // num_n
+        pid_n = rem % num_n
+    elif SPLIT_K == 1:
+        pid_k = 0
+        pid_slot = 0
         pid_token = pid // num_n
         pid_n = pid % num_n
     else:
+        pid_slot = 0
         per_k = M * num_n
         pid_k = pid // per_k
         rem = pid % per_k
@@ -905,7 +1013,9 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     a_scale = gl.full((M_DUP, BLOCK_K_SCALE), 127, gl.uint8, layout=a_scale_layout)
     acc_total = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
     if pid_token < M:
-        for slot in gl.static_range(0, TOPK):
+        NUM_SLOTS: gl.constexpr = 1 if SPLIT_TOPK else TOPK
+        for slot_iter in gl.static_range(0, NUM_SLOTS):
+            slot = pid_slot if SPLIT_TOPK else slot_iter
             expert = gl.load(
                 TopkIds + pid_token * TOPK + slot, mask=pid_token < M, other=-1
             )
@@ -990,9 +1100,10 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     sm = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, mfma_layout))[:, None]
     sn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))[None, :]
     col = pid_n * BLOCK_N + sn
+    out_row = pid_token * TOPK + pid_slot if SPLIT_TOPK else pid_token
     out_base = (
         Out
-        + pid_token.to(gl.int64) * stride_om
+        + out_row.to(gl.int64) * stride_om
         + col.to(gl.int64) * stride_on
         + sm.to(gl.int64) * 0
     )

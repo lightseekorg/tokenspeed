@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import pdl_enabled
 
 __all__ = ["inkling_topk"]
 
@@ -136,7 +137,7 @@ def inkling_topk(
     top_k: int,
     n_routed: int,
     route_scale: float,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused Inkling gate: biased sigmoid top-k + sink-normalized weights.
 
@@ -150,9 +151,9 @@ def inkling_topk(
         top_k: number of routed experts to select (``1 <= top_k <= n_routed``).
         n_routed: number of routed experts (``<= logits.shape[1]``).
         route_scale: static weight multiplier from the model config.
-        enable_pdl: launch with Programmatic Dependent Launch (Hopper+):
-            the kernel waits for its producer before the first load and
-            signals dependents after its last store.
+        enable_pdl: launch with Programmatic Dependent Launch (Hopper+), using
+            the platform default when omitted. The kernel waits for its producer
+            before the first load and signals dependents after its last store.
 
     Returns:
         ``(weights, topk_ids)`` where ``weights`` is ``[num_tokens,
@@ -181,6 +182,7 @@ def inkling_topk(
     if num_tokens == 0:
         return weights, topk_ids
 
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     inkling_topk_kernel[(num_tokens,)](
         logits,
         gate_bias,

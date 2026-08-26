@@ -491,6 +491,7 @@ def triton_dsa_decode(
     k_scale: float = 1.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     return _run_dsa(
         q=q,
@@ -551,6 +552,7 @@ def triton_dsa_prefill(
     k_scale: float = 1.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     return _run_dsa(
         q=q,

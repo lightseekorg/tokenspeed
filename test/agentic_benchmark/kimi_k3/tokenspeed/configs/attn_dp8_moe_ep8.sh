@@ -40,7 +40,7 @@ exec ts serve \
     --speculative-algorithm DSPARK \
     --speculative-draft-model-path Inferact/Kimi-K3-DSpark \
     --speculative-num-draft-tokens 8 \
-    --drafter-attention-backend mla \
+    --drafter-attention-backend tokenspeed_mla \
     --mm-encoder-tp-mode data \
     --enable-cache-report \
     --host 127.0.0.1 \

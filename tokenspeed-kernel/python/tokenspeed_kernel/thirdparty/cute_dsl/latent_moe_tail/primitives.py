@@ -13,14 +13,12 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+from tokenspeed_kernel.platform import pdl_enabled
 
 VEC_BF16 = 8
 PACKED_BYTES = 16
 NUM_LAMPORT_BUFFERS = 3
-import os
 
-# Read the runtime's process-wide PDL kill switch once to keep it out of compile keys.
-PDL_ENABLED = os.environ.get("TOKENSPEED_DISABLE_PDL") != "1"
 
 NEG_ZERO_F32_BITS = 0x80000000
 NEG_ZERO_BF16_BITS = 0x8000

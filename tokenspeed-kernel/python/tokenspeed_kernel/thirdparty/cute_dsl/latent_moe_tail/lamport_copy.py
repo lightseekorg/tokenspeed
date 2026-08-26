@@ -14,12 +14,12 @@ import torch
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 from .primitives import (
-    PDL_ENABLED,
     VEC_BF16,
     bf16x8_to_packed_u32x4,
     fragment_is_dirty,
     load_global_u32x4,
     packed_u32x4_to_bf16x8,
+    pdl_enabled,
     store_global_u32x4,
     store_lamport_sentinel_128,
     to_cute,
@@ -39,7 +39,7 @@ class LamportCopy:
         self, hidden_dim: int, ctas: int, threads: int, has_residual: bool = False
     ):
         # Bind in host Python; the JIT resolves names from self, not module globals.
-        self.use_pdl = PDL_ENABLED
+        self.use_pdl = pdl_enabled()
         self.hidden_dim = hidden_dim
         self.ctas = ctas
         self.threads = threads

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import torch
 import tvm_ffi
+from tokenspeed_kernel.platform import pdl_enabled
 
 # kv_cache_dtype int codes (must match the C++ Fp8KVCacheDataType enum).
 _KV_DTYPE_CODE = {"auto": 0, "fp8_e4m3": 1, "fp8": 1, "fp8_e5m2": 2}
@@ -56,7 +57,7 @@ def fused_qknorm_rope_kv_insert(
     index_q_out: torch.Tensor | None = None,
     kv_cache_dtype: str = "auto",
     skip_index_branch: bool = False,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> None:
     """Fused Gemma qk-norm + partial-NeoX RoPE (main q/k + index q/k), with
     optional K/V and index-K cache scatter-insert.
@@ -68,9 +69,10 @@ def fused_qknorm_rope_kv_insert(
     Norm weights are the folded Gemma weights (``1 + w``). ``cos_sin_cache`` is
     ``[max_pos, rotary_dim]`` ([cos | sin] halves) in the qkv dtype.
 
-    ``enable_pdl`` requests Programmatic Dependent Launch (SM90+); when False the
-    kernel launches without the stream-serialization attribute (its in-body
-    grid-dependency intrinsics become no-ops).
+    ``enable_pdl`` requests Programmatic Dependent Launch (SM90+) and defaults
+    to the platform setting; when False the kernel launches without the
+    stream-serialization attribute (its in-body grid-dependency intrinsics
+    become no-ops).
     """
     if qkv.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError(f"qkv must be float16 or bfloat16, got {qkv.dtype}")
@@ -84,6 +86,7 @@ def fused_qknorm_rope_kv_insert(
     if index_slot_mapping is not None and index_slot_mapping.dtype != torch.int64:
         index_slot_mapping = index_slot_mapping.to(torch.int64)
 
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     _load_module().fused_minimax_m3_qknorm_rope_kv_insert(
         qkv,
         q_norm_weight,

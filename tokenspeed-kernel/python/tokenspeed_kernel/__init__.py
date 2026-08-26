@@ -18,7 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed_kernel.platform import create_device_stream, release_device_memory_cache
 from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 
 bootstrap_profiling_from_env()
@@ -132,9 +131,6 @@ from tokenspeed_kernel.selection import NoKernelFoundError
 __all__ = [
     # exceptions
     "NoKernelFoundError",
-    # platform
-    "create_device_stream",
-    "release_device_memory_cache",
     # gemm
     "bmm",
     "dsv4_grouped_output_projection",

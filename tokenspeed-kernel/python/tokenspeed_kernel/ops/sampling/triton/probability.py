@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 @triton.jit
@@ -78,7 +79,7 @@ def min_p_renorm_prob(
     probs: torch.Tensor,
     min_p: torch.Tensor,
     *,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> torch.Tensor:
     """Renormalize probabilities after applying a per-row min-p cutoff.
 
@@ -86,6 +87,7 @@ def min_p_renorm_prob(
     zeros probabilities below the threshold, and renormalizes the surviving
     probabilities so the row sums to one.
     """
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     if probs.ndim != 2:
         raise ValueError(f"min_p_renorm_prob expects 2D probs, got {probs.ndim}D")
     if min_p.ndim != 1:

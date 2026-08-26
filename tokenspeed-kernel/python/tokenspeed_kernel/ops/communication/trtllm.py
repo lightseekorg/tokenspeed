@@ -526,7 +526,7 @@ if current_platform().is_nvidia:
         residual_reduce_scattered: bool = False,
         has_partial_norm_out: bool = False,
         max_sm_to_use: int | None = None,
-        launch_with_pdl: bool = False,
+        launch_with_pdl: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Use TRT-LLM fused allreduce + residual + RMS norm operation.
@@ -684,7 +684,7 @@ if current_platform().is_nvidia:
         eps: float = 1e-6,
         max_token_num: int = 2048,
         trigger_completion_at_end: bool = False,
-        launch_with_pdl: bool = False,
+        launch_with_pdl: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """AR + residual + AttnRes prefix combine in one kernel (Kimi-K3).
 
@@ -771,7 +771,7 @@ if current_platform().is_nvidia:
         eps: float = 1e-6,
         max_token_num: int = 2048,
         trigger_completion_at_end: bool = False,
-        launch_with_pdl: bool = False,
+        launch_with_pdl: bool | None = None,
     ) -> torch.Tensor:
         """All-reduce the [latent | hidden] lane and RMS-norm the latent slice.
 
@@ -852,7 +852,7 @@ if current_platform().is_nvidia:
         fp32_acc: bool = False,
         block_quant_fp8: bool = False,
         add_in: torch.Tensor | None = None,
-        launch_with_pdl: bool = False,
+        launch_with_pdl: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Use TRT-LLM fused reducescatter + residual + RMS norm operation.
@@ -971,7 +971,7 @@ if current_platform().is_nvidia:
         block_quant_fp8: bool = False,
         trigger_completion_at_end: bool = False,
         fp32_acc: bool = False,
-        launch_with_pdl: bool = False,
+        launch_with_pdl: bool | None = None,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,

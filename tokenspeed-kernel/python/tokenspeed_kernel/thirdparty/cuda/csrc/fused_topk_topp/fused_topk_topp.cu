@@ -696,7 +696,8 @@ void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float cons
         cudaEventDestroy(initEvent);
     }
     air_top_p::launchRadixOnly<float>(toppCounters, toppHistograms, toppCountHistograms,
-                                     toppBuf1, toppBuf2, batchSize, vocabSize, msStream);
+                                      toppBuf1, toppBuf2, batchSize, vocabSize, msStream,
+                                      enable_pdl);
 
     // ── Stage 1b: deterministic radix top-K on main stream ──────────────────
     // K is pinned to K_TOPK_MAX so the grid configuration is fixed regardless

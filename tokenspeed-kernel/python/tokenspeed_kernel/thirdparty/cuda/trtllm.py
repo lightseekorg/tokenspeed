@@ -35,6 +35,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.thirdparty.cuda.cuda_ipc import (
     create_shared_buffer,
     cudart,
@@ -606,10 +607,10 @@ def trtllm_allreduce_fusion(
     token_num: int,
     hidden_dim: int,
     workspace_ptrs: torch.Tensor,
-    launch_with_pdl: bool,
     trigger_completion_at_end: bool,
     fp32_acc: bool,
     pattern_code: int,
+    launch_with_pdl: Optional[bool] = None,
     use_oneshot: Optional[bool] = None,
     allreduce_out: Optional[torch.Tensor] = None,
     residual_in: Optional[torch.Tensor] = None,
@@ -632,6 +633,7 @@ def trtllm_allreduce_fusion(
     attnres_out_norm_w: Optional[torch.Tensor] = None,
     latent_width: Optional[int] = None,
 ) -> None:
+    launch_with_pdl = pdl_enabled() if launch_with_pdl is None else launch_with_pdl
     if use_oneshot is None:
         if isinstance(workspace_ptrs, MnnvlAllReduceFusionWorkspace):
             use_oneshot = workspace_ptrs.resolve_use_oneshot(token_num, None)
@@ -825,11 +827,11 @@ def trtllm_allgather_fusion(
     world_rank: int,
     hidden_dim: int,
     workspace_ptrs: torch.Tensor,
-    launch_with_pdl: bool,
     trigger_completion_at_end: bool,
     num_token_current_rank: int,
     allgather_out: torch.Tensor,
     num_token_all_group: int,
+    launch_with_pdl: Optional[bool] = None,
     pattern_code: int = AllGatherFusionPattern.kAllGather,
     use_oneshot: Optional[bool] = None,
     fp32_acc: bool = False,
@@ -845,6 +847,7 @@ def trtllm_allgather_fusion(
     kv_lora_rank: int = 0,
     qk_rope_head_dim: int = 0,
 ) -> None:
+    launch_with_pdl = pdl_enabled() if launch_with_pdl is None else launch_with_pdl
     assert (
         q_lora_rank % 128 == 0
     ), f"q_lora_rank ({q_lora_rank}) must be divisible by block_size (128)"
@@ -973,11 +976,11 @@ def trtllm_reducescatter_fusion(
     token_num: int,
     hidden_dim: int,
     workspace_ptrs: torch.Tensor,
-    launch_with_pdl: bool,
     trigger_completion_at_end: bool,
     fp32_acc: bool,
     num_token_current_rank: int,
     pattern_code: int,
+    launch_with_pdl: Optional[bool] = None,
     use_oneshot: Optional[bool] = None,
     reducescatter_out: Optional[torch.Tensor] = None,
     add_in: Optional[torch.Tensor] = None,
@@ -992,6 +995,7 @@ def trtllm_reducescatter_fusion(
     layout_code: Optional[int] = None,
     metadata: Optional[dict] = None,
 ) -> None:
+    launch_with_pdl = pdl_enabled() if launch_with_pdl is None else launch_with_pdl
     if use_oneshot is None:
         use_oneshot = _rs_should_use_oneshot(
             token_num, hidden_dim, reducescatter_in.dtype, world_size
@@ -1169,7 +1173,7 @@ def minimax_allreduce_rms(
     nranks: int,
     eps: float,
     trigger_completion_at_end: bool = True,
-    launch_with_pdl: bool = False,
+    launch_with_pdl: Optional[bool] = None,
     rms_norm_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Single-matrix Lamport AR + RMSNorm over sharded hidden dim.
@@ -1180,6 +1184,7 @@ def minimax_allreduce_rms(
     """
     if rms_norm_out is None:
         rms_norm_out = torch.empty_like(input)
+    launch_with_pdl = pdl_enabled() if launch_with_pdl is None else launch_with_pdl
     _load_trtllm_comm_module().minimax_allreduce_rms(
         input,
         norm_weight,
@@ -1204,7 +1209,7 @@ def minimax_allreduce_rms_qk(
     nranks: int,
     eps: float,
     trigger_completion_at_end: bool = True,
-    launch_with_pdl: bool = False,
+    launch_with_pdl: Optional[bool] = None,
     rms_norm_out_q: Optional[torch.Tensor] = None,
     rms_norm_out_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1217,6 +1222,7 @@ def minimax_allreduce_rms_qk(
         rms_norm_out_q = torch.empty_like(q, memory_format=torch.contiguous_format)
     if rms_norm_out_k is None:
         rms_norm_out_k = torch.empty_like(k, memory_format=torch.contiguous_format)
+    launch_with_pdl = pdl_enabled() if launch_with_pdl is None else launch_with_pdl
     _load_trtllm_comm_module().minimax_allreduce_rms_qk(
         q,
         k,

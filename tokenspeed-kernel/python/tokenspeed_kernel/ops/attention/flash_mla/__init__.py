@@ -292,6 +292,7 @@ if (
         k_scale: float = 1.0,
         return_lse: bool = False,
         out: torch.Tensor | None = None,
+        enable_pdl: bool = False,
     ) -> torch.Tensor:
         if sparse_kv_cache is None:
             raise RuntimeError("FlashMLA sparse decode requires sparse_kv_cache")
@@ -477,6 +478,7 @@ if (
         k_scale: float = 1.0,
         return_lse: bool = False,
         out: torch.Tensor | None = None,
+        enable_pdl: bool = False,
     ) -> torch.Tensor:
         if kv_cache is None:
             raise RuntimeError("FlashMLA sparse prefill requires kv_cache")
