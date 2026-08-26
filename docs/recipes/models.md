@@ -352,6 +352,38 @@ tokenspeed serve zai-org/GLM-5.2-FP8 \
   --port 8000
 ```
 
+### GLM-5.3-Flash
+
+GLM-5.3-Flash automatically configures its KDA/DSA backends and supports MTP from
+the base checkpoint.
+
+Install `ffmpeg` before serving multimodal requests:
+
+```bash
+apt-get update && apt-get install -y ffmpeg
+```
+
+On MI350X, use tensor parallel size 4 with expert parallelism disabled for the
+BF16 or block-FP8 checkpoints. The block-FP8 path retains compact expert
+weights for its decode-specialized Gluon kernel and materializes BF16 expert
+copies once at load time for prefill.
+
+On platforms without DeepGEMM, four-stream mHC uses a portable Triton path and
+switches to its tiled prefill projection above 256 tokens.
+
+```bash
+ts serve zai-org/GLM-5.3-Flash \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --moe-backend flashinfer_trtllm \
+  --kv-cache-dtype fp8 \
+  --draft-model-path-use-base \
+  --speculative-algorithm MTP \
+  --speculative-num-steps 2 \
+  --speculative-num-draft-tokens 3
+```
+
 ## Qwen3 Dense / Qwen3 30B-A3B
 
 Qwen2, dense Qwen3, and Qwen3 MoE checkpoints use different architecture names.
