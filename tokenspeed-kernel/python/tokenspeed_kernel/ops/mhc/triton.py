@@ -102,6 +102,14 @@ def _mhc_prenorm_gemm_triton_kernel(
     )
 
 
+def _mhc_prenorm_gemm_launch_config(
+    num_tokens: int, k: int, n: int, n_splits: int
+) -> tuple[int, int, int, int, int]:
+    if (num_tokens, k, n, n_splits) == (64, 16384, 24, 64):
+        return 16, 16, 64, 2, 3
+    return 16, 32, 64, 4, 1
+
+
 def _mhc_prenorm_gemm_triton(
     x: torch.Tensor,
     fn: torch.Tensor,
@@ -111,10 +119,16 @@ def _mhc_prenorm_gemm_triton(
 ) -> None:
     num_tokens, k = x.shape
     n = fn.shape[0]
-    block_k = 64
+    block_m, block_n, block_k, num_warps, num_stages = _mhc_prenorm_gemm_launch_config(
+        num_tokens, k, n, n_splits
+    )
     split_k = triton.cdiv(triton.cdiv(k, n_splits), block_k) * block_k
     _mhc_prenorm_gemm_triton_kernel[
-        (n_splits, triton.cdiv(num_tokens, 16), triton.cdiv(n, 32))
+        (
+            n_splits,
+            triton.cdiv(num_tokens, block_m),
+            triton.cdiv(n, block_n),
+        )
     ](
         x,
         fn,
@@ -124,11 +138,11 @@ def _mhc_prenorm_gemm_triton(
         K=k,
         N=n,
         SPLIT_K=split_k,
-        BLOCK_M=16,
-        BLOCK_N=32,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         BLOCK_K=block_k,
-        num_warps=4,
-        num_stages=1,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
 

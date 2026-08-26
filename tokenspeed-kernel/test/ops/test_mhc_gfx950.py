@@ -98,3 +98,46 @@ def test_gluon_mhc_pre_multitoken_matches_reference(
         torch.testing.assert_close(
             actual_tensor.float(), expected_tensor.float(), rtol=2e-2, atol=2e-2
         )
+
+
+def test_glm5_next_mhc_pre_graph_shape_replays_changed_input() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(456)
+    residual = torch.randn(
+        64,
+        4,
+        4096,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    fn = (
+        torch.randn(
+            24,
+            4 * 4096,
+            device="cuda",
+            dtype=torch.float32,
+            generator=generator,
+        )
+        * 0.01
+    )
+    hc_scale = torch.tensor([0.7, 1.1, 0.5], device="cuda", dtype=torch.float32)
+    hc_base = (
+        torch.randn(24, device="cuda", dtype=torch.float32, generator=generator) * 0.01
+    )
+    args = (residual, fn, hc_scale, hc_base, 1e-6, 1e-6, 20)
+
+    tokenspeed_kernel.mhc_pre(*args)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = tokenspeed_kernel.mhc_pre(*args)
+
+    residual.copy_(torch.randn(residual.shape, device="cuda", dtype=residual.dtype))
+    expected = _reference(*args)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    for actual_tensor, expected_tensor in zip(graph_output, expected, strict=True):
+        torch.testing.assert_close(
+            actual_tensor.float(), expected_tensor.float(), rtol=2e-2, atol=2e-2
+        )
