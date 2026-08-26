@@ -46,6 +46,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
         CacheModelFamily,
+        CachePlacement,
         CacheSetup,
     )
 
@@ -128,18 +129,7 @@ class CacheRecipe(ABC):
                 placement_contract=CachePlacementContract(
                     dcp_size=int(getattr(self.attn_config, "dcp_size", 1)),
                     dcp_rank=int(getattr(self.attn_config, "dcp_rank", 0)),
-                    layer_placements=tuple(
-                        (
-                            "cyclic_history"
-                            if (
-                                layer_id < self.num_target_layers
-                                and int(getattr(self.attn_config, "dcp_size", 1)) > 1
-                                and group_id == "full_attention"
-                            )
-                            else "replicated"
-                        )
-                        for layer_id, group_id in enumerate(self.group_ids)
-                    ),
+                    layer_placements=self.layer_placements,
                 ),
             ),
             num_draft_layers=self.num_draft_layers,
@@ -173,6 +163,29 @@ class CacheRecipe(ABC):
         raise NotImplementedError(
             f"{type(self).__name__} uses the default per-layer groups() walk "
             "but does not define group_ids"
+        )
+
+    @property
+    def layer_placements(self) -> tuple[CachePlacement, ...]:
+        """Per-layer DCP storage placement, target layers then draft layers.
+
+        The default follows the per-layer group vocabulary. Families that
+        declare their groups wholesale can override this seam independently
+        without manufacturing ``group_ids`` that do not describe their
+        storage layout.
+        """
+        dcp_size = int(getattr(self.attn_config, "dcp_size", 1))
+        return tuple(
+            (
+                "cyclic_history"
+                if (
+                    layer_id < self.num_target_layers
+                    and dcp_size > 1
+                    and group_id == FULL_ATTENTION
+                )
+                else "replicated"
+            )
+            for layer_id, group_id in enumerate(self.group_ids)
         )
 
     @property

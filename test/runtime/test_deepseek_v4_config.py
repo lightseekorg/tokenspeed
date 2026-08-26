@@ -3231,6 +3231,73 @@ class TestDeepseekV4Config(unittest.TestCase):
             (1, 0),
         )
 
+    def test_deepseek_v4_prefill_preserves_compressed_table_metadata(self):
+        backend = object.__new__(DeepseekV4AttentionBackend)
+        backend.dcp_size = 1
+        backend.dcp_rank = 0
+        compressed_table = torch.tensor([[10, 11, 12]], dtype=torch.int32)
+        compressed_base_offsets = torch.tensor([7], dtype=torch.int32)
+        backend.forward_metadata = _make_deepseek_v4_forward_metadata(
+            page_size=64,
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            page_table=torch.tensor([[1]], dtype=torch.int32),
+            seq_lens=torch.tensor([20], dtype=torch.int32),
+            query_lens=torch.tensor([4], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+            token_to_req_indices=torch.tensor([0, 0, 0, 0], dtype=torch.int32),
+            block_tables={"v4.c4a.compressed_kv": compressed_table},
+            block_table_base_offsets={"v4.c4a.compressed_kv": compressed_base_offsets},
+            swa_page_table=torch.tensor([[20, 21]], dtype=torch.int32),
+            swa_base_logical_page=torch.tensor([0], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([20], dtype=torch.int32),
+            query_lens_cpu=torch.tensor([4], dtype=torch.int32),
+        )
+        backend._get_prefill_workspace = lambda **kwargs: torch.empty(
+            (kwargs["num_reqs"], kwargs["workspace_width"], kwargs["head_dim"]),
+            dtype=torch.bfloat16,
+            device=kwargs["device"],
+        )
+        token_to_kv_pool = SimpleNamespace(
+            swa_block_size=64,
+            get_compressed_block_size=lambda _layer_id: 64,
+            get_compressed_kv_buffer_2d=lambda _layer_id: torch.empty(
+                (1, 64), dtype=torch.uint8
+            ),
+            get_swa_kv_buffer=lambda _layer_id: torch.empty((1, 64), dtype=torch.uint8),
+        )
+        captured = {}
+
+        def combine(**kwargs):
+            captured.update(kwargs)
+            return (
+                torch.zeros((4, 1), dtype=torch.int32),
+                torch.ones(4, dtype=torch.int32),
+            )
+
+        with (
+            patch.object(
+                deepseek_v4_backend,
+                "dsv4_dequantize_and_gather_k_cache",
+            ),
+            patch.object(
+                deepseek_v4_backend,
+                "dsv4_combine_topk_swa_indices",
+                side_effect=combine,
+            ),
+        ):
+            backend._prefill_workspace(
+                positions=torch.arange(16, 20, dtype=torch.int64),
+                token_to_kv_pool=token_to_kv_pool,
+                layer_id=0,
+                compress_ratio=4,
+                window_size=16,
+                head_dim=8,
+                topk_indices=torch.zeros((4, 2), dtype=torch.int32),
+            )
+
+        self.assertIs(captured["block_table_base_offsets"], compressed_base_offsets)
+        self.assertEqual(captured["compressed_table_capacity"], 3 * 64)
+
     def test_deepseek_v4_prefill_workspace_bounds_fail_closed(self):
         invalid_cases = (
             (
@@ -6178,6 +6245,8 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
     schedule = build_cache_fields_by_producer_step(
         setup.spec.memory_plan, num_target_layers=3
     )
+    assert setup.spec.placement_contract is not None
+    assert setup.spec.placement_contract.layer_placements == ("replicated",) * 3
     assert schedule.step_count == 3
     assert all(schedule.fields_by_step)
 

@@ -33,6 +33,7 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from functools import cached_property
+from typing import TYPE_CHECKING
 
 from tokenspeed_kernel import dsv4_indexer_cache_format
 from typing_extensions import override
@@ -65,6 +66,11 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     apply_pd_transfer_policies,
     cyclic_history_spec,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+        CachePlacement,
+    )
 
 _MAX_PADDING_FRACTION = 2.0
 
@@ -222,6 +228,20 @@ class DeepseekV4Recipe(CacheRecipe):
     def layer_types(self) -> tuple[str, ...]:
         """The compression ratio per layer -- V4's own layer vocabulary."""
         return tuple(str(ratio) for ratio in self._cache_layout.layer_ratio)
+
+    @cached_property
+    @override
+    def layer_placements(self) -> tuple[CachePlacement, ...]:
+        """Describe the sharded history without inventing per-layer groups."""
+        dcp_size = int(getattr(self.attn_config, "dcp_size", 1))
+        return tuple(
+            (
+                "cyclic_history"
+                if layer_id < self.num_target_layers and dcp_size > 1 and ratio > 1
+                else "replicated"
+            )
+            for layer_id, ratio in enumerate(self._cache_layout.layer_ratio)
+        )
 
     # ---- geometry ----
 

@@ -1757,12 +1757,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             cache: torch.Tensor,
             page_table: torch.Tensor,
             block_size: int,
-        ) -> None:
+        ) -> tuple[torch.Tensor | None, int]:
             base_offsets = (
                 _compressed_block_table_base_offsets(metadata, compress_ratio)
                 if page_table is not cache_metadata.page_table
                 else None
             )
+            table_capacity = page_table.shape[1] * block_size
             if self.dcp_size == 1:
                 dsv4_dequantize_and_gather_k_cache(
                     out=kv_workspace,
@@ -1775,7 +1776,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     offset=0,
                     max_gather_len=compressed_base,
                 )
-                return
+                return base_offsets, table_capacity
             # Reconstruct cyclic rows only in transient prefill scratch.  The
             # persistent history remains sharded; rank chunks are interleaved
             # back into global compressed-position order.
@@ -1806,6 +1807,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
             if compressed_base:
                 kv_workspace[:, :compressed_base].copy_(dense[:, :compressed_base])
+            return base_offsets, table_capacity
 
         if compress_ratio == 4 and topk_indices is not None:
             compressed_block_size = token_to_kv_pool.get_compressed_block_size(layer_id)
@@ -1814,8 +1816,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compress_ratio,
                 compressed_block_size,
             )
-            gather_compressed_history(
-                compressed_cache, compressed_page_table, compressed_block_size
+            compressed_base_offsets, compressed_table_capacity = (
+                gather_compressed_history(
+                    compressed_cache,
+                    compressed_page_table,
+                    compressed_block_size,
+                )
             )
             dsv4_dequantize_and_gather_k_cache(
                 out=kv_workspace,
@@ -1860,8 +1866,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compress_ratio,
                 compressed_block_size,
             )
-            gather_compressed_history(
-                compressed_cache, compressed_page_table, compressed_block_size
+            compressed_base_offsets, compressed_table_capacity = (
+                gather_compressed_history(
+                    compressed_cache,
+                    compressed_page_table,
+                    compressed_block_size,
+                )
             )
         dsv4_dequantize_and_gather_k_cache(
             out=kv_workspace,
