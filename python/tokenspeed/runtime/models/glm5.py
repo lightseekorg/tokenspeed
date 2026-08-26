@@ -626,11 +626,16 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             )
 
         chunk_meta = ctx.attn_backend.chunked_prefill_metadata
-        prefix_lens_cpu = chunk_meta.extend_prefix_lens_cpu[: ctx.num_extends].to(
-            torch.int64
+        prefix_lens = getattr(chunk_meta, "extend_prefix_lens_cpu", None)
+        if prefix_lens is None:
+            prefix_lens = chunk_meta.extend_prefix_lens
+        prefix_lens_cpu = torch.as_tensor(
+            prefix_lens[: ctx.num_extends], dtype=torch.int64, device="cpu"
         )
-        extend_lens_cpu = chunk_meta.extend_seq_lens_cpu[: ctx.num_extends].to(
-            torch.int64
+        extend_lens_cpu = torch.as_tensor(
+            chunk_meta.extend_seq_lens_cpu[: ctx.num_extends],
+            dtype=torch.int64,
+            device="cpu",
         )
         if extend_lens_cpu.numel() == 0:
             return None
