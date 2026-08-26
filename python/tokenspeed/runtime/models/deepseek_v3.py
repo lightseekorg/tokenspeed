@@ -37,7 +37,7 @@ from tokenspeed_kernel.ops.attention import (
     mla_project_value_prefers_contiguous_weight,
 )
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
-from tokenspeed_kernel.ops.embedding import apply_rope_mla
+from tokenspeed_kernel.ops.embedding import apply_rope_mla, apply_rope_mla_set_kv
 from tokenspeed_kernel.ops.gemm import bmm
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
@@ -68,6 +68,7 @@ _platform = current_platform()
 _is_blackwell = _platform.is_blackwell
 _is_hopper_plus = _platform.is_hopper_plus
 _device_sm = _platform.arch_version.major * 10 + _platform.arch_version.minor
+
 
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
@@ -126,7 +127,6 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
 
@@ -219,7 +219,8 @@ class DeepseekV3MLP(nn.Module):
 
         if self._use_nvfp4_gemm_swiglu_nvfp4_quant:
             x_fc1_fp4, x_fc1_scale = fp4_quantize(
-                x, self.gate_up_proj.input_scale_inv, enable_pdl=pdl_enabled()
+                x,
+                self.gate_up_proj.input_scale_inv,
             )
             x_fp4, x_scale = nvfp4_gemm_swiglu_nvfp4_quant(
                 x_fc1_fp4,
@@ -228,7 +229,6 @@ class DeepseekV3MLP(nn.Module):
                 self.gate_up_proj.weight_scale_swiglu_interleaved,
                 self.gate_up_proj.alpha,
                 self.down_proj.input_scale_inv,
-                enable_pdl=pdl_enabled(),
             )
             x, _ = self.down_proj((x_fp4, x_scale))
             return x
@@ -266,7 +266,6 @@ class MoEGate(nn.Module):
                 hidden_states,
                 self.weight,
                 out_dtype=torch.float32,
-                enable_pdl=pdl_enabled(),
             )
         else:
             logits = F.linear(hidden_states, self.weight, None)
@@ -397,7 +396,6 @@ class DeepseekV3MoE(nn.Module):
                 expert_weights,
                 shared_output,
                 top_k=self.topk.topk_config.top_k,
-                enable_pdl=pdl_enabled(),
             )
         else:
             final_hidden_states = (
@@ -845,11 +843,11 @@ class DeepseekV3AttentionMLA(nn.Module):
         self,
         q: torch.Tensor,
         latent_cache: torch.Tensor,
-        positions,
+        positions: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         absorbed_query: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Model-owned KV writes route their locations through the backend:
         # identity on the legacy path (base AttentionBackend hook), the
         # group-derived locations on the Paged cache path.
@@ -891,6 +889,36 @@ class DeepseekV3AttentionMLA(nn.Module):
             k_nope_raw = K[..., : self.kv_lora_rank]
             k_pe_raw = K[..., self.kv_lora_rank :]
 
+            fused_kv_arg = create_fused_mla_set_kv_buffer_arg(
+                k_nope=k_nope_raw,
+                rope_dim=self.qk_rope_head_dim,
+                rotary_emb=self.rotary_emb,
+                out_cache_loc=out_cache_loc,
+                token_to_kv_pool=ctx.token_to_kv_pool,
+                layer_id=self.attn_mqa.layer_id,
+                num_q_heads=self.num_local_heads,
+                q_nope=q_nope_absorbed,
+            )
+            if fused_kv_arg is not None:
+                # One launch for RoPE (or its absence), the FP8 quantize, and
+                # the KV scatter. The key lands in the cache and never exists
+                # as a tensor, so K comes back None: the decode backends read
+                # the cache and only touch k under save_kv_cache, which the
+                # model owns here.
+                query_fp8 = torch.empty(
+                    Q.shape,
+                    dtype=torch.float8_e4m3fn,
+                    device=Q.device,
+                )
+                apply_rope_mla_set_kv(
+                    positions=positions,
+                    q_rope=q_pe,
+                    k_rope=k_pe_raw,
+                    fused_mla_set_kv_buffer_arg=fused_kv_arg,
+                    q_rope_out=query_fp8,
+                )
+                return query_fp8, None
+
             query_fp8, key_fp8 = apply_rope_mla(
                 positions=positions,
                 q_rope=q_pe,
@@ -909,7 +937,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                 ),
                 quant_scale_q=1.0,
                 quant_scale_kv=k_scale,
-                enable_pdl=pdl_enabled(),
             )
 
             # Write FP8 KV cache (single write, no double-write)
@@ -926,23 +953,28 @@ class DeepseekV3AttentionMLA(nn.Module):
                 create_fused_mla_set_kv_buffer_arg(
                     k_nope=K[..., : self.kv_lora_rank],
                     rope_dim=self.qk_rope_head_dim,
-                    rotary_head_size=self.rotary_emb.head_size,
-                    is_neox_style=self.rotary_emb.is_neox_style,
+                    rotary_emb=self.rotary_emb,
                     out_cache_loc=out_cache_loc,
                     token_to_kv_pool=ctx.token_to_kv_pool,
                     layer_id=self.attn_mqa.layer_id,
+                    num_q_heads=self.num_local_heads,
                 )
                 if self.attention_backend in self._MLA_KERNEL_BACKENDS
                 else None
             )
             if fused_mla_kv_arg is not None:
-                self.rotary_emb(
-                    positions,
-                    q_pe,
-                    K[..., self.kv_lora_rank :],
+                # The same entry point the FP8 branch takes, so the gate's
+                # probe and the launch resolve one dispatch key. Routing this
+                # through ``rotary_emb`` instead would dispatch
+                # ``embedding.rope``, which an override can redirect to a
+                # solution that rejects the fused argument -- after the gate
+                # already answered for ``embedding.rope_mla_set_kv``.
+                apply_rope_mla_set_kv(
+                    positions=positions,
+                    q_rope=q_pe,
+                    k_rope=K[..., self.kv_lora_rank :],
                     fused_mla_set_kv_buffer_arg=fused_mla_kv_arg,
-                    output_q_rope=Q[..., self.kv_lora_rank :],
-                    enable_pdl=pdl_enabled(),
+                    q_rope_out=Q[..., self.kv_lora_rank :],
                 )
                 K = None
             else:
@@ -1094,14 +1126,13 @@ class DeepseekV3AttentionMLA(nn.Module):
                 is_neox=is_neox,
                 quant_scale_q=1.0,
                 quant_scale_kv=k_scale,
-                enable_pdl=pdl_enabled(),
             )
 
-            v_fp8 = fp8_quantize(v, enable_pdl=pdl_enabled())
+            v_fp8 = fp8_quantize(v)
 
             # Write FP8 KV cache directly (skip BF16→FP8 conversion in pool)
             k_pe_for_cache = k_fp8[:, 0:1, self.qk_nope_head_dim :]
-            kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=pdl_enabled())
+            kv_a_fp8 = fp8_quantize(kv_a)
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mha,
                 out_cache_loc,
@@ -1199,7 +1230,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             if q.dtype == torch.float8_e4m3fn:
                 # FP8 Attention
                 k, v = mla_kv_pack_quantize_fp8(
-                    k_nope, k_pe, v, k_scale_inv=1.0 / k_scale, enable_pdl=pdl_enabled()
+                    k_nope, k_pe, v, k_scale_inv=1.0 / k_scale
                 )
             else:
                 # BF16 Attention
@@ -1228,7 +1259,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                 chunk_output,
                 lse,
                 inplace=True,
-                enable_pdl=pdl_enabled(),
             )
 
         return output
@@ -2319,7 +2349,9 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         remapped = []
         for name, loaded_weight in weights:
             if "d2t" in name:
-                self.hot_token_id = loaded_weight + torch.arange(loaded_weight.size(0))
+                self.hot_token_id = loaded_weight + torch.arange(
+                    loaded_weight.size(0), device=loaded_weight.device
+                )
                 continue
             if "t2d" in name:
                 continue

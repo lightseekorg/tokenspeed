@@ -43,7 +43,6 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 _is_amd = current_platform().is_amd
 
@@ -140,7 +139,6 @@ class RMSNorm(torch.nn.Module):
                     residual,
                     self.weight.data,
                     self.variance_epsilon,
-                    enable_pdl=pdl_enabled(),
                 )
                 return x, residual
             out = rmsnorm(
@@ -148,7 +146,6 @@ class RMSNorm(torch.nn.Module):
                 self.weight.data,
                 self.variance_epsilon,
                 out=out,
-                enable_pdl=pdl_enabled(),
             )
             return out
 
@@ -190,7 +187,6 @@ class RMSNorm(torch.nn.Module):
                     max_sm_to_use=max_sm_to_use,
                     trigger_completion_at_end=trigger_completion_at_end,
                     has_partial_norm_out=has_partial_norm_out,
-                    launch_with_pdl=pdl_enabled(),
                 )
                 if fused_result[0] is not None:
                     return fused_result
@@ -227,7 +223,6 @@ class RMSNorm(torch.nn.Module):
                     use_oneshot=True,
                     block_quant_fp8=fuse_block_quant_fp8,
                     add_in=add_in,
-                    launch_with_pdl=pdl_enabled(),
                 )
                 if fused_result[0] is not None:
                     return fused_result
@@ -294,14 +289,12 @@ class GemmaRMSNorm(torch.nn.Module):
                     residual,
                     self.weight.data,
                     self.variance_epsilon,
-                    enable_pdl=pdl_enabled(),
                 )
                 return x, residual
             out = gemma_rmsnorm(
                 x,
                 self.weight.data,
                 self.variance_epsilon,
-                enable_pdl=pdl_enabled(),
             )
             return out
 
@@ -345,7 +338,6 @@ class GemmaRMSNorm(torch.nn.Module):
                     max_sm_to_use=max_sm_to_use,
                     trigger_completion_at_end=trigger_completion_at_end,
                     has_partial_norm_out=has_partial_norm_out,
-                    launch_with_pdl=pdl_enabled(),
                 )
                 if fused_result[0] is not None:
                     return fused_result
@@ -384,7 +376,6 @@ class GemmaRMSNorm(torch.nn.Module):
                     use_oneshot=True,
                     block_quant_fp8=fuse_block_quant_fp8,
                     add_in=add_in,
-                    launch_with_pdl=pdl_enabled(),
                 )
                 if fused_result[0] is not None:
                     return fused_result
@@ -422,6 +413,10 @@ class FusedRMSNorm(nn.Module):
         """Expose weight_kv_a from kv_a_norm for backward compatibility."""
         return self.kv_a_norm.weight
 
+    def supports(self, input_q_a: torch.Tensor) -> bool:
+        """Return whether the fused implementation supports this input."""
+        return input_q_a.device.type != "cpu"
+
     def forward(
         self,
         input_q_a: torch.Tensor,
@@ -448,7 +443,6 @@ class FusedRMSNorm(nn.Module):
                 weight2=self.weight_kv_a,
                 output2=output_kv_a if output_kv_a is not None else input_kv_a,
                 eps=self.q_a_norm.variance_epsilon,
-                enable_pdl=pdl_enabled(),
             )
         else:
             rmsnorm_fused_parallel(
@@ -459,7 +453,6 @@ class FusedRMSNorm(nn.Module):
                 weight2=self.weight_kv_a,
                 output2=output_kv_a if output_kv_a is not None else input_kv_a,
                 eps=self.q_a_norm.variance_epsilon,
-                enable_pdl=pdl_enabled(),
             )
         return input_q_a, input_kv_a
 
@@ -510,7 +503,6 @@ class FusedRMSNorm(nn.Module):
                 block_quant_fp8=fuse_block_quant_fp8,
                 trigger_completion_at_end=trigger_completion_at_end,
                 fp32_acc=False,
-                launch_with_pdl=pdl_enabled(),
             )
             if fused_result[0] is not None:
                 return fused_result

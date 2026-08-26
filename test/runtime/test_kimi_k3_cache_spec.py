@@ -79,7 +79,13 @@ def test_lcm_geometry_packs_two_kda_pages_at_tp16() -> None:
     assert conv.shape[0] == 3 * 96 * 128 // 16
 
 
-def test_speculative_verify_workspace_is_reserved_outside_the_arena() -> None:
+def test_speculative_verify_workspace_is_reserved_outside_the_arena(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda_replay_commit_supported",
+        lambda dtype, **kwargs: False,
+    )
     recipe, _, layout = kimi_tp8_layout(
         draft_layers=5,
         max_bs=4,
@@ -93,6 +99,46 @@ def test_speculative_verify_workspace_is_reserved_outside_the_arena() -> None:
     assert recipe.workspace_bytes() == expected_workspace_bytes
 
     setup = recipe.setup()
+    assert setup.fixed_workspace_bytes == expected_workspace_bytes
+    expected_parents = (
+        recipe.cache_budget_bytes - expected_workspace_bytes
+    ) // layout.lcm_block_bytes - 1
+    assert setup.spec.memory_plan.num_lcm_blocks == expected_parents
+
+
+def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda_replay_commit_supported",
+        lambda dtype, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda_batched_replay_uses_raw_gate",
+        lambda dtype: False,
+    )
+    recipe, groups, layout = kimi_tp8_layout(
+        draft_layers=5,
+        max_bs=4,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=8,
+    )
+    conv_row_bytes = 4 * sum(
+        field.payload_bytes
+        for spec, fields in groups
+        if spec.group_id != "full_attention"
+        for field in fields
+        if field.field_id.endswith(".conv_state")
+    )
+    # 69 KDA layers x (4 requests x 8 draft tokens) rows, each one bf16
+    # qkv/f_a/beta row (4608 + 128 + 12 channels) plus an fp32 gate row
+    # (12 x 128), per rank at TP8.
+    expected_payload_bytes = 69 * 4 * 8 * ((4608 + 128 + 12) * 2 + 12 * 128 * 4)
+    expected_workspace_bytes = conv_row_bytes + expected_payload_bytes
+
+    setup = recipe.setup()
+
+    assert recipe.workspace_bytes() == expected_workspace_bytes
     assert setup.fixed_workspace_bytes == expected_workspace_bytes
     expected_parents = (
         recipe.cache_budget_bytes - expected_workspace_bytes

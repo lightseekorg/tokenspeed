@@ -137,7 +137,7 @@ def test_public_entry_point_is_cuda_graph_capturable():
     moe_softmax_topk(logits, 8, renormalize=True)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        weights, ids = moe_softmax_topk(logits, 8, renormalize=True, enable_pdl=True)
+        weights, ids = moe_softmax_topk(logits, 8, renormalize=True)
     graph.replay()
     torch.cuda.synchronize()
     _assert_valid_topk(logits, weights, ids, 8, True, 1.0)

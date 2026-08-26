@@ -18,15 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Plumbing tests for the ``cu_seqlens_cpu`` host-boundary hint.
+"""Plumbing tests for the required ``cu_seqlens_cpu`` host boundaries.
 
-The CuteDSL KDA wrapper plans launch grids, routing, and workspace
-partitioning on the host from the ``cu_seqlens`` contents. Without a CPU copy
-it reads them back with a stream-synchronizing D2H per call, and its identity
-memo cannot hit across layers because ``cutedsl_kda_chunk_prefill`` casts
-``cu_seqlens`` to a fresh int64 tensor on every call. These tests pin the
-hint's path from the dispatch layer down to the wrapper call, entirely on CPU
-with the wrapper entry points stubbed out.
+Every KDA prefill solution plans its chunk indices on the host from the
+``cu_seqlens`` contents. Reading them from the device tensor instead is a
+stream-synchronizing D2H per layer per chunk that stalls the launch thread
+behind all queued GPU work (and serializes the chunk pipeline's stages), so
+``kda_paged_prefill`` REQUIRES a host int64 copy and forwards it to every
+solution. These tests pin that path from the dispatch layer down to the
+wrapper call, entirely on CPU with the wrapper entry points stubbed out.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
     KdaPrefillResult,
     _nvidia_kda_prefill,
 )
+from tokenspeed_kernel.selection import SelectedKernel
 
 H, HV, K, V, T = 2, 2, 128, 128, 32
 
@@ -79,7 +80,7 @@ def stubbed_wrapper(monkeypatch):
 def test_hint_reaches_wrapper_calls(stubbed_wrapper):
     q, k, v, g, beta, a_log, dt_bias = _inputs()
     cu = torch.tensor([0, 10, T], dtype=torch.int32)
-    hint = (0, 10, T)
+    hint = torch.tensor([0, 10, T], dtype=torch.int64)
 
     cutedsl_op.cutedsl_kda_chunk_prefill(
         q,
@@ -95,8 +96,8 @@ def test_hint_reaches_wrapper_calls(stubbed_wrapper):
         lower_bound=-5.0,
     )
 
-    assert stubbed_wrapper["ws_cu_seqlens_cpu"] == hint
-    assert stubbed_wrapper["fwd_cu_seqlens_cpu"] == hint
+    assert stubbed_wrapper["ws_cu_seqlens_cpu"] is hint
+    assert stubbed_wrapper["fwd_cu_seqlens_cpu"] is hint
     assert stubbed_wrapper["boundaries"].dtype == torch.int64
 
 
@@ -115,7 +116,7 @@ def test_hint_length_mismatch_raises(stubbed_wrapper):
             dt_bias,
             initial_state=None,
             cu_seqlens=cu,
-            cu_seqlens_cpu=(0, T),
+            cu_seqlens_cpu=torch.tensor([0, T], dtype=torch.int64),
             lower_bound=-5.0,
         )
 
@@ -136,11 +137,13 @@ def test_batch_fallback_synthesizes_hint(stubbed_wrapper):
         lower_bound=-5.0,
     )
 
-    assert stubbed_wrapper["ws_cu_seqlens_cpu"] == (0, 16, 32)
-    assert stubbed_wrapper["fwd_cu_seqlens_cpu"] == (0, 16, 32)
+    synthesized = stubbed_wrapper["ws_cu_seqlens_cpu"]
+    assert isinstance(synthesized, torch.Tensor)
+    assert synthesized.tolist() == [0, 16, 32]
+    assert stubbed_wrapper["fwd_cu_seqlens_cpu"] is synthesized
 
 
-def test_dispatch_forwards_hint_only_when_set():
+def test_dispatch_always_forwards_host_boundaries():
     calls = []
 
     def impl(*args, **kwargs):
@@ -150,12 +153,7 @@ def test_dispatch_forwards_hint_only_when_set():
 
     q, k, v, g, beta, a_log, dt_bias = _inputs()
     cu = torch.tensor([0, T], dtype=torch.int32)
-    common = dict(
-        initial_state=torch.zeros(1, HV, K, V), cu_seqlens=cu, lower_bound=-5.0
-    )
-
-    _nvidia_kda_prefill(impl, q, k, v, g, beta, a_log, dt_bias, **common)
-    assert "cu_seqlens_cpu" not in calls[-1]
+    cu_cpu = torch.tensor([0, T], dtype=torch.int64)
 
     _nvidia_kda_prefill(
         impl,
@@ -166,13 +164,15 @@ def test_dispatch_forwards_hint_only_when_set():
         beta,
         a_log,
         dt_bias,
-        cu_seqlens_cpu=(0, T),
-        **common,
+        initial_state=torch.zeros(1, HV, K, V),
+        cu_seqlens=cu,
+        cu_seqlens_cpu=cu_cpu,
+        lower_bound=-5.0,
     )
-    assert calls[-1]["cu_seqlens_cpu"] == (0, T)
+    assert calls[-1]["cu_seqlens_cpu"] is cu_cpu
 
 
-def test_facade_forwards_hint_only_when_set(monkeypatch):
+def test_facade_requires_host_boundaries(monkeypatch):
     import tokenspeed_kernel.ops.attention as attn
 
     calls = []
@@ -183,24 +183,31 @@ def test_facade_forwards_hint_only_when_set(monkeypatch):
             out=torch.zeros(1, T, HV, V), final_state=torch.zeros(1, HV, K, V)
         )
 
-    monkeypatch.setattr(attn, "select_kernel", lambda *a, **kw: fake_kernel)
+    selected = SelectedKernel("fake_kda_prefill", fake_kernel)
+    monkeypatch.setattr(attn, "select_kernel", lambda *a, **kw: selected)
 
     q, k, v, g, beta, a_log, dt_bias = _inputs()
     cu = torch.tensor([0, T], dtype=torch.int32)
+    cu_cpu = torch.tensor([0, T], dtype=torch.int64)
     common = dict(
         initial_state=torch.zeros(1, HV, K, V), cu_seqlens=cu, lower_bound=-5.0
     )
 
-    attn.kda_paged_prefill(q, k, v, g, beta, a_log, dt_bias, **common)
-    assert "cu_seqlens_cpu" not in calls[-1]
+    with pytest.raises(TypeError):
+        attn.kda_paged_prefill(q, k, v, g, beta, a_log, dt_bias, **common)
+
+    with pytest.raises(ValueError, match="host int64 tensor"):
+        attn.kda_paged_prefill(
+            q, k, v, g, beta, a_log, dt_bias, cu_seqlens_cpu=(0, T), **common
+        )
 
     attn.kda_paged_prefill(
-        q, k, v, g, beta, a_log, dt_bias, cu_seqlens_cpu=(0, T), **common
+        q, k, v, g, beta, a_log, dt_bias, cu_seqlens_cpu=cu_cpu, **common
     )
-    assert calls[-1]["cu_seqlens_cpu"] == (0, T)
+    assert calls[-1]["cu_seqlens_cpu"] is cu_cpu
 
 
-def test_device_planning_wrappers_strip_hint(monkeypatch):
+def test_solution_wrappers_forward_host_boundaries(monkeypatch):
     import tokenspeed_kernel.ops.attention.triton.kda_dispatch as kd
 
     received = []
@@ -226,11 +233,11 @@ def test_device_planning_wrappers_strip_hint(monkeypatch):
         initial_state=torch.zeros(1, HV, K, V),
         cu_seqlens=cu,
         lower_bound=-5.0,
-        cu_seqlens_cpu=(0, T),
+        cu_seqlens_cpu=torch.tensor([0, T], dtype=torch.int64),
     )
 
     kd.triton_nvidia_kda_paged_prefill(**dict(kwargs))
-    assert "cu_seqlens_cpu" not in received[-1]
+    assert received[-1]["cu_seqlens_cpu"] is kwargs["cu_seqlens_cpu"]
 
     kd.flashkda_nvidia_kda_paged_prefill(**dict(kwargs))
-    assert "cu_seqlens_cpu" not in received[-1]
+    assert received[-1]["cu_seqlens_cpu"] is kwargs["cu_seqlens_cpu"]

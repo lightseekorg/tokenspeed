@@ -710,6 +710,14 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         moe_origin_input: torch.Tensor = None,
     ):
         buffer = self._get_buffer()
+        combine_kwargs = {}
+        if moe_origin_input is not None:
+            # Trees whose low-latency combine carries the identity-expert leg
+            # (routing weight on a -1 id folds moe_origin_input back in) take
+            # the original tokens as ``x_ori`` — and their device kernel
+            # asserts the pointer whenever any routing weight is nonzero, so
+            # it must be forwarded rather than dropped.
+            combine_kwargs["x_ori"] = moe_origin_input
         combined_hidden_states, event, hook = buffer.low_latency_combine(
             hidden_states,
             topk_idx,
@@ -717,6 +725,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.handle,
             async_finish=not self.return_recv_hook,
             return_recv_hook=self.return_recv_hook,
+            **combine_kwargs,
         )
         self.handle = None
         return combined_hidden_states, event, hook

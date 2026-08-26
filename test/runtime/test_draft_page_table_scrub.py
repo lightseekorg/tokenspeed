@@ -14,7 +14,9 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution.draft_page_staging import DraftPageStaging
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
+from tokenspeed.runtime.execution.types import DpForwardMetadata
 
 
 def _staging(rows: int = 8, columns: int = 4, page_ratio: int = 1):
@@ -145,7 +147,15 @@ class IdleReplayScrubTest(unittest.TestCase):
         # Simulate a prior larger batch leaving real ids behind.
         staging.table[:6] = 7
         ModelExecutor.execute_idle_forward(
-            ex, global_num_tokens=[0], global_bs=[0], all_decode_or_idle=True
+            ex,
+            DpForwardMetadata(
+                global_num_tokens=[0],
+                global_batch_size=[0],
+                global_forward_mode=[int(ForwardMode.IDLE)],
+                all_decode_or_idle=True,
+                all_extend=False,
+                need_idle_forward=True,
+            ),
         )
         self.assertIn("rows", captured)
         self.assertTrue(

@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -40,37 +41,66 @@ class FusedMLASetKVBufferArg:
     k_nope: torch.Tensor
     kv_buffer: torch.Tensor
     cache_loc: torch.Tensor
+    # Setting the absorbed query half switches the write from updating the
+    # query's rotated columns in place to assembling the whole query, which
+    # widens the caller's output accordingly. supports_fused_mla_kv_write
+    # requires the selected solution to explicitly declare
+    # fused_mla_full_query -- select_kernel alone treats an undeclared trait
+    # as a non-match rather than a rejection, so this is checked separately
+    # -- and declines to fuse otherwise, rather than run a solution that
+    # would silently leave the unrotated columns unwritten.
+    q_nope: torch.Tensor | None = None
+    # RoPE tables for the fused write. ``cos_sin_cache=None`` selects the NoPE
+    # form, where the halves are assembled without rotation -- a model with no
+    # rotary module then needs no separate path.
+    cos_sin_cache: torch.Tensor | None = None
+    is_neox: bool = True
+    # Clamp NaN/inf on the latent store only, as set_mla_kv_buffer_triton does.
+    sanitize: bool = False
 
 
 def supports_fused_mla_kv_write(
     *,
     q_dtype: torch.dtype,
     k_dtype: torch.dtype,
-    head_size: int,
-    rotary_dim: int,
+    has_rope: bool,
     is_neox: bool,
+    has_q_nope: bool = False,
 ) -> bool:
-    """Whether a registered RoPE kernel can write the MLA KV cache."""
+    """Whether a registered kernel can do the fused MLA query + KV write.
+
+    Resolves the same (mode, signature, traits) key ``apply_rope_mla_set_kv``
+    dispatches on, so a caller that gets ``True`` here runs the kernel this
+    answered for.
+    """
     try:
-        select_kernel(
+        kernel = select_kernel(
             "embedding",
-            "rope",
+            "rope_mla_set_kv",
             format_signature(
-                q=dense_tensor_format(q_dtype),
-                k=dense_tensor_format(k_dtype),
+                q_rope=dense_tensor_format(q_dtype),
+                k_rope=dense_tensor_format(k_dtype),
             ),
             traits={
-                "head_size": head_size,
-                "partial_rotary": rotary_dim != head_size,
+                "has_rope": has_rope,
                 "is_neox": is_neox,
-                "has_fused_kv": False,
-                "has_fused_mla_kv": True,
-                "has_q_out": True,
-                "has_k_out": False,
+                "fused_mla_full_query": has_q_nope,
             },
         )
     except NoKernelFoundError:
         return False
+    if has_q_nope:
+        # An explicit override resolves without trait filtering, and a
+        # solution that never declared this trait matches by omission, so
+        # neither route proves the selected kernel writes the query's
+        # unrotated columns. Require the declaration to cover the True case
+        # and decline otherwise -- falling back is always correct, a
+        # half-written query is not.
+        from tokenspeed_kernel.registry import KernelRegistry
+
+        spec = KernelRegistry.get().get_by_name(kernel.name)
+        if spec is None or True not in spec.traits.get("fused_mla_full_query", ()):
+            return False
     return True
 
 
@@ -88,7 +118,6 @@ def apply_rope(
     q_rope_out: torch.Tensor | None = None,
     k_rope_out: torch.Tensor | None = None,
     # dispatch options
-    enable_pdl: bool = False,
     solution: str | None = None,
     override: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -114,7 +143,6 @@ def apply_rope(
             q is updated in place.
         k_rope_out: Optional output buffer for the rotated key. If omitted,
             k is updated in place.
-        enable_pdl: Passed through to kernels that support PDL.
         solution: Optional registered solution to select.
         override: Optional exact kernel-name or solution override.
 
@@ -140,12 +168,17 @@ def apply_rope(
     num_q_heads = q.numel() // (num_tokens * head_size)
     num_kv_heads = k.numel() // (num_tokens * head_size)
 
+    fused_mla_full_query = (
+        fused_mla_set_kv_buffer_arg is not None
+        and fused_mla_set_kv_buffer_arg.q_nope is not None
+    )
     traits = {
         "head_size": head_size,
         "partial_rotary": rotary_dim != head_size,
         "is_neox": is_neox,
         "has_fused_kv": fused_set_kv_buffer_arg is not None,
         "has_fused_mla_kv": fused_mla_set_kv_buffer_arg is not None,
+        "fused_mla_full_query": fused_mla_full_query,
         "has_q_out": q_rope_out is not None,
         "has_k_out": k_rope_out is not None,
     }
@@ -170,6 +203,7 @@ def apply_rope(
         "rotary_dim": rotary_dim,
         "has_fused_kv": fused_set_kv_buffer_arg is not None,
         "has_fused_mla_kv": fused_mla_set_kv_buffer_arg is not None,
+        "fused_mla_full_query": fused_mla_full_query,
         "has_q_out": q_rope_out is not None,
         "has_k_out": k_rope_out is not None,
     }
@@ -199,7 +233,7 @@ def apply_rope(
             fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
             q_rope_out=q_rope_out,
             k_rope_out=k_rope_out,
-            enable_pdl=enable_pdl,
+            enable_pdl=pdl_enabled(),
         )
 
     return (
@@ -225,7 +259,6 @@ def apply_rope_mla(
     k_rope_out: torch.Tensor | None = None,
     q_nope_out: torch.Tensor | None = None,
     k_nope_out: torch.Tensor | None = None,
-    enable_pdl: bool = False,
     # dispatch options
     solution: str | None = None,
     override: str | None = None,
@@ -261,7 +294,6 @@ def apply_rope_mla(
         k_nope_out: Optional FP8 output buffer for k_nope. If omitted together
             with k_rope_out, a combined key output is allocated and this slice is
             derived from it.
-        enable_pdl: Passed through to kernels that support PDL.
         solution: Optional registered solution to select.
         override: Optional exact kernel-name or solution override.
 
@@ -386,7 +418,7 @@ def apply_rope_mla(
             is_neox=is_neox,
             quant_scale_q=quant_scale_q,
             quant_scale_kv=quant_scale_kv,
-            enable_pdl=enable_pdl,
+            enable_pdl=pdl_enabled(),
         )
 
     query_fp8 = (
@@ -405,6 +437,7 @@ __all__ = [
     "FusedSetKVBufferArg",
     "apply_rope",
     "apply_rope_mla",
+    "apply_rope_mla_set_kv",
     "supports_fused_mla_kv_write",
 ]
 
@@ -413,3 +446,76 @@ __all__ = [
 import tokenspeed_kernel.ops.embedding.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.triton  # noqa: E402,F401
+
+
+def apply_rope_mla_set_kv(
+    *,
+    positions: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    fused_mla_set_kv_buffer_arg: FusedMLASetKVBufferArg,
+    q_rope_out: torch.Tensor,
+) -> None:
+    """Assemble the MLA query and write the latent KV cache in one launch.
+
+    The RoPE tables ride on ``fused_mla_set_kv_buffer_arg``, so a model with a
+    rotary embedding and one without (NoPE) make the same call; the kernel
+    specializes on whether the tables are present. Destination dtypes are free
+    to differ from the sources -- the stores convert.
+
+    Args:
+        positions: ``[tokens]`` token positions. Read only when the arg
+            carries a ``cos_sin_cache``, but still required: the launch reads
+            its length and dtype either way.
+        q_rope: ``[tokens, heads, rope_dim]`` query RoPE half.
+        k_rope: ``[tokens, 1, rope_dim]`` latent RoPE half.
+        fused_mla_set_kv_buffer_arg: destination pool, write locations, the
+            latent NoPE half, the absorbed query half, and the RoPE tables.
+        q_rope_out: ``[tokens, heads, nope_dim + rope_dim]`` query destination.
+    Returns:
+        ``None``. The kernel writes through ``q_rope_out`` and the pool buffer
+        named by the arg; there is no value to hand back.
+    """
+    has_rope = fused_mla_set_kv_buffer_arg.cos_sin_cache is not None
+    traits = {
+        "has_rope": has_rope,
+        "is_neox": bool(fused_mla_set_kv_buffer_arg.is_neox),
+        "fused_mla_full_query": fused_mla_set_kv_buffer_arg.q_nope is not None,
+    }
+    signature = format_signature(
+        q_rope=dense_tensor_format(q_rope.dtype),
+        k_rope=dense_tensor_format(k_rope.dtype),
+    )
+    kernel = select_kernel("embedding", "rope_mla_set_kv", signature, traits=traits)
+
+    shape_params = {
+        "num_tokens": q_rope.shape[0],
+        "q_heads": q_rope.shape[1],
+        "rope_dim": q_rope.shape[-1],
+        "nope_dim": fused_mla_set_kv_buffer_arg.k_nope.shape[-1],
+        **traits,
+    }
+    ShapeCapture.get().record(
+        "embedding",
+        "rope_mla_set_kv",
+        kernel.name,
+        q_rope.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "embedding",
+        "rope_mla_set_kv",
+        q_rope.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        kernel(
+            positions=positions,
+            q_rope=q_rope,
+            k_rope=k_rope,
+            cos_sin_cache=fused_mla_set_kv_buffer_arg.cos_sin_cache,
+            is_neox=fused_mla_set_kv_buffer_arg.is_neox,
+            fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
+            q_rope_out=q_rope_out,
+            enable_pdl=pdl_enabled(),
+        )

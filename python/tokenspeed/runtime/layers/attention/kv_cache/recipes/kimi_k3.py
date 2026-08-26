@@ -293,11 +293,72 @@ class KimiK3Recipe(CacheRecipe):
 
     # ---- extras ----
 
+    @cached_property
+    def replay_kda(self) -> bool:
+        """Whether verify commits by replaying from one conv checkpoint row."""
+        if self.server_args.speculative_algorithm is None:
+            return False
+        from tokenspeed_kernel.ops.attention import (
+            kda_recurrent_layout,
+            kda_replay_commit_supported,
+        )
+
+        return bool(
+            kda_replay_commit_supported(
+                self.attn_config.dtype, recurrent_layout=kda_recurrent_layout()
+            )
+        )
+
     @override
     def workspace_bytes(self) -> int:
-        """Dense KDA state rows staged by speculative target verification."""
-        if getattr(self.server_args, "speculative_algorithm", None) is None:
+        """KDA verify staging reserved outside the cache arena."""
+        if self.server_args.speculative_algorithm is None:
             return 0
+        if self.replay_kda:
+            # Replay starts from the committed convolution checkpoint and
+            # reconstructs the accepted recurrent state.
+            from tokenspeed_kernel.ops.attention import (
+                kda_batched_replay_uses_raw_gate,
+            )
+
+            replay_uses_raw_gate = kda_batched_replay_uses_raw_gate(
+                self.attn_config.dtype
+            )
+            # Raw-g replay reuses the committed convolution pool as verify scratch.
+            conv_bytes = (
+                0
+                if replay_uses_raw_gate
+                else self.attn_config.max_bs
+                * sum(
+                    field.payload_bytes
+                    for spec, fields in self.groups()
+                    if spec.group_id != FULL_ATTENTION
+                    for field in fields
+                    if field.field_id.endswith(".conv_state")
+                )
+            )
+            conv_shape, recurrent_shape = self._kda_shapes
+            heads, head_dim, _ = recurrent_shape
+            rows = self.attn_config.max_bs * int(
+                self.server_args.speculative_num_draft_tokens
+            )
+            layer_count = sum(
+                field.field_id.endswith(".conv_state")
+                for spec, fields in self.groups()
+                if spec.group_id != FULL_ATTENTION
+                for field in fields
+            )
+            payload_bytes_per_row = (
+                conv_shape[0] + head_dim + heads
+            ) * torch.bfloat16.itemsize
+            # Fused raw-g capture stores BF16; other replay paths need FP32 scratch.
+            gate_itemsize = (
+                torch.bfloat16.itemsize
+                if replay_uses_raw_gate
+                else torch.float32.itemsize
+            )
+            payload_bytes_per_row += heads * head_dim * gate_itemsize
+            return conv_bytes + layer_count * rows * payload_bytes_per_row
         verify_rows = self.attn_config.max_bs * (
             int(self.server_args.speculative_num_draft_tokens) + 1
         )

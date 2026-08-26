@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
+from tokenspeed_kernel.platform import pdl_enabled
 
 __all__ = [
     "add3",
@@ -237,6 +238,8 @@ def _silu_and_mul_kernel(
     hidden_dim: tl.constexpr,
     input_stride_row: tl.constexpr,
     out_stride_row: tl.constexpr,
+    limit: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
@@ -251,6 +254,9 @@ def _silu_and_mul_kernel(
 
     gate = tl.load(gate_addrs, mask=mask).to(tl.float32)
     up = tl.load(up_addrs, mask=mask).to(tl.float32)
+    if HAS_LIMIT:
+        gate = tl.minimum(gate, limit)
+        up = tl.clamp(up, -limit, limit)
     out = gate * tl.sigmoid(gate) * up
     tl.store(out_ptr + row * out_stride_row + col, out, mask=mask)
 
@@ -258,8 +264,8 @@ def _silu_and_mul_kernel(
 def silu_and_mul(
     x: torch.Tensor,
     out: torch.Tensor | None = None,
-    *,
     enable_pdl: bool = False,
+    limit: float | None = None,
 ) -> torch.Tensor:
     """Fused ``SiLU(x[..., :D]) * x[..., D:]``.
 
@@ -267,6 +273,8 @@ def silu_and_mul(
     and up values in the second half. The output has shape ``[..., D]``.
     """
     del enable_pdl
+    if limit is not None and limit <= 0:
+        raise ValueError(f"limit must be positive, got {limit}")
     if x.shape[-1] % 2 != 0:
         raise ValueError(f"last dimension must be even, got {x.shape[-1]}")
     if x.stride(-1) != 1:
@@ -297,6 +305,8 @@ def silu_and_mul(
         hidden_dim=hidden_dim,
         input_stride_row=flat_x.stride(0),
         out_stride_row=flat_out.stride(0),
+        limit=0.0 if limit is None else limit,
+        HAS_LIMIT=limit is not None,
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return out
@@ -575,7 +585,7 @@ def fused_swiglu_fp8_ue8m0(
     swiglu_alpha: float = 1.0,
     swiglu_beta: float = 0.0,
     *,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused SwiGLU activation + FP8 UE8M0 block-scale quantization.
 
@@ -588,9 +598,10 @@ def fused_swiglu_fp8_ue8m0(
         swiglu_limit: Clamp bound. 0 or negative disables clamping.
         swiglu_alpha: Sigmoid multiplier applied to the gate.
         swiglu_beta: Value added to the up projection before multiplication.
-        enable_pdl: Join an SM90+ Programmatic Dependent Launch chain. The
-            kernel waits for the preceding producer before reading ``gate_up``
-            and releases the following dependent after writing both outputs.
+        enable_pdl: Join an SM90+ Programmatic Dependent Launch chain, defaulting
+            to the platform setting. The kernel waits for the preceding producer
+            before reading ``gate_up`` and releases the following dependent after
+            writing both outputs.
 
     Returns:
         ``(fp8_out, scale)``: ``fp8_out`` is ``[M, N]`` float8_e4m3fn,
@@ -621,6 +632,7 @@ def fused_swiglu_fp8_ue8m0(
     PACK = 4
     packs_per_row = (groups_per_row + PACK - 1) // PACK
     num_programs = M * packs_per_row
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _fused_swiglu_fp8_ue8m0_kernel[(num_programs,)](
         gate_up,
@@ -1202,10 +1214,13 @@ def _attnres_combine_kernel(
     eps,
     HAS_OUTNORM: tl.constexpr,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Fold the prefix candidate into the block partial; optional out-norm.
 
-    All operands are read once and stay register-resident.
+    All operands are read once and stay register-resident. Under PDL all but
+    the prefix are prefetched before ``gdc_wait``, so the caller must ensure
+    the immediate same-stream predecessor writes only the prefix.
     """
     t = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
@@ -1217,31 +1232,36 @@ def _attnres_combine_kernel(
     mask0 = col0 < n_cols
     mask1 = col1 < n_cols
 
-    v0 = tl.load(prefix_ptr + t * stride_p + col0, mask=mask0, other=0.0).to(tl.float32)
-    v1 = tl.load(prefix_ptr + t * stride_p + col1, mask=mask1, other=0.0).to(tl.float32)
     wp0 = tl.load(wp_ptr + col0, mask=mask0, other=0.0).to(tl.float32)
     wp1 = tl.load(wp_ptr + col1, mask=mask1, other=0.0).to(tl.float32)
+    m_b = tl.load(m_ptr + t)
+    s_b = tl.load(s_ptr + t)
+    a0 = tl.load(acc_ptr + t * n_cols + col0, mask=mask0, other=0.0)
+    a1 = tl.load(acc_ptr + t * n_cols + col1, mask=mask1, other=0.0)
+    if HAS_OUTNORM:
+        ow0 = tl.load(outw_ptr + col0, mask=mask0, other=0.0).to(tl.float32)
+        ow1 = tl.load(outw_ptr + col1, mask=mask1, other=0.0).to(tl.float32)
+
+    if ENABLE_PDL:
+        # The prefix is the predecessor's output; everything above is not.
+        tl.extra.cuda.gdc_wait()
+
+    v0 = tl.load(prefix_ptr + t * stride_p + col0, mask=mask0, other=0.0).to(tl.float32)
+    v1 = tl.load(prefix_ptr + t * stride_p + col1, mask=mask1, other=0.0).to(tl.float32)
     sq = tl.sum(v0 * v0) + tl.sum(v1 * v1)
     dot = tl.sum(v0 * wp0) + tl.sum(v1 * wp1)
     rsig = tl.math.rsqrt(sq / n_cols + eps)
     logit_p = dot * rsig
-    m_b = tl.load(m_ptr + t)
-    s_b = tl.load(s_ptr + t)
     m = tl.maximum(m_b, logit_p)
     corr = tl.exp(m_b - m)
     w_p = tl.exp(logit_p - m)
     inv_s = 1.0 / (s_b * corr + w_p)
-
-    a0 = tl.load(acc_ptr + t * n_cols + col0, mask=mask0, other=0.0)
-    a1 = tl.load(acc_ptr + t * n_cols + col1, mask=mask1, other=0.0)
     mix0 = ((a0 * corr + w_p * v0) * inv_s).to(tl.bfloat16).to(tl.float32)
     mix1 = ((a1 * corr + w_p * v1) * inv_s).to(tl.bfloat16).to(tl.float32)
 
     if HAS_OUTNORM:
         mix_sq = tl.sum(mix0 * mix0) + tl.sum(mix1 * mix1)
         rsig_mix = tl.math.rsqrt(mix_sq / n_cols + eps)
-        ow0 = tl.load(outw_ptr + col0, mask=mask0, other=0.0).to(tl.float32)
-        ow1 = tl.load(outw_ptr + col1, mask=mask1, other=0.0).to(tl.float32)
         tl.store(
             out_ptr + t * stride_o + col0,
             (mix0 * rsig_mix * ow0).to(out_ptr.dtype.element_ty),
@@ -1263,6 +1283,8 @@ def _attnres_combine_kernel(
             mix1.to(out_ptr.dtype.element_ty),
             mask=mask1,
         )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def attnres_partial(blocks, wp, eps, scratch):
@@ -1317,19 +1339,23 @@ def attnres_partial_dual(blocks, wp_a, wp_b, eps, scratch_a, scratch_b):
     )
 
 
-def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out):
+def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out, enable_pdl=None):
     """Merge the prefix candidate into the partial; optional fused out-norm.
 
     Args:
         prefix: ``[T, H]`` residual stream.
         scratch: (m, s, acc) from :func:`attnres_partial`.
         out: ``[T, H]`` mixed (and out-normed) hidden destination.
+        enable_pdl: programmatic dependent launch, defaulting to the platform
+            setting; prefetches everything but the prefix before ``gdc_wait``.
 
     Returns:
         ``out``.
     """
     T, H = prefix.shape
     m, s_, acc = scratch
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _attnres_combine_kernel[(T,)](
         prefix,
         wp,
@@ -1345,5 +1371,7 @@ def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out):
         HAS_OUTNORM=out_norm_w is not None,
         BLOCK=4096,
         num_warps=8,
+        ENABLE_PDL=enable_pdl,
+        **pdl_kwargs,
     )
     return out

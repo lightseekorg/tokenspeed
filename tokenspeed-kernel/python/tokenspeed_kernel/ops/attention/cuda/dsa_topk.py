@@ -30,7 +30,7 @@ behind the DSA decode top-k selection, so callers pre-mask nothing.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
+from tokenspeed_kernel.ops.attention.cuda.dsv4 import (
     has_persistent_topk,
     persistent_topk,
 )

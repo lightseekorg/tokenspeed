@@ -181,6 +181,9 @@ def setup_dp_sampling(
         The resolved runtime config (``enabled=False`` when unsupported).
     """
     processor = model.logits_processor
+    if processor is None:
+        # Mid-pipeline PP stage: no logits, no sampling of any kind here.
+        return DpSamplingRuntimeConfig(enabled=False)
     topology = DpSamplingTopology(
         tp_rank=processor.tp_rank,
         tp_size=processor.tp_size,

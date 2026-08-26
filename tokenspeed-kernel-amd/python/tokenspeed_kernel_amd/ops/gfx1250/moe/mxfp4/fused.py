@@ -1233,6 +1233,20 @@ def _validate_schedule(
             raise ValueError("pingpong requires num_buffers=3")
 
 
+def _resolve_block_m(
+    decode: bool,
+    m: int,
+    num_experts: int | None,
+    *,
+    is_combine: bool,
+) -> int:
+    """Use stage defaults for prefill and expert occupancy for decode."""
+    if not decode:
+        return 256 if is_combine else 128
+    rows_per_expert = max(1, m // num_experts)
+    return max(16, min(triton.next_power_of_2(rows_per_expert), 128))
+
+
 def matmul(
     a,
     b,
@@ -1247,7 +1261,7 @@ def matmul(
     x_global_scale: torch.Tensor | float | None = None,
     num_buffers: int = 2,
     scale_block: int = 32,
-    block_m: int = 128,
+    block_m: int,
     block_n: int = 128,
     block_k: int = 256,
     group_m: int = 8,
@@ -1274,6 +1288,7 @@ def matmul(
         precision_config: MX scale/output dtype configuration.
         x_global_scale: Optional scalar activation dequantization scale.
         fused_activation: Optional SwiGLU activation descriptor.
+        block_m: Concrete row tile resolved by the caller.
         decode: Select the small-M, M-ragged decode kernel.
 
     Returns:
@@ -1498,7 +1513,7 @@ def gluon_mxfp_dispatch_swiglu(
     swiglu_alpha: float = 1.0,
     swiglu_limit: float = 0.0,
     swiglu_beta: float = 1.0,
-    block_m: int = 128,
+    block_m: int | None = None,
     block_n: int = 256,
     block_k: int = 256,
     num_warps: int = 4,
@@ -1528,6 +1543,10 @@ def gluon_mxfp_dispatch_swiglu(
     if x_format != "e2m1" and x_scale is not None:
         raise ValueError("x_scale is only supported for e2m1/MXFP4 activation input")
     gather_tensor = _index_tensor(gather_indx, "src_indx")
+    m = int(x.shape[-2] if gather_tensor is None else gather_tensor.shape[0])
+    num_experts = None if a_ragged_metadata is None else a_ragged_metadata.n_slices
+    if block_m is None:
+        block_m = _resolve_block_m(decode, m, num_experts, is_combine=False)
     activation = FusedActivation(
         FnSpecs("swiglu", swiglu_fn, ("alpha", "limit", "beta"), reduction_n=2),
         (float(swiglu_alpha), float(swiglu_limit), float(swiglu_beta)),
@@ -1573,7 +1592,7 @@ def gluon_mxfp_combine(
     n_tokens: int | None = None,
     n_expts_act: int | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    block_m: int = 256,
+    block_m: int | None = None,
     block_n: int = 256,
     block_k: int = 256,
     num_warps: int = 4,
@@ -1601,6 +1620,11 @@ def gluon_mxfp_combine(
     if x_format != "e2m1" and x_scale is not None:
         raise ValueError("x_scale is only supported for e2m1/MXFP4 activation input")
     scatter_tensor = _index_tensor(scatter_indx, "dst_indx")
+    num_experts = None if a_ragged_metadata is None else a_ragged_metadata.n_slices
+    if block_m is None:
+        block_m = _resolve_block_m(
+            decode, int(x.shape[-2]), num_experts, is_combine=True
+        )
     precision = PrecisionConfig(
         out_dtype=out_dtype,
         a_mx_scale=x_scale,
@@ -1739,6 +1763,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     swiglu_limit: float = 7.0,
     swiglu_beta: float = 1.0,
     decode: bool = False,
+    block_m: int | None = None,
 ) -> torch.Tensor:
     """Dispatch + combine for gfx1250 MXFP4-weight MoE with precomputed top-k.
 
@@ -1758,6 +1783,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         swiglu_limit: Optional SwiGLU clamp limit; ``0`` disables clamping.
         swiglu_beta: SwiGLU linear branch offset.
         decode: Select the small-M decode kernel for both MoE projections.
+        block_m: Optional row-tile override; unset values resolve per projection.
 
     Returns:
         Tensor shaped ``(n_tokens, hidden_size)``.
@@ -1811,7 +1837,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         swiglu_alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
         swiglu_beta=swiglu_beta,
-        block_m=128,
+        block_m=block_m,
         block_n=256,
         block_k=256,
         num_warps=4,
@@ -1833,7 +1859,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         a_ragged_metadata=ragged_metadata,
         scatter_indx=scatter_indx,
         out_dtype=out_dtype,
-        block_m=256,
+        block_m=block_m,
         block_n=256,
         block_k=256,
         num_warps=4,
@@ -1946,17 +1972,26 @@ def gluon_mxfp_ragged_matmul(
     precision = PrecisionConfig(
         out_dtype=out_dtype, a_mx_scale=x_mx_scale, b_mx_scale=w_mx_scale
     )
+    gather_tensor = _index_tensor(gather_indx, "src_indx")
+    decode = bool(launch_kwargs.pop("decode", False))
+    m = int(x.shape[-2] if gather_tensor is None else gather_tensor.shape[0])
+    num_experts = None if a_ragged_metadata is None else a_ragged_metadata.n_slices
+    block_m = launch_kwargs.pop("block_m", None)
+    if block_m is None:
+        block_m = _resolve_block_m(decode, m, num_experts, is_combine=False)
     out, _ = matmul(
         x,
         w,
         bias,
         a_ragged_metadata=a_ragged_metadata,
-        gather_indx=_index_tensor(gather_indx, "src_indx"),
+        gather_indx=gather_tensor,
         scatter_indx=_index_tensor(scatter_indx, "dst_indx"),
         precision_config=precision,
+        block_m=block_m,
         x_global_scale=x_global_scale,
         scale_preshuffle=scale_preshuffle,
         w_transpose=w_transpose,
+        decode=decode,
         **launch_kwargs,
     )
     return out

@@ -36,7 +36,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
 
@@ -55,7 +54,6 @@ class MHATokenToKVPool(CachePool):
         rank: int,
         *,
         layer_types: tuple[str, ...] = (),
-        layer_group_ids: tuple[str, ...] = (),
         layer_kv_head_counts: tuple[int, ...] | None = None,
         kv_alloc_head_count: int | None = None,
         field_layer_offset: int = 0,
@@ -87,17 +85,6 @@ class MHATokenToKVPool(CachePool):
             int(kv_alloc_head_count) if kv_alloc_head_count else None
         )
         self._layer_types = tuple(layer_types or ())
-        # Physical group id per layer, from the cache recipe
-        # (CachePoolSpec.layer_group_ids) — the single source the scheduler
-        # groups are published from.
-        self.layer_cache_group_ids = tuple(layer_group_ids)
-        if len(self.layer_cache_group_ids) != layer_num:
-            raise ValueError(
-                f"layer_group_ids has {len(self.layer_cache_group_ids)} "
-                f"entries but the pool has {layer_num} layers; the cache "
-                "recipe must supply one group id per layer "
-                "(CachePoolSpec.layer_group_ids)"
-            )
         self._bind_layer_planes()
 
         k_size, v_size = self.get_kv_size_bytes()
@@ -212,7 +199,6 @@ class MHATokenToKVPool(CachePool):
             self._layer_row_view(self.k_buffer[layer_id], layer_id),
             self._layer_row_view(self.v_buffer[layer_id], layer_id),
             loc,
-            enable_pdl=pdl_enabled(),
         )
 
 
@@ -306,7 +292,6 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             self._layer_row_view(self.k_buffer[layer_id], layer_id).view(torch.uint8),
             self._layer_row_view(self.v_buffer[layer_id], layer_id).view(torch.uint8),
             loc,
-            enable_pdl=pdl_enabled(),
         )
         if self._layer_kv_head_counts is not None:
             page_tokens = self._layer_page_tokens(layer_id)
@@ -315,22 +300,16 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
                 self.k_scale_buffer[layer_id],
                 loc,
                 page_size=page_tokens,
-                enable_pdl=pdl_enabled(),
             )
             store_sf_interleaved(
                 v_scale,
                 self.v_scale_buffer[layer_id],
                 loc,
                 page_size=page_tokens,
-                enable_pdl=pdl_enabled(),
             )
         elif self.arena.kv_page_size == MXFP8_KV_SCALE_TILE_TOKENS:
-            store_sf_interleaved(
-                k_scale, self.k_scale_buffer[layer_id], loc, enable_pdl=pdl_enabled()
-            )
-            store_sf_interleaved(
-                v_scale, self.v_scale_buffer[layer_id], loc, enable_pdl=pdl_enabled()
-            )
+            store_sf_interleaved(k_scale, self.k_scale_buffer[layer_id], loc)
+            store_sf_interleaved(v_scale, self.v_scale_buffer[layer_id], loc)
         else:
             self.k_scale_buffer[layer_id][loc] = k_scale
             self.v_scale_buffer[layer_id][loc] = v_scale
@@ -370,7 +349,6 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             self.v_scale_buffer[layer_id],
             loc,
             page_tokens=page_tokens,
-            enable_pdl=pdl_enabled(),
         )
         return True
 

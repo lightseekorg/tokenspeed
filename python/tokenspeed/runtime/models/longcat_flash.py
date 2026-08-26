@@ -82,7 +82,6 @@ from tokenspeed.runtime.moe.expert_location import (
 from tokenspeed.runtime.utils import LazyValue, add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.cuda_stream import StreamFork as _StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled as _pdl_enabled
 
 _longcat_logger = get_colorful_logger(__name__)
 _longcat_platform = _current_platform()
@@ -192,7 +191,6 @@ class _RuntimeLongcatRouter(nn.Module):
                 hidden_states,
                 self.classifier.weight,
                 out_dtype=torch.float32,
-                enable_pdl=_pdl_enabled(),
             )
         return _F.linear(hidden_states.float(), self.classifier.weight.float(), None)
 
@@ -345,7 +343,6 @@ class _RuntimeLongcatMoE(nn.Module):
                 expert_weights,
                 zero_expert_output,
                 top_k=self.topk.topk_config.top_k,
-                enable_pdl=_pdl_enabled(),
             )
 
         if zero_expert_output is not None:

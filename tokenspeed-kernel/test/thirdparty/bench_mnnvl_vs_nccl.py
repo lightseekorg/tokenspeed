@@ -23,8 +23,8 @@
 Sweeps token count and times, per shape:
   * ``nccl``          -- ``dist.all_reduce`` + a separate torch RMSNorm, i.e.
                          what the unfused path actually costs end to end;
-  * ``mnnvl_oneshot`` -- fused kernel, one-shot (valid to 128 tokens);
-  * ``mnnvl_twoshot`` -- fused kernel, two-shot (valid past 128);
+  * ``mnnvl_oneshot`` -- fused kernel with one-shot forced for every shape;
+  * ``mnnvl_twoshot`` -- fused kernel with two-shot forced for every shape;
   * ``ipc_lamport``   -- the single-node IPC workspace, for reference when run
                          on one node (skipped automatically if unavailable).
 
@@ -109,6 +109,7 @@ def main() -> None:
     rank, world, dev = _setup()
     p0 = rank == 0
 
+    # One strategy-independent allocation serves both forced variants.
     mnnvl_ws = trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
         rank, world, MAXTOK, H, group=dist.group.WORLD
     )
@@ -175,8 +176,8 @@ def main() -> None:
             return run
 
         t_nccl = _time_us(nccl_path)
-        t_one = _time_us(fused(mnnvl_ws, True)) if ntok <= 128 else float("nan")
-        t_two = _time_us(fused(mnnvl_ws, False)) if ntok > 128 else float("nan")
+        t_one = _time_us(fused(mnnvl_ws, True))
+        t_two = _time_us(fused(mnnvl_ws, False))
         t_ipc = float("nan")
         if ipc_ws is not None:
             t_ipc = _time_us(fused(ipc_ws, ntok <= 128))

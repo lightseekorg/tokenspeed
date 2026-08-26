@@ -1,14 +1,17 @@
-"""Sliding-window write-location kernel.
+"""Write-location kernels: the sliding-window ring and the page-table width.
 
-The SWA draft's page table is a ring: absolute position ``p`` lives in
-column ``(p // P) % window_pages``. These tests pin the three properties the
-multi-step draft depends on: ring mapping (including wrap-around), null-hole
-routing to the safe dummy slot, and agreement with the full-history kernel
-inside the window (before any wrap).
+The SWA draft's page table is a ring: absolute position ``p`` lives in column
+``(p // P) % window_pages``. The first half pins ring mapping (including
+wrap-around), null-hole routing to the dummy slot, and agreement with the
+full-history kernel before any wrap.
+
+The last test pins that table's width as a runtime argument: ``tl.constexpr``
+there recompiles the kernel once per distinct width.
 """
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 
@@ -26,8 +29,11 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 from test.runtime.conftest import requires_cuda
 
 from tokenspeed.runtime.execution.cache_loc_kernel import (
+    compute_out_cache_loc_kernel,
     compute_out_cache_loc_sliding,
     compute_out_cache_loc_uniform,
+    dflash_prepare_decode_kernel,
+    fused_decode_input_prep_kernel,
 )
 from tokenspeed.runtime.execution.draft_page_staging import CacheView
 
@@ -169,3 +175,23 @@ def test_capture_replay_address_stability() -> None:
     graph.replay()
     torch.cuda.synchronize()
     assert int(out[0]) == 77 * _P
+
+
+# --------------------------------------------------------------------------
+# Page-table width stays a runtime argument
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [
+        compute_out_cache_loc_kernel,
+        fused_decode_input_prep_kernel,
+        dflash_prepare_decode_kernel,
+    ],
+    ids=["out_cache_loc", "fused_decode_input_prep", "dflash_prepare_decode"],
+)
+def test_max_pages_is_not_constexpr(kernel) -> None:
+    """Re-annotating it ``tl.constexpr`` is the regression to catch."""
+    parameter = inspect.signature(kernel.fn).parameters["max_pages"]
+    assert parameter.annotation is inspect.Parameter.empty

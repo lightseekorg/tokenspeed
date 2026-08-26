@@ -206,12 +206,11 @@ def test_bf16_mode_unchanged() -> None:
 
 
 def test_qkvfab_fp8_w8a8_matches_dequant_reference_and_pins_flashinfer() -> None:
-    from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_qkvfab_projection
-
-    from tokenspeed.runtime.layers.dense.fp8 import (
+    from tokenspeed_kernel.ops.gemm.flashinfer import (
         has_flashinfer_fp8_blockscale,
         prepare_flashinfer_fp8_blockscale_weight_scales,
     )
+    from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_qkvfab_projection
 
     torch.manual_seed(1)
     ckpt = _make_ckpt_segments(torch.Generator().manual_seed(20260819))
@@ -228,7 +227,6 @@ def test_qkvfab_fp8_w8a8_matches_dequant_reference_and_pins_flashinfer() -> None
             x,
             module.weight,
             weight_scale=module.weight_scale_inv,
-            enable_pdl=False,
         )
         torch.cuda.synchronize()
         assert out.shape == (m, n) and out.dtype == torch.bfloat16
@@ -251,7 +249,6 @@ def test_qkvfab_fp8_w8a8_matches_dequant_reference_and_pins_flashinfer() -> None
         module.weight,
         weight_scale=module.weight_scale_inv,
         prepacked_scales=prepacked,
-        enable_pdl=False,
     )
     torch.cuda.synchronize()
     ref32 = x.float() @ w_dq.t()

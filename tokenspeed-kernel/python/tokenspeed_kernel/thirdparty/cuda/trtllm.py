@@ -35,6 +35,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.thirdparty.cuda.cuda_ipc import (
     create_shared_buffer,
     cudart,
@@ -240,12 +241,38 @@ def _destroy_ipc_workspace(
 # MNNVL-structured one-shot workspace (NVLS multicast + Lamport rotation)
 # ---------------------------------------------------------------------------
 
-# Mirror of kMnnvlOneShotMaxToken in trtllm_mnnvl_allreduce_fusion.cuh: the
-# mnnvl kernel is a decode-latency one-shot path; larger payloads stay on the
-# IPC lamport/twoshot fallback, so the workspace is sized (and clamped) for
-# this many tokens at most.
-MNNVL_ONESHOT_MAX_TOKEN = 128
-# Two-shot serves 129..2048-token calls; mirrors kMnnvlTwoShotMaxToken in the
+# Match flashinfer's one-shot traffic threshold. Traffic includes the payload
+# sent by every rank, so the token boundary varies with hidden width, dtype,
+# and TP size.
+MNNVL_ONESHOT_BYTES = int(
+    os.environ.get("TOKENSPEED_MNNVL_ONESHOT_BYTES", 64 * 1024 * 8 * 2)
+)
+
+
+def _mnnvl_oneshot_token_cap(
+    hidden_dim: int,
+    elem_size: int,
+    world_size: int,
+    threshold_bytes: int = MNNVL_ONESHOT_BYTES,
+) -> int:
+    """Maximum token count admitted by the aggregate-traffic rule."""
+    return threshold_bytes // (hidden_dim * world_size * elem_size)
+
+
+def _mnnvl_should_use_oneshot(
+    token_num: int,
+    hidden_dim: int,
+    elem_size: int,
+    world_size: int,
+    threshold_bytes: int = MNNVL_ONESHOT_BYTES,
+) -> bool:
+    """Select one-shot when aggregate one-shot traffic is within its limit."""
+    return token_num <= _mnnvl_oneshot_token_cap(
+        hidden_dim, elem_size, world_size, threshold_bytes
+    )
+
+
+# Two-shot serves calls through 2048 tokens; mirrors kMnnvlTwoShotMaxToken in the
 # kernel header. Workspace slot layout: [A: token][rank][hidden] + [B: token][hidden].
 MNNVL_TWOSHOT_MAX_TOKEN = 2048
 
@@ -318,6 +345,7 @@ class MnnvlAllReduceFusionWorkspace:
         peer_ptrs: torch.Tensor,
         local_ptr: int,
         buffer_flags: torch.Tensor,
+        oneshot_token_cap: int,
         refs: tuple,
     ):
         self.tp_rank = tp_rank
@@ -329,7 +357,18 @@ class MnnvlAllReduceFusionWorkspace:
         self.peer_ptrs = peer_ptrs
         self.local_ptr = local_ptr
         self.buffer_flags = buffer_flags
+        # Frozen when the allocation is built: dispatch must never re-read an
+        # environment override that could select a layout this buffer cannot hold.
+        self.oneshot_token_cap = oneshot_token_cap
         self._refs = refs  # keep the symm_mem tensor + handle alive
+
+    def resolve_use_oneshot(self, token_num: int, requested: Optional[bool]) -> bool:
+        """Resolve dispatch against the one-shot lane this workspace owns."""
+        if requested is False:
+            return False
+        # This cap is both the creation-time traffic rule and the allocation
+        # bound. A forced request beyond it must use the always-sized two-shot lane.
+        return token_num <= self.oneshot_token_cap
 
     def supports(
         self,
@@ -338,7 +377,7 @@ class MnnvlAllReduceFusionWorkspace:
         dtype: torch.dtype,
         world_size: int,
         pattern_code: int,
-        use_oneshot: bool = True,
+        use_oneshot: Optional[bool] = None,
         residual_reduce_scattered: bool = False,
     ) -> bool:
         """Whether this call shape can run on the mnnvl kernel.
@@ -349,7 +388,7 @@ class MnnvlAllReduceFusionWorkspace:
             dtype: payload dtype (fp16/bf16 only).
             world_size: TP world size of this call.
             pattern_code: AllReduceFusionPattern value.
-            use_oneshot: advisory only; the device picks the kernel from the token count.
+            use_oneshot: strategy the device launcher will execute.
             residual_reduce_scattered: RS-residual mode (unsupported).
 
         Returns:
@@ -358,35 +397,25 @@ class MnnvlAllReduceFusionWorkspace:
         """
         if residual_reduce_scattered:
             return False
-        # two-shot (use_oneshot=False) is served by the twoshot kernel up to
-        # MNNVL_TWOSHOT_MAX_TOKEN, provided the workspace was sized for it.
+        # Both strategies are served through MNNVL_TWOSHOT_MAX_TOKEN when the
+        # workspace was sized for the requested shape.
         if world_size != self.tp_size or world_size not in _MNNVL_SUPPORTED_WORLD_SIZES:
             return False
         if dtype not in (torch.bfloat16, torch.float16):
             return False
         if pattern_code not in _MNNVL_SUPPORTED_PATTERNS:
             return False
-        # The device ignores use_oneshot entirely: the launcher branches on
-        # token_num > MNNVL_ONESHOT_MAX_TOKEN. Capping on the caller's flag
-        # rejected prefill-sized calls the kernel handles fine whenever the
-        # host heuristic happened to resolve one-shot (129..585 tokens at
-        # world 4, for instance), pushing them off the mnnvl path for no
-        # reason. Cap on what actually runs.
         # token_num <= 0 would reach cudaLaunchKernelEx with gridDim.x = 0:
         # the launch fails with a STICKY invalid-argument error that poisons
         # the CUDA context, unlike every other rejected shape which raises a
         # recoverable RuntimeError before any launch.
         if token_num <= 0 or token_num > MNNVL_TWOSHOT_MAX_TOKEN:
             return False
-        # Charge the lane count this workspace was actually allocated with: the
-        # creator only adds the region-B lane when it is sized past the one-shot
-        # cap. Charging world+1 unconditionally made a workspace built for
-        # max_token_num<=128 reject calls it had the memory for -- everything
-        # above world/(world+1) of its declared range, e.g. 113 tokens at world 8.
-        # Charge the layout THIS call will run, which the device picks from the
-        # token count alone -- not from self.max_token_num and not from the
-        # caller's use_oneshot, neither of which the kernel consults.
-        if token_num > MNNVL_ONESHOT_MAX_TOKEN:
+        use_oneshot = self.resolve_use_oneshot(token_num, use_oneshot)
+        # Validate the layout selected by the real device parameter. Resolution
+        # above downgrades an unsafe forced one-shot request to the always-sized
+        # two-shot layout.
+        if not use_oneshot:
             stage_tokens = -(-token_num // world_size) * world_size
             lane_tokens = 2 * stage_tokens
         else:
@@ -415,8 +444,7 @@ def trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
         tp_rank: this rank within the group.
         tp_size: group world size (2, 4, 8 or 16).
         max_token_num: maximum tokens per call; clamped to
-            ``MNNVL_TWOSHOT_MAX_TOKEN``. Calls above ``MNNVL_ONESHOT_MAX_TOKEN``
-            run the two-shot kernel.
+            ``MNNVL_TWOSHOT_MAX_TOKEN``.
         hidden_dim: maximum hidden (lane) width the workspace must hold.
         group: the process group to rendezvous over.
         dtype_elem_size: payload element size in bytes (2 for bf16/fp16).
@@ -430,19 +458,20 @@ def trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
         raise RuntimeError(f"mnnvl workspace: unsupported tp_size {tp_size}")
 
     device = torch.device("cuda", torch.cuda.current_device())
-    # Size for the largest path the caller may use: one-shot needs
-    # token*rank*hidden; two-shot appends a [token][hidden] B region, i.e.
-    # (rank+1) lanes. Callers asking for <=128 tokens get the old footprint.
     ws_max_token = min(max_token_num, MNNVL_TWOSHOT_MAX_TOKEN)
+    oneshot_threshold_bytes = MNNVL_ONESHOT_BYTES
+    oneshot_token_cap = _mnnvl_oneshot_token_cap(
+        hidden_dim, dtype_elem_size, tp_size, oneshot_threshold_bytes
+    )
     # ONE buffer serves BOTH kernels, so it must fit whichever layout is larger:
     #   two-shot: 2 stages of ceil(T/tp)*tp vectors (SCATTER is shard-local);
-    #   one-shot: T*tp vectors, capped at the one-shot token limit.
-    # Sizing for two-shot alone is what let a 128-token one-shot call write 6.4x
-    # past the buffer at tp=16 -- the previous (tp+1)-lane layout only survived
-    # that by accident.
+    #   one-shot: T*tp vectors, but only through its creation-time traffic cap.
+    # Do not "fix" this back to ws_max_token: the byte rule can never select
+    # one-shot above this cap, and dispatch is pinned to the same stored value.
     stage_tokens = -(-ws_max_token // tp_size) * tp_size
     lane_tokens = max(
-        2 * stage_tokens, min(ws_max_token, MNNVL_ONESHOT_MAX_TOKEN) * tp_size
+        2 * stage_tokens,
+        min(ws_max_token, oneshot_token_cap) * tp_size,
     )
     bytes_per_buffer = _round_up(lane_tokens * hidden_dim * dtype_elem_size, 32)
     total_bytes = 3 * bytes_per_buffer
@@ -495,6 +524,7 @@ def trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
         peer_ptrs=peer_ptrs,
         local_ptr=local_ptr,
         buffer_flags=buffer_flags,
+        oneshot_token_cap=oneshot_token_cap,
         refs=(buf, handle),
     )
 
@@ -577,10 +607,10 @@ def trtllm_allreduce_fusion(
     token_num: int,
     hidden_dim: int,
     workspace_ptrs: torch.Tensor,
-    launch_with_pdl: bool,
     trigger_completion_at_end: bool,
     fp32_acc: bool,
     pattern_code: int,
+    launch_with_pdl: Optional[bool] = None,
     use_oneshot: Optional[bool] = None,
     allreduce_out: Optional[torch.Tensor] = None,
     residual_in: Optional[torch.Tensor] = None,
@@ -603,12 +633,17 @@ def trtllm_allreduce_fusion(
     attnres_out_norm_w: Optional[torch.Tensor] = None,
     latent_width: Optional[int] = None,
 ) -> None:
+    launch_with_pdl = pdl_enabled() if launch_with_pdl is None else launch_with_pdl
     if use_oneshot is None:
-        use_oneshot = _ar_should_use_oneshot(
-            token_num, hidden_dim, allreduce_in.dtype, world_size
-        )
+        if isinstance(workspace_ptrs, MnnvlAllReduceFusionWorkspace):
+            use_oneshot = workspace_ptrs.resolve_use_oneshot(token_num, None)
+        else:
+            use_oneshot = _ar_should_use_oneshot(
+                token_num, hidden_dim, allreduce_in.dtype, world_size
+            )
 
     if isinstance(workspace_ptrs, MnnvlAllReduceFusionWorkspace):
+        use_oneshot = workspace_ptrs.resolve_use_oneshot(token_num, use_oneshot)
         # MNNVL-structured one-shot path: single NVLS multicast payload store,
         # local-buffer Lamport polling, same FusedOp epilogues.
         # RuntimeError, not assert: callers such as PrefillGraph catch
@@ -642,6 +677,7 @@ def trtllm_allreduce_fusion(
             workspace_ptrs.peer_ptrs,
             workspace_ptrs.buffer_flags,
             launch_with_pdl,
+            use_oneshot,
             trigger_completion_at_end,
             fp32_acc,
             pattern_code,
@@ -791,11 +827,11 @@ def trtllm_allgather_fusion(
     world_rank: int,
     hidden_dim: int,
     workspace_ptrs: torch.Tensor,
-    launch_with_pdl: bool,
     trigger_completion_at_end: bool,
     num_token_current_rank: int,
     allgather_out: torch.Tensor,
     num_token_all_group: int,
+    launch_with_pdl: Optional[bool] = None,
     pattern_code: int = AllGatherFusionPattern.kAllGather,
     use_oneshot: Optional[bool] = None,
     fp32_acc: bool = False,
@@ -811,6 +847,7 @@ def trtllm_allgather_fusion(
     kv_lora_rank: int = 0,
     qk_rope_head_dim: int = 0,
 ) -> None:
+    launch_with_pdl = pdl_enabled() if launch_with_pdl is None else launch_with_pdl
     assert (
         q_lora_rank % 128 == 0
     ), f"q_lora_rank ({q_lora_rank}) must be divisible by block_size (128)"
@@ -939,11 +976,11 @@ def trtllm_reducescatter_fusion(
     token_num: int,
     hidden_dim: int,
     workspace_ptrs: torch.Tensor,
-    launch_with_pdl: bool,
     trigger_completion_at_end: bool,
     fp32_acc: bool,
     num_token_current_rank: int,
     pattern_code: int,
+    launch_with_pdl: Optional[bool] = None,
     use_oneshot: Optional[bool] = None,
     reducescatter_out: Optional[torch.Tensor] = None,
     add_in: Optional[torch.Tensor] = None,
@@ -958,6 +995,7 @@ def trtllm_reducescatter_fusion(
     layout_code: Optional[int] = None,
     metadata: Optional[dict] = None,
 ) -> None:
+    launch_with_pdl = pdl_enabled() if launch_with_pdl is None else launch_with_pdl
     if use_oneshot is None:
         use_oneshot = _rs_should_use_oneshot(
             token_num, hidden_dim, reducescatter_in.dtype, world_size
@@ -1135,7 +1173,7 @@ def minimax_allreduce_rms(
     nranks: int,
     eps: float,
     trigger_completion_at_end: bool = True,
-    launch_with_pdl: bool = False,
+    launch_with_pdl: Optional[bool] = None,
     rms_norm_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Single-matrix Lamport AR + RMSNorm over sharded hidden dim.
@@ -1146,6 +1184,7 @@ def minimax_allreduce_rms(
     """
     if rms_norm_out is None:
         rms_norm_out = torch.empty_like(input)
+    launch_with_pdl = pdl_enabled() if launch_with_pdl is None else launch_with_pdl
     _load_trtllm_comm_module().minimax_allreduce_rms(
         input,
         norm_weight,
@@ -1170,7 +1209,7 @@ def minimax_allreduce_rms_qk(
     nranks: int,
     eps: float,
     trigger_completion_at_end: bool = True,
-    launch_with_pdl: bool = False,
+    launch_with_pdl: Optional[bool] = None,
     rms_norm_out_q: Optional[torch.Tensor] = None,
     rms_norm_out_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1183,6 +1222,7 @@ def minimax_allreduce_rms_qk(
         rms_norm_out_q = torch.empty_like(q, memory_format=torch.contiguous_format)
     if rms_norm_out_k is None:
         rms_norm_out_k = torch.empty_like(k, memory_format=torch.contiguous_format)
+    launch_with_pdl = pdl_enabled() if launch_with_pdl is None else launch_with_pdl
     _load_trtllm_comm_module().minimax_allreduce_rms_qk(
         q,
         k,

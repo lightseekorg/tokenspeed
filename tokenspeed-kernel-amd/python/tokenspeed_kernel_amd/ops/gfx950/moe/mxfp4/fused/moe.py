@@ -554,7 +554,6 @@ def gluon_mxfp_fused_moe(
 
 def _maybe_precomputed_mxfp4_direct_mfma_decode(
     hidden_states: torch.Tensor,
-    router_logits: torch.Tensor,
     w13_weight: torch.Tensor,
     w2_weight: torch.Tensor,
     *,
@@ -570,6 +569,7 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
     swiglu_alpha: float,
     swiglu_limit: float,
     swiglu_beta: float,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Direct top-k MXFP4xMXFP4 decode for tiny precomputed-routing batches.
 
@@ -594,6 +594,15 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         or precomputed_topk_weights.shape != precomputed_topk_ids.shape
         or int(precomputed_topk_ids.shape[0]) != n_tokens
         or int(precomputed_topk_ids.shape[1]) != top_k
+        or (
+            out is not None
+            and (
+                out.shape != hidden_states.shape
+                or out.dtype != out_dtype
+                or out.device != hidden_states.device
+                or not out.is_contiguous()
+            )
+        )
     ):
         return None
 
@@ -676,7 +685,10 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         swiglu_beta=swiglu_beta,
     )
     q_inter, q_inter_scale = _quantize_mxfp4_activation(inter)
-    out = torch.empty((n_tokens, out_dim), dtype=out_dtype, device=hidden_states.device)
+    if out is None:
+        out = torch.empty(
+            (n_tokens, out_dim), dtype=out_dtype, device=hidden_states.device
+        )
     invoke_stage2_mxfp4_mfma_decode_gluon(
         q_inter,
         q_inter_scale,
@@ -950,7 +962,6 @@ def _maybe_route_owned_mxfp4_mfma_decode(
 
     out = _maybe_precomputed_mxfp4_direct_mfma_decode(
         hidden_states,
-        router_logits,
         w13_weight,
         w2_weight,
         w13_mx_scale=w13_mx_scale,
@@ -1322,7 +1333,6 @@ def gluon_mxfp_dynamic_mxfp4_fused_moe(
         if int(n_tokens) <= _DECODE_MAX_M:
             decode_out = _maybe_precomputed_mxfp4_direct_mfma_decode(
                 hidden_states,
-                router_logits,
                 w13_weight,
                 w2_weight,
                 w13_mx_scale=w13_mx_scale,
@@ -1445,6 +1455,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
     swiglu_beta: float = 1.0,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dispatch + combine for dynamic MXFP4 activations with precomputed top-k."""
     if topk_ids.ndim != 2:
@@ -1460,6 +1471,26 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         raise ValueError("w13_weight must expose a rank-3 expert weight tensor")
     num_experts = int(w13_raw.shape[0])
     n_tokens, top_k = topk_ids.shape
+    direct_out = _maybe_precomputed_mxfp4_direct_mfma_decode(
+        hidden_states,
+        w13_weight,
+        w2_weight,
+        w13_mx_scale=w13_mx_scale,
+        w2_mx_scale=w2_mx_scale,
+        top_k=int(top_k),
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+        out_dtype=out_dtype,
+        max_m=_DECODE_MAX_M,
+        precomputed_topk_weights=topk_weights,
+        precomputed_topk_ids=topk_ids,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
+        swiglu_beta=swiglu_beta,
+        out=out,
+    )
+    if direct_out is not None:
+        return direct_out
     if n_tokens < SMALLM_MAX_M and n_tokens * top_k <= GLUON_ROUTE_MAX_G:
         ragged_metadata, gather_indx, scatter_indx, gate_scal = (
             gluon_precomputed_topk_fused_route(
@@ -1494,6 +1525,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         swiglu_alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
         swiglu_beta=swiglu_beta,
+        out=out,
     )
 
 
@@ -1515,6 +1547,7 @@ def _gluon_mxfp_dynamic_mxfp4_fused_moe_from_route(
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
     swiglu_beta: float = 1.0,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     n_tokens = hidden_states.shape[0]
 
@@ -1555,6 +1588,7 @@ def _gluon_mxfp_dynamic_mxfp4_fused_moe_from_route(
         n_tokens=n_tokens,
         n_expts_act=top_k,
         x_scale_ragged_padded=True,
+        out=out,
     )
 
 

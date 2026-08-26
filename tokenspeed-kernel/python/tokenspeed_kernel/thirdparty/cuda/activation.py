@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 def _round_up(x: int, m: int) -> int:
@@ -49,11 +50,12 @@ def silu_and_mul_fuse_block_quant(
     input: torch.Tensor,
     scale_out: torch.Tensor,
     out: Optional[torch.Tensor] = None,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
     num_tokens_per_expert: Optional[torch.Tensor] = None,
     num_tokens_hint: Optional[int] = None,
     num_experts: Optional[int] = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     if out is None:
         out = torch.empty(
             input.shape[:-1] + (input.shape[-1] // 2,),

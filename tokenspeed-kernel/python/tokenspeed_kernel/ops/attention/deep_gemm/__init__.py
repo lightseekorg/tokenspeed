@@ -23,6 +23,7 @@ from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -100,8 +101,48 @@ def _check_out(
 
 
 if platform.is_nvidia:
+    import tokenspeed_kernel.ops.attention.deep_gemm.dsv4  # noqa: F401
     from tokenspeed_kernel.thirdparty import deep_gemm
     from tokenspeed_kernel.thirdparty import trtllm as _trtllm  # noqa: F401
+
+    def _deep_gemm_paged_mqa_plan(
+        *,
+        page_size: int,
+        seq_lens_2d: torch.Tensor,
+        out: object | None = None,
+        operation: str,
+    ) -> torch.Tensor:
+        if deep_gemm.get_pdl() != pdl_enabled():
+            deep_gemm.set_pdl(pdl_enabled())
+        refreshed = deep_gemm.get_paged_mqa_logits_metadata(
+            seq_lens_2d,
+            page_size,
+            deep_gemm.get_num_sms(),
+        )
+        if out is None:
+            with torch.inference_mode(False):
+                return refreshed.clone()
+
+        if (
+            not isinstance(out, torch.Tensor)
+            or out.shape != refreshed.shape
+            or out.device != refreshed.device
+            or out.dtype != refreshed.dtype
+        ):
+            actual = (
+                f"{tuple(out.shape)} {out.dtype} {out.device}"
+                if isinstance(out, torch.Tensor)
+                else type(out).__name__
+            )
+            raise RuntimeError(
+                f"{operation} plan changed shape during CUDA graph replay; "
+                "recapture or use eager for this batch. "
+                f"captured={actual}, refreshed={tuple(refreshed.shape)} "
+                f"{refreshed.dtype} {refreshed.device}"
+            )
+        with torch.inference_mode():
+            out.copy_(refreshed)
+        return out
 
     @register_kernel(
         "attention",
@@ -124,33 +165,40 @@ if platform.is_nvidia:
         seq_lens_2d: torch.Tensor,
         out: object | None = None,
     ) -> torch.Tensor:
-        refreshed = deep_gemm.get_paged_mqa_logits_metadata(
-            seq_lens_2d,
-            page_size,
-            deep_gemm.get_num_sms(),
+        return _deep_gemm_paged_mqa_plan(
+            page_size=page_size,
+            seq_lens_2d=seq_lens_2d,
+            out=out,
+            operation="DSA paged top-k",
         )
-        if out is None:
-            return refreshed
 
-        if (
-            not isinstance(out, torch.Tensor)
-            or out.shape != refreshed.shape
-            or out.device != refreshed.device
-            or out.dtype != refreshed.dtype
-        ):
-            actual = (
-                f"{tuple(out.shape)} {out.dtype} {out.device}"
-                if isinstance(out, torch.Tensor)
-                else type(out).__name__
-            )
-            raise RuntimeError(
-                "DSA paged top-k plan changed shape during CUDA graph replay; "
-                "recapture or use eager for this batch. "
-                f"captured={actual}, refreshed={tuple(refreshed.shape)} "
-                f"{refreshed.dtype} {refreshed.device}"
-            )
-        out.copy_(refreshed)
-        return out
+    @register_kernel(
+        "attention",
+        "dsv4_plan",
+        name="deep_gemm_dsv4_plan",
+        solution="deep_gemm",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset({format_signature()}),
+        traits={
+            "page_size": frozenset({64}),
+        },
+        priority=Priority.PERFORMANT,
+    )
+    def deep_gemm_dsv4_plan(
+        *,
+        page_size: int,
+        seq_lens_2d: torch.Tensor,
+        out: object | None = None,
+    ) -> torch.Tensor:
+        return _deep_gemm_paged_mqa_plan(
+            page_size=page_size,
+            seq_lens_2d=seq_lens_2d,
+            out=out,
+            operation="DeepSeek V4 decode indexer",
+        )
 
     @register_kernel(
         "attention",
@@ -179,6 +227,7 @@ if platform.is_nvidia:
             "topk": frozenset({512, 1024, 2048}),
             "page_size": frozenset({64}),
             "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed"}),
             "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
         },
         priority=Priority.PERFORMANT,
@@ -262,6 +311,8 @@ if platform.is_nvidia:
             if q_len_per_req > 1
             else block_table
         )
+        if deep_gemm.get_pdl() != pdl_enabled():
+            deep_gemm.set_pdl(pdl_enabled())
         logits = deep_gemm.fp8_paged_mqa_logits(
             q_fp8.view(tokens, 1, q.shape[1], q.shape[-1]),
             kv_cache,
@@ -352,6 +403,7 @@ if platform.is_nvidia:
             "head_dim": frozenset({128}),
             "topk": frozenset({512, 1024, 2048}),
             "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed"}),
         },
         priority=Priority.PERFORMANT,
     )
@@ -444,6 +496,8 @@ if platform.is_nvidia:
         for start in range(0, tokens, max_query_rows):
             end = min(start + max_query_rows, tokens)
             max_seqlen_k = int(candidate_lens[start:end].max().item())
+            if deep_gemm.get_pdl() != pdl_enabled():
+                deep_gemm.set_pdl(pdl_enabled())
             logits = deep_gemm.fp8_mqa_logits(
                 q_fp8[start:end].contiguous(),
                 kv_fp8,

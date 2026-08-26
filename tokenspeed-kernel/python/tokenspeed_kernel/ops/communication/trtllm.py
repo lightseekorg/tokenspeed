@@ -60,7 +60,6 @@ if current_platform().is_nvidia:
     from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
     from tokenspeed_kernel.thirdparty.cuda.trtllm import (
         _MNNVL_SUPPORTED_WORLD_SIZES,
-        MNNVL_ONESHOT_MAX_TOKEN,
         MNNVL_PREFER_IPC_BYTES,
         AllGatherFusionPattern,
         AllReduceFusionPattern,
@@ -400,8 +399,8 @@ if current_platform().is_nvidia:
         Decision, first match wins:
           1. IPC exists (single-node) AND (payload >= MNNVL_PREFER_IPC_BYTES
              OR pattern == kAllReduceLatentNorm) ....... IPC lamport/twoshot
-          2. mnnvl supports this shape ................. mnnvl (one-shot <=128
-             tokens, two-shot 129..2048; device picks by token count)
+          2. mnnvl supports this shape ................. mnnvl (the caller's
+             ``use_oneshot`` parameter selects its strategy)
           3. no IPC fallback (cross-node) ............. None (caller degrades:
              the rmsnorm family runs unfused NCCL + torch epilogue, the rest
              raise loudly -- never a null workspace into the kernel)
@@ -527,7 +526,7 @@ if current_platform().is_nvidia:
         residual_reduce_scattered: bool = False,
         has_partial_norm_out: bool = False,
         max_sm_to_use: int | None = None,
-        launch_with_pdl: bool = False,
+        launch_with_pdl: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Use TRT-LLM fused allreduce + residual + RMS norm operation.
@@ -594,27 +593,18 @@ if current_platform().is_nvidia:
         if residual_reduce_scattered or has_partial_norm_out:
             use_oneshot = True
 
-        resolved_oneshot = (
+        requested_oneshot = (
             use_oneshot
             if use_oneshot is not None
             else _ar_should_use_oneshot(
                 token_num, hidden_dim, input_tensor.dtype, world_size
             )
         )
-        # The size heuristic above encodes the IPC-lamport crossover in BYTES,
-        # while the mnnvl one-shot kernel is capped in TOKENS
-        # (MNNVL_ONESHOT_MAX_TOKEN). They disagree: at world=8 the 42 MB
-        # threshold lands on 192 tokens, which one-shot mnnvl cannot serve, and
-        # cross-node there is no IPC workspace to fall back to. Respect the
-        # kernel's own cap so such shapes take the two-shot path instead.
-        if (
-            resolved_oneshot
-            and token_num > MNNVL_ONESHOT_MAX_TOKEN
-            and _workspace_manager.mnnvl_workspace is not None
-            and _workspace_manager.workspace_tensor is None
-        ):
-            resolved_oneshot = False
-
+        resolved_oneshot = requested_oneshot
+        if _workspace_manager.mnnvl_workspace is not None:
+            resolved_oneshot = _workspace_manager.mnnvl_workspace.resolve_use_oneshot(
+                token_num, use_oneshot
+            )
         workspace = _ar_fusion_workspace(
             token_num,
             hidden_dim,
@@ -623,6 +613,9 @@ if current_platform().is_nvidia:
             resolved_oneshot,
             residual_reduce_scattered,
         )
+        # IPC has its own heuristic; only MNNVL uses the workspace's frozen cap.
+        if workspace is not _workspace_manager.mnnvl_workspace:
+            resolved_oneshot = requested_oneshot
         if workspace is None:
             # Cross-node group, pattern/shape the mnnvl kernel cannot serve
             # (block-quant or partial-out epilogue, oversized call). Degrade to
@@ -691,7 +684,7 @@ if current_platform().is_nvidia:
         eps: float = 1e-6,
         max_token_num: int = 2048,
         trigger_completion_at_end: bool = False,
-        launch_with_pdl: bool = False,
+        launch_with_pdl: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """AR + residual + AttnRes prefix combine in one kernel (Kimi-K3).
 
@@ -778,7 +771,7 @@ if current_platform().is_nvidia:
         eps: float = 1e-6,
         max_token_num: int = 2048,
         trigger_completion_at_end: bool = False,
-        launch_with_pdl: bool = False,
+        launch_with_pdl: bool | None = None,
     ) -> torch.Tensor:
         """All-reduce the [latent | hidden] lane and RMS-norm the latent slice.
 
@@ -859,7 +852,7 @@ if current_platform().is_nvidia:
         fp32_acc: bool = False,
         block_quant_fp8: bool = False,
         add_in: torch.Tensor | None = None,
-        launch_with_pdl: bool = False,
+        launch_with_pdl: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Use TRT-LLM fused reducescatter + residual + RMS norm operation.
@@ -978,7 +971,7 @@ if current_platform().is_nvidia:
         block_quant_fp8: bool = False,
         trigger_completion_at_end: bool = False,
         fp32_acc: bool = False,
-        launch_with_pdl: bool = False,
+        launch_with_pdl: bool | None = None,
     ) -> tuple[
         torch.Tensor | None,
         torch.Tensor | None,

@@ -136,7 +136,6 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.utils import add_prefix, make_layers
 from tokenspeed.runtime.utils.common import set_weight_attrs
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -412,7 +411,6 @@ def _sconv_apply(
         checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
         num_extends=md.num_extends,
         page_size=backend.conv_columns["block_tokens"],
-        enable_pdl=pdl_enabled(),
     )
     if md.num_extends > 0 and backend.conv_columns.get("pd_endpoint_snapshots", False):
         # The fused kernel already publishes aligned boundaries. CachePD also
@@ -620,7 +618,6 @@ class InklingAttention(nn.Module):
                 self.q_norm.weight,
                 self.k_norm.weight,
                 self.q_norm.variance_epsilon,
-                enable_pdl=pdl_enabled(),
             )
 
         attn_output = self.attn(
@@ -755,9 +752,7 @@ class InklingGate(nn.Module):
         and the shared sink gammas (last ``S`` columns) from one joint
         normalization; callers slice as needed."""
         if self.use_dsv3_router_gemm and x.size(0) > 0:
-            logits = dsv3_router_gemm(
-                x, self.weight, out_dtype=torch.float32, enable_pdl=pdl_enabled()
-            )
+            logits = dsv3_router_gemm(x, self.weight, out_dtype=torch.float32)
         else:
             logits = F.linear(x, self.weight, None)
 
@@ -965,7 +960,6 @@ class InklingSparseMoeBlock(nn.Module):
                 weights,
                 shared_out,
                 top_k=top_k,
-                enable_pdl=pdl_enabled(),
             )
         else:
             weights, topk_ids, router_logits = self.gate(x)

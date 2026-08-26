@@ -149,6 +149,7 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "passthrough",
         "--disable-circuit-breaker",
         "--disable-retries",
+        "--disable-load-monitoring",
         "--policy",
         "passthrough",
         "--tokenizer-cache-enable-l0",
@@ -219,6 +220,7 @@ def test_smg_disable_flags_appended_when_absent():
         "/tmp/x",
         "--disable-circuit-breaker",
         "--disable-retries",
+        "--disable-load-monitoring",
     ]
 
 
@@ -231,13 +233,21 @@ def test_smg_disable_flags_not_duplicated():
     assert gateway_args == [
         "--disable-circuit-breaker",
         "--disable-retries",
+        "--disable-load-monitoring",
     ]
 
 
-def test_smg_disable_flag_set_covers_both():
+def test_smg_disable_defaults_turn_off_load_monitoring():
+    gateway_args = _gateway_args_with_smg_disable_defaults(["--model", "/tmp/x"])
+
+    assert gateway_args.count("--disable-load-monitoring") == 1
+
+
+def test_smg_disable_flag_set_covers_all_three():
     assert _DEFAULT_SMG_DISABLE_FLAGS == (
         "--disable-circuit-breaker",
         "--disable-retries",
+        "--disable-load-monitoring",
     )
 
 

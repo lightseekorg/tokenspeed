@@ -43,7 +43,6 @@ from tokenspeed.runtime.layers.quantization.utils import (
     should_ignore_quant_layer,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 class MoELayer(torch.nn.Module):
@@ -342,7 +341,6 @@ class MoELayer(torch.nn.Module):
                 num_tokens_global=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 do_finalize=do_finalize,
-                enable_pdl=pdl_enabled(),
                 low_latency=low_latency,
                 overlap_fn=overlap_fn,
                 **shared_kwargs,
@@ -358,7 +356,6 @@ class MoELayer(torch.nn.Module):
                 num_tokens_global=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 do_finalize=do_finalize,
-                enable_pdl=pdl_enabled(),
                 low_latency=low_latency,
                 overlap_fn=overlap_fn,
                 **shared_kwargs,

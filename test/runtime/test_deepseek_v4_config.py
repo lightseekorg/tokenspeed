@@ -18,8 +18,10 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
-    has_fused_qnorm_rope_kv_insert,
+from tokenspeed_kernel import (
+    dsv4_compute_global_topk_indices_and_lens,
+)
+from tokenspeed_kernel.ops.attention.cuda.dsv4 import (
     has_indexer_topk_prefill,
     indexer_topk_prefill,
 )
@@ -75,10 +77,6 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     v4_compressed_kv_group_id,
     v4_compressor_state_group_id,
 )
-from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
-    deepseek_v4_compute_global_topk_indices_and_lens,
-    fused_qnorm_rope_kv_insert,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
     HybridDeepseekV4TokenToKVPool,
@@ -113,7 +111,6 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4MoEGate,
     _deepseek_v4_expert_scale_parameter_name,
     _deepseek_v4_forward_metadata,
-    _deepseek_v4_fused_select_experts,
     _deepseek_v4_indexer_decode_max_len,
     _deepseek_v4_indexer_decode_plan,
     _deepseek_v4_indexer_prefill_max_logits_bytes,
@@ -121,13 +118,12 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_indexer_prefill_request_chunks,
     _deepseek_v4_indexer_prefill_request_gather_plan,
     _deepseek_v4_indexer_token_split,
-    _deepseek_v4_indexer_topk_from_logits,
     _deepseek_v4_mega_moe_max_num_tokens,
     _deepseek_v4_reorder_c4_ape_2604,
     _deepseek_v4_routed_expert_quant_config,
     _DeepseekV4TopKBuffer,
     deepseek_v4_rope_config,
-    deepseek_v4_select_experts,
+    dsv4_select_experts,
     hc_head,
     mhc_post,
     mhc_pre,
@@ -717,11 +713,11 @@ class TestDeepseekV4Config(unittest.TestCase):
                 None,
             )
 
-        def routed_experts(states, topk_weights, topk_ids, activation_clamp=None):
-            del topk_weights, activation_clamp
+        def routed_experts(states, topk_weights, topk_ids):
+            del topk_weights
             calls.append("routed")
             self.assertIs(states, hidden_states)
-            self.assertEqual(topk_ids.dtype, torch.int64)
+            self.assertEqual(topk_ids.dtype, torch.int32)
             return hidden_states + 1
 
         moe = SimpleNamespace(
@@ -1475,24 +1471,6 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "does not match"):
             model_config._verify_quantization()
-
-    def test_deepseek_v4_attention_op_boundary_fails_loudly_when_missing(self):
-        if has_fused_qnorm_rope_kv_insert():
-            self.skipTest("DeepSeek V4 fused attention op is available in this build")
-
-        q = torch.empty(1, 1, 512)
-        kv = torch.empty(1, 512)
-        cache = torch.empty(1, 584, dtype=torch.uint8)
-        slots = torch.zeros(1, dtype=torch.int32)
-        positions = torch.zeros(1, dtype=torch.int32)
-        cos_sin = torch.empty(1, 128)
-
-        with self.assertRaisesRegex(
-            RuntimeError, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"
-        ):
-            fused_qnorm_rope_kv_insert(
-                q, kv, cache, slots, positions, cos_sin, 1e-6, 256
-            )
 
     def test_deepseek_v4_flashmla_wrapper_exposes_required_api(self):
         try:
@@ -4738,7 +4716,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.equal(hca_lens, torch.tensor([2, 0], dtype=torch.int32)))
 
     def test_deepseek_v4_global_topk_cpu_masks_invalid_req_before_indexing(self):
-        indices, lens = deepseek_v4_compute_global_topk_indices_and_lens(
+        indices, lens = dsv4_compute_global_topk_indices_and_lens(
             topk_indices=torch.tensor([[0, 4], [0, 1]], dtype=torch.int32),
             token_to_req_indices=torch.tensor([0, 99], dtype=torch.int32),
             block_table=torch.tensor([[10]], dtype=torch.int32),
@@ -4891,7 +4869,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         with patch.object(
             deepseek_v4_backend,
-            "deepseek_v4_indexer_decode_metadata_compute",
+            "dsv4_indexer_decode_metadata_compute",
             side_effect=fake_compute,
         ):
             deepseek_v4_backend._refresh_decode_indexer_plan_cache(
@@ -4933,7 +4911,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         with patch.object(
             deepseek_v4_model,
-            "deepseek_v4_indexer_decode_metadata_compute",
+            "dsv4_indexer_decode_metadata_compute",
             side_effect=fake_compute,
         ):
             plan = _deepseek_v4_indexer_decode_plan(
@@ -4962,16 +4940,13 @@ class TestDeepseekV4Config(unittest.TestCase):
     def test_deepseek_v4_indexer_schedule_refresh_uses_decode_plan_lens(self):
         captured = {}
 
-        def fake_get_metadata(context_lens, cache_block_size, num_sms):
-            captured["context_lens"] = context_lens.clone()
-            captured["cache_block_size"] = cache_block_size
-            captured["num_sms"] = num_sms
-            return torch.full((2, 1), 9, dtype=torch.int32)
+        def fake_dsv4_plan(*, seq_lens_2d, page_size, out):
+            captured["context_lens"] = seq_lens_2d.clone()
+            captured["cache_block_size"] = page_size
+            captured["out"] = out
+            out.fill_(9)
+            return out
 
-        fake_deep_gemm = SimpleNamespace(
-            get_paged_mqa_logits_metadata=fake_get_metadata,
-            get_num_sms=lambda: 123,
-        )
         key = (4, 4, 2)
         metadata = _make_deepseek_v4_forward_metadata(
             page_size=64,
@@ -4993,7 +4968,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             dtype=torch.int32,
         )
 
-        with patch.object(deepseek_v4_backend, "deep_gemm", fake_deep_gemm):
+        with patch.object(deepseek_v4_backend, "dsv4_plan", side_effect=fake_dsv4_plan):
             deepseek_v4_backend._refresh_decode_indexer_schedule_metadata(metadata)
 
         self.assertTrue(
@@ -5002,7 +4977,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
         self.assertEqual(captured["cache_block_size"], 4)
-        self.assertEqual(captured["num_sms"], 123)
+        self.assertIs(
+            captured["out"], metadata.indexer.decode_schedule_metadata_cache[key]
+        )
         self.assertTrue(
             torch.equal(
                 metadata.indexer.decode_schedule_metadata_cache[key],
@@ -5318,7 +5295,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             patch.dict(global_server_args_dict, {"max_model_len": None}),
             patch.object(
                 deepseek_v4_model,
-                "deepseek_v4_indexer_decode_metadata_compute",
+                "dsv4_indexer_decode_metadata_compute",
                 fake_decode_metadata_compute,
             ),
         ):
@@ -5369,72 +5346,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 ),
                 4112,
             )
-
-    def test_deepseek_v4_indexer_topk_requires_cuda_logits(self):
-        logits = torch.tensor(
-            [[0.0, 3.0, 1.0, -float("inf")]],
-            dtype=torch.float32,
-        )
-        lengths = torch.tensor([3], dtype=torch.int32)
-
-        with self.assertRaisesRegex(RuntimeError, "requires CUDA float32 logits"):
-            _deepseek_v4_indexer_topk_from_logits(
-                logits,
-                lengths,
-                topk_tokens=2,
-            )
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_deepseek_v4_indexer_topk_rejects_unsupported_decode_topk(self):
-        logits = torch.tensor(
-            [[0.0, 3.0, 1.0, -float("inf")]],
-            device="cuda",
-            dtype=torch.float32,
-        )
-        lengths = torch.tensor([3], device="cuda", dtype=torch.int32)
-
-        with self.assertRaisesRegex(RuntimeError, "supports topk_tokens"):
-            _deepseek_v4_indexer_topk_from_logits(
-                logits,
-                lengths,
-                topk_tokens=4,
-            )
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_deepseek_v4_indexer_topk_uses_local_prefill_op(self):
-        logits = torch.tensor(
-            [
-                [0.0, 3.0, 1.0, -float("inf"), -float("inf"), -float("inf")],
-                [-float("inf"), -float("inf"), -float("inf"), 2.0, 8.0, 5.0],
-            ],
-            device="cuda",
-            dtype=torch.float32,
-        )
-        row_starts = torch.tensor([0, 3], device="cuda", dtype=torch.int32)
-        row_ends = torch.tensor([3, 6], device="cuda", dtype=torch.int32)
-        out = torch.empty((2, 4), device="cuda", dtype=torch.int32)
-
-        try:
-            actual = _deepseek_v4_indexer_topk_from_logits(
-                logits,
-                row_ends - row_starts,
-                topk_tokens=4,
-                use_prefill_topk_op=True,
-                row_starts=row_starts,
-                row_ends=row_ends,
-                out=out,
-            )
-        except RuntimeError as exc:
-            if "requires the CUDA prefill top-k op" not in str(exc):
-                raise
-            self.skipTest(str(exc))
-
-        self.assertEqual(actual.data_ptr(), out.data_ptr())
-        expected = torch.tensor(
-            [[0, 1, 2, -1], [0, 1, 2, -1]],
-            dtype=torch.int32,
-        )
-        self.assertTrue(torch.equal(actual.cpu(), expected))
 
     def test_deepseek_v4_topk_buffer_grows_and_reuses(self):
         buffer = _DeepseekV4TopKBuffer(topk_tokens=3)
@@ -5560,22 +5471,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         with (
-            # deep_gemm is unavailable on AMD runners; the guard only checks
-            # for None and every consumer below is patched out.
-            patch.object(
-                deepseek_v4_model,
-                "deep_gemm",
-                deepseek_v4_model.deep_gemm or SimpleNamespace(),
-            ),
             patch.object(
                 deepseek_v4_model,
                 "deepseek_v4_prepare_indexer_q_mxfp4",
                 side_effect=fake_prepare_mxfp4,
-            ),
-            patch.object(
-                deepseek_v4_model,
-                "_deepseek_v4_deepgemm_fp4_indexer_available",
-                return_value=True,
             ),
             patch.object(
                 deepseek_v4_model,
@@ -5856,7 +5755,9 @@ class TestDeepseekV4Config(unittest.TestCase):
                 torch.tensor([[0, 6, 0, 6, 4, 0, 3]], dtype=torch.int64),
             )
         )
-        self.assertEqual(actual.slots.numel(), 0)
+        self.assertTrue(
+            torch.equal(actual.slots, torch.tensor([40, 41, 42, 43, 80, 81]))
+        )
         self.assertTrue(
             torch.equal(actual.cu_seq_lens, torch.tensor([0, 4, 6], dtype=torch.int32))
         )
@@ -6012,7 +5913,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         bias = torch.tensor([0.0, -0.4, 0.6, 0.0], dtype=torch.float32)
 
-        topk_weights, topk_ids, scores = deepseek_v4_select_experts(
+        topk_weights, topk_ids, scores = dsv4_select_experts(
             logits,
             top_k=2,
             renormalize=True,
@@ -6047,7 +5948,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             dtype=torch.int32,
         )
 
-        topk_weights, topk_ids, _ = deepseek_v4_select_experts(
+        topk_weights, topk_ids, _ = dsv4_select_experts(
             logits,
             top_k=2,
             renormalize=True,
@@ -6139,7 +6040,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         ).repeat(2, 1)
         bias = torch.linspace(0.25, -0.25, 256, device="cuda", dtype=torch.float32)
 
-        topk_weights, topk_ids, scores = deepseek_v4_select_experts(
+        topk_weights, topk_ids, scores = dsv4_select_experts(
             logits,
             top_k=6,
             renormalize=True,
@@ -6154,21 +6055,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.allclose(scores, expected_scores))
         self.assertTrue(torch.equal(topk_ids, expected_ids.to(torch.int32)))
         self.assertTrue(torch.allclose(topk_weights, expected_weights, atol=1e-6))
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_deepseek_v4_bias_fused_router_runs_by_default(self):
-        logits = torch.zeros(2, 256, device="cuda", dtype=torch.float32)
-        bias = torch.linspace(0.25, -0.25, 256, device="cuda", dtype=torch.float32)
-
-        out = _deepseek_v4_fused_select_experts(
-            logits, top_k=6, renormalize=True, correction_bias=bias
-        )
-
-        if out is None:
-            self.skipTest("fused DeepSeek V4 router op unavailable")
-        topk_weights, topk_ids = out
-        self.assertEqual(tuple(topk_weights.shape), (2, 6))
-        self.assertEqual(tuple(topk_ids.shape), (2, 6))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_deepseek_v4_fused_hash_topk_matches_reference(self):

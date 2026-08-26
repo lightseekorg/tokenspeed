@@ -24,16 +24,15 @@ from typing import ClassVar
 
 import numpy as np
 import torch
-
-from tokenspeed.runtime.cache.utils import (
+from tokenspeed_kernel.ops.kvcache.triton import (
     get_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton,
 )
+
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
 
@@ -47,6 +46,10 @@ def _get_tensor_size_bytes(t: torch.Tensor | list[torch.Tensor]):
 
 
 class MLATokenToKVPool(CachePool):
+    #: ``set_mla_kv_buffer``'s ``sanitize`` default; declared, not overridden,
+    #: so the fused MLA write gate's method-identity check still admits a pool.
+    latent_write_sanitizes: ClassVar[bool] = False
+
     def __init__(
         self,
         arena: CacheArena,
@@ -58,7 +61,6 @@ class MLATokenToKVPool(CachePool):
         layer_num: int,
         rank: int,
         *,
-        layer_group_ids: tuple[str, ...] = (),
         field_layer_offset: int = 0,
     ):
         super().__init__(
@@ -74,17 +76,6 @@ class MLATokenToKVPool(CachePool):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.layer_num = layer_num
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
-        # Physical group id per layer, from the cache recipe
-        # (CachePoolSpec.layer_group_ids) — the single source the scheduler
-        # groups are published from.
-        self.layer_cache_group_ids = tuple(layer_group_ids)
-        if len(self.layer_cache_group_ids) != layer_num:
-            raise ValueError(
-                f"layer_group_ids has {len(self.layer_cache_group_ids)} "
-                f"entries but the pool has {layer_num} layers; the cache "
-                "recipe must supply one group id per layer "
-                "(CachePoolSpec.layer_group_ids)"
-            )
         self._bind_layer_planes()
 
     # Quantized MLA splits one logical cache into three planes, so its
@@ -170,8 +161,10 @@ class MLATokenToKVPool(CachePool):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
-        sanitize: bool = False,
+        sanitize: bool | None = None,
     ):
+        if sanitize is None:
+            sanitize = self.latent_write_sanitizes
         layer_id = layer.layer_id
         if self.quant_method == "per_token_head":
             # Preserve the writer's sanitization contract for the quantized
@@ -202,7 +195,6 @@ class MLATokenToKVPool(CachePool):
                 loc,
                 cache_k_nope,
                 cache_k_rope,
-                enable_pdl=pdl_enabled(),
                 sanitize=sanitize,
             )
 
@@ -235,7 +227,5 @@ class MLATokenToKVPool(CachePool):
             dtype=dst_dtype,
             device=kv_buffer.device,
         )
-        get_mla_kv_buffer_triton(
-            kv_buffer, loc, cache_k_nope, cache_k_rope, enable_pdl=pdl_enabled()
-        )
+        get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return cache_k_nope, cache_k_rope

@@ -22,7 +22,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from concurrent.futures import Future
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
@@ -31,6 +32,23 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.grammar.capturable_grammar import (
         GrammarStepCompletion,
     )
+
+
+@dataclass(frozen=True)
+class DpForwardMetadata:
+    """CPU-only DP metadata, gathered by the event loop before each forward.
+
+    Every DP rank must enter the model's collectives with the same shapes,
+    so the loop all-gathers these before any GPU work and hands the result
+    to the executor as one unit.
+    """
+
+    global_num_tokens: list[int]
+    global_batch_size: list[int]
+    global_forward_mode: list[int]
+    all_decode_or_idle: bool
+    all_extend: bool
+    need_idle_forward: bool
 
 
 @dataclass
@@ -62,8 +80,52 @@ class ModelExecutionResult:
     # Optional verify-input snapshot used by speculative diagnostics. Layout is
     # [batch, verify_width]: anchor followed by draft candidate token ids.
     spec_candidate_tokens: torch.Tensor | None = None
+    # Set by sync(); guards the exactly-once contract below.
+    _synced: bool = field(default=False, init=False, repr=False, compare=False)
 
     def sync(self) -> None:
+        """Block until this result's D2H copy has landed.
+
+        Called exactly once, by ``PendingExecution.result()`` — the single
+        gate between the forward thread and the control plane. Consumers
+        receive an already-synced result and must not call this again; a
+        second call means a redundant sync path was reintroduced, so it
+        raises instead of silently costing a no-op event join.
+        """
+        if self._synced:
+            raise RuntimeError(
+                "ModelExecutionResult is synced exactly once, by "
+                "PendingExecution.result(); consumers get a synced result."
+            )
         if self.copy_event is None:
             raise RuntimeError("copy_event is required before synchronizing results.")
         self.copy_event.synchronize()
+        self._synced = True
+
+
+@dataclass
+class PendingExecution:
+    """A forward submitted to the forward thread, awaiting its result.
+
+    The control plane's ``in_flight`` queue holds these instead of raw
+    ``ModelExecutionResult``s. ``result()`` joins the forward-thread future
+    (all launches + D2H issued) and then syncs the copy event (D2H landed).
+    Only commit blocks here — the dispatch path never waits, which is what
+    keeps a backpressured stage's launches from stalling the control plane.
+
+    This is also the only place a ``ModelExecutionResult`` crosses from the
+    forward thread to the control plane, which is what makes the sync
+    exactly-once: the future is private, so host tensors are unreachable
+    without going through ``result()`` (never under-synced), and the result
+    is memoized, so repeated calls join nothing (never over-synced).
+    """
+
+    _future: Future
+    _result: ModelExecutionResult | None = field(default=None, init=False, repr=False)
+
+    def result(self) -> ModelExecutionResult:
+        if self._result is None:
+            results = self._future.result()
+            results.sync()
+            self._result = results
+        return self._result

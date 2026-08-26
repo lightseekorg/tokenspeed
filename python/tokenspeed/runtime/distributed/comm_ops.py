@@ -59,7 +59,6 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (  # no
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 def _get_process_group(group: Group):
@@ -192,7 +191,6 @@ def all_reduce_latent_norm(
         group=process_group,
         eps=eps,
         max_token_num=max_token_num,
-        launch_with_pdl=pdl_enabled(),
         trigger_completion_at_end=True,
     )
 
@@ -294,7 +292,6 @@ def fused_all_reduce(
             has_partial_norm_out=fusion_params.has_partial_norm_out,
             trigger_completion_at_end=fusion_params.trigger_completion_at_end,
             max_sm_to_use=fusion_params.max_sm_to_use,
-            launch_with_pdl=pdl_enabled(),
         )
 
     raise ValueError(
@@ -328,7 +325,6 @@ def fused_reduce_scatter(
             fp32_acc=fusion_params.fp32_acc,
             block_quant_fp8=fusion_params.block_quant_fp8,
             max_token_num=fusion_params.max_token_num or tensor.shape[0],
-            launch_with_pdl=pdl_enabled(),
         )
 
     raise ValueError(
@@ -365,7 +361,6 @@ def fused_all_gather(
             or max(tensor.shape[0], fusion_params.total_num_tokens),
             fp32_acc=fusion_params.fp32_acc,
             block_quant_fp8=fusion_params.block_quant_fp8,
-            launch_with_pdl=pdl_enabled(),
         )
 
     raise ValueError(
@@ -410,3 +405,54 @@ def token_reduce_scatter(
     if backend is None:
         backend = get_global_backend()
     return backend.token_reduce_scatter(tensor, group, scattered_num_tokens)
+
+
+def pp_send(
+    tensor: torch.Tensor,
+    dst_group_index: int,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> None:
+    """Send a tensor to another pipeline stage (P2P over the PP group).
+
+    Args:
+        tensor: Contiguous device tensor to send.
+        dst_group_index: Destination position within ``group`` (the PP rank of
+            the receiving stage), not a global rank.
+        group: The PP group (one rank per stage, same intra-stage position).
+        backend: Communication backend; defaults to the global backend.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    backend.send(tensor.contiguous(), dst_group_index, group)
+
+
+def pp_recv(
+    size: torch.Size | tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    src_group_index: int,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> torch.Tensor:
+    """Receive a tensor from another pipeline stage (P2P over the PP group).
+
+    The shape/dtype are supplied by the caller: every PP rank runs the same
+    deterministic scheduler, so the receiver derives the payload geometry from
+    its own forward op without a metadata exchange.
+
+    Args:
+        size: Shape of the incoming tensor.
+        dtype: Element type of the incoming tensor.
+        device: Device to allocate the receive buffer on.
+        src_group_index: Source position within ``group`` (the PP rank of the
+            sending stage), not a global rank.
+        group: The PP group (one rank per stage, same intra-stage position).
+        backend: Communication backend; defaults to the global backend.
+
+    Returns:
+        The received tensor.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.recv(torch.Size(size), dtype, device, src_group_index, group)

@@ -286,7 +286,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self, registration: KVArgsRegisterInfo
     ) -> KVArgsRegisterInfo:
         """Validate and cache the route owned by this Prefill rank once."""
-        layout = self.kv_args.cache_layout
+        # Plan against the LOGICAL layout (full model): peer validation and
+        # fragment geometry must match what Decode sees on the wire. The
+        # window filter below keeps only fields this stage's physical arena
+        # actually holds, so local addressing never touches a dropped plane.
+        layout = getattr(self.kv_args, "wire_layout", None) or self.kv_args.cache_layout
         peer_layout = registration.peer_cache_layout
         prefill_tp_size = self.topology.tp_size
         local_tp_rank = self.topology.tp_rank
@@ -295,6 +299,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             decode_tp_size=registration.decode_tp_size,
             prefill_layout=layout,
             decode_layout=peer_layout,
+            # PP: this stage transfers only its own layers' fields; the other
+            # stages run their own planners over their windows, and the union
+            # covers the whole plan on the Decode side.
+            prefill_layer_window=getattr(self.kv_args, "pp_layer_window", None),
         )
         route = planner.plan_for_decode_rank(registration.decode_tp_rank)
         expected_decode_ranks = planner.decode_ranks_by_prefill_rank[local_tp_rank]
@@ -620,11 +628,26 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 registration.dst_port,
                 req.room,
                 TransferPoll.Success,
-                self.topology.tp_rank,
+                self._status_prefill_rank,
                 bootstrap_token=bootstrap_token,
                 spec_candidate_ids=spec_candidate_ids,
             )
         return True
+
+    @property
+    def _status_prefill_rank(self) -> int:
+        """This rank's identity in Decode's completion-tracking rank space.
+
+        Without PP this is the intra-DP TP rank. With the prefill chunk
+        pipeline every stage sends its own layers' KV, so Decode must count
+        completions from pp*tp distinct sources: stage-major
+        ``pp_rank * tp_size + tp_rank`` keeps the space dense and collision
+        free.
+        """
+        pp_rank = getattr(self.topology, "pp_rank", 0)
+        if pp_rank == 0:
+            return self.topology.tp_rank
+        return pp_rank * self.topology.tp_size + self.topology.tp_rank
 
     def sync_status_to_decode_endpoint(
         self,
@@ -693,7 +716,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                         dst_port,
                         req.room,
                         TransferPoll.Failed,
-                        self.topology.tp_rank,
+                        self._status_prefill_rank,
                     )
                 except Exception:
                     logger.exception(
@@ -796,7 +819,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                         registration.dst_port,
                         req.room,
                         TransferPoll.Success,
-                        self.topology.tp_rank,
+                        self._status_prefill_rank,
                         bootstrap_token=bootstrap_token,
                         spec_candidate_ids=spec_candidate_ids,
                     )
@@ -872,7 +895,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     registration.dst_port,
                     parsed_room,
                     TransferPoll.Failed,
-                    self.topology.tp_rank,
+                    self._status_prefill_rank,
                 )
                 return
             if transfer_info.block_manifest is not None:
@@ -926,7 +949,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     dst_port,
                     parsed_room,
                     TransferPoll.Failed,
-                    self.topology.tp_rank,
+                    self._status_prefill_rank,
                 )
             except Exception:
                 logger.exception(
@@ -946,7 +969,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 registration.dst_port,
                 parsed_room,
                 TransferPoll.Failed,
-                self.topology.tp_rank,
+                self._status_prefill_rank,
             )
             return
         complete = len(candidate_infos) == expected_fanout
@@ -1055,14 +1078,23 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
         bootstrap_server_url = f"{ip_address}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
+        pp_layer_partition = getattr(self.topology, "pp_layer_partition", None)
         payload = {
             "role": "Prefill",
             "world_size": self.topology.world_size,
             "dp_size": self.topology.dp_size,
+            "pp_size": self.topology.pp_size,
+            "pp_layer_partition": (
+                list(pp_layer_partition) if pp_layer_partition else None
+            ),
             "rank_ip": get_local_ip_by_remote(),
             "rank_port": self.rank_port,
             "engine_rank": self.topology.global_rank,
-            "cache_layout": self.kv_args.cache_layout.to_wire_bytes().decode("ascii"),
+            "cache_layout": (
+                getattr(self.kv_args, "wire_layout", None) or self.kv_args.cache_layout
+            )
+            .to_wire_bytes()
+            .decode("ascii"),
         }
 
         try:

@@ -25,6 +25,7 @@ from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import (
@@ -80,10 +81,38 @@ if platform.is_hopper_plus:
     try:
         from flashinfer.gemm import (
             gemm_fp8_nt_groupwise,
-            tinygemm_bf16,
         )
+        from flashinfer.gemm import tinygemm_bf16 as _tinygemm_bf16
     except ImportError:
         pass
+    else:
+
+        def tinygemm_bf16(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            out: torch.Tensor,
+            bias: torch.Tensor | None = None,
+            use_pdl: bool | None = None,
+        ) -> None:
+            """Run FlashInfer tiny GEMM using the platform PDL default.
+
+            Args:
+                input: Contiguous BF16 input matrix.
+                weight: Contiguous BF16 weight matrix.
+                out: Preallocated contiguous BF16 output matrix.
+                bias: Optional contiguous BF16 bias.
+                use_pdl: Whether to use PDL. Uses the platform default when omitted.
+
+            Returns:
+                None; ``out`` is updated in place.
+            """
+            _tinygemm_bf16(
+                input,
+                weight,
+                out,
+                bias,
+                use_pdl=pdl_enabled() if use_pdl is None else use_pdl,
+            )
 
 
 def has_flashinfer_fp8_blockscale() -> bool:
@@ -314,6 +343,7 @@ if mm_mxfp8 is not error_fn:
             "k_align_32": frozenset({True}),
             "n_min_128": frozenset({True}),
             "k_min_128": frozenset({True}),
+            "pdl_enabled": frozenset({True}),
         },
         priority=Priority.SPECIALIZED + 2,
     )

@@ -44,6 +44,12 @@ def test_capture_tensor_matches_post_layer_attnres_reference():
     model = SimpleNamespace(
         embed_tokens=lambda input_ids: input_ids.to(torch.bfloat16).unsqueeze(-1),
         config=SimpleNamespace(num_hidden_layers=4, attn_res_block_size=2),
+        # Single-stage pipeline window: the forward walks
+        # [pp_start_layer, pp_end_layer) and only the last stage applies
+        # the output AttnRes fold.
+        pp_start_layer=0,
+        pp_end_layer=4,
+        mapping=SimpleNamespace(is_last_pp_rank=True),
         layers=[
             FakeLayer(torch.tensor([[1.0], [2.0]], dtype=torch.bfloat16)),
             FakeLayer(torch.tensor([[3.0], [4.0]], dtype=torch.bfloat16)),
