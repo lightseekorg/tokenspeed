@@ -500,9 +500,9 @@ void resolveWorkspace(int batchSize, int vocabSize, void* workspace,
 // (e.g. by the fused kernel's unifiedInitKernel).
 template <typename T>
 void launchRadixOnly(Counter<T>* counters, HisT<T>* histograms, IdxT* countHistograms,
-                     T* buf1, T* buf2, int batchSize, int vocabSize,
-                     cudaStream_t stream) {
-    auto launchPDL = [&](auto kernel, dim3 grid, dim3 block, size_t smem, auto... args) {
+                      T* buf1, T* buf2, int batchSize, int vocabSize,
+                      cudaStream_t stream, bool enablePDL) {
+    auto launch = [&](auto kernel, dim3 grid, dim3 block, size_t smem, auto... args) {
         cudaLaunchAttribute attr[1];
         attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
         attr[0].val.programmaticStreamSerializationAllowed = 1;
@@ -511,8 +511,8 @@ void launchRadixOnly(Counter<T>* counters, HisT<T>* histograms, IdxT* countHisto
         config.blockDim = block;
         config.dynamicSmemBytes = smem;
         config.stream = stream;
-        config.attrs = attr;
-        config.numAttrs = 1;
+        config.attrs = enablePDL ? attr : nullptr;
+        config.numAttrs = enablePDL ? 1 : 0;
         cudaLaunchKernelEx(&config, kernel, args...);
     };
 
@@ -523,15 +523,15 @@ void launchRadixOnly(Counter<T>* counters, HisT<T>* histograms, IdxT* countHisto
     dim3 grid(blockNum, batchSize);
     constexpr int numPasses = NUM_PASSES<T>;
     for (int pass = 0; pass < numPasses; ++pass) {
-        launchPDL(AirTopPRadixKernel<T>, grid, dim3(BLOCK_SIZE), 0, counters, histograms,
-                  countHistograms, pass, buf1, buf2);
+        launch(AirTopPRadixKernel<T>, grid, dim3(BLOCK_SIZE), 0, counters, histograms,
+               countHistograms, pass, buf1, buf2);
     }
 }
 
 template <typename T>
 void launch(T const* probs, float const* topPArr, int32_t const* topKArr, int32_t maxTopK,
             int batchSize, int vocabSize, void* workspace, Counter<T>*& outCounters,
-            cudaStream_t stream) {
+            cudaStream_t stream, bool enablePDL) {
     auto align256 = [](size_t x) { return ((x + 255) / 256) * 256; };
     IdxT const bufLen = calcBufLen<T>(vocabSize);
     size_t countersSize = align256(sizeof(Counter<T>) * batchSize);
@@ -548,7 +548,7 @@ void launch(T const* probs, float const* topPArr, int32_t const* topKArr, int32_
 
     outCounters = counters;
 
-    auto launchPDL = [&](auto kernel, dim3 grid, dim3 block, size_t smem, auto... args) {
+    auto launch = [&](auto kernel, dim3 grid, dim3 block, size_t smem, auto... args) {
         cudaLaunchAttribute attr[1];
         attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
         attr[0].val.programmaticStreamSerializationAllowed = 1;
@@ -557,13 +557,13 @@ void launch(T const* probs, float const* topPArr, int32_t const* topKArr, int32_
         config.blockDim = block;
         config.dynamicSmemBytes = smem;
         config.stream = stream;
-        config.attrs = attr;
-        config.numAttrs = 1;
+        config.attrs = enablePDL ? attr : nullptr;
+        config.numAttrs = enablePDL ? 1 : 0;
         cudaLaunchKernelEx(&config, kernel, args...);
     };
 
-    launchPDL(AirTopPInitKernel<T>, dim3(batchSize), dim3(256), 0, counters, vocabSize, probs,
-              topPArr, topKArr, maxTopK, histograms, countHistograms);
+    launch(AirTopPInitKernel<T>, dim3(batchSize), dim3(256), 0, counters, vocabSize, probs,
+           topPArr, topKArr, maxTopK, histograms, countHistograms);
 
     int dev = 0, smCnt = 0;
     cudaGetDevice(&dev);
@@ -572,8 +572,8 @@ void launch(T const* probs, float const* topPArr, int32_t const* topKArr, int32_
     dim3 grid(blockNum, batchSize);
     constexpr int numPasses = NUM_PASSES<T>;
     for (int pass = 0; pass < numPasses; ++pass) {
-        launchPDL(AirTopPRadixKernel<T>, grid, dim3(BLOCK_SIZE), 0, counters, histograms,
-                  countHistograms, pass, buf1, buf2);
+        launch(AirTopPRadixKernel<T>, grid, dim3(BLOCK_SIZE), 0, counters, histograms,
+               countHistograms, pass, buf1, buf2);
     }
 }
 

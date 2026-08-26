@@ -39,9 +39,9 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils.distributed import atomicAdd
 from cutlass.utils.hardware_info import HardwareInfo
 from cutlass.utils.smem_allocator import SmemAllocator
+from tokenspeed_kernel.platform import pdl_enabled
 
 from ..utils import (
-    TRTLLM_ENABLE_PDL,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
 )
@@ -622,5 +622,5 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
                 else None
             ),
             stream=stream,
-            use_pdl=TRTLLM_ENABLE_PDL,
+            use_pdl=pdl_enabled(),
         )

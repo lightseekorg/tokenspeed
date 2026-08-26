@@ -132,9 +132,10 @@ struct FwdRunner {
                          int pack_factor = 1,
                          int q_stride_n_original = 0,
                          int q_stride_h_original = 0,
-                         int h_r_original = 0,
-                         PackGQAUnpackParams pack_gqa = {},
-                         int num_ctas = 0) {
+                          int h_r_original = 0,
+                          PackGQAUnpackParams pack_gqa = {},
+                          int num_ctas = 0,
+                          bool enable_pdl = false) {
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.sm_count = (num_ctas > 0)
@@ -283,7 +284,7 @@ struct FwdRunner {
       }
       GPUTraceParam _gt_param;
       gpu_trace::setup_from_env(_gt_param, stream);
-      status = op.run(stream);
+      status = op.run(stream, enable_pdl);
       if (status != cutlass::Status::kSuccess) {
         cudaError_t err = cudaGetLastError();
         std::cerr << "Failed to launch the CUTLASS kernel. Last CUDA error is: "
@@ -400,7 +401,7 @@ struct FwdRunner {
       }
       GPUTraceParam _gt_param;
       gpu_trace::setup_from_env(_gt_param, stream);
-      status = op.run(stream);
+      status = op.run(stream, enable_pdl);
       if (status != cutlass::Status::kSuccess) {
         cudaError_t err = cudaGetLastError();
         std::cerr << "Failed to launch the CUTLASS kernel. Last CUDA error is: "
@@ -451,9 +452,10 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
                          int pack_factor = 1,
                          int q_stride_n_original = 0,
                          int q_stride_h_original = 0,
-                         int h_r_original = 0,
-                         PackGQAUnpackParams pack_gqa = {},
-                         int num_ctas = 0) {
+                          int h_r_original = 0,
+                          PackGQAUnpackParams pack_gqa = {},
+                          int num_ctas = 0,
+                          bool enable_pdl = false) {
   return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask,
                    ThreadShape, IsSplitKV, SingleSoftmaxWarpGroup, KVPageSize, kSparseAttnMode>::run(
       workspace_buffer, q, k, v, qo_segment_lens, kv_segment_lens,
@@ -469,7 +471,7 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
       max_score_stride_t, max_score_stride_h, max_score_stride_k,
       kv_block_indexes, kv_block_num,
       pack_factor, q_stride_n_original, q_stride_h_original, h_r_original,
-      pack_gqa, num_ctas);
+      pack_gqa, num_ctas, enable_pdl);
 }
 
 };  // namespace flashinfer

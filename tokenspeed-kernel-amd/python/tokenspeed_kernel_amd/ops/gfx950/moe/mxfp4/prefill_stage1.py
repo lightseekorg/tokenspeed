@@ -220,6 +220,29 @@ def _compute_mxfp4_group(cur_a, a_scale, cur_b, b_scale, acc):
 
 
 @gluon.jit
+def _apply_gate_activation(
+    gate,
+    up,
+    DO_SITU: gl.constexpr,
+    ALPHA: gl.constexpr,
+    LIMIT: gl.constexpr,
+    BETA: gl.constexpr,
+    LINEAR_BETA: gl.constexpr,
+):
+    if DO_SITU:
+        gate = gate.to(gl.bfloat16).to(gl.float32)
+        up = up.to(gl.bfloat16).to(gl.float32)
+        gate = ALPHA * gl.extra.libdevice.tanh(gate / ALPHA) / (1.0 + gl.exp(-gate))
+        up = LINEAR_BETA * gl.extra.libdevice.tanh(up / LINEAR_BETA)
+        return gate * up
+    if LIMIT > 0.0:
+        gate = gl.minimum(gate, LIMIT)
+        up = gl.minimum(gl.maximum(up, -LIMIT), LIMIT)
+    silu = gate / (1.0 + gl.exp(-(ALPHA * gate)))
+    return gl.fma(silu, up, silu * BETA)
+
+
+@gluon.jit
 def _store_swiglu_tile_group(
     acc_swiglu,
     c_ptr,
@@ -303,6 +326,8 @@ def gluon_mxfp4_moe_stage1_kernel(
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
     SWIGLU_BETA: gl.constexpr,
+    DO_SITU: gl.constexpr,
+    SITU_LINEAR_BETA: gl.constexpr,
 ):
     """Stage 1 kernel: per-token A gather + 4-deep A LDS ring + 4-deep
     A_scale LDS ring + per-quarter MFMA K-loop with fused SwiGLU.
@@ -1325,45 +1350,42 @@ def gluon_mxfp4_moe_stage1_kernel(
         up_acc_group3,
     )
 
-    # ---- SwiGLU epilogue ------------------------------------------------
-    # Per-quarter SwiGLU.  The historical path is plain
-    # ``silu(gate) * up`` and is represented by
-    # ``alpha=1, limit=0, beta=0``.  Kimi uses the parameterized
-    # form ``gate * sigmoid(alpha * gate) * (clamp(up) + beta)`` with
-    # optional gate/up clamping.
-    # ``gl.sigmoid`` is not in the Gluon language module today, so we
-    # build sigmoid from ``gl.exp``. Each quarter's fp32 result casts to
-    # bf16 inside ``_store_swiglu_tile_group`` and lands at
-    # ``dst_row = token_id * top_k + topk_id`` decoded from the
-    # bit-packed ``sorted_token_ids[m]``; padding rows are mask-rejected.
-    if SWIGLU_LIMIT > 0.0:
-        gate_acc_group0 = gl.minimum(gate_acc_group0, SWIGLU_LIMIT)
-        gate_acc_group1 = gl.minimum(gate_acc_group1, SWIGLU_LIMIT)
-        gate_acc_group2 = gl.minimum(gate_acc_group2, SWIGLU_LIMIT)
-        gate_acc_group3 = gl.minimum(gate_acc_group3, SWIGLU_LIMIT)
-        up_acc_group0 = gl.minimum(
-            gl.maximum(up_acc_group0, -SWIGLU_LIMIT), SWIGLU_LIMIT
-        )
-        up_acc_group1 = gl.minimum(
-            gl.maximum(up_acc_group1, -SWIGLU_LIMIT), SWIGLU_LIMIT
-        )
-        up_acc_group2 = gl.minimum(
-            gl.maximum(up_acc_group2, -SWIGLU_LIMIT), SWIGLU_LIMIT
-        )
-        up_acc_group3 = gl.minimum(
-            gl.maximum(up_acc_group3, -SWIGLU_LIMIT), SWIGLU_LIMIT
-        )
-    # Match the reference exact floating-point grouping.  Computing a reciprocal
-    # first and then multiplying by ``gate`` is algebraically equivalent but
-    # changes sparse near-zero BF16 results by one ULP after the final cast.
-    silu_g0 = gate_acc_group0 / (1.0 + gl.exp(-(SWIGLU_ALPHA * gate_acc_group0)))
-    acc_swiglu_group0 = gl.fma(silu_g0, up_acc_group0, silu_g0 * SWIGLU_BETA)
-    silu_g1 = gate_acc_group1 / (1.0 + gl.exp(-(SWIGLU_ALPHA * gate_acc_group1)))
-    acc_swiglu_group1 = gl.fma(silu_g1, up_acc_group1, silu_g1 * SWIGLU_BETA)
-    silu_g2 = gate_acc_group2 / (1.0 + gl.exp(-(SWIGLU_ALPHA * gate_acc_group2)))
-    acc_swiglu_group2 = gl.fma(silu_g2, up_acc_group2, silu_g2 * SWIGLU_BETA)
-    silu_g3 = gate_acc_group3 / (1.0 + gl.exp(-(SWIGLU_ALPHA * gate_acc_group3)))
-    acc_swiglu_group3 = gl.fma(silu_g3, up_acc_group3, silu_g3 * SWIGLU_BETA)
+    acc_swiglu_group0 = _apply_gate_activation(
+        gate_acc_group0,
+        up_acc_group0,
+        DO_SITU,
+        SWIGLU_ALPHA,
+        SWIGLU_LIMIT,
+        SWIGLU_BETA,
+        SITU_LINEAR_BETA,
+    )
+    acc_swiglu_group1 = _apply_gate_activation(
+        gate_acc_group1,
+        up_acc_group1,
+        DO_SITU,
+        SWIGLU_ALPHA,
+        SWIGLU_LIMIT,
+        SWIGLU_BETA,
+        SITU_LINEAR_BETA,
+    )
+    acc_swiglu_group2 = _apply_gate_activation(
+        gate_acc_group2,
+        up_acc_group2,
+        DO_SITU,
+        SWIGLU_ALPHA,
+        SWIGLU_LIMIT,
+        SWIGLU_BETA,
+        SITU_LINEAR_BETA,
+    )
+    acc_swiglu_group3 = _apply_gate_activation(
+        gate_acc_group3,
+        up_acc_group3,
+        DO_SITU,
+        SWIGLU_ALPHA,
+        SWIGLU_LIMIT,
+        SWIGLU_BETA,
+        SITU_LINEAR_BETA,
+    )
 
     _store_swiglu_tile_group(
         acc_swiglu_group0,
@@ -1463,13 +1485,17 @@ def invoke_gluon_mxfp4_moe_stage1(
     swiglu_alpha: float = 1.0,
     swiglu_limit: float = 0.0,
     swiglu_beta: float = 0.0,
+    situ_linear_beta: float | None = None,
 ):
     """Host-side launcher for Gluon MXFP4 MoE stage 1.
 
-    Computes, for each expert ``e``::
+    Computes, for each expert ``e``, the default SwiGLU expression::
 
         inter_e = silu(hidden_states_e @ w1_e[:I_r, :].T)
                   * (hidden_states_e @ w1_e[I_r:, :].T)
+
+    When ``situ_linear_beta`` is provided, the same GEMM body instead uses the
+    SiTU-v2 epilogue.
 
     in one kernel launch over all experts. The grid is one CTA per
     (M-tile, N-tile); each CTA owns one ``BLOCK_M`` x ``BLOCK_N``
@@ -1668,6 +1694,8 @@ def invoke_gluon_mxfp4_moe_stage1(
         SWIGLU_ALPHA=float(swiglu_alpha),
         SWIGLU_LIMIT=float(swiglu_limit),
         SWIGLU_BETA=float(swiglu_beta),
+        DO_SITU=situ_linear_beta is not None,
+        SITU_LINEAR_BETA=(1.0 if situ_linear_beta is None else float(situ_linear_beta)),
         num_warps=NUM_WARPS,
     )
     return out

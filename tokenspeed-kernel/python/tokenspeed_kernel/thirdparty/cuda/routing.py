@@ -24,6 +24,7 @@ import functools
 from pathlib import Path
 
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 @functools.cache
@@ -48,7 +49,9 @@ def routing_flash(
     num_experts_real: int,
     scaling_factor: float,
     renorm: bool = False,
+    enable_pdl: bool | None = None,
 ) -> None:
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     _load_routing_module().softmax_topk_flash(
         input,
         correction_bias,
@@ -57,6 +60,7 @@ def routing_flash(
         int(num_experts_real),
         float(scaling_factor),
         bool(renorm),
+        bool(enable_pdl),
     )
 
 

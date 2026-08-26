@@ -19,7 +19,6 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from .primitives import (
     NUM_LAMPORT_BUFFERS,
     PACKED_BYTES,
-    PDL_ENABLED,
     VEC_BF16,
     bf16x8_to_packed_u32x4,
     block_sum_specialized,
@@ -30,6 +29,7 @@ from .primitives import (
     load_volatile_u32,
     map_shared_to_peer,
     packed_u32x4_to_bf16x8,
+    pdl_enabled,
     red_async_release_gpu_add_u32,
     sanitize_negative_zero,
     store_global_u32x4,
@@ -112,9 +112,9 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
     ):
         # Bind in host Python; the JIT resolves names from self, not module globals.
         if use_pdl is None:
-            self.use_pdl = PDL_ENABLED
+            self.use_pdl = pdl_enabled()
         else:
-            self.use_pdl = use_pdl and PDL_ENABLED
+            self.use_pdl = use_pdl
         validate_shape(
             tp_size=tp_size,
             latent_dim=latent_dim,

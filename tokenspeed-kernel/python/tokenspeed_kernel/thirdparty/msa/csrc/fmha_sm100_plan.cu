@@ -32,7 +32,8 @@ void fmha_sm100_plan_forward(
     int64_t stream_ptr,
     Optional<TensorView> maybe_workspace_lse,
     int64_t lse_total_size,
-    int64_t pack_factor) {
+    int64_t pack_factor,
+    bool enable_pdl) {
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
   int batch_size = qo_segment_lens.size(0);
 
@@ -56,7 +57,7 @@ void fmha_sm100_plan_forward(
                                        : nullptr;
   float* workspace_lse_ptr = maybe_workspace_lse.has_value()
                                  ? static_cast<float*>(maybe_workspace_lse.value().data_ptr())
-                                 : nullptr;
+                                  : nullptr;
 
   auto status = flashinfer::plan_kernel_wrapper(
       static_cast<int*>(qo_segment_offsets.data_ptr()),
@@ -66,7 +67,7 @@ void fmha_sm100_plan_forward(
       static_cast<uint64_t*>(packed_work_info.data_ptr()),
       qo_tile_size, kv_tile_size, batch_size,
       num_heads, num_buckets, causal, qo_offsets_ptr,
-      /*enable_pdl=*/true, stream,
+      enable_pdl, stream,
       num_kv_splits, kv_tile_begin_ptr, kv_tile_end_ptr, kv_split_ptr,
       adaptive_chunk_size, out_max_sm_cost_ptr,
       num_kv_splits_per_row_ptr,

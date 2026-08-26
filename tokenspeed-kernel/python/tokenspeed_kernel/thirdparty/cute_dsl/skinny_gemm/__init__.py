@@ -8,12 +8,12 @@
 
 from __future__ import annotations
 
-import os
 import threading
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 
 MAX_M = 16
 
@@ -80,9 +80,7 @@ class ShapeDynamicSkinnyGemm:
 
     @staticmethod
     def _use_pdl(device: torch.device) -> bool:
-        if os.environ.get("TOKENSPEED_DISABLE_PDL") == "1":
-            return False
-        return torch.cuda.get_device_capability(device)[0] >= 9
+        return torch.cuda.get_device_capability(device)[0] >= 9 and pdl_enabled()
 
     def _compile(
         self,

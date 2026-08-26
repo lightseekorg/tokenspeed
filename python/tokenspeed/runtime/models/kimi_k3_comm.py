@@ -74,7 +74,6 @@ from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.layers.layernorm import RMSNorm, _get_process_group
 from tokenspeed.runtime.layers.moe.latent import kimi3_join_reduce_moe
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -403,7 +402,6 @@ class K3AttnComm:
                     group=_get_process_group(self.mapping.attn.tp_group),
                     eps=eps,
                     max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
-                    launch_with_pdl=pdl_enabled(),
                 )
                 return residual_out, h
             _, residual_out, *_ = self.state.dummy_norm.forward_with_allreduce_fusion(

@@ -36,7 +36,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
 
@@ -200,7 +199,6 @@ class MHATokenToKVPool(CachePool):
             self._layer_row_view(self.k_buffer[layer_id], layer_id),
             self._layer_row_view(self.v_buffer[layer_id], layer_id),
             loc,
-            enable_pdl=pdl_enabled(),
         )
 
 
@@ -294,7 +292,6 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             self._layer_row_view(self.k_buffer[layer_id], layer_id).view(torch.uint8),
             self._layer_row_view(self.v_buffer[layer_id], layer_id).view(torch.uint8),
             loc,
-            enable_pdl=pdl_enabled(),
         )
         if self._layer_kv_head_counts is not None:
             page_tokens = self._layer_page_tokens(layer_id)
@@ -303,22 +300,16 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
                 self.k_scale_buffer[layer_id],
                 loc,
                 page_size=page_tokens,
-                enable_pdl=pdl_enabled(),
             )
             store_sf_interleaved(
                 v_scale,
                 self.v_scale_buffer[layer_id],
                 loc,
                 page_size=page_tokens,
-                enable_pdl=pdl_enabled(),
             )
         elif self.arena.kv_page_size == MXFP8_KV_SCALE_TILE_TOKENS:
-            store_sf_interleaved(
-                k_scale, self.k_scale_buffer[layer_id], loc, enable_pdl=pdl_enabled()
-            )
-            store_sf_interleaved(
-                v_scale, self.v_scale_buffer[layer_id], loc, enable_pdl=pdl_enabled()
-            )
+            store_sf_interleaved(k_scale, self.k_scale_buffer[layer_id], loc)
+            store_sf_interleaved(v_scale, self.v_scale_buffer[layer_id], loc)
         else:
             self.k_scale_buffer[layer_id][loc] = k_scale
             self.v_scale_buffer[layer_id][loc] = v_scale
@@ -358,7 +349,6 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             self.v_scale_buffer[layer_id],
             loc,
             page_tokens=page_tokens,
-            enable_pdl=pdl_enabled(),
         )
         return True
 

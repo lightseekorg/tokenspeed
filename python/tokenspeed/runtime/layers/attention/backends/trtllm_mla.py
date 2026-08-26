@@ -57,7 +57,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import envs
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -741,7 +740,6 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             window_left=-1,
             cum_seq_lens_q=cum_seq_lens_q,
             cum_seq_lens_kv=cum_seq_lens_kv,
-            enable_pdl=pdl_enabled(),
             is_causal=causal,
             return_lse=True,
             out=out,
