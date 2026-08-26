@@ -33,4 +33,5 @@ void run_attn_res_fwd_online_v2(
     int block_stride_r,
     float rms_eps,
     int num_sm,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    bool enable_pdl);

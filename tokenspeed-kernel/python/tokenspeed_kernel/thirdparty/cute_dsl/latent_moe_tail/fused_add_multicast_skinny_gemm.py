@@ -15,11 +15,11 @@ from cutlass import BFloat16, Float32, Int64, const_expr
 from cutlass.cute.runtime import from_dlpack
 
 from .primitives import (
-    PDL_ENABLED,
     CUDAGraphCompatibleWrapper,
     bf16x2_to_u32,
     bf16x4_to_packed_u32x2,
     bf16x8_to_packed_u32x4,
+    pdl_enabled,
     sanitize_negative_zero,
     sanitize_negative_zero_u32,
     sanitize_negative_zero_u32x2,
@@ -75,7 +75,7 @@ class FusedAddMulticastSkinnyGemm:
         config: SkinnyConfig,
     ) -> None:
         # Bind in host Python; the JIT resolves names from self, not module globals.
-        self.use_pdl = PDL_ENABLED
+        self.use_pdl = pdl_enabled()
         if config.block_size % 32:
             raise ValueError("skinny block_size must be a multiple of 32")
         self.num_rows = num_rows

@@ -60,7 +60,6 @@ from tokenspeed.runtime.layers.attention.registry import (
 )
 from tokenspeed.runtime.layers.attention.utils import build_page_table
 from tokenspeed.runtime.utils.common import ceil_div
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -578,7 +577,6 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
             k_scale=layer.k_scale if self.is_fp8 else None,
             v_scale=layer.v_scale if self.is_fp8 else None,
             score_out=metadata.score_out,
-            enable_pdl=pdl_enabled(),
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -690,7 +688,6 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 k_scale=layer.k_scale,
                 v_scale=layer.v_scale,
                 page_size=self.kernel_page_size,
-                enable_pdl=pdl_enabled(),
             )
         else:
             token_to_kv_pool.set_kv_buffer(

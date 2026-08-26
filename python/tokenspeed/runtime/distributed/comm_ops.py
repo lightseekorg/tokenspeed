@@ -59,7 +59,6 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (  # no
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 def _get_process_group(group: Group):
@@ -192,7 +191,6 @@ def all_reduce_latent_norm(
         group=process_group,
         eps=eps,
         max_token_num=max_token_num,
-        launch_with_pdl=pdl_enabled(),
         trigger_completion_at_end=True,
     )
 
@@ -294,7 +292,6 @@ def fused_all_reduce(
             has_partial_norm_out=fusion_params.has_partial_norm_out,
             trigger_completion_at_end=fusion_params.trigger_completion_at_end,
             max_sm_to_use=fusion_params.max_sm_to_use,
-            launch_with_pdl=pdl_enabled(),
         )
 
     raise ValueError(
@@ -328,7 +325,6 @@ def fused_reduce_scatter(
             fp32_acc=fusion_params.fp32_acc,
             block_quant_fp8=fusion_params.block_quant_fp8,
             max_token_num=fusion_params.max_token_num or tensor.shape[0],
-            launch_with_pdl=pdl_enabled(),
         )
 
     raise ValueError(
@@ -365,7 +361,6 @@ def fused_all_gather(
             or max(tensor.shape[0], fusion_params.total_num_tokens),
             fp32_acc=fusion_params.fp32_acc,
             block_quant_fp8=fusion_params.block_quant_fp8,
-            launch_with_pdl=pdl_enabled(),
         )
 
     raise ValueError(

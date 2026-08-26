@@ -27,18 +27,15 @@ from tokenspeed_kernel.ops.activation.triton import (
     add3,
 )
 from tokenspeed_kernel.ops.activation.triton import silu_and_mul as triton_silu_and_mul
-from tokenspeed_kernel.ops.activation.triton import (
-    situ_and_mul,
-)
+from tokenspeed_kernel.ops.activation.triton import situ_and_mul as triton_situ_and_mul
 from tokenspeed_kernel.ops.gemm import _fp8_linear_activation
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import error_fn
 
 
 def silu_and_mul(
     x: torch.Tensor,
     out: torch.Tensor | None = None,
-    enable_pdl: bool = False,
     limit: float | None = None,
 ) -> torch.Tensor:
     """Apply SwiGLU through the platform implementation.
@@ -51,8 +48,8 @@ def silu_and_mul(
         or current_platform().is_amd
         or flashinfer_silu_and_mul is error_fn
     ):
-        return triton_silu_and_mul(x, out, enable_pdl=enable_pdl, limit=limit)
-    return flashinfer_silu_and_mul(x, out, enable_pdl=enable_pdl)
+        return triton_silu_and_mul(x, out, enable_pdl=pdl_enabled(), limit=limit)
+    return flashinfer_silu_and_mul(x, out, enable_pdl=pdl_enabled())
 
 
 def prepare_fp8_linear_activation(
@@ -63,7 +60,6 @@ def prepare_fp8_linear_activation(
     limit: float | None = None,
     alpha: float = 1.0,
     beta: float = 0.0,
-    enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Prepare an activation for a compatible block-FP8 linear plan.
 
@@ -78,7 +74,6 @@ def prepare_fp8_linear_activation(
         limit: Optional activation clamp limit.
         alpha: Sigmoid multiplier for SwiGLU.
         beta: Value added to SwiGLU's up branch.
-        enable_pdl: Join a Programmatic Dependent Launch chain when supported.
 
     Returns:
         Prepared FP8 values and scales, or ``None`` when no fused contract is
@@ -91,7 +86,25 @@ def prepare_fp8_linear_activation(
         limit=limit,
         alpha=alpha,
         beta=beta,
-        enable_pdl=enable_pdl,
+        enable_pdl=pdl_enabled(),
+    )
+
+
+def situ_and_mul(
+    x: torch.Tensor,
+    out: torch.Tensor | None = None,
+    *,
+    beta: float = 1.0,
+    linear_beta: float | None = None,
+) -> torch.Tensor:
+    """Apply SiTU through the portable Triton implementation."""
+
+    return triton_situ_and_mul(
+        x,
+        out,
+        beta=beta,
+        linear_beta=linear_beta,
+        enable_pdl=pdl_enabled(),
     )
 
 

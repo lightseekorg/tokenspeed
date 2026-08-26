@@ -178,7 +178,6 @@ class RotaryEmbedding(torch.nn.Module):
         fused_mla_set_kv_buffer_arg: FusedMLASetKVBufferArg | None = None,
         output_q_rope: torch.Tensor | None = None,
         output_k_rope: torch.Tensor | None = None,
-        enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if offsets is not None:
             raise ValueError("embedding.rope does not support offsets")
@@ -193,7 +192,6 @@ class RotaryEmbedding(torch.nn.Module):
             fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
             q_rope_out=output_q_rope,
             k_rope_out=output_k_rope,
-            enable_pdl=enable_pdl,
         )
 
     def extra_repr(self) -> str:
@@ -679,7 +677,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         fused_mla_set_kv_buffer_arg=None,
         output_q_rope=None,
         offsets: torch.Tensor | None = None,
-        enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if offsets is None:
             return super().forward(
@@ -690,7 +687,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
                 fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
                 output_q_rope=output_q_rope,
                 offsets=offsets,
-                enable_pdl=enable_pdl,
             )
         if (
             fused_set_kv_buffer_arg is not None

@@ -21,6 +21,7 @@ __all__ = [
 
 import numpy as np
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 
 from .jit import (
     _PACK_FACTORS,
@@ -630,6 +631,7 @@ def _call_plan(
         workspace_lse,
         lse_total_size,
         pack_factor,
+        pdl_enabled(),
     )
 
 
@@ -1767,6 +1769,7 @@ def sparse_topk_select(
         int(force_end_blocks),
         layout_arg,
         torch.cuda.current_stream().cuda_stream,
+        pdl_enabled(),
     )
 
     return output_indices

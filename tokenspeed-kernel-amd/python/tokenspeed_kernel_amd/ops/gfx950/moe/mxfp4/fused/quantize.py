@@ -513,6 +513,33 @@ def _fp8_quantize_kernel(
     tl.store(out_ptr + out_off, x_fp8, mask=load_mask)
 
 
+@triton.jit
+def _dynamic_fp8_quantize_kernel(x_ptr, out_ptr, scale_ptr, N: tl.constexpr):
+    block: tl.constexpr = triton.next_power_of_2(N)
+    offsets = tl.arange(0, block)
+    mask = offsets < N
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x)), 1.0e-12)
+    scale = amax / 448.0
+    tl.store(scale_ptr, scale)
+    tl.store(out_ptr + offsets, (x / scale).to(tl.float8e4nv), mask=mask)
+
+
+def _dynamic_fp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if not x.is_contiguous():
+        x = x.contiguous()
+    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(1, dtype=torch.float32, device=x.device)
+    _dynamic_fp8_quantize_kernel[(1,)](
+        x,
+        out,
+        scale,
+        N=x.numel(),
+        num_warps=8,
+    )
+    return out, scale
+
+
 def _flatten_to_2d(x: torch.Tensor):
     assert x.stride(-1) == 1, f"expected stride-1 inner dim, got stride={x.stride(-1)}"
     N = x.shape[-1]

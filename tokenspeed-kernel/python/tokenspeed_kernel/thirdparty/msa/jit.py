@@ -10,6 +10,7 @@ To recompile after kernel changes: scripts/clear_fmha_cache.sh
 """
 
 import fcntl
+import hashlib
 import itertools
 import logging
 import os
@@ -60,6 +61,14 @@ def _release_file_lock(fd):
 # so that JIT compilation works from both editable and wheel installs.
 _PACKAGE_DIR = Path(__file__).resolve().parent
 _FMHA_VARLEN_DIR = _PACKAGE_DIR / "csrc"
+
+
+def _hash_sources(paths):
+    hasher = hashlib.sha256()
+    for path in paths:
+        hasher.update(path.name.encode())
+        hasher.update(path.read_bytes())
+    return hasher.hexdigest()[:16]
 
 
 # TokenSpeed patch: the upstream cutlass/ submodule is not vendored; resolve
@@ -248,7 +257,18 @@ def _get_cuda_home():
     raise RuntimeError("Cannot find CUDA toolkit. Set CUDA_HOME.")
 
 
-_ALL_VARIANTS_SO = CACHE_BASE / "_all_variants" / "all_variants.so"
+_VARIANT_SOURCE_HASH = _hash_sources(
+    (
+        _FMHA_VARLEN_DIR / "fmha_sm100_inst.jinja",
+        _FMHA_VARLEN_DIR / "fmha_sm100_variant_run.cu.jinja",
+        _FMHA_VARLEN_DIR / "fmha_sm100_params.h",
+        _FMHA_VARLEN_DIR / "include" / "fmha_cutlass_sm100.cuh",
+        _FMHA_VARLEN_DIR / "tvm_ffi_utils.h",
+    )
+)
+_ALL_VARIANTS_SO = (
+    CACHE_BASE / "_all_variants" / _VARIANT_SOURCE_HASH / "all_variants.so"
+)
 
 
 def _get_nvcc_flags(cache_dir, fmha=True):
@@ -374,7 +394,7 @@ class FMHAVariantManager:
                     pass
 
             # Try per-variant .so
-            cache_dir = CACHE_BASE / variant_name
+            cache_dir = CACHE_BASE / "variants" / _VARIANT_SOURCE_HASH / variant_name
             so_path = cache_dir / f"{variant_name}.so"
             lock_fd = _acquire_file_lock(cache_dir / ".compile.lock")
             try:
@@ -392,7 +412,7 @@ class FMHAVariantManager:
 
     def _compile_only(self, variant_name, params):
         """Compile a variant without loading. Safe to call from subprocesses."""
-        cache_dir = CACHE_BASE / variant_name
+        cache_dir = CACHE_BASE / "variants" / _VARIANT_SOURCE_HASH / variant_name
         so_path = cache_dir / f"{variant_name}.so"
 
         if so_path.exists():
@@ -488,9 +508,24 @@ _plan_module = None
 _plan_lock = threading.Lock()
 
 
+def _plan_cache_dir():
+    return (
+        CACHE_BASE
+        / "plan"
+        / _hash_sources(
+            (
+                _FMHA_VARLEN_DIR / "fmha_sm100_plan.cu",
+                _FMHA_VARLEN_DIR / "fmha_sm100_plan.h",
+                _FMHA_VARLEN_DIR / "include" / "plan.cuh",
+                _FMHA_VARLEN_DIR / "tvm_ffi_utils.h",
+            )
+        )
+    )
+
+
 def _do_compile_plan():
     """Generate and compile plan kernel. No TVM loading."""
-    cache_dir = CACHE_BASE / "plan"
+    cache_dir = _plan_cache_dir()
     so_path = cache_dir / "fmha_sm100_plan.so"
 
     if so_path.exists():
@@ -553,7 +588,7 @@ def _compile_plan_module():
         _do_compile_plan()
         import tvm_ffi
 
-        so_path = CACHE_BASE / "plan" / "fmha_sm100_plan.so"
+        so_path = _plan_cache_dir() / "fmha_sm100_plan.so"
         return tvm_ffi.load_module(str(so_path))
     finally:
         _release_file_lock(lock_fd)

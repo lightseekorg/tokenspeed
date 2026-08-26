@@ -47,10 +47,13 @@ def _is_cdna4_scale(scale: torch.Tensor) -> bool:
     return scale.ndim == 3 and scale.stride(-2) == 1 and int(scale.shape[1]) % 32 == 0
 
 
-def _make_gdot128_weight_alias(weight: torch.Tensor) -> torch.Tensor:
-    """Expose gdot128 weight storage with the ``(E, N, K/2)`` logical shape.
+def _make_gdot128_weight_alias(
+    weight: torch.Tensor, *, preserve_logical_k: bool
+) -> torch.Tensor:
+    """Expose gdot128 storage as ``(E, N, K/2)`` without copying it.
 
-    This is a metadata-only alias. The package kernels use the
+    ``preserve_logical_k`` drops physical K padding; stage 2 retains it because
+    its activation is padded with zeros to the same width. The package kernels use the
     ``is_gdot128_shuffled`` marker to apply gdot128 byte addressing instead of
     interpreting the storage as a 16x16 shuffle.
     """
@@ -58,11 +61,16 @@ def _make_gdot128_weight_alias(weight: torch.Tensor) -> torch.Tensor:
         getattr(weight, "is_shuffled_for_gluon_dot", False)
     ):
         raise ValueError("package prefill requires gdot128-preshuffled 3-D weights")
-    experts, k_packed, n_cols = map(int, weight.shape)
+    experts, k_packed_padded, n_cols = map(int, weight.shape)
+    k_packed = (
+        int(getattr(weight, "original_k_pk", k_packed_padded))
+        if preserve_logical_k
+        else k_packed_padded
+    )
     alias = torch.as_strided(
         weight,
         (experts, n_cols, k_packed),
-        (n_cols * k_packed, k_packed, 1),
+        (n_cols * k_packed_padded, k_packed, 1),
     )
     if hasattr(torch, "float4_e2m1fn_x2"):
         alias = alias.view(torch.float4_e2m1fn_x2)
@@ -71,7 +79,9 @@ def _make_gdot128_weight_alias(weight: torch.Tensor) -> torch.Tensor:
     return alias
 
 
-def _make_gdot128_scale_alias(scale: torch.Tensor) -> torch.Tensor:
+def _make_gdot128_scale_alias(
+    scale: torch.Tensor, *, logical_k_packed: int | None
+) -> torch.Tensor:
     """Expose CDNA4-swizzled scales with the ``(E, N, K/32)`` logical shape."""
     if scale.ndim != 3 or scale.stride(-2) != 1:
         raise ValueError("package prefill requires CDNA4-swizzled 3-D scales")
@@ -79,11 +89,12 @@ def _make_gdot128_scale_alias(scale: torch.Tensor) -> torch.Tensor:
     if scale_linear % 32 != 0:
         raise ValueError(f"invalid CDNA4 scale shape: {tuple(scale.shape)}")
     n_cols = n_blocks * 32
-    k_scale = scale_linear // 32
+    k_scale_padded = scale_linear // 32
+    k_scale = k_scale_padded if logical_k_packed is None else logical_k_packed // 16
     return torch.as_strided(
         scale,
         (experts, n_cols, k_scale),
-        (n_cols * k_scale, k_scale, 1),
+        (n_cols * k_scale_padded, k_scale, 1),
     )
 
 
@@ -120,7 +131,19 @@ def attach_prefill_aliases(
         and _is_cdna4_scale(w2_scale)
     ):
         return
-    w13.gluon_package_prefill_weight = _make_gdot128_weight_alias(w13)
-    w13.gluon_package_prefill_scale = _make_gdot128_scale_alias(w13_scale)
-    w2.gluon_package_prefill_weight = _make_gdot128_weight_alias(w2)
-    w2.gluon_package_prefill_scale = _make_gdot128_scale_alias(w2_scale)
+    w13.gluon_package_prefill_weight = _make_gdot128_weight_alias(
+        w13, preserve_logical_k=True
+    )
+    w13.gluon_package_prefill_scale = _make_gdot128_scale_alias(
+        w13_scale,
+        logical_k_packed=int(getattr(w13, "original_k_pk", w13.shape[1])),
+    )
+    # Stage 2 keeps its physical K padding. The activation is padded with zeros
+    # to the same width before the package down projection.
+    w2.gluon_package_prefill_weight = _make_gdot128_weight_alias(
+        w2, preserve_logical_k=False
+    )
+    w2.gluon_package_prefill_scale = _make_gdot128_scale_alias(
+        w2_scale,
+        logical_k_packed=None,
+    )

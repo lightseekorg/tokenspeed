@@ -66,7 +66,6 @@ from tokenspeed.runtime.models.utils import (
 )
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
 
@@ -108,7 +107,7 @@ class TinyGemmLinear(ReplicatedLinear):
             and x.dtype == torch.bfloat16
         ):
             out = x.new_empty((x.shape[0], self.output_size))
-            tinygemm_bf16(x, self.weight, out, self.bias, use_pdl=pdl_enabled())
+            tinygemm_bf16(x, self.weight, out, self.bias)
             return out, None
 
         return super().forward(x)
@@ -251,7 +250,6 @@ class GptOssAttention(nn.Module):
                 k,
                 fused_set_kv_buffer_arg=fused_kv_arg,
                 output_q_rope=q_rope,
-                enable_pdl=pdl_enabled(),
             )
             inner_state = q_rope, None, None
         else:
