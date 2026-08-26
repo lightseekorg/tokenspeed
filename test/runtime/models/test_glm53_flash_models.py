@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -24,6 +25,7 @@ from tokenspeed.runtime.models.glm53_flash import (
     Glm53FlashAttention,
     Glm53FlashForCausalLM,
     Glm53FlashForConditionalGeneration,
+    Glm53FlashIndexerOutput,
     Glm53FlashKDA,
     Glm53FlashMoE,
 )
@@ -165,6 +167,78 @@ def test_kpool_decode_forwards_configured_context_bound(monkeypatch) -> None:
     assert captured["kwargs"]["kv_page_size"] == 64
     assert captured["kwargs"]["out"].shape == (4, 2051)
     assert captured["kwargs"]["lens_out"].shape == (4,)
+
+
+@pytest.mark.parametrize(
+    ("decode_start", "num_decode_tokens", "expected_fill_value", "expected_fill"),
+    [
+        pytest.param(0, 4, None, False, id="full-decode"),
+        pytest.param(1, 2, -1, True, id="mixed-prefill"),
+    ],
+)
+def test_glm53_flash_decode_topk_skips_only_overwritten_workspace_fills(
+    decode_start: int,
+    num_decode_tokens: int,
+    expected_fill_value: int | None,
+    expected_fill: bool,
+) -> None:
+    attention = Glm53FlashAttention.__new__(Glm53FlashAttention)
+    attention.index_topk = 12
+    attention.index_kpool = 4
+    attention.indexer = SimpleNamespace(weights_softmax_scale=0.25)
+    attention.attn_mqa = SimpleNamespace(layer_id=3)
+    captured = {}
+    topk_indices = torch.empty((4, 15), dtype=torch.int32)
+    topk_lens = torch.empty(4, dtype=torch.int32)
+
+    def get_indices(_name, _rows, _width, _device, *, fill_value=-1):
+        captured["fill_value"] = fill_value
+        return topk_indices
+
+    def get_lens(_rows, _device, *, fill=True):
+        captured["fill"] = fill
+        return topk_lens
+
+    def select_decode(**kwargs):
+        captured["out"] = kwargs["out"]
+        captured["lens_out"] = kwargs["lens_out"]
+
+    attention._get_decode_topk_workspace = get_indices
+    attention._get_decode_topk_lens_workspace = get_lens
+    ctx = SimpleNamespace(
+        attn_backend=SimpleNamespace(
+            require_kpool_runtime=lambda: SimpleNamespace(
+                select_decode=select_decode,
+            )
+        )
+    )
+    indexer_output = Glm53FlashIndexerOutput(
+        query=torch.zeros((4, 1, 128), dtype=torch.bfloat16),
+        key=torch.empty(0),
+        weights=torch.zeros((4, 1), dtype=torch.bfloat16),
+        gate=torch.empty(0),
+    )
+
+    result = attention._compute_decode_topk_indices_portable(
+        indexer_output=indexer_output,
+        ctx=ctx,
+        seq_lens=torch.tensor([8], dtype=torch.int32),
+        page_table=torch.zeros((1, 1), dtype=torch.int32),
+        q_len_per_req=1,
+        decode_start=decode_start,
+        num_tokens=4,
+        num_decode_tokens=num_decode_tokens,
+        topk=12,
+    )
+
+    assert captured["fill_value"] == expected_fill_value
+    assert captured["fill"] is expected_fill
+    assert captured["out"] is topk_indices
+    assert captured["lens_out"] is topk_lens
+    assert result.topk_indices is topk_indices
+    assert result.topk_lens is topk_lens
+
+
 def _build_model(monkeypatch) -> Glm53FlashForConditionalGeneration:
     monkeypatch.setattr(glm53_flash, "Glm53FlashForCausalLM", _FakeLanguageModel)
     return Glm53FlashForConditionalGeneration(
