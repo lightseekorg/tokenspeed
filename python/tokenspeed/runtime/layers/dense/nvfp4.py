@@ -30,12 +30,6 @@ from tokenspeed.runtime.layers.quantization.base_config import QuantizeMethodBas
 logger = logging.getLogger(__name__)
 
 
-def _pdl_enabled() -> bool:
-    from tokenspeed.runtime.utils.pdl import pdl_enabled
-
-    return pdl_enabled()
-
-
 class Nvfp4LinearMethod(QuantizeMethodBase):
     """Linear method for NVFP4 quantization.
 
@@ -192,9 +186,7 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
             output_dtype = torch.bfloat16
 
         else:
-            x_fp4, x_scale = fp4_quantize(
-                x, layer.input_scale_inv, enable_pdl=_pdl_enabled()
-            )
+            x_fp4, x_scale = fp4_quantize(x, layer.input_scale_inv)
             output_dtype = x.dtype
 
         kernel_override = layer.override_kernel_name
@@ -207,7 +199,6 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
             out_dtype=output_dtype,
             alpha=layer.alpha,
             quant="nvfp4",
-            enable_pdl=_pdl_enabled(),
             override=kernel_override,
         )
         return out.view(x_fp4.size(0), w_n)

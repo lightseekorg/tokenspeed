@@ -23,7 +23,8 @@ import warnings
 from contextlib import contextmanager
 from typing import Any
 
-from tokenspeed.runtime.utils.pdl import pdl_enabled
+from tokenspeed_kernel.platform import pdl_enabled
+
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 global_server_args_dict: dict = {
@@ -69,10 +70,7 @@ global_server_args_dict: dict = {
 
 
 def global_server_args_dict_update(server_args: ServerArgs):
-
-    # Export the PDL kill-switch: tokenspeed_kernel cannot import runtime modules.
-    if server_args.disable_pdl:
-        os.environ["TOKENSPEED_DISABLE_PDL"] = "1"
+    pdl_enabled(not server_args.disable_pdl)
     global_server_args_dict.update(
         {
             "attention_backend": server_args.attention_backend,
@@ -117,7 +115,6 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "deepep_mode": server_args.deepep_mode,
         }
     )
-    pdl_enabled.cache_clear()
 
 
 class EnvField:

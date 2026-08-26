@@ -29,6 +29,7 @@ import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
 import tokenspeed_kernel.ops.moe.marlin  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import SelectedKernel, select_kernel
@@ -738,8 +739,6 @@ def moe_apply(
     num_tokens_global: int | None = None,
     max_num_tokens_per_gpu: int | None = None,
     do_finalize: bool = True,
-    # launch config
-    enable_pdl: bool = False,
     # all-to-all EP
     low_latency: bool | None = None,
     overlap_fn: Callable[[], None] | None = None,
@@ -758,7 +757,6 @@ def moe_apply(
         num_tokens_global: Optional global token count for distributed MoE.
         max_num_tokens_per_gpu: Optional per-GPU token capacity hint.
         do_finalize: Whether the kernel must produce the finalized output.
-        enable_pdl: Whether kernels may honor programmatic dependent launch.
         low_latency: Only forwarded to all-to-all EP plans, and only meaningful
             when the plan mode is "auto": True selects the latency-optimized
             dispatch/combine legs (decode-shaped batches), False the
@@ -795,6 +793,6 @@ def moe_apply(
         num_tokens_global=num_tokens_global,
         max_num_tokens_per_gpu=max_num_tokens_per_gpu,
         do_finalize=do_finalize,
-        enable_pdl=enable_pdl,
+        enable_pdl=pdl_enabled(),
         **a2a_kwargs,
     )

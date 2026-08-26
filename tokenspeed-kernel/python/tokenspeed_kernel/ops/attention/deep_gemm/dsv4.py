@@ -29,7 +29,7 @@ from tokenspeed_kernel.ops.attention.cuda.dsv4 import (
     indexer_topk_prefill,
     persistent_topk,
 )
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.thirdparty import deep_gemm, trtllm
@@ -334,6 +334,8 @@ def _dsv4_indexer_prefill_topk(
     result.fill_(-1)
     if q_values.shape[0] == 0 or max_seqlen_k <= 0:
         return result, gathered_k
+    if deep_gemm.get_pdl() != pdl_enabled():
+        deep_gemm.set_pdl(pdl_enabled())
 
     if index_k_format == "mxfp4":
         if gathered_k is None:
@@ -401,6 +403,8 @@ def _dsv4_indexer_decode_topk(
     out: torch.Tensor | None = None,
     persistent_topk_workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if deep_gemm.get_pdl() != pdl_enabled():
+        deep_gemm.set_pdl(pdl_enabled())
     q_values, q_scales = index_q
     result = _allocate_topk(
         out, tokens=q_values.shape[0], topk=topk, device=q_values.device
@@ -517,4 +521,6 @@ _register("mxfp4", ArchVersion(10, 0))
     priority=Priority.SPECIALIZED,
 )
 def deep_gemm_dsv4_warmup(**kwargs) -> None:
+    if deep_gemm.get_pdl() != pdl_enabled():
+        deep_gemm.set_pdl(pdl_enabled())
     warmup_prefill_jit(**kwargs)

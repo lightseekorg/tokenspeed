@@ -35,7 +35,6 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 _is_amd = current_platform().is_amd
 
@@ -87,15 +86,12 @@ class SiluAndMul(torch.nn.Module):
                     silu_and_mul_fuse_block_quant,
                 )
 
-                out, scale = silu_and_mul_fuse_block_quant(
-                    x, scale, out, enable_pdl=pdl_enabled()
-                )
+                out, scale = silu_and_mul_fuse_block_quant(x, scale, out)
                 return out, scale
             out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
             return silu_and_mul(
                 x,
                 out,
-                enable_pdl=pdl_enabled(),
                 limit=self.swiglu_limit,
             )
 
@@ -106,7 +102,6 @@ class SiluAndMul(torch.nn.Module):
         return silu_and_mul(
             x,
             out,
-            enable_pdl=pdl_enabled(),
             limit=self.swiglu_limit,
         )
 
@@ -128,7 +123,6 @@ class SiluAndMul(torch.nn.Module):
             x,
             activation="swiglu",
             limit=self.swiglu_limit,
-            enable_pdl=pdl_enabled(),
         )
 
 
@@ -171,7 +165,6 @@ class SituAndMul(torch.nn.Module):
                 x,
                 beta=self.beta,
                 linear_beta=self.linear_beta,
-                enable_pdl=pdl_enabled(),
             )
         return self.forward_native(x)
 
