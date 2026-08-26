@@ -35,6 +35,19 @@ def test_jit_cache_url_tracks_flashinfer_and_cuda_versions():
     )
 
 
+def test_jit_cache_url_tracks_nightly_release_tag():
+    assert jit_cache_wheel_url(
+        "0.6.18.dev20260811",
+        "130",
+        platform_tag="manylinux_2_28_x86_64",
+    ) == (
+        "https://github.com/flashinfer-ai/flashinfer/releases/download/"
+        "nightly-v0.6.18-20260811/"
+        "flashinfer_jit_cache-0.6.18.dev20260811+cu130-cp39-abi3-"
+        "manylinux_2_28_x86_64.whl"
+    )
+
+
 def test_install_url_if_needed_skips_matching_version(tmp_path: Path):
     requirements = tmp_path / "cuda.txt"
     requirements.write_text("flashinfer-python==0.6.16\n")

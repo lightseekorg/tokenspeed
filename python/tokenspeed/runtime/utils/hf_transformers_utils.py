@@ -61,6 +61,13 @@ from tokenspeed.runtime.configs import (
     Qwen3Config,
     Qwen3MoeConfig,
 )
+from tokenspeed.runtime.configs.glm53_flash_config import (
+    GLM53_FLASH_MODEL_TYPE,
+    GLM53_FLASH_TEXT_MODEL_TYPE,
+    GLM53_FLASH_VISION_MODEL_TYPE,
+    LEGACY_GLM53_FLASH_MODEL_TYPE,
+    Glm53FlashConfig,
+)
 from tokenspeed.runtime.utils import lru_cache_frozenset
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
@@ -83,6 +90,15 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     KimiK3DSparkConfig.model_type: KimiK3DSparkConfig,
     InklingModelConfig.model_type: InklingModelConfig,
     InklingMMConfig.model_type: InklingMMConfig,
+    Glm53FlashConfig.model_type: Glm53FlashConfig,
+    LEGACY_GLM53_FLASH_MODEL_TYPE: Glm53FlashConfig,
+}
+
+_GLM53_FLASH_ARCHITECTURE_ALIASES = {
+    "Glm5NextForConditionalGeneration": "Glm53FlashForConditionalGeneration",
+    "Glm5NextForConditionalGenerationNextN": (
+        "Glm53FlashForConditionalGenerationNextN"
+    ),
 }
 
 
@@ -203,6 +219,29 @@ def _materialize_architectures(config: PretrainedConfig, raw_config: dict) -> No
     ):
         return
     config.__dict__["architectures"] = list(raw_archs)
+
+
+def _normalize_glm53_flash_metadata(config: PretrainedConfig) -> None:
+    """Collapse legacy checkpoint names at the config-loading boundary."""
+    architectures = getattr(config, "architectures", None) or []
+    if not (
+        getattr(config, "model_type", None)
+        in {GLM53_FLASH_MODEL_TYPE, LEGACY_GLM53_FLASH_MODEL_TYPE}
+        or any(arch in _GLM53_FLASH_ARCHITECTURE_ALIASES for arch in architectures)
+    ):
+        return
+
+    config.model_type = GLM53_FLASH_MODEL_TYPE
+    config.__dict__["architectures"] = [
+        _GLM53_FLASH_ARCHITECTURE_ALIASES.get(arch, arch) for arch in architectures
+    ]
+    for nested_name, model_type in (
+        ("text_config", GLM53_FLASH_TEXT_MODEL_TYPE),
+        ("vision_config", GLM53_FLASH_VISION_MODEL_TYPE),
+    ):
+        nested = getattr(config, nested_name, None)
+        if nested is not None:
+            nested.model_type = model_type
 
 
 def _restore_raw_glm_dsa_fields(config: PretrainedConfig, raw_config: dict) -> None:
@@ -351,6 +390,7 @@ def get_config(
     config._name_or_path = model
 
     _materialize_architectures(config, raw_config)
+    _normalize_glm53_flash_metadata(config)
     _restore_raw_glm_dsa_fields(config, raw_config)
     _restore_raw_dflash_fields(config, raw_config)
 
@@ -409,6 +449,9 @@ def get_config(
         "KimiK3ForConditionalGeneration",
         "KimiK3ForConditionalGenerationNextN",
         "KimiK3Config",
+        "Glm53FlashForConditionalGeneration",
+        "Glm53FlashForConditionalGenerationNextN",
+        "Glm53FlashConfig",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5MoeForConditionalGenerationNextN",
         "Qwen3_5MoeConfig",

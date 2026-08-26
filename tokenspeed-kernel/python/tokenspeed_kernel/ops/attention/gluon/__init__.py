@@ -37,9 +37,12 @@ from tokenspeed_kernel.signature import (
 )
 
 if current_platform().is_amd:
-    _DSA_FULL_TOPK_WIDTHS = frozenset({512, 1024, 2048})
+    _DSA_FULL_TOPK_WIDTHS = frozenset({512, 1024, 2048, 2049, 2050, 2051})
     _DSA_PREFILL_TOPK_WIDTHS = _DSA_FULL_TOPK_WIDTHS
 
+    from tokenspeed_kernel.ops.attention.gluon.kpool_select import (
+        gluon_kpool_prefill_topk_fp8_gfx950 as _kpool_prefill_topk_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
         gluon_dsa_decode_gfx950 as _dsa_decode_impl,
     )
@@ -1488,6 +1491,34 @@ if current_platform().is_amd:
 
     @register_kernel(
         "attention",
+        "kpool_prefill_topk",
+        name="gluon_kpool_prefill_topk_fp8_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "index_heads": frozenset({32}),
+            "head_dim": frozenset({128}),
+            "pool_size": frozenset({4}),
+            "page_size": frozenset({16}),
+            "topk_pools": frozenset({512}),
+            "index_k_format": frozenset({"fp8_scaled"}),
+            "score_activation": frozenset({"relu"}),
+            "topk_layout": frozenset({"global_slots"}),
+            "prefill_plan": frozenset({False, True}),
+        },
+        tags={"amd", "gfx950", "hybrid", "kpool", "mfma-score", "radix-topk"},
+    )
+    def gluon_kpool_prefill_topk_fp8_gfx950(*args, **kwargs):
+        return _kpool_prefill_topk_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
         "dsa_decode",
         name="gluon_dsa_decode_gfx950",
         solution="gluon",
@@ -1507,9 +1538,9 @@ if current_platform().is_amd:
         traits={
             "page_size": frozenset({64}),
             "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
-            "qk_nope_head_dim": frozenset({128, 192}),
+            "qk_nope_head_dim": frozenset({128, 192, 256}),
             "kv_lora_rank": frozenset({128, 512}),
-            "qk_rope_head_dim": frozenset({64}),
+            "qk_rope_head_dim": frozenset({0, 64}),
             "topk": _DSA_FULL_TOPK_WIDTHS,
             "kv_cache_available": frozenset({False, True}),
             "sparse_kv_cache_available": frozenset({False, True}),
@@ -1519,6 +1550,7 @@ if current_platform().is_amd:
         },
     )
     def gluon_dsa_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
+        kwargs.pop("kv_seq_lens", None)
         return _dsa_decode_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1540,9 +1572,9 @@ if current_platform().is_amd:
         traits={
             "page_size": frozenset({64}),
             "q_len_per_req": frozenset({1}),
-            "qk_nope_head_dim": frozenset({128, 192}),
+            "qk_nope_head_dim": frozenset({128, 192, 256}),
             "kv_lora_rank": frozenset({128, 512}),
-            "qk_rope_head_dim": frozenset({64}),
+            "qk_rope_head_dim": frozenset({0, 64}),
             "topk": _DSA_PREFILL_TOPK_WIDTHS,
             "kv_cache_available": frozenset({False, True}),
             "sparse_kv_cache_available": frozenset({False, True}),
@@ -1552,6 +1584,7 @@ if current_platform().is_amd:
         },
     )
     def gluon_dsa_prefill_gfx950(*args, enable_pdl: bool = False, **kwargs):
+        kwargs.pop("kv_seq_lens", None)
         return _dsa_prefill_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1586,6 +1619,7 @@ if current_platform().is_amd:
         },
     )
     def gluon_dsa_prefill_fp8_dense_gfx950(*args, enable_pdl: bool = False, **kwargs):
+        kwargs.pop("kv_seq_lens", None)
         return _dsa_prefill_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1693,6 +1727,7 @@ if current_platform().is_amd:
         tags={"amd", "gfx1250"},
     )
     def gluon_dsa_decode_gfx1250(*args, enable_pdl: bool = False, **kwargs):
+        kwargs.pop("kv_seq_lens", None)
         return _dsa_decode_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1727,6 +1762,7 @@ if current_platform().is_amd:
         tags={"amd", "gfx1250"},
     )
     def gluon_dsa_prefill_gfx1250(*args, enable_pdl: bool = False, **kwargs):
+        kwargs.pop("kv_seq_lens", None)
         return _dsa_prefill_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1762,6 +1798,7 @@ if current_platform().is_amd:
         tags={"amd", "gfx1250"},
     )
     def gluon_dsa_prefill_fp8_dense_gfx1250(*args, enable_pdl: bool = False, **kwargs):
+        kwargs.pop("kv_seq_lens", None)
         return _dsa_prefill_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(

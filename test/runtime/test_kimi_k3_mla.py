@@ -450,6 +450,12 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
     _init_prefill(
         single_table_backend, pool, logical_rows, prefix, extend, grouped=False
     )
+    assert grouped_backend.chunked_prefill_metadata.extend_prefix_lens_cpu.tolist() == (
+        prefix
+    )
+    assert (
+        grouped_backend.chunked_prefill_metadata.extend_seq_lens_cpu.tolist() == extend
+    )
 
     # Write-location oracle: positions [prefix, seq) at page_id*P+offset.
     locs = grouped_backend.forward_prefill_metadata.group_out_cache_loc

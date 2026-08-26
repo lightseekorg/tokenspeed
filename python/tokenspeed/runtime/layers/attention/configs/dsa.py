@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from tokenspeed_kernel.platform import current_platform
@@ -49,6 +49,7 @@ class DSAConfig(MLAConfig):
     index_topk: int
     index_head_dim: int
     index_n_heads: int
+    index_kpool: int | None = field(default=None, kw_only=True)
 
     @classmethod
     def generate(
@@ -72,6 +73,7 @@ class DSAConfig(MLAConfig):
             index_topk=model_config.index_topk,
             index_head_dim=model_config.index_head_dim,
             index_n_heads=model_config.index_n_heads,
+            index_kpool=getattr(model_config, "index_kpool", None),
         )
 
     def cache_cell_size(self) -> int:

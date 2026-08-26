@@ -74,6 +74,33 @@ def create_cache_pool(
     merged plan's global layer window, so a draft view names the
     continuation fields the target's plan already reserved.
     """
+    if spec.family == "glm53_flash":
+        from tokenspeed.runtime.layers.attention.kv_cache.hybrid_glm53_flash import (
+            HybridGlm53FlashTokenToKVPool,
+        )
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.glm53_flash import (
+            Glm53FlashPoolOptions,
+        )
+
+        options = spec.pool_options
+        if not isinstance(options, Glm53FlashPoolOptions):
+            raise TypeError("GLM-5.3-Flash cache spec is missing pool options")
+        if options.index_head_dim != config.index_head_dim:
+            raise ValueError("GLM-5.3-Flash cache spec and attention config disagree")
+
+        return HybridGlm53FlashTokenToKVPool(
+            arena=arena,
+            dtype=config.kv_cache_dtype,
+            model_dtype=config.dtype,
+            quant_method=config.kv_cache_quant_method,
+            kv_lora_rank=config.kv_lora_rank,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            layer_num=num_layers,
+            rank=rank,
+            pool_options=options,
+            layer_types=spec.layer_types,
+            field_layer_offset=field_layer_offset,
+        )
     if spec.family == "deepseek_v4":
         from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
             HybridDeepseekV4TokenToKVPool,

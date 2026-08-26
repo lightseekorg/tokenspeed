@@ -188,6 +188,10 @@ _HYBRID_GDN_ARCHITECTURES = {
 _HYBRID_MLA_KDA_ARCHITECTURES = {
     "KimiK3ForConditionalGeneration",
 }
+_HYBRID_DSA_KDA_ARCHITECTURES = {
+    "Glm53FlashForConditionalGeneration",
+    "Glm53FlashForConditionalGenerationNextN",
+}
 
 # Inkling stays on the MHA path plus its thin sconv wrapper; it is not hybrid-GDN.
 _INKLING_ARCHITECTURES = {
@@ -344,12 +348,15 @@ def _resolve_hybrid_full_backend_name(
     requested_name: str | None,
     *,
     is_kda: bool,
+    is_dsa: bool,
     has_cache_plan: bool,
 ) -> str | None:
     """Resolve the compute backend that consumes the hybrid history cache."""
     name = _BACKEND_ALIASES.get(requested_name, requested_name)
     if name == "hybrid_linear_attn":
         name = None
+    if has_cache_plan and is_dsa and name is None:
+        return "dsa"
     # NVIDIA K3 defaults to its CuteDSL history consumer. AMD keeps the
     # generic MLA backend; explicit user choices remain authoritative.
     if has_cache_plan and is_kda and name is None and not current_platform().is_amd:
@@ -369,8 +376,9 @@ def _create_hybrid_linear_attn_backend(
     """Create a hybrid backend for a linear-attention model over one pool.
 
     GDN (Qwen3.5, MHA base) or, when ``is_kda`` is set, KDA (Kimi-K3,
-    MLA base). ``pool`` is the model's layer-mapped view over the one
-    shared cache pool; both sub-backends consume its per-group tables.
+    MLA base; GLM-5.3-Flash, DSA base). ``pool`` is the model's layer-mapped
+    view over the one shared cache pool; both sub-backends consume its
+    per-group tables.
     """
     from tokenspeed.runtime.layers.attention.backends.hybrid_kda import (
         HybridKDABackend,
@@ -416,10 +424,14 @@ def _create_hybrid_linear_attn_backend(
     # as the target, which breaks the captured CUDA graph).
     mamba_layer_ids = text_config.mamba2_cache_params[-1]
 
-    if len(mamba_layer_ids) == 0:
+    # The target and draft share one model config, but the draft's layer window
+    # can contain only full-attention layers. The cache view is authoritative
+    # about whether this particular model view owns recurrent state planes.
+    state_layer_count = len(getattr(pool, "_state_buffers_by_layer", ()))
+    if len(mamba_layer_ids) == 0 or state_layer_count == 0:
         logger.info(
             "Created hybrid_linear_attn backend: %d full attn layers, 0 linear "
-            "attn layers (skipping mamba backend)",
+            "attn layers in this cache view (skipping linear backend)",
             len(full_attn_layers),
         )
         return full_attn_backend
@@ -713,9 +725,10 @@ def create_attn_components(
     is_hybrid_gdn = any(a in _HYBRID_GDN_ARCHITECTURES for a in architectures)
     is_inkling = any(a in _INKLING_ARCHITECTURES for a in architectures)
     is_hybrid_mla_kda = any(a in _HYBRID_MLA_KDA_ARCHITECTURES for a in architectures)
+    is_hybrid_dsa_kda = any(a in _HYBRID_DSA_KDA_ARCHITECTURES for a in architectures)
     # Both take the hybrid-linear path; they differ only in the linear kernel
     # (GDN scalar decay vs KDA per-channel) and the base attn arch (MHA vs MLA).
-    is_hybrid_linear = is_hybrid_gdn or is_hybrid_mla_kda
+    is_hybrid_linear = is_hybrid_gdn or is_hybrid_mla_kda or is_hybrid_dsa_kda
     is_deepseek_v4_model = is_deepseek_v4(model_config.hf_config)
     draft_architectures = (
         getattr(draft_model_config.hf_config, "architectures", None) or []
@@ -787,6 +800,7 @@ def create_attn_components(
     )
     use_cache_gdn = is_hybrid_gdn and has_state
     use_cache_k3 = is_hybrid_mla_kda
+    use_cache_glm53_flash = is_hybrid_dsa_kda
     use_cache_inkling = is_inkling
     if is_deepseek_v4_model:
         cache_family = "deepseek_v4"
@@ -794,6 +808,8 @@ def create_attn_components(
         cache_family = "qwen_gdn"
     elif use_cache_k3:
         cache_family = "kimi_k3"
+    elif use_cache_glm53_flash:
+        cache_family = "glm53_flash"
     elif use_cache_inkling:
         cache_family = "inkling"
     elif type(config) is MHAConfig:
@@ -814,7 +830,8 @@ def create_attn_components(
     target_full_attn_backend_name = (
         _resolve_hybrid_full_backend_name(
             original_attn_backend,
-            is_kda=is_hybrid_mla_kda,
+            is_kda=is_hybrid_mla_kda or is_hybrid_dsa_kda,
+            is_dsa=is_hybrid_dsa_kda,
             has_cache_plan=True,
         )
         if is_hybrid_linear
@@ -837,12 +854,17 @@ def create_attn_components(
         architecture in _HYBRID_MLA_KDA_ARCHITECTURES
         for architecture in draft_architectures
     )
+    draft_is_hybrid_dsa_kda = any(
+        architecture in _HYBRID_DSA_KDA_ARCHITECTURES
+        for architecture in draft_architectures
+    )
     draft_full_attn_backend_name = None
     if draft_attn_config is not None:
-        if draft_is_hybrid_gdn or draft_is_hybrid_mla_kda:
+        if draft_is_hybrid_gdn or draft_is_hybrid_mla_kda or draft_is_hybrid_dsa_kda:
             draft_full_attn_backend_name = _resolve_hybrid_full_backend_name(
                 draft_attn_config.backend_name,
-                is_kda=draft_is_hybrid_mla_kda,
+                is_kda=draft_is_hybrid_mla_kda or draft_is_hybrid_dsa_kda,
+                is_dsa=draft_is_hybrid_dsa_kda,
                 has_cache_plan=True,
             )
         else:
@@ -953,7 +975,7 @@ def create_attn_components(
         rank=rank,
         full_attn_backend_name=target_full_attn_backend_name,
         is_hybrid_linear=is_hybrid_linear,
-        is_kda=is_hybrid_mla_kda,
+        is_kda=is_hybrid_mla_kda or is_hybrid_dsa_kda,
         is_inkling=is_inkling,
     )
     draft_attn_backend, draft_pool = _create_draft_components(
@@ -965,8 +987,10 @@ def create_attn_components(
         num_target_layers=cache_setup.num_target_layers,
         full_attn_backend_name=draft_full_attn_backend_name,
         is_heterogeneous=heterogeneous_draft_family is not None,
-        is_hybrid_linear=draft_is_hybrid_gdn or draft_is_hybrid_mla_kda,
-        is_kda=draft_is_hybrid_mla_kda,
+        is_hybrid_linear=draft_is_hybrid_gdn
+        or draft_is_hybrid_mla_kda
+        or draft_is_hybrid_dsa_kda,
+        is_kda=draft_is_hybrid_mla_kda or draft_is_hybrid_dsa_kda,
         is_inkling=any(a in _INKLING_ARCHITECTURES for a in draft_architectures),
     )
 

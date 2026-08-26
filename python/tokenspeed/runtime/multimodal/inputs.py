@@ -131,6 +131,12 @@ def resolve_mm_pad_substitute_ids(config: Any) -> dict[Modality, int]:
             "audio_token_id", "audio_placeholder_token_id"
         ),
     }
+    # GLM-5.3-Flash authors both image and video patch runs with image_token_id;
+    # the surrounding start/end tokens distinguish the modality. Restoring a
+    # hash-derived video pad to video_token_id would therefore change the
+    # authored prompt before the vision embedding is scattered into it.
+    if getattr(config, "model_type", None) == "glm53_flash":
+        candidates[Modality.VIDEO] = candidates[Modality.IMAGE]
     return {
         modality: token_id if token_id is not None else shared
         for modality, token_id in candidates.items()

@@ -27,6 +27,11 @@ For each MoE expert ``e`` and every token routed to it::
 Unquantized bf16 stage-1: bf16 activations, bf16 weights, fp32 MFMA
 accumulate, SwiGLU epilogue.
 
+The exact block-FP8 decode path copies compact weight bytes directly into LDS,
+then scales and rounds them to bf16 in registers immediately before the same
+bf16 MFMA. This preserves the materialized-bf16 arithmetic while reducing the
+weight pipeline's memory traffic.
+
 GEMM hot loop follows the ROCm/gfx950-gluon-tutorials **a16w16 v4/v9**
 design: a 2-stage double-buffered async prefetch pipeline
 (``buffer_load_to_shared`` into a ping-pong LDS buffer, consume the
@@ -54,6 +59,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.fp16._grid import get_pids
 def gluon_bf16_moe_stage1_kernel(
     a_ptr,  # hidden_states  (num_tokens, D)  bf16
     b_ptr,  # w1             (E, 2*I, D)      bf16
+    b_scale_ptr,
     c_ptr,  # out            (num_tokens*topk, I) bf16
     sorted_token_ids_ptr,
     sorted_expert_ids_ptr,
@@ -68,6 +74,9 @@ def gluon_bf16_moe_stage1_kernel(
     stride_be,
     stride_bn,
     stride_bk,
+    stride_bse,
+    stride_bsn,
+    stride_bsk,
     stride_cm,
     stride_cn,
     GRID_MN,
@@ -78,6 +87,8 @@ def gluon_bf16_moe_stage1_kernel(
     NUM_WARPS: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
+    WEIGHT_FP8: gl.constexpr,
+    FP8_ASYNC: gl.constexpr,
 ):
     num_pid_m = gl.cdiv(EM, BLOCK_M)
     # Grid covers the SwiGLU output columns ``I_r`` (not the un-fused
@@ -94,11 +105,13 @@ def gluon_bf16_moe_stage1_kernel(
         return
 
     # ---- MFMA + operand layouts (bf16: instr [16,16,32], k_width=8) ----
+    # A 16-row sparse tile owns exactly one MFMA row. Keep all four waves on
+    # N instead of allocating a second, empty MFMA row as the dense tile does.
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16, 32],
         transposed=True,
-        warps_per_cta=[2, NUM_WARPS // 2],
+        warps_per_cta=([1, NUM_WARPS] if BLOCK_M == 16 else [2, NUM_WARPS // 2]),
     )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=8
@@ -111,22 +124,39 @@ def gluon_bf16_moe_stage1_kernel(
     gload_a: gl.constexpr = gl.BlockedLayout(
         [1, 8], [512 // BLOCK_K, BLOCK_K // 8], [NUM_WARPS, 1], [1, 0]
     )
-    gload_b: gl.constexpr = gl.BlockedLayout(
-        [8, 1], [BLOCK_K // 8, 512 // BLOCK_K], [1, NUM_WARPS], [0, 1]
-    )
+    if WEIGHT_FP8 and FP8_ASYNC:
+        # Direct-to-LDS byte loads require a full 16-byte vector per thread.
+        gload_b: gl.constexpr = gl.BlockedLayout(
+            [16, 1], [BLOCK_K // 16, 1024 // BLOCK_K], [1, NUM_WARPS], [0, 1]
+        )
+    else:
+        gload_b: gl.constexpr = gl.BlockedLayout(
+            [8, 1], [BLOCK_K // 8, 512 // BLOCK_K], [1, NUM_WARPS], [0, 1]
+        )
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(8, 2, 8, order=[1, 0])
-    shared_b: gl.constexpr = gl.SwizzledSharedLayout(8, 2, 8, order=[0, 1])
+    if WEIGHT_FP8 and FP8_ASYNC:
+        shared_b: gl.constexpr = gl.SwizzledSharedLayout(16, 2, 8, order=[0, 1])
+    else:
+        shared_b: gl.constexpr = gl.SwizzledSharedLayout(8, 2, 8, order=[0, 1])
 
     NBUF: gl.constexpr = 2
     smem_a = gl.allocate_shared_memory(
         a_ptr.dtype.element_ty, [NBUF, BLOCK_M, BLOCK_K], shared_a
     )
-    smem_bg = gl.allocate_shared_memory(
-        b_ptr.dtype.element_ty, [NBUF, BLOCK_K, BLOCK_N], shared_b
-    )
-    smem_bu = gl.allocate_shared_memory(
-        b_ptr.dtype.element_ty, [NBUF, BLOCK_K, BLOCK_N], shared_b
-    )
+    if WEIGHT_FP8 and FP8_ASYNC:
+        smem_bg = gl.allocate_shared_memory(
+            b_ptr.dtype.element_ty, [NBUF, BLOCK_K, BLOCK_N], shared_b
+        )
+        smem_bu = gl.allocate_shared_memory(
+            b_ptr.dtype.element_ty, [NBUF, BLOCK_K, BLOCK_N], shared_b
+        )
+    else:
+        smem_bg = gl.allocate_shared_memory(
+            gl.bfloat16, [NBUF, BLOCK_K, BLOCK_N], shared_b
+        )
+        smem_bu = gl.allocate_shared_memory(
+            gl.bfloat16, [NBUF, BLOCK_K, BLOCK_N], shared_b
+        )
 
     # ---- Per-token A-row gather offsets --------------------------------
     am_layout: gl.constexpr = gl.SliceLayout(1, gload_a)
@@ -164,27 +194,106 @@ def gluon_bf16_moe_stage1_kernel(
     cdna4_async_copy.buffer_load_to_shared(
         smem_a.index(0), a_base, a_offsets, mask=token_mask[:, None]
     )
-    cdna4_async_copy.buffer_load_to_shared(smem_bg.index(0), b_base, b_off_gate)
-    cdna4_async_copy.buffer_load_to_shared(smem_bu.index(0), b_base, b_off_up)
+    if WEIGHT_FP8:
+        if FP8_ASYNC:
+            cdna4_async_copy.buffer_load_to_shared(smem_bg.index(0), b_base, b_off_gate)
+            cdna4_async_copy.buffer_load_to_shared(smem_bu.index(0), b_base, b_off_up)
+        else:
+            scale_n = (pid_n * BLOCK_N) // 128
+            scale_bg = gl.load(
+                b_scale_ptr + off_experts * stride_bse + scale_n * stride_bsn
+            )
+            scale_bu = gl.load(
+                b_scale_ptr
+                + off_experts * stride_bse
+                + (I_r // 128 + scale_n) * stride_bsn
+            )
+            bg_fp8 = gl.load(b_base + b_off_gate).to(gl.float8e4nv, bitcast=True)
+            bu_fp8 = gl.load(b_base + b_off_up).to(gl.float8e4nv, bitcast=True)
+            smem_bg.index(0).store((bg_fp8.to(gl.float32) * scale_bg).to(gl.bfloat16))
+            smem_bu.index(0).store((bu_fp8.to(gl.float32) * scale_bu).to(gl.bfloat16))
+    else:
+        cdna4_async_copy.buffer_load_to_shared(smem_bg.index(0), b_base, b_off_gate)
+        cdna4_async_copy.buffer_load_to_shared(smem_bu.index(0), b_base, b_off_up)
     cdna4_async_copy.commit_group()
     a_base += BLOCK_K * stride_ak
     b_base += BLOCK_K * stride_bk
 
     # ---- Steady state: prefetch k+1 into g_idx, consume k from l_idx ---
-    for k in range(0, num_k - 1):
+    for k in range(num_k - 1):
         l_idx = k % 2
         g_idx = 1 - l_idx
         cdna4_async_copy.buffer_load_to_shared(
             smem_a.index(g_idx), a_base, a_offsets, mask=token_mask[:, None]
         )
-        cdna4_async_copy.buffer_load_to_shared(smem_bg.index(g_idx), b_base, b_off_gate)
-        cdna4_async_copy.buffer_load_to_shared(smem_bu.index(g_idx), b_base, b_off_up)
+        if WEIGHT_FP8:
+            if FP8_ASYNC:
+                cdna4_async_copy.buffer_load_to_shared(
+                    smem_bg.index(g_idx), b_base, b_off_gate
+                )
+                cdna4_async_copy.buffer_load_to_shared(
+                    smem_bu.index(g_idx), b_base, b_off_up
+                )
+            else:
+                scale_k = ((k + 1) * BLOCK_K) // 128
+                scale_n = (pid_n * BLOCK_N) // 128
+                scale_bg = gl.load(
+                    b_scale_ptr
+                    + off_experts * stride_bse
+                    + scale_n * stride_bsn
+                    + scale_k * stride_bsk
+                )
+                scale_bu = gl.load(
+                    b_scale_ptr
+                    + off_experts * stride_bse
+                    + (I_r // 128 + scale_n) * stride_bsn
+                    + scale_k * stride_bsk
+                )
+                bg_fp8 = gl.load(b_base + b_off_gate).to(gl.float8e4nv, bitcast=True)
+                bu_fp8 = gl.load(b_base + b_off_up).to(gl.float8e4nv, bitcast=True)
+                smem_bg.index(g_idx).store(
+                    (bg_fp8.to(gl.float32) * scale_bg).to(gl.bfloat16)
+                )
+                smem_bu.index(g_idx).store(
+                    (bu_fp8.to(gl.float32) * scale_bu).to(gl.bfloat16)
+                )
+        else:
+            cdna4_async_copy.buffer_load_to_shared(
+                smem_bg.index(g_idx), b_base, b_off_gate
+            )
+            cdna4_async_copy.buffer_load_to_shared(
+                smem_bu.index(g_idx), b_base, b_off_up
+            )
         cdna4_async_copy.commit_group()
         cdna4_async_copy.wait_group(1)
 
         a = smem_a.index(l_idx).load(dot_a_layout)
-        bg = smem_bg.index(l_idx).load(dot_b_layout)
-        bu = smem_bu.index(l_idx).load(dot_b_layout)
+        if WEIGHT_FP8 and FP8_ASYNC:
+            scale_k = (k * BLOCK_K) // 128
+            scale_n = (pid_n * BLOCK_N) // 128
+            scale_bg = gl.load(
+                b_scale_ptr
+                + off_experts * stride_bse
+                + scale_n * stride_bsn
+                + scale_k * stride_bsk
+            )
+            scale_bu = gl.load(
+                b_scale_ptr
+                + off_experts * stride_bse
+                + (I_r // 128 + scale_n) * stride_bsn
+                + scale_k * stride_bsk
+            )
+            bg_fp8 = (
+                smem_bg.index(l_idx).load(dot_b_layout).to(gl.float8e4nv, bitcast=True)
+            )
+            bu_fp8 = (
+                smem_bu.index(l_idx).load(dot_b_layout).to(gl.float8e4nv, bitcast=True)
+            )
+            bg = (bg_fp8.to(gl.float32) * scale_bg).to(gl.bfloat16)
+            bu = (bu_fp8.to(gl.float32) * scale_bu).to(gl.bfloat16)
+        else:
+            bg = smem_bg.index(l_idx).load(dot_b_layout)
+            bu = smem_bu.index(l_idx).load(dot_b_layout)
         gate_acc = gl.amd.cdna3.mfma(a, bg, gate_acc)
         up_acc = gl.amd.cdna3.mfma(a, bu, up_acc)
 
@@ -195,8 +304,28 @@ def gluon_bf16_moe_stage1_kernel(
     cdna4_async_copy.wait_group(0)
     l_idx = (num_k - 1) % 2
     a = smem_a.index(l_idx).load(dot_a_layout)
-    bg = smem_bg.index(l_idx).load(dot_b_layout)
-    bu = smem_bu.index(l_idx).load(dot_b_layout)
+    if WEIGHT_FP8 and FP8_ASYNC:
+        scale_k = ((num_k - 1) * BLOCK_K) // 128
+        scale_n = (pid_n * BLOCK_N) // 128
+        scale_bg = gl.load(
+            b_scale_ptr
+            + off_experts * stride_bse
+            + scale_n * stride_bsn
+            + scale_k * stride_bsk
+        )
+        scale_bu = gl.load(
+            b_scale_ptr
+            + off_experts * stride_bse
+            + (I_r // 128 + scale_n) * stride_bsn
+            + scale_k * stride_bsk
+        )
+        bg_fp8 = smem_bg.index(l_idx).load(dot_b_layout).to(gl.float8e4nv, bitcast=True)
+        bu_fp8 = smem_bu.index(l_idx).load(dot_b_layout).to(gl.float8e4nv, bitcast=True)
+        bg = (bg_fp8.to(gl.float32) * scale_bg).to(gl.bfloat16)
+        bu = (bu_fp8.to(gl.float32) * scale_bu).to(gl.bfloat16)
+    else:
+        bg = smem_bg.index(l_idx).load(dot_b_layout)
+        bu = smem_bu.index(l_idx).load(dot_b_layout)
     gate_acc = gl.amd.cdna3.mfma(a, bg, gate_acc)
     up_acc = gl.amd.cdna3.mfma(a, bu, up_acc)
 
@@ -235,11 +364,13 @@ def invoke_stage1(
     topk: int,
     BLOCK_M: int = 64,
     BLOCK_N: int = 128,
-    BLOCK_K: int = 64,
+    BLOCK_K: int | None = None,
     num_warps: int = 4,
     num_xcds: int = 8,
     group_size_m: int = 8,
     split_k: int | None = None,
+    w1_scale: torch.Tensor | None = None,
+    fp8_async: bool | None = None,
 ):
     """Launch bf16 MoE stage 1 (gate + up + SwiGLU).
 
@@ -248,14 +379,31 @@ def invoke_stage1(
         big split at small M, ``1`` (this single-launch path) at large M.
       * ``1``            -> force this single-launch pipelined kernel.
       * ``> 1``          -> force split-K with that factor.
+
+    The default exact-FP8 16x64 decode tile uses a 128-wide compact-weight
+    pipeline. Passing ``fp8_async=False`` retains the legacy load path for
+    matched benchmarking.
     """
     assert hidden_states.dtype == torch.bfloat16
-    assert w1.dtype == torch.bfloat16
+    weight_fp8 = w1_scale is not None
+    if BLOCK_K is None:
+        # The compact FP8 path uses one complete 128-wide scale block per
+        # reduction tile. Other stage-1 shapes retain their established tile.
+        BLOCK_K = 128 if weight_fp8 and BLOCK_M == 16 and BLOCK_N == 64 else 64
+    if fp8_async is None:
+        fp8_async = weight_fp8 and BLOCK_M == 16 and BLOCK_N == 64 and BLOCK_K == 128
+    if weight_fp8:
+        assert w1.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        assert w1_scale.dtype == torch.float32
+        assert BLOCK_N <= 128 and 128 % BLOCK_N == 0
+        assert BLOCK_K <= 128 and 128 % BLOCK_K == 0
+    else:
+        assert w1.dtype == torch.bfloat16
     assert out.dtype == torch.bfloat16
     assert hidden_states.dim() == 2 and w1.dim() == 3
 
     num_tokens, D = hidden_states.shape
-    E, two_I, Dw = w1.shape
+    _, two_I, Dw = w1.shape
     assert Dw == D, f"w1 K dim {Dw} != hidden D {D}"
     assert two_I % 2 == 0
     I_r = two_I // 2
@@ -276,6 +424,8 @@ def invoke_stage1(
 
     if split_k is None:
         split_k = auto_split_k(num_tokens, D // BLOCK_K)
+    if weight_fp8 and split_k > 1:
+        raise ValueError("exact block-FP8 stage 1 does not support split-K")
     if split_k > 1:
         return invoke_stage1_splitk(
             hidden_states,
@@ -293,9 +443,13 @@ def invoke_stage1(
         )
 
     grid_mn = triton.cdiv(EM, BLOCK_M) * triton.cdiv(I_r, BLOCK_N)
+    scale = w1 if w1_scale is None else w1_scale
+    scale_strides = (0, 0, 0) if w1_scale is None else w1_scale.stride()
+    weight = w1.view(torch.uint8) if weight_fp8 else w1
     gluon_bf16_moe_stage1_kernel[(grid_mn,)](
         hidden_states,
-        w1,
+        weight,
+        scale,
         out,
         sorted_token_ids,
         sorted_expert_ids,
@@ -310,6 +464,9 @@ def invoke_stage1(
         w1.stride(0),
         w1.stride(1),
         w1.stride(2),
+        scale_strides[0],
+        scale_strides[1],
+        scale_strides[2],
         out.stride(0),
         out.stride(1),
         grid_mn,
@@ -320,6 +477,8 @@ def invoke_stage1(
         NUM_WARPS=num_warps,
         NUM_XCDS=num_xcds,
         GROUP_SIZE_M=group_size_m,
+        WEIGHT_FP8=weight_fp8,
+        FP8_ASYNC=fp8_async,
         num_warps=num_warps,
     )
     return out

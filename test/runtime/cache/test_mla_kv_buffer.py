@@ -173,6 +173,22 @@ def test_set_casts_bf16_sources_into_fp8_buffer(n_loc, pattern):
 
 
 @pytest.mark.parametrize("n_loc", [4, 600])
+def test_set_supports_zero_width_rope_with_int32_locations(n_loc):
+    loc = torch.arange(n_loc, device="cuda", dtype=torch.int32)
+    k_nope = torch.randn(n_loc, 1, NOPE_DIM, device="cuda", dtype=torch.bfloat16)
+    k_rope = torch.empty(n_loc, 1, 0, device="cuda", dtype=torch.bfloat16)
+    kv = torch.full((n_loc + 8, NOPE_DIM), 7.5, device="cuda", dtype=torch.bfloat16)
+    ref = kv.clone()
+    ref[loc.long()] = k_nope[:, 0]
+
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope)
+    torch.cuda.synchronize()
+
+    assert loc.dtype == torch.int32
+    assert _bitwise_equal(kv, ref)
+
+
+@pytest.mark.parametrize("n_loc", [4, 600])
 def test_set_squashes_nan_and_inf(n_loc):
     """Sanitized mixed-dtype writes stay finite in the fp8 destination."""
     loc, k_nope, k_rope = _make_inputs(n_loc, torch.bfloat16, "rand")

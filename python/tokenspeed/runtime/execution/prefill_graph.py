@@ -734,9 +734,10 @@ class PrefillGraph:
         """Publish ``ctx`` as the ambient live context, pinned to the padded bucket.
 
         The graph replays over ``bucket`` (padded) tokens; attention metadata stays
-        at the real count (set upstream), so the eager attention break only touches
-        real tokens; eager-break handoffs clear the padded rows before the
-        following graph segment consumes them. Pin
+        live and ``real_input_num_tokens`` preserves the scheduler's row count.
+        Attention paths may either narrow at cache-write boundaries or carry
+        inactive rows through fixed-shape kernels. Eager-break handoffs clear the
+        padded rows before the following graph segment consumes them. Pin
         ``input_num_tokens`` to the bucket and, under DP, ``global_num_tokens`` /
         ``global_bs`` to the captured uniform layout so any live read during the
         break matches the baked EP shapes. The break reads ``forward_mode`` / ``bs``
@@ -744,7 +745,13 @@ class PrefillGraph:
         so models split prefill vs decode and dispatch the per-mode backend
         correctly with no side channel.
         """
-        saved = (ctx.input_num_tokens, ctx.global_num_tokens, ctx.global_bs)
+        saved = (
+            ctx.input_num_tokens,
+            ctx.real_input_num_tokens,
+            ctx.global_num_tokens,
+            ctx.global_bs,
+        )
+        ctx.real_input_num_tokens = ctx.input_num_tokens
         ctx.input_num_tokens = bucket
         if self.dp_size > 1 and ctx.global_num_tokens is not None:
             ctx.global_num_tokens = [bucket] * self.config.world_size
@@ -753,7 +760,12 @@ class PrefillGraph:
             with active_forward(ctx):
                 yield
         finally:
-            ctx.input_num_tokens, ctx.global_num_tokens, ctx.global_bs = saved
+            (
+                ctx.input_num_tokens,
+                ctx.real_input_num_tokens,
+                ctx.global_num_tokens,
+                ctx.global_bs,
+            ) = saved
 
     def _log_engaged_once(
         self, bucket: int, ctx: ForwardContext, is_multimodal: bool

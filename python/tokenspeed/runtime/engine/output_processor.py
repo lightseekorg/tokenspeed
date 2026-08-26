@@ -70,6 +70,9 @@ class ReqState:
 
     # For metrics
     created_time: float
+    dispatched: bool = False
+    abort_sent: bool = False
+    abandoned: bool = False
     tokenized_time: float = 0.0
     finished_time: float = 0.0
     first_token_time: float = 0.0
@@ -118,6 +121,11 @@ class OutputProcessor:
                     "Received output for rid=%r but the state was deleted in AsyncLLM.",
                     rid,
                 )
+                continue
+
+            if state.abandoned:
+                if recv_obj.finished_reasons[i] is not None:
+                    self.engine.rid_to_state.pop(rid, None)
                 continue
 
             # Build meta_info and return value

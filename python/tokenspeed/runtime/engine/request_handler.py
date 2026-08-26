@@ -93,6 +93,21 @@ def _profile_rank_tag(attn_mapping) -> str:
     return "-".join(parts)
 
 
+def _get_request_tokenizer(
+    server_args: ServerArgs, architectures: list[str] | None = None
+):
+    """Load the scheduler tokenizer unless raw-token serving was requested."""
+    if server_args.skip_tokenizer_init:
+        return None
+    return get_tokenizer(
+        server_args.tokenizer,
+        tokenizer_mode=server_args.tokenizer_mode,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.revision,
+        architectures=architectures,
+    )
+
+
 class RequestHandler:
     """
     1. Recv Reqs from ZMQ
@@ -152,13 +167,7 @@ class RequestHandler:
         self.vocab_size = vocab_size
         self.clear_cache_fn = clear_cache_fn
 
-        self.tokenizer = get_tokenizer(
-            server_args.tokenizer,
-            tokenizer_mode=server_args.tokenizer_mode,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            architectures=architectures,
-        )
+        self.tokenizer = _get_request_tokenizer(server_args, architectures)
 
         self.recv_func = recv_func
         self.send_func = send_func

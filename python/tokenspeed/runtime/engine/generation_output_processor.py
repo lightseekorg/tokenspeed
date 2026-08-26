@@ -130,9 +130,7 @@ class RequestState:
         # abort related
         self.to_abort = False
         self.to_abort_message = None
-        # Client-initiated aborts skip streaming a finish (the TM already tore
-        # down its state). Pause-initiated aborts set this so the passive client
-        # still receives a terminating finish.
+        # Retain the abort origin for pause diagnostics.
         self.abort_notify_client = False
 
         # cached tokenizer ids
@@ -148,8 +146,7 @@ class RequestState:
         """Mark this request as aborted with ``message``; finished_reason is
         materialized immediately so callers don't need a check_finished() pass.
 
-        ``notify_client`` streams a terminating finish to the client (used for
-        pause-initiated aborts, where the client did not tear down its state).
+        ``notify_client`` records that pause handling initiated the abort.
         """
         self.to_abort = True
         self.to_abort_message = message
@@ -437,9 +434,9 @@ class OutputProcesser:
         cancelled request burns up to ``max_tokens`` forward steps and
         latches a ``--max-num-seqs`` slot in the meantime.
 
-        ``notify_client`` streams a terminating finish to the client (for
-        pause-initiated aborts; client-initiated aborts leave it False since
-        the tokenizer manager has already cleaned up its own state).
+        ``notify_client`` records whether the abort came from pause handling.
+        Every abort still sends a terminal frame so the frontend can release
+        its request state after scheduler acknowledgement.
         """
         state = self.rid_to_state.get(rid)
         if state is not None:
@@ -481,15 +478,10 @@ class OutputProcesser:
     def reap_finished_orphan(self, rid: str, state: RequestState) -> None:
         """Resolve a finished request that no future forward op will reap.
 
-        Stream the terminating finish to a passive client (pause-initiated
-        aborts still have the client waiting on the stream); client-initiated
-        aborts already tore down their own state, so just drop the registered
-        state so the rid does not leak.
+        The terminal frame also acknowledges client-initiated aborts so the
+        frontend can safely release its retained request state.
         """
-        if state.abort_notify_client:
-            self.publish_finished_at_admission(rid, state)
-        else:
-            self.rid_to_state.pop(rid, None)
+        self.publish_finished_at_admission(rid, state)
 
     def _host_advance_matcher(self, completion, model_execution_results):
         """Host-side fallback for the grammar matcher advance.
@@ -793,10 +785,8 @@ class OutputProcesser:
             if request_state.output_ids:
                 request_state.stats.mark_first_token(stats_now)
 
-            # For aborted requests, skip output to detokenizer (the tokenizer
-            # manager already cleaned up), just notify the scheduler to finish.
-            # Exception: pause-initiated aborts (abort_notify_client) leave a
-            # passive client that still needs a terminating finish streamed.
+            # Aborts send a terminal frame so the frontend can release state
+            # only after the scheduler has stopped the request.
             if request_state.to_abort and request_state.finished:
                 request_changes.append(make_extend_result_event(rid, new_ids))
                 if is_prefill_instance:
@@ -805,9 +795,8 @@ class OutputProcesser:
                     # prefill handoff can finish before the scheduler releases it.
                     continue
                 request_changes.append(make_finish_event(rid))
-                if request_state.abort_notify_client:
-                    stream_out_rids.append(rid)
-                    stream_out_states.append(request_state)
+                stream_out_rids.append(rid)
+                stream_out_states.append(request_state)
                 self._log_request_stats(rid, request_state, stats_now)
                 request_state.release_pending_multimodal_features()
                 self.rid_to_state.pop(rid)
@@ -901,8 +890,7 @@ class OutputProcesser:
         if not state.to_abort:
             state.stats.mark_first_token(now)
         self._log_request_stats(req_id, state, now)
-        if not state.to_abort or state.abort_notify_client:
-            self.stream_output([req_id], [state])
+        self.stream_output([req_id], [state])
         state.release_pending_multimodal_features()
         self.rid_to_state.pop(req_id)
         return [
@@ -934,8 +922,7 @@ class OutputProcesser:
         # PD prefill node's terminal path (the other finish/abort logging lives in
         # post_process_forward_op). Self-guarded, so a no-op when the flag is off.
         self._log_request_stats(req_id, rs, time.time())
-        if not rs.to_abort or rs.abort_notify_client:
-            self.stream_output([req_id], [rs])
+        self.stream_output([req_id], [rs])
         # SucceededEvent already finishes the C++ FSM; no extra FinishEvent needed
         return []
 

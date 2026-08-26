@@ -130,6 +130,15 @@ def _resolve_prefill_graph_max_tokens(server_args) -> int:
     return cap
 
 
+def _should_disable_prefill_graph(server_args, model_config: ModelConfig) -> bool:
+    """Keep unsupported DSA models eager while allowing GLM-5.3 replay."""
+    if bool(server_args.disable_prefill_graph):
+        return True
+    if model_config.attention_arch != AttentionArch.DSA:
+        return False
+    return getattr(model_config.hf_config, "model_type", None) != "glm53_flash"
+
+
 def _cache_arena_attr(pool, name: str, default):
     """Read one arena attribute off a cache view, tolerating fakes.
 
@@ -250,13 +259,9 @@ class ModelExecutorConfig:
                 physical_context_len - derived_context_len,
             )
 
-        # DSA's sparse indexer reads the attention backend's
-        # ``chunked_prefill_metadata`` from inside the captured prefill segment,
-        # but the prefill graph rebinds only the live ForwardContext at replay --
-        # the backend metadata object stays frozen at capture-time (dummy) values.
-        # So the two are fundamentally incompatible; force eager prefill for DSA.
-        disable_prefill_graph = bool(server_args.disable_prefill_graph) or (
-            model_config.attention_arch == AttentionArch.DSA
+        disable_prefill_graph = _should_disable_prefill_graph(
+            server_args,
+            model_config,
         )
 
         return ModelExecutorConfig(

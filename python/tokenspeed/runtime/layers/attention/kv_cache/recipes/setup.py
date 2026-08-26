@@ -32,6 +32,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecip
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
     DeepseekV4Recipe,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.glm53_flash import (
+    Glm53FlashRecipe,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
     InklingRecipe,
 )
@@ -57,6 +60,7 @@ CacheModelFamily = Literal[
     "qwen_gdn",
     "inkling",
     "kimi_k3",
+    "glm53_flash",
     "deepseek_v4",
 ]
 
@@ -157,6 +161,7 @@ _RECIPES: dict[CacheModelFamily, Callable[..., CacheRecipe]] = {
     "qwen_gdn": QwenGDNRecipe,
     "inkling": InklingRecipe,
     "kimi_k3": KimiK3Recipe,
+    "glm53_flash": Glm53FlashRecipe,
     "deepseek_v4": DeepseekV4Recipe,
 }
 

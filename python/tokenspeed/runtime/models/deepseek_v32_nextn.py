@@ -27,7 +27,7 @@ resolves the ``DeepseekV32ForCausalLMNextN`` draft architecture.
 
 from __future__ import annotations
 
-from tokenspeed.runtime.models.glm5_nextn import GlmMoeDsaForCausalLMNextN
+from tokenspeed.runtime.models.glm_moe_dsa_nextn import GlmMoeDsaForCausalLMNextN
 
 
 class DeepseekV32ForCausalLMNextN(GlmMoeDsaForCausalLMNextN):

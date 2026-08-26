@@ -288,12 +288,14 @@ if (
         softmax_scale: float,
         page_size: int,
         q_len_per_req: int = 1,
+        kv_seq_lens: torch.Tensor | None = None,
         logit_cap: float = 0.0,
         k_scale: float = 1.0,
         return_lse: bool = False,
         out: torch.Tensor | None = None,
         enable_pdl: bool = False,
     ) -> torch.Tensor:
+        del kv_seq_lens
         if sparse_kv_cache is None:
             raise RuntimeError("FlashMLA sparse decode requires sparse_kv_cache")
         if return_lse:
@@ -474,6 +476,7 @@ if (
         softmax_scale: float,
         page_size: int,
         q_len_per_req: int = 1,
+        kv_seq_lens: torch.Tensor | None = None,
         logit_cap: float = 0.0,
         k_scale: float = 1.0,
         return_lse: bool = False,

@@ -113,6 +113,7 @@ class KdaAttnBackend(MambaAttnBackend):
         self._replay_payloads: tuple[torch.Tensor, ...] | None = None
         self._replay_weights: dict[int, tuple] = {}
         self._replay_descriptors = None
+        self._replay_group_indices = None
         self._batched_replay_launch = None
         self._batched_replay_ready = False
         self._replay_descriptor_bound: set[int] = set()
@@ -144,6 +145,14 @@ class KdaAttnBackend(MambaAttnBackend):
             with torch.inference_mode(False):
                 addresses = torch.zeros(
                     (len(layer_ids), 10), dtype=torch.uint64, device=self.device
+                )
+                group_indices = torch.tensor(
+                    [
+                        self._replay_group_rows[self._state_group_for(layer_id)]
+                        for layer_id in layer_ids
+                    ],
+                    dtype=torch.int32,
+                    device=self.device,
                 )
                 first_conv, first_ssm = self._state_components(layer_ids[0])
                 hv, head_dim = first_ssm.shape[1:3]
@@ -180,6 +189,7 @@ class KdaAttnBackend(MambaAttnBackend):
                     ),
                 )
                 self._replay_descriptors = addresses
+                self._replay_group_indices = group_indices
                 self._replay_descriptor_bound.clear()
                 self._replay_weights.clear()
                 self._batched_replay_launch = None
@@ -270,30 +280,17 @@ class KdaAttnBackend(MambaAttnBackend):
                 lower_bounds.add(layer_weights[-1])
             if len(lower_bounds) != 1:
                 raise RuntimeError("batched KDA replay requires one lower bound")
-            layers_per_group = len(self._descriptor_row_by_layer) // len(
-                self._replay_group_ids
-            )
-            expected_groups = tuple(
-                group_id
-                for group_id in self._replay_group_ids
-                for _ in range(layers_per_group)
-            )
-            actual_groups = tuple(
-                self._state_group_for(layer_id)
-                for layer_id in self._descriptor_row_by_layer
-            )
-            if actual_groups != expected_groups:
-                raise RuntimeError(
-                    "batched KDA replay requires equal contiguous layer groups"
-                )
             conv_width = geometry[3]
             if self._batched_replay_kernel is not None:
                 descriptors = self._replay_descriptors
+                group_indices = self._replay_group_indices
+                assert group_indices is not None
                 draft_tokens = self.speculative_num_draft_tokens
 
                 def launch(read_indices, write_indices, accepted_length):
                     self._batched_replay_kernel(
                         descriptors=descriptors,
+                        group_indices=group_indices,
                         read_indices=read_indices,
                         write_indices=write_indices,
                         accepted_length=accepted_length,
@@ -308,7 +305,6 @@ class KdaAttnBackend(MambaAttnBackend):
                         state_stride=strides[4],
                         gate_stride=strides[5],
                         conv_width=conv_width,
-                        layers_per_group=layers_per_group,
                         lower_bound=next(iter(lower_bounds)),
                     )
 

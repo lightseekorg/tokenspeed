@@ -12,7 +12,9 @@ tokenspeed-triton>=3.8.10.post20260721
 # gencode. Keep protobuf 7.x and ignore that resolver warning.
 nvidia-cutlass-dsl[cu13]==4.6.0
 nvidia-cutlass-dsl-libs-cu13==4.6.0
-flashinfer-python==0.6.16
+# The Aug 11 nightly contains sparse-MLA counter-buffer support and accepts
+# CUTLASS DSL >=4.5. Aug 13 and newer nightlies require 4.7 exactly.
+flashinfer-python==0.6.18.dev20260811
 # FlashInfer tactic-cache metadata includes the frontend version; keep it stable.
 nvidia-cudnn-frontend==1.26.0
 nvidia-ml-py==13.580.82

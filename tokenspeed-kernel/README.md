@@ -99,8 +99,13 @@ folder.
 
 ### Solution choices
 
-- **Triton** — in-tree; default portable JIT path for various kernels
+- **Triton** — in-tree; default portable JIT path for various kernels, including
+  precomputed-routing MoE with unquantized or MXFP4 expert weights
 - **Gluon / CuteDSL** — in-tree; performant JIT path for key kernels
+- **gfx950 block-FP8 MoE** — direct compact-weight Gluon warp GEMVs for
+  decode-shaped batches and tuned BF16 Gluon kernels for prefill. BF16 expert
+  copies are created at load time while compact FP8 experts remain available
+  for decode
 - **Vendor libraries** — wrapped (FlashAttention, TRT-LLM, etc.);
   no in-tree C++ build
 - **PyTorch reference** — under `numerics/reference/`; never auto-selects

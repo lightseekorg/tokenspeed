@@ -554,6 +554,56 @@ class TestPrefillTokenBuckets(unittest.TestCase):
         self.assertEqual(buckets, [256, 1024, 2048])
 
 
+class TestPrefillGraphPaddedContext(unittest.TestCase):
+    def test_padded_context_preserves_live_token_count(self):
+        from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+        graph = PrefillGraph.__new__(PrefillGraph)
+        graph.dp_size = 1
+        ctx = SimpleNamespace(
+            input_num_tokens=3,
+            real_input_num_tokens=None,
+            global_num_tokens=None,
+            global_bs=None,
+        )
+
+        with graph._padded_to(ctx, 8):
+            self.assertEqual(ctx.input_num_tokens, 8)
+            self.assertEqual(ctx.real_input_num_tokens, 3)
+
+        self.assertEqual(ctx.input_num_tokens, 3)
+        self.assertIsNone(ctx.real_input_num_tokens)
+
+
+class TestPrefillGraphModelSupport(unittest.TestCase):
+    def test_only_glm53_flash_enables_dsa_prefill_replay(self):
+        from tokenspeed.runtime.configs.model_config import AttentionArch
+        from tokenspeed.runtime.execution.model_executor import (
+            _should_disable_prefill_graph,
+        )
+
+        args = SimpleNamespace(disable_prefill_graph=False)
+        glm53_flash = SimpleNamespace(
+            attention_arch=AttentionArch.DSA,
+            hf_config=SimpleNamespace(model_type="glm53_flash"),
+        )
+        legacy_dsa = SimpleNamespace(
+            attention_arch=AttentionArch.DSA,
+            hf_config=SimpleNamespace(model_type="glm_moe_dsa"),
+        )
+        dense = SimpleNamespace(
+            attention_arch=AttentionArch.MHA,
+            hf_config=SimpleNamespace(model_type="llama"),
+        )
+
+        self.assertFalse(_should_disable_prefill_graph(args, glm53_flash))
+        self.assertTrue(_should_disable_prefill_graph(args, legacy_dsa))
+        self.assertFalse(_should_disable_prefill_graph(args, dense))
+
+        args.disable_prefill_graph = True
+        self.assertTrue(_should_disable_prefill_graph(args, glm53_flash))
+
+
 class TestPrefillGraphMaxTokensResolution(unittest.TestCase):
     """Which server args switch the prefill graph off entirely."""
 

@@ -74,6 +74,18 @@ def get_is_cuda_graph_phase() -> bool:
     return _is_cuda_graph_phase
 
 
+def get_capture_warmup_seq_len(max_tokens_per_req: int, has_drafter: bool) -> int:
+    """Return a safe dummy sequence length for decode graph capture.
+
+    MTP verify can accept only one of the ``max_tokens_per_req`` candidates.
+    The first draft step then removes the rejected tail before processing the
+    same number of query rows, so capture needs that much extra dummy history.
+    """
+    if not has_drafter:
+        return max_tokens_per_req
+    return 2 * max_tokens_per_req - 1
+
+
 def _should_update_mamba_state_after_mtp_verify(
     drafter, attn_backend, forward_mode: ForwardMode
 ) -> bool:
@@ -469,14 +481,18 @@ class CudaGraphWrapper:
 
         # Warm the same primary stream used by capture. Capture-only auxiliary
         # branches use this graph phase to warm their own streams serially.
+        capture_seq_len = get_capture_warmup_seq_len(
+            self.max_tokens_per_req,
+            has_drafter=self.drafter is not None,
+        )
         with torch.cuda.stream(self.stream):
             for _ in range(4):
                 torch.cuda.synchronize()
                 dist.barrier()
                 self._prepare_sampling_capture(bs=bs, variant=variant)
-                # Keep warmup seq_lens >= q_len_per_req so no query row gets an
-                # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
-                self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
+                # Leave enough history after a worst-case MTP verify accepts only
+                # one token and the draft first step trims the rejected tail.
+                self.input_buffers.seq_lens_buf[:bs].fill_(capture_seq_len)
                 self._init_capture_metadata(bs)
                 run_once()
             # Order the reset below after the last warmup's stateful kernels.
@@ -593,7 +609,11 @@ class CudaGraphWrapper:
                     bs=bs,
                     variant=CUDA_GRAPH_VARIANT_DEFAULT,
                 )
-                self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
+                capture_seq_len = get_capture_warmup_seq_len(
+                    self.max_tokens_per_req,
+                    has_drafter=self.drafter is not None,
+                )
+                self.input_buffers.seq_lens_buf[:bs].fill_(capture_seq_len)
                 self._init_capture_metadata(bs)
                 self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
                 torch.cuda.synchronize()

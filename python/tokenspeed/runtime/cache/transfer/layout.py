@@ -310,11 +310,31 @@ def combine_cache_transfer_layouts(
         field.field_id for group in target.groups for field in group.fields
     }
     draft_fields = {field.field_id for group in draft.groups for field in group.fields}
-    overlap = target_fields & draft_fields
-    if overlap:
-        raise ValueError(
-            "shared target/draft arena views overlap fields " f"{sorted(overlap)}"
+    aliased_fields = target_fields & draft_fields
+    if aliased_fields:
+        # A strict draft subset is one physical layout with two compute views.
+        if not draft_fields < target_fields:
+            raise ValueError(
+                "shared target/draft arena views have ambiguous overlapping "
+                f"fields {sorted(aliased_fields)}"
+            )
+
+        target_locations = {
+            field.field_id: (group.group_id, field)
+            for group in target.groups
+            for field in group.fields
+        }
+        conflicts = sorted(
+            field.field_id
+            for group in draft.groups
+            for field in group.fields
+            if target_locations[field.field_id] != (group.group_id, field)
         )
+        if conflicts:
+            raise ValueError(
+                "shared target/draft arena fields use conflicting layouts "
+                f"{conflicts}"
+            )
     if any(
         field.device_buffer_index != 0
         for layout in (target, draft)
@@ -330,7 +350,11 @@ def combine_cache_transfer_layouts(
         if target_group is not None:
             fields += target_group.fields
         if draft_group is not None:
-            fields += draft_group.fields
+            fields += tuple(
+                field
+                for field in draft_group.fields
+                if field.field_id not in aliased_fields
+            )
         geometry = target_group if target_group is not None else draft_group
         groups.append(
             CacheGroupLayout(
@@ -339,9 +363,13 @@ def combine_cache_transfer_layouts(
                 fields=fields,
             )
         )
+    target_consumers = tuple(
+        tuple(field_id for field_id in consumer if field_id not in aliased_fields)
+        for consumer in target.consumers
+    )
     return CacheTransferLayout(
         num_lcm_blocks=target.num_lcm_blocks,
         groups=tuple(groups),
         buffers=target.buffers,
-        consumers=target.consumers + draft.consumers,
+        consumers=target_consumers + draft.consumers,
     )

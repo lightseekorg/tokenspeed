@@ -696,6 +696,7 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
         ),
         page_table=torch.zeros((1, 1), dtype=torch.int32),
         seq_lens=torch.ones(1, dtype=torch.int32),
+        kv_seq_lens=torch.ones(1, dtype=torch.int32),
         workspace_indices=torch.zeros((1, 2), dtype=torch.int64),
         topk_lens=torch.ones(1, dtype=torch.int32),
         kv_workspace_slots=torch.zeros(1, dtype=torch.int64),
