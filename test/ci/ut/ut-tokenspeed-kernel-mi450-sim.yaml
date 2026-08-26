@@ -13,6 +13,14 @@ env:
   BUILD_AND_DOWNLOAD_PARALLEL: "4"
   CI: "true"
   GFX_ARCH: gfx1250
+  TEST_DESELECTS: |
+    # Iris symmetric heaps require physical KFD/ARSMI peer topology. rocJITsu
+    # provides compute emulation only, so keep these tests enabled on hardware.
+    --deselect=tokenspeed-kernel/test/ops/test_iris_communication.py::test_iris_allreduce_residual_rmsnorm_world1[per_row]
+    --deselect=tokenspeed-kernel/test/ops/test_iris_communication.py::test_iris_allreduce_residual_rmsnorm_world1[persistent]
+
+    # Tests below pass on physical MI450 but time out on rocJITsu.
+    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_prefill[noncausal-triton-fp8-e5m2]
   TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.13.0+rocm10.1.0a20260812
   TORCH_INDEX_URL: https://rocm.nightlies.amd.com/whl-multi-arch/
   TORCH_VERSION: 2.13.0+rocm10.1.0a20260812
@@ -22,16 +30,15 @@ install:
 ut:
   commands:
     - >-
-      bash test/ci_system/run_mi450_sim.sh
+      bash test/ci_system/run_mi450_rocjitsu.sh
       python3 -c
       'import torch; print("HIP", torch.version.hip, "available",
       torch.cuda.is_available(), "devices", torch.cuda.device_count(), flush=True);
       torch.cuda.init(); props = torch.cuda.get_device_properties(0);
       print(props, flush=True); assert "gfx1250" in props.gcnArchName'
     - >-
-      timeout 20m bash test/ci_system/run_mi450_sim.sh
-      python3 -m pytest
-      'tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[decode-m1-adaptive]'
-      -v
+      bash test/ci_system/run_mi450_rocjitsu.sh
+      python3 -m pytest tokenspeed-kernel/test/ -v --timeout=60
+      $(printf '%s\n' "${TEST_DESELECTS}" | awk 'NF && $1 !~ /^#/')
 report:
   github_step_summary: true
