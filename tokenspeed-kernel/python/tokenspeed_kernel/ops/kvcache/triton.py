@@ -30,21 +30,28 @@ import os
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
 _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32"))
 
 _is_nvidia = current_platform().is_nvidia
 
+
+def _use_pdl(enable_pdl: bool | None) -> bool:
+    return bool((pdl_enabled() if enable_pdl is None else enable_pdl) and _is_nvidia)
+
+
 __all__ = [
     "compute_group_decode_locs",
     "copy_state_rows",
     "fused_fp8_set_kv_buffer",
     "gather_page_table_with_padding",
+    "get_mla_kv_buffer_triton",
     "index_k_block_split_scatter",
     "quantize_mxfp8_rows",
     "quantize_store_kv_mxfp8",
+    "set_mla_kv_buffer_triton",
     "store_kv_cache",
     "store_sf_interleaved",
     "transfer_cache_ranges",
@@ -420,7 +427,7 @@ def store_sf_interleaved(
     sf_out: torch.Tensor,
     loc: torch.Tensor,
     page_size: int = 128,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> None:
     """Scatter per-token MXFP8 scale factors into the interleaved page layout.
 
@@ -435,7 +442,8 @@ def store_sf_interleaved(
             kernel's paged TMA consumes under ``kv_sf_interleaved``.
         loc: Destination slot index per token, shape [num_tokens], integer.
         page_size: Tokens per page; must be a multiple of 128.
-        enable_pdl: Launch with Programmatic Dependent Launch (Hopper+).
+        enable_pdl: Whether to use Programmatic Dependent Launch. Defaults to
+            the platform policy; pass ``False`` to disable it explicitly.
     """
     assert (
         page_size % 128 == 0
@@ -456,7 +464,7 @@ def store_sf_interleaved(
 
     BLOCK_T = 128
     grid = ((num_tokens + BLOCK_T - 1) // BLOCK_T,)
-    use_pdl = bool(enable_pdl and _is_nvidia)
+    use_pdl = _use_pdl(enable_pdl)
     kwargs = {}
     if use_pdl:
         kwargs["launch_pdl"] = True
@@ -471,6 +479,382 @@ def store_sf_interleaved(
         ENABLE_PDL=use_pdl,
         **kwargs,
     )
+
+
+# -----------------------------------------------------------------------------
+# MLA KV Cache Scatter/Gather
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _set_mla_kv_buffer_kernel(
+    kv_buffer_ptr,
+    cache_k_nope_ptr,
+    cache_k_rope_ptr,
+    loc_ptr,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    rope_stride: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+    SANITIZE: tl.constexpr,
+    MAX_FINITE: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    pid_loc = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    base = pid_blk * BLOCK
+    offs = base + tl.arange(0, BLOCK)
+    total_dim = nope_dim + rope_dim
+    mask = offs < total_dim
+
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
+    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+
+    if base + BLOCK <= nope_dim:
+        src = tl.load(
+            cache_k_nope_ptr + pid_loc * nope_stride + offs,
+            mask=mask,
+        )
+    else:
+        offs_rope = offs - nope_dim
+        src = tl.load(
+            cache_k_rope_ptr + pid_loc * rope_stride + offs_rope,
+            mask=mask,
+        )
+
+    if SANITIZE:
+        src = src.to(tl.float32)
+        src = tl.where(src != src, 0.0, src)
+        src = tl.where(src == float("inf"), MAX_FINITE, src)
+        src = tl.where(src == -float("inf"), -MAX_FINITE, src)
+
+    tl.store(dst_ptr, src, mask=mask)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
+def _set_mla_kv_buffer_per_loc_kernel(
+    kv_buffer_ptr,
+    cache_k_nope_ptr,
+    cache_k_rope_ptr,
+    loc_ptr,
+    n_loc,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    rope_stride: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    BLOCK_LOC: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+    SANITIZE: tl.constexpr,
+    MAX_FINITE: tl.constexpr,
+):
+    """Write multiple complete MLA cache entries per CTA."""
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    pid = tl.program_id(0)
+    loc_indices = pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)
+    loc_mask = loc_indices < n_loc
+    locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
+
+    nope_offs = tl.arange(0, nope_dim)
+    src_nope = tl.load(
+        cache_k_nope_ptr + loc_indices[:, None] * nope_stride + nope_offs[None, :],
+        mask=loc_mask[:, None],
+    )
+    if SANITIZE:
+        src_nope = src_nope.to(tl.float32)
+        src_nope = tl.where(src_nope != src_nope, 0.0, src_nope)
+        src_nope = tl.where(src_nope == float("inf"), MAX_FINITE, src_nope)
+        src_nope = tl.where(src_nope == -float("inf"), -MAX_FINITE, src_nope)
+    tl.store(
+        kv_buffer_ptr + locs[:, None] * buffer_stride + nope_offs[None, :],
+        src_nope,
+        mask=loc_mask[:, None],
+    )
+
+    rope_offs = tl.arange(0, rope_dim)
+    src_rope = tl.load(
+        cache_k_rope_ptr + loc_indices[:, None] * rope_stride + rope_offs[None, :],
+        mask=loc_mask[:, None],
+    )
+    if SANITIZE:
+        src_rope = src_rope.to(tl.float32)
+        src_rope = tl.where(src_rope != src_rope, 0.0, src_rope)
+        src_rope = tl.where(src_rope == float("inf"), MAX_FINITE, src_rope)
+        src_rope = tl.where(src_rope == -float("inf"), -MAX_FINITE, src_rope)
+    tl.store(
+        kv_buffer_ptr + locs[:, None] * buffer_stride + nope_dim + rope_offs[None, :],
+        src_rope,
+        mask=loc_mask[:, None],
+    )
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def set_mla_kv_buffer_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    enable_pdl: bool | None = None,
+    sanitize: bool = False,
+) -> None:
+    """Scatter split MLA keys into a latent KV cache.
+
+    Args:
+        kv_buffer: Destination cache with one combined latent and RoPE row per
+            cache slot.
+        loc: Destination cache slot for each input row.
+        cache_k_nope: Input latent key rows.
+        cache_k_rope: Input RoPE key rows.
+        enable_pdl: Whether to use Programmatic Dependent Launch. Defaults to
+            the platform policy; pass ``False`` to disable it explicitly.
+        sanitize: Replace NaN and infinity values before storing.
+
+    Returns:
+        None. The cache writes are enqueued on the current device stream.
+    """
+    # Dispatch buckets from experiments on B200 GPUs.
+    # Small batches use more CTAs per location; large batches use wider tiles.
+    n_loc = loc.numel()
+    nope_dim = cache_k_nope.size(-1)
+    rope_dim = cache_k_rope.size(-1)
+    # Clamp to a value representable by both source and destination. Bitwise
+    # viewed pools copy raw words, so no clamp applies to non-floating tensors.
+    float_maxes = [
+        torch.finfo(t.dtype).max
+        for t in (cache_k_nope, kv_buffer)
+        if t.dtype.is_floating_point
+    ]
+    max_finite = min(float_maxes) if float_maxes else float("inf")
+    use_pdl = _use_pdl(enable_pdl)
+    extra_kwargs = {"launch_pdl": True} if use_pdl else {}
+
+    if n_loc >= 512:
+        if n_loc >= 16384:
+            block_loc, num_warps, num_stages = 4, 1, 2
+        elif n_loc >= 2048:
+            block_loc, num_warps, num_stages = 4, 4, 2
+        else:
+            block_loc, num_warps, num_stages = 2, 4, 2
+        grid = (triton.cdiv(n_loc, block_loc),)
+        _set_mla_kv_buffer_per_loc_kernel[grid](
+            kv_buffer,
+            cache_k_nope,
+            cache_k_rope,
+            loc,
+            n_loc,
+            kv_buffer.stride(0),
+            cache_k_nope.stride(0),
+            cache_k_rope.stride(0),
+            nope_dim,
+            rope_dim,
+            BLOCK_LOC=block_loc,
+            ENABLE_PDL=use_pdl,
+            SANITIZE=sanitize,
+            MAX_FINITE=max_finite,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            **extra_kwargs,
+        )
+    else:
+        block = 256
+        if nope_dim % block != 0:
+            raise ValueError(
+                f"nope_dim ({nope_dim}) must be a multiple of BLOCK ({block})"
+            )
+        grid = (n_loc, triton.cdiv(nope_dim + rope_dim, block))
+        _set_mla_kv_buffer_kernel[grid](
+            kv_buffer,
+            cache_k_nope,
+            cache_k_rope,
+            loc,
+            kv_buffer.stride(0),
+            cache_k_nope.stride(0),
+            cache_k_rope.stride(0),
+            nope_dim,
+            rope_dim,
+            BLOCK=block,
+            ENABLE_PDL=use_pdl,
+            SANITIZE=sanitize,
+            MAX_FINITE=max_finite,
+            **extra_kwargs,
+        )
+
+
+@triton.jit
+def _get_mla_kv_buffer_kernel(
+    kv_buffer_ptr,
+    cache_k_nope_ptr,
+    cache_k_rope_ptr,
+    loc_ptr,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    rope_stride: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    """Read one block of an MLA cache entry per CTA."""
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    pid_loc = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    base = pid_blk * BLOCK
+    offs = base + tl.arange(0, BLOCK)
+    total_dim = nope_dim + rope_dim
+    mask = offs < total_dim
+
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
+    src = tl.load(kv_buffer_ptr + loc * buffer_stride + offs, mask=mask)
+
+    if base + BLOCK <= nope_dim:
+        tl.store(cache_k_nope_ptr + pid_loc * nope_stride + offs, src, mask=mask)
+    else:
+        offs_rope = offs - nope_dim
+        tl.store(cache_k_rope_ptr + pid_loc * rope_stride + offs_rope, src, mask=mask)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
+def _get_mla_kv_buffer_per_loc_kernel(
+    kv_buffer_ptr,
+    cache_k_nope_ptr,
+    cache_k_rope_ptr,
+    loc_ptr,
+    n_loc,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    rope_stride: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    BLOCK_LOC: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    """Read multiple complete MLA cache entries per CTA."""
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    pid = tl.program_id(0)
+    loc_indices = pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)
+    loc_mask = loc_indices < n_loc
+    locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
+
+    nope_offs = tl.arange(0, nope_dim)
+    src_nope = tl.load(
+        kv_buffer_ptr + locs[:, None] * buffer_stride + nope_offs[None, :],
+        mask=loc_mask[:, None],
+    )
+    tl.store(
+        cache_k_nope_ptr + loc_indices[:, None] * nope_stride + nope_offs[None, :],
+        src_nope,
+        mask=loc_mask[:, None],
+    )
+
+    rope_offs = tl.arange(0, rope_dim)
+    src_rope = tl.load(
+        kv_buffer_ptr + locs[:, None] * buffer_stride + nope_dim + rope_offs[None, :],
+        mask=loc_mask[:, None],
+    )
+    tl.store(
+        cache_k_rope_ptr + loc_indices[:, None] * rope_stride + rope_offs[None, :],
+        src_rope,
+        mask=loc_mask[:, None],
+    )
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def get_mla_kv_buffer_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    enable_pdl: bool | None = None,
+) -> None:
+    """Gather split MLA keys from a latent KV cache.
+
+    Args:
+        kv_buffer: Source cache with one combined latent and RoPE row per slot.
+        loc: Source cache slot for each output row.
+        cache_k_nope: Destination for latent key rows.
+        cache_k_rope: Destination for RoPE key rows.
+        enable_pdl: Whether to use Programmatic Dependent Launch. Defaults to
+            the platform policy; pass ``False`` to disable it explicitly.
+
+    Returns:
+        None. The cache reads are enqueued on the current device stream.
+    """
+    # Dispatch buckets from experiments on B200 GPUs.
+    n_loc = loc.numel()
+    nope_dim = cache_k_nope.size(-1)
+    rope_dim = cache_k_rope.size(-1)
+    use_pdl = _use_pdl(enable_pdl)
+    extra_kwargs = {"launch_pdl": True} if use_pdl else {}
+
+    if n_loc >= 512:
+        if n_loc >= 16384:
+            block_loc, num_warps, num_stages = 8, 1, 2
+        elif n_loc >= 2048:
+            block_loc, num_warps, num_stages = 8, 1, 3
+        else:
+            block_loc, num_warps, num_stages = 2, 4, 2
+        grid = (triton.cdiv(n_loc, block_loc),)
+        _get_mla_kv_buffer_per_loc_kernel[grid](
+            kv_buffer,
+            cache_k_nope,
+            cache_k_rope,
+            loc,
+            n_loc,
+            kv_buffer.stride(0),
+            cache_k_nope.stride(0),
+            cache_k_rope.stride(0),
+            nope_dim,
+            rope_dim,
+            BLOCK_LOC=block_loc,
+            ENABLE_PDL=use_pdl,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            **extra_kwargs,
+        )
+    else:
+        block = 256
+        if nope_dim % block != 0:
+            raise ValueError(
+                f"nope_dim ({nope_dim}) must be a multiple of BLOCK ({block})"
+            )
+        grid = (n_loc, triton.cdiv(nope_dim + rope_dim, block))
+        _get_mla_kv_buffer_kernel[grid](
+            kv_buffer,
+            cache_k_nope,
+            cache_k_rope,
+            loc,
+            kv_buffer.stride(0),
+            cache_k_nope.stride(0),
+            cache_k_rope.stride(0),
+            nope_dim,
+            rope_dim,
+            BLOCK=block,
+            ENABLE_PDL=use_pdl,
+            **extra_kwargs,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -530,7 +914,7 @@ def store_kv_cache(
     k_dst: torch.Tensor,
     v_dst: torch.Tensor,
     loc: torch.Tensor,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> None:
     """Fused per-token KV cache scatter for one layer.
 
@@ -540,9 +924,10 @@ def store_kv_cache(
     lets src tensors come from a qkv-split view directly (no contiguous copy
     required).
 
-    ``enable_pdl`` launches with Programmatic Dependent Launch (Hopper+):
-    the kernel waits for its producer before the first load and signals
-    dependents after its last store.
+    ``enable_pdl`` defaults to the platform policy; pass ``False`` to disable
+    Programmatic Dependent Launch explicitly. When enabled, the kernel waits
+    for its producer before the first load and signals dependents after its
+    last store.
     """
     n_tokens = k_src.shape[0]
     if n_tokens == 0:
@@ -561,7 +946,7 @@ def store_kv_cache(
     v_dst_stride = v_dst.stride(0) if v_dst.dim() > 1 else v_dst.shape[-1]
 
     block = triton.next_power_of_2(n_kv_k)
-    use_pdl = bool(enable_pdl and _is_nvidia)
+    use_pdl = _use_pdl(enable_pdl)
     kwargs = {}
     if use_pdl:
         kwargs["launch_pdl"] = True
@@ -751,7 +1136,7 @@ def fused_fp8_set_kv_buffer(
     k_scale: float | torch.Tensor | None = None,
     v_scale: float | torch.Tensor | None = None,
     page_size: int = 16,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> None:
     """Quantize K/V tensors to FP8 and scatter them into a paged KV cache.
 
@@ -770,8 +1155,8 @@ def fused_fp8_set_kv_buffer(
         v_scale: Optional scalar V scale. When provided with ``k_scale``, V is
             divided by this scale before FP8 conversion.
         page_size: Number of tokens per cache page.
-        enable_pdl: Request Programmatic Dependent Launch (SM90+); no-op on
-            non-NVIDIA platforms.
+        enable_pdl: Whether to use Programmatic Dependent Launch. Defaults to
+            the platform policy; pass ``False`` to disable it explicitly.
     """
     num_tokens = k.shape[0]
     if num_tokens == 0:
@@ -855,7 +1240,7 @@ def fused_fp8_set_kv_buffer(
         inv_k_scale_ptr = k_3d
         inv_v_scale_ptr = k_3d
 
-    use_pdl = bool(enable_pdl and _is_nvidia)
+    use_pdl = _use_pdl(enable_pdl)
     kwargs = {}
     if use_pdl:
         kwargs["launch_pdl"] = True
@@ -1615,7 +2000,7 @@ def quantize_store_kv_mxfp8(
     v_sf: torch.Tensor,
     loc: torch.Tensor,
     page_tokens: int = 128,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> None:
     """Fused per-token MXFP8 quantize + KV data store + interleaved SF store.
 
@@ -1628,7 +2013,8 @@ def quantize_store_kv_mxfp8(
             ``store_sf_interleaved`` for this layer's ``page_tokens``.
         loc: [T] destination row per token (layer-view row units).
         page_tokens: Tokens per page of the layer's group (multiple of 128).
-        enable_pdl: Launch with Programmatic Dependent Launch (Hopper+).
+        enable_pdl: Whether to use Programmatic Dependent Launch. Defaults to
+            the platform policy; pass ``False`` to disable it explicitly.
     """
     assert page_tokens % 128 == 0
     t = k.shape[0]
@@ -1647,7 +2033,7 @@ def quantize_store_kv_mxfp8(
     sf_page_stride = nheads * chunks_per_page * 128
 
     grid = (2, t)
-    use_pdl = bool(enable_pdl and _is_nvidia)
+    use_pdl = _use_pdl(enable_pdl)
     kwargs = {}
     if use_pdl:
         kwargs["launch_pdl"] = True
@@ -1702,13 +2088,14 @@ def _quantize_mxfp8_rows_kernel(
 
 def quantize_mxfp8_rows(
     x: torch.Tensor,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """MXFP8-quantize [R, 128] rows: (fp8-e4m3 [R, 128], e8m0 [R, 4]).
 
     PDL-capable row quantizer intended for the decode-Q fusion follow-up
     (inkling_mxfp8_attn.md); parity-tested against flashinfer's
-    mxfp8_quantize, no runtime caller yet.
+    mxfp8_quantize, no runtime caller yet. PDL defaults to the platform policy;
+    pass ``False`` to disable it explicitly.
     """
     r, d = x.shape
     assert d == 128 and x.stride(-1) == 1
@@ -1718,7 +2105,7 @@ def quantize_mxfp8_rows(
         return data, sf
     rows_per_prog = 4
     grid = ((r + rows_per_prog - 1) // rows_per_prog,)
-    use_pdl = bool(enable_pdl and _is_nvidia)
+    use_pdl = _use_pdl(enable_pdl)
     kwargs = {}
     if use_pdl:
         kwargs["launch_pdl"] = True

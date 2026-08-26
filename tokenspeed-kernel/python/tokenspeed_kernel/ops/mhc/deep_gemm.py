@@ -22,12 +22,16 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.mhc.triton import _mhc_pre_impl
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 try:
-    from tokenspeed_kernel.thirdparty.deep_gemm import tf32_hc_prenorm_gemm
+    from tokenspeed_kernel.thirdparty.deep_gemm import (
+        get_pdl,
+        set_pdl,
+        tf32_hc_prenorm_gemm,
+    )
 except Exception:
     tf32_hc_prenorm_gemm = None  # type: ignore[assignment]
 
@@ -66,6 +70,8 @@ if tf32_hc_prenorm_gemm is not None:
         sinkhorn_iters: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run mHC pre-mapping with DeepGEMM prenorm and Triton mixing."""
+        if get_pdl() != pdl_enabled():
+            set_pdl(pdl_enabled())
         return _mhc_pre_impl(
             residual,
             fn,

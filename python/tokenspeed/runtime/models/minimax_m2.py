@@ -78,7 +78,6 @@ from tokenspeed.runtime.utils import (
     set_weight_attrs,
 )
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +189,6 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
                 hidden_states,
                 self.gate.weight,
                 out_dtype=torch.float32,
-                enable_pdl=pdl_enabled(),
             )
         else:
             router_logits, _ = self.gate(hidden_states.to(torch.float32))
@@ -474,7 +472,6 @@ def fused_qk_rmsnorm(
                 nranks=tp_size,
                 eps=eps,
                 trigger_completion_at_end=True,
-                launch_with_pdl=pdl_enabled(),
             )
 
     return fused_qk_rmsnorm_triton(
@@ -696,7 +693,6 @@ class MiniMaxM2Attention(nn.Module):
                 k,
                 fused_set_kv_buffer_arg=fused_kv_arg,
                 output_q_rope=q_rope,
-                enable_pdl=pdl_enabled(),
             )
             attn_output = self.attn(
                 q_rope,

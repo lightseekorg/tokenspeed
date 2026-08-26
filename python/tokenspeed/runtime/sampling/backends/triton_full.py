@@ -65,7 +65,6 @@ from tokenspeed.runtime.sampling.backends.triton import (
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -538,7 +537,6 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             accept_token_num=accept_length,
             candidates=candidates.to(torch.int32),
             target_sampled=target_sampled,
-            enable_pdl=pdl_enabled(),
         )
 
         accept_length += 1

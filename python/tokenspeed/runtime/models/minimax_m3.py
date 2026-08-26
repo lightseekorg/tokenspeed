@@ -95,7 +95,6 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.utils import add_prefix, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -262,7 +261,6 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
                     hidden_states,
                     self.gate.weight,
                     out_dtype=torch.float32,
-                    enable_pdl=pdl_enabled(),
                 )
             else:
                 router_logits, _ = self.gate(hidden_states.to(torch.float32))
@@ -298,7 +296,6 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
                 expert_weights,
                 shared_output,
                 top_k=self.topk.topk_config.top_k,
-                enable_pdl=pdl_enabled(),
             )
         else:
             output = (
@@ -705,9 +702,8 @@ class MiniMaxM3Attention(nn.Module):
             self.q_norm.gemma_weight,
             self.k_norm.gemma_weight,
             self.q_norm.variance_epsilon,
-            enable_pdl=pdl_enabled(),
         )
-        q, k = self.rotary_emb(positions, q, k, enable_pdl=pdl_enabled())
+        q, k = self.rotary_emb(positions, q, k)
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
@@ -737,7 +733,6 @@ class MiniMaxM3Attention(nn.Module):
             num_index_heads=self.indexer.num_index_heads,
             q_out=q_out,
             index_q_out=index_q_out,
-            enable_pdl=pdl_enabled(),
         )
         _, k, v, _, index_k = qkv.split(
             [

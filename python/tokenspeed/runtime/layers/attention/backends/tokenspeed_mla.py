@@ -66,7 +66,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -172,7 +171,6 @@ class CuteDSLMLABackend(AttentionBackend):
             q_dtype=torch.float8_e4m3fn,
             d_qk=d_qk,
             d_v=self.v_head_dim,
-            enable_pdl=pdl_enabled(),
         )
 
         # Validate page_size
@@ -1020,7 +1018,6 @@ class CuteDSLMLABackend(AttentionBackend):
             seq_lens=metadata.seq_lens_k[num_extends:],
             max_seq_len=metadata.max_seq_len_k,
             softmax_scale=softmax_scale,
-            enable_pdl=pdl_enabled(),
         )
 
         return raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -1087,7 +1084,6 @@ class CuteDSLMLABackend(AttentionBackend):
             return_lse=True,
             cum_seq_lens_q=cum_seq_lens_q,
             max_seq_len_q=max_q_len,
-            enable_pdl=pdl_enabled(),
             out=out,
         )
 

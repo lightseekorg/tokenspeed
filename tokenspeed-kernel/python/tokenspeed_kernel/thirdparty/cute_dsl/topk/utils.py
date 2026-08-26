@@ -48,7 +48,6 @@
 # This file is copied and modified from cutlass https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py
 
 import ctypes
-import os
 from typing import Union
 
 import cutlass
@@ -58,8 +57,6 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 from cutlass.cutlass_dsl import T, dsl_user_op
-
-TRTLLM_ENABLE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 # WAR for CuTeDSL make_ptr implementation

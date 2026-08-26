@@ -211,4 +211,5 @@ if platform.is_nvidia:
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=getattr(w, "swiglu_beta_t", None),
             swiglu_limit=getattr(w, "swiglu_limit_t", None),
+            enable_pdl=enable_pdl,
         )[0]

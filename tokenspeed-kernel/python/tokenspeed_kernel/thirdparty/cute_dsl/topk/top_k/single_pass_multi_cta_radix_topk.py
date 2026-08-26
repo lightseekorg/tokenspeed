@@ -30,9 +30,9 @@ from cutlass.cute.typing import Pointer as CutePointer
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils.distributed import atomicAdd
 from cutlass.utils.smem_allocator import SmemAllocator
+from tokenspeed_kernel.platform import pdl_enabled
 
 from ..utils import (
-    TRTLLM_ENABLE_PDL,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
 )
@@ -1447,5 +1447,5 @@ class SinglePassMultiCTARadixTopKKernel:
             grid=(total_ctas, 1, 1),
             block=(self.num_threads, 1, 1),
             stream=stream,
-            use_pdl=TRTLLM_ENABLE_PDL,
+            use_pdl=pdl_enabled(),
         )

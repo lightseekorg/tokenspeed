@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 @triton.jit
@@ -76,9 +77,10 @@ def verify_chain_target_sampled(
     candidates: torch.Tensor,
     target_sampled: torch.Tensor,
     *,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> None:
     """Verify a speculative chain against already-sampled target tokens."""
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     if candidates.ndim != 2:
         raise ValueError(f"candidates must be 2D, got {candidates.ndim}D")
     if accept_index.shape != candidates.shape:

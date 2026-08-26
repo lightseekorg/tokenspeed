@@ -68,6 +68,12 @@ if current_platform().is_amd:
         gluon_kda_fused_decode_gfx950 as _kda_fused_decode_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
+        gluon_kda_fused_replay_gfx950 as _kda_fused_replay_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
+        gluon_kda_fused_verify_gfx950 as _kda_fused_verify_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
         gluon_kda_recurrent_decode_gfx950 as _kda_decode_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.prefill import (
@@ -385,6 +391,157 @@ if current_platform().is_amd:
             lower_bound=lower_bound,
         )
 
+    def _gluon_kda_fused_paged_verify_vmajor_gfx950(
+        mixed_qkv: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_states: torch.Tensor,
+        conv_scratch: torch.Tensor,
+        f_a_out: torch.Tensor,
+        f_b_weight: torch.Tensor,
+        beta_logits: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        *,
+        state_pool: torch.Tensor,
+        state_scratch: torch.Tensor | None,
+        read_indices: torch.Tensor,
+        write_indices: torch.Tensor,
+        num_heads: int,
+        head_dim: int,
+        draft_token_num: int,
+        lower_bound: float | None,
+        replay_mixed_qkv: torch.Tensor | None = None,
+        replay_gate: torch.Tensor | None = None,
+        replay_beta: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run target verify and optionally capture a complete raw-g replay tape."""
+        raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
+        return _kda_fused_verify_impl(
+            mixed_qkv=mixed_qkv,
+            conv_weights=conv_weights,
+            conv_pool=conv_states,
+            conv_scratch=conv_scratch,
+            raw_g=raw_g,
+            beta_logits=beta_logits,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            state_pool=state_pool,
+            state_scratch=state_scratch,
+            read_indices=read_indices,
+            write_indices=write_indices,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            draft_token_num=draft_token_num,
+            lower_bound=lower_bound,
+            replay_mixed_qkv=replay_mixed_qkv,
+            replay_gate=replay_gate,
+            replay_beta=replay_beta,
+        )
+
+    @register_kernel(
+        "attention",
+        "kda_fused_paged_verify",
+        name="gluon_kda_fused_paged_verify_nostore_vmajor_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "paged_state": frozenset({True}),
+            "store_states": frozenset({False}),
+            "recurrent_layout": frozenset({"v_major"}),
+            "num_heads": frozenset({12}),
+            "head_dim": frozenset({128}),
+        },
+        tags={
+            "amd",
+            "gfx950",
+            "paged_cache",
+            "cuda_graph",
+            "fusion",
+            "speculative",
+            "replay",
+        },
+    )
+    def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(*args, **kwargs):
+        return _gluon_kda_fused_paged_verify_vmajor_gfx950(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "kda_replay_commit",
+        name="gluon_kda_fused_replay_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "flat_state": frozenset({True}),
+            "batched_layers": frozenset({True}),
+            "recurrent_layout": frozenset({"v_major"}),
+            "replay_raw_gate": frozenset({True}),
+            "num_heads": frozenset({12}),
+            "head_dim": frozenset({128}),
+        },
+        tags={
+            "amd",
+            "gfx950",
+            "paged_cache",
+            "cuda_graph",
+            "speculative",
+            "replay",
+            "batched_layers",
+            "raw_gate",
+        },
+    )
+    def gluon_kda_fused_replay_gfx950(
+        descriptors: torch.Tensor,
+        *,
+        read_indices: torch.Tensor,
+        write_indices: torch.Tensor,
+        accepted_length: torch.Tensor,
+        draft_token_num: int,
+        num_heads: int,
+        head_dim: int,
+        f_a_dim: int,
+        qkv_stride: int,
+        conv_stride: int,
+        f_a_stride: int,
+        beta_stride: int,
+        state_stride: int,
+        gate_stride: int,
+        conv_width: int,
+        layers_per_group: int,
+        lower_bound: float,
+    ) -> None:
+        """Replay all gfx950 layers from persistent BF16 raw-g descriptors."""
+        _kda_fused_replay_impl(
+            descriptors,
+            read_indices,
+            write_indices,
+            accepted_length,
+            draft_token_num=draft_token_num,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            f_a_dim=f_a_dim,
+            qkv_stride=qkv_stride,
+            conv_stride=conv_stride,
+            f_a_stride=f_a_stride,
+            beta_stride=beta_stride,
+            state_stride=state_stride,
+            gate_stride=gate_stride,
+            conv_width=conv_width,
+            layers_per_group=layers_per_group,
+            lower_bound=lower_bound,
+        )
+
     @register_kernel(
         "attention",
         "kda_paged_decode",
@@ -513,7 +670,7 @@ if current_platform().is_amd:
             "return_lse": frozenset({False}),
         },
     )
-    def gluon_mha_decode_gfx950(*args, **kwargs):
+    def gluon_mha_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
         return _decode_impl(*args, **kwargs)
 
     @register_kernel(
@@ -547,7 +704,7 @@ if current_platform().is_amd:
             "return_lse": frozenset({False}),
         },
     )
-    def gluon_mha_decode_gfx1250(*args, **kwargs):
+    def gluon_mha_decode_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         return _decode_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
@@ -645,7 +802,7 @@ if current_platform().is_amd:
             "return_lse": frozenset({False, True}),
         },
     )
-    def gluon_mha_extend_gfx950(*args, **kwargs):
+    def gluon_mha_extend_gfx950(*args, enable_pdl: bool = False, **kwargs):
         return _extend_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1361,7 +1518,7 @@ if current_platform().is_amd:
             "return_lse": frozenset({False}),
         },
     )
-    def gluon_dsa_decode_gfx950(*args, **kwargs):
+    def gluon_dsa_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
         return _dsa_decode_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1394,7 +1551,7 @@ if current_platform().is_amd:
             "return_lse": frozenset({False}),
         },
     )
-    def gluon_dsa_prefill_gfx950(*args, **kwargs):
+    def gluon_dsa_prefill_gfx950(*args, enable_pdl: bool = False, **kwargs):
         return _dsa_prefill_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1428,7 +1585,7 @@ if current_platform().is_amd:
             "return_lse": frozenset({False}),
         },
     )
-    def gluon_dsa_prefill_fp8_dense_gfx950(*args, **kwargs):
+    def gluon_dsa_prefill_fp8_dense_gfx950(*args, enable_pdl: bool = False, **kwargs):
         return _dsa_prefill_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1535,7 +1692,7 @@ if current_platform().is_amd:
         },
         tags={"amd", "gfx1250"},
     )
-    def gluon_dsa_decode_gfx1250(*args, **kwargs):
+    def gluon_dsa_decode_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         return _dsa_decode_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1569,7 +1726,7 @@ if current_platform().is_amd:
         },
         tags={"amd", "gfx1250"},
     )
-    def gluon_dsa_prefill_gfx1250(*args, **kwargs):
+    def gluon_dsa_prefill_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         return _dsa_prefill_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
@@ -1604,7 +1761,7 @@ if current_platform().is_amd:
         },
         tags={"amd", "gfx1250"},
     )
-    def gluon_dsa_prefill_fp8_dense_gfx1250(*args, **kwargs):
+    def gluon_dsa_prefill_fp8_dense_gfx1250(*args, enable_pdl: bool = False, **kwargs):
         return _dsa_prefill_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(

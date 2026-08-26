@@ -5,16 +5,18 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.trtllm import (
-    allgather_dual_rmsnorm,
+    allgather_dual_rmsnorm as _allgather_dual_rmsnorm,
 )
 from tokenspeed_kernel.ops.communication.trtllm import (
     allreduce_lane_latent_norm as _allreduce_lane_latent_norm,
 )
 from tokenspeed_kernel.ops.communication.trtllm import (
-    allreduce_residual_rmsnorm,
-    reducescatter_residual_rmsnorm,
+    allreduce_residual_rmsnorm as _allreduce_residual_rmsnorm,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.communication.trtllm import (
+    reducescatter_residual_rmsnorm as _reducescatter_residual_rmsnorm,
+)
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _ALLREDUCE_FUSION_LANE: torch.Tensor | None = None
 
@@ -98,7 +100,6 @@ def allreduce_lane_latent_norm(
     group: dist.ProcessGroup,
     eps: float,
     max_token_num: int,
-    launch_with_pdl: bool = False,
     trigger_completion_at_end: bool = False,
 ) -> torch.Tensor:
     """Reduce a routed/shared lane and normalize its routed prefix."""
@@ -111,8 +112,116 @@ def allreduce_lane_latent_norm(
         group=group,
         eps=eps,
         max_token_num=max_token_num,
-        launch_with_pdl=launch_with_pdl,
+        launch_with_pdl=pdl_enabled(),
         trigger_completion_at_end=trigger_completion_at_end,
+    )
+
+
+def allreduce_residual_rmsnorm(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    rank: int,
+    group: dist.ProcessGroup,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    use_oneshot: bool | None = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+    block_quant_fp8: bool = False,
+    residual_reduce_scattered: bool = False,
+    has_partial_norm_out: bool = False,
+    max_sm_to_use: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run fused all-reduce, residual addition, and RMS normalization."""
+
+    return _allreduce_residual_rmsnorm(
+        input_tensor=input_tensor,
+        residual=residual,
+        weight=weight,
+        rank=rank,
+        group=group,
+        eps=eps,
+        max_token_num=max_token_num,
+        use_oneshot=use_oneshot,
+        trigger_completion_at_end=trigger_completion_at_end,
+        fp32_acc=fp32_acc,
+        block_quant_fp8=block_quant_fp8,
+        residual_reduce_scattered=residual_reduce_scattered,
+        has_partial_norm_out=has_partial_norm_out,
+        max_sm_to_use=max_sm_to_use,
+        launch_with_pdl=pdl_enabled(),
+    )
+
+
+def reducescatter_residual_rmsnorm(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    rank: int,
+    group: dist.ProcessGroup,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    use_oneshot: bool | None = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+    block_quant_fp8: bool = False,
+    add_in: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Run fused reduce-scatter, residual addition, and RMS normalization."""
+
+    return _reducescatter_residual_rmsnorm(
+        input_tensor=input_tensor,
+        residual=residual,
+        weight=weight,
+        rank=rank,
+        group=group,
+        eps=eps,
+        max_token_num=max_token_num,
+        use_oneshot=use_oneshot,
+        trigger_completion_at_end=trigger_completion_at_end,
+        fp32_acc=fp32_acc,
+        block_quant_fp8=block_quant_fp8,
+        add_in=add_in,
+        launch_with_pdl=pdl_enabled(),
+    )
+
+
+def allgather_dual_rmsnorm(
+    qkv: torch.Tensor,
+    total_num_tokens: int,
+    weight_q_a: torch.nn.Parameter,
+    weight_kv_a: torch.nn.Parameter,
+    rank: int,
+    group: dist.ProcessGroup,
+    eps_q: float,
+    eps_kv: float,
+    max_token_num: int,
+    block_quant_fp8: bool = False,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+) -> tuple[
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Run fused all-gather with dual RMS normalization."""
+
+    return _allgather_dual_rmsnorm(
+        qkv=qkv,
+        total_num_tokens=total_num_tokens,
+        weight_q_a=weight_q_a,
+        weight_kv_a=weight_kv_a,
+        rank=rank,
+        group=group,
+        eps_q=eps_q,
+        eps_kv=eps_kv,
+        max_token_num=max_token_num,
+        block_quant_fp8=block_quant_fp8,
+        trigger_completion_at_end=trigger_completion_at_end,
+        fp32_acc=fp32_acc,
+        launch_with_pdl=pdl_enabled(),
     )
 
 

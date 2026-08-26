@@ -44,6 +44,7 @@ from src.sm100.prepare_scheduler import (
     SparseAttentionSchedule,
     prepare_sparse_fwd_schedule_and_split,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 
 _compile_cache: dict = {}
 _TEMPERATURE_LSE_FAST_PATH_ABS_TOL = 1e-12
@@ -1034,7 +1035,7 @@ def sparse_atten_nvfp4_kv_func(
         cu_seqlens=cu_seqlens_q,
         split_counts=split_counts,
         output_scale=v_global_scale,
-        use_pdl=True,
+        use_pdl=pdl_enabled(),
     )
     if temperature_lse_fast_path:
         LSE_temperature_out = LSE_out
@@ -1630,7 +1631,7 @@ def _sparse_atten_csr_varlen_forward(
         lse_temperature_out=LSE_temperature_out,
         cu_seqlens=cu_seqlens_q,
         split_counts=split_counts,
-        use_pdl=True,
+        use_pdl=pdl_enabled(),
         output_scale=output_scale,
     )
     if temperature_lse_fast_path:
