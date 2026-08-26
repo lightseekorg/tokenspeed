@@ -289,9 +289,9 @@ def copy_state_rows(
         src_addresses: CUDA uint64 ``[num_layers]`` base addresses of the
             source slabs (address of row 0).
         dst_addresses: CUDA uint64 ``[num_layers]`` destination base addresses.
-        src_rows: CUDA int64 ``[num_layers * rows_per_layer]`` source row ids,
-            layer-major. A negative id zero-fills its destination row.
-        dst_rows: CUDA int64 tensor, same layout, destination row ids.
+        src_rows: CUDA int32 or int64 ``[num_layers * rows_per_layer]`` source
+            row ids, layer-major. A negative id zero-fills its destination row.
+        dst_rows: CUDA int32 or int64 tensor, same layout, destination row ids.
         row_bytes: Byte width of the copied row payload (divisible by 4).
         src_row_strides: CUDA int64 ``[num_layers]`` row-to-row strides of the
             source slabs in int32 units (``stride_bytes // 4``).
@@ -309,8 +309,9 @@ def copy_state_rows(
         raise ValueError("src_rows must hold rows_per_layer ids per layer")
     if src_addresses.dtype != torch.uint64 or dst_addresses.dtype != torch.uint64:
         raise ValueError("slab address tables must have dtype torch.uint64")
-    if src_rows.dtype != torch.int64 or dst_rows.dtype != torch.int64:
-        raise ValueError("row id tensors must have dtype torch.int64")
+    row_id_dtypes = (torch.int32, torch.int64)
+    if src_rows.dtype not in row_id_dtypes or dst_rows.dtype not in row_id_dtypes:
+        raise ValueError("row id tensors must have dtype torch.int32 or torch.int64")
     if (
         src_row_strides.dtype != torch.int64
         or dst_row_strides.dtype != torch.int64
@@ -604,21 +605,25 @@ def _set_mla_kv_buffer_per_loc_kernel(
         mask=loc_mask[:, None],
     )
 
-    rope_offs = tl.arange(0, rope_dim)
-    src_rope = tl.load(
-        cache_k_rope_ptr + loc_indices[:, None] * rope_stride + rope_offs[None, :],
-        mask=loc_mask[:, None],
-    )
-    if SANITIZE:
-        src_rope = src_rope.to(tl.float32)
-        src_rope = tl.where(src_rope != src_rope, 0.0, src_rope)
-        src_rope = tl.where(src_rope == float("inf"), MAX_FINITE, src_rope)
-        src_rope = tl.where(src_rope == -float("inf"), -MAX_FINITE, src_rope)
-    tl.store(
-        kv_buffer_ptr + locs[:, None] * buffer_stride + nope_dim + rope_offs[None, :],
-        src_rope,
-        mask=loc_mask[:, None],
-    )
+    if rope_dim > 0:
+        rope_offs = tl.arange(0, rope_dim)
+        src_rope = tl.load(
+            cache_k_rope_ptr + loc_indices[:, None] * rope_stride + rope_offs[None, :],
+            mask=loc_mask[:, None],
+        )
+        if SANITIZE:
+            src_rope = src_rope.to(tl.float32)
+            src_rope = tl.where(src_rope != src_rope, 0.0, src_rope)
+            src_rope = tl.where(src_rope == float("inf"), MAX_FINITE, src_rope)
+            src_rope = tl.where(src_rope == -float("inf"), -MAX_FINITE, src_rope)
+        tl.store(
+            kv_buffer_ptr
+            + locs[:, None] * buffer_stride
+            + nope_dim
+            + rope_offs[None, :],
+            src_rope,
+            mask=loc_mask[:, None],
+        )
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()

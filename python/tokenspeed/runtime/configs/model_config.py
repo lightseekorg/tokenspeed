@@ -84,6 +84,8 @@ _DSA_ARCHITECTURES = frozenset(
         # attention family and indexer geometry as GLM-DSA.
         "DeepseekV32ForCausalLM",
         "DeepseekV32ForCausalLMNextN",
+        "Glm53FlashForConditionalGeneration",
+        "Glm53FlashForConditionalGenerationNextN",
     }
 )
 _MSA_ARCHITECTURES = frozenset(
@@ -204,6 +206,7 @@ def configure_glm_attention(model_config) -> None:
     model_config.index_topk = mla_config.index_topk
     model_config.index_head_dim = mla_config.index_head_dim
     model_config.index_n_heads = mla_config.index_n_heads
+    model_config.index_kpool = getattr(mla_config, "index_kpool", None)
     model_config.index_topk_pattern = getattr(mla_config, "index_topk_pattern", None)
 
     model_config.scaling = 1 / math.sqrt(
@@ -840,6 +843,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Qwen3ASRForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
+        "Glm53FlashForConditionalGeneration",
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
     }

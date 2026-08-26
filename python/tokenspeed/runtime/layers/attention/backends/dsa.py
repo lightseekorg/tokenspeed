@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from tokenspeed_kernel.ops.attention import (
     dsa_decode,
@@ -41,6 +43,11 @@ from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DSA_SPARSE_PAGE_SIZE,
 )
+from tokenspeed.runtime.layers.attention.kpool import (
+    KPoolPrefillPlan,
+    KPoolRuntime,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 
@@ -54,16 +61,23 @@ def _make_dense_backend(
     raise RuntimeError(f"DSA backend does not support platform {platform.vendor!r}.")
 
 
+@dataclass
+class DSAForwardMetadata:
+    """DSA-owned state shared by sparse-attention layers in one forward."""
+
+    kpool_prefill_plan: KPoolPrefillPlan | None = None
+    req_pool_indices: torch.Tensor | None = None
+
+
 class DSABackend(AttentionBackend):
     """DSA backend for sparse MLA attention.
 
     Dense MLA metadata and dense attention calls are delegated to a platform backend.
     """
 
-    # DSA reads the history (full-attention) family: the dense sub-backend holds
-    # the group tables, and the sparse path maps its top-k slots through the same
-    # block_kv_indices. Declared here because the scheduler validates the
-    # outermost backend, not the delegate.
+    # DSA owns the derived sparse-index contents and request-local tail, while
+    # its pooled index and latent KV share the scheduler-owned history table.
+    uses_cache_groups = True
     cache_consumer_families = frozenset({"history"})
 
     def __init__(self, config: AttnConfig, spec: DSAConfig):
@@ -71,6 +85,11 @@ class DSABackend(AttentionBackend):
         platform = current_platform()
         self._dense_backend = _make_dense_backend(config, spec, platform)
         self.index_topk = spec.index_topk
+        self.kpool_runtime = (
+            KPoolRuntime(spec.index_kpool, spec.index_topk)
+            if spec.index_kpool is not None
+            else None
+        )
         self.max_context_len = config.context_len
         self.kernel_page_size = (
             config.kernel_page_size
@@ -87,6 +106,25 @@ class DSABackend(AttentionBackend):
         self.q_data_type = config.dtype
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
         self._prefill_page_table: torch.Tensor | None = None
+        self.forward_metadata = DSAForwardMetadata()
+
+    def require_kpool_runtime(self) -> KPoolRuntime:
+        """Return the configured KPool runtime for sparse pooled indexing."""
+        if self.kpool_runtime is None:
+            raise RuntimeError("DSA backend was created without KPool configuration")
+        return self.kpool_runtime
+
+    def _reset_forward_metadata(
+        self, req_pool_indices: torch.Tensor | None = None
+    ) -> None:
+        """Start a new per-forward metadata lifetime.
+
+        Mirrors KDA's ``MambaForwardMetadata`` ownership: model-specific DSA
+        planning may be shared by layers in this forward, but never by the next
+        request batch.
+        """
+        self.forward_metadata = DSAForwardMetadata(req_pool_indices=req_pool_indices)
+        self._prefill_page_table = None
 
     @property
     def forward_decode_metadata(self):
@@ -99,6 +137,40 @@ class DSABackend(AttentionBackend):
     @property
     def chunked_prefill_metadata(self):
         return self._dense_backend.chunked_prefill_metadata
+
+    def kpool_prefill_page_table(self, num_requests: int) -> torch.Tensor:
+        """Return the scheduler-owned history rows used by KPool prefill."""
+        table = self._prefill_page_table
+        if table is None:
+            table = getattr(self.chunked_prefill_metadata, "page_table", None)
+        if table is None:
+            raise RuntimeError("DSA KPool prefill requires a full-history page table")
+        if num_requests < 0 or table.shape[0] < num_requests:
+            raise RuntimeError(
+                "DSA KPool prefill page-table row mismatch: "
+                f"table={table.shape[0]}, requests={num_requests}"
+            )
+        return table[:num_requests]
+
+    def kpool_decode_page_table(
+        self, row_start: int, num_requests: int
+    ) -> torch.Tensor:
+        """Return the scheduler-owned history rows used by KPool decode."""
+        metadata = self.forward_decode_metadata
+        table = getattr(metadata, "block_kv_indices", None)
+        row_end = row_start + num_requests
+        if (
+            table is None
+            or row_start < 0
+            or num_requests < 0
+            or table.shape[0] < row_end
+        ):
+            rows = None if table is None else table.shape[0]
+            raise RuntimeError(
+                "DSA KPool decode page-table row mismatch: "
+                f"table={rows}, rows=[{row_start}, {row_end})"
+            )
+        return table[row_start:row_end]
 
     @property
     def decode_cuda_graph_metadata(self):
@@ -137,9 +209,15 @@ class DSABackend(AttentionBackend):
         return self._dense_backend.override_num_extends(num_extends)
 
     def mark_cache_contract(self) -> None:
-        """Forward the contract mark to the dense sub-backend, which owns the
-        group tables and the graph write-location buffer."""
-        self._dense_backend.mark_cache_contract()
+        """Bind target MLA writes while keeping draft history independently staged."""
+        # A chaining MTP draft owns its live write locations and reads the
+        # batch-ordered history table staged by DraftPageStaging.  The outer
+        # DSA backend still consumes the index/tail cache-group tables, but its
+        # dense MLA delegate must remain on the draft page-table path.  Marking
+        # that delegate contract-bound would allocate target-style write
+        # locations and make graph capture reject the draft path.
+        if not self.is_draft:
+            self._dense_backend.mark_cache_contract()
 
     @property
     def consumes_cache_metadata(self) -> bool:
@@ -147,6 +225,8 @@ class DSABackend(AttentionBackend):
         return self._dense_backend.consumes_cache_metadata
 
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
+        if self.is_draft:
+            return out_cache_loc
         return self._dense_backend.select_out_cache_loc(
             layer, out_cache_loc, forward_mode
         )
@@ -160,12 +240,21 @@ class DSABackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
+        cache_group_ids: tuple[str, ...] = (),
+        **kwargs,
     ):
+        self._reset_forward_metadata(req_pool_indices[:bs])
+        # The target's MLA delegate binds the history group.  A chaining MTP
+        # draft instead consumes its independently staged batch-ordered table;
+        # advertising target cache groups would incorrectly select paged MLA.
+        dense_cache_group_ids = () if self.is_draft else cache_group_ids
         self._dense_backend.init_forward_metadata_capture_cuda_graph(
             bs=bs,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=forward_mode,
+            cache_group_ids=dense_cache_group_ids,
+            **kwargs,
         )
         metadata = self.forward_decode_metadata
         # Per-token context lengths: the paged-MQA-logits kernel only supports
@@ -191,6 +280,7 @@ class DSABackend(AttentionBackend):
         page_table: torch.Tensor = None,
         **kwargs,
     ):
+        self._reset_forward_metadata(req_pool_indices[:bs])
         self._dense_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=req_pool_indices,
@@ -234,6 +324,7 @@ class DSABackend(AttentionBackend):
         page_table: torch.Tensor,
         **kwargs,
     ):
+        self._reset_forward_metadata(req_pool_indices[:bs])
         self._dense_backend.init_forward_metadata(
             bs=bs,
             num_extends=num_extends,
@@ -271,7 +362,6 @@ class DSABackend(AttentionBackend):
                 seq_lens_2d=seq_lens_2d, page_size=self.kernel_page_size
             )
 
-        self._prefill_page_table = None
         if num_extends > 0 and forward_mode.is_extend_or_mixed():
             cache_metadata = kwargs.get("cache_metadata")
             cmeta = getattr(self._dense_backend, "chunked_prefill_metadata", None)
@@ -281,8 +371,8 @@ class DSABackend(AttentionBackend):
                 # draft is handed the batch-ordered draft page table directly.
                 table = None
                 if cache_metadata is not None:
-                    table = cache_metadata.require_full_attention_table(
-                        active_forward_op=kwargs.get("forward_batch")
+                    table = cache_metadata.require_table(
+                        FULL_ATTENTION, active_forward_op=kwargs.get("forward_batch")
                     )
                 elif page_table is not None:
                     table = page_table
@@ -407,6 +497,7 @@ class DSABackend(AttentionBackend):
         token_to_kv_pool,
         page_table: torch.Tensor,
         seq_lens: torch.Tensor,
+        kv_seq_lens: torch.Tensor,
         workspace_indices: torch.Tensor,
         topk_lens: torch.Tensor,
         kv_workspace_slots: torch.Tensor | None = None,
@@ -429,20 +520,26 @@ class DSABackend(AttentionBackend):
                 "DSA sparse prefill top-k length mismatch: "
                 f"lens={topk_lens.shape[0]}, q_tokens={q.shape[0]}"
             )
+        if kv_seq_lens.dim() != 1 or kv_seq_lens.numel() != q.shape[0]:
+            raise RuntimeError(
+                "DSA sparse prefill physical length mismatch: "
+                f"lens={tuple(kv_seq_lens.shape)}, q_tokens={q.shape[0]}"
+            )
         if q.shape[0] == 0:
             return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
-        if workspace_indices.shape != (q.shape[0], self.index_topk):
+        # KPool selection can append up to pool_size - 1 visible tail tokens,
+        # so its workspace may be wider than the configured pooled top-k.
+        if workspace_indices.dim() != 2 or workspace_indices.shape[1] <= 0:
             raise RuntimeError(
                 "DSA sparse prefill top-k shape mismatch: "
-                f"indices={tuple(workspace_indices.shape)}, "
-                f"expected={(q.shape[0], self.index_topk)}"
+                f"indices={tuple(workspace_indices.shape)}"
             )
         if kv_workspace_slots is None:
             raise RuntimeError(
                 "DSA sparse prefill requires kv_workspace_slots to "
                 "map workspace-local top-k rows back to KV cache slots."
             )
-        topk_slots = workspace_topk_to_global_slots(
+        topk_indices = workspace_topk_to_global_slots(
             workspace_indices=workspace_indices,
             kv_workspace_slots=kv_workspace_slots,
         )
@@ -461,12 +558,19 @@ class DSABackend(AttentionBackend):
             if getattr(layer, "k_scale_float", None) is not None
             else 1.0
         )
+        selected_token_lens = topk_lens.to(
+            device=q.device, dtype=torch.int32
+        ).contiguous()
+        physical_token_lens = kv_seq_lens.to(
+            device=q.device, dtype=torch.int32
+        ).contiguous()
         out = dsa_prefill(
             q=q_view,
             kv_cache=kv_cache,
             sparse_kv_cache=sparse_kv_cache,
-            topk_slots=topk_slots,
-            topk_lens=topk_lens.to(device=q.device, dtype=torch.int32).contiguous(),
+            topk_slots=topk_indices,
+            topk_lens=selected_token_lens,
+            kv_seq_lens=physical_token_lens,
             max_seqlen_k=max_seq_len,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
@@ -530,7 +634,7 @@ class DSABackend(AttentionBackend):
 
         if topk_indices.dtype != torch.int32:
             topk_indices = topk_indices.to(torch.int32)
-        if topk_indices.shape[-1] != self.index_topk:
+        if topk_indices.shape[-1] != self.index_topk and topk_lens is None:
             raise RuntimeError(
                 "DSA sparse decode top-k width mismatch: "
                 f"indices={topk_indices.shape[-1]}, expected={self.index_topk}"
@@ -582,6 +686,17 @@ class DSABackend(AttentionBackend):
                 )
             topk_lens = topk_lens.to(device=q.device, dtype=torch.int32).contiguous()
 
+        seq_lens = seq_lens.to(device=q.device, dtype=torch.int32).contiguous()
+        if q_len_per_req == 1:
+            kv_seq_lens = seq_lens
+        else:
+            offsets = torch.arange(
+                q_len_per_req, device=q.device, dtype=torch.int32
+            ) - (q_len_per_req - 1)
+            kv_seq_lens = (
+                seq_lens.unsqueeze(1).add(offsets).clamp_min(0).reshape(-1).contiguous()
+            )
+
         q_view = q.view(num_tokens, layer.tp_q_head_num, layer.head_dim)
         if self.data_type == torch.float8_e4m3fn:
             q_view = q_view.to(self.data_type)
@@ -613,6 +728,7 @@ class DSABackend(AttentionBackend):
             softmax_scale=layer.scaling,
             page_size=self.kernel_page_size,
             q_len_per_req=q_len_per_req,
+            kv_seq_lens=kv_seq_lens,
             logit_cap=layer.logit_cap,
             k_scale=k_scale,
         )

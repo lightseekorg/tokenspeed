@@ -510,18 +510,15 @@ class ServerArgs:
         # AttnInitializer.modify_args where both hardware and model arch are known.
 
         if self.sampling_backend is None:
-            # ``flashinfer`` is the only built-in backend that respects per-request
-            # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
-            # (see ``GreedySamplingBackend.sample``: *"sampling_info is ignored
-            # for single-step (always argmax)"*) — fast for hand-tuned greedy
-            # decoding but silently wrong for any serving deployment where
-            # requests carry sampling params, since the model collapses into
-            # repetition-mode loops within a few hundred steps. Default to the
-            # sampling-respecting backend on NVIDIA where flashinfer is
-            # available, fall back to greedy elsewhere; users can still opt
-            # into greedy explicitly via ``--sampling-backend greedy``.
-            if current_platform().is_nvidia:
+            # Choose a backend that honors per-request sampling parameters on
+            # each GPU vendor. ``greedy`` always takes argmax and intentionally
+            # ignores temperature/top-p/top-k, so it remains opt-in for
+            # performance-only or explicitly deterministic workloads.
+            platform = current_platform()
+            if platform.is_nvidia:
                 self.sampling_backend = "flashinfer"
+            elif platform.is_amd:
+                self.sampling_backend = "triton"
             else:
                 self.sampling_backend = "greedy"
 
@@ -1093,9 +1090,10 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8", "fp8_e4m3", "mxfp8"],
+            choices=["auto", "bfloat16", "fp8", "fp8_e4m3", "mxfp8"],
             help='Data type for kv cache storage. "auto" will use model data type. '
-            '"fp8" is an alias for "fp8_e4m3" (per-tensor scales). "mxfp8" stores '
+            '"bfloat16" explicitly selects BF16 storage. "fp8" is an alias for '
+            '"fp8_e4m3" (per-tensor scales). "mxfp8" stores '
             "block-scaled fp8-e4m3 (one UE8M0 scale per 32 head_dim elements) and "
             "requires --block-size 128 with an MHA attention backend.",
         )

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Inference-only GLM5 NextN speculative decoding."""
+"""Inference-only NextN drafter for the shared GLM-MoE-DSA backbone."""
 
 from __future__ import annotations
 
@@ -128,7 +128,7 @@ class GlmMoeDsaModelNextN(nn.Module):
         hidden_states = torch.where(positions.unsqueeze(-1) == 0, 0, hidden_states)
         if captured_hidden_states is None:
             if not ctx.forward_mode.is_idle():
-                raise ValueError("GLM5 NextN requires captured_hidden_states.")
+                raise ValueError("GLM-MoE-DSA NextN requires captured_hidden_states.")
             captured_hidden_states = hidden_states
 
         hidden_states = self.eh_proj(

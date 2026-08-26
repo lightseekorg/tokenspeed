@@ -80,6 +80,16 @@ def test_resolve_mtp_tokens_supports_specific_and_shared_model_configs():
         Modality.AUDIO: 151_676,
     }
 
+    glm53_flash = SimpleNamespace(
+        model_type="glm53_flash",
+        image_token_id=154_854,
+        video_token_id=154_855,
+    )
+    assert resolve_mm_pad_substitute_ids(glm53_flash) == {
+        Modality.IMAGE: 154_854,
+        Modality.VIDEO: 154_854,
+    }
+
     nested_explicit_beats_outer_transport_placeholder = SimpleNamespace(
         image_placeholder_token_id=9,
         thinker_config=SimpleNamespace(image_token_id=10),

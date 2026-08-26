@@ -124,7 +124,7 @@ def _batched_descriptor(xs):
     return torch.tensor(addresses, dtype=torch.uint64, device=DEV)
 
 
-def _batched_static_args(x, layers_per_group):
+def _batched_static_args(x):
     return dict(
         qkv_stride=x["qkv_raw"].stride(0),
         conv_stride=x["conv_pool"].stride(0),
@@ -133,7 +133,6 @@ def _batched_static_args(x, layers_per_group):
         state_stride=x["h_pool"].stride(0),
         gate_stride=x["gate_scratch"].stride(0),
         conv_width=x["conv_w"].shape[1],
-        layers_per_group=layers_per_group,
         lower_bound=LOWER_BOUND,
     )
 
@@ -174,6 +173,7 @@ def test_batched_conv_window_is_independent_of_its_column_block(block):
             (layers, n, (conv_dim + block_size - 1) // block_size)
         ](
             _batched_descriptor(xs),
+            torch.arange(layers, device=DEV, dtype=torch.int32),
             reads,
             writes,
             accepted,
@@ -182,7 +182,6 @@ def test_batched_conv_window_is_independent_of_its_column_block(block):
             STRIDE_QKV=xs[0]["qkv_raw"].stride(0),
             STRIDE_CONV=xs[0]["conv_pool"].stride(0),
             CONV_DIM=conv_dim,
-            LAYERS_PER_GROUP=1,
             BLOCK=block_size,
             num_warps=min(8, max(1, block_size // 128)),
         )
@@ -194,7 +193,7 @@ def test_batched_conv_window_is_independent_of_its_column_block(block):
 
 def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
     """One launch matches the layer loop; a wrong descriptor must be detected."""
-    layers, n, t = 4, 5, 4
+    layers, n, t = 5, 5, 4
     source = [_window(n, t, seed=100 + layer) for layer in range(layers)]
     loop = []
     writes = torch.stack(
@@ -207,7 +206,8 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
         torch.int32
     )
     accepted = torch.tensor([0, t, 1, 3, 2], device=DEV, dtype=torch.int32)
-    groups = [0, 0, 1, 1]
+    groups = [0, 0, 0, 1, 1]
+    group_indices = torch.tensor(groups, device=DEV, dtype=torch.int32)
     for x, group in zip(source, groups, strict=True):
         local = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in x.items()}
         local["read_indices"] = reads[group]
@@ -222,6 +222,7 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
     descriptors = _batched_descriptor(batched)
     batched_recurrent_kda_replay_commit(
         descriptors,
+        group_indices,
         reads,
         writes,
         accepted,
@@ -229,7 +230,7 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
         num_heads=HV,
         head_dim=K,
         f_a_dim=D_FA,
-        **_batched_static_args(batched[0], layers_per_group=2),
+        **_batched_static_args(batched[0]),
     )
     for expected, actual in zip(loop, batched, strict=True):
         accepted_rows = torch.cat(
@@ -260,6 +261,7 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
     bad[2, 1] = negative[1]["conv_w"].data_ptr()
     batched_recurrent_kda_replay_commit(
         bad,
+        group_indices,
         reads,
         writes,
         accepted,
@@ -267,7 +269,7 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
         num_heads=HV,
         head_dim=K,
         f_a_dim=D_FA,
-        **_batched_static_args(negative[0], layers_per_group=2),
+        **_batched_static_args(negative[0]),
     )
     with pytest.raises(AssertionError):
         torch.testing.assert_close(
@@ -350,6 +352,7 @@ def test_batched_replay_checkpoint_boundary_matches_layer_loop(accepted, crossin
         x["read_indices"] = reads[group]
     batched_recurrent_kda_replay_commit(
         _batched_descriptor(batched),
+        torch.tensor(groups, device=DEV, dtype=torch.int32),
         reads,
         writes,
         accepted_tensor,
@@ -357,7 +360,7 @@ def test_batched_replay_checkpoint_boundary_matches_layer_loop(accepted, crossin
         num_heads=HV,
         head_dim=K,
         f_a_dim=D_FA,
-        **_batched_static_args(batched[0], layers_per_group=23),
+        **_batched_static_args(batched[0]),
     )
     for expected, actual in zip(loop, batched, strict=True):
         torch.testing.assert_close(

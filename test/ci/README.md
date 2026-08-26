@@ -50,6 +50,58 @@ tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
 bounded non-thinking chat template for CI stability. The task requires a score
 of at least 0.90.
 
+Pull requests targeting the private `shared/glm5-next` integration branch run
+separate GLM-5.3-Flash AIME26 jobs for AMD and NVIDIA. Each cold job gets its own CI
+work directory, starts a new server, and reloads the model into GPU memory.
+The checkpoint is mounted under `/cache/huggingface/hub/horizon` on AMD and
+`/raid/cache/huggingface/hub/horizon` on NVIDIA, with `hf_fp8/` and `hf/`
+subdirectories for the FP8 and BF16 weight formats, respectively. The server
+reads those model directories directly, while `HF_HOME` remains job-local for
+EvalScope dataset downloads.
+
+The AMD gate uses the FP8 model under `horizon/hf_fp8/` on four MI350X GPUs
+with TP4/EP1, the checkpoint's embedded single-layer MTP drafter with three
+speculative steps and four draft tokens, Triton sampling, decode graphs through
+batch size 16, a 65,536-token model context, and a 65,000-token maximum-effort
+generation limit. Runtime gateway polling is disabled after the explicit CI
+readiness gate so probe requests cannot perturb long-running graph batches or
+speculative acceptance. Its one-run stochastic accuracy floor is 0.75. Three
+cold MTP3 validation runs scored 0.8667, 0.8333, and 0.7667, with the misses
+dominated by recurring 65,000-token truncations; the floor keeps one-run CI
+below the observed range while retaining a meaningful accuracy guard. This matches the
+fastest validated ShareGPT launch shape, and the AIME26 gate remains the
+accuracy and long-generation runtime guardrail for that configuration.
+
+The NVIDIA gate uses the same FP8 model under `horizon/hf_fp8/` on four B200 GPUs
+with TP4/EP4, the FlashInfer TRT-LLM MoE backend, and FlashInfer sampling. It evaluates the
+target model without speculative decoding and uses the same 65,536-token
+context, 32,768-token generation limit, and official EvalScope AIME26 prompt
+and grader as the AMD gate. It explicitly selects the checkpoint's embedded
+`hf_fp8/chat_template.jinja`. This keeps decode graph-compiled while avoiding
+DeepEP's unqualified low-latency numerical path and its normal-mode capture
+incompatibility. Runtime gateway health polling is disabled for this
+single-worker evaluation because sustained B200 decode can starve the independent
+probe even while generation continues normally; startup readiness is still
+checked before EvalScope begins.
+
+The NVIDIA workflow also runs a fixed ShareGPT performance gate with the
+FlashInfer TRT-LLM MoE backend and the throughput-oriented MTP 3-step/4-token
+configuration. It uses 16 concurrent requests with 512 generated tokens, seed
+45, greedy sampling, and no prefix cache. Three representative passes warm the
+long-input kernel shapes; the gate then takes the median of three runs and rejects
+either per-user decode speed or output throughput per GPU below 90% of the
+established four-B200 baseline.
+
+Both jobs validate and serve the mounted checkpoint directly, avoiding a
+several-hundred-gigabyte download for every pull request. Each job still has an
+independent server process and performs a full disk-to-HBM weight load.
+
+The manually dispatched GLM-5.3-Flash FP8+MTP task exercises the stacked FP8 MoE
+and MTP paths with the same TP4/EP1 graph and AIME26 settings. It uses the
+mounted `horizon/hf_fp8/` checkpoint and is intentionally not a second
+pull-request gate. The gfx950 Gluon path retains compact FP8 experts for decode
+and creates BF16 expert copies at load time for tuned prefill.
+
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
 jobs in include-list order, so `high` entries reach a contended runner pool

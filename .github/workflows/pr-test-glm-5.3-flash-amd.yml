@@ -1,0 +1,21 @@
+name: PR Test GLM-5.3-Flash AMD
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [shared/glm5-next]
+
+concurrency:
+  group: pr-test-glm-5.3-flash-amd-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  aime26:
+    if: github.event.pull_request.draft == false
+    uses: ./.github/workflows/run-pr-test-stage.yml
+    with:
+      matrix: >-
+        {"include":[{"name":"eval-glm-5.3-flash-fp8-mtp-tp4ep1-aime26-amd","type":"eval","config":"test/ci/eval/glm-5.3-flash-fp8-mtp-tp4ep1-evalscope-aime26-amd.yaml","runner":"amd-mi35x-4gpu-test","priority":"normal","optional":false,"workflow_stage":"model-test"}]}
+      install_tokenspeed_mla_from_source: "0"
+      timeout_minutes: 90
+    secrets: inherit

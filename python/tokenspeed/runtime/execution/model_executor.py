@@ -130,6 +130,27 @@ def _resolve_prefill_graph_max_tokens(server_args) -> int:
     return cap
 
 
+def _should_disable_prefill_graph(server_args, model_config: ModelConfig) -> bool:
+    """Keep unsupported models eager while allowing GLM-5.3 replay."""
+    if bool(server_args.disable_prefill_graph):
+        return True
+
+    text_config = model_config.hf_text_config
+    qwen4_exp_has_side_state = getattr(
+        text_config, "model_type", None
+    ) == "qwen4_exp_text" and bool(
+        getattr(text_config, "ple_layer_ids", None)
+        or getattr(text_config, "indexer_n_heads", None) is not None
+    )
+    if qwen4_exp_has_side_state:
+        return True
+
+    return (
+        model_config.attention_arch == AttentionArch.DSA
+        and getattr(model_config.hf_config, "model_type", None) != "glm53_flash"
+    )
+
+
 def _cache_arena_attr(pool, name: str, default):
     """Read one arena attribute off a cache view, tolerating fakes.
 
@@ -250,25 +271,9 @@ class ModelExecutorConfig:
                 physical_context_len - derived_context_len,
             )
 
-        # DSA's sparse indexer reads the attention backend's
-        # ``chunked_prefill_metadata`` from inside the captured prefill segment,
-        # but the prefill graph rebinds only the live ForwardContext at replay --
-        # the backend metadata object stays frozen at capture-time (dummy) values.
-        # Qwen4-Exp's PLE/QSA modules likewise own token-indexed side-state writes;
-        # replay pads token rows to a bucket while their cache metadata remains
-        # real-token shaped. Keep those prefills eager so padding can never
-        # advance n-gram, short-conv, or compressed-key state.
-        text_config = model_config.hf_text_config
-        qwen4_exp_has_side_state = getattr(text_config, "model_type", None) == (
-            "qwen4_exp_text"
-        ) and bool(
-            getattr(text_config, "ple_layer_ids", None)
-            or getattr(text_config, "indexer_n_heads", None) is not None
-        )
-        disable_prefill_graph = (
-            bool(server_args.disable_prefill_graph)
-            or (model_config.attention_arch == AttentionArch.DSA)
-            or qwen4_exp_has_side_state
+        disable_prefill_graph = _should_disable_prefill_graph(
+            server_args,
+            model_config,
         )
 
         return ModelExecutorConfig(

@@ -1,0 +1,33 @@
+name: PR Test GLM-5.3-Flash NVIDIA
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [shared/glm5-next]
+
+concurrency:
+  group: pr-test-glm-5.3-flash-nvidia-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  aime26:
+    if: github.event.pull_request.draft == false
+    uses: ./.github/workflows/run-pr-test-stage.yml
+    with:
+      matrix: >-
+        {"include":[{"name":"eval-glm-5.3-flash-fp8-tp4ep4-aime26-nvidia","type":"eval","config":"test/ci/eval/glm-5.3-flash-fp8-tp4ep4-evalscope-aime26-nvidia.yaml","runner":"${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}-4gpu","priority":"normal","optional":false,"workflow_stage":"model-test"}]}
+      install_tokenspeed_mla_from_source: "0"
+      b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
+      timeout_minutes: 120
+    secrets: inherit
+
+  sharegpt:
+    if: github.event.pull_request.draft == false
+    uses: ./.github/workflows/run-pr-test-stage.yml
+    with:
+      matrix: >-
+        {"include":[{"name":"perf-glm-5.3-flash-fp8-mtp-tp4ep4-sharegpt-nvidia","type":"perf","config":"test/ci/perf/glm-5.3-flash-fp8-mtp-tp4ep4-sharegpt-nvidia.yaml","runner":"${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}-4gpu","priority":"normal","optional":false,"workflow_stage":"model-test"}]}
+      install_tokenspeed_mla_from_source: "0"
+      b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
+      timeout_minutes: 90
+    secrets: inherit

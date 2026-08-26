@@ -365,8 +365,18 @@ def _is_glm_dsa_model(model_id: str | None) -> bool:
         return True
     config = _load_model_config(model_id)
     architectures = config.get("architectures") or []
-    return config.get("model_type") == "glm_moe_dsa" or any(
-        arch in {"GlmMoeDsaForCausalLM", "GlmMoeDsaForCausalLMNextN"}
+    return config.get("model_type") in {
+        "glm53_flash",
+        "glm5_next",
+        "glm_moe_dsa",
+    } or any(
+        arch
+        in {
+            "Glm53FlashForConditionalGeneration",
+            "Glm53FlashForConditionalGenerationNextN",
+            "GlmMoeDsaForCausalLM",
+            "GlmMoeDsaForCausalLMNextN",
+        }
         for arch in architectures
     )
 

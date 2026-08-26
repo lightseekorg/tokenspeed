@@ -1,0 +1,73 @@
+# GLM-5.3-Flash FP8 MTP AIME26 validation on AMD.
+api_version: ci.tokenspeed.io/v1
+name: eval-glm-5.3-flash-fp8-mtp-tp4ep1-aime26-amd
+type: eval
+workflow_stage: model-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi35x-4gpu-test
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+  - >-
+    test -f /cache/huggingface/hub/horizon/hf_fp8/config.json
+server:
+  # MoE keeps compact experts for gfx950 decode and creates BF16 expert copies
+  # for the faster large-M prefill kernel.
+  command: >-
+    ts serve
+    --model /cache/huggingface/hub/horizon/hf_fp8
+    --served-model-name glm-5.3-flash-fp8-mtp
+    --attn-tp-size 4
+    --ep-size 1
+    --language-model-only
+    --max-model-len 65536
+    --max-num-seqs 16
+    --max-total-tokens 131072
+    --max-prefill-tokens 8192
+    --chunked-prefill-size 8192
+    --max-cudagraph-capture-size 16
+    --cudagraph-capture-sizes 1 2 4 8 16
+    --gpu-memory-utilization 0.95
+    --trust-remote-code
+    --sampling-backend triton
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --no-enable-prefix-caching
+    --enable-cache-report
+    --host 127.0.0.1
+    --port 8000
+    --policy round_robin
+    --disable-health-check
+    --engine-startup-timeout 900
+    --gateway-startup-timeout 600
+    --speculative-algorithm MTP
+    --speculative-num-steps 3
+    --speculative-eagle-topk 1
+    --speculative-num-draft-tokens 4
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1200
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]==1.10.0'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model glm-5.3-flash-fp8-mtp
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets aime26
+    --dataset-hub huggingface
+    --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
+    --eval-batch-size 16
+    --stream
+    --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"seed":42,"max_tokens":65000,"extra_body":{"reasoning_effort":"max"}}'
+report:
+  github_step_summary: true
+score_threshold: 0.75

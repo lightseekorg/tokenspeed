@@ -2191,6 +2191,7 @@ def batched_kda_gate_precompute_dot_kernel(
 @triton.jit
 def batched_recurrent_kda_replay_commit_kernel(
     addresses,
+    group_indices,
     read_indices,
     write_indices,
     accepted_length,
@@ -2202,8 +2203,6 @@ def batched_recurrent_kda_replay_commit_kernel(
     STRIDE_STATE: tl.constexpr,
     STRIDE_GATE: tl.constexpr,
     CONV_WIDTH: tl.constexpr,
-    LAYERS_PER_GROUP: tl.constexpr,
-    NUM_GROUPS: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
     BK: tl.constexpr,
@@ -2220,7 +2219,7 @@ def batched_recurrent_kda_replay_commit_kernel(
     beta = tl.load(addresses + ab + 5).to(tl.pointer_type(tl.bfloat16))
     state = tl.load(addresses + ab + 8).to(tl.pointer_type(tl.float32))
     gate_scratch = tl.load(addresses + ab + 9).to(tl.pointer_type(tl.float32))
-    group = i_l // LAYERS_PER_GROUP
+    group = tl.load(group_indices + i_l).to(tl.int64)
 
     read_page = tl.load(read_indices + group * B + i_n).to(tl.int64)
     write_page = tl.load(write_indices + group * B + i_n).to(tl.int64)
@@ -2345,6 +2344,7 @@ def batched_recurrent_kda_replay_commit_kernel(
 @triton.jit
 def batched_kda_commit_conv_window_kernel(
     addresses,
+    group_indices,
     read_indices,
     write_indices,
     accepted_length,
@@ -2353,7 +2353,6 @@ def batched_kda_commit_conv_window_kernel(
     STRIDE_QKV: tl.constexpr,
     STRIDE_CONV: tl.constexpr,
     CONV_DIM: tl.constexpr,
-    LAYERS_PER_GROUP: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Publish convolution windows after every recurrent program has read."""
@@ -2361,7 +2360,7 @@ def batched_kda_commit_conv_window_kernel(
     ab = i_l * 10
     qkv = tl.load(addresses + ab).to(tl.pointer_type(tl.bfloat16))
     conv_pool = tl.load(addresses + ab + 2).to(tl.pointer_type(tl.bfloat16))
-    group = i_l // LAYERS_PER_GROUP
+    group = tl.load(group_indices + i_l).to(tl.int64)
     read_page = tl.load(read_indices + group * B + i_n).to(tl.int64)
     write_page = tl.load(write_indices + group * B + i_n).to(tl.int64)
     steps = tl.load(accepted_length + i_n).to(tl.int32)
@@ -2387,6 +2386,7 @@ def batched_kda_commit_conv_window_kernel(
 
 def batched_recurrent_kda_replay_commit(
     addresses: torch.Tensor,
+    group_indices: torch.Tensor,
     read_indices: torch.Tensor,
     write_indices: torch.Tensor,
     accepted_length: torch.Tensor,
@@ -2402,13 +2402,22 @@ def batched_recurrent_kda_replay_commit(
     state_stride: int,
     gate_stride: int,
     conv_width: int,
-    layers_per_group: int,
     lower_bound: float,
 ) -> None:
-    """Commit all descriptor-table KDA layers with constant launch count."""
+    """Commit descriptor-table KDA layers using an explicit cache-group map."""
     if head_dim != 128:
         raise ValueError("batched KDA replay currently requires head_dim=128")
     layers = addresses.shape[0]
+    if group_indices.shape != (layers,):
+        raise ValueError(
+            f"group_indices must have shape ({layers},), got {group_indices.shape}"
+        )
+    if group_indices.dtype != torch.int32:
+        raise TypeError("group_indices must use torch.int32")
+    if group_indices.device != addresses.device:
+        raise ValueError("group_indices and addresses must be on the same device")
+    if not group_indices.is_contiguous():
+        raise ValueError("group_indices must be contiguous")
     batch = accepted_length.numel()
     rows = batch * draft_token_num
     # tl.dot needs 16 rows; tensor cores run this gate 5x faster than tl.sum.
@@ -2443,6 +2452,7 @@ def batched_recurrent_kda_replay_commit(
     )
     batched_recurrent_kda_replay_commit_kernel[(layers, batch, num_heads)](
         addresses,
+        group_indices,
         read_indices,
         write_indices,
         accepted_length,
@@ -2454,8 +2464,6 @@ def batched_recurrent_kda_replay_commit(
         STRIDE_STATE=state_stride,
         STRIDE_GATE=gate_stride,
         CONV_WIDTH=conv_width,
-        LAYERS_PER_GROUP=layers_per_group,
-        NUM_GROUPS=read_indices.shape[0],
         HV=num_heads,
         K=head_dim,
         BK=triton.next_power_of_2(head_dim),
@@ -2474,6 +2482,7 @@ def batched_recurrent_kda_replay_commit(
         (layers, batch, triton.cdiv(conv_dim, conv_block))
     ](
         addresses,
+        group_indices,
         read_indices,
         write_indices,
         accepted_length,
@@ -2482,7 +2491,6 @@ def batched_recurrent_kda_replay_commit(
         STRIDE_QKV=qkv_stride,
         STRIDE_CONV=conv_stride,
         CONV_DIM=conv_dim,
-        LAYERS_PER_GROUP=layers_per_group,
         BLOCK=conv_block,
         num_warps=1,
     )

@@ -1,0 +1,120 @@
+api_version: ci.tokenspeed.io/v1
+name: perf-glm-5.3-flash-fp8-mtp-tp4ep4-sharegpt-nvidia
+type: perf
+workflow_stage: model-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - b200-4gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+  - >-
+    test -f /raid/cache/huggingface/hub/horizon/hf_fp8/config.json
+server:
+  command: >-
+    ts serve
+    --model /raid/cache/huggingface/hub/horizon/hf_fp8
+    --served-model-name glm-5.3-flash
+    --attn-tp-size 4
+    --enable-expert-parallel
+    --language-model-only
+    --moe-backend flashinfer_trtllm
+    --max-model-len 32768
+    --max-num-seqs 32
+    --max-prefill-tokens 8192
+    --chunked-prefill-size 4096
+    --max-cudagraph-capture-size 80
+    --cudagraph-capture-sizes 1 2 4 8 16 32
+    --gpu-memory-utilization 0.85
+    --trust-remote-code
+    --sampling-backend flashinfer
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --no-enable-prefix-caching
+    --host 127.0.0.1
+    --port 8000
+    --policy round_robin
+    --disable-health-check
+    --engine-startup-timeout 1800
+    --gateway-startup-timeout 600
+    --speculative-algorithm MTP
+    --speculative-draft-model-path
+    /raid/cache/huggingface/hub/horizon/hf_fp8
+    --draft-model-path-use-base
+    --speculative-num-steps 3
+    --speculative-eagle-topk 1
+    --speculative-num-draft-tokens 4
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+perf:
+  command: |
+    set -eu
+    MODEL_PATH=/raid/cache/huggingface/hub/horizon/hf_fp8
+    RESULT_PREFIX=/tmp/tokenspeed-glm53-flash-sharegpt
+    run_sharegpt() {
+      ts bench serve \
+        --backend tokenspeed \
+        --host 127.0.0.1 \
+        --port 8000 \
+        --endpoint /v1/completions \
+        --model glm-5.3-flash \
+        --served-model-name glm-5.3-flash \
+        --tokenizer "$MODEL_PATH" \
+        --dataset-name sharegpt \
+        --num-prompts 16 \
+        --sharegpt-output-len 512 \
+        --max-model-len 32768 \
+        --max-concurrency 16 \
+        --num-warmups 16 \
+        --request-rate inf \
+        --ignore-eos \
+        --seed 45 \
+        --extra-body '{"temperature":0}' \
+        --disable-tqdm \
+        --output-file "$1"
+    }
+    for warmup_id in 1 2 3; do
+      run_sharegpt "${RESULT_PREFIX}-warmup-${warmup_id}.json" >/dev/null
+    done
+    for run_id in 1 2 3; do
+      run_sharegpt "${RESULT_PREFIX}-${run_id}.json"
+    done
+    python3 - "$RESULT_PREFIX" <<'PY'
+    import json
+    import statistics
+    import sys
+
+    results = []
+    for run_id in range(1, 4):
+        with open(f"{sys.argv[1]}-{run_id}.json", encoding="utf-8") as result_file:
+            results.append(json.load(result_file))
+    failed = sum(result.get("failed", 0) for result in results)
+    if failed:
+        raise SystemExit(f"ShareGPT benchmark had {failed} failed requests")
+
+    latency_tps = statistics.median(
+        1000.0 / float(result["mean_tpot_ms"]) for result in results
+    )
+    throughput_per_gpu = statistics.median(
+        float(result["output_throughput"]) / 4 for result in results
+    )
+    print("\nOverall perf table:")
+    print(
+        "config,Conc.,Latency (tps/user),Throughput (tps/gpu),"
+        "Approx Cache Hit,Decoded Tok/Iter"
+    )
+    print(f"sharegpt-512,16,{latency_tps:.2f},{throughput_per_gpu:.2f},0,0")
+    PY
+report:
+  github_step_summary: true
+perf_threshold: 0.9
+# Median of three hot fixed-seed runs on 4x B200, rounded down. Values are
+# [Latency (tps/user), Throughput (tps/gpu)].
+perf_reference:
+  16: [112.2, 280.4]
