@@ -374,8 +374,14 @@ class DFlash(BaseDrafter):
         hidden_states: torch.Tensor,
         out: torch.Tensor | None = None,
         bias_fn: "Callable[[int, int], torch.Tensor] | None" = None,
+        base_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Shared vocab-parallel greedy argmax primitive."""
+        """Shared vocab-parallel greedy argmax primitive.
+
+        ``base_logits`` lets a caller that walks several positions supply the
+        org-vocab projection it already computed for all of them at once; only
+        the bias and the argmax have to follow the previous token.
+        """
         if not hasattr(self.lm_head, "weight") or not hasattr(
             self.lm_head, "shard_indices"
         ):
@@ -406,7 +412,8 @@ class DFlash(BaseDrafter):
         # with an empty org shard skipping it would strand the rest.
         dist_state = self._ensure_dist_argmax_state(weight.dtype, weight.device)
         if num_org > 0:
-            base_logits = torch.matmul(hidden_states, weight[:num_org].T)
+            if base_logits is None:
+                base_logits = torch.matmul(hidden_states, weight[:num_org].T)
             if bias_fn is not None:
                 base_logits = base_logits + bias_fn(org_vocab_start, num_org).to(
                     base_logits.dtype

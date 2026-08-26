@@ -396,3 +396,80 @@ def test_kda_commit_is_skipped_outside_decode() -> None:
         attn_backend=_BackendWithCommit(),
         forward_mode=ForwardMode.EXTEND,
     )
+
+
+class _ShardIndices:
+    def __init__(self, num_org: int) -> None:
+        self.num_org_elements = num_org
+
+
+class _ShardedHead:
+    """Enough of a vocab-parallel head for the block projection to run."""
+
+    def __init__(self, weight: torch.Tensor) -> None:
+        self.weight = weight
+        self.shard_indices = _ShardIndices(weight.shape[0])
+
+
+def test_the_walk_feeds_each_round_its_own_positions_hoisted_slice() -> None:
+    """The whole proposal walk must hand round k the hoisted projection of
+    position k-1, bit-for-bit what projecting that position alone gives."""
+    torch.manual_seed(11)
+    drafter = _drafter()
+    weight = torch.randn(VOCAB, HIDDEN)
+    drafter.lm_head = _ShardedHead(weight)
+    received: list[torch.Tensor] = []
+
+    def fake_argmax(hidden, out=None, bias_fn=None, base_logits=None):
+        assert base_logits is not None, "the walk must use the hoisted slice"
+        assert base_logits.is_contiguous()
+        received.append(base_logits.clone())
+        logits = base_logits.float()
+        if bias_fn is not None:
+            logits = logits + bias_fn(0, logits.shape[-1]).float()
+        argmax = torch.argmax(logits, dim=-1)
+        if out is not None:
+            out.copy_(argmax.view_as(out))
+            return out
+        return argmax
+
+    drafter._greedy_argmax_vocab_parallel = fake_argmax
+    hidden = torch.randn(3, drafter.spec_num_tokens, HIDDEN)
+    ids = torch.zeros(3, drafter.spec_num_tokens, dtype=torch.long)
+    block = torch.randint(0, VOCAB, (3, drafter.spec_num_tokens))
+    drafter._sample_block(hidden, block, ids)
+
+    assert len(received) == drafter.spec_num_tokens - 1
+    for k, got in enumerate(received, start=1):
+        want = hidden[:, k - 1, :].to(weight.dtype) @ weight.T
+        assert torch.equal(got, want)
+
+
+def test_the_block_projection_matches_projecting_each_position() -> None:
+    """The walk is semi-autoregressive, so the projection is hoisted out of it
+    while the bias and the argmax stay behind. A layout slip here would feed
+    each position another position's logits and go unnoticed: every proposal
+    would still be a valid token id."""
+    rows, positions = 3, 8
+    drafter = _drafter(spec_num_tokens=positions)
+    torch.manual_seed(1)
+    weight = torch.randn(VOCAB, HIDDEN)
+    drafter.lm_head = _ShardedHead(weight)
+    draft_hidden = torch.randn(rows, positions, HIDDEN)
+
+    block = drafter._block_base_logits(draft_hidden)
+
+    assert block is not None
+    assert block.shape == (positions, rows, VOCAB)
+    for k in range(positions):
+        expected = torch.matmul(draft_hidden[:, k, :], weight.T)
+        assert torch.allclose(block[k], expected, atol=1e-5), f"position {k}"
+
+
+def test_the_block_projection_stands_down_without_a_sharded_head() -> None:
+    """Drafters whose head carries no shard metadata keep the per-step path."""
+    drafter = _drafter(spec_num_tokens=4)
+    assert drafter._block_base_logits(torch.randn(2, 4, HIDDEN)) is None
+
+    drafter.lm_head = _ShardedHead(torch.randn(0, HIDDEN))
+    assert drafter._block_base_logits(torch.randn(2, 4, HIDDEN)) is None

@@ -1168,6 +1168,10 @@ def distributed_argmax(
     cross-rank exchange is collective and slot bands are reused across
     calls. Do not share one ``DistArgmaxState`` across concurrent streams.
     """
+    assert logits.is_contiguous(), (
+        "distributed_argmax wraps its input as compact rows; a strided view "
+        "would be read with the wrong row pitch"
+    )
     M, N = _dist_argmax_validate_inputs(state, logits, out_max, out_idx)
     device = logits.device
 
