@@ -1978,6 +1978,11 @@ def resolve_kda_batched_replay_commit(dtype: torch.dtype = torch.bfloat16):
             "kda_replay_commit",
             signature,
             traits={"flat_state": True, "batched_layers": True},
+            override=(
+                "triton_nvidia_kda_batched_replay_commit"
+                if current_platform().is_nvidia
+                else None
+            ),
         )
     except NoKernelFoundError:
         return None
