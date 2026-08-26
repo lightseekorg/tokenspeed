@@ -55,6 +55,8 @@ WARP_DECODE_STAGE2_BLOCK_KB = 512
 WARP_DECODE_STAGE2_NUM_WARPS = 8
 WARP_DECODE_STAGE2_M4_NUM_WARPS = 4
 _MIN_WARP_DECODE_BLOCK_KB = 128
+_ROUTE_DIRECT_DECODE_MAX_TOKENS = 16
+_BUFFER_LOAD_OFFSET_LIMIT = 1 << 31
 _KIMI3_SHARED_K = gl.constexpr(768)
 _KIMI3_SHARED_BLOCK_K = gl.constexpr(512)
 
@@ -66,6 +68,31 @@ def _largest_exact_block_kb(packed_k: int, max_block_kb: int) -> int:
     while block_kb > _MIN_WARP_DECODE_BLOCK_KB and packed_k % block_kb:
         block_kb //= 2
     return block_kb
+
+
+def _supports_a16w4_warp_decode_ep_gfx950(
+    hidden_states: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_scale: torch.Tensor,
+) -> bool:
+    """Return whether the route-direct kernel supports this tensor layout."""
+    two_intermediate = int(w13_weight.shape[1])
+    intermediate = two_intermediate // 2
+    offsets_fit = all(
+        tensor.numel() * tensor.element_size() < _BUFFER_LOAD_OFFSET_LIMIT
+        for tensor in (w13_weight, w13_scale, w2_weight, w2_scale)
+    )
+    return (
+        0 < hidden_states.shape[0] <= _ROUTE_DIRECT_DECODE_MAX_TOKENS
+        and hidden_states.is_contiguous()
+        and offsets_fit
+        and hidden_states.shape[1] % 256 == 0
+        and two_intermediate % 2 == 0
+        and intermediate % 256 == 0
+        and int(w13_weight.shape[2]) * 2 == hidden_states.shape[1]
+    )
 
 
 @gluon.jit

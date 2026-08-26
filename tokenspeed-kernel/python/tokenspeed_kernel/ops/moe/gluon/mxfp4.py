@@ -31,18 +31,6 @@ from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
-# TP8/EP8 model measurements favor warp GEMV through M=16.
-_ROUTE_DIRECT_DECODE_MAX_TOKENS = 16
-_BUFFER_LOAD_OFFSET_LIMIT = 1 << 31
-
-
-def _buffer_load_offsets_fit_int32(*tensors: torch.Tensor) -> bool:
-    return all(
-        tensor.numel() * tensor.element_size() < _BUFFER_LOAD_OFFSET_LIMIT
-        for tensor in tensors
-    )
-
-
 _GFX1250_DECODE_MAX_AVERAGE_BPE = 16
 
 
@@ -147,31 +135,21 @@ if platform.is_amd:
         else:
             raise ValueError(f"unsupported gfx950 A16W4 activation: {activation}")
 
-        two_intermediate = int(w.w13_weight.shape[1])
-        intermediate = two_intermediate // 2
         num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
         expert_start = int(getattr(w, "ep_rank", 0)) * num_local_experts
-        buffer_load_safe = _buffer_load_offsets_fit_int32(
+        output = getattr(w, "_situ_output_buffer", None)
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
+            _supports_a16w4_warp_decode_ep_gfx950,
+            gluon_a16w4_warp_decode_ep_gfx950,
+        )
+
+        if _supports_a16w4_warp_decode_ep_gfx950(
+            x,
             w.w13_weight,
             w.w13_weight_scale,
             w.w2_weight,
             w.w2_weight_scale,
-        )
-        use_route_direct_decode = (
-            0 < x.shape[0] <= _ROUTE_DIRECT_DECODE_MAX_TOKENS
-            and x.is_contiguous()
-            and buffer_load_safe
-            and x.shape[1] % 256 == 0
-            and two_intermediate % 2 == 0
-            and intermediate % 256 == 0
-            and int(w.w13_weight.shape[2]) * 2 == x.shape[1]
-        )
-        output = getattr(w, "_situ_output_buffer", None)
-        if use_route_direct_decode:
-            from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
-                gluon_a16w4_warp_decode_ep_gfx950,
-            )
-
+        ):
             # Both stages localize global expert IDs while consuming the linear
             # checkpoint layout, avoiding four pointwise localization kernels.
             return gluon_a16w4_warp_decode_ep_gfx950(
