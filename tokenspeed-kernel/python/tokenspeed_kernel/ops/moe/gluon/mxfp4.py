@@ -295,7 +295,6 @@ if platform.is_amd:
             "supports_bias": frozenset({False}),
         },
         priority=Priority.SPECIALIZED + 1,
-        tags={"amd", "gfx950", "ep", "latency", "throughput"},
     )
     def gluon_mxfp4_a16w4_swiglu_ep_precomputed_moe_apply(
         plan: dict,
