@@ -206,10 +206,8 @@ def test_flashinfer_situ_kernel_routing_deferred_matches_finalized() -> None:
     finalized = flashinfer_trtllm_mxfp4_situ_moe_apply(
         {}, hidden_states, w, router_logits
     )
-    gemm2_out, expert_weights, expanded_idx = (
-        flashinfer_trtllm_mxfp4_situ_moe_apply(
-            {}, hidden_states, w, router_logits, do_finalize=False
-        )
+    gemm2_out, expert_weights, expanded_idx = flashinfer_trtllm_mxfp4_situ_moe_apply(
+        {}, hidden_states, w, router_logits, do_finalize=False
     )
     torch.cuda.synchronize()
 
@@ -248,9 +246,6 @@ def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
         internal_activation_dtype="fp8",
         solution="flashinfer_trtllm",
     )
-    assert (
-        plan["apply_kernel_name"]
-        == "flashinfer_trtllm_mxfp4_situ_moe_apply"
-    )
+    assert plan["apply_kernel_name"] == "flashinfer_trtllm_mxfp4_situ_moe_apply"
     assert plan["support_routing"] is True
     assert plan["supports_precomputed_topk"] is True
