@@ -63,6 +63,7 @@ class AttentionConfig:
     NUM_BLOCKS: gl.constexpr
     IS_FP8: gl.constexpr
     ENABLE_SKIP_SOFTMAX: gl.constexpr
+    DEFER_V_LOAD: gl.constexpr
     q_strides: InputStrides
     k_strides: InputStrides
     v_strides: InputStrides
@@ -93,6 +94,7 @@ class AttentionConfig:
         WINDOW_LEFT,
         IS_FP8,
         ENABLE_SKIP_SOFTMAX,
+        DEFER_V_LOAD,
         KV_DTYPE,
         q_strides,
         k_strides,
@@ -136,6 +138,7 @@ class AttentionConfig:
         self.NUM_BLOCKS = gl.constexpr(512)
         self.IS_FP8 = gl.constexpr(IS_FP8)
         self.ENABLE_SKIP_SOFTMAX = gl.constexpr(ENABLE_SKIP_SOFTMAX)
+        self.DEFER_V_LOAD = gl.constexpr(DEFER_V_LOAD)
         self.q_strides = q_strides
         self.k_strides = k_strides
         self.v_strides = v_strides
@@ -750,23 +753,37 @@ def process_attention_tile(
 
     for _ in range(0, main_end):
         program.issue_load_k(k_offsets, k_smem)
-        program.issue_load_v(v_offsets, v_smem)
+        if cfg.DEFER_V_LOAD:
+            async_copy.wait_group(0)
+            k = program.shared_load_k(k_smem)
+            qk = program.compute_qk(q, k)
+            p, m_i, l_i, acc, all_skip = program.softmax(qk, m_i, l_i, acc)
 
-        async_copy.wait_group(1)
-        k = program.shared_load_k(k_smem)
-        qk = program.compute_qk(q, k)
-        p, m_i, l_i, acc, all_skip = program.softmax(qk, m_i, l_i, acc)
+            if not (cfg.ENABLE_SKIP_SOFTMAX and all_skip):
+                program.issue_load_v(v_offsets, v_smem)
+                async_copy.wait_group(0)
+                v = program.shared_load_v(v_smem)
+                acc = program.compute_pv(p, v, acc)
+        else:
+            program.issue_load_v(v_offsets, v_smem)
 
-        async_copy.wait_group(0)
-        v = program.shared_load_v(v_smem)
-        if not (cfg.ENABLE_SKIP_SOFTMAX and all_skip):
-            acc = program.compute_pv(p, v, acc)
+            async_copy.wait_group(1)
+            k = program.shared_load_k(k_smem)
+            qk = program.compute_qk(q, k)
+            p, m_i, l_i, acc, all_skip = program.softmax(qk, m_i, l_i, acc)
+
+            async_copy.wait_group(0)
+            v = program.shared_load_v(v_smem)
+            if not (cfg.ENABLE_SKIP_SOFTMAX and all_skip):
+                acc = program.compute_pv(p, v, acc)
 
         k_offsets = program.update_k_offsets(k_offsets)
         v_offsets = program.update_v_offsets(v_offsets)
         offs_n = offs_n + cfg.BLOCK_N
 
     # The main loop handles prefix tiles; the two boundary tiles are causal.
+    # DEFER_V_LOAD does not apply: diagonal tiles are almost never fully
+    # skipped, so V is co-issued with K here.
     boundary_start = main_end * cfg.BLOCK_N
     k_offsets, offs_n = program.make_k_offsets(boundary_start)
     v_offsets = program.make_v_offsets(boundary_start)
@@ -818,6 +835,8 @@ def process_sliding_attention_tile(
     k_smem: gl.shared_memory_descriptor,
     v_smem: gl.shared_memory_descriptor,
 ):
+    # The launcher forces DEFER_V_LOAD off here: too few KV tiles for the
+    # saved traffic to cover the cost of deferring.
     cfg = program.cfg
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_attention_state()
@@ -907,6 +926,7 @@ def _mha_prefill(
     WINDOW_LEFT: gl.constexpr,
     IS_FP8: gl.constexpr,
     ENABLE_SKIP_SOFTMAX: gl.constexpr,
+    DEFER_V_LOAD: gl.constexpr,
     log2_threshold,
 ):
     cfg = AttentionConfig(
@@ -923,6 +943,7 @@ def _mha_prefill(
         -1,
         IS_FP8,
         ENABLE_SKIP_SOFTMAX,
+        DEFER_V_LOAD,
         k_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
@@ -999,6 +1020,7 @@ def _mha_prefill_sliding(
     WINDOW_LEFT: gl.constexpr,
     IS_FP8: gl.constexpr,
     ENABLE_SKIP_SOFTMAX: gl.constexpr,
+    DEFER_V_LOAD: gl.constexpr,
     log2_threshold,
 ):
     cfg = AttentionConfig(
@@ -1015,6 +1037,7 @@ def _mha_prefill_sliding(
         WINDOW_LEFT,
         IS_FP8,
         ENABLE_SKIP_SOFTMAX,
+        DEFER_V_LOAD,
         k_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
@@ -1122,6 +1145,7 @@ def gluon_mha_prefill_gfx950(
     return_lse: bool = False,
     softmax_scale: float | None = None,
     skip_softmax_threshold: float = 0.0,
+    defer_v_load: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Causal MHA prefill for gfx950, optionally with skip-softmax sparsity.
 
@@ -1132,6 +1156,12 @@ def gluon_mha_prefill_gfx950(
             and its result is exact. The skip rate depends on the score
             distribution and must be calibrated per model and sequence
             length. 0.0 (default) is exact dense attention.
+        defer_v_load: only load V for blocks that are not skipped, so a
+            skipped block costs no V traffic either. Applies to the causal
+            main loop only: the sliding-window kernel and the two boundary
+            tiles always load V together with K. Output is bit-identical
+            either way. Off by default, since the different load order has
+            a fixed cost that only pays off at high sparsity.
 
     Returns:
         The attention output with the same shape as ``q``, or
@@ -1161,7 +1191,11 @@ def gluon_mha_prefill_gfx950(
     sink_arg = sinks if sinks is not None else q
     lse_arg = lse if lse is not None else q
 
-    kernel = _mha_prefill_sliding if config.window_left >= 0 else _mha_prefill
+    is_sliding = config.window_left >= 0
+    # The sliding kernel ignores DEFER_V_LOAD; normalize it off so it does not
+    # compile a second, identical variant.
+    defer_v_load = defer_v_load and not is_sliding
+    kernel = _mha_prefill_sliding if is_sliding else _mha_prefill
     kernel[config.grid](
         q,
         k,
@@ -1193,6 +1227,7 @@ def gluon_mha_prefill_gfx950(
         config.window_left,
         is_fp8,
         enable_skip_softmax,
+        defer_v_load,
         config.log2_threshold,
         num_warps=config.num_warps,
     )

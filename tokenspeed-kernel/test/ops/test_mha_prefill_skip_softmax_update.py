@@ -30,8 +30,8 @@ in TensorRT-LLM discards the per-row bits the same way.
 Checks (bf16, causal, fixed seed):
   [1] VOTES ARE INERT   thresholds where many rows vote but no block is
       unanimous give output bit-identical to a threshold too small for any
-      row to vote, across GQA ratios, sinks, LSE, sliding window and ragged
-      batch
+      row to vote, across GQA ratios, both ``defer_v_load`` settings, sinks,
+      LSE, sliding window and ragged batch
   [2] ELISION FIRES     past that range the output does move, so [1] is not
       vacuously true of a kernel that skips nothing
   [3] NO REGRESSION     with skipping off, the result matches dense SDPA
@@ -116,13 +116,15 @@ def _run(q, k, v, seqlens: list[int], threshold: float, **kwargs):
 
 @pytest.mark.parametrize("n_heads,n_kv_heads", _GQA_SHAPES)
 @pytest.mark.parametrize("threshold", _ROW_VOTE_RATES)
+@pytest.mark.parametrize("defer_v_load", [False, True])
 def test_row_votes_alone_change_nothing(
-    n_heads: int, n_kv_heads: int, threshold: float
+    n_heads: int, n_kv_heads: int, threshold: float, defer_v_load: bool
 ) -> None:
     """[1] Rows vote, but a block that is not unanimous must be exact."""
     q, k, v = _qkv(n_heads, n_kv_heads, _SEQLEN)
-    voting = _run(q, k, v, [_SEQLEN], threshold)
-    inert = _run(q, k, v, [_SEQLEN], _TINY_THRESHOLD)
+    kwargs = {"defer_v_load": defer_v_load}
+    voting = _run(q, k, v, [_SEQLEN], threshold, **kwargs)
+    inert = _run(q, k, v, [_SEQLEN], _TINY_THRESHOLD, **kwargs)
     assert torch.isfinite(voting).all()
     assert torch.equal(voting, inert)
 
