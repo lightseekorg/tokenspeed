@@ -349,6 +349,9 @@ def test_kda_replay_supported_on_the_nvidia_serving_platform(b300_platform) -> N
         assert kda_replay_commit_supported(torch.bfloat16)
         assert kda_replay_commit_supported(torch.float16)
         assert not kda_replay_commit_supported(torch.float32)
+        batched = attention_ops.resolve_kda_batched_replay_commit()
+        assert batched is not None
+        assert batched.name == "triton_nvidia_kda_batched_replay_commit"
     finally:
         Platform.override(real_platform)
         registry.clear_cache()
