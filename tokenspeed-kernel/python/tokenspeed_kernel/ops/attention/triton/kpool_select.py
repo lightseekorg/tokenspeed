@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.cute_dsl.dsa_topk import (
     cute_dsl_decode_topk,
     has_cute_dsl_decode_topk,
@@ -51,6 +52,50 @@ _TRAITS = {
     "score_activation": frozenset({"relu", "none"}),
     "topk_layout": frozenset({"global_slots"}),
 }
+
+
+@triton.jit
+def _kpool_decode_metadata_kernel(
+    seq_lens,
+    req_ids,
+    causal_lens,
+    num_tokens: tl.constexpr,
+    q_len_per_req: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = token < num_tokens
+    req = token // q_len_per_req
+    q_offset = token - req * q_len_per_req
+    seq_len = tl.load(seq_lens + req, mask=mask, other=0).to(tl.int32)
+    causal_len = tl.maximum(
+        seq_len - (q_len_per_req - 1) + q_offset,
+        0,
+    )
+    tl.store(req_ids + token, req, mask=mask)
+    tl.store(causal_lens + token, causal_len, mask=mask)
+
+
+def _prepare_kpool_decode_metadata(
+    seq_lens: torch.Tensor,
+    num_tokens: int,
+    q_len_per_req: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build request ids and visible lengths in one device launch."""
+    req_ids = torch.empty(num_tokens, dtype=torch.int32, device=seq_lens.device)
+    causal_lens = torch.empty_like(req_ids)
+    block = min(triton.next_power_of_2(num_tokens), 1024)
+    _kpool_decode_metadata_kernel[(triton.cdiv(num_tokens, block),)](
+        seq_lens,
+        req_ids,
+        causal_lens,
+        num_tokens=num_tokens,
+        q_len_per_req=q_len_per_req,
+        BLOCK=block,
+        num_warps=1,
+        num_stages=1,
+    )
+    return req_ids, causal_lens
 
 
 def _empty_result(
@@ -83,14 +128,20 @@ def _select_pools_dense(
     use_cute_dsl_topk: bool,
 ) -> torch.Tensor:
     num_tokens = q.shape[0]
-    pool_indices = torch.empty(
-        (num_tokens, topk_pools), dtype=torch.int32, device=q.device
-    )
     if max_num_pools <= topk_pools:
-        return pool_indices
+        return torch.empty((num_tokens, topk_pools), dtype=torch.int32, device=q.device)
 
     row_bytes = max_num_pools * torch.float32.itemsize
     rows_per_tile = min(num_tokens, max(1, _MAX_DENSE_LOGITS_BYTES // row_bytes))
+    pool_indices = (
+        torch.empty(
+            (num_tokens, topk_pools),
+            dtype=torch.int32 if use_cute_dsl_topk else torch.int64,
+            device=q.device,
+        )
+        if use_cute_dsl_topk or rows_per_tile < num_tokens
+        else None
+    )
     logits_workspace = torch.empty(
         (rows_per_tile, max_num_pools), dtype=torch.float32, device=q.device
     )
@@ -118,6 +169,7 @@ def _select_pools_dense(
             length_masked_consumer=use_cute_dsl_topk,
         )
         if use_cute_dsl_topk:
+            assert pool_indices is not None
             cute_dsl_decode_topk(
                 logits,
                 pool_lens[start:end],
@@ -127,7 +179,10 @@ def _select_pools_dense(
             )
         else:
             selected = torch.topk(logits, k=topk_pools, dim=-1, sorted=False).indices
-            pool_indices[start:end].copy_(selected.to(torch.int32))
+            if pool_indices is None:
+                return selected
+            pool_indices[start:end].copy_(selected)
+    assert pool_indices is not None
     return pool_indices
 
 
@@ -207,18 +262,12 @@ def triton_dense_kpool_decode_topk(
         raise RuntimeError("KPool decode top-k requires CUDA tensors")
 
     device = q.device
-    seq_lens = seq_lens.to(device=device, dtype=torch.int32).contiguous()
-    token_ids = torch.arange(num_tokens, device=device, dtype=torch.int32)
-    req_ids = torch.div(token_ids, q_len_per_req, rounding_mode="floor")
-    # ROCm's int32 index-select path has a narrow crossover at 16 rows.
-    selected_seq_lens = (
-        seq_lens[req_ids]
-        if torch.version.hip is not None and num_tokens == 16
-        else seq_lens.index_select(0, req_ids)
+    seq_lens = seq_lens.to(device=device).contiguous()
+    req_ids, causal_lens = _prepare_kpool_decode_metadata(
+        seq_lens,
+        num_tokens,
+        q_len_per_req,
     )
-    causal_lens = (
-        selected_seq_lens - (q_len_per_req - 1) + token_ids % q_len_per_req
-    ).clamp_min_(0)
     use_cute = (
         has_cute_dsl_decode_topk()
         and topk_pools == _CUTE_DSL_TOPK_POOLS
@@ -239,7 +288,7 @@ def triton_dense_kpool_decode_topk(
     pool_indices = _select_pools_dense(
         q.contiguous(),
         pooled_k_cache,
-        weights.to(torch.float32).contiguous(),
+        weights.contiguous(),
         causal_lens,
         req_ids,
         index_block_table.to(device=device, dtype=torch.int32).contiguous(),

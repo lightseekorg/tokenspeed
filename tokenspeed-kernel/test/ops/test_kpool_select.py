@@ -26,6 +26,9 @@ import pytest
 import torch
 from tokenspeed_kernel import kpool_decode_topk, kpool_prefill_topk
 from tokenspeed_kernel.ops.attention.triton.kpool_score import score_kpool_dense
+from tokenspeed_kernel.ops.attention.triton.kpool_select import (
+    _prepare_kpool_decode_metadata,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -147,11 +150,13 @@ def _assert_selection(
         )
 
 
-def test_dense_scores_match_reference() -> None:
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16])
+def test_dense_scores_match_reference(weight_dtype: torch.dtype) -> None:
     q, cache, pooled_k, weights, seq_lens, index_table, _ = _setup(
         [2051, 4101], seed=47
     )
     req_ids = torch.arange(q.shape[0], dtype=torch.int32, device="cuda")
+    weights = weights.to(weight_dtype)
     pool_lens = seq_lens // _POOL
     max_num_pools = int(pool_lens.max())
     actual = score_kpool_dense(
@@ -180,6 +185,32 @@ def test_dense_scores_match_reference() -> None:
         ).sum(0)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=5e-7)
+
+
+@pytest.mark.parametrize("q_len_per_req", [1, 2, 4])
+@pytest.mark.parametrize("seq_dtype", [torch.int32, torch.int64])
+def test_decode_metadata_matches_torch_chain(
+    q_len_per_req: int,
+    seq_dtype: torch.dtype,
+) -> None:
+    seq_lens = torch.tensor([0, 2, 7], dtype=seq_dtype, device="cuda")
+    num_tokens = seq_lens.numel() * q_len_per_req
+    actual_req_ids, actual_causal_lens = _prepare_kpool_decode_metadata(
+        seq_lens,
+        num_tokens,
+        q_len_per_req,
+    )
+
+    token_ids = torch.arange(num_tokens, dtype=torch.int32, device="cuda")
+    expected_req_ids = token_ids // q_len_per_req
+    expected_causal_lens = (
+        seq_lens.to(torch.int32).index_select(0, expected_req_ids)
+        - (q_len_per_req - 1)
+        + token_ids % q_len_per_req
+    ).clamp_min(0)
+
+    assert torch.equal(actual_req_ids, expected_req_ids)
+    assert torch.equal(actual_causal_lens, expected_causal_lens)
 
 
 @pytest.mark.parametrize(
