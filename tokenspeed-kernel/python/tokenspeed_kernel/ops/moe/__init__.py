@@ -770,6 +770,16 @@ def moe_apply(
             inside the dispatch window (tokens sent, not yet awaited), so it
             overlaps the transfer. It must not read the dispatch result or write
             ``x``.
+        shared_input: Optional activated shared-expert input with shape
+            [tokens, shared_size]. Must be provided together with
+            ``shared_weight`` and ``shared_out`` to request a joint routed/shared
+            projection from kernels that support it.
+        shared_weight: Optional shared-expert down-projection weight with shape
+            [output_size, shared_size]. Must be provided together with
+            ``shared_input`` and ``shared_out``.
+        shared_out: Optional destination for the shared-expert down projection
+            with shape [tokens, output_size]. Must be provided together with
+            ``shared_input`` and ``shared_weight``.
 
     Solutions may use precomputed top-k tensors or route from logits directly.
     """

@@ -311,11 +311,13 @@ def spec_matches_traits(
             the spec are ignored. When ``True`` (reference compatibility checks),
             every requested trait must be explicitly present on the spec.
     """
+    # ispp stands for "intermediate size per partition" and has special
+    # requirements that depend on the kernel's declared exact sizes and
+    # supported alignments (if any). It is used in some MoE ops to ensure the
+    # intermediate buffer sizes are compatible with the kernel's requirements.
     if "ispp" in spec.traits and "ispp" not in traits:
         return False
     for trait_name, trait_value in traits.items():
-        # ispp stands for "intermediate size per partition" and may require an
-        # exact size, an alignment, or both.
         if trait_name == "ispp":
             if not _ispp_satisfies_alignment(spec, trait_value):
                 return False
