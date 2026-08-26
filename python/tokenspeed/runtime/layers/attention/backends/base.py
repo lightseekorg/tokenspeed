@@ -23,7 +23,7 @@ from __future__ import annotations
 import inspect
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, TypeVar
 
 import torch
 
@@ -35,6 +35,22 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
+
+
+class SpeculativeStateBackend(Protocol):
+    """Model side-state that consumes speculative verification results."""
+
+    def commit_after_mtp_verify(
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+    ) -> None: ...
+
+
+_SpeculativeStateBackendT = TypeVar(
+    "_SpeculativeStateBackendT", bound=SpeculativeStateBackend
+)
 
 
 def init_backend_cuda_graph_state(
@@ -92,6 +108,7 @@ class AttentionBackend(ABC):
         self.is_draft = config.is_draft
         self.spec_num_tokens = config.speculative_num_draft_tokens
         self.cache_pool: CachePool | None = None
+        self._speculative_state_backends: list[SpeculativeStateBackend] = []
         # True when this backend's CUDA-graph block-table (kv_indices) buffer is
         # aliased to a peer backend's (e.g. a drafter sharing the target's), so
         # the replay path skips rebuilding it — the peer already populates it.
@@ -215,6 +232,71 @@ class AttentionBackend(ABC):
 
     def register_step_counter(self, step_counter: StepCounter):
         self.step_counter = step_counter
+
+    def register_speculative_state_backend(
+        self, backend: SpeculativeStateBackend
+    ) -> None:
+        """Register a model side-state consumer of MTP verification results.
+
+        Args:
+            backend: Side backend implementing ``commit_after_mtp_verify``.
+
+        Returns:
+            None.
+        """
+
+        # Some composite backends predate this registry and intentionally do
+        # not call ``AttentionBackend.__init__``.  Initialize lazily so model
+        # side-state remains usable through those wrappers as well.
+        backends = getattr(self, "_speculative_state_backends", None)
+        if backends is None:
+            backends = []
+            self._speculative_state_backends = backends
+        if backend not in backends:
+            backends.append(backend)
+
+    def find_speculative_state_backend(
+        self, backend_type: type[_SpeculativeStateBackendT]
+    ) -> _SpeculativeStateBackendT | None:
+        """Return the registered speculative side backend of ``backend_type``.
+
+        Args:
+            backend_type: Concrete side-backend type to locate.
+
+        Returns:
+            The first matching backend, or ``None`` when it is not registered.
+        """
+
+        return next(
+            (
+                backend
+                for backend in getattr(self, "_speculative_state_backends", ())
+                if isinstance(backend, backend_type)
+            ),
+            None,
+        )
+
+    def commit_speculative_state_after_verify(
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+    ) -> None:
+        """Publish MTP accept/reject results to registered model side-state.
+
+        Args:
+            accepted_lengths: Per-request accepted lengths from the sampler.
+            num_extends: Number of leading extend requests in a mixed batch.
+
+        Returns:
+            None.
+        """
+
+        for backend in getattr(self, "_speculative_state_backends", ()):
+            backend.commit_after_mtp_verify(
+                accepted_lengths,
+                num_extends=num_extends,
+            )
 
     @contextmanager
     def record_pd_cache_step(

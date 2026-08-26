@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
+from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -36,6 +38,48 @@ def test_serialized_checkpoint_keeps_per_tensor_default() -> None:
     """A per-tensor FP8 checkpoint must not be reinterpreted as block-scaled."""
     config = Fp8Config(is_checkpoint_fp8_serialized=True)
     assert config.weight_block_size is None
+
+
+def test_serialized_checkpoint_honors_modules_to_not_convert() -> None:
+    config = Fp8Config.from_config(
+        {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": [
+                "lm_head",
+                "model.layers.0.mlp.shared_expert.down_proj",
+            ],
+        }
+    )
+
+    assert config.ignored_layers == [
+        "lm_head",
+        "model.layers.0.mlp.shared_expert.down_proj",
+    ]
+
+
+def test_serialized_checkpoint_excludes_fused_projection_members() -> None:
+    config = Fp8Config.from_config(
+        {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": [
+                "model.layers.1.ple.key_proj",
+                "model.layers.1.ple.value_proj",
+            ],
+        }
+    )
+
+    layer = ReplicatedLinear(
+        128,
+        128,
+        quant_config=config,
+        prefix="model.layers.1.ple.kv_proj",
+    )
+
+    assert isinstance(layer.quant_method, UnquantizedLinearMethod)
 
 
 def test_block_quant_rejects_static_activation() -> None:

@@ -254,9 +254,21 @@ class ModelExecutorConfig:
         # ``chunked_prefill_metadata`` from inside the captured prefill segment,
         # but the prefill graph rebinds only the live ForwardContext at replay --
         # the backend metadata object stays frozen at capture-time (dummy) values.
-        # So the two are fundamentally incompatible; force eager prefill for DSA.
-        disable_prefill_graph = bool(server_args.disable_prefill_graph) or (
-            model_config.attention_arch == AttentionArch.DSA
+        # Qwen4-Exp's PLE/QSA modules likewise own token-indexed side-state writes;
+        # replay pads token rows to a bucket while their cache metadata remains
+        # real-token shaped. Keep those prefills eager so padding can never
+        # advance n-gram, short-conv, or compressed-key state.
+        text_config = model_config.hf_text_config
+        qwen4_exp_has_side_state = getattr(text_config, "model_type", None) == (
+            "qwen4_exp_text"
+        ) and bool(
+            getattr(text_config, "ple_layer_ids", None)
+            or getattr(text_config, "indexer_n_heads", None) is not None
+        )
+        disable_prefill_graph = (
+            bool(server_args.disable_prefill_graph)
+            or (model_config.attention_arch == AttentionArch.DSA)
+            or qwen4_exp_has_side_state
         )
 
         return ModelExecutorConfig(

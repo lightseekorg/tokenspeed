@@ -29,8 +29,9 @@ def create_cache_arena(
 def _mha_pool_class(family: str, *, mxfp8: bool) -> type[CachePool]:
     """The MHA-shaped pool for one family, in its plain or mxfp8 variant.
 
-    All three take the same arguments; only the recurrent-state aliasing (and
-    the scale planes) differ, which is the class's business, not the caller's.
+    All supported families take the same arguments; only the recurrent-state
+    aliasing (and the scale planes) differ, which is the class's business, not
+    the caller's.
     """
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_inkling import (
         HybridInklingTokenToKVPool,
@@ -49,6 +50,7 @@ def _mha_pool_class(family: str, *, mxfp8: bool) -> type[CachePool]:
         "mha": (MHATokenToKVPool, MHATokenToKVPoolMXFP8),
         "inkling": (HybridInklingTokenToKVPool, HybridInklingTokenToKVPoolMXFP8),
         "qwen_gdn": (HybridMHATokenToKVPool, HybridMHATokenToKVPoolMXFP8),
+        "qwen4_exp": (HybridMHATokenToKVPool, HybridMHATokenToKVPoolMXFP8),
     }
     try:
         plain, scaled = by_family[family]

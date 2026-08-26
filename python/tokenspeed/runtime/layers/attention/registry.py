@@ -26,7 +26,11 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
+from tokenspeed.runtime.configs.model_config import (
+    AttentionArch,
+    is_deepseek_v4,
+    is_qwen4_exp,
+)
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -179,6 +183,9 @@ _HYBRID_GDN_ARCHITECTURES = {
     "Qwen3_5ForConditionalGenerationNextN",
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForCausalLMNextN",
+    "Qwen4ExpForConditionalGeneration",
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpForCausalLMNextN",
 }
 # Hybrid linear-attention models whose full-attention layers are MLA (not MHA)
 # and whose linear layers are KDA (per-channel gated delta rule), not GDN.
@@ -428,6 +435,12 @@ def _create_hybrid_linear_attn_backend(
     if is_kda:
         kda_backend = _resolve_kda_backend(kda_backend)
         linear_attn_backend = KdaAttnBackend(config, kda_backend=kda_backend)
+    elif is_qwen4_exp(hf_config):
+        from tokenspeed.runtime.layers.attention.backends.qwen4_exp import (
+            Qwen4ExpMambaAttnBackend,
+        )
+
+        linear_attn_backend = Qwen4ExpMambaAttnBackend(config)
     else:
         linear_attn_backend = MambaAttnBackend(config)
 
@@ -786,10 +799,16 @@ def create_attn_components(
         )
     )
     use_cache_gdn = is_hybrid_gdn and has_state
+    # The qwen4_exp family check needs the top-level config: the nested
+    # text_config has no ``architectures`` so resolve_architecture would
+    # return its class name and the check would always be False.
+    use_qwen4_exp_cache = use_cache_gdn and is_qwen4_exp(model_config.hf_config)
     use_cache_k3 = is_hybrid_mla_kda
     use_cache_inkling = is_inkling
     if is_deepseek_v4_model:
         cache_family = "deepseek_v4"
+    elif use_qwen4_exp_cache:
+        cache_family = "qwen4_exp"
     elif use_cache_gdn:
         cache_family = "qwen_gdn"
     elif use_cache_k3:

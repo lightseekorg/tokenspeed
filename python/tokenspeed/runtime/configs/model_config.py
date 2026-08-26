@@ -55,6 +55,13 @@ _DEEPSEEK_V4_ARCHITECTURES = frozenset(
         "DeepseekV4ForCausalLMNextN",
     }
 )
+_QWEN4_EXP_ARCHITECTURES = frozenset(
+    {
+        "Qwen4ExpForConditionalGeneration",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForCausalLMNextN",
+    }
+)
 _MLA_ARCHITECTURES = frozenset(
     {
         "DeepseekV3ForCausalLM",
@@ -127,6 +134,13 @@ def override_model_config(model_config, ext_yaml):
 
 def is_deepseek_v4(config: PretrainedConfig) -> bool:
     return resolve_architecture(config) in _DEEPSEEK_V4_ARCHITECTURES
+
+
+def is_qwen4_exp(config: PretrainedConfig) -> bool:
+    return (
+        getattr(config, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}
+        or resolve_architecture(config) in _QWEN4_EXP_ARCHITECTURES
+    )
 
 
 def is_deepseek_v4_nextn(config: PretrainedConfig) -> bool:
@@ -821,6 +835,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
     multimodal_architectures = {
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",
         "KimiK25ForConditionalGeneration",

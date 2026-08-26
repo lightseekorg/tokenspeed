@@ -41,6 +41,16 @@ from tokenspeed.runtime.layers.quantization.base_config import (
 from tokenspeed.runtime.utils import set_weight_attrs
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
+_FLOAT8_DTYPES = tuple(
+    dtype
+    for name in (
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+    )
+    if (dtype := getattr(torch, name, None)) is not None
+)
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -511,7 +521,15 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         # Mask the output embedding.
         if self.tp_size > 1:
-            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+            output_mask = input_mask.unsqueeze(-1)
+            if output_parallel.dtype in _FLOAT8_DTYPES:
+                # CUDA does not implement masked_fill_ for FP8. PLE keeps its
+                # n-gram table in FP8 and dequantizes after this sharded
+                # lookup, so preserve the FP8 payload while zeroing rows that
+                # belong to another TP rank with the supported pointwise op.
+                output_parallel = torch.where(output_mask, 0.0, output_parallel)
+            else:
+                output_parallel.masked_fill_(output_mask, 0)
 
             if reduce_results:
                 output = all_reduce(output_parallel, self.tp_group)

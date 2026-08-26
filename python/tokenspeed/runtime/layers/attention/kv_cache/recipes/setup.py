@@ -42,6 +42,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     OrdinaryRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen4_exp import (
+    Qwen4ExpRecipe,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
     QwenGDNRecipe,
 )
@@ -55,6 +58,7 @@ CacheModelFamily = Literal[
     "dsa",
     "msa",
     "qwen_gdn",
+    "qwen4_exp",
     "inkling",
     "kimi_k3",
     "deepseek_v4",
@@ -155,6 +159,7 @@ _RECIPES: dict[CacheModelFamily, Callable[..., CacheRecipe]] = {
     "dsa": partial(OrdinaryRecipe, family="dsa"),
     "msa": partial(OrdinaryRecipe, family="msa"),
     "qwen_gdn": QwenGDNRecipe,
+    "qwen4_exp": Qwen4ExpRecipe,
     "inkling": InklingRecipe,
     "kimi_k3": KimiK3Recipe,
     "deepseek_v4": DeepseekV4Recipe,

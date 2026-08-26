@@ -132,21 +132,25 @@ class Eagle(BaseDrafter):
             - 1
         )
 
-        hf_config = getattr(draft_model_runner.model_config, "hf_config", None)
-        self._dsa_reuse_mtp_topk = bool(
-            getattr(hf_config, "index_share_for_mtp_iteration", False)
-        )
-
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _model_shares_mtp_topk(self) -> bool:
+        return bool(
+            getattr(
+                self.draft_model_runner.model,
+                "index_share_for_mtp_iteration",
+                False,
+            )
+        )
 
     def _attach_dsa_topk(
         self,
         ctx: ForwardContext,
         dsa_topk: DsaTopKState,
     ) -> None:
-        if not self._dsa_reuse_mtp_topk:
+        if not self._model_shares_mtp_topk():
             return
         ctx.dsa_prefill_topk, ctx.dsa_decode_topk = dsa_topk
 
@@ -155,7 +159,7 @@ class Eagle(BaseDrafter):
         ctx: ForwardContext,
         dsa_topk: DsaTopKState,
     ) -> DsaTopKState:
-        if not self._dsa_reuse_mtp_topk:
+        if not self._model_shares_mtp_topk():
             return dsa_topk
         return ctx.dsa_prefill_topk, ctx.dsa_decode_topk
 
@@ -255,8 +259,8 @@ class Eagle(BaseDrafter):
             getattr(draft_model, "compute_dsa_topk_first_step", False)
         )
         if compute_dsa_topk_first_step:
-            # GLM NextN has its own indexer weights. Compute first-step top-k
-            # in the draft model, then select rows used by later MTP steps.
+            # The draft model has its own sparse indexer weights. Compute
+            # first-step top-k, then select rows used by later MTP steps.
             dsa_topk = (None, None)
         elif draft_input.num_extends == 0 and prepare_dsa_topk is not None:
             dsa_topk = prepare_dsa_topk(dsa_topk, gather_ids)
