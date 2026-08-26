@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 
 @triton.jit
@@ -199,7 +199,7 @@ def qk_rmsnorm(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
     eps: float,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-head RMSNorm of q and k in a single kernel launch.
 
@@ -224,6 +224,7 @@ def qk_rmsnorm(
 
     q_in_stride = q.stride(0) if q.dim() > 1 else q.shape[-1]
     k_in_stride = k.stride(0) if k.dim() > 1 else k.shape[-1]
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
 
     # Allocate fresh contiguous outputs so downstream RoPE/attention kernels
     # — which assume row-major layouts — work without further copies.

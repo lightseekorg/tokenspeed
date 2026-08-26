@@ -23,6 +23,7 @@ from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
+    pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -111,6 +112,8 @@ if platform.is_nvidia:
         out: object | None = None,
         operation: str,
     ) -> torch.Tensor:
+        if deep_gemm.get_pdl() != pdl_enabled():
+            deep_gemm.set_pdl(pdl_enabled())
         refreshed = deep_gemm.get_paged_mqa_logits_metadata(
             seq_lens_2d,
             page_size,
@@ -308,6 +311,8 @@ if platform.is_nvidia:
             if q_len_per_req > 1
             else block_table
         )
+        if deep_gemm.get_pdl() != pdl_enabled():
+            deep_gemm.set_pdl(pdl_enabled())
         logits = deep_gemm.fp8_paged_mqa_logits(
             q_fp8.view(tokens, 1, q.shape[1], q.shape[-1]),
             kv_cache,
@@ -497,6 +502,8 @@ if platform.is_nvidia:
                 else candidate_lens[start:end]
             )
             max_seqlen_k = int(chunk_candidate_lens.max().item())
+            if deep_gemm.get_pdl() != pdl_enabled():
+                deep_gemm.set_pdl(pdl_enabled())
             logits = deep_gemm.fp8_mqa_logits(
                 q_fp8[start:end].contiguous(),
                 kv_fp8,

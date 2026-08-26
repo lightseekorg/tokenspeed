@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
+from tokenspeed_kernel.platform import pdl_enabled
 
 __all__ = [
     "add3",
@@ -584,7 +585,7 @@ def fused_swiglu_fp8_ue8m0(
     swiglu_alpha: float = 1.0,
     swiglu_beta: float = 0.0,
     *,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused SwiGLU activation + FP8 UE8M0 block-scale quantization.
 
@@ -597,9 +598,10 @@ def fused_swiglu_fp8_ue8m0(
         swiglu_limit: Clamp bound. 0 or negative disables clamping.
         swiglu_alpha: Sigmoid multiplier applied to the gate.
         swiglu_beta: Value added to the up projection before multiplication.
-        enable_pdl: Join an SM90+ Programmatic Dependent Launch chain. The
-            kernel waits for the preceding producer before reading ``gate_up``
-            and releases the following dependent after writing both outputs.
+        enable_pdl: Join an SM90+ Programmatic Dependent Launch chain, defaulting
+            to the platform setting. The kernel waits for the preceding producer
+            before reading ``gate_up`` and releases the following dependent after
+            writing both outputs.
 
     Returns:
         ``(fp8_out, scale)``: ``fp8_out`` is ``[M, N]`` float8_e4m3fn,
@@ -630,6 +632,7 @@ def fused_swiglu_fp8_ue8m0(
     PACK = 4
     packs_per_row = (groups_per_row + PACK - 1) // PACK
     num_programs = M * packs_per_row
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _fused_swiglu_fp8_ue8m0_kernel[(num_programs,)](
         gate_up,
@@ -1336,21 +1339,22 @@ def attnres_partial_dual(blocks, wp_a, wp_b, eps, scratch_a, scratch_b):
     )
 
 
-def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out, enable_pdl=False):
+def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out, enable_pdl=None):
     """Merge the prefix candidate into the partial; optional fused out-norm.
 
     Args:
         prefix: ``[T, H]`` residual stream.
         scratch: (m, s, acc) from :func:`attnres_partial`.
         out: ``[T, H]`` mixed (and out-normed) hidden destination.
-        enable_pdl: programmatic dependent launch; prefetches everything
-            but the prefix before ``gdc_wait``.
+        enable_pdl: programmatic dependent launch, defaulting to the platform
+            setting; prefetches everything but the prefix before ``gdc_wait``.
 
     Returns:
         ``out``.
     """
     T, H = prefix.shape
     m, s_, acc = scratch
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _attnres_combine_kernel[(T,)](
         prefix,

@@ -57,6 +57,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.launch import (
     static_profile,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.moe import (
+    gluon_mxfp4_fp8_precomputed_situ,
     gluon_mxfp_dynamic_mxfp4_fused_moe,
     gluon_mxfp_fused_moe,
     gluon_mxfp_precomputed_mxfp4_fused_moe,
@@ -121,6 +122,7 @@ __all__ = [
     "gluon_fused_route",
     "gluon_mxfp_combine",
     "gluon_mxfp_dispatch_swiglu",
+    "gluon_mxfp4_fp8_precomputed_situ",
     "gluon_mxfp_dynamic_mxfp4_fused_moe",
     "gluon_mxfp_fused_moe",
     "gluon_mxfp_precomputed_mxfp4_fused_moe",

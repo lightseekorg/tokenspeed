@@ -66,6 +66,7 @@ struct FMHACutlassSM100Params {
   void* o_direct_ptr = nullptr;
   int num_qo_heads_orig = 0;
   int num_ctas = 0;
+  bool enable_pdl = false;
   // TMA fused direct-O unpack: enabled when pack_factor > 1, ptr_O_direct present,
   // qo_len uniform across batches, and FMHA_DISABLE_TMA_DIRECT_O env var not set.
   // When false, epilogue falls back to vec16 software scatter.

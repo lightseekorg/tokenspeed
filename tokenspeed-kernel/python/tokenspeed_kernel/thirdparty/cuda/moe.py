@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+from tokenspeed_kernel.platform import pdl_enabled
 
 
 @functools.cache
@@ -47,7 +48,7 @@ def moe_finalize_fuse_shared(
     expert_weights: torch.Tensor,
     shared_output: Optional[torch.Tensor],
     top_k: int,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> torch.Tensor:
     """Fused MoE finalize + optional shared-output residual (bf16, SM>=90).
 
@@ -91,7 +92,8 @@ def moe_finalize_fuse_shared(
             ``[S, num_tokens, hidden_dim]`` bf16 un-weighted shared-expert
             outputs (weighted by the tail columns), or ``None``.
         top_k: top-k count (must be ``<= 64``).
-        enable_pdl: honor upstream/downstream PDL if True.
+        enable_pdl: honor upstream/downstream PDL. Uses the platform default
+            when omitted.
 
     Returns:
         ``[num_tokens, hidden_dim]`` bf16.
@@ -133,6 +135,7 @@ def moe_finalize_fuse_shared(
     if shared_output is None:
         shared_output = gemm2_out.new_empty((0, 0), dtype=torch.bfloat16)
 
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     mod = _load_moe_finalize_fuse_shared_module()
     mod.moe_finalize_fuse_shared(
         out,

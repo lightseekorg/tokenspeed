@@ -60,7 +60,12 @@ from tokenspeed_kernel.ops.gemm.linear_attnres_partials import (
     linear_attnres_partials,
     linear_attnres_partials_available,
 )
-from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    Platform,
+    current_platform,
+    pdl_enabled,
+)
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import SelectedKernel, select_kernel
@@ -154,6 +159,7 @@ def prepare_fp8_linear(
     block_n, block_k = int(block_size[0]), int(block_size[1])
     n, k = weight.shape
     platform = current_platform()
+    enable_pdl = pdl_enabled()
     deep_gemm_spec = KernelRegistry.get().get_by_name("deep_gemm_mm_fp8_blockscale")
     scale_requires_transform = (
         scale_format == "ue8m0" and weight_scales.dtype.is_floating_point
@@ -190,19 +196,24 @@ def prepare_fp8_linear(
         )
 
     if (
-        has_flashinfer_mxfp8()
-        and (block_n, block_k) == (1, 32)
+        (block_n, block_k) == (1, 32)
         and weight_scales.dtype == torch.uint8
         and weight_scales.ndim == 2
         and n >= 128
         and k >= 128
         and k % 32 == 0
     ):
-        return _PreparedFp8Linear(
-            override="flashinfer_mm_mxfp8",
-            block_size=(block_n, block_k),
-            prepared_weight_scales=swizzle_mxfp8_scale(weight_scales, n, k),
-        )
+        if has_flashinfer_mxfp8() and enable_pdl:
+            return _PreparedFp8Linear(
+                override="flashinfer_mm_mxfp8",
+                block_size=(block_n, block_k),
+                prepared_weight_scales=swizzle_mxfp8_scale(weight_scales, n, k),
+            )
+        if not enable_pdl:
+            return _PreparedFp8Linear(
+                override="triton_mm_fp8_blockscale",
+                block_size=(block_n, block_k),
+            )
 
     if (
         has_flashinfer_fp8_blockscale()
@@ -242,7 +253,6 @@ def fp8_linear(
     input_scales: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
-    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Execute a block-FP8 linear operation through a prepared plan.
 
@@ -255,8 +265,6 @@ def fp8_linear(
         input_scales: Optional pre-quantized activation block scales.
         bias: Optional output bias.
         out_dtype: Requested output dtype.
-        enable_pdl: Request Programmatic Dependent Launch when supported.
-
     Returns:
         The linear output matrix ``[M, N]``.
     """
@@ -281,7 +289,6 @@ def fp8_linear(
         quant="mxfp8",
         block_size=list(typed_plan.block_size),
         override=override,
-        enable_pdl=enable_pdl,
         prepacked_scales=prepacked_scales,
     )
 
@@ -664,7 +671,6 @@ def dsv4_grouped_output_projection_warmup_model(
 def dsv4_linear_fp32(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
-    enable_pdl: bool = False,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -673,7 +679,6 @@ def dsv4_linear_fp32(
     Args:
         hidden_states: Floating-point activations with trailing dimension K.
         weight: Floating-point row-major weight shaped [N, K].
-        enable_pdl: Request Programmatic Dependent Launch when supported.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
 
@@ -692,6 +697,7 @@ def dsv4_linear_fp32(
     if not hidden_states.is_floating_point() or not weight.is_floating_point():
         raise ValueError("hidden_states and weight must be floating-point tensors")
 
+    enable_pdl = pdl_enabled()
     traits = {
         "hidden_rank": hidden_states.ndim,
         "weight_rank": weight.ndim,
@@ -998,7 +1004,6 @@ def mm(
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
     quant: str | None = None,
-    enable_pdl: bool = False,
     override: str | None = None,
     prepacked_scales: bool = False,
 ) -> torch.Tensor:
@@ -1027,14 +1032,13 @@ def mm(
         quant: Explicit quant type override.  One of ``"mxfp8"``,
             ``"fp8"``, ``"nvfp4"``, ``"mxfp4"``, ``"none"``.
             If ``None``, inferred from input dtypes and scales.
-        enable_pdl: Whether to request Programmatic Dependent Launch support
-            from kernels that accept it.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
         prepacked_scales: Whether the FP8 block scales already use the selected
             kernel's prepared layout. This is supported only by FlashInfer's
             FP8 ``[128, 128]`` block-scale GEMM.
     """
+    enable_pdl = pdl_enabled()
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
 
     M = A.shape[0]
@@ -1071,6 +1075,7 @@ def mm(
         "n_min_128": N >= 128,
         "k_min_128": K >= 128,
         "block_scale_layout": block_scale_layout,
+        "pdl_enabled": pdl_enabled(),
     }
 
     signature = _gemm_format_signature(

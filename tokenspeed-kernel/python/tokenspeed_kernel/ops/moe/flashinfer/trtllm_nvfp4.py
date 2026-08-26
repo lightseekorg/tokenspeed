@@ -368,6 +368,7 @@ if platform.is_nvidia:
             local_expert_offset=_spec.ep_rank * _spec.num_local_experts,
             local_num_experts=_spec.num_local_experts,
             do_finalize=do_finalize,
+            enable_pdl=enable_pdl,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
         )
 

@@ -18,7 +18,7 @@ from typing import Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -105,7 +105,7 @@ def fp8_quantize(
     scale: float | torch.Tensor | None = None,
     out: Optional[torch.Tensor] = None,
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
-    enable_pdl: bool = False,
+    enable_pdl: bool | None = None,
 ) -> torch.Tensor:
     """Cast a BF16/FP16 tensor to FP8 with an optional per-tensor scale.
 
@@ -121,8 +121,9 @@ def fp8_quantize(
         out: optional pre-allocated FP8 output. Same shape as ``x``. If not
            provided, allocated as contiguous.
         fp8_dtype: ``torch.float8_e4m3fn`` (default) or ``torch.float8_e5m2``.
-        enable_pdl: opt into Programmatic Dependent Launch (Hopper+). Caller
-           must also pass ``launch_pdl=True`` upstream / downstream as needed.
+        enable_pdl: opt into Programmatic Dependent Launch (Hopper+), defaulting
+           to the platform setting. Caller must also enable PDL upstream /
+           downstream as needed.
 
     Returns:
         FP8 tensor with the same shape as ``x``.
@@ -177,6 +178,7 @@ def fp8_quantize(
     # ``launch_pdl`` is a NVIDIA-only Triton runtime kwarg (Hopper+ Programmatic
     # Dependent Launch). The HIP backend rejects unknown kwargs, so only forward
     # it when PDL is actually requested.
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
 
     _fp8_quantize_kernel[grid](

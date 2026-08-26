@@ -67,5 +67,5 @@ cudaError_t {{ func_name }}(const FMHACutlassSM100Params& p) {
                                       , p.gmem_bounds
 #endif
                                       },
-      p.num_ctas);
+      p.num_ctas, p.enable_pdl);
 }

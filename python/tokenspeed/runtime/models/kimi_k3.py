@@ -158,7 +158,6 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.utils import add_prefix, ceil_div, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
@@ -1141,7 +1140,6 @@ class KimiLinearKDA(nn.Module):
                 prepacked_scales=getattr(
                     self.qkvgb_proj, "_flashinfer_scales_mn", None
                 ),
-                enable_pdl=pdl_enabled(),
             )
         else:
             blocks, weight_a, weight_b, eps, scratch_a, scratch_b = attnres_partial_args
@@ -1290,7 +1288,6 @@ class KimiLinearMoEGate(nn.Module):
         return kimi3_router_projection(
             hidden_states,
             self.weight,
-            enable_pdl=pdl_enabled(),
         )
 
 
@@ -2081,7 +2078,6 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_norm.variance_epsilon,
                 _sliced_scratch(prefix_sum, 1, n_tok),
                 torch.empty_like(prefix_sum),
-                enable_pdl=pdl_enabled(),
             )
         else:
             h = _apply_attn_res(

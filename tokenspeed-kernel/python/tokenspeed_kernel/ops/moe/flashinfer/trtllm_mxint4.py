@@ -277,6 +277,7 @@ if platform.is_nvidia:
             local_num_experts=local_experts,
             routed_scaling_factor=w._routed_scaling_factor,
             routing_method_type=w._routing_method_type,
+            enable_pdl=enable_pdl,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
         )
         return result[0]

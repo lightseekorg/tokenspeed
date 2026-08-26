@@ -120,4 +120,5 @@ if platform.is_nvidia:
             tune_max_num_tokens=get_autotune_max_num_tokens(),
             activation_type=ActivationType.Swiglu,
             use_deepseek_fp8_block_scale=True,
+            enable_pdl=enable_pdl,
         )[0]
