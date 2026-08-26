@@ -973,6 +973,7 @@ if current_platform().is_amd:
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
+            "support_skip_softmax": frozenset({False, True}),
         },
     )
     def gluon_mha_prefill_gfx950(*args, **kwargs):
@@ -1005,6 +1006,7 @@ if current_platform().is_amd:
             "support_sinks": frozenset({False, True}),
             "support_logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
+            "support_skip_softmax": frozenset({False}),
         },
     )
     def gluon_mha_prefill_gfx1250(*args, **kwargs):
