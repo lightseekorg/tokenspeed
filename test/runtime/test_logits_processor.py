@@ -108,7 +108,7 @@ def test_force_deterministic_rsag_disables_logits_symm_mem(
     )
     monkeypatch.setattr(
         logits_processor_module,
-        "create_dist_argmax_state",
+        "try_create_dist_argmax_state",
         lambda *args, **kwargs: pytest.fail(
             "symmetric-memory state must not initialize"
         ),
@@ -142,16 +142,76 @@ def test_tp_logits_custom_collectives_skip_cross_node_group(monkeypatch):
         "create_state",
         lambda **kwargs: pytest.fail("cross-node TP must not create RSAG state"),
     )
+    # Distributed argmax is no longer topology-gated: cross-node groups probe
+    # for NVLS instead. This shard is below the kernel's vocab floor, so the
+    # state is rejected before any collective work.
     monkeypatch.setattr(
         logits_processor_module,
-        "create_dist_argmax_state",
+        "try_create_dist_argmax_state",
         lambda **kwargs: pytest.fail(
-            "cross-node TP must not create distributed-argmax state"
+            "a shard below the vocab floor must not reach the constructor"
         ),
     )
 
     assert processor._init_all_gather_state(lm_head) is None
     assert processor._init_dist_argmax_state(lm_head) is None
+
+
+def test_dist_argmax_probe_failure_falls_back_and_latches(monkeypatch):
+    """A failed probe falls back, latches its verdict, and skips capture."""
+    monkeypatch.setitem(
+        global_server_args_dict,
+        "mapping",
+        SimpleNamespace(nprocs_per_node=4),
+    )
+    monkeypatch.setattr(logits_processor_module, "dist_argmax_available", lambda: True)
+    monkeypatch.setattr(
+        logits_processor_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=True),
+    )
+    capturing = {"on": True}
+    monkeypatch.setattr(
+        logits_processor_module.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: capturing["on"],
+    )
+    monkeypatch.setattr(
+        logits_processor_module.pg_manager,
+        "get_process_group",
+        lambda *a, **k: object(),
+    )
+    monkeypatch.setattr(
+        logits_processor_module.torch.distributed,
+        "all_reduce",
+        lambda tensor, **k: None,
+    )
+    calls = []
+
+    def failing_create(**kwargs):
+        calls.append(1)
+        return None  # the group has no NVLS multicast
+
+    monkeypatch.setattr(
+        logits_processor_module, "try_create_dist_argmax_state", failing_create
+    )
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=8192),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 4),
+    )
+    lm_head = SimpleNamespace(weight=torch.ones((4096, 2), dtype=torch.float32))
+
+    # Inside capture: no collective work, and nothing may latch.
+    assert processor._init_dist_argmax_state(lm_head) is None
+    assert len(calls) == 0
+
+    capturing["on"] = False
+    assert processor._init_dist_argmax_state(lm_head) is None
+    # The verdict is cached: the constructor must not be retried.
+    assert processor._init_dist_argmax_state(lm_head) is None
+    assert len(calls) == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
