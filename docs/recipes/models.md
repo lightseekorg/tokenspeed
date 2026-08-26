@@ -352,7 +352,7 @@ tokenspeed serve zai-org/GLM-5.2-FP8 \
   --port 8000
 ```
 
-### GLM-5.3-Flash
+### GLM 5.3 Flash
 
 GLM-5.3-Flash automatically configures its KDA/DSA backends and supports MTP from
 the base checkpoint.
