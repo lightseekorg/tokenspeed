@@ -627,7 +627,7 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
     torch.testing.assert_close(captured, eager, atol=3e-4, rtol=3e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [2, 4, 32])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 32])
 def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
     num_tokens: int,
 ) -> None:
