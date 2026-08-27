@@ -33,7 +33,6 @@ from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
 from tokenspeed.runtime.layers.attention.backends.qsa import bind_qsa_indexers
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_PLE_CACHE_GROUP,
-    QWEN4_EXP_PLE_CONTEXT_FIELD,
     qwen4_exp_ple_conv_field,
 )
 
@@ -96,10 +95,10 @@ class Qwen4ExpMambaAttnBackend(MambaAttnBackend):
         self._ple_verify_scratch = scratch
 
     def ple_verify_scratch(
-        self, layer_id: int
+        self, context_field_id: str, layer_id: int
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Return shared context and per-layer PLE convolution verify rows."""
-        context = self._ple_verify_scratch.get(QWEN4_EXP_PLE_CONTEXT_FIELD)
+        context = self._ple_verify_scratch.get(context_field_id)
         conv = self._ple_verify_scratch.get(qwen4_exp_ple_conv_field(layer_id))
         if context is None or conv is None:
             return None

@@ -30,7 +30,6 @@ from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_PLE_CACHE_GROUP,
-    QWEN4_EXP_PLE_CONTEXT_FIELD,
     QWEN4_EXP_QSA_CACHE_GROUP,
     QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE,
     QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
@@ -38,6 +37,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qsa_compressed_field,
     qsa_raw_key_field,
     qsa_rope_position_field,
+    qwen4_exp_ple_context_field,
     qwen4_exp_ple_conv_field,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
@@ -83,10 +83,12 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
     def _ple_fields(self) -> tuple[CacheFieldSpec, ...]:
         if not getattr(self._text_config, "ple_layer_ids", None):
             return ()
+        ple_layer_ids = tuple(self._text_config.short_conv_layer_ids)
+        context_field = qwen4_exp_ple_context_field(min(ple_layer_ids))
         fields = (
             CacheFieldSpec(
-                QWEN4_EXP_PLE_CONTEXT_FIELD,
-                QWEN4_EXP_PLE_CONTEXT_FIELD,
+                context_field,
+                context_field,
                 (int(self._text_config.ngram_context_len),),
                 cache_dtype_name(torch.int64),
                 exact_page_stride=False,
@@ -101,7 +103,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                 cache_dtype_name(torch.bfloat16),
                 exact_page_stride=False,
             )
-            for layer_id in self._text_config.short_conv_layer_ids
+            for layer_id in ple_layer_ids
         )
 
     @cached_property

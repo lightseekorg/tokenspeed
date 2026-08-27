@@ -26,7 +26,6 @@ kernels as a side effect.
 """
 
 QWEN4_EXP_PLE_CACHE_GROUP = "qwen4_exp_ple"
-QWEN4_EXP_PLE_CONTEXT_FIELD = "qwen4_exp.ple.context"
 
 QWEN4_EXP_QSA_CACHE_GROUP = "qwen4_exp_qsa"
 QWEN4_EXP_QSA_RECENT_CACHE_GROUP = "qwen4_exp_qsa_recent"
@@ -34,10 +33,16 @@ QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE = 64
 QWEN4_EXP_QSA_RECENT_ROWS_PER_PAGE = 64
 
 
+def qwen4_exp_ple_context_field(layer_id: int) -> str:
+    """Return the shared PLE context field owned by its first consumer."""
+
+    return f"layer.{layer_id}.qwen4_exp.ple.context"
+
+
 def qwen4_exp_ple_conv_field(layer_id: int) -> str:
     """Return the cache field id for one PLE short-convolution state."""
 
-    return f"qwen4_exp.ple.layer.{layer_id}.conv"
+    return f"layer.{layer_id}.qwen4_exp.ple.conv"
 
 
 def qsa_raw_key_field(layer_id: int) -> str:
@@ -60,7 +65,6 @@ def qsa_rope_position_field(layer_id: int) -> str:
 
 __all__ = [
     "QWEN4_EXP_PLE_CACHE_GROUP",
-    "QWEN4_EXP_PLE_CONTEXT_FIELD",
     "QWEN4_EXP_QSA_CACHE_GROUP",
     "QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE",
     "QWEN4_EXP_QSA_RECENT_CACHE_GROUP",
@@ -68,5 +72,6 @@ __all__ = [
     "qsa_compressed_field",
     "qsa_raw_key_field",
     "qsa_rope_position_field",
+    "qwen4_exp_ple_context_field",
     "qwen4_exp_ple_conv_field",
 ]

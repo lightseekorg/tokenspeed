@@ -44,7 +44,7 @@ from tokenspeed.runtime.layers.attention.backends.qwen4_exp import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_PLE_CACHE_GROUP,
-    QWEN4_EXP_PLE_CONTEXT_FIELD,
+    qwen4_exp_ple_context_field,
     qwen4_exp_ple_conv_field,
 )
 from tokenspeed.runtime.layers.hyperconnection import GroupedGemmaRMSNorm
@@ -781,6 +781,8 @@ class Qwen4ExpPLELayer(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_id = int(layer_id)
+        context_layer_id = min(config.short_conv_layer_ids)
+        self.context_field_id = qwen4_exp_ple_context_field(context_layer_id)
         self.hidden_size = int(config.hidden_size)
         self.hc_count = int(config.hc_count)
         self.hc_hidden_size = self.hidden_size * self.hc_count
@@ -1281,7 +1283,7 @@ class Qwen4ExpPLELayer(nn.Module):
         key = (bs, width)
         self._active_verify_key = key
         rows = bs * (width + 1)
-        external = backend.ple_verify_scratch(self.layer_id)
+        external = backend.ple_verify_scratch(self.context_field_id, self.layer_id)
         if external is None:
             raise RuntimeError("Qwen4-Exp PLE verify workspace was not preallocated")
         if external[0].shape[0] < rows or external[1].shape[0] < rows:
@@ -1317,7 +1319,7 @@ class Qwen4ExpPLELayer(nn.Module):
         accepted = accepted_lengths.to(torch.long).clamp(1, width)
         source = torch.arange(bs, device=accepted.device) * (width + 1) + accepted
         pool = self._last_pool
-        context_field = pool.arena.field(QWEN4_EXP_PLE_CONTEXT_FIELD)
+        context_field = pool.arena.field(self.context_field_id)
         conv_field = pool.arena.field(qwen4_exp_ple_conv_field(self.layer_id))
         self._write_pages(
             context_field, destination_pages, context_scratch.index_select(0, source)
@@ -1456,7 +1458,10 @@ class Qwen4ExpPLELayer(nn.Module):
         output_pages = out_blocks_by_group[QWEN4_EXP_PLE_CACHE_GROUP][: ctx.bs]
         pool = ctx.token_to_kv_pool
         self._last_pool = pool
-        context_field = pool.arena.field(QWEN4_EXP_PLE_CONTEXT_FIELD)
+        load_tracker = getattr(pool, "layerwise_load_tracker", None)
+        if load_tracker is not None:
+            load_tracker.wait_for_layer(self.layer_id)
+        context_field = pool.arena.field(self.context_field_id)
         conv_field = pool.arena.field(qwen4_exp_ple_conv_field(self.layer_id))
         initial_context = self._read_pages(
             context_field, input_pages, self.ple_embedding.eos_token_id
@@ -1528,9 +1533,9 @@ class Qwen4ExpPLELayer(nn.Module):
 
 __all__ = [
     "QWEN4_EXP_PLE_CACHE_GROUP",
-    "QWEN4_EXP_PLE_CONTEXT_FIELD",
     "Qwen4ExpNGramEmbedding",
     "Qwen4ExpPLELayer",
+    "qwen4_exp_ple_context_field",
     "qwen4_exp_ple_conv_field",
     "quantize_ple_embedding_rows",
 ]

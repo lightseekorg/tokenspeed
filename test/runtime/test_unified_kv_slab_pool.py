@@ -8,6 +8,7 @@ import os
 import pathlib
 import sys
 import unittest
+from functools import partial
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -650,7 +651,10 @@ class DeriveStateGroupsByLayerTest(unittest.TestCase):
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
-        self.derive = derive_state_groups_by_layer
+        self.derive = partial(
+            derive_state_groups_by_layer,
+            state_field_suffixes=("conv", "ssm"),
+        )
 
     @staticmethod
     def _arena(fields, families):
@@ -674,10 +678,15 @@ class DeriveStateGroupsByLayerTest(unittest.TestCase):
             fields=(
                 ("layer.0.conv", "linear_attention_0"),
                 ("layer.0.ssm", "linear_attention_0"),
+                ("layer.0.qwen4_exp.ple.conv", "qwen4_exp_ple"),
                 ("layer.1.k", "full_attention"),
                 ("layer.1.v", "full_attention"),
             ),
-            families={"linear_attention_0": "state", "full_attention": "history"},
+            families={
+                "linear_attention_0": "state",
+                "qwen4_exp_ple": "state",
+                "full_attention": "history",
+            },
         )
         mapping = self.derive(arena, first_layer=0, num_layers=2, state_layer_ids=(0,))
         self.assertEqual(mapping, {0: "linear_attention_0"})

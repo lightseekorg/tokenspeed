@@ -5,7 +5,10 @@ import pytest
 import torch
 
 import tokenspeed.runtime.layers.attention.kv_cache.mha as mha_cache
-from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
+from tokenspeed.runtime.cache.transfer.layout import (
+    combine_cache_transfer_layouts,
+    select_layer_fields,
+)
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
@@ -648,7 +651,7 @@ def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
         )
 
 
-def test_hybrid_draft_layers_share_the_merged_plan() -> None:
+def test_hybrid_draft_layers_share_plan_with_disjoint_views() -> None:
     setup = _hybrid_setup_with_narrow_draft()
 
     # One big model: the draft layer's field is planned as a continuation
@@ -662,6 +665,18 @@ def test_hybrid_draft_layers_share_the_merged_plan() -> None:
         plan.group(draft_field.group_id).page_count
         == plan.group(target_field.group_id).page_count
     )
+    target_fields, _ = select_layer_fields(
+        plan.fields,
+        first_layer=0,
+        num_layers=setup.num_target_layers,
+    )
+    draft_fields, _ = select_layer_fields(
+        plan.fields,
+        first_layer=setup.num_target_layers,
+        num_layers=setup.num_draft_layers,
+    )
+    assert target_fields.isdisjoint(draft_fields)
+    assert target_fields | draft_fields == {field.field_id for field in plan.fields}
 
 
 def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:

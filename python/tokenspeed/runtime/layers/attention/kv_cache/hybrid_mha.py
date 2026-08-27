@@ -92,6 +92,7 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
             first_layer=self._field_layer_offset,
             num_layers=self.layer_num,
             state_layer_ids=self._state_layer_ids,
+            state_field_suffixes=("conv", "ssm"),
         )
 
     def get_state_buffers(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:

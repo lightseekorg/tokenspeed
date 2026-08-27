@@ -566,8 +566,8 @@ def _create_target_components(
     is_inkling: bool,
 ):
     """The target's compute view onto the shared arena + target backend."""
-    # The merged spec includes the draft's continuation layers; the target
-    # view binds every planned field regardless of which model consumes it.
+    # The arena owns every planned field; this view binds only the target
+    # model's layer window.
     pool = create_cache_pool(
         cache_spec,
         config,
@@ -891,21 +891,19 @@ def create_attn_components(
         overlap_schedule_depth=overlap_schedule_depth,
     )
     spec = cache_setup.spec
-    # The target view binds every planned field, draft continuation layers
-    # included, so the merged plan has one owner. The draft is a second view
-    # over the same arena, offset onto its own layer window.
     target_spec = spec
     draft_view_spec = None
     if cache_setup.num_draft_layers:
+        # Transfer fields need one owner even when target and draft share a
+        # cache family, so both compute views use disjoint layer windows.
+        target_spec = spec.layer_view(
+            first_layer=0,
+            num_layers=cache_setup.num_target_layers,
+        )
         draft_view_spec = spec.layer_view(
             first_layer=cache_setup.num_target_layers,
             num_layers=cache_setup.num_draft_layers,
             family=heterogeneous_draft_family,
-        )
-    if heterogeneous_draft_family is not None:
-        target_spec = spec.layer_view(
-            first_layer=0,
-            num_layers=cache_setup.num_target_layers,
         )
     prefix_granularity = spec.memory_plan.prefix_granularity
     _validate_lcm_page_size(

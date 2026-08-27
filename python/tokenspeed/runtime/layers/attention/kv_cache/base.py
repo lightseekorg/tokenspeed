@@ -63,6 +63,7 @@ def derive_state_groups_by_layer(
     first_layer: int,
     num_layers: int,
     state_layer_ids: Iterable[int],
+    state_field_suffixes: Iterable[str],
 ) -> dict[int, str]:
     """Map each recurrent layer to the state-family group holding its fields.
 
@@ -75,6 +76,8 @@ def derive_state_groups_by_layer(
         first_layer: This view's first layer in the merged plan.
         num_layers: Number of layers in this view's window.
         state_layer_ids: View-local ids of the recurrent (state) layers.
+        state_field_suffixes: Field ID suffixes that make up the pool's
+            recurrent state.
 
     Returns:
         View-local layer id -> state-family group id, one entry per state
@@ -87,13 +90,16 @@ def derive_state_groups_by_layer(
         spec.group_id for spec in arena.cache_group_specs if spec.family == "state"
     }
     wanted = set(state_layer_ids)
+    wanted_suffixes = set(state_field_suffixes)
     mapping: dict[int, str] = {}
     for field in arena.plan.fields:
         located = _layer_plane(field.field_id, first_layer, num_layers)
         if located is None:
             continue
-        layer_id, _ = located
-        if layer_id not in wanted or field.group_id not in state_groups:
+        layer_id, suffix = located
+        if layer_id not in wanted or suffix not in wanted_suffixes:
+            continue
+        if field.group_id not in state_groups:
             continue
         existing = mapping.setdefault(layer_id, field.group_id)
         if existing != field.group_id:

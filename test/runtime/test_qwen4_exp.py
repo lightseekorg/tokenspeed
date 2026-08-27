@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tokenspeed.runtime.cache.transfer.layout import select_layer_fields
 from tokenspeed.runtime.configs.model_config import is_qwen4_exp
 from tokenspeed.runtime.configs.qwen4_exp_config import (
     Qwen4ExpConfig,
@@ -69,11 +70,11 @@ from tokenspeed.runtime.models.qwen4_exp import (
 )
 from tokenspeed.runtime.models.qwen4_exp_ple import (
     QWEN4_EXP_PLE_CACHE_GROUP,
-    QWEN4_EXP_PLE_CONTEXT_FIELD,
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLELayer,
     _nth_prime_after,
     quantize_ple_embedding_rows,
+    qwen4_exp_ple_context_field,
     qwen4_exp_ple_conv_field,
 )
 
@@ -1081,10 +1082,11 @@ def test_qwen4_exp_nextn_reads_nested_mtp_index_sharing_config() -> None:
 
 
 def test_qwen4_exp_ple_verify_workspace_shares_context_rows() -> None:
+    context_field = qwen4_exp_ple_context_field(0)
     fields = (
         SimpleNamespace(
             group_id=QWEN4_EXP_PLE_CACHE_GROUP,
-            field_id=QWEN4_EXP_PLE_CONTEXT_FIELD,
+            field_id=context_field,
             shape=(2,),
         ),
         SimpleNamespace(
@@ -1099,7 +1101,7 @@ def test_qwen4_exp_ple_verify_workspace_shares_context_rows() -> None:
         ),
     )
     cache_fields = {
-        QWEN4_EXP_PLE_CONTEXT_FIELD: torch.empty((3, 2), dtype=torch.int64),
+        context_field: torch.empty((3, 2), dtype=torch.int64),
         qwen4_exp_ple_conv_field(0): torch.empty((3, 16, 9), dtype=torch.bfloat16),
         qwen4_exp_ple_conv_field(2): torch.empty((3, 16, 9), dtype=torch.bfloat16),
     }
@@ -1114,8 +1116,8 @@ def test_qwen4_exp_ple_verify_workspace_shares_context_rows() -> None:
     backend._ple_verify_scratch = {}
 
     backend._ensure_ple_verify_scratch(max_bs=2, draft_token_num=3)
-    first = backend.ple_verify_scratch(0)
-    second = backend.ple_verify_scratch(2)
+    first = backend.ple_verify_scratch(context_field, 0)
+    second = backend.ple_verify_scratch(context_field, 2)
 
     assert first is not None and second is not None
     assert first[0] is second[0]
@@ -1226,6 +1228,7 @@ def _ple_layer_stub(hc_count: int = 1, hidden_size: int = 2, pages: int = 5):
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     torch.nn.Module.__init__(layer)
     layer.layer_id = 0
+    layer.context_field_id = qwen4_exp_ple_context_field(0)
     layer.hidden_size = hidden_size
     layer.hc_count = hc_count
     layer.hc_hidden_size = hidden_size * hc_count
@@ -1260,7 +1263,7 @@ def _ple_layer_stub(hc_count: int = 1, hidden_size: int = 2, pages: int = 5):
 
     layer._conv_sequences = conv_sequences
     fields = {
-        QWEN4_EXP_PLE_CONTEXT_FIELD: torch.zeros((pages, 1), dtype=torch.int64),
+        layer.context_field_id: torch.zeros((pages, 1), dtype=torch.int64),
         qwen4_exp_ple_conv_field(0): torch.zeros(
             (pages, layer.hc_hidden_size, 1), dtype=torch.bfloat16
         ),
@@ -1270,7 +1273,7 @@ def _ple_layer_stub(hc_count: int = 1, hidden_size: int = 2, pages: int = 5):
 
 def test_qwen4_exp_ple_reads_state_block_metadata() -> None:
     layer, fields, folded = _ple_layer_stub(pages=3)
-    context = fields[QWEN4_EXP_PLE_CONTEXT_FIELD]
+    context = fields[layer.context_field_id]
     context[1] = 5
     metadata = SimpleNamespace(
         state_in_blocks_by_group={
@@ -1284,7 +1287,11 @@ def test_qwen4_exp_ple_reads_state_block_metadata() -> None:
     )
     layer._metadata = lambda ctx: metadata
     layer._linear_backend = lambda ctx: SimpleNamespace()
-    pool = SimpleNamespace(arena=SimpleNamespace(field=fields.__getitem__))
+    waited_layers = []
+    pool = SimpleNamespace(
+        arena=SimpleNamespace(field=fields.__getitem__),
+        layerwise_load_tracker=SimpleNamespace(wait_for_layer=waited_layers.append),
+    )
     ctx = SimpleNamespace(
         bs=1,
         forward_mode=ForwardMode.DECODE,
@@ -1299,6 +1306,7 @@ def test_qwen4_exp_ple_reads_state_block_metadata() -> None:
     )
 
     assert output.shape == (1, 2)
+    assert waited_layers == [0]
     # The layer folds the residual into the conv itself, so it hands the conv
     # the incoming hidden states and returns updated states, not a delta.
     assert folded["add_terms"][1] is hidden_states
@@ -1370,7 +1378,7 @@ def test_qwen4_exp_ple_handles_a_ragged_padded_batch() -> None:
     torch.testing.assert_close(req, torch.tensor([0, 0, 0, 1, 1]))
     torch.testing.assert_close(starts, torch.tensor([0, 3]))
     # Each request carries its own last token into its own output page.
-    context = fields[QWEN4_EXP_PLE_CONTEXT_FIELD]
+    context = fields[layer.context_field_id]
     torch.testing.assert_close(context[3], torch.tensor([12]))
     torch.testing.assert_close(context[4], torch.tensor([21]))
 
@@ -1437,7 +1445,8 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     groups = {group.group_id: group for group in setup.spec.cache_group_specs}
 
     assert setup.spec.family == "qwen4_exp"
-    assert fields[QWEN4_EXP_PLE_CONTEXT_FIELD].shape == (2,)
+    context_field = qwen4_exp_ple_context_field(0)
+    assert fields[context_field].shape == (2,)
     assert fields[qwen4_exp_ple_conv_field(0)].shape == (16, 9)
     assert fields[qsa_raw_key_field(1)].shape == (4, 1, 8)
     assert fields[qsa_compressed_field(1)].shape == (64, 1, 8)
@@ -1469,7 +1478,14 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         for group in groups.values()
     )
     assert groups[QWEN4_EXP_PLE_CACHE_GROUP].block_granularity == 256
-    assert fields[QWEN4_EXP_PLE_CONTEXT_FIELD].dtype == "int64"
+    assert fields[context_field].dtype == "int64"
+    selected, consumers = select_layer_fields(
+        setup.spec.memory_plan.fields,
+        first_layer=0,
+        num_layers=2,
+    )
+    assert selected == frozenset(fields)
+    assert context_field in consumers[0]
     assert fields[qsa_raw_key_field(1)].dtype == "bfloat16"
     assert fields[qsa_compressed_field(1)].dtype == "bfloat16"
     assert fields[qsa_rope_position_field(1)].dtype == "int64"
