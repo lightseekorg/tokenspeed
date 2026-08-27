@@ -301,6 +301,9 @@ def test_forced_torch_solution_is_not_routed():
     ):
         kimi3.kimi3_latent_projection(x, latent_w, solution="torch")
         kimi3.kimi3_shared_down_projection(y, down_w, solution="torch")
+    # Drain the queued vendor-BLAS work here: under emulation it otherwise keeps
+    # executing into the next test and charges its runtime against that test.
+    torch.cuda.synchronize()
 
 
 def test_route_predicate_admits_the_registered_arch_floor():
@@ -321,3 +324,4 @@ def test_route_predicate_admits_the_registered_arch_floor():
         ):
             assert routed_gemv.decode_gemv_routed(x, w) is expected
     routed_gemv._is_routed_arch.cache_clear()
+    torch.cuda.synchronize()
