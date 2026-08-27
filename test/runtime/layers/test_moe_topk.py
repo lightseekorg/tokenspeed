@@ -4,7 +4,28 @@ import pytest
 import torch
 
 from tokenspeed.runtime.layers.moe import topk as topk_module
-from tokenspeed.runtime.layers.moe.topk import TopKConfig, select_experts
+from tokenspeed.runtime.layers.moe.topk import (
+    TopK,
+    TopKConfig,
+    TopKOutputFormat,
+    select_experts,
+)
+
+
+def test_topk_call_can_override_configured_output_format() -> None:
+    topk = TopK(top_k=2, output_format=TopKOutputFormat.STANDARD)
+    hidden_states = torch.empty((3, 4))
+    router_logits = torch.empty((3, 8))
+
+    output = topk(
+        hidden_states,
+        router_logits,
+        output_format=TopKOutputFormat.BYPASSED,
+    )
+
+    assert output.format.is_bypassed()
+    assert output.hidden_states is hidden_states
+    assert output.router_logits is router_logits
 
 
 def test_plain_route_uses_kernel_package_softmax_topk(

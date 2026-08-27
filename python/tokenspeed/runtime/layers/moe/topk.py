@@ -389,13 +389,13 @@ class TopK(torch.nn.Module):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         *,
+        output_format: TopKOutputFormat | None = None,
         num_token_non_padded: torch.Tensor | None = None,
         expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
     ) -> TopKOutput:
-        if self.topk_config.output_format is not None:
-            output_format = self.topk_config.output_format
-        else:
-            output_format = TopKOutputFormat.STANDARD
+        output_format = (
+            output_format or self.topk_config.output_format or TopKOutputFormat.STANDARD
+        )
 
         if output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(

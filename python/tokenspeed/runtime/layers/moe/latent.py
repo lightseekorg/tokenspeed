@@ -201,10 +201,6 @@ class Kimi3MoEExecutionPlan:
     lane_latent_norm_ar: bool = False
     comm_fusion_max_num_tokens: int = 0
 
-    @property
-    def use_precomputed_topk(self) -> bool:
-        return self.use_native or self.use_trtllm or self.use_marlin
-
     @classmethod
     def build(
         cls,
@@ -334,8 +330,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
         ):
             # Chunked loads use full-weight row offsets, which sharded params cannot honor.
             raise ValueError(
-                "column-parallel Kimi3LatentProjection only supports whole-"
-                "tensor loads"
+                "column-parallel Kimi3LatentProjection only supports whole-tensor loads"
             )
         if self.shard_group is not None:
             rows = self.output_size_full // self.shard_size

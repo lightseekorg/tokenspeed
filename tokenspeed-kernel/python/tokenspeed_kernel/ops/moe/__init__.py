@@ -689,6 +689,7 @@ def moe_plan(
 
     routing_modes = apply_spec.traits.get("routing_mode", frozenset())
     support_routing = "kernel_routing" in routing_modes
+    supports_precomputed_topk = "precomputed_topk" in routing_modes
     supports_deferred_finalize = True in apply_spec.traits.get(
         "supports_deferred_finalize", frozenset({False})
     )
@@ -704,6 +705,7 @@ def moe_plan(
             deepep_low_latency_max_num_tokens_per_gpu
         ),
         "support_routing": support_routing,
+        "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
         "solution": apply_spec.solution,
         "internal_activation_dtype": internal_activation_dtype,

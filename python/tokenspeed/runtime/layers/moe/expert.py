@@ -306,6 +306,11 @@ class MoELayer(torch.nn.Module):
         return self.plan["support_routing"]
 
     @property
+    def supports_precomputed_topk(self) -> bool:
+        # The fallback keeps lightweight out-of-tree/mock plans compatible.
+        return self.plan.get("supports_precomputed_topk", not self.support_routing)
+
+    @property
     def topk_output_format(self):
         if self.support_routing:
             return TopKOutputFormat.BYPASSED
@@ -376,7 +381,14 @@ class MoELayer(torch.nn.Module):
             else {}
         )
 
-        if self.support_routing:
+        use_kernel_routing = topk_output.format.is_bypassed() or (
+            self.support_routing and not self.supports_precomputed_topk
+        )
+        if use_kernel_routing:
+            if not self.support_routing:
+                raise ValueError(
+                    "selected MoE kernel does not support in-kernel routing"
+                )
             return tokenspeed_kernel.moe_apply(
                 self.plan,
                 hidden_states,
@@ -389,18 +401,21 @@ class MoELayer(torch.nn.Module):
                 overlap_fn=overlap_fn,
                 **shared_kwargs,
             )
-        else:
-            return tokenspeed_kernel.moe_apply(
-                self.plan,
-                hidden_states,
-                self,
-                topk_output.router_logits,
-                topk_weights=topk_output.topk_weights,
-                topk_ids=topk_output.topk_ids,
-                num_tokens_global=num_global_tokens,
-                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-                do_finalize=do_finalize,
-                low_latency=low_latency,
-                overlap_fn=overlap_fn,
-                **shared_kwargs,
+        if not self.supports_precomputed_topk:
+            raise ValueError(
+                "selected MoE kernel does not support precomputed top-k routing"
             )
+        return tokenspeed_kernel.moe_apply(
+            self.plan,
+            hidden_states,
+            self,
+            topk_output.router_logits,
+            topk_weights=topk_output.topk_weights,
+            topk_ids=topk_output.topk_ids,
+            num_tokens_global=num_global_tokens,
+            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            do_finalize=do_finalize,
+            low_latency=low_latency,
+            overlap_fn=overlap_fn,
+            **shared_kwargs,
+        )

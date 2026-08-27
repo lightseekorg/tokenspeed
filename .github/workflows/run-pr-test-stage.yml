@@ -41,7 +41,10 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(inputs.matrix) }}
     name: ${{ matrix.name }} (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
+    # `runner` is the platform a task targets, and carries its vendor
+    # classification. `runs_on` is the machine that hosts it, and differs
+    # whenever the target platform is not the host's own hardware.
+    runs-on: ${{ matrix.runs_on || matrix.runner }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
     continue-on-error: ${{ matrix.optional }}
     env:
@@ -61,6 +64,17 @@ jobs:
       - name: Set work directory
         run: |
           echo "WORK_DIR=${{ github.workspace }}/run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}" >> "$GITHUB_ENV"
+
+      - name: Restore MI450 simulator cache
+        if: matrix.runner == 'amd-mi450-sim'
+        id: mi450-simulator-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/uv
+            ${{ runner.temp }}/tokenspeed-mi450-sim
+          key: mi450-sim-${{ runner.os }}-rocjitsu-08ae3860-rocm-20260812-v1
 
       - name: Install pipeline dependency
         # pypi.org occasionally returns "Content-Type: Unknown" for the simple
@@ -85,6 +99,16 @@ jobs:
             --only-stage install \
             --keep-runner-state \
             --result-json .ci-artifacts/result.json
+
+      - name: Save MI450 simulator cache
+        if: matrix.runner == 'amd-mi450-sim' && steps.mi450-simulator-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/uv
+            ${{ runner.temp }}/tokenspeed-mi450-sim
+          key: ${{ steps.mi450-simulator-cache.outputs.cache-primary-key }}
 
       - name: Execute CI task
         run: |
