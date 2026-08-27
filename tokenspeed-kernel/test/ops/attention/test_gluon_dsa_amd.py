@@ -1650,18 +1650,39 @@ def test_dsa_native_fp8_split_schedule(
 
 
 @pytest.mark.parametrize(
-    ("tokens", "qk_rope_head_dim", "expected_splits"),
-    ((1, 0, 1), (16, 0, 16), (32, 0, 1), (64, 0, 4), (64, 64, 1)),
+    (
+        "tokens",
+        "topk_width",
+        "max_seqlen_k",
+        "qk_rope_head_dim",
+        "expected_splits",
+    ),
+    (
+        (1, 2048, 2047, 0, 1),
+        (16, 2048, 2047, 0, 16),
+        (32, 2048, 2047, 0, 1),
+        (64, 2048, 2047, 0, 4),
+        (16, 2051, 131072, 0, 16),
+        (64, 2049, 131072, 0, 4),
+        (64, 2051, 131072, 0, 4),
+        (64, 2051, 1961, 0, 1),
+        (64, 2051, 131072, 64, 1),
+        (64, 2052, 131072, 0, 1),
+    ),
 )
 def test_dsa_glm53_bf16_split_schedule(
-    tokens: int, qk_rope_head_dim: int, expected_splits: int
+    tokens: int,
+    topk_width: int,
+    max_seqlen_k: int,
+    qk_rope_head_dim: int,
+    expected_splits: int,
 ) -> None:
     assert (
         gfx950_dsa_backend._select_num_kv_splits(
             num_tokens=tokens,
             num_heads=16,
-            topk_width=2048,
-            max_seqlen_k=2047,
+            topk_width=topk_width,
+            max_seqlen_k=max_seqlen_k,
             is_fp8=False,
             qk_rope_head_dim=qk_rope_head_dim,
         )
@@ -1678,7 +1699,7 @@ def test_dsa_decode_glm53_flash_bf16_split_mfma(tokens: int) -> None:
     device = "cuda"
     num_heads = 16
     num_slots = 256
-    topk = 2048
+    topk = 2051
     kv_lora_rank = 512
     qk_nope_head_dim = 256
     generator = _generator(device, 1204 + tokens)
@@ -1707,7 +1728,7 @@ def test_dsa_decode_glm53_flash_bf16_split_mfma(tokens: int) -> None:
         sparse_kv_cache=None,
         topk_slots=topk_slots,
         topk_lens=topk_lens,
-        max_seqlen_k=2047,
+        max_seqlen_k=131072,
         qk_nope_head_dim=qk_nope_head_dim,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=0,
@@ -1728,6 +1749,76 @@ def test_dsa_decode_glm53_flash_bf16_split_mfma(tokens: int) -> None:
     assert out.dtype == torch.bfloat16
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.skipif(
+    not is_cdna4(),
+    reason="the tested DSA kernel currently only supports gfx950",
+)
+def test_dsa_decode_glm53_flash_bf16_split_graph_tracks_live_lengths() -> None:
+    device = "cuda"
+    tokens = 16
+    num_heads = 16
+    num_slots = 512
+    topk = 2051
+    kv_lora_rank = 512
+    qk_nope_head_dim = 256
+    generator = _generator(device, 1220)
+    q = _randn_bf16(
+        (tokens, num_heads, kv_lora_rank), device=device, generator=generator
+    )
+    kv_cache = _randn_bf16(
+        (num_slots, kv_lora_rank), device=device, generator=generator
+    )
+    topk_slots = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
+    topk_lens = torch.empty(tokens, device=device, dtype=torch.int32)
+    out = torch.empty(
+        (tokens, num_heads, kv_lora_rank), device=device, dtype=torch.bfloat16
+    )
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim)
+
+    def invoke() -> None:
+        gluon_dsa_decode(
+            q=q,
+            kv_cache=kv_cache,
+            sparse_kv_cache=None,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            max_seqlen_k=131072,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=0,
+            softmax_scale=softmax_scale,
+            page_size=64,
+            q_len_per_req=4,
+            out=out,
+        )
+
+    topk_lens.fill_(13)
+    topk_slots[:, :13] = torch.arange(13, device=device, dtype=torch.int32)
+    invoke()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        invoke()
+
+    for visible in (13, 449):
+        topk_slots.fill_(-1)
+        topk_lens.fill_(visible)
+        selected = torch.arange(visible, device=device, dtype=torch.int32)
+        for row in range(tokens):
+            topk_slots[row, :visible] = torch.roll(selected, row)
+        graph.replay()
+        torch.cuda.synchronize()
+        ref = _dsa_reference(
+            q,
+            kv_cache,
+            torch.empty((num_slots, 0), dtype=q.dtype, device=device),
+            topk_slots,
+            topk_lens,
+            softmax_scale,
+        )
+        torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 
 @pytest.mark.skipif(

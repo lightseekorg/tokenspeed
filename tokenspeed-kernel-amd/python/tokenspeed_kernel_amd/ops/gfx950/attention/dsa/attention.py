@@ -1024,12 +1024,15 @@ def _select_num_kv_splits(
         return 1
     if not is_fp8:
         # This tuning comes from GLM-5.3-Flash. Split sufficiently large selected-KV
-        # rows across CTAs so the launch provides enough parallel work to fill the GPU.
+        # rows across CTAs so the launch provides enough parallel work to fill the
+        # GPU.
+        # Pooled selection can append up to three tail slots to the configured
+        # 2,048-token budget, so graph captures use widths from 2,048 through 2,051.
         if (
             int(qk_rope_head_dim) == 0
             and int(num_heads) == 16
-            and int(topk_width) == 2048
-            and work_tiles == 64
+            and 2048 <= int(topk_width) <= 2051
+            and work_tiles >= 64
         ):
             if int(num_tokens) == 16:
                 return 16
