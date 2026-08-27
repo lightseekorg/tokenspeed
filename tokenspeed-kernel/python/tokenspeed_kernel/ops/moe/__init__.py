@@ -742,6 +742,9 @@ def moe_apply(
     # all-to-all EP
     low_latency: bool | None = None,
     overlap_fn: Callable[[], None] | None = None,
+    shared_input: torch.Tensor | None = None,
+    shared_weight: torch.Tensor | None = None,
+    shared_out: torch.Tensor | None = None,
 ):
     """Apply a planned MoE kernel.
 
@@ -767,6 +770,16 @@ def moe_apply(
             inside the dispatch window (tokens sent, not yet awaited), so it
             overlaps the transfer. It must not read the dispatch result or write
             ``x``.
+        shared_input: Optional activated shared-expert input with shape
+            [tokens, shared_size]. Must be provided together with
+            ``shared_weight`` and ``shared_out`` to request a joint routed/shared
+            projection from kernels that support it.
+        shared_weight: Optional shared-expert down-projection weight with shape
+            [output_size, shared_size]. Must be provided together with
+            ``shared_input`` and ``shared_out``.
+        shared_out: Optional destination for the shared-expert down projection
+            with shape [tokens, output_size]. Must be provided together with
+            ``shared_input`` and ``shared_weight``.
 
     Solutions may use precomputed top-k tensors or route from logits directly.
     """
@@ -783,6 +796,20 @@ def moe_apply(
         if _uses_all_to_all_ep(plan.get("a2a_backend"))
         else {}
     )
+    shared_tensors = (shared_input, shared_weight, shared_out)
+    if any(value is not None for value in shared_tensors) and not all(
+        value is not None for value in shared_tensors
+    ):
+        raise ValueError("joint shared projection requires input, weight, and output")
+    shared_kwargs = (
+        {
+            "shared_input": shared_input,
+            "shared_weight": shared_weight,
+            "shared_out": shared_out,
+        }
+        if all(value is not None for value in shared_tensors)
+        else {}
+    )
     return kernel(
         plan=plan,
         x=x,
@@ -795,4 +822,5 @@ def moe_apply(
         do_finalize=do_finalize,
         enable_pdl=pdl_enabled(),
         **a2a_kwargs,
+        **shared_kwargs,
     )

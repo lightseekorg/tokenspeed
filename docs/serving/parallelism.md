@@ -43,6 +43,26 @@ Kimi-K3 TP8 deployments must combine `--tensor-parallel-size 8` with
 `--mm-encoder-tp-mode data`. This keeps the text model at TP8 while running the
 wide-QKV MoonViT encoder at TP1 with whole-item DP8.
 
+### Pinning a request to an attention-DP rank
+
+Each attention-DP rank owns a private prefix cache, so multi-turn requests
+only reuse their cache when every turn lands on the same rank. The
+`data_parallel_rank` request field (`Engine.generate` / `async_generate`, or
+the gateway's gRPC protocol) pins a request to one rank: it dispatches
+straight there, bypassing load balancing — overload spill is the router's
+job. An invalid pin fails that request; the engine keeps serving. Engines
+without attention DP drop the pin.
+
+Disaggregation engines ignore the pin: the `bootstrap_room` residue
+(`room % dp_size`) governs prefill placement (and decode placement under
+`round_robin`), so steer placement by minting the room instead. A
+conflicting pin is logged and ignored, never rejected.
+
+With the bundled gateway, pass `--policy cache_aware --dp-aware` to
+`ts serve` to enable per-rank affinity routing. This requires bundled smg
+releases that carry the TokenSpeed dp-affinity support; see the lockstep
+note in `serve_smg.py`.
+
 ## MoE Deployments
 
 Large MoE models usually choose one of these shapes:
@@ -199,11 +219,21 @@ staging buffer used for per-step model inputs must therefore have per-step
 lifetime, or use an explicit synchronization before reuse. This applies to
 MTP/GDN mamba state indices as well as token, length, and request-pool inputs.
 
-CUDA IPC and symmetric-memory collectives are node-local. `AutoBackend` routes
-cross-node all-reduce, all-gather, and token all-gather/reduce-scatter groups to
-NCCL. Logits all-gather and distributed argmax use the same cross-node fallback.
-This is required for layouts such as attention DP with dense TP or MoE EP
-spanning nodes.
+CUDA IPC collectives are node-local; the mnnvl fabric workspace spans nodes.
+`AutoBackend` serves single-tensor SUM all-reduces (16-bit, or fp32 where a
+single-node workspace was armed for it; mnnvl serves 16-bit only) on groups
+whose fan-in is 2, 4, 8, or 16 through the armed workspace -- one-shot
+inside its traffic window, two-shot up to the workspace token capacity.
+Cross-node groups arm the full two-shot capacity at startup; single-node
+groups start at the one-shot window and serve larger shapes once
+model-level preparation widens the shared workspace. Other
+fan-ins and dtypes, and any shape the workspace rejects, fall back to NCCL
+(inside the trtllm backend for armed groups; the Triton all-reduce tier
+serves AMD only, where no trtllm workspace exists). Single-node token
+all-gather/reduce-scatter runs on the Triton RSAG backend and uses NCCL
+across nodes. Logits all-gather and distributed argmax use the same
+cross-node fallback. This is required for layouts such as attention DP
+with dense TP or MoE EP spanning nodes.
 
 On ARM systems, [NCCL 2.29.3](https://github.com/NVIDIA/nccl/releases/tag/v2.29.3-1)
 fixes a weak compare-and-swap failure that can hang NCCL when it was compiled

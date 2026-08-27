@@ -310,6 +310,10 @@ class Envs:
     # engine.io_struct.
     TOKENSPEED_USE_PICKLE_IPC = EnvBool(False)
 
+    # Qwen4-Exp QSA
+    TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH = EnvStr("auto")
+    TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB = EnvInt(256)
+
     # Multimodal / VLM
     TOKENSPEED_LOG_MM_TIMING = EnvBool(False)
     TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH = EnvBool(False)

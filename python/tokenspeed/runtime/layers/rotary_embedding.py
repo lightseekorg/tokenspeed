@@ -1031,6 +1031,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                         "qwen3_vl_moe",
                         "qwen3_5",
                         "qwen3_5_moe",
+                        "qwen4_exp",
                     ):
                         t_index = (
                             torch.arange(llm_grid_t)

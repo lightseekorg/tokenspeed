@@ -32,6 +32,24 @@ def _make_eagle(spec_num_tokens: int = 4, max_bs: int = 8) -> Eagle:
     return drafter
 
 
+def test_mtp_index_sharing_uses_model_context_state() -> None:
+    model = SimpleNamespace(index_share_for_mtp_iteration=True)
+    drafter = Eagle.__new__(Eagle)
+    drafter.draft_model_runner = SimpleNamespace(model=model)
+    ctx = SimpleNamespace(dsa_prefill_topk=None, dsa_decode_topk=None)
+    first_step_topk = (object(), object())
+
+    drafter._attach_dsa_topk(ctx, first_step_topk)
+
+    assert ctx.dsa_prefill_topk is first_step_topk[0]
+    assert ctx.dsa_decode_topk is first_step_topk[1]
+    assert drafter._extract_dsa_topk(ctx, (None, None)) == first_step_topk
+
+    model.index_share_for_mtp_iteration = False
+    fallback = (object(), object())
+    assert drafter._extract_dsa_topk(ctx, fallback) == fallback
+
+
 class TestDrafterAcceptIndexing(unittest.TestCase):
     def test_mtp_stash_uses_request_pool_capacity(self):
         max_bs = 16

@@ -279,13 +279,16 @@ def _trait_value_matches(spec_values: frozenset[Any], trait_value: Any) -> bool:
 
 
 def _ispp_satisfies_alignment(spec: KernelSpec, ispp: Any) -> bool:
-    alignments = spec.traits.get("ispp_alignment")
-    if alignments is None:
-        return True
     try:
         ispp_value = int(ispp)
     except (TypeError, ValueError):
         return False
+    exact_sizes = spec.traits.get("ispp")
+    if exact_sizes is not None and ispp_value not in exact_sizes:
+        return False
+    alignments = spec.traits.get("ispp_alignment")
+    if alignments is None:
+        return True
     return any(
         int(alignment) > 0 and ispp_value % int(alignment) == 0
         for alignment in alignments
@@ -308,12 +311,13 @@ def spec_matches_traits(
             the spec are ignored. When ``True`` (reference compatibility checks),
             every requested trait must be explicitly present on the spec.
     """
+    # ispp stands for "intermediate size per partition" and has special
+    # requirements that depend on the kernel's declared exact sizes and
+    # supported alignments (if any). It is used in some MoE ops to ensure the
+    # intermediate buffer sizes are compatible with the kernel's requirements.
+    if "ispp" in spec.traits and "ispp" not in traits:
+        return False
     for trait_name, trait_value in traits.items():
-        # ispp stands for "intermediate size per partition" and has special
-        # alignment requirements that depend on the kernel's declared
-        # supported alignments (if any). It is used in some MoE ops to ensure
-        # the intermediate buffer sizes are compatible with the kernel's
-        # requirements.
         if trait_name == "ispp":
             if not _ispp_satisfies_alignment(spec, trait_value):
                 return False

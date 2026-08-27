@@ -170,14 +170,7 @@ class DistributedInitializer:
             # broadcasts like the sampled first token (gloo).
             pg_manager.init_process_group(config.mapping.pp_group)
 
-        # Register the trtllm one-shot all-reduce workspaces for the TP
-        # groups. AutoBackend routes small SUM all-reduces (<= 2 MB payload,
-        # i.e. the per-step decode reductions) through them; larger payloads
-        # and every other op keep using NCCL. Without this the one-shot
-        # backend is never armed and raw all_reduce callers (e.g. models whose
-        # comm cannot fuse into a norm) pay ring latency per layer.
-        # Unconditional: --force-deterministic-rsag is the escape hatch, and
-        # it overrides at dispatch (auto.py) rather than at registration.
+        # Arm the trtllm AR workspaces; --force-deterministic-rsag overrides at dispatch.
         if config.hidden_size > 0:
             from tokenspeed.runtime.distributed.comm_backend import (
                 get_global_backend,
@@ -186,7 +179,7 @@ class DistributedInitializer:
             backend = get_global_backend()
             trtllm_ar = getattr(backend, "trtllm_ar", None)
             if trtllm_ar is not None:
-                # One-shot serves <= 2 MB only; a small token window bounds the IPC workspace (else NCCL).
+                # One-shot window; configure_group widens cross-node groups.
                 max_oneshot_tokens = max(
                     1, (2 * 1024 * 1024) // max(config.hidden_size * 2, 1)
                 )

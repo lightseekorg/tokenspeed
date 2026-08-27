@@ -172,16 +172,6 @@ class Engine(EngineBase):
         ``tokenspeed.runtime.engine.io_struct.GenerateReqInput``.
         Please refer to ``GenerateReqInput`` for the documentation.
         """
-        if self.server_args.mapping.has_attn_dp:
-            if data_parallel_rank is None:
-                logger.debug("data_parallel_rank not provided, using default dispatch")
-            elif data_parallel_rank < 0:
-                raise ValueError("data_parallel_rank must be non-negative")
-            elif data_parallel_rank >= self.server_args.mapping.attn.dp_size:
-                raise ValueError(
-                    f"data_parallel_rank must be less than dp_size: {self.server_args.mapping.attn.dp_size}"
-                )
-
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
@@ -198,6 +188,7 @@ class Engine(EngineBase):
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
+            data_parallel_rank=data_parallel_rank,
         )
         if stream:
             return self.llm.generate_stream(obj)
@@ -228,6 +219,7 @@ class Engine(EngineBase):
         bootstrap_port: list[int] | int | None = None,
         bootstrap_room: list[int] | int | None = None,
         user_rid: list[str] | str | None = None,
+        data_parallel_rank: list[int] | int | None = None,
     ) -> dict | AsyncIterator[dict]:
         """
         The arguments of this function match
@@ -255,6 +247,7 @@ class Engine(EngineBase):
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
             user_rid=user_rid,
+            data_parallel_rank=data_parallel_rank,
         )
         generator = self.tokenizer_manager.generate_request(obj)
 

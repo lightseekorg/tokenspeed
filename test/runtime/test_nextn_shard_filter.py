@@ -23,8 +23,34 @@ import torch
 from tokenspeed.runtime.configs.load_config import LoadConfig
 from tokenspeed.runtime.model_loader.loader import DefaultModelLoader
 from tokenspeed.runtime.model_loader.weight_utils import (
+    filter_duplicate_safetensors_files,
     filter_safetensors_files_by_weight_names,
 )
+
+
+class TestFilterDuplicateSafetensorsFiles(unittest.TestCase):
+    def test_keeps_modelopt_input_scales_outside_weight_index(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shard = os.path.join(tmpdir, "model-00001-of-00001.safetensors")
+            scales = os.path.join(tmpdir, "input_scales.safetensors")
+            duplicate = os.path.join(tmpdir, "consolidated.safetensors")
+            for path in (shard, scales, duplicate):
+                with open(path, "wb"):
+                    pass
+            with open(
+                os.path.join(tmpdir, "model.safetensors.index.json"), "w"
+            ) as index:
+                json.dump(
+                    {"weight_map": {"model.weight": os.path.basename(shard)}}, index
+                )
+
+            kept = filter_duplicate_safetensors_files(
+                [shard, scales, duplicate],
+                tmpdir,
+                "model.safetensors.index.json",
+            )
+
+            self.assertEqual(kept, [shard, scales])
 
 
 class TestFilterSafetensorsFilesByWeightNames(unittest.TestCase):

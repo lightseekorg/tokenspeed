@@ -91,6 +91,94 @@ class InputProcessor:
         """
         if isinstance(obj, EmbeddingReqInput) and self.engine.is_generation:
             raise ValueError("Embedding and rerank model requests are not supported.")
+        self._validate_data_parallel_rank(obj)
+
+    def _validate_data_parallel_rank(
+        self, obj: GenerateReqInput | EmbeddingReqInput
+    ) -> None:
+        """Validate the attention-DP hard pin on every ingress.
+
+        This is the single choke point all GenerateReqInput paths traverse
+        (Engine API, the SMG gRPC servicer, batch fan-out), unlike
+        ``entrypoints/engine.py`` whose checks the servicer bypasses. Runs
+        before ``normalize_batch_and_arguments``, so fields may be scalar
+        or list.
+
+        Semantics:
+        - non-integer pins (bool/float/str) are a caller error and raise on
+          EVERY engine shape — checked first, before the mode branches below.
+        - engines without attention DP: the pin is meaningless; drop it.
+        - disaggregation engines: the bootstrap_room residue is the
+          authoritative rank carrier on BOTH the prefill and decode sides
+          (pd/mooncake must re-derive the same rank from the room), so the
+          pin is dropped; a conflicting pin is logged, never rejected —
+          rejecting would turn gateway/room version skew into a 400 storm.
+        - colocated attention-DP engines: an out-of-range pin is a caller
+          error and raises (surfacing as a request-level failure).
+        """
+        ranks = getattr(obj, "data_parallel_rank", None)
+        if ranks is None:
+            return
+        rank_list = ranks if isinstance(ranks, list) else [ranks]
+        for rank in rank_list:
+            # bool is an int subclass; both bool and float pins would pass a
+            # bare range compare and then fail the int|None typed msgpack
+            # decode inside the DP controller's dispatch loop.
+            if rank is not None and (
+                not isinstance(rank, int) or isinstance(rank, bool)
+            ):
+                raise ValueError(f"data_parallel_rank must be an int, got {rank!r}")
+
+        server_args = self.engine.server_args
+        mapping = server_args.mapping
+        if not mapping.has_attn_dp:
+            obj.data_parallel_rank = None
+            return
+        dp_size = mapping.attn.dp_size
+
+        if server_args.disaggregation_mode != "null":
+            rooms = obj.bootstrap_room
+            room_list = rooms if isinstance(rooms, list) else [rooms]
+            # Broadcast whichever side is scalar so a scalar pin is checked
+            # against EVERY room residue (and vice versa), then pad the
+            # shorter side with None — zip truncation would silently skip
+            # conflicts past the shorter list, and a rank with no room to
+            # check against is itself a conflict signal.
+            width = max(len(rank_list), len(room_list), 1)
+            if len(rank_list) == 1:
+                rank_list = rank_list * width
+            if len(room_list) == 1:
+                room_list = room_list * width
+            rank_list = rank_list + [None] * (width - len(rank_list))
+            room_list = room_list + [None] * (width - len(room_list))
+            for rank, room in zip(rank_list, room_list):
+                if rank is None:
+                    continue
+                # A non-int room (gateway format bug) is unverifiable — take
+                # the warn+drop path, never raise: on disaggregation engines
+                # a pin must not turn room skew into request rejections.
+                if (
+                    not isinstance(room, int)
+                    or isinstance(room, bool)
+                    or room % dp_size != rank
+                ):
+                    self.engine.logger.warning(
+                        "data_parallel_rank=%s conflicts with bootstrap_room "
+                        "residue (room=%s, dp_size=%d); the room stays "
+                        "authoritative on disaggregation engines — pin ignored.",
+                        rank,
+                        room,
+                        dp_size,
+                    )
+                    break
+            obj.data_parallel_rank = None
+            return
+
+        for rank in rank_list:
+            if rank is not None and not 0 <= rank < dp_size:
+                raise ValueError(
+                    f"data_parallel_rank must be in [0, {dp_size}), got {rank}"
+                )
 
     async def tokenize_batch(
         self,
@@ -281,6 +369,7 @@ class InputProcessor:
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
+                data_parallel_rank=obj.data_parallel_rank,
                 input_embeds=input_embeds,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,

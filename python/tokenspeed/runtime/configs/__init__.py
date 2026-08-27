@@ -50,6 +50,11 @@ from tokenspeed.runtime.configs.qwen3_asr_config import (
 )
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
 from tokenspeed.runtime.configs.qwen3_moe_config import Qwen3MoeConfig
+from tokenspeed.runtime.configs.qwen4_exp_config import (
+    Qwen4ExpConfig,
+    Qwen4ExpTextConfig,
+    Qwen4ExpVisionConfig,
+)
 
 __all__ = [
     "DeepseekV4Config",
@@ -62,6 +67,9 @@ __all__ = [
     "Qwen3ASRAudioEncoderConfig",
     "Qwen3ASRConfig",
     "Qwen3ASRThinkerConfig",
+    "Qwen4ExpConfig",
+    "Qwen4ExpTextConfig",
+    "Qwen4ExpVisionConfig",
     "MiniMaxM2Config",
     "MiniMaxM3Config",
     "KimiK2Config",

@@ -114,17 +114,12 @@ def load_w13(
     if not use_presharded_weights:
         if not is_bias and do_transpose:
             loaded_weight = loaded_weight.transpose(-2, -1)
-        if tp_size > 1:
-            # Derive the unpadded shard size from the checkpoint tensor.
-            # expert_data may be Blackwell-padded; checkpoint is not.
-            load_shard = loaded_weight.shape[shard_dim] // tp_size
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, load_shard * tp_rank, load_shard
-            )
-        else:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
-            )
+        load_start = min(shard_size * tp_rank, loaded_weight.shape[shard_dim])
+        load_size = min(shard_size, loaded_weight.shape[shard_dim] - load_start)
+        loaded_weight = loaded_weight.narrow(shard_dim, load_start, load_size)
+
+    if loaded_weight.shape[shard_dim] == 0:
+        return
 
     expert_data = expert_data.narrow(shard_dim, start, shard_size)
     dst = expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
@@ -175,13 +170,14 @@ def load_w2(
         if not is_bias and do_transpose:
             loaded_weight = loaded_weight.transpose(-2, -1)
         if is_bias:
-            load_shard = shard_size
-        elif tp_size > 1:
-            load_shard = loaded_weight.shape[shard_dim] // tp_size
+            loaded_weight = loaded_weight.narrow(shard_dim, 0, shard_size)
         else:
-            load_shard = shard_size
-        start = 0 if is_bias else load_shard * tp_rank
-        loaded_weight = loaded_weight.narrow(shard_dim, start, load_shard)
+            load_start = min(shard_size * tp_rank, loaded_weight.shape[shard_dim])
+            load_size = min(shard_size, loaded_weight.shape[shard_dim] - load_start)
+            loaded_weight = loaded_weight.narrow(shard_dim, load_start, load_size)
+
+    if loaded_weight.shape[shard_dim] == 0:
+        return
 
     dst = expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim])
     scale_dst = None

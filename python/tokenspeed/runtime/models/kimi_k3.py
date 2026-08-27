@@ -1551,6 +1551,9 @@ class KimiLinearMoE(nn.Module):
             activation_situ_linear_beta=situ_linear_beta,
         )
         self.packed_input_projection_weight: torch.Tensor | None = None
+        # LatentMoELayer reduces routed partials across EP only. A TP-sharded
+        # W2 also needs a TP reduction, which the graph-safe K3MoeTailComm path
+        # below performs across the full TP x EP group.
         self.native_latent_moe = (
             LatentMoELayer(
                 router=self.gate,
@@ -1572,7 +1575,7 @@ class KimiLinearMoE(nn.Module):
                 expert_parallel_group=mapping.moe.ep_group,
                 input_projections=self._latent_input_projections,
             )
-            if self.execution_plan.use_native
+            if self.execution_plan.use_native and mapping.moe.tp_size == 1
             else None
         )
         # Dry-run exact registry selection for the fused decode pipeline.
@@ -1681,9 +1684,9 @@ class KimiLinearMoE(nn.Module):
         max_num_tokens_per_gpu: int,
         do_finalize: bool = True,
     ) -> torch.Tensor:
-        """Run the precomputed-TopK SiTU MoE (TRT-LLM cubin or Hopper Marlin)."""
+        """Run the selected precomputed-TopK SiTU MoE kernel."""
         plan = self.execution_plan
-        if not plan.use_trtllm and not plan.use_marlin:
+        if not plan.use_native and not plan.use_trtllm and not plan.use_marlin:
             raise RuntimeError(
                 "Kimi-K3 has no portable SiTU Triton fallback; use the native, "
                 "FlashInfer TRT-LLM, or Marlin SiTU MoE path."

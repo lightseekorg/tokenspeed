@@ -21,6 +21,10 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.sampling.cute_dsl import distributed_argmax as _dist_argmax
+from tokenspeed_kernel.ops.sampling.cute_dsl import (
+    supports_dist_argmax_shape as _supports_dist_argmax_shape,
+)
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
 from tokenspeed.runtime.execution.cache_loc_kernel import (
@@ -36,7 +40,10 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
+from tokenspeed.runtime.layers.logits_processor import (
+    LogitsMetadata,
+    _force_deterministic_rsag,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
@@ -101,6 +108,9 @@ def _resolve_block_geometry(cfg, spec_num_tokens: int) -> tuple[int, int]:
 def _resolve_draft_query_width(verify_width: int, sample_from_anchor: bool) -> int:
     """Resolve rows consumed by one native draft forward."""
     return verify_width - 1 if sample_from_anchor else verify_width
+
+
+_UNSET = object()
 
 
 class DFlash(BaseDrafter):
@@ -194,6 +204,8 @@ class DFlash(BaseDrafter):
             dtype=torch.int32,
             device=self.device,
         )
+        # None means probed-and-unavailable; unset means not probed yet.
+        self._dist_argmax_state: object = _UNSET
         self.draft_input_lengths_buf = torch.full(
             (max_bs,),
             self.draft_query_width,
@@ -269,6 +281,35 @@ class DFlash(BaseDrafter):
                 f"{type(target_model).__name__} does not implement "
                 "set_dflash_aux_hidden_stream, so it can only supply 'prefix'."
             )
+
+    def _probe_dist_argmax_state(self, dtype: torch.dtype, device: torch.device):
+        """Ask for a drafting state, once the head's shard is a fit for one."""
+        head = self.lm_head
+        shard = int(head.shard_indices.num_org_elements)
+        tp_size = int(self.logits_processor.tp_size)
+        if (
+            _force_deterministic_rsag()
+            or not 2 <= tp_size <= 32
+            or int(head.num_embeddings) != int(head.org_vocab_size)
+            or shard * tp_size != int(head.org_vocab_size)
+            or not _supports_dist_argmax_shape(shard, dtype, tp_size)
+        ):
+            return None
+        return self.logits_processor.acquire_dist_argmax_state(
+            head,
+            max_M=self.input_buffers.max_bs * max(self.spec_num_tokens - 1, 1),
+            # Back-to-back walk rounds carry no cross-rank sync between them,
+            # which skip_ping_pong would require.
+            skip_ping_pong=False,
+        )
+
+    def _ensure_dist_argmax_state(self, dtype: torch.dtype, device: torch.device):
+        """Probe once, before capture, and reuse the verdict for the process."""
+        if self._dist_argmax_state is _UNSET:
+            if torch.cuda.is_current_stream_capturing():
+                return None  # rendezvous is collective; leave it to warmup
+            self._dist_argmax_state = self._probe_dist_argmax_state(dtype, device)
+        return self._dist_argmax_state
 
     def _greedy_gather_capacity(self) -> int:
         """Max element count for the greedy head's tensor-parallel all-gather
@@ -361,12 +402,22 @@ class DFlash(BaseDrafter):
         added_vocab_start = int(shard.added_vocab_start_index)
 
         chunk_len = int(hidden_states.shape[0])
+        # The collective probe must sit outside every rank-local branch: a rank
+        # with an empty org shard skipping it would strand the rest.
+        dist_state = self._ensure_dist_argmax_state(weight.dtype, weight.device)
         if num_org > 0:
             base_logits = torch.matmul(hidden_states, weight[:num_org].T)
             if bias_fn is not None:
                 base_logits = base_logits + bias_fn(org_vocab_start, num_org).to(
                     base_logits.dtype
                 )
+            if dist_state is not None:
+                # Without padding the rank-major index IS the global id.
+                _, idx = _dist_argmax(dist_state, base_logits)
+                if out is not None:
+                    out.copy_(idx.view_as(out))
+                    return out
+                return idx.to(torch.int32)
             local_max, local_arg = torch.max(base_logits, dim=-1)
         else:
             local_max = torch.full(

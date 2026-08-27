@@ -375,6 +375,18 @@ class TestSpecMatchesTraits:
             require_all_traits=True,
         )
 
+    def test_exact_ispp_requires_and_matches_requested_size(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"ispp": frozenset({384}), "ispp_alignment": frozenset({128})},
+        )
+
+        assert not spec_matches_traits(spec, {})
+        assert spec_matches_traits(spec, {"ispp": 384})
+        assert not spec_matches_traits(spec, {"ispp": 512})
+
 
 class TestSpecMatchesShapeTraits:
     def test_exact_dimension_traits_match(self):

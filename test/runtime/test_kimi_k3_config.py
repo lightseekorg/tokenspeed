@@ -389,7 +389,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
                 self.assertEqual(captured[0].is_contiguous(), expect_contiguous)
 
-    def test_ep_kimi_moe_combines_shared_and_routed_reductions(self):
+    def test_native_kimi_moe_uses_direct_ep_and_collective_tp_paths(self):
         import tokenspeed.runtime.models.kimi_k3 as kimi_k3
 
         shared_calls = []
@@ -414,6 +414,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 # Consumed by K3MoeTailComm arming (real MoELayer exposes it
                 # from the selected kernel's plan trait).
                 self.supports_deferred_finalize = False
+
+            def forward(self, *, hidden_states, **kwargs):
+                return hidden_states + 1
 
         class FakeSharedExperts(torch.nn.Module):
             def __init__(self, *args, **kwargs):
@@ -493,6 +496,67 @@ class KimiK3RegistrationTests(unittest.TestCase):
         self.assertTrue(layer.native_latent_moe.components["joint_reduce"])
         self.assertEqual(
             layer.native_latent_moe.components["expert_parallel_group"], ep_group
+        )
+
+        # TP shards each produce only a partial W2 result. They must use the
+        # composed tail, whose reduction group spans TP x EP, instead of the
+        # native LatentMoELayer path that only reduces across EP.
+        tp_mapping = SimpleNamespace(
+            world_size=8,
+            attn=mapping.attn,
+            moe=SimpleNamespace(
+                tp_rank=0,
+                tp_size=8,
+                tp_group=ep_group,
+                ep_rank=0,
+                ep_size=1,
+                ep_group=(0,),
+                tp_ep_size=8,
+                tp_ep_rank=0,
+                tp_ep_group=ep_group,
+            ),
+        )
+        with (
+            mock.patch.object(kimi_k3, "ReplicatedLinear", FakeLinear),
+            mock.patch.object(kimi_k3, "Kimi3LatentProjection", FakeLinear),
+            mock.patch.object(kimi_k3, "MoELayer", FakeExperts),
+            mock.patch.object(kimi_k3, "KimiLinearMLP", FakeSharedExperts),
+            mock.patch.object(kimi_k3, "LatentMoELayer", FakeLatentMoE),
+            mock.patch.object(
+                kimi_k3.Kimi3MoEExecutionPlan,
+                "build",
+                return_value=kimi_k3.Kimi3MoEExecutionPlan(
+                    use_native=True,
+                    use_trtllm=False,
+                    overlap_shared_experts=False,
+                    joint_moe_reduce=False,
+                ),
+            ),
+            mock.patch.dict(
+                kimi_k3.global_server_args_dict,
+                {"enforce_eager": False},
+            ),
+        ):
+            tp_layer = kimi_k3.KimiLinearMoE(
+                config,
+                tp_mapping,
+                layer_index=1,
+                model_scope="model.layers",
+                quant_config=None,
+                prefix="model.layers.1.block_sparse_moe",
+            )
+
+        self.assertIsNone(tp_layer.native_latent_moe)
+        self.assertEqual(tp_layer.comm.mapping.moe.tp_ep_group, ep_group)
+        routed_input = torch.zeros(1, config.routed_expert_hidden_size)
+        torch.testing.assert_close(
+            tp_layer._routed_experts(
+                routed_input,
+                mock.Mock(),
+                num_global_tokens=1,
+                max_num_tokens_per_gpu=1,
+            ),
+            routed_input + 1,
         )
 
     def test_cross_dp_ep_gather_uses_dp_group_and_returns_local_offset(self):

@@ -959,6 +959,32 @@ def _topk_with_padding(
     return out
 
 
+def triton_topk_from_logits(
+    logits: torch.Tensor, topk: int, *, enable_pdl: bool = False
+) -> torch.Tensor:
+    """Select per-row top-k column indices from a materialized logits matrix.
+
+    This is the selection backend behind the DSA prefill/decode top-k entry
+    points, exposed for other indexers that materialize their own scores
+    (e.g. the Qwen4-Exp QSA block top-k ``logits`` path). Column counts
+    at or above the radix threshold switch to the radix selection pipeline
+    automatically.
+
+    Args:
+        logits: FP32 scores shaped ``[rows, cols]``. Padded or invalid
+            entries must be ``-inf``.
+        topk: Entries selected per row; must be a power of two.
+        enable_pdl: Overlap the selection launch with the producer kernel
+            on NVIDIA GPUs via programmatic dependent launch.
+
+    Returns:
+        Int32 column indices shaped ``[rows, topk]``; invalid entries are
+        ``-1``.
+    """
+
+    return _topk_with_padding(logits, topk, enable_pdl=enable_pdl)
+
+
 def dsa_decode_topk_fp8(
     q: torch.Tensor,
     index_k_cache: torch.Tensor,
@@ -1322,6 +1348,7 @@ __all__ = [
     "combine_topk_weights",
     "dsa_decode_topk_fp8",
     "dsa_prefill_topk_fp8",
+    "triton_topk_from_logits",
     "local_topk_to_global_slots",
     "triton_dsa_plan",
     "triton_dsa_decode_topk_fp8",

@@ -115,6 +115,7 @@ def build_prefill_kv_workspace_slots(
     max_seq_len: int,
     page_size: int,
     device: torch.device,
+    num_tokens: int | None = None,
 ) -> torch.Tensor:
     """Flatten a kernel page table into per-token KV cache slot ids.
 
@@ -125,11 +126,36 @@ def build_prefill_kv_workspace_slots(
         max_seq_len: Upper bound of ``seq_lens``; fixes the gather width.
         page_size: Tokens covered by one kernel page.
         device: Device the slot tensor is built on.
+        num_tokens: Exact sum of ``seq_lens`` when already known on the host.
+            Providing it avoids the device synchronization otherwise required by
+            boolean indexing to determine the packed output size.
 
     Returns:
         1-D int64 tensor of cache slot ids, request-major, covering exactly
         the first ``seq_lens[i]`` positions of each request.
     """
+    if num_tokens is not None:
+        seq_lens_i64 = seq_lens.to(device=device, dtype=torch.int64)
+        request_ids = torch.repeat_interleave(
+            torch.arange(seq_lens.numel(), dtype=torch.int64, device=device),
+            seq_lens_i64,
+            output_size=int(num_tokens),
+        )
+        seq_starts = torch.zeros(
+            seq_lens.numel() + 1,
+            dtype=torch.int64,
+            device=device,
+        )
+        torch.cumsum(seq_lens_i64, dim=0, out=seq_starts[1:])
+        local_offsets = torch.arange(
+            int(num_tokens), dtype=torch.int64, device=device
+        ) - seq_starts.index_select(0, request_ids)
+        pages = page_table.to(device=device, dtype=torch.int64)[
+            request_ids,
+            torch.div(local_offsets, int(page_size), rounding_mode="floor"),
+        ]
+        return (pages * int(page_size) + local_offsets % int(page_size)).contiguous()
+
     local_offsets = torch.arange(
         int(max_seq_len),
         dtype=torch.int64,

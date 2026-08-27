@@ -591,7 +591,14 @@ class MambaAttnBackend(AttentionBackend):
         if self._gdn_replay is not None:
             total += self._gdn_replay.payload.nbytes
             total += self._gdn_replay.parameters.nbytes
+        total += self._preallocate_aux_verify_workspace(max_bs, draft_token_num)
         return total
+
+    def _preallocate_aux_verify_workspace(
+        self, max_bs: int, draft_token_num: int
+    ) -> int:
+        """Allocate model-owned verify state and return its byte size."""
+        return 0
 
     def _verify_copy_tables_get(self) -> dict:
         """Pointer tables for the batched verify state copies and replay:
@@ -763,6 +770,7 @@ class MambaAttnBackend(AttentionBackend):
                 .to(torch.int64)
                 .clamp_min(0)
             )
+        self._commit_aux_verified_state(accepted_length, pages_by_group)
         copy_tables = self._verify_copy_tables_get()
         pages_stack = torch.stack(
             [pages_by_group[group_id] for group_id in self._state_groups()]
@@ -814,6 +822,13 @@ class MambaAttnBackend(AttentionBackend):
                 dst_row_strides=copy_tables["ssm_comp_stride"],
             )
         self._verify_commit_ctx = None
+
+    def _commit_aux_verified_state(
+        self,
+        accepted_length: torch.Tensor,
+        pages_by_group: dict[str, torch.Tensor],
+    ) -> None:
+        """Commit model-owned side state after speculative verification."""
 
     def _cache_contract_state_blocks(
         self,

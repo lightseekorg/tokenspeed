@@ -251,6 +251,73 @@ def test_smg_disable_flag_set_covers_all_three():
     )
 
 
+def test_cache_aware_policy_keeps_load_monitoring():
+    # cache_aware's imbalance/overload triggers feed on the worker load
+    # monitor; injecting the disable flag would leave them silently dead.
+    gateway_args = _gateway_args_with_smg_disable_defaults(["--policy", "cache_aware"])
+
+    assert "--disable-load-monitoring" not in gateway_args
+    assert "--disable-circuit-breaker" in gateway_args
+    assert "--disable-retries" in gateway_args
+
+
+def test_cache_aware_policy_equals_form_keeps_load_monitoring():
+    gateway_args = _gateway_args_with_smg_disable_defaults(["--policy=cache_aware"])
+
+    assert "--disable-load-monitoring" not in gateway_args
+
+
+def test_operator_policy_is_last_wins():
+    # clap/argparse are last-wins on duplicated flags; the cache_aware
+    # detection must key off the value the gateway will actually use.
+    from tokenspeed.cli.serve_smg import _operator_policy
+
+    assert (
+        _operator_policy(["--policy", "cache_aware", "--policy", "round_robin"])
+        == "round_robin"
+    )
+    assert (
+        _operator_policy(["--policy", "round_robin", "--policy=cache_aware"])
+        == "cache_aware"
+    )
+
+
+def test_gateway_defaults_pipeline_for_cache_aware():
+    # Pipeline-level guarantee: explicit cache_aware keeps load monitoring,
+    # keeps the other disable defaults, does not duplicate --policy, and does
+    # NOT auto-inject --dp-aware (wheel-pin lockstep is the operator's call).
+    gateway_args = _gateway_args_with_defaults(
+        ["--model", "/tmp/x", "--policy", "cache_aware"]
+    )
+
+    assert "--disable-load-monitoring" not in gateway_args
+    assert "--disable-circuit-breaker" in gateway_args
+    assert "--disable-retries" in gateway_args
+    assert "--dp-aware" not in gateway_args
+    assert gateway_args.count("--policy") == 1
+    idx = gateway_args.index("--policy")
+    assert gateway_args[idx + 1] == "cache_aware"
+
+
+def test_gateway_defaults_pipeline_for_cache_aware_equals_form():
+    # --policy=cache_aware must suppress the passthrough default too: the
+    # default-policy injection and the cache_aware detection have to agree on
+    # flag spelling, or clap's last-wins silently reverts the operator's
+    # policy to passthrough while load monitoring stays on.
+    gateway_args = _gateway_args_with_defaults(
+        ["--model", "/tmp/x", "--policy=cache_aware"]
+    )
+
+    # No bare "--policy <value>" pair may be appended; the operator's
+    # equals-form token must stay the only policy on the line. (A bare
+    # "passthrough" value may legitimately appear as the reasoning parser.)
+    assert "--policy" not in gateway_args
+    assert "--policy=passthrough" not in gateway_args
+    assert gateway_args.count("--policy=cache_aware") == 1
+    assert "--disable-load-monitoring" not in gateway_args
+    assert "--disable-circuit-breaker" in gateway_args
+
+
 def test_get_from_args_extracts_value():
     assert (
         _get_from_args(
