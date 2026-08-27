@@ -17,7 +17,11 @@ server:
     ts serve
     --model deepseek-ai/DeepSeek-V4-Pro
     --tensor-parallel-size 8
+    --enable-expert-parallel
+    --dense-tp-size 1
     --kv-cache-dtype fp8_e4m3
+    --moe-backend gluon
+    --attention-use-fp4-indexer-cache
     --max-model-len 4096
     --max-total-tokens 16384
     --chunked-prefill-size 8192
