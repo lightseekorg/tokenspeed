@@ -80,11 +80,11 @@ dependencies = [
     # --enable-memory-saver is set. See runtime/utils/torch_memory_saver_adapter.py.
     "torch_memory_saver==0.0.9.post1",
     "tqdm",
-    "transformers==5.12.0",
+    "transformers==5.16.1",
     "uv",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.2.3",
+    "xgrammar==0.2.5",
     "viztracer",
 ]
 
