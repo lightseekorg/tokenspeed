@@ -31,6 +31,7 @@ from tokenspeed.runtime.configs.qwen4_exp_config import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
 )
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention import registry as attention_registry
 from tokenspeed.runtime.layers.attention.backends.qwen4_exp import (
@@ -2399,3 +2400,137 @@ def test_should_exclude_quant_module_expands_fused_members() -> None:
         f"{mlp}.gate_up_proj", [f"{mlp}.gate_proj", f"{mlp}.up_proj"]
     )
     assert not should_exclude_quant_module(f"{mlp}.gate_up_proj", [f"{mlp}.up_proj"])
+
+
+def _ngram_embedding_pair(
+    store_fp8: bool,
+) -> tuple[Qwen4ExpNGramEmbedding, Qwen4ExpNGramEmbedding]:
+    """A device-resident and a host-offloaded n-gram table holding equal rows.
+
+    ``ngram_vocab_size_base`` is tiny here so the two tables fit side by side;
+    the hash geometry that decides which rows are read is unaffected by it.
+    """
+
+    kwargs = dict(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        layer_types=["linear_attention", "full_attention"],
+        ple_layer_ids=[2],
+        ngram_size=3,
+        heads_per_ngram=4,
+        ngram_vocab_size_base=257,
+        make_ngram_vocab_size_divisible_by=8,
+        ple_embed_dtype="float8_e4m3fn" if store_fp8 else None,
+        hc_count=2,
+        num_experts=None,
+        eos_token_id=7,
+    )
+    mapping = Mapping(rank=0, world_size=1)
+    built = []
+    for offload in (False, True):
+        config = Qwen4ExpTextConfig(**kwargs, ple_offload_embedding=offload)
+        with torch.device("cuda"):
+            built.append(
+                Qwen4ExpNGramEmbedding(config, mapping, 64, 0, "ple_embedding")
+            )
+    device, host = built
+
+    torch.manual_seed(3)
+    rows = torch.randn(
+        device.ngram_embedding.weight.shape, dtype=torch.bfloat16, device="cuda"
+    )
+    if store_fp8:
+        payload, scale = quantize_ple_embedding_rows(rows)
+        device.ngram_embedding_scale.copy_(scale)
+        host.ngram_embedding_scale.copy_(scale)
+    else:
+        payload = rows
+    device.ngram_embedding.weight.data.copy_(payload)
+    host.ngram_embedding.weight.data.copy_(payload.cpu())
+    return device, host
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="host n-gram gather requires CUDA"
+)
+@pytest.mark.parametrize("store_fp8", [False, True])
+def test_ple_host_gather_matches_device_lookup(store_fp8: bool) -> None:
+    device, host = _ngram_embedding_pair(store_fp8)
+
+    assert not host.ngram_embedding.weight.is_cuda
+    # Pageable host storage has no device-visible address; the gather kernel
+    # would fault on it rather than fall back.
+    assert host.ngram_embedding.weight.is_pinned()
+
+    lengths = [5, 1, 9]
+    tokens = sum(lengths)
+    torch.manual_seed(4)
+    input_ids = torch.randint(0, 128, (tokens,), device="cuda")
+    initial = torch.full((len(lengths), 2), 7, dtype=torch.long, device="cuda")
+    req = torch.repeat_interleave(
+        torch.arange(len(lengths), device="cuda"),
+        torch.tensor(lengths, device="cuda"),
+    )
+    col = torch.cat(
+        [torch.arange(length, device="cuda") for length in lengths]
+    )
+    starts = torch.cumsum(
+        torch.tensor([0] + lengths[:-1], device="cuda"), dim=0
+    )
+
+    expected, _ = device.forward_flat(input_ids, initial, req, col, starts)
+    got, _ = host.forward_flat(input_ids, initial, req, col, starts)
+
+    assert got.shape == expected.shape
+    assert got.dtype == expected.dtype
+    # Both paths read the same stored payload and apply the same per-row scale,
+    # so the only permitted difference is the order of the fp8 -> compute cast.
+    torch.testing.assert_close(got, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="host n-gram gather requires CUDA"
+)
+def test_ple_host_table_skips_device_allocation() -> None:
+    """The table must never be materialized on the device, not even briefly.
+
+    A production table is tens of gigabytes, so a construct-then-move
+    implementation would OOM before it ever reached the host.
+    """
+
+    config = Qwen4ExpTextConfig(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        layer_types=["linear_attention", "full_attention"],
+        ple_layer_ids=[2],
+        ngram_size=3,
+        heads_per_ngram=4,
+        ngram_vocab_size_base=1_000_003,
+        make_ngram_vocab_size_divisible_by=8,
+        hc_count=2,
+        num_experts=None,
+        eos_token_id=7,
+        ple_offload_embedding=True,
+    )
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.max_memory_allocated()
+    with torch.device("cuda"):
+        embedding = Qwen4ExpNGramEmbedding(
+            config, Mapping(rank=0, world_size=1), 64, 0, "ple_embedding"
+        )
+    growth = torch.cuda.max_memory_allocated() - before
+
+    table_bytes = embedding.ngram_embedding.weight.numel() * 2
+    assert growth < table_bytes // 4
+
