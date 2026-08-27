@@ -23,9 +23,17 @@ from __future__ import annotations
 import pytest
 import tokenspeed_kernel.ops.attention as attention
 import torch
-from tokenspeed_kernel.ops.attention.gluon import kpool_select
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from utils import is_cdna4
+
+if not is_cdna4():
+    pytest.skip(
+        "AMD CDNA4 (GFX950) is required for Gluon KPool integration tests",
+        allow_module_level=True,
+    )
+
+from tokenspeed_kernel.ops.attention.gluon import kpool_select  # isort: skip
 
 
 class _FakeSortKernel:

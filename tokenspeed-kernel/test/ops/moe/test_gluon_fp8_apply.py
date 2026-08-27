@@ -148,6 +148,7 @@ def test_gluon_block_fp8_medium_batch_uses_exact_mfma(
     assert actual is sentinel
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize(
     ("num_tokens", "expected_block_m"),
     ((16, 16), (64, 16), (128, 32), (256, 32), (512, 64)),
@@ -155,6 +156,7 @@ def test_gluon_block_fp8_medium_batch_uses_exact_mfma(
 def test_gluon_block_fp8_exact_mfma_route_block_size(
     num_tokens: int, expected_block_m: int
 ) -> None:
+    _requires_gfx950()
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.exact_mfma import (
         _select_route_block_size,
     )
