@@ -375,7 +375,7 @@ if platform.is_amd:
         traits={
             "weight_dtype": frozenset({"mxfp4"}),
             "activation": frozenset({"silu", "swiglu"}),
-            "routing_mode": frozenset({"kernel_routing", "precomputed_topk"}),
+            "routing_mode": frozenset({"kernel_routing"}),
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({False}),
             "supports_all_to_all_ep": frozenset({False}),

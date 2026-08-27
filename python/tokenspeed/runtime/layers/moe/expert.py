@@ -381,7 +381,10 @@ class MoELayer(torch.nn.Module):
             else {}
         )
 
-        if topk_output.format.is_bypassed():
+        use_kernel_routing = topk_output.format.is_bypassed() or (
+            self.support_routing and not self.supports_precomputed_topk
+        )
+        if use_kernel_routing:
             if not self.support_routing:
                 raise ValueError(
                     "selected MoE kernel does not support in-kernel routing"
