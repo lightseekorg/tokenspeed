@@ -23,9 +23,12 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from tokenspeed_kernel.ops.ple import (
     ple_conv_sequences,
     ple_gate_norm,
@@ -119,6 +122,88 @@ def quantize_ple_embedding_rows(
     return quantized, scale
 
 
+@triton.jit
+def _ple_host_gather_kernel(
+    table_address,
+    ids_ptr,
+    scale_ptr,
+    out_ptr,
+    head_dim,
+    vocab_start,
+    vocab_end,
+    IS_FP8: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Gather one n-gram row per program straight out of pinned host memory."""
+
+    row = tl.program_id(0)
+    global_id = tl.load(ids_ptr + row)
+    in_range = (global_id >= vocab_start) & (global_id < vocab_end)
+    local_id = tl.where(in_range, global_id - vocab_start, 0)
+    offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < head_dim
+    out_dtype = out_ptr.dtype.element_ty
+    if IS_FP8:
+        table = table_address.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+    else:
+        table = table_address.to(tl.int64).to(tl.pointer_type(out_dtype))
+    values = tl.load(
+        table + local_id * head_dim + offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+    if HAS_SCALE:
+        values = values * tl.load(scale_ptr + local_id)
+    tl.store(
+        out_ptr + row * head_dim + offsets,
+        tl.where(in_range, values, 0.0).to(out_dtype),
+        mask=mask,
+    )
+
+
+def materialize_ngram_table_on_host(embedding: VocabParallelEmbedding) -> None:
+    """Give a meta-constructed n-gram table page-locked host storage."""
+
+    source = embedding.weight
+    host_weight = nn.Parameter(
+        torch.empty(
+            source.shape, dtype=source.dtype, device="cpu", pin_memory=True
+        ),
+        requires_grad=False,
+    )
+    for name, value in vars(source).items():
+        setattr(host_weight, name, value)
+    del embedding.weight
+    embedding.register_parameter("weight", host_weight)
+
+
+def host_gather_ngram_rows(
+    embedding: VocabParallelEmbedding,
+    ids: torch.Tensor,
+    scales: torch.Tensor | None,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Fill ``out`` with the ``ids`` rows of a host-resident n-gram table."""
+
+    rows = ids.numel()
+    if rows == 0:
+        return out
+    head_dim = out.shape[-1]
+    _ple_host_gather_kernel[(rows,)](
+        embedding.weight.data_ptr(),
+        ids.reshape(-1),
+        scales,
+        out.view(rows, head_dim),
+        head_dim,
+        embedding.shard_indices.org_vocab_start_index,
+        embedding.shard_indices.org_vocab_end_index,
+        IS_FP8=embedding.weight.dtype == torch.float8_e4m3fn,
+        HAS_SCALE=scales is not None,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        num_warps=1,
+    )
+    return out
+
+
 class Qwen4ExpNGramEmbedding(nn.Module):
     """Hashed, independently-sharded n-gram embedding used by PLE."""
 
@@ -201,16 +286,24 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # this value when that tensor arrives; keeping it as Python state lets
         # CPU-side shard copies apply the scale without a device sync.
         self._checkpoint_weight_scale = 1.0
-        self.ngram_embedding = VocabParallelEmbedding(
-            padded_vocab,
-            self.head_dim,
-            org_num_embeddings=padded_vocab,
-            params_dtype=self.embed_store_dtype,
-            prefix=add_prefix("ngram_embedding", prefix),
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
+        # Construct offloaded tables on meta so production-sized tables never
+        # transiently consume device memory before moving to pinned host RAM.
+        self.offload_embedding = bool(
+            getattr(config, "ple_offload_embedding", False)
         )
+        with torch.device("meta") if self.offload_embedding else nullcontext():
+            self.ngram_embedding = VocabParallelEmbedding(
+                padded_vocab,
+                self.head_dim,
+                org_num_embeddings=padded_vocab,
+                params_dtype=self.embed_store_dtype,
+                prefix=add_prefix("ngram_embedding", prefix),
+                tp_rank=mapping.attn.tp_rank,
+                tp_size=mapping.attn.tp_size,
+                tp_group=mapping.attn.tp_group,
+            )
+        if self.offload_embedding:
+            materialize_ngram_table_on_host(self.ngram_embedding)
         if self.embed_store_dtype is not None:
             # Per-local-row dequant scales, written by the loader's online
             # quantization. Ones (not zeros / empty): rows gathered before the
@@ -222,6 +315,35 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 torch.ones(self.ngram_embedding.num_embeddings_per_partition),
                 persistent=False,
             )
+
+    def allocate_lookup_buffer(
+        self, tokens: int, device: torch.device
+    ) -> torch.Tensor:
+        """Destination for a host gather, shaped like a flattened lookup."""
+
+        return torch.empty(
+            (tokens, self.embedding_dim),
+            dtype=self.embed_output_dtype,
+            device=device,
+        )
+
+    def gather_host(self, ids: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Read the ``ids`` rows from host memory into ``out``."""
+
+        host_gather_ngram_rows(
+            self.ngram_embedding,
+            ids,
+            getattr(self, "ngram_embedding_scale", None),
+            out.view(-1, self.head_dim),
+        )
+        return out
+
+    def reduce_lookup(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """Combine per-rank shard contributions of a gathered lookup."""
+
+        if self.ngram_embedding.tp_size > 1:
+            return all_reduce(embeddings, self.ngram_embedding.tp_group)
+        return embeddings
 
     @classmethod
     def _splitmix64(cls, value: int) -> int:
@@ -344,6 +466,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             tail_out,
             tail_block_rows,
         )
+        if self.offload_embedding:
+            out = self.allocate_lookup_buffer(ids.shape[0], ids.device)
+            return self.reduce_lookup(self.gather_host(ids, out)), tail
         # Reduce the flattened [tokens, heads * head_dim] view instead of the
         # 3D lookup: the lamport backend folds trailing dims into token count
         # ([T * heads, head_dim]), which blows past the mnnvl token cap and
@@ -363,6 +488,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         contexts = contexts.to(torch.long)
         ids = self._ngram_ids_torch(contexts)
+        if self.offload_embedding:
+            out = self.allocate_lookup_buffer(ids.shape[0], ids.device)
+            return self.reduce_lookup(self.gather_host(ids, out))
         embeddings = self.ngram_embedding(ids, reduce_results=False)
         if self.embed_store_dtype is not None:
             embeddings = self._dequant(embeddings, ids)
