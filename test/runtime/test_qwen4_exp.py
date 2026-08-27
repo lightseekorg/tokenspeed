@@ -2298,6 +2298,43 @@ def test_ple_fp8_dequant_gather_matches_bf16() -> None:
     assert relative.median() < 0.07
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="host n-gram gather requires CUDA"
+)
+@pytest.mark.parametrize("store_fp8", [False, True])
+def test_ple_host_prefetch_matches_inline_gather(store_fp8: bool) -> None:
+    """The side-stream prefetch must land the same rows as the inline gather.
+
+    ``start_flat_gather`` issues the copy on a private stream and returns before
+    it lands; ``finish_flat_gather`` is the join. A missing barrier would read
+    the destination early and diverge nondeterministically, so equality here is
+    what proves the cross-stream handoff is ordered.
+    """
+
+    _, host = _ngram_embedding_pair(store_fp8)
+
+    lengths = [5, 1, 9]
+    tokens = sum(lengths)
+    torch.manual_seed(4)
+    input_ids = torch.randint(0, 128, (tokens,), device="cuda")
+    initial = torch.full((len(lengths), 2), 7, dtype=torch.long, device="cuda")
+    req = torch.repeat_interleave(
+        torch.arange(len(lengths), device="cuda"),
+        torch.tensor(lengths, device="cuda"),
+    )
+    col = torch.cat([torch.arange(length, device="cuda") for length in lengths])
+    starts = torch.cumsum(
+        torch.tensor([0] + lengths[:-1], device="cuda"), dim=0
+    )
+
+    inline, _ = host.forward_flat(input_ids, initial, req, col, starts)
+    gathered, _ = host.start_flat_gather(input_ids, initial, req, col, starts)
+    prefetched = host.finish_flat_gather(gathered)
+
+    assert host._gather_stream is not None
+    torch.testing.assert_close(prefetched, inline, rtol=0, atol=0)
+
+
 def _ple_checkpoint_loader_stub(
     store_dtype: torch.dtype,
 ) -> tuple[torch.nn.Module, Qwen4ExpNGramEmbedding]:

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 from contextlib import nullcontext
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -709,6 +710,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             )
         if self.offload_embedding:
             materialize_ngram_table_on_host(self.ngram_embedding)
+        # Created on first use rather than here: a host table can be built on a
+        # CUDA-less box, and only the prefetch path ever needs the stream.
+        self._gather_stream: torch.cuda.Stream | None = None
         if self.embed_store_dtype is not None:
             # Per-local-row dequant scales, written by the loader's online
             # quantization. Ones (not zeros / empty): rows gathered before the
@@ -755,6 +759,47 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if self.ngram_embedding.tp_size > 1:
             return all_reduce(embeddings, self.ngram_embedding.tp_group)
         return embeddings
+
+    def start_flat_gather(
+        self,
+        input_ids: torch.Tensor,
+        initial: torch.Tensor,
+        req: torch.Tensor,
+        col: torch.Tensor,
+        starts: torch.Tensor,
+        need_tail: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Issue the host gather on a side stream and return before it lands.
+
+        Only the gather itself is moved off the caller's stream. The hash kernel
+        is microseconds of device work, so overlapping it would buy nothing,
+        while keeping its outputs on the caller's stream means the ids and the
+        destination are allocated there and only *read* across the boundary --
+        the pair of ``record_stream`` calls is what tells the caching allocator
+        the side stream still holds them.
+
+        The returned buffer is not readable until :meth:`finish_flat_gather`.
+        """
+
+        ids, tail = self._ngram_ids_flat_cuda(
+            input_ids, initial, req, col, starts, need_tail
+        )
+        out = self.allocate_lookup_buffer(ids.shape[0], ids.device)
+        if self._gather_stream is None:
+            self._gather_stream = torch.cuda.Stream()
+        stream = self._gather_stream
+        stream.wait_stream(torch.cuda.current_stream())
+        ids.record_stream(stream)
+        out.record_stream(stream)
+        with torch.cuda.stream(stream):
+            self.gather_host(ids, out)
+        return out, tail
+
+    def finish_flat_gather(self, gathered: torch.Tensor) -> torch.Tensor:
+        """Wait for a :meth:`start_flat_gather` to land, then reduce it."""
+
+        torch.cuda.current_stream().wait_stream(self._gather_stream)
+        return self.reduce_lookup(gathered)
 
     @classmethod
     def _splitmix64(cls, value: int) -> int:
@@ -917,6 +962,31 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         return embeddings.flatten(-2)
 
 
+class _PleLookupPlan(NamedTuple):
+    """What a PLE forward derives before it touches the n-gram table.
+
+    Extracted so :meth:`Qwen4ExpPLELayer.start_prefetch` and
+    :meth:`Qwen4ExpPLELayer.forward` share a single derivation. Re-deriving it
+    on both sides is the kind of duplication that fails silently: the lengths,
+    the state page ids and the carried context all have to describe the same
+    batch as the rows a prefetch already has in flight, and a mismatch yields
+    plausible embeddings for the wrong tokens rather than an error.
+    """
+
+    lengths: list[int]
+    num_real_tokens: int
+    flat_ids: torch.Tensor
+    index: tuple
+    input_pages: torch.Tensor
+    output_pages: torch.Tensor
+    context_field: torch.Tensor
+    conv_field: torch.Tensor
+    initial_context: torch.Tensor
+    initial_conv: torch.Tensor
+    verify: bool
+    linear_backend: Any
+
+
 class Qwen4ExpPLELayer(nn.Module):
     """PLE gating plus dilated depthwise short convolution.
 
@@ -1002,6 +1072,8 @@ class Qwen4ExpPLELayer(nn.Module):
             tuple[int, int], tuple[torch.Tensor, torch.Tensor]
         ] = {}
         self._active_verify_key: tuple[int, int] | None = None
+        # Set by start_prefetch, consumed by the next forward; see start_prefetch.
+        self._prefetched: tuple | None = None
 
     def _load_kv_proj_shard(
         self,
@@ -1567,6 +1639,84 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         return gated, normalized
 
+    def _lookup_plan(
+        self, input_ids: torch.Tensor, ctx: ForwardContext
+    ) -> _PleLookupPlan | None:
+        """Derive the per-request quantities a lookup needs; ``None`` when idle.
+
+        Everything here is stream-agnostic bookkeeping (CPU lengths, index
+        bundle, page reads) that both :meth:`forward` and :meth:`start_prefetch`
+        must agree on. It stops just short of the n-gram hash so the two callers
+        can drive the gather onto different streams from a single derivation.
+        """
+
+        if ctx.forward_mode.is_idle() or input_ids.shape[0] == 0:
+            return None
+        linear_backend = self._linear_backend(ctx)
+        metadata = self._metadata(linear_backend)
+        in_blocks_by_group = metadata.state_in_blocks_by_group or {}
+        out_blocks_by_group = metadata.state_out_blocks_by_group or {}
+        if QWEN4_EXP_PLE_CACHE_GROUP not in in_blocks_by_group:
+            raise RuntimeError("Qwen4-Exp PLE cache group was not published")
+        # A padded-bucket replay hands us bucket rows whose tail is filler, so
+        # the lengths decide how many rows are real before anything reads them.
+        lengths = self._lengths(metadata, input_ids.shape[0], ctx.bs)
+        num_real_tokens = sum(lengths)
+        (input_ids,) = slice_to_real_tokens(num_real_tokens, input_ids)
+        input_pages = in_blocks_by_group[QWEN4_EXP_PLE_CACHE_GROUP][: ctx.bs]
+        output_pages = out_blocks_by_group[QWEN4_EXP_PLE_CACHE_GROUP][: ctx.bs]
+        pool = ctx.token_to_kv_pool
+        self._last_pool = pool
+        load_tracker = getattr(pool, "layerwise_load_tracker", None)
+        if load_tracker is not None:
+            load_tracker.wait_for_layer(self.layer_id)
+        context_field = pool.arena.field(self.context_field_id)
+        conv_field = pool.arena.field(qwen4_exp_ple_conv_field(self.layer_id))
+        initial_context = self._read_pages(
+            context_field, input_pages, self.ple_embedding.eos_token_id
+        )
+        initial_conv = self._read_pages(conv_field, input_pages)
+        index = self._batch_indices(lengths, input_ids.device)
+        flat_ids = input_ids.flatten()
+        verify = metadata.mamba_output_indices is not None
+        return _PleLookupPlan(
+            lengths=lengths,
+            num_real_tokens=num_real_tokens,
+            flat_ids=flat_ids,
+            index=index,
+            input_pages=input_pages,
+            output_pages=output_pages,
+            context_field=context_field,
+            conv_field=conv_field,
+            initial_context=initial_context,
+            initial_conv=initial_conv,
+            verify=verify,
+            linear_backend=linear_backend,
+        )
+
+    def start_prefetch(self, input_ids: torch.Tensor, ctx: ForwardContext) -> None:
+        """Kick off the host gather so it overlaps the preceding decoder layers.
+
+        Only meaningful when the table lives on the host and the ids are on the
+        device -- otherwise there is nothing to hide behind PCIe/C2C latency and
+        this is a no-op. The plan is derived once here and carried to
+        :meth:`forward`, which reuses it verbatim instead of re-deriving (see
+        :class:`_PleLookupPlan`). Called before the layer that owns this PLE
+        runs, so its result is waited on, not recomputed.
+        """
+
+        if not self.ple_embedding.offload_embedding or self._prefetched is not None:
+            return
+        plan = self._lookup_plan(input_ids, ctx)
+        if plan is None or not plan.flat_ids.is_cuda:
+            return
+        req, col, _, starts, _, _, _ = plan.index
+        gathered, context_tail = self.ple_embedding.start_flat_gather(
+            plan.flat_ids, plan.initial_context, req, col, starts,
+            need_tail=plan.verify,
+        )
+        self._prefetched = (plan, gathered, context_tail)
+
     @break_point
     def forward(
         self,
@@ -1596,36 +1746,31 @@ class Qwen4ExpPLELayer(nn.Module):
         """
         if ctx.forward_mode.is_idle() or hidden_states.shape[0] == 0:
             return hidden_states
-        linear_backend = self._linear_backend(ctx)
-        metadata = self._metadata(linear_backend)
-        in_blocks_by_group = metadata.state_in_blocks_by_group or {}
-        out_blocks_by_group = metadata.state_out_blocks_by_group or {}
-        if QWEN4_EXP_PLE_CACHE_GROUP not in in_blocks_by_group:
-            raise RuntimeError("Qwen4-Exp PLE cache group was not published")
-        # A padded-bucket replay hands us bucket rows whose tail is filler, so
-        # the lengths decide how many rows are real before anything reads them.
-        lengths = self._lengths(metadata, input_ids.shape[0], ctx.bs)
-        hidden_states, input_ids = slice_to_real_tokens(
-            sum(lengths), hidden_states, input_ids
-        )
-        input_pages = in_blocks_by_group[QWEN4_EXP_PLE_CACHE_GROUP][: ctx.bs]
-        output_pages = out_blocks_by_group[QWEN4_EXP_PLE_CACHE_GROUP][: ctx.bs]
-        pool = ctx.token_to_kv_pool
-        self._last_pool = pool
-        load_tracker = getattr(pool, "layerwise_load_tracker", None)
-        if load_tracker is not None:
-            load_tracker.wait_for_layer(self.layer_id)
-        context_field = pool.arena.field(self.context_field_id)
-        conv_field = pool.arena.field(qwen4_exp_ple_conv_field(self.layer_id))
-        initial_context = self._read_pages(
-            context_field, input_pages, self.ple_embedding.eos_token_id
-        )
-        initial_conv = self._read_pages(conv_field, input_pages)
-        index = self._batch_indices(lengths, input_ids.device)
-        req, col, lengths_t, starts, _, total, bs = index
-        flat_ids = input_ids.flatten()
-        verify = metadata.mamba_output_indices is not None
-        if flat_ids.is_cuda:
+        prefetched = getattr(self, "_prefetched", None)
+        self._prefetched = None
+        if prefetched is not None:
+            plan, gathered, context_tail = prefetched
+        else:
+            plan = self._lookup_plan(input_ids, ctx)
+        (hidden_states,) = slice_to_real_tokens(plan.num_real_tokens, hidden_states)
+        req, col, lengths_t, starts, _, total, bs = plan.index
+        lengths = plan.lengths
+        flat_ids = plan.flat_ids
+        initial_context = plan.initial_context
+        initial_conv = plan.initial_conv
+        context_field = plan.context_field
+        conv_field = plan.conv_field
+        output_pages = plan.output_pages
+        linear_backend = plan.linear_backend
+        verify = plan.verify
+        if prefetched is not None:
+            # The gather was issued on a side stream by start_prefetch; join it
+            # and reduce. context_tail already came back with the ids.
+            embeddings = self.ple_embedding.finish_flat_gather(gathered)
+            final_context = self._final_context(
+                flat_ids, initial_context, lengths_t, starts
+            )
+        elif flat_ids.is_cuda:
             # The n-gram windows are gathered inside the hash kernel; the
             # [tokens, ngram_size] context matrix is never materialized. The
             # raw verify-scratch rows (tail) are only emitted under verify.
@@ -1637,7 +1782,7 @@ class Qwen4ExpPLELayer(nn.Module):
             )
         else:
             contexts, final_context = self._token_contexts(
-                flat_ids, initial_context, lengths, index
+                flat_ids, initial_context, lengths, plan.index
             )
             embeddings = self.ple_embedding(contexts)
             context_tail = contexts[:, 1:]
@@ -1664,7 +1809,7 @@ class Qwen4ExpPLELayer(nn.Module):
             normalized,
             initial_conv,
             lengths,
-            index,
+            plan.index,
             need_intermediate=verify,
             add_terms=(gated, hidden_states),
             windows_out=conv_scratch,
@@ -1674,7 +1819,7 @@ class Qwen4ExpPLELayer(nn.Module):
         if verify:
             # Row 0 of every (width + 1)-strided block holds the carried state;
             # the conv already filled the token rows that follow it.
-            init_rows = torch.arange(bs, device=input_ids.device) * scratch_stride
+            init_rows = torch.arange(bs, device=flat_ids.device) * scratch_stride
             context_scratch[init_rows] = initial_context
             conv_scratch[init_rows] = initial_conv
             if total:

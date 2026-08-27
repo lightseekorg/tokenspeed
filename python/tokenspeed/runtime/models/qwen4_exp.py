@@ -37,6 +37,10 @@ from tokenspeed.runtime.configs.qwen4_exp_config import (
 from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    BreakableCapture,
+    current_forward_ctx,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.backends.qwen4_exp import (
     bind_qwen4_exp_side_state,
@@ -551,6 +555,14 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             paged_attention.k_scale_float = scale
             paged_attention.v_scale_float = scale
 
+    def _start_ple_prefetch(
+        self, input_ids: torch.Tensor, ctx: ForwardContext
+    ) -> None:
+        """Issue every PLE layer's host gather ahead of the decoder loop."""
+
+        for ple in self.ple_layers:
+            ple.start_prefetch(input_ids, ctx)
+
     @torch.no_grad()
     def forward(
         self,
@@ -571,6 +583,20 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
+        # Start the host-resident PLE gather now so it overlaps the decoder
+        # layers that precede the PLE layer. A no-op unless the table was
+        # offloaded to host memory (see Qwen4ExpPLELayer.start_prefetch). Under a
+        # breakable capture the trigger must itself be an eager break: it runs
+        # the per-request hash kernel and a side-stream copy, neither of which
+        # can be baked into a graph segment.
+        if self.ple_layers:
+            cap = BreakableCapture.current()
+            if cap is not None and cap._capturing:
+                cap.add_eager(
+                    lambda: self._start_ple_prefetch(input_ids, current_forward_ctx())
+                )
+            else:
+                self._start_ple_prefetch(input_ids, ctx)
         residual = None
         for layer_id, layer in enumerate(self.layers):
             with get_global_expert_distribution_recorder().with_current_layer(layer_id):
