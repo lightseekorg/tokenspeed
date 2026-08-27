@@ -11,7 +11,7 @@ from test.runtime.conftest import KIMI_STATE_GROUPS as _STATE_GROUPS
 from test.runtime.conftest import cache_metadata_for as _metadata_for
 from test.runtime.conftest import kimi_recipe as _kimi_recipe
 from test.runtime.conftest import make_kimi_pool as _make_kimi_pool
-from types import SimpleNamespace  # noqa: E402
+from types import MethodType, SimpleNamespace  # noqa: E402
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.hybrid_kda import KdaAttnBackend
@@ -159,6 +159,101 @@ def _assert_committed_pages_equal(left, right, pages):
                 right.pool.get_component(layer_id, "recurrent_state")[page],
                 atol=1e-5,
                 rtol=1e-3,
+            )
+
+
+def test_direct_committed_read_matches_seeded_verify_and_commit_bitwise():
+    """The fallback may skip only the recurrent-state seed copy."""
+    direct = _Harness(eager_replay=False, seed=73)
+    seeded = _Harness(eager_replay=False, seed=73)
+    for harness in (direct, seeded):
+        harness.backend._verify = MethodType(MambaAttnBackend._verify, harness.backend)
+    seeded.backend._verify_reads_committed_recurrent_state = False
+
+    def seeded_verify_scan(
+        self,
+        query,
+        key,
+        value,
+        ssm_comp,
+        ssm_scratch,
+        state_in_blocks,
+        output_indices,
+        **kwargs,
+    ):
+        del ssm_comp, state_in_blocks
+        return KdaAttnBackend._verify_scan(
+            self,
+            query,
+            key,
+            value,
+            ssm_scratch,
+            ssm_scratch,
+            output_indices[: kwargs["batch_size"], 0] - 1,
+            output_indices,
+            **kwargs,
+        )
+
+    seeded.backend._verify_scan = MethodType(seeded_verify_scan, seeded.backend)
+    rpis = [0, 1, 2]
+    pages = {
+        group_id: [2 + group * len(rpis) + i for i in range(len(rpis))]
+        for group, group_id in enumerate(_STATE_GROUPS)
+    }
+    generator = torch.Generator(device=DEV).manual_seed(79)
+    for direct_layer, seeded_layer in zip(direct.layer_ids, seeded.layer_ids):
+        direct_group = direct.pool.state_group_by_layer[direct_layer]
+        seeded_group = seeded.pool.state_group_by_layer[seeded_layer]
+        assert direct_group == seeded_group
+        page_ids = torch.tensor(pages[direct_group], dtype=torch.int64, device=DEV)
+        for component in ("conv_state", "recurrent_state"):
+            direct_pool = direct.pool.get_component(direct_layer, component)
+            seeded_pool = seeded.pool.get_component(seeded_layer, component)
+            values = torch.randn(
+                (len(page_ids), *direct_pool.shape[1:]),
+                dtype=direct_pool.dtype,
+                device=DEV,
+                generator=generator,
+            )
+            direct_pool[page_ids] = values
+            seeded_pool[page_ids] = values
+
+    committed_before = {
+        (layer_id, component): direct.pool.get_component(layer_id, component).clone()
+        for layer_id in direct.layer_ids
+        for component in ("conv_state", "recurrent_state")
+    }
+
+    seq_lens = [8 + T] * len(rpis)
+    for harness in (direct, seeded):
+        harness.prepare_metadata(rpis, pages, seq_lens)
+    inputs = direct.inputs(len(rpis), 83)
+    direct_out = direct.forward(inputs, len(rpis))
+    seeded_out = seeded.forward(inputs, len(rpis))
+    torch.cuda.synchronize()
+
+    write_rows = direct.backend.forward_metadata.mamba_output_indices.long()
+    for layer_id, actual, expected in zip(direct.layer_ids, direct_out, seeded_out):
+        assert torch.equal(actual, expected)
+        direct_conv, direct_state = direct.backend._verify_scratch[layer_id]
+        seeded_conv, seeded_state = seeded.backend._verify_scratch[layer_id]
+        assert torch.equal(direct_conv[write_rows], seeded_conv[write_rows])
+        assert torch.equal(direct_state[write_rows], seeded_state[write_rows])
+        for component in ("conv_state", "recurrent_state"):
+            assert torch.equal(
+                direct.pool.get_component(layer_id, component),
+                committed_before[(layer_id, component)],
+            )
+
+    accepted = torch.tensor([1, T, 2], dtype=torch.int32, device=DEV)
+    direct.backend.commit_verified_state(accepted)
+    seeded.backend.commit_verified_state(accepted)
+    torch.cuda.synchronize()
+    for layer_id in direct.layer_ids:
+        for component in ("conv_state", "recurrent_state"):
+            assert torch.equal(
+                direct.pool.get_component(layer_id, component),
+                seeded.pool.get_component(layer_id, component),
             )
 
 

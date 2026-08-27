@@ -271,6 +271,47 @@ def test_set_kv_pool_binds_contract_state_groups(monkeypatch) -> None:
     }
 
 
+def test_kda_verify_seed_omits_only_the_recurrent_state(monkeypatch) -> None:
+    """KDA reads committed recurrence directly while GDN keeps full seeding."""
+    from tokenspeed_kernel.ops.kvcache import triton as kvcache_triton
+
+    contract = _stub_contract(prefix_granularity=4, usable_pages=8)
+    pool = _StubContractPool(
+        contract,
+        "cpu",
+        conv_dim=3 * 4 * 128,
+        width=4,
+        num_heads=4,
+        head_dim=128,
+    )
+    state_pages = {
+        group_id: torch.tensor([1, 2], dtype=torch.int32) for group_id in _STATE_GROUPS
+    }
+    calls = []
+
+    def record_copy(*_args, **kwargs):
+        calls.append(kwargs["row_bytes"])
+
+    monkeypatch.setattr(kvcache_triton, "copy_state_rows", record_copy)
+
+    kda = _backend("cpu", contract_pool=pool, spec_tokens=4)
+    kda._replay_active = False
+    kda.preallocate_verify_workspace(2, 4)
+    kda.forward_metadata = SimpleNamespace(state_in_blocks_by_group=state_pages)
+    kda._seed_verify_scratch_batched(2, 4)
+    conv_bytes = pool.get_component(0, "conv_state")[0].nbytes
+    state_bytes = pool.get_component(0, "recurrent_state")[0].nbytes
+    assert calls == [conv_bytes]
+
+    calls.clear()
+    gdn = hybrid_linear_attn.MambaAttnBackend(*_backend_config("cpu", spec_tokens=4))
+    gdn.set_kv_pool(pool)
+    gdn.preallocate_verify_workspace(2, 4)
+    gdn.forward_metadata = SimpleNamespace(state_in_blocks_by_group=state_pages)
+    gdn._seed_verify_scratch_batched(2, 4)
+    assert calls == [conv_bytes, state_bytes]
+
+
 # ---------------------------------------------------------------------------
 # Per-group dual-index metadata
 # ---------------------------------------------------------------------------

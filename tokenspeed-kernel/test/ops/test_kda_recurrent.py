@@ -298,6 +298,125 @@ def test_glm53_flash_mtp_graph_shape_matches_baseline_and_replays() -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mtp_direct_committed_read_matches_seeded_scratch_and_replays() -> None:
+    """Separate read/write pools replace the recurrent-state seed exactly."""
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        fused_recurrent_kda_mtp,
+    )
+
+    torch.manual_seed(91)
+    device = "cuda"
+    batch, steps, heads, dim = 3, 4, 4, 128
+    pages = 7
+    row_elements = heads * dim * dim
+    page_stride = row_elements + 37
+    committed_storage = torch.randn(
+        pages * page_stride, dtype=torch.float32, device=device
+    )
+    committed = torch.as_strided(
+        committed_storage,
+        size=(pages, heads, dim, dim),
+        stride=(page_stride, dim * dim, dim, 1),
+    )
+    q = torch.randn(batch, steps, heads, dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    gate = torch.randn_like(q)
+    beta = torch.randn(batch, steps, heads, dtype=torch.bfloat16, device=device)
+    a_log = torch.randn(heads, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(heads, dim, dtype=torch.float32, device=device)
+    read_indices = torch.tensor([-1, 4, 1], dtype=torch.int32, device=device)
+    scratch_rows = batch * (steps + 1)
+    bases = torch.arange(batch, dtype=torch.int32, device=device) * (steps + 1)
+    write_indices = bases[:, None] + torch.arange(
+        1, steps + 1, dtype=torch.int32, device=device
+    )
+
+    def run(
+        state_pool: torch.Tensor,
+        initial_rows: torch.Tensor,
+        state_out: torch.Tensor,
+    ) -> torch.Tensor:
+        return fused_recurrent_kda_mtp(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            a_log,
+            dt_bias,
+            state_pool,
+            initial_rows,
+            write_indices,
+            h_pool_out=state_out,
+            lower_bound=-5.0,
+            recurrent_layout="v_major",
+        )
+
+    def seeded_oracle(indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        scratch = torch.full(
+            (scratch_rows, heads, dim, dim),
+            13.0,
+            dtype=torch.float32,
+            device=device,
+        )
+        scratch[bases.long()] = 0
+        valid = indices >= 0
+        scratch[bases[valid].long()] = committed[indices[valid].long()]
+        return run(scratch, bases, scratch), scratch
+
+    expected_out, expected_scratch = seeded_oracle(read_indices)
+    direct_scratch = torch.full_like(expected_scratch, -17.0)
+    committed_before = committed_storage.clone()
+    actual_out = run(committed, read_indices, direct_scratch)
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual_out, expected_out)
+    assert torch.equal(
+        direct_scratch[write_indices.long()],
+        expected_scratch[write_indices.long()],
+    )
+    assert torch.equal(committed_storage, committed_before)
+    assert committed.data_ptr() != direct_scratch.data_ptr()
+
+    accepted = torch.tensor([1, 4, 2], dtype=torch.int64, device=device)
+    destinations = torch.tensor([2, 3, 5], dtype=torch.int64, device=device)
+    expected_committed = committed.clone()
+    actual_committed = committed.clone()
+    rows = bases.long() + accepted
+    expected_committed[destinations] = expected_scratch[rows]
+    actual_committed[destinations] = direct_scratch[rows]
+    assert torch.equal(actual_committed, expected_committed)
+
+    stable_indices = torch.tensor([1, -1, 4], dtype=torch.int32, device=device)
+    graph_scratch = torch.empty_like(direct_scratch)
+    run(committed, stable_indices, graph_scratch)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = run(committed, stable_indices, graph_scratch)
+    graph.replay()
+    torch.cuda.synchronize()
+    first_graph_out = graph_out.clone()
+
+    stable_indices.copy_(torch.tensor([-1, 3, 5], dtype=torch.int32, device=device))
+    committed[3].copy_(torch.randn_like(committed[3]))
+    committed[5].copy_(torch.randn_like(committed[5]))
+    changed_committed = committed_storage.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    replay_expected_out, replay_expected_scratch = seeded_oracle(stable_indices)
+    assert not torch.equal(graph_out, first_graph_out)
+    assert torch.equal(graph_out, replay_expected_out)
+    assert torch.equal(
+        graph_scratch[write_indices.long()],
+        replay_expected_scratch[write_indices.long()],
+    )
+    assert torch.equal(committed_storage, changed_committed)
+
+
 @pytest.mark.parametrize(
     "recurrent_layout,store_states",
     [

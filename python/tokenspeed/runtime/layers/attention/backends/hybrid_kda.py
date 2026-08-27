@@ -97,6 +97,8 @@ class KdaAttnBackend(MambaAttnBackend):
     the conv, the gate GEMV and the recurrence into a single launch.
     """
 
+    _verify_reads_committed_recurrent_state = True
+
     def __init__(
         self,
         config: AttnConfig,
@@ -686,8 +688,10 @@ class KdaAttnBackend(MambaAttnBackend):
         )
 
         beta_b = beta_raw.view(batch_size, draft_token_num, num_value_heads)
-        initial_pool = ssm_scratch
-        initial_rows = output_indices[:batch_size, 0] - 1
+        # The recurrence has independent read and write pools: committed pages
+        # provide the initial state while every speculative checkpoint lands in scratch.
+        initial_pool = ssm_comp
+        initial_rows = state_in_blocks[:batch_size]
         write_rows = output_indices[:batch_size]
         state_out = ssm_scratch
 
