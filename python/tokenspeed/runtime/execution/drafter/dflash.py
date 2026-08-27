@@ -27,9 +27,6 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
 )
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
-from tokenspeed.runtime.distributed.process_group_manager import (
-    process_group_manager as pg_manager,
-)
 from tokenspeed.runtime.execution.cache_loc_kernel import (
     dflash_prepare_decode,
 )
