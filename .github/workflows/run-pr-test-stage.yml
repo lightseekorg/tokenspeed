@@ -41,8 +41,9 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(inputs.matrix) }}
     name: ${{ matrix.name }} (${{ matrix.runner }})
-    # `runner` is the logical TokenSpeed platform identity passed to the task.
-    # `runs_on` may map it to GitHub-hosted CPU infrastructure (for emulators).
+    # `runner` is the platform a task targets, and carries its vendor
+    # classification. `runs_on` is the machine that hosts it, and differs
+    # whenever the target platform is not the host's own hardware.
     runs-on: ${{ matrix.runs_on || matrix.runner }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
     continue-on-error: ${{ matrix.optional }}
