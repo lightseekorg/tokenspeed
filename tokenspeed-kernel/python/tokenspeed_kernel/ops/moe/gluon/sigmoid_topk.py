@@ -49,9 +49,11 @@ if invoke_sigmoid_bias_topk_route_prefill_gluon is not None:
         normalize_topk_weights: bool,
         weights_dtype: torch.dtype = torch.float32,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        decode_supported = router_logits.shape[0] * topk <= 128
         route = (
             invoke_sigmoid_bias_topk_route_gluon
-            if (
+            if decode_supported
+            and (
                 router_logits.shape[0] == 1
                 or router_logits.dtype != torch.float32
                 or topk > 16
