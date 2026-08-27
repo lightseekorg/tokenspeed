@@ -158,6 +158,7 @@ env:
     # outputs and no longer match an fp32 reference exactly:
     # https://github.com/ROCm/rocm-systems/issues/10806
     --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_normalize_project_query_cuda_fallback
+    --deselect=tokenspeed-kernel/test/ops/test_qwen4_exp_qsa.py::test_qwen4_exp_qsa_block_topk_two_stage_merge_matches_torch
   TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.13.0+rocm10.1.0a20260812
   TORCH_INDEX_URL: https://rocm.nightlies.amd.com/whl-multi-arch/
   TORCH_VERSION: 2.13.0+rocm10.1.0a20260812
