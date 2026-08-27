@@ -1755,15 +1755,17 @@ def test_dsa_decode_glm53_flash_bf16_split_mfma(tokens: int) -> None:
     not is_cdna4(),
     reason="the tested DSA kernel currently only supports gfx950",
 )
-def test_dsa_decode_glm53_flash_bf16_split_graph_tracks_live_lengths() -> None:
+@pytest.mark.parametrize("tokens", (16, 64))
+def test_dsa_decode_glm53_flash_bf16_split_graph_tracks_live_lengths(
+    tokens: int,
+) -> None:
     device = "cuda"
-    tokens = 16
     num_heads = 16
-    num_slots = 512
+    num_slots = 2051
     topk = 2051
     kv_lora_rank = 512
     qk_nope_head_dim = 256
-    generator = _generator(device, 1220)
+    generator = _generator(device, 1220 + tokens)
     q = _randn_bf16(
         (tokens, num_heads, kv_lora_rank), device=device, generator=generator
     )
@@ -1772,12 +1774,15 @@ def test_dsa_decode_glm53_flash_bf16_split_graph_tracks_live_lengths() -> None:
     )
     topk_slots = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
     topk_lens = torch.empty(tokens, device=device, dtype=torch.int32)
-    out = torch.empty(
+    graph_out = torch.empty(
+        (tokens, num_heads, kv_lora_rank), device=device, dtype=torch.bfloat16
+    )
+    eager_out = torch.empty(
         (tokens, num_heads, kv_lora_rank), device=device, dtype=torch.bfloat16
     )
     softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim)
 
-    def invoke() -> None:
+    def invoke(out: torch.Tensor) -> None:
         gluon_dsa_decode(
             q=q,
             kv_cache=kv_cache,
@@ -1796,13 +1801,13 @@ def test_dsa_decode_glm53_flash_bf16_split_graph_tracks_live_lengths() -> None:
 
     topk_lens.fill_(13)
     topk_slots[:, :13] = torch.arange(13, device=device, dtype=torch.int32)
-    invoke()
+    invoke(graph_out)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        invoke()
+        invoke(graph_out)
 
-    for visible in (13, 449):
+    for visible in (13, 449, 526, 1961):
         topk_slots.fill_(-1)
         topk_lens.fill_(visible)
         selected = torch.arange(visible, device=device, dtype=torch.int32)
@@ -1810,6 +1815,10 @@ def test_dsa_decode_glm53_flash_bf16_split_graph_tracks_live_lengths() -> None:
             topk_slots[row, :visible] = torch.roll(selected, row)
         graph.replay()
         torch.cuda.synchronize()
+        replayed = graph_out.clone()
+        invoke(eager_out)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(replayed, eager_out, rtol=0.0, atol=0.0)
         ref = _dsa_reference(
             q,
             kv_cache,
@@ -1818,7 +1827,7 @@ def test_dsa_decode_glm53_flash_bf16_split_graph_tracks_live_lengths() -> None:
             topk_lens,
             softmax_scale,
         )
-        torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+        torch.testing.assert_close(replayed.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 
 @pytest.mark.skipif(

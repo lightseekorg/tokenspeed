@@ -159,6 +159,7 @@ def _dsa_dense_mfma_kv_kernel(
     FP8_INPUTS: gl.constexpr,
     NATIVE_FP8: gl.constexpr,
     NATIVE_E5M2: gl.constexpr,
+    COLUMN_PARALLEL: gl.constexpr,
     TRIM_EMPTY_TILES: gl.constexpr,
     NUM_KV_SPLITS: gl.constexpr,
 ):
@@ -171,6 +172,14 @@ def _dsa_dense_mfma_kv_kernel(
     ROPE_LOAD_VEC: gl.constexpr = 4 if NATIVE_FP8 else 2
     SHARED_INTERVAL: gl.constexpr = 1024 if NATIVE_FP8 else 512
     SHARED_PADDING: gl.constexpr = 32 if NATIVE_FP8 else 16
+    # The BF16 no-RoPE tile owns one MFMA row. Split its columns across the
+    # four waves, then restore the original score layout before softmax.
+    mfma_qk: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, instr_k],
+        transposed=True,
+        warps_per_cta=([1, 4] if COLUMN_PARALLEL else [4, 1]),
+    )
     mfma_s: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16, instr_k],
@@ -181,7 +190,7 @@ def _dsa_dense_mfma_kv_kernel(
         version=4,
         instr_shape=[16, 16, instr_k],
         transposed=True,
-        warps_per_cta=[4, 1],
+        warps_per_cta=([1, 4] if COLUMN_PARALLEL else [4, 1]),
     )
 
     _qlora_tpw_k: gl.constexpr = min(64, D_V // INPUT_VEC)
@@ -249,22 +258,22 @@ def _dsa_dense_mfma_kv_kernel(
 
     dot_qlora_a: gl.constexpr = gl.DotOperandLayout(
         operand_index=0,
-        parent=mfma_s,
+        parent=mfma_qk,
         k_width=QK_K_WIDTH,
     )
     dot_qrope_a: gl.constexpr = gl.DotOperandLayout(
         operand_index=0,
-        parent=mfma_s,
+        parent=mfma_qk,
         k_width=QK_K_WIDTH,
     )
     dot_klora_b: gl.constexpr = gl.DotOperandLayout(
         operand_index=1,
-        parent=mfma_s,
+        parent=mfma_qk,
         k_width=QK_K_WIDTH,
     )
     dot_krope_b: gl.constexpr = gl.DotOperandLayout(
         operand_index=1,
-        parent=mfma_s,
+        parent=mfma_qk,
         k_width=QK_K_WIDTH,
     )
     dot_p_a: gl.constexpr = gl.DotOperandLayout(
@@ -569,10 +578,11 @@ def _dsa_dense_mfma_kv_kernel(
         if HAS_ROPE:
             k_rope_t_dot = smem_krope.index(cur_buf).load(dot_krope_b)
 
-        scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_s)
+        scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_qk)
         scores = gl.amd.cdna4.mfma(q_lora_dot, k_lora_t_dot, scores)
         if HAS_ROPE:
             scores = gl.amd.cdna4.mfma(q_rope_dot, k_rope_t_dot, scores)
+        scores = gl.convert_layout(scores, mfma_s)
         scores = scores * scale
 
         offs_h_mma = hg_offset + gl.arange(
@@ -613,10 +623,11 @@ def _dsa_dense_mfma_kv_kernel(
     if HAS_ROPE:
         k_rope_t_dot = smem_krope.index(cur_buf).load(dot_krope_b)
 
-    scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_s)
+    scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_qk)
     scores = gl.amd.cdna4.mfma(q_lora_dot, k_lora_t_dot, scores)
     if HAS_ROPE:
         scores = gl.amd.cdna4.mfma(q_rope_dot, k_rope_t_dot, scores)
+    scores = gl.convert_layout(scores, mfma_s)
     scores = scores * scale
 
     offs_h_mma = hg_offset + gl.arange(
@@ -1167,6 +1178,11 @@ def _run_dense_kv(
         NATIVE_FP8=(q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES),
         NATIVE_E5M2=(
             q.dtype == torch.float8_e5m2 and kv_cache.dtype == torch.float8_e5m2
+        ),
+        COLUMN_PARALLEL=(
+            q.dtype == torch.bfloat16
+            and kv_cache.dtype == torch.bfloat16
+            and qk_rope_head_dim == 0
         ),
         TRIM_EMPTY_TILES=int(max_seqlen_k) < int(topk_slots.shape[1]),
         NUM_KV_SPLITS=num_kv_splits,
