@@ -13,7 +13,7 @@ env:
   BUILD_AND_DOWNLOAD_PARALLEL: "4"
   CI: "true"
   GFX_ARCH: gfx1250
-  MI450_SIM_SHARDS: "6"
+  MI450_SIM_WORKERS: "6"
   TEST_DESELECTS: |
     # Iris symmetric heaps require physical KFD/ARSMI peer topology. rocJITsu
     # provides compute emulation only, so keep these tests enabled on hardware.
@@ -174,7 +174,7 @@ ut:
       torch.cuda.init(); props = torch.cuda.get_device_properties(0);
       print(props, flush=True); assert "gfx1250" in props.gcnArchName'
     - >-
-      bash test/ci_system/run_mi450_rocjitsu_sharded.sh
+      bash test/ci_system/run_mi450_rocjitsu_parallel.sh
       -v --timeout=180
       $(printf '%s\n' "${TEST_DESELECTS}" | awk 'NF && $1 !~ /^#/')
 report:
