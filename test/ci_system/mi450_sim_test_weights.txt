@@ -1,0 +1,112 @@
+# Measured rocJITsu runtime per test file, in seconds, on the reference
+# development host. This only balances the concurrent shards started by
+# run_mi450_rocjitsu_sharded.sh; it never changes which tests run. Files whose
+# tests all skip on gfx1250 are listed at 0.0s.
+#
+# A test file missing from this list still runs: the last shard is handed the
+# whole test tree minus the files assigned to the other shards, so adding a test
+# file does not require touching this table.
+#
+# Regenerate after a large test-suite change by re-running the lane with
+# --durations=0 and summing call+setup+teardown per file.
+16.1 tokenspeed-kernel/test/ops/activation/test_attnres_split.py
+76.4 tokenspeed-kernel/test/ops/attention/test_capture_payload.py
+1.4 tokenspeed-kernel/test/ops/attention/test_expand_page_table.py
+75.6 tokenspeed-kernel/test/ops/attention/test_gdn_replay_commit.py
+53.8 tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py
+0.0 tokenspeed-kernel/test/ops/attention/test_gluon_mla_launch_tuning_gfx950.py
+0.0 tokenspeed-kernel/test/ops/attention/test_kda_cu_seqlens_cpu_hint.py
+0.0 tokenspeed-kernel/test/ops/attention/test_kda_replay_commit.py
+0.7 tokenspeed-kernel/test/ops/attention/test_mla_write_locations.py
+1.2 tokenspeed-kernel/test/ops/attention/test_verify_state_blocks.py
+0.0 tokenspeed-kernel/test/ops/communication/test_multimem_distributed.py
+0.0 tokenspeed-kernel/test/ops/gemm/test_per_block_quant_fp8.py
+106.5 tokenspeed-kernel/test/ops/gemm/test_routed_gemv.py
+1.4 tokenspeed-kernel/test/ops/metadata/test_prep_tape.py
+0.0 tokenspeed-kernel/test/ops/moe/test_deepep_nvfp4.py
+0.0 tokenspeed-kernel/test/ops/moe/test_deepep_overlap.py
+51.2 tokenspeed-kernel/test/ops/moe/test_deepep_permute.py
+0.0 tokenspeed-kernel/test/ops/moe/test_gluon_latent_input_gfx950.py
+0.0 tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py
+72.5 tokenspeed-kernel/test/ops/moe/test_latent_input.py
+0.0 tokenspeed-kernel/test/ops/moe/test_latent_tail_contract.py
+0.0 tokenspeed-kernel/test/ops/moe/test_latent_tail_distributed.py
+0.0 tokenspeed-kernel/test/ops/moe/test_marlin_mxfp4_apply.py
+45.2 tokenspeed-kernel/test/ops/moe/test_minimax_biased_grouped_topk.py
+0.0 tokenspeed-kernel/test/ops/moe/test_mxfp4_situ_ep_distributed_gfx950.py
+0.0 tokenspeed-kernel/test/ops/moe/test_mxfp4_situ_flashinfer_trtllm.py
+0.0 tokenspeed-kernel/test/ops/moe/test_mxfp4_situ_latent_moe_reference.py
+0.0 tokenspeed-kernel/test/ops/moe/test_nvfp4_situ_flashinfer_trtllm.py
+0.0 tokenspeed-kernel/test/ops/moe/test_softmax_topk_nvidia.py
+2.9 tokenspeed-kernel/test/ops/moe/test_triton_bf16_apply.py
+0.0 tokenspeed-kernel/test/ops/moe/test_triton_mxfp4_apply.py
+0.0 tokenspeed-kernel/test/ops/moe/test_triton_mxfp4_weights.py
+215.0 tokenspeed-kernel/test/ops/test_activation.py
+615.3 tokenspeed-kernel/test/ops/test_attention.py
+25.4 tokenspeed-kernel/test/ops/test_attention_dsa.py
+28.6 tokenspeed-kernel/test/ops/test_attention_dsv4.py
+223.6 tokenspeed-kernel/test/ops/test_attention_gdn.py
+59.4 tokenspeed-kernel/test/ops/test_attention_mla.py
+40.9 tokenspeed-kernel/test/ops/test_attention_msa.py
+0.0 tokenspeed-kernel/test/ops/test_attention_rel_bias_fused.py
+44.0 tokenspeed-kernel/test/ops/test_attention_rel_mha.py
+0.0 tokenspeed-kernel/test/ops/test_attention_tsmha_multiquery.py
+0.0 tokenspeed-kernel/test/ops/test_attention_tsmha_v2_paging.py
+0.0 tokenspeed-kernel/test/ops/test_attention_tsmha_varlen.py
+0.0 tokenspeed-kernel/test/ops/test_communcation.py
+0.0 tokenspeed-kernel/test/ops/test_communication_policy.py
+94.7 tokenspeed-kernel/test/ops/test_conv.py
+0.0 tokenspeed-kernel/test/ops/test_deepep_mode.py
+1.6 tokenspeed-kernel/test/ops/test_dsa_topk.py
+2.7 tokenspeed-kernel/test/ops/test_embedding.py
+0.0 tokenspeed-kernel/test/ops/test_flashinfer_fp8_blockscale.py
+0.2 tokenspeed-kernel/test/ops/test_gemm.py
+1.3 tokenspeed-kernel/test/ops/test_group_tables_unpack.py
+0.1 tokenspeed-kernel/test/ops/test_host_cache_transfer.py
+1.7 tokenspeed-kernel/test/ops/test_inkling_topk.py
+0.0 tokenspeed-kernel/test/ops/test_iris_communication.py
+95.1 tokenspeed-kernel/test/ops/test_kda_recurrent.py
+17.7 tokenspeed-kernel/test/ops/test_kvcache.py
+10.4 tokenspeed-kernel/test/ops/test_layernorm.py
+0.0 tokenspeed-kernel/test/ops/test_minimax_m3_fused_qknorm_rope_kv_insert.py
+0.0 tokenspeed-kernel/test/ops/test_mxfp8_attention.py
+0.0 tokenspeed-kernel/test/ops/test_mxfp8_gemm.py
+1.2 tokenspeed-kernel/test/ops/test_nvfp4_gemm_swiglu_nvfp4_quant.py
+44.3 tokenspeed-kernel/test/ops/test_quantization.py
+5.5 tokenspeed-kernel/test/ops/test_quantize_store_kv_mxfp8.py
+2.4 tokenspeed-kernel/test/ops/test_sampling.py
+225.8 tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py
+25.2 tokenspeed-kernel/test/ops/test_sampling_triton.py
+0.7 tokenspeed-kernel/test/ops/test_sampling_triton_full.py
+2.8 tokenspeed-kernel/test/ops/test_store_sf_interleaved.py
+0.0 tokenspeed-kernel/test/ops/test_tokenspeed_mla.py
+0.1 tokenspeed-kernel/test/ops/test_tokenspeed_mla_fallback.py
+0.3 tokenspeed-kernel/test/ops/test_transform.py
+0.6 tokenspeed-kernel/test/test_benchmark.py
+0.0 tokenspeed-kernel/test/test_deep_ep_mnnvl_flag.py
+0.0 tokenspeed-kernel/test/test_dsv4_sparse_compress_launch.py
+0.0 tokenspeed-kernel/test/test_dsv4_sparse_compress_parity_gpu.py
+13.2 tokenspeed-kernel/test/test_kernel_api_selection.py
+0.1 tokenspeed-kernel/test/test_kimi_prefill_ops.py
+0.0 tokenspeed-kernel/test/test_numerics.py
+0.0 tokenspeed-kernel/test/test_plugins.py
+0.0 tokenspeed-kernel/test/test_profiling.py
+0.0 tokenspeed-kernel/test/test_registry.py
+0.0 tokenspeed-kernel/test/test_selection.py
+0.6 tokenspeed-kernel/test/test_setup.py
+0.0 tokenspeed-kernel/test/test_trtllm_mnnvl_gate.py
+0.0 tokenspeed-kernel/test/test_tuning_cache.py
+0.0 tokenspeed-kernel/test/thirdparty/test_attn_res_online_v2.py
+0.0 tokenspeed-kernel/test/thirdparty/test_cuda.py
+0.0 tokenspeed-kernel/test/thirdparty/test_cutedsl_kda_prefill.py
+0.0 tokenspeed-kernel/test/thirdparty/test_deep_ep_import.py
+0.0 tokenspeed-kernel/test/thirdparty/test_fa3.py
+0.0 tokenspeed-kernel/test/thirdparty/test_fa4.py
+0.0 tokenspeed-kernel/test/thirdparty/test_flash_kda_prefill.py
+0.0 tokenspeed-kernel/test/thirdparty/test_flashinfer.py
+0.0 tokenspeed-kernel/test/thirdparty/test_flashmla.py
+0.0 tokenspeed-kernel/test/thirdparty/test_merge_state.py
+0.0 tokenspeed-kernel/test/thirdparty/test_moe_finalize_fuse_shared.py
+0.0 tokenspeed-kernel/test/thirdparty/test_trtllm_comm.py
+0.0 tokenspeed-kernel/test/thirdparty/test_trtllm_mnnvl_comm.py
+0.0 tokenspeed-kernel/test/thirdparty/test_trtllm_mnnvl_twoshot.py

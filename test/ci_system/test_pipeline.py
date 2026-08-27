@@ -121,7 +121,7 @@ def test_mi450_sim_uses_github_hosted_cpu_runner(tmp_path):
     )
 
     assert matrix["include"][0]["runner"] == "amd-mi450-sim"
-    assert matrix["include"][0]["runs_on"] == "ubuntu-24.04"
+    assert matrix["include"][0]["runs_on"] == "ubuntu-24.04-32core-x64"
 
 
 def test_nvidia_runner_groups_split_arm_from_x86():

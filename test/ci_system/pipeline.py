@@ -74,7 +74,7 @@ AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-", "amd-mi450-")
 GITHUB_HOSTED_RUNNERS = {
     # Logical AMD runner used by the normal task matrix. The workload itself
     # provides gfx1250 through rocJITsu, so no self-hosted GPU runner exists.
-    "amd-mi450-sim": "ubuntu-24.04",
+    "amd-mi450-sim": "ubuntu-24.04-32core-x64",
 }
 NVIDIA_ARM_RUNNER_PREFIXES = (
     "gb200",
