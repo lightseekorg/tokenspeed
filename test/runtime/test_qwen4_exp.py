@@ -2337,6 +2337,7 @@ def test_ple_host_prefetch_matches_inline_gather(store_fp8: bool) -> None:
 
 def _ple_checkpoint_loader_stub(
     store_dtype: torch.dtype,
+    offload: bool = False,
 ) -> tuple[torch.nn.Module, Qwen4ExpNGramEmbedding]:
     root = torch.nn.Module()
     ple = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
@@ -2345,9 +2346,11 @@ def _ple_checkpoint_loader_stub(
         torch.float8_e4m3fn if store_dtype == torch.float8_e4m3fn else None
     )
     ple._checkpoint_weight_scale = 1.0
+    ple.offload_embedding = offload
 
     embedding = torch.nn.Module()
     embedding.org_vocab_size = 8
+    embedding.num_embeddings_per_partition = 8
     embedding.shard_indices = SimpleNamespace(
         org_vocab_start_index=0,
         org_vocab_end_index=8,
@@ -2357,10 +2360,91 @@ def _ple_checkpoint_loader_stub(
         torch.nn.Parameter(torch.empty(8, 4, dtype=store_dtype), requires_grad=False),
     )
     ple.ngram_embedding = embedding
-    if ple.embed_store_dtype is not None:
+    # Offloaded FP8 tables carry a per-tensor scalar instead of a per-row buffer.
+    if ple.embed_store_dtype is not None and not offload:
         ple.register_buffer("ngram_embedding_scale", torch.ones(8))
     root.ple = ple
     return root, ple
+
+
+def test_ple_offload_loader_records_scalar_scale_without_row_buffer() -> None:
+    """A pre-quantized checkpoint into an offloaded table keeps a scalar scale.
+
+    Offloading exists to keep the table off the device, so the loader must not
+    fall back to a per-row scale buffer; it records the single checkpoint scale
+    and leaves the FP8 payload untouched for the gather kernel to dequant.
+    """
+
+    root, ple = _ple_checkpoint_loader_stub(torch.float8_e4m3fn, offload=True)
+    source = torch.tensor(
+        [
+            [-48.0, 72.0, -80.0, 64.0],
+            [10.0, 20.0, 144.0, -88.0],
+            [1.0, -2.0, 3.0, -4.0],
+            [32.0, 40.0, -56.0, 8.0],
+            [0.5, -0.5, 0.25, -0.25],
+            [96.0, -112.0, 128.0, -144.0],
+            [6.0, 7.0, 8.0, 9.0],
+            [-16.0, -24.0, 48.0, 80.0],
+        ],
+        dtype=torch.float8_e4m3fn,
+    )
+    checkpoint_scale = torch.tensor([2.0e-4], dtype=torch.bfloat16)
+    weights = [
+        ("ple.ngram_embedding.weight_scale", checkpoint_scale),
+        ("ple.ngram_embedding.shard_0.weight", source),
+    ]
+
+    loaded = load_qwen4_exp_weights(
+        root,
+        SimpleNamespace(num_experts=None, split_ngram_parts=1),
+        SimpleNamespace(),
+        weights,
+        include_visual=False,
+    )
+
+    assert getattr(ple, "ngram_embedding_scale", None) is None
+    assert ple._checkpoint_weight_scale == pytest.approx(
+        checkpoint_scale.float().item()
+    )
+    # The FP8 payload is preserved verbatim; the scale is applied only at gather.
+    assert torch.equal(ple.ngram_embedding.weight, source)
+    assert loaded == {"ple.ngram_embedding.weight"}
+
+
+@_requires_cuda
+def test_ple_offload_loader_online_quantizes_bf16_to_host() -> None:
+    """A compute-dtype checkpoint under offload is quantized online, per row.
+
+    Offloading does not require a pre-quantized checkpoint: a bf16 source is
+    quantized one streamed shard at a time, its FP8 payload written to the
+    host table, and the per-row scales populate a device buffer allocated
+    lazily -- the buffer the offline FP8 path (which offloading targets) never
+    needs.
+    """
+
+    root, ple = _ple_checkpoint_loader_stub(torch.float8_e4m3fn, offload=True)
+    assert getattr(ple, "ngram_embedding_scale", None) is None
+    torch.manual_seed(5)
+    source = torch.randn(8, 4, dtype=torch.bfloat16)
+    weights = [("ple.ngram_embedding.shard_0.weight", source)]
+
+    loaded = load_qwen4_exp_weights(
+        root,
+        SimpleNamespace(num_experts=None, split_ngram_parts=1),
+        SimpleNamespace(),
+        weights,
+        include_visual=False,
+    )
+
+    expected_payload, expected_scale = quantize_ple_embedding_rows(source)
+    scale_buffer = getattr(ple, "ngram_embedding_scale", None)
+    assert scale_buffer is not None and scale_buffer.is_cuda
+    assert scale_buffer.shape == (8,)
+    # The payload is the online FP8 quantization; the per-row scales dequant it.
+    assert torch.equal(ple.ngram_embedding.weight, expected_payload)
+    torch.testing.assert_close(scale_buffer.cpu(), expected_scale)
+    assert loaded == {"ple.ngram_embedding.weight"}
 
 
 @pytest.mark.parametrize("scale_first", [False, True])
@@ -2482,9 +2566,19 @@ def _ngram_embedding_pair(
         device.ngram_embedding.weight.shape, dtype=torch.bfloat16, device="cuda"
     )
     if store_fp8:
-        payload, scale = quantize_ple_embedding_rows(rows)
-        device.ngram_embedding_scale.copy_(scale)
-        host.ngram_embedding_scale.copy_(scale)
+        # An offloaded table is pre-quantized offline with a single per-tensor
+        # scale, so quantize the whole table against one amax rather than
+        # per-row. The device path reads it from its per-row buffer (filled with
+        # the constant); the host path reads the scalar from _checkpoint_weight_scale.
+        values = rows.to(torch.float32)
+        scale = (values.abs().amax() / 448.0).clamp_min(1e-12)
+        payload = (values / scale).to(torch.float8_e4m3fn)
+        scale = float(scale)
+        device.ngram_embedding_scale.fill_(scale)
+        assert not hasattr(host, "ngram_embedding_scale") or (
+            getattr(host, "ngram_embedding_scale", None) is None
+        )
+        host._checkpoint_weight_scale = scale
     else:
         payload = rows
     device.ngram_embedding.weight.data.copy_(payload)

@@ -107,6 +107,7 @@ def quantize_ple_embedding_rows(
 def _ple_host_gather_kernel(
     table_address,
     ids_ptr,
+    scale_value,
     scale_ptr,
     out_ptr,
     head_dim,
@@ -114,6 +115,7 @@ def _ple_host_gather_kernel(
     vocab_end,
     IS_FP8: tl.constexpr,
     HAS_SCALE: tl.constexpr,
+    ROW_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """Gather one n-gram row per program straight out of pinned host memory.
@@ -123,6 +125,15 @@ def _ple_host_gather_kernel(
     device address, so the load below is a PCIe/C2C read issued by the GPU
     itself. Rows outside this rank's shard emit zeros, matching the masked
     lookup that :class:`VocabParallelEmbedding` performs before its all-reduce.
+
+    The dequant scale mirrors how the table was quantized, independent of
+    offloading. An offline FP8 checkpoint publishes one whole-table factor, so
+    ``ROW_SCALE`` is false and the scalar ``scale_value`` is used. A
+    compute-dtype checkpoint is quantized online, one row at a time, so
+    ``ROW_SCALE`` is true and each row's factor is read from ``scale_ptr`` at
+    its local id (folded row-0 for shard-masked rows is harmless: the output
+    is zeroed anyway). Either factor commutes with the all-reduce, so applying
+    it here -- before the reduce -- stays correct under tensor parallelism.
     """
 
     row = tl.program_id(0)
@@ -140,7 +151,10 @@ def _ple_host_gather_kernel(
         table + local_id * head_dim + offsets, mask=mask, other=0.0
     ).to(tl.float32)
     if HAS_SCALE:
-        values = values * tl.load(scale_ptr + local_id)
+        if ROW_SCALE:
+            values = values * tl.load(scale_ptr + local_id)
+        else:
+            values = values * scale_value
     tl.store(
         out_ptr + row * head_dim + offsets,
         tl.where(in_range, values, 0.0).to(out_dtype),
@@ -178,25 +192,38 @@ def materialize_ngram_table_on_host(embedding: VocabParallelEmbedding) -> None:
 def host_gather_ngram_rows(
     embedding: VocabParallelEmbedding,
     ids: torch.Tensor,
-    scales: torch.Tensor | None,
+    scale: float | None,
     out: torch.Tensor,
+    row_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Fill ``out`` with the ``ids`` rows of a host-resident n-gram table."""
+    """Fill ``out`` with the ``ids`` rows of a host-resident n-gram table.
+
+    The dequant factor follows the checkpoint format (see
+    :func:`_ple_host_gather_kernel`): ``row_scale`` is the device per-row buffer
+    for an online-quantized table, ``scale`` the per-tensor scalar for an
+    offline FP8 one, and both ``None`` for a compute-dtype table that needs
+    none.
+    """
 
     rows = ids.numel()
     if rows == 0:
         return out
     head_dim = out.shape[-1]
+    has_row = row_scale is not None
     _ple_host_gather_kernel[(rows,)](
         embedding.weight.data_ptr(),
         ids.reshape(-1),
-        scales,
+        float(scale) if scale is not None else 1.0,
+        # Unused when ROW_SCALE is false; ``out`` is a valid device pointer to
+        # keep triton's type inference happy without a throwaway allocation.
+        row_scale if has_row else out,
         out.view(rows, head_dim),
         head_dim,
         embedding.shard_indices.org_vocab_start_index,
         embedding.shard_indices.org_vocab_end_index,
         IS_FP8=embedding.weight.dtype == torch.float8_e4m3fn,
-        HAS_SCALE=scales is not None,
+        HAS_SCALE=has_row or scale is not None,
+        ROW_SCALE=has_row,
         BLOCK_D=triton.next_power_of_2(head_dim),
         # One row per program: a warp already covers a row's payload, so wider
         # blocks would only idle lanes on this latency-bound access pattern.
@@ -713,12 +740,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # Created on first use rather than here: a host table can be built on a
         # CUDA-less box, and only the prefetch path ever needs the stream.
         self._gather_stream: torch.cuda.Stream | None = None
-        if self.embed_store_dtype is not None:
+        if self.embed_store_dtype is not None and not self.offload_embedding:
             # Per-local-row dequant scales, written by the loader's online
             # quantization. Ones (not zeros / empty): rows gathered before the
             # checkpoint lands, or shard-masked rows folded to local row 0,
             # must stay finite. Non-persistent: derived from the bf16
             # checkpoint, never round-tripped.
+            #
+            # An offloaded table is not built with this buffer: the offline FP8
+            # checkpoint offloading targets carries a single per-tensor scale
+            # (kept in _checkpoint_weight_scale), so a per-row buffer would be
+            # ngram_vocab_size_base * 4 bytes of a repeated constant. A
+            # compute-dtype checkpoint under offload is still quantized online
+            # per row; the loader allocates this buffer lazily in that case.
             self.register_buffer(
                 "ngram_embedding_scale",
                 torch.ones(self.ngram_embedding.num_embeddings_per_partition),
@@ -743,13 +777,24 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         the per-head rows land contiguously, so the flatten that the device
         path applies afterwards is already implicit here, and the FP8 dequant
         happens inside the kernel instead of materializing an fp32 temporary.
+        The dequant factor follows the checkpoint format: a per-row device
+        buffer for an online-quantized table, the per-tensor scalar for an
+        offline FP8 one (see :meth:`__init__`), and none for a compute-dtype
+        table.
         """
 
+        row_scale = getattr(self, "ngram_embedding_scale", None)
+        scale = (
+            self._checkpoint_weight_scale
+            if row_scale is None and self.embed_store_dtype is not None
+            else None
+        )
         host_gather_ngram_rows(
             self.ngram_embedding,
             ids,
-            getattr(self, "ngram_embedding_scale", None),
+            scale,
             out.view(-1, self.head_dim),
+            row_scale=row_scale,
         )
         return out
 
