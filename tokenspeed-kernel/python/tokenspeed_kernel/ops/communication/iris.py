@@ -86,6 +86,24 @@ _PRODUCER_DIRECT_GL_DTYPES = {
     torch.float16: gl.float16,
     torch.float32: gl.float32,
 }
+_ONE_SHOT_DEFAULT_SCHEDULE = (2048, 4)
+_ONE_SHOT_GFX950_DECODE_SCHEDULE = (512, 1)
+_ONE_SHOT_GFX950_DECODE_NUMELS = frozenset((16 * 4096, 64 * 4096))
+
+
+def _one_shot_schedule(
+    numel: int,
+    world_size: int,
+    dtype: torch.dtype,
+) -> tuple[int, int]:
+    if (
+        _platform.is_cdna4
+        and world_size == 4
+        and dtype == torch.bfloat16
+        and numel in _ONE_SHOT_GFX950_DECODE_NUMELS
+    ):
+        return _ONE_SHOT_GFX950_DECODE_SCHEDULE
+    return _ONE_SHOT_DEFAULT_SCHEDULE
 
 
 def _use_two_stage_producer_direct(
@@ -401,8 +419,13 @@ class IrisAllReduce(object):
         self._producer_direct_output_buf = torch.empty(
             max_numel, dtype=dtype, device=self.device
         )
-        self._block_size = 2048
-        self._max_blocks = triton.cdiv(max_numel, self._block_size)
+        self._max_blocks = triton.cdiv(
+            max_numel,
+            min(
+                _ONE_SHOT_DEFAULT_SCHEDULE[0],
+                _ONE_SHOT_GFX950_DECODE_SCHEDULE[0],
+            ),
+        )
         self._ready_flags = self._ctx.zeros(
             (self._max_blocks, self.world_size), dtype=torch.int32
         )
@@ -458,7 +481,12 @@ class IrisAllReduce(object):
             f"tensor numel ({numel}) exceeds iris buffer capacity "
             f"({self.max_numel})"
         )
-        iris_stage_one_shot_allreduce_kernel[(triton.cdiv(numel, self._block_size),)](
+        block_size, num_warps = _one_shot_schedule(
+            numel,
+            self.world_size,
+            self.dtype,
+        )
+        iris_stage_one_shot_allreduce_kernel[(triton.cdiv(numel, block_size),)](
             tensor.view(-1),
             self._staged_input_buf.view(-1),
             tensor.view(-1),
@@ -467,10 +495,10 @@ class IrisAllReduce(object):
             numel,
             RANK=self._iris_rank,
             WORLD_SIZE=self.world_size,
-            BLOCK_SIZE=self._block_size,
+            BLOCK_SIZE=block_size,
             SLOT_STRIDE=self.max_numel,
             NUM_SLOTS=_STAGED_SLOTS,
-            num_warps=4,
+            num_warps=num_warps,
         )
 
         return tensor.clone() if safe else tensor

@@ -233,6 +233,10 @@ def _ar_shape_cases() -> List[Tuple[int, ...]]:
     ]
 
 
+def _ar_graph_shape_cases() -> List[Tuple[int, ...]]:
+    return [(16, 4096), (64, 4096)]
+
+
 def _ar_output_shape_cases() -> List[Tuple[Tuple[int, ...], ...]]:
     """Producer-direct collections spanning one, two, and three outputs."""
     return [
@@ -276,6 +280,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         output_shape_cases = _ar_output_shape_cases()
         max_numel = max(
             max(int(torch.tensor(s).prod()) for s in _ar_shape_cases()),
+            max(int(torch.tensor(s).prod()) for s in _ar_graph_shape_cases()),
             max(
                 sum(int(torch.tensor(shape).prod()) for shape in shapes)
                 for shapes in output_shape_cases
@@ -289,6 +294,15 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         )
         for shape in _ar_shape_cases():
             _check_all_reduce(state, rank, world_size, shape, device)
+        if world_size == 4:
+            for shape in _ar_graph_shape_cases():
+                _check_all_reduce_graph_replay(
+                    state,
+                    rank,
+                    world_size,
+                    shape,
+                    device,
+                )
         for shapes in output_shape_cases:
             _check_all_reduce_symmetric_outputs(
                 state,
@@ -363,6 +377,47 @@ def _check_all_reduce(state, rank: int, world_size: int, shape, device) -> None:
         result.shape == expected.shape
     ), f"shape mismatch: {result.shape} vs {expected.shape}"
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
+def _check_all_reduce_graph_replay(
+    state,
+    rank: int,
+    world_size: int,
+    shape,
+    device,
+) -> None:
+    from tokenspeed_kernel.ops.communication.iris import iris_all_reduce
+
+    local = torch.full(shape, rank + 1, dtype=torch.bfloat16, device=device)
+    result = iris_all_reduce(state, local, safe=False)
+    expected_value = world_size * (world_size + 1) // 2
+    torch.testing.assert_close(
+        result,
+        torch.full_like(result, expected_value),
+        atol=0,
+        rtol=0,
+    )
+
+    local.fill_(rank + 1)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_result = iris_all_reduce(state, local, safe=False)
+
+    for replay_index in range(1, 5):
+        scale = replay_index + 1
+        local.fill_(scale * (rank + 1))
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            graph_result,
+            torch.full_like(graph_result, scale * expected_value),
+            atol=0,
+            rtol=0,
+        )
 
 
 def _check_all_reduce_symmetric_outputs(
