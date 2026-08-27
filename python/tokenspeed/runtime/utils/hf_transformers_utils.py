@@ -60,6 +60,8 @@ from tokenspeed.runtime.configs import (
     Qwen3ASRConfig,
     Qwen3Config,
     Qwen3MoeConfig,
+    Qwen4ExpConfig,
+    Qwen4ExpTextConfig,
 )
 from tokenspeed.runtime.utils import lru_cache_frozenset
 
@@ -75,6 +77,8 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     Qwen3_5Config.model_type: Qwen3_5Config,
     Qwen3_5MoeConfig.model_type: Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig.model_type: Qwen3_5MoeTextConfig,
+    Qwen4ExpConfig.model_type: Qwen4ExpConfig,
+    Qwen4ExpTextConfig.model_type: Qwen4ExpTextConfig,
     MiniMaxM2Config.model_type: MiniMaxM2Config,
     MiniMaxM3Config.model_type: MiniMaxM3Config,
     KimiK2Config.model_type: KimiK2Config,
@@ -382,7 +386,19 @@ def get_config(
     if (
         is_draft_worker
         and config.architectures
+        and config.architectures[0]
+        in ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
+    ):
+        config.architectures[0] = "Qwen4ExpForCausalLMNextN"
+        text_config.num_hidden_layers = 1
+        text_config.layer_types = ["full_attention"]
+        text_config.ple_layer_ids = []
+
+    if (
+        is_draft_worker
+        and config.architectures
         and "NextN" not in config.architectures[0]
+        and "MTP" not in config.architectures[0]
         and "Eagle" not in config.architectures[0]
         and "DFlash" not in config.architectures[0]
         and "DSpark" not in config.architectures[0]
@@ -414,6 +430,9 @@ def get_config(
         "Qwen3_5MoeConfig",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5ForConditionalGenerationNextN",
+        "Qwen4ExpForConditionalGeneration",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForCausalLMNextN",
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationNextN",
         "InklingMMConfig",
@@ -423,6 +442,8 @@ def get_config(
         "Qwen3ASRConfig",
         "MiniMaxM3SparseForConditionalGeneration",
     ]:
+        if config is text_config:
+            return config
         config.text_config = text_config
         return config
 

@@ -55,6 +55,7 @@ def _layer_norm_fwd_1pass_kernel(
     HAS_Z: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
+    SIGMOID_GATE: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
     row = tl.program_id(0)
@@ -74,7 +75,7 @@ def _layer_norm_fwd_1pass_kernel(
     x = tl.load(X + cols, mask=cols < N, other=0.0).to(tl.float32)
     if HAS_Z and not NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=cols < N).to(tl.float32)
-        x *= z * tl.sigmoid(z)
+        x *= tl.sigmoid(z) if SIGMOID_GATE else z * tl.sigmoid(z)
     if not IS_RMS_NORM:
         mean = tl.sum(x, axis=0) / N
         tl.store(Mean + row, mean)
@@ -94,7 +95,7 @@ def _layer_norm_fwd_1pass_kernel(
     y = x_hat * w + b if HAS_BIAS else x_hat * w
     if HAS_Z and NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=mask).to(tl.float32)
-        y *= z * tl.sigmoid(z)
+        y *= tl.sigmoid(z) if SIGMOID_GATE else z * tl.sigmoid(z)
     # Write output
     tl.store(Y + cols, y, mask=mask)
 
@@ -109,6 +110,7 @@ def _layer_norm_fwd(
     group_size=None,
     norm_before_gate=True,
     is_rms_norm=False,
+    sigmoid_gate=False,
 ):
     M, N = x.shape
     if group_size is None:
@@ -162,6 +164,7 @@ def _layer_norm_fwd(
             BLOCK_N=BLOCK_N,
             NORM_BEFORE_GATE=norm_before_gate,
             IS_RMS_NORM=is_rms_norm,
+            SIGMOID_GATE=sigmoid_gate,
             num_warps=num_warps,
         )
     return out, mean, rstd
@@ -180,8 +183,10 @@ class LayerNormFn(torch.autograd.Function):
         group_size=None,
         norm_before_gate=True,
         is_rms_norm=False,
+        sigmoid_gate=False,
     ):
-        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else
+        norm(x * silu(z)); ``sigmoid_gate`` swaps silu(z) for sigmoid(z)."""
 
         x_shape_og = x.shape
         # reshape input data into 2D tensor
@@ -205,15 +210,23 @@ class LayerNormFn(torch.autograd.Function):
             group_size=group_size,
             norm_before_gate=norm_before_gate,
             is_rms_norm=is_rms_norm,
+            sigmoid_gate=sigmoid_gate,
         )
         return y.reshape(x_shape_og)
 
 
 def rmsnorm_fn(
-    x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True
+    x,
+    weight,
+    bias,
+    z=None,
+    eps=1e-6,
+    group_size=None,
+    norm_before_gate=True,
+    sigmoid_gate=False,
 ):
     return LayerNormFn.apply(
-        x, weight, bias, z, eps, group_size, norm_before_gate, True
+        x, weight, bias, z, eps, group_size, norm_before_gate, True, sigmoid_gate
     )
 
 
@@ -227,6 +240,7 @@ class RMSNorm(torch.nn.Module):
         norm_before_gate=True,
         device=None,
         dtype=None,
+        sigmoid_gate=False,
     ):
         """If group_size is not None, we do GroupNorm with each group having group_size elements.
         group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
@@ -238,13 +252,15 @@ class RMSNorm(torch.nn.Module):
         self.register_parameter("bias", None)
         self.group_size = group_size
         self.norm_before_gate = norm_before_gate
+        self.sigmoid_gate = sigmoid_gate
         self.reset_parameters()
 
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)
 
     def forward(self, x, z=None):
-        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else
+        norm(x * silu(z)); ``sigmoid_gate`` swaps silu(z) for sigmoid(z)."""
         return rmsnorm_fn(
             x,
             self.weight,
@@ -253,4 +269,5 @@ class RMSNorm(torch.nn.Module):
             eps=self.eps,
             group_size=self.group_size,
             norm_before_gate=self.norm_before_gate,
+            sigmoid_gate=self.sigmoid_gate,
         )

@@ -41,6 +41,7 @@ from tokenspeed.runtime.layers.rotary_embedding import MRotaryEmbedding
 # (vision_config.spatial_merge_size, image/video/vision_start token ids, etc.).
 _MROPE_ARCHITECTURES = {
     "Qwen3_5ForConditionalGeneration",
+    "Qwen4ExpForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
 }
@@ -247,7 +248,7 @@ def compute_mrope_positions(hf_config, input_ids, mm_items):
         return _compute_qwen3_omni_mrope_positions(hf_config, input_ids, mm_items)
 
     model_type = getattr(hf_config, "model_type", None)
-    if model_type in ("qwen3_5", "qwen3_5_moe"):
+    if model_type in ("qwen3_5", "qwen3_5_moe", "qwen4_exp"):
         fast = _compute_qwen35_mrope_positions_from_offsets(
             hf_config,
             input_ids,
@@ -271,7 +272,11 @@ def compute_mrope_positions(hf_config, input_ids, mm_items):
     # The vision encoder still consumes the original grid [T, H, W], but the
     # text prompt contains T separate <|video_pad|> runs. Split only the RoPE
     # grid to match HuggingFace's Qwen3.5 get_rope_index behavior.
-    if video_grid_thw is not None and model_type in ("qwen3_5", "qwen3_5_moe"):
+    if video_grid_thw is not None and model_type in (
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen4_exp",
+    ):
         video_grid_thw = torch.repeat_interleave(
             video_grid_thw, video_grid_thw[:, 0].to(torch.long), dim=0
         )

@@ -156,6 +156,57 @@ def test_plain_allreduce_matches_nccl(token_num):
     torch.testing.assert_close(out.float(), ref, atol=3e-2, rtol=3e-2)
 
 
+@pytest.mark.parametrize("token_num", [8, 147, 288, 576])
+def test_trtllm_workspace_allreduce(token_num):
+    """The backend-facing plain AR serves the workspace's full token range.
+
+    8 tokens rides the one-shot window; the larger counts land past it,
+    where the previous behavior was a NCCL ring fallback, and resolve to
+    two-shot inside the same workspace.
+    """
+    from tokenspeed_kernel.ops.communication.trtllm import (
+        ensure_workspace_initialized,
+        trtllm_workspace_allreduce,
+    )
+
+    rank, dev = _setup()
+    try:
+        armed = ensure_workspace_initialized(
+            rank=rank, group=dist.group.WORLD, max_token_num=2048, hidden_dim=H
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"trtllm fusion workspace unavailable: {exc}")
+    if not armed:
+        pytest.skip("trtllm fusion workspace unavailable")
+    torch.manual_seed(300 + rank)
+    x = (torch.randn(token_num, H, dtype=torch.bfloat16, device=dev) * 0.1).contiguous()
+    out = trtllm_workspace_allreduce(x, dist.group.WORLD)
+    if out is None:
+        pytest.skip("no armed workspace serves this shape on this fabric")
+    torch.cuda.synchronize()
+    assert out.shape == x.shape and out.dtype == x.dtype
+    ref = x.float().clone()
+    dist.all_reduce(ref)
+    torch.testing.assert_close(out.float(), ref, atol=3e-2, rtol=3e-2)
+
+    from tokenspeed_kernel.ops.communication import trtllm as comm
+
+    cap = comm._manager_for_group(dist.group.WORLD).max_token_num
+    oversized = torch.randn(cap + 1, H, dtype=torch.bfloat16, device=dev)
+    assert trtllm_workspace_allreduce(oversized, dist.group.WORLD) is None
+
+    # Non-contiguous input is served through a contiguous copy, never mutated.
+    strided = torch.randn(token_num, 2 * H, dtype=torch.bfloat16, device=dev)[:, ::2]
+    keep = strided.clone()
+    out_nc = trtllm_workspace_allreduce(strided, dist.group.WORLD)
+    assert out_nc is not None
+    torch.cuda.synchronize()
+    torch.testing.assert_close(strided, keep, atol=0, rtol=0)
+    ref_nc = strided.float().clone()
+    dist.all_reduce(ref_nc)
+    torch.testing.assert_close(out_nc.float(), ref_nc, atol=3e-2, rtol=3e-2)
+
+
 @pytest.mark.parametrize("token_num", [1, 8])
 def test_residual_rmsnorm_matches_ipc_backend(token_num):
     from tokenspeed_kernel.thirdparty.cuda.trtllm import AllReduceFusionPattern
@@ -342,7 +393,7 @@ def test_rmsnorm_family_unfused_fallback():
     assert comm.ensure_workspace_initialized(
         rank=rank, group=pg, max_token_num=MAXTOK, hidden_dim=H
     )
-    mgr = comm._workspace_manager
+    mgr = comm._manager_for_group(pg)
 
     token_num = 6
     torch.manual_seed(9_000 + rank)
@@ -392,3 +443,177 @@ def test_rmsnorm_family_unfused_fallback():
     g = [torch.empty_like(norm_out) for _ in range(world)]
     dist.all_gather(g, norm_out)
     assert all(torch.equal(g[0], gi) for gi in g)
+
+
+def test_rsag_serve_and_sentinel_guard():
+    """RS/AG wrappers serve matched-width payloads and raise on a mismatch.
+
+    Runs on a [0, 1] subgroup so its sticky fp32 flip cannot poison the
+    WORLD workspace the other tests share. The workspace registry keys on
+    the global rank tuple, so at world size 2 the subgroup IS the WORLD
+    entry -- skip there.
+    """
+    from tokenspeed_kernel.ops.communication import trtllm as comm
+
+    rank, dev = _setup()
+    if dist.get_world_size() < 4:
+        pytest.skip("needs a world larger than the [0, 1] subgroup")
+    sub = dist.new_group(ranks=[0, 1])
+    try:
+        if rank <= 1:
+            _rsag_body(comm, sub, dist.get_rank(group=sub), dev)
+    finally:
+        try:
+            if rank <= 1:
+                # The sticky fp32 flip would poison the (0, 1) registry entry
+                # for any later use of that rank tuple in this process.
+                comm._manager_for_group(sub).cleanup()
+        finally:
+            dist.barrier()
+
+
+def _rsag_body(comm, sub, grank, dev):
+    hid, maxtok, eps, world = 1024, 32, 1e-6, 2
+    try:
+        armed = comm.ensure_workspace_initialized(
+            rank=grank, group=sub, max_token_num=maxtok, hidden_dim=hid
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"trtllm fusion workspace unavailable: {exc}")
+    if not armed:
+        pytest.skip("trtllm fusion workspace unavailable")
+    manager = comm._manager_for_group(sub)
+    if manager.workspace_tensor is None:
+        pytest.skip("no IPC lamport workspace on this group")
+
+    def _rmsnorm(x32, w):
+        return x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps) * w.float()
+
+    # Odd token count so the front-loaded remainder branch is exercised.
+    tok = 9
+    tpr, remaining = tok // world, tok % world
+    my_count = tpr + (1 if grank < remaining else 0)
+    my_off = grank * tpr + min(grank, remaining)
+    torch.manual_seed(500 + grank)
+    x = (torch.randn(tok, hid, dtype=torch.bfloat16, device=dev) * 0.1).contiguous()
+    res = (
+        torch.randn(my_count, hid, dtype=torch.bfloat16, device=dev) * 0.1
+    ).contiguous()
+    w = torch.randn(hid, dtype=torch.bfloat16, device=dev).abs().contiguous()
+    dist.broadcast(w, src=0, group=sub)
+    parts = [torch.empty_like(x) for _ in range(world)]
+    dist.all_gather(parts, x, group=sub)
+    ref_resid = torch.stack(parts).float().sum(0)[my_off : my_off + my_count]
+    ref_resid = ref_resid + res.float()
+    ref_norm = _rmsnorm(ref_resid, w)
+    # use_oneshot pinned: the upstream two-shot RS back-loads the remainder.
+    n_out, r_out, _ = comm.reducescatter_residual_rmsnorm(
+        input_tensor=x.clone(),
+        residual=res.clone(),
+        weight=w,
+        rank=grank,
+        group=sub,
+        eps=eps,
+        max_token_num=maxtok,
+        use_oneshot=True,
+    )
+
+    ql, kvl = 512, 256
+    ntok_cur = 4
+    total = ntok_cur * world
+    qkv = (
+        torch.randn(ntok_cur, hid, dtype=torch.bfloat16, device=dev) * 0.1
+    ).contiguous()
+    wq = torch.nn.Parameter(
+        torch.randn(ql, dtype=torch.bfloat16, device=dev).abs().contiguous(),
+        requires_grad=False,
+    )
+    wkv = torch.nn.Parameter(
+        torch.randn(kvl, dtype=torch.bfloat16, device=dev).abs().contiguous(),
+        requires_grad=False,
+    )
+    dist.broadcast(wq.data, src=0, group=sub)
+    dist.broadcast(wkv.data, src=0, group=sub)
+    gparts = [torch.empty_like(qkv) for _ in range(world)]
+    dist.all_gather(gparts, qkv, group=sub)
+    gathered = torch.cat(gparts, dim=0).float()
+    ref_q = _rmsnorm(gathered[:, :ql], wq.data)
+    ref_kv = _rmsnorm(gathered[:, ql : ql + kvl], wkv.data)
+    ag_out, qn, kvn, _ = comm.allgather_dual_rmsnorm(
+        qkv=qkv.clone(),
+        total_num_tokens=total,
+        weight_q_a=wq,
+        weight_kv_a=wkv,
+        rank=grank,
+        group=sub,
+        eps_q=eps,
+        eps_kv=eps,
+        max_token_num=maxtok,
+    )
+    # Asserts only after every subgroup collective, and on subgroup-MAX
+    # errors, so a one-rank numeric failure cannot desync a peer inside a
+    # later collective (NCCL-watchdog hang instead of a clean FAIL).
+    # Thresholds join the reduce: ref_norm is a per-rank slice, so its scale
+    # is rank-varying; ref_q/ref_kv follow for uniformity.
+    errs = torch.tensor(
+        [
+            (r_out.float() - ref_resid).abs().max().item(),
+            (n_out.float() - ref_norm).abs().max().item(),
+            (qn.float() - ref_q).abs().max().item(),
+            (kvn.float() - ref_kv).abs().max().item(),
+            (ag_out[:, ql + kvl :].float() - gathered[:, ql + kvl :])
+            .abs()
+            .max()
+            .item(),
+            ref_norm.abs().max().item(),
+            ref_q.abs().max().item(),
+            ref_kv.abs().max().item(),
+        ],
+        device=dev,
+    )
+    dist.all_reduce(errs, op=dist.ReduceOp.MAX, group=sub)
+    scale = errs[5].item() or 1.0
+    sq = errs[6].item() or 1.0
+    skv = errs[7].item() or 1.0
+    assert errs[0].item() <= 5e-2, f"RS residual: {errs[0].item():.4g}"
+    assert errs[1].item() <= 0.03 * scale + 0.02, f"RS norm: {errs[1].item():.4g}"
+    assert errs[2].item() <= 0.03 * sq + 0.02, f"AG q: {errs[2].item():.4g}"
+    assert errs[3].item() <= 0.03 * skv + 0.02, f"AG kv: {errs[3].item():.4g}"
+    assert errs[4].item() <= 5e-2, f"AG rope passthrough: {errs[4].item():.4g}"
+
+    # Sticky fp32 flip; 16-bit payloads must now be refused loudly, pre-FFI.
+    assert comm.ensure_workspace_initialized(
+        rank=grank,
+        group=sub,
+        max_token_num=maxtok,
+        hidden_dim=hid,
+        use_fp32_lamport=True,
+    )
+    assert manager.use_fp32_lamport is True
+    ws_before = manager.workspace_tensor
+    with pytest.raises(RuntimeError, match="payload width does not match"):
+        comm.reducescatter_residual_rmsnorm(
+            input_tensor=x.clone(),
+            residual=res.clone(),
+            weight=w,
+            rank=grank,
+            group=sub,
+            eps=eps,
+            max_token_num=maxtok,
+            use_oneshot=True,
+        )
+    with pytest.raises(RuntimeError, match="payload width does not match"):
+        comm.allgather_dual_rmsnorm(
+            qkv=qkv.clone(),
+            total_num_tokens=total,
+            weight_q_a=wq,
+            weight_kv_a=wkv,
+            rank=grank,
+            group=sub,
+            eps_q=eps,
+            eps_kv=eps,
+            max_token_num=maxtok,
+        )
+    # Refusals must not mutate the armed workspace.
+    assert manager.initialized and manager.use_fp32_lamport is True
+    assert manager.workspace_tensor is ws_before

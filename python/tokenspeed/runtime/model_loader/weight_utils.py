@@ -55,6 +55,8 @@ from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
+_AUXILIARY_SAFETENSORS_FILES = {"input_scales.safetensors"}
+
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
 # lock files in the temp directory will be automatically deleted when the
@@ -267,8 +269,16 @@ def filter_duplicate_safetensors_files(
     weight_files_in_index = set()
     for weight_name in weight_map:
         weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
-    # Filter out any fields that are not found in the index file.
-    hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
+    # ModelOpt may store activation scales in a standalone safetensors file
+    # that is intentionally absent from the model weight index. It is not a
+    # duplicate checkpoint, and dropping it leaves NVFP4 input scales
+    # uninitialized. Preserve known auxiliary files alongside indexed shards.
+    hf_weights_files = [
+        file_path
+        for file_path in hf_weights_files
+        if file_path in weight_files_in_index
+        or os.path.basename(file_path) in _AUXILIARY_SAFETENSORS_FILES
+    ]
     return hf_weights_files
 
 

@@ -74,7 +74,7 @@ class ForwardContext:
     # accept_lengths: per-request accepted verify width for cache_seqlens correction.
     accept_lengths: torch.Tensor | None = None
 
-    # DSA sparse top-k shared across layers and draft steps.
+    # Sparse-attention top-k shared across layers and draft steps (DSA/QSA).
     dsa_prefill_topk: Any | None = None
     dsa_decode_topk: Any | None = None
 

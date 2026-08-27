@@ -20,17 +20,36 @@
 
 from __future__ import annotations
 
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.attention.triton.dsa  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.dsa_topk  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.dsv4  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.gated_delta_rule  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.kda_dispatch  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.merge_state  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mha_decode  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mha_prefill  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.minimax_sparse_attention  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mla_decode  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mla_prefill  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.rel_mha  # noqa: F401
+import pytest
+import torch
+
+from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="FP8 embedding lookup requires CUDA"
+)
+def test_fp8_tp_lookup_masks_remote_rows() -> None:
+    embedding = VocabParallelEmbedding(
+        num_embeddings=128,
+        embedding_dim=4,
+        params_dtype=torch.float8_e4m3fn,
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    ).cuda()
+    embedding.weight.data.copy_(
+        torch.arange(64 * 4, device="cuda", dtype=torch.float32)
+        .reshape(64, 4)
+        .remainder(32)
+        .to(torch.float8_e4m3fn)
+    )
+    token_ids = torch.tensor([0, 63, 64, 127], device="cuda")
+
+    output = embedding(token_ids, reduce_results=False)
+
+    assert output.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(output[:2].float(), embedding.weight[[0, 63]].float())
+    assert torch.count_nonzero(output[2:].float()) == 0

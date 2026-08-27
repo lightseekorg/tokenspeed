@@ -28,6 +28,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (  # noqa: E402
     break_here,
     break_point,
     current_forward_ctx,
+    current_valid_rows,
     is_breakable_capture_active,
     scrub_padding_tail,
     slice_to_real_tokens,
@@ -129,6 +130,42 @@ class TestBreakableCudaGraph(unittest.TestCase):
 
         expected = torch.zeros_like(captured_out)
         expected[:1] = (new_x @ self.w1)[:1] @ self.w2
+        torch.testing.assert_close(captured_out, expected, rtol=1e-4, atol=1e-4)
+
+    def test_break_body_reads_the_replay_valid_row_count(self):
+        """A break narrows its own padded input from ``current_valid_rows``."""
+        seen = []
+
+        class SlicingOp:
+            @break_point
+            def forward(self, x):
+                rows = current_valid_rows()
+                seen.append(rows)
+                (x,) = slice_to_real_tokens(x.shape[0] if rows is None else rows, x)
+                return x * 2
+
+        op = SlicingOp()
+
+        def forward():
+            return op.forward(self.x_static @ self.w1) @ self.w2
+
+        for _ in range(3):
+            forward()
+        torch.cuda.synchronize()
+        seen.clear()
+        cap = BreakableCapture()
+        with cap:
+            captured_out = forward()
+
+        new_x = torch.randn(self.n, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static.copy_(new_x)
+        cap.replay(valid_rows=1)
+        torch.cuda.synchronize()
+
+        assert seen == [None, 1]
+        assert current_valid_rows() is None
+        expected = torch.zeros_like(captured_out)
+        expected[:1] = ((new_x @ self.w1)[:1] * 2) @ self.w2
         torch.testing.assert_close(captured_out, expected, rtol=1e-4, atol=1e-4)
 
     def test_multiple_breaks_chain(self):

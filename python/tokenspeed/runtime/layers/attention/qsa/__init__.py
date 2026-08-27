@@ -18,19 +18,26 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
+"""Qwen sparse-attention (QSA) indexer and cache identifiers."""
 
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.attention.triton.dsa  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.dsa_topk  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.dsv4  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.gated_delta_rule  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.kda_dispatch  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.merge_state  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mha_decode  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mha_prefill  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.minimax_sparse_attention  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mla_decode  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mla_prefill  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.qwen4_exp_qsa  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.rel_mha  # noqa: F401
+from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
+    QWEN4_EXP_QSA_CACHE_GROUP,
+    QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE,
+    QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
+    QWEN4_EXP_QSA_RECENT_ROWS_PER_PAGE,
+    qsa_compressed_field,
+    qsa_raw_key_field,
+    qsa_rope_position_field,
+)
+from tokenspeed.runtime.layers.attention.qsa.indexer import QSAIndexer
+
+__all__ = [
+    "QWEN4_EXP_QSA_CACHE_GROUP",
+    "QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE",
+    "QWEN4_EXP_QSA_RECENT_CACHE_GROUP",
+    "QWEN4_EXP_QSA_RECENT_ROWS_PER_PAGE",
+    "QSAIndexer",
+    "qsa_compressed_field",
+    "qsa_raw_key_field",
+    "qsa_rope_position_field",
+]

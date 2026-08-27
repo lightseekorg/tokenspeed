@@ -190,6 +190,9 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.mapping = mapping
+        self.index_share_for_mtp_iteration = bool(
+            getattr(config, "index_share_for_mtp_iteration", False)
+        )
 
         if quant_config is not None and quant_config.get_name() == "nvfp4":
             quant_config = None

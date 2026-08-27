@@ -471,7 +471,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads % self.num_k_heads == 0:
+        if self.num_v_heads % self.num_k_heads == 0 and not getattr(
+            self, "requires_qkvz_reordering", False
+        ):
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                 projected_states_qkvz,
                 projected_states_ba,
