@@ -676,7 +676,22 @@ def _copy_ple_shard(
         # _load_ple_weight_scale independently of checkpoint weight ordering.
         if target_is_fp8 and not source_is_fp8:
             if scale_buffer is None:
-                raise RuntimeError("FP8 PLE embedding is missing its scale buffer")
+                if not ple_embedding.offload_embedding:
+                    raise RuntimeError(
+                        "FP8 PLE embedding is missing its scale buffer"
+                    )
+                # A compute-dtype checkpoint under offload is quantized online,
+                # one streamed shard at a time, and its FP8 payload lands on the
+                # host table. The offline FP8 path offloading targets carries
+                # only a per-tensor scale, so the per-row buffer is not built at
+                # construction; allocate it lazily here, on the device the
+                # gather reads scales from.
+                scale_buffer = torch.ones(
+                    embedding.num_embeddings_per_partition, device="cuda"
+                )
+                ple_embedding.register_buffer(
+                    "ngram_embedding_scale", scale_buffer, persistent=False
+                )
             # Quantize compute-dtype checkpoint rows for FP8 storage and retain
             # their independently derived dequant scales.
             source_rows, scale = quantize_ple_embedding_rows(source_rows)
@@ -722,6 +737,11 @@ def _load_ple_weight_scale(
         # The checkpoint scale is shared by every pre-quantized row, so one
         # fill handles both scale-before-shards and scale-after-shards order.
         scale_buffer.fill_(scale)
+    elif ple_embedding.embed_store_dtype is not None:
+        # Offloaded FP8: the payload stays FP8 on the host and this per-tensor
+        # scalar is applied by the gather kernel, so there is no per-row buffer
+        # to fill and no payload to rescale -- recording it below is enough.
+        pass
     else:
         # Compute-dtype target: rescale any raw FP8 rows copied before the
         # scale tensor. Future shard copies multiply by the new value.
