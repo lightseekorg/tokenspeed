@@ -1821,7 +1821,7 @@ class KimiLinearMoE(nn.Module):
             max_num_tokens_per_gpu = num_global_tokens
 
         if self.native_latent_moe is not None:
-            if self._use_fused_decode_pipeline and hidden_states.shape[0] <= 4:
+            if self._use_fused_decode_pipeline and 0 < hidden_states.shape[0] <= 4:
                 output = self._forward_fused_decode_pipeline(hidden_states, prefix_sum)
             else:
                 output = self.native_latent_moe(

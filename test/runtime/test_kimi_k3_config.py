@@ -559,6 +559,40 @@ class KimiK3RegistrationTests(unittest.TestCase):
             routed_input + 1,
         )
 
+    def test_native_kimi_moe_zero_tokens_bypass_fused_pipeline(self):
+        from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
+
+        hidden_states = torch.empty(0, 64)
+        prefix_sum = torch.empty_like(hidden_states)
+        native_latent_moe = mock.Mock(return_value=prefix_sum)
+        fused_pipeline = mock.Mock(
+            side_effect=AssertionError("zero tokens must bypass the fused pipeline")
+        )
+        layer = SimpleNamespace(
+            _gather_dp_tokens_for_moe=False,
+            native_latent_moe=native_latent_moe,
+            _use_fused_decode_pipeline=True,
+            _forward_fused_decode_pipeline=fused_pipeline,
+        )
+
+        output = KimiLinearMoE.forward(
+            layer,
+            hidden_states,
+            prefix_sum,
+            num_global_tokens=0,
+            max_num_tokens_per_gpu=0,
+        )
+
+        torch.testing.assert_close(output, prefix_sum)
+        self.assertEqual(tuple(output.shape), (0, 64))
+        fused_pipeline.assert_not_called()
+        native_latent_moe.assert_called_once_with(
+            hidden_states,
+            num_global_tokens=0,
+            max_num_tokens_per_gpu=0,
+            prefix_sum=prefix_sum,
+        )
+
     def test_cross_dp_ep_gather_uses_dp_group_and_returns_local_offset(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
 

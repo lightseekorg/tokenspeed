@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from unittest import mock
+
 import pytest
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as gluon_sigmoid_topk
 import torch
@@ -126,6 +128,43 @@ def test_public_sigmoid_bias_topk_uses_per_token_float32_route(
         16,
         routed_scaling_factor=2.827,
         normalize_topk_weights=True,
+    )
+
+    assert actual_weights is sentinel_weights
+    assert actual_ids is sentinel_ids
+
+
+def test_public_sigmoid_bias_topk_retains_decode_route_above_prefill_topk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logits = torch.zeros((2, 64), device="cuda", dtype=torch.float32)
+    correction_bias = torch.zeros(64, device="cuda", dtype=torch.float32)
+    sentinel_ids = torch.empty((2, 32), device="cuda", dtype=torch.int32)
+    sentinel_weights = torch.empty((2, 32), device="cuda", dtype=torch.float32)
+
+    def launch(route_input, bias, topk, **kwargs):
+        assert route_input is logits
+        assert bias is correction_bias
+        assert topk == 32
+        return sentinel_ids, sentinel_weights
+
+    monkeypatch.setattr(
+        gluon_sigmoid_topk,
+        "invoke_sigmoid_bias_topk_route_gluon",
+        launch,
+    )
+    monkeypatch.setattr(
+        gluon_sigmoid_topk,
+        "invoke_sigmoid_bias_topk_route_prefill_gluon",
+        mock.Mock(side_effect=AssertionError("top-k 32 must use the decode route")),
+    )
+    actual_weights, actual_ids = moe_sigmoid_bias_topk(
+        logits,
+        correction_bias,
+        32,
+        routed_scaling_factor=2.827,
+        normalize_topk_weights=True,
+        solution="gluon",
     )
 
     assert actual_weights is sentinel_weights
