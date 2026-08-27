@@ -10,6 +10,47 @@ _worker_descendants() {
   done < <(pgrep -P "$parent" 2>/dev/null || true)
 }
 
+# True only for a running process. `kill -0` succeeds on zombies, which made
+# wait_serving hang for the full startup timeout after a worker crashed on
+# bind (the parent had not wait(2)ed yet).
+pid_is_live() {
+  local pid=$1
+  local state
+  [[ -n "$pid" && -d "/proc/$pid" ]] || return 1
+  state=$(awk '/^State:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null) || return 1
+  [[ "$state" != "Z" ]]
+}
+
+_listen_pids() {
+  local port=$1
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true
+  elif command -v fuser >/dev/null 2>&1; then
+    fuser -n tcp "$port" 2>/dev/null || true
+  fi
+}
+
+# Drop leftover LISTEN sockets from a previous EPD/PD job on this runner.
+free_listen_ports() {
+  local label=$1
+  shift
+  local port pids
+  for port in "$@"; do
+    [[ -n "$port" ]] || continue
+    pids=$(_listen_pids "$port")
+    [[ -n "$pids" ]] || continue
+    echo "[$label] killing stale listener(s) on port $port: $pids"
+    # shellcheck disable=SC2086
+    kill -TERM $pids 2>/dev/null || true
+    sleep 1
+    pids=$(_listen_pids "$port")
+    if [[ -n "$pids" ]]; then
+      # shellcheck disable=SC2086
+      kill -KILL $pids 2>/dev/null || true
+    fi
+  done
+}
+
 stop_worker_pids() {
   local label=$1
   local timeout=$2
@@ -28,7 +69,7 @@ stop_worker_pids() {
   while ((SECONDS < deadline)); do
     alive=()
     for pid in "${worker_pids[@]}"; do
-      kill -0 "$pid" 2>/dev/null && alive+=("$pid")
+      pid_is_live "$pid" && alive+=("$pid")
     done
     ((${#alive[@]})) || break
     sleep 1
@@ -36,7 +77,7 @@ stop_worker_pids() {
 
   alive=()
   for pid in "${worker_pids[@]}"; do
-    kill -0 "$pid" 2>/dev/null && alive+=("$pid")
+    pid_is_live "$pid" && alive+=("$pid")
   done
   if ((${#alive[@]})); then
     echo "[$label] forcing ${#alive[@]} processes to stop after ${timeout}s"

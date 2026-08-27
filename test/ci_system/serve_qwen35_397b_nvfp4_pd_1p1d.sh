@@ -85,6 +85,10 @@ echo "[pd-1p1d] model=$MODEL served_model_name=$SERVED_MODEL_NAME model_path=$MO
 echo "[pd-1p1d] prefill=${PREFILL_GPUS}/${PREFILL_PORT}/${PREFILL_BOOTSTRAP_PORT}/${PREFILL_DIST_INIT_ADDR} decode=${DECODE_GPUS}/${DECODE_PORT}/${DECODE_DIST_INIT_ADDR} lb=${LB_HOST}:${LB_PORT}"
 echo "[pd-1p1d] world_size=$WORLD_SIZE enable_mtp=$ENABLE_MTP moe_backend=$MOE_BACKEND attention_backend=$ATTENTION_BACKEND"
 
+free_listen_ports "pd-1p1d" \
+  "$PREFILL_PORT" "$DECODE_PORT" "$PREFILL_BOOTSTRAP_PORT" \
+  "$LB_PORT" "$PROMETHEUS_PORT"
+
 pids=()
 cleanup() {
   local code=$?
@@ -121,7 +125,8 @@ wait_serving() {
   local start
   start=$(date +%s)
   until grep -q "health status -> SERVING" "$log" 2>/dev/null; do
-    if ! kill -0 "$pid" 2>/dev/null; then
+    if ! pid_is_live "$pid"; then
+      wait "$pid" 2>/dev/null || true
       echo "[pd-1p1d] $role exited before reaching SERVING (log=$log)" >&2
       tail -n 200 "$log" >&2 || true
       return 1
