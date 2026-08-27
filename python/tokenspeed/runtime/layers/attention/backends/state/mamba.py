@@ -319,6 +319,7 @@ class MambaAttnBackend(AttentionBackend):
     # The hybrid wrapper unions the sub-backends' declarations, so a Kimi-K3
     # contract (history + state) is covered once both consumers exist.
     cache_consumer_families = frozenset({"state"})
+    _verify_reads_committed_recurrent_state: bool = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig):
         super().__init__(config, spec)
@@ -684,7 +685,7 @@ class MambaAttnBackend(AttentionBackend):
             src_row_strides=tables["conv_comp_stride"],
             dst_row_strides=tables["conv_scratch_stride"],
         )
-        if not self.replay_ssm:
+        if not self.replay_ssm and not self._verify_reads_committed_recurrent_state:
             copy_state_rows(
                 tables["ssm_comp"],
                 tables["ssm_scratch"],
