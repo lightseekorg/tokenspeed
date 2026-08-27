@@ -136,15 +136,14 @@ dispatch still transports FP32 power-of-two scales, but the existing expert
 scatter packs them while permuting tokens, so neither mode needs a separate
 sequence of elementwise shifts, fills, copies, and a transpose before GEMM1.
 
-On SM100, dense `(128, 128)` FP8 projections also keep FlashInfer's MN-major
-scale layout through the decode hot path. Weight scales are transposed once
-after loading, while online activation quantization writes MN-major scales and
-the at-most-three padded rows directly. This removes the per-projection scale
-transposes plus the zero/one fills and device-to-device padding copies that
-would otherwise run between activation quantization and GEMM. The runtime sets
-``prepacked_scales=True`` only for this prepared path. Generic callers keep the
-default canonical-scale contract, for which the FlashInfer wrapper performs the
-compatibility conversion.
+On SM100, dense `(128, 128)` FP8 projections pass their canonical scales to
+FlashInfer's FP8 block-scale GEMM in K-major mode: the quant kernel's native
+`[M, K/128]` activation scales and the checkpoint's native `[N/128, K/128]`
+weight scales go through without per-call padding, transposes, or layout
+conversion (strided scale views are normalized to contiguous first). K-major
+output is bitwise identical to the former MN-major conversion path. The
+prepared MN-major path remains available behind ``prepacked_scales=True`` for
+callers that opt in at load time.
 
 ## Multi-Node
 

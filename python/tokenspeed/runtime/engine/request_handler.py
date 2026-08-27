@@ -71,7 +71,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
-from tokenspeed.runtime.utils import broadcast_pyobj
+from tokenspeed.runtime.utils import PipelinedPyobjBroadcaster
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
@@ -145,6 +145,15 @@ class RequestHandler:
                 "gloo", mapping.attn.tp_group
             )
             self.attn_tp_src_rank = mapping.attn.tp_group[0]
+        self.req_broadcaster = (
+            PipelinedPyobjBroadcaster(
+                self.attn_global_rank,
+                self.attn_tp_cpu_group,
+                src=self.attn_tp_src_rank,
+            )
+            if self.attn_tp_size != 1
+            else None
+        )
         self.profile_rank_tag = _profile_rank_tag(mapping.attn)
 
         self.hf_eos_token_id = hf_eos_token_id
@@ -173,8 +182,7 @@ class RequestHandler:
 
         self.init_profiler()
 
-    def recv_reqs(self) -> list:
-        """Receive results at attn_tp_rank = 0 and broadcast it to all other TP ranks."""
+    def _drain_reqs(self) -> list | None:
         if self.attn_tp_rank == 0:
             recv_reqs = []
 
@@ -187,16 +195,21 @@ class RequestHandler:
         else:
             recv_reqs = None
 
-        if self.attn_tp_size != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.attn_global_rank,
-                self.attn_tp_cpu_group,
-                src=self.attn_tp_src_rank,
-            )
+        return recv_reqs
+
+    def recv_reqs(self) -> list:
+        if self.attn_tp_size == 1:
+            recv_reqs = self._drain_reqs()
+        else:
+            if not self.req_broadcaster.in_flight:
+                self.req_broadcaster.start(self._drain_reqs())
+            recv_reqs = self.req_broadcaster.finish()
 
         if recv_reqs:
             prepare_shm_features(recv_reqs, self.attn_tp_cpu_group)
+
+        if self.attn_tp_size != 1:
+            self.req_broadcaster.start(self._drain_reqs())
 
         return recv_reqs
 

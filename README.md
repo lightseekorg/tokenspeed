@@ -20,6 +20,7 @@ Core components:
 
 ## News
 
+- [2026/08] [Qwen3.8 Flash Next](https://developer.nvidia.com/blog/experiment-with-qwen3-8-flash-next-176b-model-on-nvidia-gb300-nvl72-for-agentic-coding/) at Day 0 and [GLM 5.3 Flash](https://huggingface.co/zai-org/GLM-5.3-Flash#serve-glm-53-flash-locally) at Day 0.
 - [2026/08] [Qwen3.8](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B#serving-qwen38) at Day 0: 2.4T-Scale Inference with TokenSpeed. [[blog](https://lightseek.org/blog/tokenspeed-qwen3-8.html)]
 - [2026/08] TokenSpeed joins the [PyTorch Ecosystem](https://github.com/pytorch-fdn/ecosystem/issues/77#issuecomment-5184836537).
 - [2026/07] [Kimi K3](https://huggingface.co/moonshotai/Kimi-K3#5-deployment) at Day 0: Frontier Model Enablement on Leading Platforms with TokenSpeed. [[blog](https://lightseek.org/blog/tokenspeed-kimi-k3.html)]
