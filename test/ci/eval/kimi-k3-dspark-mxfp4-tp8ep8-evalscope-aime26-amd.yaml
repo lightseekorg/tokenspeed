@@ -4,6 +4,12 @@ api_version: ci.tokenspeed.io/v1
 name: eval-kimi-k3-dspark-mxfp4-tp8ep8-aime26-amd
 type: eval
 workflow_stage: model-test
+# AIME26 is 30 problems at temperature 1.0. Per-commit scores on the
+# amd-mi35x-8gpu-test pool have landed at 0.800, 0.867, 0.900, 0.933,
+# 0.967 — binomial noise around ~0.87, and the same-machine MI355X
+# control was 0.800. One extra server+eval attempt covers a remaining
+# one-problem swing after the 0.75 floor.
+retries: 1
 triggers:
   - per-commit
   - manual
@@ -69,18 +75,14 @@ eval:
     --generation-config '{"do_sample":true,"temperature":1.0,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'
 report:
   github_step_summary: true
-# Same bar as the speculator-free gate, which measured 0.933 (28/30) on 8x
-# MI350X. DSpark preserves the target's distribution rather than its exact
-# tokens, so this score is the correctness check that matters; a per-token diff
-# is not available on batch-variant kernels.
+# DSpark preserves the target's distribution rather than its exact tokens, so
+# this score is the correctness check that matters; a per-token diff is not
+# available on batch-variant kernels.
 #
-# A same-machine control on 8x MI355X, both arms in this exact configuration:
+# Same-machine control on 8x MI355X, both arms in this exact configuration:
 #   DSpark   0.800 (24/30), TPOT  45.56 ms, 17.35 tok/s, TTFT 3779 ms
 #   no spec  0.667 (20/30), TPOT 103.22 ms,  9.94 tok/s, TTFT 1945 ms
-# So DSpark does not regress accuracy (it scored higher, within the noise of 30
-# problems at temperature 1.0) and cuts TPOT by 2.27x, consistent with the
-# measured accept length of ~2.6. Note the MI355X control also came in well
-# under the 0.933 recorded on MI350X, so this threshold wants re-calibrating
-# against the CI runner's own speculator-free number rather than trusted across
-# hardware.
-score_threshold: 0.90
+# MI350X previously measured 0.933 (28/30). 0.90 (27/30) sits inside the
+# 30-problem sampling noise (CI has failed at 0.800 and 0.867). 0.75 (23/30)
+# matches the other AMD AIME gates and stays above the speculator-free control.
+score_threshold: 0.75
