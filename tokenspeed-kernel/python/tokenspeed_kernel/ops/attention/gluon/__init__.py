@@ -589,6 +589,7 @@ if current_platform().is_amd:
     def gluon_kda_fused_replay_gfx950(
         descriptors: torch.Tensor,
         *,
+        group_indices: torch.Tensor,
         read_indices: torch.Tensor,
         write_indices: torch.Tensor,
         accepted_length: torch.Tensor,
@@ -603,12 +604,12 @@ if current_platform().is_amd:
         state_stride: int,
         gate_stride: int,
         conv_width: int,
-        layers_per_group: int,
         lower_bound: float,
     ) -> None:
         """Replay all gfx950 layers from persistent BF16 raw-g descriptors."""
         _kda_fused_replay_impl(
             descriptors,
+            group_indices,
             read_indices,
             write_indices,
             accepted_length,
@@ -623,7 +624,6 @@ if current_platform().is_amd:
             state_stride=state_stride,
             gate_stride=gate_stride,
             conv_width=conv_width,
-            layers_per_group=layers_per_group,
             lower_bound=lower_bound,
         )
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from inspect import signature
 from types import SimpleNamespace
 
 import pytest
@@ -355,6 +356,38 @@ def test_kda_replay_supported_on_the_nvidia_serving_platform(b300_platform) -> N
     finally:
         Platform.override(real_platform)
         registry.clear_cache()
+
+
+def test_batched_replay_call_contract() -> None:
+    """The selected all-layer replay accepts the runtime's explicit group map."""
+    kernel = attention_ops.resolve_kda_batched_replay_commit()
+    if kernel is None:
+        pytest.skip("batched KDA replay is unavailable")
+
+    parameters = signature(kernel.impl).parameters
+    assert "group_indices" in parameters
+    assert "layers_per_group" not in parameters
+
+    tensor = torch.empty(0)
+    signature(kernel.impl).bind(
+        descriptors=tensor,
+        group_indices=tensor,
+        read_indices=tensor,
+        write_indices=tensor,
+        accepted_length=tensor,
+        draft_token_num=1,
+        num_heads=1,
+        head_dim=128,
+        f_a_dim=1,
+        qkv_stride=1,
+        conv_stride=1,
+        f_a_stride=1,
+        beta_stride=1,
+        state_stride=1,
+        gate_stride=1,
+        conv_width=4,
+        lower_bound=-5.0,
+    )
 
 
 def test_kda_split_verify_registration_traits() -> None:

@@ -29,7 +29,9 @@ if not torch.cuda.is_available():
 
 from tokenspeed_kernel.ops.attention import (  # noqa: E402
     kda_replay_commit_supported,
+    resolve_kda_batched_replay_commit,
 )
+from tokenspeed_kernel.platform import current_platform  # noqa: E402
 
 #: The registry entries behind the probe and the no-store fused verify are
 #: vendor-gated (NVIDIA today); direct Triton-kernel tests below run anywhere.
@@ -53,9 +55,10 @@ LOWER_BOUND = -5.0
 DEV = "cuda"
 
 
-def _window(n, t, pages=32, seed=0):
+def _window(n, t, pages=32, seed=0, num_heads=HV):
     """A draft window of ``t`` positions for ``n`` requests, plus the pools."""
     g = torch.Generator(device="cpu").manual_seed(seed)
+    projection_width = num_heads * K
 
     def rnd(*shape, dtype=torch.bfloat16, scale=1.0):
         return (torch.randn(*shape, generator=g, dtype=torch.float32) * scale).to(
@@ -63,16 +66,18 @@ def _window(n, t, pages=32, seed=0):
         )
 
     return dict(
-        qkv_raw=rnd(n * t, 3 * P),
-        conv_w=rnd(3 * P, 4, scale=0.3).contiguous(),
-        conv_pool=rnd(pages, 3 * P, 3),
+        qkv_raw=rnd(n * t, 3 * projection_width),
+        conv_w=rnd(3 * projection_width, 4, scale=0.3).contiguous(),
+        conv_pool=rnd(pages, 3 * projection_width, 3),
         f_a=rnd(n * t, D_FA),
-        w_fb=rnd(P, D_FA, scale=0.05).contiguous(),
-        beta=rnd(n * t, HV),
-        A_log=rnd(HV, dtype=torch.float32, scale=0.5),
-        dt_bias=rnd(P, dtype=torch.float32),
-        h_pool=rnd(pages, HV, K, V, dtype=torch.float32),
-        gate_scratch=torch.empty(n * t, P, device=DEV, dtype=torch.float32),
+        w_fb=rnd(projection_width, D_FA, scale=0.05).contiguous(),
+        beta=rnd(n * t, num_heads),
+        A_log=rnd(num_heads, dtype=torch.float32, scale=0.5),
+        dt_bias=rnd(projection_width, dtype=torch.float32),
+        h_pool=rnd(pages, num_heads, K, V, dtype=torch.float32),
+        gate_scratch=torch.empty(
+            n * t, projection_width, device=DEV, dtype=torch.float32
+        ),
         read_indices=torch.arange(1, n + 1, device=DEV, dtype=torch.int32),
     )
 
@@ -274,6 +279,72 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
     with pytest.raises(AssertionError):
         torch.testing.assert_close(
             negative[2]["h_pool"], loop[2]["h_pool"], atol=0, rtol=0
+        )
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna4,
+    reason="AMD CDNA4 is required for GFX950 KDA replay execution",
+)
+def test_gluon_batched_replay_uneven_groups_match_per_layer_launches():
+    """The GFX950 all-layer launch honors each descriptor's cache-group row."""
+    layers, n, t, pages, num_heads = 5, 2, 8, 10, 12
+    groups = [0, 0, 0, 1, 1]
+    source = [
+        _window(n, t, pages=pages, seed=500 + layer, num_heads=num_heads)
+        for layer in range(layers)
+    ]
+    projection_width = num_heads * K
+    for layer in source:
+        layer["gate_scratch"] = layer["qkv_raw"][:, :projection_width].clone()
+    batched = [
+        {name: value.clone() for name, value in layer.items()} for layer in source
+    ]
+    per_layer = [
+        {name: value.clone() for name, value in layer.items()} for layer in source
+    ]
+    reads = torch.tensor([[1, 2], [3, 4]], device=DEV, dtype=torch.int32)
+    writes = torch.tensor([[5, 6], [7, 8]], device=DEV, dtype=torch.int32)
+    accepted = torch.tensor([1, t], device=DEV, dtype=torch.int32)
+    kernel = resolve_kda_batched_replay_commit()
+    assert kernel is not None
+    assert kernel.name == "gluon_kda_fused_replay_gfx950"
+
+    def launch(xs, group_indices, read_indices, write_indices):
+        kernel(
+            descriptors=_batched_descriptor(xs),
+            group_indices=group_indices,
+            read_indices=read_indices,
+            write_indices=write_indices,
+            accepted_length=accepted,
+            draft_token_num=t,
+            num_heads=num_heads,
+            head_dim=K,
+            f_a_dim=D_FA,
+            **_batched_static_args(xs[0]),
+        )
+
+    launch(
+        batched,
+        torch.tensor(groups, device=DEV, dtype=torch.int32),
+        reads,
+        writes,
+    )
+    for layer, group in zip(per_layer, groups, strict=True):
+        launch(
+            [layer],
+            torch.zeros(1, device=DEV, dtype=torch.int32),
+            reads[group : group + 1],
+            writes[group : group + 1],
+        )
+    torch.cuda.synchronize()
+
+    for actual, expected in zip(batched, per_layer, strict=True):
+        torch.testing.assert_close(
+            actual["conv_pool"], expected["conv_pool"], atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(
+            actual["h_pool"], expected["h_pool"], atol=0.0, rtol=0.0
         )
 
 
