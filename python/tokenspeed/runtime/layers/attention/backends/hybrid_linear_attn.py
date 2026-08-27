@@ -739,16 +739,27 @@ class MambaAttnBackend(AttentionBackend):
         grid = cache.get((bs, draft_token_num))
         if grid is not None:
             return grid
-        stride = draft_token_num + 1
-        base = (
-            torch.arange(bs, dtype=torch.int32, device=self.device) * stride
-        ).unsqueeze(1)
+        base = self._verify_scratch_base_rows(bs, draft_token_num).unsqueeze(1)
         steps = torch.arange(
             1, draft_token_num + 1, dtype=torch.int32, device=self.device
         ).unsqueeze(0)
         grid = base + steps
         cache[(bs, draft_token_num)] = grid
         return grid
+
+    def _verify_scratch_base_rows(self, bs: int, draft_token_num: int) -> torch.Tensor:
+        """Graph-stable scratch initialization row for each request."""
+        cache = getattr(self, "_verify_base_cache", None)
+        if cache is None:
+            cache = self._verify_base_cache = {}
+        key = (bs, draft_token_num)
+        rows = cache.get(key)
+        if rows is None:
+            rows = torch.arange(bs, dtype=torch.int32, device=self.device) * (
+                draft_token_num + 1
+            )
+            cache[key] = rows
+        return rows
 
     def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
         """Commit the accepted draft prefix into each group's state slab."""
@@ -1761,7 +1772,7 @@ class MambaAttnBackend(AttentionBackend):
             if layer_id == self._state_layer_ids()[0]:
                 self._seed_verify_scratch_batched(batch_size, draft_token_num)
             conv_states = conv_scratch
-            conv_read = output_indices[:batch_size, 0] - 1
+            conv_read = self._verify_scratch_base_rows(batch_size, draft_token_num)
             conv_out = output_indices[:batch_size]
             # shouldn't use contiguous here, because causal_conv1d_update
             # support input non-contiguous

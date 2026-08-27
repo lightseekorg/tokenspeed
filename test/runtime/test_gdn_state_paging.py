@@ -460,6 +460,18 @@ class VerifyMetadataTest(unittest.TestCase):
             560,
         )
 
+    def test_target_verify_reuses_graph_stable_scratch_base_rows(self):
+        rows = self.backend._verify_scratch_base_rows(3, 4)
+        grid = self.backend._verify_scratch_grid(3, 4)
+
+        self.assertIs(rows, self.backend._verify_scratch_base_rows(3, 4))
+        self.assertEqual(rows.dtype, self.torch.int32)
+        self.assertEqual(rows.tolist(), [0, 5, 10])
+        self.assertEqual(
+            grid.tolist(),
+            [[1, 2, 3, 4], [6, 7, 8, 9], [11, 12, 13, 14]],
+        )
+
 
 class GDNStatePagingGPUTest(unittest.TestCase):
     """MambaAttnBackend state paging vs the
