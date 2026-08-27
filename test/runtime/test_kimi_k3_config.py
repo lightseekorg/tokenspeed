@@ -696,21 +696,29 @@ class KimiK3LcmPlanTests(unittest.TestCase):
 
         return kimi_tp8_layout(text_config=cfg, tp_size=tp)[2].bind(64)
 
-    def test_linear_packing_scales_with_attn_tp(self):
-        """KDA pages pack into an MLA-sized plane, so tp=16 -- where the KDA
-        state page halves while the MLA latent page is tp-invariant -- packs
-        twice as many KDA pages per plane instead of failing the planner's
-        padding bound (1.268089 > 0.25 before the fix)."""
+    def test_mla_packing_scales_with_attn_tp(self):
+        """The MLA plane is the smallest that covers one per-layer KDA state,
+        so tp=16 -- where the KDA state page halves while the MLA latent page
+        is tp-invariant -- halves the plane and the parent, and tp=1
+        (attention-DP) grows them 8/tp-fold instead of failing the planner's
+        exact-page-stride check."""
         cfg = KimiLinearConfig()
         plan8 = self._plan(cfg, 8)
         plan16 = self._plan(cfg, 16)
+        plan1 = self._plan(cfg, 1)
         packs8 = {g.group_id: g.cache_blocks_per_lcm_block for g in plan8.groups}
         packs16 = {g.group_id: g.cache_blocks_per_lcm_block for g in plan16.groups}
-        self.assertEqual(packs8[FULL_ATTENTION], packs16[FULL_ATTENTION])
+        packs1 = {g.group_id: g.cache_blocks_per_lcm_block for g in plan1.groups}
+        self.assertEqual(packs8[FULL_ATTENTION], 12)
+        self.assertEqual(packs16[FULL_ATTENTION], 6)
+        self.assertEqual(packs1[FULL_ATTENTION], 89)
         for gid in (f"{LINEAR_ATTENTION}_0", f"{LINEAR_ATTENTION}_1"):
-            self.assertEqual(packs16[gid], 2 * packs8[gid])
-        self.assertEqual(len(plan8.planes), _NUM_MLA)
-        self.assertEqual(len(plan16.planes), _NUM_MLA)
+            self.assertEqual(packs8[gid], 1)
+            self.assertEqual(packs16[gid], 1)
+            self.assertEqual(packs1[gid], 1)
+        self.assertEqual(plan16.lcm_block_bytes * 2, plan8.lcm_block_bytes)
+        for plan in (plan8, plan16, plan1):
+            self.assertEqual(len(plan.planes), _NUM_MLA)
 
     def test_reduced_layer_variant_plans(self):
         """Layer counts derive from the config: a structurally-identical
