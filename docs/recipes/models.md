@@ -355,6 +355,38 @@ tokenspeed serve zai-org/GLM-5.2-FP8 \
   --port 8000
 ```
 
+## GLM 5.3 Flash
+
+GLM-5.3-Flash automatically configures its KDA/DSA backends and supports MTP from
+the base checkpoint.
+
+Install `ffmpeg` before serving multimodal requests:
+
+```bash
+apt-get update && apt-get install -y ffmpeg
+```
+
+On MI350X, use tensor parallel size 4 with expert parallelism disabled for the
+BF16 or block-FP8 checkpoints. The block-FP8 path retains compact expert
+weights for its decode-specialized Gluon kernel and materializes BF16 expert
+copies once at load time for prefill.
+
+On platforms without DeepGEMM, four-stream mHC uses a portable Triton path and
+switches to its tiled prefill projection above 256 tokens.
+
+```bash
+ts serve zai-org/GLM-5.3-Flash \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --moe-backend flashinfer_trtllm \
+  --kv-cache-dtype fp8 \
+  --draft-model-path-use-base \
+  --speculative-algorithm MTP \
+  --speculative-num-steps 2 \
+  --speculative-num-draft-tokens 3
+```
+
 ## Qwen3 Dense / Qwen3 30B-A3B
 
 Qwen2, dense Qwen3, and Qwen3 MoE checkpoints use different architecture names.
@@ -517,11 +549,55 @@ tokenspeed serve Qwen/Qwen3.8-27B-FP8 \
   --speculative-algorithm MTP \
   --speculative-draft-model-path Qwen/Qwen3.8-27B-FP8 \
   --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --disable-kvstore \
-  --host 0.0.0.0 --port 8000
+  --disable-kvstore
 ```
+
+## Qwen3.8 Flash Next
+
+Qwen3.8-Flash-Next is a multimodal MoE model and an early preview of the
+Qwen4 architecture, playing for Qwen4 the role Qwen3-Next played for Qwen3.5.
+It pairs a 125B-parameter main model with 51B of N-gram embeddings (6B
+activated per token), supports 262,144 tokens of context natively and 1M with
+YaRN, and upgrades four axes of the hybrid design:
+
+- GDN + QSA hybrid attention
+- 4-branch Gated Residual
+- N-gram (predictive latent) embeddings
+- Muon optimization
+
+In TokenSpeed it runs as a hybrid linear-attention (GDN) / full-attention model
+with optional predictive latent embeddings (PLE), optional QSA sparse
+attention, and a one-layer MTP draft. Dense and MoE checkpoints share the same
+launch command.
+
+```bash
+ts serve \
+    --model Qwen/Qwen3.8-Flash-Next-FP8 \
+    --trust-remote-code \
+    --tensor-parallel-size 4 \
+    --quantization fp8 \
+    --moe-backend flashinfer_trtllm \
+    --disable-kvstore \
+    --speculative-algorithm MTP \
+    --speculative-num-steps 3
+```
+
+### Optional `--hf-overrides`
+
+Both keys are optional and can be combined in a single `--hf-overrides` JSON
+object:
+
+```bash
+--hf-overrides \
+  '{"ple_embed_dtype":"float8_e4m3fn","index_share_for_mtp_iteration":true}'
+```
+
+- `ple_embed_dtype: "float8_e4m3fn"`: store the PLE n-gram embedding table in
+  FP8 to save memory. Omit it to store the table in the model's compute
+  dtype.
+- `index_share_for_mtp_iteration: true`: reuse the QSA top-k selection across
+  MTP steps. Checkpoints that already set
+  `text_config.index_share_for_mtp_iteration=true` do not need this flag.
 
 ## GPT-OSS 20B / 120B
 

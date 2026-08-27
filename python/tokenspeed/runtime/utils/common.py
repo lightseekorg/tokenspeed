@@ -526,6 +526,47 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
+class PipelinedPyobjBroadcaster:
+    """Overlap empty Python-object notifications with useful work."""
+
+    def __init__(
+        self,
+        rank: int,
+        dist_group: torch.distributed.ProcessGroup | None = None,
+        src: int = 0,
+    ) -> None:
+        self.rank = rank
+        self.dist_group = dist_group
+        self.src = src
+        self._data = None
+        self._ready = torch.zeros(1, dtype=torch.long)
+        self._work = None
+
+    @property
+    def in_flight(self) -> bool:
+        return self._work is not None
+
+    def start(self, data: list[Any] | None) -> None:
+        self._data = data
+        if self.rank == self.src:
+            self._ready[0] = bool(data)
+        self._work = dist.broadcast(
+            self._ready,
+            src=self.src,
+            group=self.dist_group,
+            async_op=True,
+        )
+
+    def finish(self) -> list[Any]:
+        self._work.wait()
+        data = self._data
+        self._data = None
+        self._work = None
+        if self._ready.item():
+            return broadcast_pyobj(data, self.rank, self.dist_group, src=self.src)
+        return data or []
+
+
 def broadcast_pyobj(
     data: list[Any],
     rank: int,
