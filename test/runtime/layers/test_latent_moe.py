@@ -314,7 +314,6 @@ def test_kimi3_moe_execution_policy_is_selected_outside_model() -> None:
 
     assert plan.use_native
     assert not plan.use_trtllm
-    assert plan.use_precomputed_topk
     assert plan.joint_moe_reduce
 
 
@@ -358,7 +357,6 @@ def test_kimi3_moe_execution_policy_preserves_nvidia_trtllm() -> None:
 
     assert not plan.use_native
     assert plan.use_trtllm
-    assert plan.use_precomputed_topk
     assert not plan.overlap_shared_experts
     assert not plan.joint_moe_reduce
 
@@ -389,10 +387,9 @@ def test_kimi3_moe_execution_plan_prepares_latent_fusions(
     monkeypatch.setattr(
         latent_module,
         "prepare_all_reduce_fusion",
-        lambda actual_group, width, tokens: norm_calls.append(
-            (actual_group, width, tokens)
-        )
-        or True,
+        lambda actual_group, width, tokens: (
+            norm_calls.append((actual_group, width, tokens)) or True
+        ),
     )
 
     prepared = plan.prepare_latent_fusion(

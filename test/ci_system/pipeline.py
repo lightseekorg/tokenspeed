@@ -70,7 +70,12 @@ RUNNER_SM_PREFIXES = (
     (("b300", "gb300", "slurm-b300", "slurm-gb300"), "sm103"),
 )
 
-AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-")
+AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-", "amd-mi450-")
+GITHUB_HOSTED_RUNNERS = {
+    # Logical AMD runner used by the normal task matrix. The workload itself
+    # provides gfx1250 through rocJITsu, so no self-hosted GPU runner exists.
+    "amd-mi450-sim": "ubuntu-24.04-32core-x64",
+}
 NVIDIA_ARM_RUNNER_PREFIXES = (
     "gb200",
     "gb300",
@@ -325,6 +330,11 @@ def resolve_runner_labels(labels: Iterable[str]) -> List[str]:
     return [resolve_runner_label(label) for label in labels]
 
 
+def resolve_runs_on(runner: str) -> str:
+    """Map a logical CI runner to the GitHub Actions runner that hosts it."""
+    return GITHUB_HOSTED_RUNNERS.get(runner, runner)
+
+
 def find_task_files(root: Path) -> List[Path]:
     return sorted(root.rglob("*.yaml"))
 
@@ -408,6 +418,9 @@ def build_matrix(
                 "priority": effective,
                 "optional": is_optional,
             }
+            runs_on = resolve_runs_on(runner)
+            if runs_on != runner:
+                entry["runs_on"] = runs_on
             if task_workflow_stage is not None:
                 entry["workflow_stage"] = task_workflow_stage
             include.append(entry)
@@ -774,7 +787,7 @@ def setup_runner(
             dry_run=dry_run,
         )
 
-    if is_amd_runner(runner):
+    if is_amd_runner(runner) and resolve_runs_on(runner) == runner:
         # Best-effort: kill any GPU-holding processes left over by a
         # previous pod scheduled on the same node. Cluster admins flagged
         # a known race where the device plugin releases a GPU back to the
