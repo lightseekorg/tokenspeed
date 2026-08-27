@@ -102,6 +102,7 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.pp_stage import PPStageState, pp_layer_window
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     get_is_capture_mode,
+    get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SituAndMul
 from tokenspeed.runtime.layers.layernorm import (
@@ -1846,7 +1847,21 @@ class KimiLinearMoE(nn.Module):
         else:
             self.experts._situ_output_buffer = None
         prepared_shared_shard = None
-        with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+        # Enable the fork for the whole graph phase, but only overlap during
+        # capture. The pre-capture warmup runs with capture mode off, so gating
+        # ``enable`` on it left the auxiliary stream completely untouched until
+        # capture itself -- the first hipBLASLt call on that stream then did its
+        # lazy handle/workspace setup inside the capturing stream and raised
+        # "operation not permitted when stream is capturing" (900) on every
+        # rank, deadlocking startup. Enabling on the graph phase makes warmup
+        # execute the same branches on the auxiliary stream, serially
+        # (``overlap=False``), so every backend is initialized before capture.
+        # This matches the contract _capture_one documents and the pattern the
+        # other fork-using models already follow.
+        with self.stream_fork.scope(
+            enable=get_is_cuda_graph_phase(),
+            overlap=get_is_capture_mode(),
+        ) as fork:
             with fork.branch():
                 topk_output = self.topk(hidden_states, router_logits)
                 if self._topk_ready is not None and fork._active:
