@@ -188,6 +188,7 @@ def _prepare_small_kernel(
     BLOCK_G: gl.constexpr,
     BLOCK_E: gl.constexpr,
     BLOCK_NB: gl.constexpr,
+    MAX_BLOCKS_PER_EXPERT: gl.constexpr,
     EM_MAX: gl.constexpr,
     INIT_TILE: gl.constexpr,
     EXPERT_START: gl.constexpr,
@@ -197,7 +198,6 @@ def _prepare_small_kernel(
     LG: gl.constexpr = gl.BlockedLayout([1], [64], [NW], [0])
     LE: gl.constexpr = gl.BlockedLayout([1], [64], [NW], [0])
     LI: gl.constexpr = gl.BlockedLayout([1], [64], [NW], [0])
-    LT: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [NW, 1], [1, 0])
 
     for r0 in gl.static_range(0, EM_MAX, INIT_TILE):
         r = r0 + gl.arange(0, INIT_TILE, layout=LI)
@@ -226,6 +226,7 @@ def _prepare_small_kernel(
     padded = blocks_pe * block_m
     row_off = gl.associative_scan(padded, 0, _add) - padded
     blocks_incl = gl.associative_scan(blocks_pe, 0, _add)
+    block_start = blocks_incl - blocks_pe
     num_valid = gl.sum(padded, 0)
     num_blocks = gl.sum(blocks_pe, 0)
 
@@ -239,24 +240,23 @@ def _prepare_small_kernel(
     gl.store(num_blocks_ptr, num_blocks)
 
     for b0 in range(0, nb_max, BLOCK_NB):
-        bb = b0 + gl.arange(0, BLOCK_NB, layout=gl.SliceLayout(1, LT))
-        bi_row = gl.expand_dims(
-            gl.convert_layout(blocks_incl, gl.SliceLayout(0, LT)), 0
-        )
-        ve_row = gl.expand_dims(
-            gl.convert_layout(valid_e.to(gl.int32), gl.SliceLayout(0, LT)), 0
-        )
-        expert_b = gl.sum(
-            ((bi_row <= gl.expand_dims(bb, 1)) & (ve_row == 1)).to(gl.int32), axis=1
-        )
-        bb_l = b0 + gl.arange(0, BLOCK_NB, layout=LE)
-        expert_l = gl.convert_layout(expert_b, LE)
-        sei_val = gl.where(
-            bb_l < num_blocks,
-            expert_l,
+        block_ids = b0 + gl.arange(0, BLOCK_NB, layout=LE)
+        gl.store(
+            sei_ptr + block_ids,
             gl.full([BLOCK_NB], -1, gl.int32, layout=LE),
+            mask=block_ids < nb_max,
         )
-        gl.store(sei_ptr + bb_l, sei_val, mask=bb_l < nb_max)
+
+    # The sentinel fill is owned by one wave; synchronize before other waves
+    # overwrite live block ranges with expert IDs.
+    gl.barrier()
+
+    for block_offset in gl.static_range(0, MAX_BLOCKS_PER_EXPERT):
+        gl.store(
+            sei_ptr + block_start + block_offset,
+            e_ids,
+            mask=valid_e & (block_offset < blocks_pe),
+        )
 
 
 @gluon.jit
@@ -362,6 +362,7 @@ def moe_align_block_size_device(
             BLOCK_G=triton.next_power_of_2(N),
             BLOCK_E=BLOCK_E,
             BLOCK_NB=64,
+            MAX_BLOCKS_PER_EXPERT=triton.cdiv(N, block_m),
             EM_MAX=EM_max,
             INIT_TILE=triton.next_power_of_2(min(1024, EM_max)),
             EXPERT_START=expert_start,

@@ -121,6 +121,186 @@ def test_small_route_device_alignment_contract() -> None:
     )
 
 
+def _assert_production_alignment_contract(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    num_experts: int,
+    block_m: int,
+    expert_start: int,
+) -> None:
+    sorted_ids, sorted_experts, sorted_weights, num_valid = outputs
+    num_tokens, top_k = topk_ids.shape
+    local_ids = topk_ids.reshape(-1) - expert_start
+    local_mask = (local_ids >= 0) & (local_ids < num_experts)
+    counts = torch.bincount(
+        local_ids[local_mask].to(torch.int64), minlength=num_experts
+    )
+    blocks_per_expert = (counts + block_m - 1) // block_m
+    expected_experts = torch.arange(
+        num_experts, device="cuda", dtype=torch.int32
+    ).repeat_interleave(blocks_per_expert)
+    valid_rows = int((blocks_per_expert.sum() * block_m).item())
+
+    assert int(num_valid.item()) == valid_rows
+    torch.testing.assert_close(
+        sorted_experts[: expected_experts.numel()], expected_experts, rtol=0, atol=0
+    )
+    assert torch.all(sorted_experts[expected_experts.numel() :] == -1)
+
+    row_experts = expected_experts.repeat_interleave(block_m)
+    packed = sorted_ids[:valid_rows]
+    weights = sorted_weights[:valid_rows]
+    routed = packed != num_tokens
+    tokens = packed[routed] & 0xFFFFFF
+    slots = packed[routed] >> 24
+    actual_flat_slots = torch.sort(tokens * top_k + slots).values
+    expected_flat_slots = (
+        torch.nonzero(local_mask, as_tuple=False).flatten().to(torch.int32)
+    )
+    torch.testing.assert_close(actual_flat_slots, expected_flat_slots, rtol=0, atol=0)
+    torch.testing.assert_close(
+        topk_ids[tokens, slots] - expert_start,
+        row_experts[routed],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        weights[routed], topk_weights[tokens, slots], rtol=0, atol=0
+    )
+    assert torch.all(packed[~routed] == num_tokens)
+    assert torch.all(weights[~routed] == 0)
+    assert torch.all(sorted_ids[valid_rows:] == num_tokens)
+    assert torch.all(sorted_weights[valid_rows:] == 0)
+
+
+@pytest.mark.parametrize("routing", ["concentrated", "distributed", "filtered"])
+def test_small_route_production_alignment_contract(routing: str) -> None:
+    """Production-sized concentrated, distributed, and EP routes stay exact."""
+    num_tokens, num_experts, top_k, block_m = 64, 288, 8, 16
+    flat_slots = torch.arange(num_tokens * top_k, device="cuda", dtype=torch.int32)
+    if routing == "concentrated":
+        expert_start = 0
+        topk_ids = torch.zeros_like(flat_slots)
+    elif routing == "distributed":
+        expert_start = 0
+        topk_ids = (flat_slots * 37).remainder(num_experts)
+    else:
+        expert_start = 100
+        route_pattern = torch.tensor(
+            [99, 100, 101, 200, 387, 388, 42, 999],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        topk_ids = route_pattern.repeat(num_tokens)
+    topk_ids = topk_ids.reshape(num_tokens, top_k)
+    topk_weights = (flat_slots.float() + 0.25).reshape(num_tokens, top_k)
+    outputs = moe_align_block_size_device(
+        topk_ids,
+        topk_weights,
+        num_experts,
+        block_m,
+        expert_start=expert_start,
+    )
+    torch.cuda.synchronize()
+    _assert_production_alignment_contract(
+        topk_ids,
+        topk_weights,
+        outputs,
+        num_experts=num_experts,
+        block_m=block_m,
+        expert_start=expert_start,
+    )
+
+
+@pytest.mark.parametrize("case", ["no_local_routes", "maximum_small_route"])
+def test_small_route_boundary_alignment_contract(case: str) -> None:
+    """The direct-fill bound handles empty routing and its 1,024-route edge."""
+    num_experts, top_k, block_m = 288, 8, 16
+    if case == "no_local_routes":
+        num_tokens = 1
+        expert_start = 100
+        topk_ids = torch.full(
+            (num_tokens, top_k),
+            expert_start - 1,
+            dtype=torch.int32,
+            device="cuda",
+        )
+    else:
+        num_tokens = 128
+        expert_start = 0
+        topk_ids = torch.full(
+            (num_tokens, top_k),
+            num_experts - 1,
+            dtype=torch.int32,
+            device="cuda",
+        )
+    topk_weights = torch.arange(
+        num_tokens * top_k, dtype=torch.float32, device="cuda"
+    ).reshape(num_tokens, top_k)
+
+    outputs = moe_align_block_size_device(
+        topk_ids,
+        topk_weights,
+        num_experts,
+        block_m,
+        expert_start=expert_start,
+    )
+    torch.cuda.synchronize()
+    _assert_production_alignment_contract(
+        topk_ids,
+        topk_weights,
+        outputs,
+        num_experts=num_experts,
+        block_m=block_m,
+        expert_start=expert_start,
+    )
+
+
+def test_small_route_production_alignment_graph_replay() -> None:
+    """Graph replay preserves cross-wave block-table initialization ordering."""
+    num_tokens, num_experts, top_k, block_m = 64, 288, 8, 16
+    flat_slots = torch.arange(num_tokens * top_k, device="cuda", dtype=torch.int32)
+    topk_ids = ((flat_slots.remainder(3) + 1) * 64).reshape(num_tokens, top_k)
+    topk_weights = (flat_slots.float() + 0.25).reshape(num_tokens, top_k)
+
+    moe_align_block_size_device(topk_ids, topk_weights, num_experts, block_m)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = moe_align_block_size_device(
+            topk_ids, topk_weights, num_experts, block_m
+        )
+    for _ in range(32):
+        graph.replay()
+    torch.cuda.synchronize()
+    _assert_production_alignment_contract(
+        topk_ids,
+        topk_weights,
+        outputs,
+        num_experts=num_experts,
+        block_m=block_m,
+        expert_start=0,
+    )
+    first_experts = outputs[1].clone()
+
+    topk_ids.copy_((((flat_slots + 1).remainder(3) + 1) * 64 + 1).reshape_as(topk_ids))
+    topk_weights.copy_(torch.flip(topk_weights, dims=(0, 1)))
+    for _ in range(32):
+        graph.replay()
+    torch.cuda.synchronize()
+    _assert_production_alignment_contract(
+        topk_ids,
+        topk_weights,
+        outputs,
+        num_experts=num_experts,
+        block_m=block_m,
+        expert_start=0,
+    )
+    assert not torch.equal(outputs[1], first_experts)
+
+
 @pytest.mark.parametrize("num_tokens", [1, 8, 32, 64, 256])
 def test_fp16_weight_moe_matches_fp32_reference(num_tokens):
     """End-to-end output matches the fp32 oracle (auto decode/prefill path)."""
