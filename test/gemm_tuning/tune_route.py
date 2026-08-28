@@ -64,6 +64,7 @@ NUM_COPIES = 8
 # 41-round medians repeat within ~1-2%, so 4% clears noise without excluding
 # the consistent 6-11% skinny wins.
 MARGIN = 1.04
+BACKENDS = ("cublas", "rowcta", "skinny", "tgv", "ll_bf16")
 
 
 def timed(fns, iters: int = 96, rounds: int = 41) -> float:
@@ -148,14 +149,23 @@ def candidates(m: int, n: int, k: int):
     except ImportError:
         pass
 
+    from tokenspeed_kernel.ops.gemm.ll_bf16 import ll_bf16_mm, ll_bf16_mm_supported
+
+    if ll_bf16_mm_supported(xs[0], ws[0]):
+
+        def ll(i):
+            return lambda: ll_bf16_mm(xs[i], ws[i], out=o)
+
+        yield "ll_bf16", [ll(i) for i in range(NUM_COPIES)], o, ref
+
 
 route: dict[str, str] = {}
 per_step_gain: dict[int, float] = dict.fromkeys(MS, 0.0)
 print(f"cold-L2 sweep: {NUM_COPIES} weight copies per backend")
 print(f"{'call site':<18}{'NxK':>12} {'M':>2}  ", end="")
-print("  ".join(f"{t:>8}" for t in ("cublas", "rowcta", "skinny", "tgv")), end="")
+print("  ".join(f"{t:>8}" for t in BACKENDS), end="")
 print(f"  {'winner':<8} {'gain':>6}")
-print("-" * 92)
+print("-" * 102)
 for n, k, calls, label in SHAPES:
     for m in MS:
         times: dict[str, float | None] = {}
@@ -174,7 +184,7 @@ for n, k, calls, label in SHAPES:
         best = min(ok, key=ok.get) if ok else None
         cells = "  ".join(
             f"{times.get(t):8.3f}" if isinstance(times.get(t), float) else f"{'-':>8}"
-            for t in ("cublas", "rowcta", "skinny", "tgv")
+            for t in BACKENDS
         )
         # An entry must beat the incumbent selection, not just cuBLAS.
         incumbent = min(
