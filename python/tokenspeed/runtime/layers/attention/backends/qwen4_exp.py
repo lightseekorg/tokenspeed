@@ -43,7 +43,7 @@ if TYPE_CHECKING:
         SoftmaxAttnConfig,
     )
     from tokenspeed.runtime.layers.attention.qsa.indexer import QSAIndexer
-    from tokenspeed.runtime.models.qwen4_exp_ple import Qwen4ExpPLELayer
+    from tokenspeed.runtime.layers.qwen4_exp_ple import Qwen4ExpPLELayer
 
 
 def qwen4_exp_linear_backend(

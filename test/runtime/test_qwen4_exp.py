@@ -59,6 +59,15 @@ from tokenspeed.runtime.layers.hyperconnection import (
     HyperConnectionConfig,
 )
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
+from tokenspeed.runtime.layers.qwen4_exp_ple import (
+    QWEN4_EXP_PLE_CACHE_GROUP,
+    Qwen4ExpNGramEmbedding,
+    Qwen4ExpPLELayer,
+    _nth_prime_after,
+    quantize_ple_embedding_rows,
+    qwen4_exp_ple_context_field,
+    qwen4_exp_ple_conv_field,
+)
 from tokenspeed.runtime.models import qwen4_exp_nextn
 from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpAttentionDecoderLayer,
@@ -67,15 +76,6 @@ from tokenspeed.runtime.models.qwen4_exp import (
     _qwen4_exp_uses_sparse_moe,
     _Qwen4ExpRMSNormGated,
     load_qwen4_exp_weights,
-)
-from tokenspeed.runtime.models.qwen4_exp_ple import (
-    QWEN4_EXP_PLE_CACHE_GROUP,
-    Qwen4ExpNGramEmbedding,
-    Qwen4ExpPLELayer,
-    _nth_prime_after,
-    quantize_ple_embedding_rows,
-    qwen4_exp_ple_context_field,
-    qwen4_exp_ple_conv_field,
 )
 
 _requires_cuda = pytest.mark.skipif(
