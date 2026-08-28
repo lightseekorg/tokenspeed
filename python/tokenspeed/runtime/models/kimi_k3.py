@@ -1038,9 +1038,12 @@ class KimiLinearKDA(nn.Module):
         proj = self.num_heads * self.head_dim
         hidden = config.hidden_size
 
-        tp_rank = mapping.attn.tp_rank
-        tp_size = mapping.attn.tp_size
-        tp_group = mapping.attn.tp_group
+        # KDA parallelism reads the linear-attention mapping: it defaults to
+        # the attention TP width and diverges only under the
+        # MLA-DP + linear-attn-TP hybrid.
+        tp_rank = mapping.linear_attn.tp_rank
+        tp_size = mapping.linear_attn.tp_size
+        tp_group = mapping.linear_attn.tp_group
         self.local_num_heads = self.num_heads // tp_size
         proj_local = proj // tp_size
 
@@ -1235,7 +1238,7 @@ class KimiLinearKDA(nn.Module):
             activation="silu",
             key_dim=proj,
             value_dim=proj,
-            attention_tp_size=self.mapping.attn.tp_size,
+            attention_tp_size=self.mapping.linear_attn.tp_size,
             head_k_dim=hd,
             head_v_dim=hd,
             f_a_out=f_a_out,

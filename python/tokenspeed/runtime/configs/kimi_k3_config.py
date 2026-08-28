@@ -314,7 +314,9 @@ class KimiLinearConfig(PretrainedConfig):
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
         mapping = global_server_args_dict["mapping"]
-        attn_tp_size = mapping.attn.tp_size
+        # KDA state shards by the linear-attention mapping (defaults to
+        # attention TP).
+        attn_tp_size = mapping.linear_attn.tp_size
 
         la = self.linear_attn_config
         num_heads = la["num_heads"]

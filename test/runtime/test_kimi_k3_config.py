@@ -107,7 +107,9 @@ class KimiK3ConfigTests(unittest.TestCase):
 
     def test_mamba2_cache_params_shapes(self):
         c = KimiLinearConfig()
-        fake_mapping = SimpleNamespace(attn=SimpleNamespace(tp_size=1))
+        fake_mapping = SimpleNamespace(
+            attn=SimpleNamespace(tp_size=1), linear_attn=SimpleNamespace(tp_size=1)
+        )
         import tokenspeed.runtime.utils.env as env_mod
 
         with mock.patch.dict(
@@ -131,7 +133,9 @@ class KimiK3ConfigTests(unittest.TestCase):
 
     def test_mamba2_cache_params_respects_tp(self):
         c = KimiLinearConfig()
-        fake_mapping = SimpleNamespace(attn=SimpleNamespace(tp_size=4))
+        fake_mapping = SimpleNamespace(
+            attn=SimpleNamespace(tp_size=4), linear_attn=SimpleNamespace(tp_size=4)
+        )
         import tokenspeed.runtime.utils.env as env_mod
 
         with mock.patch.dict(
@@ -300,7 +304,8 @@ class KimiK3RegistrationTests(unittest.TestCase):
             },
         )
         mapping = SimpleNamespace(
-            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,))
+            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
+            linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
         )
         layer = KimiLinearKDA(config, mapping, layer_id=0)
 
@@ -369,7 +374,8 @@ class KimiK3RegistrationTests(unittest.TestCase):
             },
         )
         mapping = SimpleNamespace(
-            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,))
+            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
+            linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
         )
         layer = KimiLinearKDA(config, mapping, layer_id=0)
         rows, projection_width = 4, 64
