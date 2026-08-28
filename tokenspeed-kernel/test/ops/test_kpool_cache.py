@@ -35,7 +35,8 @@ _POOL = 4
 _DIM = 128
 _ROWS_PER_PAGE = 64 // _POOL
 _FP8_MAX = 448.0
-_MAX_CODE_MISMATCH_RATIO = 5e-4
+_FP8_E4M3FN_MAX_FINITE_MAGNITUDE_CODE = 0x7E
+_MAX_FP8_QUANTUM_DISTANCE = 2
 
 
 def _sylvester_h(n: int) -> torch.Tensor:
@@ -67,6 +68,26 @@ def _random(
     )
 
 
+def _fp8_quantum_distance(actual: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
+    """Return the number of E4M3FN representable steps separating two values."""
+    assert actual.dtype == expected.dtype == torch.float8_e4m3fn
+
+    def ordered_rank(values: torch.Tensor) -> torch.Tensor:
+        bits = values.contiguous().view(torch.uint8)
+        magnitude = (bits & 0x7F).to(torch.int16)
+        assert not bool(
+            (magnitude == 0x7F).any()
+        ), "FP8 quantum distance is undefined for NaN encodings"
+        negative = (bits & 0x80) != 0
+        return torch.where(
+            negative,
+            _FP8_E4M3FN_MAX_FINITE_MAGNITUDE_CODE - magnitude,
+            _FP8_E4M3FN_MAX_FINITE_MAGNITUDE_CODE + magnitude,
+        )
+
+    return (ordered_rank(actual) - ordered_rank(expected)).abs()
+
+
 def _assert_encoded(
     actual_values: torch.Tensor,
     actual_scales: torch.Tensor,
@@ -79,10 +100,70 @@ def _assert_encoded(
     active = expected_scales >= 0
     actual_values = actual_values.reshape(-1, _DIM)[active]
     expected_values = expected_values.reshape(-1, _DIM)[active]
-    mismatches = (
-        actual_values.view(torch.uint8) != expected_values.view(torch.uint8)
-    ).sum()
-    assert mismatches.item() / actual_values.numel() <= _MAX_CODE_MISMATCH_RATIO
+    quantum_distance = _fp8_quantum_distance(actual_values, expected_values)
+    max_distance = int(quantum_distance.max().item())
+    assert max_distance <= _MAX_FP8_QUANTUM_DISTANCE, (
+        f"FP8 values differ by up to {max_distance} representable steps; "
+        f"expected at most {_MAX_FP8_QUANTUM_DISTANCE}"
+    )
+
+
+def test_fp8_quantum_distance_counts_representable_steps() -> None:
+    actual_bits = torch.tensor(
+        [0x66, 0x67, 0xEA, 0xEB, 0x80, 0x01, 0xFE],
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    expected_bits = torch.tensor(
+        [0x65, 0x65, 0xE9, 0xE9, 0x00, 0x81, 0x7E],
+        dtype=torch.uint8,
+        device="cuda",
+    )
+
+    distance = _fp8_quantum_distance(
+        actual_bits.view(torch.float8_e4m3fn),
+        expected_bits.view(torch.float8_e4m3fn),
+    )
+
+    assert torch.equal(
+        distance,
+        torch.tensor([1, 2, 1, 2, 0, 2, 252], device="cuda", dtype=torch.int16),
+    )
+
+
+def test_fp8_quantum_distance_rejects_nan() -> None:
+    nan = torch.tensor([0x7F], dtype=torch.uint8, device="cuda").view(
+        torch.float8_e4m3fn
+    )
+    zero = torch.tensor([0x00], dtype=torch.uint8, device="cuda").view(
+        torch.float8_e4m3fn
+    )
+
+    with pytest.raises(AssertionError, match="undefined for NaN"):
+        _fp8_quantum_distance(nan, zero)
+
+
+def test_assert_encoded_limits_fp8_quantum_distance() -> None:
+    expected_bits = torch.full((1, _DIM), 0x65, dtype=torch.uint8, device="cuda")
+    actual_bits = expected_bits.clone()
+    scales = torch.ones(1, dtype=torch.float32, device="cuda")
+
+    actual_bits[0, 0] = 0x67
+    _assert_encoded(
+        actual_bits.view(torch.float8_e4m3fn),
+        scales,
+        expected_bits.view(torch.float8_e4m3fn),
+        scales,
+    )
+
+    actual_bits[0, 0] = 0x68
+    with pytest.raises(AssertionError, match="up to 3 representable steps"):
+        _assert_encoded(
+            actual_bits.view(torch.float8_e4m3fn),
+            scales,
+            expected_bits.view(torch.float8_e4m3fn),
+            scales,
+        )
 
 
 @dataclass
