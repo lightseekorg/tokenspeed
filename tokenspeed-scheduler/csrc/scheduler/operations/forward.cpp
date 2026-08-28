@@ -256,14 +256,14 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     return match;
 }
 
-std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(PlanBuildContext& context,
+std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   CacheCoordinator::PrefixProbe&& prefix,
                                                                   std::span<const GroupDemand> demands,
                                                                   std::optional<std::uint64_t> request_access_epoch) {
     std::optional<CacheCoordinator::AdmissionResult> result =
         coordinator_.Admit(std::move(prefix), demands, request_access_epoch);
     if (!result) {
-        context.admission_failed = true;
+        feedback.admission_failed = true;
         return std::nullopt;
     }
 
@@ -271,30 +271,31 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(PlanBuildConte
             "admission fresh-page groups must match scheduler config");
     for (std::size_t i = 0; i < result->new_page_ids.size(); ++i) {
         auto& page_ids = result->new_page_ids[i];
-        auto& pending = context.plan.pages_to_zero[cache_group_ids_[i]];
+        auto& pending = plan.pages_to_zero[cache_group_ids_[i]];
         pending.insert(pending.end(), page_ids.begin(), page_ids.end());
     }
     return result;
 }
 
-std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(PlanBuildContext& context,
+std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   std::span<const GroupDemand> demands,
                                                                   std::uint64_t request_access_epoch) {
-    return admit(context, coordinator_.ProbePrefix({}), demands, request_access_epoch);
+    return admit(plan, feedback, coordinator_.ProbePrefix({}), demands, request_access_epoch);
 }
 
-bool Scheduler::admitWithKvEventTracking(PlanBuildContext& context, Request& request,
+bool Scheduler::admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request,
                                          const fsm::CacheProgress& cache_progress, std::int32_t new_prefix_hash_begin,
                                          std::span<const GroupDemand> demands) {
     std::vector<CacheKey> event_keys =
         registerKvEventPrefixPages(request, cache_progress.prefix_hashes, new_prefix_hash_begin);
-    const bool admitted = admit(context, demands, cache_progress.access_epoch).has_value();
+    const bool admitted = admit(plan, feedback, demands, cache_progress.access_epoch).has_value();
     discardUncachedKvEventPages(event_keys);
     return admitted;
 }
 
 std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFirstChunk(
-    PlanBuildContext& context, Request* request, std::int32_t remaining, std::int32_t decode_input_tokens) {
+    ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request, std::int32_t remaining,
+    std::int32_t decode_input_tokens) {
     if (req_pool_allocator_.AvailableSlots() == 0) {
         return std::nullopt;
     }
@@ -367,7 +368,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
     setSnapshotStatePrefillReserve(demands, config_.cache_groups, split_tail_tokens);
     std::vector<CacheKey> event_keys = registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
-    std::optional<CacheCoordinator::AdmissionResult> admission = admit(context, std::move(match.probe), demands);
+    std::optional<CacheCoordinator::AdmissionResult> admission = admit(plan, feedback, std::move(match.probe), demands);
     if (!admission) {
         discardUncachedKvEventPages(event_keys);
         return std::nullopt;
@@ -402,7 +403,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 }
 
 std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
-    PlanBuildContext& context, Request* request, std::int32_t remaining,
+    ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request, std::int32_t remaining,
     std::int32_t reserve_num_tokens_in_next_schedule_event) {
     const std::int32_t unscheduled = request->UnscheduledPrefillSize();
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
@@ -459,7 +460,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, first_pos + tokens_this_round);
     }
     setSnapshotStatePrefillReserve(demands, config_.cache_groups, checkpoint_tail_reserve);
-    if (!admitWithKvEventTracking(context, *request, cache_progress, completed.first_new_prefix_page, demands)) {
+    if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, completed.first_new_prefix_page, demands)) {
         return std::nullopt;
     }
 
@@ -471,7 +472,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     };
 }
 
-std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(PlanBuildContext& context, Request* request) {
+std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
+                                                                  Request* request) {
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     const std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
     fsm::CacheProgress cache_progress = request->CacheProgress();
@@ -498,7 +500,8 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(PlanBuildConte
                                          .completed_boundary_kind = completed.boundary_kind,
                                          .num_computed_tokens = num_computed_tokens,
                                      });
-        if (!admitWithKvEventTracking(context, *request, cache_progress, completed.first_new_prefix_page, demands)) {
+        if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, completed.first_new_prefix_page,
+                                      demands)) {
             return std::nullopt;
         }
     }
@@ -543,17 +546,17 @@ DecodeOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::Sc
     return operation;
 }
 
-std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(PlanBuildContext& context, Request* request,
-                                                                    std::int32_t token_budget,
+std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
+                                                                    Request* request, std::int32_t token_budget,
                                                                     std::int32_t decode_reserve,
                                                                     std::vector<LoadBackOperation>& load_backs) {
     if (request->Is<fsm::Prefilling>()) {
-        if (auto event = schedulePrefill(context, request, token_budget, decode_reserve)) {
+        if (auto event = schedulePrefill(plan, feedback, request, token_budget, decode_reserve)) {
             return applyEventAndBuildOperation(request, std::move(*event));
         }
         return std::nullopt;
     }
-    if (auto event = schedulePrefillFirstChunk(context, request, token_budget, decode_reserve)) {
+    if (auto event = schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve)) {
         return applyEventAndBuildOperation(request, std::move(*event), load_backs);
     }
     return std::nullopt;
@@ -664,10 +667,10 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
 // already-built decode batch, where the role's grammar keeps them apart)
 // still retracts one victim: the next round's phase order tries the blocker
 // before any other claim on the freed pages.
-void Scheduler::maybeRetractForCapacity(PlanBuildContext& context, PlanBuild& build,
+void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& build,
                                         std::span<Request* const> candidates,
                                         std::vector<WriteBackOperation>& write_back_operations) {
-    Request* blocker = std::exchange(context.capacity_blocker, nullptr);
+    Request* blocker = std::exchange(feedback.capacity_blocker, nullptr);
     if (!build.NoPrefillProgress() || blocker == nullptr) {
         return;
     }
@@ -717,9 +720,9 @@ void Scheduler::maybeRetractForCapacity(PlanBuildContext& context, PlanBuild& bu
             return;
         }
 
-        context.admission_failed = false;
+        feedback.admission_failed = false;
         if (blocked_on_decode) {
-            if (auto event = scheduleDecode(context, blocker)) {
+            if (auto event = scheduleDecode(build.plan, feedback, blocker)) {
                 pushOperation(build, *blocker, applyEventAndBuildOperation(blocker, std::move(*event)));
                 blocker->TrackScheduledForward();
                 return;
@@ -730,8 +733,8 @@ void Scheduler::maybeRetractForCapacity(PlanBuildContext& context, PlanBuild& bu
             // plan.remote_prefill beside whatever batch this round built.
             // Everything else is local prefill work joining the model batch.
             const std::int32_t budget = remote_grant ? blocker->PrefillSize() : build.token_budget;
-            if (auto operation =
-                    schedulePrefillCandidate(context, blocker, budget, config_.decode_input_tokens, build.load_backs)) {
+            if (auto operation = schedulePrefillCandidate(build.plan, feedback, blocker, budget,
+                                                          config_.decode_input_tokens, build.load_backs)) {
                 if (remote_grant) {
                     build.scheduled.insert(blocker);
                     build.remote_prefill.emplace_back(std::move(*operation));
@@ -747,7 +750,7 @@ void Scheduler::maybeRetractForCapacity(PlanBuildContext& context, PlanBuild& bu
                 return;
             }
         }
-        if (!context.admission_failed) {
+        if (!feedback.admission_failed) {
             return;  // not a capacity failure (zero-token alignment); stop retracting
         }
     }
@@ -784,21 +787,21 @@ Request* Scheduler::nextReadmission(std::span<Request* const> candidates) {
 // capacity blocker (retracting a victim for it is pure thrash -- the two
 // simply do not fit together), but it does seal new-prompt admission:
 // a newcomer taking the pages it is waiting for would starve it.
-void Scheduler::scheduleLocalPrefillWork(PlanBuildContext& context, PlanBuild& build,
+void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build,
                                          std::span<Request* const> candidates, Request* readmission,
                                          std::int32_t decode_reserve) {
     bool new_prompts_sealed = false;
     if (readmission != nullptr) {
-        context.admission_failed = false;
-        if (auto operation =
-                schedulePrefillCandidate(context, readmission, build.token_budget, decode_reserve, build.load_backs)) {
+        feedback.admission_failed = false;
+        if (auto operation = schedulePrefillCandidate(build.plan, feedback, readmission, build.token_budget,
+                                                      decode_reserve, build.load_backs)) {
             pushOperation(build, *readmission, std::move(*operation));
             readmission->TrackScheduledForward();
             if (holdsHeadOfLine(*readmission)) {
                 return;
             }
         } else {
-            new_prompts_sealed = context.admission_failed;
+            new_prompts_sealed = feedback.admission_failed;
         }
     }
     for (const bool resident : {true, false}) {
@@ -813,9 +816,9 @@ void Scheduler::scheduleLocalPrefillWork(PlanBuildContext& context, PlanBuild& b
                 build.Scheduled(*request)) {
                 continue;
             }
-            context.admission_failed = false;
-            if (auto operation =
-                    schedulePrefillCandidate(context, request, build.token_budget, decode_reserve, build.load_backs)) {
+            feedback.admission_failed = false;
+            if (auto operation = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget,
+                                                          decode_reserve, build.load_backs)) {
                 pushOperation(build, *request, std::move(*operation));
                 if (config_.enable_pd_cache) {
                     // Pages stay pinned until the PD transfer completes.
@@ -825,9 +828,9 @@ void Scheduler::scheduleLocalPrefillWork(PlanBuildContext& context, PlanBuild& b
                 if (holdsHeadOfLine(*request)) {
                     return;
                 }
-            } else if (context.admission_failed) {
-                if (context.capacity_blocker == nullptr) {
-                    context.capacity_blocker = request;
+            } else if (feedback.admission_failed) {
+                if (feedback.capacity_blocker == nullptr) {
+                    feedback.capacity_blocker = request;
                 }
                 if (resident) {
                     return;
@@ -841,7 +844,8 @@ void Scheduler::scheduleLocalPrefillWork(PlanBuildContext& context, PlanBuild& b
 // (its first decode) and Decoding candidate. The budget guard protects the
 // mamba state reserve of a prefill scheduled beside them in mixed mode; on
 // the D role decodes consume no budget, so it never binds there.
-void Scheduler::scheduleDecodeBatch(PlanBuildContext& context, PlanBuild& build, std::span<Request* const> candidates) {
+void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build,
+                                    std::span<Request* const> candidates) {
     for (Request* request : candidates) {
         if (build.Full(config_.max_batch_size) ||
             build.token_budget < build.state_prefill_reserve + config_.decode_input_tokens) {
@@ -850,12 +854,12 @@ void Scheduler::scheduleDecodeBatch(PlanBuildContext& context, PlanBuild& build,
         if ((!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) || build.Scheduled(*request)) {
             continue;
         }
-        context.admission_failed = false;
-        if (auto event = scheduleDecode(context, request)) {
+        feedback.admission_failed = false;
+        if (auto event = scheduleDecode(build.plan, feedback, request)) {
             pushOperation(build, *request, applyEventAndBuildOperation(request, std::move(*event)));
             request->TrackScheduledForward();
-        } else if (context.admission_failed && context.capacity_blocker == nullptr) {
-            context.capacity_blocker = request;
+        } else if (feedback.admission_failed && feedback.capacity_blocker == nullptr) {
+            feedback.capacity_blocker = request;
         }
     }
 }
@@ -867,7 +871,7 @@ void Scheduler::scheduleDecodeBatch(PlanBuildContext& context, PlanBuild& build,
 // retraction either: a P node's pressure valve is the transfer itself, so
 // this grammar never calls maybeRetractForCapacity and nothing here is ever
 // readmitted.
-void Scheduler::buildPrefillWorkerPlan(PlanBuildContext& context, PlanBuild& build,
+void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& build,
                                        std::span<Request* const> candidates) {
     // The prompt decodes on the peer node: its KV goes out on the plan's own
     // stream, occupying no token budget and no batch slot. A prompt still
@@ -878,21 +882,22 @@ void Scheduler::buildPrefillWorkerPlan(PlanBuildContext& context, PlanBuild& bui
     // its fence is the PD ACK.
     for (Request* request : candidates) {
         if (request->Is<fsm::PrefillDone>()) {
-            if (auto event = scheduleDecode(context, request)) {
+            if (auto event = scheduleDecode(build.plan, feedback, request)) {
                 build.scheduled.insert(request);
                 build.remote_decode.emplace_back(applyEventAndBuildOperation(request, std::move(*event)));
             }
         }
     }
 
-    scheduleLocalPrefillWork(context, build, candidates, /*readmission=*/nullptr, /*decode_reserve=*/0);
+    scheduleLocalPrefillWork(feedback, build, candidates, /*readmission=*/nullptr, /*decode_reserve=*/0);
 }
 
 // D role: decode worker. Local recovery work runs alone in its batch;
 // otherwise the round is a decode batch, beside which at most ONE remote
 // admission rides plan.remote_prefill. Retraction picks decode victims and
 // retries the blocked admission in the same round.
-void Scheduler::buildDecodeWorkerPlan(PlanBuildContext& context, PlanBuild& build, std::span<Request* const> candidates,
+void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& build,
+                                      std::span<Request* const> candidates,
                                       std::vector<WriteBackOperation>& write_back_operations) {
     // Phase 1: local recovery, alone in its batch -- a resident chunk if one
     // is mid-prompt (always recovery here: a remote prompt is
@@ -905,21 +910,21 @@ void Scheduler::buildDecodeWorkerPlan(PlanBuildContext& context, PlanBuild& buil
     const auto resident = std::ranges::find_if(candidates, &Request::Is<fsm::Prefilling>);
     Request* recovery = resident != candidates.end() ? *resident : nextReadmission(candidates);
     if (recovery != nullptr) {
-        context.admission_failed = false;
-        if (auto operation = schedulePrefillCandidate(context, recovery, build.token_budget,
+        feedback.admission_failed = false;
+        if (auto operation = schedulePrefillCandidate(build.plan, feedback, recovery, build.token_budget,
                                                       config_.decode_input_tokens, build.load_backs)) {
             pushOperation(build, *recovery, std::move(*operation));
             recovery->TrackScheduledForward();
             return;  // recovery runs alone
         }
-        if (recovery->Is<fsm::Prefilling>() && context.admission_failed && context.capacity_blocker == nullptr) {
-            context.capacity_blocker = recovery;
+        if (recovery->Is<fsm::Prefilling>() && feedback.admission_failed && feedback.capacity_blocker == nullptr) {
+            feedback.capacity_blocker = recovery;
         }
     }
 
     // Phase 2: the decode batch. Completed prefills' first decodes go ahead
     // of the running ones; neither consumes token budget on this role.
-    scheduleDecodeBatch(context, build, candidates);
+    scheduleDecodeBatch(feedback, build, candidates);
 
     // Phase 3: at most one remote admission -- the whole prompt reserves at
     // once, so admitting a queue's worth in one round would drain the pool
@@ -931,8 +936,8 @@ void Scheduler::buildDecodeWorkerPlan(PlanBuildContext& context, PlanBuild& buil
         if (!admitsLikeNewPrompt(*request)) {
             continue;
         }
-        context.admission_failed = false;
-        if (auto operation = schedulePrefillCandidate(context, request, request->PrefillSize(),
+        feedback.admission_failed = false;
+        if (auto operation = schedulePrefillCandidate(build.plan, feedback, request, request->PrefillSize(),
                                                       config_.decode_input_tokens, build.load_backs)) {
             build.scheduled.insert(request);
             build.remote_prefill.emplace_back(std::move(*operation));
@@ -941,12 +946,12 @@ void Scheduler::buildDecodeWorkerPlan(PlanBuildContext& context, PlanBuild& buil
             }
             break;
         }
-        if (context.admission_failed && context.capacity_blocker == nullptr) {
-            context.capacity_blocker = request;
+        if (feedback.admission_failed && feedback.capacity_blocker == nullptr) {
+            feedback.capacity_blocker = request;
         }
     }
 
-    maybeRetractForCapacity(context, build, candidates, write_back_operations);
+    maybeRetractForCapacity(feedback, build, candidates, write_back_operations);
 }
 
 // Fused role: one engine does everything locally. In mixed mode resident
@@ -956,7 +961,7 @@ void Scheduler::buildDecodeWorkerPlan(PlanBuildContext& context, PlanBuild& buil
 // the rest. Outside mixed mode prefill work runs alone, and decodes get a
 // round only when no prefill scheduled. Recovery readmission is live when a
 // host cache gives victims a way back.
-void Scheduler::buildFusedPlan(PlanBuildContext& context, PlanBuild& build, std::span<Request* const> candidates,
+void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                std::vector<WriteBackOperation>& write_back_operations) {
     Request* readmission = nextReadmission(candidates);
     if (config_.enable_mixed_prefill_decode) {
@@ -966,34 +971,34 @@ void Scheduler::buildFusedPlan(PlanBuildContext& context, PlanBuild& build, std:
             });
         build.state_prefill_reserve =
             coordinator_.HasMambaStateGroup() && has_local_prefill ? coordinator_.PrefixGranularity() : 0;
-        scheduleDecodeBatch(context, build, candidates);
+        scheduleDecodeBatch(feedback, build, candidates);
     }
 
-    scheduleLocalPrefillWork(context, build, candidates, readmission, config_.decode_input_tokens);
+    scheduleLocalPrefillWork(feedback, build, candidates, readmission, config_.decode_input_tokens);
 
     if (!config_.enable_mixed_prefill_decode && !build.pushed_prefill) {
-        scheduleDecodeBatch(context, build, candidates);
+        scheduleDecodeBatch(feedback, build, candidates);
     }
 
-    maybeRetractForCapacity(context, build, candidates, write_back_operations);
+    maybeRetractForCapacity(feedback, build, candidates, write_back_operations);
 }
 
 std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> Scheduler::buildForwardOperations(
     ExecutionPlan& plan, std::vector<Request*> candidates, std::vector<WriteBackOperation>& write_back_operations) {
     // The candidates arrive in submission order (requests_ is the FIFO),
     // identical on every rank -- so within a phase, older requests win.
-    PlanBuildContext context{plan};
-    PlanBuild build;
+    AdmissionFeedback feedback;
+    PlanBuild build{plan};
     build.token_budget = config_.max_scheduled_tokens;
     switch (config_.role) {
         case Role::kP:
-            buildPrefillWorkerPlan(context, build, candidates);
+            buildPrefillWorkerPlan(feedback, build, candidates);
             break;
         case Role::kD:
-            buildDecodeWorkerPlan(context, build, candidates, write_back_operations);
+            buildDecodeWorkerPlan(feedback, build, candidates, write_back_operations);
             break;
         case Role::kFused:
-            buildFusedPlan(context, build, candidates, write_back_operations);
+            buildFusedPlan(feedback, build, candidates, write_back_operations);
             break;
     }
 

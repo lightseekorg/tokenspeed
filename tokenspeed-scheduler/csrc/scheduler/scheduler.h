@@ -96,10 +96,12 @@ private:
         std::vector<std::uint64_t> block_hashes;
     };
 
-    struct PlanBuildContext {
-        explicit PlanBuildContext(ExecutionPlan& output_plan) : plan{output_plan} {}
-
-        ExecutionPlan& plan;
+    // What the per-request admission layer reports back to the role
+    // grammars. Together with the output ExecutionPlan (where admit()
+    // records fresh pages to zero) this is ALL that layer sees of a
+    // plan-building pass: batch composition lives in PlanBuild, which the
+    // grammars alone hold, so nothing below them can bypass pushOperation.
+    struct AdmissionFeedback {
         // Set by admit() when the last admission failed for capacity (as
         // opposed to a chunk that aligned to zero tokens). The phases clear
         // it before each attempt.
@@ -113,14 +115,16 @@ private:
 
     std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> buildForwardOperations(
         ExecutionPlan& plan, std::vector<Request*> candidates, std::vector<WriteBackOperation>& write_back_operations);
-    std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(PlanBuildContext& context,
+    std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(ExecutionPlan& plan,
+                                                                                 AdmissionFeedback& feedback,
                                                                                  Request* request,
                                                                                  std::int32_t remaining,
                                                                                  std::int32_t decode_input_tokens);
-    std::optional<fsm::SchedulePrefillEvent> schedulePrefill(PlanBuildContext& context, Request* request,
-                                                             std::int32_t remaining,
+    std::optional<fsm::SchedulePrefillEvent> schedulePrefill(ExecutionPlan& plan, AdmissionFeedback& feedback,
+                                                             Request* request, std::int32_t remaining,
                                                              std::int32_t reserve_num_tokens_in_next_schedule_event);
-    std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(PlanBuildContext& context, Request* request);
+    std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
+                                                           Request* request);
 
     PrefillOperation applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
                                                  std::vector<LoadBackOperation>& load_back_operations);
@@ -129,13 +133,14 @@ private:
 
     AdmissionMatch matchPrefixAtAdmission(Request* request);
     std::optional<CacheCoordinator::AdmissionResult> admit(
-        PlanBuildContext& context, CacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
-        std::optional<std::uint64_t> request_access_epoch = std::nullopt);
-    std::optional<CacheCoordinator::AdmissionResult> admit(PlanBuildContext& context,
+        ExecutionPlan& plan, AdmissionFeedback& feedback, CacheCoordinator::PrefixProbe&& prefix,
+        std::span<const GroupDemand> demands, std::optional<std::uint64_t> request_access_epoch = std::nullopt);
+    std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            std::span<const GroupDemand> demands,
                                                            std::uint64_t request_access_epoch);
-    bool admitWithKvEventTracking(PlanBuildContext& context, Request& request, const fsm::CacheProgress& cache_progress,
-                                  std::int32_t new_prefix_hash_begin, std::span<const GroupDemand> demands);
+    bool admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request,
+                                  const fsm::CacheProgress& cache_progress, std::int32_t new_prefix_hash_begin,
+                                  std::span<const GroupDemand> demands);
     std::vector<CacheKey> registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
                                                      std::int32_t first_page);
     void discardUncachedKvEventPages(std::span<const CacheKey> keys);
@@ -156,11 +161,16 @@ private:
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
 
-    // Mutable state of one plan-building pass: the model batch under
-    // construction, the transfer peer's two streams, and the composition
-    // flags the role grammars consult. buildForwardOperations owns one and
-    // hands it to the role's builder.
+    // Mutable state of one plan-building pass: the output plan, the model
+    // batch under construction, the transfer peer's two streams, and the
+    // composition flags the role grammars consult. buildForwardOperations
+    // owns one and hands it to the role's builder. The admission layer never
+    // sees this struct -- it receives build.plan and an AdmissionFeedback --
+    // so batch and budget accounting stay behind pushOperation.
     struct PlanBuild {
+        explicit PlanBuild(ExecutionPlan& output_plan) : plan{output_plan} {}
+
+        ExecutionPlan& plan;
         std::vector<ForwardOperation> operations;
         std::vector<ForwardOperation> remote_decode;
         std::vector<ForwardOperation> remote_prefill;
@@ -211,10 +221,11 @@ private:
 
     // Admission for one prefill-work candidate: a resumed chunk for a
     // Prefilling request, the first chunk otherwise. Returns the built
-    // operation, or nullopt when admission fails (context.admission_failed
+    // operation, or nullopt when admission fails (feedback.admission_failed
     // says whether capacity was the reason).
-    std::optional<PrefillOperation> schedulePrefillCandidate(PlanBuildContext& context, Request* request,
-                                                             std::int32_t token_budget, std::int32_t decode_reserve,
+    std::optional<PrefillOperation> schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
+                                                             Request* request, std::int32_t token_budget,
+                                                             std::int32_t decode_reserve,
                                                              std::vector<LoadBackOperation>& load_backs);
 
     // The readmission this round may schedule, or nullptr: among the
@@ -231,7 +242,7 @@ private:
     // victims and RETRIES the blocked admission in the same plan build, so
     // the freed capacity reaches the request it was freed for -- never a
     // free page waiting for whoever asks first next round.
-    void maybeRetractForCapacity(PlanBuildContext& context, PlanBuild& build, std::span<Request* const> candidates,
+    void maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                  std::vector<WriteBackOperation>& write_back_operations);
     Request* chooseVictim(std::span<Request* const> candidates) const;
     void retractVictim(Request& victim, std::vector<WriteBackOperation>& write_back_operations);
@@ -243,14 +254,14 @@ private:
     // role conditionals. Every phase walks the candidates in submission
     // order (requests_ is the FIFO) -- what used to be a priority ladder is
     // now the phase sequence itself, and within a phase older requests win.
-    void buildPrefillWorkerPlan(PlanBuildContext& context, PlanBuild& build, std::span<Request* const> candidates);
-    void buildDecodeWorkerPlan(PlanBuildContext& context, PlanBuild& build, std::span<Request* const> candidates,
+    void buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
+    void buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                std::vector<WriteBackOperation>& write_back_operations);
-    void buildFusedPlan(PlanBuildContext& context, PlanBuild& build, std::span<Request* const> candidates,
+    void buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                         std::vector<WriteBackOperation>& write_back_operations);
-    void scheduleLocalPrefillWork(PlanBuildContext& context, PlanBuild& build, std::span<Request* const> candidates,
+    void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   Request* readmission, std::int32_t decode_reserve);
-    void scheduleDecodeBatch(PlanBuildContext& context, PlanBuild& build, std::span<Request* const> candidates);
+    void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
     std::int32_t calculateMaxSingleRequestTokens(std::int64_t usable_lcm_blocks) const;
     std::int64_t singleRequestLcmBlocksRequired(std::int32_t token_limit) const;
