@@ -104,3 +104,46 @@ exit 1
     assert (tmp_path / "curl-calls").read_text().splitlines() == ["called"]
     assert (cache_dir / "pkg.whl").read_text() == "complete wheel"
     assert not list(cache_dir.glob("*.tmp.*"))
+
+
+def test_cached_remote_wheel_rejects_empty_download(tmp_path: Path):
+    bin_dir = tmp_path / "bin"
+    cache_dir = tmp_path / "wheelhouse"
+    bin_dir.mkdir()
+    cache_dir.mkdir()
+    fake_curl = bin_dir / "curl"
+    fake_curl.write_text("""#!/bin/bash
+set -e
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--output" ]; then
+        : > "$2"
+        exit 0
+    fi
+    shift
+done
+exit 1
+""")
+    fake_curl.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "CI_WHEEL_CACHE_DIR": str(cache_dir),
+            "PATH": f"{bin_dir}:{env['PATH']}",
+        }
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{SCRIPT}"; cache_remote_wheel "https://example.test/pkg.whl"',
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "Downloaded an empty wheel" in result.stderr
+    assert not (cache_dir / "pkg.whl").exists()

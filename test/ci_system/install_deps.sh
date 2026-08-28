@@ -97,6 +97,7 @@ ensure_flashinfer_jit_cache() {
         return 0
     fi
 
+    local wheel_source
     local wheel_url
     wheel_url="$(python3 "${SCRIPT_DIR}/flashinfer_jit_cache_installer.py" \
         --requirements "${CUDA_REQ}" \
@@ -105,8 +106,12 @@ ensure_flashinfer_jit_cache() {
         return 0
     fi
 
+    # pip treats GitHub's zero-length redirect response as the wheel body for
+    # large release assets on the ARM Slurm workers. curl follows the redirect
+    # correctly, and the shared wheel cache avoids downloading it per worker.
+    wheel_source="$(cache_remote_wheel "${wheel_url}")"
     pip_install_with_retry pip3 install --break-system-packages \
-        --force-reinstall --no-deps "${wheel_url}"
+        --force-reinstall --no-deps "${wheel_source}"
 }
 
 echo "=========================================="

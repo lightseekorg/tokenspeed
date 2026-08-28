@@ -45,6 +45,10 @@ cache_remote_wheel() {
             echo "Downloading ${wheel_url} to persistent cache" >&2
             curl --fail --location --retry 5 --retry-all-errors \
                 --connect-timeout 30 --output "${tmp_path}" "${wheel_url}"
+            if [ ! -s "${tmp_path}" ]; then
+                echo "Downloaded an empty wheel from ${wheel_url}" >&2
+                return 1
+            fi
             if [ -n "${expected_sha256}" ]; then
                 local downloaded_sha256
                 downloaded_sha256="$(sha256sum "${tmp_path}")"
@@ -59,7 +63,7 @@ cache_remote_wheel() {
         else
             echo "Using cached wheel ${cache_path}" >&2
         fi
-    ) 9>"${cache_path}.lock"
+    ) 9>"${cache_path}.lock" || return $?
 
     printf '%s\n' "${cache_path}"
 }
