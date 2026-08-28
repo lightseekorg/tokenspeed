@@ -50,6 +50,12 @@ class TestAttentionBackendChoices(unittest.TestCase):
         )
         self.assertEqual(args.attention_backend, "mla")
 
+    def test_attention_backend_accepts_gluon(self):
+        args = self._build_parser().parse_args(
+            ["--model", "x", "--attention-backend", "gluon"]
+        )
+        self.assertEqual(args.attention_backend, "gluon")
+
     def test_attention_backend_accepts_mha_kernel_solutions(self):
         for backend in ("fa3", "fa4", "triton", "flashinfer"):
             args = self._build_parser().parse_args(
@@ -63,6 +69,12 @@ class TestAttentionBackendChoices(unittest.TestCase):
             ["--model", "x", "--drafter-attention-backend", "trtllm_mla"]
         )
         self.assertEqual(args.drafter_attention_backend, "trtllm_mla")
+
+    def test_drafter_attention_backend_accepts_gluon(self):
+        args = self._build_parser().parse_args(
+            ["--model", "x", "--drafter-attention-backend", "gluon"]
+        )
+        self.assertEqual(args.drafter_attention_backend, "gluon")
 
     def test_drafter_choices_match_main_choices(self):
         parser = self._build_parser()
@@ -118,6 +130,43 @@ class TestAttentionBackendChoices(unittest.TestCase):
             registry._get_backend_cls("mla", AttentionArch.MLA),
             MLAAttnBackend,
         )
+
+    def test_gluon_backend_registered_for_mla(self):
+        from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
+
+        self.assertIs(
+            registry._get_backend_cls("gluon", AttentionArch.MLA),
+            MLAAttnBackend,
+        )
+
+    def test_gluon_mla_backend_forces_gluon_kernel_solution(self):
+        import torch
+
+        from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
+
+        config = SimpleNamespace(
+            device="cpu",
+            backend_name="gluon",
+            num_attention_heads=128,
+            num_kv_heads=1,
+            head_dim=576,
+            attn_tp_size=8,
+            dtype=torch.bfloat16,
+            kv_cache_dtype=torch.float8_e4m3fn,
+            is_draft=True,
+            speculative_num_draft_tokens=4,
+            context_len=65536,
+            kernel_page_size=64,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            kv_cache_dim=576,
+            scaling=192**-0.5,
+            draft_block_decode=False,
+        )
+
+        self.assertEqual(MLAAttnBackend(config).kernel_solution, "gluon")
 
     def test_defaults_to_mla_for_mla(self):
         self.assertEqual(registry._get_default_backend_name(AttentionArch.MLA), "mla")

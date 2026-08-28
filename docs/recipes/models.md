@@ -301,7 +301,9 @@ Blackwell GPU (B200/B300); on other NVIDIA platforms use
 
 ### AMD
 
-The standard AMD path on 8x gfx950 uses the `mla` backend. For TP8/EP8,
+The standard AMD path on 8x gfx950 uses the `mla` backend, which selects MLA
+kernels automatically. Use `gluon` to require Gluon MLA kernels for both the
+target and, when speculative decoding is enabled, its MLA drafter. For TP8/EP8,
 automatic MoE selection uses the specialized Gluon SiTU kernels:
 
 ```bash
@@ -321,6 +323,17 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --host 0.0.0.0 \
   --port 8000
 ```
+
+To force Gluon attention for an Eagle3 launch, replace the attention option
+above and add the drafter option:
+
+```bash
+  --attention-backend gluon \
+  --drafter-attention-backend gluon
+```
+
+The explicit policy fails fast when the current GPU, dtype, or attention shape
+has no registered Gluon kernel instead of silently selecting another solution.
 
 On gfx950, the replicated 7168↔3584 latent projections automatically select
 among a one-token Triton GEMV, tuned Gluon GEMMs, and the vendor GEMM according

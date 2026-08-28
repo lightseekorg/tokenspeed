@@ -137,7 +137,8 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         # target verify and ordinary decode are untouched.
         self.draft_block_decode = bool(config.draft_block_decode)
 
-        self.kernel_solution = None
+        backend_name = config.backend_name or "mla"
+        self.kernel_solution = {"mla": None, "gluon": "gluon"}[backend_name]
 
         self.forward_decode_metadata: MLADecodeMetadata | None = None
         self.forward_prefill_metadata: MLAPrefillMetadata | None = None
@@ -480,6 +481,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             not self._cache_groups_bound
             or forward_mode is None
             or forward_mode.is_idle()
+            or (self.is_draft and getattr(self, "reads_staged_draft_page_table", False))
         ):
             return out_cache_loc
         if self._block_decode_active:
@@ -544,7 +546,13 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 f"mla CUDA graph capture not supported for {forward_mode}"
             )
 
-        uses_cache_groups = bool(cache_group_ids) or self._cache_contract_bound
+        # Contract-bound MLA drafts consume the staged, batch-ordered draft
+        # page table rather than the target's per-group tables.  Only an
+        # explicit group dispatch puts a draft on the grouped path; targets
+        # still use the contract marker established before graph allocation.
+        uses_cache_groups = bool(cache_group_ids) or (
+            self._cache_contract_bound and not self.is_draft
+        )
         if self._block_decode_active:
             if uses_cache_groups:
                 self._cache_groups_bound = True
@@ -981,4 +989,5 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         return result
 
 
-register_backend("mla", {AttentionArch.MLA}, MLAAttnBackend)
+for _backend_name in ("mla", "gluon"):
+    register_backend(_backend_name, {AttentionArch.MLA}, MLAAttnBackend)

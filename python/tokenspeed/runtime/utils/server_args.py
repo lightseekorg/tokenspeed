@@ -1574,6 +1574,7 @@ class ServerArgs:
             "fa3",
             "fa4",
             "triton",
+            "gluon",
             "flashinfer",
             "trtllm",
             "trtllm_mla",
@@ -1586,7 +1587,8 @@ class ServerArgs:
             type=str,
             choices=attention_backend_choices,
             default=ServerArgs.attention_backend,
-            help="Choose the kernels for attention layers.",
+            help="Choose the kernels for attention layers. 'gluon' forces "
+            "registered Gluon kernels for supported attention architectures.",
         )
         parser.add_argument(
             "--kda-backend",

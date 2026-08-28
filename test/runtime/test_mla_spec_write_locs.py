@@ -269,6 +269,19 @@ def test_count_mismatch_is_still_caught() -> None:
         )
 
 
+def test_staged_mla_draft_keeps_drafter_write_locations() -> None:
+    backend = _backend(spec_num_tokens=4, is_draft=True)
+    caller = torch.tensor([11, 12], dtype=torch.int64)
+    assert (
+        backend.select_out_cache_loc(
+            layer=None,
+            out_cache_loc=caller,
+            forward_mode=ForwardMode.DECODE,
+        )
+        is caller
+    )
+
+
 # --------------------------------------------------------------------------
 # Graph buffer sizing
 # --------------------------------------------------------------------------
@@ -326,6 +339,20 @@ def test_an_unmarked_draft_is_refused_on_the_group_graph_path() -> None:
             forward_mode=ForwardMode.DECODE,
             cache_group_ids=("full_attention",),
         )
+
+
+def test_contract_bound_draft_captures_staged_page_table_path() -> None:
+    """An Eagle MLA draft reads its staged table, not target group tables."""
+    backend = _backend(spec_num_tokens=4, is_draft=True)
+    backend.init_cuda_graph_state(max_bs=2)
+    backend.init_forward_metadata_capture_cuda_graph(
+        bs=2,
+        req_pool_indices=torch.tensor([0, 1]),
+        seq_lens=torch.tensor([100, 200], dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+    )
+    metadata = backend.decode_cuda_graph_metadata[2]
+    assert metadata.group_out_cache_loc is None
 
 
 def test_a_contract_bound_block_draft_is_admitted_on_the_group_graph_path() -> None:
