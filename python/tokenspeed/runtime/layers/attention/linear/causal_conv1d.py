@@ -46,7 +46,6 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     token_chunk_offset_ptr,
     o_ptr,  # (dim, seqlen) - actually pointing to x_ptr
     # Matrix dimensions
-    batch: tl.int32,  # actually padded_batch
     dim: tl.constexpr,
     seqlen: tl.int32,  # cu_seqlen
     num_cache_lines: tl.constexpr,
@@ -616,7 +615,6 @@ def causal_conv1d_fn(
         token_chunk_offset_ptr,
         out,
         # Matrix dimensions
-        padded_batch,
         dim,
         cu_seqlen,
         num_cache_lines,
