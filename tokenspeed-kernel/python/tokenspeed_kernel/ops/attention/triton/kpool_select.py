@@ -54,12 +54,15 @@ _TRAITS = {
 }
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens"],
+    do_not_specialize_on_alignment=["num_tokens"],
+)
 def _kpool_decode_metadata_kernel(
     seq_lens,
     req_ids,
     causal_lens,
-    num_tokens: tl.constexpr,
+    num_tokens,
     q_len_per_req: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
