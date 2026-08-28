@@ -412,7 +412,7 @@ class K3AttnComm:
             )
             if residual_out is not None:
                 return residual_out, None
-        if combine is not None and prefix_sum is not None and num_tokens == 1:
+        if combine is not None and prefix_sum is not None and num_tokens > 0:
             scratch, _, _, out_norm_w, eps = combine
             if out_norm_w is not None:
                 from tokenspeed_kernel.ops.communication.triton import (
