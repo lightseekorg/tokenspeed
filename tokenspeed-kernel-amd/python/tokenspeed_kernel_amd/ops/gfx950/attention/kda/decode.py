@@ -748,7 +748,6 @@ def _kda_fused_replay_kernel(
     H: gl.constexpr,
     D: gl.constexpr,
     TOKENS_PER_SEQUENCE: gl.constexpr,
-    VALUE_SPLITS: gl.constexpr,
     MIXED_ROW_STRIDE: gl.constexpr,
     CONV_WEIGHT_ROW_STRIDE: gl.constexpr,
     CONV_WEIGHT_COL_STRIDE: gl.constexpr,
@@ -763,7 +762,13 @@ def _kda_fused_replay_kernel(
     LAYERS_PER_GROUP: gl.constexpr,
     BATCH_SIZE: gl.constexpr,
 ):
-    """Replay accepted raw-g prefixes for every descriptor layer."""
+    """Replay accepted raw-g prefixes for every descriptor layer.
+
+    One program owns a head's whole eight-panel value loop. The grid already
+    spans every descriptor layer, so it covers the device without splitting a
+    head across programs, and splitting would only duplicate the convolution
+    and gate work every program has to redo per panel.
+    """
     layer_idx = gl.program_id(2)
     descriptor_base = layer_idx * 10
     mixed_qkv = tl.cast(
@@ -802,9 +807,7 @@ def _kda_fused_replay_kernel(
     read_indices += group_offset
     write_indices += group_offset
 
-    head_program_idx = gl.program_id(0)
-    head_idx = head_program_idx // VALUE_SPLITS
-    value_split_idx = head_program_idx % VALUE_SPLITS
+    head_idx = gl.program_id(0)
     sequence_idx = gl.program_id(1)
     token_base = sequence_idx * TOKENS_PER_SEQUENCE
 
@@ -829,13 +832,10 @@ def _kda_fused_replay_kernel(
     read_page_offset = read_idx.to(gl.int64)
     read_base = read_page_offset * STATE_POOL_PAGE_STRIDE + head_idx * D * D
     panel_value_offsets = gl.arange(0, 16, layout=value_layout)
-    off_pipe = ()
-    raw_pipe = ()
-    if VALUE_SPLITS == 1:
-        _off = panel_value_offsets[:, None] * D + key_offsets[None, :]
-        _raw = gl.load(state_pool + read_base + _off).to(gl.float32)
-        off_pipe = (_off,)
-        raw_pipe = (_raw,)
+    _off = panel_value_offsets[:, None] * D + key_offsets[None, :]
+    _raw = gl.load(state_pool + read_base + _off).to(gl.float32)
+    off_pipe = (_off,)
+    raw_pipe = (_raw,)
 
     qkv_channel, slot_id, local_offset, is_decay = _kda_qkvd_indices(head_idx, H, D)
     qkv_history0 = gl.load(
@@ -891,7 +891,7 @@ def _kda_fused_replay_kernel(
             + safe_write_idx * CONV_POOL_PAGE_STRIDE
             + qkv_channel * CONV_POOL_CHANNEL_STRIDE
         )
-        write_mask = valid_write & (slot_id != 3) & (value_split_idx == 0)
+        write_mask = valid_write & (slot_id != 3)
         gl.store(qkv_write_base, qkv_history1, mask=write_mask)
         gl.store(
             qkv_write_base + CONV_POOL_HISTORY_STRIDE,
@@ -949,53 +949,42 @@ def _kda_fused_replay_kernel(
         key_queries = key_queries + (gl.sum(k_value * q_value, axis=0),)
         value_panels_by_token = value_panels_by_token + (value_panels,)
 
-    panels_per_split: gl.constexpr = 8 // VALUE_SPLITS
     for panel_idx in gl.static_range(8):
-        if value_split_idx == panel_idx // panels_per_split:
-            if VALUE_SPLITS == 1:
-                panel_offsets = off_pipe[0]
-                running = raw_pipe[0]
-            else:
-                panel_offsets = (
-                    panel_value_offsets[:, None] + panel_idx * 16
-                ) * D + key_offsets[None, :]
-                running = gl.load(state_pool + read_base + panel_offsets).to(gl.float32)
+        panel_offsets = off_pipe[0]
+        running = raw_pipe[0]
 
-            for token_offset in gl.static_range(TOKENS_PER_SEQUENCE):
-                token_active = token_offset < replay_steps
-                panel_out = gl.zeros([16], gl.float32, layout=value_layout)
-                if token_active:
-                    running *= decay_values[token_offset][None, :]
-                    running, panel_out = _kda_recurrent_step(
-                        running,
-                        k_values[token_offset],
-                        q_values[token_offset],
-                        value_panels_by_token[token_offset][panel_idx],
-                        beta_values[token_offset],
-                        key_queries[token_offset],
-                    )
-                valid_write = valid_write_idx & (replay_steps == token_offset + 1)
-                write_base = safe_write_idx * STATE_POOL_PAGE_STRIDE + head_idx * D * D
-                gl.store(
-                    state_pool + write_base + panel_offsets,
+        for token_offset in gl.static_range(TOKENS_PER_SEQUENCE):
+            token_active = token_offset < replay_steps
+            panel_out = gl.zeros([16], gl.float32, layout=value_layout)
+            if token_active:
+                running *= decay_values[token_offset][None, :]
+                running, panel_out = _kda_recurrent_step(
                     running,
-                    mask=valid_write,
+                    k_values[token_offset],
+                    q_values[token_offset],
+                    value_panels_by_token[token_offset][panel_idx],
+                    beta_values[token_offset],
+                    key_queries[token_offset],
                 )
+            valid_write = valid_write_idx & (replay_steps == token_offset + 1)
+            write_base = safe_write_idx * STATE_POOL_PAGE_STRIDE + head_idx * D * D
+            gl.store(
+                state_pool + write_base + panel_offsets,
+                running,
+                mask=valid_write,
+            )
 
-            if VALUE_SPLITS == 1:
-                next_idx = panel_idx + 1
-                if next_idx < 8:
-                    next_offsets = (
-                        panel_value_offsets[:, None] + next_idx * 16
-                    ) * D + key_offsets[None, :]
-                    next_raw = gl.load(state_pool + read_base + next_offsets).to(
-                        gl.float32
-                    )
-                    off_pipe = off_pipe[1:] + (next_offsets,)
-                    raw_pipe = raw_pipe[1:] + (next_raw,)
-                else:
-                    off_pipe = off_pipe[1:] + (off_pipe[-1],)
-                    raw_pipe = raw_pipe[1:] + (raw_pipe[-1],)
+        next_idx = panel_idx + 1
+        if next_idx < 8:
+            next_offsets = (
+                panel_value_offsets[:, None] + next_idx * 16
+            ) * D + key_offsets[None, :]
+            next_raw = gl.load(state_pool + read_base + next_offsets).to(gl.float32)
+            off_pipe = off_pipe[1:] + (next_offsets,)
+            raw_pipe = raw_pipe[1:] + (next_raw,)
+        else:
+            off_pipe = off_pipe[1:] + (off_pipe[-1],)
+            raw_pipe = raw_pipe[1:] + (raw_pipe[-1],)
 
 
 def gluon_kda_recurrent_decode_gfx950(
@@ -1455,8 +1444,7 @@ def gluon_kda_fused_replay_gfx950(
     batch = accepted_length.numel()
     if read_indices.shape[1] != batch:
         raise ValueError("accepted_length must match the replay batch")
-    value_splits = _kda_value_splits(batch)
-    _kda_fused_replay_kernel[(num_heads * value_splits, batch, descriptors.shape[0])](
+    _kda_fused_replay_kernel[(num_heads, batch, descriptors.shape[0])](
         descriptors,
         read_indices,
         write_indices,
@@ -1464,7 +1452,6 @@ def gluon_kda_fused_replay_gfx950(
         H=num_heads,
         D=head_dim,
         TOKENS_PER_SEQUENCE=draft_token_num,
-        VALUE_SPLITS=value_splits,
         MIXED_ROW_STRIDE=qkv_stride,
         CONV_WEIGHT_ROW_STRIDE=conv_width,
         CONV_WEIGHT_COL_STRIDE=1,
