@@ -18,25 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Registry entry for the vendored CuTe low-latency BF16 router GEMM.
-
-Also exposes :func:`ll_bf16_mm`, the dense-linear form of the same two kernels:
-BF16 output with an optional fused ``[N]`` bias, the shape vLLM reaches through
-``--linear-backend flashinfer_cutedsl``. FlashInfer upstreamed those kernels as
-``mm_bf16``'s ``cute-dsl`` backend, so :func:`ll_bf16_mm` calls FlashInfer when
-the installed wheel declares it and runs the vendored copy otherwise; older
-wheels therefore keep working without pinning a floor.
-
-:func:`ll_bf16_mm` is deliberately *not* registered on ``gemm/decode_gemv``:
-swept on B200 (sm100) against cublas, skinny, and tgv at the six ``(N, K)`` the
-decode path actually dispatches, cold L2, CUDA-graph timed, it clears the
-route's 4% margin at only 4 of the 33 ``(M, N, K)`` points measured and loses by
-up to 3.5x at wide N -- 7168x768 at M = 4 costs 11.84us against cublas 3.39. The
-kernel is bandwidth-optimal only when N is narrow enough that one CTA per column
-still saturates, which the router shape satisfies and these projections do not.
-``test/gemm_tuning/tune_route.py`` carries it as a candidate so a future sweep
-can earn it entries the way skinny and tgv did.
-"""
+"""Registry entry for the vendored CuTe low-latency BF16 router GEMM."""
 
 from __future__ import annotations
 
@@ -158,12 +140,6 @@ def ll_bf16_mm(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``x @ weight.T (+ bias)`` in BF16, the dense-linear form of the router GEMM.
-
-    Runs FlashInfer's ``cute-dsl`` ``mm_bf16`` backend where the wheel declares
-    it, and the vendored copy of the same kernels otherwise. Accumulation stays
-    in FP32 and the bias folds into the epilogue either way, so the result rounds
-    once. Call :func:`ll_bf16_mm_supported` first; operands outside the guard
-    raise.
 
     Args:
         x: ``[..., K]`` contiguous BF16 activation; leading dims flatten to

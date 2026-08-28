@@ -19,11 +19,6 @@ a bound vLLM does not apply). ``(split_k, num_stages)`` is tuned here too:
 vLLM's tables cover ``(K, N)`` from ``(4096, 256)`` to ``(7168, 384)`` and never
 ``(7168, 896)``, so they run K3 on a ``(6, 4)`` default that loses at every M
 measured -- 5.75 / 8.74 / 9.19 us at M = 16 / 24 / 32 against the picks below.
-
-Both kernels accumulate in fp32 and convert on store, so the same code serves
-the fp32 router projection and a bf16 dense-linear path, with an optional
-``[N]`` bias folded into the epilogue. Output element type and bias presence are
-compile-time specializations, hence part of the compile-cache key.
 """
 
 from __future__ import annotations
