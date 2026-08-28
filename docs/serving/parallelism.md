@@ -136,14 +136,21 @@ dispatch still transports FP32 power-of-two scales, but the existing expert
 scatter packs them while permuting tokens, so neither mode needs a separate
 sequence of elementwise shifts, fills, copies, and a transpose before GEMM1.
 
-On SM100, dense `(128, 128)` FP8 projections pass their canonical scales to
-FlashInfer's FP8 block-scale GEMM in K-major mode: the quant kernel's native
-`[M, K/128]` activation scales and the checkpoint's native `[N/128, K/128]`
-weight scales go through without per-call padding, transposes, or layout
-conversion (strided scale views are normalized to contiguous first). K-major
-output is bitwise identical to the former MN-major conversion path. The
-prepared MN-major path remains available behind ``prepacked_scales=True`` for
-callers that opt in at load time.
+Dense `(128, 128)` FP8 projections have two scale contracts against
+FlashInfer's FP8 block-scale GEMM, and both are copy-free for the layout they
+own. The canonical K-major contract takes the quant kernel's `[M, K/128]`
+activation scales and the checkpoint's `[N/128, K/128]` weight scales with no
+layout conversion (strided scale views are normalized to contiguous first).
+The prepared MN-major contract, selected at load time on every Blackwell
+datacenter part, transposes the weight scales once and then consumes the
+TRT-LLM quantizer's native `[K/128, M]` activation scales directly, which is
+what the canonical path would otherwise have to transpose on every call. Both
+produce bitwise identical output.
+
+MN-major requires `M` to be a multiple of four, so a prepared layer falls back
+to the canonical contract once padding would cost more than the transpose it
+saves — the fused padding quantizer grows with `M` while the transpose does
+not. Decode row counts stay on the prepared path.
 
 ## Multi-Node
 

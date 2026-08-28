@@ -117,10 +117,26 @@ if platform.is_hopper_plus:
 
 def has_flashinfer_fp8_blockscale() -> bool:
     """Return whether the native FlashInfer FP8 block-scale GEMM is usable."""
-    return (
-        gemm_fp8_nt_groupwise is not error_fn
-        and platform.arch_version == ArchVersion(10, 0)
-    )
+    # Every Blackwell datacenter part runs this kernel; GB300 reports 10.3.
+    return gemm_fp8_nt_groupwise is not error_fn and platform.is_blackwell
+
+
+# Past ~224 rows (GB300, K=7168) padding M costs more than the transpose it saves.
+_PREPACKED_PAD_TOKEN_LIMIT = 256
+
+
+def use_flashinfer_fp8_blockscale_prepacked(num_tokens: int) -> bool:
+    """Whether MN-major prepacked scales beat canonical scales for this M.
+
+    Args:
+        num_tokens: Row count ``M`` of the activation matrix.
+
+    Returns:
+        True when the prepared MN-major path avoids more work than it adds.
+        Row counts that are already a multiple of four need no padding at all,
+        so the quantizer's native output is used as-is.
+    """
+    return num_tokens % 4 == 0 or num_tokens <= _PREPACKED_PAD_TOKEN_LIMIT
 
 
 def prepare_flashinfer_fp8_blockscale_weight_scales(
@@ -255,6 +271,7 @@ if gemm_fp8_nt_groupwise is not error_fn:
         # K-major mode reads the quant kernel's native (m, k//128) activation
         # scales and the checkpoint's native (n//128, k//128) weight scales,
         # so no padding, transposes, or scale copies are needed per call.
+        # FlashInfer defect: SM10x mis-reads these scales for 17 <= M <= 32.
         if A_scales.shape[0] != orig_m:
             A_scales = A_scales[:orig_m]
         # The kernel reads raw row-major storage; normalize strided views

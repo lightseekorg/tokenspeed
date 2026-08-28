@@ -45,6 +45,7 @@ from tokenspeed_kernel.ops.gemm.flashinfer import (
     has_flashinfer_fp8_blockscale,
     has_flashinfer_mxfp8,
     prepare_flashinfer_fp8_blockscale_weight_scales,
+    use_flashinfer_fp8_blockscale_prepacked,
 )
 from tokenspeed_kernel.ops.gemm.fp8_utils import swizzle_mxfp8_scale
 from tokenspeed_kernel.ops.gemm.kimi3 import (
@@ -270,7 +271,11 @@ def fp8_linear(
     """
     typed_plan = _require_fp8_linear_plan(plan)
     override = typed_plan.override
-    prepacked_scales = typed_plan.prepacked_scales and input_scales is None
+    prepacked_scales = (
+        typed_plan.prepacked_scales
+        and input_scales is None
+        and use_flashinfer_fp8_blockscale_prepacked(x.shape[0])
+    )
     if typed_plan.prepacked_scales and not prepacked_scales:
         override = None
     selected_weight_scales = (
