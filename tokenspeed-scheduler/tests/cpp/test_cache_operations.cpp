@@ -102,6 +102,7 @@ TEST(CacheOperationTest, DecodeCanStartWithoutHostL2) {
             .total_pages = 4,
             .retention = CacheGroupConfig::Retention::FullHistory,
             .family = CacheGroupFamily::History,
+            .transfer_policy = CacheTransferPolicy::FullSuffix,
         });
         return config;
     };
@@ -131,6 +132,7 @@ TEST(CacheOperationTest, DeviceRequestLimitDoesNotDependOnHostCapacity) {
             .total_pages = 9,
             .retention = CacheGroupConfig::Retention::FullHistory,
             .family = CacheGroupFamily::History,
+            .transfer_policy = CacheTransferPolicy::FullSuffix,
         });
         return config;
     };
@@ -237,6 +239,7 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) 
         .total_pages = 4,
         .retention = CacheGroupConfig::Retention::FullHistory,
         .family = CacheGroupFamily::History,
+        .transfer_policy = CacheTransferPolicy::FullSuffix,
     });
     Scheduler scheduler{std::move(config)};
     ASSERT_EQ(scheduler.MaxSingleRequestTokens(), 6);
@@ -264,6 +267,7 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
         .total_pages = 4,
         .retention = CacheGroupConfig::Retention::FullHistory,
         .family = CacheGroupFamily::History,
+        .transfer_policy = CacheTransferPolicy::FullSuffix,
     });
     Scheduler scheduler{std::move(config)};
     ASSERT_EQ(scheduler.MaxSingleRequestTokens(), 6);

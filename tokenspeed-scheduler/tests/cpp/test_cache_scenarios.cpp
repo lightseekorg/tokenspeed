@@ -303,7 +303,6 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = MambaStateCheckpointSplitSuite::MakeConfig();
         cfg.role = Role::kP;
-        cfg.enable_pd_cache = true;
         for (CacheGroupConfig& group : cfg.cache_groups) {
             group.transfer_policy =
                 group.IsSnapshotStateGroup() ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
@@ -2087,7 +2086,6 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = RetractSuite::MakeConfig();
         cfg.role = Role::kP;
-        cfg.enable_pd_cache = true;
         for (CacheGroupConfig& group : cfg.cache_groups) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
         }
@@ -2247,7 +2245,6 @@ TEST(PdSlidingCapacityTest, CountsPrefixIslandPhasePageAndGroupPacking) {
     cfg.max_batch_size = 1;
     cfg.decode_input_tokens = 1;
     cfg.role = Role::kD;
-    cfg.enable_pd_cache = true;
     cfg.disable_l2_cache = true;
 
     CacheGroupConfig sliding;

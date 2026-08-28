@@ -58,8 +58,11 @@ struct SchedulerConfig {
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
 
+    // The P and D roles ARE the cache-transfer PD protocol: there is no
+    // disaggregated deployment without it, so everything PD-specific
+    // (transfer pins, destination layouts, transfer_policy validation) keys
+    // on the role directly.
     Role role{Role::kFused};
-    bool enable_pd_cache{false};
 
     bool disable_prefix_cache{false};
     // Minimum prompt tail that must be recomputed after a prefix-cache hit.

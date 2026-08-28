@@ -135,7 +135,6 @@ protected:
         cfg.decode_input_tokens = 1;
         cfg.role = Role::kD;
         cfg.enable_l3_storage = false;
-        cfg.enable_pd_cache = true;
         cfg.disable_l2_cache = false;
         cfg.disable_prefix_cache = true;
 
@@ -654,7 +653,6 @@ protected:
         cfg.host_allocator.total_pages = 32;   // Keep retraction capacity outside these placement tests.
         cfg.max_scheduled_tokens = 2;
         cfg.overlap_schedule_depth = 0;
-        cfg.enable_pd_cache = true;
         cfg.disable_prefix_cache = false;
 
         CacheGroupConfig full = cfg.cache_groups.front();
@@ -718,7 +716,6 @@ protected:
         cfg.device_allocator.total_pages = 8;
         cfg.host_allocator.total_pages = 0;
         cfg.max_scheduled_tokens = 16;
-        cfg.enable_pd_cache = true;
         cfg.disable_prefix_cache = false;
 
         CacheGroupConfig sliding;

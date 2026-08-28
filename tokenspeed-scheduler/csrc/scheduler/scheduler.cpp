@@ -163,15 +163,13 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
         if (coordinator_.GroupIsPrefixClosed(i)) {
             child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
         } else if (config_.role == Role::kD) {
-            const bool latest_snapshot =
-                config_.enable_pd_cache && group.transfer_policy == CacheTransferPolicy::LatestSnapshot;
-            if (latest_snapshot) {
+            if (group.transfer_policy == CacheTransferPolicy::LatestSnapshot) {
                 const std::int64_t snapshot_pages = token_limit == 0 ? 0 : 1;
                 // A retracted Decode request may recover by locally
                 // recomputing its suffix. Old State checkpoints are
                 // evictable, but one recovery chunk and its lookback must fit.
                 child_pages = std::max(snapshot_pages, local_prefill_peak());
-            } else if (config_.enable_pd_cache && group.retention == CacheGroupConfig::Retention::SlidingWindow) {
+            } else if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
                 const std::int64_t dense_pages =
                     ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
                 const std::int64_t window_pages = ceilDiv(static_cast<std::int64_t>(*group.sliding_window_tokens - 1) +

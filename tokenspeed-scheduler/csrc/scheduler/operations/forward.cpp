@@ -350,7 +350,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, hit_tokens + tokens_this_round);
     }
 
-    if (config_.enable_pd_cache && source == fsm::PrefillSource::kRemote) {
+    if (source == fsm::PrefillSource::kRemote) {
         for (std::size_t i = 0; i < demands.size(); ++i) {
             const CacheGroupConfig& group = config_.cache_groups[i];
             const std::int32_t block_granularity = coordinator_.GroupBlockGranularity(i);
@@ -744,7 +744,7 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
                 }
                 // A D-role LOCAL recovery grant must not pin: no PD ACK ever
                 // arrives to erase it (its lifetime is the L2 load ticket).
-                if (config_.enable_pd_cache && (remote_grant || config_.role != Role::kD)) {
+                if (remote_grant) {
                     pd_transfer_pins_.insert(blocker->Id());
                 }
                 return;
@@ -820,7 +820,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             if (auto operation = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget,
                                                           decode_reserve, build.load_backs)) {
                 pushOperation(build, *request, std::move(*operation));
-                if (config_.enable_pd_cache) {
+                if (config_.role != Role::kFused) {
                     // Pages stay pinned until the PD transfer completes.
                     pd_transfer_pins_.insert(request->Id());
                 }
@@ -941,9 +941,7 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
                                                       config_.decode_input_tokens, build.load_backs)) {
             build.scheduled.insert(request);
             build.remote_prefill.emplace_back(std::move(*operation));
-            if (config_.enable_pd_cache) {
-                pd_transfer_pins_.insert(request->Id());
-            }
+            pd_transfer_pins_.insert(request->Id());
             break;
         }
         if (feedback.admission_failed && feedback.capacity_blocker == nullptr) {

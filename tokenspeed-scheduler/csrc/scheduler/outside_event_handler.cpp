@@ -83,7 +83,7 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
 }
 
 void Scheduler::handleEvent(const forward::Finish& event) {
-    if (config_.enable_pd_cache && pd_transfer_pins_.contains(event.request_id)) {
+    if (pd_transfer_pins_.contains(event.request_id)) {
         throw std::logic_error("PD Finish received while transfer pages are pinned");
     }
     if (Request* request = findRequest(event.request_id)) {

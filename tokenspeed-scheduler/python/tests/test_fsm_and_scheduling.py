@@ -293,7 +293,6 @@ class TestPrefillFirst:
         cfg = make_config(max_scheduled_tokens=8)
         cfg.role = SchedulerConfig.Role.P
         cfg.decode_input_tokens = 0
-        cfg.enable_pd_cache = True
         cfg.cache_groups[0].transfer_policy = CacheTransferPolicy.FullSuffix
         s = Scheduler(cfg)
         s.submit_requests(
