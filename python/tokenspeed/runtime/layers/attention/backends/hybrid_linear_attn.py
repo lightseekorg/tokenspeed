@@ -80,6 +80,31 @@ if TYPE_CHECKING:
 _STATE_GROUP_ID = LINEAR_ATTENTION
 
 
+def _packed_qkv_views(
+    mixed_qkv: torch.Tensor,
+    *,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_q: int,
+    head_k: int,
+    head_v: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Expose packed Q/K/V rows without changing storage or materializing copies."""
+    seq_len = mixed_qkv.shape[0]
+    widths = (
+        num_q_heads * head_q,
+        num_k_heads * head_k,
+        num_v_heads * head_v,
+    )
+    query, key, value = mixed_qkv.split(widths, dim=-1)
+    return (
+        query.view(1, seq_len, num_q_heads, head_q),
+        key.view(1, seq_len, num_k_heads, head_k),
+        value.view(1, seq_len, num_v_heads, head_v),
+    )
+
+
 def _mask_fresh_initial_state(
     recurrent_state: torch.Tensor,
     has_initial_states: torch.Tensor | None,
@@ -355,6 +380,7 @@ class MambaAttnBackend(AttentionBackend):
     cache_consumer_families = frozenset({"state"})
     _replay_active: bool = False
     _verify_reads_committed_recurrent_state: bool = False
+    _verify_packed_qkv_views: bool = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig):
         super().__init__(config, spec)
@@ -1849,16 +1875,30 @@ class MambaAttnBackend(AttentionBackend):
                 b.view(seq_len, -1),
             )
 
-        query, key, value = fused_qkv_split_gdn_prefill(
-            mixed_qkv,
-            num_q_heads=num_heads,
-            num_k_heads=num_heads,
-            num_v_heads=num_value_heads,
-            head_q=head_k_dim,
-            head_k=head_k_dim,
-            head_v=head_v_dim,
-            replay=replay_inputs,
-        )
+        # KDA can consume zero-copy strided views. When recurrent-state replay is
+        # enabled, the existing split kernel must remain because it also saves the
+        # persistent inputs needed to reconstruct accepted state later.
+        if is_target_verify and self._verify_packed_qkv_views and replay_inputs is None:
+            query, key, value = _packed_qkv_views(
+                mixed_qkv,
+                num_q_heads=num_heads,
+                num_k_heads=num_heads,
+                num_v_heads=num_value_heads,
+                head_q=head_k_dim,
+                head_k=head_k_dim,
+                head_v=head_v_dim,
+            )
+        else:
+            query, key, value = fused_qkv_split_gdn_prefill(
+                mixed_qkv,
+                num_q_heads=num_heads,
+                num_k_heads=num_heads,
+                num_v_heads=num_value_heads,
+                head_q=head_k_dim,
+                head_k=head_k_dim,
+                head_v=head_v_dim,
+                replay=replay_inputs,
+            )
 
         if is_target_verify:
             core_attn_out = self._verify_scan(
