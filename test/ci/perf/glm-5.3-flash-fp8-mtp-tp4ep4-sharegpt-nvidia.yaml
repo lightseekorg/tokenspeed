@@ -53,56 +53,64 @@ server:
     timeout: 1800
     interval: 10
 perf:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]==1.10.0'
   command: |
     set -eu
     MODEL_PATH=/raid/cache/huggingface/hub/horizon/hf_fp8
-    RESULT_PREFIX=/tmp/tokenspeed-glm53-flash-sharegpt
+    RESULTS_DIR=/tmp/tokenspeed-glm53-flash-sharegpt
+    trap 'rm -rf "$RESULTS_DIR"' EXIT
+    rm -rf "$RESULTS_DIR"
     run_sharegpt() {
-      ts bench serve \
-        --backend tokenspeed \
-        --host 127.0.0.1 \
-        --port 8000 \
-        --endpoint /v1/completions \
+      /tmp/evalscope-perf/bin/evalscope perf \
         --model glm-5.3-flash \
-        --served-model-name glm-5.3-flash \
-        --tokenizer "$MODEL_PATH" \
-        --dataset-name sharegpt \
-        --num-prompts 16 \
-        --sharegpt-output-len 512 \
-        --max-model-len 32768 \
-        --max-concurrency 16 \
-        --num-warmups 16 \
-        --request-rate inf \
-        --ignore-eos \
+        --url http://127.0.0.1:8000/v1/completions \
+        --api openai \
+        --dataset share_gpt_en \
+        --tokenizer-path "$MODEL_PATH" \
+        --tokenize-prompt \
+        --max-prompt-length 32256 \
+        --min-tokens 512 \
+        --max-tokens 512 \
+        --parallel 16 \
+        --number 16 \
+        --warmup-num 16 \
+        --rate -1 \
         --seed 45 \
-        --extra-body '{"temperature":0}' \
-        --disable-tqdm \
-        --output-file "$1"
+        --temperature 0 \
+        --stream \
+        --outputs-dir "$1" \
+        --no-timestamp \
+        --extra-args '{"ignore_eos":true}'
     }
-    for warmup_id in 1 2 3; do
-      run_sharegpt "${RESULT_PREFIX}-warmup-${warmup_id}.json" >/dev/null
-    done
     for run_id in 1 2 3; do
-      run_sharegpt "${RESULT_PREFIX}-${run_id}.json"
+      run_sharegpt "${RESULTS_DIR}/run_${run_id}"
     done
-    python3 - "$RESULT_PREFIX" <<'PY'
+    python3 - "$RESULTS_DIR" <<'PY'
     import json
     import statistics
     import sys
+    from pathlib import Path
 
     results = []
     for run_id in range(1, 4):
-        with open(f"{sys.argv[1]}-{run_id}.json", encoding="utf-8") as result_file:
-            results.append(json.load(result_file))
-    failed = sum(result.get("failed", 0) for result in results)
+        summaries = list(
+            (Path(sys.argv[1]) / f"run_{run_id}").rglob("benchmark_summary.json")
+        )
+        if len(summaries) != 1:
+            raise SystemExit(
+                f"expected one benchmark summary for run {run_id}, got {summaries}"
+            )
+        results.append(json.loads(summaries[0].read_text(encoding="utf-8")))
+    failed = sum(result.get("Failed Requests", 0) for result in results)
     if failed:
         raise SystemExit(f"ShareGPT benchmark had {failed} failed requests")
 
     latency_tps = statistics.median(
-        1000.0 / float(result["mean_tpot_ms"]) for result in results
+        1000.0 / float(result["Avg TPOT (ms)"]) for result in results
     )
     throughput_per_gpu = statistics.median(
-        float(result["output_throughput"]) / 4 for result in results
+        float(result["Output Throughput (tok/s)"]) / 4 for result in results
     )
     print("\nOverall perf table:")
     print(

@@ -87,9 +87,13 @@ apt_install_with_retry() {
 }
 
 ensure_flashinfer_jit_cache() {
-    # GB200 and B200 runner images preinstall flashinfer-jit-cache; it must
-    # match the flashinfer-python pin exactly or flashinfer refuses to import.
-    if [[ "${CI_RUNNER_LABEL:-}" != gb200* && "${CI_RUNNER_LABEL:-}" != b200* ]]; then
+    # Blackwell runner images preinstall flashinfer-jit-cache; it must match
+    # the flashinfer-python pin exactly or flashinfer refuses to import. GB300
+    # Slurm workers expose their architecture through SM rather than a runner
+    # label.
+    if [[ "${CI_RUNNER_LABEL:-}" != gb200* && \
+          "${CI_RUNNER_LABEL:-}" != b200* && \
+          "${SM}" != sm103 ]]; then
         return 0
     fi
 
@@ -151,9 +155,9 @@ python3 -m pip install --upgrade --ignore-installed --break-system-packages \
     pip setuptools wheel
 
 # ============================================================
-# Step 3: Sync FlashInfer JIT cache on GB200/B200
+# Step 3: Sync FlashInfer JIT cache on Blackwell runners
 # ============================================================
-echo "=== Step 3: Sync FlashInfer JIT cache on GB200/B200 ==="
+echo "=== Step 3: Sync FlashInfer JIT cache on Blackwell runners ==="
 ensure_flashinfer_jit_cache
 
 # ============================================================
@@ -221,6 +225,18 @@ pin_version() {
     local pkg="$1"
     grep -E "^${pkg}(\[[^]]+\])?==" "${CUDA_REQ}" | head -n1 | tr -d '[:space:]'
 }
+
+# The Aug 11 FlashInfer JIT cache was built with TVM-FFI 0.1.13.post3.
+# Loading its prebuilt modules with the older 0.1.13 runtime corrupts type
+# indices. Install the matching runtime after dependency resolution because
+# the currently published tokenspeed-mla wheel still declares 0.1.13.
+if grep -qx 'flashinfer-python==0.6.18.dev20260811' "${CUDA_REQ}"; then
+    TVM_FFI_RUNTIME_SPEC="apache-tvm-ffi==0.1.13.post3"
+    echo "Force-reinstalling FlashInfer-compatible TVM-FFI: ${TVM_FFI_RUNTIME_SPEC}"
+    pip_install_with_retry pip3 install --break-system-packages \
+        --force-reinstall --no-deps "${TVM_FFI_RUNTIME_SPEC}"
+fi
+
 CUDA_MAJOR="${CUDA_VERSION%%.*}"
 CUTLASS_DSL_SPEC="$(pin_version nvidia-cutlass-dsl)"
 if [ -n "${CUTLASS_DSL_SPEC}" ]; then

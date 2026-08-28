@@ -5013,7 +5013,7 @@ def kda_paged_decode(
     )
 
 
-def kda_fused_paged_decode(
+def try_kda_fused_paged_decode(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
     conv_states: torch.Tensor,
@@ -5133,7 +5133,7 @@ def kda_fused_paged_decode(
     return KdaFusedDecodeResult(out=out, output_norm_applied=output_norm_applied)
 
 
-def kda_fused_paged_verify(
+def try_kda_fused_paged_verify(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
     conv_states: torch.Tensor,
@@ -5162,7 +5162,7 @@ def kda_fused_paged_verify(
 ) -> torch.Tensor | None:
     """Run a registered pre-convolution KDA target-verify fusion when available.
 
-    Mirrors ``kda_fused_paged_decode`` for the speculative verify batch:
+    Mirrors ``try_kda_fused_paged_decode`` for the speculative verify batch:
     per-position conv windows and recurrent states land in the verify
     scratches for partial-accept commit. ``store_states`` selects the
     rollback-tape variant and ``recurrent_layout`` defaults to the
@@ -5187,6 +5187,8 @@ def kda_fused_paged_verify(
                 "paged_state": True,
                 "store_states": store_states,
                 "recurrent_layout": recurrent_layout,
+                "num_heads": num_heads,
+                "head_dim": head_dim,
             },
             solution=solution,
             override=override,
@@ -5222,7 +5224,7 @@ def kda_fused_paged_verify(
     )
 
 
-def kda_replay_commit(
+def try_kda_replay_commit(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
     conv_states: torch.Tensor,
@@ -5273,7 +5275,12 @@ def kda_replay_commit(
             "attention",
             "kda_replay_commit",
             signature,
-            traits={"flat_state": True, "recurrent_layout": recurrent_layout},
+            traits={
+                "flat_state": True,
+                "recurrent_layout": recurrent_layout,
+                "num_heads": num_heads,
+                "head_dim": head_dim,
+            },
             solution=solution,
             override=override,
         )
@@ -5305,22 +5312,37 @@ def kda_replay_commit(
     return True
 
 
-def kda_resolve_batched_replay_commit(dtype: torch.dtype = torch.bfloat16):
+def resolve_kda_batched_replay_commit(
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    num_heads: int | None = None,
+    head_dim: int | None = None,
+):
     """Resolve the all-layer replay kernel once, or return ``None``.
 
     Batched kernels dereference descriptor addresses as BF16, so other dtypes
     use the per-layer commit.
+
+    Args:
+        dtype: Activation dtype used by the replay payload.
+        num_heads: Local KDA head count, when known.
+        head_dim: KDA head dimension, when known.
     """
     if dtype is not torch.bfloat16:
         return None
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    traits = {"flat_state": True, "batched_layers": True}
+    if num_heads is not None:
+        traits["num_heads"] = num_heads
+    if head_dim is not None:
+        traits["head_dim"] = head_dim
     try:
         return select_kernel(
             "attention",
             "kda_replay_commit",
             signature,
-            traits={"flat_state": True, "batched_layers": True},
+            traits=traits,
             override=(
                 "triton_nvidia_kda_batched_replay_commit"
                 if current_platform().is_nvidia
@@ -5333,9 +5355,20 @@ def kda_resolve_batched_replay_commit(dtype: torch.dtype = torch.bfloat16):
 
 def kda_batched_replay_uses_raw_gate(
     dtype: torch.dtype = torch.bfloat16,
+    *,
+    num_heads: int | None = None,
+    head_dim: int | None = None,
 ) -> bool:
-    """Whether the selected batched replay consumes persistent BF16 raw-g."""
-    kernel = kda_resolve_batched_replay_commit(dtype)
+    """Whether the selected batched replay consumes persistent BF16 raw-g.
+
+    Args:
+        dtype: Activation dtype used by the replay payload.
+        num_heads: Local KDA head count, when known.
+        head_dim: KDA head dimension, when known.
+    """
+    kernel = resolve_kda_batched_replay_commit(
+        dtype, num_heads=num_heads, head_dim=head_dim
+    )
     if kernel is None:
         return False
     registered = KernelRegistry.get().get_by_name(kernel.name)
@@ -5349,6 +5382,8 @@ def kda_replay_commit_supported(
     *,
     solution: str | None = None,
     recurrent_layout: str | None = None,
+    num_heads: int | None = None,
+    head_dim: int | None = None,
 ) -> bool:
     """Whether this platform can run the KDA speculative replay path.
 
@@ -5363,6 +5398,8 @@ def kda_replay_commit_supported(
         recurrent_layout: Layout of the committed state; the platform default
             when omitted. It must match what the caller stores, or the probe
             answers for kernels the backend will not select.
+        num_heads: Local KDA head count, when known.
+        head_dim: KDA head dimension, when known.
 
     Returns:
         ``True`` when both kernels are registered for the current platform.
@@ -5370,12 +5407,21 @@ def kda_replay_commit_supported(
     recurrent_layout = recurrent_layout or kda_recurrent_layout()
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    shape_traits = {}
+    if num_heads is not None:
+        shape_traits["num_heads"] = num_heads
+    if head_dim is not None:
+        shape_traits["head_dim"] = head_dim
     try:
         select_kernel(
             "attention",
             "kda_replay_commit",
             signature,
-            traits={"flat_state": True, "recurrent_layout": recurrent_layout},
+            traits={
+                "flat_state": True,
+                "recurrent_layout": recurrent_layout,
+                **shape_traits,
+            },
             solution=solution,
         )
         select_kernel(
@@ -5386,6 +5432,7 @@ def kda_replay_commit_supported(
                 "paged_state": True,
                 "store_states": False,
                 "recurrent_layout": recurrent_layout,
+                **shape_traits,
             },
             solution=solution,
         )
@@ -5530,10 +5577,10 @@ __all__ = [
     "kda_recurrent_layout",
     "kda_paged_prefill",
     "kda_paged_decode",
-    "kda_fused_paged_decode",
-    "kda_fused_paged_verify",
-    "kda_replay_commit",
-    "kda_resolve_batched_replay_commit",
+    "try_kda_fused_paged_decode",
+    "try_kda_fused_paged_verify",
+    "try_kda_replay_commit",
+    "resolve_kda_batched_replay_commit",
     "kda_batched_replay_uses_raw_gate",
     "kda_replay_commit_supported",
     "attn_merge_state",

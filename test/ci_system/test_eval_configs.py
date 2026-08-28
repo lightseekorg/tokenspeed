@@ -250,15 +250,18 @@ def test_glm53_flash_nvidia_sharegpt_uses_fixed_mtp_configuration():
     assert [
         flag_value(perf_tokens, flag)
         for flag in (
-            "--dataset-name",
-            "--num-prompts",
-            "--sharegpt-output-len",
-            "--max-concurrency",
+            "--dataset",
+            "--number",
+            "--min-tokens",
+            "--max-tokens",
+            "--parallel",
+            "--warmup-num",
             "--seed",
-            "--extra-body",
+            "--extra-args",
         )
-    ] == ["sharegpt", "16", "512", "16", "45", '{"temperature":0}']
-    assert "for warmup_id in 1 2 3" in task["perf"]["command"]
+    ] == ["share_gpt_en", "16", "512", "512", "16", "16", "45", '{"ignore_eos":true}']
+    assert "--tokenize-prompt" in perf_tokens
+    assert "'evalscope[perf]==1.10.0'" in task["perf"]["install"][0]
     assert "for run_id in 1 2 3" in task["perf"]["command"]
     assert "statistics.median" in task["perf"]["command"]
     assert task["perf_threshold"] == 0.9
