@@ -25,7 +25,9 @@ from typing import Literal
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.gemm import flashinfer as flashinfer_ops
 from tokenspeed_kernel.ops.gemm import ll_bf16 as ll_bf16_ops
+from tokenspeed_kernel.ops.gemm.flashinfer import _declares_cute_dsl_backend
 from tokenspeed_kernel.ops.gemm.kimi3 import (
     KIMI3_HIDDEN_SIZE,
     KIMI3_ROUTER_SIZE,
@@ -33,7 +35,6 @@ from tokenspeed_kernel.ops.gemm.kimi3 import (
 )
 from tokenspeed_kernel.ops.gemm.ll_bf16 import (
     MAX_M,
-    _declares_cute_dsl_backend,
     ll_bf16_mm,
     ll_bf16_mm_supported,
     ll_bf16_router_supported,
@@ -172,7 +173,8 @@ def test_flashinfer_branch_meets_its_documented_requirement(monkeypatch) -> None
             a_arg, b_arg.t(), out, bias=bias, out_dtype=torch.bfloat16
         )
 
-    monkeypatch.setattr(ll_bf16_ops, "_flashinfer_mm_bf16", lambda: stub)
+    monkeypatch.setattr(flashinfer_ops, "_mm_bf16", stub)
+    monkeypatch.setattr(ll_bf16_ops, "has_flashinfer_cute_dsl_bf16", lambda: True)
     torch.testing.assert_close(
         ll_bf16_mm(a, b, bias).float(),
         torch.nn.functional.linear(a.float(), b.float(), bias.float()),

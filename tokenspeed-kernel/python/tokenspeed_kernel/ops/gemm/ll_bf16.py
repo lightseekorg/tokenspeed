@@ -40,18 +40,12 @@ can earn it entries the way skinny and tgv did.
 
 from __future__ import annotations
 
-import functools
-import inspect
-from collections.abc import Callable
-from typing import get_args
-
 import torch
-from tokenspeed_kernel.platform import (
-    ArchVersion,
-    CapabilityRequirement,
-    current_platform,
-    pdl_enabled,
+from tokenspeed_kernel.ops.gemm.flashinfer import (
+    flashinfer_cute_dsl_mm_bf16,
+    has_flashinfer_cute_dsl_bf16,
 )
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import MAX_M, ll_bf16_router
@@ -116,47 +110,6 @@ def ll_bf16_router_supported(
 _PTR_ALIGN = 32
 # Both backends step K in multiples of 128.
 _K_ALIGN = 128
-
-# FlashInfer upstreamed these kernels as this backend, for sm100/sm103 only.
-_FLASHINFER_BACKEND = "cute-dsl"
-_FLASHINFER_ARCHS = frozenset({ArchVersion(10, 0), ArchVersion(10, 3)})
-
-
-def _declares_cute_dsl_backend(mm_bf16: Callable[..., object]) -> bool:
-    """Whether this ``mm_bf16`` lists :data:`_FLASHINFER_BACKEND`.
-
-    Args:
-        mm_bf16: FlashInfer's entry point, whose ``backend`` annotation is the
-            ``Literal`` of the backends that build it.
-
-    Returns:
-        True on wheels carrying the upstreamed kernels, False on earlier ones,
-        which name every other backend but not this one.
-    """
-    try:
-        # eval_str resolves the Literal even if FlashInfer postpones annotations.
-        backend = inspect.signature(mm_bf16, eval_str=True).parameters["backend"]
-    except (KeyError, NameError, TypeError, ValueError):
-        return False
-    return _FLASHINFER_BACKEND in get_args(backend.annotation)
-
-
-@functools.lru_cache(maxsize=1)
-def _flashinfer_mm_bf16() -> Callable[..., torch.Tensor] | None:
-    """FlashInfer's ``mm_bf16`` when it can run these kernels.
-
-    Returns:
-        The callable, or None when the platform is outside
-        :data:`_FLASHINFER_ARCHS` or the wheel predates the backend -- either
-        way the signal to run the vendored copy instead.
-    """
-    if current_platform().arch_version not in _FLASHINFER_ARCHS:
-        return None
-    try:
-        from flashinfer import mm_bf16
-    except ImportError:
-        return None
-    return mm_bf16 if _declares_cute_dsl_backend(mm_bf16) else None
 
 
 def ll_bf16_mm_supported(
@@ -228,24 +181,15 @@ def ll_bf16_mm(
     n = weight.shape[0]
     # view, not reshape: a reshaped non-contiguous out would take the writes.
     flat_out = None if out is None else out.view(m, n)
-    mm_bf16 = _flashinfer_mm_bf16()
-    if mm_bf16 is None:
+    if has_flashinfer_cute_dsl_bf16():
+        result = flashinfer_cute_dsl_mm_bf16(x.view(m, k), weight, bias, flat_out)
+    else:
         result = ll_bf16_router(
             x.view(m, k),
             weight,
             flat_out,
             bias=bias,
             out_dtype=torch.bfloat16,
-        )
-    else:
-        # weight.t() is the (K, N) column-major B it wants, at no copy.
-        result = mm_bf16(
-            x.view(m, k),
-            weight.t(),
-            bias=bias,
-            pdl=pdl_enabled(),
-            out=flat_out,
-            backend=_FLASHINFER_BACKEND,
         )
     return result.view(*x.shape[:-1], n)
 

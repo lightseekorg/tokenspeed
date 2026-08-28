@@ -20,6 +20,11 @@
 
 from __future__ import annotations
 
+import functools
+import inspect
+from collections.abc import Callable
+from typing import get_args
+
 import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -485,3 +490,76 @@ if mm_fp4 is not error_fn:
             out.copy_(output)
             return out
         return output
+
+
+# ---- FlashInfer BF16 low-latency GEMM, cute-dsl backend ------------------
+
+# The upstreamed form of the kernels vendored under thirdparty/cute_dsl/ll_bf16.
+_CUTE_DSL_BF16_BACKEND = "cute-dsl"
+_CUTE_DSL_BF16_ARCHS = frozenset({ArchVersion(10, 0), ArchVersion(10, 3)})
+
+_mm_bf16 = error_fn
+
+if platform.is_nvidia and platform.arch_version in _CUTE_DSL_BF16_ARCHS:
+    try:
+        from flashinfer import mm_bf16 as _mm_bf16
+    except ImportError:
+        pass
+
+
+def _declares_cute_dsl_backend(mm_bf16: Callable[..., object]) -> bool:
+    """Whether this ``mm_bf16`` lists :data:`_CUTE_DSL_BF16_BACKEND`.
+
+    Args:
+        mm_bf16: FlashInfer's entry point, whose ``backend`` annotation is the
+            ``Literal`` of the backends that build it.
+
+    Returns:
+        True on wheels carrying the upstreamed kernels, False on earlier ones,
+        which name every other backend but not this one.
+    """
+    try:
+        # eval_str resolves the Literal even if FlashInfer postpones annotations.
+        backend = inspect.signature(mm_bf16, eval_str=True).parameters["backend"]
+    except (KeyError, NameError, TypeError, ValueError):
+        return False
+    return _CUTE_DSL_BF16_BACKEND in get_args(backend.annotation)
+
+
+@functools.lru_cache(maxsize=1)
+def has_flashinfer_cute_dsl_bf16() -> bool:
+    """Whether the flashinfer cute-dsl BF16 low-latency GEMM is usable here.
+
+    Returns:
+        True when running on an SM100 or SM103 GPU with a flashinfer build
+        whose ``mm_bf16`` declares the backend.
+    """
+    return _mm_bf16 is not error_fn and _declares_cute_dsl_backend(_mm_bf16)
+
+
+def flashinfer_cute_dsl_mm_bf16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``x @ weight.T (+ bias)`` through the cute-dsl ``mm_bf16`` backend.
+
+    Args:
+        x: ``[M, K]`` contiguous BF16 activation.
+        weight: ``[N, K]`` contiguous BF16 weight; its transpose is the
+            column-major ``(K, N)`` operand the backend wants, with no copy.
+        bias: Optional contiguous ``[N]`` BF16 bias, fused into the epilogue.
+        out: Optional ``[M, N]`` BF16 destination; allocated when omitted.
+
+    Returns:
+        ``[M, N]`` BF16 output, ``out`` when it was given.
+    """
+    return _mm_bf16(
+        x,
+        weight.t(),
+        bias=bias,
+        pdl=pdl_enabled(),
+        out=out,
+        backend=_CUTE_DSL_BF16_BACKEND,
+    )
