@@ -32,7 +32,6 @@ export C_INCLUDE_PATH="/usr/local/cuda/include/cccl"
 
 WORKSPACE=${WORKSPACE:-$(pwd)}
 CUDA_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda.txt"
-THIRDPARTY_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda-thirdparty.txt"
 configure_package_cache
 
 # Wrap pip install in a retry loop. PyPI's CDN occasionally returns a
@@ -179,15 +178,8 @@ if [[ "${FLASHINFER_PIN_VERSION}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.dev([0-9]{8})$ ]
 fi
 cd ${WORKSPACE}
 export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu${CUINDEX}"
-# The pinned FA4 build supports this repository's Cutlass DSL version, while
-# quack-kernels still declares an exact dependency on the previous DSL line.
-# Build tokenspeed-kernel from its core requirements, then install the locked
-# third-party wheels without re-resolving their stale transitive metadata.
 TOKENSPEED_KERNEL_BACKEND=cuda FLASHINFER_CUDA_ARCH_LIST="${FI_ARCH}" \
-pip_install_with_retry pip3 install tokenspeed-kernel/python/ \
-    --no-build-isolation --no-deps -v
-pip_install_with_retry pip3 install --break-system-packages \
-    --no-deps -r "${THIRDPARTY_REQ}"
+pip_install_with_retry pip3 install tokenspeed-kernel/python/ --no-build-isolation -v
 
 # ============================================================
 # Step 5: Install TokenSpeed Scheduler (C++)
@@ -272,6 +264,7 @@ else
     echo "No FlashInfer Python pin found in ${CUDA_REQ}; skipping FlashInfer installs."
 fi
 
+THIRDPARTY_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda-thirdparty.txt"
 FA4_SPEC="$(grep -E '^tokenspeed-fa4(\[[^]]+\])?==' "${THIRDPARTY_REQ}" | head -n1 | tr -d '[:space:]')"
 if [ -n "${FA4_SPEC}" ]; then
     echo "Force-reinstalling pinned FA4: ${FA4_SPEC}"
