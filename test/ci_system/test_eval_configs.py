@@ -42,7 +42,7 @@ DATASETS = {
         "dataset_args": json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)["gpqa_diamond"],
     },
     "gsm8k": {
-        "count": 4,
+        "count": 7,
         "dataset_args": {"dataset_id": "openai/gsm8k"},
     },
     "mmlu": {
@@ -132,6 +132,29 @@ def test_evalscope_configs_use_expected_dataset_sources():
         len(paths) == expected_total
     ), f"expected {expected_total} EvalScope configs, found {len(paths)}"
     assert counts == expected_counts, f"expected {expected_counts}, found {counts}"
+
+
+def test_qwen38_flash_next_runs_gsm8k_with_kvstore_enabled():
+    path = EVAL_CONFIG_DIR / "qwen3.8-flash-next-fp8-evalscope-gsm8k.yaml"
+    task = yaml.safe_load(path.read_text(encoding="utf-8"))
+    server_tokens = shlex.split(task["server"]["command"])
+    eval_tokens = shlex.split(task["eval"]["command"])
+
+    assert task["type"] == "eval"
+    assert task["workflow_stage"] == "model-test"
+    assert task["triggers"] == ["per-commit", "manual"]
+    assert task["runner"]["labels"] == ["gb200-2gpu"]
+    assert flag_value(server_tokens, "--model") == "Qwen/Qwen3.8-Flash-Next-FP8"
+    assert flag_value(server_tokens, "--tensor-parallel-size") == "2"
+    assert flag_value(server_tokens, "--speculative-algorithm") == "MTP"
+    assert flag_value(server_tokens, "--speculative-num-steps") == "3"
+    assert flag_value(server_tokens, "--max-model-len") == "8192"
+    assert flag_value(server_tokens, "--max-num-seqs") == "16"
+    assert flag_value(server_tokens, "--max-cudagraph-capture-size") == "16"
+    assert "--disable-kvstore" not in server_tokens
+    assert flag_value(eval_tokens, "--model") == "Qwen/Qwen3.8-Flash-Next-FP8"
+    assert flag_value(eval_tokens, "--datasets") == "gsm8k"
+    assert task["score_threshold"] == 0.90
 
 
 def test_kvv_configs_use_pinned_upstream_and_local_api():

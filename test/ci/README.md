@@ -44,6 +44,11 @@ normal path during prefill and low-latency path during decode, and the task
 uses the bounded non-thinking chat template for CI stability. The task requires
 a score of at least 0.90.
 
+The Qwen3.8 Flash Next FP8 correctness task runs GSM8K on two GB200 GPUs with
+tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
+bounded non-thinking chat template for CI stability. The task requires a score
+of at least 0.90.
+
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
 jobs in include-list order, so `high` entries reach a contended runner pool

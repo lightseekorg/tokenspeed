@@ -443,7 +443,6 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
   --gpu-memory-utilization 0.95 --max-num-seqs 128 \
-  --disable-kvstore \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -460,7 +459,6 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
   --gpu-memory-utilization 0.95 --max-num-seqs 128 \
-  --disable-kvstore \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -486,7 +484,6 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
   --gpu-memory-utilization 0.95 --max-num-seqs 128 \
-  --disable-kvstore \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -505,7 +502,6 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
   --gpu-memory-utilization 0.95 --max-num-seqs 128 \
-  --disable-kvstore \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -548,8 +544,7 @@ tokenspeed serve Qwen/Qwen3.8-27B-FP8 \
   --kv-cache-dtype fp8_e4m3 \
   --speculative-algorithm MTP \
   --speculative-draft-model-path Qwen/Qwen3.8-27B-FP8 \
-  --speculative-num-steps 3 \
-  --disable-kvstore
+  --speculative-num-steps 3
 ```
 
 ## Qwen3.8 Flash Next
@@ -577,7 +572,6 @@ ts serve \
     --tensor-parallel-size 4 \
     --quantization fp8 \
     --moe-backend flashinfer_trtllm \
-    --disable-kvstore \
     --speculative-algorithm MTP \
     --speculative-num-steps 3
 ```

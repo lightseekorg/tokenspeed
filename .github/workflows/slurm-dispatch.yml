@@ -48,6 +48,7 @@ on:
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-dp4ep4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-pd-1p1d-evalscope-aime25.yaml
+          - test/ci/eval/qwen3.8-flash-next-fp8-evalscope-gsm8k.yaml
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu.yaml
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic.yaml
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-longctx.yaml

@@ -40,6 +40,7 @@ on:
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-pd-1p1d-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-397b-a17b-mxfp4-evalscope-aime25.yaml
+          - test/ci/eval/qwen3.8-flash-next-fp8-evalscope-gsm8k.yaml
           - test/ci/perf/gpt-oss-120b-mxfp4-evalscope-mi355.yaml
           - test/ci/perf/kimi-k2.5-nvfp4-evalscope-agentic.yaml
           - test/ci/perf/kimi-k3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml
