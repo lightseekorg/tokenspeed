@@ -99,10 +99,17 @@ is **retried in the same plan build**, looping (retract → retry → retract)
 until it fits or the victims run out. The freed capacity therefore reaches the
 request it was freed for within the round; there is never a free page waiting
 for whoever asks first next round, which is what previously required a
-cross-round capacity barrier. A grant that cannot legally join its round's
-batch (a D-role recovery chunk beside an already-built decode batch; a fused
-prefill beside decodes outside mixed mode) still retracts one victim, and the
-next round's phase order (§3) tries the blocker before any other claim.
+cross-round capacity barrier. Two edges of the loop:
+
+- **The victim may BE the blocker** (a resident request blocked on its own
+  next page is the preferred victim). It comes back through the readmission
+  phase; the grant is redirected to the first waiting prompt instead —
+  granting the pages straight back to the victim's own readmission is the
+  loop the grant exists to break.
+- **A grant that cannot legally join its round's batch** (a D-role recovery
+  chunk beside an already-built decode batch; a fused prefill beside decodes
+  outside mixed mode) still retracts one victim, and the next round's phase
+  order (§3) tries the blocker before any other claim.
 
 **The victim's pages are released — and grantable — immediately**, even though
 its L2 snapshot has not been copied yet. The runtime enqueues the D2H snapshot
@@ -192,22 +199,29 @@ batch and a remote admission coexist routinely, and only a local recovery
 chunk still claims a round to itself (its load-back's layerwise streaming and
 the recovery prefill are batch-global machinery).
 
-**Retraction and recovery:** victims are decode work (every resident request
-is decoding a prompt the peer prefilled), chosen by the shared rule in §2.
-The victim's KV is written back to L2 (best-effort) and it enters
-`fsm::Retracted`; recovery re-prefills locally, loading the snapshot back
-(`LoadBackBatch`). A D-role victim recovers through this ordered path even
-when there is no host cache to snapshot into (`from scratch`), because the
-role has no other way back.
+**Retraction and recovery:** victims are chosen by the shared rule in §2 —
+normally decode work (resident requests are decoding prompts the peer
+prefilled), with a mid-prompt local recovery chunk as the one possible
+prefill-tier victim. The victim's KV is written back to L2 (best-effort) and
+it enters `fsm::Retracted`; recovery re-prefills locally, loading the
+snapshot back (`LoadBackBatch`). A D-role victim recovers through this
+ordered path even when there is no host cache to snapshot into (from
+scratch), because the role has no other way back.
 
 ### 3.3 Fused — one engine, everything local
 
-**Phases:** the shared local-prefill phases with the readmission first (it
-holds an L2 snapshot other admissions could evict), then resident chunks,
-then new prompts; then decodes, joining the prefills in one batch only under
-`enable_mixed_prefill_decode`; then `maybeRetractForCapacity`. A mamba
-prefill's state page needs no reservation against the decodes anymore: the
-prefill phases run first, so scheduling order is the capacity priority.
+**Phases, mixed mode** (`enable_mixed_prefill_decode`): decodes first — a
+client is streaming them, and a long prefill chunk must not starve them of
+token budget — then the shared local-prefill phases (readmission first, since
+it holds an L2 snapshot other admissions could evict; then resident chunks;
+then new prompts) spend what remains, then `maybeRetractForCapacity`. The
+decode batch leaves `state_prefill_reserve` (one state-checkpoint page of
+budget) untouched when a mamba prefill is pending, since that prefill cannot
+advance in sub-page chunks.
+
+**Phases, non-mixed:** the prefill phases run first and alone; decodes get
+the round only when no prefill scheduled. No state reserve is needed —
+scheduling order is the capacity priority.
 
 **Retraction:** the shared victim rule (§2): incomplete prefills first, then
 decode work. Whether the victim's KV is stored depends on the host cache:
@@ -225,14 +239,19 @@ barrier, recovering-pin, priority overrides — is gone; §2's same-round grant
 and the rules below absorb each of its jobs.
 
 **Readmission order** (`nextReadmission`) is derived, not stored. Each
-retraction stamps a monotonic `retraction_epoch` and a `from_decoding` flag
-onto the `fsm::Retracted` state; among this round's candidates holding a
-recoverable snapshot, decode-origin victims first (they resume a generation a
-client is already reading), then oldest epoch. A store-less fused retraction
-is not in this ordering at all — it has no L2 pages to load back, so it
-re-prefills through the ordinary admission path (`admitsLikeNewPrompt`).
-There is no queue to keep in step with the FSM: a request that finishes or
-aborts while retracted simply stops qualifying, with no bookkeeping to prune.
+retraction stamps a monotonic `retraction_epoch` and a `resumes_generation`
+flag onto the `fsm::Retracted` state; among this round's candidates holding a
+recoverable snapshot, victims with generated output first (they resume a
+generation a client is already reading), then oldest epoch. The flag is
+`Request::HasGeneratedOutput()` — token count above the submitted prompt
+size — rather than "was the victim decoding": a victim taken mid-RECOVERY is
+Prefilling again, but its generated tokens still exist (an earlier
+retraction rebased them into its prefill window), and its standing survives.
+A store-less fused retraction is not in this ordering at all — it has no L2
+pages to load back, so it re-prefills through the ordinary admission path
+(`admitsLikeNewPrompt`). There is no queue to keep in step with the FSM: a
+request that finishes or aborts while retracted simply stops qualifying,
+with no bookkeeping to prune.
 
 **A readmission that does not fit, waits.** Its failed admission never
 triggers retraction (it is never recorded as the capacity blocker): when the
@@ -279,8 +298,8 @@ over-optimistic, and never makes anyone else wait.
   in-flight stores defer nothing.
 - Freed capacity is granted to the request it was freed for in the same plan
   build whenever the round's grammar admits the grant (2); the write-back →
-  zero → load → forward order on the execution stream is what makes the
-  immediate release safe, and changing `DeviceHandle.execute`'s ordering
+  zero → load → forward order on the forward thread's stream is what makes
+  the immediate release safe, and changing `DeviceHandle.execute`'s ordering
   breaks it.
 - Only computed tokens are published as a prefix — `retractVictim` reads the
   window of an incomplete prefill rather than its whole token count.
