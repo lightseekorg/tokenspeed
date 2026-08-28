@@ -1580,6 +1580,10 @@ def test_dsa_decode_sparse_kvcache_trims_large_topk_for_tiny_lens() -> None:
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 
+@pytest.mark.skipif(
+    not is_cdna4(),
+    reason="GLM-5.3-Flash native FP8 MFMA decode is specific to gfx950",
+)
 def test_dsa_decode_glm53_flash_native_fp8_mfma() -> None:
     device = "cuda"
     num_heads = 16
