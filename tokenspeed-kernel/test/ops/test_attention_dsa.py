@@ -304,6 +304,98 @@ def test_dsa_workspace_topk_to_global_slots(device: str) -> None:
     torch.testing.assert_close(slots.cpu(), expected.cpu())
 
 
+@pytest.mark.parametrize("total", [1, 255, 256, 257, 513])
+def test_dsa_workspace_conversion_tracks_runtime_total(device: str, total: int) -> None:
+    storage = torch.arange(total * 2, device=device, dtype=torch.int32).view(1, -1)
+    storage.remainder_(97)
+    workspace_indices = storage[:, ::2]
+    workspace_indices[:, ::11] = -1
+    output_storage = torch.empty((1, total * 2), device=device, dtype=torch.int32)
+    out = output_storage[:, ::2]
+    kv_workspace_slots = torch.arange(97, device=device, dtype=torch.int64) * 3 + 5
+    if total > 1:
+        assert not workspace_indices.is_contiguous()
+        assert not out.is_contiguous()
+
+    actual = dsa_workspace_topk_to_global_slots(
+        workspace_indices=workspace_indices,
+        kv_workspace_slots=kv_workspace_slots,
+        out=out,
+    )
+    safe_indices = workspace_indices.clamp_min(0).long()
+    expected = kv_workspace_slots[safe_indices].to(torch.int32)
+    expected.masked_fill_(workspace_indices < 0, -1)
+
+    assert actual.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(actual, expected)
+
+
+def test_dsa_workspace_conversion_empty_and_error_contracts() -> None:
+    workspace_indices = torch.empty((0, 3), dtype=torch.int32)
+    kv_workspace_slots = torch.empty(4, dtype=torch.int64)
+    out = torch.empty_like(workspace_indices)
+
+    actual = dsa_workspace_topk_to_global_slots(
+        workspace_indices=workspace_indices,
+        kv_workspace_slots=kv_workspace_slots,
+        out=out,
+    )
+
+    assert actual is out
+    with pytest.raises(TypeError, match="must be int32"):
+        dsa_workspace_topk_to_global_slots(
+            workspace_indices=workspace_indices.float(),
+            kv_workspace_slots=kv_workspace_slots,
+        )
+    with pytest.raises(ValueError, match=r"\[tokens, topk\]"):
+        dsa_workspace_topk_to_global_slots(
+            workspace_indices=torch.empty(0, dtype=torch.int32),
+            kv_workspace_slots=kv_workspace_slots,
+        )
+    with pytest.raises(ValueError, match="must be 1-D"):
+        dsa_workspace_topk_to_global_slots(
+            workspace_indices=workspace_indices,
+            kv_workspace_slots=kv_workspace_slots.view(2, 2),
+        )
+
+
+def test_dsa_workspace_conversion_graph_replay(device: str) -> None:
+    total = 257
+    workspace_indices = torch.arange(total, device=device, dtype=torch.int32).view(
+        1, total
+    )
+    workspace_indices.remainder_(97)
+    kv_workspace_slots = torch.arange(97, device=device, dtype=torch.int64) * 7 + 11
+    out = torch.empty_like(workspace_indices)
+
+    def run() -> torch.Tensor:
+        return dsa_workspace_topk_to_global_slots(
+            workspace_indices=workspace_indices,
+            kv_workspace_slots=kv_workspace_slots,
+            out=out,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+
+    workspace_indices.copy_(
+        torch.arange(total - 1, -1, -1, device=device, dtype=torch.int32).view(1, total)
+        % 97
+    )
+    workspace_indices[:, ::13] = -1
+    graph.replay()
+    torch.cuda.synchronize()
+
+    safe_indices = workspace_indices.clamp_min(0).long()
+    expected = kv_workspace_slots[safe_indices].to(torch.int32)
+    expected.masked_fill_(workspace_indices < 0, -1)
+    assert captured is out
+    torch.testing.assert_close(captured, expected)
+
+
 def _pack_sparse_kv(
     latent: torch.Tensor,
     rope: torch.Tensor,

@@ -229,14 +229,15 @@ def local_topk_to_global_slots(
     return global_slots, lens
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["total"],
+    do_not_specialize_on_alignment=["total"],
+)
 def _workspace_topk_to_global_slots_kernel(
     out_ptr,
     workspace_indices_ptr,
-    workspace_indices_stride,
     kv_workspace_slots_ptr,
     total,
-    topk: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -295,10 +296,8 @@ def workspace_topk_to_global_slots(
     _workspace_topk_to_global_slots_kernel[(triton.cdiv(total, block),)](
         out_view,
         workspace_indices,
-        workspace_indices.stride(0),
         kv_workspace_slots,
         total=total,
-        topk=workspace_indices.shape[1],
         BLOCK=block,
         num_warps=4,
         num_stages=1,
