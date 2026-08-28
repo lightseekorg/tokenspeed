@@ -105,9 +105,10 @@ distributed update mode until that implementation is added.
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
 | `--block-size` | KV cache block size. |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | Enable or disable prefix cache reuse. |
-| `--enforce-eager` | Disable CUDA graph execution. |
-| `--max-cudagraph-capture-size` | Largest batch size to capture with CUDA graphs. |
-| `--cudagraph-capture-sizes` | Explicit CUDA graph capture sizes. |
+| `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
+| `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
+| `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. |
+| `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
 
 `--chunked-prefill-size` is intentionally separate from
 `--max-num-batched-tokens`: in TokenSpeed it is the scheduler's per-iteration

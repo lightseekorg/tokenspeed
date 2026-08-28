@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69.5.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokenspeed-kernel-npu"
+version = "0.1.0"
+description = "TokenSpeed Ascend-specific kernels."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "torch",
+    "triton-ascend==3.2.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/lightseekorg/tokenspeed/tree/main/tokenspeed-kernel-npu"
+Repository = "https://github.com/lightseekorg/tokenspeed"
+
+[tool.setuptools]
+license-files = ["LICENSE", "THIRDPARTYNOTICES"]
+
+[tool.setuptools.packages.find]
+where = ["python"]

@@ -18,21 +18,37 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Runtime device configuration helpers."""
+"""Ascend rotary embedding operator."""
+
+from __future__ import annotations
 
 import torch
-
-from tokenspeed.runtime.utils import get_colorful_logger
-
-logger = get_colorful_logger(__name__)
+import torch_npu
 
 
-class DeviceConfig:
-    device: torch.device | None
+def apply_rope(
+    *,
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+    q_rope_out: torch.Tensor | None = None,
+    k_rope_out: torch.Tensor | None = None,
+) -> None:
+    """Apply RoPE to Q and K, writing into outputs or the inputs in place."""
+    q_out, k_out = torch_npu.npu_mrope(
+        positions,
+        q,
+        k,
+        cos_sin_cache.to(q.dtype),
+        head_size,
+        mrope_section=[0, 0, 0],
+        rotary_mode="half" if is_neox else "interleave",
+    )
+    (q if q_rope_out is None else q_rope_out).copy_(q_out)
+    (k if k_rope_out is None else k_rope_out).copy_(k_out)
 
-    def __init__(self, device: str = "cuda") -> None:
-        if device in {"cuda", "npu"}:
-            self.device_type = device
-        else:
-            raise RuntimeError(f"Not supported device type: {device}")
-        self.device = torch.device(self.device_type)
+
+__all__ = ["apply_rope"]

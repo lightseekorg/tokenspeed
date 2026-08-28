@@ -442,6 +442,8 @@ __all__ = [
 ]
 
 
+import tokenspeed_kernel.ops.embedding.ascend  # noqa: E402,F401
+
 # Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.embedding.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.flashinfer  # noqa: E402,F401

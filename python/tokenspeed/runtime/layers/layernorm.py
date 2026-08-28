@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.communication.trtllm import (
 from tokenspeed_kernel.ops.communication.trtllm import (
     reducescatter_residual_rmsnorm,
 )
+from tokenspeed_kernel.ops.layernorm import rmsnorm
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -44,29 +45,53 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
-_is_amd = current_platform().is_amd
+_platform = current_platform()
+_is_amd = _platform.is_amd
+
+
+def _torch_allreduce_residual_rmsnorm(
+    *,
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    group,
+    eps: float,
+    **_,
+) -> tuple[torch.Tensor, torch.Tensor, None]:
+    torch.distributed.all_reduce(input_tensor, group=group)
+    output, updated_residual = rmsnorm(
+        input_tensor,
+        weight,
+        eps,
+        residual=residual,
+    )
+    return output, updated_residual, None
+
 
 if _is_amd:
-    from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm
     from tokenspeed_kernel.ops.layernorm.triton import (
         rmsnorm_fused_parallel as triton_rmsnorm_fused_parallel,
     )
-else:
+
+    _allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
+elif _platform.is_nvidia:
     from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
     from tokenspeed_kernel.ops.layernorm.flashinfer import (
-        fused_add_rmsnorm,
         gemma_fused_add_rmsnorm,
         gemma_rmsnorm,
         layernorm,
-        rmsnorm,
     )
+
+    _allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
+else:
+    _allreduce_residual_rmsnorm = _torch_allreduce_residual_rmsnorm
 
 
 logger = get_colorful_logger(__name__)
 
 
 def _get_process_group(group: tuple[int, ...]):
-    return pg_manager.get_process_group("nccl", group)
+    return pg_manager.get_device_process_group(group)
 
 
 class LayerNorm(nn.Module):
@@ -80,7 +105,7 @@ class LayerNorm(nn.Module):
         # There might be no tokens here (e.g. idle/padded graph rows).
         if x.shape[0] == 0:
             return x
-        if current_platform().is_nvidia:
+        if _platform.is_nvidia:
             return layernorm(x, self.weight, self.bias, self.variance_epsilon)
         return nn.functional.layer_norm(
             x.float(),
@@ -114,40 +139,13 @@ class RMSNorm(torch.nn.Module):
             else:
                 return x
 
-        if _is_amd:
-            if residual is not None:
-                if out is not None:
-                    raise ValueError("fused add rmsnorm does not support out")
-                return triton_rmsnorm(
-                    x,
-                    self.weight.data,
-                    self.variance_epsilon,
-                    residual=residual,
-                )
-            return triton_rmsnorm(
-                x,
-                self.weight.data,
-                self.variance_epsilon,
-                out=out,
-            )
-        else:
-            if residual is not None:
-                if out is not None:
-                    raise ValueError("fused_add_rmsnorm does not support out")
-                fused_add_rmsnorm(
-                    x,
-                    residual,
-                    self.weight.data,
-                    self.variance_epsilon,
-                )
-                return x, residual
-            out = rmsnorm(
-                x,
-                self.weight.data,
-                self.variance_epsilon,
-                out=out,
-            )
-            return out
+        return rmsnorm(
+            x,
+            self.weight.data,
+            self.variance_epsilon,
+            residual=residual,
+            out=out,
+        )
 
     def forward_with_allreduce_fusion(
         self,
@@ -168,13 +166,7 @@ class RMSNorm(torch.nn.Module):
         if residual is not None:
 
             if len(group) > 1:
-                if _is_amd:
-                    allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
-                else:
-                    if not current_platform().is_nvidia:
-                        raise RuntimeError("Allreduce RMSNorm requires NVIDIA or AMD.")
-                    allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
-                fused_result = allreduce_residual_rmsnorm(
+                fused_result = _allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
                     weight=self.weight,
@@ -319,13 +311,7 @@ class GemmaRMSNorm(torch.nn.Module):
         if residual is not None:
 
             if len(group) > 1:
-                if _is_amd:
-                    allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
-                else:
-                    if not current_platform().is_nvidia:
-                        raise RuntimeError("Allreduce RMSNorm requires NVIDIA or AMD.")
-                    allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
-                fused_result = allreduce_residual_rmsnorm(
+                fused_result = _allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
                     weight=self.gemma_weight,

@@ -157,22 +157,23 @@ def get_available_gpu_memory(
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
-    if device == "cuda":
-        num_gpus = torch.cuda.device_count()
+    if device in {"cuda", "npu"}:
+        device_module = torch.get_device_module(device)
+        num_gpus = device_module.device_count()
         if gpu_id >= num_gpus:
             raise ValueError(f"gpu_id={gpu_id} must be less than num_gpus={num_gpus}.")
 
-        if torch.cuda.current_device() != gpu_id:
+        if device_module.current_device() != gpu_id:
             logger.debug(
                 "Current device is not %s, but %s, which may cause useless "
                 "memory allocation for torch CUDA context.",
                 gpu_id,
-                torch.cuda.current_device(),
+                device_module.current_device(),
             )
 
         if empty_cache:
-            torch.cuda.empty_cache()
-        free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+            device_module.empty_cache()
+        free_gpu_memory, _ = device_module.mem_get_info(gpu_id)
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)

@@ -288,7 +288,7 @@ class L2CacheExecutor:
         # releases -- and may re-grant -- the source pages the moment it
         # emits this op, and the single-stream FIFO is what keeps the copy
         # ahead of the pages' next writer.
-        stream = torch.cuda.current_stream()
+        stream = device_module.current_stream()
         transfer_cache_ranges(
             "d2h",
             self.layout.buffers,
@@ -297,7 +297,7 @@ class L2CacheExecutor:
             stream,
             backend=self.transfer_backend,
         )
-        finish = torch.cuda.Event()
+        finish = device_module.Event()
         finish.record(stream)
         with self._ack_lock:
             self._write_acks.append(_Ack(finish, op_ids))
@@ -348,7 +348,7 @@ class L2CacheExecutor:
                     self.load_stream,
                     backend=self.transfer_backend,
                 )
-                finish = torch.cuda.Event()
+                finish = device_module.Event()
                 finish.record(self.load_stream)
                 load_events.layer_done_events[layer_index] = finish
             consumer_offset += consumer_count

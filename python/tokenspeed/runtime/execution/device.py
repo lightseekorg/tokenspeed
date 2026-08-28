@@ -733,6 +733,7 @@ def build_device_side(
             gpu_id,
             global_rank,
             logger,
+            device=server_args.device,
             draft_model=draft.model if draft is not None else None,
             kv_pool=token_to_kv_pool,
             draft_kv_pool=draft_token_to_kv_pool,

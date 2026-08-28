@@ -62,7 +62,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 
 
 def _get_process_group(group: Group):
-    return pg_manager.get_process_group("nccl", group)
+    return pg_manager.get_device_process_group(group)
 
 
 # ---------------------------------------------------------------------------

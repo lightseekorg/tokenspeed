@@ -25,6 +25,7 @@ import torch
 
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
+    get_masked_input_and_mask,
 )
 
 
@@ -53,3 +54,81 @@ def test_fp8_tp_lookup_masks_remote_rows() -> None:
     assert output.dtype == torch.float8_e4m3fn
     torch.testing.assert_close(output[:2].float(), embedding.weight[[0, 63]].float())
     assert torch.count_nonzero(output[2:].float()) == 0
+
+
+def test_masked_input_stays_inside_local_vocab_shard():
+    input_ids = torch.tensor(
+        [-1, 0, 75967, 75968, 151644, 151935, 151936, torch.iinfo(torch.int32).max]
+    )
+
+    masked_input, input_mask = get_masked_input_and_mask(
+        input_ids,
+        org_vocab_start_index=75968,
+        org_vocab_end_index=151936,
+        num_org_vocab_padding=0,
+        added_vocab_start_index=151936,
+        added_vocab_end_index=151936,
+    )
+
+    torch.testing.assert_close(
+        masked_input,
+        torch.tensor([0, 0, 0, 0, 75676, 75967, 0, 0]),
+    )
+    torch.testing.assert_close(
+        input_mask,
+        torch.tensor([True, True, True, False, False, False, True, True]),
+    )
+    assert masked_input.min() == 0
+    assert masked_input.max() < 75968
+
+
+def test_masked_input_handles_changing_token_counts():
+    input_ids = torch.tensor(
+        [
+            151644,
+            872,
+            198,
+            14880,
+            110298,
+            66017,
+            82587,
+            16,
+            26939,
+            20,
+            3837,
+            11622,
+            107463,
+            17992,
+            17177,
+            99859,
+            1773,
+            151645,
+            198,
+            151644,
+            77091,
+            198,
+            151667,
+            271,
+            151668,
+            271,
+        ],
+        dtype=torch.int32,
+    )
+
+    for token_count in (19, 26, 17, 26):
+        current = input_ids[:token_count]
+        masked_input, input_mask = get_masked_input_and_mask(
+            current,
+            org_vocab_start_index=0,
+            org_vocab_end_index=75968,
+            num_org_vocab_padding=0,
+            added_vocab_start_index=151936,
+            added_vocab_end_index=151936,
+        )
+        expected_mask = current >= 75968
+        torch.testing.assert_close(
+            masked_input,
+            current.masked_fill(expected_mask, 0),
+            check_dtype=False,
+        )
+        torch.testing.assert_close(input_mask, expected_mask)

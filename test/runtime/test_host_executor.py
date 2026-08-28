@@ -203,9 +203,9 @@ class GroupAwareWireTest(unittest.TestCase):
 
         with (
             patch.object(
-                executor_module.torch.cuda, "current_stream", return_value=stream
+                executor_module.device_module, "current_stream", return_value=stream
             ),
-            patch.object(executor_module.torch.cuda, "Event", return_value=finish),
+            patch.object(executor_module.device_module, "Event", return_value=finish),
             patch.object(executor_module, "transfer_cache_ranges") as transfer,
         ):
             executor._start_writing([7], [(0, 5, 9)])

@@ -18,21 +18,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Runtime device configuration helpers."""
+"""Single import boundary for the Triton-Ascend distribution."""
 
-import torch
+import triton
+from triton import language as tl
+from triton import profiler as proton
+from triton.language.extra import libdevice
 
-from tokenspeed.runtime.utils import get_colorful_logger
 
-logger = get_colorful_logger(__name__)
+@triton.jit
+def _unsupported_pdl_noop():
+    """Keep disabled CUDA PDL branches parseable on Triton-Ascend."""
+    pass
 
 
-class DeviceConfig:
-    device: torch.device | None
+if not hasattr(tl.extra.cuda, "gdc_wait"):
+    tl.extra.cuda.gdc_wait = _unsupported_pdl_noop
+if not hasattr(tl.extra.cuda, "gdc_launch_dependents"):
+    tl.extra.cuda.gdc_launch_dependents = _unsupported_pdl_noop
 
-    def __init__(self, device: str = "cuda") -> None:
-        if device in {"cuda", "npu"}:
-            self.device_type = device
-        else:
-            raise RuntimeError(f"Not supported device type: {device}")
-        self.device = torch.device(self.device_type)
+
+__all__ = ["libdevice", "proton", "tl", "triton"]
