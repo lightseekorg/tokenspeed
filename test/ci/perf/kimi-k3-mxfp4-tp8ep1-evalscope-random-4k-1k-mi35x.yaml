@@ -7,18 +7,24 @@ api_version: ci.tokenspeed.io/v1
 # (hipBLASLt "operation not permitted when stream is capturing" (900) on every
 # rank, GPUs pinned at 0% utilization) while EP8 captured cleanly, so the bug
 # reached main unnoticed and was only found by hand. Server startup alone
-# exercises that path, which is why this runs per-commit: the capture happens
-# before the first request, so a regression fails here without needing the
-# perf numbers to mean anything.
+# exercises that path: the capture happens before the first request, so a
+# regression shows up here as a startup failure without needing the perf
+# numbers to mean anything.
 #
 # Keep --cudagraph-capture-sizes set. Running this job with --enforce-eager
 # would skip capture entirely and silence exactly the class of bug it exists
 # to catch.
+#
+# Manual trigger only, so this does not gate commits and does not consume the
+# 8-GPU bench runner on every push. That leaves no automated signal for the
+# EP1 placement: the per-commit guard for the graph-capture contract is the
+# CPU-only test/runtime/test_kimi_k3_moe_fork_warmup.py, which is narrower --
+# it pins the call site, not the stream behaviour. Run this job by hand when
+# touching the MoE stream fork, the A8W4 SiTU kernel, or graph capture.
 name: perf-kimi-k3-mxfp4-tp8ep1-random-4k-1k-mi35x
 type: perf
 workflow_stage: model-test
 triggers:
-  - per-commit
   - manual
 runner:
   labels:
