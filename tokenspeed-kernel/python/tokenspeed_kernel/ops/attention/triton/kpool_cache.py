@@ -223,7 +223,10 @@ def triton_kpool_prefill_write(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens"],
+    do_not_specialize_on_alignment=["num_tokens"],
+)
 def _kpool_prefill_tail_write_kernel(
     k_ptr,
     gate_ptr,
@@ -239,7 +242,7 @@ def _kpool_prefill_tail_write_kernel(
     tail_k_stride_pool: tl.constexpr,
     tail_gate_stride_req: tl.constexpr,
     tail_gate_stride_pool: tl.constexpr,
-    NUM_TOKENS: tl.constexpr,
+    num_tokens,
     POOL_SIZE: tl.constexpr,
     TAIL_SIZE: tl.constexpr,
     TAIL_NUM_REQUESTS: tl.constexpr,
@@ -267,7 +270,7 @@ def _kpool_prefill_tail_write_kernel(
             valid_destination
             & (pool_offset < valid_count)
             & (source_row >= 0)
-            & (source_row < NUM_TOKENS)
+            & (source_row < num_tokens)
         )
         safe_source_row = tl.where(active, source_row, 0)
         destination_row = (destination_position + pool_offset) % TAIL_SIZE
@@ -394,7 +397,7 @@ def triton_kpool_prefill_tail_write(
         tail_k.stride(1),
         tail_gate.stride(0),
         tail_gate.stride(1),
-        NUM_TOKENS=k.shape[0],
+        num_tokens=k.shape[0],
         POOL_SIZE=pool_size,
         TAIL_SIZE=tail_k.shape[1],
         TAIL_NUM_REQUESTS=tail_k.shape[0],
