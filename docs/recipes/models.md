@@ -369,15 +369,10 @@ ts serve zai-org/GLM-5.3 \
   --moe-backend flashinfer_trtllm \
   --kv-cache-dtype fp8 \
   --max-model-len 262144 \
-  --chunked-prefill-size 8192 \
   --max-num-seqs 128 \
   --draft-model-path-use-base \
   --speculative-algorithm MTP \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --host 0.0.0.0 \
-  --port 8000
+  --speculative-num-steps 3
 ```
 
 ## GLM 5.3 Flash
