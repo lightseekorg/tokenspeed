@@ -39,7 +39,7 @@ that order. The csrc tree compiles cleanly against flashinfer's CUTLASS
 
 ## Runtime requirements and behavior
 
-- SM100 (Blackwell) only; `nvidia-cutlass-dsl==4.6.0` and
+- SM100 (Blackwell) only; `nvidia-cutlass-dsl==4.7.1` and
   `quack-kernels==0.6.1` (both in `requirements/cuda-thirdparty.txt`).
 - Importing `.sparse` performs the upstream `sys.path.insert` of the
   `cute/` directory, exposing its top-level module names (`interface`,
