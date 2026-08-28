@@ -46,7 +46,7 @@ from enum import IntEnum
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.activation.triton import add3, attnres_combine
+from tokenspeed_kernel.ops.activation.triton import add3
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
 from tokenspeed_kernel.ops.communication.multimem import (
@@ -445,19 +445,7 @@ class K3AttnComm:
                         local_world_size=self.mapping.nprocs_per_node,
                         eps=eps,
                     )
-                else:
-                    residual_out = prefix_sum + all_reduce(
-                        attn_partial, self.mapping.attn.tp_group
-                    )
-                    h = attnres_combine(
-                        residual_out,
-                        mlp_wp,
-                        out_norm_w,
-                        eps,
-                        scratch,
-                        torch.empty_like(residual_out),
-                    )
-                return residual_out, h
+                    return residual_out, h
         reduced = all_reduce(attn_partial, self.mapping.attn.tp_group)
         return (reduced if prefix_sum is None else prefix_sum + reduced), None
 
