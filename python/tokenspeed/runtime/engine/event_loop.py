@@ -93,6 +93,32 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 logger = get_colorful_logger(__name__)
 
 
+def maybe_warm_cupti_for_graph_capture() -> None:
+    """Preload CUPTI before any CUDA graph is captured. NVIDIA only.
+
+    A profiler that first attaches AFTER capture invalidates the captured
+    graphs -- every later replay dies with cudaErrorLaunchFailure -- which
+    would forbid runtime ``/start_profile`` on graph-mode servers. One empty
+    profiler session loads CUPTI ahead of every capture, making runtime
+    attach/detach safe.
+
+    Both the hazard and the remedy are CUDA-specific. CUPTI is CUDA's
+    profiling interface; ROCm routes torch profiling through roctracer, where
+    this empty warm-up session instead leaves activity collection permanently
+    dead for the life of the process: every subsequent ``/start_profile``
+    returns a trace with ``cpu_op`` entries but zero ``"cat": "kernel"``
+    events, on every rank, in eager and graph mode alike. So skip it on AMD.
+    """
+    from tokenspeed_kernel.platform import current_platform
+
+    if not torch.cuda.is_available() or current_platform().is_amd:
+        return
+
+    from torch.profiler._utils import _init_for_cuda_graphs
+
+    _init_for_cuda_graphs()
+
+
 class EventLoop:
     def __init__(
         self,
@@ -1156,17 +1182,7 @@ def run_event_loop(
                 lambda _signum, _frame: shutdown_event.set(),
             )
 
-        if torch.cuda.is_available():
-            # Warm up CUPTI before EventLoop init captures any CUDA graph
-            # (decode/prefill/encoder). A profiler that first attaches AFTER
-            # capture invalidates the captured graphs — every later replay
-            # dies with cudaErrorLaunchFailure — which would forbid runtime
-            # /start_profile on graph-mode servers. One empty profiler
-            # session loads CUPTI ahead of every capture, making runtime
-            # attach/detach safe.
-            from torch.profiler._utils import _init_for_cuda_graphs
-
-            _init_for_cuda_graphs()
+        maybe_warm_cupti_for_graph_capture()
 
         event_loop = EventLoop(
             server_args,
