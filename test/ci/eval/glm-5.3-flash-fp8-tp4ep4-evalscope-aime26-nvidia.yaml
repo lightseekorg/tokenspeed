@@ -16,7 +16,7 @@ install:
 server:
   command: >-
     ts serve
-    --model zai-org/GLM-5.3
+    --model zai-org/GLM-5.3-Flash
     --served-model-name glm-5.3-flash
     --attn-tp-size 4
     --enable-expert-parallel

@@ -54,9 +54,9 @@ Pull requests targeting the private `shared/glm5-next` integration branch run
 separate GLM-5.3-Flash AIME26 jobs for AMD and NVIDIA. Each cold job gets its own CI
 work directory, starts a new server, and reloads the model into GPU memory.
 The tasks address the checkpoints by their public Hugging Face IDs:
-`zai-org/GLM-5.3` for FP8 and `zai-org/GLM-5.3-BF16` for BF16. Runner-local
-Hugging Face caches avoid repeated weight downloads, while `HF_HOME` remains
-job-local for EvalScope dataset downloads.
+`zai-org/GLM-5.3-Flash` for FP8 and `zai-org/GLM-5.3-Flash-BF16` for BF16.
+Runner-local Hugging Face caches avoid repeated weight downloads, while
+`HF_HOME` remains job-local for EvalScope dataset downloads.
 
 The AMD gate uses the FP8 model on four MI350X GPUs
 with TP4/EP1, the checkpoint's embedded single-layer MTP drafter with three

@@ -19,7 +19,7 @@ server:
   command: >-
     TORCH_BLAS_PREFER_HIPBLASLT=0
     ts serve
-    --model zai-org/GLM-5.3-BF16
+    --model zai-org/GLM-5.3-Flash-BF16
     --served-model-name glm-5.3-flash
     --attn-tp-size 4
     --ep-size 1

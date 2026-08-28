@@ -18,7 +18,7 @@ server:
   # for the faster large-M prefill kernel.
   command: >-
     ts serve
-    --model zai-org/GLM-5.3
+    --model zai-org/GLM-5.3-Flash
     --served-model-name glm-5.3-flash-fp8-mtp
     --attn-tp-size 4
     --ep-size 1

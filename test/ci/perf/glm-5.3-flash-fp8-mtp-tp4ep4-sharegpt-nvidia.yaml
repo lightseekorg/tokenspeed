@@ -15,7 +15,7 @@ install:
 server:
   command: >-
     ts serve
-    --model zai-org/GLM-5.3
+    --model zai-org/GLM-5.3-Flash
     --served-model-name glm-5.3-flash
     --attn-tp-size 4
     --enable-expert-parallel
@@ -41,7 +41,7 @@ server:
     --gateway-startup-timeout 600
     --speculative-algorithm MTP
     --speculative-draft-model-path
-    zai-org/GLM-5.3
+    zai-org/GLM-5.3-Flash
     --draft-model-path-use-base
     --speculative-num-steps 3
     --speculative-eagle-topk 1
@@ -64,7 +64,7 @@ perf:
         --url http://127.0.0.1:8000/v1/completions \
         --api openai \
         --dataset share_gpt_en \
-        --tokenizer-path zai-org/GLM-5.3 \
+        --tokenizer-path zai-org/GLM-5.3-Flash \
         --tokenize-prompt \
         --max-prompt-length 32256 \
         --min-tokens 512 \

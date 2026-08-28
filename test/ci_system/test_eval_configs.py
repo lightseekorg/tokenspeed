@@ -29,8 +29,8 @@ GLM53_FLASH_BF16_AMD_CONFIG_PATH = (
     EVAL_CONFIG_DIR / "glm-5.3-flash-bf16-tp4ep1-evalscope-aime26-amd.yaml"
 )
 HF_HOME_ASSIGNMENT = "HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache"
-GLM53_FLASH_FP8_MODEL_ID = "zai-org/GLM-5.3"
-GLM53_FLASH_BF16_MODEL_ID = "zai-org/GLM-5.3-BF16"
+GLM53_FLASH_FP8_MODEL_ID = "zai-org/GLM-5.3-Flash"
+GLM53_FLASH_BF16_MODEL_ID = "zai-org/GLM-5.3-Flash-BF16"
 FORK_PR_EXPRESSION = (
     "${{ github.event_name == 'pull_request' && "
     "github.event.pull_request.head.repo.full_name != github.repository }}"
