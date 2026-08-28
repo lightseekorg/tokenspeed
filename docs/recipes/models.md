@@ -355,6 +355,31 @@ tokenspeed serve zai-org/GLM-5.2-FP8 \
   --port 8000
 ```
 
+## GLM 5.3
+
+GLM-5.3 follows the GLM-5.2 DSA serving path. Its base checkpoint includes the
+NextN draft layer, so MTP does not require a separate draft checkpoint.
+
+```bash
+ts serve zai-org/GLM-5.3 \
+  --served-model-name glm-5.3 \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --moe-backend flashinfer_trtllm \
+  --kv-cache-dtype fp8 \
+  --max-model-len 262144 \
+  --chunked-prefill-size 8192 \
+  --max-num-seqs 128 \
+  --draft-model-path-use-base \
+  --speculative-algorithm MTP \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
 ## GLM 5.3 Flash
 
 GLM-5.3-Flash automatically configures its KDA/DSA backends and supports MTP from
