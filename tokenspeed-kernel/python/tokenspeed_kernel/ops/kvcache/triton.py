@@ -563,7 +563,10 @@ def _set_mla_kv_buffer_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["n_loc"],
+    do_not_specialize_on_alignment=["n_loc"],
+)
 def _set_mla_kv_buffer_per_loc_kernel(
     kv_buffer_ptr,
     cache_k_nope_ptr,
