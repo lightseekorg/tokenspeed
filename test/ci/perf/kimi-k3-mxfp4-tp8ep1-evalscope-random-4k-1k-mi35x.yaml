@@ -1,0 +1,124 @@
+api_version: ci.tokenspeed.io/v1
+# TP8/EP1 counterpart to the tp8ep8 job. Every other Kimi-K3 AMD job runs
+# EP8, so the tensor-parallel MoE placement -- and with it the gfx950 A8W4
+# SiTU kernel -- had no CI coverage at all.
+#
+# The gap was not theoretical: EP1 deadlocked during HIP graph capture
+# (hipBLASLt "operation not permitted when stream is capturing" (900) on every
+# rank, GPUs pinned at 0% utilization) while EP8 captured cleanly, so the bug
+# reached main unnoticed and was only found by hand. Server startup alone
+# exercises that path, which is why this runs per-commit: the capture happens
+# before the first request, so a regression fails here without needing the
+# perf numbers to mean anything.
+#
+# Keep --cudagraph-capture-sizes set. Running this job with --enforce-eager
+# would skip capture entirely and silence exactly the class of bug it exists
+# to catch.
+name: perf-kimi-k3-mxfp4-tp8ep1-random-4k-1k-mi35x
+type: perf
+workflow_stage: model-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi350-8gpu-bench
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+server:
+  command: >-
+    ts serve
+    --model moonshotai/Kimi-K3
+    --served-model-name kimi-k3
+    --tp 8
+    --ep-size 1
+    --attention-backend mla
+    --moe-backend auto
+    --kv-cache-dtype fp8
+    --mm-encoder-tp-mode data
+    --max-model-len 8192
+    --max-num-seqs 1
+    --max-cudagraph-capture-size 1
+    --cudagraph-capture-sizes 1
+    --disable-prefill-graph
+    --gpu-memory-utilization 0.92
+    --trust-remote-code
+    --sampling-backend greedy
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --no-enable-prefix-caching
+    --enable-cache-report
+    --host 127.0.0.1
+    --port 21000
+    --policy round_robin
+    --engine-startup-timeout 1200
+    --gateway-startup-timeout 600
+  ready:
+    # Deliberately tighter than the tp8ep8 job's 3600s. The failure this job
+    # guards is a deadlock, not a crash: nothing is raised, the server simply
+    # never reports ready. A long ceiling burns most of an hour of an 8-GPU
+    # runner per occurrence before reporting an opaque timeout.
+    url: http://127.0.0.1:21000/readiness
+    timeout: 1800
+    interval: 10
+perf:
+  install:
+    # Keep the load generator aligned with the version used to establish the
+    # perf_reference below; EvalScope 1.10 changed its metric semantics.
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]==1.9.1'
+  command: >-
+    REPO_ROOT=$PWD &&
+    MODEL=kimi-k3 &&
+    URL=http://127.0.0.1:21000/v1/completions &&
+    OUTPUTS_DIR=/tmp/tokenspeed-kimi-k3-ep1-mi35x-perf &&
+    trap 'rm -rf "$OUTPUTS_DIR"' EXIT &&
+    rm -rf "$OUTPUTS_DIR" &&
+    set +e &&
+    echo "==================================================" &&
+    echo ">>> input=4k output=1k conc=1" &&
+    echo "==================================================" &&
+    /tmp/evalscope-perf/bin/evalscope perf
+    --model "$MODEL"
+    --url "$URL"
+    --api openai
+    --dataset random
+    --tokenizer-path moonshotai/Kimi-K3
+    --min-prompt-length 4096
+    --max-prompt-length 4096
+    --prefix-length 0
+    --min-tokens 1024
+    --max-tokens 1024
+    --parallel 1
+    --number 1
+    --warmup-num 1
+    --rate -1
+    --seed 1
+    --temperature 0
+    --stream
+    --outputs-dir "$OUTPUTS_DIR/input_4k"
+    --no-timestamp
+    --extra-args '{"ignore_eos": true}';
+    PERF_STATUS=$?;
+    python3 "$REPO_ROOT/test/random_benchmark/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR" --num-gpus 8 --emit-csv;
+    PARSE_STATUS=$?;
+    if [ "$PERF_STATUS" -ne 0 ]; then exit "$PERF_STATUS"; fi;
+    exit "$PARSE_STATUS"
+report:
+  github_step_summary: true
+perf_threshold: 0.9
+# Values are [Latency (tps/user), Throughput (tps/gpu)]; gate fails any conc whose actual falls below ref * perf_threshold.
+#
+# PROVISIONAL -- these have not been established on this runner. They are set
+# deliberately loose so the job reports rather than gates while it settles, and
+# should be replaced by the documented convention (rounded down from the median
+# of the three most recent passing runs) once there are three.
+#
+# The starting point is a hand measurement on an 8x MI355X box: EP1 sustained
+# 53.98 tok/s at concurrency 1 against EP8's 73.84 on the same commit. EP1 is
+# expected to be SLOWER here -- its advantage is at batch (it overtook EP8 by
+# ~28% at concurrency 16) and concurrency 1 is its worst case. Do not copy the
+# tp8ep8 reference into this file.
+perf_reference:
+  1: [45, 5.4]

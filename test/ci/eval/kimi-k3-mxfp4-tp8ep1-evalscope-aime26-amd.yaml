@@ -1,0 +1,80 @@
+api_version: ci.tokenspeed.io/v1
+# Accuracy coverage for the TP8/EP1 placement, which selects the gfx950 A8W4
+# SiTU MoE kernel instead of the A16W4 EP path every other Kimi-K3 AMD job
+# exercises. That kernel quantizes activations to FP8, so it is the config
+# where a numerics regression would show up first -- and it shipped with one:
+# the MoE combine wrote to a freshly allocated tensor instead of the caller's
+# output buffer, and the model emitted repetition loops and wrong arithmetic
+# while EP8 stayed clean.
+#
+# Manual, matching the non-DSpark tp8ep8 eval: the per-commit signal for this
+# placement is the cheaper perf job, which catches startup and graph-capture
+# regressions without the full AIME26 budget.
+name: eval-kimi-k3-mxfp4-tp8ep1-aime26-amd
+type: eval
+workflow_stage: model-test
+triggers:
+  - manual
+runner:
+  labels:
+    - amd-mi35x-8gpu-test
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+server:
+  command: >-
+    ts serve
+    --model moonshotai/Kimi-K3
+    --served-model-name kimi-k3
+    --tp 8
+    --ep-size 1
+    --attention-backend mla
+    --moe-backend auto
+    --kv-cache-dtype fp8
+    --mm-encoder-tp-mode data
+    --max-model-len 65536
+    --max-num-seqs 16
+    --max-cudagraph-capture-size 16
+    --cudagraph-capture-sizes 1 2 4 8 16
+    --disable-prefill-graph
+    --gpu-memory-utilization 0.92
+    --trust-remote-code
+    --sampling-backend greedy
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --enable-cache-report
+    --reasoning-parser kimi_k3
+    --host 127.0.0.1
+    --port 8000
+    --policy round_robin
+    --engine-startup-timeout 1200
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model kimi-k3
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets aime26
+    --dataset-hub huggingface
+    --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
+    --eval-batch-size 16
+    --stream
+    --generation-config '{"do_sample":true,"temperature":1.0,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'
+report:
+  github_step_summary: true
+# PROVISIONAL -- not yet established for this placement. Held at the tp8ep8
+# gate's 0.90 because a hand comparison found the two paths agreeing closely:
+# on a fixed greedy prompt set EP1 matched the EP8 reference answer for answer
+# and, on 7 of 8 prompts, completion-token count for completion-token count.
+# Confirm against the first passing runs and adjust if A8W4 sits consistently
+# lower; 30 questions is a small sample and AIME26 pass rates are noisy.
+score_threshold: 0.90
