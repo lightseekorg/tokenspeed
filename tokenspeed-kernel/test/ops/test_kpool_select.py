@@ -268,6 +268,27 @@ def test_decode_metadata_matches_torch_chain(
     assert torch.equal(actual_causal_lens, expected_causal_lens)
 
 
+@pytest.mark.parametrize("num_reqs", [3, 13])
+def test_decode_metadata_cuda_graph_tracks_tail_batch_lengths(num_reqs: int) -> None:
+    seq_lens = torch.arange(num_reqs, dtype=torch.int32, device="cuda")
+
+    _prepare_kpool_decode_metadata(seq_lens, num_reqs, 1)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        req_ids, causal_lens = _prepare_kpool_decode_metadata(seq_lens, num_reqs, 1)
+
+    seq_lens.add_(17)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        req_ids,
+        torch.arange(num_reqs, dtype=torch.int32, device="cuda"),
+    )
+    assert torch.equal(causal_lens, seq_lens)
+
+
 @pytest.mark.parametrize("table_cols", [1, 2, 5, 9, 16, 31])
 def test_expand_kpool_tracks_runtime_page_table_width(table_cols: int) -> None:
     pool_indices = torch.tensor(
