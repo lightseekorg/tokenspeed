@@ -41,44 +41,10 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.engine.event_loop import EventLoop  # noqa: E402
-from tokenspeed.runtime.engine.forward_dispatch import (  # noqa: E402
-    ForwardDispatcher,
-    PrefillDispatcher,
-)
 
 
-def _predicate_loop(*, dispatcher=None, eager_grammar_buffers=None):
-    return SimpleNamespace(
-        _forward_dispatcher=dispatcher or ForwardDispatcher(device=None),
-        _uses_eager_grammar=eager_grammar_buffers is not None,
-    )
-
-
-def test_the_roles_own_rule_reaches_the_registry() -> None:
-    # The registry asks the role first. No role declares a rule today (the
-    # P-side handoff's was removed once the C++ scheduler learned to defer the
-    # handoff batch), so a role that starts declaring one must reach the
-    # registry through this path.
-    class _DemandingRole(ForwardDispatcher):
-        def needs_pending_commit(self, forward_op) -> bool:
-            return forward_op.num_extends() == 0
-
-    loop = _predicate_loop(dispatcher=_DemandingRole(device=None))
-    handoff_op = SimpleNamespace(num_extends=lambda: 0)
-    extend_op = SimpleNamespace(num_extends=lambda: 1)
-
-    assert EventLoop._dispatch_depends_on_pending_commit(loop, handoff_op, None)
-    assert not EventLoop._dispatch_depends_on_pending_commit(loop, extend_op, None)
-
-
-def test_the_prefill_role_no_longer_drains_for_its_handoff() -> None:
-    # Draining emptied the whole chunk pipeline under PP on every finished
-    # prompt; the scheduler now defers the handoff batch instead.
-    prefill = PrefillDispatcher(None, store_prefill_token=None, epd_hooks=None)
-    loop = _predicate_loop(dispatcher=prefill)
-    handoff_op = SimpleNamespace(num_extends=lambda: 0)
-
-    assert not EventLoop._dispatch_depends_on_pending_commit(loop, handoff_op, None)
+def _predicate_loop(*, eager_grammar_buffers=None):
+    return SimpleNamespace(_uses_eager_grammar=eager_grammar_buffers is not None)
 
 
 def test_handoff_shaped_batch_without_pd_keeps_overlap() -> None:
@@ -110,14 +76,14 @@ class _DrainHarness:
     def __init__(self) -> None:
         self.committed: list[object] = []
 
-    def _commit_forward_results(self, forward_op, results, on_first_token):
+    def _commit_forward_results(self, forward_op, results):
         self.committed.append(forward_op)
         return [f"change-{forward_op}"]
 
 
 def test_drain_in_flight_commits_oldest_first() -> None:
     loop = _DrainHarness()
-    in_flight = deque([("op0", None, None), ("op1", None, None)])
+    in_flight = deque([("op0", None), ("op1", None)])
 
     request_changes = EventLoop._drain_in_flight(loop, in_flight)
 

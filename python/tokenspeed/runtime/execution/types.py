@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -51,6 +51,39 @@ class DpForwardMetadata:
     need_idle_forward: bool
 
 
+@dataclass(frozen=True)
+class PlannedForward:
+    """One round's planned work, as the device side needs to see it.
+
+    Everything the data plane learns about a round arrives through here and
+    is captured into the submitted closure, so every field must be something
+    the control plane will not touch again once the round is dispatched (the
+    capture contract in ``forward_thread.py``). A new field either satisfies
+    that, or it is a new registered exception — not a comment.
+
+    Attributes:
+        forward_op: The scheduler's op for this round. A per-round value copy
+            out of C++ (``rv_policy::copy`` on ``ExecutionPlan.forward``), so
+            no later scheduler activity can reach it.
+        sampling_params_list: Per-slot sampling params, gathered by the loop.
+            Read-only for the request's lifetime.
+        dp_metadata: CPU-gathered DP metadata, None outside DP. A frozen
+            dataclass of plain lists.
+        grammar_inputs: Per-batch grammar state, None when no request in the
+            batch is constrained. A registered exception: these are the
+            control plane's live matchers, see the contract's rule 5.
+        multimodal_context: Per-batch multimodal state, None for text-only.
+            Its ``mm_inputs`` are shallow copies taken at gather time; the
+            items inside are the other registered exception.
+    """
+
+    forward_op: Any
+    sampling_params_list: list
+    dp_metadata: "DpForwardMetadata | None"
+    grammar_inputs: Any
+    multimodal_context: Any
+
+
 @dataclass
 class ModelExecutionResult:
     """
@@ -60,27 +93,25 @@ class ModelExecutionResult:
 
     Attributes:
         output_tokens: Sampled token IDs
-        output_logits: Output logits (if requested)
         output_lengths: Number of tokens generated per request (for spec decoding)
     """
 
     output_tokens: torch.Tensor
     copy_event: torch.cuda.Event | None = None
-    output_logits: torch.Tensor | None = None
     output_lengths: torch.Tensor | None = None
     grammar_completion: GrammarStepCompletion | None = None
     # Per-position logprob of the sampled token, same layout as output_tokens.
     # Populated unconditionally by the sampling backend so it's always
     # available if any request asks for it.
     output_logprobs: torch.Tensor | None = None
-    # Optional next-round input rows captured for PD prefill data-plane handoff.
+    # P role, final chunk only: the sampled rows the commit path folds into
+    # the ExtendResult as the bootstrap payload the peer's decode needs.
     next_input_ids: torch.Tensor | None = None
     # Per-request NaN-guard flags (int32, [bs]); None when the guard is disabled.
     output_nan_flags: torch.Tensor | None = None
     # Optional verify-input snapshot used by speculative diagnostics. Layout is
     # [batch, verify_width]: anchor followed by draft candidate token ids.
     spec_candidate_tokens: torch.Tensor | None = None
-    # Set by sync(); guards the exactly-once contract below.
     _synced: bool = field(default=False, init=False, repr=False, compare=False)
 
     def sync(self) -> None:
@@ -113,11 +144,9 @@ class PendingExecution:
     Only commit blocks here — the dispatch path never waits, which is what
     keeps a backpressured stage's launches from stalling the control plane.
 
-    This is also the only place a ``ModelExecutionResult`` crosses from the
-    forward thread to the control plane, which is what makes the sync
-    exactly-once: the future is private, so host tensors are unreachable
-    without going through ``result()`` (never under-synced), and the result
-    is memoized, so repeated calls join nothing (never over-synced).
+    Also the only place a ``ModelExecutionResult`` crosses back, which is
+    what makes the sync exactly-once: the future is private and the result
+    is memoized.
     """
 
     _future: Future

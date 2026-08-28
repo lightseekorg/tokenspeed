@@ -29,6 +29,9 @@ as a wrong token.
 
 So the event loop does not hold a ``ModelExecutor``. It holds one of these,
 and the operations below are the complete list of what it can do to the GPU.
+(The PD transfer peer is the one object it also holds directly, for the
+control-plane half of the transport — bootstrap, event polling; its
+execution half is reached only through this handle.)
 Each one packages its arguments into a closure and hands that closure to the
 forward thread; there is no accessor here for the executor, a backend, a
 buffer, or a stream. The rule "the control plane issues no CUDA work, and
@@ -43,23 +46,25 @@ itself runs on the building thread, before the forward thread has any work,
 which is why weight loading, autotuning and CUDA graph capture can touch the
 device directly in there.
 
-What comes back is split three ways, by how long the caller may hold it:
+What comes back is one ``DeviceBuild``, split by how long the caller may
+hold each piece:
 
 - ``DeviceSpecs`` — plain values the control plane plans with (cache
   geometry, speculation widths, capability flags). No device object, safe to
   keep forever, and reading one never goes through the handle.
-- ``DeviceWiring`` — the startup steps that need a real device object:
-  describing the KV to a PD peer, installing the layerwise step counter,
-  reading the encoder's model facts. A local of ``EventLoop.__init__``,
-  dropped when it returns.
-- ``DeviceHandle`` — the running handle, and the only one the loop keeps.
+- ``transfer`` — the PD transfer peer's CONTROL face (bootstrap
+  register/abort, event polling), or None outside PD. Built here too: its
+  execution face lives inside the handle, and everything its construction
+  needs is ``server_args`` or an object this builder already owns.
+- ``encoder_model_facts`` — a startup-only callable for EPD admission,
+  resolved past its gate because a text-only model has no vision tower.
+- ``DeviceHandle`` — the running handle, and the only piece the loop stores.
 
-The split exists because the wiring list is the one that grows: every new
-cache tier, transport or accelerator integration wants a hook that needs a
-pool or a backend. Sending that growth to an object the running loop does
-not hold means it cannot widen what the loop can do to the GPU mid-flight.
-Adding a method to ``DeviceHandle`` is then a deliberate change to the running
-contract rather than somewhere a startup convenience quietly lands.
+Startup steps that need a real device object (the layerwise step counter,
+the peer's KV description) happen INSIDE the builder, so no such object ever
+comes back out. A new device interaction belongs in here if it runs once at
+startup, and on ``DeviceHandle`` only if the running loop genuinely needs it
+— the second widens what the loop can do to the GPU mid-flight.
 
 See ``forward_thread.py`` for the capture contract each closure must satisfy.
 """
@@ -67,17 +72,24 @@ See ``forward_thread.py`` for the capture contract each closure must satisfy.
 from __future__ import annotations
 
 import contextlib
+import enum
 import os
 from collections import deque
 from collections.abc import Callable
-from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from tokenspeed.runtime.execution.types import DpForwardMetadata, PendingExecution
+from tokenspeed.runtime.execution.types import (
+    DpForwardMetadata,
+    PendingExecution,
+    PlannedForward,
+)
+from tokenspeed.runtime.utils import get_colorful_logger
+
+logger = get_colorful_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -146,17 +158,69 @@ class DeviceSpecs:
 
 @dataclass(frozen=True)
 class DeviceBuild:
-    """The three things constructing the device side produces.
+    """What constructing the device side produces, split by how long the
+    caller may hold each piece.
 
     Attributes:
         specs: Plain values the control plane plans with; safe to keep.
-        wiring: Startup-only hooks; a local of ``__init__``, dropped after.
-        handle: The running handle; the only one the loop keeps.
+        transfer: The PD transfer peer's control face — bootstrap
+            register/abort, event polling — or None outside PD.
+        handle: The running handle; the loop's only reach into the device.
+        encoder_model_facts: Zero-argument callable extracting the facts EPD
+            admission needs (``EncoderModelFacts``). A callable, not a value:
+            reading the vision tower's dtype raises on a text-only model, so
+            it must only run after the EPD admission gate has decided the
+            node is a multimodal prefill node. Startup-only, like the rest of
+            this object.
     """
 
     specs: DeviceSpecs
-    wiring: "DeviceWiring"
+    transfer: Any
     handle: "DeviceHandle"
+    encoder_model_facts: Any
+
+
+class DeviceRole(enum.Enum):
+    """How this engine divides a scheduler plan between its two executors.
+
+    Fixed at startup by the deployment mode: the values ARE
+    ``server_args.disaggregation_mode``, and the split mirrors the C++
+    scheduler's own (``config_.role``). A value rather than a class hierarchy: the
+    three roles differ by about a dozen lines, and giving each a subclass
+    forced the handle to publish its own internals so those subclasses could
+    call back into it — a reference cycle for no gain.
+    """
+
+    #: No disaggregation: the model runs every batch, and the plan carries
+    #: no remote streams.
+    PLAIN = "null"
+    #: Prefills prompts; a completed prompt's KV goes out on
+    #: ``plan.remote_decode`` for the node that will decode it.
+    PD_PREFILL = "prefill"
+    #: Decodes prompts another node prefilled; ``plan.remote_prefill`` pulls
+    #: an admitted prompt's KV in.
+    PD_DECODE = "decode"
+
+
+def _settle(submissions: deque, failure: str) -> None:
+    """Drain finished data-plane submissions, re-raising the first failure.
+
+    A submission's semantic completion arrives elsewhere (a transfer event,
+    a cache-op ack), so a submission that RAISED produces no completion at
+    all: swallowing it would strand its request silently. Only finished
+    futures are inspected, so this never blocks.
+
+    Args:
+        submissions: The pending submission futures, oldest first.
+        failure: What the caller loses if the failure is swallowed.
+
+    Raises:
+        RuntimeError: A settled submission raised on the data plane.
+    """
+    while submissions and submissions[0].done():
+        exc = submissions.popleft().exception()
+        if exc is not None:
+            raise RuntimeError(failure) from exc
 
 
 class DeviceHandle:
@@ -167,7 +231,13 @@ class DeviceHandle:
     then use to bypass the rest.
     """
 
-    def __init__(self, executor, *, l2_cache_executor=None) -> None:
+    def __init__(
+        self,
+        executor,
+        *,
+        l2_cache_executor=None,
+        kv_transfer=None,
+    ) -> None:
         # Private by convention AND by absence: nothing below returns it.
         self._executor = executor
         self._thread = executor.forward_thread
@@ -175,19 +245,131 @@ class DeviceHandle:
         # handle for the same reason the pools are: its submit path launches
         # transfers and records events.
         self._l2 = l2_cache_executor
-        # The PD transfer executor's EXECUTION face; see attach_kv_transfer.
-        self._kv_transfer = None
+        # The PD transfer peer's execution face: its transfers move KV-pool
+        # device memory over RDMA, so they need the same ordering against
+        # forwards and page zeroing as everything else behind this handle.
+        self._kv_transfer = kv_transfer
+        self._role = _resolve_role(kv_transfer)
         # Cache-plan submission futures, drained by poll_cache_results: a
         # submission that raised must surface, or its ops stay counted
         # in flight forever and the cache-gated requests hang silently.
         # Appended and drained on the control-plane thread only.
         self._l2_submissions: deque = deque()
+        # The transfer peer's submissions, settled at the next round's
+        # execute (see ``_settle``).
+        self._transfer_submissions: deque = deque()
 
     # ------------------------------------------------------------------
     # Per-round work
     # ------------------------------------------------------------------
 
-    def submit_forward(
+    def execute(
+        self, execution_plan, planned: "PlannedForward | None"
+    ) -> PendingExecution | None:
+        """Execute one scheduler plan; never blocks on the per-round path.
+
+        The whole plan on the FIFO -- one thread, one stream -- in an order
+        that IS the correctness argument for same-round page reuse:
+        retraction write-backs first (they must read the reused pages' old
+        bytes), then page zeroing (the new owner's sanitization), then
+        load-backs (they target zeroed pages), the transfer peer's remote
+        streams, and finally the ``ForwardBatch``. The loop hands the round
+        over and does not branch on it.
+
+        Args:
+            execution_plan: The round's plan, a per-round value copy out of
+                C++; its cache ops are read on the data plane.
+            planned: The control plane's half of the round — the gathered
+                per-batch state only it can produce (sampling params, live
+                grammar matchers, the multimodal snapshot, DP metadata).
+                None when no batch runs this round, which the plan alone
+                cannot always say: an empty ``ForwardBatch`` could be read
+                off it, but a DP-idle rank is the outcome of the loop's gloo
+                collective. Either way the plan's page zeroing and cache
+                transfers — retraction writebacks, load-back destinations —
+                still run; they do not depend on a forward.
+
+        Returns:
+            The submitted forward's ``PendingExecution``, or None on rounds
+            that run no batch — DP-idle, an empty plan, or a D-role round
+            whose only work was the peer's.
+        """
+        # See ``_settle``: a submission that raised produces no transfer event.
+        _settle(
+            self._transfer_submissions,
+            "PD transfer submission failed on the data plane; it produces no "
+            "transfer event, so its request would hang silently",
+        )
+
+        executor = self._executor
+        l2 = self._l2 if execution_plan.cache else None
+        if l2 is not None:
+            # Ahead of the zeroing: a retraction's snapshot sources may be
+            # this very plan's pages_to_zero.
+            self._l2_submissions.append(
+                self._thread.submit(lambda: l2.submit_write_backs(execution_plan))
+            )
+        pages = execution_plan.pages_to_zero
+        zero_future = (
+            self._thread.submit(lambda: executor.zero_cache_pages(pages))
+            if pages
+            else None
+        )
+        if l2 is not None:
+            self._l2_submissions.append(
+                self._thread.submit(lambda: l2.submit_load_backs(execution_plan))
+            )
+
+        # The transfer peer's streams: prefills or decodes the peer NODE runs,
+        # submitted asynchronously exactly like the model's ForwardBatch —
+        # same FIFO, fire-and-forget, completion via the transfer events. They
+        # are the plan's own work, so they go out even on a DP-idle round
+        # that runs no batch.
+        peer = self._kv_transfer
+        remote_decode = execution_plan.remote_decode
+        if remote_decode is not None:
+            # P role: the prompt's decode happens on the peer, so its KV goes
+            # out. The scheduler emits this only after the final chunk's
+            # result landed, so the forwards that wrote the KV are already
+            # ahead of it on the FIFO.
+            self._transfer_submissions.append(
+                self._thread.submit(lambda: peer.execute(remote_decode))
+            )
+        remote_prefill = execution_plan.remote_prefill
+        if remote_prefill is not None:
+            # D role: the prompt prefills on the peer; pull its KV into the
+            # pages this plan admitted (and may be zeroing).
+            self._transfer_submissions.append(
+                self._submit_remote_prefill(remote_prefill, zero_future)
+            )
+
+        if planned is None:
+            return None
+
+        if self._role is DeviceRole.PD_PREFILL:
+            # A prefill chunk. Arming its layerwise KV streaming must be
+            # enqueued ahead of the forward it arms — same FIFO, first, and
+            # submitted like everything else on the per-round path (waiting
+            # here would drain the queue, collapsing the PP chunk pipeline
+            # to lockstep on every chunk).
+            forward_op = planned.forward_op
+            self._transfer_submissions.append(
+                self._thread.submit(lambda: peer.prepare_prefill(forward_op))
+            )
+            return self._submit_forward(planned, capture_next_input_ids=True)
+
+        # Plain engine, or a D-role decode / local recovery prefill. A
+        # constrained request's matcher was advanced past the prefill node's
+        # token when its RemotePrefillDoneEvent landed, so masking continues
+        # from the right state.
+        return self._submit_forward(planned)
+
+    @property
+    def role(self) -> DeviceRole:
+        """How this engine divides a plan; see ``DeviceRole``."""
+        return self._role
+
+    def _submit_forward(
         self,
         planned,
         *,
@@ -201,7 +383,8 @@ class DeviceHandle:
         Args:
             planned: The round's ``PlannedForward``.
             capture_next_input_ids: Whether to keep the round's sampled rows
-                for a PD prefill handoff.
+                (P role: the commit path folds them into the final chunk's
+                ExtendResult as the bootstrap payload).
 
         Returns:
             A ``PendingExecution`` the loop resolves at commit.
@@ -220,49 +403,6 @@ class DeviceHandle:
 
         return PendingExecution(self._thread.submit(_forward))
 
-    def submit_page_zeroing(self, pages) -> Future | None:
-        """Queue sanitization of newly owned KV pages; never blocks.
-
-        Not awaited by the loop: the forward thread's FIFO already orders the
-        zeroing before this round's forward. Only the PD-decode RDMA barrier
-        needs the completion event, and it resolves the future from inside
-        the thread (see ``run_remote_receive``).
-
-        Args:
-            pages: The scheduler's page-reuse list for this round.
-
-        Returns:
-            A future resolving to the completion event, or None when no page
-            needed sanitizing.
-        """
-        if not pages:
-            return None
-        executor = self._executor
-        # Bound now, not read at execution time: by then a later round may
-        # have rebound the caller's variable.
-        return self._thread.submit(lambda pages=pages: executor.zero_cache_pages(pages))
-
-    def submit_cache_plan(self, execution_plan) -> None:
-        """Queue the plan's L2 host-cache transfers; never blocks.
-
-        The FIFO position is load-bearing twice over. Launching here (not on
-        the control plane) keeps a full CUDA launch queue from stalling the
-        scheduler round at its cross-rank collectives. And running AFTER this
-        round's page-zeroing closure on the same thread and stream is what
-        actually orders "zero, then load" for a page in both sets — the
-        load's start event can only capture zeroing that is already enqueued.
-
-        Args:
-            execution_plan: The round's plan (a per-round value copy out of
-                C++); its cache ops are read on the data plane.
-        """
-        l2 = self._l2
-        if l2 is None:
-            raise RuntimeError("cache plan submitted without --enable-kvstore")
-        self._l2_submissions.append(
-            self._thread.submit(lambda: l2.submit_plan(execution_plan))
-        )
-
     def poll_cache_results(self) -> list:
         """Collect completed L2 cache ops; never blocks.
 
@@ -280,19 +420,16 @@ class DeviceHandle:
             The completed ops' scheduler events; empty when nothing finished.
 
         Raises:
-            RuntimeError: A queued ``submit_plan`` raised on the data plane.
+            RuntimeError: A queued cache submission raised on the data plane.
         """
         l2 = self._l2
         if l2 is None:
             raise RuntimeError("cache results polled without --enable-kvstore")
-        while self._l2_submissions and self._l2_submissions[0].done():
-            exc = self._l2_submissions.popleft().exception()
-            if exc is not None:
-                raise RuntimeError(
-                    "L2 cache-plan submission failed on the data plane; its "
-                    "ops have no completion events and would hang their "
-                    "cache-gated requests"
-                ) from exc
+        _settle(
+            self._l2_submissions,
+            "L2 cache-plan submission failed on the data plane; its ops have "
+            "no completion events and would hang their cache-gated requests",
+        )
         return l2.poll_results()
 
     def run_idle_forward(self, dp_metadata: DpForwardMetadata) -> None:
@@ -304,104 +441,91 @@ class DeviceHandle:
         executor = self._executor
         self._thread.run(lambda: executor.execute_idle_forward(dp_metadata))
 
-    def run_remote_receive(
-        self, forward_op, *, cache_zero_future: Future | None
-    ) -> None:
-        """Execute a remote-prefill ForwardBatch: pull its KV from the peer.
+    def _submit_remote_prefill(self, remote_prefill, zero_future):
+        """Queue a remote-prefill stream: pull its rows' KV from the peer.
 
-        The D-role half of ``IsLocalPrefill()``. Slot preparation and the
-        cache-length reset touch the execution stream; the RDMA trigger is
-        CPU-issued but writes the same device pages, so it must follow them
-        and the zeroing barrier. One ordered unit, so one submission.
+        Slot preparation and the cache-length reset touch the execution
+        stream; the RDMA trigger is CPU-issued but writes the same device
+        pages, so it must follow them and the zeroing fence (Mooncake and
+        GPUDirect writes are not ordered by the zeroing stream, so the
+        destination pages must be published from sanitized memory). The same
+        fence covers a retraction write-back reading pages this admission was
+        granted: the zero event is recorded on the forward thread's stream
+        AFTER the write-back copies, so waiting on it waits on them too. One
+        ordered
+        unit, so one submission — asynchronous like every other: completion
+        arrives through the transfer events, and a submission failure
+        surfaces from the settle at the next round's execute.
 
         Args:
-            forward_op: The round's op; supplies the admitted rows.
-            cache_zero_future: This round's page-zeroing submission, or None.
-                Page zeroing runs on a CUDA stream while Mooncake/GPUDirect
-                writes are not ordered by it, so the destination manifest is
-                published only after the new pages are fully sanitized.
+            remote_prefill: The plan's remote-prefill stream; supplies the
+                admitted rows.
+            zero_future: This plan's page-zeroing submission, or None when
+                the plan zeroes nothing (an admission always zeroes its fresh
+                pages, so a granted request's receive never sees None).
+
+        Returns:
+            The submission future, for the settle queue.
         """
         executor = self._executor
-        kv_transfer = self._require_kv_transfer()
-        num_extends = forward_op.num_extends()
+        kv_transfer = self._kv_transfer
+        num_extends = remote_prefill.num_extends()
 
         def _receive():
             executor.prepare_remote_cache_slots(
-                list(forward_op.request_pool_indices[:num_extends])
+                list(remote_prefill.request_pool_indices[:num_extends])
             )
-            executor.reset_remote_prefill_cache_lengths(forward_op)
-            if cache_zero_future is not None:
-                cache_zero_event = cache_zero_future.result()
-                if cache_zero_event is not None:
-                    cache_zero_event.synchronize()
-            kv_transfer.execute(forward_op)
+            executor.reset_remote_prefill_cache_lengths(remote_prefill)
+            if zero_future is not None:
+                zero_event = zero_future.result()
+                if zero_event is not None:
+                    zero_event.synchronize()
+            kv_transfer.execute(remote_prefill)
 
-        self._thread.run(_receive)
+        return self._thread.submit(_receive)
 
-    def run_kv_handoff(self, forward_op) -> None:
-        """Execute a P-role handoff ForwardBatch: send this prompt's KV out.
+    def run_multimodal_work(self, work: Callable[[], Any], *, wait: bool = True) -> Any:
+        """Run multimodal feature-lifecycle work on the data plane, in order.
 
-        The RDMA read walks KV-pool device memory the round's forwards just
-        wrote, so it rides the FIFO behind them. The loop also drains its
-        in-flight queue before dispatching a handoff (the batch needs the
-        final chunk's bootstrap token, which lands at commit) — but that is
-        a scheduling rule, and this ordering should not depend on it.
-
-        Args:
-            forward_op: The handoff batch (no extends left to run).
-        """
-        kv_transfer = self._require_kv_transfer()
-        self._thread.run(lambda: kv_transfer.execute(forward_op))
-
-    def prepare_kv_handoff(self, forward_op) -> None:
-        """Arm this chunk's layerwise KV streaming before its forward runs.
-
-        Pure CPU transfer bookkeeping, but it must be enqueued ahead of the
-        forward whose per-layer events it arms — so it goes over the same
-        FIFO rather than racing it from the control plane.
+        The one generic slot on this handle: the multimodal feature lifecycle
+        is a state machine reached from several control-plane points (EPD
+        admission's device half, the commit-side SHM release), and naming
+        each step would pull those state machines' internals in here. A
+        second KIND of user gets its own named method instead.
 
         Args:
-            forward_op: The chunk about to be dispatched.
+            work: Zero-argument callable performing the device step.
+            wait: Block for the result (EPD admission) or fire-and-forget
+                (the commit-side release).
+
+        Returns:
+            ``work``'s return value when waiting, else None.
         """
-        kv_transfer = self._require_kv_transfer()
-        self._thread.run(lambda: kv_transfer.prepare_prefill(forward_op))
+        if wait:
+            return self._thread.run(work)
 
-    def attach_kv_transfer(self, kv_transfer) -> None:
-        """Hand the handle the PD transfer executor. Startup only, once.
+        def _logged():
+            try:
+                work()
+            except Exception:
+                # Nobody observes this future; swallowing would turn an SHM
+                # release failure into a silent leak. Log and keep the data
+                # plane running.
+                logger.exception("fire-and-forget multimodal work failed")
 
-        A peer of the model executor, not a subordinate of it: the C++
-        scheduler emits one ``ForwardBatch`` and ``IsLocalPrefill()`` decides
-        which of the two runs it — a local forward, or a remote KV pull. Its
-        transfers move KV-pool device memory over RDMA, so they need the same
-        ordering against forwards and page zeroing that everything else behind
-        this handle needs.
+        self._thread.submit(_logged)
+        return None
 
-        Only the EXECUTION face lands here. The transport's CONTROL face —
-        ``register``/``abort``/``generate_events``/``pop_*`` — stays on the
-        control plane, where it drives bootstrap lifecycle and feeds scheduler
-        events (Principle 3).
+    def run_kv_repair(self) -> None:
+        """Zero the KV arena after a memory-saver wake re-maps its storage.
 
-        A setter rather than a constructor argument because the transfer
-        executor needs PD topology, bootstrap args and a gloo group, all built
-        after the device side; dragging those into ``build_device_side`` would
-        invert the dependency. Refuses a second attach so this cannot become a
-        channel the running loop swaps things through.
-
-        Args:
-            kv_transfer: The role's ``Disagg{Prefill,Decode}Executor``.
-
-        Raises:
-            RuntimeError: A transfer executor is already attached.
+        Re-mapped memory holds garbage. The draft pool names the same arena,
+        so clearing the target's clears both — walking two pools only cleared
+        it twice. FP8 KV scales ride with the weights region and need no
+        reset.
         """
-        if self._kv_transfer is not None:
-            raise RuntimeError("the PD transfer executor is attached once, at startup")
-        self._kv_transfer = kv_transfer
-
-    def _require_kv_transfer(self):
-        kv_transfer = self._kv_transfer
-        if kv_transfer is None:
-            raise RuntimeError("PD transfer requested on a non-disaggregated engine")
-        return kv_transfer
+        pool = self._executor.token_to_kv_pool
+        self._thread.run(pool.clear_kv_buffers)
 
     def run_remote_prefill_landing(
         self,
@@ -434,172 +558,42 @@ class DeviceHandle:
         # decode, and PD completions are rare enough to afford the wait.
         self._thread.run(_land)
 
-    def submit_release(self, release: Callable[[], None]) -> None:
-        """Queue a resource release behind every forward already in the queue.
+    def update_weights(self, req) -> tuple[bool, str]:
+        """Apply one in-place RL weight-sync request, ordered against forwards.
 
-        For resources a queued forward may still read — a request's shared
-        multimodal features, freed when it finishes while an earlier round is
-        still in flight. The FIFO is the ordering; nothing waits on it.
-
-        Args:
-            release: Zero-argument callable performing the release.
-        """
-        self._thread.submit(release)
-
-    # ------------------------------------------------------------------
-    # Memory occupation (pause / release / wake)
-    # ------------------------------------------------------------------
-
-    def run_embedding_work(self, work: Callable[[], Any]) -> Any:
-        """Run one EPD embedding device step on the data plane; block for it.
-
-        EPD admission's device half — receive-buffer allocation at stage, the
-        publish clone/scatter and the NCCL shard reassembly at drain. Named
-        for EPD rather than generic on purpose: like ``submit_release`` this
-        is a deliberately narrow callable slot, and a second user should add
-        its own named method, not widen this one.
-
-        Blocking is the point twice over. Admission needs the results (buffer
-        addresses to register, ``item.encoded`` set) before it returns, and
-        the P role's round head finds the FIFO empty, so the wait is a thread
-        hop. And issuing the reassembly's NCCL broadcasts from the forward
-        thread — instead of racing them against forward collectives from a
-        second thread — is what keeps the cross-rank launch order identical
-        on every rank, which NCCL requires across communicators.
+        Type-dispatched on the request — join the trainer's NCCL group,
+        receive and apply one broadcast, or tear the group down. One entry
+        point because it is one capability: rewriting model parameters in
+        place, which must be ordered against forwards rather than raced with
+        them.
 
         Args:
-            work: Zero-argument callable performing the device step.
+            req: An ``io_struct`` weight-update request.
 
         Returns:
-            ``work``'s return value; its exception is re-raised here.
+            ``(ok, message)`` from the model runner.
+
+        Raises:
+            TypeError: Not a weight-update request.
         """
-        return self._thread.run(work)
-
-    def run_kv_repair(self) -> None:
-        """Zero every KV pool's buffers after a wake re-maps them.
-
-        Re-mapped memory holds garbage, and the draft pool is tagged
-        ``kv_cache`` too, so a wake that skipped it would feed the draft model
-        stale KV. FP8 KV scales ride with the weights region and need no reset.
-        """
-        executor = self._executor
-        self._thread.run(lambda: _clear_kv_buffers(executor))
-
-    # ------------------------------------------------------------------
-    # Online weight update (RL trainer sync)
-    # ------------------------------------------------------------------
-    #
-    # These rewrite model parameters in place, so they must be ordered
-    # against forwards rather than raced with them — hence the FIFO, and
-    # hence the request handler holding this instead of the model runner.
-
-    def init_weights_update_group(self, req) -> tuple[bool, str]:
-        """Join the trainer's NCCL weight-update group."""
-        runner = self._executor.model_runner
-        return self._thread.run(lambda: runner.init_weights_update_group(req))
-
-    def update_weights_from_distributed(self, req) -> tuple[bool, str]:
-        """Receive and apply one broadcast of weights from the trainer."""
-        runner = self._executor.model_runner
-        return self._thread.run(lambda: runner.update_weights_from_distributed(req))
-
-    def destroy_weights_update_group(self, req) -> tuple[bool, str]:
-        """Leave the trainer's weight-update group."""
-        runner = self._executor.model_runner
-        return self._thread.run(lambda: runner.destroy_weights_update_group(req))
-
-
-class DeviceWiring:
-    """Startup-only capabilities: hand the device side to its collaborators.
-
-    Every method here needs a real device object — the KV pool, an attention
-    backend, the model — and each exists because one startup step cannot be
-    expressed as plain data. That is a list that WILL grow: the next cache
-    tier, the next transport, the next accelerator integration all want a
-    hook like these.
-
-    So it grows here and not on ``DeviceHandle``. This object lives for the
-    length of ``EventLoop.__init__`` and is dropped; the running loop never
-    holds one, so nothing added here can widen what the loop can do to the
-    GPU mid-flight. If a new hook belongs on ``DeviceHandle`` instead, that is a
-    deliberate decision about the RUNNING contract, not a place a startup
-    convenience can quietly land.
-    """
-
-    def __init__(self, executor) -> None:
-        self._executor = executor
-
-    def encoder_model_facts(self) -> EncoderModelFacts:
-        """Extract the four model facts EPD admission needs, as plain values.
-
-        Not a ``DeviceSpecs`` field, and handed to the EPD path as a BOUND
-        METHOD rather than a value: reading the vision tower's dtype raises
-        on a text-only model, so this must only run after the EPD admission
-        gate has decided the node is a multimodal prefill node.
-        """
-        model = self._executor.model_runner.model
-        return EncoderModelFacts(
-            device=self._executor.device,
-            hidden=model.config.hidden_size,
-            num_deepstack=getattr(model, "num_deepstack_embeddings", 0),
-            dtype=(getattr(model, "visual", None) or model.vision_tower).dtype,
+        from tokenspeed.runtime.engine.io_struct import (
+            DestroyWeightsUpdateGroupReqInput,
+            InitWeightsUpdateGroupReqInput,
+            UpdateWeightsFromDistributedReqInput,
         )
 
-    def pd_kv_args(
-        self,
-        *,
-        global_rank: int,
-        ib_device,
-        model_config,
-        draft_model_config,
-        pp_layer_window,
-    ):
-        """Describe this engine's KV to a PD peer.
-
-        Args:
-            global_rank: This worker's global rank, used for both the engine
-                and the KV-manager rank fields.
-            ib_device: The disaggregation InfiniBand device.
-            model_config: The target model's config.
-            draft_model_config: The draft model's config, or None.
-            pp_layer_window: This stage's layer range under PP, else None.
-
-        Returns:
-            The peer-facing KV argument struct.
-        """
-        from tokenspeed.runtime.pd.factory import get_kv_args
-
-        return get_kv_args(
-            global_rank,
-            global_rank,
-            ib_device,
-            self._executor.token_to_kv_pool,
-            model_config=model_config,
-            draft_model_config=draft_model_config,
-            pp_layer_window=pp_layer_window,
-        )
-
-    def install_pd_step_counter(self, gpu_id: int):
-        """Arm layerwise KV streaming and return the counter the sender reads.
-
-        The counter is what the attention backends tick as each layer's KV
-        lands. Registering it is backend surgery, so it happens here; the PD
-        sender gets the counter, not the backends.
-
-        Args:
-            gpu_id: Local device index the counter lives on.
-
-        Returns:
-            The registered ``StepCounter``.
-        """
-        from tokenspeed.runtime.pd.utils import StepCounter
-
-        executor = self._executor
-        step_counter = StepCounter(executor.device, gpu_id)
-        executor.attn_backend.register_step_counter(step_counter)
-        if executor.draft_attn_backend is not None:
-            executor.register_draft_final_step_counter(step_counter)
-        return step_counter
+        runner = self._executor.model_runner
+        handlers = {
+            InitWeightsUpdateGroupReqInput: runner.init_weights_update_group,
+            UpdateWeightsFromDistributedReqInput: (
+                runner.update_weights_from_distributed
+            ),
+            DestroyWeightsUpdateGroupReqInput: runner.destroy_weights_update_group,
+        }
+        handler = handlers.get(type(req))
+        if handler is None:
+            raise TypeError(f"unsupported weight-update request {type(req).__name__}")
+        return self._thread.run(lambda: handler(req))
 
 
 def build_device_side(
@@ -619,8 +613,9 @@ def build_device_side(
 
     The model runners, attention backends, KV pools and executor are locals
     of this function and never leave it. What comes back is split by how long
-    the caller may hold it: specs it may keep forever, wiring it must drop
-    after construction, and the handle it runs with.
+    the caller may hold it: specs it may keep forever, the transfer peer's
+    control face and the encoder-facts callable it consumes at startup, and
+    the handle it runs with.
 
     The chain is linear and the order is load-bearing: the multimodal
     runtime must be prepared after weights are loaded and before
@@ -646,8 +641,8 @@ def build_device_side(
             sink row.
 
     Returns:
-        A ``DeviceBuild``. No device object escapes except inside the wiring
-        and the handle; the specs hold none at all.
+        A ``DeviceBuild``. No device object escapes except inside the
+        handle; the specs hold none at all.
     """
     # Imported here: these pull in the model/backend registries, which
     # import execution types — a module-level import would cycle.
@@ -732,7 +727,6 @@ def build_device_side(
     )
 
     # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
-    # rank0 only; best-effort, never fails startup.
     if attn_tp_rank == 0:
         log_gpu_memory_summary(
             target.model,
@@ -761,6 +755,15 @@ def build_device_side(
             io_backend=server_args.kvstore_io_backend,
         )
 
+    kv_transfer = _build_kv_transfer(
+        server_args,
+        executor,
+        model_config=model_config,
+        draft_model_config=draft_model_config,
+        gpu_id=gpu_id,
+        global_rank=global_rank,
+    )
+
     specs = DeviceSpecs(
         cache_geometry=cache_geometry,
         cache_groups=cache_groups,
@@ -782,10 +785,25 @@ def build_device_side(
             l2_cache_executor.num_host_pages if l2_cache_executor is not None else 0
         ),
     )
+
+    def encoder_model_facts() -> EncoderModelFacts:
+        model = target.model
+        return EncoderModelFacts(
+            device=executor.device,
+            hidden=model.config.hidden_size,
+            num_deepstack=getattr(model, "num_deepstack_embeddings", 0),
+            dtype=(getattr(model, "visual", None) or model.vision_tower).dtype,
+        )
+
     return DeviceBuild(
         specs=specs,
-        wiring=DeviceWiring(executor),
-        handle=DeviceHandle(executor, l2_cache_executor=l2_cache_executor),
+        transfer=kv_transfer,
+        encoder_model_facts=encoder_model_facts,
+        handle=DeviceHandle(
+            executor,
+            l2_cache_executor=l2_cache_executor,
+            kv_transfer=kv_transfer,
+        ),
     )
 
 
@@ -883,9 +901,100 @@ def maybe_control_plane_guard():
     return _NoDeviceWork()
 
 
-def _clear_kv_buffers(executor) -> None:
-    """Clear the target and draft KV pools. Runs on the forward thread."""
-    for attr in ("token_to_kv_pool", "draft_token_to_kv_pool"):
-        pool = getattr(executor, attr, None)
-        if pool is not None and hasattr(pool, "clear_kv_buffers"):
-            pool.clear_kv_buffers()
+def _resolve_role(kv_transfer) -> DeviceRole:
+    """Read the engine's role off its transfer peer. Fixed for the process."""
+    if kv_transfer is None:
+        return DeviceRole.PLAIN
+    from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
+    from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
+
+    if isinstance(kv_transfer, DisaggDecodeExecutor):
+        return DeviceRole.PD_DECODE
+    if isinstance(kv_transfer, DisaggPrefillExecutor):
+        return DeviceRole.PD_PREFILL
+    raise TypeError("kv_transfer must be a Disagg{Prefill,Decode}Executor.")
+
+
+def _build_kv_transfer(
+    server_args,
+    executor,
+    *,
+    model_config,
+    draft_model_config,
+    gpu_id: int,
+    global_rank: int,
+):
+    """Build the PD transfer peer, or None outside disaggregation.
+
+    Here rather than in the event loop because everything it needs is either
+    ``server_args`` or the KV pool this function already owns: the topology
+    comes from the mapping, the sync group from the process-group manager,
+    and the peer-facing KV description from the pool's transfer layout.
+    """
+    if server_args.disaggregation_mode == "null":
+        return None
+
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+    from tokenspeed.runtime.pd.factory import create_kv_transfer, get_kv_args
+    from tokenspeed.runtime.pd.mooncake.entities import KVManagerArgs
+    from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
+    from tokenspeed.runtime.pd.topology import PDParallelTopology
+
+    mapping = server_args.mapping
+    topology = PDParallelTopology.from_mapping(mapping)
+    topology.require_cache_pd_supported()
+
+    pp_layer_window = None
+    if mapping.has_pp:
+        from tokenspeed.runtime.distributed.pp_stage import (
+            pp_layer_window as resolve_pp_layer_window,
+        )
+
+        pp_layer_window = resolve_pp_layer_window(
+            model_config.num_attention_layers, mapping
+        )
+
+    # PP: transfer-status consensus must span every stage — all ranks run the
+    # same deterministic scheduler and must agree on Bootstrapped/Succeeded
+    # events, and the KV for one request is produced by pp*tp ranks together.
+    sync_group = pg_manager.get_process_group(
+        "gloo", mapping.world_group if mapping.has_pp else mapping.attn.tp_group
+    )
+    kv_transfer = create_kv_transfer(
+        mode=server_args.disaggregation_mode,
+        backend=server_args.disaggregation_transfer_backend,
+        args=KVManagerArgs(
+            bootstrap_port=server_args.disaggregation_bootstrap_port,
+            dist_init_addr=server_args.dist_init_addr,
+            topology=topology,
+            enable_metrics=False,
+            served_model_name=server_args.served_model_name,
+            app_key=server_args.app_key,
+            metrics_reporters=server_args.metrics_reporters,
+            enable_dp_attention=mapping.has_attn_dp,
+        ),
+        kv_args=get_kv_args(
+            global_rank,
+            global_rank,
+            server_args.disaggregation_ib_device,
+            executor.token_to_kv_pool,
+            model_config=model_config,
+            draft_model_config=draft_model_config,
+            pp_layer_window=pp_layer_window,
+        ),
+        gloo_group=sync_group,
+    )
+    interval = server_args.disaggregation_layerwise_interval
+    if isinstance(kv_transfer, DisaggPrefillExecutor) and interval > 0:
+        # P-side layerwise KV streaming: one counter, ticked by the attention
+        # backends as each layer's KV lands and read by the sender.
+        from tokenspeed.runtime.pd.utils import StepCounter
+
+        step_counter = StepCounter(executor.device, gpu_id)
+        executor.attn_backend.register_step_counter(step_counter)
+        if executor.draft_attn_backend is not None:
+            executor.register_draft_final_step_counter(step_counter)
+        kv_transfer.register_layerwise_step_counter(step_counter, interval)
+    return kv_transfer

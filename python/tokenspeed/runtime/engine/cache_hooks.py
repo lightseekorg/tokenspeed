@@ -21,9 +21,9 @@
 """L2 cache-op submission and rank-synchronized completion tracking.
 
 Owns everything between an execution plan's cache ops and the scheduler
-events their completions eventually produce: submit ops through the device
-handle (the transfers launch on the data plane; see
-``DeviceHandle.submit_cache_plan``), count what is in flight, poll
+events their completions eventually produce: count what the plan puts in
+flight (``DeviceHandle.execute`` submits the transfers themselves, on the
+data plane, from the same plan), poll
 completions (control-side event queries), and agree across attn-tp ranks on
 which completions EVERY rank has seen (the C++ scheduler is mirrored, so an
 event may only advance once all ranks hold it). ``poll_ready_events`` returns
@@ -81,11 +81,16 @@ class L2CacheHooks:
         # in poll_ready_events entirely when nothing is in flight.
         self._num_inflight = 0
 
-    def submit(self, execution_plan) -> None:
-        """Queue the plan's cache ops on the data plane; count them in flight."""
+    def count_plan_ops(self, execution_plan) -> None:
+        """Count the cache ops this plan will put in flight.
+
+        ``DeviceHandle.execute`` submits them, from the same plan (write-backs
+        ahead of the page zeroing, load-backs behind it). Call this with the
+        SAME plan and only when ``execute`` will run: a plan counted but never
+        submitted leaves ops in flight forever.
+        """
         if self._device is None:
             return
-        self._device.submit_cache_plan(execution_plan)
         for op in execution_plan.cache:
             if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
                 self._num_inflight += len(op.op_ids)
@@ -109,8 +114,8 @@ class L2CacheHooks:
         # _pending_payloads) diverges transiently. A rank-local skip would let
         # some ranks gather while others return, deadlocking the group. Agree on
         # the skip via a cheap single-int all_reduce.
-        # NOTE: For non-DFLASH algorithms, cache ops are deterministic across
-        # ranks, so the local short-circuit is safe and avoids collective overhead.
+        # Outside DFLASH/DSPARK cache ops are rank-deterministic, so the local
+        # short-circuit is safe and avoids the collective.
         local_has_work = bool(self._num_inflight != 0 or self._pending_payloads)
         if self._speculative_algorithm in ("DFLASH", "DSPARK"):
             if not self._group_has_work(local_has_work):

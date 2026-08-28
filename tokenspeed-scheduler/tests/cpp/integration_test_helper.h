@@ -123,8 +123,10 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
-    // Send ExtendResult (new decode tokens) to the scheduler.
-    void SendForwardDone(const std::string& request_id, const std::vector<std::int32_t>& tokens) {
+    // Send ExtendResult to the scheduler: the forward landed. `tokens` are
+    // the new tokens it produced -- empty for an intermediate prefill chunk,
+    // which produces only KV.
+    void SendForwardDone(const std::string& request_id, const std::vector<std::int32_t>& tokens = {}) {
         ExecutionEvent event;
         event.With(forward::ExtendResult{
             .request_id = request_id,
@@ -159,6 +161,11 @@ inline const ForwardBatch* FindForwardBatch(const ExecutionPlan& plan) {
         if (const auto* batch = std::get_if<ForwardBatch>(&op)) return batch;
     }
     return nullptr;
+}
+
+// D-side remote admissions ride the plan's own stream, beside the batch.
+inline const ForwardBatch* FindRemoteAdmission(const ExecutionPlan& plan) {
+    return plan.remote_prefill ? &*plan.remote_prefill : nullptr;
 }
 
 // Inserts every real (>0) page id found in `rows` into `seen`, expecting each

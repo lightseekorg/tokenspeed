@@ -18,19 +18,32 @@ launch-queue backpressure stalls only its own forward thread, never the round.
 
 This is enforced by **visibility**, not by discipline. `build_device_side`
 (`execution/device.py`) constructs the model runners, attention backends, KV
-pools and executor as its own locals, and returns three things split by how
-long the caller may hold them:
+pools and executor as its own locals, and returns one `DeviceBuild`, split by
+how long the caller may hold each piece:
 
 | | what it is | lifetime |
 | --- | --- | --- |
 | `DeviceSpecs` | plain values the loop plans with: cache geometry, cache groups, speculation widths, capability flags | keep forever |
-| `DeviceWiring` | the startup steps that need a real device object: describe the KV to a PD peer, install the layerwise step counter, read the encoder's model facts | a local of `__init__`, dropped when it returns |
 | `DeviceHandle` | the running handle: the complete list of what the loop may ask of the device side | the only one stored (`self._device`) |
+| `transfer` | the PD peer's CONTROL face — bootstrap register/abort, event polling — or None outside PD | held by the PD hooks |
+| `encoder_model_facts` | a callable resolving the encoder facts EPD admission needs (raises on text-only) | consumed at startup, past the EPD gate |
 
-The handle owns BOTH executors of a scheduler `ForwardBatch`. The C++ side
-emits one operation and `IsLocalPrefill()` decides who runs it: the model
-executor (a local prefill or decode) or the PD transfer peer (a remote KV
-pull, or the handoff that sends this prompt's KV out). The transfer moves
+The device side is built **complete**, not built-then-wired: the transfer peer
+is constructed inside the builder (everything it needs is `server_args` or the
+KV pool the builder already owns) and the engine's role is read off it once, at
+construction. An earlier shape had the loop assemble the peer and hand it back
+through a setter, which left the role mutable after startup for no reason.
+
+The handle owns BOTH executors of a scheduler plan, and treats their work
+identically: a model forward runs asynchronously on the GPU, and handing a
+prefill or decode to the peer node is asynchronous work of exactly the same
+standing. The plan separates its streams by executor — the `ForwardBatch`
+is the model's work, `plan.remote_prefill` is the peer's on a D node (pull
+the admitted prompt's KV in), `plan.remote_decode` the peer's on a P node
+(the completed prompt decodes over there, so its KV goes out). The remote
+streams ride beside whatever forward work the round schedules, occupy no
+batch slot, and go out even on rounds with no batch at all — everything
+dispatchable dispatches in one round. The transfer moves
 KV-pool device memory over RDMA rather than through a CUDA kernel, but it
 needs the same ordering against forwards and page zeroing — so its execution
 face lives behind the handle too, attached once at startup. Its control face
@@ -43,23 +56,38 @@ Consequences:
   pass one implicitly or mutate one a forward is still using. A test asserts
   this over the AST of `EventLoop.__init__` — locals included, because a name
   it can write is a name a later change can keep.
-* A new device interaction goes on `DeviceWiring` if it runs once at startup,
-  and on `DeviceHandle` only if the running loop genuinely needs it — the
-  second widens what the loop can do to the GPU mid-flight. The wiring list is
-  the one that grows (each new cache tier, transport or accelerator wants a
-  hook that needs a pool); sending that growth to an object the loop does not
-  hold is the point of the split. Hand over the capability, never the object.
+* A new device interaction belongs **inside the builder** if it runs once at
+  startup, and on `DeviceHandle` only if the running loop genuinely needs it —
+  the second widens what the loop can do to the GPU mid-flight. Hand over the
+  capability, never the object.
+* Every method on the handle is a **named operation**, with one registered
+  exception: `run_multimodal_work`, because multimodal feature lifecycle is a
+  state machine reached from several control-plane points (EPD admission's
+  stage/drain device half; the commit-side SHM release). A generic "run this
+  closure" slot is the hole this whole design closes, so a second KIND of
+  user does not join it — it gets its own name.
+* The role is a **value** (`DeviceRole`), not a class hierarchy. Subclassing
+  per role forced the handle to publish its own internals so the subclasses
+  could call back into it — a reference cycle for about a dozen lines of
+  difference. With every remote op on its own plan stream, the batch needs
+  no per-role reading at all: a `ForwardBatch` is model work, full stop, and
+  a DP rank counts work by simply asking whether the batch has tokens.
 * Collaborators are **given** the handle in their constructor. Do not reach it
   through another object (`loop._device...`): a traversal is the seam the next
   change widens, first to the handle and then to whatever it exposes.
 * On the per-round path only commit waits, through `PendingExecution.result()`:
   join the forward thread's future (launches issued), then its copy event (D2H
-  landed). Dispatch never waits, which is what keeps a backpressured stage off
-  the control plane. The handle's other `run_*` methods do block, deliberately
-  — the DP idle forward, the PD receive and landing, the KV repair after a
-  wake, the RL weight updates — but each is a low-rate path whose caller
-  cannot proceed without the result. A new blocking method on the per-round
-  path is a bug.
+  landed). Dispatch never waits — model forwards and the peer's remote
+  prefills/decodes alike are submitted fire-and-forget, which is what keeps a
+  backpressured stage off the control plane. The remote submissions' only
+  failure surface is a settle at the next round's `execute` (their semantic
+  completion arrives through the transfer events; a submission that RAISED
+  produces none, so it must not be swallowed). The handle's remaining `run_*`
+  methods do block, deliberately — the DP idle forward, the landing of a
+  completed remote prefill, the KV repair after a wake, the RL weight sync —
+  but each is a low-rate path whose caller cannot proceed without the result
+  (the landing's failure must surface BEFORE the scheduler advances the
+  request into decode). A new blocking method on the per-round path is a bug.
 
 The rule is also mechanically enforced, on by default: a thread-local
 dispatch mode over the loop raises on any CUDA tensor op run from the
@@ -67,7 +95,7 @@ control thread. Event waits — the inbound channel — and metadata-only view
 ops pass untouched; neither submits device work.
 ``TOKENSPEED_GUARD_CONTROL_PLANE=0`` is the escape hatch for a deployment
 that trips on an unrouted op (report it). EPD prefill admission, the one
-known violator, now crosses through ``DeviceHandle.run_embedding_work``:
+known violator, now crosses through ``DeviceHandle.run_multimodal_work``:
 receive-buffer allocation, the publish clone/scatter, and the NCCL shard
 reassembly all run on the forward thread — which also puts the reassembly
 broadcasts on the same issuing thread as the model's collectives, restoring
@@ -143,13 +171,14 @@ overlap-breaking dependencies (currently: eager-grammar batches). New rules go
 there, not into `event_loop`. Rounds that run no real forward (pause/freeze,
 DP idle) drain the queue fully.
 
-Prefer removing a dependency over registering one. The P-side PD handoff was
-registered here until the C++ scheduler learned to hold a request out of the
-handoff batch until its forward result lands: a request turns `PrefillDone`
-when its last chunk is *scheduled*, so the handoff was being planned while
-that chunk was still in flight, and satisfying it meant draining the whole
-queue — under PP, emptying the chunk pipeline every time a prompt finished
-prefill. The dependency was real; the right fix was upstream, not a drain.
+Prefer removing a dependency over registering one. The P-side remote decode
+was registered here until the C++ scheduler learned to hold it until its
+final chunk's forward result lands (it now rides `plan.remote_decode`,
+beside the batch): a request turns `PrefillDone` when its last chunk is
+*scheduled*, so the transfer was being planned while that chunk was still in
+flight, and satisfying it meant draining the whole queue — under PP,
+emptying the chunk pipeline every time a prompt finished prefill. The
+dependency was real; the right fix was upstream, not a drain.
 
 Depth ≥ 1 also means a round is planned *before* the previous round's commit,
 so a batch can contain a request that commit is about to finish. Anything the
@@ -188,9 +217,9 @@ Current inventory:
 | Attribute      | Class / home                                  | Shape          | Loop entry points |
 | -------------- | --------------------------------------------- | -------------- | ----------------- |
 | `_pause_hooks` | `PauseHooks` — `engine/pause.py`              | glue (PauseController is the state machine) | `apply_transitions`, `withhold_admissions`, `paused_idle_step` |
-| `_epd_hooks`   | `EpdPrefillHooks` — `epd/prefill_hooks.py`    | glue (EpdPrefillAdmission decides)          | `try_stage`, `drain_ready_embeddings` (and `assert_embeddings_received`, from the P-role dispatcher) |
+| `_epd_hooks`   | `EpdPrefillHooks` — `epd/prefill_hooks.py`    | glue (EpdPrefillAdmission decides)          | `try_stage`, `drain_ready_embeddings`, `assert_embeddings_received` |
 | `_pd_hooks`    | `PdTransferHooks` — `pd/transfer_hooks.py`    | glue (transfer executors decide)            | `poll_transfer_events` |
-| `_cache_hooks` | `L2CacheHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission is GPU work; polling stays control-side event queries) | `submit`, `poll_ready_events` |
+| `_cache_hooks` | `L2CacheHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries) | `count_plan_ops`, `poll_ready_events` |
 
 `_pause_hooks` and `_pd_hooks` are also handed the `DeviceHandle`: both have
 work that must land on the data plane — the DP idle forward and the KV repair
@@ -199,19 +228,18 @@ lands. `PauseHooks` additionally supplies `reset_caches_for_release` and
 `kv_repair_after_wake` to the memory-occupation controller as callbacks; those
 are not loop entry points, they fire on release/wake.
 
-Per-round dispatch is not a hooks class but follows the same rule:
-`ForwardDispatcher` and its PD subclasses (`engine/forward_dispatch.py`) are
-control plane, chosen once per engine role, and hold the handle rather than
-anything behind it.
+Per-round dispatch needs no hooks class at all: the loop hands
+`DeviceHandle.execute` the plan and the round's `PlannedForward`, and the
+plan's streams already say who runs what — the batch is the model's, the
+remote streams are the transfer peer's.
 
 Related placements that follow the same principle without a hooks class: the
 SMG startup handshake lives in `zmq_msgpack.connect_msgpack_engine_for_loop`
 (wire-schema helpers in `zmq_wire`), multimodal batch-context assembly in
 `multimodal/inputs.py::multimodal_context_for_forward` (which also snapshots
 each request's multimodal inputs, per Principle 1's capture contract), and
-P-side layerwise KV streaming setup in
-`DisaggPrefillExecutor.setup_layerwise_transfer` (which takes a `DeviceWiring`
-and gets the step counter back, rather than reaching into attention backends).
+P-side layerwise KV streaming setup, which happens inside the device builder
+(the step counter is backend surgery; the sender just receives it).
 
 All hooks obey Principle 3: they return events or decisions; they never call
 `advance_scheduler`.
@@ -225,15 +253,21 @@ For orientation, one iteration of `event_loop`:
 2. Poll completed L2 cache ops; **advance the scheduler (head call site)** so
    this round's plan sees them.
 3. Frozen (`PAUSED_ALL`)? Drain the in-flight queue and run the paused idle
-   step. Otherwise: plan (`next_execution_plan`), submit the round's page
-   zeroing and then its L2 cache transfers to the data plane (submitted, not
-   awaited — the FIFO orders the zeroing before this round's forward, and
-   before the host-cache loads that may overwrite the same pages), derive the
-   forward op, record metrics, and DP-sync (running an idle forward on idle
-   ranks).
-4. Non-idle rounds: gather per-batch state, drain the in-flight queue if the
-   dispatch depends on a pending commit (Principle 4), dispatch, commit from
-   the queue head down to the effective depth, and poll PD transfer events.
+   step. Otherwise: plan (`next_execution_plan`), derive the forward op,
+   record metrics, DP-sync, and gather per-batch state (draining the
+   in-flight queue first if the dispatch depends on a pending commit,
+   Principle 4).
+4. **One `DeviceHandle.execute(plan, planned)` call per round**, in an order
+   that is itself a correctness contract for same-round page reuse:
+   host-cache write-backs first (a retraction's snapshot copy must read the
+   reused pages' old bytes), then page zeroing (the new owner's
+   sanitization), then load-backs (they target zeroed pages), then the
+   plan's remote streams to the transfer peer (a D-node remote prefill
+   waits on the zeroing fence inside its submission, which the FIFO orders
+   after the write-backs), then the plan's batch to the model. `planned` is
+   None on idle and empty rounds; the plan's own work (hygiene, the remote
+   streams) still runs. Then commit from the queue head down to the
+   effective depth and poll PD transfer events.
 5. **Advance the scheduler (tail call site)** with the round's
    `request_changes`, publish KV events (once), and resolve any pending
    pause/release drain.
@@ -243,9 +277,9 @@ For orientation, one iteration of `event_loop`:
 * New logic that reacts to scheduler/transfer/cache progress: put it in the
   matching hooks class (or add one), return events, and apply them at an
   existing advance point.
-* New device interaction: `DeviceWiring` if it is startup-only, `DeviceHandle`
-  if the running loop needs it — and inject the handle into whoever needs it
-  rather than traversing to it.
+* New device interaction: inside `build_device_side` if it is startup-only,
+  `DeviceHandle` if the running loop needs it — and inject the handle into
+  whoever needs it rather than traversing to it.
 * New reason a dispatch cannot overlap a pending commit: add it to
   `_dispatch_depends_on_pending_commit`.
 * New per-round work: add a single-line hook call at a fixed position in the

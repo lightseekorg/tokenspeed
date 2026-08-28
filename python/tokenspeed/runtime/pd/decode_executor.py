@@ -28,18 +28,12 @@ from tokenspeed.runtime.pd.mooncake.decode import MooncakeKVManagerDecode
 from tokenspeed.runtime.pd.mooncake.receiver import MooncakeKVReceiver
 from tokenspeed.runtime.pd.utils import poll_and_all_reduce
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 
 logger = get_colorful_logger(__name__)
 
 
 class DisaggDecodeExecutor:
     def __init__(self, args, kv_args, gloo_group):
-        self._dispatcher = TypeBasedDispatcher(
-            [
-                (Forward.Batch, self._cache_prefill),
-            ]
-        )
         self.cache_layout = kv_args.cache_layout
         self.receivers: dict[str, MooncakeKVReceiver] = {}
         self.kv_manager = MooncakeKVManagerDecode(args, kv_args)
@@ -99,9 +93,15 @@ class DisaggDecodeExecutor:
         self._bootstrap(request_id, bootstrap_info)
 
     def execute(self, op):
+        """Pull this admitted prompt's KV from the prefill node.
+
+        The D-role half of the plan's remote streams, submitted on the
+        forward thread like any forward; completion arrives as a transfer
+        event, not from here.
+        """
         if not isinstance(op, Forward.Batch):
             raise TypeError(f"Expected Batch, got {type(op).__name__}.")
-        self._dispatcher(op)
+        self._cache_prefill(op)
 
     def generate_events(self):
         if not self.receivers:
@@ -154,13 +154,9 @@ class DisaggDecodeExecutor:
                     req_id,
                     bootstrap_token,
                 )
-                # Use RemotePrefillDoneEvent to carry the bootstrap_token to event_loop;
-                # the C++ FSM will extend it into the TokenContainer via
-                # fsm::RemotePrefillDoneEvent::operator()(Prefilling&&).
-                event = PD.RemotePrefillDoneEvent(
-                    req_id, bootstrap_token if bootstrap_token != -1 else -1
-                )
-                events.append(event)
+                # The C++ FSM extends the token into the TokenContainer as it
+                # applies this event (RemotePrefilling -> PrefillDone).
+                events.append(PD.RemotePrefillDoneEvent(req_id, bootstrap_token))
                 to_remove.append(req_id)
             else:
                 pass

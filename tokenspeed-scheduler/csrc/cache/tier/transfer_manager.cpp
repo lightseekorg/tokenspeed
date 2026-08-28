@@ -26,17 +26,6 @@
 
 namespace tokenspeed {
 
-std::vector<std::pair<std::uint32_t, CacheBlockLocation>> TierTransferManager::DeviceLocationsReleasedOnStoreAck()
-    const {
-    std::vector<std::pair<std::uint32_t, CacheBlockLocation>> locations;
-    for (const auto& [_, stores] : write_backs_) {
-        for (const StoreTicket& ticket : stores) {
-            locations.emplace_back(ticket.key.group_id, ticket.device_block_ref->Location());
-        }
-    }
-    return locations;
-}
-
 std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
     std::vector<CacheTransfer> transfers;
     std::vector<StoreTicket> tickets;
@@ -47,7 +36,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
             continue;
         }
 
-        CacheBlockRef device_block_ref = coordinator_.AcquireDeviceCachedBlock(candidate.key);
+        const CacheBlockRef device_block_ref = coordinator_.AcquireDeviceCachedBlock(candidate.key);
         if (!device_block_ref) {
             continue;
         }
@@ -56,6 +45,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
         if (!host_block_ref) {
             continue;
         }
+        // The source page id is resolved here and not pinned: the forward
+        // thread's stream orders the copy ahead of any later reuse.
         transfers.push_back(CacheTransfer{
             .group_id = candidate.key.group_id,
             .source_page = manager.ResolveCacheBlockId(device_block_ref->Location()),
@@ -63,7 +54,6 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores() {
         });
         tickets.push_back(StoreTicket{
             std::move(candidate.key),
-            std::move(device_block_ref),
             std::move(host_block_ref),
         });
     }

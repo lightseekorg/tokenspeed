@@ -246,19 +246,19 @@ class RequestHandler:
                 )
             elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
                 # RL weight sync: join the trainer's NCCL group on this worker.
-                ok, msg = self._device.init_weights_update_group(recv_req)
+                ok, msg = self._device.update_weights(recv_req)
                 self.send_func.send_pyobj(
                     InitWeightsUpdateGroupReqOutput(success=ok, message=msg)
                 )
             elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
                 # RL weight sync: receive broadcast weights + load into the model.
-                ok, msg = self._device.update_weights_from_distributed(recv_req)
+                ok, msg = self._device.update_weights(recv_req)
                 self.send_func.send_pyobj(
                     UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
                 )
             elif isinstance(recv_req, DestroyWeightsUpdateGroupReqInput):
                 # RL weight sync: tear down the trainer's NCCL group on this worker.
-                ok, msg = self._device.destroy_weights_update_group(recv_req)
+                ok, msg = self._device.update_weights(recv_req)
                 self.send_func.send_pyobj(
                     DestroyWeightsUpdateGroupReqOutput(success=ok, message=msg)
                 )

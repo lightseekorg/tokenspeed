@@ -164,10 +164,11 @@ TEST(CacheOperationTest, RetractionStoreIsBestEffortAndUsesOrdinaryTransferPins)
     auto write_back = transfers.StartPendingStores();
     ASSERT_TRUE(write_back);
     coordinator.Free(tables);
-    EXPECT_FALSE(coordinator.ClearDeviceCache()) << "the transfer ticket must pin its Device source";
+    // The ticket pins no Device source: the runtime orders the D2H copy on
+    // the forward thread's stream ahead of any reuse, so the cache stays clearable.
+    EXPECT_TRUE(coordinator.ClearDeviceCache());
 
     transfers.CompleteWriteBack(write_back->op_id);
-    EXPECT_TRUE(coordinator.ClearDeviceCache());
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(CacheKey{.group_id = 0, .content_hash = "h0"}));
 }
 

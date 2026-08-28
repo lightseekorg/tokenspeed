@@ -41,18 +41,18 @@ class _SchedulerHarness:
 
     def next_execution_plan(self):
         self._trace.append("next_plan")
-        return SimpleNamespace(pages_to_zero=())
+        return SimpleNamespace(pages_to_zero=(), cache=())
 
 
 class _DeviceHarness:
     def __init__(self, trace: list[str]) -> None:
         self._trace = trace
 
-    def submit_page_zeroing(self, pages):
-        # Unreached while the harness plans no page; kept so a plan that
-        # does would trace the submission rather than fail on a missing attr.
-        if pages:
-            self._trace.append("zero_pages")
+    def execute(self, execution_plan, planned):
+        # The harness plans no device work and no batch; trace anything that
+        # does appear rather than fail on a missing attr.
+        if execution_plan.pages_to_zero or execution_plan.cache or planned:
+            self._trace.append("execute")
         return None
 
 
@@ -70,14 +70,13 @@ class _EventLoopHarness:
         self.output_processor = SimpleNamespace(rid_to_state={})
         self.has_dp = False
         self.kv_transfer = None
-        self._pd_cache_enabled = False
         self.in_flight_depth = 0
         self._epd_hooks = SimpleNamespace(
             drain_ready_embeddings=lambda: self.trace.append("drain_epd")
         )
         self._cache_hooks = SimpleNamespace(
             poll_ready_events=lambda: (self.trace.append("poll_cache"), [])[1],
-            submit=lambda _plan: self.trace.append("submit_cache"),
+            count_plan_ops=lambda _plan: self.trace.append("count_cache"),
         )
         self._pd_hooks = SimpleNamespace(
             poll_transfer_events=lambda: (self.trace.append("poll_pd"), [])[1]
@@ -137,7 +136,7 @@ def test_event_loop_finishes_current_iteration_then_observes_shutdown() -> None:
         "next_plan",
         # No "zero_pages": the round's plan plans no page, so the loop
         # submits no zeroing work to the forward thread.
-        "submit_cache",
+        "count_cache",
         "get_forward",
         "stats",
         "observe_load",

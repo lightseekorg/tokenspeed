@@ -30,15 +30,15 @@ scheduler with — feedback into the scheduler stays an explicit
 
 from __future__ import annotations
 
-from tokenspeed_scheduler import PD, ForwardEvent
+from tokenspeed_scheduler import PD
 
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 
 
 class PdTransferHooks:
-    """EventLoop-side PD transfer hooks. Stateless glue: holds only a loop
-    back-reference; a cheap no-op when PD is disabled (``kv_transfer=None``).
+    """EventLoop-side PD transfer hooks: glue, no state of its own. A cheap
+    no-op when PD is disabled (``kv_transfer=None``).
     """
 
     def __init__(self, loop, device) -> None:
@@ -71,10 +71,9 @@ class PdTransferHooks:
                     loop.output_processor.on_remote_prefill_done(
                         req_id, bootstrap_token
                     )
-                if loop._pd_cache_enabled:
-                    processed.extend(
-                        loop.output_processor.finish_remote_prefill_only_request(req_id)
-                    )
+                processed.extend(
+                    loop.output_processor.finish_remote_prefill_only_request(req_id)
+                )
                 if isinstance(loop.kv_transfer, DisaggDecodeExecutor):
                     remote_cache_slot = loop.kv_transfer.pop_remote_cache_slot(req_id)
                     candidate_info = loop.kv_transfer.pop_remote_spec_candidate_ids(
@@ -96,10 +95,9 @@ class PdTransferHooks:
             elif isinstance(event, PD.FailedEvent):
                 # A PD/EPD transfer failed: the decode KV receiver timed out (e.g. the
                 # prefill aborted on embedding timeout so the KV never arrives), or a
-                # transfer errored. Publish the client-visible failure here. An
-                # encode-only EPD flow still needs a following Forward.Abort because
-                # its C++ FailedEvent handler is a no-op; CachePD FailedEvent
-                # atomically terminalizes and fences the leased scheduler resources.
+                # transfer errored. Publish the client-visible failure here; the C++
+                # FailedEvent handler atomically terminalizes and fences the leased
+                # scheduler resources, so no Forward.Abort needs to follow.
                 req_id = event.request_id
                 state = loop.output_processor.rid_to_state.get(req_id)
                 if state is not None:
@@ -112,8 +110,4 @@ class PdTransferHooks:
                         loop.output_processor.publish_finished_at_admission(
                             req_id, state
                         )
-                    if not loop._pd_cache_enabled:
-                        abort = ForwardEvent.Abort()
-                        abort.request_id = req_id
-                        processed.append(abort)
         return processed

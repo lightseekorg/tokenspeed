@@ -114,11 +114,13 @@ def _typed_layout(
     )
 
 
-def _op(*, state_page: int = 6):
+def _op(*, state_page: int = 6, spec_candidate_ids=((),)):
     tables = {
         "history": np.asarray([[1, 2, 3]], dtype=np.int32),
         "state": np.asarray([[4, 5, state_page]], dtype=np.int32),
     }
+    # The remote-decode op is self-contained: the scheduler stamps the
+    # bootstrap token and drafter candidates onto its rows.
     return make_operation(
         tables,
         request_ids=["request-0"],
@@ -126,6 +128,8 @@ def _op(*, state_page: int = 6):
         extend_prefix_lens=[2],
         prefill_lengths=[5],
         num_extends=lambda: 1,
+        decode_input_ids=[42],
+        spec_candidate_ids=[list(ids) for ids in spec_candidate_ids],
     )
 
 
@@ -575,9 +579,6 @@ def test_prefill_submits_manifest_through_contract_sender() -> None:
             peer_cache_layout=layout
         ),
     )
-    executor._request_token = {"request-0": 42}
-    executor._request_spec_candidate_ids = {}
-
     executor._cache_decode(_op())
 
     assert len(calls) == 1
@@ -585,7 +586,6 @@ def test_prefill_submits_manifest_through_contract_sender() -> None:
     assert args == (True,)
     assert kwargs["bootstrap_token"] == 42
     assert kwargs["block_manifest"].prompt_len == 5
-    assert executor._request_token == {}
 
 
 def test_idle_prefill_rank_submits_final_dummy_rendezvous() -> None:
@@ -599,9 +599,6 @@ def test_idle_prefill_rank_submits_final_dummy_rendezvous() -> None:
     executor.kv_manager = SimpleNamespace(
         transfer_infos={9: {"dummy": SimpleNamespace(is_dummy=True)}}
     )
-    executor._request_token = {"request-0": 42}
-    executor._request_spec_candidate_ids = {}
-
     executor._cache_decode(_op())
 
     assert len(calls) == 1
@@ -612,7 +609,6 @@ def test_idle_prefill_rank_submits_final_dummy_rendezvous() -> None:
         "spec_candidate_ids": None,
         "block_manifest": None,
     }
-    assert executor._request_token == {}
 
 
 def test_idle_layerwise_prefill_rank_submits_final_dummy_rendezvous() -> None:
@@ -626,11 +622,7 @@ def test_idle_layerwise_prefill_rank_submits_final_dummy_rendezvous() -> None:
     executor.kv_manager = SimpleNamespace(
         transfer_infos={9: {"dummy": SimpleNamespace(is_dummy=True)}}
     )
-    executor._request_token = {"request-0": 42}
-    executor._request_spec_candidate_ids = {"request-0": [7, 8]}
-    executor._layerwise_token_published = {"request-0"}
-
-    executor._cache_decode(_op())
+    executor._cache_decode(_op(spec_candidate_ids=[[7, 8]]))
 
     assert len(calls) == 1
     args, kwargs = calls[0]
@@ -640,9 +632,6 @@ def test_idle_layerwise_prefill_rank_submits_final_dummy_rendezvous() -> None:
         "spec_candidate_ids": [7, 8],
         "block_manifest": None,
     }
-    assert executor._request_token == {}
-    assert executor._request_spec_candidate_ids == {}
-    assert executor._layerwise_token_published == set()
 
 
 def test_layerwise_final_preserves_speculative_candidates() -> None:
@@ -655,17 +644,9 @@ def test_layerwise_final_preserves_speculative_candidates() -> None:
     executor.kv_manager = SimpleNamespace(
         set_prefill_metadata=lambda *args: metadata_calls.append(args)
     )
-    executor._request_token = {}
-    executor._request_spec_candidate_ids = {}
-    executor._layerwise_token_published = set()
-    executor.store_prefill_token("request-0", 0, 42, [7, 8])
-
-    executor._cache_decode(_op())
+    executor._cache_decode(_op(spec_candidate_ids=[[7, 8]]))
 
     assert metadata_calls == [(9, 42, [7, 8])]
-    assert executor._request_token == {}
-    assert executor._request_spec_candidate_ids == {}
-    assert executor._layerwise_token_published == set()
 
 
 def test_shared_manager_executes_strided_cache_tp_fragment() -> None:

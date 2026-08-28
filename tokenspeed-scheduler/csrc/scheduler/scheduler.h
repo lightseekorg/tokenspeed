@@ -22,12 +22,12 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -100,9 +100,15 @@ private:
         explicit PlanBuildContext(ExecutionPlan& output_plan) : plan{output_plan} {}
 
         ExecutionPlan& plan;
+        // Set by admit() when the last admission failed for capacity (as
+        // opposed to a chunk that aligned to zero tokens). The phases clear
+        // it before each attempt.
         bool admission_failed{false};
-        bool waits_for_store_ack{false};
-        std::optional<std::string> capacity_blocker;
+        // The first candidate whose admission failed for capacity, in phase
+        // order -- the request a retraction would serve. A readmission is
+        // never recorded here: when it needs a victim, the two simply do not
+        // fit together, and swapping them is pure thrash.
+        Request* capacity_blocker{nullptr};
     };
 
     std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> buildForwardOperations(
@@ -135,10 +141,7 @@ private:
     void discardUncachedKvEventPages(std::span<const CacheKey> keys);
     void handleCacheMutation(const CacheKey& key, CacheCoordinator::CacheMutation mutation);
     void publishCompletedPages(Request& request);
-    void retractForCapacity(PlanBuildContext& context, const std::vector<Request*>& candidates,
-                            std::vector<WriteBackOperation>& write_back_operations);
 
-    std::optional<WriteBackOperation> beginRetraction(Request& request);
     std::size_t groupIndex(const std::string& group_id) const;
     Request* findRequest(const std::string& request_id);
 
@@ -152,6 +155,102 @@ private:
     void handleEvent(const forward::Abort& event);
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
+
+    // Mutable state of one plan-building pass: the model batch under
+    // construction, the transfer peer's two streams, and the composition
+    // flags the role grammars consult. buildForwardOperations owns one and
+    // hands it to the role's builder.
+    struct PlanBuild {
+        std::vector<ForwardOperation> operations;
+        std::vector<ForwardOperation> remote_decode;
+        std::vector<ForwardOperation> remote_prefill;
+        std::vector<LoadBackOperation> load_backs;
+        // A round schedules each request at most once, whatever states it
+        // moves through while the phases run (a prompt completed by the
+        // prefill phase is PrefillDone by the time the decode phase walks
+        // the same candidates -- its first decode is next round's work).
+        std::unordered_set<const Request*> scheduled;
+        std::int32_t token_budget{0};
+        // Budget the decode batch must leave untouched: one state-checkpoint
+        // page for a pending local mamba prefill, which cannot advance in
+        // sub-page chunks (fused mixed mode only).
+        std::int32_t state_prefill_reserve{0};
+        bool pushed_prefill{false};
+        bool pushed_decode{false};
+        bool Full(std::int32_t max_batch_size) const {
+            return token_budget <= 0 || operations.size() == static_cast<std::size_t>(max_batch_size);
+        }
+        bool Scheduled(const Request& request) const { return scheduled.contains(&request); }
+        // No prefill made progress this round: nothing new was admitted and
+        // no resident prefill advanced a chunk. Decode steps do not count --
+        // they release no capacity, so a round of pure decode leaves a
+        // stalled prefill exactly as stuck as an empty one.
+        bool NoPrefillProgress() const { return !pushed_prefill && remote_prefill.empty(); }
+    };
+
+    // Budget/flag accounting for one operation entering the model batch.
+    // Work handed to the transfer peer takes neither budget nor a batch
+    // slot, so it bypasses this (but still marks the request scheduled).
+    template <typename Operation>
+    void pushOperation(PlanBuild& build, const Request& request, Operation operation) {
+        build.scheduled.insert(&request);
+        // The D role budgets prompt tokens only: its prefills are the peer's
+        // work (they ride plan.remote_prefill and never reach here), so its
+        // decode steps run against no chunk budget.
+        if constexpr (std::is_same_v<Operation, PrefillOperation>) {
+            build.token_budget -= operation.input_length;
+            build.pushed_prefill = true;
+        } else if (config_.role != Role::kD) {
+            build.token_budget -= operation.input_length;
+        }
+        if constexpr (std::is_same_v<Operation, DecodeOperation>) {
+            build.pushed_decode = true;
+        }
+        build.operations.push_back(std::move(operation));
+    }
+
+    // Admission for one prefill-work candidate: a resumed chunk for a
+    // Prefilling request, the first chunk otherwise. Returns the built
+    // operation, or nullopt when admission fails (context.admission_failed
+    // says whether capacity was the reason).
+    std::optional<PrefillOperation> schedulePrefillCandidate(PlanBuildContext& context, Request* request,
+                                                             std::int32_t token_budget, std::int32_t decode_reserve,
+                                                             std::vector<LoadBackOperation>& load_backs);
+
+    // The readmission this round may schedule, or nullptr: among the
+    // retracted requests holding a recoverable snapshot, decode-origin
+    // victims first, then oldest retraction epoch. Derived from the states
+    // themselves, so a request that finishes or aborts while retracted
+    // simply stops qualifying. A snapshot-less retraction is not in this
+    // ordering at all -- it re-prefills through the ordinary admission path
+    // (admitsLikeNewPrompt).
+    static Request* nextReadmission(std::span<Request* const> candidates);
+
+    // The capacity-retraction entry shared by the D and fused grammars:
+    // fires only when no prefill progressed and admission failed. Retracts
+    // victims and RETRIES the blocked admission in the same plan build, so
+    // the freed capacity reaches the request it was freed for -- never a
+    // free page waiting for whoever asks first next round.
+    void maybeRetractForCapacity(PlanBuildContext& context, PlanBuild& build, std::span<Request* const> candidates,
+                                 std::vector<WriteBackOperation>& write_back_operations);
+    Request* chooseVictim(std::span<Request* const> candidates) const;
+    void retractVictim(Request& victim, std::vector<WriteBackOperation>& write_back_operations);
+
+    // One plan-building grammar per engine role: the roles share the
+    // scheduling mechanism (schedulePrefill / scheduleDecode / admission)
+    // and the two phase helpers below, but compose genuinely different
+    // batches, so each role states its own story instead of one loop full of
+    // role conditionals. Every phase walks the candidates in submission
+    // order (requests_ is the FIFO) -- what used to be a priority ladder is
+    // now the phase sequence itself, and within a phase older requests win.
+    void buildPrefillWorkerPlan(PlanBuildContext& context, PlanBuild& build, std::span<Request* const> candidates);
+    void buildDecodeWorkerPlan(PlanBuildContext& context, PlanBuild& build, std::span<Request* const> candidates,
+                               std::vector<WriteBackOperation>& write_back_operations);
+    void buildFusedPlan(PlanBuildContext& context, PlanBuild& build, std::span<Request* const> candidates,
+                        std::vector<WriteBackOperation>& write_back_operations);
+    void scheduleLocalPrefillWork(PlanBuildContext& context, PlanBuild& build, std::span<Request* const> candidates,
+                                  Request* readmission, std::int32_t decode_reserve);
+    void scheduleDecodeBatch(PlanBuildContext& context, PlanBuild& build, std::span<Request* const> candidates);
 
     std::int32_t calculateMaxSingleRequestTokens(std::int64_t usable_lcm_blocks) const;
     std::int64_t singleRequestLcmBlocksRequired(std::int32_t token_limit) const;
@@ -167,13 +266,17 @@ private:
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};
 
-    std::unordered_map<std::string, std::int32_t> pending_forward_results_;
     std::unordered_set<std::string> pd_transfer_pins_;
-    std::deque<std::string> recovery_queue_;
-    std::optional<std::string> recovery_barrier_;
-    bool fused_capacity_drain_{false};
+    // Stamped onto each retraction; the readmission order lives on the
+    // Retracted states themselves (nextReadmission).
+    std::int64_t next_retraction_epoch_{1};
 
-    std::unordered_map<std::string, std::unique_ptr<Request>> requests_;
+    // Submission order -- the FIFO every scheduling phase walks, identical
+    // on every rank because the mirrored schedulers receive identical
+    // batches. The unique_ptr keeps each Request's address stable across
+    // vector reshuffles, so the id index below never dangles.
+    std::vector<std::unique_ptr<Request>> requests_;
+    std::unordered_map<std::string, Request*> requests_by_id_;
     std::vector<KvCacheEvent> kv_events_;
     std::unordered_map<std::string, KvEventHashProgress> kv_event_hash_progress_;
     std::unordered_map<CacheKey, KvBlockStoredEvent, CacheKeyHash> kv_event_pages_;

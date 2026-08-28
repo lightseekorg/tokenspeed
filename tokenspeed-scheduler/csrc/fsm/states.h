@@ -29,7 +29,8 @@
 // Put resources into each particular state
 namespace tokenspeed::fsm {
 
-using State = std::variant<Bootstrapping, Submitted, Prefilling, PrefillDone, Decoding, Retracted, Finished>;
+using State = std::variant<Bootstrapping, Submitted, Prefilling, RemotePrefilling, PrefillAwaitingResult, PrefillDone,
+                           Decoding, Retracted, Finished>;
 
 inline State ToState(State state) {
     return state;

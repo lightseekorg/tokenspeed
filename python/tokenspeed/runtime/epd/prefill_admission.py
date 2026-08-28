@@ -357,7 +357,7 @@ class EmbeddingReceiveJob:
     ):
         self.manager = manager
         # Device steps (buffer allocation, publish clone/scatter, shard
-        # reassembly) go through here — DeviceHandle.run_embedding_work in
+        # reassembly) go through here — DeviceHandle.run_multimodal_work in
         # the engine, so they land on the forward thread. None (tests, the
         # blocking receive_encoded_embeddings wrapper) runs them inline.
         self._run_device = run_device_work or (lambda work: work())
@@ -1128,10 +1128,10 @@ def make_epd_prefill_admission(
     if manager is None:
         return None
     # The narrow model facts the controller needs (vision dtype, hidden width,
-    # deepstack width, device), read off the device wiring rather than the
-    # model: the controller holds these, never the model itself. Resolved only
-    # past the gate above — reading the vision tower's dtype raises on a
-    # text-only model, and every text-only PD node passes through here.
+    # deepstack width, device), extracted by the device builder rather than
+    # read off the model: the controller holds these, never the model itself.
+    # Resolved only past the gate above — reading the vision tower's dtype
+    # raises on a text-only model, and every text-only PD node passes here.
     facts = encoder_model_facts()
     return EpdPrefillAdmission(
         manager=manager,

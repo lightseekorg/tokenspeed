@@ -329,11 +329,17 @@ def resolve_dspark_prefix_replay_tokens(
 
 
 def make_extend_result_event(
-    request_id: str, tokens: Sequence[int] = ()
+    request_id: str,
+    tokens: Sequence[int] = (),
+    spec_candidate_ids: Sequence[int] | None = None,
 ) -> "ForwardEvent.ExtendResult":
     fe = ForwardEvent.ExtendResult()
     fe.request_id = request_id
     fe.tokens = list(tokens)
+    if spec_candidate_ids:
+        # P-side final chunk: the drafter candidates ride to the scheduler so
+        # its remote-decode operation is self-contained.
+        fe.spec_candidate_ids = list(spec_candidate_ids)
     return fe
 
 

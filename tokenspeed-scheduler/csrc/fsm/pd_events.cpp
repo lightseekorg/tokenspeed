@@ -37,7 +37,7 @@ Finished SucceededEvent::operator()(Decoding&& /*state*/) {
     return Finished{};
 }
 
-PrefillDone RemotePrefillDoneEvent::operator()(Prefilling&& state) {
+PrefillDone RemotePrefillDoneEvent::operator()(RemotePrefilling&& state) {
     const TokenContainer::Window window = state.window;
     TokenContainer* token_container = state.TokenContainerPtr();
     const std::int32_t prefix_granularity = state.PrefixGranularity();

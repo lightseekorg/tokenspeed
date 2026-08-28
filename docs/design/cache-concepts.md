@@ -322,9 +322,10 @@ Its responsibilities:
   prefix hits per group on both tiers, converged to the common prefix length
   across groups; `Admit` then allocates, pins the hit prefix, and produces
   host→device `load_pairs` plus each group's fresh pages. Probe and admit are
-  deliberately split so that a failed admission can be retried under a
-  hypothetical release (`CanAdmitAfterReleasing`) without mutating cache
-  state. `ProbeDecodeDevicePrefix` is the PD-decode variant: local history
+  deliberately split so the probe can be taken once and the admission retried
+  against it — the scheduler's same-round retract-and-grant re-runs a failed
+  admission after freeing a victim (see `scheduler.md`) without re-probing.
+  `ProbeDecodeDevicePrefix` is the PD-decode variant: local history
   pages are reused while final-state groups are restored from the remote
   endpoint snapshot.
 * **Prefix publication.** `CacheFullBlocks` / `CacheCompletedBlocks` register

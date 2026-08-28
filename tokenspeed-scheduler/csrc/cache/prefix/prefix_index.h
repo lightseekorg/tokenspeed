@@ -179,22 +179,14 @@ public:
     }
 
     std::vector<CacheBlockLocation> EvictableLocations(const BlockPool& pool) const {
-        return EvictableLocationsAfterReleasing(pool, {});
-    }
-
-    std::vector<CacheBlockLocation> EvictableLocationsAfterReleasing(
-        const BlockPool& pool, std::span<const CacheBlockLocation> released_locations) const {
         const CacheEntries* cache_index = findCacheEntries(pool);
         if (cache_index == nullptr) {
             return {};
         }
         std::vector<CacheBlockLocation> locations;
         for (const CacheEntry& cache_entry : cache_index->entries) {
-            const CacheBlockLocation location = cache_entry.block_ref->Location();
-            const std::uint32_t released_owners =
-                static_cast<std::uint32_t>(std::ranges::count(released_locations, location));
-            if (cache_entry.block_ref.use_count() == 1 + released_owners) {
-                locations.push_back(location);
+            if (cache_entry.block_ref.use_count() == 1) {
+                locations.push_back(cache_entry.block_ref->Location());
             }
         }
         return locations;

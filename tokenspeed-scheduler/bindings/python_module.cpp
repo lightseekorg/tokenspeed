@@ -171,7 +171,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::forward::ExtendResult>(forward_event, "ExtendResult")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::forward::ExtendResult::request_id)
-        .def_rw("tokens", &tokenspeed::forward::ExtendResult::tokens);
+        .def_rw("tokens", &tokenspeed::forward::ExtendResult::tokens)
+        .def_rw("spec_candidate_ids", &tokenspeed::forward::ExtendResult::spec_candidate_ids);
 
     nb::class_<tokenspeed::forward::Finish>(forward_event, "Finish")
         .def(nb::init<>())
@@ -238,7 +239,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](const tokenspeed::ForwardBatch& op) -> const std::vector<std::int32_t>& { return op.prefill_lengths; },
             nb::rv_policy::reference_internal)
         .def_ro("decode_input_ids", &tokenspeed::ForwardBatch::decode_input_ids)
-        .def("is_local_prefill", &tokenspeed::ForwardBatch::IsLocalPrefill)
+        .def_ro("spec_candidate_ids", &tokenspeed::ForwardBatch::spec_candidate_ids)
         .def_prop_ro(
             "block_tables",
             [](const tokenspeed::ForwardBatch& op)
@@ -299,6 +300,20 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def_prop_ro("forward", collect_forward)
         .def_prop_ro("cache", collect_cache)
+        .def_prop_ro("remote_decode",
+                     [](const tokenspeed::ExecutionPlan& plan) -> nb::object {
+                         if (!plan.remote_decode) {
+                             return nb::none();
+                         }
+                         return nb::cast(*plan.remote_decode, nb::rv_policy::copy);
+                     })
+        .def_prop_ro("remote_prefill",
+                     [](const tokenspeed::ExecutionPlan& plan) -> nb::object {
+                         if (!plan.remote_prefill) {
+                             return nb::none();
+                         }
+                         return nb::cast(*plan.remote_prefill, nb::rv_policy::copy);
+                     })
         .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero);
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")

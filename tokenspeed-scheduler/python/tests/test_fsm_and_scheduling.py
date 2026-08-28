@@ -286,8 +286,10 @@ class TestPrefillFirst:
         assert plan2.forward[0].num_extends() > 0
         assert plan2.forward[0].request_ids == ["r0"]
 
-    def test_prefill_role_batches_handoffs_before_new_admission(self):
-        """Priority selects a pure, batched P-side handoff round."""
+    def test_prefill_role_emits_remote_decodes_beside_new_admission(self):
+        """A P-side completed prompt leaves on plan.remote_decode, beside
+        whatever forward work the round schedules -- everything dispatchable
+        dispatches in one round."""
         cfg = make_config(max_scheduled_tokens=8)
         cfg.role = SchedulerConfig.Role.P
         cfg.decode_input_tokens = 0
@@ -313,10 +315,28 @@ class TestPrefillFirst:
         s.submit_requests([make_spec("r2", list(range(8, 12)))])
         s.advance(ExecutionEvent().add_event(PD.BootstrappedEvent("r2")))
 
+        # r0/r1's results have not landed, so their remote decodes are held
+        # (the transfer needs the bootstrap token that arrives with the
+        # result) while r2's prefill proceeds.
+        held = s.next_execution_plan()
+        assert held.remote_decode is None
+        assert held.forward[0].request_ids == ["r2"]
+
+        results = ExecutionEvent()
+        for rid, token in (("r0", 42), ("r1", 43)):
+            ev = ForwardEvent.ExtendResult()
+            ev.request_id = rid
+            ev.tokens = [token]
+            results.add_event(ev)
+        s.advance(results)
+
+        # Results in hand: both remote decodes go out on the plan's own
+        # stream, carrying the bootstrap token each transfer needs.
         transfer_start = s.next_execution_plan()
-        assert transfer_start.forward[0].request_ids == ["r0", "r1"]
-        assert transfer_start.forward[0].num_extends() == 0
-        assert s.waiting_size() == 1
+        assert transfer_start.remote_decode is not None
+        assert transfer_start.remote_decode.request_ids == ["r0", "r1"]
+        assert transfer_start.remote_decode.decode_input_ids == [42, 43]
+        assert s.waiting_size() == 0
 
     def test_decode_batch_only_when_no_prefill_work(self):
         """Decode batch is only scheduled when there are no prefilling/submitted requests."""

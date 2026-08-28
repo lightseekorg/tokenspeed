@@ -146,7 +146,7 @@ class GroupAwareWireTest(unittest.TestCase):
             ("state", "full"),
         )
 
-    def test_submit_plan_clears_layerwise_waits_without_load(self):
+    def test_submit_load_backs_clears_layerwise_waits_without_load(self):
         try:
             from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
         except (ImportError, ModuleNotFoundError) as exc:
@@ -157,7 +157,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._ack_lock = threading.Lock()
         executor._load_trackers = [(tracker, 1)]
 
-        executor.submit_plan(SimpleNamespace(cache=[]))
+        executor.submit_load_backs(SimpleNamespace(cache=[]))
 
         tracker.set_consumers.assert_called_once_with(-1)
 
@@ -194,33 +194,34 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._ready_write_op_ids = []
         executor.layout = SimpleNamespace(buffers=("device",))
         executor.host_storage = SimpleNamespace(host_buffer="host")
-        executor.write_stream = object()
         executor.transfer_backend = "dma"
         executor._write_acks = []
         ranges = [(0, 64, 128, 32)]
         executor._transfer_ranges = Mock(return_value=ranges)
-        start = Mock()
+        stream = object()
         finish = Mock()
 
         with (
             patch.object(
-                executor_module.torch.cuda, "Event", side_effect=(start, finish)
+                executor_module.torch.cuda, "current_stream", return_value=stream
             ),
+            patch.object(executor_module.torch.cuda, "Event", return_value=finish),
             patch.object(executor_module, "transfer_cache_ranges") as transfer,
         ):
             executor._start_writing([7], [(0, 5, 9)])
 
+        # On the CALLER's current stream: the copy must read the source pages
+        # before anything later in the plan (zeroing, the granted request's
+        # writes) can touch them, and the single-stream FIFO is that fence.
         transfer.assert_called_once_with(
             "d2h",
             executor.layout.buffers,
             executor.host_storage.host_buffer,
             ranges,
-            executor.write_stream,
+            stream,
             backend="dma",
         )
-        start.record.assert_called_once_with()
-        start.wait.assert_called_once_with(executor.write_stream)
-        finish.record.assert_called_once_with(executor.write_stream)
+        finish.record.assert_called_once_with(stream)
 
     def test_loadback_logs_non_empty_batch(self):
         try:
@@ -338,7 +339,7 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
             [7],
             [(0, 1, 1), (0, 4, 4), (1, 3, 3)],
         )
-        executor.write_stream.synchronize()
+        torch.cuda.current_stream().synchronize()
         write_results = executor.poll_results()
         self.assertEqual([int(event.op_id) for event in write_results], [7])
 

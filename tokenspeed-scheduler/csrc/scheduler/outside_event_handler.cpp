@@ -46,7 +46,6 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
     if (request == nullptr || request->Is<fsm::Finished>()) {
         return;
     }
-    pending_forward_results_.erase(event.request_id);
     pd_transfer_pins_.erase(event.request_id);
     request->Apply(fsm::AbortEvent{&coordinator_});
 }
@@ -59,7 +58,6 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
         throw std::logic_error("PD SucceededEvent received in state " + request->StateName());
     }
-    pending_forward_results_.erase(event.request_id);
     pd_transfer_pins_.erase(event.request_id);
     request->Apply(fsm::FinishEvent{&coordinator_});
 }
@@ -69,7 +67,7 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
     if (request == nullptr) {
         return;
     }
-    if (request->Is<fsm::Prefilling>()) {
+    if (request->Is<fsm::RemotePrefilling>()) {
         if (event.bootstrap_token < 0) {
             throw std::invalid_argument("PD RemotePrefillDoneEvent requires a non-negative bootstrap token");
         }
@@ -88,7 +86,6 @@ void Scheduler::handleEvent(const forward::Finish& event) {
     if (config_.enable_pd_cache && pd_transfer_pins_.contains(event.request_id)) {
         throw std::logic_error("PD Finish received while transfer pages are pinned");
     }
-    pending_forward_results_.erase(event.request_id);
     if (Request* request = findRequest(event.request_id)) {
         if (request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>()) {
             publishCompletedPages(*request);
@@ -127,17 +124,16 @@ void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
 }
 
 void Scheduler::handleEvent(const forward::ExtendResult& event) {
-    if (auto it = pending_forward_results_.find(event.request_id);
-        it != pending_forward_results_.end() && --it->second <= 0) {
-        pending_forward_results_.erase(it);
-    }
     if (Request* request = findRequest(event.request_id)) {
+        request->NoteResultLanded();
         request->Apply(fsm::ExtendResultEvent{event.tokens});
+        if (!event.spec_candidate_ids.empty()) {
+            request->StoreSpecCandidates(event.spec_candidate_ids);
+        }
     }
 }
 
 void Scheduler::handleEvent(const forward::Abort& event) {
-    pending_forward_results_.erase(event.request_id);
     pd_transfer_pins_.erase(event.request_id);
     if (Request* request = findRequest(event.request_id)) {
         request->Apply(fsm::AbortEvent{&coordinator_});

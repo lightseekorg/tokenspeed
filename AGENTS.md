@@ -33,6 +33,8 @@ change.
   scheduler feedback, in-flight depth, the hooks pattern.
 * `docs/design/cache-concepts.md` — KV cache vocabulary and the layering
   between prefix matching, allocation and page geometry.
+* `docs/design/scheduler.md` — the C++ scheduler's admission granularity,
+  what triggers retraction in each engine role, and the recovery protocol.
 
 ## Public pull requests
 

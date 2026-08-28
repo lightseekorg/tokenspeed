@@ -175,9 +175,8 @@ public:
         return freed;
     }
 
-    std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(
-        const PrefixCacheIndex& index, const BlockTable& table, std::int32_t num_expired_blocks,
-        std::span<const CacheBlockLocation> released_locations) const {
+    std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(const PrefixCacheIndex& index, const BlockTable& table,
+                                                                std::int32_t num_expired_blocks) const {
         const std::int32_t expired = std::min(num_expired_blocks, table.NumBlocks());
         std::vector<CacheBlockLocation> locations;
         for (std::int32_t i = table.ReclaimedPrefixBlocks(); i < expired; ++i) {
@@ -186,9 +185,7 @@ public:
                 continue;
             }
             const bool cached = index.Contains(block);
-            const std::uint32_t released_owners =
-                static_cast<std::uint32_t>(std::ranges::count(released_locations, block->Location()));
-            if ((cached && block.use_count() == 2 + released_owners) || (!cached && block.unique())) {
+            if ((cached && block.use_count() == 2) || (!cached && block.unique())) {
                 locations.push_back(block->Location());
             }
         }

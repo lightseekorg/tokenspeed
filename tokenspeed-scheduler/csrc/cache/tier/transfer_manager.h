@@ -45,15 +45,17 @@ public:
     void CompleteWriteBack(std::uint32_t op_id);
     void CompleteLoadBack(std::uint32_t op_id);
 
-    bool HasStoresInFlight() const { return !write_backs_.empty(); }
     bool HasLoadBacksInFlight() const { return !load_backs_.empty(); }
     bool HasAnyInFlight() const { return !write_backs_.empty() || !load_backs_.empty(); }
-    std::vector<std::pair<std::uint32_t, CacheBlockLocation>> DeviceLocationsReleasedOnStoreAck() const;
 
 private:
+    // A store ticket pins only its Host destination. The Device source may
+    // be reused (even freed and re-granted) the moment the store is issued:
+    // the runtime enqueues the D2H copy on the forward thread's stream ahead
+    // of any subsequent write to those pages, so the snapshot reads the old
+    // bytes. The ACK's one job is publishing the Host entry (CacheHostBlock).
     struct StoreTicket {
         CacheKey key;
-        CacheBlockRef device_block_ref;
         CacheBlockRef host_block_ref;
     };
 

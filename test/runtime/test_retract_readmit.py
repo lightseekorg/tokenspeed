@@ -23,9 +23,11 @@
 Retraction rebases the victim's generated tokens into its prefill window
 (C++ RebasePrefill), so on re-admission the op's ``prefill_lengths`` exceeds
 the original prompt length that RequestState.prefill_finished compares
-against. A mid-chunk re-prefill slot must emit NO ExtendResultEvent (the C++
-FSM is still Prefilling and would throw) and stream NO token (the sampled
-token is garbage). The gate is the op's own chunking criterion:
+against. A mid-chunk re-prefill slot must emit an EMPTY ExtendResultEvent --
+the arrival clears the in-flight count that protects the chunk's pages, but
+the C++ FSM is still Prefilling and a token would make it throw -- and
+stream NO token (the sampled one is garbage). The gate is the op's own
+chunking criterion:
 ``extend_prefix_lens[i] + input_lengths[i] < prefill_lengths[i]``.
 """
 
@@ -133,7 +135,7 @@ def _kinds(events) -> list[str]:
     return [type(e).__name__ for e in events]
 
 
-def test_mid_chunk_readmit_slot_emits_nothing():
+def test_mid_chunk_readmit_slot_reports_empty_and_streams_nothing():
     # Retract-rebase shape: prompt is 3 tokens but the op's prefill length is 9
     # (prompt + 6 generated tokens rebased into the prefill window). First
     # re-admission chunk covers 4+4=8 < 9 — mid-chunk, C++ owes no result.
@@ -150,13 +152,14 @@ def test_mid_chunk_readmit_slot_emits_nothing():
         prefill_lengths=[9],
     )
     changes = proc.post_process_forward_op(
-        op, _Results([777], [1]), is_prefill_instance=False, on_first_token=None
+        op, _Results([777], [1]), is_prefill_instance=False
     )
 
-    # The old prompt-length gate saw computed(8) >= prompt(3) and emitted an
-    # ExtendResultEvent (C++ Prefilling FSM throws) plus one garbage token.
-    assert "ExtendResult" not in _kinds(changes)
-    assert changes == []
+    # The chunk reports back EMPTY: its arrival clears the in-flight count
+    # guarding the pages, but no token reaches the FSM (still Prefilling)
+    # and nothing streams to the client -- the sampled token is garbage.
+    assert _kinds(changes) == ["ExtendResult"]
+    assert list(changes[0].tokens) == []
     assert state.output_ids == []
     assert sender.items == []
     assert "victim" in proc.rid_to_state
@@ -179,7 +182,7 @@ def test_final_chunk_readmit_slot_emits_result():
         prefill_lengths=[9],
     )
     changes = proc.post_process_forward_op(
-        op, _Results([777], [1]), is_prefill_instance=False, on_first_token=None
+        op, _Results([777], [1]), is_prefill_instance=False
     )
 
     assert "ExtendResult" in _kinds(changes)
@@ -203,7 +206,7 @@ def test_decode_slot_unaffected_by_prefill_lengths():
         prefill_lengths=[],
     )
     changes = proc.post_process_forward_op(
-        op, _Results([555], [1]), is_prefill_instance=False, on_first_token=None
+        op, _Results([555], [1]), is_prefill_instance=False
     )
 
     kinds = _kinds(changes)

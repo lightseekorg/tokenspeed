@@ -90,7 +90,7 @@ public:
     bool GroupHasReclaimableBlocksAt(std::int32_t i, const BlockTable& table, std::int32_t num_computed_tokens) const {
         const CacheGroup& group = groups_[static_cast<std::size_t>(i)];
         return !group.Allocator()
-                    .ReclaimableBlockLocationsAt(group.Index(), table, groupExpiredBlocksAt(i, num_computed_tokens), {})
+                    .ReclaimableBlockLocationsAt(group.Index(), table, groupExpiredBlocksAt(i, num_computed_tokens))
                     .empty();
     }
     std::int32_t GroupBlocksReclaimableAt(std::int32_t i, const BlockTable& table, std::int32_t num_computed_tokens,
@@ -139,9 +139,6 @@ public:
     std::int32_t PromotionBoundaryTokens(const PrefixProbe& prefix) const;
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          std::optional<std::uint64_t> request_access_epoch = std::nullopt);
-    bool CanAdmitAfterReleasing(
-        const PrefixProbe& prefix, std::span<const GroupDemand> demands,
-        std::span<const std::pair<std::uint32_t, CacheBlockLocation>> pending_store_releases) const;
     // Capacity views for scheduling code, counted in LCM parent blocks. The
     // counts are opaque capacity units to the scheduler: all packing/geometry
     // arithmetic stays behind these methods.

@@ -47,7 +47,8 @@ import pytest
 import torch
 from tokenspeed_scheduler import PD
 
-from tokenspeed.runtime.execution.device import DeviceHandle, DeviceWiring
+from tokenspeed.runtime.execution.device import DeviceHandle
+from tokenspeed.runtime.execution.types import PlannedForward
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
@@ -55,6 +56,7 @@ from tokenspeed.runtime.multimodal.inputs import (
     multimodal_context_for_forward,
 )
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
+from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.pd.transfer_hooks import PdTransferHooks
 
 
@@ -83,6 +85,24 @@ class _ForwardThread:
         return fn()
 
 
+def _peer(trace=None):
+    """A P-role transfer peer the handle will recognize by type."""
+
+    class _Peer(DisaggPrefillExecutor):
+        def __init__(self) -> None:
+            pass
+
+        def execute(self, op) -> None:
+            if trace is not None:
+                trace.append(("send", op))
+
+        def prepare_prefill(self, op) -> None:
+            if trace is not None:
+                trace.append(("arm", op))
+
+    return _Peer()
+
+
 class _DecodeExecutor(DisaggDecodeExecutor):
     """A decode-role kv_transfer the hooks will recognize by type.
 
@@ -106,15 +126,44 @@ class _DecodeExecutor(DisaggDecodeExecutor):
         return self._candidates
 
 
-def _handle(trace):
+def _handle(trace, **kwargs):
     return DeviceHandle(
         SimpleNamespace(
             forward_thread=_ForwardThread(trace),
+            execute_forward_op=lambda *a, **k: trace.append("forward"),
             write_remote_spec_candidate_ids=lambda idx, ids: trace.append(
                 ("candidates", idx, list(ids))
             ),
             mark_remote_cache_ready=lambda slot: trace.append(("ready", slot)),
-        )
+        ),
+        **kwargs,
+    )
+
+
+def _plan(*, pages_to_zero=(), cache=(), remote_decode=None, remote_prefill=None):
+    """A round's ExecutionPlan as ``execute`` reads it — every field the real
+    plan exposes, so a fake cannot hide a renamed one."""
+    return SimpleNamespace(
+        pages_to_zero=list(pages_to_zero),
+        cache=list(cache),
+        remote_decode=remote_decode,
+        remote_prefill=remote_prefill,
+    )
+
+
+def _planned(*, num_extends, label=None):
+    """A round whose op carries only what routing reads."""
+    return PlannedForward(
+        forward_op=SimpleNamespace(
+            label=label,
+            request_ids=["a"],
+            request_pool_indices=[0],
+            num_extends=lambda: num_extends,
+        ),
+        sampling_params_list=[],
+        dp_metadata=None,
+        grammar_inputs=None,
+        multimodal_context=None,
     )
 
 
@@ -127,7 +176,6 @@ def _loop(trace, kv_transfer, state):
     return SimpleNamespace(
         kv_transfer=kv_transfer,
         output_processor=output_processor,
-        _pd_cache_enabled=False,
     )
 
 
@@ -184,72 +232,81 @@ def test_an_aborted_request_still_lands_its_candidates_but_is_not_armed():
 
 
 # ----------------------------------------------------------------------
-# L2 cache plans: transfers launch on the data plane, behind the zeroing.
+# L2 cache plans: write-backs launch AHEAD of the zeroing (they must read
+# the reused pages' old bytes), load-backs behind it.
 # ----------------------------------------------------------------------
 
 
-def test_cache_plan_submission_rides_the_fifo_behind_page_zeroing():
-    """The FIFO order zero-then-load is what keeps a reused page from being
-    zeroed after the load already overwrote it; submitting the plan from the
-    control plane would race that."""
+def test_one_plan_orders_write_backs_zeroing_then_load_backs():
+    """The FIFO carries the correctness order for same-round page reuse: the
+    retraction snapshot copies read the reused pages before the new owner's
+    zeroing wipes them, and the load-backs target zeroed pages."""
     trace: list = []
-    l2 = SimpleNamespace(
-        submit_plan=lambda plan: trace.append(("cache_plan", plan)),
-        poll_results=lambda: ["done"],
-    )
-    handle = DeviceHandle(
-        SimpleNamespace(
-            forward_thread=_ForwardThread(trace),
-            zero_cache_pages=lambda pages: trace.append(("zero", tuple(pages))),
+    plan = _plan(pages_to_zero=[3, 4], cache=["op"])
+    handle = _handle(
+        trace,
+        l2_cache_executor=SimpleNamespace(
+            submit_write_backs=lambda p: trace.append(("write_backs", p.cache)),
+            submit_load_backs=lambda p: trace.append(("load_backs", p.cache)),
+            poll_results=lambda: ["done"],
         ),
-        l2_cache_executor=l2,
+    )
+    handle._executor.zero_cache_pages = lambda pages: trace.append(
+        ("zero", tuple(pages))
     )
 
-    handle.submit_page_zeroing([3, 4])
-    handle.submit_cache_plan("PLAN")
+    handle.execute(plan, None)
 
-    assert trace == ["submit", ("zero", (3, 4)), "submit", ("cache_plan", "PLAN")]
+    assert trace == [
+        "submit",
+        ("write_backs", ["op"]),
+        "submit",
+        ("zero", (3, 4)),
+        "submit",
+        ("load_backs", ["op"]),
+    ]
     # Polling never touches the FIFO — the round head must not wait on it.
     assert handle.poll_cache_results() == ["done"]
     assert trace[-1] != "submit"
 
 
-def test_a_failed_cache_plan_submission_surfaces_at_the_next_poll():
+def test_a_plan_with_no_device_work_submits_nothing():
+    trace: list = []
+    handle = _handle(trace, l2_cache_executor=SimpleNamespace())
+
+    handle.execute(_plan(), None)
+
+    assert trace == []
+
+
+def test_a_failed_cache_submission_surfaces_at_the_next_poll():
     """A submission that raised produces no completion acks; swallowing it
     would leave its ops counted in flight forever."""
     trace: list = []
 
-    def exploding_submit_plan(plan):
+    def exploding(plan):
         raise ValueError("bad cache op")
 
-    handle = DeviceHandle(
-        SimpleNamespace(forward_thread=_ForwardThread(trace)),
+    handle = _handle(
+        trace,
         l2_cache_executor=SimpleNamespace(
-            submit_plan=exploding_submit_plan,
+            submit_write_backs=exploding,
+            submit_load_backs=lambda p: None,
             poll_results=lambda: [],
         ),
     )
 
     # Submission itself never raises (fire-and-forget)...
-    handle.submit_cache_plan("PLAN")
+    handle.execute(_plan(cache=["op"]), None)
     # ...the failure re-raises at the round head, data-plane cause chained.
     with pytest.raises(RuntimeError, match="cache-plan submission failed") as info:
         handle.poll_cache_results()
     assert isinstance(info.value.__cause__, ValueError)
 
-    # A clean submission is settled and dropped; polling keeps working.
-    handle._l2.submit_plan = lambda plan: trace.append(("plan", plan))
-    handle.submit_cache_plan("PLAN2")
-    assert handle.poll_cache_results() == []
-    assert not handle._l2_submissions
 
-
-def test_cache_ops_without_kvstore_refuse_loudly():
-    handle = _handle([])
+def test_cache_polling_without_kvstore_refuses_loudly():
     with pytest.raises(RuntimeError, match="enable-kvstore"):
-        handle.submit_cache_plan("PLAN")
-    with pytest.raises(RuntimeError, match="enable-kvstore"):
-        handle.poll_cache_results()
+        _handle([]).poll_cache_results()
 
 
 # ----------------------------------------------------------------------
@@ -257,42 +314,35 @@ def test_cache_ops_without_kvstore_refuse_loudly():
 # ----------------------------------------------------------------------
 
 
-def test_the_transfer_executor_is_attached_once():
-    """A startup handoff, not a channel the running loop can swap through."""
-    handle = _handle([])
-    handle.attach_kv_transfer(SimpleNamespace())
-    with pytest.raises(RuntimeError, match="attached once"):
-        handle.attach_kv_transfer(SimpleNamespace())
+def test_an_unrecognized_transfer_peer_is_refused():
+    """The role is read off the peer at construction, so a peer of the wrong
+    type is a startup error, not a surprise at the first transfer."""
+    with pytest.raises(TypeError, match="Disagg"):
+        _handle([], kv_transfer=SimpleNamespace())
 
 
-def test_pd_execution_without_a_transfer_peer_refuses_loudly():
-    handle = _handle([])
-    for call in (
-        lambda: handle.run_kv_handoff("OP"),
-        lambda: handle.prepare_kv_handoff("OP"),
-        lambda: handle.run_remote_receive("OP", cache_zero_future=None),
-    ):
-        with pytest.raises(RuntimeError, match="non-disaggregated"):
-            call()
-
-
-def test_the_kv_handoff_rides_the_fifo_behind_the_round_s_forwards():
-    """The send walks KV-pool device memory the forwards just wrote. The loop
-    also drains in-flight before a handoff, but that is a scheduling rule —
-    the ordering must not depend on it."""
+def test_the_remote_decode_and_the_arming_ride_the_fifo():
+    """The send walks KV-pool device memory the forwards wrote, and the
+    arming must precede the forward it arms. Both orderings come from the
+    FIFO, not from the loop's scheduling rules."""
     trace: list = []
-    handle = _handle(trace)
-    handle.attach_kv_transfer(
-        SimpleNamespace(
-            execute=lambda op: trace.append(("send", op)),
-            prepare_prefill=lambda op: trace.append(("arm", op)),
-        )
+    handle = _handle(trace, kv_transfer=_peer(trace))
+
+    chunk = _planned(num_extends=1, label="CHUNK")
+    remote_decode = SimpleNamespace(request_ids=["done"])
+
+    handle.execute(_plan(), chunk)
+    handle.execute(
+        _plan(remote_decode=remote_decode),
+        None,
     )
 
-    handle.prepare_kv_handoff("CHUNK")
-    handle.run_kv_handoff("HANDOFF")
-
-    assert trace == ["run", ("arm", "CHUNK"), "run", ("send", "HANDOFF")]
+    # Arming is enqueued before the forward it arms; the send follows the
+    # forwards whose KV it reads (the scheduler emits a remote decode only
+    # after its final chunk's result landed), submitted asynchronously like
+    # the forwards themselves.
+    assert trace[:3] == ["submit", ("arm", chunk.forward_op), "submit"]
+    assert trace[-2:] == ["submit", ("send", remote_decode)]
 
 
 # ----------------------------------------------------------------------
@@ -396,7 +446,7 @@ def test_shm_release_is_queued_behind_the_forwards_that_may_read_it():
     processor = OutputProcesser(
         send_to_tokenizer=lambda *a, **k: None,
         metrics=SimpleNamespace(),
-        defer_to_device=_handle(trace).submit_release,
+        defer_to_device=_handle(trace).run_multimodal_work,
     )
     state = SimpleNamespace(
         has_pending_multimodal_features=lambda: True,
@@ -417,7 +467,7 @@ def test_a_request_with_no_pending_features_releases_inline():
     processor = OutputProcesser(
         send_to_tokenizer=lambda *a, **k: None,
         metrics=SimpleNamespace(),
-        defer_to_device=_handle(trace).submit_release,
+        defer_to_device=_handle(trace).run_multimodal_work,
     )
     state = SimpleNamespace(
         has_pending_multimodal_features=lambda: False,
@@ -484,7 +534,7 @@ def test_metadata_only_ops_are_recognized_by_schema():
 
 def test_epd_receive_allocation_crosses_through_the_runner(monkeypatch):
     """The job's device steps run wherever the runner says — the engine
-    passes ``DeviceHandle.run_embedding_work``, so they land on the forward
+    passes ``DeviceHandle.run_multimodal_work``, so they land on the forward
     thread; ``None`` (the blocking test wrapper) runs them inline."""
     from tokenspeed.runtime.epd import prefill_admission
 
@@ -588,11 +638,11 @@ def test_the_event_loop_never_binds_a_device_object():
 
 
 def test_the_event_loop_stores_only_the_running_handle():
-    """The wiring and the build result must not outlive the constructor.
+    """The build result must not outlive the constructor.
 
-    ``DeviceWiring`` can reach a KV pool and an attention backend. Keeping
-    one would put every startup hook back within reach of the running loop,
-    which is the whole reason the wiring is a separate object.
+    It carries the transfer peer and the specs; keeping it would put the
+    device side back within reach of the running loop, which is the whole
+    point of handing back a handle.
     """
     stored = {
         node.attr
@@ -604,21 +654,22 @@ def test_the_event_loop_stores_only_the_running_handle():
     }
     assert "_device" in stored
     assert not (stored & _RAW_DEVICE_OBJECTS)
-    assert not (stored & {"device", "wiring", "specs"})
+    assert not (stored & {"device", "specs"})
 
 
-def test_the_running_handle_carries_no_startup_hook():
-    """Startup capability grows on DeviceWiring, never on DeviceHandle.
+def test_the_handle_stays_a_closed_list_of_named_operations():
+    """A god object forms one convenience method at a time.
 
-    The wiring list is the one that keeps growing — the next cache tier or
-    transport wants a hook that needs a pool. This asserts that growth lands
-    where the running loop cannot reach it.
+    The bound is not sacred, but pushing past it should be a deliberate
+    change — and every entry should be a named operation, not a "run this
+    closure" slot. Exactly one such slot is registered (EPD admission's
+    device half is a state machine; see run_multimodal_work).
     """
-    running = {name for name in vars(DeviceHandle) if not name.startswith("_")}
-    startup = {name for name in vars(DeviceWiring) if not name.startswith("_")}
-    assert startup
-    assert not (running & startup)
-    assert not (running & _RAW_DEVICE_OBJECTS)
+    public = {name for name in vars(DeviceHandle) if not name.startswith("_")}
+    assert len(public) <= 10, sorted(public)
+    assert {name for name in public if name.endswith("_work")} == {
+        "run_multimodal_work"
+    }
 
 
 def test_the_handle_hands_back_no_device_object():

@@ -21,13 +21,13 @@
 """The per-rank forward thread: the engine's single data plane.
 
 The event loop is the CONTROL plane: ZMQ input, gloo collectives, the C++
-scheduler, and commit post-processing. Along the per-round path it never
-waits on the GPU — dispatch submits and moves on, and only commit joins — so
-a control-plane round is microseconds and the cross-rank collectives that
-keep the redundant schedulers aligned (request broadcast, DP sync) always
-find every rank promptly, no matter how deep the GPUs are in queued work.
-(``DeviceHandle``'s low-rate ``run_*`` operations do wait, deliberately;
-adding one to the per-round path is a bug.)
+scheduler, and commit post-processing. Dispatching a round never waits on
+the GPU — it submits and moves on, and only commit joins — so a round is
+microseconds and the cross-rank collectives that keep the redundant
+schedulers aligned (request broadcast, DP sync) always find every rank
+promptly, no matter how deep the GPUs are in queued work. (``DeviceHandle``
+does have blocking ``run_*`` operations, but only on rounds that dispatch
+nothing — the DP idle forward — or off the round path entirely.)
 
 Everything that touches CUDA is therefore submitted here and runs on ONE
 thread per rank, in submission order:
@@ -106,10 +106,10 @@ this becomes a process the interface is already the whole interface.
      is ordering, not freezing: mutations happen on the FIFO (inside the
      forward, or a submitted closure), the control plane only reads them at
      commit time or later, and the release of the shared SHM handles rides
-     the FIFO too (``submit_release``) so it lands behind any forward still
-     reading them. What the shallow copy does freeze is the OUTER struct —
-     ``mrope_positions`` and its siblings, which the control plane rebinds
-     every round.
+     the FIFO too (``run_multimodal_work`` with ``wait=False``) so it lands
+     behind any forward still reading them. What the shallow copy does
+     freeze is the OUTER struct — ``mrope_positions`` and its siblings,
+     which the control plane rebinds every round.
 """
 
 from __future__ import annotations

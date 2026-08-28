@@ -441,19 +441,18 @@ TEST(SwaManagerTest, ReclaimExpiredFreedCachedPageStaysPrefixReusable) {
     EXPECT_EQ(hit->Location().lcm_block_id, p0);
 }
 
-TEST(SwaManagerTest, WriteBackAckMakesSlidCachedPageReclaimable) {
+TEST(SwaManagerTest, DroppingAnExtraPinMakesSlidCachedPageReclaimable) {
     BlockPool pool(2);
     SwaManager mgr(/*block_granularity=*/4, /*sliding_window=*/4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 4));
     mgr.CacheFullBlocks(pool, table, std::vector<CacheKey>{RealKey({1, 2, 3, 4}, 0)});
-    CacheBlockRef writeback_pin = table.Blocks().front();
-    const CacheBlockLocation location = writeback_pin->Location();
+    CacheBlockRef extra_pin = table.Blocks().front();
+    const CacheBlockLocation location = extra_pin->Location();
 
-    EXPECT_TRUE(mgr.ReclaimableBlockLocationsAt(table, /*num_computed_tokens=*/7, {}).empty());
-    EXPECT_TRUE(mgr.EvictableBlockLocationsAfterReleasing(pool, std::vector{location}).empty());
-    EXPECT_EQ(mgr.ReclaimableBlockLocationsAt(table, /*num_computed_tokens=*/7, std::vector{location}),
-              std::vector{location});
+    EXPECT_TRUE(mgr.ReclaimableBlockLocationsAt(table, /*num_computed_tokens=*/7).empty());
+    extra_pin.reset();
+    EXPECT_EQ(mgr.ReclaimableBlockLocationsAt(table, /*num_computed_tokens=*/7), std::vector{location});
 }
 
 TEST(SwaManagerTest, ReclaimExpiredLeavesAvailableCapacityUnchanged) {
