@@ -168,13 +168,17 @@ def test_glm53_flash_nvidia_sharegpt_uses_fixed_mtp_configuration():
     )
     server_tokens = shlex.split(task["server"]["command"])
     perf_tokens = shlex.split(task["perf"]["command"])
+    tokenizer_path = flag_value(perf_tokens, "--tokenizer-path")
 
     assert flag_value(server_tokens, "--model") == GLM53_FLASH_FP8_MODEL_ID
     assert (
         flag_value(server_tokens, "--speculative-draft-model-path")
         == GLM53_FLASH_FP8_MODEL_ID
     )
-    assert flag_value(perf_tokens, "--tokenizer-path") == GLM53_FLASH_FP8_MODEL_ID
+    assert tokenizer_path == "/tmp/glm-5.3-flash-tokenizer"
+    tokenizer_install = task["perf"]["install"][1]
+    assert GLM53_FLASH_FP8_MODEL_ID in tokenizer_install
+    assert f"--local-dir {tokenizer_path}" in tokenizer_install
     assert [
         flag_value(server_tokens, flag)
         for flag in (

@@ -53,6 +53,7 @@ server:
 perf:
   install:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]==1.10.0'
+    - /tmp/evalscope-perf/bin/hf download zai-org/GLM-5.3-Flash config.json tokenizer.json tokenizer_config.json chat_template.jinja --local-dir /tmp/glm-5.3-flash-tokenizer
   command: |
     set -eu
     RESULTS_DIR=/tmp/tokenspeed-glm53-flash-sharegpt
@@ -64,7 +65,7 @@ perf:
         --url http://127.0.0.1:8000/v1/completions \
         --api openai \
         --dataset share_gpt_en \
-        --tokenizer-path zai-org/GLM-5.3-Flash \
+        --tokenizer-path /tmp/glm-5.3-flash-tokenizer \
         --tokenize-prompt \
         --max-prompt-length 32256 \
         --min-tokens 512 \
