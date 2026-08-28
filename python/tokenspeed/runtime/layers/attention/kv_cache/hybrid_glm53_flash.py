@@ -26,9 +26,10 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
+from tokenspeed_kernel.ops.kvcache.triton import set_mla_kv_buffer_triton
+from tokenspeed_kernel.platform import pdl_enabled
 from typing_extensions import override
 
-from tokenspeed.runtime.cache.utils import set_mla_kv_buffer_triton
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
     HybridKDATokenToKVPool,
 )
@@ -36,7 +37,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.glm53_flash import (
     Glm53FlashPoolOptions,
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
-from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 @dataclass
