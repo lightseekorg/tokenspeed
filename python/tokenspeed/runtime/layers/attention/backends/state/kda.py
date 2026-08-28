@@ -101,6 +101,7 @@ class KdaAttnBackend(MambaAttnBackend):
     """
 
     _verify_reads_committed_recurrent_state = True
+    _verify_packed_qkv_views = True
 
     def __init__(
         self,
