@@ -220,10 +220,18 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
         return std::move(state);
     }
 
-    // The result this state was waiting for: the prompt's last token is now
-    // real, so the request becomes schedulable (P: its remote decode can
-    // carry the bootstrap token).
-    PrefillDone operator()(PrefillAwaitingResult&& state) {
+    // Only the FINAL chunk's result carries a token (an intermediate chunk
+    // reports back empty -- see the Prefilling overload below), and under
+    // the PP chunk pipeline older intermediate results may still be landing
+    // after the final chunk was scheduled. So an empty arrival keeps
+    // waiting, and the token-bearing one is the result this state was
+    // waiting FOR: the prompt's last token is now real, so the request
+    // becomes schedulable (P: its remote decode can carry the bootstrap
+    // token).
+    std::variant<PrefillDone, PrefillAwaitingResult> operator()(PrefillAwaitingResult&& state) {
+        if (result_tokens_.empty()) {
+            return std::move(state);
+        }
         state.ExtendResultTokens(result_tokens_);
         TokenContainer* token_container = state.TokenContainerPtr();
         const std::int32_t prefix_granularity = state.PrefixGranularity();

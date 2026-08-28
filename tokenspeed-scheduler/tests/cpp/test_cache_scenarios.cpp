@@ -1918,6 +1918,40 @@ TEST_F(PrefillHeadOfLineSuite, RetractingAnIncompletePrefillPublishesOnlyCompute
     }
 }
 
+TEST(ExtendResultEvent, AwaitingResultAbsorbsEmptyIntermediateResults) {
+    // Under the PP chunk pipeline, older intermediate chunk results (empty
+    // by contract) can land AFTER the final chunk was scheduled, i.e. while
+    // the request already sits in PrefillAwaitingResult. Only the final
+    // chunk's result carries a token; an empty arrival must keep waiting,
+    // or the handoff batch goes out before the bootstrap token is real.
+    BlockPool pool(/*num_lcm_blocks=*/8);
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    ReqPoolAllocator req_pool{4};
+
+    RequestSpec spec{.request_id = "r", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
+    Request request{spec, /*prefix_granularity=*/2, Role::kFused};
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+    request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
+                                                      /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
+                                                      fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
+                                                      /*hit_tokens=*/0, fsm::CacheProgress{},
+                                                      /*load_pairs=*/{},
+                                                      /*awaits_result=*/true});
+    ASSERT_TRUE(request.Is<fsm::PrefillAwaitingResult>());
+
+    request.Apply(fsm::ExtendResultEvent{{}});  // an older intermediate chunk's empty result
+    EXPECT_TRUE(request.Is<fsm::PrefillAwaitingResult>()) << "an empty result must not end the wait";
+
+    request.Apply(fsm::ExtendResultEvent{{42}});  // the final chunk's token
+    EXPECT_TRUE(request.Is<fsm::PrefillDone>());
+    EXPECT_EQ(request.LastToken(), 42);
+}
+
 TEST(RetractEvent, StampsResumePriorityFromGeneratedOutput) {
     // The readmission order is derived off the Retracted states: a victim
     // with generated output a client is reading resumes ahead of one that
@@ -1969,6 +2003,49 @@ TEST(RetractionHeadroom, EscalatesPerRetractionAndStopsAtTheGenerationBudget) {
 
     request.NoteRetracted();
     EXPECT_EQ(request.AdmissionHeadroom(kSafeSteps), 6000) << "and stays there";
+}
+
+TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
+    // Retraction rebases generated tokens into the prompt. A readmission
+    // that still reserved the full declared budget on top of them would
+    // demand prompt + generated + max_new -- more than the request can ever
+    // write, and near the single-request limit more than the pool holds,
+    // leaving it Retracted forever.
+    BlockPool pool(/*num_lcm_blocks=*/16);
+    std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{
+            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
+    ReqPoolAllocator req_pool{4};
+
+    RequestSpec spec{.request_id = "r", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
+    spec.max_new_tokens = 6000;
+    Request request{spec, /*prefix_granularity=*/2, Role::kFused};
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+    request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
+                                                      /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
+                                                      fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
+                                                      /*hit_tokens=*/0, fsm::CacheProgress{},
+                                                      /*load_pairs=*/{}});
+    request.Apply(fsm::ExtendResultEvent{{42}});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, request.CacheProgress()});
+    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(999, 7)});
+    ASSERT_EQ(request.GeneratedTokens(), 1000);
+
+    constexpr std::int32_t kSafeSteps = 4096;
+    EXPECT_EQ(request.RemainingNewTokens(), 5000);
+    EXPECT_EQ(request.AdmissionHeadroom(kSafeSteps), 4096) << "one window, not yet the remaining budget";
+    request.NoteRetracted();
+    EXPECT_EQ(request.AdmissionHeadroom(kSafeSteps), 5000)
+        << "capped by the REMAINING budget: the generated 1000 are part of the rebased prompt now";
+    EXPECT_TRUE(request.ReserveCoversGeneration(kSafeSteps));
+
+    request.Apply(
+        fsm::RetractEvent{&coordinator, /*epoch=*/1, /*has_recoverable_snapshot=*/true, request.HasGeneratedOutput()});
+    EXPECT_EQ(request.PrefillSize(), 1004) << "rebase folded prompt + generated into the prefill window";
+    EXPECT_EQ(request.RemainingNewTokens(), 5000) << "rebasing does not change the remaining budget";
 }
 
 TEST(RetractionHeadroom, AnUndeclaredGenerationBudgetDemandsNone) {

@@ -46,8 +46,12 @@ public:
     // Decode headroom an admission must secure before the prefill starts:
     // one safe-step window up front, plus one more per retraction suffered
     // -- being retracted means the previous admission was still too
-    // optimistic. Capped by the generation budget the request could ever
-    // use, which makes the escalation terminate.
+    // optimistic. Capped by the generation budget the request can STILL
+    // use, which makes the escalation terminate. Remaining, not declared:
+    // retraction rebases generated tokens into the prompt, so a readmission
+    // that reserved the full declared budget on top of them would demand
+    // prompt + generated + max_new -- more than the request can ever write,
+    // and possibly more than the pool holds, leaving it Retracted forever.
     //
     // A request with no declared budget (max_new_tokens == 0) demands none,
     // and keeps demanding none however often it is retracted. That looks
@@ -55,10 +59,9 @@ public:
     // what bounds the escalation, and without one there is nothing to stop
     // it from demanding more than the pool can ever hold -- at which point
     // the request could not be readmitted at all. An undeclared budget
-    // stays optimistic and relies on the victim policy (which exempts a
-    // request already recovering) to make progress.
+    // stays optimistic and relies on the victim policy to make progress.
     std::int32_t AdmissionHeadroom(std::int32_t safe_steps) const {
-        return std::min(max_new_tokens_, safe_steps * (1 + retraction_count_));
+        return std::min(RemainingNewTokens(), safe_steps * (1 + retraction_count_));
     }
     void NoteRetracted() { ++retraction_count_; }
 
@@ -68,13 +71,16 @@ public:
     // freed -- so the victim policy skips it. (An undeclared budget is
     // never covered: nothing was reserved for it.)
     bool ReserveCoversGeneration(std::int32_t safe_steps) const {
-        return max_new_tokens_ > 0 && AdmissionHeadroom(safe_steps) >= max_new_tokens_;
+        return max_new_tokens_ > 0 && AdmissionHeadroom(safe_steps) >= RemainingNewTokens();
     }
 
-    // Whether any generated token exists, whatever state currently holds it.
-    // Survives retraction's RebasePrefill (which folds generated tokens into
-    // the prefill window): the comparison is against the SUBMITTED prompt.
-    bool HasGeneratedOutput() const { return TokenSize() > submitted_prompt_size_; }
+    // Tokens generated so far / still permitted. Both survive retraction's
+    // RebasePrefill (which folds generated tokens into the prefill window):
+    // the comparison is against the SUBMITTED prompt, which rebasing cannot
+    // change.
+    std::int32_t GeneratedTokens() const { return std::max(0, TokenSize() - submitted_prompt_size_); }
+    std::int32_t RemainingNewTokens() const { return std::max(0, max_new_tokens_ - GeneratedTokens()); }
+    bool HasGeneratedOutput() const { return GeneratedTokens() > 0; }
 
     template <typename Event>
     void Apply(Event&& event) {
