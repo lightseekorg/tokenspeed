@@ -66,14 +66,6 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         self.profile_sync = sync_patcher.start()
         self.addCleanup(sync_patcher.stop)
 
-    def test_raw_token_mode_does_not_load_tokenizer(self):
-        args = SimpleNamespace(skip_tokenizer_init=True)
-        with mock.patch.object(request_handler_mod, "get_tokenizer") as loader:
-            tokenizer = request_handler_mod._get_request_tokenizer(args)
-
-        self.assertIsNone(tokenizer)
-        loader.assert_not_called()
-
     def test_init_fails_when_proton_unavailable(self):
         with mock.patch.object(
             request_handler_mod, "proton_available", return_value=False

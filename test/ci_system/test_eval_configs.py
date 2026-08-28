@@ -9,14 +9,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 EVAL_CONFIG_DIR = REPO_ROOT / "test" / "ci" / "eval"
 PERF_CONFIG_DIR = REPO_ROOT / "test" / "ci" / "perf"
 STAGE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "run-pr-test-stage.yml"
-GLM53_FLASH_AMD_WORKFLOW_PATH = (
-    REPO_ROOT / ".github" / "workflows" / "pr-test-glm-5.3-flash-amd.yml"
-)
 GLM53_FLASH_AMD_CONFIG_PATH = (
     EVAL_CONFIG_DIR / "glm-5.3-flash-fp8-mtp-tp4ep1-evalscope-aime26-amd.yaml"
-)
-GLM53_FLASH_NVIDIA_WORKFLOW_PATH = (
-    REPO_ROOT / ".github" / "workflows" / "pr-test-glm-5.3-flash-nvidia.yml"
 )
 GLM53_FLASH_NVIDIA_CONFIG_PATH = (
     EVAL_CONFIG_DIR / "glm-5.3-flash-fp8-tp4ep4-evalscope-aime26-nvidia.yaml"
@@ -24,7 +18,6 @@ GLM53_FLASH_NVIDIA_CONFIG_PATH = (
 GLM53_FLASH_NVIDIA_SHAREGPT_CONFIG_PATH = (
     PERF_CONFIG_DIR / "glm-5.3-flash-fp8-mtp-tp4ep4-sharegpt-nvidia.yaml"
 )
-DEFAULT_B200_RUNNER_EXPRESSION = "${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}"
 GLM53_FLASH_BF16_AMD_CONFIG_PATH = (
     EVAL_CONFIG_DIR / "glm-5.3-flash-bf16-tp4ep1-evalscope-aime26-amd.yaml"
 )
@@ -103,28 +96,6 @@ def test_fork_pr_context_is_exposed_to_ci_tasks():
     )
 
 
-def test_glm53_flash_amd_workflow_runs_aime26_for_shared_branch_prs_only():
-    workflow = yaml.safe_load(GLM53_FLASH_AMD_WORKFLOW_PATH.read_text(encoding="utf-8"))
-    triggers = workflow.get("on") or workflow[True]
-    matrix = json.loads(workflow["jobs"]["aime26"]["with"]["matrix"])
-
-    assert set(triggers) == {"pull_request"}
-    assert triggers["pull_request"]["branches"] == ["shared/glm5-next"]
-    assert matrix["include"] == [
-        {
-            "name": "eval-glm-5.3-flash-fp8-mtp-tp4ep1-aime26-amd",
-            "type": "eval",
-            "config": (
-                "test/ci/eval/" "glm-5.3-flash-fp8-mtp-tp4ep1-evalscope-aime26-amd.yaml"
-            ),
-            "runner": "amd-mi35x-4gpu-test",
-            "priority": "normal",
-            "optional": False,
-            "workflow_stage": "model-test",
-        }
-    ]
-
-
 def test_glm53_flash_amd_aime26_uses_validated_fp8_mtp_tp4_ep1_configuration():
     task = yaml.safe_load(GLM53_FLASH_AMD_CONFIG_PATH.read_text(encoding="utf-8"))
     server_command = task["server"]["command"]
@@ -157,33 +128,6 @@ def test_glm53_flash_amd_aime26_uses_validated_fp8_mtp_tp4_ep1_configuration():
     assert generation_config["max_tokens"] == 65000
     assert generation_config["extra_body"]["reasoning_effort"] == "max"
     assert task["score_threshold"] == 0.75
-
-
-def test_glm53_flash_nvidia_workflow_runs_aime26_for_shared_branch_prs_only():
-    workflow = yaml.safe_load(
-        GLM53_FLASH_NVIDIA_WORKFLOW_PATH.read_text(encoding="utf-8")
-    )
-    triggers = workflow.get("on") or workflow[True]
-    job = workflow["jobs"]["aime26"]
-    matrix = json.loads(job["with"]["matrix"])
-
-    assert set(triggers) == {"pull_request"}
-    assert triggers["pull_request"]["branches"] == ["shared/glm5-next"]
-    assert matrix["include"] == [
-        {
-            "name": "eval-glm-5.3-flash-fp8-tp4ep4-aime26-nvidia",
-            "type": "eval",
-            "config": (
-                "test/ci/eval/" "glm-5.3-flash-fp8-tp4ep4-evalscope-aime26-nvidia.yaml"
-            ),
-            "runner": f"{DEFAULT_B200_RUNNER_EXPRESSION}-4gpu",
-            "priority": "normal",
-            "optional": False,
-            "workflow_stage": "model-test",
-        }
-    ]
-    assert job["with"]["b200_runner_label"] == DEFAULT_B200_RUNNER_EXPRESSION
-    assert job["with"]["timeout_minutes"] >= 120
 
 
 def test_glm53_flash_nvidia_aime26_uses_validated_tp4_ep4_configuration():

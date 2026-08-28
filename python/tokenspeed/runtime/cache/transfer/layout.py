@@ -363,13 +363,13 @@ def combine_cache_transfer_layouts(
                 fields=fields,
             )
         )
-    target_consumers = tuple(
+    draft_consumers = tuple(
         tuple(field_id for field_id in consumer if field_id not in aliased_fields)
-        for consumer in target.consumers
+        for consumer in draft.consumers
     )
     return CacheTransferLayout(
         num_lcm_blocks=target.num_lcm_blocks,
         groups=tuple(groups),
         buffers=target.buffers,
-        consumers=target_consumers + draft.consumers,
+        consumers=target.consumers + draft_consumers,
     )

@@ -339,7 +339,7 @@ def test_aliased_target_and_draft_layout_is_transferred_once():
     assert combined.consumers == (("layer.0.k",),)
 
 
-def test_merged_owner_target_deduplicates_draft_subset():
+def test_merged_owner_keeps_aliased_field_on_target():
     buffer = object()
     target = _single_group_layout(buffer, _field("layer.0.k"), _field("layer.1.k"))
     draft = _single_group_layout(buffer, _field("layer.1.k"))
@@ -348,7 +348,7 @@ def test_merged_owner_target_deduplicates_draft_subset():
 
     assert combined.buffers == (buffer,)
     assert combined.groups == target.groups
-    assert combined.consumers == (("layer.0.k",), (), ("layer.1.k",))
+    assert combined.consumers == (("layer.0.k",), ("layer.1.k",), ())
 
 
 @pytest.mark.parametrize(
