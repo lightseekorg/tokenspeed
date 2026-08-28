@@ -29,6 +29,7 @@ namespace tokenspeed {
 namespace fsm {
 
 struct Bootstrapping;
+struct RemotePrefilling;
 
 struct BootstrappedEvent : InvalidTransitionHandler<BootstrappedEvent> {
     using InvalidTransitionHandler<BootstrappedEvent>::operator();

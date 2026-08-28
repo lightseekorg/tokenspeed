@@ -31,11 +31,13 @@
 #include "cache/coordinator/cache_coordinator.h"
 #include "fsm/base_event.h"
 #include "fsm/forward_states.h"
+// The D and P role grammars schedule INTO the PD parking states
+// (RemotePrefilling, PrefillAwaitingResult), so the forward events name them
+// in their transition signatures.
+#include "fsm/pd_states.h"
 #include "utils.h"
 
 namespace tokenspeed::fsm {
-
-struct Bootstrapping;
 
 struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefillFirstChunkEvent> {
     using InvalidTransitionHandler<SchedulePrefillFirstChunkEvent>::operator();
