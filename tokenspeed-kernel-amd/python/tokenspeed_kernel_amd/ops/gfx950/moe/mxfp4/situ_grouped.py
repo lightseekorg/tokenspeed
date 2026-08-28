@@ -46,7 +46,7 @@ _MXFP4_GROUP_SIZE_GL = gl.constexpr(32)
 # Each stage tuple is (BLOCK_N, BLOCK_K, subgroup count). BM128 retains the
 # original configuration: its larger row tile already amortizes weight traffic,
 # and increasing BLOCK_K loses once many experts execute concurrently.
-_GROUPED_GEMM_CONFIGS = {
+_GROUPED_SITU_GEMM_CONFIGS = {
     16: ((32, 128, 4), (128, 128, 4)),
     32: ((64, 128, 4), (128, 128, 4)),
     64: ((64, 128, 8), (128, 128, 8)),
@@ -792,7 +792,9 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
     ):
         raise ValueError("W2 scale shape mismatch")
     gemm_configs = (
-        _GROUPED_GEMM_CONFIGS if activation == "situ" else _GROUPED_SWIGLU_GEMM_CONFIGS
+        _GROUPED_SITU_GEMM_CONFIGS
+        if activation == "situ"
+        else _GROUPED_SWIGLU_GEMM_CONFIGS
     )
     if hidden_dim % 256 or intermediate % 128 or block_m not in gemm_configs:
         supported_block_m = ", ".join(str(value) for value in gemm_configs)
