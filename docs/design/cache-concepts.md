@@ -195,6 +195,15 @@ window, state checkpoints) are the norm, not the exception. A backend's
 override, never from `prefix_granularity` as a fallback. The CLI flag is
 `--prefix-granularity` (`--block-size` remains a deprecated alias).
 
+Layerwise L2 load fences guard the first access to every field owned by a
+layer, not just the conventional paged-KV buffers. Model-owned side caches
+(for example QSA raw/compressed keys and positions, or PLE state) must wait on
+the pool's layerwise load tracker before their first read or write. A wait in a
+later attention-buffer accessor is too late: the side-cache kernels would
+already be racing the asynchronous H2D restore. Place the fence immediately
+before the first cache-field access so independent projections can still
+overlap the load.
+
 ## block vs. page
 
 **`block` is the general concept; `page` is its specialization under

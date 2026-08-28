@@ -677,7 +677,11 @@ class QSAIndexer(nn.Module):
             query_lengths=query_lengths,
         )
         q, token_k = self._project_qk(hidden_states, positions)
-        _, compressed, _ = self._fields(ctx.token_to_kv_pool)
+        pool = ctx.token_to_kv_pool
+        load_tracker = getattr(pool, "layerwise_load_tracker", None)
+        if load_tracker is not None:
+            load_tracker.wait_for_layer(self.layer_id)
+        _, compressed, _ = self._fields(pool)
         full_backend = self._full_backend(ctx)
         verify_bs = ctx.bs - ctx.num_extends
         is_target_verify = (
@@ -750,7 +754,7 @@ class QSAIndexer(nn.Module):
             requests,
             qsa_locs,
             recent_locs,
-            ctx.token_to_kv_pool,
+            pool,
             recent_request_limit=ctx.num_extends if is_target_verify else None,
             write_mask=write_mask,
             draft_scratch=draft_scratch if is_draft_decode_step else None,
@@ -766,7 +770,7 @@ class QSAIndexer(nn.Module):
                 logical[-verify_tokens:],
                 recent_locs[-verify_tokens:],
                 verify_bs,
-                ctx.token_to_kv_pool,
+                pool,
             )
         if self.share_topk_for_mtp_iteration:
             shared_topk = getattr(ctx, "dsa_decode_topk", None)

@@ -462,6 +462,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
     rows = torch.tensor([[3, 1, -1], [5, 2, 0]], dtype=torch.int32)
     indexer = QSAIndexer.__new__(QSAIndexer)
     torch.nn.Module.__init__(indexer)
+    indexer.layer_id = 3
     indexer.share_topk_for_mtp_iteration = True
     indexer.compressed_token_page_size = 256
     indexer.recent_page_size = 64
@@ -478,6 +479,12 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
     requests = torch.tensor([0, 1])
     cache_locs = torch.tensor([1, 2], dtype=torch.int32)
     updates = []
+    cache_accesses = []
+    pool = SimpleNamespace(
+        layerwise_load_tracker=SimpleNamespace(
+            wait_for_layer=lambda layer_id: cache_accesses.append(("wait", layer_id))
+        )
+    )
 
     indexer._metadata = lambda ctx: metadata
     indexer._decode_query_lengths = lambda ctx, total_tokens: None
@@ -486,7 +493,13 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
         torch.zeros((2, 1, 1)),
         torch.ones((2, 1, 1)),
     )
-    indexer._fields = lambda pool: (None, torch.empty(0), None)
+
+    def fields(actual_pool):
+        assert actual_pool is pool
+        cache_accesses.append(("fields", indexer.layer_id))
+        return None, torch.empty(0), None
+
+    indexer._fields = fields
     indexer._full_backend = lambda ctx: backend
     indexer._backend_group_page_size = lambda *args: 64
     indexer._page_table_expansion = lambda *args: 1
@@ -506,7 +519,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
         num_extends=2,
         forward_mode=ForwardMode.EXTEND,
         attn_backend=backend,
-        token_to_kv_pool=object(),
+        token_to_kv_pool=pool,
         dsa_decode_topk=None,
     )
 
@@ -514,6 +527,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
 
     torch.testing.assert_close(actual, rows)
     torch.testing.assert_close(ctx.dsa_decode_topk, rows)
+    assert cache_accesses == [("wait", 3), ("fields", 3)]
     assert len(updates) == 1
     assert len(selections) == 1
 
@@ -524,6 +538,12 @@ def test_qwen4_exp_qsa_publishes_and_reuses_context_topk() -> None:
     actual = indexer(torch.zeros((2, 4)), torch.tensor([9, 10]), ctx)
 
     torch.testing.assert_close(actual, rows)
+    assert cache_accesses == [
+        ("wait", 3),
+        ("fields", 3),
+        ("wait", 3),
+        ("fields", 3),
+    ]
     assert len(updates) == 2
 
 
