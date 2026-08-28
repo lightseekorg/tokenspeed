@@ -268,12 +268,13 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                     f"{path}: multi-node Slurm tasks must have type 'eval' or 'perf'"
                 )
             if len(data["triggers"]) != 1 or data["triggers"][0] not in {
+                "nightly",
                 "per-commit",
                 "slurm",
             }:
                 raise ValueError(
                     f"{path}: multi-node Slurm tasks must use exactly one of the "
-                    "'per-commit' or 'slurm' triggers"
+                    "'nightly', 'per-commit', or 'slurm' triggers"
                 )
             if not all(label.startswith("slurm-") for label in labels):
                 raise ValueError(

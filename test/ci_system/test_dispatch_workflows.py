@@ -360,6 +360,102 @@ def test_kimi_k3_nvfp4_gb300_uses_pinned_local_models():
     assert dspark["env"]["TOKENSPEED_DFLASH_AUX_STREAM"] == "attn_res"
 
 
+def test_gb300_slurm_nightly_workflow_is_scheduled_and_isolated():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/gb300-slurm-nightly.yml")
+    triggers = workflow.get("on") or workflow.get(True)
+    scan = workflow["jobs"]["scan"]
+    submit = workflow["jobs"]["submit"]
+    gate = next(
+        step for step in scan["steps"] if step.get("name") == "Check trusted source"
+    )
+    matrix_step = next(
+        step
+        for step in scan["steps"]
+        if step.get("name") == "Build nightly GB300 task matrix"
+    )
+    submit_script = next(
+        step["run"]
+        for step in submit["steps"]
+        if step.get("name") == "Submit and wait for nightly GB300 Slurm task"
+    )
+    checkout = next(
+        step for step in submit["steps"] if step.get("name") == "Checkout dispatcher"
+    )
+
+    assert set(triggers) == {"schedule", "workflow_dispatch"}
+    assert triggers["schedule"] == [{"cron": "17 18 * * *"}]
+    assert "github.repository == 'lightseekorg/tokenspeed'" in gate["env"]["ALLOWED"]
+    assert "vars.TOKENSPEED_CI_REPOSITORY" in gate["env"]["ALLOWED"]
+    assert "github.ref == 'refs/heads/main'" in gate["env"]["ALLOWED"]
+    assert gate["env"]["ENABLED"] == (
+        "${{ vars.TOKENSPEED_CI_GB300_SLURM_NIGHTLY_ENABLED == 'true' }}"
+    )
+    gate_condition = (
+        "steps.gate.outputs.allowed == 'true' && "
+        "steps.gate.outputs.enabled == 'true'"
+    )
+    for step_name in (
+        "Checkout code",
+        "Install scan dependency",
+        "Build nightly GB300 task matrix",
+    ):
+        step = next(step for step in scan["steps"] if step.get("name") == step_name)
+        assert step["if"] == gate_condition
+    assert workflow["concurrency"] == {
+        "group": "gb300-slurm-nightly",
+        "cancel-in-progress": False,
+    }
+    assert submit["name"] == "${{ matrix.name }}"
+    assert submit["runs-on"] == "slurm-dispatch-gb300"
+    assert "needs.scan.outputs.allowed == 'true'" in submit["if"]
+    assert "needs.scan.outputs.enabled == 'true'" in submit["if"]
+    assert "needs.scan.outputs.has_tasks == 'true'" in submit["if"]
+    assert "--trigger nightly" in matrix_step["run"]
+    assert "--runner-group nvidia-arm" in matrix_step["run"]
+    assert "--workflow-stage model-test" in matrix_step["run"]
+    assert "--multi-node only" in matrix_step["run"]
+    assert "startswith('slurm-gb300-')" in matrix_step["run"]
+    assert '--runner "$RUNNER"' in submit_script
+    assert "--source-pr" not in submit_script
+    assert "secrets.HF_TOKEN" not in str(submit)
+    assert "unset HF_TOKEN HUGGING_FACE_HUB_TOKEN" in submit_script
+    scan_checkout = next(
+        step for step in scan["steps"] if step.get("name") == "Checkout code"
+    )
+    assert scan_checkout["with"]["ref"] == "${{ github.sha }}"
+    assert scan_checkout["with"]["persist-credentials"] is False
+    assert checkout["with"]["ref"] == "${{ github.sha }}"
+    assert checkout["with"]["fetch-depth"] == 0
+    assert checkout["with"]["persist-credentials"] is False
+
+
+def test_gb300_slurm_nightly_matrix_selects_kimi_k3_vision_tasks(monkeypatch):
+    monkeypatch.delenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", raising=False)
+
+    matrix = build_matrix(
+        REPO_ROOT / "test/ci",
+        REPO_ROOT,
+        trigger="nightly",
+        runner_group="nvidia-arm",
+        workflow_stage="model-test",
+        multi_node="only",
+    )
+
+    assert {(entry["config"], entry["runner"]) for entry in matrix["include"]} == {
+        (
+            "test/ci/eval/"
+            "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-mmmu-pro-vision-"
+            "gb300-slurm.yaml",
+            "slurm-gb300-4gpu",
+        ),
+        (
+            "test/ci/eval/"
+            "kimi-k3-mxfp4-dspark-tp8-two-node-kvv-ocr-bench-gb300-slurm.yaml",
+            "slurm-gb300-4gpu",
+        ),
+    }
+
+
 def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
     workflow = load_yaml(REPO_ROOT / ".github/workflows/gb300-slurm-per-commit.yml")
     triggers = workflow.get("on") or workflow.get(True)

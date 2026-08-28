@@ -1,0 +1,129 @@
+name: GB300 Slurm Nightly
+
+on:
+  schedule:
+    - cron: "17 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gb300-slurm-nightly
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      has_tasks: ${{ steps.matrix.outputs.has_tasks }}
+      allowed: ${{ steps.gate.outputs.allowed }}
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - name: Check trusted source
+        id: gate
+        env:
+          ALLOWED: ${{ (github.repository == 'lightseekorg/tokenspeed' || github.repository == vars.TOKENSPEED_CI_REPOSITORY) && github.ref == 'refs/heads/main' }}
+          ENABLED: ${{ vars.TOKENSPEED_CI_GB300_SLURM_NIGHTLY_ENABLED == 'true' }}
+        run: |
+          echo "allowed=$ALLOWED" >> "$GITHUB_OUTPUT"
+          echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
+          if [ "$ALLOWED" != true ]; then
+            echo "GB300 Slurm nightly runs only from main in lightseekorg/tokenspeed or the configured TOKENSPEED_CI_REPOSITORY." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$ENABLED" != true ]; then
+            echo "GB300 Slurm nightly submission is disabled; set TOKENSPEED_CI_GB300_SLURM_NIGHTLY_ENABLED=true to enable it." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Checkout code
+        if: steps.gate.outputs.allowed == 'true' && steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install scan dependency
+        if: steps.gate.outputs.allowed == 'true' && steps.gate.outputs.enabled == 'true'
+        run: |
+          for i in 1 2 3 4 5; do
+            python3 -m pip install pyyaml && exit 0
+            echo "pyyaml install attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          exit 1
+
+      - name: Build nightly GB300 task matrix
+        if: steps.gate.outputs.allowed == 'true' && steps.gate.outputs.enabled == 'true'
+        id: matrix
+        run: |
+          matrix=$(python3 test/ci_system/pipeline.py scan \
+            --root test/ci \
+            --trigger nightly \
+            --runner-group nvidia-arm \
+            --workflow-stage model-test \
+            --multi-node only)
+          matrix=$(printf '%s' "$matrix" | python3 -c \
+            "import json, sys; data=json.load(sys.stdin); data['include']=[item for item in data.get('include', []) if item['runner'].startswith('slurm-gb300-')]; print(json.dumps(data, separators=(',', ':')))")
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          printf '%s' "$matrix" | python3 -c \
+            "import json, sys; print('has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" \
+            >> "$GITHUB_OUTPUT"
+
+  submit:
+    name: ${{ matrix.name }}
+    needs: scan
+    if: |
+      needs.scan.outputs.allowed == 'true' &&
+      needs.scan.outputs.enabled == 'true' &&
+      needs.scan.outputs.has_tasks == 'true'
+    runs-on: slurm-dispatch-gb300
+    timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.scan.outputs.matrix || '{"include":[]}') }}
+    steps:
+      - name: Checkout dispatcher
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Submit and wait for nightly GB300 Slurm task
+        env:
+          CONFIG: ${{ matrix.config }}
+          RUNNER: ${{ matrix.runner }}
+          TASK_TYPE: ${{ matrix.type }}
+        run: |
+          set -euo pipefail
+          unset HF_TOKEN HUGGING_FACE_HUB_TOKEN
+          case "$RUNNER" in
+            slurm-gb300-*) ;;
+            *) echo "Unsupported GB300 Slurm runner: $RUNNER" >&2; exit 2 ;;
+          esac
+          coordinator_user=${USER:-$(id -un)}
+          export TS_CI_ARTIFACT_ROOT="/data/home/$coordinator_user/tokenspeed-slurm"
+          export TS_CI_CACHE_DIR="/data/home/$coordinator_user/tokenspeed-cache"
+          exec test/ci/run_slurm.sh \
+            --config "$CONFIG" \
+            --runner "$RUNNER" \
+            --type "$TASK_TYPE" \
+            --wait \
+            --report-dir "$RUNNER_TEMP/slurm-report"
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/slurm-report/summary.md" ]; then
+            cat "$RUNNER_TEMP/slurm-report/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Slurm dispatcher exited before producing a report." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Slurm results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gb300-slurm-nightly-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/slurm-report
+          if-no-files-found: warn

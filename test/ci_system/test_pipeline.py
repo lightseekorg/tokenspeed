@@ -267,6 +267,9 @@ def test_multi_node_slurm_task_validation():
     task["triggers"] = ["per-commit"]
     validate_task(task, Path("task.yaml"))
 
+    task["triggers"] = ["nightly"]
+    validate_task(task, Path("task.yaml"))
+
     task["triggers"] = ["manual"]
     with pytest.raises(ValueError, match="exactly one"):
         validate_task(task, Path("task.yaml"))

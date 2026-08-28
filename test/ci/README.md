@@ -9,6 +9,7 @@ Current trigger values:
 - `manual`
 - `nightly`
 - `debug`
+- `slurm`
 
 Supported task types:
 
@@ -146,9 +147,10 @@ slurm:
   gpus_per_node: 4
 ```
 
-Multi-node tasks must use only the `slurm` trigger and a `slurm-*` runner label,
-so GitHub runner matrices cannot select them accidentally. The GPU count in the
-label must equal `slurm.gpus_per_node`.
+Multi-node tasks must use exactly one of the `nightly`, `per-commit`, or `slurm`
+triggers and a `slurm-*` runner label, so only their dedicated workflow or the
+manual Slurm dispatcher can select them. The GPU count in the label must equal
+`slurm.gpus_per_node`.
 
 For a multi-node task, the generated batch script extracts the committed source
 snapshot into a server workspace on every node and a separate client workspace
@@ -257,8 +259,8 @@ existing `slurm-dispatch` coordinator and runner defaults. `gb300` is an
 explicit opt-in: select one YAML that declares exactly one `gb300-Ngpu` or
 `slurm-gb300-Ngpu` label. The workflow passes that label through unchanged and
 validates any explicit runner selection against it. Five
-`slurm-dispatch-gb300` coordinators form one shared pool for manual and
-per-commit submissions. GB300 perf tasks are disabled until GB300-specific
+`slurm-dispatch-gb300` coordinators form one shared pool for manual, nightly,
+and per-commit submissions. GB300 perf tasks are disabled until GB300-specific
 reference values are measured.
 
 The `GB300 Slurm Per Commit` workflow selects only multi-node model tasks with
@@ -279,14 +281,22 @@ cannot filter the multi-node matrix here. During this workflow's
 bootstrap only, leave the switch unset; after dispatcher support reaches
 `main`, set it to `true` and re-run the merge commit's workflow.
 
+The `GB300 Slurm Nightly` workflow runs every day at 18:17 UTC and can also be
+started manually from `main`. It selects only multi-node model tests with the
+`nightly` trigger, then restricts the generated matrix to `slurm-gb300-*`
+runners before submitting through the GB300 coordinator pool. The runner filter
+keeps future GB200 nightly tasks out of the GB300 workflow. Submission is
+fail-closed until `TOKENSPEED_CI_GB300_SLURM_NIGHTLY_ENABLED` is set to `true`;
+this switch is independent of the per-commit workflow's enable variable.
+
 The two-node Kimi K3 tasks declare `slurm-gb300-4gpu`, `slurm.nodes: 2`, and
 `slurm.gpus_per_node: 4`. The runner label describes GPUs per node, while the
 Slurm topology fields describe the allocation. The NVFP4 DSpark task pairs the
 pinned `nvidia/Kimi-K3-NVFP4` target with `Inferact/Kimi-K3-DSpark` and
 preserves the draft checkpoint's required `attn_res` auxiliary stream.
-The MXFP4 DSpark OCRBench and MMMU-Pro Vision tasks are manual-only baselines
-that use a pinned Kimi Vendor Verifier revision; select either YAML through
-`Slurm Dispatch` with the `gb300` cluster.
+The MXFP4 DSpark OCRBench and MMMU-Pro Vision tasks are nightly baselines that
+use a pinned Kimi Vendor Verifier revision. Either YAML can still be rerun
+explicitly through `Slurm Dispatch` with the `gb300` cluster.
 
 GB200 examples:
 
