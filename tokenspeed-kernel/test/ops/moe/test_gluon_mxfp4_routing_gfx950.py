@@ -291,6 +291,35 @@ def test_sigmoid_bias_topk_route_gluon_matches_bf16_e384(
     torch.testing.assert_close(actual_weights, expected_weights, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 8, 9, 13, 16])
+def test_sigmoid_bias_topk_route_gluon_matches_v9_shapes(
+    num_tokens: int,
+) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(4900 + num_tokens)
+    logits = torch.randn(
+        (num_tokens, 288),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    correction_bias = (
+        torch.randn(288, device="cuda", dtype=torch.float32, generator=generator) * 0.01
+    )
+    expected_weights, expected_ids = _route_reference(logits, correction_bias)
+
+    actual_ids, actual_weights = invoke_sigmoid_bias_topk_route_gluon(
+        logits,
+        correction_bias,
+        8,
+        routed_scaling_factor=2.827,
+        normalize_topk_weights=True,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual_ids, expected_ids, atol=0, rtol=0)
+    torch.testing.assert_close(actual_weights, expected_weights, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("dtype", _ROUTE_DTYPES)
 def test_sigmoid_bias_topk_route_gluon_handles_strided_inputs(
     dtype: torch.dtype,
@@ -472,6 +501,57 @@ def test_sigmoid_bias_topk_route_gluon_graph_replay_uses_updated_inputs(
         correction_bias,
         routed_scaling_factor=2.0,
     )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(graph_ids, expected_ids, atol=0, rtol=0)
+    torch.testing.assert_close(graph_weights, expected_weights, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("num_tokens", [3, 13])
+def test_sigmoid_bias_topk_route_gluon_v9_graph_replay_uses_updated_inputs(
+    num_tokens: int,
+) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(5700 + num_tokens)
+    logits = torch.randn(
+        (num_tokens, 288),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    correction_bias = (
+        torch.randn(288, device="cuda", dtype=torch.float32, generator=generator) * 0.01
+    )
+    invoke_sigmoid_bias_topk_route_gluon(
+        logits,
+        correction_bias,
+        8,
+        routed_scaling_factor=2.827,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_ids, graph_weights = invoke_sigmoid_bias_topk_route_gluon(
+            logits,
+            correction_bias,
+            8,
+            routed_scaling_factor=2.827,
+            normalize_topk_weights=True,
+        )
+
+    replacement_logits = torch.randn(
+        logits.shape,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    replacement_bias = (
+        torch.randn(288, device="cuda", dtype=torch.float32, generator=generator) * 0.01
+    )
+    logits.copy_(replacement_logits)
+    correction_bias.copy_(replacement_bias)
+    expected_weights, expected_ids = _route_reference(logits, correction_bias)
     graph.replay()
     torch.cuda.synchronize()
 
