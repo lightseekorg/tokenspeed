@@ -42,8 +42,20 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_fused import (
 
 MXFP4_GROUP_SIZE = 32
 _MXFP4_GROUP_SIZE_GL = gl.constexpr(32)
-GROUPED_BLOCK_M = 64
-GROUPED_FUSED_ALIGN_MAX_ROUTES = 128
+# K3 EP8 full-grid profiling tunes W13 and W2 independently for each row tile.
+# Each stage tuple is (BLOCK_N, BLOCK_K, subgroup count). BM128 retains the
+# original configuration: its larger row tile already amortizes weight traffic,
+# and increasing BLOCK_K loses once many experts execute concurrently.
+_GROUPED_GEMM_CONFIGS = {
+    16: ((32, 128, 4), (128, 128, 4)),
+    32: ((64, 128, 4), (128, 128, 4)),
+    64: ((64, 128, 8), (128, 128, 8)),
+    128: ((64, 64, 8), (128, 64, 4)),
+}
+_GROUPED_SWIGLU_GEMM_CONFIGS = {
+    64: ((64, 64, 4), (128, 64, 4)),
+    128: ((64, 64, 8), (128, 64, 4)),
+}
 # Atomic combine's cost hardly depends on the batch size at all.  The list of
 # (token, expert) pairs is padded out to a full GROUPED_BLOCK_M-row block per
 # expert, so with 112 experts it is ~7168 rows even for a single token.
@@ -717,9 +729,9 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
     *,
     situ_beta: float,
     situ_linear_beta: float | None,
+    block_m: int,
     activation: str = "situ",
     swiglu_limit: float | None = None,
-    block_m: int | None = None,
     expert_start: int = 0,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -729,6 +741,8 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
     the first expert represented by the local weight tensors; non-local routes
     are discarded by alignment and reduction kernels. ``activation="swiglu"``
     selects standard alpha=1, beta=0 SwiGLU with an optional clamp.
+    ``block_m`` is shared by route alignment, W13, and W2; the two GEMMs
+    independently choose their output-column tiles for that row tile.
     """
     if hidden_states.dtype != torch.bfloat16 or hidden_states.ndim != 2:
         raise ValueError("grouped gfx950 A16W4 requires rank-2 BF16 activations")
@@ -758,10 +772,6 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
         or not out.is_contiguous()
     ):
         raise ValueError("output must match the hidden-state shape, dtype, and device")
-    if block_m is None:
-        # Sparse EP padding dominates until each rank owns roughly 7k routes.
-        # Keep BM64 below M=3584; BM128 then amortizes launch/grid overhead.
-        block_m = 128 if num_tokens >= 3584 else GROUPED_BLOCK_M
     num_experts, two_intermediate, packed_hidden = w13_weight.shape
     intermediate = two_intermediate // 2
     top_k = int(local_topk_ids.shape[1])
@@ -781,16 +791,21 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
         intermediate // MXFP4_GROUP_SIZE,
     ):
         raise ValueError("W2 scale shape mismatch")
-    if hidden_dim % 256 or intermediate % 128 or block_m not in (64, 128):
+    gemm_configs = (
+        _GROUPED_GEMM_CONFIGS if activation == "situ" else _GROUPED_SWIGLU_GEMM_CONFIGS
+    )
+    if hidden_dim % 256 or intermediate % 128 or block_m not in gemm_configs:
+        supported_block_m = ", ".join(str(value) for value in gemm_configs)
         raise ValueError(
             "grouped gfx950 A16W4 requires hidden_dim divisible by 256, "
-            "intermediate divisible by 128, and block_m in {64, 128}"
+            "intermediate divisible by 128, and block_m in "
+            f"{{{supported_block_m}}} for {activation}"
         )
 
     num_routes = num_tokens * top_k
     align = (
         moe_align_block_size_fused
-        if (0 < num_routes <= GROUPED_FUSED_ALIGN_MAX_ROUTES and num_tokens <= block_m)
+        if activation == "swiglu" and 0 < num_routes <= 128 and num_tokens <= block_m
         else moe_align_block_size_device
     )
     sorted_ids, sorted_experts, sorted_weights, num_valid = align(
@@ -807,9 +822,10 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
         device=hidden_states.device,
     )
 
-    s1_block_n = 64
-    s1_block_k = 64
-    s1_warps = {64: 4, 128: 8}[block_m]
+    # W13 and W2 consume the same aligned row list but use independently tuned
+    # output-column, reduction, and subgroup geometry.
+    stage1_config, stage2_config = gemm_configs[block_m]
+    s1_block_n, s1_block_k, s1_warps = stage1_config
     s1_grid = triton.cdiv(em, block_m) * triton.cdiv(intermediate, s1_block_n)
     _grouped_a16w4_situ_stage1_kernel[(s1_grid,)](
         hidden_states,
@@ -862,9 +878,7 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
             device=hidden_states.device,
         )
         stage2_strides = stage2_out.stride()
-    s2_block_n = 128
-    s2_block_k = 64
-    s2_warps = 4
+    s2_block_n, s2_block_k, s2_warps = stage2_config
     s2_grid = triton.cdiv(em, block_m) * triton.cdiv(hidden_dim, s2_block_n)
     _grouped_a16w4_stage2_kernel[(s2_grid,)](
         inter,

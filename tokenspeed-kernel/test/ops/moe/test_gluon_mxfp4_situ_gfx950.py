@@ -310,6 +310,7 @@ def test_grouped_atomic_combine_matches_partial_reduction_gfx950(
             topk_ids,
             situ_beta=4.0,
             situ_linear_beta=25.0,
+            block_m=64,
             expert_start=0,
         )
 
@@ -595,7 +596,7 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     ).clone()
-    assert bool(grouped_calls) == (num_tokens > 16)
+    assert bool(grouped_calls) == (num_tokens >= 16)
     output = torch.empty_like(hidden_states)
     module._situ_output_buffer = output
 

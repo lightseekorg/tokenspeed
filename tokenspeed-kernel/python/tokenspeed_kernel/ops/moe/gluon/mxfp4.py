@@ -31,7 +31,32 @@ from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
+_ROUTE_DIRECT_DECODE_MAX_TOKENS = 16
 _GFX1250_DECODE_MAX_AVERAGE_BPE = 16
+
+
+def _select_gfx950_grouped_block_m(
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+) -> int:
+    """Select the MI350X-tuned grouped-MoE row block."""
+
+    if num_tokens < 0:
+        raise ValueError("num_tokens must be non-negative")
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    if num_experts <= 0:
+        raise ValueError("num_experts must be positive")
+
+    routed_rows_x7 = 7 * num_tokens * top_k
+    if routed_rows_x7 < 65 * num_experts:
+        return 16
+    if routed_rows_x7 < 215 * num_experts:
+        return 32
+    if routed_rows_x7 < 425 * num_experts:
+        return 64
+    return 128
 
 
 def _use_gfx1250_moe_decode(num_routed_rows: int, num_experts: int) -> bool:
@@ -144,13 +169,16 @@ if platform.is_amd:
             gluon_a16w4_warp_decode_ep_gfx950,
         )
 
-        if _supports_a16w4_warp_decode_ep_gfx950(
+        use_route_direct_decode = _supports_a16w4_warp_decode_ep_gfx950(
             x,
             w.w13_weight,
             w.w13_weight_scale,
             w.w2_weight,
             w.w2_weight_scale,
-        ):
+        ) and (
+            activation != "situ" or int(x.shape[0]) < _ROUTE_DIRECT_DECODE_MAX_TOKENS
+        )
+        if use_route_direct_decode:
             # Both stages localize global expert IDs while consuming the linear
             # checkpoint layout, avoiding four pointwise localization kernels.
             return gluon_a16w4_warp_decode_ep_gfx950(
@@ -169,6 +197,22 @@ if platform.is_amd:
                 routed_out=output,
                 **activation_kwargs,
             )
+        global_num_experts = int(
+            getattr(
+                w,
+                "num_experts",
+                num_local_experts * int(getattr(w, "ep_size", 1)),
+            )
+        )
+        block_m = (
+            _select_gfx950_grouped_block_m(
+                int(x.shape[0]),
+                int(topk_ids.shape[1]),
+                global_num_experts,
+            )
+            if activation == "situ"
+            else (128 if int(x.shape[0]) >= 3584 else 64)
+        )
         grouped_kernel = (
             gluon_a16w4_situ_grouped_ep_gfx950
             if activation == "situ"
@@ -182,6 +226,7 @@ if platform.is_amd:
             w.w2_weight_scale,
             topk_weights,
             topk_ids,
+            block_m=block_m,
             expert_start=expert_start,
             out=output,
             **activation_kwargs,
