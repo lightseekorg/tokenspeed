@@ -482,8 +482,8 @@ class PrefillGraph:
         The prefill analogue of decode's ``_init_capture_metadata``. KV writes
         go to the reserved dummy slot. Per-group tables use page 0 when a
         backend permits the null page for capture and page 1 when active
-        metadata requires a real writable page. Backends with extra paged
-        caches (DeepSeek-V4 DSA: SWA + compressor + indexer state) need every
+        metadata requires a real writable page. Backends with extra cache
+        groups (DeepSeek-V4 DSA: SWA + compressor + indexer state) need every
         group table, or their extend metadata is incomplete.
         """
         ib = self.input_buffers

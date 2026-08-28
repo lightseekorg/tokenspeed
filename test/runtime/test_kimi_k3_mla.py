@@ -1,4 +1,4 @@
-"""Kimi-K3 MLA attention on the paged-cache full-attention table.
+"""Kimi-K3 MLA attention on the cache-group full-attention table.
 
 Coverage:
 

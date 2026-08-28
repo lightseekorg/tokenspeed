@@ -135,7 +135,7 @@ class AttentionBackend(ABC):
 
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
         """Per-group write-location hook for out-of-backend KV writers
-        (fused RoPE prewrite); identity for backends without paged cache
+        (fused RoPE prewrite); identity for backends without cache
         groups (see uses_cache_groups). ``forward_mode`` picks the
         metadata slot for backends that prewrite on extend as well."""
         return out_cache_loc

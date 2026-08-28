@@ -2313,7 +2313,7 @@ class DeepseekV4Compressor(nn.Module):
             else:
                 if state_block_table is None:
                     raise RuntimeError(
-                        "DeepSeek V4 missing paged-cache block table for compressor "
+                        "DeepSeek V4 missing cache-group block table for compressor "
                         f"state ratio={self.compress_ratio}"
                     )
                 state_slot_mapping = _group_slot_mapping_from_raw(
@@ -2850,7 +2850,7 @@ class DeepseekV4Indexer(nn.Module):
             )
             if indexer_state_block_table is None:
                 raise RuntimeError(
-                    "DeepSeek V4 missing paged-cache block table for indexer "
+                    "DeepSeek V4 missing cache-group block table for indexer "
                     "compressor state"
                 )
             indexer_state_block_size = pool.get_indexer_state_block_size(layer_index)
@@ -3183,7 +3183,7 @@ class DeepseekV4Attention(nn.Module):
     ) -> torch.Tensor:
         """DSA attention, one COARSE breakable-graph break point.
 
-        Per layer it does multiple paged-cache writes (SWA / compressor /
+        Per layer it does multiple cache-group writes (SWA / compressor /
         indexer), a data/length-dependent indexer -> top-k stage, the FlashMLA
         sparse kernel, AND aux-stream forks -- none capturable into a CUDA
         graph. Under a prefill-graph capture the whole attention runs eager
@@ -3291,7 +3291,7 @@ class DeepseekV4Attention(nn.Module):
 
         # --- Phase 2: state-update + cache-write overlap ---
         # With GEMMs already done, the remaining work per stream is lightweight
-        # state updates and paged cache writes — safe to overlap.
+        # state updates and cache-group writes — safe to overlap.
         topk_indices = None
         if self.indexer is not None:
             if self.compressor is None:

@@ -182,7 +182,7 @@ class CacheBatchMetadata:
     def _validate_active_forward_op(self, active_forward_op: Any) -> None:
         if active_forward_op is not self._forward_op:
             raise RuntimeError(
-                "stale paged cache metadata does not match the active forward operation"
+                "stale cache metadata does not match the active forward operation"
             )
 
     def tables(self, *, active_forward_op: Any) -> Mapping[str, torch.Tensor]:

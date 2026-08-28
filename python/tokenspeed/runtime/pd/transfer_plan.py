@@ -93,7 +93,7 @@ class _RankPartition:
 
 
 class CacheTransferPlanner:
-    """Plan model-neutral dense Paged-cache fields across unequal TP sizes."""
+    """Plan model-neutral dense cache fields across unequal TP sizes."""
 
     def __init__(
         self,
@@ -115,10 +115,10 @@ class CacheTransferPlanner:
                 None plans every field (no PP).
         """
         if prefill_tp_size <= 0 or decode_tp_size <= 0:
-            raise UnsupportedPDLayoutError("Paged cache TP sizes must be positive")
+            raise UnsupportedPDLayoutError("Cache TP sizes must be positive")
         if prefill_tp_size > MAX_CACHE_TP_SIZE or decode_tp_size > MAX_CACHE_TP_SIZE:
             raise UnsupportedPDLayoutError(
-                f"Paged cache TP sizes cannot exceed {MAX_CACHE_TP_SIZE}"
+                f"Cache TP sizes cannot exceed {MAX_CACHE_TP_SIZE}"
             )
         self.prefill_tp_size = prefill_tp_size
         self.decode_tp_size = decode_tp_size
@@ -175,7 +175,7 @@ class CacheTransferPlanner:
         target_ranks = tuple(fragments_by_rank)
         if not target_ranks:
             raise UnsupportedPDLayoutError(
-                f"Paged cache decode TP rank {decode_tp_rank} has no source fragments"
+                f"Cache-transfer decode TP rank {decode_tp_rank} has no source fragments"
             )
         return RankTransferPlan(
             fragments_by_prefill_rank=fragments_by_rank,
@@ -188,7 +188,7 @@ class CacheTransferPlanner:
             or prefill_segment.payload_bytes != decode_segment.payload_bytes
         ):
             raise UnsupportedPDLayoutError(
-                f"equal-TP Paged cache field {field!r} rank-local geometry differs"
+                f"equal-TP cache field {field!r} rank-local geometry differs"
             )
         partition = self._partitions[prefill_segment.field_id]
         if partition is None:
@@ -330,7 +330,7 @@ class CacheTransferPlanner:
         distinct_shards = global_extent // local_extent
         if distinct_shards > tp_size or tp_size % distinct_shards:
             raise UnsupportedPDLayoutError(
-                f"Paged cache field {segment.field_id!r} cannot map global "
+                f"Cache field {segment.field_id!r} cannot map global "
                 f"extent {global_extent} and local extent {local_extent} to TP={tp_size}"
             )
         replica_group_size = tp_size // distinct_shards

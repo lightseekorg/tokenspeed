@@ -83,7 +83,7 @@ class CuteDSLMLAPrefillMetadata:
     max_seq_len: int
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
-    # Paged cache only: absolute latent write locations for the extend tokens,
+    # Cache-group path only: absolute latent write locations for the extend tokens,
     # flattened in q/k/v token order (positions [prefix, seq) per request).
     group_out_cache_loc: torch.Tensor | None = None
 
@@ -94,7 +94,7 @@ class CuteDSLMLADecodeMetadata:
     block_kv_indices: torch.Tensor | None = None
     max_seq_len_k: int | None = None
     seq_lens_k: torch.Tensor | None = None
-    # Paged cache only: absolute latent write locations, group_q_len_per_req
+    # Cache-group path only: absolute latent write locations, group_q_len_per_req
     # entries per batch row. Mixed-batch decode skips whole prefill windows.
     group_out_cache_loc: torch.Tensor | None = None
     group_q_len_per_req: int = 1
@@ -118,7 +118,7 @@ class CuteDSLMLABackend(AttentionBackend):
     def __init__(self, config: MLAConfig):
         super().__init__(config)
 
-        # Latched the first time paged cache metadata arrives. Once bound, a
+        # Latched the first time cache metadata arrives. Once bound, a
         # forward without cache metadata is a hard error: the cache contract
         # forbids falling back to legacy page_table metadata.
         self._cache_groups_bound = False
@@ -259,7 +259,7 @@ class CuteDSLMLABackend(AttentionBackend):
 
         return block_kv_indices
 
-    # ---- Paged cache full-attention-table metadata ----
+    # ---- Cache-group full-attention-table metadata ----
 
     def _resolve_full_history_table(
         self, cache_metadata, forward_batch, bs: int
@@ -403,11 +403,11 @@ class CuteDSLMLABackend(AttentionBackend):
                     seq_lens[:bs], active_forward_op=forward_batch
                 )
         elif self._cache_groups_bound and bs > 0 and not forward_mode.is_idle():
-            # Missing Paged cache metadata must never select the legacy page_table
+            # Missing cache metadata must never select the legacy page_table
             # path after the backend is bound to the contract.
             raise RuntimeError(
                 "tokenspeed_mla is bound to the Cache contract but received "
-                "no paged cache metadata; refusing the legacy page_table path"
+                "no cache metadata; refusing the legacy page_table path"
             )
 
         if forward_mode.is_extend_or_mixed():
@@ -463,7 +463,7 @@ class CuteDSLMLABackend(AttentionBackend):
             self.forward_decode_metadata.num_extends = prev
 
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
-        """Paged cache write-location hook for model-owned latent KV writes.
+        """Cache-group write-location hook for model-owned latent KV writes.
 
         Forwards without grouped cache metadata return caller locations untouched;
         byte-for-byte the base-class behavior, so DeepSeek-style MLA models
@@ -480,7 +480,7 @@ class CuteDSLMLABackend(AttentionBackend):
             if metadata is None or metadata.group_out_cache_loc is None:
                 raise RuntimeError(
                     "MLA decode write locations are missing; "
-                    "init_forward_metadata must run with paged cache metadata"
+                    "init_forward_metadata must run with cache metadata"
                 )
             locs = metadata.group_out_cache_loc[
                 metadata.num_extends * metadata.group_q_len_per_req :
@@ -490,7 +490,7 @@ class CuteDSLMLABackend(AttentionBackend):
             if metadata is None or metadata.group_out_cache_loc is None:
                 raise RuntimeError(
                     "MLA prefill write locations are missing; "
-                    "init_forward_metadata must run with paged cache metadata"
+                    "init_forward_metadata must run with cache metadata"
                 )
             locs = metadata.group_out_cache_loc
         if out_cache_loc is not None and locs.shape[0] != out_cache_loc.shape[0]:
@@ -512,7 +512,7 @@ class CuteDSLMLABackend(AttentionBackend):
     ):
         max_blocks = self._calc_padded_blocks(self.max_context_len)
         if group_table is not None:
-            # Paged cache path: kernel pages and write locations both derive from
+            # Cache-group path: kernel pages and write locations both derive from
             # the full-attention table; page_table is never consulted.
             block_kv_indices = self._create_block_kv_indices(
                 bs, max_blocks, group_table
@@ -682,7 +682,7 @@ class CuteDSLMLABackend(AttentionBackend):
         torch.cumsum(extend_seq_lens, dim=0, out=cum_extend_seq_lens[1:])
         max_extend_seq_len = extend_seq_lens_cpu.max().item()
         if group_table is not None:
-            # Paged cache path: chunked history reads gather from the
+            # Cache-group path: chunked history reads gather from the
             # full-attention table (rows are batch-ordered, prefill rows
             # first) in kernel pages.
             chunk_page_table = group_table[:num_extends]
@@ -741,7 +741,7 @@ class CuteDSLMLABackend(AttentionBackend):
             (graph_rows, max_blocks), dtype=torch.int32, device=self.device
         )
         if self._cache_contract_bound:
-            # The Paged cache decode graph uses one absolute latent write slot per
+            # The cache-group decode graph uses one absolute latent write slot per
             # row, refreshed in place from the current full-attention table.
             # Allocate the stable-address buffer outside the graph pool, like
             # the KV indices.
@@ -763,13 +763,13 @@ class CuteDSLMLABackend(AttentionBackend):
         **kwargs,
     ):
         # Structural gate: the target (contract always marked by the registry)
-        # takes the Paged cache capture path; the MTP draft, whose
+        # takes the cache-group capture path; the MTP draft, whose
         # mark_cache_contract deliberately early-returns, keeps the
         # batch-ordered non-cache path.
         uses_cache_groups = bool(cache_group_ids) or self._cache_contract_bound
         if uses_cache_groups and self.is_draft:
             raise NotImplementedError(
-                "tokenspeed_mla draft worker does not take the Paged cache path"
+                "tokenspeed_mla draft worker does not take the cache-group path"
             )
         if forward_mode.is_extend_or_mixed():
             raise NotImplementedError(
@@ -783,7 +783,7 @@ class CuteDSLMLABackend(AttentionBackend):
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks]
 
         if uses_cache_groups:
-            # The captured Paged cache graph reads the kernel page table and latent
+            # The captured cache-group graph reads the kernel page table and latent
             # write locations from persistent buffers; replay refreshes both
             # in place from the current full-attention table. Latch _cache_groups_bound
             # so the recorded forward_decode takes the cache write-location
@@ -791,7 +791,7 @@ class CuteDSLMLABackend(AttentionBackend):
             self._cache_groups_bound = True
             if self.decode_cuda_graph_group_out_cache_loc is None:
                 raise RuntimeError(
-                    "tokenspeed_mla Paged cache graph capture: the cache write-location "
+                    "tokenspeed_mla cache-group graph capture: the cache write-location "
                     "buffer is not allocated; init_cuda_graph_state ran before "
                     "the backend was marked as the Cache contract sub-backend"
                 )
@@ -848,11 +848,11 @@ class CuteDSLMLABackend(AttentionBackend):
             self.forward_decode_metadata = metadata
             return
         # The captured metadata is the source of truth: a cache write-location buffer
-        # exists iff this bs was captured on the Paged cache path.
+        # exists iff this bs was captured on the cache-group path.
         uses_cache_groups = metadata.group_out_cache_loc is not None
         if uses_cache_groups and self.is_draft:
             raise NotImplementedError(
-                "tokenspeed_mla draft worker does not take the Paged cache path"
+                "tokenspeed_mla draft worker does not take the cache-group path"
             )
 
         # Copy the live cache lengths into our own buffer (metadata.seq_lens_k
@@ -903,7 +903,7 @@ class CuteDSLMLABackend(AttentionBackend):
         """
         if metadata.group_out_cache_loc is None:
             raise RuntimeError(
-                "tokenspeed_mla Paged cache graph replay: captured decode metadata "
+                "tokenspeed_mla cache-group graph replay: captured decode metadata "
                 "has no cache write-location buffer"
             )
         # Target verify graphs are captured with q_len write locations per
@@ -961,7 +961,7 @@ class CuteDSLMLABackend(AttentionBackend):
         if save_kv_cache:
             assert k is not None
             if self._cache_groups_bound:
-                # Paged cache: write locations derive from the full-attention
+                # Cache-group path: write locations derive from the full-attention
                 # table, never from the caller's page_table-derived locs.
                 out_cache_loc = self.select_out_cache_loc(
                     layer, out_cache_loc, ForwardMode.DECODE

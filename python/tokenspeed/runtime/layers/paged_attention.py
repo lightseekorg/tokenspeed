@@ -101,7 +101,7 @@ def validate_cache_group_ids(
     model: nn.Module,
     cache_group_specs: Sequence,
 ) -> None:
-    """Fail fast (ValueError) when a pool publishing more than one paged-cache
+    """Fail fast (ValueError) when a pool publishing more than one cache
     group meets a PagedAttention layer whose group_id is empty or unknown --
     instead of a KeyError deep in the backend, possibly during graph capture.
     """

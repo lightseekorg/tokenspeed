@@ -1259,7 +1259,7 @@ class ModelExecutor:
         A PD decode destination never executes the prompt locally, so no
         forward of its own can establish these lengths — they come from the
         complete remotely-computed prompt instead, before the first local
-        decode. Paged cache additionally selects the transferred
+        decode. The cache-transfer path additionally selects the transferred
         recurrent-state snapshot block from the resulting sequence length.
         """
         num_extends = forward_op.num_extends()

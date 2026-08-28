@@ -77,7 +77,7 @@ class MLAPrefillMetadata:
     chunked_seq_len: torch.Tensor
     cu_chunked_seq_len: torch.Tensor
     max_chunk_len_per_loop: list[int]
-    # Paged cache only: absolute latent locations for model-owned extend writes.
+    # Cache-group path only: absolute latent locations for model-owned extend writes.
     group_out_cache_loc: torch.Tensor | None = None
 
 
@@ -87,7 +87,7 @@ class MLADecodeMetadata:
     num_extends: int
     page_table: torch.Tensor
     seq_lens: torch.Tensor
-    # Paged cache only: absolute latent write locations, request-major, with
+    # Cache-group path only: absolute latent write locations, request-major, with
     # ``group_q_len_per_req`` entries per batch row (1 outside target verify).
     group_out_cache_loc: torch.Tensor | None = None
     group_q_len_per_req: int = 1
@@ -211,7 +211,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             published_draft_page_table = True
         elif self._cache_groups_bound and bs > 0 and not forward_mode.is_idle():
             raise RuntimeError(
-                "MLAAttnBackend is bound to Paged cache but received no paged cache "
+                "MLAAttnBackend is bound to cache groups but received no cache "
                 "metadata; refusing the legacy page_table path"
             )
 
@@ -552,7 +552,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             return
         if uses_cache_groups and self.is_draft:
             raise NotImplementedError(
-                "MLA draft worker does not take the Paged cache path"
+                "MLA draft worker does not take the cache-group path"
             )
         page_table = self.cuda_graph_page_table[:bs, :]
         capture_q_len = self._graph_verify_q_len()
@@ -560,7 +560,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             self._cache_groups_bound = True
             if self.decode_cuda_graph_group_out_cache_loc is None:
                 raise RuntimeError(
-                    "MLA Paged cache graph capture buffer was not allocated; "
+                    "MLA cache-group graph capture buffer was not allocated; "
                     "mark_cache_contract must run before init_cuda_graph_state"
                 )
             page_table.zero_()

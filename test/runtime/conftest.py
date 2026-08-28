@@ -1,4 +1,4 @@
-"""Shared helpers for Kimi-K3 paged cache runtime tests."""
+"""Shared helpers for Kimi-K3 cache-group runtime tests."""
 
 from __future__ import annotations
 

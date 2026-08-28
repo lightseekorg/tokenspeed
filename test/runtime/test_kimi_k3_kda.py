@@ -839,7 +839,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
 @requires_fla
 @pytest.mark.skipif(
     not current_platform().is_amd,
-    reason="indexed paged cache KDA decode is an AMD-specific contract",
+    reason="indexed cache-group KDA decode is an AMD-specific contract",
 )
 def test_kda_cache_pool_component_views_end_to_end(
     monkeypatch: pytest.MonkeyPatch,
@@ -875,7 +875,7 @@ def test_kda_cache_pool_component_views_end_to_end(
     from tokenspeed_kernel.thirdparty.triton import fla_kda_recurrent
 
     def _unexpected_megafuse(*args, **kwargs):
-        raise AssertionError("AMD paged cache decode must bypass the FLA KDA megafuse")
+        raise AssertionError("AMD cache-group decode must bypass the FLA KDA megafuse")
 
     indexed_decode_calls = 0
     indexed_decode = hybrid_kda.kda_paged_decode

@@ -3721,7 +3721,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             RuntimeError,
-            "missing paged-cache block table",
+            "missing cache-group block table",
         ):
             metadata.cache.compressed_page_table(128)
 

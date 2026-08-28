@@ -46,7 +46,7 @@ def _split_block_tables_into_v4_metadata(
     dict[int, torch.Tensor],
     torch.Tensor | None,
 ]:
-    """Split paged-cache dict into V4-named tables + per-sliding-group offsets.
+    """Split the cache-group dict into V4-named tables + per-sliding-group offsets.
 
     Returns (swa, {ratio: compressor_state}, indexer_state, swa_base,
     {ratio: compressor_state_base}, indexer_state_base). Unknown group ids
@@ -209,7 +209,7 @@ class DeepseekV4CacheMetadata:
         table = self.block_tables.get(v4_compressed_kv_group_id(compress_ratio))
         if table is None:
             raise RuntimeError(
-                "DeepSeek V4 missing paged-cache block table for compressed "
+                "DeepSeek V4 missing cache-group block table for compressed "
                 f"KV group {v4_compressed_kv_group_id(compress_ratio)!r}"
             )
         return table

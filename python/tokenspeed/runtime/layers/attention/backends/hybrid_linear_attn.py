@@ -82,7 +82,7 @@ def _mask_fresh_initial_state(
 ) -> torch.Tensor:
     """Zero the initial recurrent state of sequences that have no history.
 
-    On the paged cache path a fresh sequence's ``state_in`` page is freshly
+    On the cache-group path a fresh sequence's ``state_in`` block is freshly
     allocated from the shared BlockPool and may carry a previous tenant's
     bytes (the slabs alias every cache group, so those bytes can be fp8 MLA
     latents that reinterpret as huge/NaN fp32) — the recurrent kernels have

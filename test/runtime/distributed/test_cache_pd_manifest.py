@@ -584,7 +584,7 @@ def test_peer_layout_reports_prefix_granularity_mismatch() -> None:
 
     with pytest.raises(
         CacheContractError,
-        match="^Paged cache P/D contract mismatch: prefix_granularity$",
+        match="^Cache P/D contract mismatch: prefix_granularity$",
     ):
         validate_cache_peer_layout(local, peer)
 

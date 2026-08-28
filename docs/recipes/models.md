@@ -223,7 +223,7 @@ pip install flash-linear-attention
 
 Notes:
 
-- K3 uses the grouped paged-cache scheduler and KDA state groups.
+- K3 uses the cache-group scheduler and KDA state groups.
 - KDA dispatch is vendor-neutral at the runtime boundary. The kernel registry
   selects the existing FLA-derived NVIDIA implementation or the native AMD
   implementation, including each backend's preferred recurrent-state layout.

@@ -767,7 +767,7 @@ class Qwen4ExpPLELayer(nn.Module):
     """PLE gating plus dilated depthwise short convolution.
 
     Persistent context and convolution windows live in the model's unified
-    paged cache under :data:`QWEN4_EXP_PLE_CACHE_GROUP`.
+    cache under :data:`QWEN4_EXP_PLE_CACHE_GROUP`.
     """
 
     def __init__(

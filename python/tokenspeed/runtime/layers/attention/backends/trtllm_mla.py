@@ -120,7 +120,7 @@ class TRTLLMMLADecodeMetadata:
     block_kv_indices: torch.Tensor | None = None
     max_seq_len_k: int | None = None
     seq_lens_k: torch.Tensor | None = None
-    # Paged cache only: absolute latent write locations, request-major, with
+    # Cache-group path only: absolute latent write locations, request-major, with
     # ``group_q_len_per_req`` entries per row (1 outside target verify).
     group_out_cache_loc: torch.Tensor | None = None
     group_q_len_per_req: int = 1
@@ -328,7 +328,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         )
 
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
-        """Group-derived latent write location on the paged-cache path.
+        """Group-derived latent write location on the cache-group path.
 
         Identity when not cache-group bound or idle. A draft owns its per-step
         locations (it passes ``num_extends == bs`` by its own convention), so it
@@ -469,7 +469,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         if self._cache_contract_bound:
             if self.decode_cuda_graph_group_out_cache_loc is None:
                 raise RuntimeError(
-                    "trtllm_mla Paged cache graph capture buffer was not "
+                    "trtllm_mla cache-group graph capture buffer was not "
                     "allocated; mark_cache_contract must run before "
                     "init_cuda_graph_state"
                 )

@@ -1,4 +1,4 @@
-"""Kimi-K3 paged-cache CUDA-graph capture/replay core logic.
+"""Kimi-K3 cache-group CUDA-graph capture/replay core logic.
 
 CPU-only (plain tensors, no real graph capture): exercises the metadata-buffer
 capture/replay LOGIC that the decode CUDA graph depends on. The real
@@ -352,7 +352,7 @@ def test_amd_mla_eager_decode_uses_group_table_and_refuses_fallback() -> None:
     )
     assert torch.equal(selected, decode.group_out_cache_loc)
 
-    with pytest.raises(RuntimeError, match="no paged cache metadata"):
+    with pytest.raises(RuntimeError, match="no cache metadata"):
         backend.init_forward_metadata(
             bs=2,
             num_extends=0,

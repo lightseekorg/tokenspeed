@@ -763,7 +763,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
     ) -> torch.Tensor:
         """GLM-5 DSA attention, one COARSE breakable-graph break point.
 
-        Like DeepSeek-V4 it does paged-cache writes, a data-dependent indexer
+        Like DeepSeek-V4 it does cache-group writes, a data-dependent indexer
         -> top-k stage and the FlashMLA sparse kernel (plus pre-attn
         collectives), none capturable. Under a prefill-graph capture the whole
         attention runs eager (reading the live ``ctx``) while the layer's

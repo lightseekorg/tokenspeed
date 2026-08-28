@@ -333,7 +333,7 @@ _SLIDING_SUBGROUP_PREFIX = "sliding_attention_"
 
 
 def _retention_for_label(label: str) -> Retention | None:
-    """Retention for a paged-cache layer_type label, or None if unknown.
+    """Retention for a cache-group layer_type label, or None if unknown.
 
     Args:
         label: A layer_type label — one of the exact vocabulary in

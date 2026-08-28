@@ -99,7 +99,7 @@ class DisaggPrefillExecutor:
                 sender.bootstrap_room, {}
             )
             if not transfer_infos:
-                raise RuntimeError("Paged cache destination metadata is unavailable")
+                raise RuntimeError("Cache-transfer destination metadata is unavailable")
             destinations = tuple(
                 info for info in transfer_infos.values() if not info.is_dummy
             )
@@ -109,14 +109,14 @@ class DisaggPrefillExecutor:
                 continue
             first = destinations[0]
             if first.block_manifest is None:
-                raise RuntimeError("Paged cache destination metadata is unavailable")
+                raise RuntimeError("Cache-transfer destination metadata is unavailable")
             prefix_len = first.block_manifest.prefix_len
             prompt_len = first.block_manifest.prompt_len
             chunk_begin = int(op.extend_prefix_lens[index])
             chunk_end = chunk_begin + int(op.input_lengths[index])
             if chunk_end > prompt_len:
                 raise ValueError(
-                    "Paged cache Prefill chunk extends past Decode's prompt manifest"
+                    "Cache-transfer Prefill chunk extends past Decode's prompt manifest"
                 )
             is_last = chunk_end == prompt_len
             # On the first submitted chunk, include blocks that Prefill found in
@@ -138,14 +138,14 @@ class DisaggPrefillExecutor:
             for destination in destinations:
                 if destination.block_manifest is None:
                     raise RuntimeError(
-                        "Paged cache destination metadata is unavailable"
+                        "Cache-transfer destination metadata is unavailable"
                     )
                 if (
                     destination.block_manifest.prefix_len != prefix_len
                     or destination.block_manifest.prompt_len != prompt_len
                 ):
                     raise ValueError(
-                        "Paged cache destinations disagree on the prompt window"
+                        "Cache-transfer destinations disagree on the prompt window"
                     )
             if (
                 not any(group.source_block_ids for group in block_selection.groups)
@@ -188,7 +188,7 @@ class DisaggPrefillExecutor:
                 continue
             token = int(op.decode_input_ids[index])
             if token < 0:
-                raise RuntimeError("Paged cache bootstrap token is unavailable")
+                raise RuntimeError("Cache-transfer bootstrap token is unavailable")
             spec_candidate_ids = list(op.spec_candidate_ids[index]) or None
 
             if self._layerwise_enabled:
@@ -226,7 +226,7 @@ class DisaggPrefillExecutor:
                 sender.bootstrap_room, {}
             )
             if not transfer_infos:
-                raise RuntimeError("Paged cache destination metadata is unavailable")
+                raise RuntimeError("Cache-transfer destination metadata is unavailable")
             destinations = [
                 info for info in transfer_infos.values() if not info.is_dummy
             ]
@@ -239,7 +239,7 @@ class DisaggPrefillExecutor:
                 continue
             destination = destinations[0]
             if destination.block_manifest is None:
-                raise RuntimeError("Paged cache destination metadata is unavailable")
+                raise RuntimeError("Cache-transfer destination metadata is unavailable")
             block_manifest = build_cache_block_manifest(
                 op,
                 layout=self.cache_layout,
@@ -250,7 +250,7 @@ class DisaggPrefillExecutor:
             for destination in destinations:
                 if destination.block_manifest is None:
                     raise RuntimeError(
-                        "Paged cache destination metadata is unavailable"
+                        "Cache-transfer destination metadata is unavailable"
                     )
                 if (
                     destination.block_manifest.prefix_len != block_manifest.prefix_len
@@ -258,7 +258,7 @@ class DisaggPrefillExecutor:
                     != block_manifest.prompt_len
                 ):
                     raise ValueError(
-                        "Paged cache destinations disagree on the prompt window"
+                        "Cache-transfer destinations disagree on the prompt window"
                     )
             pending.append((sender, token, spec_candidate_ids, block_manifest))
 

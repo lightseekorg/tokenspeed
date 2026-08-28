@@ -223,7 +223,7 @@ class EventLoop:
         )
 
         # Encode nodes never build an EventLoop (they run the LM-free encode
-        # loop), so here "disaggregation is on" means the paged-cache PD
+        # loop), so here "disaggregation is on" means the cache-transfer PD
         # protocol: this engine is a P or D role.
         pd_enabled = server_args.disaggregation_mode != "null"
         if pd_enabled:
@@ -257,7 +257,7 @@ class EventLoop:
                 unsupported.append("non-Mooncake transfer backend")
             if unsupported:
                 raise NotImplementedError(
-                    "Paged-cache PD currently does not support: "
+                    "Cache-transfer PD currently does not support: "
                     + ", ".join(unsupported)
                 )
         # Backend/pool compatibility is validated inside ModelExecutor
@@ -327,7 +327,7 @@ class EventLoop:
         self.max_req_input_len = self.max_model_len - input_reserve
         if self.max_req_input_len < 1:
             raise RuntimeError(
-                "Paged cache cannot admit one request with the configured "
+                "The cache cannot admit one request with the configured "
                 f"decode reserve: max_single_request_tokens="
                 f"{self.max_single_request_tokens}, reserve={input_reserve}"
             )
@@ -660,7 +660,7 @@ class EventLoop:
 
             if self.kv_transfer is not None and bootstrap is None:
                 raise ValueError(
-                    "Paged cache PD request is missing bootstrap information"
+                    "Cache-transfer PD request is missing bootstrap information"
                 )
             if self._device.role is DeviceRole.PD_DECODE:
                 # The prompt was computed on the prefill node.

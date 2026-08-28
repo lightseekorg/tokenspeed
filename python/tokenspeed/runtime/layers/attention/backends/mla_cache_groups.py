@@ -20,7 +20,7 @@
 
 """Shared cache-group (LCM full-history) helpers for MLA backends.
 
-Every MLA backend that consumes the paged-cache full-attention table needs the
+Every MLA backend that consumes the cache-group full-attention table needs the
 same primitives: resolve the scheduler's full-history table in this backend's
 KERNEL pages, and turn per-request sequence lengths into absolute latent write
 locations. The logical->kernel page expansion happens once upstream
@@ -139,7 +139,7 @@ class MlaCacheGroupMixin:
         out: torch.Tensor | None = None,
         q_len_per_req: int = 1,
     ) -> torch.Tensor:
-        """Absolute latent write locations for decoded tokens in Paged cache.
+        """Absolute latent write locations for decoded tokens in the full-attention group.
 
         Plain decode writes one location per request (position ``seq-1``).
         Speculative target verify decodes ``q_len_per_req`` tokens per request
@@ -200,7 +200,7 @@ class MlaCacheGroupMixin:
         *,
         validate_pages: bool = False,
     ) -> torch.Tensor:
-        """Return packed Paged cache extend-write locations in query order."""
+        """Return packed cache-group extend-write locations in query order."""
         page_size = self.kernel_page_size
         chunks: list[torch.Tensor] = []
         pages_for_validation: list[torch.Tensor] = []

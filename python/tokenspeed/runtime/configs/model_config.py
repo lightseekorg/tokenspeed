@@ -431,7 +431,7 @@ class ModelConfig:
             # pattern (mtp_config.local_layer_ids) and only depths
             # 0..steps-1 ever run; swap in the depth-specialized (and
             # steps-pruned) text config so layer construction, attention
-            # metadata, and paged-cache layout all derive from it.
+            # metadata, and cache-group layout all derive from it.
             from tokenspeed.runtime.configs.inkling_config import (
                 inkling_mtp_text_config,
             )

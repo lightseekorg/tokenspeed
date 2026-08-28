@@ -362,7 +362,7 @@ def _sconv_apply(
     is just a wider ``dim`` with concatenated weights. The paged bridges are
     mandatory and fused: extend chunks tap the checkpoint at their aligned
     start (the prefill kernel never reads the ring), decode rounds tap the
-    ring (the decode kernel never reads the paged cache), and both publish
+    ring (the decode kernel never reads the checkpoint blocks), and both publish
     every covered boundary in-kernel.
     """
     backend = ctx.attn_backend

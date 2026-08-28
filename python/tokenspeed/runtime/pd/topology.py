@@ -108,7 +108,7 @@ class PDParallelTopology:
         )
 
     def require_cache_pd_supported(self) -> None:
-        """Reject attention topologies unsupported by paged-cache PD."""
+        """Reject attention topologies unsupported by cache-transfer PD."""
         if self.cp_size != 1:
             raise ValueError(
                 "CachePD does not support context parallelism: "

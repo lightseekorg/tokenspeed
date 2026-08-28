@@ -110,7 +110,7 @@ def inkling_mtp_text_config(
     patterns: the checkpoint records the head's depth-local ids in top-level
     ``mtp_config.local_layer_ids`` (copied here as ``mtp_local_layer_ids``).
     The returned config drives draft layer construction, attention metadata,
-    and paged-cache layout, so its ``local_layer_ids`` are the DEPTH-local
+    and cache-group layout, so its ``local_layer_ids`` are the DEPTH-local
     ids and its ``num_hidden_layers`` is the depth count.
 
     With ``num_steps`` set, depths beyond it are pruned: an MTP chain only
@@ -355,7 +355,7 @@ class InklingModelConfig(PretrainedConfig):
         group (Inkling: 55 sliding + 11 full -> 5 sub-groups of 11 -> 11
         six-way-bound slabs). All sub-groups share the one window, so
         eviction semantics per layer are unchanged vs a single sliding
-        group. Consumed by the paged-cache path (cache-group
+        group. Consumed by the cache-group path (cache-group
         publication and the hybrid slab layout); inert on a single-table-built
         scheduler ext, so the scheduler-blind contract above still holds
         there.

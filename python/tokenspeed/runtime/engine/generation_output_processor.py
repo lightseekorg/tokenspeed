@@ -947,7 +947,7 @@ class OutputProcesser:
     def finish_remote_prefill_only_request(self, req_id: str) -> list:
         """Finish after remote prefill when no decode step is needed.
 
-        Paged cache Prefill computes the first real output token.  A one-token
+        A PD Prefill computes the first real output token.  A one-token
         request is therefore already complete when Decode receives
         ``RemotePrefillDoneEvent`` and must not be scheduled for an additional
         decode forward. An aborted request follows the same transport fence
