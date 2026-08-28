@@ -13,16 +13,10 @@ env:
   CI: "true"
 install:
   - bash test/ci_system/install_deps.sh
-  - >-
-    test -f /raid/cache/huggingface/hub/horizon/hf_fp8/config.json
-  - >-
-    test -f /raid/cache/huggingface/hub/horizon/hf_fp8/chat_template.jinja
 server:
   command: >-
     ts serve
-    --model /raid/cache/huggingface/hub/horizon/hf_fp8
-    --chat-template
-    /raid/cache/huggingface/hub/horizon/hf_fp8/chat_template.jinja
+    --model zai-org/GLM-5.3
     --served-model-name glm-5.3-flash
     --attn-tp-size 4
     --enable-expert-parallel

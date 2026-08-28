@@ -29,8 +29,8 @@ GLM53_FLASH_BF16_AMD_CONFIG_PATH = (
     EVAL_CONFIG_DIR / "glm-5.3-flash-bf16-tp4ep1-evalscope-aime26-amd.yaml"
 )
 HF_HOME_ASSIGNMENT = "HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache"
-GLM53_FLASH_AMD_MODEL_ROOT = "/cache/huggingface/hub/horizon"
-GLM53_FLASH_NVIDIA_MODEL_ROOT = "/raid/cache/huggingface/hub/horizon"
+GLM53_FLASH_FP8_MODEL_ID = "zai-org/GLM-5.3"
+GLM53_FLASH_BF16_MODEL_ID = "zai-org/GLM-5.3-BF16"
 FORK_PR_EXPRESSION = (
     "${{ github.event_name == 'pull_request' && "
     "github.event.pull_request.head.repo.full_name != github.repository }}"
@@ -128,7 +128,6 @@ def test_glm53_flash_amd_workflow_runs_aime26_for_shared_branch_prs_only():
 def test_glm53_flash_amd_aime26_uses_validated_fp8_mtp_tp4_ep1_configuration():
     task = yaml.safe_load(GLM53_FLASH_AMD_CONFIG_PATH.read_text(encoding="utf-8"))
     server_command = task["server"]["command"]
-    model_setup = task["install"][1]
     eval_install = task["eval"]["install"][0]
     generation_config = json.loads(
         flag_value(shlex.split(task["eval"]["command"]), "--generation-config")
@@ -137,9 +136,9 @@ def test_glm53_flash_amd_aime26_uses_validated_fp8_mtp_tp4_ep1_configuration():
     assert task["runner"]["labels"] == ["amd-mi35x-4gpu-test"]
     assert task["triggers"] == ["per-commit", "manual"]
     assert "HF_HOME" not in task["env"]
-    assert model_setup == f"test -f {GLM53_FLASH_AMD_MODEL_ROOT}/hf_fp8/config.json"
+    assert task["install"] == ["bash test/ci_system/install_deps_rocm.sh"]
     assert server_command.startswith("ts serve")
-    assert f"--model {GLM53_FLASH_AMD_MODEL_ROOT}/hf_fp8" in server_command
+    assert f"--model {GLM53_FLASH_FP8_MODEL_ID}" in server_command
     assert "--attn-tp-size 4" in server_command
     assert "--ep-size 1" in server_command
     assert "--sampling-backend triton" in server_command
@@ -191,24 +190,15 @@ def test_glm53_flash_nvidia_aime26_uses_validated_tp4_ep4_configuration():
     task = yaml.safe_load(GLM53_FLASH_NVIDIA_CONFIG_PATH.read_text(encoding="utf-8"))
     server_command = task["server"]["command"]
     server_tokens = shlex.split(server_command)
-    model_setup = task["install"][1:]
     eval_tokens = shlex.split(task["eval"]["command"])
     generation_config = json.loads(flag_value(eval_tokens, "--generation-config"))
 
     assert task["runner"]["labels"] == ["b200-4gpu"]
     assert "HF_HOME" not in task["env"]
-    assert model_setup == [
-        f"test -f {GLM53_FLASH_NVIDIA_MODEL_ROOT}/hf_fp8/config.json",
-        f"test -f {GLM53_FLASH_NVIDIA_MODEL_ROOT}/hf_fp8/chat_template.jinja",
-    ]
+    assert task["install"] == ["bash test/ci_system/install_deps.sh"]
     assert server_tokens[0] == "ts"
-    assert flag_value(server_tokens, "--model") == (
-        f"{GLM53_FLASH_NVIDIA_MODEL_ROOT}/hf_fp8"
-    )
-    assert (
-        flag_value(server_tokens, "--chat-template")
-        == f"{GLM53_FLASH_NVIDIA_MODEL_ROOT}/hf_fp8/chat_template.jinja"
-    )
+    assert flag_value(server_tokens, "--model") == GLM53_FLASH_FP8_MODEL_ID
+    assert "--chat-template" not in server_tokens
     assert flag_value(server_tokens, "--attn-tp-size") == "4"
     assert "--enable-expert-parallel" in server_tokens
     assert "--language-model-only" in server_tokens
@@ -235,6 +225,12 @@ def test_glm53_flash_nvidia_sharegpt_uses_fixed_mtp_configuration():
     server_tokens = shlex.split(task["server"]["command"])
     perf_tokens = shlex.split(task["perf"]["command"])
 
+    assert flag_value(server_tokens, "--model") == GLM53_FLASH_FP8_MODEL_ID
+    assert (
+        flag_value(server_tokens, "--speculative-draft-model-path")
+        == GLM53_FLASH_FP8_MODEL_ID
+    )
+    assert flag_value(perf_tokens, "--tokenizer-path") == GLM53_FLASH_FP8_MODEL_ID
     assert [
         flag_value(server_tokens, flag)
         for flag in (
@@ -271,7 +267,6 @@ def test_glm53_flash_nvidia_sharegpt_uses_fixed_mtp_configuration():
 def test_glm53_flash_bf16_mtp_manual_task_uses_validated_configuration():
     task = yaml.safe_load(GLM53_FLASH_BF16_AMD_CONFIG_PATH.read_text(encoding="utf-8"))
     server_command = task["server"]["command"]
-    model_setup = task["install"][1]
     eval_install = task["eval"]["install"][0]
     generation_config = json.loads(
         flag_value(shlex.split(task["eval"]["command"]), "--generation-config")
@@ -280,9 +275,9 @@ def test_glm53_flash_bf16_mtp_manual_task_uses_validated_configuration():
     assert task["triggers"] == ["manual"]
     assert task["runner"]["labels"] == ["amd-mi35x-4gpu-test"]
     assert "HF_HOME" not in task["env"]
-    assert model_setup == f"test -f {GLM53_FLASH_AMD_MODEL_ROOT}/hf/config.json"
+    assert task["install"] == ["bash test/ci_system/install_deps_rocm.sh"]
     assert server_command.startswith("TORCH_BLAS_PREFER_HIPBLASLT=0 ts serve")
-    assert f"--model {GLM53_FLASH_AMD_MODEL_ROOT}/hf" in server_command
+    assert f"--model {GLM53_FLASH_BF16_MODEL_ID}" in server_command
     assert "--attn-tp-size 4" in server_command
     assert "--ep-size 1" in server_command
     assert "--sampling-backend triton" in server_command

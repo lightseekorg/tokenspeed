@@ -12,8 +12,6 @@ env:
   CI: "true"
 install:
   - bash test/ci_system/install_deps_rocm.sh
-  - >-
-    test -f /cache/huggingface/hub/horizon/hf/config.json
 server:
   # ROCm 7.2 hipBLASLt attempts a forbidden operation when the first decode
   # graph is captured on this runner. Prefer graph-safe hipBLAS/rocBLAS while
@@ -21,7 +19,7 @@ server:
   command: >-
     TORCH_BLAS_PREFER_HIPBLASLT=0
     ts serve
-    --model /cache/huggingface/hub/horizon/hf
+    --model zai-org/GLM-5.3-BF16
     --served-model-name glm-5.3-flash
     --attn-tp-size 4
     --ep-size 1

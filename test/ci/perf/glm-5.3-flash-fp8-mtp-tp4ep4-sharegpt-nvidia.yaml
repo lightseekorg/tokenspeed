@@ -12,12 +12,10 @@ env:
   CI: "true"
 install:
   - bash test/ci_system/install_deps.sh
-  - >-
-    test -f /raid/cache/huggingface/hub/horizon/hf_fp8/config.json
 server:
   command: >-
     ts serve
-    --model /raid/cache/huggingface/hub/horizon/hf_fp8
+    --model zai-org/GLM-5.3
     --served-model-name glm-5.3-flash
     --attn-tp-size 4
     --enable-expert-parallel
@@ -43,7 +41,7 @@ server:
     --gateway-startup-timeout 600
     --speculative-algorithm MTP
     --speculative-draft-model-path
-    /raid/cache/huggingface/hub/horizon/hf_fp8
+    zai-org/GLM-5.3
     --draft-model-path-use-base
     --speculative-num-steps 3
     --speculative-eagle-topk 1
@@ -57,7 +55,6 @@ perf:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]==1.10.0'
   command: |
     set -eu
-    MODEL_PATH=/raid/cache/huggingface/hub/horizon/hf_fp8
     RESULTS_DIR=/tmp/tokenspeed-glm53-flash-sharegpt
     trap 'rm -rf "$RESULTS_DIR"' EXIT
     rm -rf "$RESULTS_DIR"
@@ -67,7 +64,7 @@ perf:
         --url http://127.0.0.1:8000/v1/completions \
         --api openai \
         --dataset share_gpt_en \
-        --tokenizer-path "$MODEL_PATH" \
+        --tokenizer-path zai-org/GLM-5.3 \
         --tokenize-prompt \
         --max-prompt-length 32256 \
         --min-tokens 512 \

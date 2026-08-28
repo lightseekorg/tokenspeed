@@ -13,14 +13,12 @@ env:
   CI: "true"
 install:
   - bash test/ci_system/install_deps_rocm.sh
-  - >-
-    test -f /cache/huggingface/hub/horizon/hf_fp8/config.json
 server:
   # MoE keeps compact experts for gfx950 decode and creates BF16 expert copies
   # for the faster large-M prefill kernel.
   command: >-
     ts serve
-    --model /cache/huggingface/hub/horizon/hf_fp8
+    --model zai-org/GLM-5.3
     --served-model-name glm-5.3-flash-fp8-mtp
     --attn-tp-size 4
     --ep-size 1

@@ -53,13 +53,12 @@ of at least 0.90.
 Pull requests targeting the private `shared/glm5-next` integration branch run
 separate GLM-5.3-Flash AIME26 jobs for AMD and NVIDIA. Each cold job gets its own CI
 work directory, starts a new server, and reloads the model into GPU memory.
-The checkpoint is mounted under `/cache/huggingface/hub/horizon` on AMD and
-`/raid/cache/huggingface/hub/horizon` on NVIDIA, with `hf_fp8/` and `hf/`
-subdirectories for the FP8 and BF16 weight formats, respectively. The server
-reads those model directories directly, while `HF_HOME` remains job-local for
-EvalScope dataset downloads.
+The tasks address the checkpoints by their public Hugging Face IDs:
+`zai-org/GLM-5.3` for FP8 and `zai-org/GLM-5.3-BF16` for BF16. Runner-local
+Hugging Face caches avoid repeated weight downloads, while `HF_HOME` remains
+job-local for EvalScope dataset downloads.
 
-The AMD gate uses the FP8 model under `horizon/hf_fp8/` on four MI350X GPUs
+The AMD gate uses the FP8 model on four MI350X GPUs
 with TP4/EP1, the checkpoint's embedded single-layer MTP drafter with three
 speculative steps and four draft tokens, Triton sampling, decode graphs through
 batch size 16, a 65,536-token model context, and a 65,000-token maximum-effort
@@ -72,12 +71,12 @@ below the observed range while retaining a meaningful accuracy guard. This match
 fastest validated ShareGPT launch shape, and the AIME26 gate remains the
 accuracy and long-generation runtime guardrail for that configuration.
 
-The NVIDIA gate uses the same FP8 model under `horizon/hf_fp8/` on four B200 GPUs
+The NVIDIA gate uses the same FP8 model on four B200 GPUs
 with TP4/EP4, the FlashInfer TRT-LLM MoE backend, and FlashInfer sampling. It evaluates the
 target model without speculative decoding and uses the same 65,536-token
 context, 32,768-token generation limit, and official EvalScope AIME26 prompt
-and grader as the AMD gate. It explicitly selects the checkpoint's embedded
-`hf_fp8/chat_template.jinja`. This keeps decode graph-compiled while avoiding
+and grader as the AMD gate. The tokenizer resolves the checkpoint's embedded
+chat template. This keeps decode graph-compiled while avoiding
 DeepEP's unqualified low-latency numerical path and its normal-mode capture
 incompatibility. Runtime gateway health polling is disabled for this
 single-worker evaluation because sustained B200 decode can starve the independent
@@ -92,13 +91,13 @@ long-input kernel shapes; the gate then takes the median of three runs and rejec
 either per-user decode speed or output throughput per GPU below 90% of the
 established four-B200 baseline.
 
-Both jobs validate and serve the mounted checkpoint directly, avoiding a
-several-hundred-gigabyte download for every pull request. Each job still has an
-independent server process and performs a full disk-to-HBM weight load.
+Both jobs resolve the checkpoint from the runner's Hugging Face cache, avoiding
+a several-hundred-gigabyte download for every pull request. Each job still has
+an independent server process and performs a full disk-to-HBM weight load.
 
 The manually dispatched GLM-5.3-Flash FP8+MTP task exercises the stacked FP8 MoE
 and MTP paths with the same TP4/EP1 graph and AIME26 settings. It uses the
-mounted `horizon/hf_fp8/` checkpoint and is intentionally not a second
+same FP8 checkpoint and is intentionally not a second
 pull-request gate. The gfx950 Gluon path retains compact FP8 experts for decode
 and creates BF16 expert copies at load time for tuned prefill.
 
