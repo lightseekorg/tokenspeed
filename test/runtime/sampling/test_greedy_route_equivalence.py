@@ -92,8 +92,13 @@ def _tie_free_logits(rows: int) -> torch.Tensor:
 
 
 def _sampling_info(req_pool_indices: torch.Tensor) -> SamplingBatchInfo:
+    # Pool-indexed philox offsets: production always supplies these (the
+    # request's cache length), and flashinfer's seeded sampling needs them —
+    # offset=None falls back to global RNG state.
+    offsets = torch.arange(100, 100 + POOL + 1, dtype=torch.int32, device="cuda")
     return SamplingBatchInfo(
         req_pool_indices=req_pool_indices,
+        valid_cache_lengths=offsets,
         vocab_size=VOCAB,
         device="cuda",
     )
@@ -163,6 +168,23 @@ def test_sample_top_k1_tie_rows_pick_a_max(backend_name):
         f"{backend_name} greedy tie row escaped the argmax-equivalent set: "
         f"{sampled.cpu().tolist()}"
     )
+
+    # Greedy must be deterministic ACROSS submissions: two identical greedy
+    # requests carry different rids, and rid-derived seeds would break ties
+    # differently. SamplingParams pins greedy's seed, so a fresh backend with
+    # fresh rids must reproduce the tie choice exactly.
+    backend2 = _backends()[backend_name](_make_config())
+    rids2 = [f"resubmitted_{i}" for i in range(bs)]
+    backend2.prepare_step(
+        request_ids=rids2,
+        request_pool_indices=list(range(bs)),
+        sampling_params_list=[_greedy_sp(r) for r in rids2],
+        num_tokens_per_req=1,
+    )
+    sampled2, _ = backend2.sample(
+        _logits_output(logits.clone()), _sampling_info(req_pool_indices)
+    )
+    torch.testing.assert_close(sampled.cpu(), sampled2.cpu())
 
 
 def _chain_greedy_reference(
