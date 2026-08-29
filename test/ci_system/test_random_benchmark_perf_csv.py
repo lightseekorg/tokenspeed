@@ -3,7 +3,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+import yaml
 from pipeline import check_perf_reference, extract_perf_summary_rows
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PERF_CONFIG_DIR = REPO_ROOT / "test" / "ci" / "perf"
 
 
 def test_random_benchmark_output_can_be_gated(tmp_path):
@@ -86,3 +91,19 @@ def test_random_benchmark_accepts_evalscope_1_10_metric_names(tmp_path):
     assert rows[0]["Latency (tps/user)"] == "40.0"
     assert rows[0]["Throughput (tps/gpu)"] == "4.0"
     assert rows[0]["Decoded Tok/Iter"] == "2.0"
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "kimi-k3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml",
+        "kimi-k3-dspark-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml",
+    ],
+)
+def test_kimi_k3_perf_uses_cached_hugging_face_tokenizer(filename):
+    task = yaml.safe_load((PERF_CONFIG_DIR / filename).read_text(encoding="utf-8"))
+    command = task["perf"]["command"]
+
+    assert 'try_to_load_from_cache("moonshotai/Kimi-K3"' in command
+    assert '"tokenizer_config.json"' in command
+    assert '--tokenizer-path "$TOKENIZER_PATH"' in command
