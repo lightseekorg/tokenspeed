@@ -535,18 +535,26 @@ def _set_mla_kv_buffer_kernel(
             cache_k_nope_ptr + pid_loc * nope_stride + offs,
             mask=mask,
         )
+        if SANITIZE:
+            src = src.to(tl.float32)
+            src = tl.where(src != src, 0.0, src)
+            src = tl.where(src == float("inf"), MAX_FINITE, src)
+            src = tl.where(src == -float("inf"), -MAX_FINITE, src)
+        # Both sides of this runtime branch must produce the same Triton type.
+        # Converting here also lets the store quantize mixed-dtype cache inputs.
+        src = src.to(kv_buffer_ptr.dtype.element_ty)
     else:
         offs_rope = offs - nope_dim
         src = tl.load(
             cache_k_rope_ptr + pid_loc * rope_stride + offs_rope,
             mask=mask,
         )
-
-    if SANITIZE:
-        src = src.to(tl.float32)
-        src = tl.where(src != src, 0.0, src)
-        src = tl.where(src == float("inf"), MAX_FINITE, src)
-        src = tl.where(src == -float("inf"), -MAX_FINITE, src)
+        if SANITIZE:
+            src = src.to(tl.float32)
+            src = tl.where(src != src, 0.0, src)
+            src = tl.where(src == float("inf"), MAX_FINITE, src)
+            src = tl.where(src == -float("inf"), -MAX_FINITE, src)
+        src = src.to(kv_buffer_ptr.dtype.element_ty)
 
     tl.store(dst_ptr, src, mask=mask)
 
@@ -648,7 +656,7 @@ def set_mla_kv_buffer_triton(
     # viewed pools copy raw words, so no clamp applies to non-floating tensors.
     float_maxes = [
         torch.finfo(t.dtype).max
-        for t in (cache_k_nope, kv_buffer)
+        for t in (cache_k_nope, cache_k_rope, kv_buffer)
         if t.dtype.is_floating_point
     ]
     max_finite = min(float_maxes) if float_maxes else float("inf")

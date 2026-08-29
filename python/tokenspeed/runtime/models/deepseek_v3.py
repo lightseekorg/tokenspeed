@@ -1132,13 +1132,12 @@ class DeepseekV3AttentionMLA(nn.Module):
 
             v_fp8 = fp8_quantize(v)
 
-            # Write FP8 KV cache directly (skip BF16→FP8 conversion in pool)
+            # The cache scatter converts the compressed BF16 latent directly to FP8.
             k_pe_for_cache = k_fp8[:, 0:1, self.qk_nope_head_dim :]
-            kv_a_fp8 = fp8_quantize(kv_a)
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mha,
                 out_cache_loc,
-                cache_k_nope=kv_a_fp8.unsqueeze(1),
+                cache_k_nope=kv_a.unsqueeze(1),
                 cache_k_rope=k_pe_for_cache,
             )
 

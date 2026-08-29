@@ -81,7 +81,18 @@ def test_mla_kv_pack_quantize_fp8_fallback(
 
 
 def test_non_nvidia_public_api_uses_fallback() -> None:
-    if current_platform().is_nvidia:
-        pytest.skip("NVIDIA uses the optional fused tokenspeed-mla implementation")
+    if current_platform().is_nvidia or current_platform().is_cdna4:
+        pytest.skip("this platform uses an optimized MLA pack implementation")
 
     assert kernel_mla.mla_kv_pack_quantize_fp8 is mla_kv_pack_quantize_fp8
+
+
+def test_gfx950_public_api_uses_gluon() -> None:
+    if not current_platform().is_cdna4:
+        pytest.skip("gfx950 is required")
+
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.kv_pack import (
+        gluon_mla_kv_pack_quantize_fp8_gfx950,
+    )
+
+    assert kernel_mla.mla_kv_pack_quantize_fp8 is gluon_mla_kv_pack_quantize_fp8_gfx950

@@ -22,41 +22,49 @@
 
 from functools import wraps
 
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.ops.attention.tokenspeed_mla.fallback import (
+    mla_kv_pack_quantize_fp8 as _fallback_mla_kv_pack_quantize_fp8,
+)
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import error_fn
 
-try:
-    from tokenspeed_mla import (
-        get_num_sm,
+
+def _with_pdl_default(kernel, enable_pdl_position):
+    @wraps(kernel)
+    def wrapped(*args, **kwargs):
+        if len(args) <= enable_pdl_position and "enable_pdl" not in kwargs:
+            kwargs["enable_pdl"] = pdl_enabled()
+        return kernel(*args, **kwargs)
+
+    return wrapped
+
+
+get_num_sm = error_fn
+tokenspeed_mla_decode = error_fn
+tokenspeed_mla_prefill = error_fn
+warmup_compile_prefill = error_fn
+mla_kv_pack_quantize_fp8 = _fallback_mla_kv_pack_quantize_fp8
+
+if current_platform().is_cdna4:
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.kv_pack import (
+        gluon_mla_kv_pack_quantize_fp8_gfx950 as mla_kv_pack_quantize_fp8,
     )
-    from tokenspeed_mla import mla_kv_pack_quantize_fp8 as _mla_kv_pack_quantize_fp8
-    from tokenspeed_mla import tokenspeed_mla_decode as _tokenspeed_mla_decode
-    from tokenspeed_mla import tokenspeed_mla_prefill as _tokenspeed_mla_prefill
-    from tokenspeed_mla import warmup_compile_prefill as _warmup_compile_prefill
-except ImportError:
-    from tokenspeed_kernel.ops.attention.tokenspeed_mla.fallback import (
-        mla_kv_pack_quantize_fp8,
-    )
-
-    get_num_sm = error_fn
-    tokenspeed_mla_decode = error_fn
-    tokenspeed_mla_prefill = error_fn
-    warmup_compile_prefill = error_fn
-else:
-
-    def _with_pdl_default(kernel, enable_pdl_position):
-        @wraps(kernel)
-        def wrapped(*args, **kwargs):
-            if len(args) <= enable_pdl_position and "enable_pdl" not in kwargs:
-                kwargs["enable_pdl"] = pdl_enabled()
-            return kernel(*args, **kwargs)
-
-        return wrapped
-
-    mla_kv_pack_quantize_fp8 = _with_pdl_default(_mla_kv_pack_quantize_fp8, 8)
-    tokenspeed_mla_decode = _with_pdl_default(_tokenspeed_mla_decode, 13)
-    tokenspeed_mla_prefill = _with_pdl_default(_tokenspeed_mla_prefill, 12)
-    warmup_compile_prefill = _with_pdl_default(_warmup_compile_prefill, 3)
+elif current_platform().is_nvidia:
+    try:
+        from tokenspeed_mla import (
+            get_num_sm,
+        )
+        from tokenspeed_mla import mla_kv_pack_quantize_fp8 as _mla_kv_pack_quantize_fp8
+        from tokenspeed_mla import tokenspeed_mla_decode as _tokenspeed_mla_decode
+        from tokenspeed_mla import tokenspeed_mla_prefill as _tokenspeed_mla_prefill
+        from tokenspeed_mla import warmup_compile_prefill as _warmup_compile_prefill
+    except ImportError:
+        pass
+    else:
+        mla_kv_pack_quantize_fp8 = _with_pdl_default(_mla_kv_pack_quantize_fp8, 8)
+        tokenspeed_mla_decode = _with_pdl_default(_tokenspeed_mla_decode, 13)
+        tokenspeed_mla_prefill = _with_pdl_default(_tokenspeed_mla_prefill, 12)
+        warmup_compile_prefill = _with_pdl_default(_warmup_compile_prefill, 3)
 
 __all__ = [
     "get_num_sm",
