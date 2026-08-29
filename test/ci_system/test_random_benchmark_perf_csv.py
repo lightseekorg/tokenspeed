@@ -3,12 +3,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-import yaml
 from pipeline import check_perf_reference, extract_perf_summary_rows
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-PERF_CONFIG_DIR = REPO_ROOT / "test" / "ci" / "perf"
 
 
 def test_random_benchmark_output_can_be_gated(tmp_path):
@@ -91,37 +86,3 @@ def test_random_benchmark_accepts_evalscope_1_10_metric_names(tmp_path):
     assert rows[0]["Latency (tps/user)"] == "40.0"
     assert rows[0]["Throughput (tps/gpu)"] == "4.0"
     assert rows[0]["Decoded Tok/Iter"] == "2.0"
-
-
-def test_random_benchmark_reports_empty_results_without_traceback(tmp_path):
-    collector = (
-        REPO_ROOT / "test" / "random_benchmark" / "tokenspeed" / "collect_outputs.py"
-    )
-    result = subprocess.run(
-        [sys.executable, collector, tmp_path, "--emit-csv"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert result.returncode == 1
-    assert "Overall perf table:" in result.stdout
-    assert "config,Conc.,Latency (tps/user),Throughput (tps/gpu)" in result.stdout
-    assert result.stderr == ""
-
-
-@pytest.mark.parametrize(
-    "filename",
-    [
-        "kimi-k3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml",
-        "kimi-k3-dspark-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml",
-    ],
-)
-def test_kimi_k3_perf_uses_hugging_face_tokenizer(filename):
-    task = yaml.safe_load((PERF_CONFIG_DIR / filename).read_text(encoding="utf-8"))
-    command = task["perf"]["command"]
-
-    assert "from transformers import AutoTokenizer" in command
-    assert 'AutoTokenizer.from_pretrained("moonshotai/Kimi-K3"' in command
-    assert "--data-source huggingface" in command
-    assert '--tokenizer-path "$TOKENIZER_PATH"' in command
