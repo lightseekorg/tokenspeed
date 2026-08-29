@@ -34,7 +34,7 @@ from tokenspeed_kernel.ops.communication.trtllm import (
 from tokenspeed_kernel.ops.communication.trtllm import (
     reducescatter_residual_rmsnorm,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -45,8 +45,15 @@ from tokenspeed.runtime.utils import (
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 _is_amd = current_platform().is_amd
+# FlashInfer's JIT norm kernels ship no SM80 kernel images and recompile via
+# nvrtc on every process start (~12 min on pre-Hopper NVIDIA). The Triton
+# norm kernels persist in the Triton compile cache, so pre-Hopper NVIDIA
+# follows the same path as AMD.
+_use_triton_norm = _is_amd or (
+    current_platform().is_nvidia and current_platform().arch_version < ArchVersion(9, 0)
+)
 
-if _is_amd:
+if _use_triton_norm:
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm
     from tokenspeed_kernel.ops.layernorm.triton import (
         rmsnorm_fused_parallel as triton_rmsnorm_fused_parallel,
@@ -80,7 +87,7 @@ class LayerNorm(nn.Module):
         # There might be no tokens here (e.g. idle/padded graph rows).
         if x.shape[0] == 0:
             return x
-        if current_platform().is_nvidia:
+        if current_platform().is_nvidia and not _use_triton_norm:
             return layernorm(x, self.weight, self.bias, self.variance_epsilon)
         return nn.functional.layer_norm(
             x.float(),
@@ -114,7 +121,7 @@ class RMSNorm(torch.nn.Module):
             else:
                 return x
 
-        if _is_amd:
+        if _use_triton_norm:
             if residual is not None:
                 if out is not None:
                     raise ValueError("fused add rmsnorm does not support out")
@@ -265,7 +272,7 @@ class GemmaRMSNorm(torch.nn.Module):
             else:
                 return x
 
-        if _is_amd:
+        if _use_triton_norm:
             if x.shape[0] == 0:
                 if residual is not None:
                     return x, residual
@@ -434,7 +441,7 @@ class FusedRMSNorm(nn.Module):
         Returns:
             Tuple of (normalized_q_a, normalized_kv_a)
         """
-        if _is_amd:
+        if _use_triton_norm:
             triton_rmsnorm_fused_parallel(
                 input1=input_q_a,
                 weight1=self.weight_q_a,

@@ -91,7 +91,9 @@ class Fp8Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 90
+        # SM80/SM86/SM88 are served by the W8A16 (bf16 MMA) Triton path;
+        # FP8 tensor-core kernels still outrank it via registry priority.
+        return 80
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:

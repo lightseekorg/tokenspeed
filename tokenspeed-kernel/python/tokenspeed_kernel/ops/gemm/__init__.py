@@ -960,6 +960,14 @@ def _online_quantize_mxfp8(
             *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
             group_major_scales=_platform.is_nvidia,
         )
+    elif kernel_name == "triton_mm_fp8_blockscale_w8a16":
+        # Triton fp8 stores are unsupported on SM80-class GPUs; quantize with
+        # torch elementwise casts (absmax per token group, e4m3 saturation).
+        lead_shape = A.reshape(-1, A.shape[-1]).shape[0]
+        groups = A.reshape(lead_shape, -1, block_k)
+        scale = groups.float().abs().amax(-1).clamp(min=1e-12) / 448.0
+        q = (groups.float() / scale[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+        return q.view(A.shape), scale.view(lead_shape, -1)
     else:
         raise ValueError(f"No online quantization defined for kernel {kernel_name!r}")
 

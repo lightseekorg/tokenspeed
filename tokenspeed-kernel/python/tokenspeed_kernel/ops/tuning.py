@@ -222,6 +222,37 @@ def load_flashinfer_tuning_cache(path: str) -> bool:
     return True
 
 
+def save_flashinfer_tuning_cache(path: str) -> bool:
+    """Write flashinfer's in-memory tactic cache to a JSON table.
+
+    The table records environment metadata (GPU model, flashinfer/CUDA
+    versions) and can be reloaded with :func:`load_flashinfer_tuning_cache`
+    on a matching host, skipping the startup autotune sweep for every shape
+    it covers.
+
+    Args:
+        path: Destination JSON path; parent directories are created.
+
+    Returns:
+        True when the table was written; False when flashinfer is
+        unavailable or serialization failed.
+    """
+    try:
+        from flashinfer.autotuner import AutoTuner
+    except ImportError as exc:
+        logger.warning(f"flashinfer tuning cache not saved (no flashinfer): {exc}")
+        return False
+    try:
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, exist_ok=True)
+        AutoTuner.get().save_configs(path)
+    except Exception:
+        logger.warning(f"flashinfer tuning cache {path} failed to save", exc_info=True)
+        return False
+    logger.info(f"flashinfer tuning cache saved to {path}")
+    return True
+
+
 @functools.cache
 def load_packaged_flashinfer_tuning_cache(
     model: str, ep_size: int, tp_size: int

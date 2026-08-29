@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_token_quant_fp8,
     static_quant_fp8,
 )
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 from torch.nn.parameter import Parameter
 
 logger = logging.getLogger(__name__)
@@ -282,6 +283,23 @@ class Fp8LinearMethod(LinearMethodBase):
             input_2d = x.view(-1, x.shape[-1])
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
             output_dtype = output_dtype or x.dtype
+            if (
+                input_2d.shape[0] <= 8
+                and current_platform().is_nvidia
+                and current_platform().arch_version < ArchVersion(9, 0)
+            ):
+                # SM80: W8A16 decode GEMV (see w8a16_gemv module docstring).
+                from tokenspeed_kernel.ops.gemm.w8a16_gemv import (
+                    w8a16_decode_gemv,
+                )
+
+                return w8a16_decode_gemv(
+                    input_2d,
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    out_dtype=output_dtype,
+                    bias=bias,
+                ).view(*output_shape)
             plan = getattr(layer, "_prepared_fp8_linear", None)
             if plan is None:
                 output = tokenspeed_kernel.mm(

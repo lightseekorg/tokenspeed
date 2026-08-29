@@ -190,6 +190,33 @@ def get_w8a8_block_fp8_configs(
 
 
 @triton.jit
+def _e4m3_bits_to_bf16(u):
+    """Widen uint8 e4m3fn bit patterns to bf16 values.
+
+    SM80-class Triton cannot load fp8e4nv directly, so operands arrive as
+    uint8 bit patterns. e4m3fn is sign(1) exp(4, bias 7) mantissa(3);
+    normals shift the exponent by +120, subnormals are renormalized, and
+    e4m3fn's single NaN pattern maps to quiet bf16 NaN.
+    """
+    ue = u.to(tl.uint16)
+    s = (ue & 0x80) << 8
+    e = (ue >> 3) & 0xF
+    m = ue & 0x7
+    is_nan = (e == 15) & (m == 7)
+    is_zero = (e == 0) & (m == 0)
+    # floor(log2(m)) for 3-bit m: {1}->0, {2,3}->1, {4..7}->2
+    hb = tl.where(m > 3, 2, tl.where(m > 1, 1, 0)).to(tl.uint16)
+    exp = tl.where(e == 0, 118 + hb, e + 120)
+    exp = tl.where(is_nan, 255, exp)
+    exp = tl.where(is_zero, 0, exp)
+    mant = tl.where(e == 0, (m - (1 << hb)) << (7 - hb), m << 4)
+    mant = tl.where(is_nan, 0x40, mant)
+    mant = tl.where(is_zero, 0, mant)
+    bits = s | (exp << 7) | mant
+    return bits.to(tl.bfloat16, bitcast=True)
+
+
+@triton.jit
 def _w8a8_block_fp8_matmul(
     # Pointers to inputs and output
     A,
@@ -220,6 +247,7 @@ def _w8a8_block_fp8_matmul(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    COMPUTE_BF16: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
@@ -260,7 +288,18 @@ def _w8a8_block_fp8_matmul(
         if Bs.dtype.element_ty == tl.uint8:
             b_s = tl.exp2(b_s.to(tl.float32) - 127.0)
 
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        if COMPUTE_BF16:
+            # Pre-FP8 NVIDIA GPUs (SM80/SM86/SM88) have no FP8 MMA and cannot
+            # load fp8e4nv at all; operands arrive as uint8 e4m3 bit patterns
+            # and are widened to BF16 here. Applying the constant per-block
+            # scales outside the dot is algebraically exact.
+            accumulator += (
+                tl.dot(_e4m3_bits_to_bf16(a), _e4m3_bits_to_bf16(b))
+                * a_s[:, None]
+                * b_s[None, :]
+            )
+        else:
+            accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -309,6 +348,7 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    COMPUTE_BF16: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
@@ -356,7 +396,18 @@ def _w8a8_block_fp8_matmul_unrolledx4(
         a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        if COMPUTE_BF16:
+            # Pre-FP8 NVIDIA GPUs (SM80/SM86/SM88) have no FP8 MMA and cannot
+            # load fp8e4nv at all; operands arrive as uint8 e4m3 bit patterns
+            # and are widened to BF16 here. Applying the constant per-block
+            # scales outside the dot is algebraically exact.
+            accumulator += (
+                tl.dot(_e4m3_bits_to_bf16(a), _e4m3_bits_to_bf16(b))
+                * a_s[:, None]
+                * b_s[None, :]
+            )
+        else:
+            accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -377,7 +428,18 @@ def _w8a8_block_fp8_matmul_unrolledx4(
         a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        if COMPUTE_BF16:
+            # Pre-FP8 NVIDIA GPUs (SM80/SM86/SM88) have no FP8 MMA and cannot
+            # load fp8e4nv at all; operands arrive as uint8 e4m3 bit patterns
+            # and are widened to BF16 here. Applying the constant per-block
+            # scales outside the dot is algebraically exact.
+            accumulator += (
+                tl.dot(_e4m3_bits_to_bf16(a), _e4m3_bits_to_bf16(b))
+                * a_s[:, None]
+                * b_s[None, :]
+            )
+        else:
+            accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -398,7 +460,18 @@ def _w8a8_block_fp8_matmul_unrolledx4(
         a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        if COMPUTE_BF16:
+            # Pre-FP8 NVIDIA GPUs (SM80/SM86/SM88) have no FP8 MMA and cannot
+            # load fp8e4nv at all; operands arrive as uint8 e4m3 bit patterns
+            # and are widened to BF16 here. Applying the constant per-block
+            # scales outside the dot is algebraically exact.
+            accumulator += (
+                tl.dot(_e4m3_bits_to_bf16(a), _e4m3_bits_to_bf16(b))
+                * a_s[:, None]
+                * b_s[None, :]
+            )
+        else:
+            accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -419,7 +492,18 @@ def _w8a8_block_fp8_matmul_unrolledx4(
         a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        if COMPUTE_BF16:
+            # Pre-FP8 NVIDIA GPUs (SM80/SM86/SM88) have no FP8 MMA and cannot
+            # load fp8e4nv at all; operands arrive as uint8 e4m3 bit patterns
+            # and are widened to BF16 here. Applying the constant per-block
+            # scales outside the dot is algebraically exact.
+            accumulator += (
+                tl.dot(_e4m3_bits_to_bf16(a), _e4m3_bits_to_bf16(b))
+                * a_s[:, None]
+                * b_s[None, :]
+            )
+        else:
+            accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -451,6 +535,7 @@ def w8a8_block_fp8_matmul_triton(
     block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
     out: torch.Tensor | None = None,
+    compute_bf16: bool = False,
 ) -> torch.Tensor:
     """This function performs matrix multiplication with block-wise quantization.
 
@@ -524,9 +609,12 @@ def w8a8_block_fp8_matmul_triton(
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
 
+    A_launch = A.view(torch.uint8) if compute_bf16 else A
+    B_launch = B.view(torch.uint8) if compute_bf16 else B
+
     kernel[grid](
-        A,
-        B,
+        A_launch,
+        B_launch,
         C,
         As,
         Bs,
@@ -545,6 +633,7 @@ def w8a8_block_fp8_matmul_triton(
         As.stride(-1),
         Bs.stride(1),
         Bs.stride(0),
+        COMPUTE_BF16=compute_bf16,
         **config,
     )
 
@@ -818,6 +907,72 @@ def triton_mm_fp8_blockscale(
         block_size=block_size,
         output_dtype=out_dtype,
         out=out,
+    )
+
+
+@register_kernel(
+    "gemm",
+    "mm",
+    name="triton_mm_fp8_blockscale_w8a16",
+    solution="triton",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(8, 0),
+        max_arch_version=ArchVersion(8, 8),
+    ),
+    signatures=_MXFP8_FORMAT_SIGNATURES,
+    traits={},
+    priority=Priority.PERFORMANT + 4,
+    tags={"portability"},
+)
+def triton_mm_fp8_blockscale_w8a16(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Block-scaled FP8 GEMM using BF16 tensor-core MMA.
+
+    Targets NVIDIA GPUs without FP8 MMA support (SM80/SM86/SM88). Numerics
+    match ``triton_mm_fp8_blockscale``: FP8 operands are widened to BF16 for
+    the dot and the constant per-block scales are applied outside it, which
+    is algebraically exact.
+
+    Args:
+        A: Activation matrix ``[M, K]`` in FP8.
+        B: Weight matrix ``[N, K]`` in FP8.
+        A_scales: Activation scales; online quantization is done by the caller.
+        B_scales: Weight block scales ``[N // group_n, K // group_k]``.
+        out_dtype: Output element dtype.
+        alpha: Unused; accepted for signature parity.
+        block_size: Logical scale block shape ``[group_n, group_k]``.
+        out: Optional output buffer.
+
+    Returns:
+        The product matrix ``[M, N]`` in ``out_dtype``.
+    """
+    assert (
+        block_size is not None
+    ), "block_size is required for triton_mm_fp8_blockscale_w8a16"
+    assert (
+        A_scales is not None
+    ), "A_scales is required; online quantization should be done by the caller"
+    if B_scales is None:
+        raise ValueError("B_scales is required for triton block-scale FP8 GEMM")
+    return w8a8_block_fp8_matmul_triton(
+        A,
+        B,
+        A_scales,
+        B_scales,
+        block_size=block_size,
+        output_dtype=out_dtype,
+        out=out,
+        compute_bf16=True,
     )
 
 

@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -29,6 +30,8 @@ import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.tuning import (
     autotune,
+    load_flashinfer_tuning_cache,
+    save_flashinfer_tuning_cache,
     set_autotune_max_num_tokens,
     set_autotune_process_group,
 )
@@ -654,6 +657,17 @@ class ModelExecutor:
         ib = self.input_buffers
         tic = time.time()
         set_autotune_process_group(cpu_group)
+        # Persist tactics across restarts: seed from a prior sweep, then save
+        # whatever this sweep learned. Disable with TOKENSPEED_FLASHINFER_
+        # TACTICS_CACHE=0/off or point it at a custom path.
+        tactics_cache = os.path.expanduser(
+            os.environ.get(
+                "TOKENSPEED_FLASHINFER_TACTICS_CACHE",
+                "~/.cache/tokenspeed/flashinfer_tactics.json",
+            )
+        )
+        if tactics_cache not in ("", "0", "off"):
+            load_flashinfer_tuning_cache(tactics_cache)
         with autotune(), maybe_inference_mode():
             ctx = self.prefill_graph.make_dummy_batch(num_tokens, self.forward_step)
             positions = (
@@ -671,6 +685,8 @@ class ModelExecutor:
         set_autotune_process_group(None)
         torch.cuda.synchronize()
         dist.barrier()
+        if tactics_cache not in ("", "0", "off"):
+            save_flashinfer_tuning_cache(tactics_cache)
         logger.info(f"Kernel tuning finished in {time.time() - tic:.1f}s")
 
     @property
