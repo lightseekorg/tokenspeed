@@ -56,6 +56,9 @@ class MlaCacheGroupMixin:
     # CUDA-graph wrapper to skip that dispatch for MLA drafts.
     reads_staged_draft_page_table = True
 
+    # Write locations clamp into the reserved page 0, so capture needs a real one.
+    capture_table_in_block_granularity = True
+
     def mark_cache_contract(self) -> None:
         """Flag this backend as an LCM cache-group contract sub-backend.
 

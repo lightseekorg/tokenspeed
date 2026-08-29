@@ -35,6 +35,20 @@ def _fake_pool(*, specs=(), **arena_attrs) -> SimpleNamespace:
     )
 
 
+def _backend(**attrs) -> SimpleNamespace:
+    """An attention-backend double whose ``consumes_cache_metadata`` the
+    production property computes, so these doubles cannot drift from it."""
+    from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+
+    attrs.setdefault("uses_cache_groups", False)
+    attrs.setdefault("_cache_contract_bound", False)
+    attrs.setdefault("capture_table_in_block_granularity", False)
+    attrs.setdefault("max_num_pages", 0)
+    ns = SimpleNamespace(**attrs)
+    ns.consumes_cache_metadata = AttentionBackend.consumes_cache_metadata.fget(ns)
+    return ns
+
+
 class SliceMhaExtendInputsTest(unittest.TestCase):
     """MHA kernels see exactly the rows covered by live cu-seqlens."""
 
@@ -121,8 +135,8 @@ class DummyGroupTablesTest(unittest.TestCase):
         pg.config = SimpleNamespace(device="cpu")
         return pg
 
-    def test_backend_gets_writable_state_tables(self):
-        backend = SimpleNamespace(
+    def test_every_group_gets_a_real_page(self):
+        backend = _backend(
             uses_cache_groups=True,
             kernel_page_size=32,
             max_num_pages=0,  # fall back to bucket-derived width
@@ -142,17 +156,17 @@ class DummyGroupTablesTest(unittest.TestCase):
         )
         for t in tables.values():
             self.assertEqual(t.shape, (1, 4))  # ceil(100/32)
-        self.assertEqual(int(tables["full_attention"].abs().sum()), 0)
-        self.assertEqual(int(tables["sliding_attention"].abs().sum()), 0)
-        self.assertTrue(
-            bool((tables["linear_attention"] == 1).all()),
-            "state checkpoints need a writable dummy page during graph capture",
-        )
+        for group_id, table in tables.items():
+            self.assertTrue(
+                bool((table == 1).all()),
+                f"{group_id}: capture writes KV, so no group may get the "
+                "reserved null page",
+            )
 
     def test_full_width_for_stride_deriving_backends(self):
         # trtllm-style: row stride comes from max_kv_len, so dummy tables
         # must span the full table width, not just the bucket.
-        backend = SimpleNamespace(
+        backend = _backend(
             uses_cache_groups=True,
             kernel_page_size=32,
             max_num_pages=2500,
@@ -163,9 +177,9 @@ class DummyGroupTablesTest(unittest.TestCase):
         self.assertEqual(tables["full_attention"].shape, (1, 2500))
 
     def test_real_active_page_contract_uses_per_group_geometry(self):
-        backend = SimpleNamespace(
+        backend = _backend(
             uses_cache_groups=True,
-            cache_active_pages_must_be_real=True,
+            capture_table_in_block_granularity=True,
             prefix_granularity=256,
             max_num_pages=257,
             state_group_ids=frozenset(),
@@ -188,10 +202,8 @@ class DummyGroupTablesTest(unittest.TestCase):
         # Hybrid wrappers set the flag but hold the paged KV consumer as
         # full_attn_backend; the helper must not AttributeError (which would
         # silently disable the prefill graph via the capture fallback).
-        child = SimpleNamespace(
-            kernel_page_size=32, max_num_pages=0, state_group_ids=frozenset()
-        )
-        wrapper = SimpleNamespace(uses_cache_groups=True, full_attn_backend=child)
+        child = _backend(kernel_page_size=32, max_num_pages=0)
+        wrapper = _backend(uses_cache_groups=True, full_attn_backend=child)
         pool = _fake_pool(
             specs=(
                 _spec("full_attention"),
@@ -203,9 +215,123 @@ class DummyGroupTablesTest(unittest.TestCase):
         self.assertEqual(tables["full_attention"].shape, (1, 2))
 
     def test_backend_without_cache_groups_is_empty(self):
-        backend = SimpleNamespace(uses_cache_groups=False)
+        backend = _backend(uses_cache_groups=False)
         pool = _fake_pool(specs=())
-        self.assertEqual(self._bare(backend, pool)._dummy_group_tables(64, 1), {})
+        self.assertEqual(
+            self._bare(backend, pool)._dummy_group_tables(64, 1),
+            {},
+        )
+
+    def test_unbound_contract_is_still_empty(self):
+        """An MLA backend the registry never bound keeps the legacy page_table
+        path and must not be handed capture metadata."""
+        backend = _backend(uses_cache_groups=False, _cache_contract_bound=False)
+        pool = _fake_pool(specs=(_spec("full_attention"),))
+        self.assertEqual(
+            self._bare(backend, pool)._dummy_group_tables(64, 1),
+            {},
+        )
+
+    def test_contract_bound_mla_target_gets_tables(self):
+        """A plain MLA target leaves uses_cache_groups False by design, so
+        gating capture on it handed the backend a dummy batch with no metadata,
+        which it refuses -- Kimi-K2.5 ran every eval on eager prefill."""
+        backend = _backend(
+            uses_cache_groups=False,
+            _cache_contract_bound=True,
+            capture_table_in_block_granularity=True,
+            kernel_page_size=32,
+            max_num_pages=2500,
+            state_group_ids=frozenset(),
+        )
+        pool = _fake_pool(specs=(_spec("full_attention", block_granularity=128),))
+        tables = self._bare(backend, pool)._dummy_group_tables(256, 2)
+        self.assertEqual(set(tables), {"full_attention"})
+        # Scheduler-table columns span block_granularity, not the backend's
+        # kernel pages: 256/128 == 2, where kernel geometry would say 8.
+        self.assertEqual(tables["full_attention"].shape, (2, 2))
+        self.assertTrue(
+            bool((tables["full_attention"] == 1).all()),
+            "MLA rejects the null page in live metadata, so capture needs a "
+            "real writable page",
+        )
+
+    def test_mla_family_capture_avoids_the_reserved_page(self):
+        """Capture must not hand an MLA backend page 0: write locations clamp
+        into the reserved null page instead of failing, so the graph would
+        scribble on the page that padding and table holes read as zero."""
+        from tokenspeed.runtime.layers.attention.backends.mla_cache_groups import (
+            MlaCacheGroupMixin,
+        )
+        from tokenspeed.runtime.layers.attention.backends.tokenspeed_mla import (
+            CuteDSLMLABackend,
+        )
+
+        for cls in (MlaCacheGroupMixin, CuteDSLMLABackend):
+            backend = _backend(
+                _cache_contract_bound=True,
+                capture_table_in_block_granularity=cls.capture_table_in_block_granularity,
+                kernel_page_size=32,
+                max_num_pages=2500,
+                state_group_ids=frozenset(),
+            )
+            pool = _fake_pool(specs=(_spec("full_attention", block_granularity=128),))
+            tables = self._bare(backend, pool)._dummy_group_tables(256, 1)
+            self.assertGreater(
+                int(tables["full_attention"].min()),
+                0,
+                f"{cls.__name__} capture would write into the reserved page",
+            )
+
+    def test_delegating_wrapper_answers_for_its_child(self):
+        """A wrapper that forwards mark_cache_contract must forward the capture
+        predicates too, or capture hands its bound child a batch the child
+        declares invalid. Asserting the values, not their presence: a property
+        that returns the wrong answer is the failure being guarded against."""
+        from tokenspeed.runtime.layers.attention.backends.dsa import DSABackend
+
+        wrapper = DSABackend.__new__(DSABackend)
+        wrapper._dense_backend = SimpleNamespace(
+            consumes_cache_metadata=True, capture_table_in_block_granularity=False
+        )
+        self.assertTrue(wrapper.consumes_cache_metadata)
+        self.assertFalse(wrapper.capture_table_in_block_granularity)
+
+        wrapper._dense_backend = SimpleNamespace(
+            consumes_cache_metadata=False, capture_table_in_block_granularity=True
+        )
+        self.assertFalse(wrapper.consumes_cache_metadata)
+        self.assertTrue(wrapper.capture_table_in_block_granularity)
+
+    def test_inkling_width_reaches_the_inner_backend(self):
+        """max_num_pages is a base-class attribute now, and a class attribute
+        shadows Inkling's __getattr__ -- the mirror block exists for exactly
+        this, and without the mirror a stride-deriving inner collapses from
+        full width to bucket width."""
+        from tokenspeed.runtime.layers.attention.backends.inkling import (
+            InklingAttnBackend,
+        )
+
+        wrapper = InklingAttnBackend.__new__(InklingAttnBackend)
+        wrapper.inner = SimpleNamespace(max_num_pages=2500)
+        self.assertEqual(wrapper.max_num_pages, 2500)
+
+    def test_inkling_wrapper_answers_for_its_inner(self):
+        """Same contract as the DSA wrapper: Inkling mirrors flags explicitly
+        because a class-level default on the base would shadow __getattr__."""
+        from tokenspeed.runtime.layers.attention.backends.inkling import (
+            InklingAttnBackend,
+        )
+
+        wrapper = InklingAttnBackend.__new__(InklingAttnBackend)
+        for answer in (True, False):
+            wrapper.inner = SimpleNamespace(
+                consumes_cache_metadata=answer,
+                capture_table_in_block_granularity=not answer,
+                uses_cache_groups=answer,
+            )
+            self.assertIs(wrapper.consumes_cache_metadata, answer)
+            self.assertIs(wrapper.capture_table_in_block_granularity, not answer)
 
     def test_runtime_contract_pool_is_eligible_for_capture(self):
         from unittest import mock
@@ -240,6 +366,62 @@ class DummyGroupTablesTest(unittest.TestCase):
 
         self.assertFalse(graph.disable)
         capture.assert_not_called()
+
+
+class CaptureFailureIsLoudTest(unittest.TestCase):
+    """A capture the dummy-batch machinery cannot serve must stop the boot.
+
+    Degrading here is what let a whole model family run eager prefill with a
+    warning nobody read: the warning was indistinguishable from the families
+    that are deliberately eager.
+    """
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + runtime deps: {exc}")
+        self.torch = torch
+        self.PrefillGraph = PrefillGraph
+
+    def _bare(self, raises=None):
+        pg = self.PrefillGraph.__new__(self.PrefillGraph)
+        pg.disable = False
+        pg.capture_buckets = [4]
+        pg.attn_backend = SimpleNamespace()
+        pg.config = SimpleNamespace(device="cpu", world_group=None, world_size=1)
+        pg._embed_tokens = SimpleNamespace(
+            weight=self.torch.zeros(2, 8, dtype=self.torch.float32)
+        )
+
+        def _capture_all_buckets(_decode_wrapper):
+            if raises is not None:
+                raise raises
+
+        pg._capture_all_buckets = _capture_all_buckets
+        return pg
+
+    def test_capture_failure_propagates_untouched(self):
+        """Nothing between the backend and the operator: same exception object,
+        same traceback. ``capture`` has no handler at all, so a partial ladder
+        cannot be left behind -- the boot dies with it."""
+        cause = RuntimeError("backend refused the dummy batch")
+        pg = self._bare(raises=cause)
+        with self.assertRaises(RuntimeError) as caught:
+            pg.capture(None)
+        self.assertIs(caught.exception, cause)
+
+    def test_successful_capture_does_not_raise(self):
+        self._bare().capture(None)
+
+    def test_oom_propagates(self):
+        """OOM keeps its own type and message. The capture pool not fitting is
+        an operator-visible sizing failure, not something to recover from."""
+        pg = self._bare(raises=self.torch.cuda.OutOfMemoryError("no room"))
+        with self.assertRaises(self.torch.cuda.OutOfMemoryError):
+            pg.capture(None)
 
 
 class TrtllmPrefillGraphSeamsTest(unittest.TestCase):

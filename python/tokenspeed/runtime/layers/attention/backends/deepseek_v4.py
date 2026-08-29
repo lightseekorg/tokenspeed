@@ -226,7 +226,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     needs_group_block_tables = True
     uses_cache_groups = True
     cache_group_tables_replace_draft_page_table = True
-    cache_active_pages_must_be_real = True
+    capture_table_in_block_granularity = True
     cache_consumer_families = frozenset({"history", "state"})
     uses_padded_decode_token_mask = True
 

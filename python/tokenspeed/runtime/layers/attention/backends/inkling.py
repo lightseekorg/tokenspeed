@@ -234,6 +234,19 @@ class InklingAttnBackend(AttentionBackend):
         return self.inner.uses_cache_groups
 
     @property
+    def consumes_cache_metadata(self) -> bool:
+        # Inherited would also work today, but only via a __getattr__ fallthrough.
+        return self.inner.consumes_cache_metadata
+
+    @property
+    def capture_table_in_block_granularity(self) -> bool:
+        return self.inner.capture_table_in_block_granularity
+
+    @property
+    def max_num_pages(self) -> int:
+        return self.inner.max_num_pages
+
+    @property
     def cache_consumer_families(self):
         return frozenset(getattr(self.inner, "cache_consumer_families", ())) | {"state"}
 

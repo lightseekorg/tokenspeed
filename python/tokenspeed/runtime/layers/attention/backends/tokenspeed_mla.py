@@ -113,6 +113,8 @@ class CuteDSLMLABackend(AttentionBackend):
     # Cache contract capability: this backend consumes only history-family
     # (full-attention) tables; state groups belong to the linear sub-backend.
     cache_consumer_families = frozenset({"history"})
+    # Same null-page contract as MlaCacheGroupMixin; this backend predates it.
+    capture_table_in_block_granularity = True
     draft_seq_lens_attr: str = "cuda_graph_seq_lens_buf"
 
     def __init__(self, config: MLAConfig):
