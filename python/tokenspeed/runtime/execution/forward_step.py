@@ -1098,13 +1098,17 @@ class ForwardStepRunner:
                 **draft_extend_kwargs,
             )
             if self.use_v4_mtp_paged_metadata:
-                self.draft_attn_backend.init_forward_metadata(
-                    bs=padded_bs,
-                    num_extends=0,
-                    req_pool_indices=req_pool_indices,
-                    seq_lens=draft_seq_lens,
-                    page_table=self.drafter.cache_view.table,
+                # The draft's step-1+ decode metadata for this extend round:
+                # the same unified refresh the pure-decode path uses.
+                if getattr(self.draft_attn_backend, "needs_group_block_tables", False):
+                    draft_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
+                self.draft_attn_backend.refresh_decode_metadata(
+                    padded_bs,
+                    padded_bs,
+                    req_pool_indices,
+                    draft_seq_lens,
                     forward_mode=ForwardMode.DECODE,
+                    page_table=self.drafter.cache_view.table,
                     **draft_kwargs,
                 )
 

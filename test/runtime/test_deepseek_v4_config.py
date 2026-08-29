@@ -1036,6 +1036,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             def init_forward_metadata(self, *args, **kwargs):
                 captured[self.key].append((args, kwargs))
 
+            def refresh_decode_metadata(self, *args, **kwargs):
+                captured[self.key].append((args, kwargs))
+
         target_cache_metadata = object()
         forward_batch = object()
         swa_table = torch.ones((1, 1), dtype=torch.int32)
