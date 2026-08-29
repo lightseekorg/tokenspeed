@@ -18,21 +18,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Runtime device configuration helpers."""
-
-import torch
-
-from tokenspeed.runtime.utils import get_colorful_logger
-
-logger = get_colorful_logger(__name__)
-
-
-class DeviceConfig:
-    device: torch.device | None
-
-    def __init__(self, device: str = "cuda") -> None:
-        if device in {"cuda", "npu"}:
-            self.device_type = device
-        else:
-            raise RuntimeError(f"Not supported device type: {device}")
-        self.device = torch.device(self.device_type)
+"""Ascend operator implementations."""

@@ -136,8 +136,14 @@ def transfer_cache_ranges(
         return
 
     global _mapped_host_triton_available
-    with torch.cuda.stream(stream):
-        if backend != "dma" and _mapped_host_triton_available is not False:
+    device_module = torch.get_device_module(device_buffers[0].device)
+    with device_module.stream(stream):
+        mapped_host_candidate = device_buffers[0].device.type != "npu"
+        if (
+            backend != "dma"
+            and mapped_host_candidate
+            and _mapped_host_triton_available is not False
+        ):
             try:
                 _transfer_cache_ranges_triton(
                     list(device_buffers),

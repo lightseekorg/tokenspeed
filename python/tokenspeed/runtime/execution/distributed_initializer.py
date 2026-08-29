@@ -138,6 +138,8 @@ class DistributedInitializer:
         # Determine backend
         if config.device == "cuda":
             backend = "nccl"
+        elif config.device == "npu":
+            backend = "hccl"
         else:
             raise ValueError(f"Unsupported device: {config.device}")
 
@@ -150,7 +152,9 @@ class DistributedInitializer:
         # Pass the device so PyTorch binds the process group to it (eager NCCL
         # init) instead of inferring it later — this also mutes the c10d
         # "barrier(): using the device under current context" warning.
-        device_id = torch.device(config.device, config.gpu_id)
+        device_id = (
+            None if backend == "hccl" else torch.device(config.device, config.gpu_id)
+        )
 
         # Initialize distributed via the mapping-based process group manager
         pg_manager.init_distributed(

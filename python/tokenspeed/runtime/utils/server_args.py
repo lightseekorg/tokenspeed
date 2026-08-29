@@ -902,6 +902,12 @@ class ServerArgs:
             )
 
     def validate(self):
+        if self.device == "npu":
+            if not self.disable_prefill_graph:
+                raise ValueError("NPU execution requires --disable-prefill-graph")
+            if not self.disable_pdl:
+                raise ValueError("NPU execution requires --disable-pdl")
+
         if (
             self.max_num_seqs is not None
             and self.max_num_seqs < self.mapping.attn.dp_size
@@ -1133,7 +1139,7 @@ class ServerArgs:
             "--device",
             type=str,
             default="cuda",
-            choices=["cuda"],
+            choices=["cuda", "npu"],
             help="The device type.",
         )
         parser.add_argument(

@@ -28,14 +28,25 @@ import importlib.abc
 import importlib.util
 import sys
 
-import tokenspeed_triton as triton
 import tokenspeed_triton.experimental.gluon.language as gl
-import tokenspeed_triton.profiler as proton
-from tokenspeed_triton import language as tl
+import torch
 from tokenspeed_triton.experimental import gluon
 from tokenspeed_triton.language.core import _aggregate as aggregate
-from tokenspeed_triton.language.extra import libdevice
 from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
+
+_IS_NPU = hasattr(torch, "npu") and torch.npu.is_available()
+
+if _IS_NPU:
+    from tokenspeed_kernel_npu._triton import libdevice, proton, tl, triton
+else:
+    import tokenspeed_triton as triton
+    from tokenspeed_triton import language as tl
+    from tokenspeed_triton.language.extra import libdevice
+
+    try:
+        import tokenspeed_triton.profiler as proton
+    except ImportError:
+        proton = None
 
 __all__ = [
     "aggregate",
@@ -108,6 +119,10 @@ def redirect_triton_to_tokenspeed_triton():
     Outside the ``with`` block ``sys.modules`` is restored to its prior
     state, so unrelated code is unaffected.
     """
+    if _IS_NPU:
+        yield
+        return
+
     saved = {
         name: sys.modules[name]
         for name in list(sys.modules)

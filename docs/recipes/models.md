@@ -426,6 +426,92 @@ Qwen2, dense Qwen3, and Qwen3 MoE checkpoints use different architecture names.
 For Qwen3 30B-A3B, the Hugging Face config advertises `qwen3_moe` and
 `Qwen3MoeForCausalLM`, so launch it as a MoE model.
 
+### Qwen3-0.6B on Ascend NPU
+
+The Ascend path supports unquantized Qwen3-0.6B on one or more NPUs. It uses
+the normal TokenSpeed scheduler and paged KV cache: prefill runs eagerly, while
+fixed-shape decode batches are captured as ACL Graphs. Aggregate serving can
+schedule prefill and decode work in the same deployment.
+
+The validated environment is CANN 9.0.0, PyTorch 2.9.0, `torch_npu`
+2.9.0.post2, Transformers 5.12.0, Triton 3.2.0, and Triton-Ascend 3.2.1.
+During validation, upgrading Transformers from 4.51.0 to 5.12.0 also changed
+`huggingface-hub` from 0.36.2 to 1.28.0, `tokenizers` from 0.21.4 to 0.22.2,
+and `hf-xet` from 1.5.1 to 1.6.0. It newly installed `typer==0.27.1`,
+`shellingham==1.5.4`, and `annotated-doc==0.0.5`. The setup also newly installs
+`apache-tvm-ffi==0.1.13` and editable `tokenspeed-kernel-npu==0.1.0`. These are
+all Python-environment mutations made during this validation. Use matching
+PyTorch and `torch_npu` builds. From the repository root, install the Ascend
+dependencies, source CANN, and expose the three source packages:
+
+```bash
+test/ci_system/install_triton_ascend.sh
+source /usr/local/Ascend/cann-9.0.0/set_env.sh
+export ASCEND_RT_VISIBLE_DEVICES=0
+export PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kernel-npu/python:${PYTHONPATH:-}"
+
+python -m tokenspeed.cli serve Qwen/Qwen3-0.6B \
+  --served-model-name qwen3-0.6b \
+  --device npu \
+  --dtype bfloat16 \
+  --kv-cache-dtype auto \
+  --attention-backend mha \
+  --sampling-backend greedy \
+  --disable-prefill-graph \
+  --disable-pdl \
+  --max-model-len 4096 \
+  --max-num-seqs 4 \
+  --max-total-tokens 16384 \
+  --chunked-prefill-size 4096 \
+  --prefix-granularity 128 \
+  --max-cudagraph-capture-size 4 \
+  --cudagraph-capture-sizes 1 2 4 \
+  --disable-autotune \
+  --host 0.0.0.0 \
+  --port 31889
+```
+
+The setup script installs Transformers 5.12.0 and Triton-Ascend 3.2.1, installs
+`tokenspeed-kernel-npu` from this checkout in editable mode, and compiles and
+executes both a vector-add kernel and a TokenSpeed KV-cache kernel on the
+visible NPU. Set `TOKENSPEED_CANN_ROOT` when CANN is installed outside the
+default path.
+
+The standard `mha` runtime backend selects the registered Ascend kernels on an
+NPU. It requires eager prefill and disabled PDL, so pass
+`--disable-prefill-graph` and `--disable-pdl` explicitly. Do not pass
+`--enforce-eager`, because that also disables the decode ACL Graph. Although the
+graph flags retain their CUDA-oriented names for CLI compatibility, they control
+ACL Graph capture on an NPU. The command above captures decode batches 1, 2,
+and 4 and was validated with a 16,384-token KV pool. Increase
+`--max-model-len`, `--max-num-seqs`, `--max-total-tokens`, and the capture sizes
+together when scaling the deployment. `--disable-autotune` shortens bring-up;
+remove it after validation when startup tuning is desired.
+
+The current Ascend sampling path is validated with greedy decoding. Because
+`--sampling-backend greedy` always performs argmax, send `temperature=0` and do
+not expect request-level `top_p` or `top_k` to take effect.
+
+Multi-card deployments use tensor parallelism; the world size must satisfy the
+model's standard divisibility constraints. Context, pipeline, and data parallel
+sizes must remain 1. Set `--world-size N` and expose `N` NPUs, for example
+`ASCEND_RT_VISIBLE_DEVICES=0,1` with `--world-size 2`.
+
+Verify the OpenAI-compatible endpoint with the served model name rather than
+the checkpoint path:
+
+```bash
+curl http://127.0.0.1:31889/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3-0.6b",
+    "messages": [{"role": "user", "content": "你好，请用一句话介绍你自己。"}],
+    "temperature": 0,
+    "max_tokens": 64,
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
+```
+
 ```bash
 tokenspeed serve Qwen/Qwen3-30B-A3B \
   --served-model-name qwen3-30b-a3b \

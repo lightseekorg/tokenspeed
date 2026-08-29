@@ -25,6 +25,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 # Backend registration (side-effect imports)
+import tokenspeed_kernel.ops.attention.ascend  # noqa: F401
 import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
 import tokenspeed_kernel.ops.attention.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401

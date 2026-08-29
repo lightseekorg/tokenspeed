@@ -50,6 +50,15 @@ __all__ = [
 ]
 
 
+def _npu_is_available() -> bool:
+    """Return whether torch-npu is installed and an Ascend device is visible."""
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return bool(torch.npu.is_available())
+
+
 # ---------------------------------------------------------------------------
 # Core data structures
 # ---------------------------------------------------------------------------
@@ -92,7 +101,7 @@ class InterconnectInfo:
 class PlatformInfo:
     """Complete description of a compute platform."""
 
-    vendor: str  # "nvidia", "amd"
+    vendor: str  # "nvidia", "amd", "ascend"
     arch_version: ArchVersion
     device_name: str
     device_count: int
@@ -141,6 +150,10 @@ class PlatformInfo:
     @property
     def is_amd(self) -> bool:
         return self.vendor == "amd"
+
+    @property
+    def is_npu(self) -> bool:
+        return self.vendor == "ascend"
 
     @property
     def is_cdna4(self) -> bool:
@@ -323,7 +336,31 @@ def _detect_platform() -> PlatformInfo:
             return _detect_rocm_platform()
         return _detect_cuda_platform()
 
-    raise RuntimeError("tokenspeed-kernel requires an NVIDIA CUDA or AMD ROCm GPU.")
+    if _npu_is_available():
+        return _detect_npu_platform()
+
+    raise RuntimeError(
+        "tokenspeed-kernel requires an NVIDIA CUDA, AMD ROCm, or Ascend NPU device."
+    )
+
+
+def _detect_npu_platform() -> PlatformInfo:
+    """Detect an Ascend platform exposed through torch-npu."""
+    props = torch.npu.get_device_properties(torch.npu.current_device())
+    return PlatformInfo(
+        vendor="ascend",
+        arch_version=ArchVersion(9, 1),
+        device_name=props.name,
+        device_count=torch.npu.device_count(),
+        total_memory=props.total_memory,
+        memory_bandwidth=0.0,
+        sm_count=getattr(props, "cube_core_num", 0),
+        max_threads_per_sm=0,
+        max_shared_memory_per_sm=0,
+        sm_features=frozenset({"tensor_core:f16", "tensor_core:bf16"}),
+        runtime_features=frozenset({"runtime:acl_graph"}),
+        interconnect=InterconnectInfo(topology="single_gpu"),
+    )
 
 
 def _detect_cuda_platform() -> PlatformInfo:

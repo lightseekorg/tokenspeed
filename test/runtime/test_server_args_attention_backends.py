@@ -63,6 +63,12 @@ class TestAttentionBackendChoices(unittest.TestCase):
             )
             self.assertEqual(args.attention_backend, backend)
 
+    def test_attention_backend_uses_generic_mha_for_ascend(self):
+        choices = set(self._action(self._build_parser(), "attention_backend").choices)
+        self.assertIn("mha", choices)
+        self.assertNotIn("ascend_mha", choices)
+        self.assertNotIn("npu", choices)
+
     def test_drafter_attention_backend_accepts_trtllm_mla(self):
         """Regression: trtllm_mla must be accepted here too."""
         args = self._build_parser().parse_args(

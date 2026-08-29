@@ -137,13 +137,16 @@ class ForwardThread:
         # "cuda" means the caller's current device (set_device(local_rank)
         # ran during distributed init), which a fresh thread would not
         # inherit — torch defaults new threads to device 0.
-        self._cuda_index: int | None = None
+        self._device_type: str | None = None
+        self._device_index: int | None = None
         resolved = torch.device(device)
-        if torch.cuda.is_available() and resolved.type == "cuda":
-            self._cuda_index = (
+        if resolved.type in {"cuda", "npu"}:
+            device_module = torch.get_device_module(resolved.type)
+            self._device_type = resolved.type
+            self._device_index = (
                 resolved.index
                 if resolved.index is not None
-                else torch.cuda.current_device()
+                else device_module.current_device()
             )
         self._queue: queue.SimpleQueue = queue.SimpleQueue()
         self._thread = threading.Thread(
@@ -152,8 +155,8 @@ class ForwardThread:
         self._thread.start()
 
     def _run(self) -> None:
-        if self._cuda_index is not None:
-            torch.cuda.set_device(self._cuda_index)
+        if self._device_index is not None:
+            torch.get_device_module(self._device_type).set_device(self._device_index)
         while True:
             item = self._queue.get()
             if item is None:

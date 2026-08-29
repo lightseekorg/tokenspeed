@@ -572,7 +572,8 @@ class ModelExecutor:
             self.model_runner, "encoder_graph_wrappers", {}
         )
 
-        self.execution_stream = torch.cuda.Stream()
+        self.device_module = torch.get_device_module(self.device)
+        self.execution_stream = self.device_module.Stream()
         # The data plane: every CUDA-touching operation after startup is
         # submitted here and runs in FIFO order on one thread. The event loop
         # (control plane) never waits on the GPU along the per-round path —
@@ -669,7 +670,7 @@ class ModelExecutor:
                     out_cache_loc=ib.out_cache_loc_buf[:num_tokens],
                 )
         set_autotune_process_group(None)
-        torch.cuda.synchronize()
+        torch.get_device_module(self.device).synchronize()
         dist.barrier()
         logger.info(f"Kernel tuning finished in {time.time() - tic:.1f}s")
 
@@ -1230,10 +1231,10 @@ class ModelExecutor:
                     sanitized = sanitize(draft_pool, draft_pages) or sanitized
         if not sanitized:
             return None
-        if torch.device(self.device).type != "cuda":
+        if torch.device(self.device).type not in {"cuda", "npu"}:
             return None
-        done = torch.cuda.Event()
-        done.record(torch.cuda.current_stream(self.device))
+        done = self.device_module.Event()
+        done.record(self.device_module.current_stream(self.device))
         return done
 
     @nvtx_range("reset_valid_cache_length", color="orange")
@@ -1272,8 +1273,8 @@ class ModelExecutor:
 
     def _write_valid_cache_lengths(self, pool_indices, lengths) -> None:
         """Publish per-row valid cache lengths on the execution stream."""
-        self.execution_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.execution_stream):
+        self.execution_stream.wait_stream(self.device_module.current_stream())
+        with self.device_module.stream(self.execution_stream):
             rows = torch.tensor(
                 pool_indices,
                 dtype=torch.int64,
@@ -1317,9 +1318,9 @@ class ModelExecutor:
             # Wait for previous iteration's runtime state updates
             # (future_input_map, valid_cache_lengths) on execution_stream to
             # complete before reading them.
-            torch.cuda.current_stream().wait_stream(self.execution_stream)
-            self.execution_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.execution_stream):
+            self.device_module.current_stream().wait_stream(self.execution_stream)
+            self.execution_stream.wait_stream(self.device_module.current_stream())
+        with self.device_module.stream(self.execution_stream):
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
@@ -1584,7 +1585,7 @@ class ModelExecutor:
 
                 output_nan_flags = self.nan_guard.flags_cpu
 
-                copy_event = torch.cuda.Event()
+                copy_event = self.device_module.Event()
                 copy_event.record()
                 if timing_enabled:
                     output_d2h_ms = (time.perf_counter() - output_d2h_start) * 1000.0
@@ -1633,7 +1634,7 @@ class ModelExecutor:
         # Remote spec candidates are CPU materialized; enqueue the H2D copy and
         # future_input_map update on execution_stream. The next forward's input
         # prep already waits on execution_stream before reading runtime state.
-        with torch.cuda.stream(self.execution_stream):
+        with self.device_module.stream(self.execution_stream):
             self.runtime_states.write_remote_spec_candidate_ids(
                 req_pool_idx, candidate_ids
             )
@@ -1662,10 +1663,10 @@ class ModelExecutor:
     def prepare_remote_cache_slots(self, req_pool_indices: list[int]) -> None:
         """Clear backend restore state before publishing RDMA destinations."""
         slots = [int(slot) for slot in req_pool_indices]
-        with torch.cuda.stream(self.execution_stream):
+        with self.device_module.stream(self.execution_stream):
             self.attn_backend.prepare_remote_cache_slots(slots)
 
     def mark_remote_cache_ready(self, req_pool_idx: int) -> None:
         """Arm backend first-decode hydration after remote transfer success."""
-        with torch.cuda.stream(self.execution_stream):
+        with self.device_module.stream(self.execution_stream):
             self.attn_backend.mark_remote_cache_ready(int(req_pool_idx))

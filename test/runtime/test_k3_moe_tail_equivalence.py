@@ -264,7 +264,9 @@ def test_call_deferred_shape_hardening():
     seen = {}
 
     class FakeCollective:
-        def call_deferred(self, gemm2, weights, idx, shared, gamma, num_tokens):
+        def call_deferred(
+            self, gemm2, weights, idx, shared, gamma, num_tokens, **kwargs
+        ):
             seen.update(gemm2=gemm2, weights=weights, idx=idx, m=num_tokens)
             return "LATENT", "SHARD"
 
@@ -353,6 +355,38 @@ def test_selector_boundaries():
         assert pick(n, fused_ar=False) is K3MoETailTier.SEPARATE_REDUCE
 
 
+def test_profit_cap_stops_the_fused_tail_below_its_capacity(monkeypatch):
+    """The fused tail ends at the measured profit edge, not the kernel's capacity.
+
+    Serving A/B showed the multicast tail losing to a plain reduce past
+    ``TAIL_FUSION_MAX_TOKENS`` even though the kernel still accepts the shape,
+    so ``plan`` must decline it there.
+    """
+    from tokenspeed.runtime.models import kimi_k3_comm as mod
+
+    monkeypatch.setattr(mod, "get_is_cuda_graph_phase", lambda: True)
+    monkeypatch.setattr(mod, "get_is_capture_mode", lambda: True)
+
+    comm = object.__new__(mod.K3MoeTailComm)
+    comm.latent_tail = SimpleNamespace(
+        max_num_tokens=mod.TAIL_FUSION_MAX_TOKENS * 2,
+        supports_deferred_finalize=True,
+        supports_split_collective=True,
+        split_collective_min_tokens=9,
+    )
+    comm.execution_plan = SimpleNamespace(fused_moe_ar=True)
+    comm.state = SimpleNamespace(multimem_ar_ok=False)
+    comm._shard_up_projection = False
+    comm.routed_hidden, comm.hidden_size = L, H
+
+    cap = mod.TAIL_FUSION_MAX_TOKENS
+    assert comm.plan(cap, None).tier is mod.K3MoETailTier.TAIL_FUSION
+    # Past the cap the plan leaves the fused tail's early return, so it needs
+    # real hidden states to reach the lane decision.
+    above = comm.plan(cap + 1, torch.zeros(cap + 1, H))
+    assert above.tier is not mod.K3MoETailTier.TAIL_FUSION
+
+
 def test_tail_fusion_plan_defer_decision(monkeypatch):
     """TAIL_FUSION defers finalize iff the tail op and the fused-AR plan agree.
 
@@ -385,7 +419,7 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
     assert plan.lane is None and not plan.routed_in_fork
 
     # A tail op without the deferred variant must keep the materialized mode.
-    plan = build(supports_deferred=False, fused_ar=True).plan(64, None)
+    plan = build(supports_deferred=False, fused_ar=True).plan(32, None)
     assert plan.tier is mod.K3MoETailTier.TAIL_FUSION
     assert not plan.defer_finalize
     assert plan.split_shared_rs

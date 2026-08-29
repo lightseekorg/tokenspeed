@@ -153,12 +153,14 @@ class CacheBatchMetadata:
                 raise ValueError(f"cache group {group_id!r} has invalid shape")
             if table.shape[1] == 0:
                 raise ValueError(f"cache group {group_id!r} has zero width")
-            if table.device.type not in ("cpu", "cuda"):
-                raise ValueError(f"cache group {group_id!r} must be on CPU or CUDA")
+            if table.device.type not in ("cpu", "cuda", "npu"):
+                raise ValueError(
+                    f"cache group {group_id!r} must be on CPU, CUDA, or NPU"
+                )
             if table_device is None:
                 table_device = table.device
             elif table.device != table_device:
-                raise ValueError("cache group tables must use one CPU/CUDA device")
+                raise ValueError("cache group tables must use one CPU/CUDA/NPU device")
         nonempty = [table for table in ordered.values() if table.numel()]
         pointers = {table.untyped_storage().data_ptr() for table in nonempty}
         if len(pointers) != 1:

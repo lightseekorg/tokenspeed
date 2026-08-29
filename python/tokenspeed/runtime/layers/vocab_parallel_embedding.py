@@ -28,6 +28,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.platform import current_platform
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
@@ -170,7 +171,7 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_added_elements <= self.num_added_elements_padded
 
 
-@torch.compile
+@torch.compile(disable=current_platform().is_npu)
 def get_masked_input_and_mask(
     input_: torch.Tensor,
     org_vocab_start_index: int,

@@ -34,8 +34,8 @@ TokenSpeed-specific behavior explicitly.
 | `--block-size` | KV cache block size. |
 | `--enable-prefix-caching` | Enable prefix cache reuse. |
 | `--no-enable-prefix-caching` | Disable prefix cache reuse. |
-| `--enforce-eager` | Disable CUDA graph execution. |
-| `--max-cudagraph-capture-size` | Largest CUDA graph capture size. |
+| `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
+| `--max-cudagraph-capture-size` | Largest decode device-graph capture size. |
 | `--tensor-parallel-size`, `--tp` | Set attention tensor parallel size. |
 | `--data-parallel-size` | Data parallel size. |
 | `--mm-encoder-tp-mode` | Select multimodal encoder weight TP (`weights`) or item data parallelism (`data`). |
