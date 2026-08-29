@@ -1,2 +1,2 @@
-nvidia-cutlass-dsl==4.6.2
-quack-kernels==0.6.4
+nvidia-cutlass-dsl>=4.6.0
+# The quack import namespace comes from tokenspeed-fa4's tokenspeed-quack dependency.
