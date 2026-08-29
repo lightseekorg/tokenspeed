@@ -124,37 +124,6 @@ def _msa_config() -> MSAConfig:
     )
 
 
-def test_dcp_accepts_only_dense_tokenspeed_mla_targets() -> None:
-    from tokenspeed.runtime.layers.attention.registry import _validate_dcp_target
-
-    config = _mla_config()
-    _validate_dcp_target(
-        config,
-        is_deepseek_v4_model=False,
-        full_attn_backend_name="tokenspeed_mla",
-    )
-
-    _validate_dcp_target(
-        config,
-        is_deepseek_v4_model=True,
-        full_attn_backend_name="deepseek_v4",
-    )
-
-    with pytest.raises(ValueError, match="requires.*'deepseek_v4'"):
-        _validate_dcp_target(
-            config,
-            is_deepseek_v4_model=True,
-            full_attn_backend_name="tokenspeed_mla",
-        )
-
-    with pytest.raises(ValueError, match="resolved full-attention backend"):
-        _validate_dcp_target(
-            config,
-            is_deepseek_v4_model=False,
-            full_attn_backend_name="trtllm_mla",
-        )
-
-
 class _SyntheticHybridRecipe(CacheRecipe):
     """A minimal hybrid family, expressed the way a real one is.
 
@@ -592,15 +561,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
 
     target_last_layer = target_pool.get_key_buffer(1).clone()
 
-    def _store_kv_cache(
-        cache_k,
-        cache_v,
-        k_buffer,
-        v_buffer,
-        loc,
-        *,
-        enable_pdl=None,
-    ):
+    def _store_kv_cache(cache_k, cache_v, k_buffer, v_buffer, loc, *, enable_pdl):
         del enable_pdl
         k_buffer[loc] = cache_k
         v_buffer[loc] = cache_v

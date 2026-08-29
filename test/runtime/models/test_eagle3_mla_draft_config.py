@@ -48,19 +48,6 @@ class DraftRopeScalingTest(unittest.TestCase):
         self.assertIsNone(dsv3._draft_rope_scaling(None))
 
 
-class TargetRopeScalingTest(unittest.TestCase):
-    def test_normalized_plain_rope_does_not_enter_yarn_path(self):
-        plain = {"rope_type": "default", "rope_theta": 50000.0}
-        self.assertIsNone(dsv3._normalize_deepseek_rope_scaling(plain))
-        self.assertEqual(plain["rope_type"], "default")
-
-    def test_yarn_is_adapted_without_mutating_shared_config(self):
-        yarn = {"rope_type": "yarn", "factor": 40.0}
-        normalized = dsv3._normalize_deepseek_rope_scaling(yarn)
-        self.assertEqual(normalized, {"rope_type": "deepseek_yarn", "factor": 40.0})
-        self.assertEqual(yarn, {"rope_type": "yarn", "factor": 40.0})
-
-
 class _Embed(torch.nn.Module):
     def __init__(self, rows):
         super().__init__()

@@ -26,7 +26,7 @@ import math
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel import pack_dcp_output_lse
 
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
@@ -34,64 +34,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.distributed.mapping import Group
 else:
     Group = tuple[int, ...]
-
-
-@triton.jit
-def _pack_dcp_partials_kernel(
-    output_ptr,
-    lse_ptr,
-    send_ptr,
-    output_stride_b,
-    output_stride_h,
-    output_stride_d,
-    lse_stride_b,
-    lse_stride_h,
-    send_stride_rank,
-    send_stride_b,
-    send_stride_h,
-    send_stride_d,
-    world_size: tl.constexpr,
-    heads_per_rank: tl.constexpr,
-    head_dim: tl.constexpr,
-    value_block: tl.constexpr,
-):
-    batch_idx = tl.program_id(0).to(tl.int64)
-    local_head = tl.program_id(1).to(tl.int64)
-    value_offsets = tl.arange(0, value_block)
-    value_mask = value_offsets < head_dim
-    for destination in tl.static_range(world_size):
-        source_head = destination * heads_per_rank + local_head
-        send_base = (
-            destination * send_stride_rank
-            + batch_idx * send_stride_b
-            + local_head * send_stride_h
-        )
-        values = tl.load(
-            output_ptr
-            + batch_idx * output_stride_b
-            + source_head * output_stride_h
-            + value_offsets * output_stride_d,
-            mask=value_mask,
-        )
-        tl.store(
-            send_ptr + send_base + value_offsets * send_stride_d,
-            values,
-            mask=value_mask,
-        )
-        lse = tl.load(
-            lse_ptr + batch_idx * lse_stride_b + source_head * lse_stride_h
-        ).to(tl.float32)
-        bits = lse.to(tl.uint32, bitcast=True)
-        low = (bits & 0xFFFF).to(tl.uint16)
-        high = ((bits >> 16) & 0xFFFF).to(tl.uint16)
-        tl.store(
-            send_ptr + send_base + head_dim * send_stride_d,
-            low.to(send_ptr.dtype.element_ty, bitcast=True),
-        )
-        tl.store(
-            send_ptr + send_base + (head_dim + 1) * send_stride_d,
-            high.to(send_ptr.dtype.element_ty, bitcast=True),
-        )
 
 
 def _merge_received_partials(
@@ -161,37 +103,18 @@ def reconstruct_with_all_to_all(
     heads, head_dim = local_output.shape[-2:]
     flat_output = local_output.reshape(-1, heads, head_dim)
     flat_lse = local_lse.reshape(-1, heads)
-    batch = flat_output.shape[0]
     if heads % world_size:
         raise ValueError(
             f"DCP A2A head count {heads} is not divisible by group size {world_size}"
         )
     heads_per_rank = heads // world_size
-    packed_shape = (world_size, batch, heads_per_rank, head_dim + 2)
-    send = torch.empty(
-        packed_shape, dtype=local_output.dtype, device=local_output.device
-    )
-    recv = torch.empty_like(send)
-    value_block = triton.next_power_of_2(head_dim)
     with nvtx_range("dcp_output_lse_pack", category="dcp"):
-        _pack_dcp_partials_kernel[(batch, heads_per_rank)](
+        send = pack_dcp_output_lse(
             flat_output,
             flat_lse,
-            send,
-            flat_output.stride(0),
-            flat_output.stride(1),
-            flat_output.stride(2),
-            flat_lse.stride(0),
-            flat_lse.stride(1),
-            send.stride(0),
-            send.stride(1),
-            send.stride(2),
-            send.stride(3),
             world_size=world_size,
-            heads_per_rank=heads_per_rank,
-            head_dim=head_dim,
-            value_block=value_block,
         )
+    recv = torch.empty_like(send)
 
     from tokenspeed.runtime.distributed.comm_ops import all_to_all_single
 

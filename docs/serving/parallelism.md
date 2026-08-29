@@ -63,68 +63,6 @@ With the bundled gateway, pass `--policy cache_aware --dp-aware` to
 releases that carry the TokenSpeed dp-affinity support; see the lockstep
 note in `serve_smg.py`.
 
-## Decode Context Parallelism
-
-`--decode-context-parallel-size D` cyclically shards dense MLA history across
-`D` ranks inside the attention TP group. Use `--dcp-comm-backend a2a` for the
-packed output/LSE exchange. DCP currently rejects speculative decoding and MTP:
-target and draft cache placement do not yet share a validated layout.
-DeepSeek V4 keeps compressed attention history cyclically sharded, but
-replicates its much smaller ratio-4 MXFP4 sparse-indexer cache in a dedicated
-64-row group. Every rank therefore runs the unchanged TP indexer over complete
-history: there is no candidate-score collective, score bucketing, or
-local-to-global top-k merge. Because the native persistent top-k order is
-unspecified, rank zero broadcasts the small ordered index tensor. Each
-owner then packs only its selected attention-history bytes into their final
-global positions, and an integer NCCL sum reconstructs one compact page-planar
-cache on every rank. The native paged selected-attention kernel then runs with
-local query heads. Page zero, invalid graph tokens, and page tails remain zero.
-
-The reserved null page is read-only. Cyclic cache writers receive an explicit
-per-token ownership mask, including fused RoPE/NoPE MLA writes; a location of
-zero is not itself the writer contract. Chunked prefill reads only rank-local
-cached-prefix rows, all-gathers the compact rows, and restores global
-request-major order before the latent projection.
-
-For TP-versus-DCP correctness, run
-`test/manual/dcp_activation_parity.py` against the TP server to write a
-reference and then against every DCP degree. It requires the repeated request
-to report a real prefix-cache hit and compares exact generated IDs plus
-sampled-token log probabilities only while the generated history is identical.
-The HTTP API does not expose forced-token decode or full logits, so this harness
-does not claim teacher-forced logit parity. DeepSeek V4's native TP persistent
-top-k also has an unspecified output order; record repeated TP runs before
-setting a numerical tolerance, and use the sparse-indexer unit tests to require
-exact selected-index sets independently of that reduction-order noise. Final
-hidden states are compared when the response path provides that optional field.
-Only after that TP control demonstrates generated-ID nondeterminism, pass
-`--allow-output-id-divergence` with an explicit `--logprob-atol` bounded by the
-measured TP-versus-TP envelope; the common generated history remains checked.
-For full-logit integration testing, run eager servers with
-`TOKENSPEED_TEST_LOGIT_DUMP_DIR` set to separate empty TP and DCP directories,
-issue the same short request, then compare them with
-`test/manual/dcp_logit_parity.py`. The dump occurs before sampling and includes
-input IDs and positions; the comparison rejects decode steps whose contexts
-have already diverged.
-
-Enable `--enable-nvtx` when profiling decode. Nsight Systems then reports these
-per-layer DCP ranges separately:
-
-- `dcp_query_pack`
-- `dcp_query_all_gather`
-- `dcp_attention_kernel`
-- `dcp_output_lse_pack`
-- `dcp_output_lse_all_to_all`
-- `dcp_output_lse_unpack_merge`
-- `dcp_prefix_pack`, `dcp_prefix_all_gather`, and `dcp_prefix_reorder`
-
-DeepSeek V4 should not report an `indexer_global_topk_gather` range: its
-dedicated replicated indexer deliberately removes that synchronization.
-
-This breakdown distinguishes packing and launch latency from the attention
-kernel and NCCL payload time; peak link bandwidth alone is not a useful
-explanation for small decode collectives.
-
 ## MoE Deployments
 
 Large MoE models usually choose one of these shapes:

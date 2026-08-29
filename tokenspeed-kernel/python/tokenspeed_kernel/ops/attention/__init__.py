@@ -35,6 +35,7 @@ import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.msa  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.attention.dcp import pack_dcp_output_lse
 from tokenspeed_kernel.ops.attention.gdn_utils import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
@@ -165,6 +166,7 @@ __all__ = [
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
     "MLAQueryProjection",
+    "pack_dcp_output_lse",
     "mla_prefill",
     "mla_use_absorbed_extend",
     "mla_extend_with_kvcache",

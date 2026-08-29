@@ -213,57 +213,6 @@ def test_set_pdl_invariant(n_loc, dtype):
     assert _bitwise_equal(kv_off, kv_on)
 
 
-@pytest.mark.parametrize("n_loc", [4, 600])
-def test_set_write_mask_preserves_unowned_rows(n_loc):
-    loc, k_nope, k_rope = _make_inputs(n_loc, torch.bfloat16, "seq")
-    write_mask = (torch.arange(n_loc, device="cuda") % 2) == 0
-    kv = _empty_kv(torch.bfloat16)
-    ref = _torch_set_reference(
-        kv,
-        loc[write_mask],
-        k_nope[write_mask],
-        k_rope[write_mask],
-    )
-
-    set_mla_kv_buffer_triton(
-        kv,
-        loc,
-        k_nope,
-        k_rope,
-        write_mask=write_mask,
-    )
-    torch.cuda.synchronize()
-
-    assert _bitwise_equal(kv, ref)
-
-
-def test_set_write_mask_is_cuda_graph_replay_safe():
-    n_loc = 17
-    loc, k_nope, k_rope = _make_inputs(n_loc, torch.bfloat16, "seq")
-    write_mask = torch.zeros(n_loc, dtype=torch.bool, device="cuda")
-    kv = _empty_kv(torch.bfloat16)
-
-    # Warm the Triton specialization before capture.
-    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, write_mask=write_mask)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, write_mask=write_mask)
-
-    for parity in (0, 1):
-        kv.fill_(7.5)
-        write_mask.copy_((torch.arange(n_loc, device="cuda") % 2) == parity)
-        graph.replay()
-        torch.cuda.synchronize()
-        ref = _torch_set_reference(
-            _empty_kv(torch.bfloat16),
-            loc[write_mask],
-            k_nope[write_mask],
-            k_rope[write_mask],
-        )
-        assert _bitwise_equal(kv, ref)
-
-
 # ─── get ─────────────────────────────────────────────────────────────
 
 
@@ -439,58 +388,6 @@ def test_mla_rope_set_kv_buffer_fp8_matches_two_kernel_path() -> None:
 
     assert _bitwise_equal(query, query_ref)
     assert _bitwise_equal(kv[loc], key_ref[:, 0])
-
-
-def test_fused_mla_write_mask_preserves_null_page_and_query_output() -> None:
-    """DCP non-owner tokens assemble Q but cannot mutate the null page."""
-    torch.manual_seed(0)
-    n_loc = 8
-    num_heads = 3
-    q_rope = torch.randn(
-        n_loc, num_heads, ROPE_DIM, device="cuda", dtype=torch.bfloat16
-    )
-    k_rope = torch.randn(n_loc, 1, ROPE_DIM, device="cuda", dtype=torch.bfloat16)
-    q_nope = torch.randn(
-        n_loc, num_heads, NOPE_DIM, device="cuda", dtype=torch.bfloat16
-    )
-    k_nope = torch.randn(n_loc, 1, NOPE_DIM, device="cuda", dtype=torch.bfloat16)
-    positions = torch.zeros(n_loc, device="cuda", dtype=torch.int64)
-    loc = torch.tensor([1, 0, 2, 0, 3, 0, 4, 0], device="cuda")
-    write_mask = torch.tensor(
-        [True, False, True, False, True, False, True, False], device="cuda"
-    )
-    query_ref, key_ref = apply_rope_mla(
-        positions=positions,
-        q_rope=q_rope,
-        k_rope=k_rope,
-        q_nope=q_nope,
-        k_nope=k_nope,
-        cos_sin_cache=None,
-        is_neox=False,
-    )
-    query = torch.empty_like(query_ref)
-    kv = _empty_kv(torch.float8_e4m3fn)
-    null_before = kv[0].clone()
-
-    apply_rope_mla_set_kv(
-        positions=positions,
-        q_rope=q_rope,
-        k_rope=k_rope,
-        fused_mla_set_kv_buffer_arg=FusedMLASetKVBufferArg(
-            k_nope=k_nope,
-            kv_buffer=kv,
-            cache_loc=loc,
-            write_mask=write_mask,
-            q_nope=q_nope,
-            cos_sin_cache=None,
-        ),
-        q_rope_out=query,
-    )
-    torch.cuda.synchronize()
-
-    assert _bitwise_equal(query, query_ref)
-    assert _bitwise_equal(kv[0], null_before)
-    assert _bitwise_equal(kv[loc[write_mask]], key_ref[write_mask, 0])
 
 
 @pytest.mark.parametrize("n_loc", [1, 17, 600])
