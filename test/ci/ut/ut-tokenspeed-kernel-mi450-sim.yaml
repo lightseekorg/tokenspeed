@@ -41,24 +41,13 @@ env:
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_trivial_q2_2048]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_persistent_2048]
 
-    # rocJITsu mishandles ds_add_u32 with lane-dependent LDS addresses:
-    # https://github.com/ROCm/rocm-systems/issues/10758
+    # rocJITsu returns incorrect values converting FP8 E4M3 to float.
+    # https://github.com/ROCm/rocm-systems/issues/10760
+    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_sparse_kvcache_trims_large_topk_for_tiny_lens
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_batch_mixed_512]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_long_1024]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_long_2048]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_q3_boundary_512]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_gluon_long_row_uses_radix_path
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_keeps_late_values_above_threshold
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_accepts_glm52_bf16_split_weights
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_chunk_512]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_long_2048]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_mixed_1024]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_gluon_long_row_uses_radix_path
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_keeps_late_values_above_threshold
-
-    # rocJITsu returns incorrect values for PyTorch FP8-to-float conversion:
-    # https://github.com/ROCm/rocm-systems/issues/10760
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_sparse_kvcache_trims_large_topk_for_tiny_lens
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_fp8_glm52_production_shape
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_e4m3-decode]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_e4m3-prefill]
@@ -69,6 +58,10 @@ env:
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_glm52_selected_attention_cases[prefill_sparse_first_prompt_2048]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_glm52_selected_attention_cases[prefill_sparse_mixed_1024]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_glm52_selected_attention_cases[prefill_sparse_short_512]
+    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_accepts_glm52_bf16_split_weights
+    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_chunk_512]
+    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_long_2048]
+    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_mixed_1024]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_with_sparse_kvcache
     --deselect=tokenspeed-kernel/test/ops/gemm/test_per_block_quant_fp8.py::test_per_block_quant_fp8_feeds_block_scaled_gemm
     --deselect=tokenspeed-kernel/test/ops/gemm/test_per_block_quant_fp8.py::test_per_block_quant_fp8_roundtrip[130-300-block_size2]
@@ -87,6 +80,12 @@ env:
     --deselect=tokenspeed-kernel/test/ops/test_attention_dsa.py::test_dsa_with_kvcache[q_fp8-triton-decode]
     --deselect=tokenspeed-kernel/test/ops/test_attention_dsa.py::test_dsa_with_kvcache[q_fp8-triton-prefill]
     --deselect=tokenspeed-kernel/test/ops/test_attention_dsv4.py::DeepseekV4AttentionOpsTest::test_sparse_prefill_dequantize_and_gather_matches_reference
+    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-native-fp8q-fp8kv-bh16bn128-k3-batch32]
+    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-native-fp8q-fp8kv-bh16bn128-k3-batch64]
+    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-native-fp8q-fp8kv-bh16bn128-k3-batch8]
+    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-native-fp8q-fp8kv-bh16bn128-k3]
+    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[triton-fp8]
+    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_extend_with_kvcache[fp8-e4m3]
     --deselect=tokenspeed-kernel/test/ops/test_attention_msa.py::test_msa_decode_qlen4_verify_matches_per_token_decode[fp8_e4m3]
     --deselect=tokenspeed-kernel/test/ops/test_attention_msa.py::test_msa_fp8_kv_descale_matches_dequant_reference[decode]
     --deselect=tokenspeed-kernel/test/ops/test_attention_msa.py::test_msa_fp8_kv_descale_matches_dequant_reference[extend]
@@ -120,23 +119,6 @@ env:
     --deselect=tokenspeed-kernel/test/ops/test_group_tables_unpack.py::test_unpack_matches_per_group[13-13]
     --deselect=tokenspeed-kernel/test/ops/test_group_tables_unpack.py::test_unpack_matches_per_group[13-16]
     --deselect=tokenspeed-kernel/test/ops/test_layernorm.py::test_fused_qk_rmsnorm_rope
-
-    # rocJITsu produces incorrect FP8 matrix dot products:
-    # https://github.com/ROCm/rocm-systems/issues/10773
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_e5m2-decode]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_e5m2-prefill]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_512-q_e5m2-decode]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_512-q_e5m2-prefill]
-    --deselect=tokenspeed-kernel/test/ops/test_attention.py::test_mha_decode_with_kvcache[q1-gluon-fp8-e5m2]
-    --deselect=tokenspeed-kernel/test/ops/test_attention.py::test_mha_decode_with_kvcache[q1-gluon-fp8]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-gfx1250-fp8-e5m2]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-native-fp8q-fp8kv-bh16bn128-k3-batch32]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-native-fp8q-fp8kv-bh16bn128-k3-batch64]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-native-fp8q-fp8kv-bh16bn128-k3-batch8]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[gluon-native-fp8q-fp8kv-bh16bn128-k3]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache[triton-fp8]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_extend_with_kvcache[fp8-e4m3]
-    --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_extend_with_kvcache[fp8-e5m2]
 
     # rocJITsu aborts on v_dual_cndmask_b32 with a vcc_hi selector:
     # https://github.com/ROCm/rocm-systems/issues/10793
