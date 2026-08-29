@@ -27,6 +27,9 @@ from collections.abc import Mapping, Sequence
 from functools import cached_property
 from typing import TYPE_CHECKING
 
+from tokenspeed.runtime.layers.attention.configs.base import (
+    SoftmaxAttnConfig,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import (
     configured_token_limit,
 )
@@ -232,9 +235,9 @@ class CacheRecipe(ABC):
         return group(
             layer_types=self.layer_types,
             group_ids=self.group_ids,
-            sliding_window_tokens=getattr(
-                self.attn_config, "sliding_window_tokens", None
-            ),
+            sliding_window_tokens=self.attn_config.component(
+                SoftmaxAttnConfig
+            ).sliding_window_tokens,
             prefix_granularity=self.prefix_granularity,
             fields_for_layer=self.fields_for_layer,
             pd_disaggregation_enabled=self.pd_disaggregation_enabled,

@@ -44,6 +44,7 @@ from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.cache_groups import (
     CacheGroupsMixin,
 )
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     MHA_PAGE_SIZE,
@@ -127,10 +128,10 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     ) -> bool:
         return forward_mode is not None and forward_mode.is_decode()
 
-    def __init__(self, config: MHAConfig):
-        super().__init__(config)
+    def __init__(self, config: AttnConfig, spec: MHAConfig):
+        super().__init__(config, spec)
         # Map the selected backend to the corresponding kernel solution string.
-        backend_name = config.backend_name or "mha"
+        backend_name = spec.backend_name or "mha"
         self.kernel_solution = _KERNEL_SOLUTION_BY_BACKEND[backend_name]
 
         # Static information needed for metadata construction and kernel dispatch
@@ -141,11 +142,11 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             else MHA_PAGE_SIZE
         )
         self.max_num_pages = ceil_div(self.max_context_len, self.kernel_page_size)
-        num_q_heads = config.num_attention_heads
-        num_kv_heads = config.num_kv_heads
-        self.tp_q_head_num = max(num_q_heads // config.attn_tp_size, 1)
-        self.tp_kv_head_num = max(num_kv_heads // config.attn_tp_size, 1)
-        self.head_dim = config.head_dim
+        num_q_heads = spec.num_attention_heads
+        num_kv_heads = spec.num_kv_heads
+        self.tp_q_head_num = max(num_q_heads // spec.attn_tp_size, 1)
+        self.tp_kv_head_num = max(num_kv_heads // spec.attn_tp_size, 1)
+        self.head_dim = spec.head_dim
         self.qkv_dtype = config.dtype
         self.kv_cache_dtype = config.kv_cache_dtype
         self.is_mxfp8 = bool(getattr(config, "kv_cache_mxfp8", False))

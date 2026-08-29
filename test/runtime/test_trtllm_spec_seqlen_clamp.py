@@ -32,19 +32,22 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.trtllm import (
     TRTLLMMHAAttnBackend,
 )
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 
 SPEC_NUM_TOKENS = 4
 
 
 def _make_backend(is_draft: bool = False) -> TRTLLMMHAAttnBackend:
-    cfg = MHAConfig(
-        device="cpu",
+    spec = MHAConfig(
         backend_name="trtllm",
         num_attention_heads=8,
         num_kv_heads=8,
         head_dim=128,
         attn_tp_size=1,
+    )
+    cfg = AttnConfig(
+        device="cpu",
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         prefix_granularity=64,
@@ -56,8 +59,9 @@ def _make_backend(is_draft: bool = False) -> TRTLLMMHAAttnBackend:
         speculative_num_steps=3,
         speculative_num_draft_tokens=SPEC_NUM_TOKENS,
         is_draft=is_draft,
+        components=(spec,),
     )
-    return TRTLLMMHAAttnBackend(cfg)
+    return TRTLLMMHAAttnBackend(cfg, spec)
 
 
 def _page_table(req_pool_size: int, max_pages: int) -> torch.Tensor:

@@ -90,6 +90,7 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
 
 
 def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
     from tokenspeed.runtime.layers.attention.kv_cache.factory import (
         create_cache_arena,
@@ -119,32 +120,35 @@ def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
         family="mla",
     )
 
-    common_config = dict(
-        device="cpu",
+    mla_spec = MLAConfig(
         backend_name="mla",
         num_attention_heads=64,
         num_kv_heads=64,
         attn_tp_size=8,
         head_dim=192,
-        dtype=torch.bfloat16,
-        context_len=1024,
-        max_graph_bs=1,
-        max_bs=1,
-        prefix_granularity=plan.prefix_granularity,
-        kv_cache_quant_method="none",
         kv_lora_rank=512,
         qk_nope_head_dim=128,
         qk_rope_head_dim=64,
         v_head_dim=128,
         scaling=1.0,
         kv_cache_dim=576,
-        max_scheduled_tokens=128,
     )
-    target_config = MLAConfig(
+    common_config = dict(
+        device="cpu",
+        dtype=torch.bfloat16,
+        context_len=1024,
+        max_graph_bs=1,
+        max_bs=1,
+        prefix_granularity=plan.prefix_granularity,
+        kv_cache_quant_method="none",
+        max_scheduled_tokens=128,
+        components=(mla_spec,),
+    )
+    target_config = AttnConfig(
         kv_cache_dtype=torch.float8_e4m3fn,
         **common_config,
     )
-    draft_config = MLAConfig(
+    draft_config = AttnConfig(
         kv_cache_dtype=torch.bfloat16,
         is_draft=True,
         **common_config,

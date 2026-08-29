@@ -57,7 +57,10 @@ from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
 )
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+    from tokenspeed.runtime.layers.attention.configs.base import (
+        AttnConfig,
+        SoftmaxAttnConfig,
+    )
 
 
 KDA_PREFILL_BACKENDS = ("auto", "fla", "flashkda", "cutedsl_kda")
@@ -96,10 +99,12 @@ class KdaAttnBackend(MambaAttnBackend):
 
     def __init__(
         self,
-        config: BaseAttnConfig,
+        config: AttnConfig,
+        spec: SoftmaxAttnConfig,
+        *,
         kda_backend: str = "auto",
     ) -> None:
-        super().__init__(config)
+        super().__init__(config, spec)
         self.max_bs = config.max_bs
         # The platform layout; the workspace planner probes the same one.
         self.kda_recurrent_layout = kda_recurrent_layout_default()

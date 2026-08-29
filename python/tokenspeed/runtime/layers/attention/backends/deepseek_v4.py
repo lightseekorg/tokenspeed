@@ -33,6 +33,8 @@ from tokenspeed_kernel import (
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4ForwardMetadata,
 )
@@ -230,8 +232,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     cache_consumer_families = frozenset({"history", "state"})
     uses_padded_decode_token_mask = True
 
-    def __init__(self, config) -> None:
-        super().__init__(config)
+    def __init__(self, config: AttnConfig, spec: MLAConfig) -> None:
+        super().__init__(config, spec)
         self.kernel_page_size = (
             config.kernel_page_size
             if config.kernel_page_size is not None
@@ -250,7 +252,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 f"({self.kernel_page_size}), got {config.prefix_granularity}"
             )
         self.swa_storage_rows = int(
-            getattr(config, "sliding_window_tokens", V4_KERNEL_BLOCK_ROWS * 2)
+            spec.sliding_window_tokens
+            if spec.sliding_window_tokens is not None
+            else V4_KERNEL_BLOCK_ROWS * 2
         )
         self.context_len = config.context_len
         prefill_chunk_size = getattr(config, "deepseek_v4_prefill_chunk_size", None)

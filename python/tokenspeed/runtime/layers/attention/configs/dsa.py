@@ -26,6 +26,7 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -44,11 +45,22 @@ def dsa_index_k_row_bytes(index_head_dim: int) -> int:
     )
 
 
-@dataclass
+@dataclass(kw_only=True)
 class DSAConfig(MLAConfig):
     index_topk: int
     index_head_dim: int
     index_n_heads: int
+
+    @classmethod
+    def _spec_kwargs(
+        cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool
+    ) -> dict:
+        return dict(
+            **super()._spec_kwargs(server_args, model_config, is_draft),
+            index_topk=model_config.index_topk,
+            index_head_dim=model_config.index_head_dim,
+            index_n_heads=model_config.index_n_heads,
+        )
 
     @classmethod
     def generate(
@@ -56,9 +68,9 @@ class DSAConfig(MLAConfig):
         server_args: ServerArgs,
         model_config: ModelConfig,
         is_draft: bool = False,
-    ):
-        base = MLAConfig.generate(server_args, model_config, is_draft)
-        if base.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+    ) -> AttnConfig:
+        config = super().generate(server_args, model_config, is_draft)
+        if config.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             platform = current_platform()
             if not (platform.is_blackwell_plus or platform.is_cdna4_plus):
                 raise ValueError(
@@ -67,15 +79,10 @@ class DSAConfig(MLAConfig):
                     "auto or bfloat16 on this platform, got "
                     f"{server_args.kv_cache_dtype}."
                 )
-        return cls(
-            **base.__dict__,
-            index_topk=model_config.index_topk,
-            index_head_dim=model_config.index_head_dim,
-            index_n_heads=model_config.index_n_heads,
-        )
+        return config
 
-    def cache_cell_size(self) -> int:
+    def cache_cell_size(self, config: AttnConfig) -> int:
         index_k_cell_size = dsa_index_k_row_bytes(
             self.index_head_dim,
         )
-        return super().cache_cell_size() + index_k_cell_size
+        return super().cache_cell_size(config) + index_k_cell_size

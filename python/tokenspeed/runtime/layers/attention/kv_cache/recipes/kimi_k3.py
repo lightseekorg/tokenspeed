@@ -35,6 +35,10 @@ from functools import cached_property
 import torch
 from typing_extensions import override
 
+from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+    LinearAttnConfig,
+)
+from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheGroupDeclaration,
     CacheRecipe,
@@ -183,10 +187,12 @@ class KimiK3Recipe(CacheRecipe):
 
     @cached_property
     def _kda_shapes(self):
-        """(conv shape, recurrent shape) per rank, validated against tp size."""
-        tp_size = self.attn_config.attn_tp_size
-        if tp_size <= 0:
-            raise ValueError(f"tp_size must be positive, got {tp_size}")
+        """(conv shape, recurrent shape) per rank, from the linear component.
+
+        Geometry, TP width, and divisibility validation live on
+        ``LinearAttnConfig`` (sourced from ``mapping.linear_attn``); the
+        recipe only validates the cache-dtype contract around them.
+        """
         cache_dtype = self.attn_config.kv_cache_dtype
         if cache_dtype not in (torch.float8_e4m3fn, torch.bfloat16):
             raise ValueError(
@@ -197,18 +203,10 @@ class KimiK3Recipe(CacheRecipe):
             raise ValueError("Kimi-K3 cache does not support per_token_head MLA cache")
         if getattr(self._text_config, "mla_use_nope", None) is not True:
             raise ValueError("Kimi-K3 cache requires mla_use_nope=True")
-        linear = self._text_config.linear_attn_config
-        num_heads = int(linear["num_heads"])
-        head_dim = int(linear["head_dim"])
-        kernel_size = int(linear["short_conv_kernel_size"])
-        if num_heads % tp_size:
-            raise ValueError(
-                f"KDA num_heads={num_heads} must be divisible by tp_size={tp_size}"
-            )
-        return (
-            (3 * num_heads * head_dim // tp_size, kernel_size - 1),
-            (num_heads // tp_size, head_dim, head_dim),
-        )
+        linear_attn = self.attn_config.component(LinearAttnConfig)
+        if linear_attn is None:
+            raise ValueError("Kimi-K3 cache requires a linear-attention component")
+        return (linear_attn.conv_state_shape, linear_attn.temporal_state_shape)
 
     @override
     def fields_for_layer(
@@ -221,7 +219,8 @@ class KimiK3Recipe(CacheRecipe):
                 if layer_id < self.num_target_layers
                 else self.draft_attn_config
             )
-            latent_width = config.kv_lora_rank + config.qk_rope_head_dim
+            spec = config.component(MLAConfig)
+            latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
             return (
                 CacheFieldSpec(
                     f"layer.{layer_id}.latent_kv",

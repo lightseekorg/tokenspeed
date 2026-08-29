@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import TYPE_CHECKING
 
@@ -31,8 +32,12 @@ from tokenspeed.runtime.configs.model_config import (
     is_deepseek_v4,
     is_qwen4_exp,
 )
-from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+from tokenspeed.runtime.layers.attention.configs.base import (
+    AttnConfig,
+    SoftmaxAttnConfig,
+)
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import (
@@ -68,14 +73,17 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
-def _ordinary_cache_family(config: BaseAttnConfig | None) -> CacheModelFamily | None:
-    if type(config) is MHAConfig:
+def _ordinary_cache_family(config: AttnConfig | None) -> CacheModelFamily | None:
+    if config is None:
+        return None
+    softmax_attn = config.component(SoftmaxAttnConfig)
+    if type(softmax_attn) is MHAConfig:
         return "mha"
-    if type(config) is MLAConfig:
+    if type(softmax_attn) is MLAConfig:
         return "mla"
-    if isinstance(config, DSAConfig):
+    if isinstance(softmax_attn, DSAConfig):
         return "dsa"
-    if isinstance(config, MSAConfig):
+    if isinstance(softmax_attn, MSAConfig):
         return "msa"
     return None
 
@@ -246,7 +254,7 @@ def _get_backend_cls(name: str, arch: AttentionArch) -> type[AttentionBackend]:
 
 
 def _validate_lcm_page_size(
-    config: BaseAttnConfig,
+    config: AttnConfig,
     *,
     prefix_granularity: int,
 ) -> None:
@@ -271,41 +279,65 @@ def _validate_lcm_page_size(
 
 # ---------- arch -> config class ----------
 
-_CONFIG_CLS: dict[AttentionArch, type[BaseAttnConfig]] = {
+_CONFIG_CLS: dict[AttentionArch, type[SoftmaxAttnConfig]] = {
     AttentionArch.MHA: MHAConfig,
     AttentionArch.MLA: MLAConfig,
     AttentionArch.DSA: DSAConfig,
     AttentionArch.MSA: MSAConfig,
 }
 
+# Architectures declaring a linear-attention component, registered like
+# _CONFIG_CLS. Whether a given checkpoint actually has linear layers is
+# decided by generate() (NextN drafts may carry none).
+_LINEAR_ATTN_CLS: dict[str, type[LinearAttnConfig]] = {
+    arch: LinearAttnConfig
+    for arch in (*_HYBRID_GDN_ARCHITECTURES, *_HYBRID_MLA_KDA_ARCHITECTURES)
+}
+
 
 def _create_attn_config(
     server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
-) -> BaseAttnConfig:
+) -> AttnConfig:
     arch = model_config.attention_arch
     if arch not in _CONFIG_CLS:
         raise NotImplementedError(f"Not supported Attention Arch: {arch!r}")
-    return _CONFIG_CLS[arch].generate(server_args, model_config, is_draft)
+    config = _CONFIG_CLS[arch].generate(server_args, model_config, is_draft)
+    # Extra components are built through the same generate() protocol and
+    # composed into config.components (consumers look them up by class via
+    # ``component()``).
+    architectures = getattr(model_config.hf_config, "architectures", None) or ()
+    linear_cls = next(
+        (_LINEAR_ATTN_CLS[a] for a in architectures if a in _LINEAR_ATTN_CLS), None
+    )
+    if linear_cls is not None:
+        linear_attn = linear_cls.generate(server_args, model_config, is_draft)
+        if linear_attn is not None:
+            config = dataclasses.replace(
+                config, components=config.components + (linear_attn,)
+            )
+    return config
 
 
 def _create_attn_backend(
     arch: AttentionArch,
-    config: BaseAttnConfig,
+    config: AttnConfig,
 ) -> AttentionBackend:
-    return _get_backend_cls(config.backend_name, arch)(config)
+    spec = config.component(SoftmaxAttnConfig)
+    return _get_backend_cls(spec.backend_name, arch)(config, spec)
 
 
 def _create_attn_backend_with_name(
     name: str | None,
     arch: AttentionArch,
-    config: BaseAttnConfig,
+    config: AttnConfig,
 ) -> AttentionBackend:
-    original_name = config.backend_name
-    config.backend_name = name
+    spec = config.component(SoftmaxAttnConfig)
+    original_name = spec.backend_name
+    spec.backend_name = name
     try:
-        return _get_backend_cls(name, arch)(config)
+        return _get_backend_cls(name, arch)(config, spec)
     finally:
-        config.backend_name = original_name
+        spec.backend_name = original_name
 
 
 def _resolve_kda_backend(kda_backend: str) -> str:
@@ -367,7 +399,7 @@ def _resolve_hybrid_full_backend_name(
 def _create_hybrid_linear_attn_backend(
     server_args: ServerArgs,
     model_config: ModelConfig,
-    config: BaseAttnConfig,
+    config: AttnConfig,
     *,
     pool,
     full_attn_backend_name: str | None = None,
@@ -407,23 +439,23 @@ def _create_hybrid_linear_attn_backend(
 
     # Create mamba/linear attention backend. Only propagate the configured
     # verify width when spec-dec is actually enabled — matches MLAConfig /
-    # MHAConfig.generate. Otherwise the BaseAttnConfig sentinel (1) wins so
+    # MHAConfig.generate. Otherwise the AttnConfig sentinel (1) wins so
     # non-spec hybrid decode doesn't get misclassified as target verify /
     # draft extend by `self.spec_num_tokens > 1`.
     if server_args.speculative_algorithm is not None:
         config.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
 
-    # Read mamba2_cache_params to decide whether this model actually has
-    # any linear / mamba layers. A draft model on a hybrid-GDN target
+    # The linear component's presence decides whether this model actually
+    # has any linear / mamba layers. A draft model on a hybrid-GDN target
     # (e.g. MTP on Qwen3.5) shares the same architecture class as the
     # target but commonly ships with *zero* mamba layers — in that case
     # we skip the mamba backend entirely so that its
     # ``init_forward_metadata_*`` hooks do not run (they would otherwise
     # touch a zero-sized pool on the same persistent state_indices_list
     # as the target, which breaks the captured CUDA graph).
-    mamba_layer_ids = text_config.mamba2_cache_params[-1]
+    linear_attn = config.component(LinearAttnConfig)
 
-    if len(mamba_layer_ids) == 0:
+    if linear_attn is None:
         logger.info(
             "Created hybrid_linear_attn backend: %d full attn layers, 0 linear "
             "attn layers (skipping mamba backend)",
@@ -434,15 +466,21 @@ def _create_hybrid_linear_attn_backend(
     kda_backend = (getattr(server_args, "kda_backend", None) or "auto").strip().lower()
     if is_kda:
         kda_backend = _resolve_kda_backend(kda_backend)
-        linear_attn_backend = KdaAttnBackend(config, kda_backend=kda_backend)
+        linear_attn_backend = KdaAttnBackend(
+            config, config.component(SoftmaxAttnConfig), kda_backend=kda_backend
+        )
     elif is_qwen4_exp(hf_config):
         from tokenspeed.runtime.layers.attention.backends.qwen4_exp import (
             Qwen4ExpMambaAttnBackend,
         )
 
-        linear_attn_backend = Qwen4ExpMambaAttnBackend(config)
+        linear_attn_backend = Qwen4ExpMambaAttnBackend(
+            config, config.component(SoftmaxAttnConfig)
+        )
     else:
-        linear_attn_backend = MambaAttnBackend(config)
+        linear_attn_backend = MambaAttnBackend(
+            config, config.component(SoftmaxAttnConfig)
+        )
 
     # Recurrent state lives in the LCM arena and is addressed by the
     # per-group block tables, so no separate request-indexed Mamba pool exists.
@@ -453,7 +491,7 @@ def _create_hybrid_linear_attn_backend(
     logger.info(
         "Created hybrid_linear_attn backend: %d full attn layers, %d linear attn layers, %s",
         len(full_attn_layers),
-        len(mamba_layer_ids),
+        len(linear_attn.layer_ids),
         "LCM state fields",
     )
     return backend
@@ -490,7 +528,9 @@ def _wrap_inkling_backend(
         num_layers=num_layers,
         # Row 0 is reserved (1-based indices); +2 covers it plus a padding slot
         num_slots=attn_config.max_bs + 2,
-        conv_dim=inkling_conv_total_dim(text_config, attn_config.attn_tp_size),
+        conv_dim=inkling_conv_total_dim(
+            text_config, attn_config.component(SoftmaxAttnConfig).attn_tp_size
+        ),
         kernel_size=kernel_size,
         ring_size=ring_size,
         dtype=torch.bfloat16,
@@ -772,8 +812,9 @@ def create_attn_components(
             server_args.drafter_attention_backend = None
 
     config = _create_attn_config(server_args, model_config)
+    softmax_attn = config.component(SoftmaxAttnConfig)
     if is_deepseek_v4_model:
-        config.sliding_window_tokens = int(model_config.hf_config.sliding_window)
+        softmax_attn.sliding_window_tokens = int(model_config.hf_config.sliding_window)
     if (
         (is_inkling or is_inkling_draft_model)
         and server_args.disaggregation_mode in ("prefill", "decode")
@@ -786,16 +827,13 @@ def create_attn_components(
             "Inkling PD supports target-only decoding; speculative/draft "
             "ShortConv checkpoint transfer is not implemented"
         )
-    target_text_config = getattr(
-        model_config.hf_config, "text_config", model_config.hf_config
-    )
-    target_mamba_params = getattr(target_text_config, "mamba2_cache_params", None)
     has_state = bool(
-        target_mamba_params
-        and target_mamba_params[-1]
+        config.component(LinearAttnConfig) is not None
         and any(
             layer_type in STATE_LAYER_TYPES
-            for layer_type in getattr(config, "layer_types", ())
+            for layer_type in getattr(
+                config.component(SoftmaxAttnConfig), "layer_types", ()
+            )
         )
     )
     use_cache_gdn = is_hybrid_gdn and has_state
@@ -815,20 +853,20 @@ def create_attn_components(
         cache_family = "kimi_k3"
     elif use_cache_inkling:
         cache_family = "inkling"
-    elif type(config) is MHAConfig:
+    elif type(softmax_attn) is MHAConfig:
         cache_family = "mha"
-    elif type(config) is MLAConfig:
+    elif type(softmax_attn) is MLAConfig:
         cache_family = "mla"
-    elif isinstance(config, DSAConfig):
+    elif isinstance(softmax_attn, DSAConfig):
         cache_family = "dsa"
-    elif isinstance(config, MSAConfig):
+    elif isinstance(softmax_attn, MSAConfig):
         cache_family = "msa"
     else:
         cache_family = None
     if cache_family is None:
         raise RuntimeError(
             "No cache recipe is registered for "
-            f"attention config {type(config).__name__}"
+            f"attention config {type(softmax_attn).__name__}"
         )
     target_full_attn_backend_name = (
         _resolve_hybrid_full_backend_name(
@@ -837,15 +875,20 @@ def create_attn_components(
             has_cache_plan=True,
         )
         if is_hybrid_linear
-        else config.backend_name
+        else config.component(SoftmaxAttnConfig).backend_name
     )
     draft_attn_config = (
         _create_attn_config(server_args, draft_model_config, is_draft=True)
         if draft_model_config and not is_dspark_draft_model
         else None
     )
+    draft_softmax_attn = (
+        draft_attn_config.component(SoftmaxAttnConfig)
+        if draft_attn_config is not None
+        else None
+    )
     if is_deepseek_v4_draft_model:
-        draft_attn_config.sliding_window_tokens = int(
+        draft_softmax_attn.sliding_window_tokens = int(
             draft_model_config.hf_config.sliding_window
         )
     draft_is_hybrid_gdn = any(
@@ -860,12 +903,12 @@ def create_attn_components(
     if draft_attn_config is not None:
         if draft_is_hybrid_gdn or draft_is_hybrid_mla_kda:
             draft_full_attn_backend_name = _resolve_hybrid_full_backend_name(
-                draft_attn_config.backend_name,
+                draft_softmax_attn.backend_name,
                 is_kda=draft_is_hybrid_mla_kda,
                 has_cache_plan=True,
             )
         else:
-            draft_full_attn_backend_name = draft_attn_config.backend_name
+            draft_full_attn_backend_name = draft_softmax_attn.backend_name
     draft_cache_family = _ordinary_cache_family(draft_attn_config)
     heterogeneous_draft_family = _resolve_heterogeneous_draft_family(
         cache_family,

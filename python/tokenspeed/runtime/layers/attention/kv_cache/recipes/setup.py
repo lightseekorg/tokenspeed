@@ -27,7 +27,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 from typing import Literal
 
-from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
     DeepseekV4Recipe,
@@ -171,9 +171,9 @@ def prepare_cache_setup(
     family: CacheModelFamily,
     server_args,
     model_config,
-    attn_config: BaseAttnConfig,
+    attn_config: AttnConfig,
     draft_model_config,
-    draft_attn_config: BaseAttnConfig | None,
+    draft_attn_config: AttnConfig | None,
     cache_budget_bytes: int,
     decode_input_tokens: int,
     overlap_schedule_depth: int,

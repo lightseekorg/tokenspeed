@@ -111,24 +111,37 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None
     assert final_state is final
 
 
-def _backend_config(device: str, *, spec_tokens: int = 1) -> SimpleNamespace:
-    return SimpleNamespace(
-        device=device,
+def _backend_config(device: str, *, spec_tokens: int = 1):
+    """(AttnConfig, softmax spec): model-wide facts + softmax geometry."""
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+
+    spec = MHAConfig(
         num_attention_heads=4,
         num_kv_heads=4,
-        attn_tp_size=1,
-        dtype=torch.bfloat16,
         head_dim=128,
+        attn_tp_size=1,
+    )
+    config = AttnConfig(
+        device=device,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        prefix_granularity=64,
+        context_len=4096,
+        max_bs=8,
+        max_graph_bs=8,
         is_draft=False,
         speculative_num_draft_tokens=spec_tokens,
-        max_bs=8,
+        components=(spec,),
     )
+    return config, spec
 
 
 def _backend(device: str, *, contract_pool, spec_tokens: int = 1) -> KdaAttnBackend:
     kda_backend = "auto" if current_platform().is_amd else "fla"
     backend = KdaAttnBackend(
-        _backend_config(device, spec_tokens=spec_tokens),
+        *_backend_config(device, spec_tokens=spec_tokens),
         kda_backend=kda_backend,
     )
     backend.set_kv_pool(contract_pool)

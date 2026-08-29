@@ -9,6 +9,8 @@ from tokenspeed.runtime.cache.transfer.layout import (
     combine_cache_transfer_layouts,
     select_layer_fields,
 )
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
@@ -48,73 +50,63 @@ def _pool_over_new_arena(spec, config, *, num_layers: int, rank: int = 0):
     )
 
 
-def _mha_config() -> MHAConfig:
-    return MHAConfig(
+def _model_wide_kwargs(**overrides) -> dict:
+    """The AttnConfig (model-wide) tier the test configs share."""
+    kwargs = dict(
         device="cpu",
-        backend_name="fa2",
-        num_attention_heads=1,
-        layer_types=(),
-        kv_cache_mxfp8=False,
-        num_kv_heads=1,
-        attn_tp_size=1,
-        head_dim=2,
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
-        context_len=1024,
-        max_graph_bs=2,
-        max_bs=2,
+        kv_cache_quant_method="none",
+        kv_cache_mxfp8=False,
         prefix_granularity=64,
         kernel_page_size=64,
-        kv_cache_quant_method="none",
+        context_len=1024,
+        max_bs=2,
+        max_graph_bs=2,
         max_scheduled_tokens=128,
     )
+    kwargs.update(overrides)
+    return kwargs
 
 
-def _mla_config() -> MLAConfig:
-    return MLAConfig(
-        device="cpu",
+def _mha_config() -> AttnConfig:
+    spec = MHAConfig(
+        backend_name="fa2",
+        num_attention_heads=1,
+        num_kv_heads=1,
+        head_dim=2,
+        attn_tp_size=1,
+        layer_types=(),
+    )
+    return AttnConfig(components=(spec,), **_model_wide_kwargs())
+
+
+def _mla_config() -> AttnConfig:
+    spec = MLAConfig(
         backend_name="trtllm_mla",
         num_attention_heads=1,
         num_kv_heads=1,
-        attn_tp_size=1,
         head_dim=8,
-        dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
-        context_len=1024,
-        max_graph_bs=2,
-        max_bs=2,
-        prefix_granularity=64,
-        kernel_page_size=64,
-        kv_cache_quant_method="none",
+        attn_tp_size=1,
         kv_lora_rank=4,
         qk_nope_head_dim=2,
         qk_rope_head_dim=2,
         v_head_dim=4,
         scaling=1.0,
         kv_cache_dim=6,
-        max_scheduled_tokens=128,
     )
+    return AttnConfig(components=(spec,), **_model_wide_kwargs())
 
 
-def _msa_config() -> MSAConfig:
-    return MSAConfig(
-        device="cpu",
+def _msa_config() -> AttnConfig:
+    spec = MSAConfig(
         backend_name="msa",
         num_attention_heads=1,
         num_kv_heads=1,
-        attn_tp_size=1,
         head_dim=2,
-        dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
-        context_len=1024,
-        max_graph_bs=2,
-        max_bs=2,
-        prefix_granularity=64,
-        kernel_page_size=64,
-        kv_cache_quant_method="none",
+        attn_tp_size=1,
         compute_layer_types=("full_attention", "sparse_attention"),
         sparse_layer_ids=frozenset({1}),
-        max_scheduled_tokens=128,
         index_head_dim=4,
         index_n_heads=1,
         index_block_size=64,
@@ -122,6 +114,7 @@ def _msa_config() -> MSAConfig:
         index_init_blocks=1,
         index_local_blocks=1,
     )
+    return AttnConfig(components=(spec,), **_model_wide_kwargs())
 
 
 class _SyntheticHybridRecipe(CacheRecipe):
@@ -148,8 +141,9 @@ class _SyntheticHybridRecipe(CacheRecipe):
         super().__init__(
             server_args=SimpleNamespace(max_total_tokens=None),
             model_config=None,
-            attn_config=SimpleNamespace(
-                prefix_granularity=4, sliding_window_tokens=windows
+            attn_config=_ns_config(
+                prefix_granularity=4,
+                spec=SimpleNamespace(sliding_window_tokens=windows),
             ),
             draft_model_config=None,
             draft_attn_config=None,
@@ -228,47 +222,56 @@ def test_attention_configs_do_not_own_cache_setup() -> None:
         "token_capacity",
     }
 
+    assert cache_setup_fields.isdisjoint(field.name for field in fields(AttnConfig))
     assert cache_setup_fields.isdisjoint(field.name for field in fields(MHAConfig))
     assert cache_setup_fields.isdisjoint(field.name for field in fields(MLAConfig))
+    assert not hasattr(AttnConfig, "create_pool")
     assert not hasattr(MHAConfig, "create_pool")
     assert not hasattr(MLAConfig, "create_pool")
 
 
+def _ns_config(*, spec, **fields):
+    """Namespace micro-stub honoring the component(cls) query with one spec."""
+    return SimpleNamespace(
+        components=(spec,), component=lambda cls, _s=spec: _s, **fields
+    )
+
+
+def _tiny_linear_attn():
+    """Tiny GDN component whose state payloads (conv 8B, ssm 8B) keep the
+    shared planes aligned with the 512-byte KV page stride."""
+    from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+        LinearAttnConfig,
+    )
+
+    return LinearAttnConfig(
+        num_k_heads=1,
+        num_v_heads=2,
+        head_k_dim=1,
+        head_v_dim=1,
+        conv_kernel_size=2,
+        layer_ids=(0,),
+        tp_size=1,
+    )
+
+
 def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
-    text_config = SimpleNamespace(
-        mamba2_cache_params=(
-            (3, 2),
-            (1, 2, 2),
-            torch.bfloat16,
-            torch.float32,
-            (0,),
-        ),
-        linear_key_head_dim=1,
-        linear_num_key_heads=1,
-        linear_value_head_dim=1,
-        linear_num_value_heads=1,
-    )
     model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(text_config=text_config),
+        hf_config=SimpleNamespace(text_config=SimpleNamespace()),
     )
-    attn_config = MHAConfig(
-        device="cpu",
-        backend_name="fa2",
-        num_attention_heads=1,
-        layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
-        kv_cache_mxfp8=False,
-        num_kv_heads=1,
-        attn_tp_size=1,
-        head_dim=2,
-        dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
-        context_len=1024,
-        max_graph_bs=2,
-        max_bs=2,
-        prefix_granularity=64,
-        kernel_page_size=64,
-        kv_cache_quant_method="none",
-        max_scheduled_tokens=128,
+    attn_config = AttnConfig(
+        components=(
+            MHAConfig(
+                backend_name="fa2",
+                num_attention_heads=1,
+                num_kv_heads=1,
+                head_dim=2,
+                attn_tp_size=1,
+                layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
+            ),
+            _tiny_linear_attn(),
+        ),
+        **_model_wide_kwargs(),
     )
     server_args = SimpleNamespace(
         prefix_granularity=64,
@@ -313,9 +316,10 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
 
 @pytest.mark.parametrize(
     ("replay_enabled", "replay_supported", "expected_workspace_bytes"),
-    # Replay: 64 conv staging bytes plus the captured payload (6 rows of 4
-    # bf16 channels) and the fp32 A_log/dt_bias pair -- 64 + 48 + 8.
-    ((False, True, 192), (True, False, 192), (True, True, 120)),
+    # Non-replay stages conv+ssm for 8 verify rows: 8 * (8 + 8). Replay: 64
+    # conv staging bytes plus the captured payload (6 rows of 7 bf16
+    # channels) and the fp32 A_log/dt_bias pairs -- 64 + 84 + 16.
+    ((False, True, 128), (True, False, 128), (True, True, 164)),
 )
 def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     monkeypatch,
@@ -327,40 +331,24 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
         "tokenspeed_kernel.ops.attention.gdn_replay_commit_supported",
         lambda dtype: replay_supported,
     )
-    text_config = SimpleNamespace(
-        mamba2_cache_params=(
-            (2, 2),
-            (1, 2, 2),
-            torch.bfloat16,
-            torch.float32,
-            (0,),
-        )
-    )
     model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(text_config=text_config),
+        hf_config=SimpleNamespace(text_config=SimpleNamespace()),
     )
-    attn_config = MHAConfig(
-        device="cuda",
+    target_spec = MHAConfig(
         backend_name="fa2",
         num_attention_heads=1,
-        layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
-        kv_cache_mxfp8=False,
         num_kv_heads=1,
-        attn_tp_size=1,
         head_dim=2,
-        dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
-        context_len=1024,
-        max_graph_bs=2,
-        max_bs=2,
-        prefix_granularity=64,
-        kernel_page_size=64,
-        kv_cache_quant_method="none",
-        max_scheduled_tokens=128,
+        attn_tp_size=1,
+        layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
+    )
+    attn_config = AttnConfig(
+        components=(target_spec, _tiny_linear_attn()),
+        **_model_wide_kwargs(device="cuda"),
     )
     draft_config = replace(
         attn_config,
-        layer_types=(FULL_ATTENTION,),
+        components=(replace(target_spec, layer_types=(FULL_ATTENTION,)),),
     )
     server_args = SimpleNamespace(
         block_size=64,
@@ -382,7 +370,9 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     )
 
     assert setup.fixed_workspace_bytes == expected_workspace_bytes
-    assert attn_config.replay_ssm is (replay_enabled and replay_supported)
+    linear_attn = attn_config.component(LinearAttnConfig)
+    assert linear_attn is not None
+    assert linear_attn.replay_ssm is (replay_enabled and replay_supported)
 
 
 def test_ordinary_mha_reserves_null_parent_within_cache_budget() -> None:
@@ -828,11 +818,10 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
     recipe = OrdinaryRecipe.__new__(OrdinaryRecipe)
     recipe.cache_budget_bytes = 16_384
     recipe.server_args = SimpleNamespace(max_total_tokens=None)
-    recipe.attn_config = SimpleNamespace(
+    recipe.attn_config = _ns_config(
         prefix_granularity=64,
+        spec=SimpleNamespace(layer_types=(), sliding_window_tokens=None),
         cache_cell_size=lambda: 16,
-        layer_types=(),
-        sliding_window_tokens=None,
     )
     recipe.draft_attn_config = None
     recipe.model_config = SimpleNamespace(num_attention_layers=1)
