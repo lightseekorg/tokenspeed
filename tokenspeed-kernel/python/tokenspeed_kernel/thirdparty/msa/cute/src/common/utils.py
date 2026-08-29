@@ -757,7 +757,7 @@ def cvt_fp4x8_e2m1_scaled_e4m3x8(
 
     from cutlass import CUDA_VERSION
 
-    # CUTLASS DSL 4.6.0 is built against CUDA 13.3, but enabling this path
+    # CUTLASS DSL 4.6.x is built against CUDA 13.3, but enabling this path
     # currently triggers NVVM_ERROR_COMPILATION. Keep using the original
     # implementation for now.
     use_native_fp4_mul = False

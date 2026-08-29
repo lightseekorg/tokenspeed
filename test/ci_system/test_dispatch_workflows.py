@@ -43,6 +43,7 @@ def run_slurm_dispatch_script(
         """printf 'arg=%s\\n' "${args[@]}"
 printf 'artifact=%s\\n' "${TS_CI_ARTIFACT_ROOT-}"
 printf 'cache=%s\\n' "${TS_CI_CACHE_DIR-}"
+printf 'image=%s\\n' "${TS_CI_CONTAINER_IMAGE-}"
 """,
     )
     script = script.replace(
@@ -53,6 +54,7 @@ printf 'cache=%s\\n' "${TS_CI_CACHE_DIR-}"
     env = {
         **os.environ,
         "PR": "",
+        "CONTAINER_IMAGE": "",
         "CLUSTER": "gb200",
         "YAML_SELECTION": "off",
         "RUNNERS": "b200-4gpu,gb200-4gpu",
@@ -66,6 +68,7 @@ printf 'cache=%s\\n' "${TS_CI_CACHE_DIR-}"
     }
     env.pop("TS_CI_ARTIFACT_ROOT", None)
     env.pop("TS_CI_CACHE_DIR", None)
+    env.pop("TS_CI_CONTAINER_IMAGE", None)
     return subprocess.run(
         ["bash", "-c", script],
         cwd=REPO_ROOT,
@@ -134,6 +137,32 @@ def test_slurm_dispatch_lists_every_supported_cluster():
     assert set(cluster["options"]) == {"gb200", "gb300"}
 
 
+def test_slurm_dispatch_accepts_immutable_tokenspeed_image_override(tmp_path):
+    image = (
+        "ghcr.io/lightseekorg/tokenspeed-runner:flashinfer-0.6.18@sha256:" + "d" * 64
+    )
+
+    result = run_slurm_dispatch_script(tmp_path, CONTAINER_IMAGE=image)
+
+    assert result.returncode == 0, result.stderr
+    assert f"image={image}" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "ghcr.io/lightseekorg/tokenspeed-runner:flashinfer-0.6.18",
+        "ghcr.io/other/tokenspeed-runner:flashinfer-0.6.18@sha256:" + "d" * 64,
+        "docker.io/lightseekorg/tokenspeed-runner:flashinfer-0.6.18@sha256:" + "d" * 64,
+    ],
+)
+def test_slurm_dispatch_rejects_unsafe_image_override(tmp_path, image):
+    result = run_slurm_dispatch_script(tmp_path, CONTAINER_IMAGE=image)
+
+    assert result.returncode == 2
+    assert "container_image must be an immutable" in result.stderr
+
+
 def test_slurm_dispatch_routes_gb300_to_its_coordinator():
     workflow = load_yaml(REPO_ROOT / ".github/workflows/slurm-dispatch.yml")
     checkout = next(
@@ -186,6 +215,7 @@ def test_slurm_dispatch_preserves_gb200_defaults(tmp_path):
     assert "arg=--runner\narg=gb200-4gpu\n" in result.stdout
     assert "artifact=\n" in result.stdout
     assert "cache=\n" in result.stdout
+    assert "image=\n" in result.stdout
 
 
 def test_slurm_dispatch_resolves_missing_coordinator_user(tmp_path):

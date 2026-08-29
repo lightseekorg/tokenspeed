@@ -10,8 +10,8 @@ tokenspeed-triton>=3.8.10.post20260721
 # The 4.6 libs wheels declare protobuf<7 solely for the (unused) iket
 # profiler gencode; serving needs protobuf>=7.35.1 for the smg grpc-health
 # gencode. Keep protobuf 7.x and ignore that resolver warning.
-nvidia-cutlass-dsl[cu13]==4.6.0
-nvidia-cutlass-dsl-libs-cu13==4.6.0
+nvidia-cutlass-dsl[cu13]==4.6.2
+nvidia-cutlass-dsl-libs-cu13==4.6.2
 flashinfer-python==0.6.18
 # FlashInfer tactic-cache metadata includes the frontend version; keep it stable.
 nvidia-cudnn-frontend==1.26.0
