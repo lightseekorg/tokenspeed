@@ -93,6 +93,23 @@ def test_random_benchmark_accepts_evalscope_1_10_metric_names(tmp_path):
     assert rows[0]["Decoded Tok/Iter"] == "2.0"
 
 
+def test_random_benchmark_reports_empty_results_without_traceback(tmp_path):
+    collector = (
+        REPO_ROOT / "test" / "random_benchmark" / "tokenspeed" / "collect_outputs.py"
+    )
+    result = subprocess.run(
+        [sys.executable, collector, tmp_path, "--emit-csv"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "Overall perf table:" in result.stdout
+    assert "config,Conc.,Latency (tps/user),Throughput (tps/gpu)" in result.stdout
+    assert result.stderr == ""
+
+
 @pytest.mark.parametrize(
     "filename",
     [

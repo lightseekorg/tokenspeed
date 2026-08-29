@@ -108,7 +108,7 @@ def print_table(rows):
     # the GitHub step summary.
     print("\nOverall perf table:")
     widths = {
-        column: max(len(column), *(len(str(row[column])) for row in rows))
+        column: max((len(column), *(len(str(row[column])) for row in rows)))
         for column in COLUMNS
     }
     header = "  ".join(column.rjust(widths[column]) for column in COLUMNS)
