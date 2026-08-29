@@ -162,6 +162,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     COALESCE_SCALES: gl.constexpr = False,
     DIRECT_SCALE_LAYOUT: gl.constexpr = False,
     DEFER_EPILOGUE: gl.constexpr = True,
+    INPUT_SORTED: gl.constexpr = False,
 ):
     """Stage 2 1x2 kernel: 2 waves/CTA, BLOCK_N=256, 2-stage v3 pipeline.
 
@@ -378,7 +379,10 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
             )
             token_id = offs_token & 0xFFFFFF
             topk_id = offs_token >> 24
-            inter_row = token_id * top_k + topk_id
+            if INPUT_SORTED:
+                inter_row = offs_sorted_slot
+            else:
+                inter_row = token_id * top_k + topk_id
             token_mask = token_id < token_num
 
             offs_ak = gl.arange(0, BLOCK_K_PACKED, layout=k_layout)
@@ -925,17 +929,12 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                 # convert + LDS-shuffle + store of chunk i hides behind the
                 # MFMA of chunk i+1.
                 #
-                # ``store_layout`` shape per chunk = [128, 64] across
-                # the 4-wave CTA. We choose ``warps_per_cta=[4, 1]``
-                # (waves split M, not N like the MFMA layout) so the
-                # convert_layout LDS shuffle redistributes data such
-                # that within one wave the N axis is contiguous and
-                # each lane can own 8 N-cols = one dwordx4. Per wave:
-                # 32 M-rows x 64 N-cols, with 8 M-lanes x 8 N-lanes,
-                # each lane owning [4 M, 8 N] = 4 dwordx4 stores per
-                # chunk. Per simultaneous-store iteration: 8 M-rows hit
-                # 16 cache lines (8 rows x 2 lines per 64-col row),
-                # vs the 32+ rows the in-place wide layouts hit.
+                # Split M across the four waves while keeping each
+                # wave's N axis contiguous. Scaling the rows per thread
+                # with BLOCK_M makes the four waves cover exactly the
+                # compute tile: [32, 64] per wave at BM128, [16, 64] at
+                # BM64, and [8, 64] at BM32. A fixed four-row ownership
+                # would alias rows for the smaller tiles.
                 if MFMA_STORE_LAYOUT:
                     # Small-M atomic A/B path: keep the accumulator's MFMA
                     # layout through the store to avoid the convert_layout
@@ -945,7 +944,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                     store_layout: gl.constexpr = mfma_layout
                 else:
                     store_layout: gl.constexpr = gl.BlockedLayout(
-                        size_per_thread=[4, 8],
+                        size_per_thread=[BLOCK_M // 32, 8],
                         threads_per_warp=[8, 8],
                         warps_per_cta=[4, 1],
                         order=[1, 0],
@@ -1451,6 +1450,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     b_preshuffled: bool = False,
     b_gdot128: bool = False,
     force_reduce: bool | None = None,
+    input_sorted: bool = False,
 ):
     """Host-side launcher for Gluon MXFP4 MoE stage 2.
 
@@ -1544,6 +1544,10 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     N = D
     assert I_r_packed_w == I_r_packed
     EM = sorted_token_ids.shape[0]
+    if input_sorted and M_padded < EM:
+        raise ValueError(
+            f"sorted stage2 input has {M_padded} rows but routing requires {EM}"
+        )
     K_scale = K // 32
     assert a2_scale.dim() == 2 and a2_scale.shape[1] == K_scale
     assert w2_scale.shape == (E_w, N, K_scale)
@@ -1709,6 +1713,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         COALESCE_SCALES=COALESCE_SCALES,
         DIRECT_SCALE_LAYOUT=DIRECT_SCALE_LAYOUT,
         DEFER_EPILOGUE=DEFER_EPILOGUE,
+        INPUT_SORTED=bool(input_sorted),
         # ``CU_NUM`` is the divisor for ``tiles_per_block`` in the
         # persistent path. When PERSISTENT=False it is unused inside
         # the kernel (branch is constexpr-pruned), so we keep it at the
