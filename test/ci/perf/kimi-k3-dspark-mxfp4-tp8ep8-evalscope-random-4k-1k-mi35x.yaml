@@ -55,16 +55,17 @@ server:
 perf:
   install:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
-  # EvalScope routes model IDs through ModelScope. Reuse the Hugging Face
-  # snapshot that the server has already populated instead of downloading it.
+  # EvalScope loads remote tokenizer paths through ModelScope even when the
+  # dataset source is Hugging Face, so materialize the HF tokenizer locally.
   command: >-
     REPO_ROOT=$PWD &&
     MODEL=kimi-k3 &&
     URL=http://127.0.0.1:21000/v1/completions &&
     OUTPUTS_DIR=/tmp/tokenspeed-kimi-k3-dspark-mi35x-perf &&
-    TOKENIZER_PATH=$(/tmp/evalscope-perf/bin/python -c 'from pathlib import Path; from huggingface_hub import try_to_load_from_cache; print(Path(try_to_load_from_cache("moonshotai/Kimi-K3", "tokenizer_config.json")).parent)') &&
+    TOKENIZER_PATH="$OUTPUTS_DIR/tokenizer" &&
     trap 'rm -rf "$OUTPUTS_DIR"' EXIT &&
     rm -rf "$OUTPUTS_DIR" &&
+    /tmp/evalscope-perf/bin/python -c 'import sys; from transformers import AutoTokenizer; AutoTokenizer.from_pretrained("moonshotai/Kimi-K3", trust_remote_code=True).save_pretrained(sys.argv[1])' "$TOKENIZER_PATH" &&
     set +e &&
     echo "==================================================" &&
     echo ">>> DSpark input=4k output=1k conc=1" &&
@@ -74,6 +75,7 @@ perf:
     --url "$URL"
     --api openai
     --dataset random
+    --data-source huggingface
     --tokenizer-path "$TOKENIZER_PATH"
     --min-prompt-length 4096
     --max-prompt-length 4096

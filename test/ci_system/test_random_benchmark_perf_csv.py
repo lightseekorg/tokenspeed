@@ -117,10 +117,11 @@ def test_random_benchmark_reports_empty_results_without_traceback(tmp_path):
         "kimi-k3-dspark-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml",
     ],
 )
-def test_kimi_k3_perf_uses_cached_hugging_face_tokenizer(filename):
+def test_kimi_k3_perf_uses_hugging_face_tokenizer(filename):
     task = yaml.safe_load((PERF_CONFIG_DIR / filename).read_text(encoding="utf-8"))
     command = task["perf"]["command"]
 
-    assert 'try_to_load_from_cache("moonshotai/Kimi-K3"' in command
-    assert '"tokenizer_config.json"' in command
+    assert "from transformers import AutoTokenizer" in command
+    assert 'AutoTokenizer.from_pretrained("moonshotai/Kimi-K3"' in command
+    assert "--data-source huggingface" in command
     assert '--tokenizer-path "$TOKENIZER_PATH"' in command
