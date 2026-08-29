@@ -4,7 +4,7 @@ psutil
 numpy
 # torch version needs to pinned here for CUDA builds
 torch==2.13.0
-apache-tvm-ffi==0.1.13
+apache-tvm-ffi==0.1.13.post3
 tokenspeed-proton>=3.8.10.post20260721
 tokenspeed-triton>=3.8.10.post20260721
 nvidia-cutlass-dsl[cu13]==4.7.1
