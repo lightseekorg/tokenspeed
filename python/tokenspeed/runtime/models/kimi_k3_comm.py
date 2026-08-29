@@ -99,6 +99,9 @@ class K3MoETailTier(IntEnum):
 # in-graph (correct, but decode-suboptimal) — a follow-up should add an
 # is_decode axis rather than gate on the graph phase, which prefill graphs
 # legitimately share.
+# Measured profit edge of the fused tail; the kernel's own capacity is larger.
+TAIL_FUSION_MAX_TOKENS = 32
+
 MULTIMEM_AR_MIN_TOKENS = 256
 # Upper edge of the measured window; larger batches take the join's grouped path.
 MULTIMEM_AR_MAX_TOKENS = 8192
@@ -117,7 +120,8 @@ def select_k3_moe_tail_tier(
     Args:
         num_tokens: Tokens in this forward (identical on every rank).
         graph_phase: Whether the forward runs under the CUDA-graph phase.
-        tail_fusion_max_tokens: Fused decode kernel capacity, 0 when absent.
+        tail_fusion_max_tokens: Largest token count the fused tail is both
+            able and worth running at, 0 when absent.
         fused_moe_ar: Whether the fused-AR execution plan is armed.
         multimem_ok: Collectively-agreed multimem availability.
 
@@ -594,7 +598,9 @@ class K3MoeTailComm:
             num_tokens=num_tokens,
             graph_phase=get_is_cuda_graph_phase(),
             tail_fusion_max_tokens=(
-                self.latent_tail.max_num_tokens if self.latent_tail is not None else 0
+                min(self.latent_tail.max_num_tokens, TAIL_FUSION_MAX_TOKENS)
+                if self.latent_tail is not None
+                else 0
             ),
             fused_moe_ar=self.execution_plan.fused_moe_ar,
             multimem_ok=self.state.multimem_ar_ok,
