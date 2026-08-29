@@ -20,9 +20,11 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -334,6 +336,17 @@ class ModelExecutor:
     ):
         self.device = config.device
         self.config = config
+        test_logit_dump_dir = (
+            os.environ.get("TOKENSPEED_TEST_LOGIT_DUMP_DIR")
+            if config.global_rank == 0
+            else None
+        )
+        self._test_logit_dump_dir = (
+            Path(test_logit_dump_dir) if test_logit_dump_dir else None
+        )
+        self._test_logit_dump_step = 0
+        if self._test_logit_dump_dir is not None:
+            self._test_logit_dump_dir.mkdir(parents=True, exist_ok=True)
         self.model_runner = model_runner
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
@@ -892,6 +905,36 @@ class ModelExecutor:
             torch.cat([prefill_accept, decode_accept]),
         )
 
+    def _dump_test_logits(
+        self,
+        logits_output: LogitsProcessorOutput,
+        ctx: ForwardContext,
+    ) -> None:
+        """Write full pre-sampling logits for opt-in parity integration tests."""
+        dump_dir = self._test_logit_dump_dir
+        logits = getattr(logits_output, "next_token_logits", None)
+        if dump_dir is None or logits is None:
+            return
+        step = self._test_logit_dump_step
+        self._test_logit_dump_step += 1
+        positions = self._active_positions_override
+        if positions is None and not self.config.model_is_mrope:
+            positions = self.input_buffers.positions_buf[: ctx.input_num_tokens]
+        payload = {
+            "step": step,
+            "forward_mode": getattr(ctx.forward_mode, "name", str(ctx.forward_mode)),
+            "input_ids": self.input_buffers.input_ids_buf[: ctx.input_num_tokens]
+            .detach()
+            .cpu(),
+            "positions": (
+                None
+                if positions is None
+                else positions[..., : ctx.input_num_tokens].detach().cpu()
+            ),
+            "logits": logits.detach().to(torch.float32).cpu(),
+        }
+        torch.save(payload, dump_dir / f"step-{step:08d}.pt")
+
     def _log_dp_sampling_route(self, bs: int, ctx: ForwardContext) -> None:
         runtime = self.dp_sampling_runtime_config
         if (
@@ -978,6 +1021,8 @@ class ModelExecutor:
             self.drafter, "_incremental_proj_enabled", False
         ):
             self.drafter.target_language_model.model._dflash_incr_active = False
+
+        self._dump_test_logits(logits_output, ctx)
 
         # Flag NaN per request and sanitize in place, before any sampling kernel.
         self.nan_guard.audit_logits(logits_output, ctx)

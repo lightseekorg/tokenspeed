@@ -22,6 +22,7 @@ from tokenspeed_kernel import (
     dsv4_compute_global_topk_indices_and_lens,
     dsv4_decode_swa_indices_and_lens,
     dsv4_dequantize_and_gather_k_cache,
+    dsv4_pack_dcp_selected_fp8_cache,
 )
 from tokenspeed_kernel.ops.attention.cuda.dsv4 import (
     has_indexer_mxfp4_paged_gather,
@@ -506,6 +507,163 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class DeepseekV4AttentionOpsTest(unittest.TestCase):
+    def test_pack_dcp_selected_fp8_cache_matches_planar_reference(self):
+        device = torch.device("cuda")
+        source_page_size = 5
+        destination_page_size = 4
+        token_bytes = 12
+        scale_bytes = 4
+        source_payload = source_page_size * (token_bytes + scale_bytes)
+        source_page_stride = source_payload + 16
+        cache = torch.full(
+            (12, source_page_stride), 0xE3, dtype=torch.uint8, device=device
+        )
+        for page in range(cache.shape[0]):
+            for row in range(source_page_size):
+                token_start = row * token_bytes
+                scale_start = source_page_size * token_bytes + row * scale_bytes
+                cache[page, token_start : token_start + token_bytes] = torch.arange(
+                    token_bytes, dtype=torch.uint8, device=device
+                ) + (page * 13 + row * 7)
+                cache[page, scale_start : scale_start + scale_bytes] = torch.arange(
+                    scale_bytes, dtype=torch.uint8, device=device
+                ) + (page * 17 + row * 3)
+
+        topk = torch.tensor(
+            [
+                [40, 41, 80, 40, -1, 240, 241],
+                [40, 41, 80, 81, 120, 121, -1],
+                [80, 81, 120, 121, 160, 161, 999],
+                [40, 41, 80, 81, -1, -1, -1],
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+        token_to_req = torch.tensor([0, 1, 2, 99], dtype=torch.int32, device=device)
+        is_valid_token = torch.tensor(
+            [True, False, True, True], dtype=torch.bool, device=device
+        )
+        block_table_storage = torch.tensor(
+            [[2, 4, -1, 99, 7], [5, 1, 3, 6, 8], [5, 99, 1, -1, 9]],
+            dtype=torch.int32,
+            device=device,
+        )
+        # Exercise a non-contiguous block-table slice.
+        block_table = block_table_storage[:, :4]
+        base_offsets = torch.tensor([1, 0, 2], dtype=torch.int32, device=device)
+        padded_width = 8
+        pages_per_batch = padded_width // destination_page_size
+        destination_payload = destination_page_size * (token_bytes + scale_bytes)
+        destination_page_stride = destination_payload + 16
+
+        for dcp_size in (2, 4, 8):
+            rank_storage = []
+            for dcp_rank in range(dcp_size):
+                storage = torch.zeros(
+                    1 + topk.shape[0] * pages_per_batch,
+                    destination_page_stride,
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                dsv4_pack_dcp_selected_fp8_cache(
+                    cache_2d=cache,
+                    topk_indices=topk,
+                    token_to_req_indices=token_to_req,
+                    is_valid_token=is_valid_token,
+                    block_table=block_table,
+                    block_table_base_offsets=base_offsets,
+                    storage=storage,
+                    source_page_size=source_page_size,
+                    destination_page_size=destination_page_size,
+                    pages_per_batch=pages_per_batch,
+                    token_bytes=token_bytes,
+                    scale_bytes=scale_bytes,
+                    dcp_size=dcp_size,
+                    dcp_rank=dcp_rank,
+                )
+                rank_storage.append(storage)
+            actual_words = rank_storage[0].view(torch.int32).clone()
+            for rank in range(1, dcp_size):
+                actual_words.add_(rank_storage[rank].view(torch.int32))
+            actual = actual_words.view(torch.uint8).reshape_as(rank_storage[0])
+            torch.cuda.synchronize()
+
+            expected = torch.zeros_like(actual)
+            for batch in range(topk.shape[0]):
+                request = int(token_to_req[batch])
+                if not bool(is_valid_token[batch]) or not 0 <= request < len(
+                    block_table
+                ):
+                    continue
+                base = int(base_offsets[request])
+                for column in range(topk.shape[1]):
+                    global_row = int(topk[batch, column])
+                    if global_row < 0:
+                        continue
+                    local_row = global_row // dcp_size
+                    logical_page = local_row // source_page_size - base
+                    if not 0 <= logical_page < block_table.shape[1]:
+                        continue
+                    physical_page = int(block_table[request, logical_page])
+                    if not 0 <= physical_page < cache.shape[0]:
+                        continue
+                    source_row = local_row % source_page_size
+                    destination_page = (
+                        1 + batch * pages_per_batch + column // destination_page_size
+                    )
+                    destination_row = column % destination_page_size
+                    expected[
+                        destination_page,
+                        destination_row
+                        * token_bytes : (destination_row + 1)
+                        * token_bytes,
+                    ].copy_(
+                        cache[
+                            physical_page,
+                            source_row * token_bytes : (source_row + 1) * token_bytes,
+                        ]
+                    )
+                    expected[
+                        destination_page,
+                        destination_page_size * token_bytes
+                        + destination_row
+                        * scale_bytes : destination_page_size
+                        * token_bytes
+                        + (destination_row + 1) * scale_bytes,
+                    ].copy_(
+                        cache[
+                            physical_page,
+                            source_page_size * token_bytes
+                            + source_row * scale_bytes : source_page_size * token_bytes
+                            + (source_row + 1) * scale_bytes,
+                        ]
+                    )
+            self.assertTrue(torch.equal(actual.cpu(), expected.cpu()), f"DCP{dcp_size}")
+            self.assertTrue(bool((actual[0] == 0).all()), f"DCP{dcp_size} null page")
+            self.assertTrue(
+                bool((actual[:, destination_payload:] == 0).all()),
+                f"DCP{dcp_size} destination tail",
+            )
+
+    def test_pack_dcp_selected_fp8_cache_validates_destination_capacity(self):
+        device = torch.device("cuda")
+        with self.assertRaisesRegex(ValueError, "do not cover top-k width"):
+            dsv4_pack_dcp_selected_fp8_cache(
+                cache_2d=torch.zeros((2, 64), dtype=torch.uint8, device=device),
+                topk_indices=torch.zeros((1, 9), dtype=torch.int32, device=device),
+                token_to_req_indices=torch.zeros(1, dtype=torch.int32, device=device),
+                is_valid_token=None,
+                block_table=torch.zeros((1, 2), dtype=torch.int32, device=device),
+                block_table_base_offsets=None,
+                storage=torch.zeros((3, 64), dtype=torch.uint8, device=device),
+                source_page_size=4,
+                destination_page_size=4,
+                pages_per_batch=2,
+                token_bytes=12,
+                scale_bytes=4,
+                dcp_size=2,
+                dcp_rank=0,
+            )
 
     def test_sanitized_insert_write_safety_under_graph_replay(self):
         # Full producer -> sanitize -> CUDA graph replay -> cache write path.

@@ -47,7 +47,6 @@ from tokenspeed_kernel.ops.attention.triton.dsv4 import (
     dsv4_build_dense_prefill_local_compressed_indices,
     dsv4_combine_dense_swa_indices,
     dsv4_combine_topk_swa_indices,
-    dsv4_compact_dcp_topk_indices,
     dsv4_compressed_slot_mapping,
     dsv4_compute_global_topk_indices_and_lens,
     dsv4_decode_swa_indices_and_lens,
@@ -57,6 +56,7 @@ from tokenspeed_kernel.ops.attention.triton.dsv4 import (
     dsv4_fused_inv_rope_fp8_quant,
     dsv4_fused_sparse_compress_cache_insert,
     dsv4_indexer_decode_metadata_compute,
+    dsv4_pack_dcp_selected_fp8_cache,
     dsv4_save_compressor_state,
     write_dsv4_indexer_mxfp4_cache_cuda,
 )
@@ -182,7 +182,6 @@ __all__ = [
     "dsv4_build_dense_prefill_local_compressed_indices",
     "dsv4_combine_dense_swa_indices",
     "dsv4_combine_topk_swa_indices",
-    "dsv4_compact_dcp_topk_indices",
     "dsv4_compressed_slot_mapping",
     "dsv4_compute_global_topk_indices_and_lens",
     "dsv4_decode_swa_indices_and_lens",
@@ -193,6 +192,7 @@ __all__ = [
     "dsv4_fused_sparse_compress_cache_insert",
     "dsv4_indexer_cache_format",
     "dsv4_indexer_decode_metadata_compute",
+    "dsv4_pack_dcp_selected_fp8_cache",
     "dsv4_indexer_decode_topk",
     "dsv4_indexer_prefill_topk",
     "dsv4_padded_heads",
@@ -272,7 +272,7 @@ def _dsv4_indexer_selection(
 ) -> tuple[object, dict[str, object]]:
     if index_k_format not in ("mxfp4", "fp8_scaled"):
         raise ValueError(
-            "index_k_format must be 'mxfp4' or 'fp8_scaled', got " f"{index_k_format!r}"
+            f"index_k_format must be 'mxfp4' or 'fp8_scaled', got {index_k_format!r}"
         )
     if index_q.ndim < 3:
         raise ValueError(

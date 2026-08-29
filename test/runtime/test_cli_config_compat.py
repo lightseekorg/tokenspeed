@@ -432,7 +432,7 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertIsNone(sa.speculative_draft_model_quantization)
 
     def test_dcp_rejects_speculative_decoding(self):
-        for algorithm in ("MTP", "EAGLE3", "DSPARK"):
+        for algorithm in ("MTP", "EAGLE3", "DFLASH", "DSPARK"):
             with self.subTest(algorithm=algorithm):
                 args = self._parse_args(
                     [

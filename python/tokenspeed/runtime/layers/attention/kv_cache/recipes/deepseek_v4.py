@@ -42,6 +42,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     V4_COMPRESSOR_STATE_ROWS_PER_PAGE,
     V4_COMPRESSOR_STATE_WINDOW_TOKENS,
     V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+    V4_INDEXER_KV_GROUP_ID,
     V4_KERNEL_BLOCK_ROWS,
     V4_SWA_KV_GROUP_ID,
     DeepseekV4CacheLayout,
@@ -60,6 +61,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     CacheLayout,
+    pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
@@ -140,6 +142,24 @@ def v4_indexer_state_spec(*, c4_state_window: int) -> CacheGroupSpec:
         entry_stride_tokens=1,
         sliding_window_tokens=c4_state_window,
         family="state",
+    )
+
+
+def v4_indexer_kv_spec(*, dcp_size: int) -> CacheGroupSpec:
+    """Replicated ratio-4 indexer history in native 64-row pages.
+
+    Replication lets the native indexer select from complete history while the
+    larger attention cache stays sharded.
+    """
+    if dcp_size <= 1:
+        raise ValueError("a dedicated indexer group is needed only when DCP is enabled")
+    return CacheGroupSpec(
+        group_id=V4_INDEXER_KV_GROUP_ID,
+        retention="full_history",
+        rows_per_page=V4_KERNEL_BLOCK_ROWS,
+        entry_stride_tokens=4,
+        sliding_window_tokens=None,
+        family="history",
     )
 
 
@@ -260,6 +280,8 @@ class DeepseekV4Recipe(CacheRecipe):
                         v4_compressed_kv_spec(int(ratio)), dcp_size=dcp_size
                     ).block_granularity
                 )
+        if 4 in self._cache_layout.layer_ratio:
+            spans.append(v4_indexer_kv_spec(dcp_size=dcp_size).block_granularity)
         return math.lcm(*spans)
 
     @property
@@ -365,13 +387,17 @@ class DeepseekV4Recipe(CacheRecipe):
             if ratio != 4:
                 continue
 
-            # The indexer's K shares the compressed chain's group but sits on
-            # planes after every compressed tenant; its state is its own group.
+            # Keep the indexer table replicated in its native 64-row geometry.
             indexer_state_spec = v4_indexer_state_spec(c4_state_window=c4_window)
             indexer_state_slot = occurrences[indexer_state_spec.group_id]
             occurrences[indexer_state_spec.group_id] += 1
+            indexer_spec = (
+                v4_indexer_kv_spec(dcp_size=dcp_size)
+                if dcp_size > 1
+                else compressed_spec
+            )
             declare(
-                compressed_spec,
+                indexer_spec,
                 CacheFieldSpec(
                     f"layer.{layer_id}.indexer_kv",
                     f"unit.{ratio_counts[4] + compressed_slot}",
@@ -413,10 +439,36 @@ class DeepseekV4Recipe(CacheRecipe):
         largest = max(raw_bytes.values())
         # Exact byte ratios would inflate a parent through their large common
         # LCM; powers of two keep every field stride naturally aligned.
-        return {
+        packing = {
             group_id: 1 << max(0, (largest // group_bytes).bit_length() - 1)
             for group_id, group_bytes in raw_bytes.items()
         }
+        if V4_INDEXER_KV_GROUP_ID in raw_bytes:
+            # Fit each power-of-two share against the complete packed parent.
+            for _ in range(len(packing) + 1):
+                candidate = pack(
+                    groups,
+                    prefix_granularity=self.prefix_granularity,
+                    cache_blocks_per_lcm_block=packing,
+                    alignment=self.alignment,
+                    max_padding_fraction=math.inf,
+                )
+                changed = False
+                for group_id, group_bytes in raw_bytes.items():
+                    count = packing[group_id]
+                    stride = candidate.lcm_block_bytes // count
+                    allowed_stride = group_bytes * (1.0 + self.max_padding_fraction)
+                    if stride <= allowed_stride:
+                        continue
+                    required = math.ceil(candidate.lcm_block_bytes / allowed_stride)
+                    next_count = 1 << max(0, (required - 1).bit_length())
+                    if next_count > count:
+                        packing[group_id] = next_count
+                        changed = True
+                if not changed:
+                    return packing
+            raise ValueError("DeepSeek V4 cache packing did not converge")
+        return packing
 
     @override
     def check_layout(self, layout: CacheLayout) -> None:

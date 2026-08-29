@@ -492,9 +492,11 @@ def _set_mla_kv_buffer_kernel(
     cache_k_nope_ptr,
     cache_k_rope_ptr,
     loc_ptr,
+    write_mask_ptr,
     buffer_stride: tl.constexpr,
     nope_stride: tl.constexpr,
     rope_stride: tl.constexpr,
+    write_mask_stride: tl.constexpr,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -502,6 +504,7 @@ def _set_mla_kv_buffer_kernel(
     SANITIZE: tl.constexpr,
     MAX_FINITE: tl.constexpr,
     SKIP_ZERO: tl.constexpr,
+    HAS_WRITE_MASK: tl.constexpr,
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -515,6 +518,8 @@ def _set_mla_kv_buffer_kernel(
     mask = offs < total_dim
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
+    if HAS_WRITE_MASK:
+        mask = mask & tl.load(write_mask_ptr + pid_loc * write_mask_stride)
     if SKIP_ZERO:
         mask = mask & (loc > 0)
     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
@@ -549,10 +554,12 @@ def _set_mla_kv_buffer_per_loc_kernel(
     cache_k_nope_ptr,
     cache_k_rope_ptr,
     loc_ptr,
+    write_mask_ptr,
     n_loc,
     buffer_stride: tl.constexpr,
     nope_stride: tl.constexpr,
     rope_stride: tl.constexpr,
+    write_mask_stride: tl.constexpr,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     BLOCK_LOC: tl.constexpr,
@@ -560,6 +567,7 @@ def _set_mla_kv_buffer_per_loc_kernel(
     SANITIZE: tl.constexpr,
     MAX_FINITE: tl.constexpr,
     SKIP_ZERO: tl.constexpr,
+    HAS_WRITE_MASK: tl.constexpr,
 ):
     """Write multiple complete MLA cache entries per CTA."""
     if ENABLE_PDL:
@@ -569,6 +577,12 @@ def _set_mla_kv_buffer_per_loc_kernel(
     loc_indices = pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)
     loc_mask = loc_indices < n_loc
     locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
+    if HAS_WRITE_MASK:
+        loc_mask = loc_mask & tl.load(
+            write_mask_ptr + loc_indices * write_mask_stride,
+            mask=loc_mask,
+            other=False,
+        )
     if SKIP_ZERO:
         loc_mask = loc_mask & (locs > 0)
 
@@ -616,6 +630,7 @@ def set_mla_kv_buffer_triton(
     enable_pdl: bool | None = None,
     sanitize: bool = False,
     skip_zero: bool = False,
+    write_mask: torch.Tensor | None = None,
 ) -> None:
     """Scatter split MLA keys into a latent KV cache.
 
@@ -629,6 +644,8 @@ def set_mla_kv_buffer_triton(
             the platform policy; pass ``False`` to disable it explicitly.
         sanitize: Replace NaN and infinity values before storing.
         skip_zero: Leave null-page locations untouched instead of writing them.
+        write_mask: Optional explicit per-row store predicate. The launch shape
+            remains static, making this safe for CUDA graph replay.
 
     Returns:
         None. The cache writes are enqueued on the current device stream.
@@ -636,6 +653,18 @@ def set_mla_kv_buffer_triton(
     # Dispatch buckets from experiments on B200 GPUs.
     # Small batches use more CTAs per location; large batches use wider tiles.
     n_loc = loc.numel()
+    if write_mask is not None:
+        if (
+            write_mask.dtype != torch.bool
+            or write_mask.ndim != 1
+            or write_mask.shape != loc.shape
+            or write_mask.device != loc.device
+        ):
+            raise ValueError(
+                "write_mask must be a one-dimensional bool tensor matching loc"
+            )
+    write_mask_arg = loc if write_mask is None else write_mask
+    write_mask_stride = 0 if write_mask is None else write_mask.stride(0)
     nope_dim = cache_k_nope.size(-1)
     rope_dim = cache_k_rope.size(-1)
     # Clamp to a value representable by both source and destination. Bitwise
@@ -662,10 +691,12 @@ def set_mla_kv_buffer_triton(
             cache_k_nope,
             cache_k_rope,
             loc,
+            write_mask_arg,
             n_loc,
             kv_buffer.stride(0),
             cache_k_nope.stride(0),
             cache_k_rope.stride(0),
+            write_mask_stride,
             nope_dim,
             rope_dim,
             BLOCK_LOC=block_loc,
@@ -673,6 +704,7 @@ def set_mla_kv_buffer_triton(
             SANITIZE=sanitize,
             MAX_FINITE=max_finite,
             SKIP_ZERO=skip_zero,
+            HAS_WRITE_MASK=write_mask is not None,
             num_warps=num_warps,
             num_stages=num_stages,
             **extra_kwargs,
@@ -689,9 +721,11 @@ def set_mla_kv_buffer_triton(
             cache_k_nope,
             cache_k_rope,
             loc,
+            write_mask_arg,
             kv_buffer.stride(0),
             cache_k_nope.stride(0),
             cache_k_rope.stride(0),
+            write_mask_stride,
             nope_dim,
             rope_dim,
             BLOCK=block,
@@ -699,6 +733,7 @@ def set_mla_kv_buffer_triton(
             SANITIZE=sanitize,
             MAX_FINITE=max_finite,
             SKIP_ZERO=skip_zero,
+            HAS_WRITE_MASK=write_mask is not None,
             **extra_kwargs,
         )
 

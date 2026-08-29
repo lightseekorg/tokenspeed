@@ -296,13 +296,7 @@ class KimiK3Recipe(CacheRecipe):
             for field in fields_by_group[first_state]
             if field.plane_id == "slot.0"
         )
-        # The smallest packing whose plane width covers one per-layer KDA
-        # state, so the state page rides inside the MLA plane at the least
-        # parent granularity. Attn tp=8 gives the historical 12; attention-DP
-        # (tp < 8) grows the state 8/tp-fold and the packing follows it up,
-        # while larger tp shrinks the state and the parent with it. DCP shrinks
-        # the MLA payload while KDA remains replicated, so the same ratio also
-        # raises the packing enough to retain the full state page.
+        # Fit one replicated KDA state inside each DCP-sharded MLA plane.
         mla_packing = max(1, -(-linear_plane_bytes // mla_page_bytes))
         linear_packing = max(1, mla_packing * mla_page_bytes // linear_plane_bytes)
         return {

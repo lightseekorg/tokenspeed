@@ -182,11 +182,11 @@ class MLATokenToKVPool(CachePool):
                 raise ValueError(
                     "MLA write_mask must be bool and match the location shape"
                 )
-            loc = loc[write_mask]
-            cache_k_nope = cache_k_nope[write_mask]
-            cache_k_rope = cache_k_rope[write_mask]
-            # The explicit predicate has already removed non-owner rows.
-            skip_zero = False
+            if self.quant_method == "per_token_head":
+                raise RuntimeError(
+                    "masked MLA writes are unsupported for per-token-head cache "
+                    "quantization; DCP rejects this configuration at startup"
+                )
         if self.quant_method == "per_token_head":
             # Preserve the writer's sanitization contract for the quantized
             # fallback. The BF16 path below folds this work into Triton.
@@ -218,6 +218,7 @@ class MLATokenToKVPool(CachePool):
                 cache_k_rope,
                 sanitize=sanitize,
                 skip_zero=skip_zero,
+                write_mask=write_mask,
             )
 
     def get_mla_kv_buffer(

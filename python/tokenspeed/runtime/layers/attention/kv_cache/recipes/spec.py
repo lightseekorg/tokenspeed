@@ -738,10 +738,7 @@ def cyclic_history_spec(spec: CacheGroupSpec, *, dcp_size: int) -> CacheGroupSpe
         return spec
     assert spec.rows_per_page is not None
     assert spec.entry_stride_tokens is not None
-    # Preserve any pre-existing compression stride.  Ordinary MLA has stride
-    # one, while DeepSeek-V4 history already represents one stored row per
-    # 4/128 source tokens.  Widen a logical page only when its stored-row count
-    # is not divisible by DCP (notably V4's ratio-128 one-row pages).
+    # Preserve the compression stride while making rows divisible by DCP.
     global_rows = math.lcm(int(spec.rows_per_page), dcp_size)
     return replace(
         spec,

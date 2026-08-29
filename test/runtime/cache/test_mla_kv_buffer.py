@@ -213,6 +213,57 @@ def test_set_pdl_invariant(n_loc, dtype):
     assert _bitwise_equal(kv_off, kv_on)
 
 
+@pytest.mark.parametrize("n_loc", [4, 600])
+def test_set_write_mask_preserves_unowned_rows(n_loc):
+    loc, k_nope, k_rope = _make_inputs(n_loc, torch.bfloat16, "seq")
+    write_mask = (torch.arange(n_loc, device="cuda") % 2) == 0
+    kv = _empty_kv(torch.bfloat16)
+    ref = _torch_set_reference(
+        kv,
+        loc[write_mask],
+        k_nope[write_mask],
+        k_rope[write_mask],
+    )
+
+    set_mla_kv_buffer_triton(
+        kv,
+        loc,
+        k_nope,
+        k_rope,
+        write_mask=write_mask,
+    )
+    torch.cuda.synchronize()
+
+    assert _bitwise_equal(kv, ref)
+
+
+def test_set_write_mask_is_cuda_graph_replay_safe():
+    n_loc = 17
+    loc, k_nope, k_rope = _make_inputs(n_loc, torch.bfloat16, "seq")
+    write_mask = torch.zeros(n_loc, dtype=torch.bool, device="cuda")
+    kv = _empty_kv(torch.bfloat16)
+
+    # Warm the Triton specialization before capture.
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, write_mask=write_mask)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, write_mask=write_mask)
+
+    for parity in (0, 1):
+        kv.fill_(7.5)
+        write_mask.copy_((torch.arange(n_loc, device="cuda") % 2) == parity)
+        graph.replay()
+        torch.cuda.synchronize()
+        ref = _torch_set_reference(
+            _empty_kv(torch.bfloat16),
+            loc[write_mask],
+            k_nope[write_mask],
+            k_rope[write_mask],
+        )
+        assert _bitwise_equal(kv, ref)
+
+
 # ─── get ─────────────────────────────────────────────────────────────
 
 

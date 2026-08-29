@@ -39,6 +39,7 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
 
 V4_KERNEL_BLOCK_ROWS: int = 64
 V4_SWA_KV_GROUP_ID = "v4.swa_kv"
+V4_INDEXER_KV_GROUP_ID = "v4.c4a.indexer_kv"
 V4_INDEXER_COMPRESSOR_STATE_GROUP_ID = "v4.c4a.indexer_compressor_state"
 DEEPSEEK_V4_FP8_MAX = 448.0
 DEEPSEEK_V4_FP8_QUANT_BLOCK = 64

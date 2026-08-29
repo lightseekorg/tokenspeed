@@ -831,8 +831,7 @@ class ServerArgs:
                 )
             if self.speculative_algorithm is not None:
                 raise ValueError(
-                    "--pipeline-parallel-size > 1 does not support "
-                    "speculative decoding"
+                    "--pipeline-parallel-size > 1 does not support speculative decoding"
                 )
             if (
                 self.pp_layer_partition is not None

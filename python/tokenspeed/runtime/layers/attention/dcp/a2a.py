@@ -9,6 +9,14 @@
 #
 # The above copyright notice and this permission notice shall be included in all
 # copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 """Packed output/LSE all-to-all combine for decode context parallelism."""
 
@@ -86,95 +94,49 @@ def _pack_dcp_partials_kernel(
         )
 
 
-@triton.jit
-def _unpack_and_merge_dcp_partials_kernel(
-    recv_ptr,
-    output_ptr,
-    recv_stride_rank,
-    recv_stride_b,
-    recv_stride_h,
-    recv_stride_d,
-    output_stride_b,
-    output_stride_h,
-    output_stride_d,
-    world_size: tl.constexpr,
-    head_dim: tl.constexpr,
-    lse_base_e: tl.constexpr,
-    value_block: tl.constexpr,
-):
-    batch_idx = tl.program_id(0).to(tl.int64)
-    head_idx = tl.program_id(1).to(tl.int64)
-    value_offsets = tl.arange(0, value_block)
-    value_mask = value_offsets < head_dim
+def _merge_received_partials(
+    recv: torch.Tensor,
+    *,
+    head_dim: int,
+    lse_base: float,
+) -> torch.Tensor:
+    """Merge packed A2A partials with the AG-RS FP32 arithmetic contract."""
+    words = recv.view(torch.uint16)[..., head_dim:]
+    low = words[..., 0].to(torch.int32)
+    high = words[..., 1].to(torch.int32)
+    lse = (low | (high << 16)).contiguous().view(torch.float32)
 
-    maximum = -float("inf")
-    for source in tl.static_range(world_size):
-        recv_base = (
-            source * recv_stride_rank
-            + batch_idx * recv_stride_b
-            + head_idx * recv_stride_h
-        )
-        low_raw = tl.load(recv_ptr + recv_base + head_dim * recv_stride_d)
-        high_raw = tl.load(recv_ptr + recv_base + (head_dim + 1) * recv_stride_d)
-        low = low_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
-        high = high_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
-        lse = (low | (high << 16)).to(tl.float32, bitcast=True)
-        lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
-        maximum = tl.maximum(maximum, lse)
-    maximum = tl.where(maximum == -float("inf"), 0.0, maximum)
-
-    denominator = 0.0
-    for source in tl.static_range(world_size):
-        recv_base = (
-            source * recv_stride_rank
-            + batch_idx * recv_stride_b
-            + head_idx * recv_stride_h
-        )
-        low_raw = tl.load(recv_ptr + recv_base + head_dim * recv_stride_d)
-        high_raw = tl.load(recv_ptr + recv_base + (head_dim + 1) * recv_stride_d)
-        low = low_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
-        high = high_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
-        lse = (low | (high << 16)).to(tl.float32, bitcast=True)
-        lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
-        if lse_base_e:
-            denominator += tl.exp(lse - maximum)
-        else:
-            denominator += tl.exp2(lse - maximum)
-
-    accumulator = tl.zeros([value_block], dtype=tl.float32)
-    for source in tl.static_range(world_size):
-        recv_base = (
-            source * recv_stride_rank
-            + batch_idx * recv_stride_b
-            + head_idx * recv_stride_h
-        )
-        low_raw = tl.load(recv_ptr + recv_base + head_dim * recv_stride_d)
-        high_raw = tl.load(recv_ptr + recv_base + (head_dim + 1) * recv_stride_d)
-        low = low_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
-        high = high_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
-        lse = (low | (high << 16)).to(tl.float32, bitcast=True)
-        lse = tl.where((lse != lse) | (lse == float("inf")), -float("inf"), lse)
-        if lse_base_e:
-            mass = tl.exp(lse - maximum)
-        else:
-            mass = tl.exp2(lse - maximum)
-        weight = tl.where(denominator > 0.0, mass / denominator, 0.0)
-        partial = tl.load(
-            recv_ptr + recv_base + value_offsets * recv_stride_d,
-            mask=value_mask,
-            other=0.0,
-        ).to(tl.float32)
-        partial = tl.where(weight == 0.0, 0.0, partial)
-        accumulator += partial * weight
-
-    tl.store(
-        output_ptr
-        + batch_idx * output_stride_b
-        + head_idx * output_stride_h
-        + value_offsets * output_stride_d,
-        accumulator,
-        mask=value_mask,
+    valid = torch.isfinite(lse)
+    sanitized = torch.where(valid, lse, torch.full_like(lse, -torch.inf))
+    maximum = sanitized.amax(dim=0)
+    has_value = torch.isfinite(maximum)
+    shifted = torch.where(
+        valid & has_value.unsqueeze(0),
+        sanitized - maximum.unsqueeze(0),
+        torch.full_like(sanitized, -torch.inf),
     )
+    if lse_base == 2.0:
+        masses = torch.exp2(shifted)
+    elif lse_base == math.e:
+        masses = torch.exp(shifted)
+    else:
+        masses = torch.pow(
+            torch.as_tensor(lse_base, device=shifted.device),
+            shifted,
+        )
+    denominator = masses.sum(dim=0)
+    weights = torch.where(
+        denominator.unsqueeze(0) > 0,
+        masses / denominator.clamp_min(torch.finfo(masses.dtype).tiny).unsqueeze(0),
+        torch.zeros_like(masses),
+    )
+    partials = recv[..., :head_dim].float()
+    safe_partials = torch.where(
+        torch.isfinite(partials),
+        partials,
+        torch.zeros_like(partials),
+    )
+    return (safe_partials * weights.unsqueeze(-1)).sum(dim=0).to(recv.dtype)
 
 
 def reconstruct_with_all_to_all(
@@ -235,26 +197,11 @@ def reconstruct_with_all_to_all(
 
     with nvtx_range("dcp_output_lse_all_to_all", category="dcp"):
         all_to_all_single(recv.view(-1), send.view(-1), group)
-    output = torch.empty(
-        (batch, heads_per_rank, head_dim),
-        dtype=local_output.dtype,
-        device=local_output.device,
-    )
     with nvtx_range("dcp_output_lse_unpack_merge", category="dcp"):
-        _unpack_and_merge_dcp_partials_kernel[(batch, heads_per_rank)](
+        output = _merge_received_partials(
             recv,
-            output,
-            recv.stride(0),
-            recv.stride(1),
-            recv.stride(2),
-            recv.stride(3),
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            world_size=world_size,
             head_dim=head_dim,
-            lse_base_e=lse_base == math.e,
-            value_block=value_block,
+            lse_base=lse_base,
         )
     return output.reshape(*leading_shape, heads_per_rank, head_dim)
 

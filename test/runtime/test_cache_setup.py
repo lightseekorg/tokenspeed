@@ -134,11 +134,17 @@ def test_dcp_accepts_only_dense_tokenspeed_mla_targets() -> None:
         full_attn_backend_name="tokenspeed_mla",
     )
 
-    with pytest.raises(ValueError, match="distributed global sparse-indexer top-k"):
+    _validate_dcp_target(
+        config,
+        is_deepseek_v4_model=True,
+        full_attn_backend_name="deepseek_v4",
+    )
+
+    with pytest.raises(ValueError, match="requires.*'deepseek_v4'"):
         _validate_dcp_target(
             config,
             is_deepseek_v4_model=True,
-            full_attn_backend_name="deepseek_v4",
+            full_attn_backend_name="tokenspeed_mla",
         )
 
     with pytest.raises(ValueError, match="resolved full-attention backend"):
@@ -586,7 +592,15 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
 
     target_last_layer = target_pool.get_key_buffer(1).clone()
 
-    def _store_kv_cache(cache_k, cache_v, k_buffer, v_buffer, loc, *, enable_pdl):
+    def _store_kv_cache(
+        cache_k,
+        cache_v,
+        k_buffer,
+        v_buffer,
+        loc,
+        *,
+        enable_pdl=None,
+    ):
         del enable_pdl
         k_buffer[loc] = cache_k
         v_buffer[loc] = cache_v

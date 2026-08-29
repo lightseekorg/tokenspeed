@@ -21,23 +21,11 @@
 """Decode-context-parallel layout and reconstruction helpers for MLA."""
 
 from tokenspeed.runtime.layers.attention.dcp.layout import (
-    dcp_block_span,
-    local_cache_slots,
-    local_length,
     local_lengths,
-    local_page_table,
-    local_position,
-    owner_rank,
     visible_local_lengths,
 )
 
 __all__ = [
-    "dcp_block_span",
-    "local_cache_slots",
-    "local_length",
     "local_lengths",
-    "local_page_table",
-    "local_position",
-    "owner_rank",
     "visible_local_lengths",
 ]

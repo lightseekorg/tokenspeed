@@ -125,9 +125,7 @@ def _cache_storage_report(
     packing = {
         group.group_id: int(group.cache_blocks_per_lcm_block) for group in plan.groups
     }
-    # Admission capacity is a scheduler-contract fact. ``arena.size`` is the
-    # most finely packed group's addressable row span and can exceed it for
-    # heterogeneous/Kimi layouts (especially under DCP).
+    # The scheduler contract owns capacity; arena.size may exceed it.
     token_capacity = int(arena.runtime_contract.token_capacity)
     geometry = {
         "prefix_granularity": int(plan.prefix_granularity),
@@ -191,11 +189,13 @@ def _validate_dcp_target(
             f"targets, got {type(config).__name__}"
         )
     if is_deepseek_v4_model:
-        raise ValueError(
-            "DeepSeek V4 decode context parallelism is not supported: its "
-            "cyclic indexer cache requires a distributed global sparse-indexer "
-            "top-k before attention outputs can match TP"
-        )
+        if full_attn_backend_name != "deepseek_v4":
+            raise ValueError(
+                "DeepSeek V4 decode context parallelism requires the resolved "
+                "full-attention backend to be 'deepseek_v4', got "
+                f"{full_attn_backend_name!r}"
+            )
+        return
     if full_attn_backend_name != "tokenspeed_mla":
         raise ValueError(
             "decode context parallelism requires the resolved full-attention "

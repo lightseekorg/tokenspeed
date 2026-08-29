@@ -194,9 +194,7 @@ class CacheRecipe(ABC):
         configured = getattr(self.model_config, "num_attention_layers", None)
         if configured is not None:
             return int(configured)
-        # Lightweight recipe wrappers and synthetic layouts may not carry a
-        # full ModelConfig.  Their merged layer list still defines the target
-        # prefix exactly: target layers first, then draft continuation layers.
+        # Synthetic recipes still list target layers before draft layers.
         return len(self.layer_types) - self.num_draft_layers
 
     @property

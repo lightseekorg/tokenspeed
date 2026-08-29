@@ -53,59 +53,6 @@ def gather_fp8_query_heads(query: torch.Tensor, group: Group) -> torch.Tensor:
     return gathered_bytes.view(query.dtype).movedim(0, -2)
 
 
-def gather_query_heads(query: torch.Tensor, group: Group) -> torch.Tensor:
-    """All-gather the head axis for ordinary NCCL-supported query dtypes."""
-    if len(group) == 1:
-        return query
-    from tokenspeed.runtime.distributed.comm_ops import all_gather
-
-    with nvtx_range("dcp_query_pack", category="dcp"):
-        head_major = query.movedim(-2, 0).contiguous()
-    with nvtx_range("dcp_query_all_gather", category="dcp"):
-        gathered = all_gather(head_major, group, dim=0)
-    return gathered.movedim(0, -2)
-
-
-def merge_partial_outputs(
-    partial_outputs: torch.Tensor,
-    partial_lse2: torch.Tensor,
-) -> torch.Tensor:
-    """Reference exact base-2 softmax merge for stacked DCP partials.
-
-    Args:
-        partial_outputs: ``[D, ..., value_dim]``.
-        partial_lse2: ``[D, ...]`` in base-2 units.
-    """
-    if partial_outputs.shape[:-1] != partial_lse2.shape:
-        raise ValueError(
-            "partial output/LSE shapes disagree: "
-            f"{tuple(partial_outputs.shape)} and {tuple(partial_lse2.shape)}"
-        )
-    lse = partial_lse2.float()
-    valid = torch.isfinite(lse)
-    sanitized = torch.where(valid, lse, torch.full_like(lse, -torch.inf))
-    maximum = sanitized.amax(dim=0)
-    has_value = torch.isfinite(maximum)
-    shifted = torch.where(
-        valid & has_value.unsqueeze(0),
-        sanitized - maximum.unsqueeze(0),
-        torch.full_like(sanitized, -torch.inf),
-    )
-    masses = torch.exp2(shifted)
-    denominator = masses.sum(dim=0)
-    weights = torch.where(
-        denominator.unsqueeze(0) > 0,
-        masses / denominator.clamp_min(torch.finfo(masses.dtype).tiny).unsqueeze(0),
-        torch.zeros_like(masses),
-    )
-    safe_outputs = torch.where(
-        torch.isfinite(partial_outputs.float()),
-        partial_outputs.float(),
-        torch.zeros_like(partial_outputs, dtype=torch.float32),
-    )
-    return (safe_outputs * weights.unsqueeze(-1)).sum(dim=0)
-
-
 def reconstruct_and_reduce_scatter(
     local_output: torch.Tensor,
     local_lse2: torch.Tensor,
@@ -116,8 +63,6 @@ def reconstruct_and_reduce_scatter(
     lse_base: float = 2.0,
 ) -> torch.Tensor:
     """Weight one local partial and reduce-scatter original TP head slices."""
-    if len(group) == 1:
-        return local_output
     if not 0 <= dcp_rank < len(group):
         raise ValueError(f"dcp_rank={dcp_rank} is invalid for group {group}")
     if local_output.shape[:-1] != local_lse2.shape:
@@ -125,15 +70,31 @@ def reconstruct_and_reduce_scatter(
     if local_nonempty is not None:
         if local_nonempty.shape != local_lse2.shape[:-1]:
             raise ValueError("local nonempty mask must cover batch/query axes")
+        expected = local_nonempty.to(device=local_lse2.device, dtype=torch.bool)
+        expected = expected.unsqueeze(-1).expand_as(local_lse2)
         if os.environ.get("TOKENSPEED_CACHE_DEBUG") == "1":
-            expected = local_nonempty.unsqueeze(-1).expand_as(local_lse2)
             unexpected = expected & ~torch.isfinite(local_lse2)
             if bool(unexpected.any().item()):
                 raise RuntimeError("non-finite DCP LSE on a nonempty local shard")
+        local_lse2 = torch.where(
+            expected,
+            local_lse2,
+            torch.full_like(local_lse2, -torch.inf),
+        )
+        local_output = torch.where(
+            expected.unsqueeze(-1),
+            local_output,
+            torch.zeros_like(local_output),
+        )
+    if len(group) == 1:
+        return local_output
 
     from tokenspeed.runtime.distributed.comm_ops import all_gather, reduce_scatter
 
-    gathered_lse = all_gather(local_lse2.float().unsqueeze(0), group, dim=0)
+    # Selected FlashMLA LSE views may be non-contiguous; NCCL requires contiguous.
+    gathered_lse = all_gather(
+        local_lse2.float().unsqueeze(0).contiguous(), group, dim=0
+    )
     valid = torch.isfinite(gathered_lse)
     sanitized = torch.where(
         valid, gathered_lse, torch.full_like(gathered_lse, -torch.inf)
@@ -171,7 +132,5 @@ def reconstruct_and_reduce_scatter(
 
 __all__ = [
     "gather_fp8_query_heads",
-    "gather_query_heads",
-    "merge_partial_outputs",
     "reconstruct_and_reduce_scatter",
 ]

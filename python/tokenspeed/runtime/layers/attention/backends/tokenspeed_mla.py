@@ -104,10 +104,9 @@ class CuteDSLMLADecodeMetadata:
     block_kv_indices: torch.Tensor | None = None
     max_seq_len_k: int | None = None
     seq_lens_k: torch.Tensor | None = None
-    # Kernel-safe local lengths. Empty DCP shards keep seq_lens_k == 0 for
-    # semantic masking, but the split-K kernel requires a positive divisor.
+    # Split-K requires positive lengths even for empty DCP shards.
     kernel_seq_lens_k: torch.Tensor | None = None
-    # Global final lengths passed unchanged as causal_seqs to every DCP rank.
+    # Global lengths used for causal masking on every DCP rank.
     global_seq_lens_k: torch.Tensor | None = None
     # Cache-group path only: absolute latent write locations, group_q_len_per_req
     # entries per batch row. Mixed-batch decode skips whole prefill windows.
@@ -358,7 +357,7 @@ class CuteDSLMLABackend(AttentionBackend):
             return
         if not bool((locations >= page_size).all().item()):
             raise RuntimeError(
-                "MLA write location resolves to the null page 0 or a " "-1 table hole"
+                "MLA write location resolves to the null page 0 or a -1 table hole"
             )
 
     def _cache_decode_out_cache_loc(
@@ -391,8 +390,7 @@ class CuteDSLMLABackend(AttentionBackend):
             self._maybe_debug_check_write_locations(locations, page_size)
             return locations
 
-        # DCP stores global position p on rank p % dcp_size at local position
-        # p // dcp_size. Non-owner writes are predicated to null page 0.
+        # Rank p % D stores global position p at local position p // D.
         last = seq_lens[:bs].to(torch.int64) - 1
         if q_len_per_req == 1:
             pos = last.unsqueeze(1)
@@ -887,8 +885,7 @@ class CuteDSLMLABackend(AttentionBackend):
         self.cuda_graph_kernel_seq_lens_buf = torch.ones(
             graph_rows, dtype=torch.int32, device=self.device
         )
-        # Compatibility name used by draft orchestration. DCP drafts are
-        # replicated (D=1), while target metadata keeps both explicit buffers.
+        # Draft orchestration expects this compatibility alias.
         self.cuda_graph_seq_lens_buf = self.cuda_graph_global_seq_lens_buf
         local_context_bound = triton.cdiv(self.max_context_len, self.dcp_size)
         max_blocks = self._calc_padded_blocks(local_context_bound)
@@ -1108,9 +1105,7 @@ class CuteDSLMLABackend(AttentionBackend):
                     out=metadata.group_out_cache_loc[: real_bs * replay_q_len],
                     q_len_per_req=replay_q_len,
                 )
-        # Padded (and bs==0 idle) rows: null page 0 for both the kernel page
-        # table and the write location, so they never touch a live page. The
-        # cyclic MLA writer predicates loc=0, keeping the null page byte-zero.
+        # Padded rows use null page 0; the write mask keeps it unchanged.
         if real_bs < bs:
             metadata.block_kv_indices[real_bs:bs].zero_()
             metadata.group_out_cache_loc[

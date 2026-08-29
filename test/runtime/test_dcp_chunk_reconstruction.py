@@ -18,8 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import torch
+
 from tokenspeed.runtime.layers.attention.chunk import (
     build_dcp_compact_reconstruction_plan,
+)
+from tokenspeed.runtime.layers.attention.dcp.a2a import _merge_received_partials
+from tokenspeed.runtime.layers.attention.dcp.comm import (
+    reconstruct_and_reduce_scatter,
 )
 
 
@@ -56,3 +62,66 @@ def test_compact_dcp_prefix_plan_reconstructs_request_major_rows() -> None:
         for pos in range(start, start + length)
     ]
     assert restored == expected
+
+
+def test_reduce_scatter_contract_masks_empty_local_rows_before_fast_path() -> None:
+    output = torch.tensor(
+        [[[[1.0, 2.0]], [[float("nan"), float("inf")]]]], dtype=torch.float32
+    )
+    lse = torch.tensor([[[0.0], [0.0]]], dtype=torch.float32)
+    nonempty = torch.tensor([[True, False]])
+
+    actual = reconstruct_and_reduce_scatter(
+        output,
+        lse,
+        dcp_rank=0,
+        group=(0,),
+        local_nonempty=nonempty,
+    )
+
+    assert torch.equal(actual[:, 0], output[:, 0])
+    assert torch.equal(actual[:, 1], torch.zeros_like(actual[:, 1]))
+
+
+def test_a2a_received_partials_use_reference_fp32_merge_arithmetic() -> None:
+    partials = torch.tensor(
+        [
+            [[[-2.0, 1.0, 4.0], [float("nan"), 2.0, 3.0]]],
+            [[[6.0, 5.0, -3.0], [7.0, 8.0, 9.0]]],
+        ],
+        dtype=torch.bfloat16,
+    )
+    lse = torch.tensor(
+        [[[0.25, -torch.inf]], [[-1.5, 2.0]]],
+        dtype=torch.float32,
+    )
+    head_dim = partials.shape[-1]
+    recv = torch.empty(
+        (*partials.shape[:-1], head_dim + 2),
+        dtype=torch.bfloat16,
+    )
+    recv[..., :head_dim].copy_(partials)
+    lse_bits = lse.contiguous().view(torch.int32)
+    recv_words = recv.view(torch.uint16)
+    recv_words[..., head_dim].copy_((lse_bits & 0xFFFF).to(torch.uint16))
+    recv_words[..., head_dim + 1].copy_(((lse_bits >> 16) & 0xFFFF).to(torch.uint16))
+
+    for base, exponent in ((torch.e, torch.exp), (2.0, torch.exp2)):
+        maximum = lse.amax(dim=0)
+        masses = exponent(lse - maximum)
+        masses = torch.where(torch.isfinite(lse), masses, torch.zeros_like(masses))
+        weights = masses / masses.sum(dim=0).clamp_min(torch.finfo(torch.float32).tiny)
+        safe = torch.where(
+            torch.isfinite(partials.float()),
+            partials.float(),
+            torch.zeros_like(partials, dtype=torch.float32),
+        )
+        expected = (safe * weights.unsqueeze(-1)).sum(dim=0).to(torch.bfloat16)
+
+        actual = _merge_received_partials(
+            recv,
+            head_dim=head_dim,
+            lse_base=float(base),
+        )
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

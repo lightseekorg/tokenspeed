@@ -54,7 +54,6 @@ __all__ = [
     "dsv4_build_dense_prefill_local_compressed_indices",
     "dsv4_combine_dense_swa_indices",
     "dsv4_combine_topk_swa_indices",
-    "dsv4_compact_dcp_topk_indices",
     "dsv4_compressed_slot_mapping",
     "dsv4_compute_global_topk_indices_and_lens",
     "dsv4_decode_swa_indices_and_lens",
@@ -65,84 +64,12 @@ __all__ = [
     "dsv4_fused_qnorm_rope_kv_insert",
     "dsv4_fused_sparse_compress_cache_insert",
     "dsv4_gather_indexer_mxfp4_cache",
+    "dsv4_pack_dcp_selected_fp8_cache",
     "dsv4_indexer_decode_metadata_compute",
     "dsv4_save_compressor_state",
     "dsv4_sparse_attention",
     "write_dsv4_indexer_mxfp4_cache_cuda",
 ]
-
-
-@triton.jit
-def _dsv4_compact_dcp_topk_indices_kernel(
-    out_ptr,
-    out_stride,
-    lens_ptr,
-    indices_ptr,
-    indices_stride,
-    topk: tl.constexpr,
-    dcp_size: tl.constexpr,
-    dcp_rank: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    token_idx = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK)
-    mask = offsets < topk
-    values = tl.load(
-        indices_ptr + token_idx * indices_stride + offsets,
-        mask=mask,
-        other=-1,
-    ).to(tl.int64)
-    owned = mask & (values >= 0) & ((values % dcp_size) == dcp_rank)
-    destinations = tl.cumsum(owned.to(tl.int32), axis=0) - 1
-    local_values = values // dcp_size
-    tl.store(
-        out_ptr + token_idx * out_stride + destinations,
-        local_values,
-        mask=owned,
-    )
-    tl.store(lens_ptr + token_idx, tl.sum(owned.to(tl.int32), axis=0))
-
-
-def dsv4_compact_dcp_topk_indices(
-    indices: torch.Tensor,
-    *,
-    dcp_size: int,
-    dcp_rank: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Stable fixed-shape compaction of one DCP rank's compressed indices."""
-    if indices.dtype != torch.int32 or indices.ndim != 2:
-        raise ValueError("DCP top-k indices must be a 2-D int32 tensor")
-    if dcp_size <= 0 or not 0 <= dcp_rank < dcp_size:
-        raise ValueError(f"invalid DCP rank/size {dcp_rank}/{dcp_size}")
-    if dcp_size == 1:
-        return indices, (indices >= 0).sum(dim=-1, dtype=torch.int32)
-    out = torch.full_like(indices, -1)
-    lens = torch.empty(indices.shape[0], dtype=torch.int32, device=indices.device)
-    if indices.numel() == 0:
-        lens.zero_()
-        return out, lens
-    if not indices.is_cuda:
-        for row in range(indices.shape[0]):
-            values = indices[row]
-            owned = (values >= 0) & ((values % dcp_size) == dcp_rank)
-            local = torch.div(values[owned], dcp_size, rounding_mode="floor")
-            out[row, : local.numel()] = local
-            lens[row] = local.numel()
-        return out, lens
-    block = triton.next_power_of_2(indices.shape[-1])
-    _dsv4_compact_dcp_topk_indices_kernel[(indices.shape[0],)](
-        out,
-        out.stride(0),
-        lens,
-        indices,
-        indices.stride(0),
-        topk=indices.shape[-1],
-        dcp_size=dcp_size,
-        dcp_rank=dcp_rank,
-        BLOCK=block,
-        num_warps=8,
-    )
-    return out, lens
 
 
 @triton.jit
@@ -1954,6 +1881,234 @@ def dsv4_gather_indexer_mxfp4_cache(
     )
 
 
+@triton.jit
+def _dsv4_pack_dcp_selected_fp8_cache_kernel(
+    cache_ptr,
+    topk_ptr,
+    token_to_req_ptr,
+    is_valid_token_ptr,
+    block_table_ptr,
+    base_offsets_ptr,
+    storage_ptr,
+    topk_stride0,
+    topk_stride1,
+    token_to_req_stride,
+    block_table_stride0,
+    block_table_stride1,
+    storage_page_stride,
+    batch_size: tl.constexpr,
+    width: tl.constexpr,
+    num_requests: tl.constexpr,
+    max_blocks_per_request: tl.constexpr,
+    source_page_stride: tl.constexpr,
+    num_source_pages: tl.constexpr,
+    source_page_size: tl.constexpr,
+    destination_page_size: tl.constexpr,
+    pages_per_batch: tl.constexpr,
+    token_bytes: tl.constexpr,
+    scale_bytes: tl.constexpr,
+    dcp_size: tl.constexpr,
+    dcp_rank: tl.constexpr,
+    HAS_BASE_OFFSETS: tl.constexpr,
+    HAS_VALID_TOKEN: tl.constexpr,
+    BLOCK_BYTES: tl.constexpr,
+):
+    selected_row = tl.program_id(0)
+    byte_offsets = tl.program_id(1) * BLOCK_BYTES + tl.arange(0, BLOCK_BYTES)
+    batch = selected_row // width
+    column = selected_row - batch * width
+    in_bounds = (batch < batch_size) & (byte_offsets < token_bytes + scale_bytes)
+
+    global_row = tl.load(
+        topk_ptr + batch * topk_stride0 + column * topk_stride1,
+        mask=batch < batch_size,
+        other=-1,
+    ).to(tl.int64)
+    request = tl.load(
+        token_to_req_ptr + batch * token_to_req_stride,
+        mask=batch < batch_size,
+        other=-1,
+    ).to(tl.int64)
+    valid_token = batch < batch_size
+    if HAS_VALID_TOKEN:
+        valid_token &= tl.load(
+            is_valid_token_ptr + batch,
+            mask=batch < batch_size,
+            other=0,
+        )
+    valid_request = valid_token & (request >= 0) & (request < num_requests)
+    safe_request = tl.where(valid_request, request, 0)
+    owned = (global_row >= 0) & ((global_row % dcp_size) == dcp_rank)
+    local_row = global_row // dcp_size
+    logical_page = local_row // source_page_size
+    if HAS_BASE_OFFSETS:
+        base_page = tl.load(
+            base_offsets_ptr + safe_request,
+            mask=valid_request,
+            other=0,
+        ).to(tl.int64)
+        logical_page -= base_page
+    valid_page = (
+        owned
+        & valid_request
+        & (logical_page >= 0)
+        & (logical_page < max_blocks_per_request)
+    )
+    safe_logical_page = tl.where(valid_page, logical_page, 0)
+    physical_page = tl.load(
+        block_table_ptr
+        + safe_request * block_table_stride0
+        + safe_logical_page * block_table_stride1,
+        mask=valid_page,
+        other=-1,
+    ).to(tl.int64)
+    valid_source = (
+        valid_page & (physical_page >= 0) & (physical_page < num_source_pages)
+    )
+    position = local_row - (local_row // source_page_size) * source_page_size
+    token_column = byte_offsets < token_bytes
+    source_column = tl.where(
+        token_column,
+        position * token_bytes + byte_offsets,
+        source_page_size * token_bytes
+        + position * scale_bytes
+        + byte_offsets
+        - token_bytes,
+    )
+    values = tl.load(
+        cache_ptr + physical_page * source_page_stride + source_column,
+        mask=in_bounds & valid_source,
+        other=0,
+    )
+
+    destination_page = 1 + batch * pages_per_batch + column // destination_page_size
+    destination_position = column % destination_page_size
+    destination_column = tl.where(
+        token_column,
+        destination_position * token_bytes + byte_offsets,
+        destination_page_size * token_bytes
+        + destination_position * scale_bytes
+        + byte_offsets
+        - token_bytes,
+    )
+    tl.store(
+        storage_ptr + destination_page * storage_page_stride + destination_column,
+        values,
+        mask=in_bounds,
+    )
+
+
+def dsv4_pack_dcp_selected_fp8_cache(
+    *,
+    cache_2d: torch.Tensor,
+    topk_indices: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    is_valid_token: torch.Tensor | None,
+    block_table: torch.Tensor,
+    block_table_base_offsets: torch.Tensor | None,
+    storage: torch.Tensor,
+    source_page_size: int,
+    destination_page_size: int,
+    pages_per_batch: int,
+    token_bytes: int,
+    scale_bytes: int,
+    dcp_size: int,
+    dcp_rank: int,
+) -> None:
+    """Pack rank-owned selected FP8 rows directly into a global-order arena.
+
+    Non-owned rows are written as zero.  A following integer SUM all-reduce
+    therefore reconstructs the byte-identical selected cache on every DCP
+    rank without an all-gather, rank reorder, or intermediate row tensor.
+    """
+
+    if topk_indices.dim() != 2:
+        raise ValueError("DSV4 selected-cache top-k indices must be 2D")
+    batch_size, width = topk_indices.shape
+    if batch_size == 0 or width == 0:
+        return
+    if token_to_req_indices.numel() < batch_size:
+        raise ValueError("DSV4 selected-cache request mapping is too small")
+    if is_valid_token is not None and is_valid_token.numel() < batch_size:
+        raise ValueError("DSV4 selected-cache valid-token mask is too small")
+    if cache_2d.dtype != torch.uint8 or storage.dtype != torch.uint8:
+        raise TypeError("DSV4 selected-cache packing requires uint8 storage")
+    if cache_2d.dim() != 2 or storage.dim() != 2:
+        raise ValueError("DSV4 selected-cache source and destination must be 2D")
+    if cache_2d.stride(1) != 1 or storage.stride(1) != 1:
+        raise ValueError("DSV4 selected-cache byte planes must be contiguous")
+    if dcp_size <= 1 or not 0 <= dcp_rank < dcp_size:
+        raise ValueError(f"invalid DCP placement size={dcp_size}, rank={dcp_rank}")
+    if source_page_size <= 0 or destination_page_size <= 0:
+        raise ValueError("DSV4 selected-cache page sizes must be positive")
+    if token_bytes <= 0 or scale_bytes <= 0:
+        raise ValueError("DSV4 selected-cache row planes must be positive")
+    if pages_per_batch <= 0:
+        raise ValueError("DSV4 selected-cache pages_per_batch must be positive")
+    if pages_per_batch * destination_page_size < width:
+        raise ValueError(
+            "DSV4 selected-cache destination pages do not cover top-k width"
+        )
+    required_pages = 1 + batch_size * pages_per_batch
+    if storage.shape[0] < required_pages:
+        raise ValueError(
+            "DSV4 selected-cache storage is too small: "
+            f"{storage.shape[0]} < {required_pages}"
+        )
+    required_payload = destination_page_size * (token_bytes + scale_bytes)
+    if storage.shape[1] < required_payload:
+        raise ValueError(
+            "DSV4 selected-cache page stride is too small: "
+            f"{storage.shape[1]} < {required_payload}"
+        )
+    if block_table.dim() != 2:
+        raise ValueError("DSV4 selected-cache block table must be 2D")
+    if block_table_base_offsets is not None:
+        if block_table_base_offsets.numel() < block_table.shape[0]:
+            raise ValueError("DSV4 selected-cache base-offset table is too small")
+        base_offsets = block_table_base_offsets
+    else:
+        base_offsets = block_table
+
+    block_bytes = 1024
+    grid = (
+        batch_size * width,
+        triton.cdiv(token_bytes + scale_bytes, block_bytes),
+    )
+    _dsv4_pack_dcp_selected_fp8_cache_kernel[grid](
+        cache_2d,
+        topk_indices,
+        token_to_req_indices,
+        is_valid_token if is_valid_token is not None else token_to_req_indices,
+        block_table,
+        base_offsets,
+        storage,
+        topk_indices.stride(0),
+        topk_indices.stride(1),
+        token_to_req_indices.stride(0),
+        block_table.stride(0),
+        block_table.stride(1),
+        storage.stride(0),
+        batch_size=batch_size,
+        width=width,
+        num_requests=block_table.shape[0],
+        max_blocks_per_request=block_table.shape[1],
+        source_page_stride=cache_2d.stride(0),
+        num_source_pages=cache_2d.shape[0],
+        source_page_size=source_page_size,
+        destination_page_size=destination_page_size,
+        pages_per_batch=pages_per_batch,
+        token_bytes=token_bytes,
+        scale_bytes=scale_bytes,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        HAS_BASE_OFFSETS=block_table_base_offsets is not None,
+        HAS_VALID_TOKEN=is_valid_token is not None,
+        BLOCK_BYTES=block_bytes,
+        num_warps=8,
+    )
+
+
 @triton.jit(do_not_specialize=["block_table_stride", "max_blocks_per_seq"])
 def _dsv4_dequantize_and_gather_k_kernel(
     out_ptr,
@@ -2814,6 +2969,8 @@ def _dsv4_indexer_decode_metadata_kernel(
     rows: tl.constexpr,
     cols: tl.constexpr,
     compress_ratio: tl.constexpr,
+    dcp_size: tl.constexpr,
+    dcp_rank: tl.constexpr,
     cache_block_size: tl.constexpr,
     max_blocks: tl.constexpr,
     candidate_block: tl.constexpr,
@@ -2828,9 +2985,13 @@ def _dsv4_indexer_decode_metadata_kernel(
         base_logical_page = tl.load(block_table_base_offsets_ptr + safe_req).to(
             tl.int64
         )
-    compressed_lens = tl.maximum(
-        ((pos + 1) // compress_ratio) - base_logical_page * cache_block_size,
+    global_compressed_lens = (pos + 1) // compress_ratio
+    local_compressed_lens = tl.maximum(
+        (global_compressed_lens + dcp_size - 1 - dcp_rank) // dcp_size,
         0,
+    )
+    compressed_lens = tl.maximum(
+        local_compressed_lens - base_logical_page * cache_block_size, 0
     )
     num_valid_pages = tl.zeros((), dtype=tl.int64)
     for col_start in range(0, max_blocks, candidate_block):
@@ -2866,6 +3027,8 @@ def dsv4_indexer_decode_metadata_compute(
     block_table: torch.Tensor,
     cache_block_size: int,
     compress_ratio: int,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
     max_blocks: int,
     out_context_lens: torch.Tensor,
     out_block_tables: torch.Tensor,
@@ -2877,6 +3040,8 @@ def dsv4_indexer_decode_metadata_compute(
         return
     if out_context_lens.dtype != torch.int32 or out_block_tables.dtype != torch.int32:
         raise TypeError("output buffers must be int32")
+    if dcp_size <= 0 or dcp_rank < 0 or dcp_rank >= dcp_size:
+        raise ValueError(f"invalid DCP coordinates: size={dcp_size}, rank={dcp_rank}")
     positions_i64 = positions.to(torch.int64)
     token_to_req_indices_i32 = token_to_req_indices.to(torch.int32)
     block_table_i32 = block_table.to(torch.int32)
@@ -2899,6 +3064,8 @@ def dsv4_indexer_decode_metadata_compute(
         rows=rows,
         cols=cols,
         compress_ratio=int(compress_ratio),
+        dcp_size=int(dcp_size),
+        dcp_rank=int(dcp_rank),
         cache_block_size=int(cache_block_size),
         max_blocks=int(max_blocks),
         candidate_block=candidate_block,
