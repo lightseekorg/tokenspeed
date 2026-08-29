@@ -169,12 +169,14 @@ def test_draft_replay_refreshes_spec_cache_seqlens_buf():
     # Replay with real seq_lens (two real rows + two padded).
     real_seq_lens = torch.tensor([512, 300, 1, 1], dtype=torch.int32)
     req_pool_indices = torch.tensor([1, 2, 0, 0], dtype=torch.int32)
-    be.init_forward_metadata_replay_cuda_graph(
+    be.refresh_decode_metadata(
+        bs,
         bs,
         req_pool_indices,
         real_seq_lens,
-        ForwardMode.DECODE,
+        forward_mode=ForwardMode.DECODE,
         page_table=None,  # skip page-table gather (Triton kernel)
+        for_graph_replay=True,
     )
 
     # spec_cache_seqlens_buf must now reflect the clamped real values.

@@ -15,12 +15,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-    _should_update_mamba_state_after_mtp_verify,
-)
 from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import DeepseekV4DSpark
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.forward_step import (
+    _should_update_mamba_state_after_mtp_verify,
+)
 from tokenspeed.runtime.models.dspark import VanillaMarkov
 
 VOCAB = 32

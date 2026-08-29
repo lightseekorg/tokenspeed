@@ -306,11 +306,13 @@ class CacheContractMetadataTest(unittest.TestCase):
             md.state_out_blocks_by_group["linear_attention"].tolist(), [-1]
         )
 
-        backend.init_forward_metadata_replay_cuda_graph(
-            bs=1,
-            req_pool_indices=torch.tensor([0], dtype=torch.int32),
-            seq_lens=torch.tensor([9], dtype=torch.int32),
+        backend.refresh_decode_metadata(
+            1,
+            1,
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([9], dtype=torch.int32),
             forward_mode=self.ForwardMode.DECODE,
+            for_graph_replay=True,
             cache_metadata=_CacheMetadata(
                 {"linear_attention": torch.tensor([[1, 2, 3]], dtype=torch.int32)}
             ),

@@ -242,6 +242,11 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             # metadata; the batch-ordered draft page table (row i is batch
             # position i) carries kernel pages published by DraftPageStaging.
             self._cache_groups_bound = True
+        if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
+            raise RuntimeError(
+                "trtllm_mla decode metadata goes through refresh_decode_metadata; "
+                f"init_forward_metadata only serves extend/mixed ({forward_mode})"
+            )
         if forward_mode.is_extend_or_mixed():
             self._init_prefill_metadata(
                 seq_lens[:num_extends],
@@ -257,7 +262,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # draft_seq_lens before calling here, so `seq_lens` aliases the
         # drafter's live buffer for step-1+ advances.
         if (
-            forward_mode.is_decode()
+            forward_mode.is_idle()
             or forward_mode.is_mixed()
             or (forward_mode.is_extend() and self.is_draft)
         ):
@@ -443,6 +448,38 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         else:
             self.decode_cuda_graph_group_out_cache_loc = None
 
+    def _decode_views(self, bs: int) -> TRTLLMMLADecodeMetadata:
+        """Per-bs decode metadata views over the persistent buffers.
+
+        One builder for capture and refresh; cached per bs — pointer-stable,
+        no storage allocated.
+        """
+        metadata = self.decode_cuda_graph_metadata.get(bs)
+        if metadata is not None:
+            return metadata
+        max_blocks = self._calc_padded_blocks(self.max_context_len)
+        capture_q_len = self._graph_verify_q_len()
+        group_out_cache_loc = None
+        if self._cache_contract_bound:
+            if self.decode_cuda_graph_group_out_cache_loc is None:
+                raise RuntimeError(
+                    "trtllm_mla cache-group buffer was not allocated; "
+                    "mark_cache_contract must run before init_cuda_graph_state"
+                )
+            group_out_cache_loc = self.decode_cuda_graph_group_out_cache_loc[
+                : bs * capture_q_len
+            ]
+        metadata = TRTLLMMLADecodeMetadata(
+            num_extends=0,
+            block_kv_indices=self.decode_cuda_graph_kv_indices[:bs, :max_blocks],
+            max_seq_len_k=self.max_context_len,
+            seq_lens_k=self.cuda_graph_seq_lens_buf[:bs],
+            group_out_cache_loc=group_out_cache_loc,
+            group_q_len_per_req=capture_q_len,
+        )
+        self.decode_cuda_graph_metadata[bs] = metadata
+        return metadata
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -458,77 +495,54 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 f"trtllm_mla CUDA graph capture not supported for {forward_mode}"
             )
 
-        max_blocks = self._calc_padded_blocks(self.max_context_len)
-        block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks]
-
-        # For capture we don't have page_table yet; just zero-fill the block indices.
-        # The actual indices will be filled on replay. seq_lens_k views the
-        # backend-owned cuda_graph_seq_lens_buf (set in init_cuda_graph_state).
-        capture_q_len = self._graph_verify_q_len()
-        group_out_cache_loc = None
-        if self._cache_contract_bound:
-            if self.decode_cuda_graph_group_out_cache_loc is None:
-                raise RuntimeError(
-                    "trtllm_mla cache-group graph capture buffer was not "
-                    "allocated; mark_cache_contract must run before "
-                    "init_cuda_graph_state"
-                )
-            group_out_cache_loc = self.decode_cuda_graph_group_out_cache_loc[
-                : bs * capture_q_len
-            ]
-            group_out_cache_loc.zero_()
-        metadata = TRTLLMMLADecodeMetadata(
-            num_extends=0,
-            block_kv_indices=block_kv_indices,
-            max_seq_len_k=self.max_context_len,
-            seq_lens_k=self.cuda_graph_seq_lens_buf[:bs],
-            group_out_cache_loc=group_out_cache_loc,
-            group_q_len_per_req=capture_q_len,
-        )
+        # For capture we don't have page_table yet; the block indices arrive
+        # on refresh. seq_lens_k views the backend-owned buffer.
+        metadata = self._decode_views(bs)
+        capture_q_len = metadata.group_q_len_per_req
+        if metadata.group_out_cache_loc is not None:
+            metadata.group_out_cache_loc.zero_()
 
         # Seed the owned buffer: the capture run reads it before replay. Verify
         # rows span seq-N..seq-1, so a length below N would start the window
         # before the sequence.
-        if capture_q_len > 1:
-            metadata.seq_lens_k.copy_(seq_lens[:bs].clamp_min(capture_q_len))
-        else:
-            metadata.seq_lens_k.copy_(seq_lens[:bs])
-        self.decode_cuda_graph_metadata[bs] = metadata
+        metadata.seq_lens_k.copy_(seq_lens[:bs].clamp_min(capture_q_len))
         self.forward_decode_metadata = metadata
 
-    def init_forward_metadata_replay_cuda_graph(
+    def refresh_decode_metadata(
         self,
         bs: int,
+        actual_bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode = None,
-        page_table: torch.Tensor = None,
+        *,
+        forward_mode: ForwardMode,
+        page_table: torch.Tensor | None = None,
+        num_extends: int = 0,
+        for_graph_replay: bool = False,
         **kwargs,
-    ):
+    ) -> None:
         if forward_mode is not None and forward_mode.is_extend_or_mixed():
             raise NotImplementedError(
-                f"trtllm_mla CUDA graph replay not supported for {forward_mode}"
+                f"trtllm_mla decode refresh not supported for {forward_mode}"
             )
 
-        metadata = self.decode_cuda_graph_metadata[bs]
+        metadata = self._decode_views(bs)
 
         # Copy the live cache lengths into our own buffer (metadata.seq_lens_k
         # views it). Block indices are refreshed separately; when the block
-        # table is aliased to a peer backend, that peer's replay already
+        # table is aliased to a peer backend, that peer's refresh already
         # populated it with identical content.
         q_len = metadata.group_q_len_per_req
-        if q_len > 1:
-            self.cuda_graph_seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
-        else:
-            self.cuda_graph_seq_lens_buf[:bs].copy_(seq_lens[:bs])
+        # clamp_min(1) is the identity, so the verify clamp is unconditional.
+        self.cuda_graph_seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
 
         cache_metadata = kwargs.get("cache_metadata")
         group_table = None
-        # See FlashMLABackend.init_forward_metadata_replay_cuda_graph: a PD
-        # decode-only node never runs eager init, so _cache_groups_bound stays
-        # False and this refresh must also fire on the registry-set
-        # _cache_contract_bound, or the captured kernel reads a stale/zero
-        # block table (null page 0) instead of the transferred KV.
+        # See FlashMLABackend.refresh_decode_metadata: a PD decode-only node
+        # never runs extend init, so _cache_groups_bound stays False and this
+        # refresh must also fire on the registry-set _cache_contract_bound, or
+        # the kernel reads a stale/zero block table (null page 0) instead of
+        # the transferred KV.
         if (
             self._cache_groups_bound or self._cache_contract_bound
         ) and cache_metadata is not None:

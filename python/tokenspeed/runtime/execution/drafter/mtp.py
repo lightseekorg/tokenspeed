@@ -536,16 +536,6 @@ class Mtp(BaseDrafter):
     # ------------------------------------------------------------------
 
     @override
-    def get_candidates(
-        self,
-        base_ctx: ForwardContext,
-    ) -> torch.Tensor | None:
-        if base_ctx.num_extends > 0:
-            return None
-        return self.input_buffers.input_ids_buf[: base_ctx.input_num_tokens].reshape(
-            base_ctx.bs, self.spec_num_tokens
-        )
-
     @override
     def draft(
         self,

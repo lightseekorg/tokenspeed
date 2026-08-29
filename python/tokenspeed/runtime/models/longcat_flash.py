@@ -36,7 +36,7 @@ from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta
 from tokenspeed.runtime.distributed.comm_manager import CommManager as _CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping as _Mapping
 from tokenspeed.runtime.execution.context import ForwardContext as _ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode as _get_is_capture_mode,
 )
 from tokenspeed.runtime.layers.layernorm import RMSNorm as _RMSNorm

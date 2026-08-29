@@ -423,10 +423,14 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu: torch.Tensor | None = None,
         extend_seq_lens_cpu: torch.Tensor | None = None,
-        use_cuda_graph: bool = False,
         block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
+        if not forward_mode.is_extend_or_mixed():
+            raise RuntimeError(
+                "trtllm decode metadata goes through refresh_decode_metadata; "
+                f"init_forward_metadata only serves extend ({forward_mode})"
+            )
         group_page_tables = self._shed_state_groups(block_tables)
         group_out_cache_locs = None
         if group_page_tables:
@@ -434,82 +438,35 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             assert not (
                 self.draft_block_decode and self.spec_num_tokens > 1
             ), "cache groups are unsupported with DFLASH block decode"
-            if forward_mode.is_extend_or_mixed():
-                assert extend_prefix_lens_cpu is not None
-                assert extend_seq_lens_cpu is not None
-                group_out_cache_locs = self._compute_extend_group_out_cache_locs(
-                    group_page_tables,
-                    extend_prefix_lens_cpu[:bs],
-                    extend_seq_lens_cpu[:bs],
-                    self.kernel_page_size,
-                )
-            else:
-                group_out_cache_locs = self._compute_decode_group_out_cache_locs(
-                    group_page_tables,
-                    seq_lens[:bs],
-                    self.kernel_page_size,
-                    self._verify_tokens(),
-                )
+            assert extend_prefix_lens_cpu is not None
+            assert extend_seq_lens_cpu is not None
+            group_out_cache_locs = self._compute_extend_group_out_cache_locs(
+                group_page_tables,
+                extend_prefix_lens_cpu[:bs],
+                extend_seq_lens_cpu[:bs],
+                self.kernel_page_size,
+            )
             self._maybe_check_group_write_locs(
                 group_page_tables, group_out_cache_locs, self.kernel_page_size
             )
             group_page_tables = self._kernel_page_tables(group_page_tables)
 
-        if forward_mode.is_extend_or_mixed():
-            self._init_extend_metadata(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                page_table,
-                extend_with_prefix=extend_with_prefix,
-                extend_prefix_lens=extend_prefix_lens,
-                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-                extend_seq_lens_cpu=extend_seq_lens_cpu,
-                group_page_tables=group_page_tables,
-                group_out_cache_locs=group_out_cache_locs,
-            )
-            # Drafter: also fill decode_metadata so step 1+ multi-step has
-            # metadata under EXTEND/MIXED target. seq_lens is the drafter's
-            # live alias buffer (wrapper pre-writes before this call).
-            if self.is_draft:
-                self._init_decode_metadata(
-                    bs,
-                    req_pool_indices,
-                    seq_lens,
-                    page_table,
-                    group_page_tables=group_page_tables,
-                    group_out_cache_locs=group_out_cache_locs,
-                )
-            return
-
-        if self.draft_block_decode and self.spec_num_tokens > 1:
-            # DFLASH draft block (eager): expand to spec_num_tokens single-query
-            # rows per request; seq_lens is the block-end length the drafter
-            # already wrote.
-            self._init_block_decode_metadata(bs, req_pool_indices, seq_lens, page_table)
-            return
-
-        if self.spec_num_tokens > 1:
-            self._init_multi_token_metadata(
-                bs,
-                self.spec_num_tokens,
-                req_pool_indices,
-                seq_lens,
-                page_table,
-                group_page_tables=group_page_tables,
-                group_out_cache_locs=group_out_cache_locs,
-            )
-            if self.is_draft:
-                # Drafter's N-1 single-token steps after the first.
-                self._init_decode_metadata(
-                    bs,
-                    req_pool_indices,
-                    seq_lens,
-                    page_table,
-                    group_page_tables=group_page_tables,
-                    group_out_cache_locs=group_out_cache_locs,
-                )
-        else:
+        self._init_extend_metadata(
+            bs,
+            req_pool_indices,
+            seq_lens,
+            page_table,
+            extend_with_prefix=extend_with_prefix,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            group_page_tables=group_page_tables,
+            group_out_cache_locs=group_out_cache_locs,
+        )
+        # Drafter: also fill decode_metadata so step 1+ multi-step has
+        # metadata under EXTEND/MIXED target. seq_lens is the drafter's
+        # live alias buffer (wrapper pre-writes before this call).
+        if self.is_draft:
             self._init_decode_metadata(
                 bs,
                 req_pool_indices,
@@ -562,53 +519,6 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         base_page_table = page_table[:bs, : self.max_num_pages]
         out[: bs * spec, :].view(bs, spec, self.max_num_pages).copy_(
             base_page_table[:, None, :]
-        )
-
-    def _init_block_decode_metadata(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        page_table: torch.Tensor,
-    ):
-        """Eager DFLASH draft-block metadata: spec_num_tokens single-query rows
-        per request, all carrying the block-end seq_len (prefix + spec_num_tokens)
-        so each query attends over the whole block. Allocates fresh buffers (the
-        cuda-graph path uses persistent ones), mirroring the MHA backend.
-        """
-        assert (
-            seq_lens.dtype == torch.int32
-        ), f"seq_lens must be int32, got {seq_lens.dtype}"
-        spec = self.spec_num_tokens
-        device = seq_lens.device
-        expanded_bs = bs * spec
-
-        expanded_page_table = torch.empty(
-            (expanded_bs, self.max_num_pages), dtype=torch.int32, device=device
-        )
-        self._replicate_block_page_table(
-            expanded_page_table, req_pool_indices, bs, page_table
-        )
-
-        # Clamp the block-end length so the decode never asks for more page-table
-        # columns than exist (prefix + spec_num_tokens can exceed max_context_len).
-        cache_seqlens = (
-            seq_lens[:bs]
-            .clamp(spec, self.max_context_len)
-            .unsqueeze(1)
-            .expand(bs, spec)
-            .reshape(expanded_bs)
-            .contiguous()
-        )
-
-        self.forward_decode_metadata = TRTLLMMHAMetadata(
-            cache_seqlens_int32=cache_seqlens,
-            max_seq_len_q=1,
-            max_seq_len_k=self.max_context_len,
-            cu_seqlens_q=torch.arange(
-                0, expanded_bs + 1, dtype=torch.int32, device=device
-            ),
-            page_table=expanded_page_table,
         )
 
     def _clamped_spec_seqlens(
@@ -800,28 +710,21 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             assert not (
                 self.draft_block_decode and self.spec_num_tokens > 1
             ), "cache_group_ids is unsupported with DFLASH block decode"
-        page_tables, out_cache_locs = self._capture_group_views(
-            bs, cache_group_ids, tokens_per_req=self._verify_tokens()
-        )
 
         if self.draft_block_decode and self.spec_num_tokens > 1:
-            self._init_block_decode_metadata_capture(bs)
+            self._decode_views(bs, cache_group_ids=cache_group_ids)
+            self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
             return
 
+        # Seed the owned buffer first: the capture run reads it (and the
+        # spec>1 clamp sources it) before any refresh.
+        self.cuda_graph_cache_seqlens[:bs].copy_(seq_lens[:bs])
+        self._decode_views(bs, cache_group_ids=cache_group_ids)
         if self.spec_num_tokens > 1:
-            # Seed the owned buffer first: it is the clamp source below.
-            self.cuda_graph_cache_seqlens[:bs].copy_(seq_lens[:bs])
-            self._init_multi_token_metadata_capture(
-                bs, self.spec_num_tokens, page_tables, out_cache_locs
-            )
-            if self.is_draft:
-                self._init_decode_metadata_capture(
-                    bs, seq_lens, page_tables, out_cache_locs
-                )
-        else:
-            self._init_decode_metadata_capture(
-                bs, seq_lens, page_tables, out_cache_locs
-            )
+            self._clamped_spec_seqlens(seq_lens, bs, self.spec_num_tokens)
+            self.forward_prefill_metadata = self.cuda_graph_prefill_metadata[bs]
+        if bs in self.cuda_graph_decode_metadata:
+            self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
 
     def _init_block_decode_metadata_capture(self, bs: int):
         """DFLASH draft block (cuda-graph capture): spec_num_tokens single-query
@@ -903,36 +806,73 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         self.cuda_graph_prefill_metadata[bs] = metadata
         self.forward_prefill_metadata = metadata
 
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-        page_table: torch.Tensor = None,
-        block_tables: dict[str, torch.Tensor] | None = None,
-        **kwargs,
-    ):
-        if forward_mode.is_extend_or_mixed():
-            raise NotImplementedError(
-                f"trtllm CUDA graph replay not supported for {forward_mode}"
+    def _decode_views(self, bs: int, cache_group_ids: tuple[str, ...] | None = None):
+        """Ensure the per-bs metadata views exist (capture and refresh share
+        this builder; the capture helpers populate the dicts, so a lazy caller
+        seeds them once for a new bs). ``cache_group_ids`` pins the group set
+        at capture time; lazy callers reuse it."""
+        if cache_group_ids is not None:
+            self._decode_view_group_ids = cache_group_ids
+        if self.draft_block_decode and self.spec_num_tokens > 1:
+            if bs not in self.cuda_graph_decode_metadata:
+                self._init_block_decode_metadata_capture(bs)
+            return
+        need_prefill = self.spec_num_tokens > 1
+        need_decode = self.spec_num_tokens == 1 or self.is_draft
+        if (not need_prefill or bs in self.cuda_graph_prefill_metadata) and (
+            not need_decode or bs in self.cuda_graph_decode_metadata
+        ):
+            return
+        gids = getattr(self, "_decode_view_group_ids", None)
+        if gids is None:
+            gids = tuple(self.cuda_graph_page_tables)
+        page_tables, out_cache_locs = self._capture_group_views(
+            bs, gids, tokens_per_req=self._verify_tokens()
+        )
+        if need_prefill and bs not in self.cuda_graph_prefill_metadata:
+            self._init_multi_token_metadata_capture(
+                bs, self.spec_num_tokens, page_tables, out_cache_locs
+            )
+        if need_decode and bs not in self.cuda_graph_decode_metadata:
+            self._init_decode_metadata_capture(
+                bs, self.cuda_graph_cache_seqlens, page_tables, out_cache_locs
             )
 
+    def refresh_decode_metadata(
+        self,
+        bs: int,
+        actual_bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        forward_mode: ForwardMode,
+        page_table: torch.Tensor | None = None,
+        num_extends: int = 0,
+        for_graph_replay: bool = False,
+        block_tables: dict[str, torch.Tensor] | None = None,
+        **kwargs,
+    ) -> None:
+        if forward_mode.is_extend_or_mixed():
+            raise NotImplementedError(
+                f"trtllm decode refresh not supported for {forward_mode}"
+            )
+
+        self._decode_views(bs)
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: replicate the page table to each request's
-            # block rows. seq_lens are re-derived in-graph, so not touched here.
-            # The per-group stale guard doesn't apply: block-decode capture
-            # records only cuda_graph_page_table, refilled right here.
+            # block rows. Under replay the seq_lens are re-derived in-graph;
+            # eager has no in-graph writer, so fill them here.
             if page_table is not None:
                 self._replicate_block_page_table(
                     self.cuda_graph_page_table, req_pool_indices, bs, page_table
                 )
-            if bs in self.cuda_graph_decode_metadata:
-                self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
+            if not for_graph_replay:
+                self.fill_block_decode_seq_lens(bs, seq_lens)
+            self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
             return
 
-        # Fail loudly instead of replaying over stale/zero page tables.
-        self._replay_stale_guard(bs, block_tables)
+        # Fail loudly instead of computing over stale/zero page tables.
+        self._replay_stale_guard(actual_bs, block_tables)
 
         # Copy the live cache lengths into our own buffer (the plain-decode and
         # draft-decode metadata view cuda_graph_cache_seqlens); the spec>1 verify
@@ -940,7 +880,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         self.cuda_graph_cache_seqlens[:bs].copy_(seq_lens[:bs])
 
         # Only page tables need refresh beyond that.
-        # Cache-group captures read only the per-group buffers; the single-table single
+        # Cache-group captures read only the per-group buffers; the single
         # table would be dead work there (and page_table is unpopulated on
         # a cache-group scheduler).
         if not self.cuda_graph_page_tables and page_table is not None:

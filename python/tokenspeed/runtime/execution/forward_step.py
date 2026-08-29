@@ -170,11 +170,14 @@ class DeepEPCudaGraphRunnerAdapter:
         cls.clean_buffer()
 
 
-class CudaGraphWrapper:
-    """
-    Wraps a forward_func and transparently dispatches to either a captured
-    CUDA graph (decode, supported batch size) or the eager path (prefill /
-    unsupported batch size).
+class ForwardStepRunner:
+    """Owns one forward step end to end: metadata prep, then execution.
+
+    Every decode prepares its metadata through the single refresh path
+    (``refresh_decode_metadata``, see docs/design/unified_path.md); extend and
+    mixed batches construct theirs via ``init_forward_metadata``. Execution is
+    then either replaying a captured CUDA graph (decode at a captured batch
+    size) or running the same forward Python the graph recorded.
 
     Callers always use the same interface::
 
@@ -182,9 +185,6 @@ class CudaGraphWrapper:
             bs, ctx, sampling_info, page_table,
             extend_with_prefix=..., extend_prefix_lens=...,
         )
-
-    Internally the wrapper owns both paths and calls init_forward_metadata
-    with use_cuda_graph=True/False to select the appropriate backend buffers.
     """
 
     def __init__(
@@ -225,7 +225,16 @@ class CudaGraphWrapper:
         self.vocab_size = config.vocab_size
         self.grammar_backend = config.grammar_backend
         self.capture_bs = get_batch_sizes_to_capture(config)
-        self.max_bs = max(self.capture_bs)
+        # Two distinct maxima: graphs exist only for the capture ladder
+        # (bounded by max_cudagraph_capture_size), but the persistent decode
+        # buffers cover every decode batch this rank can serve, so a decode
+        # above the ladder runs the same refresh path with no graph — the
+        # ladder is a performance subset, never a capacity limit.
+        self.max_capture_bs = max(self.capture_bs)
+        self.max_decode_bs = max(
+            config.max_num_seqs // max(config.data_parallel_size, 1),
+            self.max_capture_bs,
+        )
         self.max_tokens_per_req = (
             config.spec_num_tokens if config.spec_algo is not None else 1
         )
@@ -238,7 +247,7 @@ class CudaGraphWrapper:
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
         init_backend_cuda_graph_state(
             attn_backend,
-            self.max_bs,
+            self.max_decode_bs,
             cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
             cache_group_page_counts=(token_to_kv_pool.arena.cache_group_page_counts),
             max_tokens_per_req=self.max_tokens_per_req,
@@ -247,7 +256,7 @@ class CudaGraphWrapper:
         if draft_attn_backend is not None:
             init_backend_cuda_graph_state(
                 draft_attn_backend,
-                self.max_bs,
+                self.max_decode_bs,
                 cache_group_specs=tuple(draft_token_to_kv_pool.arena.cache_group_specs),
                 cache_group_page_counts=(
                     draft_token_to_kv_pool.arena.cache_group_page_counts
@@ -271,7 +280,7 @@ class CudaGraphWrapper:
             # also line up, point the draft backend at the target's buffer and
             # skip its gather+copy in the replay path: the target's metadata
             # prep runs first and populates the shared buffer (see
-            # init_forward_metadata_replay_cuda_graph).
+            # refresh_decode_metadata).
             target_kv = getattr(attn_backend, "decode_cuda_graph_kv_indices", None)
             draft_kv = getattr(draft_attn_backend, "decode_cuda_graph_kv_indices", None)
             if (
@@ -283,11 +292,6 @@ class CudaGraphWrapper:
                 draft_attn_backend.decode_cuda_graph_kv_indices = target_kv
                 draft_attn_backend._page_table_aliased = True
 
-        self.graph_variants = (
-            sampling_backend.cuda_graph_capture_variants(self.max_tokens_per_req)
-            if sampling_backend is not None
-            else (CUDA_GRAPH_VARIANT_DEFAULT,)
-        )
         self.graphs: dict[tuple[str, int], object] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
 
@@ -425,11 +429,9 @@ class CudaGraphWrapper:
             # uniform dummy.
             ctx.global_bs = [bs] * self.world_size
 
-        # Capture with is_all_greedy=False so the graph records the full
-        # top_k_top_p_sampling path (greedy-only requests are served by the
-        # same path with top_k=1 in the buffer, which effectively argmaxes).
-        # is_all_greedy=True at capture would freeze the graph into
-        # argmax and bypass per-request seeding at replay.
+        # The sampler has a single pool-indexed route: greedy requests are
+        # served by top_k=1 in the pool buffers, so capture and every replay
+        # record the same top_k_top_p sampling path.
         ibd = self.input_buffers
         sampling_info = SamplingBatchInfo(
             req_pool_indices=ibd.req_pool_indices_buf[:bs],
@@ -438,7 +440,6 @@ class CudaGraphWrapper:
                 if self.runtime_states is not None
                 else None
             ),
-            is_all_greedy=False,
             vocab_size=self.vocab_size,
             device=self.device,
         )
@@ -581,7 +582,6 @@ class CudaGraphWrapper:
                         if self.runtime_states is not None
                         else None
                     ),
-                    is_all_greedy=False,
                     vocab_size=self.vocab_size,
                     device=self.device,
                 )
@@ -625,7 +625,7 @@ class CudaGraphWrapper:
             max_pages = compute_max_logical_pages_for_capture(
                 spec,
                 max_context_len=(
-                    self.max_tokens_per_req * self.max_bs
+                    self.max_tokens_per_req * self.max_decode_bs
                     if self.context_len <= 0
                     else self.context_len
                 ),
@@ -829,7 +829,7 @@ class CudaGraphWrapper:
             )
         return out
 
-    def _init_replay_metadata(
+    def _prepare_decode_metadata(
         self,
         padded_bs: int,
         actual_bs: int,
@@ -837,12 +837,37 @@ class CudaGraphWrapper:
         seq_lens: torch.Tensor,
         page_table: torch.Tensor,
         forward_mode: ForwardMode,
+        *,
+        use_graph: bool,
         **kwargs,
     ):
-        """Graph-replay path — update persistent cuda-graph buffers in place."""
-        group_placeholder_tables = kwargs.pop("group_placeholder_tables", None)
+        """The single decode metadata path — graph replay AND eager decode.
+
+        Assembles per-group tables once (row padding is a no-op when
+        ``padded_bs == actual_bs``, i.e. every eager call), then refreshes the
+        target backend's persistent decode buffers and the draft's. The target
+        must refresh first: a draft whose kv-indices buffer is aliased to the
+        target's (``_page_table_aliased``) reads what the target's refresh
+        populated.
+        """
         block_table_base_offsets = kwargs.pop("block_table_base_offsets", None)
         block_tables = kwargs.pop("block_tables", None)
+        group_placeholder_tables = kwargs.pop("group_placeholder_tables", None)
+
+        # The bs==0 idle replay carries no live tables: synthesize minimal
+        # valid ones so the backends' stale-table guards hold. Eager idle
+        # bypasses the wrapper entirely (see execute_idle_forward).
+        if actual_bs == 0 and use_graph:
+            if (
+                group_placeholder_tables is None
+                and self.attn_backend.needs_group_block_tables
+            ):
+                group_placeholder_tables = self._capture_group_block_tables(
+                    padded_bs,
+                    self.token_to_kv_pool,
+                )
+            if not block_tables and self._any_backend_uses_cache_groups():
+                block_tables = self._idle_block_tables(padded_bs)
         target_needs_group_tables = getattr(
             self.attn_backend,
             "needs_group_block_tables",
@@ -917,28 +942,59 @@ class CudaGraphWrapper:
                 kwargs["block_tables"] = block_tables
             else:
                 kwargs["block_tables"] = padded_block_tables
-        if self.attn_backend.uses_padded_decode_token_mask:
-            kwargs["actual_bs"] = actual_bs
-        if target_needs_group_tables and getattr(self, "drafter", None) is not None:
+        if (
+            not use_graph
+            and target_needs_group_tables
+            and block_table_base_offsets is not None
+        ):
+            # Live replay reads offsets through cache_metadata; only the eager
+            # path and the padded placeholder branch above feed them directly.
+            kwargs["block_table_base_offsets"] = block_table_base_offsets
+        if target_needs_group_tables:
+            # Pure decode: ctx.input_num_tokens == bs * max_tokens_per_req, so
+            # this is the same value both paths passed before unification.
             kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
-        self.attn_backend.init_forward_metadata_replay_cuda_graph(
+        self.attn_backend.refresh_decode_metadata(
             padded_bs,
+            actual_bs,
             req_pool_indices,
             seq_lens,
-            page_table=page_table,
             forward_mode=forward_mode,
+            page_table=page_table,
+            for_graph_replay=use_graph,
             **kwargs,
         )
         if self.draft_attn_backend is not None:
+            # The drafter mutates draft_seq_lens_buf between MTP draft steps;
+            # decode metadata must alias that buffer. Copy before any early
+            # return: DFLASH reads these lengths even when it owns its own
+            # per-step metadata init.
+            draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
+            draft_seq_lens.copy_(seq_lens[:padded_bs])
+            if not use_graph:
+                from tokenspeed.runtime.execution.drafter.dflash import DFlash
+
+                # Eager DFLASH inits its own draft metadata inside each
+                # block-decode step (the drafter python runs); under replay no
+                # drafter python runs, so the refresh below covers it.
+                if isinstance(self.drafter, DFlash):
+                    return
             draft_attn_kwargs = {}
-            if draft_needs_group_tables and group_placeholder_tables is not None:
-                draft_attn_kwargs["block_tables"] = group_placeholder_tables
-                if block_table_base_offsets is not None:
+            if draft_needs_group_tables:
+                if group_placeholder_tables is not None:
+                    # Idle replay: the padded placeholder pair travels together.
+                    draft_attn_kwargs["block_tables"] = group_placeholder_tables
+                    if block_table_base_offsets is not None:
+                        draft_attn_kwargs["block_table_base_offsets"] = (
+                            block_table_base_offsets
+                        )
+                elif not use_graph and block_table_base_offsets is not None:
+                    # Live replay reads offsets through cache_metadata; only
+                    # eager feeds them directly.
                     draft_attn_kwargs["block_table_base_offsets"] = (
                         block_table_base_offsets
                     )
-            if getattr(self.draft_attn_backend, "uses_padded_decode_token_mask", False):
-                draft_attn_kwargs["actual_bs"] = actual_bs
+                draft_attn_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
             draft_table_source = (
                 block_tables
                 if getattr(
@@ -951,17 +1007,20 @@ class CudaGraphWrapper:
             draft_group_tables = self._draft_group_tables(draft_table_source)
             if draft_group_tables is not None:
                 draft_attn_kwargs["block_tables"] = draft_group_tables
-            draft_forward_mode = ForwardMode.DECODE
-            if draft_needs_group_tables:
-                draft_attn_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
-            draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
-            draft_seq_lens.copy_(seq_lens[:padded_bs])
-            self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
+            # V4's eager paged path reads the accepted-prefix view for its
+            # decode metadata rather than the drafter-owned mutable buffer.
+            if not use_graph and self.use_v4_mtp_paged_metadata:
+                draft_metadata_seq_lens = seq_lens
+            else:
+                draft_metadata_seq_lens = draft_seq_lens
+            self.draft_attn_backend.refresh_decode_metadata(
                 padded_bs,
+                actual_bs,
                 req_pool_indices,
-                draft_seq_lens,
+                draft_metadata_seq_lens,
+                forward_mode=ForwardMode.DECODE,
                 page_table=self.drafter.cache_view.table,
-                forward_mode=draft_forward_mode,
+                for_graph_replay=use_graph,
                 **draft_attn_kwargs,
             )
 
@@ -976,13 +1035,11 @@ class CudaGraphWrapper:
         forward_mode: ForwardMode,
         **kwargs,
     ):
-        """Eager path — allocate/refresh metadata for the upcoming forward."""
-        if (
-            getattr(self.attn_backend, "needs_group_block_tables", False)
-            and self.drafter is not None
-            and forward_mode.is_decode()
-        ):
-            kwargs.setdefault("num_tokens", padded_bs * self.max_tokens_per_req)
+        """Extend/mixed path — construct metadata for the upcoming forward.
+
+        Pure decode goes through ``_prepare_decode_metadata``; this arm keeps
+        the dynamic-shape prefill construction.
+        """
         self.attn_backend.init_forward_metadata(
             bs=padded_bs,
             num_extends=num_extends,
@@ -1006,69 +1063,48 @@ class CudaGraphWrapper:
             # decode metadata must alias that buffer.
             draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
             draft_seq_lens.copy_(seq_lens[:padded_bs])
-            if forward_mode.is_extend_or_mixed():
-                # Non-V4 draft backends follow the legacy contract: a single
-                # EXTEND/MIXED metadata init fills both first-step prefill
-                # metadata and step 1+ decode metadata, with seq_lens aliased
-                # to the drafter-owned mutable buffer. V4 additionally needs
-                # the accepted-prefix view for first-step grouped-cache
-                # metadata, then a separate decode init to prepare the draft
-                # decode metadata from that first-step state.
-                draft_prefill_seq_lens = (
-                    seq_lens if self.use_v4_mtp_paged_metadata else draft_seq_lens
-                )
-                # Drafter consumes its own groups' tables (see _draft_group_tables).
-                draft_extend_kwargs = (
-                    {**kwargs, "block_tables": draft_group_tables}
-                    if kwargs.get("block_tables") is not None
-                    else kwargs
-                )
-                if self.use_v4_mtp_paged_metadata:
-                    # cache_metadata describes the target pool and exposes all
-                    # target cache groups. The V4 drafter has a narrower cache
-                    # contract, so it must consume only the identity-selected
-                    # subset above instead of rebuilding tables from the target
-                    # metadata.
-                    draft_extend_kwargs = dict(draft_extend_kwargs)
-                    draft_extend_kwargs.pop("cache_metadata", None)
-                    draft_extend_kwargs.pop("forward_batch", None)
-                self.draft_attn_backend.init_forward_metadata(
-                    bs=padded_bs,
-                    num_extends=num_extends,
-                    req_pool_indices=req_pool_indices,
-                    seq_lens=draft_prefill_seq_lens,
-                    page_table=self.drafter.cache_view.table,
-                    forward_mode=forward_mode,
-                    **draft_extend_kwargs,
-                )
-                if self.use_v4_mtp_paged_metadata:
-                    self.draft_attn_backend.init_forward_metadata(
-                        bs=padded_bs,
-                        num_extends=0,
-                        req_pool_indices=req_pool_indices,
-                        seq_lens=draft_seq_lens,
-                        page_table=self.drafter.cache_view.table,
-                        forward_mode=ForwardMode.DECODE,
-                        **draft_kwargs,
-                    )
-            else:
-                from tokenspeed.runtime.execution.drafter.dflash import DFlash
-
-                if isinstance(self.drafter, DFlash):
-                    return
-                draft_metadata_seq_lens = (
-                    seq_lens if self.use_v4_mtp_paged_metadata else draft_seq_lens
-                )
-                draft_forward_mode = ForwardMode.DECODE
-                if getattr(self.draft_attn_backend, "needs_group_block_tables", False):
-                    draft_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
+            # Non-V4 draft backends follow the legacy contract: a single
+            # EXTEND/MIXED metadata init fills both first-step prefill
+            # metadata and step 1+ decode metadata, with seq_lens aliased
+            # to the drafter-owned mutable buffer. V4 additionally needs
+            # the accepted-prefix view for first-step grouped-cache
+            # metadata, then a separate decode init to prepare the draft
+            # decode metadata from that first-step state.
+            draft_prefill_seq_lens = (
+                seq_lens if self.use_v4_mtp_paged_metadata else draft_seq_lens
+            )
+            # Drafter consumes its own groups' tables (see _draft_group_tables).
+            draft_extend_kwargs = (
+                {**kwargs, "block_tables": draft_group_tables}
+                if kwargs.get("block_tables") is not None
+                else kwargs
+            )
+            if self.use_v4_mtp_paged_metadata:
+                # cache_metadata describes the target pool and exposes all
+                # target cache groups. The V4 drafter has a narrower cache
+                # contract, so it must consume only the identity-selected
+                # subset above instead of rebuilding tables from the target
+                # metadata.
+                draft_extend_kwargs = dict(draft_extend_kwargs)
+                draft_extend_kwargs.pop("cache_metadata", None)
+                draft_extend_kwargs.pop("forward_batch", None)
+            self.draft_attn_backend.init_forward_metadata(
+                bs=padded_bs,
+                num_extends=num_extends,
+                req_pool_indices=req_pool_indices,
+                seq_lens=draft_prefill_seq_lens,
+                page_table=self.drafter.cache_view.table,
+                forward_mode=forward_mode,
+                **draft_extend_kwargs,
+            )
+            if self.use_v4_mtp_paged_metadata:
                 self.draft_attn_backend.init_forward_metadata(
                     bs=padded_bs,
                     num_extends=0,
                     req_pool_indices=req_pool_indices,
-                    seq_lens=draft_metadata_seq_lens,
+                    seq_lens=draft_seq_lens,
                     page_table=self.drafter.cache_view.table,
-                    forward_mode=draft_forward_mode,
+                    forward_mode=ForwardMode.DECODE,
                     **draft_kwargs,
                 )
 
@@ -1091,10 +1127,10 @@ class CudaGraphWrapper:
                 return False
             if self.disable_padding:
                 return self._has_cuda_graph_for_bs(global_bs)
-            return global_bs <= self.max_bs
+            return global_bs <= self.max_capture_bs
         if self.disable_padding:
             return self._has_cuda_graph_for_bs(bs)
-        return bs <= self.max_bs
+        return bs <= self.max_capture_bs
 
     def can_run(self, bs: int, ctx: ForwardContext) -> bool:
         return self._can_use_graph(bs, ctx)
@@ -1163,9 +1199,12 @@ class CudaGraphWrapper:
         """
         Unified forward entry point.
 
-        Dispatches to the captured CUDA graph when possible; falls back to the
-        eager forward_func otherwise.  The caller does not need to know which
-        path was taken.
+        Every decode prepares its metadata through the same
+        ``_prepare_decode_metadata`` refresh; a captured graph is replayed when
+        one exists for the (padded) batch size, otherwise the same forward
+        code the graph recorded runs eagerly. Extend/mixed batches keep the
+        eager ``init_forward_metadata`` construction path. The caller does not
+        need to know which path was taken.
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
@@ -1201,32 +1240,84 @@ class CudaGraphWrapper:
             else {}
         )
 
-        if use_graph:
-            group_placeholder_tables = None
-            if bs == 0 and self.attn_backend.needs_group_block_tables:
-                group_placeholder_tables = self._capture_group_block_tables(
-                    padded_bs,
-                    self.token_to_kv_pool,
-                )
-            # The backend's stale-table guard also covers the bs==0 idle
-            # replay: synthesize minimal valid tables for it. The draft's
-            # group-table consumption needs them for the same reason.
-            if bs == 0 and not block_tables and self._any_backend_uses_cache_groups():
-                block_tables = self._idle_block_tables(padded_bs)
-            self._init_replay_metadata(
+        # Eager stale-table guard, all modes: with >1 published group the
+        # single-table fallback would serve first-group pages to every layer.
+        # Replay relies on the backends' own _replay_stale_guard instead (a
+        # live replay may resolve its tables through cache_metadata with no
+        # block_tables argument). Idle/bs==0 forwards carry no requests.
+        if (
+            not use_graph
+            and bs > 0
+            and not ctx.forward_mode.is_idle()
+            and not block_tables
+            and getattr(self.attn_backend, "uses_cache_groups", False)
+            and len(self.token_to_kv_pool.arena.cache_group_specs) > 1
+        ):
+            raise RuntimeError(
+                "ForwardStepRunner eager forward: pool publishes "
+                f"{len(self.token_to_kv_pool.arena.cache_group_specs)} "
+                "cache groups and the backend consumes group tables, "
+                f"but block_tables is missing/empty at bs={bs} "
+                f"({ctx.forward_mode.name}); the single-table fallback "
+                "would use one group's pages for all layers."
+            )
+
+        # _can_use_graph already requires a decode mode, so this branches on
+        # the mode alone: decode → unified refresh; extend/mixed → construct.
+        if ctx.forward_mode.is_decode():
+            self._prepare_decode_metadata(
                 padded_bs,
                 bs,
                 req_pool_indices,
                 seq_lens,
                 page_table=page_table,
                 forward_mode=ctx.forward_mode,
-                num_padding=padded_bs - bs if padded_bs != bs else 0,
-                group_placeholder_tables=group_placeholder_tables,
+                use_graph=use_graph,
                 block_table_base_offsets=block_table_base_offsets,
-                block_tables=block_tables,
+                block_tables=(
+                    block_tables
+                    if use_graph or self._any_backend_uses_cache_groups()
+                    else None
+                ),
+                **cache_kwargs,
+            )
+        else:
+            # Extend/mixed (and the never-in-practice eager idle): dynamic
+            # shapes, fresh construction.
+            self._init_forward_metadata(
+                padded_bs,
+                ctx.num_extends,
+                req_pool_indices,
+                seq_lens,
+                page_table=page_table,
+                forward_mode=ctx.forward_mode,
+                extend_with_prefix=extend_with_prefix,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                extend_seq_lens=extend_seq_lens,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                positions=positions,
+                out_cache_loc=out_cache_loc,
+                global_num_tokens=ctx.global_num_tokens,
+                all_decode_or_idle=ctx.all_decode_or_idle,
+                capture_hidden_mode=ctx.capture_hidden_mode,
+                **(
+                    {"num_tokens": ctx.input_num_tokens}
+                    if self.attn_backend.needs_group_block_tables
+                    else {}
+                ),
+                block_tables=(
+                    block_tables if self._any_backend_uses_cache_groups() else None
+                ),
+                block_table_base_offsets=(
+                    block_table_base_offsets
+                    if self.attn_backend.needs_group_block_tables
+                    else None
+                ),
                 **cache_kwargs,
             )
 
+        if use_graph:
             # Runtime prepare() is called by ModelExecutor with per-request rids
             # BEFORE self.forward_step — we don't refill here to avoid clobbering
             # the per-request generators with the capture-stub generator.
@@ -1258,61 +1349,7 @@ class CudaGraphWrapper:
                     else None
                 ),
             )
-
         else:
-            # Eager parity with the replay stale-table guard: with >1 group
-            # the single-table fallback would serve first-group pages to
-            # every layer. Idle/bs==0 forwards carry no requests (exempt);
-            # a single published group falls back to the single table.
-            if (
-                bs > 0
-                and not ctx.forward_mode.is_idle()
-                and not block_tables
-                and getattr(self.attn_backend, "uses_cache_groups", False)
-                and len(self.token_to_kv_pool.arena.cache_group_specs) > 1
-            ):
-                raise RuntimeError(
-                    "CudaGraphWrapper eager forward: pool publishes "
-                    f"{len(self.token_to_kv_pool.arena.cache_group_specs)} "
-                    "cache groups and the backend consumes group tables, "
-                    f"but block_tables is missing/empty at bs={bs} "
-                    f"({ctx.forward_mode.name}); the single-table fallback "
-                    "would use one group's pages for all layers."
-                )
-            metadata_num_tokens = (
-                {"num_tokens": ctx.input_num_tokens}
-                if self.attn_backend.needs_group_block_tables
-                else {}
-            )
-            self._init_forward_metadata(
-                padded_bs,
-                ctx.num_extends,
-                req_pool_indices,
-                seq_lens,
-                page_table=page_table,
-                forward_mode=ctx.forward_mode,
-                extend_with_prefix=extend_with_prefix,
-                extend_prefix_lens=extend_prefix_lens,
-                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-                extend_seq_lens=extend_seq_lens,
-                extend_seq_lens_cpu=extend_seq_lens_cpu,
-                positions=positions,
-                out_cache_loc=out_cache_loc,
-                global_num_tokens=ctx.global_num_tokens,
-                all_decode_or_idle=ctx.all_decode_or_idle,
-                capture_hidden_mode=ctx.capture_hidden_mode,
-                **metadata_num_tokens,
-                block_tables=(
-                    block_tables if self._any_backend_uses_cache_groups() else None
-                ),
-                block_table_base_offsets=(
-                    block_table_base_offsets
-                    if self.attn_backend.needs_group_block_tables
-                    else None
-                ),
-                **cache_kwargs,
-            )
-
             result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
         if use_graph and padded_bs != bs:

@@ -273,7 +273,7 @@ class MultimodalRuntime:
         Overrides modality encoder callables (e.g. ``image_encoder``,
         ``video_encoder``) with model-built graph wrappers — the
         multimodal-encoder analogue of ``forward_step``'s
-        ``CudaGraphWrapper``. Returns the installed wrappers by attribute
+        ``ForwardStepRunner``. Returns the installed wrappers by attribute
         name (empty when the model has no encoder-graph support or it is
         disabled).
         """

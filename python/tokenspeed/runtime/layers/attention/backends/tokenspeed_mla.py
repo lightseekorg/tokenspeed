@@ -410,6 +410,12 @@ class CuteDSLMLABackend(AttentionBackend):
                 "no cache metadata; refusing the legacy page_table path"
             )
 
+        if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
+            raise RuntimeError(
+                "tokenspeed_mla decode metadata goes through "
+                "refresh_decode_metadata; init_forward_metadata only serves "
+                f"extend/mixed ({forward_mode})"
+            )
         if forward_mode.is_extend_or_mixed():
             self._init_prefill_metadata(
                 seq_lens[:num_extends],
@@ -427,7 +433,7 @@ class CuteDSLMLABackend(AttentionBackend):
         # draft_seq_lens before calling here so `seq_lens` aliases the
         # drafter's live buffer.
         if (
-            forward_mode.is_decode()
+            forward_mode.is_idle()
             or forward_mode.is_mixed()
             or (forward_mode.is_extend() and self.is_draft)
         ):
@@ -438,7 +444,7 @@ class CuteDSLMLABackend(AttentionBackend):
                 if (
                     self.spec_num_tokens > 1
                     and not self.is_draft
-                    and (forward_mode.is_decode() or forward_mode.is_mixed())
+                    and forward_mode.is_mixed()
                 )
                 else 1
             )
@@ -577,30 +583,6 @@ class CuteDSLMLABackend(AttentionBackend):
             .contiguous()
         )
         return expanded_indices, expanded_seq_lens
-
-    def _capture_block_decode_graph(self, bs: int, max_blocks: int) -> None:
-        """Record graph metadata over the expanded block rows.
-
-        The block-end lengths are written by the drafter *inside* the captured
-        graph (see ``fill_block_decode_seq_lens``), so they are only seeded here
-        with a value the capture run can safely read.
-        """
-        spec = self.spec_num_tokens
-        rows = bs * spec
-        block_kv_indices = self.decode_cuda_graph_kv_indices[:rows, :max_blocks]
-        block_kv_indices.zero_()
-        seq_lens_k = self.cuda_graph_seq_lens_buf[:rows]
-        seq_lens_k.fill_(spec)
-        metadata = CuteDSLMLADecodeMetadata(
-            block_kv_indices=block_kv_indices,
-            max_seq_len_k=self.max_context_len,
-            seq_lens_k=seq_lens_k,
-            num_extends=0,
-            group_out_cache_loc=None,
-            group_q_len_per_req=1,
-        )
-        self.decode_cuda_graph_metadata[bs] = metadata
-        self.forward_decode_metadata = metadata
 
     def _replay_block_decode_page_table(
         self, bs: int, page_table: torch.Tensor | None
@@ -776,79 +758,111 @@ class CuteDSLMLABackend(AttentionBackend):
                 f"tokenspeed_mla CUDA graph capture not supported for {forward_mode}"
             )
 
-        max_blocks = self._calc_padded_blocks(self.max_context_len)
         if self._block_decode_active:
-            self._capture_block_decode_graph(bs, max_blocks)
+            # Block decode: seed only. The block-end lengths are written by
+            # the drafter *inside* the captured graph (see
+            # fill_block_decode_seq_lens).
+            metadata = self._decode_views(bs)
+            metadata.block_kv_indices.zero_()
+            metadata.seq_lens_k.fill_(self.spec_num_tokens)
+            self.forward_decode_metadata = metadata
             return
-        block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks]
 
         if uses_cache_groups:
-            # The captured cache-group graph reads the kernel page table and latent
-            # write locations from persistent buffers; replay refreshes both
-            # in place from the current full-attention table. Latch _cache_groups_bound
-            # so the recorded forward_decode takes the cache write-location
-            # branch (select_out_cache_loc), matching the eager path.
+            # Latch _cache_groups_bound so the recorded forward_decode takes
+            # the cache write-location branch (select_out_cache_loc).
             self._cache_groups_bound = True
+        metadata = self._decode_views(bs)
+        if metadata.group_out_cache_loc is not None:
+            # Placeholders resolve to the null page 0 until the first refresh.
+            metadata.block_kv_indices.zero_()
+            metadata.group_out_cache_loc.zero_()
+        # Seed the owned buffer: the capture run reads it before replay.
+        metadata.seq_lens_k.copy_(seq_lens[:bs])
+        self.forward_decode_metadata = metadata
+
+    def _decode_views(self, bs: int) -> "CuteDSLMLADecodeMetadata":
+        """Per-bs decode metadata views over the persistent buffers.
+
+        One builder for capture and refresh; cached per bs — pointer-stable,
+        no storage allocated.
+        """
+        metadata = self.decode_cuda_graph_metadata.get(bs)
+        if metadata is not None:
+            return metadata
+        max_blocks = self._calc_padded_blocks(self.max_context_len)
+        if self._block_decode_active:
+            rows = bs * self.spec_num_tokens
+            metadata = CuteDSLMLADecodeMetadata(
+                block_kv_indices=self.decode_cuda_graph_kv_indices[:rows, :max_blocks],
+                max_seq_len_k=self.max_context_len,
+                seq_lens_k=self.cuda_graph_seq_lens_buf[:rows],
+                num_extends=0,
+                group_out_cache_loc=None,
+                group_q_len_per_req=1,
+            )
+        elif self._cache_contract_bound and not self.is_draft:
             if self.decode_cuda_graph_group_out_cache_loc is None:
                 raise RuntimeError(
-                    "tokenspeed_mla cache-group graph capture: the cache write-location "
+                    "tokenspeed_mla cache-group decode: the cache write-location "
                     "buffer is not allocated; init_cuda_graph_state ran before "
                     "the backend was marked as the Cache contract sub-backend"
                 )
-            # Placeholders resolve to the null page 0 until the first replay.
-            block_kv_indices.zero_()
-            capture_q_len = (
+            q_len = (
                 self.spec_num_tokens
                 if (self.spec_num_tokens > 1 and not self.is_draft)
                 else 1
             )
-            group_out_cache_loc = self.decode_cuda_graph_group_out_cache_loc[
-                : bs * capture_q_len
-            ]
-            group_out_cache_loc.zero_()
             metadata = CuteDSLMLADecodeMetadata(
-                block_kv_indices=block_kv_indices,
+                block_kv_indices=self.decode_cuda_graph_kv_indices[:bs, :max_blocks],
                 max_seq_len_k=self.max_context_len,
                 seq_lens_k=self.cuda_graph_seq_lens_buf[:bs],
                 num_extends=0,
-                group_out_cache_loc=group_out_cache_loc,
-                group_q_len_per_req=capture_q_len,
+                group_out_cache_loc=self.decode_cuda_graph_group_out_cache_loc[
+                    : bs * q_len
+                ],
+                group_q_len_per_req=q_len,
             )
         else:
             metadata = CuteDSLMLADecodeMetadata(
-                block_kv_indices=block_kv_indices,
+                block_kv_indices=self.decode_cuda_graph_kv_indices[:bs, :max_blocks],
                 max_seq_len_k=self.max_context_len,
                 seq_lens_k=self.cuda_graph_seq_lens_buf[:bs],
                 num_extends=0,
             )
-        # Seed the owned buffer: the capture run reads it before replay.
-        metadata.seq_lens_k.copy_(seq_lens[:bs])
         self.decode_cuda_graph_metadata[bs] = metadata
-        self.forward_decode_metadata = metadata
+        return metadata
 
-    def init_forward_metadata_replay_cuda_graph(
+    def refresh_decode_metadata(
         self,
         bs: int,
+        actual_bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode = None,
-        page_table: torch.Tensor = None,
+        *,
+        forward_mode: ForwardMode,
+        page_table: torch.Tensor | None = None,
+        num_extends: int = 0,
+        for_graph_replay: bool = False,
         **kwargs,
-    ):
+    ) -> None:
         cache_metadata = kwargs.get("cache_metadata")
         if forward_mode is not None and forward_mode.is_extend_or_mixed():
             raise NotImplementedError(
-                f"tokenspeed_mla CUDA graph replay not supported for {forward_mode}"
+                f"tokenspeed_mla decode refresh not supported for {forward_mode}"
             )
 
-        metadata = self.decode_cuda_graph_metadata[bs]
+        metadata = self._decode_views(bs)
         if self._block_decode_active:
-            # Lengths come from fill_block_decode_seq_lens, inside the graph.
+            # Under replay the lengths come from fill_block_decode_seq_lens,
+            # inside the graph; eager has no in-graph writer, so fill here.
             self._replay_block_decode_page_table(bs, page_table)
+            if not for_graph_replay:
+                self.fill_block_decode_seq_lens(bs, seq_lens)
             self.forward_decode_metadata = metadata
             return
-        # The captured metadata is the source of truth: a cache write-location buffer
-        # exists iff this bs was captured on the cache-group path.
+        # A cache write-location buffer exists iff this backend runs the
+        # cache-group decode path.
         uses_cache_groups = metadata.group_out_cache_loc is not None
         if uses_cache_groups and self.is_draft:
             raise NotImplementedError(
@@ -859,7 +873,8 @@ class CuteDSLMLABackend(AttentionBackend):
         # views it) on both paths; the grouped helper only refreshes tables.
         self.cuda_graph_seq_lens_buf[:bs].copy_(seq_lens[:bs])
 
-        if uses_cache_groups:
+        if uses_cache_groups and cache_metadata is not None:
+            self._cache_groups_bound = True
             self._replay_refresh_decode(
                 bs,
                 seq_lens,
@@ -871,7 +886,7 @@ class CuteDSLMLABackend(AttentionBackend):
             return
 
         # Block indices are refreshed separately; when the block table is
-        # aliased to a peer backend, that peer's replay already populated it.
+        # aliased to a peer backend, that peer's refresh already populated it.
         if page_table is not None and not self._page_table_aliased:
             self._create_block_kv_indices(
                 bs,

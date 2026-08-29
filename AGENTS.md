@@ -35,6 +35,9 @@ change.
   between prefix matching, allocation and page geometry.
 * `docs/design/scheduler.md` — the C++ scheduler's admission granularity,
   what triggers retraction in each engine role, and the recovery protocol.
+* `docs/design/unified_path.md` — the unified decode path: one
+  refresh-in-place metadata contract for eager and CUDA-graph decode, the
+  padding contract, buffer sizing, and what stays graph-only.
 
 ## Public pull requests
 

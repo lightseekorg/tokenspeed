@@ -37,7 +37,7 @@ from tokenspeed.runtime.cache.l2.storage import (
     compute_host_lcm_block_bytes,
 )
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
-from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
+from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 
 logger = get_colorful_logger(__name__)

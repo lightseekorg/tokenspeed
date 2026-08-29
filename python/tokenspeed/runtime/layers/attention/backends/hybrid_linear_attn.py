@@ -1148,19 +1148,24 @@ class MambaAttnBackend(AttentionBackend):
             state_out_blocks_by_group=state_out_blocks_by_group,
         )
 
-    def init_forward_metadata_replay_cuda_graph(
+    def refresh_decode_metadata(
         self,
         bs: int,
+        actual_bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode = None,
+        *,
+        forward_mode: ForwardMode,
+        page_table: torch.Tensor | None = None,
+        num_extends: int = 0,
+        for_graph_replay: bool = False,
         **kwargs,
-    ):
-        # State attention has no page table; the shared replay call's
-        # page_table keyword is absorbed by **kwargs unused.
-        num_padding = kwargs.get("num_padding", 0)
-
-        real_bs = bs - num_padding
+    ) -> None:
+        # State attention has no page table; the shared decode call's
+        # page_table keyword is unused.
+        del page_table
+        real_bs = actual_bs
+        num_padding = bs - actual_bs
         req_pool_indices = req_pool_indices[:bs]
 
         is_target_verify = (
@@ -2243,11 +2248,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             *args, **kwargs
         )
 
-    def init_forward_metadata_replay_cuda_graph(self, *args, **kwargs):
-        self.full_attn_backend.init_forward_metadata_replay_cuda_graph(*args, **kwargs)
-        self.linear_attn_backend.init_forward_metadata_replay_cuda_graph(
-            *args, **kwargs
-        )
+    def refresh_decode_metadata(self, *args, **kwargs) -> None:
+        self.full_attn_backend.refresh_decode_metadata(*args, **kwargs)
+        self.linear_attn_backend.refresh_decode_metadata(*args, **kwargs)
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None

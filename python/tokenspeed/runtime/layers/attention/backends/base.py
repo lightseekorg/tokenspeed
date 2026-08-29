@@ -146,10 +146,10 @@ class AttentionBackend(ABC):
 
     @abstractmethod
     def init_forward_metadata(self, *args, **kwargs):
-        """Init the metadata for a forward pass.
+        """Construct metadata for an extend/mixed (or idle warmup) forward.
 
-        When use_cuda_graph=True the backend should use its pre-allocated
-        cuda-graph buffers instead of the normal eager buffers.
+        Decode metadata goes through :meth:`refresh_decode_metadata`; a pure
+        DECODE call here is a contract violation.
         """
         raise NotImplementedError()
 
@@ -188,30 +188,55 @@ class AttentionBackend(ABC):
         """
         raise NotImplementedError()
 
-    def init_forward_metadata_replay_cuda_graph(
+    def refresh_decode_metadata(
         self,
         bs: int,
+        actual_bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode = None,
-        page_table: torch.Tensor = None,
-        block_tables: dict[str, torch.Tensor] | None = None,
+        *,
+        forward_mode: ForwardMode,
+        page_table: torch.Tensor | None = None,
+        num_extends: int = 0,
+        for_graph_replay: bool = False,
         **kwargs,
-    ):
-        """Update pre-allocated CUDA-graph metadata buffers in-place before replay.
+    ) -> None:
+        """The single decode metadata path — eager decode and graph replay.
 
-        Called instead of init_forward_metadata when use_cuda_graph=True, so
-        that the captured kernels (which hold pointers into the pre-allocated
-        buffers) see the current batch's data without any new allocations.
-        ``block_tables`` carries per-group page tables
-        (group_id -> [>=bs, cols]) for group-aware backends; a backend that
-        captured group buffers must receive non-empty tables whenever bs > 0.
-        Default: fall back to init_forward_metadata (correct but may not work
-        for all backends that use separate cuda-graph buffer pools).
+        Refreshes the backend's persistent decode buffers in place (``copy_``)
+        and points ``forward_decode_metadata`` at views over them. There is
+        deliberately no fresh-allocation decode path: capture allocates and
+        seeds the buffers, replay refreshes them before ``graph.replay()``,
+        and eager decode refreshes them before running the same forward code
+        the graph recorded.
+
+        Args:
+            bs: Rows to prepare. On graph replay this is the padded capture
+                batch size; eager passes ``bs == actual_bs`` (unpadded).
+            actual_bs: Live-request rows. Rows in ``[actual_bs, bs)`` are
+                padding: the backend must route them to the null page / dummy
+                slot so they never touch a live request's cache.
+                ``actual_bs == 0`` is the idle replay.
+            req_pool_indices: ``[>=bs]`` request-pool slots (padding rows hold
+                a sentinel or slot 0 per the wrapper's padding contract).
+            seq_lens: ``[>=bs]`` live cache lengths (padding rows hold 1).
+            forward_mode: A decode mode; extend/mixed metadata stays on
+                ``init_forward_metadata``.
+            page_table: Batch-ordered table for backends outside the
+                cache-group contract (and the draft's staged table).
+            num_extends: Leading extend rows of a MIXED batch whose decode
+                half this refresh describes; 0 for pure decode.
+            for_graph_replay: True only under graph replay. The only
+                sanctioned use is a kernel-imposed asymmetry (e.g. FlashMLA
+                must swap in a fresh tile-schedule object per eager step
+                because the kernel freezes the schedule on first use, while
+                the captured schedule-build re-runs inside the graph).
+            **kwargs: Cache-contract extras — ``block_tables``,
+                ``block_table_base_offsets``, ``cache_metadata``,
+                ``forward_batch``, ``num_tokens``.
         """
         raise NotImplementedError(
-            f"{type(self).__name__} must implement init_forward_metadata_replay_cuda_graph "
-            "for CUDA graph support"
+            f"{type(self).__name__} must implement refresh_decode_metadata"
         )
 
     def configure_runtime(self, **kwargs) -> None:

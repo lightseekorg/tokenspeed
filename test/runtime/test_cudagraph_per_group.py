@@ -39,11 +39,11 @@ class _TorchCase(unittest.TestCase):
 class PadBlockTablesTest(_TorchCase):
     def setUp(self):
         super().setUp()
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-            CudaGraphWrapper,
+        from tokenspeed.runtime.execution.forward_step import (
+            ForwardStepRunner,
         )
 
-        self.pad = CudaGraphWrapper._pad_block_tables_to_padded_bs
+        self.pad = ForwardStepRunner._pad_block_tables_to_padded_bs
 
     def _tables(self):
         torch = self.torch
@@ -97,11 +97,11 @@ class CacheGroupIdsTest(_TorchCase):
 
     def setUp(self):
         super().setUp()
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-            CudaGraphWrapper,
+        from tokenspeed.runtime.execution.forward_step import (
+            ForwardStepRunner,
         )
 
-        self.group_ids = CudaGraphWrapper._cache_group_ids
+        self.group_ids = ForwardStepRunner._cache_group_ids
 
     def _wrapper(self, uses_cache_groups=True):
         return SimpleNamespace(
@@ -141,11 +141,11 @@ class DraftCacheGroupIdsTest(_TorchCase):
 
     def setUp(self):
         super().setUp()
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-            CudaGraphWrapper,
+        from tokenspeed.runtime.execution.forward_step import (
+            ForwardStepRunner,
         )
 
-        self.group_ids = CudaGraphWrapper._draft_cache_group_ids
+        self.group_ids = ForwardStepRunner._draft_cache_group_ids
 
     def _wrapper(
         self,
@@ -209,19 +209,21 @@ class DraftCacheGroupIdsTest(_TorchCase):
 
 
 class WrapperReplayGroupedTest(_TorchCase):
-    """Call-site wiring: the real _init_replay_metadata must row-pad grouped
-    tables with 0 (not the -1 default) before handing them to the backend."""
+    """Call-site wiring: the real _prepare_decode_metadata must row-pad
+    grouped tables with 0 (not the -1 default) before handing them to the
+    backend's unified refresh."""
 
     def _run_replay(self, block_tables, padded_bs, actual_bs):
         torch = self.torch
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-            CudaGraphWrapper,
+        from tokenspeed.runtime.execution.forward_step import (
+            ForwardStepRunner,
         )
 
         recorded = {}
 
-        def record(bs, req_pool_indices, seq_lens, **kwargs):
+        def record(bs, actual_bs, req_pool_indices, seq_lens, **kwargs):
             recorded["bs"] = bs
+            recorded["actual_bs"] = actual_bs
             recorded.update(kwargs)
 
         mock = SimpleNamespace(
@@ -229,15 +231,15 @@ class WrapperReplayGroupedTest(_TorchCase):
                 uses_cache_groups=True,
                 needs_group_block_tables=False,
                 uses_padded_decode_token_mask=False,
-                init_forward_metadata_replay_cuda_graph=record,
+                refresh_decode_metadata=record,
             ),
             draft_attn_backend=None,
             # Production helper, so the pinned pad_value is the real one.
             _pad_block_tables_to_padded_bs=(
-                CudaGraphWrapper._pad_block_tables_to_padded_bs
+                ForwardStepRunner._pad_block_tables_to_padded_bs
             ),
         )
-        CudaGraphWrapper._init_replay_metadata(
+        ForwardStepRunner._prepare_decode_metadata(
             mock,
             padded_bs,
             actual_bs,
@@ -245,6 +247,7 @@ class WrapperReplayGroupedTest(_TorchCase):
             torch.ones(padded_bs, dtype=torch.int32),
             torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
             _decode_forward_mode(),
+            use_graph=True,
             block_tables=block_tables,
         )
         return recorded
@@ -277,13 +280,13 @@ class WrapperReplayGroupedTest(_TorchCase):
 
     def test_single_table_target_pads_group_tables_before_draft_routing(self):
         torch = self.torch
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-            CudaGraphWrapper,
+        from tokenspeed.runtime.execution.forward_step import (
+            ForwardStepRunner,
         )
 
         draft_call = {}
 
-        def record_draft(bs, req_pool_indices, seq_lens, **kwargs):
+        def record_draft(bs, actual_bs, req_pool_indices, seq_lens, **kwargs):
             draft_call.update(kwargs)
 
         mock = SimpleNamespace(
@@ -291,13 +294,13 @@ class WrapperReplayGroupedTest(_TorchCase):
                 uses_cache_groups=False,
                 needs_group_block_tables=False,
                 uses_padded_decode_token_mask=False,
-                init_forward_metadata_replay_cuda_graph=lambda *args, **kwargs: None,
+                refresh_decode_metadata=lambda *args, **kwargs: None,
             ),
             draft_attn_backend=SimpleNamespace(
                 uses_cache_groups=True,
                 needs_group_block_tables=False,
                 uses_padded_decode_token_mask=False,
-                init_forward_metadata_replay_cuda_graph=record_draft,
+                refresh_decode_metadata=record_draft,
             ),
             drafter=SimpleNamespace(
                 draft_seq_lens_buf=torch.zeros(2, dtype=torch.int32),
@@ -305,16 +308,17 @@ class WrapperReplayGroupedTest(_TorchCase):
                     table=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32)
                 ),
             ),
+            use_v4_mtp_paged_metadata=False,
             _draft_group_tables=lambda tables: tables,
             _pad_block_tables_to_padded_bs=(
-                CudaGraphWrapper._pad_block_tables_to_padded_bs
+                ForwardStepRunner._pad_block_tables_to_padded_bs
             ),
         )
         tables = {
             "full_attention": torch.tensor([[3, 4]], dtype=torch.int32),
         }
 
-        CudaGraphWrapper._init_replay_metadata(
+        ForwardStepRunner._prepare_decode_metadata(
             mock,
             padded_bs=2,
             actual_bs=1,
@@ -322,6 +326,7 @@ class WrapperReplayGroupedTest(_TorchCase):
             seq_lens=torch.ones(2, dtype=torch.int32),
             page_table=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32),
             forward_mode=_decode_forward_mode(),
+            use_graph=True,
             block_tables=tables,
         )
 
@@ -334,16 +339,16 @@ class WrapperReplayGroupedTest(_TorchCase):
 
     def test_target_and_draft_share_padded_replay_tables(self):
         torch = self.torch
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-            CudaGraphWrapper,
+        from tokenspeed.runtime.execution.forward_step import (
+            ForwardStepRunner,
         )
 
         calls = {}
 
-        def record_target(bs, req_pool_indices, seq_lens, **kwargs):
+        def record_target(bs, actual_bs, req_pool_indices, seq_lens, **kwargs):
             calls["target"] = kwargs["block_tables"]
 
-        def record_draft(bs, req_pool_indices, seq_lens, **kwargs):
+        def record_draft(bs, actual_bs, req_pool_indices, seq_lens, **kwargs):
             calls["draft"] = kwargs["block_tables"]
 
         backend_contract = {
@@ -354,11 +359,11 @@ class WrapperReplayGroupedTest(_TorchCase):
         mock = SimpleNamespace(
             attn_backend=SimpleNamespace(
                 **backend_contract,
-                init_forward_metadata_replay_cuda_graph=record_target,
+                refresh_decode_metadata=record_target,
             ),
             draft_attn_backend=SimpleNamespace(
                 **backend_contract,
-                init_forward_metadata_replay_cuda_graph=record_draft,
+                refresh_decode_metadata=record_draft,
             ),
             drafter=SimpleNamespace(
                 draft_seq_lens_buf=torch.zeros(4, dtype=torch.int32),
@@ -366,11 +371,12 @@ class WrapperReplayGroupedTest(_TorchCase):
                     table=torch.zeros((4, MAX_NUM_PAGES), dtype=torch.int32)
                 ),
             ),
+            use_v4_mtp_paged_metadata=False,
             _draft_group_tables=lambda tables: {
                 "full_attention": tables["full_attention"]
             },
             _pad_block_tables_to_padded_bs=(
-                CudaGraphWrapper._pad_block_tables_to_padded_bs
+                ForwardStepRunner._pad_block_tables_to_padded_bs
             ),
         )
         tables = {
@@ -378,7 +384,7 @@ class WrapperReplayGroupedTest(_TorchCase):
             "state": torch.ones((3, 2), dtype=torch.int32),
         }
 
-        CudaGraphWrapper._init_replay_metadata(
+        ForwardStepRunner._prepare_decode_metadata(
             mock,
             padded_bs=4,
             actual_bs=3,
@@ -386,6 +392,7 @@ class WrapperReplayGroupedTest(_TorchCase):
             seq_lens=torch.ones(4, dtype=torch.int32),
             page_table=torch.zeros((4, MAX_NUM_PAGES), dtype=torch.int32),
             forward_mode=_decode_forward_mode(),
+            use_graph=True,
             block_tables=tables,
         )
 
@@ -409,8 +416,8 @@ class WrapperCaptureGroupIdsTest(_TorchCase):
         torch = self.torch
         from types import MethodType
 
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-            CudaGraphWrapper,
+        from tokenspeed.runtime.execution.forward_step import (
+            ForwardStepRunner,
         )
 
         recorded = {}
@@ -441,8 +448,8 @@ class WrapperCaptureGroupIdsTest(_TorchCase):
             use_target_verify_forward_mode=False,
             draft_attn_backend=None,
         )
-        mock._cache_group_ids = MethodType(CudaGraphWrapper._cache_group_ids, mock)
-        CudaGraphWrapper._init_capture_metadata(mock, bs)
+        mock._cache_group_ids = MethodType(ForwardStepRunner._cache_group_ids, mock)
+        ForwardStepRunner._init_capture_metadata(mock, bs)
         return recorded
 
     def test_capture_passes_group_ids_from_pool_specs(self):
@@ -470,10 +477,10 @@ class WrapperEagerGroupGuardTest(_TorchCase):
 
     def _call(self, group_ids, block_tables=None):
         torch = self.torch
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-            CudaGraphWrapper,
-        )
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.execution.forward_step import (
+            ForwardStepRunner,
+        )
 
         calls = {}
 
@@ -504,7 +511,7 @@ class WrapperEagerGroupGuardTest(_TorchCase):
             _forward_func=lambda **kwargs: (None, None, None),
         )
         mock._any_backend_uses_cache_groups = (
-            lambda: CudaGraphWrapper._any_backend_uses_cache_groups(mock)
+            lambda: ForwardStepRunner._any_backend_uses_cache_groups(mock)
         )
         ctx = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
@@ -513,7 +520,7 @@ class WrapperEagerGroupGuardTest(_TorchCase):
             all_decode_or_idle=False,
             capture_hidden_mode=None,
         )
-        CudaGraphWrapper.__call__(
+        ForwardStepRunner.__call__(
             mock,
             bs=2,
             ctx=ctx,
@@ -548,11 +555,11 @@ class IdleBlockTablesTest(_TorchCase):
 
     def setUp(self):
         super().setUp()
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-            CudaGraphWrapper,
+        from tokenspeed.runtime.execution.forward_step import (
+            ForwardStepRunner,
         )
 
-        self.idle = CudaGraphWrapper._idle_block_tables
+        self.idle = ForwardStepRunner._idle_block_tables
 
     def _wrapper(self, group_ids):
         return SimpleNamespace(
@@ -627,12 +634,14 @@ class _BackendCase(_TorchCase):
         kwargs = {}
         if block_tables is not None:
             kwargs["block_tables"] = block_tables
-        self.backend.init_forward_metadata_replay_cuda_graph(
+        self.backend.refresh_decode_metadata(
+            bs,
             bs,
             torch.arange(MAX_BS, dtype=torch.int64),
             torch.ones(MAX_BS, dtype=torch.int32),
-            torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
-            _decode_forward_mode(),
+            forward_mode=_decode_forward_mode(),
+            page_table=torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
+            for_graph_replay=True,
             **kwargs,
         )
 
@@ -686,19 +695,24 @@ class BackendStateGroupShedTest(_BackendCase):
         self.assertIsNone(metadata.out_cache_locs)
         self.assertEqual(self.backend.cuda_graph_page_tables, {})
 
-    def test_eager_decode_metadata_sheds_state_group(self):
+    def test_eager_decode_refresh_sheds_state_group(self):
         torch = self.torch
         forward_mode = SimpleNamespace(
             is_mixed=lambda: False,
             is_extend_or_mixed=lambda: False,
         )
-        self.backend.init_forward_metadata(
-            bs=2,
-            num_extends=0,
-            req_pool_indices=torch.arange(2, dtype=torch.int64),
-            seq_lens=torch.tensor([3, 4], dtype=torch.int32),
-            page_table=torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
+        # Unified decode path: state groups never enter the stacked graph
+        # buffers (learned at init), and the eager refresh (bs == actual_bs)
+        # fills the same persistent buffers replay does.
+        self.backend.group_block_granularities = {"full_attention": 2}
+        self.backend._init_group_graph_buffers(MAX_BS)
+        self.backend.refresh_decode_metadata(
+            2,
+            2,
+            torch.arange(2, dtype=torch.int64),
+            torch.tensor([3, 4], dtype=torch.int32),
             forward_mode=forward_mode,
+            page_table=torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
             block_tables={
                 "full_attention": torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
                 "linear_attention": torch.tensor([[0, 5], [0, 6]], dtype=torch.int32),
@@ -709,7 +723,7 @@ class BackendStateGroupShedTest(_BackendCase):
         self.assertEqual(set(metadata.out_cache_locs), {"full_attention"})
         # seq_lens [3, 4], page_size 2 -> last pos 2, 3 -> page col 1 ->
         # pages 2, 4 -> locs 2*2+0=4, 4*2+1=9.
-        self.assertEqual(metadata.out_cache_locs["full_attention"].tolist(), [4, 9])
+        self.assertEqual(metadata.out_cache_locs["full_attention"][:2].tolist(), [4, 9])
 
 
 class BackendReplayNoGroupBuffersTest(_BackendCase):

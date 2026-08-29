@@ -145,7 +145,12 @@ def test_graph_capture_records_expanded_metadata() -> None:
     backend = _backend(spec_num_tokens=8)
     backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=4)
-    backend._capture_block_decode_graph(bs=2, seq_lens=torch.tensor([10, 20]))
+    backend.init_forward_metadata_capture_cuda_graph(
+        bs=2,
+        req_pool_indices=torch.tensor([0, 1]),
+        seq_lens=torch.tensor([10, 20]),
+        forward_mode=ForwardMode.DECODE,
+    )
 
     metadata = backend.decode_cuda_graph_metadata[2]
     assert metadata.page_table.shape == (16, 4)
@@ -176,14 +181,22 @@ def test_graph_replay_replicates_the_page_table_across_block_rows() -> None:
     backend = _backend(spec_num_tokens=4, max_num_pages=3)
     backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=2)
-    backend._capture_block_decode_graph(bs=2, seq_lens=torch.tensor([10, 20]))
+    backend.init_forward_metadata_capture_cuda_graph(
+        bs=2,
+        req_pool_indices=torch.tensor([0, 1]),
+        seq_lens=torch.tensor([10, 20]),
+        forward_mode=ForwardMode.DECODE,
+    )
 
     page_table = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
-    backend.init_forward_metadata_replay_cuda_graph(
-        bs=2,
-        req_pool_indices=torch.tensor([1, 2]),
-        seq_lens=torch.tensor([10, 20], dtype=torch.int32),
+    backend.refresh_decode_metadata(
+        2,
+        2,
+        torch.tensor([1, 2]),
+        torch.tensor([10, 20], dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
         page_table=page_table,
+        for_graph_replay=True,
     )
 
     table = backend.cuda_graph_page_table[:8]
@@ -199,15 +212,23 @@ def test_contract_draft_replay_does_not_expand_published_pages_twice() -> None:
     backend._cache_groups_bound = True
     backend.kernel_page_size = 64
     backend.init_cuda_graph_state(max_bs=1)
-    backend._capture_block_decode_graph(bs=1, seq_lens=torch.tensor([10]))
+    backend.init_forward_metadata_capture_cuda_graph(
+        bs=1,
+        req_pool_indices=torch.tensor([0]),
+        seq_lens=torch.tensor([10]),
+        forward_mode=ForwardMode.DECODE,
+    )
 
     # ModelExecutor already expanded logical page 3 into kernel pages 6 and 7.
     published = torch.tensor([[6, 7, 0, 1, 99]], dtype=torch.int32)
-    backend.init_forward_metadata_replay_cuda_graph(
-        bs=1,
-        req_pool_indices=torch.tensor([9]),
-        seq_lens=torch.tensor([10], dtype=torch.int32),
+    backend.refresh_decode_metadata(
+        1,
+        1,
+        torch.tensor([9]),
+        torch.tensor([10], dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
         page_table=published,
+        for_graph_replay=True,
     )
 
     rows = backend.cuda_graph_page_table[:4]
@@ -219,19 +240,20 @@ def test_contract_draft_eager_does_not_expand_published_pages_twice() -> None:
     backend._cache_contract_bound = True
     backend._cache_groups_bound = True
     backend.kernel_page_size = 64
+    backend.init_cuda_graph_state(max_bs=1)
 
     published = torch.tensor([[6, 7, 0, 1, 99]], dtype=torch.int32)
-    backend.init_forward_metadata(
-        bs=1,
-        num_extends=0,
-        req_pool_indices=torch.tensor([9]),
-        seq_lens=torch.tensor([10], dtype=torch.int32),
-        page_table=published,
+    backend.refresh_decode_metadata(
+        1,
+        1,
+        torch.tensor([9]),
+        torch.tensor([10], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
+        page_table=published,
     )
 
     rows = backend.forward_decode_metadata.page_table
-    assert rows.eq(published[0, :4]).all()
+    assert rows[0].eq(published[0, :4]).all()
 
 
 # --------------------------------------------------------------------------

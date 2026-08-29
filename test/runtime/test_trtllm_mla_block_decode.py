@@ -45,11 +45,12 @@ def test_eager_draft_page_table_is_not_expanded_twice() -> None:
     backend.mark_cache_contract()
     kernel_page_table = torch.tensor([[6, 7, 10, 11, 14, 15]], dtype=torch.int32)
 
-    backend.init_forward_metadata(
-        bs=1,
-        num_extends=0,
-        req_pool_indices=torch.tensor([1], dtype=torch.int64),
-        seq_lens=torch.tensor([12], dtype=torch.int32),
+    backend.init_cuda_graph_state(max_bs=1)
+    backend.refresh_decode_metadata(
+        1,
+        1,
+        torch.tensor([1], dtype=torch.int64),
+        torch.tensor([12], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
         page_table=kernel_page_table,
     )
@@ -75,12 +76,14 @@ def test_graph_replay_draft_page_table_is_not_expanded_twice() -> None:
 
     # DraftPageStaging publishes kernel pages; the replay must copy them as-is
     # (identity), never re-expand. seq_lens fit the 4-page (page_size=2) table.
-    backend.init_forward_metadata_replay_cuda_graph(
-        bs=2,
-        req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
-        seq_lens=torch.tensor([8, 8], dtype=torch.int32),
+    backend.refresh_decode_metadata(
+        2,
+        2,
+        torch.tensor([0, 1], dtype=torch.int64),
+        torch.tensor([8, 8], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
         page_table=kernel_page_table,
+        for_graph_replay=True,
     )
 
     block_table = backend.forward_decode_metadata.block_kv_indices

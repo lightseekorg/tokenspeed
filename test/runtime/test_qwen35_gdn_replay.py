@@ -305,11 +305,13 @@ def test_qwen_replay_payload_and_commit_survive_cuda_graph_replay():
     payload_ptr = payload.data_ptr()
     captured_key = payload[:, :KEY_DIM].clone()
     tables = torch.tensor([[1, 5], [2, 6]], dtype=torch.int32, device=DEVICE)
-    backend.init_forward_metadata_replay_cuda_graph(
+    backend.refresh_decode_metadata(
+        BATCH,
         BATCH,
         req_pool_indices,
         seq_lens,
-        ForwardMode.DECODE,
+        forward_mode=ForwardMode.DECODE,
+        for_graph_replay=True,
         cache_metadata=_CacheMetadata({"linear_attention": tables}),
     )
     inputs["mixed_qkv"].normal_(mean=0.5, std=0.2)

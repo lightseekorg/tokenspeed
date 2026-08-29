@@ -956,17 +956,6 @@ class DFlash(BaseDrafter):
             ]
         return current
 
-    def get_candidates(self, base_ctx: ForwardContext) -> torch.Tensor | None:
-        num_extends = base_ctx.num_extends
-        num_decodes = base_ctx.bs - num_extends
-        if num_decodes == 0:
-            return None
-        num_decode_tokens = num_decodes * self.spec_num_tokens
-        num_prefill_tokens = base_ctx.input_num_tokens - num_decode_tokens
-        return self.input_buffers.input_ids_buf[
-            num_prefill_tokens : base_ctx.input_num_tokens
-        ].reshape(num_decodes, self.spec_num_tokens)
-
     def draft(self, current_tokens: torch.Tensor) -> torch.Tensor:
         return self._draft_native(current_tokens)
 
@@ -1007,17 +996,16 @@ class DFlash(BaseDrafter):
         # MLA backends slice the entire block out of their decode metadata.
         metadata_num_extends = 0 if self.attention_kind == "kimi_mla" else bs
         if not is_capturing:
-            self.attn_backend.init_forward_metadata(
-                bs=bs,
-                num_extends=metadata_num_extends,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens_after,
-                page_table=self.cache_view.table,
+            # Same unified refresh the wrapper's decode path uses; a captured
+            # graph instead re-derives the block-end seq_lens in-graph.
+            self.attn_backend.refresh_decode_metadata(
+                bs,
+                bs,
+                req_pool_indices,
+                seq_lens_after,
                 forward_mode=ForwardMode.DECODE,
-                extend_seq_lens=None,
-                extend_seq_lens_cpu=self.draft_extend_seq_lens_cpu[:bs],
-                extend_prefix_lens=None,
-                extend_prefix_lens_cpu=None,
+                page_table=self.cache_view.table,
+                num_extends=metadata_num_extends,
             )
         else:
             self.attn_backend.fill_block_decode_seq_lens(bs, seq_lens_after)
@@ -1082,7 +1070,7 @@ class DFlash(BaseDrafter):
         if not hasattr(self, "target_model"):
             raise RuntimeError("DFLASH drafter is not bound to a target model.")
 
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+        from tokenspeed.runtime.execution.forward_step import (
             get_is_cuda_graph_phase,
         )
 

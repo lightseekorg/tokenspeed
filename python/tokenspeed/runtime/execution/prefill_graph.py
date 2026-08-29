@@ -26,7 +26,7 @@ the captured region: graphs start from a static input-embeds buffer, filled at
 replay by an eager ``embed_tokens`` gather (text) or by precomputed merged
 embeddings (multimodal, via the model's ``multimodal_input_embeds`` seam).
 Capture borrows the decode
-:class:`~tokenspeed.runtime.execution.cuda_graph_wrapper.CudaGraphWrapper`'s
+:class:`~tokenspeed.runtime.execution.forward_step.ForwardStepRunner`'s
 stream; buckets share one private mempool, deliberately not the decode graphs'
 pool (see :meth:`capture`). At serving time
 the executor's target-forward dispatch is a simple
@@ -74,7 +74,7 @@ from tokenspeed.runtime.utils.common import (
 logger = get_colorful_logger(__name__)
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
+    from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -268,7 +268,7 @@ class PrefillGraph:
     # Graph capture
     # ------------------------------------------------------------------
 
-    def capture(self, decode_wrapper: CudaGraphWrapper | None = None) -> None:
+    def capture(self, decode_wrapper: ForwardStepRunner | None = None) -> None:
         """Capture one breakable graph per token bucket (no-op when disabled).
 
         ``decode_wrapper`` supplies the shared capture stream and dummy
@@ -336,7 +336,7 @@ class PrefillGraph:
         if not self._capture_unanimous(captured_ok):
             self.disable = True
 
-    def _capture_all_buckets(self, decode_wrapper: CudaGraphWrapper | None) -> None:
+    def _capture_all_buckets(self, decode_wrapper: ForwardStepRunner | None) -> None:
         rank = self.config.global_rank
         buckets = sorted(self.capture_buckets, reverse=True)
         capture_range = tqdm.tqdm(buckets) if rank == 0 else buckets
@@ -369,7 +369,7 @@ class PrefillGraph:
             )
 
     def _capture_bucket(
-        self, bucket: int, decode_wrapper: CudaGraphWrapper | None
+        self, bucket: int, decode_wrapper: ForwardStepRunner | None
     ) -> None:
         """Warm up and capture the breakable graph for ``bucket`` from the buffers."""
         for _ in range(self.num_warmup):
@@ -467,7 +467,7 @@ class PrefillGraph:
         return out
 
     def make_dummy_batch(
-        self, num_tokens: int, decode_wrapper: CudaGraphWrapper | None
+        self, num_tokens: int, decode_wrapper: ForwardStepRunner | None
     ) -> ForwardContext:
         """Populate the static buffers + attention metadata for a dummy extend
         forward of ``num_tokens`` tokens, and return its ForwardContext.

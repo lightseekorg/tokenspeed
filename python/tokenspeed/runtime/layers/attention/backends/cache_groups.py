@@ -514,7 +514,8 @@ class CacheGroupsMixin:
         bridge guarantees both); returns False to take the per-group
         fallback otherwise."""
         stack = self._group_tables_stack
-        if stack is None:
+        if stack is None or stack.device.type != "cuda":
+            # CPU unit tests take the per-group torch fallback.
             return False
         gids = self._graph_group_ids
         # Fresh pinned alloc each step: a persistent pinned buffer would race with overlap scheduling
@@ -637,11 +638,39 @@ class CacheGroupsMixin:
                     buf[rows:bs].fill_(0)
 
         # One fused launch writes every group's locs into the stacked buffer the graphs read
-        compute_group_decode_locs(
-            self._group_tables_stack[: self._attention_group_count],
-            self._group_block_granularities_tensor,
-            seq_lens[:bs],
-            self._group_locs_stack,
-            bs,
-            tokens_per_req,
-        )
+        if self._group_locs_stack.device.type != "cuda":
+            # CPU unit tests: same math in torch (triton needs a GPU).
+            self._compute_group_decode_locs_torch(bs, seq_lens, tokens_per_req)
+        else:
+            compute_group_decode_locs(
+                self._group_tables_stack[: self._attention_group_count],
+                self._group_block_granularities_tensor,
+                seq_lens[:bs],
+                self._group_locs_stack,
+                bs,
+                tokens_per_req,
+            )
+
+    def _compute_group_decode_locs_torch(
+        self, bs: int, seq_lens, tokens_per_req: int
+    ) -> None:
+        n = tokens_per_req
+        if n == 1:
+            pos = (seq_lens[:bs].to(torch.int64) - 1).clamp_min(0)
+        else:
+            steps = torch.arange(n, device=seq_lens.device, dtype=torch.int64)
+            pos = (
+                (seq_lens[:bs].to(torch.int64).unsqueeze(1) - n + steps)
+                .clamp_min(0)
+                .reshape(-1)
+            )
+        for i in range(self._attention_group_count):
+            ps = int(self._group_block_granularities_tensor[i])
+            table = self._group_tables_stack[i, :bs]
+            page_idx = pos // ps
+            off = (pos % ps).to(torch.int32)
+            if n == 1:
+                pages = table.gather(1, page_idx.unsqueeze(1)).squeeze(1)
+            else:
+                pages = table.gather(1, page_idx.view(bs, n)).reshape(-1)
+            self._group_locs_stack[i, : bs * n].copy_(pages.clamp_min(0) * ps + off)

@@ -380,12 +380,6 @@ class InklingAttnBackend(AttentionBackend):
     # Conv metadata
     # ------------------------------------------------------------------
 
-    def _decode_query_start_loc(self, bs: int, device) -> torch.Tensor:
-        if self._decode_qsl is None or self._decode_qsl.shape[0] < bs + 1:
-            size = max(bs + 1, 256)
-            self._decode_qsl = torch.arange(size, dtype=torch.int32, device=device)
-        return self._decode_qsl[: bs + 1]
-
     def init_forward_metadata(
         self,
         bs: int,
@@ -405,6 +399,11 @@ class InklingAttnBackend(AttentionBackend):
                 "Inkling sconv does not support MIXED batches: the prefill "
                 "kernel hard-codes checkpoint taps at aligned chunk starts "
                 "and decode rows have none (run without --enable-mixed-batch)"
+            )
+        if not forward_mode.is_extend_or_mixed():
+            raise RuntimeError(
+                "Inkling decode metadata goes through refresh_decode_metadata; "
+                f"init_forward_metadata only serves extend ({forward_mode})"
             )
         # Paged sconv: conv groups ride block_tables, which the inner backend sheds — grab here.
         group_tables = kwargs.get("block_tables") or {}
@@ -451,64 +450,39 @@ class InklingAttnBackend(AttentionBackend):
         )
 
         cache_indices = req_pool_indices[:bs].to(torch.int32)
-        seq_idx = None
-        if forward_mode.is_extend_or_mixed():
-            assert extend_seq_lens is not None and extend_prefix_lens is not None
-            # Reuse the cumsum the inner backend just computed for this batch.
-            inner_md = getattr(self.inner, "forward_extend_metadata", None)
-            if inner_md is not None:
-                query_start_loc = inner_md.cu_extend_seq_lens
-            else:
-                query_start_loc = torch.nn.functional.pad(
-                    torch.cumsum(extend_seq_lens[:bs], dim=0, dtype=torch.int32),
-                    (1, 0),
-                )
-            has_initial_state = extend_prefix_lens[:bs] > 0
-            if extend_total is not None:
-                seq_idx = seq_idx_from_cu_seqlens(query_start_loc, extend_total)
-            if pfg_total >= 0:
-                # PFG statics: tail qsl closes the PAD request's empty chunk; tail seq_idx marks pads PAD.
-                self._pfg_qsl[: bs + 1].copy_(query_start_loc)
-                self._pfg_qsl[bs + 1 :].fill_(pfg_total)
-                self._pfg_seq_idx[:pfg_total].copy_(seq_idx)
-                self._pfg_seq_idx[pfg_total:].fill_(self._pfg_max_bs)
-                self._pfg_prefix_lens[:bs].copy_(extend_prefix_lens[:bs])
-                self._pfg_prefix_lens[bs:].zero_()
-                self._pfg_seq_lens[:bs].copy_(seq_lens[:bs])
-                self._pfg_seq_lens[bs:].zero_()
-                self._pfg_cache_indices[:bs].copy_(cache_indices)
-                self._pfg_cache_indices[bs:].fill_(PAD_SLOT_ID)
-                self._pfg_has_initial_state[:bs].copy_(has_initial_state)
-                self._pfg_has_initial_state[bs:].zero_()
-                query_start_loc = self._pfg_qsl
-                seq_idx = self._pfg_seq_idx
-                cache_indices = self._pfg_cache_indices
-                has_initial_state = self._pfg_has_initial_state
-        elif forward_mode.is_decode() and self.conv_spec_num_tokens > 1:
-            # Multi-token decode: target verify / draft catch-up, k rows per
-            # request written speculatively at their ring positions.
-            k = self.conv_spec_num_tokens
-            device = req_pool_indices.device
-            query_start_loc = torch.arange(
-                0, bs * k + 1, step=k, dtype=torch.int32, device=device
-            )
-            seq_idx = seq_idx_from_cu_seqlens(query_start_loc, bs * k)
-            has_initial_state = torch.ones(bs, dtype=torch.bool, device=device)
+        assert extend_seq_lens is not None and extend_prefix_lens is not None
+        # Reuse the cumsum the inner backend just computed for this batch.
+        inner_md = getattr(self.inner, "forward_extend_metadata", None)
+        if inner_md is not None:
+            query_start_loc = inner_md.cu_extend_seq_lens
         else:
-            query_start_loc = self._decode_query_start_loc(bs, req_pool_indices.device)
-            # Decode: token t belongs to request t, so seq_idx is the same
-            # cached arange, one element shorter.
-            seq_idx = query_start_loc[:bs]
-            has_initial_state = torch.ones(
-                bs, dtype=torch.bool, device=req_pool_indices.device
+            query_start_loc = torch.nn.functional.pad(
+                torch.cumsum(extend_seq_lens[:bs], dim=0, dtype=torch.int32),
+                (1, 0),
             )
+        has_initial_state = extend_prefix_lens[:bs] > 0
+        seq_idx = None
+        if extend_total is not None:
+            seq_idx = seq_idx_from_cu_seqlens(query_start_loc, extend_total)
+        if pfg_total >= 0:
+            # PFG statics: tail qsl closes the PAD request's empty chunk; tail seq_idx marks pads PAD.
+            self._pfg_qsl[: bs + 1].copy_(query_start_loc)
+            self._pfg_qsl[bs + 1 :].fill_(pfg_total)
+            self._pfg_seq_idx[:pfg_total].copy_(seq_idx)
+            self._pfg_seq_idx[pfg_total:].fill_(self._pfg_max_bs)
+            self._pfg_prefix_lens[:bs].copy_(extend_prefix_lens[:bs])
+            self._pfg_prefix_lens[bs:].zero_()
+            self._pfg_seq_lens[:bs].copy_(seq_lens[:bs])
+            self._pfg_seq_lens[bs:].zero_()
+            self._pfg_cache_indices[:bs].copy_(cache_indices)
+            self._pfg_cache_indices[bs:].fill_(PAD_SLOT_ID)
+            self._pfg_has_initial_state[:bs].copy_(has_initial_state)
+            self._pfg_has_initial_state[bs:].zero_()
+            query_start_loc = self._pfg_qsl
+            seq_idx = self._pfg_seq_idx
+            cache_indices = self._pfg_cache_indices
+            has_initial_state = self._pfg_has_initial_state
         remote_restore_mask = None
-        if (
-            forward_mode.is_decode()
-            and self.conv_spec_num_tokens == 1
-            and self.conv_columns.get("pd_endpoint_snapshots", False)
-        ):
-            remote_restore_mask = self._consume_remote_restore_mask(cache_indices[:bs])
         self.conv_metadata = InklingConvMetadata(
             query_start_loc=query_start_loc,
             cache_indices=cache_indices,
@@ -977,28 +951,34 @@ class InklingAttnBackend(AttentionBackend):
             self._graph_remote_restore_mask[:bs].zero_()
         self.conv_metadata = self._graph_decode_conv_metadata(bs)
 
-    def init_forward_metadata_replay_cuda_graph(
+    def refresh_decode_metadata(
         self,
         bs: int,
+        actual_bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode = None,
-        page_table: torch.Tensor = None,
+        *,
+        forward_mode: ForwardMode,
+        page_table: torch.Tensor | None = None,
+        num_extends: int = 0,
+        for_graph_replay: bool = False,
         **kwargs,
-    ):
-        actual_bs = kwargs.pop("actual_bs", None)
-        self.inner.init_forward_metadata_replay_cuda_graph(
+    ) -> None:
+        self.inner.refresh_decode_metadata(
             bs,
+            actual_bs,
             req_pool_indices,
             seq_lens,
             forward_mode=forward_mode,
             page_table=page_table,
+            num_extends=num_extends,
+            for_graph_replay=for_graph_replay,
             **kwargs,
         )
         assert self._graph_cache_indices is not None
         self._graph_seq_lens[:bs].copy_(seq_lens[:bs])
         self._graph_cache_indices[:bs].copy_(req_pool_indices[:bs].to(torch.int32))
-        if actual_bs is not None and actual_bs < bs:
+        if actual_bs < bs:
             # Pad rows may carry stale indices aliasing LIVE slots; PAD_SLOT_ID keeps writes off them.
             self._graph_cache_indices[actual_bs:bs].fill_(PAD_SLOT_ID)
         group_tables = kwargs.get("block_tables") or {}
@@ -1009,7 +989,7 @@ class InklingAttnBackend(AttentionBackend):
             src = group_tables.get(g)
             if src is None:
                 raise RuntimeError(
-                    f"paged sconv replay: no {g!r} table in " "block_tables"
+                    f"paged sconv decode: no {g!r} table in block_tables"
                 )
             if adopted_filled:
                 # The inner mixin's packed unpack already filled the shared stack rows this step.
@@ -1021,7 +1001,7 @@ class InklingAttnBackend(AttentionBackend):
                 buf[:rows, cols:].fill_(-1)
             if rows < bs:
                 buf[rows:bs].fill_(-1)
-            if actual_bs is not None and actual_bs < min(bs, rows):
+            if actual_bs < min(bs, rows):
                 buf[actual_bs:bs].fill_(-1)
         if self.conv_spec_num_tokens > 1:
             # Rebuild so the eager post-verify hook (outside the graph) sees this round's bs and mode.

@@ -103,7 +103,7 @@ from tokenspeed.runtime.multimodal.embedder import (
     pad_input_tokens,
 )
 from tokenspeed.runtime.multimodal.encoder_cudagraph import (
-    EncoderCudaGraphWrapper,
+    EncoderForwardStepRunner,
     VisionEncoderCudaGraphAdapter,
 )
 from tokenspeed.runtime.multimodal.inputs import (
@@ -1417,7 +1417,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             capture_tp_size=mapping.vision.tp_size,
             capture_tp_group=mapping.vision.tp_group,
         )
-        return EncoderCudaGraphWrapper(
+        return EncoderForwardStepRunner(
             adapter=adapter,
             budget_range=(64, 4096),
             max_metadata_sequences_per_batch=max_metadata_sequences_per_batch,

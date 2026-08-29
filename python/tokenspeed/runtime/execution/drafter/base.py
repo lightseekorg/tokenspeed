@@ -88,13 +88,6 @@ class BaseDrafter:
         """
 
     @abstractmethod
-    def get_candidates(
-        self,
-        base_ctx: ForwardContext,
-    ) -> torch.Tensor | None:
-        raise NotImplementedError
-
-    @abstractmethod
     def run(
         self,
         base_ctx: ForwardContext,

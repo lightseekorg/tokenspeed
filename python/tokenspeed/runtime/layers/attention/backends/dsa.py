@@ -174,26 +174,48 @@ class DSABackend(AttentionBackend):
             seq_lens_2d=metadata._dsa_seq_lens_2d, page_size=self.kernel_page_size
         )
 
-    def init_forward_metadata_replay_cuda_graph(
+    def refresh_decode_metadata(
         self,
         bs: int,
+        actual_bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode = None,
-        page_table: torch.Tensor = None,
+        *,
+        forward_mode: ForwardMode,
+        page_table: torch.Tensor | None = None,
+        num_extends: int = 0,
+        for_graph_replay: bool = False,
         **kwargs,
-    ):
-        self._dense_backend.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
+    ) -> None:
+        self._dense_backend.refresh_decode_metadata(
+            bs,
+            actual_bs,
+            req_pool_indices,
+            seq_lens,
             forward_mode=forward_mode,
             page_table=page_table,
+            num_extends=num_extends,
+            for_graph_replay=for_graph_replay,
             **kwargs,
         )
         metadata = self.forward_decode_metadata
+        if getattr(metadata, "_dsa_seq_lens_2d", None) is None:
+            # First refresh at a lazily-built bs (no capture ran): allocate the
+            # per-token view once; subsequent refreshes update it in place.
+            metadata._dsa_seq_lens_2d = (
+                seq_lens[:bs]
+                .unsqueeze(1)
+                .expand(-1, self.spec_num_tokens)
+                .reshape(-1, 1)
+                .contiguous()
+            )
+            metadata._dsa_plan = dsa_plan(
+                seq_lens_2d=metadata._dsa_seq_lens_2d,
+                page_size=self.kernel_page_size,
+            )
+            return
         metadata._dsa_seq_lens_2d.copy_(
-            seq_lens.unsqueeze(1).expand(-1, self.spec_num_tokens).reshape(-1, 1)
+            seq_lens[:bs].unsqueeze(1).expand(-1, self.spec_num_tokens).reshape(-1, 1)
         )
         dsa_plan(
             seq_lens_2d=metadata._dsa_seq_lens_2d,
@@ -226,6 +248,11 @@ class DSABackend(AttentionBackend):
         page_table: torch.Tensor,
         **kwargs,
     ):
+        if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
+            raise RuntimeError(
+                "DSA decode metadata goes through refresh_decode_metadata; "
+                f"init_forward_metadata only serves extend/mixed ({forward_mode})"
+            )
         self._dense_backend.init_forward_metadata(
             bs=bs,
             num_extends=num_extends,
@@ -235,11 +262,7 @@ class DSABackend(AttentionBackend):
             page_table=page_table,
             **kwargs,
         )
-        if (
-            forward_mode.is_decode()
-            or forward_mode.is_mixed()
-            or (forward_mode.is_extend() and self.is_draft)
-        ):
+        if forward_mode.is_mixed() or (forward_mode.is_extend() and self.is_draft):
             metadata = self.forward_decode_metadata
             # Per-token context lengths: the paged-MQA-logits kernel only supports
             # next_n == 1, so each verify token is its own row (bs * spec_num_tokens

@@ -40,10 +40,6 @@ from tokenspeed.runtime.configs.model_config import (
     is_deepseek_v4_nextn,
 )
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-    CudaGraphWrapper,
-    _should_update_mamba_state_after_mtp_verify,
-)
 from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (
     DeepseekV4DSpark,
     _dspark_decode_position_plan,
@@ -53,6 +49,10 @@ from tokenspeed.runtime.execution.drafter.eagle import (
     _advance_draft_forward_metadata_if_supported,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.forward_step import (
+    ForwardStepRunner,
+    _should_update_mamba_state_after_mtp_verify,
+)
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.layers.attention.backends import (
     deepseek_v4 as deepseek_v4_backend,
@@ -851,7 +851,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_cuda_graph_group_table_padding_uses_invalid_page_rows(self):
         table = torch.tensor([[5, -1]], dtype=torch.int32)
-        padded = CudaGraphWrapper._pad_block_tables_to_padded_bs(
+        padded = ForwardStepRunner._pad_block_tables_to_padded_bs(
             {"v4.swa": table},
             actual_bs=1,
             padded_bs=3,
@@ -865,31 +865,33 @@ class TestDeepseekV4Config(unittest.TestCase):
         class FakeBackend:
             needs_group_block_tables = True
             uses_padded_decode_token_mask = True
+            uses_cache_groups = False
 
-            def init_forward_metadata_replay_cuda_graph(self, *args, **kwargs):
+            def refresh_decode_metadata(self, *args, **kwargs):
                 captured["args"] = args
                 captured["kwargs"] = kwargs
 
-        wrapper = object.__new__(CudaGraphWrapper)
+        wrapper = object.__new__(ForwardStepRunner)
         wrapper.attn_backend = FakeBackend()
         wrapper.draft_attn_backend = None
         wrapper.max_tokens_per_req = 1
 
-        wrapper._init_replay_metadata(
-            padded_bs=4,
-            actual_bs=0,
+        wrapper._prepare_decode_metadata(
+            4,
+            0,
             req_pool_indices=torch.zeros(4, dtype=torch.int32),
             seq_lens=torch.ones(4, dtype=torch.int32),
             page_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
+            use_graph=True,
             group_placeholder_tables={
                 "v4.swa": torch.zeros((4, 1), dtype=torch.int32),
             },
         )
 
-        # padded_bs is the first positional arg.
+        # (padded_bs, actual_bs) are the leading positional args.
         self.assertEqual(captured["args"][0], 4)
-        self.assertEqual(captured["kwargs"]["actual_bs"], 0)
+        self.assertEqual(captured["args"][1], 0)
         self.assertEqual(
             captured["kwargs"]["block_tables"]["v4.swa"].shape,
             (4, 1),
@@ -905,11 +907,11 @@ class TestDeepseekV4Config(unittest.TestCase):
             def __init__(self, key):
                 self.key = key
 
-            def init_forward_metadata_replay_cuda_graph(self, *args, **kwargs):
+            def refresh_decode_metadata(self, *args, **kwargs):
                 captured[self.key]["args"] = args
                 captured[self.key]["kwargs"] = kwargs
 
-        wrapper = object.__new__(CudaGraphWrapper)
+        wrapper = object.__new__(ForwardStepRunner)
         wrapper.attn_backend = FakeBackend("target")
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.drafter = SimpleNamespace(
@@ -921,13 +923,14 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         table = torch.tensor([[7], [8]], dtype=torch.int32)
         offsets = {"v4.swa": torch.tensor([1, 2], dtype=torch.int64)}
-        wrapper._init_replay_metadata(
-            padded_bs=4,
-            actual_bs=2,
+        wrapper._prepare_decode_metadata(
+            4,
+            2,
             req_pool_indices=torch.zeros(4, dtype=torch.int32),
             seq_lens=torch.ones(4, dtype=torch.int32),
             page_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
+            use_graph=True,
             group_placeholder_tables={"v4.swa": table},
             block_table_base_offsets=offsets,
         )
@@ -942,7 +945,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             [1, 2, 0, 0],
         )
         self.assertEqual(draft_kwargs["forward_mode"], ForwardMode.DECODE)
-        draft_seq_lens = captured["draft"]["args"][2]
+        draft_seq_lens = captured["draft"]["args"][3]
         self.assertEqual(
             draft_seq_lens.data_ptr(),
             wrapper.drafter.draft_seq_lens_buf.data_ptr(),
@@ -990,7 +993,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             def init_forward_metadata(self, *args, **kwargs):
                 captured[self.key].append((args, kwargs))
 
-        wrapper = object.__new__(CudaGraphWrapper)
+        wrapper = object.__new__(ForwardStepRunner)
         wrapper.attn_backend = FakeBackend("target")
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
@@ -1038,7 +1041,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         swa_table = torch.ones((1, 1), dtype=torch.int32)
         state_table = torch.full((1, 1), 2, dtype=torch.int32)
 
-        wrapper = object.__new__(CudaGraphWrapper)
+        wrapper = object.__new__(ForwardStepRunner)
         wrapper.attn_backend = FakeBackend("target")
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
@@ -1081,14 +1084,16 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         class FakeBackend:
             needs_group_block_tables = False
+            uses_padded_decode_token_mask = False
+            uses_cache_groups = False
 
             def __init__(self, key):
                 self.key = key
 
-            def init_forward_metadata(self, *args, **kwargs):
+            def refresh_decode_metadata(self, *args, **kwargs):
                 captured[self.key].append((args, kwargs))
 
-        wrapper = object.__new__(CudaGraphWrapper)
+        wrapper = object.__new__(ForwardStepRunner)
         wrapper.attn_backend = FakeBackend("target")
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.max_tokens_per_req = 4
@@ -1099,34 +1104,36 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         seq_lens = torch.tensor([21, 22], dtype=torch.int32)
         wrapper.use_v4_mtp_paged_metadata = False
-        wrapper._init_forward_metadata(
-            padded_bs=2,
-            num_extends=0,
+        wrapper._prepare_decode_metadata(
+            2,
+            2,
             req_pool_indices=torch.zeros(2, dtype=torch.int32),
             seq_lens=seq_lens,
             page_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
+            use_graph=False,
         )
 
-        _, non_v4_kwargs = captured["draft"][-1]
+        non_v4_args, non_v4_kwargs = captured["draft"][-1]
         self.assertEqual(
-            non_v4_kwargs["seq_lens"].data_ptr(),
+            non_v4_args[3].data_ptr(),
             wrapper.drafter.draft_seq_lens_buf.data_ptr(),
         )
         self.assertEqual(non_v4_kwargs["forward_mode"], ForwardMode.DECODE)
 
         wrapper.use_v4_mtp_paged_metadata = True
-        wrapper._init_forward_metadata(
-            padded_bs=2,
-            num_extends=0,
+        wrapper._prepare_decode_metadata(
+            2,
+            2,
             req_pool_indices=torch.zeros(2, dtype=torch.int32),
             seq_lens=seq_lens,
             page_table=torch.zeros((1, 1), dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
+            use_graph=False,
         )
 
-        _, v4_kwargs = captured["draft"][-1]
-        self.assertEqual(v4_kwargs["seq_lens"].data_ptr(), seq_lens.data_ptr())
+        v4_args, v4_kwargs = captured["draft"][-1]
+        self.assertEqual(v4_args[3].data_ptr(), seq_lens.data_ptr())
         self.assertEqual(v4_kwargs["forward_mode"], ForwardMode.DECODE)
 
     def test_deepseek_v4_tokenizer_wrapper_uses_model_encoder(self):
@@ -2514,10 +2521,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         compact = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
         base = torch.tensor([2, 1], dtype=torch.int32)
 
-        backend.init_forward_metadata(
-            bs=2,
-            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
-            seq_lens=torch.tensor([200, 80], dtype=torch.int32),
+        backend.init_cuda_graph_state(max_bs=max(2, 4))
+        backend.refresh_decode_metadata(
+            2,
+            2,
+            torch.tensor([0, 1], dtype=torch.int64),
+            torch.tensor([200, 80], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             page_table=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
             block_tables={"v4.swa_kv": compact},
@@ -2927,15 +2936,17 @@ class TestDeepseekV4Config(unittest.TestCase):
             for index, table in enumerate(target_live.values()):
                 table[0].fill_(step + index + 1)
                 table[1].zero_()
-            target.init_forward_metadata_replay_cuda_graph(
+            target.refresh_decode_metadata(
                 **common,
                 actual_bs=1,
                 block_tables=target_live,
+                for_graph_replay=True,
             )
-            draft.init_forward_metadata_replay_cuda_graph(
+            draft.refresh_decode_metadata(
                 **common,
                 actual_bs=1,
                 block_tables=draft_live,
+                for_graph_replay=True,
             )
             graph.replay()
 
@@ -3414,13 +3425,14 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertIsNotNone(mixed_metadata)
         self.assertIs(backend.forward_prefill_metadata, mixed_metadata)
 
-        backend.init_forward_metadata(
-            bs=2,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
+        backend.init_cuda_graph_state(max_bs=max(2, 4))
+        backend.refresh_decode_metadata(
+            2,
+            2,
+            req_pool_indices,
+            seq_lens,
             forward_mode=ForwardMode.DECODE,
             page_table=page_table,
-            num_extends=0,
         )
         decode_metadata = backend.forward_metadata
         self.assertIs(backend.forward_decode_metadata, decode_metadata)
@@ -3504,10 +3516,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         c128_state_base = torch.tensor([5, 6], dtype=torch.int32)
         indexer_state_base = torch.tensor([7, 8], dtype=torch.int32)
 
-        backend.init_forward_metadata(
-            bs=2,
-            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
-            seq_lens=torch.tensor([200, 80], dtype=torch.int32),
+        backend.init_cuda_graph_state(max_bs=max(2, 4))
+        backend.refresh_decode_metadata(
+            2,
+            2,
+            torch.tensor([0, 1], dtype=torch.int64),
+            torch.tensor([200, 80], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             page_table=torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32),
             block_tables={
@@ -4239,11 +4253,13 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
 
-        backend.init_forward_metadata(
-            bs=2,
+        backend.init_cuda_graph_state(max_bs=max(2, 4))
+        backend.refresh_decode_metadata(
+            2,
+            2,
+            torch.tensor([0, 1], dtype=torch.int64),
+            torch.tensor([70, 3], dtype=torch.int32),
             num_tokens=8,
-            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
-            seq_lens=torch.tensor([70, 3], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
         )
@@ -4273,11 +4289,13 @@ class TestDeepseekV4Config(unittest.TestCase):
                 speculative_num_draft_tokens=4,
             )
         )
-        draft_backend.init_forward_metadata(
-            bs=2,
+        draft_backend.init_cuda_graph_state(max_bs=max(2, 4))
+        draft_backend.refresh_decode_metadata(
+            2,
+            2,
+            torch.tensor([0, 1], dtype=torch.int64),
+            torch.tensor([70, 3], dtype=torch.int32),
             num_tokens=8,
-            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
-            seq_lens=torch.tensor([70, 3], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
         )
@@ -4293,11 +4311,13 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(RuntimeError, "uniformly packed"):
-            backend.init_forward_metadata(
-                bs=2,
+            backend.init_cuda_graph_state(max_bs=max(2, 4))
+            backend.refresh_decode_metadata(
+                2,
+                2,
+                torch.tensor([0, 1], dtype=torch.int64),
+                torch.tensor([70, 3], dtype=torch.int32),
                 num_tokens=7,
-                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
-                seq_lens=torch.tensor([70, 3], dtype=torch.int32),
                 forward_mode=ForwardMode.DECODE,
                 page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
             )
@@ -4319,10 +4339,12 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
 
-        backend.init_forward_metadata(
-            bs=2,
-            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
-            seq_lens=torch.tensor([70, 3], dtype=torch.int32),
+        backend.init_cuda_graph_state(max_bs=max(2, 4))
+        backend.refresh_decode_metadata(
+            2,
+            2,
+            torch.tensor([0, 1], dtype=torch.int64),
+            torch.tensor([70, 3], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             page_table=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
         )
@@ -4407,11 +4429,13 @@ class TestDeepseekV4Config(unittest.TestCase):
             forward_mode=ForwardMode.DECODE,
         )
 
-        backend.init_forward_metadata_replay_cuda_graph(
-            bs=2,
-            req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
-            seq_lens=torch.tensor([70, 3], dtype=torch.int32),
+        backend.refresh_decode_metadata(
+            2,
+            2,
+            torch.tensor([0, 1], dtype=torch.int32),
+            torch.tensor([70, 3], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
+            for_graph_replay=True,
         )
 
         self.assertTrue(
@@ -4440,10 +4464,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         seq_lens = torch.tensor([70, 3], dtype=torch.int32)
         c4_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
-        backend.init_forward_metadata(
-            bs=2,
-            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
-            seq_lens=seq_lens,
+        backend.init_cuda_graph_state(max_bs=max(2, 4))
+        backend.refresh_decode_metadata(
+            2,
+            2,
+            torch.tensor([0, 1], dtype=torch.int64),
+            seq_lens,
             forward_mode=ForwardMode.DECODE,
             page_table=c4_table,
             block_tables=_v4_compressed_kv_tables(c4=c4_table),
@@ -4476,10 +4502,12 @@ class TestDeepseekV4Config(unittest.TestCase):
             [[10, 11, 12, 13], [20, 21, 22, 23]],
             dtype=torch.int32,
         )
-        backend.init_forward_metadata(
-            bs=2,
-            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
-            seq_lens=seq_lens,
+        backend.init_cuda_graph_state(max_bs=max(2, 4))
+        backend.refresh_decode_metadata(
+            2,
+            2,
+            torch.tensor([0, 1], dtype=torch.int64),
+            seq_lens,
             forward_mode=ForwardMode.DECODE,
             page_table=c128_table,
             block_tables=_v4_compressed_kv_tables(c128=c128_table),
@@ -4534,10 +4562,12 @@ class TestDeepseekV4Config(unittest.TestCase):
             device=device,
             dtype=torch.int32,
         )
-        backend.init_forward_metadata(
-            bs=2,
-            req_pool_indices=torch.tensor([0, 1], device=device, dtype=torch.int64),
-            seq_lens=seq_lens,
+        backend.init_cuda_graph_state(max_bs=max(2, 4))
+        backend.refresh_decode_metadata(
+            2,
+            2,
+            torch.tensor([0, 1], device=device, dtype=torch.int64),
+            seq_lens,
             forward_mode=ForwardMode.DECODE,
             page_table=c128_table,
             block_tables=_v4_compressed_kv_tables(c128=c128_table),
@@ -4680,10 +4710,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         seq_lens = torch.tensor([70, 3], dtype=torch.int32)
         compressed_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
-        backend.init_forward_metadata(
-            bs=2,
-            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
-            seq_lens=seq_lens,
+        backend.init_cuda_graph_state(max_bs=max(2, 4))
+        backend.refresh_decode_metadata(
+            2,
+            2,
+            torch.tensor([0, 1], dtype=torch.int64),
+            seq_lens,
             forward_mode=ForwardMode.DECODE,
             page_table=compressed_table,
             block_tables=_v4_compressed_kv_tables(
@@ -4756,11 +4788,11 @@ class TestDeepseekV4Config(unittest.TestCase):
             forward_mode=ForwardMode.DECODE,
         )
 
-        backend.init_forward_metadata_replay_cuda_graph(
-            bs=4,
-            actual_bs=2,
-            req_pool_indices=torch.arange(4, dtype=torch.int32),
-            seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
+        backend.refresh_decode_metadata(
+            4,
+            2,
+            torch.arange(4, dtype=torch.int32),
+            torch.tensor([70, 3, 1, 1], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             page_table=torch.tensor(
                 [
@@ -4771,6 +4803,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 ],
                 dtype=torch.int32,
             ),
+            for_graph_replay=True,
         )
 
         metadata = backend.forward_metadata
@@ -4823,13 +4856,14 @@ class TestDeepseekV4Config(unittest.TestCase):
             [[10, 11], [20, 21], [0, 0], [0, 0]], dtype=torch.int32
         )
 
-        backend.init_forward_metadata_replay_cuda_graph(
-            bs=4,
-            actual_bs=2,
-            req_pool_indices=torch.arange(4, dtype=torch.int32),
-            seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
+        backend.refresh_decode_metadata(
+            4,
+            2,
+            torch.arange(4, dtype=torch.int32),
+            torch.tensor([70, 3, 1, 1], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             block_tables={group_id: active_table},
+            for_graph_replay=True,
         )
 
         table = backend.forward_metadata.cache.page_table
@@ -5037,12 +5071,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         self.assertEqual(metadata.decode_token_count(), 16)
 
-        backend.init_forward_metadata_replay_cuda_graph(
-            bs=4,
-            actual_bs=2,
+        backend.refresh_decode_metadata(
+            4,
+            2,
+            torch.arange(4, dtype=torch.int32),
+            torch.tensor([70, 3, 1, 1], dtype=torch.int32),
             num_tokens=16,
-            req_pool_indices=torch.arange(4, dtype=torch.int32),
-            seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             page_table=torch.tensor(
                 [
@@ -5053,6 +5087,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 ],
                 dtype=torch.int32,
             ),
+            for_graph_replay=True,
         )
 
         metadata = backend.forward_metadata
@@ -5093,12 +5128,12 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=torch.ones(4, dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
         )
-        backend.init_forward_metadata_replay_cuda_graph(
-            bs=4,
-            actual_bs=2,
+        backend.refresh_decode_metadata(
+            4,
+            2,
+            torch.arange(4, dtype=torch.int32),
+            torch.tensor([70, 3, 1, 1], dtype=torch.int32),
             num_tokens=16,
-            req_pool_indices=torch.arange(4, dtype=torch.int32),
-            seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             page_table=torch.tensor(
                 [
@@ -5109,6 +5144,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 ],
                 dtype=torch.int32,
             ),
+            for_graph_replay=True,
         )
 
         self.assertIs(backend.forward_prefill_metadata, backend.forward_metadata)
@@ -5201,11 +5237,13 @@ class TestDeepseekV4Config(unittest.TestCase):
             extend_seq_lens_cpu=seq_lens.cpu(),
             extend_prefix_lens_cpu=torch.zeros(1, dtype=torch.int32),
         )
-        backend.init_forward_metadata(
-            bs=1,
+        backend.init_cuda_graph_state(max_bs=max(1, 4))
+        backend.refresh_decode_metadata(
+            1,
+            1,
+            req_pool_indices,
+            seq_lens,
             num_tokens=1,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
             forward_mode=ForwardMode.DECODE,
             page_table=page_table,
         )

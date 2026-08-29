@@ -190,17 +190,25 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         self.assertEqual(page_table.data_ptr(), out.data_ptr())
         self.assertEqual(page_table.tolist(), [[3, 5, 7, 9]])
 
-    def test_eager_expands_per_group_table(self):
+    def test_decode_refresh_expands_per_group_table(self):
+        # Unified decode path: refresh expands the scheduler table into the
+        # persistent per-group buffers (same math as the old eager assembly).
         b = self._bare_backend(
             page_size=64,
             max_num_pages=4,
             groups={"full_attention": 128},
         )
+        b.engine_owned_group_ids = frozenset()
+        b.state_group_ids = frozenset()
+        b.cuda_graph_page_table = self.torch.zeros((2, 4), dtype=self.torch.int32)
+        b.cuda_graph_cache_seqlens = self.torch.ones(2, dtype=self.torch.int32)
+        b._init_group_graph_buffers(2)
 
-        b.init_forward_metadata(
-            bs=1,
-            req_pool_indices=self.torch.tensor([0], dtype=self.torch.int32),
-            seq_lens=self.torch.tensor([129], dtype=self.torch.int32),
+        b.refresh_decode_metadata(
+            1,
+            1,
+            self.torch.tensor([0], dtype=self.torch.int32),
+            self.torch.tensor([129], dtype=self.torch.int32),
             forward_mode=_DecodeMode(),
             page_table=None,
             block_tables={
@@ -211,10 +219,12 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         metadata = b.forward_decode_metadata
         self.assertIsNone(metadata.page_table)
         self.assertEqual(
-            metadata.page_tables["full_attention"].tolist(),
+            metadata.page_tables["full_attention"][:1].tolist(),
             [[6, 7, 10, 11]],
         )
-        self.assertEqual(metadata.out_cache_locs["full_attention"].tolist(), [10 * 64])
+        self.assertEqual(
+            metadata.out_cache_locs["full_attention"][:1].tolist(), [10 * 64]
+        )
 
     def test_select_out_cache_loc_routes_by_group(self):
         b = self._bare_backend()
@@ -372,10 +382,19 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             [10 * 64, 0],
         )
 
-    def test_verify_metadata_expanded_write_locs(self):
+    def test_verify_refresh_expanded_write_locs(self):
         # Target verify (spec N, not draft): [bs]-row per-group tables in the
-        # prefill slot + [bs*N] token-major write locs (single-table verify layout).
-        b = self._bare_backend(spec_num_tokens=4)
+        # prefill slot + [bs*N] token-major write locs, refreshed into the
+        # persistent buffers by the unified decode path.
+        b = self._bare_backend(
+            spec_num_tokens=4,
+            groups={"full_attention": 64, "sliding_attention": 64},
+        )
+        b.engine_owned_group_ids = frozenset()
+        b.state_group_ids = frozenset()
+        b.cuda_graph_page_table = self.torch.zeros((2, 8), dtype=self.torch.int32)
+        b.cuda_graph_cache_seqlens = self.torch.ones(2, dtype=self.torch.int32)
+        b._init_group_graph_buffers(2)
         seq_lens = self.torch.tensor([65, 3], dtype=self.torch.int32)
         tables = {
             "full_attention": self.torch.tensor(
@@ -385,25 +404,25 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
                 [[21, 22], [23, -1]], dtype=self.torch.int32
             ),
         }
-        b.init_forward_metadata(
-            bs=2,
-            req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
-            seq_lens=seq_lens,
+        b.refresh_decode_metadata(
+            2,
+            2,
+            self.torch.tensor([0, 1], dtype=self.torch.int32),
+            seq_lens,
             forward_mode=_DecodeMode(),
             page_table=None,
             block_tables=tables,
         )
         meta = b.forward_prefill_metadata
         self.assertIsNone(meta.page_table)
-        self.assertIs(meta.page_tables, tables)
         # req0 positions 61..64 (pages 11,11,11,12); req1 clamps 0,0,1,2 (page 13).
         self.assertEqual(
-            meta.out_cache_locs["full_attention"].tolist(),
+            meta.out_cache_locs["full_attention"][:8].tolist(),
             [11 * 64 + 61, 11 * 64 + 62, 11 * 64 + 63, 12 * 64 + 0]
             + [13 * 64 + 0, 13 * 64 + 0, 13 * 64 + 1, 13 * 64 + 2],
         )
         self.assertEqual(
-            meta.out_cache_locs["sliding_attention"].tolist(),
+            meta.out_cache_locs["sliding_attention"][:8].tolist(),
             [21 * 64 + 61, 21 * 64 + 62, 21 * 64 + 63, 22 * 64 + 0]
             + [23 * 64 + 0, 23 * 64 + 0, 23 * 64 + 1, 23 * 64 + 2],
         )
@@ -444,11 +463,13 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
                 [[11, 12], [0, -1]], dtype=self.torch.int32, device="cuda"
             )
         }
-        b.init_forward_metadata_replay_cuda_graph(
+        b.refresh_decode_metadata(
             bs,
-            req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
-            seq_lens=b.cuda_graph_cache_seqlens,
+            bs,
+            self.torch.tensor([0, 1], dtype=self.torch.int32),
+            b.cuda_graph_cache_seqlens,
             forward_mode=_DecodeMode(),
+            for_graph_replay=True,
             block_tables=src,
         )
         locs = b.cuda_graph_out_cache_locs["full_attention"][: bs * 4]
@@ -470,15 +491,13 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         b = self._bare_backend(spec_num_tokens=4)
         b.is_draft = True
         b.draft_block_decode = True
-        tables = {"full_attention": self.torch.zeros((1, 1), dtype=self.torch.int32)}
         with self.assertRaisesRegex(AssertionError, "DFLASH"):
-            b.init_forward_metadata(
+            b.init_forward_metadata_capture_cuda_graph(
                 bs=1,
                 req_pool_indices=self.torch.tensor([0], dtype=self.torch.int32),
                 seq_lens=self.torch.tensor([1], dtype=self.torch.int32),
                 forward_mode=_DecodeMode(),
-                page_table=None,
-                block_tables=tables,
+                cache_group_ids=("full_attention",),
             )
 
 

@@ -575,11 +575,13 @@ view, mirrored by the host tier. Specifically:
 
 Remaining known item (deliberate, separate project): the mapping *primitive*
 is single but the *owners* are four — MLA `CacheBatchMetadata.kernel_table`,
-the MHA `CacheGroupsMixin` (eager plus two graph paths),
-`DraftPageStaging.publish`, and DeepSeek-V4's bespoke slot mapping — each
-with its own caching and validation, and the write-location math triplicated
-alongside. Consolidating them means touching every backend family at once;
-do it as its own milestone.
+the MHA `CacheGroupsMixin` (one unified decode refresh plus the extend path;
+see `unified_path.md`), `DraftPageStaging.publish`, and DeepSeek-V4's bespoke
+slot mapping — each with its own caching and validation, and the
+write-location math triplicated alongside. Consolidating them means touching
+every backend family at once; do it as its own milestone. The decode-path
+unification (`unified_path.md`) shrank the surface: each owner now has ONE
+decode-side implementation instead of an eager arm plus a replay arm.
 
 ### Principle 6 — provenance discipline: fixed
 

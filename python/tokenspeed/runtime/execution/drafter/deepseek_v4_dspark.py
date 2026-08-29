@@ -279,16 +279,6 @@ class DeepseekV4DSpark(BaseDrafter):
             out[num_extends:].copy_(output_tokens[offsets + accepted - 1])
         return out
 
-    def get_candidates(self, base_ctx: ForwardContext) -> torch.Tensor | None:
-        num_decodes = base_ctx.bs - base_ctx.num_extends
-        if num_decodes <= 0:
-            return None
-        decode_tokens = num_decodes * self.spec_num_tokens
-        prefill_tokens = base_ctx.input_num_tokens - decode_tokens
-        return self.input_buffers.input_ids_buf[
-            prefill_tokens : base_ctx.input_num_tokens
-        ].reshape(num_decodes, self.spec_num_tokens)
-
     def _seed_prefill_windows(
         self,
         hidden_states: torch.Tensor,

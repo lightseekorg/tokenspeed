@@ -839,6 +839,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         extend_prefix_lens: torch.Tensor | None = None,
         **kwargs,
     ) -> None:
+        if forward_mode is not None and forward_mode.is_decode():
+            raise RuntimeError(
+                "DeepSeek V4 decode metadata goes through "
+                "refresh_decode_metadata; init_forward_metadata only serves "
+                "extend/mixed/idle"
+            )
         dsv4_reset_attention_state()
         cache_metadata = kwargs.pop("cache_metadata", None)
         forward_batch = kwargs.pop("forward_batch", None)
@@ -2381,30 +2387,33 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             self.forward_decode_metadata = metadata
         self.forward_metadata = metadata
 
-    def init_forward_metadata_replay_cuda_graph(
+    def refresh_decode_metadata(
         self,
         bs: int,
+        actual_bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        forward_mode: ForwardMode = None,
-        page_table: torch.Tensor = None,
+        *,
+        forward_mode: ForwardMode,
+        page_table: torch.Tensor | None = None,
+        num_extends: int = 0,
+        for_graph_replay: bool = False,
         **kwargs,
-    ):
+    ) -> None:
         dsv4_reset_attention_state()
         cache_metadata = kwargs.pop("cache_metadata", None)
         forward_batch = kwargs.pop("forward_batch", None)
         block_tables = kwargs.pop("block_tables", None) or {}
         block_table_base_offsets = kwargs.pop("block_table_base_offsets", None) or {}
-        actual_bs = int(kwargs.pop("actual_bs", bs))
         if actual_bs < 0 or actual_bs > bs:
             raise RuntimeError(
-                f"DeepSeek V4 replay actual_bs={actual_bs} must be within 0..{bs}"
+                f"DeepSeek V4 decode actual_bs={actual_bs} must be within 0..{bs}"
             )
         num_tokens_arg = kwargs.pop("num_tokens", None)
         del kwargs
         if forward_mode is not None and not forward_mode.is_decode_or_idle():
             raise NotImplementedError(
-                f"DeepSeek V4 CUDA graph replay not supported for {forward_mode}"
+                f"DeepSeek V4 decode refresh not supported for {forward_mode}"
             )
         if num_tokens_arg is None:
             num_tokens = bs
@@ -2419,7 +2428,29 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             actual_bs=actual_bs,
             tokens_per_req=tokens_per_req,
         )
-        metadata = self._cuda_graph_metadata[bs]
+        metadata = self._cuda_graph_metadata.get(bs)
+        if metadata is None:
+            # Lazy per-bs views for a bs never captured (eager decode above
+            # the graph ladder, or enforce-eager): dataclass views over the
+            # same persistent buffers, built once and cached.
+            metadata = DeepseekV4ForwardMetadata(
+                req_pool_indices=self._cuda_graph_req_pool_indices[:bs],
+                seq_lens=self._cuda_graph_seq_lens[:bs],
+                query_lens=self._cuda_graph_query_lens[:bs],
+                query_start_loc=self._cuda_graph_query_start_loc[: bs + 1],
+                token_to_req_indices=self._cuda_graph_token_to_req[:total_tokens],
+                cache=DeepseekV4CacheMetadata(
+                    page_size=self.kernel_page_size,
+                    page_table=self._cuda_graph_page_table[:bs, : self.max_num_pages],
+                    block_tables={},
+                    block_table_base_offsets={},
+                ),
+                is_valid_token=self._cuda_graph_is_valid_token[:total_tokens],
+                seq_lens_cpu=None,
+                query_lens_cpu=None,
+                forward_mode=forward_mode,
+            )
+            self._cuda_graph_metadata[bs] = metadata
         self._cuda_graph_req_pool_indices[:bs].copy_(req_pool_indices[:bs])
         self._cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs].to(torch.int32))
         # Base page table for ratio<=1 indexer layers: the first (smallest-ratio)
@@ -2456,7 +2487,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         # actual_bs == 0 replays only ever carry capture/idle placeholder
         # tables; those must go through the refresh path below, never the
         # live-table prepare path.
-        if actual_bs > 0 and block_tables:
+        if actual_bs > 0 and block_tables and not self._expected_cache_group_ids:
+            # No published group contract (warmup placeholders, unit
+            # fixtures): accept the named tables as-is, like the former
+            # eager path did.
+            metadata_block_tables = {
+                str(group_id): table.to(device=self.device, dtype=torch.int32)
+                for group_id, table in block_tables.items()
+            }
+            metadata_base_offsets = offsets_on_device
+        elif actual_bs > 0 and block_tables:
             metadata_block_tables = self._prepare_cache_group_tables(
                 block_tables,
                 bs=bs,
@@ -2540,6 +2580,19 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             self._prepare_draft_decode_metadata(
                 metadata,
                 self._cuda_graph_seq_lens[:bs],
+            )
+        elif (
+            not is_packed_decode
+            and is_decode
+            and self.forward_prefill_metadata is not None
+            and self.forward_prefill_metadata.req_pool_indices.numel() == bs
+        ):
+            # Plain draft decode after an extend round: rebuild the draft's
+            # step-1+ decode metadata from the prefill state, exactly as the
+            # legacy eager decode arm did.
+            self._prepare_draft_decode_metadata(
+                self.forward_prefill_metadata,
+                seq_lens[:bs].clone(),
             )
         if (
             metadata_forward_mode is not None

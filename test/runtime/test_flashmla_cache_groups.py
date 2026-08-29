@@ -94,12 +94,17 @@ def _init_cache_decode(backend, pool, logical_rows, seq_lens_cpu, spec=1):
     table_np = np.array(logical_rows, dtype=np.int32)
     metadata, forward_op = _metadata_for(pool, table_np, "cuda")
     seq_lens = torch.tensor(seq_lens_cpu, device="cuda", dtype=torch.int32)
-    backend.init_forward_metadata(
-        bs=bs,
-        num_extends=0,
+    # Unified decode path: refresh writes the persistent buffers the wrapper
+    # allocates at startup (init_backend_cuda_graph_state is unconditional).
+    if not hasattr(backend, "cuda_graph_kv_indices"):
+        backend.mark_cache_contract()
+        backend.init_cuda_graph_state(max_bs=max(bs, 4))
+    backend.refresh_decode_metadata(
+        bs,
+        bs,
         # Poisoned: the grouped path must never consume page_table.
-        req_pool_indices=_poison((bs,)).to(torch.int64),
-        seq_lens=seq_lens,
+        _poison((bs,)).to(torch.int64),
+        seq_lens,
         forward_mode=ForwardMode.DECODE,
         page_table=_poison((16, 256)),
         cache_metadata=metadata,
@@ -232,17 +237,19 @@ def test_flashmla_classic_path_uses_page_table() -> None:
     bs = 2
     page_table = torch.arange(bs * 4, device="cuda", dtype=torch.int32).view(bs, 4)
     seq_lens = torch.tensor([10, 20], device="cuda", dtype=torch.int32)
-    backend.init_forward_metadata(
-        bs=bs,
-        num_extends=0,
-        req_pool_indices=torch.arange(bs, device="cuda", dtype=torch.int64),
-        seq_lens=seq_lens,
+    backend.init_cuda_graph_state(max_bs=4)
+    backend.refresh_decode_metadata(
+        bs,
+        bs,
+        torch.arange(bs, device="cuda", dtype=torch.int64),
+        seq_lens,
         forward_mode=ForwardMode.DECODE,
         page_table=page_table,
     )
     assert backend._cache_groups_bound is False
     meta = backend.forward_decode_metadata
     assert meta.group_out_cache_loc is None
+    assert meta.page_table[0, :4].tolist() == page_table[0].tolist()
     # Classic path: select_out_cache_loc is identity.
     caller = torch.tensor([1, 2], device="cuda", dtype=torch.int64)
     assert torch.equal(
@@ -314,11 +321,12 @@ def test_flashmla_draft_consumes_staged_page_table() -> None:
     seq_lens = torch.tensor(
         [page_size + 41, page_size + 7], device="cuda", dtype=torch.int32
     )
-    backend.init_forward_metadata(
-        bs=2,
-        num_extends=0,
-        req_pool_indices=_poison((2,)).to(torch.int64),
-        seq_lens=seq_lens,
+    backend.init_cuda_graph_state(max_bs=4)
+    backend.refresh_decode_metadata(
+        2,
+        2,
+        _poison((2,)).to(torch.int64),
+        seq_lens,
         forward_mode=ForwardMode.DECODE,
         page_table=staged,
     )

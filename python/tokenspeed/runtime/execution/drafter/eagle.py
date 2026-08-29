@@ -386,22 +386,6 @@ class Eagle(BaseDrafter):
     # ------------------------------------------------------------------
 
     @override
-    def get_candidates(
-        self,
-        base_ctx: ForwardContext,
-    ) -> torch.Tensor | None:
-        num_extends = base_ctx.num_extends
-        num_decodes = base_ctx.bs - num_extends
-        if num_decodes == 0:
-            return None
-
-        num_decode_tokens = num_decodes * self.spec_num_tokens
-        num_prefill_tokens = base_ctx.input_num_tokens - num_decode_tokens
-        return self.input_buffers.input_ids_buf[
-            num_prefill_tokens : base_ctx.input_num_tokens
-        ].reshape(num_decodes, self.spec_num_tokens)
-
-    @override
     def draft(
         self,
         draft_input: EagleDraftInput,

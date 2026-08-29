@@ -342,12 +342,13 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
     tables = _kimi_tables(bs=2, width=4, base=1)
     metadata, forward_op = _metadata_for(pool.arena.runtime_contract, tables, "cpu")
     # bs 2 requests, one padding row (real_bs 1). Decode: before = seq-1.
-    backend.init_forward_metadata_replay_cuda_graph(
-        bs=2,
-        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
-        seq_lens=torch.tensor([5, 1], dtype=torch.int32),
+    backend.refresh_decode_metadata(
+        2,
+        1,
+        torch.tensor([0, 1], dtype=torch.int32),
+        torch.tensor([5, 1], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
-        num_padding=1,
+        for_graph_replay=True,
         cache_metadata=metadata,
         forward_batch=forward_op,
     )

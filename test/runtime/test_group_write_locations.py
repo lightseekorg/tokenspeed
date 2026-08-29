@@ -254,8 +254,20 @@ class InitForwardMetadataAssemblyTest(_MHACase):
             block_tables=block_tables,
         )
 
-    def test_decode_assembly_populates_out_cache_locs(self):
+    def test_decode_refresh_populates_out_cache_locs(self):
+        # Unified decode path: refresh fills the persistent per-group buffers
+        # (same math as the old eager assembly, same expected locs).
         torch = self.torch
+        backend = self.backend
+        backend.device = "cpu"
+        backend.group_block_granularities = {gid: PAGE for gid in _GROUP_IDS}
+        backend.engine_owned_group_ids = frozenset()
+        backend.cuda_graph_decode_metadata = {}
+        backend.cuda_graph_page_table = torch.zeros(
+            (MAX_BS, MAX_NUM_PAGES), dtype=torch.int32
+        )
+        backend.cuda_graph_seq_lens = torch.ones(MAX_BS, dtype=torch.int32)
+        backend._init_group_graph_buffers(MAX_BS)
         tables = {
             "sliding_attention": torch.tensor(
                 [[0, 5, 7, -1], [0, 6, -1, -1]], dtype=torch.int32
@@ -265,23 +277,19 @@ class InitForwardMetadataAssemblyTest(_MHACase):
             ),
         }
         seq_lens = torch.tensor([5, 4], dtype=torch.int32)
-        self._init(_decode_forward_mode(), seq_lens, tables)
-        md = self.backend.forward_decode_metadata
-        self.assertIs(md.page_tables, tables)
-        self.assertEqual(md.out_cache_locs["sliding_attention"].tolist(), [14, 13])
-        self.assertEqual(md.out_cache_locs["full_attention"].tolist(), [6, 17])
-        self.assertEqual(md.out_cache_locs["full_attention"].dtype, self.torch.int32)
-
-    def test_decode_assembly_none_without_group_tables(self):
-        torch = self.torch
-        self._init(
-            _decode_forward_mode(),
-            torch.tensor([5, 4], dtype=torch.int32),
-            None,
+        backend.refresh_decode_metadata(
+            2,
+            2,
+            torch.arange(2, dtype=torch.int64),
+            seq_lens,
+            forward_mode=_decode_forward_mode(),
+            page_table=self.page_table,
+            block_tables=tables,
         )
-        md = self.backend.forward_decode_metadata
-        self.assertIsNone(md.page_tables)
-        self.assertIsNone(md.out_cache_locs)
+        md = backend.forward_decode_metadata
+        self.assertEqual(md.out_cache_locs["sliding_attention"][:2].tolist(), [14, 13])
+        self.assertEqual(md.out_cache_locs["full_attention"][:2].tolist(), [6, 17])
+        self.assertEqual(md.out_cache_locs["full_attention"].dtype, self.torch.int32)
 
     def test_extend_assembly_populates_out_cache_locs(self):
         torch = self.torch
@@ -467,16 +475,18 @@ class GraphLocBuffersTest(_MHACase):
         kwargs = {}
         if block_tables is not None:
             kwargs["block_tables"] = block_tables
-        self.backend.init_forward_metadata_replay_cuda_graph(
+        self.backend.refresh_decode_metadata(
+            bs,
             bs,
             torch.arange(MAX_BS, dtype=torch.int64, device=self.backend.device),
             live_seq_lens,
-            torch.zeros(
+            forward_mode=_decode_forward_mode(),
+            page_table=torch.zeros(
                 (MAX_BS, MAX_NUM_PAGES),
                 dtype=torch.int32,
                 device=self.backend.device,
             ),
-            _decode_forward_mode(),
+            for_graph_replay=True,
             **kwargs,
         )
 

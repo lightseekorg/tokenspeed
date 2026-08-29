@@ -256,6 +256,11 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 "metadata; refusing the legacy page_table path"
             )
 
+        if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
+            raise RuntimeError(
+                "FlashMLA decode metadata goes through refresh_decode_metadata; "
+                f"init_forward_metadata only serves extend/mixed ({forward_mode})"
+            )
         if forward_mode.is_extend_or_mixed():
             self._init_prefill_metadata(
                 req_pool_indices=req_pool_indices[:num_extends],
@@ -275,7 +280,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # draft_seq_lens before calling here, so `seq_lens` aliases the
         # drafter's live buffer for step-1+ advances.
         if (
-            forward_mode.is_decode_or_idle()
+            forward_mode.is_idle()
             or forward_mode.is_mixed()
             or (forward_mode.is_extend() and self.is_draft)
         ):
@@ -575,12 +580,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # span seq-N..seq-1, so a length below N would start the window before
         # the sequence.
         capture_q_len = self._graph_verify_q_len()
-        if capture_q_len > 1:
-            self.cuda_graph_seq_lens_k[:bs].copy_(
-                seq_lens[:bs].clamp_min(capture_q_len)
-            )
-        else:
-            self.cuda_graph_seq_lens_k[:bs].copy_(seq_lens[:bs])
+        self.cuda_graph_seq_lens_k[:bs].copy_(seq_lens[:bs].clamp_min(capture_q_len))
         group_out_cache_loc = None
         if self._cache_contract_bound:
             if self.cuda_graph_group_out_cache_loc is None:
@@ -602,41 +602,49 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             group_q_len_per_req=capture_q_len,
         )
 
-    def init_forward_metadata_replay_cuda_graph(
+    def refresh_decode_metadata(
         self,
         bs: int,
+        actual_bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        *,
         forward_mode: ForwardMode,
-        page_table: torch.Tensor,
+        page_table: torch.Tensor | None = None,
+        num_extends: int = 0,
+        for_graph_replay: bool = False,
         **kwargs,
-    ):
+    ) -> None:
         if forward_mode is None or not forward_mode.is_decode_or_idle():
             raise RuntimeError(f"Not supported forward mode: {forward_mode}")
 
         # Verify rows span seq-N..seq-1; clamp so a request shorter than the
-        # window does not resolve locations before its start. Width was baked
-        # into the captured buffer view at capture time.
-        q_len = self.forward_decode_metadata.group_q_len_per_req
-        if q_len > 1:
-            self.cuda_graph_seq_lens_k[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
+        # window does not resolve locations before its start. On replay the
+        # width was baked into the captured buffer view at capture time.
+        if for_graph_replay:
+            q_len = self.forward_decode_metadata.group_q_len_per_req
         else:
-            self.cuda_graph_seq_lens_k[:bs].copy_(seq_lens[:bs])
+            q_len = self._verify_q_len(forward_mode)
+        # clamp_min(1) is the identity, so the verify clamp is unconditional.
+        self.cuda_graph_seq_lens_k[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
 
         cache_metadata = kwargs.get("cache_metadata")
         # Refresh from cache metadata whenever this backend is a contract
         # sub-backend. Gating on _cache_groups_bound alone breaks a PD decode
-        # node: that flag is only latched in the eager init path, but a
+        # node: that flag is only latched in the extend init path, but a
         # decode-only node receives its KV over the transfer and never runs an
-        # eager extend/decode forward — it only replays decode graphs. The flag
-        # would stay False, this refresh would be skipped, and the captured
-        # kernel would read a stale/zero kv-index table (the null page 0)
-        # instead of the transferred KV. _cache_contract_bound is set by the
-        # registry at startup for every contract sub-backend, so it is the
-        # correct gate here; latch _cache_groups_bound for the write-loc path.
-        if (
-            self._cache_groups_bound or self._cache_contract_bound
-        ) and cache_metadata is not None:
+        # extend forward — it only decodes. The flag would stay False, this
+        # refresh would be skipped, and the kernel would read a stale/zero
+        # kv-index table (the null page 0) instead of the transferred KV.
+        # _cache_contract_bound is set by the registry at startup for every
+        # contract sub-backend, so it is the correct gate here; latch
+        # _cache_groups_bound for the write-loc path.
+        refreshed = False
+        if cache_metadata is not None and (
+            not for_graph_replay
+            or self._cache_groups_bound
+            or self._cache_contract_bound
+        ):
             self._cache_groups_bound = True
             # Refresh the block table and per-request write locations in place
             # from the live full-history table (cache-group path).
@@ -662,22 +670,44 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 self.cuda_graph_group_out_cache_loc[
                     real_bs * q_len : bs * q_len
                 ].zero_()
-            return
-
-        if self._draft_reads_batch_pages(bs, forward_mode):
-            # Draft replay: DraftPageStaging.publish already expanded the target
+            refreshed = True
+        elif self._draft_reads_batch_pages(bs, forward_mode):
+            # Draft: DraftPageStaging.publish already expanded the target
             # full-history table into this backend's kernel pages, so the
             # batch-ordered draft page table holds kernel-page ids. Copy them
-            # as-is (identity), matching the eager draft path.
+            # as-is (identity). Latch the group binding: the draft consumes
+            # published group pages from here on.
+            self._cache_groups_bound = True
             block_table = page_table[:bs]
             self.cuda_graph_kv_indices[:bs, : block_table.shape[1]].copy_(block_table)
-            return
+        elif page_table is not None:
+            # Idle/warmup before the backend binds: page_table is an empty
+            # batch-ordered placeholder. A live LCM batch takes one of the
+            # branches above.
+            block_table = page_table[:bs]
+            self.cuda_graph_kv_indices[:bs, : block_table.shape[1]].copy_(block_table)
 
-        # Idle/warmup replay before the backend binds: page_table is an empty
-        # batch-ordered placeholder. A live LCM batch takes one of the branches
-        # above.
-        block_table = page_table[:bs]
-        self.cuda_graph_kv_indices[:bs, : block_table.shape[1]].copy_(block_table)
+        if for_graph_replay:
+            # The captured kernels read the refreshed buffers directly; the
+            # capture-time metadata object (with its recorded schedule-build)
+            # stays authoritative.
+            return
+        # Eager: point the decode metadata at views of the same persistent
+        # buffers, with a FRESH tile-schedule object — flash_mla freezes its
+        # tile schedule on the first kernel call against a sched-meta, so
+        # reusing one across steps would pin every step to stale lengths (the
+        # captured graph instead re-runs the recorded schedule-build).
+        group_out_cache_loc = None
+        if refreshed and self.cuda_graph_group_out_cache_loc is not None:
+            group_out_cache_loc = self.cuda_graph_group_out_cache_loc[: bs * q_len]
+        self.forward_decode_metadata = FlashMLADecodeMetadata(
+            num_extends=num_extends,
+            flashmla_metadata=self._new_eager_tile_metadata(),
+            page_table=self.cuda_graph_kv_indices[:bs],
+            seq_lens_k=self.cuda_graph_seq_lens_k[:bs],
+            group_out_cache_loc=group_out_cache_loc,
+            group_q_len_per_req=q_len,
+        )
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """Publish block-end cache lengths inside a captured draft graph.

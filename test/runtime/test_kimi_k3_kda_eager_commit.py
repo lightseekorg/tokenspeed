@@ -235,11 +235,13 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
         }
         metadata, op = _metadata_for(captured.contract, tables, DEV)
         seq_lens_tensor.copy_(torch.tensor(seq_lens, dtype=torch.int32, device=DEV))
-        captured.backend.init_forward_metadata_replay_cuda_graph(
+        captured.backend.refresh_decode_metadata(
+            bs,
             bs,
             req_pool_indices,
             seq_lens_tensor,
-            ForwardMode.DECODE,
+            forward_mode=ForwardMode.DECODE,
+            for_graph_replay=True,
             cache_metadata=metadata,
             forward_batch=op,
         )
@@ -268,11 +270,13 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
     }
     metadata, op = _metadata_for(captured.contract, tables, DEV)
     seq_lens_tensor.copy_(torch.tensor(seq_lens, dtype=torch.int32, device=DEV))
-    captured.backend.init_forward_metadata_replay_cuda_graph(
+    captured.backend.refresh_decode_metadata(
+        bs,
         bs,
         req_pool_indices,
         seq_lens_tensor,
-        ForwardMode.DECODE,
+        forward_mode=ForwardMode.DECODE,
+        for_graph_replay=True,
         cache_metadata=metadata,
         forward_batch=op,
     )

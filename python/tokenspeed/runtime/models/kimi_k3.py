@@ -100,7 +100,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.pp_stage import PPStageState, pp_layer_window
-from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
     get_is_cuda_graph_phase,
 )
@@ -163,7 +163,7 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.multimodal.encoder_cudagraph import (
-        EncoderCudaGraphWrapper,
+        EncoderForwardStepRunner,
     )
 
 logger = logging.getLogger(__name__)
@@ -3293,7 +3293,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
     def make_encoder_cudagraph_wrapper(
         self, mapping: Mapping
-    ) -> EncoderCudaGraphWrapper:
+    ) -> EncoderForwardStepRunner:
         return self.vision.make_encoder_cudagraph_wrapper(mapping)
 
     def make_encoder_cudagraph_wrappers(self, mapping: Mapping) -> dict:

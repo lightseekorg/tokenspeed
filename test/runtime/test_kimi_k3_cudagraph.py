@@ -211,12 +211,14 @@ def test_replay_refreshes_buffers_in_place_and_pads_page_zero() -> None:
     table = torch.tensor([[3, 5]], dtype=torch.int32)
     meta = _StubFullAttnMeta(table, _LOGICAL_P, forward_op)
 
-    backend.init_forward_metadata_replay_cuda_graph(
-        bs=2,  # padded bs
-        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
-        seq_lens=torch.tensor([70, 1], dtype=torch.int32),  # real seq 70, pad 1
+    backend.refresh_decode_metadata(
+        2,  # padded bs
+        1,
+        torch.tensor([0, 1], dtype=torch.int32),
+        torch.tensor([70, 1], dtype=torch.int32),  # real seq 70, pad 1
         forward_mode=ForwardMode.DECODE,
         page_table=None,
+        for_graph_replay=True,
         cache_metadata=meta,
         forward_batch=forward_op,
     )
@@ -258,12 +260,14 @@ def test_amd_mla_grouped_graph_replay_is_pointer_stable_and_null_padded() -> Non
         _LOGICAL_P,
         forward_op,
     )
-    backend.init_forward_metadata_replay_cuda_graph(
-        bs=2,
-        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
-        seq_lens=torch.tensor([70, 1], dtype=torch.int32),
+    backend.refresh_decode_metadata(
+        2,
+        1,
+        torch.tensor([0, 1], dtype=torch.int32),
+        torch.tensor([70, 1], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
         page_table=None,
+        for_graph_replay=True,
         cache_metadata=metadata,
         forward_batch=forward_op,
     )
@@ -298,12 +302,14 @@ def test_amd_mla_target_verify_graph_refreshes_all_write_locations() -> None:
         _LOGICAL_P,
         forward_op,
     )
-    backend.init_forward_metadata_replay_cuda_graph(
-        bs=2,
-        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
-        seq_lens=torch.tensor([70, 1], dtype=torch.int32),
+    backend.refresh_decode_metadata(
+        2,
+        1,
+        torch.tensor([0, 1], dtype=torch.int32),
+        torch.tensor([70, 1], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
         page_table=None,
+        for_graph_replay=True,
         cache_metadata=metadata,
         forward_batch=forward_op,
     )
@@ -328,13 +334,14 @@ def test_amd_mla_eager_decode_uses_group_table_and_refuses_fallback() -> None:
     )
     seq_lens = torch.tensor([70, 40], dtype=torch.int32)
     poisoned = torch.full((8, 8), -99, dtype=torch.int32)
-    backend.init_forward_metadata(
-        bs=2,
-        num_extends=0,
-        req_pool_indices=torch.tensor([-99, -99], dtype=torch.int64),
-        seq_lens=seq_lens,
-        page_table=poisoned,
+    backend.init_cuda_graph_state(max_bs=2)
+    backend.refresh_decode_metadata(
+        2,
+        2,
+        torch.tensor([-99, -99], dtype=torch.int64),
+        seq_lens,
         forward_mode=ForwardMode.DECODE,
+        page_table=poisoned,
         cache_metadata=metadata,
         forward_batch=forward_op,
     )
@@ -352,16 +359,6 @@ def test_amd_mla_eager_decode_uses_group_table_and_refuses_fallback() -> None:
     )
     assert torch.equal(selected, decode.group_out_cache_loc)
 
-    with pytest.raises(RuntimeError, match="no cache metadata"):
-        backend.init_forward_metadata(
-            bs=2,
-            num_extends=0,
-            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
-            seq_lens=seq_lens,
-            page_table=torch.zeros((2, 4), dtype=torch.int32),
-            forward_mode=ForwardMode.DECODE,
-        )
-
 
 def test_amd_mla_eager_target_verify_writes_the_full_window() -> None:
     backend = _bare_amd_mla_backend(cache_contract=True, spec_num_tokens=2)
@@ -371,13 +368,14 @@ def test_amd_mla_eager_target_verify_writes_the_full_window() -> None:
         _LOGICAL_P,
         forward_op,
     )
-    backend.init_forward_metadata(
-        bs=2,
-        num_extends=0,
-        req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
-        seq_lens=torch.tensor([70, 130], dtype=torch.int32),
-        page_table=torch.zeros((2, 4), dtype=torch.int32),
+    backend.init_cuda_graph_state(max_bs=2)
+    backend.refresh_decode_metadata(
+        2,
+        2,
+        torch.tensor([0, 1], dtype=torch.int64),
+        torch.tensor([70, 130], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
+        page_table=torch.zeros((2, 4), dtype=torch.int32),
         cache_metadata=metadata,
         forward_batch=forward_op,
     )

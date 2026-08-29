@@ -196,45 +196,30 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         **kwargs,
     ):
         assert not forward_mode.is_mixed(), "mha backend does not support mixed batch"
+        if not forward_mode.is_extend_or_mixed():
+            raise RuntimeError(
+                "MHA decode metadata goes through refresh_decode_metadata; "
+                f"init_forward_metadata only serves extend ({forward_mode})"
+            )
+        assert extend_seq_lens is not None
+        assert extend_seq_lens_cpu is not None
+        assert extend_prefix_lens is not None
+        assert extend_prefix_lens_cpu is not None
 
         seq_lens = seq_lens[:bs]
 
         group_page_tables = self._shed_state_groups(block_tables)
         group_out_cache_locs = None
         if group_page_tables:
-            # Verify keeps [bs]-row tables; only DFLASH expands rows.
-            assert not (
-                self.draft_block_decode and self.spec_num_tokens > 1
-            ), "cache groups are unsupported with DFLASH block decode"
             # The cache path routes every read/write through the per-group
             # tables; a shared single page_table would be dead work.
             page_table = None
-            if forward_mode.is_extend_or_mixed():
-                assert extend_prefix_lens_cpu is not None
-                assert extend_seq_lens_cpu is not None
-                group_out_cache_locs = self._compute_extend_group_out_cache_locs(
-                    group_page_tables,
-                    extend_prefix_lens_cpu[:bs],
-                    extend_seq_lens_cpu[:bs],
-                    self.kernel_page_size,
-                )
-            else:
-                # Spec rounds write multi-token windows on BOTH sides: the
-                # target's verify chunk, and a window-mode draft's catch-up
-                # plus per-depth window passes, which all cover the same
-                # verify-window rows (positions seq-N..seq-1) every step.
-                # Sizing the draft's locs at 1 token/request used to make
-                # _save_kv_cache trim the bs*N-row draft writes down to bs —
-                # silently corrupting every decode-round draft KV write on
-                # the grouped-cache arm. (A chaining draft ignores these locs via
-                # prefer_caller in the base forward_decode.)
-                verify_tokens = self.spec_num_tokens if self.spec_num_tokens > 1 else 1
-                group_out_cache_locs = self._compute_decode_group_out_cache_locs(
-                    group_page_tables,
-                    seq_lens,
-                    self.kernel_page_size,
-                    verify_tokens,
-                )
+            group_out_cache_locs = self._compute_extend_group_out_cache_locs(
+                group_page_tables,
+                extend_prefix_lens_cpu[:bs],
+                extend_seq_lens_cpu[:bs],
+                self.kernel_page_size,
+            )
             self._maybe_check_group_write_locs(
                 group_page_tables, group_out_cache_locs, self.kernel_page_size
             )
@@ -247,87 +232,48 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 self.max_context_len,
             )
 
-        if forward_mode.is_extend_or_mixed():
-            assert extend_seq_lens is not None
-            assert extend_seq_lens_cpu is not None
-            assert extend_prefix_lens is not None
-            assert extend_prefix_lens_cpu is not None
+        # Create cumulative sum of the sequence lengths for Q and KV.
+        extend_seq_lens = extend_seq_lens[:bs]
+        extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu[:bs].tolist()]
+        cu_extend_seq_lens = torch.nn.functional.pad(
+            torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32),
+            (1, 0),
+        )
+        cu_extend_seq_lens_cpu = [0]
+        for length in extend_seq_lens_cpu:
+            cu_extend_seq_lens_cpu.append(cu_extend_seq_lens_cpu[-1] + length)
+        cu_seqlens_kv = torch.nn.functional.pad(
+            torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
+            (1, 0),
+        )
+        extend_prefix_lens = extend_prefix_lens[:bs]
+        max_extend_seq_len = max(extend_seq_lens_cpu)
+        max_extend_prefix_len = int(extend_prefix_lens_cpu[:bs].max().item())
 
-            # Create cumulative sum of the sequence lengths for Q and KV.
-            extend_seq_lens = extend_seq_lens[:bs]
-            extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu[:bs].tolist()]
-            cu_extend_seq_lens = torch.nn.functional.pad(
-                torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32),
-                (1, 0),
-            )
-            cu_extend_seq_lens_cpu = [0]
-            for length in extend_seq_lens_cpu:
-                cu_extend_seq_lens_cpu.append(cu_extend_seq_lens_cpu[-1] + length)
-            cu_seqlens_kv = torch.nn.functional.pad(
-                torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
-                (1, 0),
-            )
-            extend_prefix_lens = extend_prefix_lens[:bs]
-            max_extend_seq_len = max(extend_seq_lens_cpu)
-            max_extend_prefix_len = int(extend_prefix_lens_cpu[:bs].max().item())
+        self.forward_extend_metadata = MHAExtendMetadata(
+            page_table=page_table,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+            cu_extend_seq_lens=cu_extend_seq_lens,
+            cu_seqlens_kv=cu_seqlens_kv,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
+            max_extend_seq_len=max_extend_seq_len,
+            max_extend_prefix_len=max_extend_prefix_len,
+            page_tables=group_page_tables,
+            out_cache_locs=group_out_cache_locs,
+        )
 
-            self.forward_extend_metadata = MHAExtendMetadata(
+        # Drafter step 1+ decodes under an EXTEND/MIXED target; seq_lens
+        # aliases the drafter's live buffer (pre-written by the wrapper).
+        if self.is_draft:
+            self.forward_decode_metadata = MHADecodeMetadata(
                 page_table=page_table,
                 seq_lens=seq_lens,
-                extend_seq_lens=extend_seq_lens,
-                cu_extend_seq_lens=cu_extend_seq_lens,
-                cu_seqlens_kv=cu_seqlens_kv,
-                extend_prefix_lens=extend_prefix_lens,
-                extend_seq_lens_cpu=extend_seq_lens_cpu,
-                cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
-                max_extend_seq_len=max_extend_seq_len,
-                max_extend_prefix_len=max_extend_prefix_len,
                 page_tables=group_page_tables,
                 out_cache_locs=group_out_cache_locs,
             )
-
-            # Drafter step 1+ decodes under an EXTEND/MIXED target; seq_lens
-            # aliases the drafter's live buffer (pre-written by the wrapper).
-            if self.is_draft:
-                self.forward_decode_metadata = MHADecodeMetadata(
-                    page_table=page_table,
-                    seq_lens=seq_lens,
-                    page_tables=group_page_tables,
-                    out_cache_locs=group_out_cache_locs,
-                )
-        else:
-            if self.draft_block_decode and self.spec_num_tokens > 1:
-                # DFLASH drafts a whole block in one decode forward; the decode
-                # kernel keys masking off max_seqlen_q, so expand each request
-                # into spec_num_tokens rows with the SAME full seq_len. That
-                # makes max_seqlen_q == 1 per row, so every block query attends
-                # over the entire block (non-causal block-diffusion drafting).
-                # Target verify keeps the unexpanded multi-query decode path.
-                expanded_page_table, expanded_seq_lens = (
-                    self._make_spec_metadata_buffers(
-                        bs,
-                        page_table.device,
-                    )
-                )
-                self._fill_spec_metadata_uniform(
-                    expanded_page_table,
-                    expanded_seq_lens,
-                    page_table,
-                    seq_lens,
-                )
-                self.forward_decode_metadata = MHADecodeMetadata(
-                    page_table=expanded_page_table,
-                    seq_lens=expanded_seq_lens,
-                    page_tables=group_page_tables,
-                    out_cache_locs=group_out_cache_locs,
-                )
-            else:
-                self.forward_decode_metadata = MHADecodeMetadata(
-                    page_table=page_table,
-                    seq_lens=seq_lens,
-                    page_tables=group_page_tables,
-                    out_cache_locs=group_out_cache_locs,
-                )
 
     def init_cuda_graph_state(
         self,
@@ -368,6 +314,69 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             (max_bs,), dtype=torch.int32, device=self.device
         )
 
+    @property
+    def _verify_floor(self) -> int:
+        """Minimum per-row seq_len the decode metadata must present.
+
+        The target's verify window spans seq-N..seq-1, so its rows need
+        seq_len >= N; every other decode (plain, drafts) needs >= 1, where
+        the clamp is the identity.
+        """
+        return self.spec_num_tokens if not self.is_draft else 1
+
+    def _decode_views(
+        self,
+        bs: int,
+        cache_group_ids: tuple[str, ...] | None = None,
+    ) -> MHADecodeMetadata:
+        """Per-bs decode metadata views over the persistent buffers.
+
+        One builder for capture and refresh: capture records these views into
+        the graph, refresh (eager or replay) repoints forward_decode_metadata
+        at them. Cached per bs — pointer-stable, no storage allocated.
+        ``cache_group_ids`` pins the group set at capture time (a draft may
+        consume a family subset of its buffers); lazy callers reuse it.
+        """
+        if cache_group_ids is not None:
+            self._decode_view_group_ids = cache_group_ids
+        metadata = self.cuda_graph_decode_metadata.get(bs)
+        if metadata is not None:
+            return metadata
+        if self.draft_block_decode and self.spec_num_tokens > 1:
+            # DFLASH draft block: spec_num_tokens decode rows per request.
+            expanded_bs = bs * self.spec_num_tokens
+            metadata = MHADecodeMetadata(
+                page_table=self.cuda_graph_page_table[:expanded_bs, :],
+                seq_lens=self.cuda_graph_seq_lens[:expanded_bs],
+            )
+        else:
+            gids = getattr(self, "_decode_view_group_ids", None)
+            if gids is None:
+                gids = tuple(self.cuda_graph_page_tables)
+            page_tables, out_cache_locs = self._capture_group_views(
+                bs,
+                gids,
+                # Multi-token window locs for target verify AND window-mode
+                # drafts alike (a chaining draft ignores them via
+                # prefer_caller in the base forward_decode).
+                tokens_per_req=self.spec_num_tokens,
+            )
+            metadata = MHADecodeMetadata(
+                # Grouped captures route reads through the per-group tables;
+                # the shared single page_table is never filled on that path,
+                # so leave it None instead of a stale zero-buffer slice.
+                page_table=(
+                    None
+                    if page_tables is not None
+                    else self.cuda_graph_page_table[:bs, :]
+                ),
+                seq_lens=self.cuda_graph_seq_lens[:bs],
+                page_tables=page_tables,
+                out_cache_locs=out_cache_locs,
+            )
+        self.cuda_graph_decode_metadata[bs] = metadata
+        return metadata
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -380,114 +389,89 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         assert not forward_mode.is_extend_or_mixed()
 
         # Real tables only arrive at replay; capture records metadata views
-        # into the persistent per-group buffers so replay can copy_ fresh data
-        # to the graph-recorded addresses.
+        # into the persistent per-group buffers so refresh can copy_ fresh
+        # data to the graph-recorded addresses.
         if cache_group_ids:
             # Verify keeps [bs]-row tables plus [bs*N] location views.
             assert not (
                 self.draft_block_decode and self.spec_num_tokens > 1
             ), "cache_group_ids is unsupported with DFLASH block decode"
-        page_tables, out_cache_locs = self._capture_group_views(
-            bs,
-            cache_group_ids,
-            # Multi-token window locs for target verify AND window-mode
-            # drafts alike; see the eager decode branch.
-            tokens_per_req=(self.spec_num_tokens if self.spec_num_tokens > 1 else 1),
-        )
-
+        metadata = self._decode_views(bs, cache_group_ids=cache_group_ids)
         if self.draft_block_decode and self.spec_num_tokens > 1:
-            # DFLASH draft block: spec_num_tokens decode rows per request.
-            expanded_bs = bs * self.spec_num_tokens
-            metadata = MHADecodeMetadata(
-                page_table=self.cuda_graph_page_table[:expanded_bs, :],
-                seq_lens=self.cuda_graph_seq_lens[:expanded_bs],
-                page_tables=page_tables,
-                out_cache_locs=out_cache_locs,
-            )
             # Uniform non-causal seq_lens are written by the drafter inside the
             # captured graph (see fill_block_decode_seq_lens); seed a safe
             # baseline for the capture run before that op records.
             metadata.seq_lens.fill_(self.spec_num_tokens)
         else:
-            metadata = MHADecodeMetadata(
-                # Cache-group captures route reads through the per-group tables and
-                # replay never fills a shared single page_table, so mirror the
-                # eager cache path: page_table=None instead of a slice of the
-                # never-filled zero buffer.
-                page_table=(
-                    None
-                    if page_tables is not None
-                    else self.cuda_graph_page_table[:bs, :]
-                ),
-                seq_lens=self.cuda_graph_seq_lens[:bs],
-                page_tables=page_tables,
-                out_cache_locs=out_cache_locs,
-            )
-            if self.spec_num_tokens > 1 and not self.is_draft:
-                metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(self.spec_num_tokens))
-            else:
-                # Seed the owned buffer: the capture run reads it before replay.
-                metadata.seq_lens.copy_(seq_lens[:bs])
-        self.cuda_graph_decode_metadata[bs] = metadata
+            # Seed the owned buffer (the capture run reads it before replay),
+            # clamped to the verify floor: verify rows span seq-N..seq-1, so a
+            # shorter length would start before zero. Drafts and plain decode
+            # have floor 1 — the clamp is the identity there.
+            metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(self._verify_floor))
         self.forward_decode_metadata = metadata
 
-    def init_forward_metadata_replay_cuda_graph(
+    def refresh_decode_metadata(
         self,
         bs: int,
+        actual_bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        page_table: torch.Tensor,
+        *,
         forward_mode: ForwardMode,
+        page_table: torch.Tensor | None = None,
+        num_extends: int = 0,
+        for_graph_replay: bool = False,
         block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
-    ):
+    ) -> None:
         assert not forward_mode.is_extend_or_mixed()
 
-        # Fail loudly instead of replaying over stale/zero page tables.
-        self._replay_stale_guard(bs, block_tables)
+        if self.draft_block_decode and self.spec_num_tokens > 1:
+            # DFLASH draft: replicate each request's page table to its
+            # spec_num_tokens block rows. The drafter's page table is
+            # batch-ordered (row i == batch position i). Under replay the
+            # block-end seq_lens are re-derived inside the captured graph
+            # from the live draft length (fill_block_decode_seq_lens); eager
+            # has no in-graph writer, so fill them here the same way.
+            base_page_table = page_table[:bs, : self.max_num_pages]
+            self.cuda_graph_page_table[: bs * self.spec_num_tokens, :].view(
+                bs, self.spec_num_tokens, self.max_num_pages
+            ).copy_(base_page_table[:, None, :])
+            if not for_graph_replay:
+                self.fill_block_decode_seq_lens(bs, seq_lens)
+            self.forward_decode_metadata = self._decode_views(bs)
+            return
+
+        # Fail loudly instead of computing over stale/zero page tables.
+        self._replay_stale_guard(actual_bs, block_tables)
 
         # Every pool publishes at least one history group now, so the
         # per-group capture buffers always exist; the pre-LCM single-table
         # gather has no remaining producer.
         if not self.cuda_graph_page_tables:
             raise RuntimeError(
-                "MHA replay without per-group capture buffers: the pool "
+                "MHA decode without per-group capture buffers: the pool "
                 "published no cache groups, which the LCM contract forbids"
             )
-        if self.spec_num_tokens > 1 and not self.is_draft:
-            # Clamp padded rows (seq_len 1) to N: verify derives row lengths as seq - N + t + 1, which must stay positive.
-            torch.clamp_min(
-                seq_lens[:bs],
-                self.spec_num_tokens,
-                out=self.cuda_graph_seq_lens[:bs],
-            )
-        elif self.draft_block_decode:
-            # DFLASH draft: replicate each request's page table to its
-            # spec_num_tokens block rows. The drafter's page table is
-            # batch-ordered (row i == batch position i). The block-end seq_lens
-            # are filled by the drafter inside the captured graph, so they are
-            # not touched here (they re-derive from the live draft length on
-            # every replay).
-            base_page_table = page_table[:bs, : self.max_num_pages]
-            self.cuda_graph_page_table[: bs * self.spec_num_tokens, :].view(
-                bs, self.spec_num_tokens, self.max_num_pages
-            ).copy_(base_page_table[:, None, :])
-        else:
-            # Plain decode / plain draft: copy the live lengths into our own
-            # buffer (previously aliased the controller's seq_lens_buf).
-            self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
+        # Clamp short rows (padded rows replay at seq_len 1) to the verify
+        # floor: verify derives row lengths as seq - N + t + 1, which must
+        # stay positive. Plain decode and drafts have floor 1 (identity);
+        # drafters republish their in-loop edits through
+        # advance_draft_forward_metadata each step.
+        torch.clamp_min(
+            seq_lens[:bs],
+            self._verify_floor,
+            out=self.cuda_graph_seq_lens[:bs],
+        )
         if block_tables:
             self._fill_group_graph_buffers(
                 bs,
                 block_tables,
                 self.cuda_graph_seq_lens,
-                tokens_per_req=(
-                    self.spec_num_tokens if self.spec_num_tokens > 1 else 1
-                ),
+                tokens_per_req=self.spec_num_tokens,
             )
 
-        if bs in self.cuda_graph_decode_metadata:
-            self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
+        self.forward_decode_metadata = self._decode_views(bs)
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """DFLASH: broadcast each request's block-end length to its
@@ -843,39 +827,6 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             device=device,
         )
         return (cuda_graph_page_table, cuda_graph_seq_lens)
-
-    def _fill_spec_metadata_uniform(
-        self,
-        expanded_page_table: torch.Tensor,
-        expanded_seq_lens: torch.Tensor,
-        page_table: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ):
-        """Expand spec metadata with a uniform (non-causal) seq_len per row.
-
-        Replicates the full seq_len to all spec_num_tokens rows of a request so
-        each row decodes with max_seqlen_q == 1 over the whole block. Used by the
-        DFLASH drafter so every block query attends over the entire block
-        (non-causal block-diffusion drafting), as opposed to the target's
-        unexpanded causal multi-query verify path.
-        """
-        bs = seq_lens.shape[0]
-        spec_num_tokens = self.spec_num_tokens
-        expanded_page_table = expanded_page_table.view(
-            bs, spec_num_tokens, self.max_num_pages
-        )
-        expanded_page_table.copy_(page_table[:, None, :])
-        # Clamp to max_context_len so the draft decode never asks the attention
-        # kernel for more than max_num_pages worth of page-table columns. The
-        # block-end length is prefix + spec_num_tokens, which can exceed
-        # max_context_len for a request near the context limit; without the
-        # clamp the kernel reads page_table[:, >= max_num_pages] out of bounds
-        # (CUDA illegal memory access). Mirrors fill_block_decode_seq_lens on the
-        # cuda-graph path (this eager path is taken by mixed prefill+decode
-        # batches even when cuda graphs are enabled).
-        expanded_seq_lens.view(bs, spec_num_tokens).copy_(
-            seq_lens.clamp(spec_num_tokens, self.max_context_len)[:, None]
-        )
 
 
 for _backend_name in _KERNEL_SOLUTION_BY_BACKEND:

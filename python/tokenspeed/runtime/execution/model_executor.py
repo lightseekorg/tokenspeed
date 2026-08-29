@@ -41,13 +41,13 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.draft_page_staging import DraftPageStaging
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 from tokenspeed.runtime.execution.forward_thread import ForwardThread
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.model_runner import ModelRunner
@@ -524,7 +524,7 @@ class ModelExecutor:
         self._active_multimodal_context = None
         self._active_positions_override = None
 
-        self.forward_step = CudaGraphWrapper(
+        self.forward_step = ForwardStepRunner(
             forward_func=self._forward_step,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
@@ -842,6 +842,26 @@ class ModelExecutor:
         ]
         return torch.where(force_mask, torch.ones_like(accept_lengths), accept_lengths)
 
+    def _decode_candidates(self, ctx: ForwardContext) -> torch.Tensor | None:
+        """This step's decode-row candidate window: ``[num_decodes, N]``.
+
+        Decode rows' input ids sit at the tail of ``input_ids_buf`` (prefill
+        tokens first), N tokens per request: column 0 the last verified
+        token, columns 1.. the draft candidates. Non-speculative serving is
+        the N == 1 case — a one-column window with nothing to accept, which
+        verify() resolves to exactly one sampled token (equivalence pinned
+        by test_decode_verify_n1_equivalence.py). A persistent-buffer view,
+        so the captured sampler reads live ids on every replay.
+        """
+        num_decodes = ctx.bs - ctx.num_extends
+        if num_decodes == 0:
+            return None
+        n = self.config.output_length
+        num_prefill_tokens = ctx.input_num_tokens - num_decodes * n
+        return self.input_buffers.input_ids_buf[
+            num_prefill_tokens : ctx.input_num_tokens
+        ].reshape(num_decodes, n)
+
     @nvtx_range("sampling", color="yellow")
     def _run_sampling(
         self,
@@ -850,9 +870,13 @@ class ModelExecutor:
         ctx: ForwardContext,
         candidates: torch.Tensor | None = None,
     ):
-        if self.drafter is None:
-            return self.sampling_backend.sample(logits_output, sampling_info)
+        """One sampling rule for every batch: prefill rows sample, decode
+        rows verify.
 
+        Non-speculative decode is verify's N == 1 case: the one-column
+        candidate window accepts nothing and resolves to exactly one sampled
+        token through the same pool kernels sample() uses (equivalence
+        pinned by test_decode_verify_n1_equivalence.py)."""
         num_extends = ctx.num_extends
         num_decodes = ctx.bs - num_extends
 
@@ -982,11 +1006,7 @@ class ModelExecutor:
         # Flag NaN per request and sanitize in place, before any sampling kernel.
         self.nan_guard.audit_logits(logits_output, ctx)
 
-        candidates = (
-            self.drafter.get_candidates(ctx)
-            if self.config.spec_algo is not None
-            else None
-        )
+        candidates = self._decode_candidates(ctx)
 
         if self.capturable_grammar is not None:
             self.capturable_grammar.wait_bitmask()
@@ -1060,15 +1080,10 @@ class ModelExecutor:
             )
         self.runtime_states.update_valid_cache_length(req_pool_indices, deltas)
 
-    def _build_sampling_info(
-        self,
-        bs: int,
-        sampling_params_list: list[SamplingParams],
-    ) -> SamplingBatchInfo:
+    def _build_sampling_info(self, bs: int) -> SamplingBatchInfo:
         return SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-            is_all_greedy=all(p.top_k <= 1 for p in sampling_params_list),
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
         )
@@ -1095,7 +1110,6 @@ class ModelExecutor:
         sampling_info = SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-            is_all_greedy=True,
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
         )
@@ -1450,7 +1464,7 @@ class ModelExecutor:
                     ctx.all_extend = dp_metadata.all_extend
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_start = time.perf_counter() if timing_enabled else 0.0
-                    sampling_info = self._build_sampling_info(bs, sampling_params_list)
+                    sampling_info = self._build_sampling_info(bs)
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,
                         bs=bs,
