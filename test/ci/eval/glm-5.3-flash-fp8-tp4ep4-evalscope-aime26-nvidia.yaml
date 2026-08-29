@@ -60,7 +60,7 @@ eval:
     --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
     --eval-batch-size 16
     --stream
-    --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'
+    --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"top_k":2,"seed":42,"max_tokens":65000,"extra_body":{"reasoning_effort":"max"}}'
 report:
   github_step_summary: true
 # Use the same conservative one-run floor as the stochastic AMD gate until

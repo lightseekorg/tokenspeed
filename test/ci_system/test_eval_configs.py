@@ -49,7 +49,7 @@ DATASETS = {
         "dataset_args": {"dataset_id": "math-ai/aime25"},
     },
     "aime26": {
-        "count": 11,
+        "count": 12,
         "dataset_args": {"dataset_id": "math-ai/aime26"},
     },
     "gpqa_diamond": {
@@ -158,8 +158,10 @@ def test_glm53_flash_nvidia_aime26_uses_validated_tp4_ep4_configuration():
     assert task["server"]["ready"]["timeout"] == 1800
     assert flag_value(eval_tokens, "--model") == "glm-5.3-flash"
     assert "'evalscope[perf]==1.10.0'" in task["eval"]["install"][0]
-    assert generation_config["max_tokens"] == 32768
-    assert generation_config["extra_body"]["reasoning_effort"] == "high"
+    assert generation_config["max_tokens"] == 65000
+    assert generation_config["top_k"] == 2
+    assert generation_config["seed"] == 42
+    assert generation_config["extra_body"]["reasoning_effort"] == "max"
 
 
 def test_glm53_flash_nvidia_sharegpt_uses_fixed_mtp_configuration():
