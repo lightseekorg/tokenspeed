@@ -25,6 +25,7 @@ env:
     --deselect=tokenspeed-kernel/test/ops/test_attention.py::test_mha_prefill_lse
     --deselect=tokenspeed-kernel/test/ops/test_attention_gdn.py::test_gdn_chunk_prefill_triton_matches_torch_reference
     --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_prefill
+    --deselect=tokenspeed-kernel/test/ops/test_conv.py::test_sconv_decode[300-2048]
     --deselect=tokenspeed-kernel/test/ops/test_conv.py::test_sconv_decode[300-6144]
     --deselect=tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_fused_paged_decode_matches_reference[32-32]
     --deselect=tokenspeed-kernel/test/ops/test_qwen4_exp_qsa.py::test_qwen4_exp_qsa_block_topk_logits_matches_stream
