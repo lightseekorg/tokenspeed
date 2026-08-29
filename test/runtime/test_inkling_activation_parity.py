@@ -269,6 +269,14 @@ class _Harness:
         for p in range(max_pages - 1):
             self.page_table[REQ_SLOT, p] = p + 1
         self.seq_len = 0
+        # Unified decode path: decode metadata is refreshed into persistent
+        # buffers allocated here (production allocates them unconditionally
+        # at ForwardStepRunner construction, enforce-eager included).
+        inner.set_cache_pool(self.kv_pool)
+        self.backend.init_cuda_graph_state(
+            max_bs=4,
+            cache_group_specs=tuple(self.kv_pool.arena.cache_group_specs),
+        )
 
     def _ctx(self, mode):
         return SimpleNamespace(
@@ -316,14 +324,17 @@ class _Harness:
         self.seq_len += 1
         req_pool_indices = torch.tensor([REQ_SLOT], dtype=torch.int32, device=dev)
         seq_lens = torch.tensor([self.seq_len], dtype=torch.int32, device=dev)
-        self.backend.init_forward_metadata(
-            bs=1,
-            num_extends=0,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            page_table=self.page_table,
+        self.backend.refresh_decode_metadata(
+            1,
+            1,
+            req_pool_indices,
+            seq_lens,
             forward_mode=ForwardMode.DECODE,
-            block_tables=self.conv_tables,
+            page_table=self.page_table,
+            block_tables={
+                **self.conv_tables,
+                "full_attention": self.page_table[REQ_SLOT : REQ_SLOT + 1],
+            },
         )
         out_cache_loc = self._token_locs(self.seq_len - 1, 1)
         ids = torch.tensor([token_id], device=dev)

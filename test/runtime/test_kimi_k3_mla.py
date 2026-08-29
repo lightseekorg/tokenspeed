@@ -211,7 +211,7 @@ def gpu_pool(cuda_env):
 def backend_factory(cuda_env, gpu_pool):
     from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 
-    def make():
+    def make(contract: bool = True):
         if current_platform().is_amd:
             from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
 
@@ -248,6 +248,12 @@ def backend_factory(cuda_env, gpu_pool):
         )
         backend = backend_cls(config)
         backend.set_cache_pool(gpu_pool)
+        # Production order: the registry marks the contract sub-backend, then
+        # the runner allocates the persistent decode buffers unconditionally.
+        # contract=False models the classic single-table (non-LCM) serving arm.
+        if contract:
+            backend.mark_cache_contract()
+        backend.init_cuda_graph_state(max_bs=8)
         return backend
 
     return make
@@ -275,12 +281,12 @@ def _init_cache_decode(backend, pool, logical_rows, seq_lens_cpu):
     seq_lens = torch.tensor(seq_lens_cpu, device="cuda", dtype=torch.int32)
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
-    backend.init_forward_metadata(
-        bs=bs,
-        num_extends=0,
+    backend.refresh_decode_metadata(
+        bs,
+        bs,
         # Poisoned: the grouped-cache path must never consume these values.
-        req_pool_indices=_poison((bs,)).to(torch.int64),
-        seq_lens=seq_lens,
+        _poison((bs,)).to(torch.int64),
+        seq_lens,
         forward_mode=ForwardMode.DECODE,
         page_table=_poison((16, 256)),
         cache_metadata=metadata,
@@ -320,15 +326,15 @@ def test_decode_grouped_matches_single_table_and_reference(
     )
 
     # Single-table arm: byte-equivalent kernel-page page_table.
-    single_table_backend = backend_factory()
+    single_table_backend = backend_factory(contract=False)
     page_table = _kernel_page_table(logical_rows, page_size, "cuda")
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
-    single_table_backend.init_forward_metadata(
-        bs=bs,
-        num_extends=0,
-        req_pool_indices=torch.arange(bs, device="cuda", dtype=torch.int64),
-        seq_lens=seq_lens,
+    single_table_backend.refresh_decode_metadata(
+        bs,
+        bs,
+        torch.arange(bs, device="cuda", dtype=torch.int64),
+        seq_lens,
         forward_mode=ForwardMode.DECODE,
         page_table=page_table,
     )
@@ -445,7 +451,7 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
     _write_history(pool, layer, logical_rows, prefix, seed=4)
 
     grouped_backend = backend_factory()
-    single_table_backend = backend_factory()
+    single_table_backend = backend_factory(contract=False)
     _init_prefill(grouped_backend, pool, logical_rows, prefix, extend, grouped=True)
     _init_prefill(
         single_table_backend, pool, logical_rows, prefix, extend, grouped=False
@@ -581,11 +587,11 @@ def test_path_never_reads_page_table(backend_factory, gpu_pool) -> None:
     ):
         table_np = np.array(logical_rows, dtype=np.int32)
         metadata, forward_op = _metadata_for(pool, table_np, "cuda")
-        backend.init_forward_metadata(
-            bs=2,
-            num_extends=0,
-            req_pool_indices=_poison((2,)).to(torch.int64),
-            seq_lens=torch.tensor(seq_lens_cpu, device="cuda", dtype=torch.int32),
+        backend.refresh_decode_metadata(
+            2,
+            2,
+            _poison((2,)).to(torch.int64),
+            torch.tensor(seq_lens_cpu, device="cuda", dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             page_table=page_table,
             cache_metadata=metadata,
