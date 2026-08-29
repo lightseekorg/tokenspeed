@@ -1099,9 +1099,11 @@ class ForwardStepRunner:
             )
             if self.use_v4_mtp_paged_metadata:
                 # The draft's step-1+ decode metadata for this extend round:
-                # the same unified refresh the pure-decode path uses.
-                if getattr(self.draft_attn_backend, "needs_group_block_tables", False):
-                    draft_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
+                # the same unified refresh the pure-decode path uses. Plain
+                # 1-token rows — deliberately NOT the packed verify width:
+                # V4's packed-decode arm would clobber forward_prefill_metadata
+                # with a DECODE-mode object and break the draft's first-step
+                # prefill.
                 self.draft_attn_backend.refresh_decode_metadata(
                     padded_bs,
                     padded_bs,
