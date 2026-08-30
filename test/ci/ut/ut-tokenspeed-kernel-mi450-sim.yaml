@@ -137,10 +137,6 @@ ut:
       torch.cuda.is_available(), "devices", torch.cuda.device_count(), flush=True);
       torch.cuda.init(); props = torch.cuda.get_device_properties(0);
       print(props, flush=True); assert "gfx1250" in props.gcnArchName'
-    # Six emulators on one runner stretch a test's wall time by two to four
-    # times, so this bound sits well above what a test costs on its own. Hangs
-    # are caught by MI450_SIM_RUN_TIMEOUT instead, since a wedged emulator sits
-    # in a HIP call that pytest-timeout cannot interrupt.
     - >-
       bash test/ci_system/run_mi450_rocjitsu_parallel.sh
       -v --timeout=600
