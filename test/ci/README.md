@@ -260,13 +260,13 @@ Inferact--Kimi-K3-DSpark/cf6b8244620e7ea4b0651d214f28e89eac75bed6
 ```
 
 The `Slurm Dispatch` workflow exposes a `cluster` input. `gb200` keeps the
-existing `slurm-dispatch` coordinator and runner defaults. `gb300` is an
-explicit opt-in: select one YAML that declares exactly one `gb300-Ngpu` or
-`slurm-gb300-Ngpu` label. The workflow passes that label through unchanged and
-validates any explicit runner selection against it. Five
+existing `slurm-dispatch` coordinator and runner defaults. Selecting `gb300`
+with every other input left at its default keeps the same logical B200/GB200
+tasks and filters, but maps their runner labels to the matching `gb300-Ngpu`
+hardware. A selected YAML follows the same rule; YAMLs that already declare a
+`gb300-Ngpu` or `slurm-gb300-Ngpu` label pass it through unchanged. Five
 `slurm-dispatch-gb300` coordinators form one shared pool for manual, nightly,
-and per-commit submissions. GB300 perf tasks are disabled until GB300-specific
-reference values are measured.
+and per-commit submissions.
 
 The `GB300 Slurm Per Commit` workflow selects only multi-node model tasks with
 the `per-commit` trigger and submits them through the same
@@ -382,10 +382,11 @@ for validating a new runner image before it becomes the default. It accepts
 only digest-pinned `ghcr.io/lightseekorg/tokenspeed-runner` images; mutable tags
 and images from other registries or organizations are rejected.
 
-The `yaml` input is `off` by default. Select one listed B200/GB200 CI YAML to
-run that YAML independently of the bulk runner, type, match, trigger, and MMLU
-filters. Every B200 or GB200 runner label declared by the selected YAML is
-submitted as its own Slurm job.
+The `yaml` input is `off` by default. Select one listed CI YAML to run that YAML
+independently of the bulk runner, type, match, trigger, and MMLU filters. On
+GB200, every B200 or GB200 runner label declared by the selected YAML is
+submitted as its own Slurm job. On GB300, those logical labels are submitted on
+the corresponding GB300 runner; native GB300 labels are submitted unchanged.
 
 The manual workflow keeps the dispatcher checkout on trusted `main` and merges
 the requested PR only in the submitter's temporary worktree. The per-commit

@@ -200,7 +200,10 @@ def test_slurm_dispatch_uses_declared_gb300_runner_and_shared_paths(tmp_path, ru
     )
 
     assert result.returncode == 0, result.stderr
-    assert "arg=--runner\narg=slurm-gb300-4gpu\n" in result.stdout
+    assert (
+        "arg=--runner-alias\n"
+        "arg=slurm-gb300-4gpu=slurm-gb300-4gpu\n" in result.stdout
+    )
     assert "arg=b200-4gpu" not in result.stdout
     assert "arg=gb200-4gpu" not in result.stdout
     assert "artifact=/data/home/test-coordinator/tokenspeed-slurm" in result.stdout
@@ -216,6 +219,20 @@ def test_slurm_dispatch_preserves_gb200_defaults(tmp_path):
     assert "artifact=\n" in result.stdout
     assert "cache=\n" in result.stdout
     assert "image=\n" in result.stdout
+
+
+def test_slurm_dispatch_maps_gb300_defaults_without_changing_filters(tmp_path):
+    result = run_slurm_dispatch_script(tmp_path, CLUSTER="gb300")
+
+    assert result.returncode == 0, result.stderr
+    assert "arg=--all\n" in result.stdout
+    assert "arg=--runner-alias\narg=b200-4gpu=gb300-4gpu\n" in result.stdout
+    assert "arg=--runner-alias\narg=gb200-4gpu=gb300-4gpu\n" in result.stdout
+    assert "arg=--type\narg=eval\n" in result.stdout
+    assert "arg=--type\narg=perf\n" in result.stdout
+    assert "arg=--exclude-match\narg=mmlu\n" in result.stdout
+    assert "artifact=/data/home/test-coordinator/tokenspeed-slurm" in result.stdout
+    assert "cache=/data/home/test-coordinator/tokenspeed-cache" in result.stdout
 
 
 def test_slurm_dispatch_resolves_missing_coordinator_user(tmp_path):
@@ -249,18 +266,19 @@ def test_slurm_dispatch_rejects_runner_for_another_cluster(tmp_path):
     )
 
     assert result.returncode == 2
-    assert "Runner b200-4gpu is not supported by the GB300 cluster" in result.stderr
+    assert "does not identify exactly one runner declared" in result.stderr
 
 
-def test_slurm_dispatch_rejects_b300_yaml_for_gb300_cluster(tmp_path):
+def test_slurm_dispatch_maps_b200_yaml_to_gb300_runners(tmp_path):
     result = run_slurm_dispatch_script(
         tmp_path,
         CLUSTER="gb300",
         YAML_SELECTION="test/ci/ut/ut-tokenspeed-kernel.yaml",
     )
 
-    assert result.returncode == 2
-    assert "No supported Slurm runners declared" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "arg=--runner-alias\narg=b200-1gpu=gb300-1gpu\n" in result.stdout
+    assert "arg=--runner-alias\narg=gb200-1gpu=gb300-1gpu\n" in result.stdout
 
 
 def test_slurm_dispatch_accepts_one_explicit_matching_gb300_runner(tmp_path):
@@ -275,7 +293,10 @@ def test_slurm_dispatch_accepts_one_explicit_matching_gb300_runner(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "arg=--runner\narg=slurm-gb300-4gpu\n" in result.stdout
+    assert (
+        "arg=--runner-alias\n"
+        "arg=slurm-gb300-4gpu=slurm-gb300-4gpu\n" in result.stdout
+    )
 
 
 def test_slurm_dispatch_passes_multi_node_gb300_runner_unchanged(tmp_path):
@@ -289,15 +310,17 @@ def test_slurm_dispatch_passes_multi_node_gb300_runner_unchanged(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "arg=--runner\narg=slurm-gb300-4gpu\n" in result.stdout
-    assert "runner-alias" not in result.stdout
+    assert (
+        "arg=--runner-alias\n"
+        "arg=slurm-gb300-4gpu=slurm-gb300-4gpu\n" in result.stdout
+    )
 
 
 @pytest.mark.parametrize(
     ("runners", "message"),
     [
-        ("gb300-4gpu", "is not declared"),
-        ("slurm-gb300-4gpu,slurm-gb300-4gpu", "exactly one explicit runner"),
+        ("gb300-4gpu", "does not identify exactly one runner declared"),
+        ("slurm-gb300-4gpu,slurm-gb300-4gpu", "more than once"),
     ],
 )
 def test_slurm_dispatch_rejects_mismatched_or_multiple_gb300_runners(
@@ -317,14 +340,7 @@ def test_slurm_dispatch_rejects_mismatched_or_multiple_gb300_runners(
     assert message in result.stderr
 
 
-def test_slurm_dispatch_requires_explicit_yaml_for_gb300(tmp_path):
-    result = run_slurm_dispatch_script(tmp_path, CLUSTER="gb300")
-
-    assert result.returncode == 2
-    assert "GB300 requires an explicit YAML selection" in result.stderr
-
-
-def test_slurm_dispatch_rejects_ambiguous_gb300_runner(tmp_path):
+def test_slurm_dispatch_accepts_multiple_native_gb300_runners(tmp_path):
     task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel.yaml")
     task["runner"]["labels"] = ["gb300-1gpu", "gb300-4gpu"]
     config = tmp_path / "ambiguous.yaml"
@@ -337,8 +353,9 @@ def test_slurm_dispatch_rejects_ambiguous_gb300_runner(tmp_path):
         TOKENSPEED_TEST_REPO_ROOT=str(tmp_path),
     )
 
-    assert result.returncode == 2
-    assert "exactly one declared [slurm-]gb300-* runner" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "arg=--runner-alias\narg=gb300-1gpu=gb300-1gpu\n" in result.stdout
+    assert "arg=--runner-alias\narg=gb300-4gpu=gb300-4gpu\n" in result.stdout
 
 
 def test_only_dedicated_tasks_declare_gb300():
