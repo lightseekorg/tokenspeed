@@ -20,10 +20,9 @@ env:
     --deselect=tokenspeed-kernel/test/ops/test_iris_communication.py::test_iris_allreduce_residual_rmsnorm_world1[per_row]
     --deselect=tokenspeed-kernel/test/ops/test_iris_communication.py::test_iris_allreduce_residual_rmsnorm_world1[persistent]
 
-    # These tests cost more than the lane can afford. Six emulators saturate the
-    # runner, so the cheapest seven of these, each about 80s on its own, still
-    # doubled the lane's wall time to 42 minutes against its 45 minute cap.
+    # These tests exceed the rocJITsu CI budget before producing a result.
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_accepts_glm52_bf16_split_weights
+    --deselect=tokenspeed-kernel/test/ops/attention/test_kda_replay_commit.py::test_batched_replay_checkpoint_boundary_matches_layer_loop
     --deselect=tokenspeed-kernel/test/ops/test_attention.py::test_mha_prefill_lse
     --deselect=tokenspeed-kernel/test/ops/test_attention_gdn.py::test_gdn_chunk_prefill_triton_matches_torch_reference
     --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_prefill
@@ -38,19 +37,13 @@ env:
     --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_matches_torch_for_kernel_shapes[199-151936]
     --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_under_cuda_graph[64-201088]
 
-    # The persistent GLM-5.2 cases no longer hit the torch.flip corruption of
-    # https://github.com/ROCm/rocm-systems/issues/10757, but every element of
-    # their output still misses an exact comparison by about 1e-5. Not yet
-    # triaged to an emulator defect.
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_persistent_q2_2048]
-    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_persistent_2048]
-
     # rocJITsu returns incorrect values converting FP8 E4M3 to float.
     # https://github.com/ROCm/rocm-systems/issues/10760
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_sparse_kvcache_trims_large_topk_for_tiny_lens
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_batch_mixed_512]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_long_1024]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_long_2048]
+    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_persistent_q2_2048]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_q3_boundary_512]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_fp8_glm52_production_shape
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_e4m3-decode]
@@ -66,6 +59,7 @@ env:
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_chunk_512]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_long_2048]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_mixed_1024]
+    --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_persistent_2048]
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_with_sparse_kvcache
     --deselect=tokenspeed-kernel/test/ops/gemm/test_per_block_quant_fp8.py::test_per_block_quant_fp8_feeds_block_scaled_gemm
     --deselect=tokenspeed-kernel/test/ops/gemm/test_per_block_quant_fp8.py::test_per_block_quant_fp8_roundtrip[130-300-block_size2]
@@ -106,12 +100,6 @@ env:
     --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[decode-explicit-bm128]
     --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[prefill-default]
 
-    # The rest of this file now passes, but building the batched descriptor
-    # still hangs the emulator on its pageable host-to-device copy, so the fix
-    # for ROCm/rocm-systems#10771 does not cover this case. A hang wedges its
-    # worker for the whole run, so keep every parametrisation deselected.
-    --deselect=tokenspeed-kernel/test/ops/attention/test_kda_replay_commit.py::test_batched_replay_checkpoint_boundary_matches_layer_loop
-
     # rocJITsu aborts on v_dual_cndmask_b32 with a vcc_hi selector:
     # https://github.com/ROCm/rocm-systems/issues/10793
     --deselect=tokenspeed-kernel/test/ops/test_conv.py::test_prefill_checkpoint_taps_and_fp8
@@ -150,9 +138,9 @@ ut:
       torch.cuda.init(); props = torch.cuda.get_device_properties(0);
       print(props, flush=True); assert "gfx1250" in props.gcnArchName'
     # Six emulators on one runner stretch a test's wall time by two to four
-    # times, so this bound has to sit well above what a test costs on its own.
-    # A wedged emulator blocks its worker inside a HIP call that pytest-timeout
-    # cannot interrupt anyway; MI450_SIM_RUN_TIMEOUT is what ends those runs.
+    # times, so this bound sits well above what a test costs on its own. Hangs
+    # are caught by MI450_SIM_RUN_TIMEOUT instead, since a wedged emulator sits
+    # in a HIP call that pytest-timeout cannot interrupt.
     - >-
       bash test/ci_system/run_mi450_rocjitsu_parallel.sh
       -v --timeout=600
