@@ -44,6 +44,7 @@ from tokenspeed.runtime.layers.attention.backends.mla_cache_groups import (
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     FLASH_MLA_PAGE_SIZE as PAGE_SIZE,
@@ -118,8 +119,8 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
 
     draft_seq_lens_attr: str = "cuda_graph_seq_lens_k"
 
-    def __init__(self, config: MLAConfig):
-        super().__init__(config)
+    def __init__(self, config: AttnConfig, spec: MLAConfig):
+        super().__init__(config, spec)
 
         # Parse constants
         self.max_context_len = config.context_len
@@ -140,17 +141,17 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         self.max_num_pages = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
 
         # MLA-specific dimensions
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
-        self.kv_cache_dim = config.kv_lora_rank + config.qk_rope_head_dim
-        self.scaling = config.scaling
-        self.softmax_scale = config.scaling
+        self.kv_lora_rank = spec.kv_lora_rank
+        self.qk_nope_head_dim = spec.qk_nope_head_dim
+        self.qk_rope_head_dim = spec.qk_rope_head_dim
+        self.v_head_dim = spec.v_head_dim
+        self.kv_cache_dim = spec.kv_lora_rank + spec.qk_rope_head_dim
+        self.scaling = spec.scaling
+        self.softmax_scale = spec.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
-        self.num_local_heads = config.num_attention_heads // config.attn_tp_size
-        self.num_q_heads = config.num_attention_heads // config.attn_tp_size
+        self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
+        self.num_q_heads = spec.num_attention_heads // spec.attn_tp_size
 
         # FlashMLA-specific
         self.draft_token_num = 0
@@ -195,7 +196,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             self.workspace_buffer,
             backend="auto",
         )
-        self.indices_updater_prefill = _PrefillIndicesUpdater(config, self)
+        self.indices_updater_prefill = _PrefillIndicesUpdater(config, spec, self)
 
         # Metadata state. Decode and prefill metadata are split so MIXED batches
         # can carry both simultaneously (decode-half + prefill-half sub-contexts
@@ -925,14 +926,16 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
 class _PrefillIndicesUpdater:
     """Plans FlashInfer MLA prefill wrappers for the EXTEND path."""
 
-    def __init__(self, config: MLAConfig, attn_backend: FlashMLABackend):
-        self.num_local_heads = config.num_attention_heads // config.attn_tp_size
+    def __init__(
+        self, config: AttnConfig, spec: MLAConfig, attn_backend: FlashMLABackend
+    ):
+        self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
         self.kv_cache_quant_method = config.kv_cache_quant_method
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
-        self.scaling = config.scaling
+        self.kv_lora_rank = spec.kv_lora_rank
+        self.qk_nope_head_dim = spec.qk_nope_head_dim
+        self.qk_rope_head_dim = spec.qk_rope_head_dim
+        self.v_head_dim = spec.v_head_dim
+        self.scaling = spec.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
         self.attn_backend = attn_backend

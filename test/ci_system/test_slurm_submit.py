@@ -13,6 +13,7 @@ from slurm_submit import (
     main,
     parse_args,
     parse_pr_number,
+    parse_runner_alias,
     pr_worktree,
     print_progress,
     print_target,
@@ -135,6 +136,68 @@ def test_load_task_supports_multi_node_gb300_runner(tmp_path):
     )
 
 
+@pytest.mark.parametrize("declared", ["b200-4gpu", "gb200-4gpu"])
+def test_load_task_maps_logical_blackwell_runner_to_gb300(tmp_path, declared):
+    config = write_task(tmp_path, runner=declared)
+
+    assert load_task(tmp_path, config, declared, "gb300-4gpu") == Task(
+        config,
+        "example",
+        "eval",
+        "gb300-4gpu",
+        4,
+        1,
+        declared,
+    )
+
+
+def test_load_task_maps_multinode_gb200_runner_to_gb300(tmp_path):
+    config = write_task(
+        tmp_path,
+        runner="slurm-gb200-4node-4gpu",
+        nodes=4,
+        gpus_per_node=4,
+    )
+
+    assert load_task(
+        tmp_path,
+        config,
+        "slurm-gb200-4node-4gpu",
+        "slurm-gb300-4node-4gpu",
+    ) == Task(
+        config,
+        "example",
+        "eval",
+        "slurm-gb300-4node-4gpu",
+        4,
+        4,
+        "slurm-gb200-4node-4gpu",
+    )
+
+
+def test_parse_runner_alias_rejects_incomplete_value():
+    with pytest.raises(ValueError, match="DECLARED=EFFECTIVE"):
+        parse_runner_alias("b200-4gpu")
+
+
+def test_select_config_rejects_duplicate_runner_alias(tmp_path):
+    config = write_task(tmp_path, runner="gb300-4gpu")
+    args = argparse.Namespace(
+        config=config,
+        runner=[],
+        runner_alias=[
+            "gb300-4gpu=gb300-4gpu",
+            "gb300-4gpu=gb300-4gpu",
+        ],
+        task_types=["eval"],
+        match=None,
+        trigger=None,
+    )
+
+    with pytest.raises(ValueError, match="duplicate declared runner"):
+        select_tasks(args, tmp_path)
+
+
 def test_render_script_passes_declared_gb300_runner_unchanged():
     script = render_script(
         Task(
@@ -152,6 +215,27 @@ def test_render_script_passes_declared_gb300_runner_unchanged():
 
     assert "--runner=gb300-1gpu" in script
     assert "--runner-override" not in script
+    assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in script
+
+
+def test_render_script_passes_declared_and_effective_runners():
+    script = render_script(
+        Task(
+            "test/ci/eval/example.yaml",
+            "example",
+            "eval",
+            "gb300-4gpu",
+            4,
+            declared_runner="b200-4gpu",
+        ),
+        Path("/shared/source.tar"),
+        Path("/shared/runs"),
+        Path("/shared/cache"),
+        "ghcr.io/example/image@sha256:abc",
+    )
+
+    assert "--runner=b200-4gpu" in script
+    assert "--runner-override=gb300-4gpu" in script
     assert 'gpu_ids="${SLURM_JOB_GPUS:-${CUDA_VISIBLE_DEVICES:-}}"' in script
 
 
@@ -179,6 +263,53 @@ def test_select_all_filters_exact_runner(monkeypatch, tmp_path):
     assert select_tasks(args, tmp_path) == [
         Task(config, "example", "eval", "gb200-1gpu", 1)
     ]
+
+
+def test_select_all_keeps_logical_tasks_and_maps_only_effective_runners(
+    monkeypatch, tmp_path
+):
+    config = write_task(tmp_path, "gb200-1gpu", "eval")
+    unit_config = write_task(tmp_path, "b200-2gpu", "ut")
+    monkeypatch.setattr(
+        "slurm_submit.build_matrix",
+        lambda *_: {
+            "include": [
+                {"config": config, "type": "eval", "runner": "gb200-1gpu"},
+                {"config": unit_config, "type": "ut", "runner": "b200-2gpu"},
+            ]
+        },
+    )
+    args = argparse.Namespace(
+        config=None,
+        runner=[],
+        runner_alias=[
+            "gb200-1gpu=gb300-1gpu",
+            "b200-2gpu=gb300-2gpu",
+        ],
+        task_types=["eval", "ut"],
+        match=None,
+        trigger=None,
+    )
+
+    assert select_tasks(args, tmp_path) == [
+        Task(config, "example", "eval", "gb300-1gpu", 1, 1, "gb200-1gpu"),
+        Task(unit_config, "example", "ut", "gb300-2gpu", 2, 1, "b200-2gpu"),
+    ]
+
+
+def test_select_all_rejects_duplicate_runner_alias(monkeypatch, tmp_path):
+    monkeypatch.setattr("slurm_submit.build_matrix", lambda *_: {"include": []})
+    args = argparse.Namespace(
+        config=None,
+        runner=[],
+        runner_alias=["b200-4gpu=gb300-4gpu", "b200-4gpu=gb300-4gpu"],
+        task_types=["eval"],
+        match=None,
+        trigger=None,
+    )
+
+    with pytest.raises(ValueError, match="duplicate runner alias"):
+        select_tasks(args, tmp_path)
 
 
 def test_select_all_supports_multiple_runners_types_and_model_match(

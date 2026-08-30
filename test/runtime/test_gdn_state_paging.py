@@ -56,6 +56,56 @@ class _ContractPool:
         return conv_state if name == "conv_state" else recurrent_state
 
 
+def _mamba_config_pair(
+    torch,
+    *,
+    heads,
+    head_dim,
+    spec_tokens=1,
+    max_bs=8,
+    device="cpu",
+    replay_ssm=False,
+):
+    """(AttnConfig, softmax spec) for MambaAttnBackend: model-wide facts live on
+    the config, softmax geometry on the softmax spec, and the GDN geometry plus
+    replay_ssm on the LinearAttnConfig component."""
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+        LinearAttnConfig,
+    )
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+
+    spec = MHAConfig(
+        num_attention_heads=heads,
+        num_kv_heads=heads,
+        head_dim=head_dim,
+        attn_tp_size=1,
+    )
+    linear = LinearAttnConfig(
+        num_k_heads=heads,
+        num_v_heads=heads,
+        head_k_dim=head_dim,
+        head_v_dim=head_dim,
+        conv_kernel_size=4,
+        layer_ids=(0,),
+        tp_size=1,
+        replay_ssm=replay_ssm,
+    )
+    config = AttnConfig(
+        device=device,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        prefix_granularity=64,
+        context_len=4096,
+        max_bs=max_bs,
+        max_graph_bs=max_bs,
+        speculative_num_draft_tokens=spec_tokens,
+        components=(spec, linear),
+    )
+    return config, spec
+
+
 class ComputeStatePageIndicesTest(unittest.TestCase):
     """CPU-only contract tests for the pure dual-index helper."""
 
@@ -188,18 +238,9 @@ class CacheContractMetadataTest(unittest.TestCase):
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.ForwardMode = ForwardMode
-        config = SimpleNamespace(
-            device="cpu",
-            num_attention_heads=16,
-            num_kv_heads=16,
-            attn_tp_size=1,
-            dtype=torch.bfloat16,
-            head_dim=128,
-            is_draft=False,
-            speculative_num_draft_tokens=1,
-            max_bs=8,
+        backend = MambaAttnBackend(
+            *_mamba_config_pair(torch, heads=16, head_dim=128, spec_tokens=1)
         )
-        backend = MambaAttnBackend(config)
         stub_pool = _ContractPool(
             self.P,
             {0: ("linear_attention", object(), object())},
@@ -337,18 +378,9 @@ class VerifyMetadataTest(unittest.TestCase):
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.ForwardMode = ForwardMode
-        config = SimpleNamespace(
-            device="cpu",
-            num_attention_heads=2,
-            num_kv_heads=2,
-            attn_tp_size=1,
-            dtype=torch.bfloat16,
-            head_dim=2,
-            is_draft=False,
-            speculative_num_draft_tokens=4,
-            max_bs=8,
+        self.backend = MambaAttnBackend(
+            *_mamba_config_pair(torch, heads=2, head_dim=2, spec_tokens=4)
         )
-        self.backend = MambaAttnBackend(config)
         self.state_buffers = {
             layer_id: (
                 torch.zeros((8, 2, 3), dtype=torch.bfloat16),
@@ -447,19 +479,16 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         self, conv_slab, ssm_slab, spec_num_tokens=1, *, replay_ssm=False
     ):
         torch = self.torch
-        config = SimpleNamespace(
-            device="cuda",
-            num_attention_heads=self.H,
-            num_kv_heads=self.H,
-            attn_tp_size=1,
-            dtype=torch.bfloat16,
-            head_dim=self.D,
-            is_draft=False,
-            speculative_num_draft_tokens=spec_num_tokens,
-            replay_ssm=replay_ssm,
-            max_bs=8,
+        backend = self.MambaAttnBackend(
+            *_mamba_config_pair(
+                torch,
+                heads=self.H,
+                head_dim=self.D,
+                spec_tokens=spec_num_tokens,
+                device="cuda",
+                replay_ssm=replay_ssm,
+            )
         )
-        backend = self.MambaAttnBackend(config)
         stub_pool = _ContractPool(
             self.P,
             {0: ("linear_attention", conv_slab, ssm_slab)},

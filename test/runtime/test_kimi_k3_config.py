@@ -105,45 +105,42 @@ class KimiK3ConfigTests(unittest.TestCase):
             else:
                 self.assertEqual(cache_label, block_type)
 
-    def test_mamba2_cache_params_shapes(self):
-        c = KimiLinearConfig()
-        fake_mapping = SimpleNamespace(attn=SimpleNamespace(tp_size=1))
-        import tokenspeed.runtime.utils.env as env_mod
+    @staticmethod
+    def _kda_spec(tp_size):
+        """The KDA component as boot construction builds it, at one TP width."""
+        from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+            LinearAttnConfig,
+        )
 
-        with mock.patch.dict(
-            env_mod.global_server_args_dict, {"mapping": fake_mapping}
-        ):
-            (
-                conv_shape,
-                temporal_shape,
-                conv_dtype,
-                ssm_dtype,
-                mamba_layers,
-            ) = c.mamba2_cache_params
+        server_args = SimpleNamespace(
+            mapping=SimpleNamespace(linear_attn=SimpleNamespace(tp_size=tp_size))
+        )
+        model = SimpleNamespace(
+            hf_config=SimpleNamespace(text_config=KimiLinearConfig())
+        )
+        return LinearAttnConfig.generate(server_args, model)
 
+    def test_kda_state_shapes(self):
+        spec = self._kda_spec(tp_size=1)
         # conv over q/k/v (3 * num_heads * head_dim) wide, kernel_size - 1 deep.
-        self.assertEqual(conv_shape, (3 * _KDA_HEADS * _KDA_HEAD_DIM, _KDA_CONV - 1))
-        # per-head (head_dim x head_dim) recurrent state.
-        self.assertEqual(temporal_shape, (_KDA_HEADS, _KDA_HEAD_DIM, _KDA_HEAD_DIM))
-        self.assertEqual(conv_dtype, torch.bfloat16)
-        self.assertEqual(ssm_dtype, torch.float32)
-        self.assertEqual(mamba_layers, c.linear_layer_ids)
-
-    def test_mamba2_cache_params_respects_tp(self):
-        c = KimiLinearConfig()
-        fake_mapping = SimpleNamespace(attn=SimpleNamespace(tp_size=4))
-        import tokenspeed.runtime.utils.env as env_mod
-
-        with mock.patch.dict(
-            env_mod.global_server_args_dict, {"mapping": fake_mapping}
-        ):
-            conv_shape, temporal_shape, *_ = c.mamba2_cache_params
-
         self.assertEqual(
-            conv_shape, (3 * _KDA_HEADS * _KDA_HEAD_DIM // 4, _KDA_CONV - 1)
+            spec.conv_state_shape, (3 * _KDA_HEADS * _KDA_HEAD_DIM, _KDA_CONV - 1)
+        )
+        # per-head (head_dim x head_dim) recurrent state.
+        self.assertEqual(
+            spec.temporal_state_shape, (_KDA_HEADS, _KDA_HEAD_DIM, _KDA_HEAD_DIM)
+        )
+        self.assertEqual(spec.layer_ids, tuple(KimiLinearConfig().linear_layer_ids))
+
+    def test_kda_state_shapes_respect_tp(self):
+        spec = self._kda_spec(tp_size=4)
+        self.assertEqual(
+            spec.conv_state_shape,
+            (3 * _KDA_HEADS * _KDA_HEAD_DIM // 4, _KDA_CONV - 1),
         )
         self.assertEqual(
-            temporal_shape, (_KDA_HEADS // 4, _KDA_HEAD_DIM, _KDA_HEAD_DIM)
+            spec.temporal_state_shape,
+            (_KDA_HEADS // 4, _KDA_HEAD_DIM, _KDA_HEAD_DIM),
         )
 
 
@@ -300,7 +297,8 @@ class KimiK3RegistrationTests(unittest.TestCase):
             },
         )
         mapping = SimpleNamespace(
-            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,))
+            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
+            linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
         )
         layer = KimiLinearKDA(config, mapping, layer_id=0)
 
@@ -369,7 +367,8 @@ class KimiK3RegistrationTests(unittest.TestCase):
             },
         )
         mapping = SimpleNamespace(
-            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,))
+            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
+            linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
         )
         layer = KimiLinearKDA(config, mapping, layer_id=0)
         rows, projection_width = 4, 64

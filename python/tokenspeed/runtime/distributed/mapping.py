@@ -312,6 +312,52 @@ class VisionTowerMapping(MappingBase):
         return _make_parallelism_group(self.rank, self.dp_size, stride=self.tp_size)
 
 
+class LinearAttnLayerMapping(MappingBase):
+    """Parallel mapping for linear-attention layers (KDA, GDN).
+
+    Linear-attention layers default to the attention TP width, which
+    preserves the historical behavior on every existing deployment. Unlike
+    MLA — whose per-token latent KV cannot shard by heads and therefore
+    needs attention-DP — linear attention is TP-friendly: weights and the
+    per-head recurrent state both shard by head. A wider ``tp_size`` (up to
+    the stage world) head-shards them across ranks that are data-parallel
+    for the full-attention layers (the MLA-DP + linear-attn-TP hybrid).
+    The TP group is contiguous (stride 1) inside a pipeline stage.
+    """
+
+    def __init__(
+        self,
+        rank: int | None = None,
+        world_size: int = 1,
+        tp_size: int | None = None,
+    ):
+        super().__init__(rank, world_size)
+        # dp is the implicit complement: the number of KDA-TP replicas.
+        self.tp_size, self.dp_size = _resolve_parallelism_sizes(
+            self.world_size, tp_size, None
+        )
+
+    @cached_property
+    def has_tp(self) -> bool:
+        return self.tp_size > 1
+
+    @cached_property
+    def tp_rank(self) -> int:
+        return _make_parallelism_rank(self.rank, self.tp_size, stride=1)
+
+    @cached_property
+    def tp_group(self) -> Group:
+        return _make_parallelism_group(self.rank, self.tp_size, stride=1)
+
+    @cached_property
+    def dp_rank(self) -> int:
+        return _make_parallelism_rank(self.rank, self.dp_size, stride=self.tp_size)
+
+    @cached_property
+    def dp_group(self) -> Group:
+        return _make_parallelism_group(self.rank, self.dp_size, stride=self.tp_size)
+
+
 class Mapping(MappingBase):
 
     def __init__(
@@ -329,6 +375,7 @@ class Mapping(MappingBase):
         moe_dp_size: int | None = None,
         vision_tp_size: int | None = None,
         vision_dp_size: int | None = None,
+        linear_attn_tp_size: int | None = None,
         pp_size: int = 1,
         pp_layer_partition: tuple[int, ...] | None = None,
         nprocs_per_node: int | None = None,
@@ -384,6 +431,18 @@ class Mapping(MappingBase):
             tp_size=vision_tp_size,
             dp_size=vision_dp_size,
         )
+        # Linear-attention layers follow the attention TP width unless
+        # overridden — the default is behavior-identical to reading
+        # mapping.attn.tp_size.
+        self.linear_attn = LinearAttnLayerMapping(
+            rank=rank,
+            world_size=stage_world_size,
+            tp_size=(
+                linear_attn_tp_size
+                if linear_attn_tp_size is not None
+                else self.attn.tp_size
+            ),
+        )
         self.nprocs_per_node, self.nnodes = _resolve_parallelism_sizes(
             self.world_size, nprocs_per_node, nnodes
         )
@@ -397,6 +456,7 @@ class Mapping(MappingBase):
         self.dense.rank = rank
         self.moe.rank = rank
         self.vision.rank = rank
+        self.linear_attn.rank = rank
 
     @cached_property
     def has_pp(self) -> bool:

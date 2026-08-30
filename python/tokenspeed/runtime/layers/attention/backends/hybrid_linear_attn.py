@@ -54,6 +54,7 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     init_backend_cuda_graph_state,
 )
+from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
@@ -69,7 +70,10 @@ from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+    from tokenspeed.runtime.layers.attention.configs.base import (
+        AttnConfig,
+        SoftmaxAttnConfig,
+    )
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 # Default cache group id carrying GDN/Mamba state pages.
@@ -351,8 +355,8 @@ class MambaAttnBackend(AttentionBackend):
     cache_consumer_families = frozenset({"state"})
     _replay_active: bool = False
 
-    def __init__(self, config: BaseAttnConfig):
-        super().__init__(config)
+    def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig):
+        super().__init__(config, spec)
         self.pad_slot_id = -1
         self.forward_metadata: MambaForwardMetadata = None
         self.query_start_loc_list = []
@@ -370,7 +374,8 @@ class MambaAttnBackend(AttentionBackend):
         # size. Values are keyed by group ID and indexed by ``bs - 1``.
         self.state_in_by_group: dict[str, list[torch.Tensor]] = {}
         self.state_out_by_group: dict[str, list[torch.Tensor]] = {}
-        self.replay_ssm = bool(getattr(config, "replay_ssm", False))
+        linear_attn = config.component(LinearAttnConfig)
+        self.replay_ssm = linear_attn is not None and bool(linear_attn.replay_ssm)
         self._gdn_replay: _GDNReplayWorkspace | None = None
         self._verify_scratch = None
         self._verify_commit_ctx = None

@@ -64,6 +64,7 @@ import tokenspeed_kernel.ops.moe.deep_gemm as _moe_deep_gemm
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
 import tokenspeed_kernel.ops.moe.gluon.dsv4 as _moe_gluon_dsv4
+import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as _moe_gluon_sigmoid_topk
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
@@ -112,10 +113,18 @@ from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as _moe_trtllm_nvf
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_unquant
 from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
 from tokenspeed_kernel.ops.moe.triton import bf16 as _moe_triton_bf16
+from tokenspeed_kernel.ops.moe.triton import (
+    decode_sigmoid_topk as _moe_triton_decode_sigmoid_topk,
+)
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
-from tokenspeed_kernel.registry import KernelRegistry, error_fn
-from tokenspeed_kernel.selection import SelectedKernel, spec_matches_traits
+from tokenspeed_kernel.registry import KernelRegistry, Priority, error_fn
+from tokenspeed_kernel.selection import (
+    SelectedKernel,
+    select_kernel,
+    spec_matches_traits,
+)
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _RELOAD_MODULES = [
     # Attention registration modules.
@@ -168,8 +177,10 @@ _RELOAD_MODULES = [
     _moe_flashinfer,
     _moe_gluon_dsv4,
     _moe_gluon_mxfp4,
+    _moe_gluon_sigmoid_topk,
     _moe_gluon,
     _moe_triton_bf16,
+    _moe_triton_decode_sigmoid_topk,
     _moe_triton_mxfp4,
     _moe_triton,
     _moe_pkg,
@@ -206,6 +217,28 @@ def test_builtin_moe_preprocessor_links_are_callables():
     assert process_weight_kernels == []
 
     assert errors == []
+
+
+def test_builtin_moe_specialized_offsets_are_intentional() -> None:
+    """Only proven same-band overlaps may use specialized priority offsets."""
+    registry = KernelRegistry.get()
+    expected_offsets = {
+        "gluon_mxfp4_dynamic_moe_apply": Priority.SPECIALIZED + 1,
+        "triton_decode_sigmoid_bias_topk": Priority.SPECIALIZED + 1,
+    }
+    actual_offsets = {
+        spec.name: spec.priority
+        for spec in registry.list_kernels("moe")
+        if Priority.SPECIALIZED < spec.priority < Priority.PLUGIN
+    }
+    available_expected = {
+        name: priority
+        for name, priority in expected_offsets.items()
+        if registry.get_by_name(name) is not None
+    }
+
+    assert actual_offsets == available_expected
+    assert all(spec.priority < Priority.PLUGIN for spec in registry.list_kernels("moe"))
 
 
 def test_dsv4_padded_heads_platform_policy(
@@ -2097,14 +2130,12 @@ def test_gluon_dsa_prefill_topk_exact_override_checks_page_size() -> None:
 def test_gluon_mxfp4_apply_priority_prefers_dynamic_over_precomputed() -> None:
     """The dynamic gluon mxfp4 apply outranks the precomputed one.
 
-    ``moe_plan`` never requests a ``routing_mode`` trait, so both the
-    ``kernel_routing`` (dynamic) and ``precomputed_topk`` apply kernels match a
-    gluon mxfp4 plan's traits. Selection therefore falls to declared priority.
-    The dynamic entry (``SPECIALIZED + 3``) is the one that forwards caller
-    top-k into BOTH the decode and package-prefill fast paths, so it must win
-    over the precomputed entry (``SPECIALIZED + 2``), which only runs the
-    generic ragged path. This test pins that ordering so a future priority
-    bump doesn't silently route the AMD mxfp4 MoE onto the slower entry.
+    When a caller leaves ``routing_mode=None``, ``moe_plan`` deliberately omits
+    that trait so both the ``kernel_routing`` (dynamic) and
+    ``precomputed_topk`` apply kernels match. The dynamic entry is the one that
+    forwards caller top-k into both the decode and package-prefill fast paths,
+    so its single intra-band offset must beat the base-priority precomputed
+    entry. An explicit routing-mode request differentiates them by trait.
     """
     registry = KernelRegistry.get()
     dynamic = registry.get_by_name("gluon_mxfp4_dynamic_moe_apply")
@@ -2124,7 +2155,40 @@ def test_gluon_mxfp4_apply_priority_prefers_dynamic_over_precomputed() -> None:
         "ispp_alignment",
     ):
         assert dynamic.traits.get(trait) == precomputed.traits.get(trait)
-    assert dynamic.priority > precomputed.priority
+    assert dynamic.priority == Priority.SPECIALIZED + 1
+    assert precomputed.priority == Priority.SPECIALIZED
+
+
+def test_triton_decode_sigmoid_topk_priority_beats_broad_gluon(
+    mi350_platform: PlatformInfo,
+) -> None:
+    """Single-token caller traits overlap the trait-less gfx950 Gluon entry."""
+    registry = KernelRegistry.get()
+    triton_spec = registry.get_by_name("triton_decode_sigmoid_bias_topk")
+    gluon_spec = registry.get_by_name("gluon_sigmoid_bias_topk_gfx950")
+    if triton_spec is None or gluon_spec is None:
+        pytest.skip("AMD sigmoid top-k kernels are unavailable")
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        selected = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            format_signature(
+                router_logits=dense_tensor_format(torch.float32),
+            ),
+            traits={"tokens": 1, "experts": 256, "topk": 8},
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert gluon_spec.traits == {}
+    assert triton_spec.priority == Priority.SPECIALIZED + 1
+    assert gluon_spec.priority == Priority.SPECIALIZED
+    assert selected.name == "triton_decode_sigmoid_bias_topk"
 
 
 def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
@@ -2150,6 +2214,7 @@ def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
             "mxfp4",
             input_dtype=torch.bfloat16,
             activation="swiglu",
+            ep_size=1,
             ispp=128,
             internal_activation_dtype="input",
             with_bias=True,
@@ -2193,16 +2258,25 @@ def test_triton_mxfp4_supports_input_activation_dtype(
 
 
 @pytest.mark.parametrize(
-    "ep_size,solution,kernel_name,preprocessor",
+    "ep_size,ispp,solution,kernel_name,preprocessor",
     [
         (
+            1,
+            384,
+            None,
+            "gluon_mxfp4_a8w4_situ_precomputed_moe_apply",
+            "gluon_mxfp4_gfx950_moe_weights",
+        ),
+        (
             8,
+            3072,
             None,
             "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply",
             "validate_linear_mxfp4_moe_weights",
         ),
         (
             8,
+            3072,
             "gluon",
             "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply",
             "validate_linear_mxfp4_moe_weights",
@@ -2212,6 +2286,7 @@ def test_triton_mxfp4_supports_input_activation_dtype(
 def test_kimi3_mxfp4_situ_selection_on_cdna4(
     mi350_platform: PlatformInfo,
     ep_size: int,
+    ispp: int,
     solution: str | None,
     kernel_name: str,
     preprocessor: str,
@@ -2229,7 +2304,7 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
             activation="situ",
             routing_mode="precomputed_topk",
             ep_size=ep_size,
-            ispp=3072,
+            ispp=ispp,
             internal_activation_dtype="input",
             solution=solution,
         )
@@ -2238,6 +2313,78 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
         registry.clear_cache()
 
     _assert_moe_plan(plan, apply=kernel_name, preprocessor=preprocessor)
+    assert plan["activation"] == "situ"
+    assert plan["support_routing"] is False
+
+
+@pytest.mark.parametrize(
+    "ep_size,kernel_name",
+    [
+        (1, "gluon_mxfp4_precomputed_moe_apply"),
+        (8, "gluon_mxfp4_a16w4_swiglu_ep_precomputed_moe_apply"),
+    ],
+)
+def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
+    mi350_platform: PlatformInfo,
+    ep_size: int,
+    kernel_name: str,
+) -> None:
+    """The caller's EP traits separate TP and EP precomputed registrations."""
+    registry = KernelRegistry.get()
+    if registry.get_by_name(kernel_name) is None:
+        pytest.skip(f"{kernel_name} is unavailable")
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        plan = tokenspeed_kernel.moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="swiglu",
+            routing_mode="precomputed_topk",
+            ep_size=ep_size,
+            ispp=128,
+            internal_activation_dtype="input",
+            solution="gluon",
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert plan["apply_kernel_name"] == kernel_name
+
+
+def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(
+    mi450_platform: PlatformInfo,
+) -> None:
+    kernel_name = "gluon_mxfp4_a8w4_situ_gfx1250_precomputed_moe_apply"
+    registry = KernelRegistry.get()
+    if registry.get_by_name(kernel_name) is None:
+        pytest.skip(f"{kernel_name} is unavailable")
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi450_platform)
+        registry.clear_cache()
+        plan = tokenspeed_kernel.moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="situ",
+            routing_mode="precomputed_topk",
+            ep_size=1,
+            ispp=384,
+            internal_activation_dtype="input",
+            solution="gluon",
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    _assert_moe_plan(
+        plan,
+        apply=kernel_name,
+        preprocessor="gluon_mxfp4_gfx1250_moe_weights",
+    )
     assert plan["activation"] == "situ"
     assert plan["support_routing"] is False
 
@@ -2375,6 +2522,60 @@ def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
 
     assert out == "sentinel"
     assert captured["decode"] is expected_decode
+
+
+def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    apply_name = "gluon_mxfp4_a8w4_situ_gfx1250_precomputed_moe_apply"
+    if not hasattr(_moe_gluon_mxfp4, apply_name):
+        pytest.skip("gfx1250 Gluon MXFP4 SiTU apply is AMD-only")
+
+    captured: dict[str, object] = {}
+
+    def fake_fused_moe(*args, **kwargs):
+        captured.update(kwargs)
+        return "sentinel"
+
+    monkeypatch.setattr(
+        _moe_gluon_mxfp4.fused_mxfp_gfx1250,
+        "gluon_mxfp_precomputed_mxfp4_fused_moe",
+        fake_fused_moe,
+    )
+
+    num_experts = 16
+    w = torch.nn.Module()
+    w.activation_situ_beta = 4.0
+    w.activation_situ_linear_beta = 25.0
+    w.w13_weight_triton_tensor = torch.empty((num_experts, 0, 0))
+    w.w2_weight_triton_tensor = object()
+    w.w13_precision_config = type("PC", (), {"b_mx_scale": object()})()
+    w.w2_precision_config = type(
+        "PC", (), {"b_mx_scale": object(), "out_dtype": torch.bfloat16}
+    )()
+    output = torch.empty((1, 16), dtype=torch.bfloat16)
+    w._situ_output_buffer = output
+    x = torch.empty_like(output)
+    router_logits = torch.empty((1, num_experts), dtype=torch.float32)
+    topk_weights = torch.ones((1, num_experts), dtype=torch.float32)
+    topk_ids = torch.arange(num_experts, dtype=torch.int32).view(1, -1)
+
+    apply = getattr(_moe_gluon_mxfp4, apply_name)
+    out = apply(
+        {},
+        x,
+        w,
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+    assert out == "sentinel"
+    assert captured["activation"] == "situ"
+    assert captured["situ_beta"] == 4.0
+    assert captured["situ_linear_beta"] == 25.0
+    assert captured["decode"] is True
+    assert captured["out"] is output
 
 
 def _moe_apply_unquant_trtllm() -> object:

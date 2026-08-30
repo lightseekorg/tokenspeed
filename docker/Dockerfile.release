@@ -1,6 +1,6 @@
 # Build with buildx for linux/amd64 and linux/arm64. The base image is a
 # multi-architecture manifest.
-FROM lightseekorg/tokenspeed-runner:cu130-torch-2.13.0-flashinfer-0.6.16
+FROM lightseekorg/tokenspeed-runner:cu130-torch-2.13.0-flashinfer-0.6.18
 
 WORKDIR /workspace
 

@@ -8,7 +8,6 @@ from typing import Callable, Optional, Tuple, Type, overload
 
 import cutlass
 import cutlass.cute as cute
-import quack.activation
 from cutlass import Float32, const_expr
 from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cute.runtime import from_dlpack
@@ -757,7 +756,7 @@ def cvt_fp4x8_e2m1_scaled_e4m3x8(
 
     from cutlass import CUDA_VERSION
 
-    # CUTLASS DSL 4.6.0 is built against CUDA 13.3, but enabling this path
+    # CUTLASS DSL is built against CUDA 13.3, but enabling this path
     # currently triggers NVVM_ERROR_COMPILATION. Keep using the original
     # implementation for now.
     use_native_fp4_mul = False
@@ -1065,10 +1064,10 @@ def ex2_emulation_2(
     )
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
-    xy_rounded_back = quack.activation.sub_packed_f32x2(
+    xy_rounded_back = cute.arch.sub_packed_f32x2(
         xy_rounded, (fp32_round_int, fp32_round_int)
     )
-    xy_frac = quack.activation.sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    xy_frac = cute.arch.sub_packed_f32x2(xy_clamped, xy_rounded_back)
     xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, POLY_EX2[poly_degree], loc=loc, ip=ip)
     x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)

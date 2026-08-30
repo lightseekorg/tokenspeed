@@ -31,7 +31,10 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-    from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+    from tokenspeed.runtime.layers.attention.configs.base import (
+        AttnConfig,
+        SoftmaxAttnConfig,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
@@ -99,12 +102,14 @@ class AttentionBackend(ABC):
     # Backend-owned cuda-graph cache-seqlens buffer the decode metadata views.
     draft_seq_lens_attr: str = "cuda_graph_seq_lens"
 
-    def __init__(self, config: BaseAttnConfig) -> None:
+    def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
+        # ``spec`` is the component this backend serves; hybrid sub-backends
+        # built over the softmax component's plumbing receive that spec.
         self.device = config.device
-        self.num_qo_heads = config.num_attention_heads // config.attn_tp_size
-        self.num_kv_heads = max(config.num_kv_heads // config.attn_tp_size, 1)
+        self.num_qo_heads = spec.num_attention_heads // spec.attn_tp_size
+        self.num_kv_heads = max(spec.num_kv_heads // spec.attn_tp_size, 1)
         self.dtype = config.dtype
-        self.head_dim = config.head_dim
+        self.head_dim = spec.head_dim
         self.is_draft = config.is_draft
         self.spec_num_tokens = config.speculative_num_draft_tokens
         self.cache_pool: CachePool | None = None

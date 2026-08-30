@@ -25,7 +25,7 @@ import triton.language as tl
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.utils import get_available_gpu_memory
 
 
@@ -90,7 +90,7 @@ def build_page_table(
 
 
 def profile_available_cache_memory_bytes(
-    attn_config: BaseAttnConfig,
+    attn_config: AttnConfig,
     gpu_id: int,
     tp_size: int,
     gpu_memory_utilization: float,
