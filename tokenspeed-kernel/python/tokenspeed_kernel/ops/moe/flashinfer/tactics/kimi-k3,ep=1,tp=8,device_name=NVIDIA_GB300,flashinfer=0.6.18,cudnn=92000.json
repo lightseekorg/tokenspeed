@@ -1,0 +1,158 @@
+{
+  "_metadata": {
+    "flashinfer_version": "0.6.18",
+    "cuda_version": "13.0",
+    "cublas_version": "13.1.1",
+    "cudnn_version": "92000",
+    "cudnn_frontend_version": "1.26.0",
+    "gpu": "NVIDIA GB300"
+  },
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((1, 3584), (0,), (1, 16), (1, 16), (1, 3584), (1, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      8,
+      380
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((1024, 3584), (0,), (1024, 16), (1024, 16), (1024, 3584), (1024, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      64,
+      0
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((128, 3584), (0,), (128, 16), (128, 16), (128, 3584), (128, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      16,
+      783
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((1280, 3584), (0,), (1280, 16), (1280, 16), (1280, 3584), (1280, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      64,
+      2
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((1536, 3584), (0,), (1536, 16), (1536, 16), (1536, 3584), (1536, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      64,
+      0
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((16, 3584), (0,), (16, 16), (16, 16), (16, 3584), (16, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      8,
+      231
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((1792, 3584), (0,), (1792, 16), (1792, 16), (1792, 3584), (1792, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      64,
+      0
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((2, 3584), (0,), (2, 16), (2, 16), (2, 3584), (2, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      8,
+      221
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((2048, 3584), (0,), (2048, 16), (2048, 16), (2048, 3584), (2048, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      64,
+      8
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((256, 3584), (0,), (256, 16), (256, 16), (256, 3584), (256, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      32,
+      569
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((2560, 3584), (0,), (2560, 16), (2560, 16), (2560, 3584), (2560, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      64,
+      8
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((3072, 3584), (0,), (3072, 16), (3072, 16), (3072, 3584), (3072, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      64,
+      8
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((32, 3584), (0,), (32, 16), (32, 16), (32, 3584), (32, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      8,
+      231
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((3584, 3584), (0,), (3584, 16), (3584, 16), (3584, 3584), (3584, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      128,
+      8
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((4, 3584), (0,), (4, 16), (4, 16), (4, 3584), (4, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      8,
+      231
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((4096, 3584), (0,), (4096, 16), (4096, 16), (4096, 3584), (4096, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      128,
+      24
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((512, 3584), (0,), (512, 16), (512, 16), (512, 3584), (512, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      64,
+      0
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((64, 3584), (0,), (64, 16), (64, 16), (64, 3584), (64, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      8,
+      221
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((768, 3584), (0,), (768, 16), (768, 16), (768, 3584), (768, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      64,
+      0
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((8, 3584), (0,), (8, 16), (8, 16), (8, 3584), (8, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      8,
+      221
+    ]
+  ],
+  "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((8192, 3584), (0,), (8192, 16), (8192, 16), (8192, 3584), (8192, 112), (0,), (0,)), ())": [
+    "MoERunner",
+    [
+      192,
+      11
+    ]
+  ],
+  "_generation": "c7b987b6154341c7edd43457cb83817d3011597a32b889fa841f0931648dd183"
+}

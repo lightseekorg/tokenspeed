@@ -101,7 +101,8 @@ def _make_moe(fork: _SpyFork) -> SimpleNamespace:
         defer_finalize=False,
     )
     comm = SimpleNamespace(
-        plan=lambda num_tokens, hs: plan,
+        # Absorb keyword axes so the stub does not pin plan's signature.
+        plan=lambda num_tokens, hs, **_: plan,
         run=lambda *a, **k: hidden,
         reduce_scatter_shared=lambda x: x,
         reduce_project_routed=lambda x: x,

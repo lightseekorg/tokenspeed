@@ -68,6 +68,7 @@ _platform = current_platform()
 _is_blackwell = _platform.is_blackwell
 _is_hopper_plus = _platform.is_hopper_plus
 _device_sm = _platform.arch_version.major * 10 + _platform.arch_version.minor
+_FUSED_A_MAX_M = 16  # measured cliff: wins to M=16, flat ~1.35x loss from 18 to 64
 
 
 from tokenspeed.runtime.distributed import Mapping
@@ -463,6 +464,7 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
         if (
             self.use_min_latency
             and x.size(0) > 0
+            and x.size(0) <= _FUSED_A_MAX_M
             and block_scale is None
             and (output_dtype is None or output_dtype == torch.bfloat16)
         ):
