@@ -109,18 +109,21 @@ def ll_bf16_mm_supported(
     """
     if weight.ndim != 2 or x.ndim < 1:
         return False
-    k = weight.shape[1]
-    n = weight.shape[0]
-    # Checked before dividing by k, and on the originals: a reshape of a
-    # non-contiguous x would copy, voiding the pointer-alignment check below.
-    if k <= 0 or n <= 0 or x.shape[-1] != k or k % _K_ALIGN:
+    n, k = weight.shape
+    # Checked on the originals: a reshape of a non-contiguous x would copy,
+    # voiding the pointer-alignment check below.
+    if x.shape[-1] != k or k % _K_ALIGN:
+        return False
+    if x.dtype is not torch.bfloat16 or weight.dtype is not torch.bfloat16:
         return False
     if not x.is_contiguous() or not weight.is_contiguous():
         return False
-    m = x.numel() // k
-    if not 1 <= m <= MAX_M:
+    if x.device != weight.device:
         return False
     if x.data_ptr() % _PTR_ALIGN or weight.data_ptr() % _PTR_ALIGN:
+        return False
+    m = x.numel() // k
+    if not 1 <= m <= MAX_M:
         return False
     if bias is not None and (
         bias.ndim != 1
@@ -130,7 +133,11 @@ def ll_bf16_mm_supported(
         or bias.device != x.device
     ):
         return False
-    return ll_bf16_router.supports(x.view(m, k), weight, m)
+    # Only the vendored path carries further requirements -- its own toolchain,
+    # and a cluster for the split-K reduce above MAX_M_DOTPROD.
+    return has_flashinfer_cute_dsl_bf16() or ll_bf16_router.supports(
+        x.view(m, k), weight, m
+    )
 
 
 def ll_bf16_mm(

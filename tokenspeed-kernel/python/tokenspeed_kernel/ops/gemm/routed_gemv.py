@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Measured decode-GEMV routing for Kimi-K3's projection shapes.
+"""Measured decode-GEMV routing for the served models' projection shapes.
 
 Every entry in ``MEASURED_ROUTE`` was measured on GB300 (sm103) at the exact
 (N, K) the TP8 decode path hands ``decode_gemv`` -- extracted from an nsys
@@ -109,6 +109,49 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
         (7, 1152, 1536): "skinny",  # 2.59 vs 4.45 (1.72x)
         (8, 1152, 1536): "skinny",  # 2.72 vs 4.46 (1.64x)
         # (1, 1152, 1536) stays on rowcta: 1.907 vs 1.943, inside the margin.
+        # TP4 (B200, sm100), bf16 dense linears: the fp8 checkpoint quantizes
+        # only the routed experts. M is the captured decode bucket -- 5 was
+        # swept but never observed.
+        (1, 512, 2560): "skinny",  # mlp.gate; 1.83 vs 4.37 (2.39x)
+        (2, 512, 2560): "skinny",  # 2.05 vs 4.38 (2.13x)
+        (4, 512, 2560): "ll_bf16",  # 2.28 vs 4.43 (1.95x)
+        (8, 512, 2560): "ll_bf16",  # 2.32 vs 4.64 (2.00x)
+        (1, 320, 2560): "skinny",  # shared_expert gate_up; 1.80 vs 4.36 (2.42x)
+        (2, 320, 2560): "skinny",  # 2.00 vs 5.75 (2.88x)
+        (4, 320, 2560): "ll_bf16",  # 2.22 vs 4.74 (2.13x)
+        (8, 320, 2560): "ll_bf16",  # 2.25 vs 4.73 (2.10x)
+        # shared_expert down-proj. K = 160 is not a multiple of 128, so neither
+        # the skinny GEMM nor ll_bf16 admits it and tgv takes every width.
+        (1, 2560, 160): "tgv",  # 1.61 vs 1.88 (1.17x)
+        (2, 2560, 160): "tgv",  # 1.65 vs 3.09 (1.87x)
+        (4, 2560, 160): "tgv",  # 1.66 vs 3.09 (1.86x)
+        (8, 2560, 160): "tgv",  # 1.65 vs 1.92 (1.16x)
+        (1, 2560, 1536): "ll_bf16",  # attn o_proj; 2.55 vs 3.25 (1.27x)
+        (2, 2560, 1536): "ll_bf16",  # 2.54 vs 4.90 (1.92x)
+        (4, 2560, 1536): "ll_bf16",  # 2.58 vs 4.84 (1.88x)
+        (8, 2560, 1536): "ll_bf16",  # 2.67 vs 4.67 (1.75x)
+        (1, 4120, 2560): "ll_bf16",  # linear_attn in_proj; 4.84 vs 9.26 (1.91x)
+        (2, 4120, 2560): "ll_bf16",  # 4.88 vs 8.55 (1.75x)
+        (4, 4120, 2560): "ll_bf16",  # 4.87 vs 8.41 (1.73x)
+        (8, 4120, 2560): "ll_bf16",  # 4.91 vs 8.38 (1.71x)
+        (1, 3584, 2560): "ll_bf16",  # 4.35 vs 5.50 (1.26x)
+        (2, 3584, 2560): "ll_bf16",  # 4.42 vs 7.50 (1.70x)
+        (4, 3584, 2560): "ll_bf16",  # 4.41 vs 7.63 (1.73x)
+        (8, 3584, 2560): "ll_bf16",  # 4.44 vs 7.28 (1.64x)
+        # 640x2560 crosses over: skinny leads to M == 4, ll_bf16 from M == 8.
+        (1, 640, 2560): "skinny",  # 1.88 vs 4.69 (2.49x)
+        (2, 640, 2560): "skinny",  # 2.10 vs 4.62 (2.20x)
+        (4, 640, 2560): "skinny",  # 2.89 vs 4.77 (1.65x)
+        (8, 640, 2560): "ll_bf16",  # 3.01 vs 4.81 (1.60x)
+        (1, 2560, 2560): "ll_bf16",  # 3.27 vs 5.06 (1.55x)
+        (2, 2560, 2560): "ll_bf16",  # 3.36 vs 6.37 (1.90x)
+        (4, 2560, 2560): "ll_bf16",  # 3.40 vs 6.08 (1.79x)
+        (8, 2560, 2560): "ll_bf16",  # 3.40 vs 6.35 (1.87x)
+        # 12800x2560's margins shrink as M grows and invert at 8 (cublas 13.70
+        # vs ll_bf16 13.43, inside the margin), so M == 8 keeps cublas.
+        (1, 12800, 2560): "skinny",  # 11.07 vs 14.62 (1.32x)
+        (2, 12800, 2560): "skinny",  # 11.81 vs 14.38 (1.22x)
+        (4, 12800, 2560): "ll_bf16",  # 13.31 vs 14.43 (1.08x)
     }
 )
 
@@ -260,6 +303,36 @@ def tgv_gemv(
     return result
 
 
+def ll_bf16_gemv(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """``x @ weight.T`` via the low-latency BF16 GEMM.
+
+    Args:
+        x: ``[M, K]`` contiguous bf16 activations.
+        weight: ``[N, K]`` contiguous bf16 weight.
+        out: optional ``[M, N]`` destination.
+
+    Returns:
+        ``[M, N]`` output in ``x``'s dtype.
+    """
+    from tokenspeed_kernel.ops.gemm.ll_bf16 import ll_bf16_mm, ll_bf16_mm_supported
+
+    m, k = x.shape
+    n = weight.shape[0]
+    dev = x.device.index or 0
+    if (
+        MEASURED_ROUTE.get((m, n, k)) != "ll_bf16"
+        or x.dtype != torch.bfloat16
+        or not _usable_in_capture("ll_bf16", dev, m, n, k)
+        or not ll_bf16_mm_supported(x, weight)
+    ):
+        return _torch_decode_gemv(x, weight, out)
+    result = ll_bf16_mm(x.detach(), weight.detach(), out=out)
+    _mark_warmed("ll_bf16", dev, m, n, k)
+    return result
+
+
 # Fused ``a + x @ W.T + c`` (K3 MoE latent up-proj epilogue): (m, n, k) ->
 # (block_size, outputs_per_block, k_unroll). Cold-L2 vs the incumbent: M == 1
 # 8.86us vs rowcta_gemv_add3 9.42, M == 2 10.05 vs composed 12.81. M == 4 was
@@ -400,13 +473,13 @@ def skinny_gemv_add3(
 
 
 def _register_route() -> None:
-    impls = {"skinny": skinny_gemv, "tgv": tgv_gemv}
+    impls = {"skinny": skinny_gemv, "tgv": tgv_gemv, "ll_bf16": ll_bf16_gemv}
     for (m, n, k), backend in MEASURED_ROUTE.items():
         register_kernel(
             "gemm",
             "decode_gemv",
             name=f"{backend}_gemv_m{m}_n{n}_k{k}",
-            solution="cute_dsl" if backend == "skinny" else "flashinfer",
+            solution="flashinfer" if backend == "tgv" else "cute_dsl",
             capability=_CAPABILITY,
             signatures=_BF16_SIG,
             traits={

@@ -494,10 +494,6 @@ if mm_fp4 is not error_fn:
 
 # ---- FlashInfer BF16 low-latency GEMM, cute-dsl backend ------------------
 
-# The upstreamed form of the kernels vendored under thirdparty/cute_dsl/ll_bf16.
-# No released wheel declares the backend yet, so the probe below reports False
-# everywhere today and callers run the vendored copy; the flashinfer path turns
-# itself on once a release carries it, with no change here.
 _CUTE_DSL_BF16_BACKEND = "cute-dsl"
 _CUTE_DSL_BF16_ARCHS = frozenset({ArchVersion(10, 0), ArchVersion(10, 3)})
 
