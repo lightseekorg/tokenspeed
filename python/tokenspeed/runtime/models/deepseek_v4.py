@@ -42,7 +42,6 @@ from tokenspeed_kernel import (
     dsv4_grouped_output_projection_plan,
     dsv4_grouped_output_projection_warmup_model,
     dsv4_indexer_cache_format,
-    dsv4_indexer_decode_metadata_compute,
     dsv4_indexer_decode_topk,
     dsv4_indexer_prefill_topk,
 )
@@ -62,6 +61,9 @@ from tokenspeed_kernel import (
 from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed_kernel import mhc_post as fast_mhc_post
 from tokenspeed_kernel import mhc_pre as fast_mhc_pre
+from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+    dsv4_indexer_decode_metadata_compute,
+)
 from torch import nn
 from transformers import PretrainedConfig
 

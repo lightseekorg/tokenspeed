@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
+from tokenspeed_kernel.ops.attention import KdaPrefillResult
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
