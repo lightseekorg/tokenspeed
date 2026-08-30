@@ -59,19 +59,19 @@ if current_platform().is_amd:
         gluon_dsa_prefill_topk_standard_gfx950 as _dsa_prefill_topk_standard_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
-        gluon_dsv4_indexer_decode_topk_mxfp4_gfx950 as _dsv4_indexer_decode_topk_impl,
+        gluon_dsv4_decode_split_gfx950 as _dsv4_decode_split_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
-        gluon_dsv4_indexer_prefill_topk_mxfp4_gfx950 as _dsv4_indexer_prefill_topk_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
-        gluon_dsv4_paged_selected_attention_split_gfx950 as _dsv4_paged_selected_attention_split_impl,
+        gluon_dsv4_decode_topk_mxfp4_gfx950 as _dsv4_decode_topk_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
         gluon_dsv4_plan_gfx950 as _dsv4_plan_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
-        gluon_dsv4_selected_attention_gfx950 as _dsv4_selected_attention_impl,
+        gluon_dsv4_prefill_gfx950 as _dsv4_prefill_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (
+        gluon_dsv4_prefill_topk_mxfp4_gfx950 as _dsv4_prefill_topk_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
         gluon_kda_fused_decode_gfx950 as _kda_fused_decode_impl,
@@ -203,8 +203,8 @@ if current_platform().is_amd:
 
     @register_kernel(
         "attention",
-        "dsv4_indexer_prefill_topk",
-        name="gluon_dsv4_indexer_prefill_topk_mxfp4_gfx950",
+        "dsv4_prefill_topk",
+        name="gluon_dsv4_prefill_topk_mxfp4_gfx950",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -216,13 +216,13 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         tags={"amd", "gfx950", "mxfp4", "sparse", "radix_topk"},
     )
-    def gluon_dsv4_indexer_prefill_topk_mxfp4_gfx950(*args, **kwargs):
-        return _dsv4_indexer_prefill_topk_impl(*args, **kwargs)
+    def gluon_dsv4_prefill_topk_mxfp4_gfx950(*args, **kwargs):
+        return _dsv4_prefill_topk_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
-        "dsv4_indexer_decode_topk",
-        name="gluon_dsv4_indexer_decode_topk_mxfp4_gfx950",
+        "dsv4_decode_topk",
+        name="gluon_dsv4_decode_topk_mxfp4_gfx950",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -234,8 +234,8 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         tags={"amd", "gfx950", "mxfp4", "sparse", "radix_topk"},
     )
-    def gluon_dsv4_indexer_decode_topk_mxfp4_gfx950(*args, **kwargs):
-        return _dsv4_indexer_decode_topk_impl(*args, **kwargs)
+    def gluon_dsv4_decode_topk_mxfp4_gfx950(*args, **kwargs):
+        return _dsv4_decode_topk_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
@@ -257,8 +257,8 @@ if current_platform().is_amd:
 
     @register_kernel(
         "attention",
-        "dsv4_paged_selected_attention",
-        name="gluon_dsv4_paged_selected_attention_split_gfx950",
+        "dsv4_decode",
+        name="gluon_dsv4_decode_split_gfx950",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -291,13 +291,13 @@ if current_platform().is_amd:
         },
         tags={"amd", "gfx950", "paged_cache", "selected_attention"},
     )
-    def gluon_dsv4_paged_selected_attention_split_gfx950(*args, **kwargs):
-        return _dsv4_paged_selected_attention_split_impl(*args, **kwargs)
+    def gluon_dsv4_decode_split_gfx950(*args, **kwargs):
+        return _dsv4_decode_split_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",
-        "dsv4_selected_attention",
-        name="gluon_dsv4_selected_attention_gfx950",
+        "dsv4_prefill",
+        name="gluon_dsv4_prefill_gfx950",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -322,8 +322,8 @@ if current_platform().is_amd:
         },
         tags={"amd", "gfx950", "selected_attention"},
     )
-    def gluon_dsv4_selected_attention_gfx950(*args, **kwargs):
-        return _dsv4_selected_attention_impl(*args, **kwargs)
+    def gluon_dsv4_prefill_gfx950(*args, **kwargs):
+        return _dsv4_prefill_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",

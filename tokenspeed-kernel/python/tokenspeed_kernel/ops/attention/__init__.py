@@ -2832,40 +2832,6 @@ def dsv4_reset_attention_state() -> None:
     reset_dsv4_tile_metadata()
 
 
-def _dsv4_indexer_selection(
-    index_q: torch.Tensor,
-    *,
-    index_k_format: str,
-    page_size: int,
-    topk: int,
-) -> tuple[object, dict[str, object]]:
-    if index_k_format not in ("mxfp4", "fp8_scaled"):
-        raise ValueError(
-            "index_k_format must be 'mxfp4' or 'fp8_scaled', got " f"{index_k_format!r}"
-        )
-    if index_q.ndim < 3:
-        raise ValueError(
-            "index_q values must have at least 3 dimensions, got "
-            f"{tuple(index_q.shape)}"
-        )
-    logical_head_dim = (
-        index_q.shape[-1] * 2 if index_k_format == "mxfp4" else index_q.shape[-1]
-    )
-    signature = format_signature(
-        q=dense_tensor_format(index_q.dtype),
-        weights=dense_tensor_format(torch.float32),
-        index_k_cache=dense_tensor_format(torch.uint8),
-    )
-    traits = {
-        "index_heads": int(index_q.shape[-2]),
-        "head_dim": int(logical_head_dim),
-        "topk": int(topk),
-        "page_size": int(page_size),
-        "index_k_format": index_k_format,
-    }
-    return signature, traits
-
-
 def dsv4_swa_cache_insert(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -3116,7 +3082,7 @@ def dsv4_csa_indexer_fp8_cache_insert(
         )
 
 
-def dsv4_selected_attention(
+def dsv4_prefill(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -3179,7 +3145,7 @@ def dsv4_selected_attention(
     }
     kernel = select_kernel(
         "attention",
-        "dsv4_selected_attention",
+        "dsv4_prefill",
         signature,
         traits=traits,
         solution=solution,
@@ -3194,14 +3160,14 @@ def dsv4_selected_attention(
     }
     ShapeCapture.get().record(
         "attention",
-        "dsv4_selected_attention",
+        "dsv4_prefill",
         kernel.name,
         q.dtype,
         shape_params,
     )
     with kernel_scope(
         "attention",
-        "dsv4_selected_attention",
+        "dsv4_prefill",
         q.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -3217,7 +3183,7 @@ def dsv4_selected_attention(
         )
 
 
-def dsv4_paged_selected_attention(
+def dsv4_decode(
     q: torch.Tensor,
     swa_kv_cache: torch.Tensor,
     swa_slots: torch.Tensor,
@@ -3353,7 +3319,7 @@ def dsv4_paged_selected_attention(
     }
     kernel = select_kernel(
         "attention",
-        "dsv4_paged_selected_attention",
+        "dsv4_decode",
         signature,
         traits=traits,
         solution=solution,
@@ -3371,14 +3337,14 @@ def dsv4_paged_selected_attention(
     }
     ShapeCapture.get().record(
         "attention",
-        "dsv4_paged_selected_attention",
+        "dsv4_decode",
         kernel.name,
         q.dtype,
         shape_params,
     )
     with kernel_scope(
         "attention",
-        "dsv4_paged_selected_attention",
+        "dsv4_decode",
         q.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -3399,7 +3365,7 @@ def dsv4_paged_selected_attention(
         )
 
 
-def dsv4_indexer_prefill_topk(
+def dsv4_prefill_topk(
     index_q: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
@@ -3456,12 +3422,25 @@ def dsv4_indexer_prefill_topk(
         are set to -1.
     """
     q_values, _ = index_q
-    signature, traits = _dsv4_indexer_selection(
-        q_values,
-        index_k_format=index_k_format,
-        page_size=page_size,
-        topk=topk,
+    if index_k_format not in ("mxfp4", "fp8_scaled"):
+        raise ValueError(
+            "index_k_format must be 'mxfp4' or 'fp8_scaled', got " f"{index_k_format!r}"
+        )
+    if q_values.ndim < 3:
+        raise ValueError(
+            "index_q values must have at least 3 dimensions, got "
+            f"{tuple(q_values.shape)}"
+        )
+    logical_head_dim = (
+        q_values.shape[-1] * 2 if index_k_format == "mxfp4" else q_values.shape[-1]
     )
+    traits = {
+        "index_heads": int(q_values.shape[-2]),
+        "head_dim": int(logical_head_dim),
+        "topk": int(topk),
+        "page_size": int(page_size),
+        "index_k_format": index_k_format,
+    }
     if weights.dtype != torch.float32:
         raise TypeError(f"weights must be float32, got {weights.dtype}")
     signature = _attention_format_signature(
@@ -3469,7 +3448,7 @@ def dsv4_indexer_prefill_topk(
     )
     kernel = select_kernel(
         "attention",
-        "dsv4_indexer_prefill_topk",
+        "dsv4_prefill_topk",
         signature,
         traits=traits,
         solution=solution,
@@ -3486,14 +3465,14 @@ def dsv4_indexer_prefill_topk(
     }
     ShapeCapture.get().record(
         "attention",
-        "dsv4_indexer_prefill_topk",
+        "dsv4_prefill_topk",
         kernel.name,
         q_values.dtype,
         shape_params,
     )
     with kernel_scope(
         "attention",
-        "dsv4_indexer_prefill_topk",
+        "dsv4_prefill_topk",
         q_values.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -3521,7 +3500,7 @@ def dsv4_indexer_prefill_topk(
         return kernel(**kernel_kwargs)
 
 
-def dsv4_indexer_decode_topk(
+def dsv4_decode_topk(
     index_q: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
@@ -3569,12 +3548,25 @@ def dsv4_indexer_decode_topk(
         is provided.
     """
     q_values, _ = index_q
-    signature, traits = _dsv4_indexer_selection(
-        q_values,
-        index_k_format=index_k_format,
-        page_size=page_size,
-        topk=topk,
+    if index_k_format not in ("mxfp4", "fp8_scaled"):
+        raise ValueError(
+            "index_k_format must be 'mxfp4' or 'fp8_scaled', got " f"{index_k_format!r}"
+        )
+    if q_values.ndim < 3:
+        raise ValueError(
+            "index_q values must have at least 3 dimensions, got "
+            f"{tuple(q_values.shape)}"
+        )
+    logical_head_dim = (
+        q_values.shape[-1] * 2 if index_k_format == "mxfp4" else q_values.shape[-1]
     )
+    traits = {
+        "index_heads": int(q_values.shape[-2]),
+        "head_dim": int(logical_head_dim),
+        "topk": int(topk),
+        "page_size": int(page_size),
+        "index_k_format": index_k_format,
+    }
     if weights.dtype != torch.float32:
         raise TypeError(f"weights must be float32, got {weights.dtype}")
     signature = _attention_format_signature(
@@ -3582,7 +3574,7 @@ def dsv4_indexer_decode_topk(
     )
     kernel = select_kernel(
         "attention",
-        "dsv4_indexer_decode_topk",
+        "dsv4_decode_topk",
         signature,
         traits=traits,
         solution=solution,
@@ -3599,14 +3591,14 @@ def dsv4_indexer_decode_topk(
     }
     ShapeCapture.get().record(
         "attention",
-        "dsv4_indexer_decode_topk",
+        "dsv4_decode_topk",
         kernel.name,
         q_values.dtype,
         shape_params,
     )
     with kernel_scope(
         "attention",
-        "dsv4_indexer_decode_topk",
+        "dsv4_decode_topk",
         q_values.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -4976,10 +4968,10 @@ __all__ = [
     "dsv4_reset_attention_state",
     "dsv4_swa_cache_insert",
     "dsv4_csa_indexer_fp8_cache_insert",
-    "dsv4_selected_attention",
-    "dsv4_paged_selected_attention",
-    "dsv4_indexer_prefill_topk",
-    "dsv4_indexer_decode_topk",
+    "dsv4_prefill",
+    "dsv4_decode",
+    "dsv4_prefill_topk",
+    "dsv4_decode_topk",
     "dsv4_plan",
     "dsv4_warmup",
     "GdnCheckpointLayout",

@@ -1183,7 +1183,7 @@ def _attention_dsv4_selected(width: int = 640) -> object:
     indices = torch.arange(width, dtype=torch.int32).unsqueeze(0)
     lens = torch.tensor([width], dtype=torch.int32)
     attn_sink = torch.empty((16,), dtype=torch.float32)
-    return tokenspeed_kernel.dsv4_selected_attention(
+    return tokenspeed_kernel.dsv4_prefill(
         q,
         kv,
         indices,
@@ -1200,7 +1200,7 @@ def _attention_dsv4_selected_short() -> object:
 def _attention_dsv4_selected_i64() -> object:
     q = torch.empty((1, 16, 512), dtype=torch.bfloat16)
     kv = torch.empty((640, 512), dtype=torch.bfloat16)
-    return tokenspeed_kernel.dsv4_selected_attention(
+    return tokenspeed_kernel.dsv4_prefill(
         q,
         kv,
         torch.arange(640, dtype=torch.int32).unsqueeze(0),
@@ -1224,7 +1224,7 @@ def _attention_dsv4_paged_selected(with_extra: bool = True) -> object:
             "extra_lens": torch.empty((2,), dtype=torch.int32),
             "extra_page_size": 64,
         }
-    return tokenspeed_kernel.dsv4_paged_selected_attention(
+    return tokenspeed_kernel.dsv4_decode(
         q=q,
         swa_kv_cache=swa_cache,
         swa_slots=swa_slots,
@@ -1250,7 +1250,7 @@ def _attention_dsv4_paged_selected_pro_tp8() -> object:
     extra_slots = torch.empty((tokens, 1024), dtype=torch.int32)
     extra_lens = torch.empty((tokens,), dtype=torch.int32)
     attn_sink = torch.empty((16,), dtype=torch.float32)
-    return tokenspeed_kernel.dsv4_paged_selected_attention(
+    return tokenspeed_kernel.dsv4_decode(
         q=q,
         swa_kv_cache=swa_cache,
         swa_slots=swa_slots,
@@ -1267,7 +1267,7 @@ def _attention_dsv4_paged_selected_pro_tp8() -> object:
 
 def _attention_dsv4_paged_selected_pro_tp8_i64() -> object:
     tokens = 6
-    return tokenspeed_kernel.dsv4_paged_selected_attention(
+    return tokenspeed_kernel.dsv4_decode(
         q=torch.empty((tokens, 16, 512), dtype=torch.bfloat16),
         swa_kv_cache=torch.empty((2, 64 * 584), dtype=torch.uint8),
         swa_slots=torch.empty((tokens, 128), dtype=torch.int32),
@@ -2848,8 +2848,8 @@ _CASES = [
         _is_hopper_plus_with_flashmla,
         "hopper-plus",
         "attention",
-        "dsv4_paged_selected_attention",
-        "flashmla_dsv4_paged_selected_attention",
+        "dsv4_decode",
+        "flashmla_dsv4_decode",
         _attention_dsv4_paged_selected,
         id_suffix="extra-segment",
     ),
@@ -2961,8 +2961,8 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
-        "dsv4_paged_selected_attention",
-        "gluon_dsv4_paged_selected_attention_split_gfx950",
+        "dsv4_decode",
+        "gluon_dsv4_decode_split_gfx950",
         _attention_dsv4_paged_selected_pro_tp8,
         id_suffix="pro-tp8",
     ),
@@ -2970,8 +2970,8 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
-        "dsv4_paged_selected_attention",
-        "triton_dsv4_paged_selected_attention",
+        "dsv4_decode",
+        "triton_dsv4_decode",
         _attention_dsv4_paged_selected_pro_tp8_i64,
         id_suffix="pro-tp8-int64-metadata",
     ),
@@ -2979,8 +2979,8 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
-        "dsv4_paged_selected_attention",
-        "triton_dsv4_paged_selected_attention",
+        "dsv4_decode",
+        "triton_dsv4_decode",
         _attention_dsv4_paged_selected,
         id_suffix="extra-segment",
     ),
@@ -2988,8 +2988,8 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
-        "dsv4_paged_selected_attention",
-        "triton_dsv4_paged_selected_attention",
+        "dsv4_decode",
+        "triton_dsv4_decode",
         _attention_dsv4_paged_selected_swa_only,
         id_suffix="swa-only",
     ),
@@ -2997,8 +2997,8 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
-        "dsv4_selected_attention",
-        "gluon_dsv4_selected_attention_gfx950",
+        "dsv4_prefill",
+        "gluon_dsv4_prefill_gfx950",
         _attention_dsv4_selected,
         id_suffix="width640",
     ),
@@ -3006,8 +3006,8 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
-        "dsv4_selected_attention",
-        "triton_dsv4_selected_attention",
+        "dsv4_prefill",
+        "triton_dsv4_prefill",
         _attention_dsv4_selected_i64,
         id_suffix="width640-int64-metadata",
     ),
@@ -3015,8 +3015,8 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
-        "dsv4_selected_attention",
-        "triton_dsv4_selected_attention",
+        "dsv4_prefill",
+        "triton_dsv4_prefill",
         _attention_dsv4_selected_short,
         id_suffix="width128",
     ),
