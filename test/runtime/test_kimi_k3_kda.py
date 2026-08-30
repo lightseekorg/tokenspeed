@@ -71,6 +71,45 @@ register_cuda_ci(est_time=240, suite="runtime-1gpu")
 _LOWER_BOUND = -5.0
 
 
+def test_flashinfer_decode_bulk_cow_runs_once_and_respects_l2_fences() -> None:
+    calls = []
+
+    class Descriptor:
+        def copy(self, reads, writes, *, batch_size):
+            calls.append((reads, writes, batch_size))
+
+    backend = object.__new__(KdaAttnBackend)
+    backend._decode_cow_descriptors = (Descriptor(), Descriptor())
+    backend._decode_cow_first_layer = 2
+    backend._decode_cow_l2_notice_emitted = False
+    backend._state_groups = lambda: ("g0", "g1", "g2")
+    backend.kv_pool = SimpleNamespace(layerwise_load_tracker=None)
+    reads = {group: torch.tensor([1, 2]) for group in backend._state_groups()}
+    writes = {group: torch.tensor([1, 3]) for group in backend._state_groups()}
+    backend.forward_metadata = SimpleNamespace(
+        state_in_blocks_by_group=reads,
+        state_out_blocks_by_group=writes,
+    )
+
+    assert backend._stage_flashinfer_decode_cow(2, 2)
+    assert len(calls) == 2
+    assert all(call[2] == 2 for call in calls)
+    assert backend._stage_flashinfer_decode_cow(3, 2)
+    assert len(calls) == 2
+
+    backend.kv_pool.layerwise_load_tracker = SimpleNamespace(consumer_indices=())
+    assert not backend._stage_flashinfer_decode_cow(2, 2)
+    assert len(calls) == 2
+
+    backend.kv_pool.layerwise_load_tracker = None
+    backend.forward_metadata = SimpleNamespace(
+        state_in_blocks_by_group=None,
+        state_out_blocks_by_group=None,
+    )
+    assert not backend._stage_flashinfer_decode_cow(3, 2)
+    assert len(calls) == 2
+
+
 def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None:
     backend = object.__new__(KdaAttnBackend)
     backend.kda_recurrent_layout = "v_major"

@@ -62,8 +62,8 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
     # A KDA layer has conv/recurrent planes planned and an MLA layer has a
     # latent plane; the plan's field list decides per layer. Latent-page
     # contiguity is a plan invariant (exact_page_stride).
-    # State planes keep their planned shape: the KDA decode ABI reads them
-    # as the plan lays them out.
+    # Recurrent planes keep their planned shape. A history-major convolution
+    # plane is exposed as a zero-copy sequence-major compute view below.
     layer_plane_bindings: ClassVar[dict[str, str]] = {
         **MLATokenToKVPool.layer_plane_bindings,
         "conv_state": "_conv_state",
@@ -77,11 +77,32 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         # A state layer with no planned planes belongs to another pipeline
         # stage (the PP-narrowed plan drops its fields); this view never
         # executes it, so it gets no entry.
-        self._state_buffers_by_layer = {
-            layer_id: (self._conv_state[layer_id], self._recurrent_state[layer_id])
-            for layer_id, label in enumerate(self._layer_types)
-            if label in STATE_LAYER_TYPES and self._conv_state[layer_id] is not None
-        }
+        self._state_buffers_by_layer = {}
+        for layer_id, label in enumerate(self._layer_types):
+            physical_conv = self._conv_state[layer_id]
+            if label not in STATE_LAYER_TYPES or physical_conv is None:
+                continue
+            if physical_conv.ndim != 3:
+                raise RuntimeError(
+                    "KDA convolution state must have three dimensions, "
+                    f"got {tuple(physical_conv.shape)}"
+                )
+            conv = (
+                physical_conv.transpose(1, 2)
+                if physical_conv.shape[1] == 3
+                else physical_conv
+            )
+            channels = conv.shape[1]
+            supported_strides = {(3, 1), (1, channels)}
+            if conv.shape[2] != 3 or conv.stride()[1:] not in supported_strides:
+                raise RuntimeError(
+                    "KDA convolution state must use a dense supported layout, "
+                    f"got {tuple(conv.stride())}"
+                )
+            self._state_buffers_by_layer[layer_id] = (
+                conv,
+                self._recurrent_state[layer_id],
+            )
 
     @property
     def num_lcm_blocks(self) -> int:

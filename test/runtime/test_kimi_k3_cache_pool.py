@@ -81,6 +81,16 @@ def test_kimi_k3_pool_binds_mla_and_kda_to_one_lcm_backing() -> None:
     )
     conv, recurrent = pool.get_state_buffers(state_layer)
     assert tuple(conv.shape[1:]) == conv_shape
+    from tokenspeed_kernel.ops.attention import kda_conv_state_layout
+
+    if kda_conv_state_layout() == "sequence_major":
+        assert conv.stride(1) == 1
+        assert conv.stride(2) == conv_shape[0]
+        physical_conv = pool.arena.field(f"layer.{state_layer}.conv_state")
+        assert tuple(physical_conv.shape[1:]) == (conv_shape[1], conv_shape[0])
+        assert physical_conv.transpose(1, 2).data_ptr() == conv.data_ptr()
+    else:
+        assert conv.stride()[1:] == (conv_shape[1], 1)
     assert tuple(recurrent.shape[1:]) == recurrent_shape
     assert (
         conv.untyped_storage().data_ptr()

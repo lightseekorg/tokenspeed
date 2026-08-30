@@ -27,6 +27,8 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -44,6 +46,7 @@ def _use_pdl(enable_pdl: bool | None) -> bool:
 
 __all__ = [
     "compute_group_decode_locs",
+    "GroupedStateCopyDescriptor",
     "copy_state_rows",
     "fused_fp8_set_kv_buffer",
     "gather_page_table_with_padding",
@@ -323,6 +326,163 @@ def copy_state_rows(
         ROW_I32=row_i32,
         BLOCK_I32=block_i32,
     )
+
+
+@triton.jit
+def _copy_grouped_state_rows_kernel(
+    addresses_ptr,
+    row_strides_ptr,
+    group_sel_ptr,
+    read_group_0,
+    read_group_1,
+    read_group_2,
+    write_group_0,
+    write_group_1,
+    write_group_2,
+    batch_size,
+    ROW_I32: tl.constexpr,
+    BLOCK_I32: tl.constexpr,
+):
+    """Copy one layer/request row selected from three dynamic cache groups."""
+    work_index = tl.program_id(0)
+    layer_index = work_index // batch_size
+    request_index = work_index - layer_index * batch_size
+    group = tl.load(group_sel_ptr + layer_index)
+
+    src_0 = tl.load(read_group_0 + request_index).to(tl.int64)
+    src_1 = tl.load(read_group_1 + request_index).to(tl.int64)
+    src_2 = tl.load(read_group_2 + request_index).to(tl.int64)
+    dst_0 = tl.load(write_group_0 + request_index).to(tl.int64)
+    dst_1 = tl.load(write_group_1 + request_index).to(tl.int64)
+    dst_2 = tl.load(write_group_2 + request_index).to(tl.int64)
+    src_row = tl.where(group == 0, src_0, tl.where(group == 1, src_1, src_2))
+    dst_row = tl.where(group == 0, dst_0, tl.where(group == 1, dst_1, dst_2))
+
+    # The common path is in-place. A negative destination is graph padding;
+    # a negative source paired with a live destination zero-initializes it.
+    if (src_row == dst_row) | (dst_row < 0):
+        return
+
+    address = tl.load(addresses_ptr + layer_index)
+    row_stride = tl.load(row_strides_ptr + layer_index)
+    pointer = tl.cast(address, tl.pointer_type(tl.int32))
+    # One CTA owns a whole layer/request row. This keeps the no-op grid bounded
+    # by layers*batch instead of launching one empty program per payload chunk.
+    for start in tl.range(0, ROW_I32, BLOCK_I32, loop_unroll_factor=1):
+        offsets = start + tl.arange(0, BLOCK_I32)
+        mask = offsets < ROW_I32
+        values = tl.load(
+            pointer + src_row * row_stride + offsets.to(tl.int64),
+            mask=mask & (src_row >= 0),
+            other=0,
+        )
+        tl.store(
+            pointer + dst_row * row_stride + offsets.to(tl.int64),
+            values,
+            mask=mask,
+        )
+
+
+@dataclass(frozen=True)
+class GroupedStateCopyDescriptor:
+    """Capture-stable pointer table for one uniform component family."""
+
+    components: tuple[torch.Tensor, ...]
+    addresses: torch.Tensor
+    row_strides: torch.Tensor
+    group_sel: torch.Tensor
+    row_bytes: int
+
+    @classmethod
+    def build(
+        cls,
+        components: Sequence[torch.Tensor],
+        group_sel: Sequence[int],
+    ) -> "GroupedStateCopyDescriptor":
+        """Build descriptors before graph capture and retain component lifetime."""
+        components = tuple(components)
+        if not components:
+            raise ValueError("components must not be empty")
+        if len(group_sel) != len(components) or any(
+            group not in (0, 1, 2) for group in group_sel
+        ):
+            raise ValueError("group_sel must contain one group id in [0, 2] per layer")
+        device = components[0].device
+        if device.type != "cuda" or any(value.device != device for value in components):
+            raise ValueError("all components must be CUDA tensors on one device")
+        pages = components[0].shape[0]
+        itemsize = components[0].element_size()
+        row_elements = components[0].numel() // pages
+        row_bytes = row_elements * itemsize
+        if row_bytes % 4:
+            raise ValueError("component row payload must be divisible by four bytes")
+        for value in components:
+            if value.ndim < 2 or value.shape[0] != pages:
+                raise ValueError("components must have a common page dimension")
+            if (
+                value.element_size() != itemsize
+                or value.numel() // pages != row_elements
+            ):
+                raise ValueError("components must have a uniform row payload")
+            # Dense inner permutations are legal (notably sequence-major conv),
+            # but padding/overlap inside a page would make a raw row copy unsafe.
+            inner_span = 1 + sum(
+                (value.shape[axis] - 1) * value.stride(axis)
+                for axis in range(1, value.ndim)
+            )
+            if inner_span != row_elements or value.stride(0) < inner_span:
+                raise ValueError(
+                    "each component page must be physically dense and disjoint"
+                )
+            if value.stride(0) * itemsize % 4:
+                raise ValueError("component row stride must be int32 aligned")
+        addresses = torch.tensor(
+            [value.data_ptr() for value in components],
+            dtype=torch.uint64,
+            device=device,
+        )
+        row_strides = torch.tensor(
+            [value.stride(0) * itemsize // 4 for value in components],
+            dtype=torch.int64,
+            device=device,
+        )
+        groups = torch.tensor(group_sel, dtype=torch.int32, device=device)
+        return cls(components, addresses, row_strides, groups, row_bytes)
+
+    def copy(
+        self,
+        read_groups: Sequence[torch.Tensor],
+        write_groups: Sequence[torch.Tensor],
+        *,
+        batch_size: int,
+    ) -> None:
+        """Copy live COW rows selected by the current graph metadata."""
+        if batch_size == 0:
+            return
+        if len(read_groups) != 3 or len(write_groups) != 3:
+            raise ValueError("exactly three read and three write groups are required")
+        for indices in (*read_groups, *write_groups):
+            if (
+                indices.device != self.addresses.device
+                or indices.dtype not in (torch.int32, torch.int64)
+                or indices.ndim != 1
+                or indices.numel() < batch_size
+            ):
+                raise ValueError(
+                    "group indices must be 1D CUDA int32/int64 buffers "
+                    "with batch capacity"
+                )
+        block_i32 = 1024
+        _copy_grouped_state_rows_kernel[(len(self.components) * batch_size,)](
+            self.addresses,
+            self.row_strides,
+            self.group_sel,
+            *read_groups,
+            *write_groups,
+            batch_size,
+            ROW_I32=self.row_bytes // 4,
+            BLOCK_I32=block_i32,
+        )
 
 
 # -----------------------------------------------------------------------------

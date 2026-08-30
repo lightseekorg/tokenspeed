@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from types import SimpleNamespace
 
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
@@ -9,6 +10,12 @@ sys.path.insert(0, os.path.dirname(_TEST_DIR))
 from test.runtime.conftest import TP8_PAGE_SET_BYTES, kimi_tp8_layout
 
 import torch
+from tokenspeed_kernel.ops.attention import kda_conv_state_layout
+
+from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
+    _partition_for_field,
+)
 
 
 def _plan(num_lcm_blocks: int, *, tp_size: int = 8):
@@ -55,7 +62,36 @@ def test_lcm_reference_geometry_is_exact() -> None:
     conv = next(
         field for field in plan.fields if field.field_id.endswith(".conv_state")
     )
-    assert conv.shape[0] == 3 * 96 * 128 // 8
+    expected_shape = (
+        (3, 3 * 96 * 128 // 8)
+        if kda_conv_state_layout() == "sequence_major"
+        else (3 * 96 * 128 // 8, 3)
+    )
+    assert conv.shape == expected_shape
+
+
+def test_conv_transfer_partitions_the_channel_axis() -> None:
+    plan = _plan(1)
+    conv = next(
+        field for field in plan.fields if field.field_id.endswith(".conv_state")
+    )
+    model = SimpleNamespace(
+        num_attention_layers=93,
+        hf_text_config=KimiLinearConfig(),
+    )
+
+    partition = _partition_for_field(
+        conv,
+        model_config=model,
+        draft_model_config=None,
+        prefix_granularity=plan.prefix_granularity,
+        inkling_layers=frozenset(),
+    )
+
+    assert partition is not None
+    assert partition.axis == (1 if kda_conv_state_layout() == "sequence_major" else 0)
+    assert partition.global_extent == 3 * 96 * 128
+    assert partition.global_parts == (96 * 128, 96 * 128, 96 * 128)
 
 
 def test_lcm_geometry_shrinks_with_the_kda_state_at_tp16() -> None:
@@ -76,7 +112,12 @@ def test_lcm_geometry_shrinks_with_the_kda_state_at_tp16() -> None:
     conv = next(
         field for field in plan.fields if field.field_id.endswith(".conv_state")
     )
-    assert conv.shape[0] == 3 * 96 * 128 // 16
+    expected_shape = (
+        (3, 3 * 96 * 128 // 16)
+        if kda_conv_state_layout() == "sequence_major"
+        else (3 * 96 * 128 // 16, 3)
+    )
+    assert conv.shape == expected_shape
 
 
 def test_attention_dp_layouts_grow_the_mla_packing() -> None:

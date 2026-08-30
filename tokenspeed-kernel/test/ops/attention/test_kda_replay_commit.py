@@ -42,6 +42,7 @@ from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (  # noqa: E40
     _gate_tiling,
     batched_kda_commit_conv_window_kernel,
     batched_recurrent_kda_replay_commit,
+    fused_kda_verify_conv_update,
     fused_recurrent_kda_replay_commit,
     fused_recurrent_kda_verify_megafuse,
 )
@@ -75,6 +76,10 @@ def _window(n, t, pages=32, seed=0):
         gate_scratch=torch.empty(n * t, P, device=DEV, dtype=torch.float32),
         read_indices=torch.arange(1, n + 1, device=DEV, dtype=torch.int32),
     )
+
+
+def _sequence_major_conv_state(conv_state: torch.Tensor) -> torch.Tensor:
+    return conv_state.transpose(1, 2).contiguous().transpose(1, 2)
 
 
 def _replay(x, write_indices, accepted, t):
@@ -128,6 +133,8 @@ def _batched_static_args(x, layers_per_group):
     return dict(
         qkv_stride=x["qkv_raw"].stride(0),
         conv_stride=x["conv_pool"].stride(0),
+        conv_feature_stride=x["conv_pool"].stride(1),
+        conv_history_stride=x["conv_pool"].stride(2),
         f_a_stride=x["f_a"].stride(0),
         beta_stride=x["beta"].stride(0),
         state_stride=x["h_pool"].stride(0),
@@ -181,6 +188,8 @@ def test_batched_conv_window_is_independent_of_its_column_block(block):
             T=t,
             STRIDE_QKV=xs[0]["qkv_raw"].stride(0),
             STRIDE_CONV=xs[0]["conv_pool"].stride(0),
+            STRIDE_CONV_FEATURE=xs[0]["conv_pool"].stride(1),
+            STRIDE_CONV_HISTORY=xs[0]["conv_pool"].stride(2),
             CONV_DIM=conv_dim,
             LAYERS_PER_GROUP=1,
             BLOCK=block_size,
@@ -192,10 +201,16 @@ def test_batched_conv_window_is_independent_of_its_column_block(block):
         torch.testing.assert_close(narrow, wide, atol=0, rtol=0)
 
 
-def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
+@pytest.mark.parametrize("sequence_major", [False, True])
+def test_batched_replay_is_bit_identical_and_descriptor_sensitive(
+    sequence_major: bool,
+):
     """One launch matches the layer loop; a wrong descriptor must be detected."""
     layers, n, t = 4, 5, 4
     source = [_window(n, t, seed=100 + layer) for layer in range(layers)]
+    if sequence_major:
+        for x in source:
+            x["conv_pool"] = _sequence_major_conv_state(x["conv_pool"])
     loop = []
     writes = torch.stack(
         [
@@ -273,6 +288,46 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
         torch.testing.assert_close(
             negative[2]["h_pool"], loop[2]["h_pool"], atol=0, rtol=0
         )
+
+
+def test_verify_conv_and_replay_accept_sequence_major_conv_state():
+    n, t = 3, 4
+    source = _window(n, t, seed=5901)
+    sequence = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in source.items()}
+    sequence["conv_pool"] = _sequence_major_conv_state(source["conv_pool"])
+    channels = sequence["conv_pool"].shape[1]
+    assert sequence["conv_pool"].stride()[1:] == (1, channels)
+
+    feature_conv = fused_kda_verify_conv_update(
+        source["qkv_raw"],
+        source["conv_w"],
+        source["conv_pool"],
+        source["read_indices"],
+        num_heads=HV,
+        head_dim=K,
+        draft_token_num=t,
+    )
+    sequence_conv = fused_kda_verify_conv_update(
+        sequence["qkv_raw"],
+        sequence["conv_w"],
+        sequence["conv_pool"],
+        sequence["read_indices"],
+        num_heads=HV,
+        head_dim=K,
+        draft_token_num=t,
+    )
+    torch.testing.assert_close(sequence_conv, feature_conv, atol=0, rtol=0)
+
+    writes = torch.arange(12, 12 + n, device=DEV, dtype=torch.int32)
+    accepted = torch.tensor([0, 2, t], device=DEV, dtype=torch.int32)
+    feature_out = _replay(source, writes, accepted, t)
+    sequence_out = _replay(sequence, writes, accepted, t)
+    torch.testing.assert_close(
+        sequence_out["conv_pool"], feature_out["conv_pool"], atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        sequence_out["h_pool"], feature_out["h_pool"], atol=1e-6, rtol=0
+    )
 
 
 @pytest.mark.parametrize(

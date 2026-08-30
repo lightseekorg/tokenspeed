@@ -4292,6 +4292,11 @@ def kda_recurrent_layout() -> str:
     return "v_major" if v_major else "k_major"
 
 
+def kda_conv_state_layout() -> str:
+    """Return the persistent convolution-state layout for this platform."""
+    return "sequence_major" if current_platform().is_blackwell else "feature_major"
+
+
 def kda_paged_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -4469,6 +4474,37 @@ def kda_paged_decode(
     )
 
 
+def prepare_kda_fused_decode_weights(
+    conv_weights: torch.Tensor,
+    norm_weight: torch.Tensor,
+    prepared_weights: object | None = None,
+) -> object | None:
+    """Prepare an opaque plan for the platform's fused KDA decode.
+
+    ``None`` means that the selected implementations need no persistent
+    preparation. Callers should retain a non-None result and pass it to
+    :func:`kda_fused_paged_decode` without inspecting it.
+
+    Args:
+        conv_weights: Loaded depthwise Q/K/V convolution filters.
+        norm_weight: Loaded per-channel output RMSNorm weight.
+        prepared_weights: Existing opaque plan to refresh in place after a
+            weight refit, preserving CUDA-graph pointer stability.
+
+    Returns:
+        An opaque prepared plan, or ``None`` when no compatible backend exists.
+    """
+    from tokenspeed_kernel.ops.attention.flashinfer.kda_decode import (
+        prepare_flashinfer_kda_decode_weights,
+    )
+
+    return prepare_flashinfer_kda_decode_weights(
+        conv_weights,
+        norm_weight,
+        prepared_weights,
+    )
+
+
 def kda_fused_paged_decode(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
@@ -4489,6 +4525,7 @@ def kda_fused_paged_decode(
     output_gate: torch.Tensor | None = None,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
+    prepared_weights: object | None = None,
     recurrent_layout: str | None = None,
     override: str | None = None,
     solution: str | None = None,
@@ -4498,7 +4535,8 @@ def kda_fused_paged_decode(
     ``output_gate``, ``norm_weight``, and ``norm_eps`` request a fused gated
     RMSNorm epilogue. If the selected backend only supports the original core
     fusion, the returned result reports that the caller must apply the
-    epilogue.
+    epilogue. Passing the same tensor as ``read_indices`` and ``write_indices``
+    signals that any required copy-on-write staging has already completed.
 
     Returns ``None`` only when no implementation supports the current
     platform. Otherwise, returns the output and whether output normalization
@@ -4529,6 +4567,7 @@ def kda_fused_paged_decode(
                 "head_dim": head_dim,
                 "conv_kernel_size": conv_weights.shape[-1],
                 "recurrent_layout": recurrent_layout,
+                "staged_state": read_indices is write_indices,
             },
             solution=solution,
             override=override,
@@ -4548,6 +4587,7 @@ def kda_fused_paged_decode(
                     "head_dim": head_dim,
                     "conv_kernel_size": conv_weights.shape[-1],
                     "recurrent_layout": recurrent_layout,
+                    "staged_state": read_indices is write_indices,
                 },
                 solution=solution,
                 override=override,
@@ -4565,6 +4605,19 @@ def kda_fused_paged_decode(
             require_all_traits=True,
         )
     )
+
+    prepared_kwargs = {}
+    requires_prepared_weights = selected_spec is not None and spec_matches_traits(
+        selected_spec,
+        {"prepared_weights": True},
+        require_all_traits=True,
+    )
+    if requires_prepared_weights:
+        if prepared_weights is None:
+            raise RuntimeError(
+                f"selected KDA kernel {kernel.name!r} requires prepared weights"
+            )
+        prepared_kwargs["prepared_weights"] = prepared_weights
 
     out = kernel(
         mixed_qkv=mixed_qkv,
@@ -4585,6 +4638,7 @@ def kda_fused_paged_decode(
         output_gate=output_gate if output_norm_applied else None,
         norm_weight=norm_weight if output_norm_applied else None,
         norm_eps=norm_eps if output_norm_applied else None,
+        **prepared_kwargs,
     )
     return KdaFusedDecodeResult(out=out, output_norm_applied=output_norm_applied)
 
@@ -4983,9 +5037,11 @@ __all__ = [
     "gdn_replay_commit_supported",
     "KdaPrefillResult",
     "KdaFusedDecodeResult",
+    "kda_conv_state_layout",
     "kda_recurrent_layout",
     "kda_paged_prefill",
     "kda_paged_decode",
+    "prepare_kda_fused_decode_weights",
     "kda_fused_paged_decode",
     "kda_fused_paged_verify",
     "kda_replay_commit",
