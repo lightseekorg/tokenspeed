@@ -97,6 +97,12 @@ env:
     --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[decode-explicit-bm128]
     --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[prefill-default]
 
+    # The rest of this file now passes, but building the batched descriptor
+    # still hangs the emulator on its pageable host-to-device copy, so the fix
+    # for ROCm/rocm-systems#10771 does not cover this case. A hang wedges its
+    # worker for the whole run, so keep every parametrisation deselected.
+    --deselect=tokenspeed-kernel/test/ops/attention/test_kda_replay_commit.py::test_batched_replay_checkpoint_boundary_matches_layer_loop
+
     # rocJITsu aborts on v_dual_cndmask_b32 with a vcc_hi selector:
     # https://github.com/ROCm/rocm-systems/issues/10793
     --deselect=tokenspeed-kernel/test/ops/test_conv.py::test_prefill_checkpoint_taps_and_fp8
