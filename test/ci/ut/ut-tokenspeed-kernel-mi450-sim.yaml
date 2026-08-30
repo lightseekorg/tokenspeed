@@ -20,14 +20,23 @@ env:
     --deselect=tokenspeed-kernel/test/ops/test_iris_communication.py::test_iris_allreduce_residual_rmsnorm_world1[per_row]
     --deselect=tokenspeed-kernel/test/ops/test_iris_communication.py::test_iris_allreduce_residual_rmsnorm_world1[persistent]
 
-    # These tests exceed the rocJITsu CI budget before producing a result.
+    # These tests cost more than the lane can afford. Six emulators saturate the
+    # runner, so the cheapest seven of these, each about 80s on its own, still
+    # doubled the lane's wall time to 42 minutes against its 45 minute cap.
     --deselect=tokenspeed-kernel/test/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_accepts_glm52_bf16_split_weights
     --deselect=tokenspeed-kernel/test/ops/test_attention.py::test_mha_prefill_lse
     --deselect=tokenspeed-kernel/test/ops/test_attention_gdn.py::test_gdn_chunk_prefill_triton_matches_torch_reference
     --deselect=tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_prefill
+    --deselect=tokenspeed-kernel/test/ops/test_conv.py::test_sconv_decode[300-2048]
     --deselect=tokenspeed-kernel/test/ops/test_conv.py::test_sconv_decode[300-6144]
     --deselect=tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_fused_paged_decode_matches_reference[32-32]
     --deselect=tokenspeed-kernel/test/ops/test_qwen4_exp_qsa.py::test_qwen4_exp_qsa_block_topk_logits_matches_stream
+    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_matches_torch_for_kernel_shapes[128-151936]
+    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_matches_torch_for_kernel_shapes[128-163840]
+    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_matches_torch_for_kernel_shapes[128-200064]
+    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_matches_torch_for_kernel_shapes[128-201088]
+    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_matches_torch_for_kernel_shapes[199-151936]
+    --deselect=tokenspeed-kernel/test/ops/test_sampling_cute_dsl.py::test_argmax_under_cuda_graph[64-201088]
 
     # The persistent GLM-5.2 cases no longer hit the torch.flip corruption of
     # https://github.com/ROCm/rocm-systems/issues/10757, but every element of
