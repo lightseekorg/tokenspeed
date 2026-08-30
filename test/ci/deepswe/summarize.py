@@ -27,9 +27,7 @@ def _reward_score(data: dict[str, Any]) -> float | None:
     return sum(rewards) / len(rewards) if rewards else None
 
 
-def build_summary(
-    data: dict[str, Any], minimum_score: float
-) -> tuple[str, list[str]]:
+def build_summary(data: dict[str, Any], minimum_score: float) -> tuple[str, list[str]]:
     stats = data.get("stats", {})
     total = int(data.get("n_total_trials", 0))
     completed = int(stats.get("n_completed_trials", 0))
@@ -43,16 +41,20 @@ def build_summary(
         f"- Trials completed: {completed}/{total}",
         f"- Trial errors: {errors}",
         f"- Cancelled trials: {cancelled}",
-        f"- Binary reward: {score:.4f}" if score is not None else "- Binary reward: unavailable",
+        (
+            f"- Binary reward: {score:.4f}"
+            if score is not None
+            else "- Binary reward: unavailable"
+        ),
         f"- Minimum score: {minimum_score:.4f}",
     ]
 
     exception_counts: dict[str, int] = {}
     for eval_stats in stats.get("evals", {}).values():
         for exception_type, trials in eval_stats.get("exception_stats", {}).items():
-            exception_counts[exception_type] = exception_counts.get(exception_type, 0) + len(
-                trials
-            )
+            exception_counts[exception_type] = exception_counts.get(
+                exception_type, 0
+            ) + len(trials)
     if exception_counts:
         lines.extend(["", "#### Exceptions", ""])
         lines.extend(
