@@ -17,6 +17,7 @@ server:
   command: >-
     ts serve ${KIMI_K3_MODEL_ROOT}/snapshots/${KIMI_K3_MODEL_REVISION}
     --served-model-name kimi-k3
+    --trust-remote-code
     --attn-tp-size 8
     --ep-size 8
     --attention-backend tokenspeed_mla
