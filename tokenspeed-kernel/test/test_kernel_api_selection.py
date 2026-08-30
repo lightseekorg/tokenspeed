@@ -74,7 +74,7 @@ import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
 import torch
-from tokenspeed_kernel.ops.attention import GdnChunkPrefillResult
+from tokenspeed_kernel.ops.attention import GdnChunkPrefillResult, KdaPrefillResult
 from tokenspeed_kernel.ops.attention.triton import dsa as _attention_triton_dsa
 from tokenspeed_kernel.ops.attention.triton import (
     dsa_topk as _attention_triton_dsa_topk,
@@ -146,7 +146,8 @@ _RELOAD_MODULES = [
     _attention_triton_dsa_topk,
     _attention_triton_gdn,
     _attention_triton,
-    _attention_pkg,
+    # The facade owns public result classes imported by other test modules.
+    # Reloading it would replace those class objects and break isinstance checks.
     # GEMM registration modules.
     _gemm_reference,
     _gemm_cuda,
@@ -203,6 +204,11 @@ def _kernel_registry(fresh_registry):
     """Reload real registrations into the fresh registry for each case."""
     for mod in _RELOAD_MODULES:
         importlib.reload(mod)
+
+
+def test_attention_result_type_identity_is_stable():
+    assert _attention_pkg.GdnChunkPrefillResult is GdnChunkPrefillResult
+    assert _attention_pkg.KdaPrefillResult is KdaPrefillResult
 
 
 def test_builtin_moe_preprocessor_links_are_callables():
