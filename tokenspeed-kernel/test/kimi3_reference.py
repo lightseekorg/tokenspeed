@@ -141,11 +141,15 @@ def _mxfp4_linear(
     x: torch.Tensor,
     packed_weight: torch.Tensor,
     scales: torch.Tensor,
+    *,
+    activation_dtype: torch.dtype,
+    output_dtype: torch.dtype,
 ) -> torch.Tensor:
-    return F.linear(x.float(), dequantize_mxfp4(packed_weight, scales)).to(x.dtype)
+    x = x.to(activation_dtype).float()
+    return F.linear(x, dequantize_mxfp4(packed_weight, scales)).to(output_dtype)
 
 
-def a16w4_mxfp4_moe_reference(
+def mxfp4_moe_reference(
     hidden_states: torch.Tensor,
     w13_packed: torch.Tensor,
     w13_scales: torch.Tensor,
@@ -154,10 +158,11 @@ def a16w4_mxfp4_moe_reference(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     *,
+    activation_dtype: torch.dtype,
     situ_beta: float = 1.0,
     situ_linear_beta: float | None = None,
 ) -> torch.Tensor:
-    """A16W4 routed experts with BF16 boundaries around FP32 SiTU."""
+    """Routed MXFP4 experts with explicit activation-quantization boundaries."""
 
     combined = torch.zeros_like(hidden_states, dtype=torch.float32)
     for expert_id in range(w13_packed.shape[0]):
@@ -169,6 +174,8 @@ def a16w4_mxfp4_moe_reference(
             hidden_states.index_select(0, token_ids),
             w13_packed[expert_id],
             w13_scales[expert_id],
+            activation_dtype=activation_dtype,
+            output_dtype=hidden_states.dtype,
         )
         output = _mxfp4_linear(
             situ_and_mul(
@@ -178,6 +185,8 @@ def a16w4_mxfp4_moe_reference(
             ),
             w2_packed[expert_id],
             w2_scales[expert_id],
+            activation_dtype=activation_dtype,
+            output_dtype=hidden_states.dtype,
         )
         route_weights = topk_weights[token_ids, slot_ids].float().unsqueeze(-1)
         combined.index_add_(0, token_ids, output.float() * route_weights)
