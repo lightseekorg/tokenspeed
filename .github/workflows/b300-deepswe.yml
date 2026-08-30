@@ -98,6 +98,8 @@ jobs:
       DEEPSWE_CONCURRENCY: ${{ inputs.concurrency }}
       DEEPSWE_SAMPLE_SEED: ${{ inputs.sample_seed }}
       DEEPSWE_MINIMUM_SCORE: ${{ inputs.minimum_score }}
+      KIMI_K3_MODEL_ROOT: /raid/cache/huggingface/hub/models--moonshotai--Kimi-K3
+      KIMI_K3_MODEL_REVISION: a590ce090cb049c93a33dfe8c208ec652aa20503
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -111,7 +113,14 @@ jobs:
           docker info >/dev/null
           docker compose version
           test -S /var/run/docker.sock
-          test -d /raid/cache/jue/kimi-k3-flat2
+          model_path="$KIMI_K3_MODEL_ROOT/snapshots/$KIMI_K3_MODEL_REVISION"
+          test "$(cat "$KIMI_K3_MODEL_ROOT/refs/main")" = "$KIMI_K3_MODEL_REVISION"
+          test -r "$model_path/config.json"
+          test -r "$model_path/model.safetensors.index.json"
+          if find -L "$model_path" -maxdepth 1 -type l -print -quit | grep -q .; then
+            echo "Kimi K3 snapshot contains broken symbolic links" >&2
+            exit 1
+          fi
           test -n "${POD_IP:-}"
           gpu_memory=$(nvidia-smi \
             --query-gpu=index,memory.used \

@@ -9,11 +9,13 @@ runner:
     - b300deepswe-8gpu
 env:
   CI: "true"
+  KIMI_K3_MODEL_ROOT: /raid/cache/huggingface/hub/models--moonshotai--Kimi-K3
+  KIMI_K3_MODEL_REVISION: a590ce090cb049c93a33dfe8c208ec652aa20503
 install:
   - bash test/ci_system/install_deps.sh
 server:
   command: >-
-    ts serve /raid/cache/jue/kimi-k3-flat2
+    ts serve ${KIMI_K3_MODEL_ROOT}/snapshots/${KIMI_K3_MODEL_REVISION}
     --served-model-name kimi-k3
     --attn-tp-size 8
     --ep-size 8
