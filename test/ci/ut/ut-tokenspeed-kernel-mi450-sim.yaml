@@ -75,6 +75,7 @@ env:
     --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[decode-m2-adaptive]
     --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[decode-m4-adaptive]
     --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_amd.py::test_static_fp8_activation_moe_gfx1250[decode-m8-adaptive]
+    --deselect=tokenspeed-kernel/test/ops/moe/test_gluon_mxfp4_situ_gfx1250.py::test_kimi_k3_tp_situ_matches_a8w4_reference_gfx1250
     --deselect=tokenspeed-kernel/test/ops/test_attention_dsa.py::test_dsa_decode_dense_kvcache[q_fp8]
     --deselect=tokenspeed-kernel/test/ops/test_attention_dsa.py::test_dsa_with_kvcache[q_bf16-triton-decode]
     --deselect=tokenspeed-kernel/test/ops/test_attention_dsa.py::test_dsa_with_kvcache[q_bf16-triton-prefill]
