@@ -11,7 +11,7 @@ env:
   CI: "true"
   HF_HUB_CACHE: /raid/cache/huggingface/hub
   HF_HUB_OFFLINE: "1"
-  HF_MODULES_CACHE: /cache/huggingface/modules
+  HF_MODULES_CACHE: /tmp/huggingface/modules
   KIMI_K3_MODEL_ROOT: /raid/cache/huggingface/hub/models--moonshotai--Kimi-K3
   KIMI_K3_MODEL_REVISION: a590ce090cb049c93a33dfe8c208ec652aa20503
 install:
