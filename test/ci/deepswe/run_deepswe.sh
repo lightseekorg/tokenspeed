@@ -29,7 +29,7 @@ minimum_score=${DEEPSWE_MINIMUM_SCORE:-0.0}
 
 docker info >/dev/null
 docker compose version
-curl -fsS --max-time 10 "http://${POD_IP}:8000/readiness" >/dev/null
+curl -fsS --max-time 10 "http://${POD_IP}/readiness" >/dev/null
 
 artifact_dir=${PWD}/.ci-artifacts/deepswe
 jobs_dir=${artifact_dir}/jobs
@@ -46,7 +46,7 @@ pier run \
   --agent-import-path kimi_code_agent:KimiCodeAgent \
   --model kimi/kimi-k3 \
   --agent-kwarg "version=${KIMI_CODE_VERSION}" \
-  --agent-env "KIMI_MODEL_BASE_URL=http://${POD_IP}:8000/v1" \
+  --agent-env "KIMI_MODEL_BASE_URL=http://${POD_IP}/v1" \
   --agent-env KIMI_MODEL_API_KEY=EMPTY_TOKEN \
   --agent-env KIMI_MODEL_PROVIDER_TYPE=kimi \
   --agent-env KIMI_MODEL_MAX_CONTEXT_SIZE=80000 \
