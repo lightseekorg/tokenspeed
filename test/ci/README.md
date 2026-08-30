@@ -377,6 +377,11 @@ collected report directory as an artifact. It excludes long-running MMLU tasks
 by default; explicitly enable `include_mmlu` in the manual workflow inputs when
 that coverage is required.
 
+The optional `container_image` input overrides the trusted dispatcher's default
+for validating a new runner image before it becomes the default. It accepts
+only digest-pinned `ghcr.io/lightseekorg/tokenspeed-runner` images; mutable tags
+and images from other registries or organizations are rejected.
+
 The `yaml` input is `off` by default. Select one listed B200/GB200 CI YAML to
 run that YAML independently of the bulk runner, type, match, trigger, and MMLU
 filters. Every B200 or GB200 runner label declared by the selected YAML is

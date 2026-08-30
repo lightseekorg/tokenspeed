@@ -8,6 +8,11 @@ on:
         required: false
         default: ""
         type: string
+      container_image:
+        description: "Optional immutable ghcr.io/lightseekorg/tokenspeed-runner image override"
+        required: false
+        default: ""
+        type: string
       cluster:
         description: "Slurm cluster"
         required: true
@@ -91,7 +96,7 @@ on:
           - slurm
 
 concurrency:
-  group: slurm-dispatch-${{ inputs.cluster }}-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}
+  group: slurm-dispatch-${{ inputs.cluster }}-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}-${{ inputs.container_image || 'default-image' }}
   cancel-in-progress: false
 
 jobs:
@@ -114,6 +119,7 @@ jobs:
       - name: Submit and wait for Slurm tasks
         env:
           PR: ${{ inputs.pr }}
+          CONTAINER_IMAGE: ${{ inputs.container_image }}
           CLUSTER: ${{ inputs.cluster }}
           YAML_SELECTION: ${{ inputs.yaml }}
           RUNNERS: ${{ inputs.runners }}
@@ -123,6 +129,13 @@ jobs:
           TRIGGER: ${{ inputs.trigger }}
         run: |
           set -euo pipefail
+          if [ -n "$CONTAINER_IMAGE" ]; then
+            [[ "$CONTAINER_IMAGE" =~ ^ghcr\.io/lightseekorg/tokenspeed-runner:[A-Za-z0-9_][A-Za-z0-9._-]{0,127}@sha256:[0-9a-f]{64}$ ]] || {
+              echo "container_image must be an immutable ghcr.io/lightseekorg/tokenspeed-runner image" >&2
+              exit 2
+            }
+            export TS_CI_CONTAINER_IMAGE="$CONTAINER_IMAGE"
+          fi
           args=(--wait --report-dir "$RUNNER_TEMP/slurm-report")
           [ -z "$PR" ] || args+=(--pr "$PR")
 

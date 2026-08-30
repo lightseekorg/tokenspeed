@@ -39,8 +39,10 @@ that order. The csrc tree compiles cleanly against flashinfer's CUTLASS
 
 ## Runtime requirements and behavior
 
-- SM100 (Blackwell) only; `nvidia-cutlass-dsl==4.6.0` and
-  `quack-kernels==0.6.1` (both in `requirements/cuda-thirdparty.txt`).
+- SM100 (Blackwell) only; `nvidia-cutlass-dsl>=4.6.0`.
+- The `quack` import namespace is installed by
+  `tokenspeed-fa4==4.0.0.post20260829` through its
+  `tokenspeed-quack>=0.6.4` dependency.
 - Importing `.sparse` performs the upstream `sys.path.insert` of the
   `cute/` directory, exposing its top-level module names (`interface`,
   `src`, `quantize`, `sparse_index_utils`, `fp4_indexer_interface`)
