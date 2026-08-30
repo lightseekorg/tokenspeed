@@ -1,0 +1,148 @@
+name: B300 DeepSWE
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Optional same-repository pull request number or URL; blank runs latest main"
+        required: false
+        default: ""
+        type: string
+      task_count:
+        description: "Deterministic DeepSWE task count"
+        required: true
+        default: "10"
+        type: choice
+        options:
+          - "1"
+          - "10"
+          - "113"
+      concurrency:
+        description: "Concurrent Pier trials"
+        required: true
+        default: "4"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "4"
+          - "8"
+      sample_seed:
+        description: "Deterministic task sampling seed"
+        required: true
+        default: "0"
+        type: string
+      minimum_score:
+        description: "Optional binary reward gate from 0 to 1"
+        required: true
+        default: "0.0"
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: b300-deepswe-${{ inputs.pr || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  source:
+    if: github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Resolve trusted source
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PR" ]; then
+            sha=$(gh api "repos/${{ github.repository }}/commits/main" --jq .sha)
+            link="https://github.com/${{ github.repository }}/commit/$sha"
+          else
+            number=${PR##*/}
+            [[ "$number" =~ ^[0-9]+$ ]] || {
+              echo "Invalid pull request: $PR" >&2
+              exit 2
+            }
+            data=$(gh api "repos/${{ github.repository }}/pulls/$number")
+            head_repo=$(jq -r .head.repo.full_name <<< "$data")
+            [ "$head_repo" = "${{ github.repository }}" ] || {
+              echo "Fork pull requests cannot run on the Docker-enabled B300 runner" >&2
+              exit 2
+            }
+            sha=$(jq -r .head.sha <<< "$data")
+            link=$(jq -r .html_url <<< "$data")
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "### B300 DeepSWE source"
+            echo
+            echo "- Source: [$link]($link)"
+            echo "- Commit: \`$sha\`"
+            echo "- Tasks: ${{ inputs.task_count }} (seed ${{ inputs.sample_seed }})"
+            echo "- Pier concurrency: ${{ inputs.concurrency }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  run:
+    needs: source
+    runs-on: b300deepswe-8gpu
+    timeout-minutes: 1440
+    env:
+      PIP_BREAK_SYSTEM_PACKAGES: "1"
+      DEEPSWE_TASK_COUNT: ${{ inputs.task_count }}
+      DEEPSWE_CONCURRENCY: ${{ inputs.concurrency }}
+      DEEPSWE_SAMPLE_SEED: ${{ inputs.sample_seed }}
+      DEEPSWE_MINIMUM_SCORE: ${{ inputs.minimum_score }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+          persist-credentials: false
+
+      - name: Verify B300 DeepSWE runner
+        run: |
+          set -euo pipefail
+          docker info >/dev/null
+          docker compose version
+          test -S /var/run/docker.sock
+          test -d /raid/cache/jue/kimi-k3-flat2
+          test -n "${POD_IP:-}"
+          gpu_memory=$(nvidia-smi \
+            --query-gpu=index,memory.used \
+            --format=csv,noheader,nounits)
+          if awk -F, '
+            { gsub(/[[:space:]]/, "", $2); if ($2 + 0 > 1024) busy = 1 }
+            END { exit busy ? 0 : 1 }
+          ' <<< "$gpu_memory"; then
+            echo "B300 has more than 1 GiB allocated on at least one GPU:" >&2
+            echo "$gpu_memory" >&2
+            exit 1
+          fi
+
+      - name: Install pipeline dependency
+        run: python3 -m pip install pyyaml
+
+      - name: Run Kimi K3 DeepSWE
+        run: |
+          mkdir -p .ci-artifacts
+          python3 test/ci_system/pipeline.py execute \
+            --config test/ci/eval/kimi-k3-deepswe-b300.yaml \
+            --runner b300deepswe-8gpu \
+            --work-dir "$GITHUB_WORKSPACE" \
+            --print-plan \
+            --result-json .ci-artifacts/pipeline-result.json
+
+      - name: Upload DeepSWE results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: b300-kimi-k3-deepswe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-artifacts/
+          include-hidden-files: true
+          if-no-files-found: warn

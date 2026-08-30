@@ -1,0 +1,53 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-kimi-k3-deepswe-b300
+type: eval
+workflow_stage: model-test
+triggers:
+  - manual
+runner:
+  labels:
+    - b300deepswe-8gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    ts serve /raid/cache/jue/kimi-k3-flat2
+    --served-model-name kimi-k3
+    --attn-tp-size 8
+    --ep-size 8
+    --attention-backend tokenspeed_mla
+    --kda-backend cutedsl_kda
+    --moe-backend flashinfer_trtllm
+    --kv-cache-dtype fp8
+    --mm-encoder-tp-mode data
+    --max-model-len 80000
+    --max-num-seqs 64
+    --max-cudagraph-capture-size 64
+    --cudagraph-capture-sizes 1 2 4 8 16 32 64
+    --max-prefill-tokens 32768
+    --chunked-prefill-size 32768
+    --gpu-memory-utilization 0.90
+    --disable-kvstore
+    --disable-autotune
+    --enable-allreduce-fusion
+    --enable-cache-report
+    --enable-log-request-stats
+    --enable-metrics
+    --reasoning-parser kimi_k3
+    --host 0.0.0.0
+    --port 80
+    --policy round_robin
+    --engine-startup-timeout 3000
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:80/readiness
+    timeout: 3600
+    interval: 10
+eval:
+  install:
+    - python3 -m pip install 'datacurve-pier==0.3.1'
+  command: bash test/ci/deepswe/run_deepswe.sh
+report:
+  github_step_summary: true
