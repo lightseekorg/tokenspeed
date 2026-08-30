@@ -45,12 +45,12 @@ server:
     --enable-metrics
     --reasoning-parser kimi_k3
     --host 0.0.0.0
-    --port 80
+    --port 8000
     --policy round_robin
     --engine-startup-timeout 3000
     --gateway-startup-timeout 600
   ready:
-    url: http://127.0.0.1:80/readiness
+    url: http://127.0.0.1:8000/readiness
     timeout: 3600
     interval: 10
 eval:
