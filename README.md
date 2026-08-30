@@ -14,7 +14,7 @@ Core components:
   finite-state machine, with safe KV resource reuse enforced by the type system at compile time.
 - **Kernels**: pluggable, layered kernel system with a portable public API and
   a centralized registry including one of the fastest **MLA**
-  (Multi-head Latent Attention) implementations on Blackwell for agentic workload.
+  (Multi-head Latent Attention) implementations on Blackwell for agentic workloads.
 - **Entrypoint**: SMG-integrated AsyncLLM for low-overhead CPU-side request
   handling.
 
@@ -47,7 +47,17 @@ LightSeek's work is advanced by the support of [sponsors and partners](https://l
 
 ## Performance Comparison
 
-<img src="https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/assets/perf/tokenspeed-kimi-k2.5-performance.png" alt="TokenSpeed vs. TensorRT-LLM Pareto curves on agentic workload (Kimi K2.5, B200)" width="800" margin="10px"></img>
+<p align="center">
+  <img
+    src="https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/assets/perf/tokenspeed-kimi-k2.5-performance.png"
+    alt="TokenSpeed vs. TensorRT-LLM Pareto curves on agentic workloads (Kimi K2.5, B200)"
+    width="800"
+  />
+</p>
+
+<p align="center">
+  <em>TokenSpeed vs. TensorRT-LLM Pareto curves on agentic workloads (Kimi K2.5, B200)</em>
+</p>
 
 ## Documentation
 
