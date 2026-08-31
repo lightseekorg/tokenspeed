@@ -88,7 +88,7 @@ class KimiCodeAgent(BaseInstalledAgent):
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if event.get("role") == "assistant":
+            if isinstance(event, dict) and event.get("role") == "assistant":
                 steps += 1
         context.n_agent_steps = steps or None
 
