@@ -270,7 +270,7 @@ def _decode_topk(
     return out
 
 
-def _dsv4_indexer_prefill_topk(
+def _dsv4_prefill_topk(
     index_q: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
@@ -335,7 +335,7 @@ def _dsv4_indexer_prefill_topk(
     return _prefill_topk(logits, seq_lens, topk, result), gathered_k
 
 
-def _dsv4_indexer_decode_topk(
+def _dsv4_decode_topk(
     index_q: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
@@ -427,14 +427,14 @@ def _register(format_name: str, min_arch: ArchVersion) -> None:
     )
     register_kernel(
         "attention",
-        "dsv4_indexer_prefill_topk",
-        name=f"deep_gemm_dsv4_{format_name}_indexer_prefill_topk",
+        "dsv4_prefill_topk",
+        name=f"deep_gemm_dsv4_{format_name}_prefill_topk",
         **common,
-    )(_dsv4_indexer_prefill_topk)
+    )(_dsv4_prefill_topk)
     register_kernel(
         "attention",
-        "dsv4_indexer_decode_topk",
-        name=f"deep_gemm_dsv4_{format_name}_indexer_decode_topk",
+        "dsv4_decode_topk",
+        name=f"deep_gemm_dsv4_{format_name}_decode_topk",
         **{
             **common,
             "traits": {
@@ -442,7 +442,7 @@ def _register(format_name: str, min_arch: ArchVersion) -> None:
                 "topk": frozenset({512, 1024, 2048}),
             },
         },
-    )(_dsv4_indexer_decode_topk)
+    )(_dsv4_decode_topk)
 
 
 _register("fp8_scaled", ArchVersion(9, 0))

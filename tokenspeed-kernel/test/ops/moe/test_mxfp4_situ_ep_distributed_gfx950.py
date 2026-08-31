@@ -34,7 +34,7 @@ import tokenspeed_kernel
 import torch
 import torch.distributed as dist
 from kimi3_reference import (
-    a16w4_mxfp4_moe_reference,
+    mxfp4_moe_reference,
 )
 from utils import make_mxfp4_moe_weights
 
@@ -122,7 +122,7 @@ def test_distributed_ep_partial_sum_matches_global_reference() -> None:
     )
     dist.all_reduce(partial, op=dist.ReduceOp.SUM)
 
-    expected = a16w4_mxfp4_moe_reference(
+    expected = mxfp4_moe_reference(
         hidden_states,
         w13,
         s13,
@@ -130,6 +130,7 @@ def test_distributed_ep_partial_sum_matches_global_reference() -> None:
         s2,
         topk_ids,
         topk_weights,
+        activation_dtype=torch.bfloat16,
         situ_beta=4.0,
         situ_linear_beta=25.0,
     )

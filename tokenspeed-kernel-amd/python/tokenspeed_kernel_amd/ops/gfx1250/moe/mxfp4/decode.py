@@ -25,6 +25,7 @@ from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
     MoEConfig,
     MoEPipelinedProgram,
+    _situ_gfx1250,
     _swiglu_gfx1250,
     compute_offsets,
     compute_pids,
@@ -90,6 +91,9 @@ def _matmul_decode(
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
     SWIGLU_BETA: gl.constexpr,
+    DO_SITU: gl.constexpr,
+    SITU_BETA: gl.constexpr,
+    SITU_LINEAR_BETA: gl.constexpr,
     ACTIVATION_REDUCTION_N: gl.constexpr,
     # MoE config
     N_EXPTS_TOT: gl.constexpr,
@@ -299,7 +303,17 @@ def _matmul_decode(
     bias = gl.convert_layout(bias, gl.SliceLayout(0, cfg.acc_layout))
     acc += bias[None, :]
 
-    if DO_SWIGLU:
+    gl.static_assert(
+        not (DO_SWIGLU and DO_SITU),
+        "SwiGLU and SiTU cannot both be enabled",
+    )
+    if DO_SITU:
+        out = _situ_gfx1250(acc, SITU_BETA, SITU_LINEAR_BETA)
+        gl.static_assert(
+            out.shape[1] == OUT_BLOCK_N,
+            f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
+        )
+    elif DO_SWIGLU:
         out = _swiglu_gfx1250(acc, SWIGLU_ALPHA, SWIGLU_LIMIT, SWIGLU_BETA)
         gl.static_assert(
             out.shape[1] == OUT_BLOCK_N,

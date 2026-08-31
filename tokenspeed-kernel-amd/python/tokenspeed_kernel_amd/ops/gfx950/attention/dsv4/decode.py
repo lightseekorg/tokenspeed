@@ -28,7 +28,7 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl
 
 __all__ = [
-    "gluon_dsv4_paged_selected_attention_split_gfx950",
+    "gluon_dsv4_decode_split_gfx950",
 ]
 
 
@@ -630,7 +630,7 @@ def _validate_paged_attention_inputs(
     return output, has_extra, scale
 
 
-def gluon_dsv4_paged_selected_attention_split_gfx950(
+def gluon_dsv4_decode_split_gfx950(
     q: torch.Tensor,
     swa_kv_cache: torch.Tensor,
     swa_slots: torch.Tensor,

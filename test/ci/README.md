@@ -259,6 +259,29 @@ nvidia--Kimi-K3-NVFP4/f8c5234a0a880bcc6cbf779a315e7ee2f405b812
 Inferact--Kimi-K3-DSpark/cf6b8244620e7ea4b0651d214f28e89eac75bed6
 ```
 
+### B300 DeepSWE
+
+`B300 DeepSWE` is a manual, single-node 8-GPU workflow for Kimi K3. It starts
+the local `/raid/cache/jue/kimi-k3-flat2` checkpoint, then runs Kimi Code
+0.23.6 inside the pinned DeepSWE v1.1 Docker tasks through Pier 0.3.1. The
+default smoke run selects the same deterministic 10-task subset (`seed=0`);
+the workflow also exposes one-task bring-up and the full 113-task corpus.
+
+The repository-scoped `b300deepswe-8gpu` runner is isolated from the normal
+B300 pools and mounts the host Docker socket. The workflow definition is loaded
+only from `main` and rejects fork pull requests. An optional pull request input
+may select code only from a branch in this repository. Keep the workflow manual
+unless the runner is moved behind an approval environment.
+The preflight fails if an out-of-cluster Docker workload is already using the
+GPUs, because Kubernetes cannot account for those allocations.
+
+Pier's restricted egress proxy permits the agent to reach only the runner Pod
+IP on HTTP port 80. Kimi Code receives the local Tokenspeed endpoint through
+`KIMI_MODEL_*`; task containers retain DeepSWE's `no-network` policy. The
+workflow fails on incomplete/error trials and optionally on a binary-reward
+minimum. The default minimum is zero because a 10-task sample is not a stable
+regression threshold.
+
 The `Slurm Dispatch` workflow exposes a `cluster` input. `gb200` keeps the
 existing `slurm-dispatch` coordinator and runner defaults. Selecting `gb300`
 with every other input left at its default keeps the same logical B200/GB200

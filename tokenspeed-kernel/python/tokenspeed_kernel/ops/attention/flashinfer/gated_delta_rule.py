@@ -43,7 +43,7 @@ Other prefill conventions (verified equal to bf16 on B200):
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.gdn_utils import (
+from tokenspeed_kernel.ops.attention import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
 )

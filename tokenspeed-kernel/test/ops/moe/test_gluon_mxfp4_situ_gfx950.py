@@ -23,7 +23,7 @@ from __future__ import annotations
 import pytest
 import torch
 from kimi3_reference import (
-    a16w4_mxfp4_moe_reference,
+    mxfp4_moe_reference,
 )
 from utils import is_cdna4, make_mxfp4_moe_weights, make_round_robin_topk
 
@@ -144,7 +144,7 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
     local_weights = torch.where(
         local_mask, topk_weights, torch.zeros_like(topk_weights)
     )
-    expected = a16w4_mxfp4_moe_reference(
+    expected = mxfp4_moe_reference(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -152,6 +152,7 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
         raw["w2_scale"],
         local_ids,
         local_weights,
+        activation_dtype=torch.bfloat16,
         situ_beta=4.0,
         situ_linear_beta=25.0,
     )
@@ -255,7 +256,7 @@ def test_gluon_grouped_a16w4_situ_matches_kimi_k3_shape_gfx950() -> None:
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
-    expected = a16w4_mxfp4_moe_reference(
+    expected = mxfp4_moe_reference(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -263,6 +264,7 @@ def test_gluon_grouped_a16w4_situ_matches_kimi_k3_shape_gfx950() -> None:
         raw["w2_scale"],
         topk_ids,
         topk_weights,
+        activation_dtype=torch.bfloat16,
         situ_beta=4.0,
         situ_linear_beta=25.0,
     )
@@ -323,7 +325,7 @@ def test_grouped_atomic_combine_matches_partial_reduction_gfx950(
     )
     atomic = run()
 
-    expected = a16w4_mxfp4_moe_reference(
+    expected = mxfp4_moe_reference(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -331,6 +333,7 @@ def test_grouped_atomic_combine_matches_partial_reduction_gfx950(
         raw["w2_scale"],
         topk_ids,
         topk_weights,
+        activation_dtype=torch.bfloat16,
         situ_beta=4.0,
         situ_linear_beta=25.0,
     )
@@ -442,7 +445,7 @@ def test_gluon_grouped_device_align_localizes_global_ep_routes_gfx950() -> None:
         topk_weights,
         torch.zeros_like(topk_weights),
     )
-    expected = a16w4_mxfp4_moe_reference(
+    expected = mxfp4_moe_reference(
         hidden_states,
         module.w13_weight,
         module.w13_weight_scale,
@@ -450,6 +453,7 @@ def test_gluon_grouped_device_align_localizes_global_ep_routes_gfx950() -> None:
         module.w2_weight_scale,
         local_ids,
         local_weights,
+        activation_dtype=torch.bfloat16,
         situ_beta=4.0,
         situ_linear_beta=25.0,
     )
@@ -518,7 +522,7 @@ def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
         )
     actual = torch.stack([partial.float() for partial in partials]).sum(0)
     actual = actual.to(torch.bfloat16)
-    expected = a16w4_mxfp4_moe_reference(
+    expected = mxfp4_moe_reference(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -526,6 +530,7 @@ def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
         raw["w2_scale"],
         topk_ids,
         topk_weights,
+        activation_dtype=torch.bfloat16,
         situ_beta=4.0,
         situ_linear_beta=25.0,
     )
@@ -672,7 +677,7 @@ def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
-    expected = a16w4_mxfp4_moe_reference(
+    expected = mxfp4_moe_reference(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -680,6 +685,7 @@ def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
         raw["w2_scale"],
         topk_ids,
         topk_weights,
+        activation_dtype=torch.bfloat16,
         situ_beta=4.0,
         situ_linear_beta=25.0,
     )
