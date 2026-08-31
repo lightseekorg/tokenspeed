@@ -18,15 +18,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import tokenspeed_kernel.ops.moe.flashinfer.cutedsl_deepep_nvfp4  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.cutlass_fp8  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.cutlass_nvfp4  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.cutlass_unquant  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.trtllm_fp8  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxint4  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.w4a8  # noqa: F401
+"""INT4 group-128 pack-quantized MoE weights for compressed-tensors W4A8.
 
-__all__ = []
+Checkpoint layout matches the mxint4 path (``weight_packed`` int32 + per-group
+``weight_scale``), so the buffers are the same; only ``group_size`` differs
+(128 vs 32). The Hopper apply kernel repacks them into CUTLASS nibbles.
+"""
+
+from __future__ import annotations
+
+from tokenspeed.runtime.layers.moe.weights.mxint4 import create_mxint4_weight_pair
+
+create_w4a8_weight_pair = create_mxint4_weight_pair
+
+__all__ = ["create_w4a8_weight_pair"]

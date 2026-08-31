@@ -29,7 +29,6 @@ from collections.abc import Callable
 
 import torch
 from compressed_tensors.quantization import ActivationOrdering
-from tokenspeed_kernel.ops.quantization.cuda import gptq_marlin_repack
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -244,6 +243,8 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
                 )
 
         def transform_w_q(x):
+            from tokenspeed_kernel.ops.quantization.cuda import gptq_marlin_repack
+
             assert isinstance(x, BaseWeightParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
             x.data = gptq_marlin_repack(

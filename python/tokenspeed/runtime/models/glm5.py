@@ -1365,7 +1365,7 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
             )
             return
 
-        if "weight_scale_inv" in name:
+        if "weight_scale_inv" in name or name.endswith(".weight_scale"):
             pending_fp8_wk.setdefault(module_name, {})["scale"] = loaded_weight
             self._flush_fused_indexer_fp8_wk(
                 module_name=module_name,

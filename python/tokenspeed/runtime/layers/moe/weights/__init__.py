@@ -28,6 +28,7 @@ from tokenspeed.runtime.layers.moe.weights.mxfp4 import (
 from tokenspeed.runtime.layers.moe.weights.mxint4 import create_mxint4_weight_pair
 from tokenspeed.runtime.layers.moe.weights.nvfp4 import create_nvfp4_weight_pair
 from tokenspeed.runtime.layers.moe.weights.unquant import create_dense_weight_pair
+from tokenspeed.runtime.layers.moe.weights.w4a8 import create_w4a8_weight_pair
 
 
 def create_layer_weights(
@@ -83,6 +84,14 @@ def create_layer_weights(
             spec,
             layer,
             group_size=weight_quant.group_size,
+        )
+        return
+
+    if quant_kind == "w4a8":
+        create_w4a8_weight_pair(
+            spec,
+            layer,
+            group_size=quant_config.moe_group_size(spec.prefix),
         )
         return
 

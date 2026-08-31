@@ -211,6 +211,8 @@ class MoELayer(torch.nn.Module):
                 internal_activation_dtype = "fp8"
             elif getattr(self.quant_config, "use_dynamic_mxfp4_activations", False):
                 internal_activation_dtype = "mxfp4"
+        if self._quant_kind == "w4a8":
+            internal_activation_dtype = "fp8"
         if self._internal_activation_dtype_override is not None:
             internal_activation_dtype = self._internal_activation_dtype_override
 

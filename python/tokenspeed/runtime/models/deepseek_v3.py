@@ -1723,6 +1723,17 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
             if name in params_dict:
                 return params_dict[name]
 
+        # compressed-tensors block-FP8 stores ``weight_scale``; TokenSpeed's
+        # Fp8LinearMethod registers the same tensor as ``weight_scale_inv``.
+        if name.endswith(".weight_scale"):
+            alias = name[: -len(".weight_scale")] + ".weight_scale_inv"
+            if alias in params_dict:
+                return params_dict[alias]
+            if "language_model." in alias:
+                alias = alias.replace("language_model.", "")
+                if alias in params_dict:
+                    return params_dict[alias]
+
         if name.endswith(_OPTIONAL_MISSING_WEIGHT_SUFFIXES):
             return None
 
@@ -1849,7 +1860,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
                         )
                         weight_loader = param.weight_loader
                         begin_size = begin_size_mp["kv_a_proj_with_mqa"]
-                    if "scale_inv" in name:
+                    if "scale_inv" in name or name.endswith(".weight_scale"):
                         begin_size //= quant_block_size
                     weight_loader(param, loaded_weight, begin_size=begin_size)
                 else:

@@ -27,7 +27,11 @@ def is_activation_quantization_format(format: str) -> bool:
         CompressionFormat.naive_quantized.value,
         CompressionFormat.int_quantized.value,
         CompressionFormat.float_quantized.value,
+        CompressionFormat.pack_quantized.value,
     ]
+    nvfp4 = getattr(CompressionFormat, "nvfp4_pack_quantized", None)
+    if nvfp4 is not None:
+        _ACTIVATION_QUANTIZATION_FORMATS.append(nvfp4.value)
     return format in _ACTIVATION_QUANTIZATION_FORMATS
 
 
