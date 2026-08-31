@@ -42,7 +42,10 @@ from tokenspeed_kernel.ops.attention.triton.mla_write_locations import (
     mla_write_locations,
 )
 
-from tokenspeed.runtime.layers.attention.page_table import expand_page_table
+from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+    expand_history_table,
+    learn_cache_group_geometry,
+)
 
 
 class MlaCacheGroupMixin:
@@ -74,11 +77,14 @@ class MlaCacheGroupMixin:
         group with ``family="history"`` and ``retention="full_history"``.
         """
         super().set_cache_pool(cache_pool)
-        for spec in getattr(cache_pool.arena, "cache_group_specs", ()):
-            if spec.family == "history" and spec.retention == "full_history":
-                self._full_history_group_id = str(spec.group_id)
-                self._history_block_granularity = int(spec.block_granularity)
-                break
+        geometry = learn_cache_group_geometry(
+            getattr(cache_pool.arena, "cache_group_specs", ()),
+            default_granularity=self.kernel_page_size,
+        )
+        self._geometry = geometry
+        if geometry.full_history_group_id is not None:
+            self._full_history_group_id = geometry.full_history_group_id
+            self._history_block_granularity = geometry.history_block_granularity
 
     def _resolve_full_history_table(
         self, block_tables, bs: int, out: torch.Tensor | None = None
@@ -111,9 +117,11 @@ class MlaCacheGroupMixin:
         """Expand a batch-ordered raw table (scheduler pages) into this
         backend's kernel pages, ``self.max_num_pages`` wide. The staged draft
         page table and the wrapper's group tables share this one mapping."""
-        return expand_page_table(
+        return expand_history_table(
             raw,
-            block_granularity=self._history_block_granularity or self.kernel_page_size,
+            history_block_granularity=(
+                self._history_block_granularity or self.kernel_page_size
+            ),
             kernel_page_size=self.kernel_page_size,
             max_kernel_pages=self.max_num_pages,
             out=out,

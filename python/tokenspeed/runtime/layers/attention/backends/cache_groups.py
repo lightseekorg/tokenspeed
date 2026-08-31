@@ -46,6 +46,10 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     unpack_group_tables,
 )
 
+from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+    expand_history_table,
+    learn_cache_group_geometry,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
@@ -204,36 +208,16 @@ class CacheGroupsMixin:
         self._learn_cache_groups(cache_pool.arena.cache_group_specs)
 
     def _learn_cache_groups(self, cache_group_specs) -> None:
-        """Record the pool's family="state" group ids (see state_group_ids)
-        and per-group CacheBlock spans (heterogeneous block sizes).
-
-        Spans are read as ``block_granularity``, the shape-agnostic name: for
-        the row-geometry groups kept here it equals ``page_size`` by
-        definition, and asking a snapshot-state group for ``page_size`` is a
-        TypeError. State groups carry no span because they are shed before any
-        page-table or write-location math (_shed_state_groups); their blocks
-        hold state snapshots, not kernel pages.
-        """
-        self.state_group_ids = frozenset(
-            str(spec.group_id) for spec in cache_group_specs if spec.family == "state"
+        """Learn the pool's group geometry (one immutable value object; see
+        CacheGroupGeometry for the state-group / span semantics) and mirror
+        it into the attribute names the mixin's readers use."""
+        geometry = learn_cache_group_geometry(
+            cache_group_specs, default_granularity=self.kernel_page_size
         )
-        self.group_block_granularities = {
-            str(spec.group_id): spec.block_granularity
-            for spec in cache_group_specs
-            if spec.family != "state"
-        }
-        # The full-history grain: the unit of the batch-ordered draft page
-        # table a DFLASH block decode reads (same selection rule as the
-        # executor's staging).
-        self._history_block_granularity = next(
-            (
-                int(spec.block_granularity)
-                for spec in cache_group_specs
-                if spec.family == "history"
-                and getattr(spec, "retention", "full_history") == "full_history"
-            ),
-            self.kernel_page_size,
-        )
+        self._geometry = geometry
+        self.state_group_ids = geometry.state_group_ids
+        self.group_block_granularities = geometry.granularities
+        self._history_block_granularity = geometry.history_block_granularity
 
     def _expand_history_table(
         self, raw: torch.Tensor, out: torch.Tensor | None = None
@@ -241,9 +225,9 @@ class CacheGroupsMixin:
         """Expand a batch-ordered raw table (scheduler pages of the
         full-history grain) into this backend's kernel pages,
         ``self.max_num_pages`` wide."""
-        return expand_page_table(
+        return expand_history_table(
             raw,
-            block_granularity=getattr(
+            history_block_granularity=getattr(
                 self, "_history_block_granularity", self.kernel_page_size
             ),
             kernel_page_size=self.kernel_page_size,
