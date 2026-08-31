@@ -28,7 +28,7 @@ all groups — the per-group python chains (~4 tiny elementwise launches per
 group per step, the nsys inter-step band) are gone, on the spec-verify path
 too.
 
-Constructed once by ``CacheGroupsMixin._init_group_graph_buffers`` (geometry
+Constructed once by ``AttentionBackend._init_group_graph_buffers`` (geometry
 is frozen by then — the registry binds the pool before graph-state
 allocation); capture records views of these buffers, replay refreshes them
 in place at the same addresses.

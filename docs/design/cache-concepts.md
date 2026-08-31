@@ -541,7 +541,7 @@ and never touches packing. No refactor needed here.
 * The Python residues are cleaned: `FlashMLADecodeMetadata.page_table`, the
   TRT-LLM MLA chunked-prefill metadata's `page_table`,
   `_page_table_aliased`, inkling's `col_block_table` (conv state), and the
-  `CacheGroupsMixin` docstring. Third-party kernel keyword names
+  base-class group routing docstrings. Third-party kernel keyword names
   (`flash_mla`'s `block_table=`, TRT-LLM's `block_tables=`) are an external
   boundary and stay as the kernels spell them.
 * The state backend's replay hook names no `page_table` parameter — state
@@ -574,16 +574,18 @@ view, mirrored by the host tier. Specifically:
   family-gated (`CacheGroupSpec.__post_init__`).
 
 Remaining known item (deliberate, separate project): the mapping *primitive*
-is single and the *owners* are down to three — the MHA `CacheGroupsMixin`
-and the MLA `MlaCacheGroupMixin` (both consuming the wrapper's per-group
-`block_tables` in raw scheduler pages and expanding in place through one
-`_expand_history_table` helper each; `CacheBatchMetadata.kernel_table` was
-deleted when the MLA family moved onto that route, see `unified_path.md`),
-and DeepSeek-V4's bespoke slot mapping. `DraftPageStaging` is no longer an
+is single and the *owners* are down to three — the MHA-family slot math and
+the MLA-family slot math (both sets of pure functions in
+`backends/group_write_locations.py`, fed by the one shared
+`CacheGroupGeometry`; every backend consumes the wrapper's per-group
+`block_tables` in raw scheduler pages and expands through the shared
+`expand_history_table`; `CacheBatchMetadata.kernel_table` was deleted when
+the MLA family moved onto that route, see `unified_path.md`), and
+DeepSeek-V4's bespoke slot mapping. `DraftPageStaging` is no longer an
 owner: its publish is a pure copy + scrub in raw pages (the address-stable
 shadow the drafters' in-graph write-location kernels need), with no page
-mapping of its own. Consolidating the two mixins and V4 means touching every
-backend family at once; do it as its own milestone.
+mapping of its own. Consolidating the two location-math families and V4
+means touching every backend family at once; do it as its own milestone.
 
 ### Principle 6 — provenance discipline: fixed
 

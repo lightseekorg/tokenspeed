@@ -35,8 +35,13 @@ from tokenspeed_kernel import (
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-from tokenspeed.runtime.layers.attention.backends.mla_cache_groups import (
-    MlaCacheGroupMixin,
+from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+    resolve_full_history_table,
+)
+from tokenspeed.runtime.layers.attention.backends.group_write_locations import (
+    graph_verify_q_len,
+    mla_decode_out_cache_loc,
+    mla_extend_out_cache_loc,
 )
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
@@ -101,8 +106,12 @@ class MLADecodeMetadata:
         return self.seq_lens
 
 
-class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
+class MLAAttnBackend(AttentionBackend):
     """Unified MLA backend routed through tokenspeed_kernel MLA APIs."""
+
+    # The refresh nulls its own dummy table rows, so the wrapper must pass
+    # UNPADDED tables (no per-step F.pad).
+    tables_self_padding = True
 
     supports_mla_projected_value_decode = True
 
@@ -178,8 +187,12 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
     ):
         kwargs.pop("cache_metadata", None)
         kwargs.pop("forward_batch", None)
-        group_table = self._resolve_full_history_table(
-            kwargs.pop("block_tables", None), bs
+        group_table = resolve_full_history_table(
+            kwargs.pop("block_tables", None),
+            self._geometry,
+            bs,
+            kernel_page_size=self.kernel_page_size,
+            max_kernel_pages=self.max_num_pages,
         )
         if group_table is not None:
             self._cache_groups_bound = True
@@ -270,10 +283,11 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             torch.cumsum(seq_lens, dim=0, out=cum_seq_lens_kv[1:])
 
         if group_table is not None:
-            group_out_cache_loc = self._extend_out_cache_loc(
+            group_out_cache_loc = mla_extend_out_cache_loc(
                 group_table[: seq_lens.shape[0]],
                 extend_prefix_lens_cpu,
                 extend_seq_lens_cpu,
+                page_size=self.kernel_page_size,
                 validate_pages=cache_debug_enabled(),
             )
             chunk_page_table = group_table[: seq_lens.shape[0]]
@@ -363,9 +377,10 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
     ):
         if group_table is not None:
             page_table = group_table[:bs]
-            group_out_cache_loc = self._cache_decode_out_cache_loc(
+            group_out_cache_loc = mla_decode_out_cache_loc(
                 group_table,
                 seq_lens,
+                page_size=self.kernel_page_size,
                 batch_size=bs,
                 validate_pages=cache_debug_enabled(),
                 q_len_per_req=q_len_per_req,
@@ -515,8 +530,9 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         # select_out_cache_loc branch reads it. A draft binds too — its
         # refresh consumes the wrapper-dispatched group table — but its
         # write locations stay drafter-owned (see _decode_views).
+        del cache_group_ids
         self._cache_groups_bound = True
-        super().bind_decode_views(bs, cache_group_ids)
+        self._decode_views(bs)
 
     def _replay_block_decode_page_table(
         self,
@@ -533,7 +549,13 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         spec = self.spec_num_tokens
         width = self.max_num_pages
         rows = self.cuda_graph_page_table[: bs * spec, :width].view(bs, spec, width)
-        table = self._resolve_full_history_table(block_tables, 0)
+        table = resolve_full_history_table(
+            block_tables,
+            self._geometry,
+            0,
+            kernel_page_size=self.kernel_page_size,
+            max_kernel_pages=self.max_num_pages,
+        )
         if table is None:
             if page_table is None:
                 raise RuntimeError(
@@ -565,7 +587,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 group_out_cache_loc=None,
             )
         else:
-            capture_q_len = self._graph_verify_q_len()
+            capture_q_len = graph_verify_q_len(self.spec_num_tokens, self.is_draft)
             # A draft owns its per-step write locations (it reads the
             # published batch-ordered table); only the target routes writes
             # through the persistent loc buffer (allocated iff not draft).
@@ -626,7 +648,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
         self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
         has_group_tables = bool(block_tables) and (
-            self._full_history_group_id in block_tables
+            self._geometry.full_history_group_id in block_tables
         )
         if metadata.group_out_cache_loc is not None and (
             has_group_tables or for_graph_replay
@@ -667,17 +689,24 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         # Must match the width baked into the captured buffer view.
         q_len = metadata.group_q_len_per_req
         real_bs = 0
-        table = self._resolve_full_history_table(block_tables, 0)
+        table = resolve_full_history_table(
+            block_tables,
+            self._geometry,
+            0,
+            kernel_page_size=self.kernel_page_size,
+            max_kernel_pages=self.max_num_pages,
+        )
         if table is not None:
             real_bs = min(int(table.shape[0]), bs)
             if real_bs > 0:
                 metadata.page_table[:real_bs, : table.shape[1]].copy_(table[:real_bs])
                 metadata.page_table[:real_bs, table.shape[1] :].zero_()
-                self._cache_decode_out_cache_loc(
+                mla_decode_out_cache_loc(
                     table,
                     # The clamped copy: a request shorter than the verify
                     # window would otherwise resolve locations before its start.
                     self.cuda_graph_seq_lens,
+                    page_size=self.kernel_page_size,
                     batch_size=real_bs,
                     validate_pages=cache_debug_enabled(),
                     out=metadata.group_out_cache_loc,

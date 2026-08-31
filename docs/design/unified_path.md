@@ -27,8 +27,9 @@ seq_lens, *, forward_mode, page_table, num_extends, for_graph_replay,
 **cache_kwargs)` is the ONLY way decode metadata is prepared:
 
 * **capture** (`init_forward_metadata_capture_cuda_graph`) is INHERITED: the
-  base default binds the per-bs views (`bind_decode_views`, implemented by
-  the cache-group mixins) and runs the idle-refresh arm (`actual_bs=0`,
+  base default binds the per-bs views (`bind_decode_views`, implemented per
+  backend over its `_decode_views` builder) and runs the idle-refresh arm
+  (`actual_bs=0`,
   `for_graph_replay=True`) against the runner-seeded seq_lens and the
   address-stable staged page_table — never live tables. Only a genuine
   capture-only asymmetry overrides it (see "Capture is inherited");
@@ -283,9 +284,12 @@ None carried information not already implied by the pool's published specs.
 
 Extend/mixed metadata keeps its dynamic-shape construction path
 (`init_forward_metadata`), with `PrefillGraph` as its own capture story.
-The two group mixins (`CacheGroupsMixin`, `MlaCacheGroupMixin`) remain two;
-merging them with V4's bespoke slot mapping is the final block-table-owner
-milestone (`cache-concepts.md` Principle 5).
+The group mixins are gone — the routing surface lives on
+`AttentionBackend` (per-group selection, GroupGraphBuffers composition) and
+the two write-location kernels stay two sets of pure functions
+(`group_write_locations.py`); unifying that math with V4's bespoke slot
+mapping is the final block-table-owner milestone (`cache-concepts.md`
+Principle 5).
 
 ## Regression gates
 

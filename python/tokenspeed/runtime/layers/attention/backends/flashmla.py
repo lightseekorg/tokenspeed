@@ -38,8 +38,15 @@ from tokenspeed_kernel.ops.attention.flashinfer import (
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-from tokenspeed.runtime.layers.attention.backends.mla_cache_groups import (
-    MlaCacheGroupMixin,
+from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+    resolve_full_history_table,
+)
+from tokenspeed.runtime.layers.attention.backends.group_write_locations import (
+    graph_verify_q_len,
+    mla_decode_out_cache_loc,
+    mla_extend_out_cache_loc,
+    mla_per_token_slot_table,
+    verify_q_len,
 )
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
@@ -104,17 +111,21 @@ class _ChunkedPrefillMetadata:
 _global_workspace_buffer = None
 
 
-class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
+class FlashMLABackend(AttentionBackend):
     """FlashMLA attention backend for TokenSpeed scheduling.
 
     Uses the FlashMLA kernel for decode (any q_len); uses FlashInfer's MLA
     prefill wrappers for the EXTEND path.
 
     Decode consumes the LCM full-history table when bound to a cache-group
-    contract (see :class:`MlaCacheGroupMixin`); otherwise it reads the classic
+    contract; otherwise it reads the classic
     ``page_table`` table. The FlashMLA kernel walks pages at a fixed
     ``PAGE_SIZE`` stride, so that is the backend's kernel page size.
     """
+
+    # The refresh nulls its own dummy table rows, so the wrapper must pass
+    # UNPADDED tables (no per-step F.pad).
+    tables_self_padding = True
 
     # Eager refresh swaps in a fresh tile-schedule object every step (the
     # kernel freezes the schedule on first use); the replayed graph re-runs
@@ -233,8 +244,12 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
     ):
         kwargs.pop("cache_metadata", None)
         kwargs.pop("forward_batch", None)
-        group_table = self._resolve_full_history_table(
-            kwargs.pop("block_tables", None), bs
+        group_table = resolve_full_history_table(
+            kwargs.pop("block_tables", None),
+            self._geometry,
+            bs,
+            kernel_page_size=self.kernel_page_size,
+            max_kernel_pages=self.max_num_pages,
         )
         if group_table is not None:
             self._cache_groups_bound = True
@@ -282,7 +297,9 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 seq_lens,
                 page_table,
                 group_table=group_table,
-                q_len_per_req=self._verify_q_len(forward_mode),
+                q_len_per_req=verify_q_len(
+                    self.spec_num_tokens, self.is_draft, forward_mode
+                ),
             )
 
     @contextmanager
@@ -333,9 +350,10 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             # the write locations. Target verify writes the whole spec window
             # (seq-N..seq-1); plain decode writes position seq-1.
             page_table_rows = group_table[:bs]
-            group_out_cache_loc = self._cache_decode_out_cache_loc(
+            group_out_cache_loc = mla_decode_out_cache_loc(
                 group_table,
                 seq_lens,
+                page_size=self.kernel_page_size,
                 batch_size=bs,
                 validate_pages=cache_debug_enabled(),
                 q_len_per_req=q_len_per_req,
@@ -434,7 +452,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # New-token write locations come from _extend_out_cache_loc either way.
         group_out_cache_loc = None
         if group_table is not None:
-            prefill_table = self._group_per_token_slot_table(
+            prefill_table = mla_per_token_slot_table(
                 group_table,
                 batch_size=seq_lens.shape[0],
                 page_size=self.kernel_page_size,
@@ -445,10 +463,11 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             )
             chunk_table = group_table[: seq_lens.shape[0]]
             chunk_page_size = self.kernel_page_size
-            group_out_cache_loc = self._extend_out_cache_loc(
+            group_out_cache_loc = mla_extend_out_cache_loc(
                 group_table[: seq_lens.shape[0]],
                 extend_prefix_lens_cpu,
                 extend_seq_lens_cpu,
+                page_size=self.kernel_page_size,
                 validate_pages=cache_debug_enabled(),
             )
         else:
@@ -541,6 +560,12 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # Buffers were (re)allocated: cached per-bs views must rebuild.
         self.decode_cuda_graph_metadata: dict[int, FlashMLADecodeMetadata] = {}
 
+    def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
+        # Pre-build the per-bs views for the base default capture (the MLA
+        # group binding is latched by refresh when tables arrive).
+        del cache_group_ids
+        self._decode_views(bs)
+
     def _decode_views(self, bs: int) -> FlashMLADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers.
 
@@ -553,7 +578,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         metadata = self.decode_cuda_graph_metadata.get(bs)
         if metadata is not None:
             return metadata
-        q_len = self._graph_verify_q_len()
+        q_len = graph_verify_q_len(self.spec_num_tokens, self.is_draft)
         group_out_cache_loc = None
         if self.cuda_graph_group_out_cache_loc is not None:
             group_out_cache_loc = self.cuda_graph_group_out_cache_loc[: bs * q_len]
@@ -619,9 +644,9 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # width must match what capture baked into the recorded buffer views
         # (_graph_verify_q_len is deterministic, so recomputing restores it).
         if for_graph_replay:
-            q_len = self._graph_verify_q_len()
+            q_len = graph_verify_q_len(self.spec_num_tokens, self.is_draft)
         else:
-            q_len = self._verify_q_len(forward_mode)
+            q_len = verify_q_len(self.spec_num_tokens, self.is_draft, forward_mode)
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
         self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
 
@@ -632,7 +657,13 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # of the transferred KV). Latch _cache_groups_bound for the write-loc
         # path.
         refreshed = False
-        table = self._resolve_full_history_table(kwargs.get("block_tables"), 0)
+        table = resolve_full_history_table(
+            kwargs.get("block_tables"),
+            self._geometry,
+            0,
+            kernel_page_size=self.kernel_page_size,
+            max_kernel_pages=self.max_num_pages,
+        )
         if table is not None:
             self._cache_groups_bound = True
             # Refresh the block table and per-request write locations in place
@@ -644,9 +675,10 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 self.cuda_graph_kv_indices[:real_bs, : table.shape[1]].copy_(
                     table[:real_bs]
                 )
-                self._cache_decode_out_cache_loc(
+                mla_decode_out_cache_loc(
                     table,
                     self.cuda_graph_seq_lens,
+                    page_size=self.kernel_page_size,
                     batch_size=real_bs,
                     validate_pages=cache_debug_enabled(),
                     out=self.cuda_graph_group_out_cache_loc,

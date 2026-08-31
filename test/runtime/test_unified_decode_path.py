@@ -42,6 +42,10 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+    CacheGroupGeometry,
+)
+
 MAX_DECODE_BS = 8
 LADDER_BS = 4  # capture ladder max, deliberately below MAX_DECODE_BS
 MAX_NUM_PAGES = 6
@@ -79,9 +83,10 @@ class _MhaCase(_TorchCase):
         backend.spec_num_tokens = 1
         backend.is_draft = False
         backend.draft_block_decode = False
-        backend.state_group_ids = frozenset()
         backend.engine_owned_group_ids = frozenset()
-        backend.group_block_granularities = {"full_attention": 2}
+        backend._geometry = CacheGroupGeometry(
+            granularities={"full_attention": 2}, history_block_granularity=2
+        )
         backend.max_num_pages = MAX_NUM_PAGES
         backend.kernel_page_size = 2
         backend.device = "cpu"

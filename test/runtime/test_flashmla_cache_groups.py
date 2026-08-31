@@ -50,6 +50,14 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
+from tokenspeed.runtime.layers.attention.backends.group_write_locations import (
+    graph_verify_q_len,
+    mla_decode_out_cache_loc,
+    mla_extend_out_cache_loc,
+    mla_per_token_slot_table,
+    verify_q_len,
+)
+
 _KERNEL_PAGE = 64
 
 
@@ -177,7 +185,7 @@ def test_flashmla_grouped_prefill_index_math() -> None:
     # Per-token slot table: token t -> table[0, t // p] * p + t % p, which by
     # the expansion invariant equals the logical-table slot. Position
     # page_size+2 -> logical index 1 -> page 5, offset 2.
-    slots = backend._group_per_token_slot_table(
+    slots = mla_per_token_slot_table(
         table,
         batch_size=1,
         page_size=_KERNEL_PAGE,
@@ -190,10 +198,11 @@ def test_flashmla_grouped_prefill_index_math() -> None:
 
     # New-token write locations: prefix=page_size, extend=3 -> positions
     # [page_size, page_size+3) -> page 5, offsets 0/1/2, packed in query order.
-    locs = backend._extend_out_cache_loc(
+    locs = mla_extend_out_cache_loc(
         table,
         torch.tensor([page_size], dtype=torch.int32),
         torch.tensor([3], dtype=torch.int32),
+        page_size=_KERNEL_PAGE,
     )
     assert locs.tolist() == [5 * page_size + 0, 5 * page_size + 1, 5 * page_size + 2]
 
@@ -210,8 +219,11 @@ def test_flashmla_grouped_target_verify_writes_whole_window() -> None:
     backend = _make_flashmla_backend(pool, speculative_num_draft_tokens=spec)
 
     # Verify-window widths: target decode -> spec; graph -> spec; draft -> 1.
-    assert backend._verify_q_len(ForwardMode.DECODE) == spec
-    assert backend._graph_verify_q_len() == spec
+    assert (
+        verify_q_len(backend.spec_num_tokens, backend.is_draft, ForwardMode.DECODE)
+        == spec
+    )
+    assert graph_verify_q_len(backend.spec_num_tokens, backend.is_draft) == spec
 
     logical_rows = [[3, 5]]
     # seq_len = page_size + 10 -> window positions page_size+7 .. page_size+10,

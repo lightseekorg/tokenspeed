@@ -295,7 +295,7 @@ class DSABackend(AttentionBackend):
                 # expansion applies); a draft is handed the batch-ordered
                 # draft page table directly.
                 block_tables = kwargs.get("block_tables") or {}
-                gid = self._dense_backend._full_history_group_id
+                gid = self._dense_backend._geometry.full_history_group_id
                 table = block_tables.get(gid) if gid is not None else None
                 if table is None and page_table is not None:
                     table = page_table

@@ -36,10 +36,13 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends import (
     tokenspeed_mla as tokenspeed_mla_module,
 )
-from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
-from tokenspeed.runtime.layers.attention.backends.mla_cache_groups import (
-    MlaCacheGroupMixin,
+from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+    CacheGroupGeometry,
 )
+from tokenspeed.runtime.layers.attention.backends.group_write_locations import (
+    verify_q_len,
+)
+from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.tokenspeed_mla import (
     CuteDSLMLABackend,
     CuteDSLMLADecodeMetadata,
@@ -79,8 +82,11 @@ def _bare_mla_backend(
     backend._cache_groups_bound = False
     backend.decode_cuda_graph_metadata = {}
     backend.decode_cuda_graph_kv_indices = None
-    backend._full_history_group_id = "full_attention"
-    backend._history_block_granularity = _LOGICAL_P
+    backend._geometry = CacheGroupGeometry(
+        granularities={"full_attention": _LOGICAL_P},
+        full_history_group_id="full_attention",
+        history_block_granularity=_LOGICAL_P,
+    )
     backend.decode_cuda_graph_group_out_cache_loc = None
     backend.forward_decode_metadata = None
     del cache_contract
@@ -107,12 +113,8 @@ def test_target_verify_mixed_batch_skips_complete_prefill_windows() -> None:
 
 
 def test_mla_target_verify_width_applies_to_mixed_batches() -> None:
-    backend = object.__new__(MlaCacheGroupMixin)
-    backend.spec_num_tokens = 8
-    backend.is_draft = False
-
-    assert backend._verify_q_len(ForwardMode.DECODE) == 8
-    assert backend._verify_q_len(ForwardMode.MIXED) == 8
+    assert verify_q_len(8, False, ForwardMode.DECODE) == 8
+    assert verify_q_len(8, False, ForwardMode.MIXED) == 8
 
 
 def test_cutedsl_mla_draft_keeps_classic_page_table_contract() -> None:
@@ -146,8 +148,11 @@ def _bare_amd_mla_backend(
     backend.decode_cuda_graph_group_out_cache_loc = None
     backend.forward_decode_metadata = None
     backend._should_use_absorbed_cached_extend = lambda **_: False
-    backend._full_history_group_id = "full_attention"
-    backend._history_block_granularity = _LOGICAL_P
+    backend._geometry = CacheGroupGeometry(
+        granularities={"full_attention": _LOGICAL_P},
+        full_history_group_id="full_attention",
+        history_block_granularity=_LOGICAL_P,
+    )
     del cache_contract
     return backend
 

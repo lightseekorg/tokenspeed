@@ -19,6 +19,10 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+    CacheGroupGeometry,
+)
+
 MAX_BS = 4
 MAX_NUM_PAGES = 6
 
@@ -621,8 +625,7 @@ class _BackendCase(_TorchCase):
         backend.spec_num_tokens = 1
         backend.is_draft = False
         backend.draft_block_decode = False
-        backend.state_group_ids = frozenset()
-        backend.group_block_granularities = {}
+        backend._geometry = CacheGroupGeometry()
         backend.max_num_pages = MAX_NUM_PAGES
         backend.kernel_page_size = 2
         backend.device = "cpu"
@@ -705,7 +708,10 @@ class BackendStateGroupShedTest(_BackendCase):
 
     def setUp(self):
         super().setUp()
-        self.backend.state_group_ids = frozenset({"linear_attention"})
+        self.backend._geometry = CacheGroupGeometry(
+            granularities=dict(self.backend._geometry.granularities),
+            state_group_ids=frozenset({"linear_attention"}),
+        )
 
     def test_capture_state_only_yields_no_attention_metadata(self):
         metadata = self._capture(2, ("linear_attention",))
@@ -722,7 +728,10 @@ class BackendStateGroupShedTest(_BackendCase):
         # Unified decode path: state groups never enter the stacked graph
         # buffers (learned at init), and the eager refresh (bs == actual_bs)
         # fills the same persistent buffers replay does.
-        self.backend.group_block_granularities = {"full_attention": 2}
+        self.backend._geometry = CacheGroupGeometry(
+            granularities={"full_attention": 2},
+            state_group_ids=frozenset({"linear_attention"}),
+        )
         self.backend._init_group_graph_buffers(MAX_BS)
         self.backend.refresh_decode_metadata(
             2,

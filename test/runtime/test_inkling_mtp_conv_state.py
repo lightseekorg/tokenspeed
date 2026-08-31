@@ -736,22 +736,20 @@ class TestCheckpointMetadata(unittest.TestCase):
         self.assertEqual(inner_calls[0].tolist(), [130])
 
     def test_update_draft_forward_metadata_recomputes_group_locs(self):
-        """The mixin hook must replace seq_lens with the frontier and point
+        """The hook must replace seq_lens with the frontier and point
         the grouped write locs at the k positions ending there."""
-        from tokenspeed.runtime.layers.attention.backends.cache_groups import (
-            CacheGroupsMixin,
+        from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+            CacheGroupGeometry,
         )
         from tokenspeed.runtime.layers.attention.backends.mha import (
+            MHAAttnBackend,
             MHADecodeMetadata,
         )
 
-        class _Host(CacheGroupsMixin):
-            pass
-
-        host = _Host()
+        host = MHAAttnBackend.__new__(MHAAttnBackend)
         host.kernel_page_size = 2
         host.spec_num_tokens = 4
-        host.group_block_granularities = {"g": 2}
+        host._geometry = CacheGroupGeometry(granularities={"g": 2})
         table = torch.tensor([[7, 8, 9]], dtype=torch.int32, device="cuda")
         host.forward_decode_metadata = MHADecodeMetadata(
             page_table=None,

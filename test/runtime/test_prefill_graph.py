@@ -74,13 +74,13 @@ class TrimKvToLocsTest(unittest.TestCase):
         try:
             import torch
 
-            from tokenspeed.runtime.layers.attention.backends.cache_groups import (
-                CacheGroupsMixin,
+            from tokenspeed.runtime.layers.attention.backends.base import (
+                AttentionBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
-        self.trim = CacheGroupsMixin._trim_kv_to_locs
+        self.trim = AttentionBackend._trim_kv_to_locs
 
     def test_padded_tail_trimmed(self):
         k = self.torch.zeros(16, 2, 8)

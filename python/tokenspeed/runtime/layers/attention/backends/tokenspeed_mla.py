@@ -49,8 +49,8 @@ from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-from tokenspeed.runtime.layers.attention.backends.mla_cache_groups import (
-    MlaCacheGroupMixin,
+from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+    resolve_full_history_table,
 )
 from tokenspeed.runtime.layers.attention.backends.trtllm_mla import (
     TRTLLM_BLOCK_CONSTRAINT,
@@ -103,12 +103,16 @@ class CuteDSLMLADecodeMetadata:
     group_q_len_per_req: int = 1
 
 
-class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
+class CuteDSLMLABackend(AttentionBackend):
     """CuteDSL MLA attention backend for Blackwell SM100 GPUs.
 
     Decode uses CuTe DSL JIT-compiled kernels via tokenspeed_mla_decode().
     Prefill uses CuTe DSL FMHA kernel via tokenspeed_mla_prefill().
     """
+
+    # The refresh nulls its own dummy table rows, so the wrapper must pass
+    # UNPADDED tables (no per-step F.pad).
+    tables_self_padding = True
 
     _logged_decode = False
     _logged_prefill = False
@@ -358,8 +362,12 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
         if not self.is_draft:
             # The MTP draft runs on its own classic paged pool and reads the
             # staged batch-ordered draft page table, never group tables.
-            group_table = self._resolve_full_history_table(
-                kwargs.pop("block_tables", None), bs
+            group_table = resolve_full_history_table(
+                kwargs.pop("block_tables", None),
+                self._geometry,
+                bs,
+                kernel_page_size=self.kernel_page_size,
+                max_kernel_pages=self.max_num_pages,
             )
         if group_table is not None:
             self._cache_groups_bound = True
@@ -689,7 +697,7 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # reads it.
         if cache_group_ids or not self.is_draft:
             self._cache_groups_bound = True
-        super().bind_decode_views(bs, cache_group_ids)
+        self._decode_views(bs)
 
     def _decode_views(self, bs: int) -> "CuteDSLMLADecodeMetadata":
         """Per-bs decode metadata views over the persistent buffers.
@@ -783,7 +791,13 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # tables; every row is a dummy row, so zero the buffers instead of
         # resolving write locations against the placeholders.
         group_table = (
-            self._resolve_full_history_table(kwargs.get("block_tables"), 0)
+            resolve_full_history_table(
+                kwargs.get("block_tables"),
+                self._geometry,
+                0,
+                kernel_page_size=self.kernel_page_size,
+                max_kernel_pages=self.max_num_pages,
+            )
             if has_group_locs and actual_bs > 0
             else None
         )

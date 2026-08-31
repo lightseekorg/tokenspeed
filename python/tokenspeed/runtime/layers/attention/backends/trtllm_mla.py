@@ -41,8 +41,13 @@ from tokenspeed_kernel.ops.attention.flashinfer import (
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-from tokenspeed.runtime.layers.attention.backends.mla_cache_groups import (
-    MlaCacheGroupMixin,
+from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+    resolve_full_history_table,
+)
+from tokenspeed.runtime.layers.attention.backends.group_write_locations import (
+    graph_verify_q_len,
+    mla_decode_out_cache_loc,
+    verify_q_len,
 )
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
@@ -126,8 +131,12 @@ class TRTLLMMLADecodeMetadata:
     group_q_len_per_req: int = 1
 
 
-class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
+class TRTLLMMLABackend(AttentionBackend):
     """trtllm_mla attention backend using fused kernels."""
+
+    # The refresh nulls its own dummy table rows, so the wrapper must pass
+    # UNPADDED tables (no per-step F.pad).
+    tables_self_padding = True
 
     def __init__(self, config: MLAConfig):
         super().__init__(config)
@@ -223,8 +232,12 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
     ):
         kwargs.pop("cache_metadata", None)
         kwargs.pop("forward_batch", None)
-        group_table = self._resolve_full_history_table(
-            kwargs.pop("block_tables", None), bs
+        group_table = resolve_full_history_table(
+            kwargs.pop("block_tables", None),
+            self._geometry,
+            bs,
+            kernel_page_size=self.kernel_page_size,
+            max_kernel_pages=self.max_num_pages,
         )
         if group_table is not None:
             self._cache_groups_bound = True
@@ -261,7 +274,9 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 seq_lens,
                 page_table,
                 group_table=group_table,
-                q_len_per_req=self._verify_q_len(forward_mode),
+                q_len_per_req=verify_q_len(
+                    self.spec_num_tokens, self.is_draft, forward_mode
+                ),
             )
 
     @contextmanager
@@ -298,9 +313,10 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             block_kv_indices = self._create_block_kv_indices(
                 bs, max_blocks, group_table
             )
-            group_out_cache_loc = self._cache_decode_out_cache_loc(
+            group_out_cache_loc = mla_decode_out_cache_loc(
                 group_table,
                 seq_lens,
+                page_size=self.kernel_page_size,
                 batch_size=bs,
                 validate_pages=cache_debug_enabled(),
                 q_len_per_req=q_len_per_req,
@@ -437,6 +453,12 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         else:
             self.decode_cuda_graph_group_out_cache_loc = None
 
+    def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
+        # Pre-build the per-bs views for the base default capture (the MLA
+        # group binding is latched by refresh when tables arrive).
+        del cache_group_ids
+        self._decode_views(bs)
+
     def _decode_views(self, bs: int) -> TRTLLMMLADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers.
 
@@ -447,7 +469,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         if metadata is not None:
             return metadata
         max_blocks = self._calc_padded_blocks(self.max_context_len)
-        capture_q_len = self._graph_verify_q_len()
+        capture_q_len = graph_verify_q_len(self.spec_num_tokens, self.is_draft)
         group_out_cache_loc = None
         if self.decode_cuda_graph_group_out_cache_loc is not None:
             group_out_cache_loc = self.decode_cuda_graph_group_out_cache_loc[
@@ -501,7 +523,13 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # delivered — decode-only PD nodes included (they never run an extend
         # forward, so an extend-latched gate would leave the kernel on a
         # stale/zero block table instead of the transferred KV).
-        group_table = self._resolve_full_history_table(kwargs.get("block_tables"), 0)
+        group_table = resolve_full_history_table(
+            kwargs.get("block_tables"),
+            self._geometry,
+            0,
+            kernel_page_size=self.kernel_page_size,
+            max_kernel_pages=self.max_num_pages,
+        )
         if group_table is not None:
             self._cache_groups_bound = True
         elif self.is_draft and bs > 0 and page_table is not None:
@@ -520,9 +548,10 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
                     metadata.block_kv_indices,
                 )
             if metadata.group_out_cache_loc is not None and real_bs > 0:
-                self._cache_decode_out_cache_loc(
+                mla_decode_out_cache_loc(
                     group_table,
                     self.cuda_graph_seq_lens,
+                    page_size=self.kernel_page_size,
                     batch_size=real_bs,
                     validate_pages=cache_debug_enabled(),
                     out=metadata.group_out_cache_loc,

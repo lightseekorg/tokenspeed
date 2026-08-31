@@ -12,6 +12,10 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, suite="runtime-1gpu")
 
+from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+    CacheGroupGeometry,
+)
+
 
 def _import_backend():
     from tokenspeed.runtime.layers.attention.backends.trtllm import (
@@ -24,7 +28,7 @@ def _import_backend():
 
 class TRTLLMCacheGroupsTest(unittest.TestCase):
     """The trtllm backend consumes per-group tables through the shared
-    CacheGroupsMixin: table/write-loc selection routes by layer.group_id,
+    shared base-class group routing: table/write-loc selection routes by layer.group_id,
     metadata drops the single table on the grouped-cache path, and the
     CUDA-graph buffers follow the capture/replay discipline."""
 
@@ -57,7 +61,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         # replay write locs are triton-only (no python fallback).
         b = self.Backend.__new__(self.Backend)
         b.kernel_page_size = page_size
-        b.group_block_granularities = dict(groups or {})
+        b._geometry = CacheGroupGeometry(granularities=dict(groups or {}))
         b.cache_pool = None
         if groups:
             b.cache_pool = MinimalCacheView.__new__(MinimalCacheView)
@@ -150,8 +154,8 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             backend = self.Backend(config)
 
         # Nothing is known before the pool arrives.
-        self.assertEqual(backend.group_block_granularities, {})
-        self.assertEqual(backend.state_group_ids, frozenset())
+        self.assertEqual(backend._geometry.granularities, {})
+        self.assertEqual(backend._geometry.state_group_ids, frozenset())
 
         pool = SimpleNamespace(
             arena=SimpleNamespace(
@@ -172,8 +176,10 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         backend.set_cache_pool(pool)
 
         self.assertIs(backend.cache_pool, pool)
-        self.assertEqual(backend.group_block_granularities, {"full_attention": 128})
-        self.assertEqual(backend.state_group_ids, frozenset({"linear_attention_0"}))
+        self.assertEqual(backend._geometry.granularities, {"full_attention": 128})
+        self.assertEqual(
+            backend._geometry.state_group_ids, frozenset({"linear_attention_0"})
+        )
 
     def test_build_page_table_keeps_single_table_direct_copy_path(self):
         b = self._bare_backend(page_size=64, max_num_pages=4)
@@ -199,7 +205,6 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             groups={"full_attention": 128},
         )
         b.engine_owned_group_ids = frozenset()
-        b.state_group_ids = frozenset()
         b.cuda_graph_page_table = self.torch.zeros((2, 4), dtype=self.torch.int32)
         b.cuda_graph_seq_lens = self.torch.ones(2, dtype=self.torch.int32)
         b._init_group_graph_buffers(2)
@@ -375,7 +380,6 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             groups={"full_attention": 64, "sliding_attention": 64},
         )
         b.engine_owned_group_ids = frozenset()
-        b.state_group_ids = frozenset()
         b.cuda_graph_page_table = self.torch.zeros((2, 8), dtype=self.torch.int32)
         b.cuda_graph_seq_lens = self.torch.ones(2, dtype=self.torch.int32)
         b._init_group_graph_buffers(2)

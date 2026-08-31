@@ -152,6 +152,35 @@ def check_group_write_locs(
 # ---------------------------------------------------------------------------
 
 
+def verify_q_len(spec_num_tokens: int, is_draft: bool, forward_mode) -> int:
+    """KV write locations each request needs this decode step.
+
+    The target's verify decode writes the whole speculative window
+    (``spec_num_tokens`` trailing positions); plain decode and any draft
+    write a single location.
+    """
+    if spec_num_tokens <= 1:
+        return 1
+    if (
+        not is_draft
+        and forward_mode is not None
+        and (forward_mode.is_decode() or forward_mode.is_mixed())
+    ):
+        return spec_num_tokens
+    return 1
+
+
+def graph_verify_q_len(spec_num_tokens: int, is_draft: bool) -> int:
+    """Verify-window width baked into captured decode-graph buffers.
+
+    Graphs only record decode, so there is no forward mode to consult;
+    capture and replay must agree on this width exactly.
+    """
+    if spec_num_tokens > 1 and not is_draft:
+        return spec_num_tokens
+    return 1
+
+
 def mla_decode_out_cache_loc(
     table: torch.Tensor,
     seq_lens: torch.Tensor,

@@ -27,7 +27,7 @@ Supports sliding window, attention sinks, and FP8 KV cache.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -47,8 +47,8 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
-from tokenspeed.runtime.layers.attention.backends.cache_groups import (
-    CacheGroupsMixin,
+from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+    learn_cache_group_geometry,
 )
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
@@ -105,8 +105,53 @@ class TRTLLMMHAMetadata:
     out_cache_locs: dict[str, torch.Tensor] | None = None
 
 
-class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
+class TRTLLMMHAAttnBackend(AttentionBackend):
     """trtllm_mha attention backend optimized for SM100 (Blackwell)."""
+
+    # The refresh nulls its own dummy table rows, so the wrapper must pass
+    # UNPADDED tables (no per-step F.pad).
+    tables_self_padding = True
+
+    def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
+        """Pre-build the per-bs views with the capture-time group set pinned,
+        so the base default capture records the exact per-group views the
+        refresh repoints at."""
+        if cache_group_ids:
+            # Verify keeps [bs]-row tables plus [bs*N] location views.
+            assert not (
+                self.draft_block_decode and self.spec_num_tokens > 1
+            ), "cache_group_ids is unsupported with DFLASH block decode"
+        self._decode_views(bs, cache_group_ids=cache_group_ids)
+
+    def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
+        """Per-group write locations for out-of-backend KV writers (fused
+        RoPE prewrite): the write must land in the pages this layer's group
+        reads, never the scheduler's single-table locations. Draft chains own
+        their per-step locations, so they must keep the caller-provided
+        tensor."""
+        metadata = self._prewrite_metadata(forward_mode)
+        if metadata is None or metadata.out_cache_locs is None:
+            return out_cache_loc
+        return self._select_out_cache_loc(
+            layer, metadata, out_cache_loc, prefer_caller=self.is_draft
+        )
+
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        """Re-anchor the k-row decode metadata to the committed frontier:
+        seq_lens becomes ``frontier`` and the grouped write locs cover
+        positions ``frontier-k..frontier-1``. Accept-dependent, so pure
+        tensor ops recomputed per graph replay; the next metadata init
+        resets."""
+        md = self.forward_decode_metadata
+        fields = {"seq_lens": frontier}
+        if md.out_cache_locs is not None:
+            fields["out_cache_locs"] = self._compute_decode_group_out_cache_locs(
+                md.page_tables,
+                frontier,
+                self.kernel_page_size,
+                self.spec_num_tokens,
+            )
+        self.forward_decode_metadata = replace(md, **fields)
 
     # Per-group tables route reads and writes by layer.group_id, so fields
     # sharing a physical plan location (for example GPT-OSS SWA/full) are safe.
@@ -614,7 +659,9 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         self.cuda_graph_decode_metadata = {}
         # Per-group persistent buffers + state-group shed; before the
         # DFLASH early return (replay reads the dict for the stale guard).
-        self._learn_cache_groups(cache_group_specs)
+        self._geometry = learn_cache_group_geometry(
+            cache_group_specs, default_granularity=self.kernel_page_size
+        )
         self._init_group_graph_buffers(max_bs)
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: spec_num_tokens decode rows per request. Unlike

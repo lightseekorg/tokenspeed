@@ -20,6 +20,10 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+    CacheGroupGeometry,
+)
+
 PAGE = 2
 MAX_NUM_PAGES = 4
 MAX_BS = 4
@@ -64,12 +68,12 @@ class _MHACase(_TorchCase):
         self.MHAAttnBackend = MHAAttnBackend
         self.backend = MHAAttnBackend.__new__(MHAAttnBackend)
         self.backend.kernel_page_size = PAGE
-        self.backend.group_block_granularities = {}
+        self.backend._geometry = CacheGroupGeometry()
 
 
 class ComputeOutCacheLocsTest(_MHACase):
     def test_mha_keeps_scheduler_pages_when_cache_view_uses_group_size(self):
-        self.backend.group_block_granularities = {"full_attention": 4}
+        self.backend._geometry = CacheGroupGeometry(granularities={"full_attention": 4})
         table = self.torch.tensor([[3, 5]], dtype=self.torch.int32)
 
         converted = self.backend._kernel_page_tables({"full_attention": table})
@@ -119,7 +123,9 @@ class ComputeOutCacheLocsTest(_MHACase):
 
     def test_decode_locs_honor_group_block_granularities(self):
         torch = self.torch
-        self.backend.group_block_granularities = {"small": 2, "large": 4}
+        self.backend._geometry = CacheGroupGeometry(
+            granularities={"small": 2, "large": 4}
+        )
         tables = {
             "small": torch.tensor([[1, 2, 3]], dtype=torch.int32),
             "large": torch.tensor([[6, 7]], dtype=torch.int32),
@@ -132,7 +138,9 @@ class ComputeOutCacheLocsTest(_MHACase):
 
     def test_extend_locs_honor_group_block_granularities(self):
         torch = self.torch
-        self.backend.group_block_granularities = {"small": 2, "large": 4}
+        self.backend._geometry = CacheGroupGeometry(
+            granularities={"small": 2, "large": 4}
+        )
         tables = {
             "small": torch.tensor([[10, 11, 12]], dtype=torch.int32),
             "large": torch.tensor([[20, 21]], dtype=torch.int32),
@@ -200,7 +208,7 @@ class MaybeCheckWriteLocsTest(_MHACase):
 
     def test_debug_honors_group_block_granularity(self):
         torch = self.torch
-        self.backend.group_block_granularities = {"wide": 4}
+        self.backend._geometry = CacheGroupGeometry(granularities={"wide": 4})
         tables = {"wide": torch.tensor([[2, 3]], dtype=torch.int32)}
         locs = {"wide": torch.tensor([11, 15], dtype=torch.int32)}
         with mock.patch.dict(os.environ, {"TOKENSPEED_CACHE_DEBUG": "1"}):
@@ -216,13 +224,12 @@ class InitForwardMetadataAssemblyTest(_MHACase):
         torch = self.torch
         backend = self.MHAAttnBackend.__new__(self.MHAAttnBackend)
         backend.kernel_page_size = PAGE
-        backend.group_block_granularities = {}
+        backend._geometry = CacheGroupGeometry()
         backend.max_context_len = MAX_NUM_PAGES * PAGE
         backend.max_num_pages = MAX_NUM_PAGES
         backend.spec_num_tokens = 1
         backend.is_draft = False
         backend.draft_block_decode = False
-        backend.state_group_ids = frozenset()
         backend.forward_decode_metadata = None
         backend.forward_extend_metadata = None
         self.backend = backend
@@ -262,7 +269,9 @@ class InitForwardMetadataAssemblyTest(_MHACase):
         torch = self.torch
         backend = self.backend
         backend.device = "cpu"
-        backend.group_block_granularities = {gid: PAGE for gid in _GROUP_IDS}
+        backend._geometry = CacheGroupGeometry(
+            granularities={gid: PAGE for gid in _GROUP_IDS}
+        )
         backend.engine_owned_group_ids = frozenset()
         backend.cuda_graph_decode_metadata = {}
         backend.cuda_graph_page_table = torch.zeros(
@@ -434,9 +443,10 @@ class GraphLocBuffersTest(_MHACase):
         backend.spec_num_tokens = 1
         backend.is_draft = False
         backend.draft_block_decode = False
-        backend.state_group_ids = frozenset()
         backend.engine_owned_group_ids = frozenset()
-        backend.group_block_granularities = {gid: PAGE for gid in _GROUP_IDS}
+        backend._geometry = CacheGroupGeometry(
+            granularities={gid: PAGE for gid in _GROUP_IDS}
+        )
         backend.max_num_pages = MAX_NUM_PAGES
         backend.kernel_page_size = PAGE
         backend.device = "cuda"

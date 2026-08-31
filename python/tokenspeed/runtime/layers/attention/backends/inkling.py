@@ -182,7 +182,8 @@ class InklingAttnBackend(AttentionBackend):
         # sconv state always has its paged bridges; there is no rolling mode.
         self.conv_columns = conv_columns
         # The conv groups are wrapper-owned: the inner mixin must skip their
-        # write-loc math and capture buffers (see cache_groups.py).
+        # write-loc math and capture buffers (see AttentionBackend's
+        # engine_owned_group_ids).
         inner.engine_owned_group_ids = frozenset(conv_columns["group_block_tokens"])
         # Two slots, like forward_prefill_metadata / forward_decode_metadata
         # on the inner backend: extend init writes the prefill slot, decode
