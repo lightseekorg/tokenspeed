@@ -21,7 +21,10 @@
 """Measure decode-GEMV backends at the served models' real shapes, cold-cache.
 
 Run as ``tune_route.py [shape_set] [route.json]``; the set names a key of
-SHAPE_SETS and defaults to K3's TP16 table.
+SHAPE_SETS and defaults to K3's TP16 table. ``tune_route.py skinny-configs``
+instead sweeps per-shape skinny configs (vector-width-16 geometries against
+the served config) over every shape MEASURED_ROUTE sends to skinny, emitting
+the full SKINNY_CONFIG_ROUTE literal to paste wholesale.
 
 The shapes are the exact (N, K) that the decode path hands the routed GEMV,
 extracted from a trace of the serving path (rowcta's launch grid is ``(N,)``,
@@ -95,7 +98,10 @@ SHAPE_SETS = {
         [1, 2, 4, 8],
     ),
 }
-SHAPES, MS = SHAPE_SETS[sys.argv[1] if len(sys.argv) > 1 else "k3_tp16"]
+_SKINNY_CONFIG_MODE = sys.argv[1:2] == ["skinny-configs"]
+SHAPES, MS = SHAPE_SETS[
+    sys.argv[1] if len(sys.argv) > 1 and not _SKINNY_CONFIG_MODE else "k3_tp16"
+]
 NUM_COPIES = 8
 # 41-round medians repeat within ~1-2%, so 4% clears noise without excluding
 # the consistent 6-11% skinny wins.
@@ -163,7 +169,11 @@ def candidates(m: int, n: int, k: int):
     )
 
     if skinny.is_available():
-        cfg = skinny.default_config(m, n, k)
+        # Rank the config serving would run, not the bare heuristic, so a
+        # re-sweep cannot demote a shape whose win lives in SKINNY_CONFIG_ROUTE.
+        from tokenspeed_kernel.ops.gemm.routed_gemv import _skinny_config
+
+        cfg = _skinny_config(m, n, k, torch.cuda.current_device())
         if skinny.supports(cfg, m, n, k):
 
             def sk(i):
@@ -194,6 +204,129 @@ def candidates(m: int, n: int, k: int):
 
         yield "ll_bf16", [ll(i) for i in range(NUM_COPIES)], o, ref
 
+
+def sweep_skinny_configs() -> None:
+    """Emit the full SKINNY_CONFIG_ROUTE literal, revalidating tuned entries.
+
+    A candidate earns an entry only by beating what will serve after this
+    sweep (the tuned entry while it holds, else the heuristic) by MARGIN,
+    cold-L2. A tuned entry keeps while it is not worse than the heuristic
+    -- MARGIN gates admission only, so marginal entries do not flap -- and
+    the block is a valid wholesale replacement, never a ratchet.
+    """
+    from tokenspeed_kernel.ops.gemm.routed_gemv import (
+        MEASURED_ROUTE,
+        SKINNY_CONFIG_ROUTE,
+        _is_skinny_config_arch,
+        _skinny_config,
+    )
+    from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm import (
+        SkinnyGemmConfig,
+    )
+    from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm import (
+        shape_dynamic_skinny_gemm as skinny,
+    )
+
+    if not _is_skinny_config_arch(torch.cuda.current_device()):
+        sys.exit("skinny-configs was swept on sm100; refusing to emit elsewhere")
+
+    block_sizes = {
+        1536: (96,),
+        2560: (160,),
+        7168: (448, 224, 64),
+        14336: (448, 224, 128),
+    }
+    winners: dict[tuple[int, int, int], tuple[int, int, int, int]] = {}
+    for (m, n, k), backend in sorted(MEASURED_ROUTE.items(), key=lambda e: e[0][::-1]):
+        if backend != "skinny":
+            continue
+        xs = [
+            torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+            for _ in range(NUM_COPIES)
+        ]
+        ws = [
+            torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+            for _ in range(NUM_COPIES)
+        ]
+        o = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+        ref = xs[0].float() @ ws[0].float().t()
+        served = _skinny_config(m, n, k, torch.cuda.current_device())
+        heuristic = skinny.default_config(m, n, k)
+        t_served = timed(
+            [
+                (lambda i, c: lambda: skinny(xs[i], ws[i], c, out=o))(i, served)
+                for i in range(NUM_COPIES)
+            ]
+        )
+        t_heuristic = t_served
+        if served != heuristic:
+            t_heuristic = timed(
+                [
+                    (lambda i, c: lambda: skinny(xs[i], ws[i], c, out=o))(i, heuristic)
+                    for i in range(NUM_COPIES)
+                ]
+            )
+        best: tuple[float, SkinnyGemmConfig] | None = None
+        for block in block_sizes.get(k, ()):
+            for outputs in (1, 2, 4, 8):
+                config = SkinnyGemmConfig(m, block, outputs, 1, 16)
+                if config == served or not skinny.supports(config, m, n, k):
+                    continue
+                try:
+                    skinny(xs[0], ws[0], config, out=o)
+                    torch.cuda.synchronize()
+                except Exception:  # noqa: BLE001
+                    continue
+                if (o.float() - ref).abs().max().item() > 1.5:
+                    continue
+                t = timed(
+                    [
+                        (lambda i, c: lambda: skinny(xs[i], ws[i], c, out=o))(i, config)
+                        for i in range(NUM_COPIES)
+                    ]
+                )
+                if best is None or t < best[0]:
+                    best = (t, config)
+        # Decide keep/demote first, then admit candidates against what will
+        # actually serve, so a candidate cannot lose to a config that is
+        # itself being demoted. MARGIN is for admission only: a tuned entry
+        # keeps while it is not worse than the heuristic, so marginal wins
+        # do not flap in and out across re-sweeps.
+        keep = (m, n, k) in SKINNY_CONFIG_ROUTE and t_served <= t_heuristic
+        bar = t_served if keep else t_heuristic
+        if best and best[0] * MARGIN <= bar:
+            winner = best[1]
+            print(
+                f"({m}, {n}, {k}) served={t_served:.3f}us "
+                f"vw16={best[0]:.3f}us {t_served / best[0]:.2f}x"
+            )
+        elif keep:
+            winner = served
+            print(f"({m}, {n}, {k}) served={t_served:.3f}us (keep tuned entry)")
+        else:
+            winner = None
+            demoted = (m, n, k) in SKINNY_CONFIG_ROUTE
+            print(
+                f"({m}, {n}, {k}) served={t_served:.3f}us "
+                f"({'DEMOTE to heuristic' if demoted else 'keep heuristic'})"
+            )
+        if winner is not None:
+            winners[(m, n, k)] = (
+                winner.block_size,
+                winner.outputs_per_block,
+                winner.k_unroll,
+                winner.vector_width,
+            )
+    print("\nSKINNY_CONFIG_ROUTE entries:")
+    for shape, tuned in winners.items():
+        print(f"        {shape}: {tuned},")
+
+
+if _SKINNY_CONFIG_MODE:
+    if len(sys.argv) > 2:
+        sys.exit("skinny-configs takes no further arguments and writes no file")
+    sweep_skinny_configs()
+    sys.exit(0)
 
 route: dict[str, str] = {}
 per_step_gain: dict[int, float] = dict.fromkeys(MS, 0.0)

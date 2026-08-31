@@ -353,5 +353,126 @@ def test_measured_route_source_has_no_duplicate_keys():
     assert not dupes, f"duplicate MEASURED_ROUTE keys in source: {dupes}"
     # Parsed size must match source count, else a duplicate collapsed.
     assert len(routed_gemv.MEASURED_ROUTE) == len(keys)
+    # Tuple-valued tables need their own pattern, scanned per table: the two
+    # config tables are independent key spaces, so a shared key is legal.
+    for name, table in (
+        ("SKINNY_CONFIG_ROUTE", routed_gemv.SKINNY_CONFIG_ROUTE),
+        ("ADD3_ROUTE", routed_gemv.ADD3_ROUTE),
+    ):
+        start = src.index(f"{name}: MappingProxyType")
+        span = src[start : src.index(")", src.index("}", start))]
+        cfg_keys = re.findall(r"\((\d+), (\d+), (\d+)\): \(", span)
+        cfg_dupes = [k for k, n in collections.Counter(cfg_keys).items() if n > 1]
+        assert not cfg_dupes, f"duplicate {name} keys in source: {cfg_dupes}"
+        assert len(table) == len(cfg_keys), name
     # Exact-M keying: entries may only exist in the gap-free swept range.
     assert all(m <= 32 for m, _, _ in routed_gemv.MEASURED_ROUTE)
+
+
+def test_skinny_config_route_entries_are_valid():
+    """Every tuned skinny config must target a shape the route actually sends
+    to skinny, and must satisfy the kernel's geometry contract; a typo here
+    would otherwise fall back (wrong M) or crash at compile time."""
+    from tokenspeed_kernel.ops.gemm.routed_gemv import SKINNY_CONFIG_ROUTE
+    from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm import (
+        SkinnyGemmConfig,
+        shape_dynamic_skinny_gemm,
+    )
+
+    for (m, n, k), tuned in SKINNY_CONFIG_ROUTE.items():
+        assert MEASURED_ROUTE.get((m, n, k)) == "skinny", (m, n, k)
+        # supports() does not know the kernel's warp-multiple block rule.
+        assert tuned[0] % 32 == 0, (m, n, k)
+        config = SkinnyGemmConfig(m, *tuned)
+        assert shape_dynamic_skinny_gemm.supports(config, m, n, k), (m, n, k)
+
+
+def test_skinny_config_consults_the_table_only_on_the_pinned_arch():
+    """The tuned tile shapes were swept on sm100; a widened pin would run
+    them unmeasured elsewhere, the hazard _is_add3_arch documents."""
+    from unittest.mock import patch
+
+    from tokenspeed_kernel.ops.gemm import routed_gemv
+    from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm import (
+        shape_dynamic_skinny_gemm,
+    )
+
+    m, n, k = 2, 768, 1536
+    # A failed assert must not leave patched-state configs cached for later
+    # tests; clear on every exit path.
+    try:
+        routed_gemv._skinny_config.cache_clear()
+        with patch.object(routed_gemv, "_is_skinny_config_arch", return_value=True):
+            config = routed_gemv._skinny_config(m, n, k, 0)
+        assert (
+            config.block_size,
+            config.outputs_per_block,
+            config.k_unroll,
+            config.vector_width,
+        ) == (96, 2, 1, 16)
+        routed_gemv._skinny_config.cache_clear()
+        with patch.object(routed_gemv, "_is_skinny_config_arch", return_value=False):
+            config = routed_gemv._skinny_config(m, n, k, 0)
+        assert config == shape_dynamic_skinny_gemm.default_config(m, n, k)
+        # The pin is exact: sm103 swept nothing, so it must say no there.
+        routed_gemv._is_skinny_config_arch.cache_clear()
+        with patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)):
+            assert not routed_gemv._is_skinny_config_arch(0)
+    finally:
+        routed_gemv._skinny_config.cache_clear()
+        routed_gemv._is_skinny_config_arch.cache_clear()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _is_routed_arch(),
+    reason="route is registered for sm100 and up",
+)
+@pytest.mark.parametrize("misalign", ["x", "weight"])
+def test_under_aligned_input_falls_back_to_torch(monkeypatch, misalign):
+    """vw-16 raises the kernel's pointer requirement to 32 bytes; supports()
+    cannot see alignment, so the guard must fall back instead of launching."""
+    from tokenspeed_kernel.ops.gemm import routed_gemv
+    from tokenspeed_kernel.thirdparty.cute_dsl import skinny_gemm
+
+    m, n, k = 2, 768, 1536  # SKINNY_CONFIG_ROUTE entry (vector_width 16)
+    # An 8-byte offset under-aligns every vector width the route can pick
+    # (vw 8 needs 16B, vw 16 needs 32B), so the fallback must fire on every
+    # routed arch -- the tuned-config pin only holds on sm100.
+    xbuf = torch.randn(m * k + 4, device="cuda", dtype=torch.bfloat16)
+    wbuf = torch.randn(n * k + 4, device="cuda", dtype=torch.bfloat16)
+    x = xbuf[4:].view(m, k) if misalign == "x" else xbuf[:-4].view(m, k)
+    w = wbuf[4:].view(n, k) if misalign == "weight" else wbuf[:-4].view(n, k)
+    assert (x if misalign == "x" else w).data_ptr() % 16
+    monkeypatch.setattr(
+        skinny_gemm.ShapeDynamicSkinnyGemm,
+        "__call__",
+        lambda *a, **kw: pytest.fail("under-aligned input must not launch"),
+    )
+    got = routed_gemv.skinny_gemv(x, w)
+    assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _is_routed_arch(),
+    reason="route is registered for sm100 and up",
+)
+def test_vw16_alignment_threshold_is_32_bytes(monkeypatch):
+    """A 16-byte-aligned view satisfies vw-8 but not vw-16; on the pinned
+    arch the tuned config must reject it, pinning align = vw * elem_size."""
+    from tokenspeed_kernel.ops.gemm import routed_gemv
+    from tokenspeed_kernel.thirdparty.cute_dsl import skinny_gemm
+
+    if not routed_gemv._is_skinny_config_arch(0):
+        pytest.skip("SKINNY_CONFIG_ROUTE is pinned to sm100")
+    m, n, k = 2, 768, 1536  # tuned entry (96, 2, 1, 16)
+    xbuf = torch.randn(m * k + 8, device="cuda", dtype=torch.bfloat16)
+    x = xbuf[8:].view(m, k)
+    assert x.data_ptr() % 32 == 16
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        skinny_gemm.ShapeDynamicSkinnyGemm,
+        "__call__",
+        lambda *a, **kw: pytest.fail("16B-aligned input must not launch vw-16"),
+    )
+    got = routed_gemv.skinny_gemv(x, w)
+    assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)

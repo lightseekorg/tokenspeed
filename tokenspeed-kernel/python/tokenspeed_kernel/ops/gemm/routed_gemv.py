@@ -331,12 +331,68 @@ def _mark_warmed(backend: str, dev: int, m: int, n: int, k: int) -> None:
             _warmed.add((backend, dev, m, n, k))
 
 
-@functools.lru_cache(maxsize=32)
-def _skinny_config(m: int, n: int, k: int):
+# Measured skinny configs that beat ``default_config`` by >=4% under the
+# tune_route.py methodology (cold L2: 8 weight copies cycled in-graph,
+# 41-round medians, GB200/sm100 -- hence the ``_is_skinny_config_arch`` pin):
+# (m, n, k) -> (block_size, outputs_per_block, k_unroll, vector_width).
+# All use 256-bit loads (vector_width 16), which nvidia-cutlass-dsl accepts
+# from 4.7; the heuristic predates that option. Wins are 4.2%-49.8%, biggest
+# where one block tile covers K (96x16 == 1536, 160x16 == 2560). The K=7168
+# and K=14336 families lost cold -- an L2-warm sweep had them ahead -- and
+# keep the heuristic, except the 1536x7168 shard at M == 5 and 6.
+SKINNY_CONFIG_ROUTE: MappingProxyType[
+    tuple[int, int, int], tuple[int, int, int, int]
+] = MappingProxyType(
+    {
+        (2, 768, 1536): (96, 2, 1, 16),
+        (3, 768, 1536): (96, 2, 1, 16),
+        (4, 768, 1536): (96, 2, 1, 16),
+        (2, 1152, 1536): (96, 4, 1, 16),
+        (3, 1152, 1536): (96, 4, 1, 16),
+        (4, 1152, 1536): (96, 4, 1, 16),
+        (5, 1152, 1536): (96, 4, 1, 16),
+        (2, 1536, 1536): (96, 4, 1, 16),
+        (3, 1536, 1536): (96, 4, 1, 16),
+        (4, 1536, 1536): (96, 2, 1, 16),
+        (2, 2304, 1536): (96, 4, 1, 16),
+        (1, 320, 2560): (160, 2, 1, 16),
+        (2, 320, 2560): (160, 2, 1, 16),
+        (1, 512, 2560): (160, 2, 1, 16),
+        (2, 512, 2560): (160, 2, 1, 16),
+        (1, 640, 2560): (160, 4, 1, 16),
+        (2, 640, 2560): (160, 2, 1, 16),
+        (4, 640, 2560): (160, 2, 1, 16),
+        (2, 12800, 2560): (160, 4, 1, 16),
+        (5, 1536, 7168): (224, 2, 1, 16),
+        (6, 1536, 7168): (64, 2, 1, 16),
+    }
+)
+
+
+@functools.lru_cache(maxsize=8)
+def _is_skinny_config_arch(device_index: int) -> bool:
+    """SKINNY_CONFIG_ROUTE's arch pin: its configs were only swept on sm100."""
+    from tokenspeed_kernel.platform import current_platform
+
+    platform = current_platform()
+    if platform.vendor != "nvidia":
+        return False
+    return torch.cuda.get_device_capability(device_index) == (10, 0)
+
+
+# Unbounded is safe: the sole hot caller admits only MEASURED_ROUTE skinny
+# shapes, so the key space is that table times the device count.
+@functools.lru_cache(maxsize=None)
+def _skinny_config(m: int, n: int, k: int, device_index: int):
     from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm import (
+        SkinnyGemmConfig,
         shape_dynamic_skinny_gemm,
     )
 
+    if _is_skinny_config_arch(device_index):
+        tuned = SKINNY_CONFIG_ROUTE.get((m, n, k))
+        if tuned is not None:
+            return SkinnyGemmConfig(m, *tuned)
     return shape_dynamic_skinny_gemm.default_config(m, n, k)
 
 
@@ -370,9 +426,13 @@ def skinny_gemv(
         or not _usable_in_capture("skinny", dev, m, n, k)
     ):
         return _torch_decode_gemv(x, weight, out)
-    config = _skinny_config(m, n, k)
+    config = _skinny_config(m, n, k, dev)
     # default_config can emit a config supports() rejects; fall back, don't raise.
     if not shape_dynamic_skinny_gemm.supports(config, m, n, k):
+        return _torch_decode_gemv(x, weight, out)
+    # supports() cannot see pointer alignment; the kernel asserts it at launch.
+    align = config.vector_width * x.element_size()
+    if x.data_ptr() % align or weight.data_ptr() % align:
         return _torch_decode_gemv(x, weight, out)
     # DLPack refuses requires_grad tensors; detach is a zero-copy view.
     result = shape_dynamic_skinny_gemm(x.detach(), weight.detach(), config, out=out)
