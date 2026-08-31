@@ -258,6 +258,7 @@ class Kimi3MoEExecutionPlan:
         lane_width: int,
         has_latent_norm: bool,
         max_token_num: int,
+        shard_up_projection: bool = False,
     ) -> "Kimi3MoEExecutionPlan":
         """Prepare optional communication fusions before graph capture."""
 
@@ -280,7 +281,13 @@ class Kimi3MoEExecutionPlan:
         # the payload exceeds COMM_ONESHOT_MAX_BYTES. Both are portable, so the
         # tail can issue one collective per MoE layer instead of two wherever a
         # TP x EP group exists -- not only where TRT-LLM can arm a lane.
-        join_moe_reduce = mapping.moe.has_tp_ep
+        #
+        # Excluded when the up projection is sharded: that tail folds the
+        # projection between two sequential all-reduces
+        # (_tail_fused_lane_ar_sharded) rather than calling the join, so the
+        # collective count is unchanged, while leaving SEPARATE_REDUCE would
+        # also give up the routed_in_fork overlap with the shared branch.
+        join_moe_reduce = mapping.moe.has_tp_ep and not shard_up_projection
         return replace(
             self,
             fused_moe_ar=fused_moe_ar,

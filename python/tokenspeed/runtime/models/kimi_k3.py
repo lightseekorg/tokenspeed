@@ -1541,6 +1541,7 @@ class KimiLinearMoE(nn.Module):
                 int(global_server_args_dict["comm_fusion_max_num_tokens"]),
                 1,
             ),
+            shard_up_projection=self._shard_up_projection,
         )
 
         self._topk_ready = (

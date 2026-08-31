@@ -147,7 +147,17 @@ def select_k3_moe_tail_tier(
         # reduces the routed and shared partials over the same group one after
         # the other -- and each collective is a rendezvous whose cost does not
         # amortize with batch, so the saving is largest at low concurrency.
-        # SEPARATE_REDUCE stays the fallback for backends that cannot join.
+        #
+        # SEPARATE_REDUCE stays the fallback for layouts that cannot join,
+        # which includes a sharded up projection: its tail folds the projection
+        # between two sequential all-reduces instead of calling
+        # kimi3_join_reduce_moe, so it would save no collective while still
+        # giving up the routed_in_fork overlap.
+        #
+        # MULTIMEM_AR is deliberately still not reachable here. It already
+        # required fused_moe_ar before this join existed, so promoting
+        # lane-less backends into the multimem window would be a separate
+        # behavioural change rather than part of this one.
         if join_moe_reduce:
             return K3MoETailTier.FUSED_LANE_AR
         return K3MoETailTier.SEPARATE_REDUCE
