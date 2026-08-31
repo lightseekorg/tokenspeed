@@ -143,11 +143,6 @@ class DSABackend(AttentionBackend):
         # mark_cache_contract binds the child, so the wrapper must answer for it.
         return self._dense_backend.consumes_cache_metadata
 
-    @property
-    def capture_table_in_block_granularity(self) -> bool:
-        # Read off the same object: capture never descends past this wrapper.
-        return self._dense_backend.capture_table_in_block_granularity
-
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
         return self._dense_backend.select_out_cache_loc(
             layer, out_cache_loc, forward_mode

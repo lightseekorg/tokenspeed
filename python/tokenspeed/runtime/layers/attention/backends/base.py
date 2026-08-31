@@ -91,12 +91,6 @@ class AttentionBackend(ABC):
     # full-history draft table for this backend. Keep this separate from
     # uses_cache_groups: generic speculative backends still consume that table.
     cache_group_tables_replace_draft_page_table: bool = False
-    # Capture tables for this backend are addressed in each group's own
-    # block_granularity. False means its kernel derives the row stride from
-    # max_kv_len and indexes the whole row, so capture must span max_num_pages.
-    capture_table_in_block_granularity: bool = False
-    # Kernel pages a table row spans; 0 when the backend derives it per forward.
-    max_num_pages: int = 0
     # Latched by mark_cache_contract on the backends the registry binds.
     _cache_contract_bound: bool = False
     uses_padded_decode_token_mask: bool = False

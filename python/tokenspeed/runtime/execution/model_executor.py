@@ -656,7 +656,7 @@ class ModelExecutor:
         tic = time.time()
         set_autotune_process_group(cpu_group)
         with autotune(), maybe_inference_mode():
-            ctx = self.prefill_graph.make_dummy_batch(num_tokens, self.forward_step)
+            ctx = self.prefill_graph.make_dummy_batch(num_tokens)
             positions = (
                 ib.mrope_positions_buf[:, :num_tokens]
                 if self.config.model_is_mrope
