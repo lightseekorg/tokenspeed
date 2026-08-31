@@ -828,7 +828,10 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                     bs,
                     self._expand_history_table(page_table[:bs]),
                 )
-            if not for_graph_replay:
+            # Eager has no in-graph writer; the capture default's idle
+            # refresh (actual_bs == 0) must seed the same safe baseline the
+            # recorded fill_block_decode_seq_lens overwrites on replay.
+            if not for_graph_replay or actual_bs == 0:
                 self.fill_block_decode_seq_lens(bs, seq_lens)
             self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
             return

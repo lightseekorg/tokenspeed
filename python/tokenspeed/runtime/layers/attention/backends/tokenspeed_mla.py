@@ -826,7 +826,10 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
             # Under replay the lengths come from fill_block_decode_seq_lens,
             # inside the graph; eager has no in-graph writer, so fill here.
             self._replay_block_decode_page_table(bs, page_table)
-            if not for_graph_replay:
+            # Eager has no in-graph writer; the capture default's idle
+            # refresh (actual_bs == 0) must seed the same safe baseline the
+            # recorded fill_block_decode_seq_lens overwrites on replay.
+            if not for_graph_replay or actual_bs == 0:
                 self.fill_block_decode_seq_lens(bs, seq_lens)
             self.forward_decode_metadata = metadata
             return

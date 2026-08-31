@@ -87,6 +87,17 @@ class CacheGroupsMixin:
     # Replay fill pads dummy rows itself, so callers may pass UNPADDED tables (no per-step F.pad)
     tables_self_padding: bool = True
 
+    def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
+        """Pre-build the per-bs views with the capture-time group set pinned,
+        so the base default capture records the exact per-group views the
+        refresh repoints at (see AttentionBackend.bind_decode_views)."""
+        if cache_group_ids:
+            # Verify keeps [bs]-row tables plus [bs*N] location views.
+            assert not (
+                self.draft_block_decode and self.spec_num_tokens > 1
+            ), "cache_group_ids is unsupported with DFLASH block decode"
+        self._decode_views(bs, cache_group_ids=cache_group_ids)
+
     # ------------------------------------------------------------------
     # Group selection
     # ------------------------------------------------------------------

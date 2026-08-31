@@ -171,6 +171,17 @@ class AttentionBackend(ABC):
         bs = seq_lens.shape[0]
         buf[:bs].copy_(seq_lens[:bs])
 
+    def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
+        """Build/bind the pointer-stable per-bs decode views before a capture.
+
+        ``cache_group_ids`` names the cache groups whose page tables arrive
+        at replay and pins the capture-time group set (a draft may consume a
+        family subset of its buffers); empty for single-table backends. The
+        base default is a no-op — refresh builds views lazily — and the
+        cache-group mixins override it so capture records the exact
+        per-group views replay refreshes.
+        """
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -178,16 +189,38 @@ class AttentionBackend(ABC):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
         cache_group_ids: tuple[str, ...] = (),
+        page_table: torch.Tensor | None = None,
         **kwargs,
     ):
-        """Init the metadata for a forward pass for capturing a cuda graph.
+        """Default capture: bind the per-bs views, then run the idle refresh.
 
-        ``cache_group_ids`` names the cache groups whose page tables arrive at
-        replay; a backend
-        allocates its persistent per-group buffers from these ids — no table
-        data exists at capture time. Empty for single-table backends.
+        Capture never reads live tables — ``refresh_decode_metadata`` with
+        ``actual_bs=0`` and ``for_graph_replay=True`` routes every row to the
+        null page over the same persistent buffers replay refreshes, against
+        the runner-seeded ``seq_lens`` (filled to ``max_tokens_per_req``,
+        which is >= every verify floor, so the capture-side clamp equals the
+        refresh-side one). ``page_table`` is the same address-stable staged
+        table replay passes; its dummy rows are zero at capture. Idempotent —
+        one capture runs it several times (warmups + re-inits). Override only
+        for a genuine capture-only asymmetry (docs/design/unified_path.md,
+        "Capture is inherited").
         """
-        raise NotImplementedError()
+        if not forward_mode.is_decode_or_idle():
+            raise NotImplementedError(
+                f"{type(self).__name__} CUDA graphs record decode only, "
+                f"got {forward_mode}"
+            )
+        self.bind_decode_views(bs, cache_group_ids)
+        self.refresh_decode_metadata(
+            bs,
+            0,
+            req_pool_indices,
+            seq_lens,
+            forward_mode=forward_mode,
+            page_table=page_table,
+            for_graph_replay=True,
+            **kwargs,
+        )
 
     def refresh_decode_metadata(
         self,

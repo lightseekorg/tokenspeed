@@ -52,6 +52,7 @@ def _decode_mode():
         is_mixed=lambda: False,
         is_extend_or_mixed=lambda: False,
         is_idle=lambda: False,
+        is_decode_or_idle=lambda: True,
     )
 
 
@@ -164,6 +165,62 @@ class AboveLadderDecodeTest(_MhaCase):
         # Lazy per-bs views: built once, pointer-stable on the next refresh.
         md2 = self._refresh(bs, bs, seq + 1, replay=False)
         self.assertIs(md2, md)
+
+
+class DefaultCaptureTest(_MhaCase):
+    """The base default capture (bind views + idle refresh) over a real
+    cache-group backend: it binds the same cached per-bs views a refresh
+    binds, seeds the same buffers, and is idempotent across the capture-time
+    re-init sequence (4 warmups + 2 re-inits per capture)."""
+
+    def _default_capture(self, bs, seq_lens):
+        from tokenspeed.runtime.layers.attention.backends.base import (
+            AttentionBackend,
+        )
+
+        torch = self.torch
+        # Explicitly the BASE default: exercises the inherited capture even
+        # while a backend still carries a bespoke override.
+        AttentionBackend.init_forward_metadata_capture_cuda_graph(
+            self.backend,
+            bs,
+            torch.arange(bs, dtype=torch.int64),
+            seq_lens,
+            _decode_mode(),
+            cache_group_ids=("full_attention",),
+            page_table=torch.zeros((bs, MAX_NUM_PAGES), dtype=torch.int32),
+        )
+        return self.backend.forward_decode_metadata
+
+    def test_capture_binds_cached_views_and_seeds_buffers(self):
+        torch = self.torch
+        seq = torch.full((LADDER_BS,), 7, dtype=torch.int32)
+        md = self._default_capture(LADDER_BS, seq)
+        self.assertIs(md, self.backend.cuda_graph_decode_metadata[LADDER_BS])
+        torch.testing.assert_close(self.backend.cuda_graph_seq_lens[:LADDER_BS], seq)
+        # Idle refresh: no live tables were read, group buffers stay null.
+        for buf in self.backend.cuda_graph_page_tables.values():
+            self.assertTrue((buf[:LADDER_BS] == 0).all())
+
+    def test_capture_is_idempotent_and_pointer_stable(self):
+        from tokenspeed.runtime.execution.graph_ptr_guard import (
+            snapshot_graph_metadata,
+        )
+
+        torch = self.torch
+        seq = torch.full((LADDER_BS,), 7, dtype=torch.int32)
+        md = self._default_capture(LADDER_BS, seq)
+        snap = snapshot_graph_metadata(self.backend)
+        for _ in range(5):
+            self.assertIs(self._default_capture(LADDER_BS, seq), md)
+        self.assertEqual(snapshot_graph_metadata(self.backend), snap)
+
+    def test_replay_refresh_rebinds_the_captured_views(self):
+        torch = self.torch
+        seq = torch.full((LADDER_BS,), 7, dtype=torch.int32)
+        md = self._default_capture(LADDER_BS, seq)
+        padded_seq = torch.tensor([5, 4, 1, 1], dtype=torch.int32)
+        self.assertIs(self._refresh(LADDER_BS, 2, padded_seq, replay=True), md)
 
 
 class GraphPtrGuardWalkTest(_TorchCase):

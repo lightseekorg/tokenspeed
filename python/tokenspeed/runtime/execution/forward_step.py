@@ -206,8 +206,14 @@ class ForwardStepRunner:
         eager_grammar_buffers=None,
         sampling_backend: SamplingBackend | None = None,
         runtime_states: RuntimeStates | None = None,
+        page_table: torch.Tensor | None = None,
     ):
         self.config = config
+        # The executor's address-stable staged full-history table — the same
+        # object every live __call__ passes as page_table. Capture hands it
+        # to the backends so the default capture's idle refresh runs the very
+        # arm replay runs (its dummy rows are zero at capture time).
+        self.page_table = page_table
         self.attn_backend = attn_backend
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
@@ -738,6 +744,8 @@ class ForwardStepRunner:
         cache_group_ids = self._cache_group_ids(self.token_to_kv_pool)
         if cache_group_ids:
             capture_kwargs["cache_group_ids"] = cache_group_ids
+        if self.page_table is not None:
+            capture_kwargs["page_table"] = self.page_table
         self.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             self.input_buffers.req_pool_indices_buf[:bs],
@@ -760,6 +768,10 @@ class ForwardStepRunner:
             draft_group_ids = self._draft_cache_group_ids()
             if draft_group_ids:
                 draft_kwargs["cache_group_ids"] = draft_group_ids
+            if self.drafter is not None:
+                # Same staged table the draft's live refresh reads
+                # (_prepare_decode_metadata passes drafter.cache_view.table).
+                draft_kwargs["page_table"] = self.drafter.cache_view.table
             # Drafter mutates seq_lens_buf in place per step; backends alias.
             self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
                 bs,

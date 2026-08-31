@@ -378,7 +378,7 @@ class WrapperCaptureGroupIdsTest(_TorchCase):
     cache_group_ids from the pool's published specs and pass them to
     the backend capture hook."""
 
-    def _run_capture(self, bs, group_ids):
+    def _run_capture(self, bs, group_ids, page_table=None):
         torch = self.torch
         from types import MethodType
 
@@ -412,6 +412,7 @@ class WrapperCaptureGroupIdsTest(_TorchCase):
             drafter=None,
             use_target_verify_forward_mode=False,
             draft_attn_backend=None,
+            page_table=page_table,
         )
         mock._cache_group_ids = MethodType(ForwardStepRunner._cache_group_ids, mock)
         ForwardStepRunner._init_capture_metadata(mock, bs)
@@ -428,6 +429,13 @@ class WrapperCaptureGroupIdsTest(_TorchCase):
     def test_capture_omits_group_ids_without_specs(self):
         recorded = self._run_capture(2, [])
         self.assertNotIn("cache_group_ids", recorded["kwargs"])
+
+    def test_capture_forwards_the_staged_page_table(self):
+        # The default capture's idle refresh reads the same address-stable
+        # staged table replay passes; the runner must hand it through.
+        table = self.torch.zeros((MAX_BS, 3), dtype=self.torch.int32)
+        recorded = self._run_capture(2, [], page_table=table)
+        self.assertIs(recorded["kwargs"]["page_table"], table)
 
 
 class WrapperEagerGroupGuardTest(_TorchCase):

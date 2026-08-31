@@ -54,6 +54,13 @@ class MlaCacheGroupMixin:
     # must not F.pad).
     tables_self_padding = True
 
+    def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
+        """Pre-build the per-bs views for the base default capture. The MLA
+        group binding is a separate latch owned by the backends whose
+        recorded write-loc branch reads it (see MLAAttnBackend)."""
+        del cache_group_ids
+        self._decode_views(bs)
+
     # Learned from the pool's published specs at set_cache_pool; None until a
     # pool binds (unit fixtures may run without one).
     _full_history_group_id: str | None = None
