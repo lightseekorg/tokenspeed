@@ -8,12 +8,31 @@ from urllib.parse import urlparse
 
 from pier.agents.installed.base import BaseInstalledAgent, with_prompt_template
 from pier.agents.network import allowlist_from_urls
+from pier.environments import agent_setup as pier_agent_setup
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
 from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.network import NetworkAllowlist
 
 KIMI_CODE_VERSION = "0.23.6"
+_DEFAULT_SQUID_BOOTSTRAP = pier_agent_setup.squid_bootstrap_command
+
+
+def _squid_bootstrap_with_http_connect() -> str:
+    """Allow authenticated CONNECT tunnels to allowlisted HTTP endpoints."""
+    bootstrap = _DEFAULT_SQUID_BOOTSTRAP()
+    original = "http_access deny CONNECT !SSL_ports"
+    replacement = "http_access deny CONNECT !Safe_ports"
+    if bootstrap.count(original) != 1:
+        raise RuntimeError("Pier Squid CONNECT policy has changed")
+    return bootstrap.replace(original, replacement)
+
+
+# Kimi Code uses Node's undici EnvHttpProxyAgent, which tunnels both HTTP and
+# HTTPS requests with CONNECT. Pier 0.3.1 permits safe HTTP destinations but
+# restricts CONNECT to port 443, so extend the existing authenticated,
+# allowlisted proxy policy to the full Safe_ports set (80 and 443).
+pier_agent_setup.squid_bootstrap_command = _squid_bootstrap_with_http_connect
 
 
 class KimiCodeAgent(BaseInstalledAgent):
@@ -102,6 +121,8 @@ class KimiCodeAgent(BaseInstalledAgent):
         await self.exec_as_agent(
             environment,
             command=(
+                'trap \'cp "$HOME/.kimi-code/logs/kimi-code.log" '
+                "/logs/agent/kimi-code.log 2>/dev/null || true' EXIT; "
                 '"$HOME/.kimi-code/bin/kimi" '
                 f"--prompt {shlex.quote(instruction)} --output-format stream-json "
                 "2>&1 </dev/null | tee /logs/agent/kimi-code.jsonl"
