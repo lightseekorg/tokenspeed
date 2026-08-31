@@ -621,7 +621,7 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
     disturb the recurrence, not which producers ran.
     """
     from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
-        triton_nvidia_kda_fused_paged_verify_no_store as try_kda_fused_paged_verify,
+        triton_nvidia_kda_fused_paged_verify_no_store as kda_fused_paged_verify,
     )
 
     n, t, rows = 2, 3, 12
@@ -631,7 +631,7 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
     state_tape = torch.randn(rows, HV, K, V, device=DEV, dtype=torch.float32)
     conv_before, state_before = conv_tape.clone(), state_tape.clone()
 
-    no_store = try_kda_fused_paged_verify(
+    no_store = kda_fused_paged_verify(
         x["qkv_raw"],
         x["conv_w"],
         x["conv_pool"],
@@ -680,7 +680,7 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
     # Negative control: the output oracle must notice a wrong committed base.
     corrupted = {**x, "h_pool": x["h_pool"].clone()}
     corrupted["h_pool"][x["read_indices"].long()] += 1
-    wrong = try_kda_fused_paged_verify(
+    wrong = kda_fused_paged_verify(
         corrupted["qkv_raw"],
         corrupted["conv_w"],
         corrupted["conv_pool"],

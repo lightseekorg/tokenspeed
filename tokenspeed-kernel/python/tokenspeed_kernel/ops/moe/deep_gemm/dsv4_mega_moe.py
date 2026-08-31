@@ -281,7 +281,7 @@ if fp8_fp4_mega_moe is not None and stage_dsv4_mega_moe_inputs is not None:
             "scale_block_size": frozenset({_MXFP4_BLOCK_SIZE}),
             "supports_ep": frozenset({True}),
         },
-        priority=Priority.SPECIALIZED + 2,
+        priority=Priority.SPECIALIZED,
         tags={"throughput"},
         weight_preprocessor=_deep_gemm_dsv4_mega_moe_process_weights,
     )

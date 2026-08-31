@@ -533,7 +533,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 )
             q = self.q_b_proj(q_norm)[0]
             return q, latent_cache, gate, None
-        projection = mla_normalize_project_query(
+        q, absorbed_query = mla_normalize_project_query(
             q_a,
             kv_a,
             self.fused_qk_layernorm.weight_q_a,
@@ -544,7 +544,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             qk_nope_head_dim=self.qk_nope_head_dim,
             qk_rope_head_dim=self.qk_rope_head_dim,
         )
-        return projection.query, latent_cache, gate, projection.absorbed_query
+        return q, latent_cache, gate, absorbed_query
 
     def can_fuse_attnres_partials(
         self,

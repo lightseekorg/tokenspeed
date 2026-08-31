@@ -390,8 +390,8 @@ def _dsv4_sparse_attention_kernel(
 
 @register_kernel(
     "attention",
-    "dsv4_selected_attention",
-    name="triton_dsv4_selected_attention",
+    "dsv4_prefill",
+    name="triton_dsv4_prefill",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=frozenset(
@@ -589,8 +589,8 @@ def _dsv4_dequantize_selected_cache_segment(
 
 @register_kernel(
     "attention",
-    "dsv4_paged_selected_attention",
-    name="triton_dsv4_paged_selected_attention",
+    "dsv4_decode",
+    name="triton_dsv4_decode",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=frozenset(
@@ -612,7 +612,7 @@ def _dsv4_dequantize_selected_cache_segment(
     priority=Priority.PORTABLE,
     tags={"portability", "paged_cache", "selected_attention"},
 )
-def triton_dsv4_paged_selected_attention(
+def triton_dsv4_decode(
     q: torch.Tensor,
     swa_kv_cache: torch.Tensor,
     swa_slots: torch.Tensor,
@@ -627,7 +627,7 @@ def triton_dsv4_paged_selected_attention(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compose page-planar dequantization with registered dense attention."""
-    from tokenspeed_kernel.ops.attention import dsv4_selected_attention
+    from tokenspeed_kernel.ops.attention import dsv4_prefill
 
     tokens = q.shape[0]
     swa_width = swa_slots.numel() // tokens
@@ -668,7 +668,7 @@ def triton_dsv4_paged_selected_attention(
             swa_width,
             workspace_width,
         )
-    return dsv4_selected_attention(
+    return dsv4_prefill(
         q=q,
         kv=kv_workspace,
         indices=selected_indices,

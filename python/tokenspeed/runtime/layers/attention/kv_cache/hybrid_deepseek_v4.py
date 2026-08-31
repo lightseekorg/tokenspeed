@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import ClassVar
 
 import torch
-from tokenspeed_kernel import dsv4_compressed_slot_mapping
+from tokenspeed_kernel.ops.attention.triton.dsv4 import dsv4_compressed_slot_mapping
 
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,

@@ -40,7 +40,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from tokenspeed_kernel.ops.attention.gdn_utils import (
+from tokenspeed_kernel.ops.attention import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
 )

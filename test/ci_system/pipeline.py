@@ -71,11 +71,6 @@ RUNNER_SM_PREFIXES = (
 )
 
 AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-", "amd-mi450-")
-GITHUB_HOSTED_RUNNERS = {
-    # Logical AMD runner used by the normal task matrix. The workload itself
-    # provides gfx1250 through rocJITsu, so no self-hosted GPU runner exists.
-    "amd-mi450-sim": "ubuntu-24.04-32core-x64",
-}
 NVIDIA_ARM_RUNNER_PREFIXES = (
     "gb200",
     "gb300",
@@ -332,8 +327,8 @@ def resolve_runner_labels(labels: Iterable[str]) -> List[str]:
 
 
 def resolve_runs_on(runner: str) -> str:
-    """Map a logical CI runner to the GitHub Actions runner that hosts it."""
-    return GITHUB_HOSTED_RUNNERS.get(runner, runner)
+    """Resolve the Actions label that executes a logical CI runner."""
+    return runner
 
 
 def find_task_files(root: Path) -> List[Path]:

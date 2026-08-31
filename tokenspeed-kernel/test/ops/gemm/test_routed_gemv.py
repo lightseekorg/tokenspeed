@@ -98,7 +98,11 @@ def test_routed_backend_matches_torch(shape, backend):
     reason="route is registered for sm100 and up",
 )
 def test_non_bf16_inputs_fall_back_to_torch():
-    from tokenspeed_kernel.ops.gemm.routed_gemv import skinny_gemv, tgv_gemv
+    from tokenspeed_kernel.ops.gemm.routed_gemv import (
+        ll_bf16_gemv,
+        skinny_gemv,
+        tgv_gemv,
+    )
 
     x = torch.randn(1, 7168, device="cuda", dtype=torch.float16)
     w = torch.randn(768, 7168, device="cuda", dtype=torch.float16)
@@ -108,6 +112,11 @@ def test_non_bf16_inputs_fall_back_to_torch():
     x = torch.randn(1, 1536, device="cuda", dtype=torch.float16)
     w = torch.randn(7168, 1536, device="cuda", dtype=torch.float16)
     got = tgv_gemv(x, w)
+    assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
+
+    x = torch.randn(1, 1536, device="cuda", dtype=torch.float16)
+    w = torch.randn(2560, 1536, device="cuda", dtype=torch.float16)
+    got = ll_bf16_gemv(x, w)
     assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
 
 

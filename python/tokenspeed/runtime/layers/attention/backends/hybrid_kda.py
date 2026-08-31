@@ -30,6 +30,8 @@ import torch
 from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention import (
     kda_batched_replay_uses_raw_gate,
+    kda_fused_paged_decode,
+    kda_fused_paged_verify,
     kda_paged_decode,
     kda_paged_prefill,
 )
@@ -38,9 +40,7 @@ from tokenspeed_kernel.ops.attention import (
 )
 from tokenspeed_kernel.ops.attention import (
     kda_replay_commit_supported,
-    resolve_kda_batched_replay_commit,
-    try_kda_fused_paged_decode,
-    try_kda_fused_paged_verify,
+    kda_resolve_batched_replay_commit,
 )
 from tokenspeed_kernel.ops.attention.triton.capture_payload import (
     capture_replay_payload,
@@ -111,7 +111,7 @@ class KdaAttnBackend(MambaAttnBackend):
         self._replay_active = kda_replay_commit_supported(
             self.dtype, recurrent_layout=self.kda_recurrent_layout
         )
-        self._batched_replay_kernel = resolve_kda_batched_replay_commit(self.dtype)
+        self._batched_replay_kernel = kda_resolve_batched_replay_commit(self.dtype)
         self._replay_uses_raw_gate = (
             self._replay_active and kda_batched_replay_uses_raw_gate(self.dtype)
         )
@@ -418,7 +418,7 @@ class KdaAttnBackend(MambaAttnBackend):
             return None
 
         num_value_heads = value_dim // attn_tp_size // head_v_dim
-        result = try_kda_fused_paged_decode(
+        result = kda_fused_paged_decode(
             mixed_qkv,
             conv_weights,
             conv_states,
@@ -581,7 +581,7 @@ class KdaAttnBackend(MambaAttnBackend):
                     lower_bound,
                 )
                 self._bind_replay_descriptor(layer_id, self._replay_weights[layer_id])
-            fused_out = try_kda_fused_paged_verify(
+            fused_out = kda_fused_paged_verify(
                 mixed_qkv,
                 conv_weights,
                 conv_comp,
@@ -613,7 +613,7 @@ class KdaAttnBackend(MambaAttnBackend):
             return None
         else:
             num_value_heads = value_dim // attn_tp_size // head_v_dim
-            return try_kda_fused_paged_verify(
+            return kda_fused_paged_verify(
                 mixed_qkv,
                 conv_weights,
                 conv_comp,
@@ -706,7 +706,7 @@ class KdaAttnBackend(MambaAttnBackend):
         ctx = self._verify_commit_ctx
         if ctx is None:
             return
-        from tokenspeed_kernel.ops.attention import try_kda_replay_commit
+        from tokenspeed_kernel.ops.attention import kda_replay_commit
 
         committed, tables, draft_token_num, read_pages_by_group = ctx
         bs = accepted_length.shape[0]
@@ -748,7 +748,7 @@ class KdaAttnBackend(MambaAttnBackend):
             group_id = self._state_group_for(layer_id)
             conv, state = self._state_components(layer_id)
             qkv, f_a, beta, gate = self._replay_payload(layer_id)
-            if not try_kda_replay_commit(
+            if not kda_replay_commit(
                 qkv[:rows, : conv_w.shape[0]],
                 conv_w,
                 conv,

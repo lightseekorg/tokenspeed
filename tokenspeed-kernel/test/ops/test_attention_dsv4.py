@@ -15,14 +15,6 @@ import math
 import unittest
 
 import torch
-from tokenspeed_kernel import (
-    dsv4_combine_dense_swa_indices,
-    dsv4_combine_topk_swa_indices,
-    dsv4_compressed_slot_mapping,
-    dsv4_compute_global_topk_indices_and_lens,
-    dsv4_decode_swa_indices_and_lens,
-    dsv4_dequantize_and_gather_k_cache,
-)
 from tokenspeed_kernel.ops.attention.cuda.dsv4 import (
     has_indexer_mxfp4_paged_gather,
     has_persistent_topk,
@@ -35,6 +27,12 @@ from tokenspeed_kernel.ops.attention.triton.dsv4 import (
     _dsv4_fused_csa_indexer_mxfp4_cache_kernel,
     _dsv4_fused_sparse_compress_cache_kernel,
     _dsv4_gather_launch_config,
+    dsv4_combine_dense_swa_indices,
+    dsv4_combine_topk_swa_indices,
+    dsv4_compressed_slot_mapping,
+    dsv4_compute_global_topk_indices_and_lens,
+    dsv4_decode_swa_indices_and_lens,
+    dsv4_dequantize_and_gather_k_cache,
 )
 from tokenspeed_kernel.ops.transform import hadamard_transform
 
