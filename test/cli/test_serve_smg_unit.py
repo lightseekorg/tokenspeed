@@ -219,9 +219,7 @@ def test_free_port_returns_first_sample_outside_ephemeral_range(monkeypatch):
         "tokenspeed.cli.serve_smg._ephemeral_port_range", lambda: (32768, 60999)
     )
     calls = iter([8413])
-    monkeypatch.setattr(
-        "tokenspeed.cli.serve_smg.get_free_port", lambda: next(calls)
-    )
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.get_free_port", lambda: next(calls))
 
     assert _free_port_avoiding_ephemeral_range() == 8413
 
@@ -233,9 +231,7 @@ def test_free_port_retries_out_of_ephemeral_range(monkeypatch):
     )
     # First two samples land inside the ephemeral range; the third clears it.
     calls = iter([40000, 41000, 9000])
-    monkeypatch.setattr(
-        "tokenspeed.cli.serve_smg.get_free_port", lambda: next(calls)
-    )
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.get_free_port", lambda: next(calls))
 
     assert _free_port_avoiding_ephemeral_range() == 9000
 
@@ -253,9 +249,7 @@ def test_free_port_gives_up_after_max_attempts(monkeypatch):
         call_count["n"] += 1
         return next(always_ephemeral)
 
-    monkeypatch.setattr(
-        "tokenspeed.cli.serve_smg.get_free_port", fake_get_free_port
-    )
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.get_free_port", fake_get_free_port)
 
     port = _free_port_avoiding_ephemeral_range()
 
@@ -266,13 +260,9 @@ def test_free_port_gives_up_after_max_attempts(monkeypatch):
 def test_free_port_skips_ephemeral_check_when_range_unknown(monkeypatch):
     """Non-Linux hosts (no /proc/sys/net/ipv4/ip_local_port_range) degrade
     to a plain get_free_port() call -- no retries, no crash."""
-    monkeypatch.setattr(
-        "tokenspeed.cli.serve_smg._ephemeral_port_range", lambda: None
-    )
+    monkeypatch.setattr("tokenspeed.cli.serve_smg._ephemeral_port_range", lambda: None)
     calls = iter([40000])
-    monkeypatch.setattr(
-        "tokenspeed.cli.serve_smg.get_free_port", lambda: next(calls)
-    )
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.get_free_port", lambda: next(calls))
 
     assert _free_port_avoiding_ephemeral_range() == 40000
 
