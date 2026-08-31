@@ -146,11 +146,14 @@ def test_graph_capture_records_expanded_metadata() -> None:
     backend = _backend(spec_num_tokens=8)
     backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=4)
+    # Runner contract: capture seq_lens are seeded to max_tokens_per_req
+    # (= spec_num_tokens) and the staged page table travels along.
     backend.init_forward_metadata_capture_cuda_graph(
         bs=2,
         req_pool_indices=torch.tensor([0, 1]),
-        seq_lens=torch.tensor([10, 20]),
+        seq_lens=torch.tensor([8, 8]),
         forward_mode=ForwardMode.DECODE,
+        page_table=torch.zeros((2, 4), dtype=torch.int32),
     )
 
     metadata = backend.decode_cuda_graph_metadata[2]
@@ -182,11 +185,14 @@ def test_graph_replay_replicates_the_page_table_across_block_rows() -> None:
     backend = _backend(spec_num_tokens=4, max_num_pages=3)
     backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=2)
+    # Runner contract: capture seq_lens are seeded to spec_num_tokens and the
+    # staged page table travels along.
     backend.init_forward_metadata_capture_cuda_graph(
         bs=2,
         req_pool_indices=torch.tensor([0, 1]),
-        seq_lens=torch.tensor([10, 20]),
+        seq_lens=torch.tensor([4, 4]),
         forward_mode=ForwardMode.DECODE,
+        page_table=torch.zeros((2, 3), dtype=torch.int32),
     )
 
     page_table = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
@@ -216,8 +222,9 @@ def test_contract_draft_replay_does_not_expand_published_pages_twice() -> None:
     backend.init_forward_metadata_capture_cuda_graph(
         bs=1,
         req_pool_indices=torch.tensor([0]),
-        seq_lens=torch.tensor([10]),
+        seq_lens=torch.tensor([4]),
         forward_mode=ForwardMode.DECODE,
+        page_table=torch.zeros((1, 4), dtype=torch.int32),
     )
 
     # ModelExecutor already expanded logical page 3 into kernel pages 6 and 7.

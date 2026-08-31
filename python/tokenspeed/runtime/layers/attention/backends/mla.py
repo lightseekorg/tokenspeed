@@ -516,48 +516,21 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         else:
             self.decode_cuda_graph_group_out_cache_loc = None
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-        cache_group_ids: tuple[str, ...] = (),
-        **kwargs,
-    ):
-        if forward_mode.is_extend_or_mixed():
-            raise NotImplementedError(
-                f"mla CUDA graph capture not supported for {forward_mode}"
-            )
+    # Capture is inherited: the base default (bind_decode_views + the idle
+    # refresh arm) reproduces the old bespoke capture — the refresh zeroes
+    # the page table and write locations at actual_bs == 0 and applies the
+    # same verify-floor clamp to the runner-seeded seq_lens.
 
+    def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
         # An explicit group dispatch or the contract marker puts this backend
-        # on the grouped path. A draft binds too — its refresh consumes the
-        # wrapper-dispatched group table — but its write locations stay
-        # drafter-owned (see _decode_views).
-        bind_groups = bool(cache_group_ids) or self._cache_contract_bound
-        if self._block_decode_active:
-            if bind_groups:
-                self._cache_groups_bound = True
-            # Block decode: seed only. The block-end seq_lens are written by
-            # the drafter *inside* the captured graph (see
-            # fill_block_decode_seq_lens); seed a value the capture run can
-            # safely read.
-            metadata = self._decode_views(bs)
-            metadata.page_table.zero_()
-            metadata.seq_lens.fill_(self.spec_num_tokens)
-            self.forward_decode_metadata = metadata
-            return
-        if bind_groups:
+        # on the grouped path; the latch must be set BEFORE the views are
+        # built (it selects the write-location view) and the recorded
+        # select_out_cache_loc branch reads it. A draft binds too — its
+        # refresh consumes the wrapper-dispatched group table — but its
+        # write locations stay drafter-owned (see _decode_views).
+        if cache_group_ids or self._cache_contract_bound:
             self._cache_groups_bound = True
-        metadata = self._decode_views(bs)
-        capture_q_len = metadata.group_q_len_per_req
-        if metadata.group_out_cache_loc is not None:
-            metadata.page_table.zero_()
-            metadata.group_out_cache_loc.zero_()
-        # Seed the owned buffer: the capture run reads it before replay. Verify
-        # rows span seq-N..seq-1, so a shorter length would start before zero.
-        metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(capture_q_len))
-        self.forward_decode_metadata = metadata
+        super().bind_decode_views(bs, cache_group_ids)
 
     def _replay_block_decode_page_table(
         self,

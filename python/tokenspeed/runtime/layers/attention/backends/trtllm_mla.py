@@ -471,31 +471,11 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         self.decode_cuda_graph_metadata[bs] = metadata
         return metadata
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-        **kwargs,
-    ):
-        if forward_mode.is_extend_or_mixed():
-            raise NotImplementedError(
-                f"trtllm_mla CUDA graph capture not supported for {forward_mode}"
-            )
-
-        # For capture we don't have page_table yet; the block indices arrive
-        # on refresh. seq_lens_k views the backend-owned buffer.
-        metadata = self._decode_views(bs)
-        capture_q_len = metadata.group_q_len_per_req
-        if metadata.group_out_cache_loc is not None:
-            metadata.group_out_cache_loc.zero_()
-
-        # Seed the owned buffer: the capture run reads it before replay. Verify
-        # rows span seq-N..seq-1, so a length below N would start the window
-        # before the sequence.
-        metadata.seq_lens_k.copy_(seq_lens[:bs].clamp_min(capture_q_len))
-        self.forward_decode_metadata = metadata
+    # Capture is inherited: the base default (bind_decode_views + the idle
+    # refresh arm) reproduces the old bespoke capture — the mixin bind builds
+    # the same cached views, the refresh applies the same verify-floor clamp,
+    # and the write-location buffer is zero-init (the old capture-time
+    # zeroing was redundant before any live refresh).
 
     def refresh_decode_metadata(
         self,

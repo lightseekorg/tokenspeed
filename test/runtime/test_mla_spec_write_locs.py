@@ -330,11 +330,13 @@ def test_contract_bound_draft_captures_staged_page_table_path() -> None:
     """An Eagle MLA draft reads its staged table, not target group tables."""
     backend = _backend(spec_num_tokens=4, is_draft=True)
     backend.init_cuda_graph_state(max_bs=2)
+    # Runner contract: the draft capture receives the drafter's staged table.
     backend.init_forward_metadata_capture_cuda_graph(
         bs=2,
         req_pool_indices=torch.tensor([0, 1]),
         seq_lens=torch.tensor([100, 200], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
+        page_table=torch.zeros((2, 4), dtype=torch.int32),
     )
     metadata = backend.decode_cuda_graph_metadata[2]
     assert metadata.group_out_cache_loc is None
@@ -350,5 +352,6 @@ def test_a_contract_bound_block_draft_is_admitted_on_the_group_graph_path() -> N
         req_pool_indices=torch.tensor([0, 1]),
         seq_lens=torch.tensor([100, 200], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
+        page_table=torch.zeros((2, 4), dtype=torch.int32),
     )
     assert 2 in backend.decode_cuda_graph_metadata

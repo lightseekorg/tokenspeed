@@ -706,47 +706,20 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
         else:
             self.decode_cuda_graph_group_out_cache_loc = None
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-        cache_group_ids: tuple[str, ...] = (),
-        **kwargs,
-    ):
+    # Capture is inherited: the base default (bind_decode_views + the idle
+    # refresh arm) reproduces the old bespoke capture — the refresh zeroes
+    # the kv indices and write locations at actual_bs == 0 and copies the
+    # runner-seeded seq_lens.
+
+    def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
         # Structural gate: the target (contract always marked by the registry)
-        # takes the cache-group capture path; the MTP draft, whose
-        # mark_cache_contract deliberately early-returns, keeps the
-        # batch-ordered draft page table for its in-graph write-loc math.
-        bind_groups = bool(cache_group_ids) or self._cache_contract_bound
-        if forward_mode.is_extend_or_mixed():
-            raise NotImplementedError(
-                f"tokenspeed_mla CUDA graph capture not supported for {forward_mode}"
-            )
-
-        if self._block_decode_active:
-            # Block decode: seed only. The block-end lengths are written by
-            # the drafter *inside* the captured graph (see
-            # fill_block_decode_seq_lens).
-            metadata = self._decode_views(bs)
-            metadata.block_kv_indices.zero_()
-            metadata.seq_lens_k.fill_(self.spec_num_tokens)
-            self.forward_decode_metadata = metadata
-            return
-
-        if bind_groups:
-            # Latch _cache_groups_bound so the recorded forward_decode takes
-            # the cache write-location branch (select_out_cache_loc).
+        # takes the cache-group path; the MTP draft, whose mark_cache_contract
+        # deliberately early-returns, keeps the batch-ordered draft page table
+        # for its in-graph write-loc math. Latch BEFORE the views are built —
+        # the recorded forward_decode's select_out_cache_loc branch reads it.
+        if cache_group_ids or self._cache_contract_bound:
             self._cache_groups_bound = True
-        metadata = self._decode_views(bs)
-        if metadata.group_out_cache_loc is not None:
-            # Placeholders resolve to the null page 0 until the first refresh.
-            metadata.block_kv_indices.zero_()
-            metadata.group_out_cache_loc.zero_()
-        # Seed the owned buffer: the capture run reads it before replay.
-        metadata.seq_lens_k.copy_(seq_lens[:bs])
-        self.forward_decode_metadata = metadata
+        super().bind_decode_views(bs, cache_group_ids)
 
     def _decode_views(self, bs: int) -> "CuteDSLMLADecodeMetadata":
         """Per-bs decode metadata views over the persistent buffers.

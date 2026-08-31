@@ -542,6 +542,40 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             )
         else:
             self.cuda_graph_group_out_cache_loc = None
+        # Buffers were (re)allocated: cached per-bs views must rebuild.
+        self.decode_cuda_graph_metadata: dict[int, FlashMLADecodeMetadata] = {}
+
+    def _decode_views(self, bs: int) -> FlashMLADecodeMetadata:
+        """Per-bs decode metadata views over the persistent buffers.
+
+        One builder for capture and refresh; cached per bs — pointer-stable,
+        no storage allocated. ``flashmla_metadata`` is deliberately per-step
+        mutable (exempted via ``graph_unstable_metadata_fields``): eager
+        refresh installs a fresh tile schedule, capture installs the recorded
+        one, and replay never reads it through Python.
+        """
+        metadata = self.decode_cuda_graph_metadata.get(bs)
+        if metadata is not None:
+            return metadata
+        q_len = self._graph_verify_q_len()
+        group_out_cache_loc = None
+        if self._cache_contract_bound:
+            if self.cuda_graph_group_out_cache_loc is None:
+                raise RuntimeError(
+                    "FlashMLA cache-group graph buffer was not allocated; "
+                    "mark_cache_contract must run before init_cuda_graph_state"
+                )
+            group_out_cache_loc = self.cuda_graph_group_out_cache_loc[: bs * q_len]
+        metadata = FlashMLADecodeMetadata(
+            num_extends=0,
+            flashmla_metadata=None,
+            page_table=self.cuda_graph_kv_indices[:bs],
+            seq_lens_k=self.cuda_graph_seq_lens_k[:bs],
+            group_out_cache_loc=group_out_cache_loc,
+            group_q_len_per_req=q_len,
+        )
+        self.decode_cuda_graph_metadata[bs] = metadata
+        return metadata
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -549,47 +583,27 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
+        cache_group_ids: tuple[str, ...] = (),
+        page_table: torch.Tensor | None = None,
         **kwargs,
     ):
-        decode_no_spec = forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1
-        is_target_verify = (
-            forward_mode.is_decode_or_idle()
-            and not self.is_draft
-            and self.spec_num_tokens > 1
+        # The one sanctioned capture-only asymmetry: flash_mla freezes its
+        # tile schedule on the first kernel call against a sched-meta, so
+        # capture installs a dedicated object whose schedule-build the graph
+        # records (kept alive for the graph's lifetime); eager refresh swaps
+        # in a fresh one per step instead. The refresh super() runs seeds the
+        # seq_lens the recorded schedule-build reads.
+        super().init_forward_metadata_capture_cuda_graph(
+            bs,
+            req_pool_indices,
+            seq_lens,
+            forward_mode,
+            cache_group_ids=cache_group_ids,
+            page_table=page_table,
+            **kwargs,
         )
-        is_draft_extend = (
-            forward_mode.is_decode_or_idle()
-            and self.is_draft
-            and self.spec_num_tokens > 1
-        )
-        if not (decode_no_spec or is_target_verify or is_draft_extend):
-            raise RuntimeError(f"Not supported forward mode: {forward_mode}")
-
-        # Seed before building the tile schedule: it is recorded against these
-        # lengths, and the capture run reads them before any replay. Verify rows
-        # span seq-N..seq-1, so a length below N would start the window before
-        # the sequence.
-        capture_q_len = self._graph_verify_q_len()
-        self.cuda_graph_seq_lens_k[:bs].copy_(seq_lens[:bs].clamp_min(capture_q_len))
-        group_out_cache_loc = None
-        if self._cache_contract_bound:
-            if self.cuda_graph_group_out_cache_loc is None:
-                raise RuntimeError(
-                    "FlashMLA cache-group graph capture buffer was not "
-                    "allocated; mark_cache_contract must run before "
-                    "init_cuda_graph_state"
-                )
-            group_out_cache_loc = self.cuda_graph_group_out_cache_loc[
-                : bs * capture_q_len
-            ]
-            group_out_cache_loc.zero_()
-        self.forward_decode_metadata = FlashMLADecodeMetadata(
-            num_extends=0,
-            flashmla_metadata=self._capture_decode_tile_metadata(bs),
-            page_table=self.cuda_graph_kv_indices[:bs],
-            seq_lens_k=self.cuda_graph_seq_lens_k[:bs],
-            group_out_cache_loc=group_out_cache_loc,
-            group_q_len_per_req=capture_q_len,
+        self.forward_decode_metadata.flashmla_metadata = (
+            self._capture_decode_tile_metadata(bs)
         )
 
     def refresh_decode_metadata(
@@ -608,11 +622,13 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         if forward_mode is None or not forward_mode.is_decode_or_idle():
             raise RuntimeError(f"Not supported forward mode: {forward_mode}")
 
+        metadata = self._decode_views(bs)
         # Verify rows span seq-N..seq-1; clamp so a request shorter than the
         # window does not resolve locations before its start. On replay the
-        # width was baked into the captured buffer view at capture time.
+        # width must match what capture baked into the recorded buffer views
+        # (_graph_verify_q_len is deterministic, so recomputing restores it).
         if for_graph_replay:
-            q_len = self.forward_decode_metadata.group_q_len_per_req
+            q_len = self._graph_verify_q_len()
         else:
             q_len = self._verify_q_len(forward_mode)
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
@@ -668,27 +684,30 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             block_table = page_table[:bs]
             self.cuda_graph_kv_indices[:bs, : block_table.shape[1]].copy_(block_table)
 
+        # Bind the cached per-bs views on BOTH paths. The replayed kernels
+        # read the refreshed buffers directly; eager forwards read them
+        # through this metadata. flash_mla freezes its tile schedule on the
+        # first kernel call against a sched-meta, so eager installs a FRESH
+        # object per step, while replay leaves the field alone — the graph
+        # re-runs its recorded schedule-build and never reads it from Python.
+        metadata.num_extends = num_extends
+        metadata.group_q_len_per_req = q_len
         if for_graph_replay:
-            # The captured kernels read the refreshed buffers directly; the
-            # capture-time metadata object (with its recorded schedule-build)
-            # stays authoritative.
-            return
-        # Eager: point the decode metadata at views of the same persistent
-        # buffers, with a FRESH tile-schedule object — flash_mla freezes its
-        # tile schedule on the first kernel call against a sched-meta, so
-        # reusing one across steps would pin every step to stale lengths (the
-        # captured graph instead re-runs the recorded schedule-build).
-        group_out_cache_loc = None
-        if refreshed and self.cuda_graph_group_out_cache_loc is not None:
-            group_out_cache_loc = self.cuda_graph_group_out_cache_loc[: bs * q_len]
-        self.forward_decode_metadata = FlashMLADecodeMetadata(
-            num_extends=num_extends,
-            flashmla_metadata=self._new_eager_tile_metadata(),
-            page_table=self.cuda_graph_kv_indices[:bs],
-            seq_lens_k=self.cuda_graph_seq_lens_k[:bs],
-            group_out_cache_loc=group_out_cache_loc,
-            group_q_len_per_req=q_len,
-        )
+            # Restore the capture-baked loc view (an interleaved eager step
+            # may have re-pointed it): same buffer, same width, same address.
+            metadata.group_out_cache_loc = (
+                self.cuda_graph_group_out_cache_loc[: bs * q_len]
+                if self.cuda_graph_group_out_cache_loc is not None
+                else None
+            )
+        else:
+            metadata.flashmla_metadata = self._new_eager_tile_metadata()
+            metadata.group_out_cache_loc = (
+                self.cuda_graph_group_out_cache_loc[: bs * q_len]
+                if refreshed and self.cuda_graph_group_out_cache_loc is not None
+                else None
+            )
+        self.forward_decode_metadata = metadata
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """Publish block-end cache lengths inside a captured draft graph.
