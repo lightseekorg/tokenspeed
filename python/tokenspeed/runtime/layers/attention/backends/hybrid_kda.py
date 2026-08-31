@@ -49,7 +49,7 @@ from tokenspeed_kernel.ops.attention.triton.capture_payload import (
 from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
     commit_state_pages,
 )
-from tokenspeed_kernel.ops.kvcache.triton import GroupedStateCopyDescriptor
+from tokenspeed_kernel.ops.kvcache.triton import KdaGroupedStateCopyDescriptor
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
@@ -124,7 +124,7 @@ class KdaAttnBackend(MambaAttnBackend):
         self._batched_replay_launch = None
         self._batched_replay_ready = False
         self._replay_descriptor_bound: set[int] = set()
-        self._decode_cow_descriptors: tuple[GroupedStateCopyDescriptor, ...] = ()
+        self._decode_cow_descriptors: tuple[KdaGroupedStateCopyDescriptor, ...] = ()
         self._decode_cow_first_layer: int | None = None
         self._decode_cow_l2_notice_emitted = False
         self._sequence_major_conv = kda_conv_state_layout() == "sequence_major"
@@ -162,10 +162,10 @@ class KdaAttnBackend(MambaAttnBackend):
                 )
                 if components and components[0][0].is_cuda:
                     self._decode_cow_descriptors = (
-                        GroupedStateCopyDescriptor.build(
+                        KdaGroupedStateCopyDescriptor.build(
                             tuple(component[0] for component in components), group_sel
                         ),
-                        GroupedStateCopyDescriptor.build(
+                        KdaGroupedStateCopyDescriptor.build(
                             tuple(component[1] for component in components), group_sel
                         ),
                     )
@@ -503,11 +503,7 @@ class KdaAttnBackend(MambaAttnBackend):
             or not self._stage_flashinfer_decode_cow(layer_id, mixed_qkv.shape[0])
         ):
             use_prepared_decode = False
-        # On Blackwell the prepared plan identifies the single-index
-        # FlashInfer implementation. Without it, retain the native fused path.
-        decode_solution = (
-            None if use_prepared_decode or not self._sequence_major_conv else "triton"
-        )
+        active_prepared_weights = prepared_weights if use_prepared_decode else None
         dispatch_read_indices = write_indices if use_prepared_decode else read_indices
 
         num_value_heads = value_dim // attn_tp_size // head_v_dim
@@ -530,9 +526,8 @@ class KdaAttnBackend(MambaAttnBackend):
             output_gate=output_gate,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
-            prepared_weights=prepared_weights,
+            prepared_weights=active_prepared_weights,
             recurrent_layout=self.kda_recurrent_layout,
-            solution=decode_solution,
         )
         if result is None:
             return None

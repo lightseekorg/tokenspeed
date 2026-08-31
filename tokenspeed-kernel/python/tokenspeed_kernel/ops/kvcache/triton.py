@@ -46,7 +46,7 @@ def _use_pdl(enable_pdl: bool | None) -> bool:
 
 __all__ = [
     "compute_group_decode_locs",
-    "GroupedStateCopyDescriptor",
+    "KdaGroupedStateCopyDescriptor",
     "copy_state_rows",
     "fused_fp8_set_kv_buffer",
     "gather_page_table_with_padding",
@@ -329,7 +329,7 @@ def copy_state_rows(
 
 
 @triton.jit
-def _copy_grouped_state_rows_kernel(
+def _copy_kda_grouped_state_rows_kernel(
     addresses_ptr,
     row_strides_ptr,
     group_sel_ptr,
@@ -384,8 +384,8 @@ def _copy_grouped_state_rows_kernel(
 
 
 @dataclass(frozen=True)
-class GroupedStateCopyDescriptor:
-    """Capture-stable pointer table for one uniform component family."""
+class KdaGroupedStateCopyDescriptor:
+    """Capture-stable pointer table for Kimi-K3's three state groups."""
 
     components: tuple[torch.Tensor, ...]
     addresses: torch.Tensor
@@ -398,7 +398,7 @@ class GroupedStateCopyDescriptor:
         cls,
         components: Sequence[torch.Tensor],
         group_sel: Sequence[int],
-    ) -> "GroupedStateCopyDescriptor":
+    ) -> "KdaGroupedStateCopyDescriptor":
         """Build descriptors before graph capture and retain component lifetime."""
         components = tuple(components)
         if not components:
@@ -473,7 +473,7 @@ class GroupedStateCopyDescriptor:
                     "with batch capacity"
                 )
         block_i32 = 1024
-        _copy_grouped_state_rows_kernel[(len(self.components) * batch_size,)](
+        _copy_kda_grouped_state_rows_kernel[(len(self.components) * batch_size,)](
             self.addresses,
             self.row_strides,
             self.group_sel,

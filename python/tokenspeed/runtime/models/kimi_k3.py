@@ -69,7 +69,7 @@ from tokenspeed_kernel.ops.activation.triton import (
 )
 from tokenspeed_kernel.ops.attention import (
     mla_normalize_project_query,
-    prepare_kda_fused_decode_weights,
+    prepare_flashinfer_kda_decode_weights,
 )
 from tokenspeed_kernel.ops.attn_res import attn_res_fwd, attn_res_fwd_available
 from tokenspeed_kernel.ops.gemm import (
@@ -1112,7 +1112,7 @@ class KimiLinearKDA(nn.Module):
             w.weight_loader = sharded_weight_loader(0, tp_rank)
         # Fused (q, k, v) conv kernel bank; built once in post_load_weights.
         self.conv_weights: torch.Tensor | None = None
-        self.kda_decode_weights: object | None = None
+        self.flashinfer_kda_decode_weights: object | None = None
 
         self.o_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.o_proj = RowParallelLinear(
@@ -1143,10 +1143,10 @@ class KimiLinearKDA(nn.Module):
             # CUDA graphs retain this pointer across online weight refits.
             with torch.no_grad():
                 self.conv_weights.copy_(fused_conv_weights)
-        self.kda_decode_weights = prepare_kda_fused_decode_weights(
+        self.flashinfer_kda_decode_weights = prepare_flashinfer_kda_decode_weights(
             self.conv_weights,
             self.o_norm.weight,
-            self.kda_decode_weights,
+            self.flashinfer_kda_decode_weights,
         )
 
     def _project_qkvfab(
@@ -1270,7 +1270,7 @@ class KimiLinearKDA(nn.Module):
             output_gate=out_gate if fuse_decode_output_norm else None,
             norm_weight=self.o_norm.weight if fuse_decode_output_norm else None,
             norm_eps=self.o_norm.variance_epsilon if fuse_decode_output_norm else None,
-            kda_decode_weights=self.kda_decode_weights,
+            flashinfer_kda_decode_weights=self.flashinfer_kda_decode_weights,
             layer_id=self.layer_id,
             seq_len=num_tokens,
         )

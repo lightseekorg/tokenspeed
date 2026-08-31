@@ -4474,37 +4474,6 @@ def kda_paged_decode(
     )
 
 
-def prepare_kda_fused_decode_weights(
-    conv_weights: torch.Tensor,
-    norm_weight: torch.Tensor,
-    prepared_weights: object | None = None,
-) -> object | None:
-    """Prepare an opaque plan for the platform's fused KDA decode.
-
-    ``None`` means that the selected implementations need no persistent
-    preparation. Callers should retain a non-None result and pass it to
-    :func:`kda_fused_paged_decode` without inspecting it.
-
-    Args:
-        conv_weights: Loaded depthwise Q/K/V convolution filters.
-        norm_weight: Loaded per-channel output RMSNorm weight.
-        prepared_weights: Existing opaque plan to refresh in place after a
-            weight refit, preserving CUDA-graph pointer stability.
-
-    Returns:
-        An opaque prepared plan, or ``None`` when no compatible backend exists.
-    """
-    from tokenspeed_kernel.ops.attention.flashinfer.kda_decode import (
-        prepare_flashinfer_kda_decode_weights,
-    )
-
-    return prepare_flashinfer_kda_decode_weights(
-        conv_weights,
-        norm_weight,
-        prepared_weights,
-    )
-
-
 def kda_fused_paged_decode(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
@@ -4567,6 +4536,7 @@ def kda_fused_paged_decode(
                 "head_dim": head_dim,
                 "conv_kernel_size": conv_weights.shape[-1],
                 "recurrent_layout": recurrent_layout,
+                "prepared_weights": prepared_weights is not None,
                 "staged_state": read_indices is write_indices,
             },
             solution=solution,
@@ -4587,6 +4557,7 @@ def kda_fused_paged_decode(
                     "head_dim": head_dim,
                     "conv_kernel_size": conv_weights.shape[-1],
                     "recurrent_layout": recurrent_layout,
+                    "prepared_weights": prepared_weights is not None,
                     "staged_state": read_indices is write_indices,
                 },
                 solution=solution,
@@ -4987,6 +4958,9 @@ import tokenspeed_kernel.ops.attention.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.flash_attn  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.flash_mla  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: E402,F401
+from tokenspeed_kernel.ops.attention.flashinfer.kda_decode import (  # noqa: E402,F401
+    prepare_flashinfer_kda_decode_weights,
+)
 import tokenspeed_kernel.ops.attention.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.msa  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: E402,F401
@@ -5041,7 +5015,7 @@ __all__ = [
     "kda_recurrent_layout",
     "kda_paged_prefill",
     "kda_paged_decode",
-    "prepare_kda_fused_decode_weights",
+    "prepare_flashinfer_kda_decode_weights",
     "kda_fused_paged_decode",
     "kda_fused_paged_verify",
     "kda_replay_commit",

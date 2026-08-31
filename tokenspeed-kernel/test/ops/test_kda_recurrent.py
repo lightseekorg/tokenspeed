@@ -949,8 +949,9 @@ def test_kda_fused_decode_override_preserves_external_output_norm(monkeypatch) -
 
 
 @pytest.mark.parametrize("staged", [False, True])
-def test_kda_fused_decode_reports_staged_state_to_dispatch(
-    monkeypatch, staged: bool
+@pytest.mark.parametrize("prepared", [False, True])
+def test_kda_fused_decode_reports_backend_requirements_to_dispatch(
+    monkeypatch, staged: bool, prepared: bool
 ) -> None:
     captured_traits = []
     kernel_name = "triton_nvidia_kda_fused_paged_verify_no_store"
@@ -983,10 +984,12 @@ def test_kda_fused_decode_reports_staged_state_to_dispatch(
         num_heads=12,
         head_dim=128,
         cu_seqlens=tensor,
+        prepared_weights=object() if prepared else None,
     )
 
     assert result is not None
     assert captured_traits[0]["staged_state"] is staged
+    assert captured_traits[0]["prepared_weights"] is prepared
 
 
 def test_kda_fused_decode_rejects_unsupported_conv_width() -> None:

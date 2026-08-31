@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.kvcache.triton import GroupedStateCopyDescriptor
+from tokenspeed_kernel.ops.kvcache.triton import KdaGroupedStateCopyDescriptor
 
 
 def _require_cuda() -> None:
@@ -43,7 +43,7 @@ def _component(pages: int, layer: int) -> torch.Tensor:
 
 def _fixture():
     components = tuple(_component(10, layer) for layer in range(6))
-    descriptor = GroupedStateCopyDescriptor.build(components, [0, 0, 1, 1, 2, 2])
+    descriptor = KdaGroupedStateCopyDescriptor.build(components, [0, 0, 1, 1, 2, 2])
     return components, descriptor
 
 
@@ -129,4 +129,4 @@ def test_grouped_state_copy_rejects_non_dense_inner_layout() -> None:
     storage = torch.empty(200, dtype=torch.float32, device="cuda")
     component = torch.as_strided(storage, (4, 2, 3), (40, 10, 2))
     with pytest.raises(ValueError, match="physically dense"):
-        GroupedStateCopyDescriptor.build([component], [0])
+        KdaGroupedStateCopyDescriptor.build([component], [0])

@@ -1473,7 +1473,7 @@ class MambaAttnBackend(AttentionBackend):
         output_gate = kwargs.get("output_gate")
         norm_weight = kwargs.get("norm_weight")
         norm_eps = kwargs.get("norm_eps")
-        prepared_weights = kwargs.get("kda_decode_weights")
+        prepared_weights = kwargs.get("flashinfer_kda_decode_weights")
         gate_lower_bound = kwargs.get("lower_bound")
         A_log = kwargs["A_log"]
         dt_bias = kwargs["dt_bias"]

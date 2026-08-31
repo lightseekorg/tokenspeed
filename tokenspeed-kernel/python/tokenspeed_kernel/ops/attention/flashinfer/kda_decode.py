@@ -127,7 +127,7 @@ def _require_prepared_weights(
 ) -> _FlashInferKdaDecodeWeights:
     if not isinstance(prepared_weights, _FlashInferKdaDecodeWeights):
         raise TypeError(
-            "prepared_weights must be returned by prepare_kda_fused_decode_weights"
+            "prepared_weights must be returned by prepare_flashinfer_kda_decode_weights"
         )
     return prepared_weights
 
