@@ -3,7 +3,7 @@ set -euo pipefail
 
 KIMI_CODE_VERSION=0.29.0
 
-install_root=${KIMI_CODE_ROOT:-/raid/cache/kimi-code/${KIMI_CODE_VERSION}}
+install_root=${KIMI_CODE_ROOT:-/cache/kimi-code/${KIMI_CODE_VERSION}}
 binary=${install_root}/bin/kimi
 
 if [[ -x "$binary" ]] && [[ $("$binary" --version) == "$KIMI_CODE_VERSION" ]]; then
