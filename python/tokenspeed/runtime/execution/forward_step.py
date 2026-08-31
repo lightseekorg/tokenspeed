@@ -76,16 +76,6 @@ def get_is_cuda_graph_phase() -> bool:
     return _is_cuda_graph_phase
 
 
-def _should_update_mamba_state_after_mtp_verify(
-    drafter, attn_backend, forward_mode: ForwardMode
-) -> bool:
-    return (
-        drafter is not None
-        and forward_mode.is_decode()
-        and hasattr(attn_backend, "update_mamba_state_after_mtp_verify")
-    )
-
-
 @contextmanager
 def freeze_gc(enable_cudagraph_gc: bool):
     """
@@ -1362,12 +1352,9 @@ class ForwardStepRunner:
         if use_graph and padded_bs != bs:
             ctx.bs = bs
 
-        # Update mamba/GDN state after speculative verify
-        if _should_update_mamba_state_after_mtp_verify(
-            self.drafter, self.attn_backend, ctx.forward_mode
-        ):
-            accept_lengths = result[1]
-            self.attn_backend.update_mamba_state_after_mtp_verify(accept_lengths, None)
+        # Update mamba/GDN state after speculative verify (base default no-op).
+        if self.drafter is not None and ctx.forward_mode.is_decode():
+            self.attn_backend.update_mamba_state_after_mtp_verify(result[1], None)
         if self.drafter is not None and (
             ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed()
         ):

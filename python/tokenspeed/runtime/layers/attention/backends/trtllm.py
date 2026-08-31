@@ -830,22 +830,5 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         if bs in self.cuda_graph_decode_metadata:
             self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
 
-    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
-        """DFLASH: broadcast each request's block-end length to its
-        spec_num_tokens cuda-graph decode rows.
-
-        Called by the drafter inside the captured graph so every replay
-        re-derives cache_seqlens from the live draft length. Mirrors the MHA
-        backend method of the same name.
-
-        Args:
-            bs: Number of draft requests.
-            block_seq_lens: ``[bs]`` per-request block-end lengths.
-        """
-        spec = self.spec_num_tokens
-        self.cuda_graph_seq_lens[: bs * spec].view(bs, spec).copy_(
-            block_seq_lens[:bs].clamp(spec, self.max_context_len).unsqueeze(1)
-        )
-
 
 register_backend("trtllm", {AttentionArch.MHA}, TRTLLMMHAAttnBackend)

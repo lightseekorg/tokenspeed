@@ -51,7 +51,6 @@ from tokenspeed.runtime.execution.drafter.eagle import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.forward_step import (
     ForwardStepRunner,
-    _should_update_mamba_state_after_mtp_verify,
 )
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.layers.attention.backends import (
@@ -948,35 +947,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             wrapper.drafter.draft_seq_lens_buf.data_ptr(),
         )
         self.assertEqual(wrapper.drafter.draft_seq_lens_buf.tolist(), [1, 1, 1, 1])
-
-    def test_cuda_graph_mamba_verify_state_update_keeps_decode_mode_speculation(self):
-        class BackendWithMambaUpdate:
-            def update_mamba_state_after_mtp_verify(self, accepted_length, model):
-                pass
-
-        backend = BackendWithMambaUpdate()
-        drafter = object()
-
-        self.assertTrue(
-            _should_update_mamba_state_after_mtp_verify(
-                drafter, backend, ForwardMode.DECODE
-            )
-        )
-        self.assertFalse(
-            _should_update_mamba_state_after_mtp_verify(
-                drafter, backend, ForwardMode.EXTEND
-            )
-        )
-        self.assertFalse(
-            _should_update_mamba_state_after_mtp_verify(
-                None, backend, ForwardMode.DECODE
-            )
-        )
-        self.assertFalse(
-            _should_update_mamba_state_after_mtp_verify(
-                drafter, object(), ForwardMode.DECODE
-            )
-        )
 
     def test_cuda_graph_eager_draft_extend_round_runs_init_then_refresh(self):
         captured = {"target": [], "draft": []}

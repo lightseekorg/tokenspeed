@@ -308,15 +308,12 @@ class PrefillGraph:
         )
         captured_ok = True
         try:
-            # Seam: backends alloc static buffers or refuse capture; kept outside inference mode (in-place refresh).
-            init_pfg_state = getattr(
-                self.attn_backend, "init_prefill_graph_state", None
+            # Seam: backends alloc static buffers or refuse capture; kept
+            # outside inference mode (in-place refresh). Base default: no-op.
+            self.attn_backend.init_prefill_graph_state(
+                max_num_tokens=max(self.capture_buckets),
+                max_bs=int(self.page_table.shape[0]),
             )
-            if init_pfg_state is not None:
-                init_pfg_state(
-                    max_num_tokens=max(self.capture_buckets),
-                    max_bs=int(self.page_table.shape[0]),
-                )
             with maybe_inference_mode():
                 self._capture_all_buckets(decode_wrapper)
         except torch.cuda.OutOfMemoryError:

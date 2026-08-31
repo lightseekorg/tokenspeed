@@ -315,6 +315,42 @@ class AttentionBackend(ABC):
             f"{type(self).__name__} must implement refresh_decode_metadata"
         )
 
+    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
+        """DFLASH: broadcast each request's block-end length to its
+        spec_num_tokens cuda-graph decode rows (uniform, non-causal).
+
+        Called by the drafter inside the captured graph so that on every
+        replay the expanded seq_lens re-derive from the live draft length
+        (recomputed in-graph from the target's accept lengths). Backends
+        whose kernel repeats one row per request across the block's queries
+        (trtllm_mla, flashmla) override with the bs-row geometry.
+
+        Args:
+            bs: Number of draft requests.
+            block_seq_lens: ``[bs]`` per-request block-end lengths
+                (prefix + spec_num_tokens).
+        """
+        spec = self.spec_num_tokens
+        self.cuda_graph_seq_lens[: bs * spec].view(bs, spec).copy_(
+            block_seq_lens[:bs].clamp(spec, self.max_context_len).unsqueeze(1)
+        )
+
+    def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
+        """Allocate static buffers the breakable prefill graphs bake.
+
+        Called once before prefill-graph capture. Default: no-op — most
+        backends' extend metadata needs no graph-persistent state (attention
+        stays eager at the break points); Inkling overrides to allocate its
+        static conv metadata.
+        """
+
+    def update_mamba_state_after_mtp_verify(self, accepted_lengths, model) -> None:
+        """Commit recurrent-state pages after MTP verification.
+
+        Called by the runner after every spec-decode round. Default: no-op —
+        only backends with Mamba/GDN state (the hybrid wrapper) override.
+        """
+
     def configure_runtime(self, **kwargs) -> None:
         """Configure runtime state after model loading (e.g. sliding_window_size).
 

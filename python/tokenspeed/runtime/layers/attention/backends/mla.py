@@ -445,18 +445,6 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         )
         return expanded_page_table, expanded_seq_lens
 
-    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
-        """Broadcast each request's block-end length to its block rows.
-
-        Called by the drafter inside the captured graph, so every replay
-        re-derives the expanded seq_lens from the live draft length (which is
-        itself recomputed in-graph from the target's accept lengths).
-        """
-        spec = self.spec_num_tokens
-        self.cuda_graph_seq_lens[: bs * spec].view(bs, spec).copy_(
-            block_seq_lens[:bs].clamp(spec, self.max_context_len).unsqueeze(1)
-        )
-
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
         # A draft owns its per-step write locations (computed from the staged
         # batch-ordered draft page table); only the target routes writes

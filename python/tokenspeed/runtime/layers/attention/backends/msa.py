@@ -419,26 +419,6 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
         # score kernels overwrite only visible blocks, leaving the tail.
         self.forward_decode_metadata.score_out.fill_(-float("inf"))
 
-    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
-        """DFLASH: broadcast each request's block-end length to its
-        spec_num_tokens cuda-graph decode rows (uniform, non-causal).
-
-        Called by the drafter inside the captured graph so that on every replay
-        the expanded seq_lens re-derive from the live draft length (which is
-        recomputed in-graph from the target's accept lengths).
-
-        Args:
-            bs: Number of draft requests.
-            block_seq_lens: ``[bs]`` per-request block-end lengths
-                (prefix + spec_num_tokens).
-        """
-        spec = self.spec_num_tokens
-        self.cuda_graph_seq_lens[: bs * spec].view(bs, spec).copy_(
-            block_seq_lens[:bs]
-            .clamp(self.spec_num_tokens, self.max_context_len)
-            .unsqueeze(1)
-        )
-
     def forward_decode(
         self,
         q: torch.Tensor,

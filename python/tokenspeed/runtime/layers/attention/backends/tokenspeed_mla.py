@@ -576,18 +576,6 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
         if real_bs < bs:
             rows[real_bs:].zero_()
 
-    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
-        """Broadcast each request's block-end length to its block rows.
-
-        Called by the drafter inside the captured graph, so every replay
-        re-derives the expanded lengths from the live draft length, which is
-        itself recomputed in-graph from the target's accept lengths.
-        """
-        spec = self.spec_num_tokens
-        self.cuda_graph_seq_lens[: bs * spec].view(bs, spec).copy_(
-            block_seq_lens[:bs].clamp(spec, self.max_context_len).unsqueeze(1)
-        )
-
     def _init_prefill_metadata(
         self,
         seq_lens: torch.Tensor,
