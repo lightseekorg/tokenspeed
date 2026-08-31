@@ -33,7 +33,6 @@ def _backend(*, draft_block_decode: bool) -> TRTLLMMLABackend:
     backend.max_num_pages = backend._calc_padded_blocks(backend.max_context_len)
     backend._page_table_aliased = False
     backend._cache_groups_bound = False
-    backend._cache_contract_bound = False
     backend.decode_cuda_graph_metadata = {}
     backend.decode_cuda_graph_group_out_cache_loc = None
     backend.forward_decode_metadata = None
@@ -42,7 +41,6 @@ def _backend(*, draft_block_decode: bool) -> TRTLLMMLABackend:
 
 def test_eager_draft_page_table_is_not_expanded_twice() -> None:
     backend = _backend(draft_block_decode=True)
-    backend.mark_cache_contract()
     kernel_page_table = torch.tensor([[6, 7, 10, 11, 14, 15]], dtype=torch.int32)
 
     backend.init_cuda_graph_state(max_bs=1)
@@ -62,7 +60,6 @@ def test_eager_draft_page_table_is_not_expanded_twice() -> None:
 
 def test_graph_replay_draft_page_table_is_not_expanded_twice() -> None:
     backend = _backend(draft_block_decode=True)
-    backend.mark_cache_contract()
     backend.init_cuda_graph_state(max_bs=2)
     backend.init_forward_metadata_capture_cuda_graph(
         bs=2,

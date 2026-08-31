@@ -248,11 +248,10 @@ def backend_factory(cuda_env, gpu_pool):
         )
         backend = backend_cls(config)
         backend.set_cache_pool(gpu_pool)
-        # Production order: the registry marks the contract sub-backend, then
-        # the runner allocates the persistent decode buffers unconditionally.
-        # contract=False models the classic single-table (non-LCM) serving arm.
-        if contract:
-            backend.mark_cache_contract()
+        # Production order: set_cache_pool binds the pool, then the runner
+        # allocates the persistent decode buffers unconditionally (every LCM
+        # pool publishes a cache contract).
+        del contract
         backend.init_cuda_graph_state(max_bs=8)
         return backend
 

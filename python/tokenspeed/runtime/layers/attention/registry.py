@@ -399,12 +399,6 @@ def _create_hybrid_linear_attn_backend(
         config,
     )
 
-    if is_kda:
-        # Cache contract: see CuteDSLMLABackend.mark_cache_contract.
-        mark_cache_contract = getattr(full_attn_backend, "mark_cache_contract", None)
-        if mark_cache_contract is not None:
-            mark_cache_contract()
-
     # Create mamba/linear attention backend. Only propagate the configured
     # verify width when spec-dec is actually enabled — matches MLAConfig /
     # MHAConfig.generate. Otherwise the BaseAttnConfig sentinel (1) wins so
@@ -987,20 +981,14 @@ def create_attn_components(
         is_inkling=any(a in _INKLING_ARCHITECTURES for a in draft_architectures),
     )
 
-    # A cache-group contract backend needs the contract marked before CUDA-graph
-    # state allocation (mark_cache_contract sizes the per-group write-location
-    # buffer). Composite/wrapper backends without the hook are a no-op.
+    # Bind the pools before CUDA-graph state allocation: backends learn
+    # their group geometry (and buffer sizing) from the pool's published
+    # specs. Every LCM pool publishes a cache contract, so there is no
+    # separate contract-marking step.
     for side_backend, side_pool in ((backend, pool), (draft_attn_backend, draft_pool)):
         if side_backend is None or side_pool is None:
             continue
         side_backend.set_cache_pool(side_pool)
-        side_arena = getattr(side_pool, "arena", None)
-        if getattr(side_arena, "runtime_contract", None) is None:
-            continue
-        mark_cache_contract = getattr(side_backend, "mark_cache_contract", None)
-        if mark_cache_contract is None:
-            continue
-        mark_cache_contract()
 
     _prepare_verify_workspace(
         server_args=server_args,

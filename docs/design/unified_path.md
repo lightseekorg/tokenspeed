@@ -173,10 +173,13 @@ that, not drafter special-casing, is the invariant to fix.
 ### PD decode nodes
 
 A PD decode-only node never runs an extend forward, so latches set on the
-extend path (`_cache_groups_bound`) stay False there. Refresh must also fire
-on the registry-set `_cache_contract_bound` — otherwise the kernels read the
-null page instead of the transferred KV. This rule predates unification and
-now protects eager decode too.
+extend path (`_cache_groups_bound`) stay False there. Refresh must therefore
+bind the group tables whenever they are delivered — never gate on an
+extend-latched flag — otherwise the kernels read the null page instead of
+the transferred KV. This rule predates unification and now protects eager
+decode too. (`_cache_contract_bound` is gone: every LCM pool publishes a
+cache contract, so the target allocates its write-location buffer
+unconditionally and drafts are gated structurally on `is_draft`.)
 
 ### Sampling has no greedy branch
 

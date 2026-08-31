@@ -110,7 +110,6 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         super().__init__(config)
 
         self._cache_groups_bound = False
-        self._cache_contract_bound = False
         self.max_context_len = config.context_len
         self.kernel_page_size = (
             config.kernel_page_size
@@ -184,7 +183,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         )
         if group_table is not None:
             self._cache_groups_bound = True
-        elif self.is_draft and self._cache_contract_bound and bs > 0:
+        elif self.is_draft and bs > 0:
             # The drafter drives the draft backend directly with no group
             # tables; the staged batch-ordered draft page table (raw
             # scheduler pages) stands in, expanded like any group table.
@@ -371,7 +370,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
                 validate_pages=cache_debug_enabled(),
                 q_len_per_req=q_len_per_req,
             )
-        elif self.is_draft and self._cache_contract_bound:
+        elif self.is_draft:
             # The executor publishes draft rows in batch order and in raw
             # scheduler pages; expand into this backend's kernel pages. Do
             # not index them by request-pool id.
@@ -494,8 +493,11 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             graph_rows, dtype=torch.int32, device=self.device
         )
         self.decode_cuda_graph_metadata = {}
-        if self._cache_contract_bound:
-            # Target verify records spec_num_tokens write locations per request.
+        if not self.is_draft:
+            # Target verify records spec_num_tokens write locations per
+            # request. A draft owns its per-step write locations and never
+            # reads this buffer (every LCM pool publishes a cache contract,
+            # so there is no separate contract gate).
             self.decode_cuda_graph_group_out_cache_loc = torch.zeros(
                 max_bs * max(1, self.spec_num_tokens),
                 dtype=torch.int64,
@@ -507,14 +509,13 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
     # Capture is inherited (base default: bind_decode_views + idle refresh).
 
     def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
-        # An explicit group dispatch or the contract marker puts this backend
-        # on the grouped path; the latch must be set BEFORE the views are
-        # built (it selects the write-location view) and the recorded
+        # Every LCM pool publishes cache groups, so capture always latches
+        # the grouped path; the latch must be set BEFORE the views are built
+        # (it selects the write-location view) and the recorded
         # select_out_cache_loc branch reads it. A draft binds too — its
         # refresh consumes the wrapper-dispatched group table — but its
         # write locations stay drafter-owned (see _decode_views).
-        if cache_group_ids or self._cache_contract_bound:
-            self._cache_groups_bound = True
+        self._cache_groups_bound = True
         super().bind_decode_views(bs, cache_group_ids)
 
     def _replay_block_decode_page_table(
@@ -566,16 +567,9 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         else:
             capture_q_len = self._graph_verify_q_len()
             # A draft owns its per-step write locations (it reads the
-            # published batch-ordered table); only the contract-bound target
-            # routes writes through the persistent loc buffer.
-            if not self.is_draft and (
-                self._cache_groups_bound or self._cache_contract_bound
-            ):
-                if self.decode_cuda_graph_group_out_cache_loc is None:
-                    raise RuntimeError(
-                        "MLA cache-group buffer was not allocated; "
-                        "mark_cache_contract must run before init_cuda_graph_state"
-                    )
+            # published batch-ordered table); only the target routes writes
+            # through the persistent loc buffer (allocated iff not draft).
+            if self.decode_cuda_graph_group_out_cache_loc is not None:
                 group_out_cache_loc = self.decode_cuda_graph_group_out_cache_loc[
                     : bs * capture_q_len
                 ]
@@ -647,7 +641,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             self._replay_refresh_decode(
                 bs, seq_lens, metadata, block_tables if actual_bs > 0 else None
             )
-        elif self.is_draft and self._cache_contract_bound:
+        elif self.is_draft:
             # Draft: expand the staged batch-ordered draft page table (raw
             # scheduler pages) into the persistent buffer.
             self._expand_history_table(

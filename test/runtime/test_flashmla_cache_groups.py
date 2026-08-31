@@ -99,7 +99,6 @@ def _init_cache_decode(backend, pool, logical_rows, seq_lens_cpu, spec=1):
     # Unified decode path: refresh writes the persistent buffers the wrapper
     # allocates at startup (init_cuda_graph_state runs unconditionally).
     if not hasattr(backend, "cuda_graph_kv_indices"):
-        backend.mark_cache_contract()
         backend.init_cuda_graph_state(max_bs=max(bs, 4))
     backend.refresh_decode_metadata(
         bs,
@@ -286,7 +285,6 @@ def _make_draft_flashmla_backend(pool):
         is_draft=True,
     )
     backend = FlashMLABackend(config)
-    backend.mark_cache_contract()
     return backend
 
 

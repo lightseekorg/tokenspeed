@@ -49,7 +49,6 @@ def _backend(
     backend.device = torch.device("cpu")
     backend.decode_cuda_graph_metadata = {}
     backend._cache_groups_bound = False
-    backend._cache_contract_bound = False
     return backend
 
 
@@ -135,7 +134,6 @@ def test_expansion_floors_at_the_block_width() -> None:
 
 def test_graph_buffers_are_sized_for_the_expanded_rows() -> None:
     backend = _backend(spec_num_tokens=8)
-    backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=4)
 
     assert backend.cuda_graph_page_table.shape == (32, 4)
@@ -144,7 +142,6 @@ def test_graph_buffers_are_sized_for_the_expanded_rows() -> None:
 
 def test_graph_capture_records_expanded_metadata() -> None:
     backend = _backend(spec_num_tokens=8)
-    backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=4)
     # Runner contract: capture seq_lens are seeded to max_tokens_per_req
     # (= spec_num_tokens) and the staged page table travels along.
@@ -165,7 +162,6 @@ def test_graph_capture_records_expanded_metadata() -> None:
 
 def test_fill_block_decode_seq_lens_broadcasts_per_request() -> None:
     backend = _backend(spec_num_tokens=4)
-    backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=2)
 
     backend.fill_block_decode_seq_lens(2, torch.tensor([31, 47], dtype=torch.int32))
@@ -174,7 +170,6 @@ def test_fill_block_decode_seq_lens_broadcasts_per_request() -> None:
 
 def test_fill_block_decode_seq_lens_clamps_to_context() -> None:
     backend = _backend(spec_num_tokens=4, max_context_len=64)
-    backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=1)
 
     backend.fill_block_decode_seq_lens(1, torch.tensor([9999], dtype=torch.int32))
@@ -183,7 +178,6 @@ def test_fill_block_decode_seq_lens_clamps_to_context() -> None:
 
 def test_graph_replay_replicates_the_page_table_across_block_rows() -> None:
     backend = _backend(spec_num_tokens=4, max_num_pages=3)
-    backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=2)
     # Runner contract: capture seq_lens are seeded to spec_num_tokens and the
     # staged page table travels along.
@@ -215,7 +209,6 @@ def test_graph_replay_replicates_the_page_table_across_block_rows() -> None:
 
 def test_contract_draft_replay_does_not_expand_published_pages_twice() -> None:
     backend = _backend(spec_num_tokens=4, max_num_pages=4)
-    backend._cache_contract_bound = True
     backend._cache_groups_bound = True
     backend.kernel_page_size = 64
     backend.init_cuda_graph_state(max_bs=1)
@@ -245,7 +238,6 @@ def test_contract_draft_replay_does_not_expand_published_pages_twice() -> None:
 
 def test_contract_draft_eager_does_not_expand_published_pages_twice() -> None:
     backend = _backend(spec_num_tokens=4, max_num_pages=4)
-    backend._cache_contract_bound = True
     backend._cache_groups_bound = True
     backend.kernel_page_size = 64
     backend.init_cuda_graph_state(max_bs=1)
@@ -375,7 +367,6 @@ def test_target_verify_keeps_the_unexpanded_causal_path() -> None:
 
 def test_graph_buffers_are_unexpanded_without_block_decode() -> None:
     backend = _backend(draft_block_decode=False, spec_num_tokens=8)
-    backend._cache_contract_bound = False
     backend.init_cuda_graph_state(max_bs=4)
     assert backend.cuda_graph_page_table.shape == (4, 4)
     assert backend.cuda_graph_seq_lens.shape == (4,)

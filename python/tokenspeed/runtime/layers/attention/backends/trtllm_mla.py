@@ -141,7 +141,6 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # Cache-group (LCM) state. The trtllm kernel walks pages at page_size,
         # padded to the fused-kernel block constraint (see _calc_padded_blocks).
         self._cache_groups_bound = False
-        self._cache_contract_bound = False
         self.max_num_pages = self._calc_padded_blocks(config.context_len)
 
         # MLA dimensions
@@ -229,7 +228,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         )
         if group_table is not None:
             self._cache_groups_bound = True
-        elif self.is_draft and self._cache_contract_bound and bs > 0:
+        elif self.is_draft and bs > 0:
             # The drafter drives this backend directly with no group tables;
             # the batch-ordered draft page table (row i is batch position i)
             # carries raw scheduler pages, expanded by the decode refresh
@@ -425,10 +424,11 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         self.decode_cuda_graph_kv_indices = torch.zeros(
             (max_bs, max_blocks), dtype=torch.int32, device=self.device
         )
-        # Cache contract: persistent write-location buffer whose address
-        # the captured graph records; replay refreshes it in place. Target
-        # verify records spec_num_tokens locations per request.
-        if self._cache_contract_bound:
+        # Persistent write-location buffer whose address the captured graph
+        # records; replay refreshes it in place. Target verify records
+        # spec_num_tokens locations per request; a draft owns its per-step
+        # locations and never reads it (select_out_cache_loc's draft guard).
+        if not self.is_draft:
             self.decode_cuda_graph_group_out_cache_loc = torch.zeros(
                 max_bs * max(1, self.spec_num_tokens),
                 dtype=torch.int64,
@@ -449,12 +449,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         max_blocks = self._calc_padded_blocks(self.max_context_len)
         capture_q_len = self._graph_verify_q_len()
         group_out_cache_loc = None
-        if self._cache_contract_bound:
-            if self.decode_cuda_graph_group_out_cache_loc is None:
-                raise RuntimeError(
-                    "trtllm_mla cache-group buffer was not allocated; "
-                    "mark_cache_contract must run before init_cuda_graph_state"
-                )
+        if self.decode_cuda_graph_group_out_cache_loc is not None:
             group_out_cache_loc = self.decode_cuda_graph_group_out_cache_loc[
                 : bs * capture_q_len
             ]
@@ -509,12 +504,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         group_table = self._resolve_full_history_table(kwargs.get("block_tables"), 0)
         if group_table is not None:
             self._cache_groups_bound = True
-        elif (
-            self.is_draft
-            and self._cache_contract_bound
-            and bs > 0
-            and page_table is not None
-        ):
+        elif self.is_draft and bs > 0 and page_table is not None:
             # Draft: the staged batch-ordered table carries raw scheduler
             # pages; expand into this backend's kernel pages.
             group_table = self._expand_history_table(page_table[:bs])

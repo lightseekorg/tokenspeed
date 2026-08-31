@@ -142,11 +142,6 @@ class DSABackend(AttentionBackend):
     def override_num_extends(self, num_extends: int):
         return self._dense_backend.override_num_extends(num_extends)
 
-    def mark_cache_contract(self) -> None:
-        """Forward the contract mark to the dense sub-backend, which owns the
-        group tables and the graph write-location buffer."""
-        self._dense_backend.mark_cache_contract()
-
     def set_cache_pool(self, cache_pool) -> None:
         # The dense sub-backend owns the group-table consumption and must
         # learn the pool's history-group geometry.

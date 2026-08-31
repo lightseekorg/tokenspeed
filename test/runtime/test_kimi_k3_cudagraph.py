@@ -11,7 +11,7 @@ Coverage:
   ``block_kv_indices`` + ``group_out_cache_loc`` buffers, replay refreshes them
   IN PLACE (same ``data_ptr``) from a fresh forward op;
 - padded batch rows resolve to the null page 0 (dummy-page protection);
-- the ``mark_cache_contract`` structural gate on the contract-bound MLA
+- the draft/target structural gate on the MLA
   capture/replay path.
 
 The KDA multi-group state capture/replay logic lives in
@@ -77,15 +77,13 @@ def _bare_mla_backend(
     backend.cutedsl_workspace = None
     backend._block_table_aliased = False
     backend._cache_groups_bound = False
-    backend._cache_contract_bound = False
     backend.decode_cuda_graph_metadata = {}
     backend.decode_cuda_graph_kv_indices = None
     backend._full_history_group_id = "full_attention"
     backend._history_block_granularity = _LOGICAL_P
     backend.decode_cuda_graph_group_out_cache_loc = None
     backend.forward_decode_metadata = None
-    if cache_contract:
-        backend.mark_cache_contract()
+    del cache_contract
     return backend
 
 
@@ -118,11 +116,16 @@ def test_mla_target_verify_width_applies_to_mixed_batches() -> None:
 
 
 def test_cutedsl_mla_draft_keeps_classic_page_table_contract() -> None:
+    # The guarantee is structural now: a draft never allocates the group
+    # write-location buffer, and its bind latch stays down unless the runner
+    # explicitly dispatches cache groups to it.
     backend = _bare_mla_backend(cache_contract=False, is_draft=True)
+    backend.init_cuda_graph_state(max_bs=2)
 
-    backend.mark_cache_contract()
+    backend.bind_decode_views(2)
 
-    assert backend._cache_contract_bound is False
+    assert backend._cache_groups_bound is False
+    assert backend.decode_cuda_graph_group_out_cache_loc is None
 
 
 def _bare_amd_mla_backend(
@@ -137,7 +140,6 @@ def _bare_amd_mla_backend(
     backend.spec_num_tokens = spec_num_tokens
     backend.draft_block_decode = False
     backend._cache_groups_bound = False
-    backend._cache_contract_bound = False
     backend.decode_cuda_graph_metadata = {}
     backend.cuda_graph_page_table = None
     backend.cuda_graph_seq_lens = None
@@ -146,8 +148,7 @@ def _bare_amd_mla_backend(
     backend._should_use_absorbed_cached_extend = lambda **_: False
     backend._full_history_group_id = "full_attention"
     backend._history_block_granularity = _LOGICAL_P
-    if cache_contract:
-        backend.mark_cache_contract()
+    del cache_contract
     return backend
 
 

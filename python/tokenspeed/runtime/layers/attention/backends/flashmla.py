@@ -134,7 +134,6 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # the FlashMLA kernel's page stride is PAGE_SIZE, so that is the kernel
         # page size the group-table expansion targets.
         self._cache_groups_bound = False
-        self._cache_contract_bound = False
         self.kernel_page_size = PAGE_SIZE
         self.max_num_pages = (self.max_context_len + PAGE_SIZE - 1) // PAGE_SIZE
 
@@ -239,7 +238,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         )
         if group_table is not None:
             self._cache_groups_bound = True
-        elif self.is_draft and self._cache_contract_bound and bs > 0:
+        elif self.is_draft and bs > 0:
             # The drafter drives this draft backend directly with no group
             # tables; it hands over the batch-ordered draft page table (row i
             # is batch position i, raw scheduler pages). Same expansion as a
@@ -526,12 +525,12 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         )
         # Own the persistent cache_seqlens buffer the captured decode kernel reads from
         self.cuda_graph_seq_lens = torch.zeros(max_bs, dtype=torch.int32, device="cuda")
-        # Cache contract: persistent write-location buffer whose address
-        # the captured graph records; replay refreshes it in place from the
-        # live full-history table. Only allocated when the backend is a cache
-        # contract sub-backend.
-        if self._cache_contract_bound:
-            # Target verify records spec_num_tokens write locations per request.
+        # Persistent write-location buffer whose address the captured graph
+        # records; replay refreshes it in place from the live full-history
+        # table. Target verify records spec_num_tokens write locations per
+        # request; a draft owns its per-step locations and never reads it
+        # (select_out_cache_loc's draft guard).
+        if not self.is_draft:
             self.cuda_graph_group_out_cache_loc = torch.zeros(
                 max_bs * max(1, self.spec_num_tokens),
                 dtype=torch.int64,
@@ -556,12 +555,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             return metadata
         q_len = self._graph_verify_q_len()
         group_out_cache_loc = None
-        if self._cache_contract_bound:
-            if self.cuda_graph_group_out_cache_loc is None:
-                raise RuntimeError(
-                    "FlashMLA cache-group graph buffer was not allocated; "
-                    "mark_cache_contract must run before init_cuda_graph_state"
-                )
+        if self.cuda_graph_group_out_cache_loc is not None:
             group_out_cache_loc = self.cuda_graph_group_out_cache_loc[: bs * q_len]
         metadata = FlashMLADecodeMetadata(
             num_extends=0,
@@ -665,7 +659,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
                     real_bs * q_len : bs * q_len
                 ].zero_()
             refreshed = True
-        elif self.is_draft and self._cache_contract_bound and bs > 0:
+        elif self.is_draft and bs > 0:
             # Draft: expand the staged batch-ordered draft page table (raw
             # scheduler pages) straight into the persistent kv-indices buffer.
             # Latch the group binding: the draft consumes published pages from

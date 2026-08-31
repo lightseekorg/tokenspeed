@@ -120,8 +120,6 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # forward without cache metadata is a hard error: the cache contract
         # forbids falling back to legacy page_table metadata.
         self._cache_groups_bound = False
-        # Set by the registry before graph capture; see mark_cache_contract.
-        self._cache_contract_bound = False
 
         # Block draft: rows expand per block position; see _block_decode_active.
         self.draft_block_decode = bool(config.draft_block_decode)
@@ -193,9 +191,10 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
         self.forward_prefill_metadata: CuteDSLMLAPrefillMetadata | None = None
         self.decode_cuda_graph_metadata: dict[int, CuteDSLMLADecodeMetadata] = {}
         self.decode_cuda_graph_kv_indices = None
-        # Cache contract decode graph: persistent write-location buffer whose
-        # address the captured graph records; replay refreshes it in place.
-        # Allocated in init_cuda_graph_state only when _cache_contract_bound.
+        # Decode graph: persistent write-location buffer whose address the
+        # captured graph records; replay refreshes it in place. Allocated in
+        # init_cuda_graph_state for the target only (a draft owns its
+        # per-step write locations).
         self.decode_cuda_graph_group_out_cache_loc: torch.Tensor | None = None
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None
 
@@ -210,20 +209,6 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
         )
         (buf,) = self._workspace_pool.allocate(((required,), torch.int8))
         return buf
-
-    def mark_cache_contract(self) -> None:
-        """Mark this MLA backend as a Kimi-K3 Cache contract sub-backend.
-
-        Called by the registry when the backend is constructed for the
-        Kimi-K3 LCM contract path. Enables grouped CUDA-graph
-        capture/replay with stable full-attention block-table and write-location
-        buffers.
-        """
-        if self.is_draft:
-            # The CuteDSL draft keeps its batch-ordered page table. Only target
-            # forwards consume scheduler cache-group tables.
-            return
-        super().mark_cache_contract()
 
     @property
     def max_num_pages(self) -> int:
@@ -679,11 +664,12 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
         self.decode_cuda_graph_kv_indices = torch.zeros(
             (graph_rows, max_blocks), dtype=torch.int32, device=self.device
         )
-        if self._cache_contract_bound:
-            # The cache-group decode graph uses one absolute latent write slot per
-            # row, refreshed in place from the current full-attention table.
-            # Allocate the stable-address buffer outside the graph pool, like
-            # the KV indices.
+        if not self.is_draft:
+            # The cache-group decode graph uses one absolute latent write slot
+            # per row, refreshed in place from the current full-attention
+            # table. Allocate the stable-address buffer outside the graph
+            # pool, like the KV indices. A draft owns its per-step write
+            # locations and keeps its batch-ordered page table.
             self.decode_cuda_graph_group_out_cache_loc = torch.zeros(
                 max_bs * max(1, self.spec_num_tokens),
                 dtype=torch.int64,
@@ -695,12 +681,13 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
     # Capture is inherited (base default: bind_decode_views + idle refresh).
 
     def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
-        # Structural gate: the target (contract always marked by the registry)
-        # takes the cache-group path; the MTP draft, whose mark_cache_contract
-        # deliberately early-returns, keeps the batch-ordered draft page table
-        # for its in-graph write-loc math. Latch BEFORE the views are built —
-        # the recorded forward_decode's select_out_cache_loc branch reads it.
-        if cache_group_ids or self._cache_contract_bound:
+        # Structural gate: the target takes the cache-group path (every LCM
+        # pool publishes a contract); the MTP draft keeps the batch-ordered
+        # draft page table for its in-graph write-loc math unless the runner
+        # explicitly dispatches groups to it. Latch BEFORE the views are
+        # built — the recorded forward_decode's select_out_cache_loc branch
+        # reads it.
+        if cache_group_ids or not self.is_draft:
             self._cache_groups_bound = True
         super().bind_decode_views(bs, cache_group_ids)
 
@@ -724,13 +711,7 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 group_out_cache_loc=None,
                 group_q_len_per_req=1,
             )
-        elif self._cache_contract_bound and not self.is_draft:
-            if self.decode_cuda_graph_group_out_cache_loc is None:
-                raise RuntimeError(
-                    "tokenspeed_mla cache-group decode: the cache write-location "
-                    "buffer is not allocated; init_cuda_graph_state ran before "
-                    "the backend was marked as the Cache contract sub-backend"
-                )
+        elif self.decode_cuda_graph_group_out_cache_loc is not None:
             q_len = (
                 self.spec_num_tokens
                 if (self.spec_num_tokens > 1 and not self.is_draft)

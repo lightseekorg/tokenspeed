@@ -30,8 +30,9 @@ logic so ``MLAAttnBackend``, ``FlashMLABackend``, ``TRTLLMMLABackend`` and
 
 Host-class requirements: ``self.kernel_page_size`` (kernel page size in tokens),
 ``self.max_num_pages`` (kernel page-table width), and ``self.device``. The host
-must also define ``self._cache_contract_bound`` / ``self._cache_groups_bound``
-(the mixin's :meth:`mark_cache_contract` sets the former).
+must also define ``self._cache_groups_bound`` (the runtime tables-arrived
+latch; every LCM pool publishes a cache contract, so there is no separate
+contract flag).
 """
 
 from __future__ import annotations
@@ -78,15 +79,6 @@ class MlaCacheGroupMixin:
                 self._full_history_group_id = str(spec.group_id)
                 self._history_block_granularity = int(spec.block_granularity)
                 break
-
-    def mark_cache_contract(self) -> None:
-        """Flag this backend as an LCM cache-group contract sub-backend.
-
-        Called by the registry before graph-state allocation. Eager forwards
-        bind the group tables automatically once they arrive; this flag lets
-        CUDA-graph capture size its per-group write-location buffer up front.
-        """
-        self._cache_contract_bound = True
 
     def _resolve_full_history_table(
         self, block_tables, bs: int, out: torch.Tensor | None = None
