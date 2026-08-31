@@ -97,3 +97,40 @@ def test_fused_lane_fallback_without_multimem(m):
 
 def test_graph_phase_above_fused_capacity_still_tiers_by_tokens():
     assert _select(num_tokens=512, graph_phase=True) is K3MoETailTier.MULTIMEM_AR
+
+
+def test_join_without_a_lane_reaches_the_join_tier():
+    """No TRT-LLM lane, but the join itself needs no lane.
+
+    ``fused_moe_ar`` implies a backend-owned lane and is TRT-LLM only, so on
+    every other backend it is False and the tail used to fall all the way to
+    SEPARATE_REDUCE -- two collectives per MoE layer over the same group.
+    ``kimi3_join_reduce_moe`` handles ``lane=None`` with a concatenated
+    one-shot or a grouped all-reduce, so the join tier is reachable without
+    one.
+    """
+    assert (
+        _select(fused_moe_ar=False, join_moe_reduce=True) is K3MoETailTier.FUSED_LANE_AR
+    )
+
+
+def test_without_join_capability_the_fallback_is_unchanged():
+    assert (
+        _select(fused_moe_ar=False, join_moe_reduce=False)
+        is K3MoETailTier.SEPARATE_REDUCE
+    )
+
+
+def test_join_does_not_preempt_the_fused_tail_or_multimem():
+    # The fused decode tail still wins inside its graph-phase window ...
+    assert (
+        _select(
+            num_tokens=8, graph_phase=True, fused_moe_ar=False, join_moe_reduce=True
+        )
+        is K3MoETailTier.TAIL_FUSION
+    )
+    # ... and an armed lane still routes through the multimem window.
+    assert (
+        _select(fused_moe_ar=True, join_moe_reduce=True, multimem_ok=True)
+        is K3MoETailTier.MULTIMEM_AR
+    )

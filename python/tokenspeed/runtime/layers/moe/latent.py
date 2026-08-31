@@ -198,6 +198,12 @@ class Kimi3MoEExecutionPlan:
     joint_moe_reduce: bool
     use_marlin: bool = False
     fused_moe_ar: bool = False
+    # Whether the routed and shared partials can be reduced together at all,
+    # independent of whether a backend-owned lane is available to avoid the
+    # concatenation. ``fused_moe_ar`` implies a lane and is TRT-LLM only;
+    # ``join_moe_reduce`` only needs a grouped or concatenated all-reduce,
+    # which every backend provides, so the join is available on AMD too.
+    join_moe_reduce: bool = False
     lane_latent_norm_ar: bool = False
     comm_fusion_max_num_tokens: int = 0
 
@@ -269,9 +275,16 @@ class Kimi3MoEExecutionPlan:
                 max_token_num,
             )
         )
+        # The join itself needs no backend-owned lane: kimi3_join_reduce_moe
+        # falls back to a concatenated one-shot, or a grouped all-reduce when
+        # the payload exceeds COMM_ONESHOT_MAX_BYTES. Both are portable, so the
+        # tail can issue one collective per MoE layer instead of two wherever a
+        # TP x EP group exists -- not only where TRT-LLM can arm a lane.
+        join_moe_reduce = mapping.moe.has_tp_ep
         return replace(
             self,
             fused_moe_ar=fused_moe_ar,
+            join_moe_reduce=join_moe_reduce,
             lane_latent_norm_ar=lane_latent_norm_ar,
             comm_fusion_max_num_tokens=max_token_num,
         )
