@@ -25,6 +25,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from tokenspeed.runtime.layers.attention.kda_geometry import (
+    kda_conv_state_channel_axis,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldLayout,
     CacheMemoryPlan,
@@ -206,9 +209,7 @@ def _partition_for_field(
         if suffix == "conv_state":
             width = num_heads * head_dim
             history = int(linear_config["short_conv_kernel_size"]) - 1
-            channel_axis = (
-                1 if len(field.shape) == 2 and field.shape[0] == history else 0
-            )
+            channel_axis = kda_conv_state_channel_axis(field.shape, history=history)
             return CacheFieldPartition(channel_axis, 3 * width, (width, width, width))
         return CacheFieldPartition(0, num_heads)
 

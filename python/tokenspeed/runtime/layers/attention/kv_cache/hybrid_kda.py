@@ -27,6 +27,9 @@ from typing import ClassVar
 
 import torch
 
+from tokenspeed.runtime.layers.attention.kda_geometry import (
+    kda_conv_state_channel_axis,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.base import (
     derive_state_groups_by_layer,
 )
@@ -87,21 +90,24 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
                     "KDA convolution state must have three dimensions, "
                     f"got {tuple(physical_conv.shape)}"
                 )
-            conv = (
-                physical_conv.transpose(1, 2)
-                if physical_conv.shape[1] == 3
-                else physical_conv
+            recurrent = self._recurrent_state[layer_id]
+            if recurrent is None:
+                raise RuntimeError("KDA convolution state has no recurrent peer")
+            channels = 3 * recurrent.shape[1] * recurrent.shape[-1]
+            channel_axis = kda_conv_state_channel_axis(
+                tuple(physical_conv.shape[1:]), channels=channels
             )
-            channels = conv.shape[1]
-            supported_strides = {(3, 1), (1, channels)}
-            if conv.shape[2] != 3 or conv.stride()[1:] not in supported_strides:
+            conv = physical_conv if channel_axis == 0 else physical_conv.transpose(1, 2)
+            channels, history = conv.shape[1:]
+            supported_strides = {(history, 1), (1, channels)}
+            if conv.stride()[1:] not in supported_strides:
                 raise RuntimeError(
                     "KDA convolution state must use a dense supported layout, "
                     f"got {tuple(conv.stride())}"
                 )
             self._state_buffers_by_layer[layer_id] = (
                 conv,
-                self._recurrent_state[layer_id],
+                recurrent,
             )
 
     @property
