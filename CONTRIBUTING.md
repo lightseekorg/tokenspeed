@@ -15,21 +15,30 @@ We believe the future of AI should be transparent, collaborative, and inclusive.
 
 We especially welcome:
 
-- obvious bug fixes
-- small and verifiable production-needed features
-- performance optimizations that fit the existing codebase style and do not introduce unnecessary complexity
-- documentation, tooling, and benchmarking improvements
+- Obvious bug fixes
+- Small and verifiable production-needed features
+- Performance optimizations that fit the existing codebase style and do not introduce unnecessary complexity
+- Documentation, tooling, and benchmarking improvements
 
 For larger features or architectural changes, we generally recommend starting with an RFC or design discussion first before implementation.
+
+### Good First Contributions
+
+If you are new to the project, consider starting with:
+
+- Fixing typos or formatting issues in documentation
+- Improving error messages or help text
+- Adding missing examples to model recipes
+- Enhancing test coverage for existing functionality
 
 ## Engineering Principles
 
 We value:
 
-- reproducible performance
-- correctness and stability
-- production-oriented engineering
-- maintainable implementations
+- Reproducible performance
+- Correctness and stability
+- Production-oriented engineering
+- Maintainable implementations
 
 We believe open-source infrastructure advances through open collaboration, healthy technical discussion, and shared engineering progress.
 

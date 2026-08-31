@@ -7,8 +7,8 @@ runtime can start.
 
 - NVIDIA GPU host
 - Docker with GPU support
-- enough shared memory for model serving
-- access to the model checkpoints you plan to serve
+- Enough shared memory for model serving
+- Access to the model checkpoints you plan to serve
 
 ## Start a Runner Container
 
