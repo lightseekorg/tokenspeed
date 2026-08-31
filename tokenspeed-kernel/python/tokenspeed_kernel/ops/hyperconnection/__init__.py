@@ -32,7 +32,6 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 __all__ = [
     "gated_residual_combine",
     "gated_residual_mix",
-    "gated_residual_mix_epilogue",
 ]
 
 
@@ -76,7 +75,7 @@ def gated_residual_mix(
     the block-injection weight. This preserves a single read of the wide input.
 
     Args:
-        normalized: Normalized residual streams shaped
+        normalized: Normalized GPU residual streams shaped
             ``[..., hc_count * hidden_size]``.
         projection_weight: Fused down/inject weight shaped either
             ``[lowrank, hc_count * hidden_size]`` or
@@ -121,6 +120,8 @@ def gated_residual_mix(
         )
     _same_tensor_contract(flat, projection_weight, "projection_weight")
     _same_tensor_contract(flat, up_weight, "up_weight")
+    if not flat.is_cuda:
+        raise ValueError("gated_residual_mix requires GPU tensors")
 
     rows = int(flat.shape[0])
     has_inject = projection_rows != lowrank
@@ -152,18 +153,13 @@ def gated_residual_mix(
         projection_weight=dense_tensor_format(projection_weight.dtype),
         up_weight=dense_tensor_format(up_weight.dtype),
     )
-    # Registered GPU implementations intentionally assume CUDA/ROCm tensors.
-    # Keep the public contract usable for references and unit tests on the CPU.
-    selected_solution = solution
-    if not flat.is_cuda:
-        selected_solution = "torch"
     kernel = select_kernel(
         "hyperconnection",
         "mix",
         signature,
         traits=traits,
         override=override,
-        solution=selected_solution,
+        solution=solution,
     )
     ShapeCapture.get().record("hyperconnection", "mix", kernel.name, flat.dtype, traits)
     with kernel_scope(
@@ -188,66 +184,6 @@ def gated_residual_mix(
     return mixed, inject
 
 
-def gated_residual_mix_epilogue(
-    gate: _torch.Tensor,
-    normalized: _torch.Tensor,
-    hc_count: int,
-    hidden_size: int,
-    *,
-    override: str | None = None,
-    solution: str | None = None,
-) -> _torch.Tensor:
-    """Apply sigmoid gates, branch weighting, and the branch mean.
-
-    Args:
-        gate: Gate logits shaped ``[..., hc_count * hidden_size]``.
-        normalized: Normalized residual branches with the same shape as
-            ``gate``. Row strides may differ.
-        hc_count: Number of residual branches.
-        hidden_size: Width of one branch.
-        override: Optional exact registered kernel name.
-        solution: Optional registered solution name.
-
-    Returns:
-        Mixed tensor shaped ``[..., hidden_size]``.
-    """
-    wide = hc_count * hidden_size
-    gate_flat = _flatten_rows(gate, wide, "gate")
-    normalized_flat = _flatten_rows(normalized, wide, "normalized")
-    if gate_flat.shape[0] != normalized_flat.shape[0]:
-        raise ValueError("gate and normalized must have the same number of rows")
-    _same_tensor_contract(gate_flat, normalized_flat, "normalized")
-    rows = int(gate_flat.shape[0])
-    if rows == 0:
-        return gate.new_empty((*gate.shape[:-1], hidden_size))
-    traits = {
-        "num_tokens": rows,
-        "hc_count": hc_count,
-        "hidden_size": hidden_size,
-    }
-    signature = format_signature(
-        gate=dense_tensor_format(gate_flat.dtype),
-        normalized=dense_tensor_format(normalized_flat.dtype),
-    )
-    kernel = select_kernel(
-        "hyperconnection",
-        "mix_epilogue",
-        signature,
-        traits=traits,
-        override=override,
-        solution=("torch" if not gate_flat.is_cuda else solution),
-    )
-    with kernel_scope(
-        "hyperconnection",
-        "mix_epilogue",
-        gate_flat.dtype,
-        kernel_name=kernel.name,
-        **traits,
-    ):
-        result = kernel(gate_flat, normalized_flat, hc_count, hidden_size)
-    return result.reshape(*gate.shape[:-1], hidden_size)
-
-
 def gated_residual_combine(
     block_output: _torch.Tensor,
     residual: _torch.Tensor,
@@ -261,7 +197,7 @@ def gated_residual_combine(
     """Gate one sublayer output and inject it into every residual branch.
 
     Args:
-        block_output: Sublayer output shaped ``[..., hidden_size]``.
+        block_output: GPU sublayer output shaped ``[..., hidden_size]``.
         residual: Hyperconnection stream shaped
             ``[..., hc_count * hidden_size]``.
         inject_logits: Per-branch logits shaped ``[..., hc_count]``.
@@ -282,6 +218,8 @@ def gated_residual_combine(
         raise ValueError("block_output, residual, and inject_logits must share rows")
     _same_tensor_contract(block_flat, residual_flat, "residual")
     _same_tensor_contract(block_flat, inject_flat, "inject_logits")
+    if not block_flat.is_cuda:
+        raise ValueError("gated_residual_combine requires GPU tensors")
     if rows == 0:
         return residual.to(block_output.dtype)
 
@@ -301,7 +239,7 @@ def gated_residual_combine(
         signature,
         traits=traits,
         override=override,
-        solution=("torch" if not block_flat.is_cuda else solution),
+        solution=solution,
     )
     ShapeCapture.get().record(
         "hyperconnection", "combine", kernel.name, block_flat.dtype, traits
@@ -326,5 +264,4 @@ def gated_residual_combine(
 import tokenspeed_kernel.ops.hyperconnection.cute_dsl  # noqa: E402,F401
 
 # Registration side effects must run after the public API is defined.
-import tokenspeed_kernel.ops.hyperconnection.torch  # noqa: E402,F401
 import tokenspeed_kernel.ops.hyperconnection.triton  # noqa: E402,F401

@@ -186,6 +186,3 @@ if _CUTEDSL_AVAILABLE:
         gate = ll_bf16_router(activated, padded_up, out_dtype=normalized.dtype)
         mixed = _launch_mix_epilogue(gate, normalized, hc_count, hidden_size)
         return mixed, inject
-
-
-__all__ = ["_CUTEDSL_AVAILABLE"]

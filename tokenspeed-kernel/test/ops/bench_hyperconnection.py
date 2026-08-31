@@ -115,9 +115,7 @@ def _backend_supported(name: str, rows: int, dtype: torch.dtype) -> bool:
     return rows > 0
 
 
-def _case(
-    rows: int, dtype: torch.dtype, backend: str
-) -> tuple[Callable[[], torch.Tensor], tuple[torch.Tensor, ...]]:
+def _case(rows: int, dtype: torch.dtype, backend: str) -> Callable[[], torch.Tensor]:
     generator = torch.Generator(device="cuda").manual_seed(2026 + rows)
     residual = torch.randn(rows, WIDE, dtype=dtype, device="cuda", generator=generator)
     norm_weight = (
@@ -158,7 +156,7 @@ def _case(
         )
         return gated_residual_combine(mixed, residual, inject, HC_COUNT, HIDDEN_SIZE)
 
-    return chain, (residual, norm_weight, projection, up)
+    return chain
 
 
 def main() -> None:
@@ -181,8 +179,7 @@ def main() -> None:
                 {"rows": rows, "backend": args.backend, "status": "unsupported"}
             )
             continue
-        chain, keepalive = _case(rows, dtype, args.backend)
-        del keepalive
+        chain = _case(rows, dtype, args.backend)
         iterations = _iterations(rows)
         result: dict[str, object] = {
             "rows": rows,

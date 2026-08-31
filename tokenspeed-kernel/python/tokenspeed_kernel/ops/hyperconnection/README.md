@@ -3,6 +3,8 @@
 This family implements the Qwen gated residual stream behind the public
 `tokenspeed_kernel` boundary. Runtime model code owns parameters and checkpoint
 mapping; all GPU implementation and dispatch logic lives here.
+The public family is GPU-only; numerical references live in tests rather than
+as a second registered runtime backend.
 
 For normalized branches `N` shaped `[T, C * H]`, the mix is:
 

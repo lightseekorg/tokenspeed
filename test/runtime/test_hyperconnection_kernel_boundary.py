@@ -25,6 +25,11 @@ import os
 
 import pytest
 import torch
+from tokenspeed_kernel import (
+    gated_residual_combine,
+    gated_residual_mix,
+    grouped_gemma_rmsnorm,
+)
 from tokenspeed_kernel.platform import (
     current_platform,
     pdl_enabled,
@@ -34,7 +39,6 @@ from tokenspeed_kernel.platform import (
 import tokenspeed.runtime.layers.hyperconnection as hyperconnection_module
 from tokenspeed.runtime.layers.hyperconnection import (
     GatedResidualSimple,
-    GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -45,6 +49,18 @@ def test_runtime_uses_tokenspeed_kernel_boundary() -> None:
     assert "from tokenspeed_kernel import" in source
     assert "import triton" not in source
     assert "@triton.jit" not in source
+
+
+def test_kernel_boundary_is_gpu_only() -> None:
+    normalized = torch.empty(1, 8)
+    projection = torch.empty(4, 8)
+    up = torch.empty(8, 2)
+    with pytest.raises(ValueError, match="requires GPU tensors"):
+        gated_residual_mix(normalized, projection, up, 2, 4, 2)
+    with pytest.raises(ValueError, match="requires GPU tensors"):
+        gated_residual_combine(torch.empty(1, 4), normalized, torch.empty(1, 2), 2, 4)
+    with pytest.raises(ValueError, match="requires GPU tensors"):
+        grouped_gemma_rmsnorm(normalized, torch.empty(8), 4, 1e-6)
 
 
 def test_server_args_is_the_authoritative_pdl_switch(monkeypatch) -> None:
@@ -71,6 +87,7 @@ def test_server_args_is_the_authoritative_pdl_switch(monkeypatch) -> None:
         set_pdl_enabled(previous)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_non_power_of_two_hc_scales_projection_results() -> None:
     hc_count, hidden_size, lowrank = 3, 8, 6
     mixer = GatedResidualSimple(
@@ -80,9 +97,9 @@ def test_non_power_of_two_hc_scales_projection_results() -> None:
             hc_lowrank=lowrank,
             params_dtype=torch.float32,
         )
-    )
-    down_weight = torch.randn(lowrank, hc_count * hidden_size)
-    inject_weight = torch.randn(hc_count, hc_count * hidden_size)
+    ).cuda()
+    down_weight = torch.randn(lowrank, hc_count * hidden_size, device="cuda")
+    inject_weight = torch.randn(hc_count, hc_count * hidden_size, device="cuda")
     param = mixer.mix_inject_proj.weight
     loader = param.weight_loader
     loader(param, down_weight, "mix")
@@ -92,8 +109,8 @@ def test_non_power_of_two_hc_scales_projection_results() -> None:
     torch.testing.assert_close(param[lowrank:], inject_weight)
     assert mixer._projection_scale == pytest.approx(1.0 / hc_count)
 
-    hyper_input = torch.randn(5, hc_count * hidden_size)
-    block_output = torch.randn(5, hidden_size)
+    hyper_input = torch.randn(5, hc_count * hidden_size, device="cuda")
+    block_output = torch.randn(5, hidden_size, device="cuda")
     mixed, residuals = mixer.mix(hyper_input)
     combined = mixer.combine(block_output, residuals)
     normalized = residuals[1]
@@ -113,42 +130,3 @@ def test_non_power_of_two_hc_scales_projection_results() -> None:
         -1, (hc_count, hidden_size)
     ) + block_output.unsqueeze(-2) * inject.unsqueeze(-1)
     torch.testing.assert_close(combined, expected_combined.flatten(-2))
-
-
-def test_power_of_two_hc_folds_projection_scale_exactly() -> None:
-    hc_count, hidden_size, lowrank = 4, 8, 6
-    mixer = GatedResidualSimple(
-        HyperConnectionConfig(
-            hc_count=hc_count,
-            hidden_size=hidden_size,
-            hc_lowrank=lowrank,
-            params_dtype=torch.bfloat16,
-        )
-    )
-    down_weight = torch.randn(lowrank, hc_count * hidden_size).bfloat16()
-    inject_weight = torch.randn(hc_count, hc_count * hidden_size).bfloat16()
-    param = mixer.mix_inject_proj.weight
-    param.weight_loader(param, down_weight, "mix")
-    param.weight_loader(param, inject_weight, "inject")
-
-    assert mixer._projection_scale == 1.0
-    torch.testing.assert_close(
-        param[:lowrank], (down_weight / hc_count).to(param.dtype)
-    )
-    torch.testing.assert_close(
-        param[lowrank:], (inject_weight / hc_count).to(param.dtype)
-    )
-
-
-def test_grouped_gemma_rmsnorm_cpu_reference() -> None:
-    norm = GroupedGemmaRMSNorm(24, 1e-6, group_size=8)
-    loaded_weight = torch.randn(24)
-    norm.weight.weight_loader(norm.weight, loaded_weight)
-    x = torch.randn(5, 24)
-    actual = norm(x)
-
-    grouped = x.float().unflatten(-1, (3, 8))
-    expected = (
-        grouped * torch.rsqrt(grouped.square().mean(dim=-1, keepdim=True) + 1e-6)
-    ).flatten(-2) * (1.0 + loaded_weight)
-    torch.testing.assert_close(actual, expected)

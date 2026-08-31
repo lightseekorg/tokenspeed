@@ -29,7 +29,6 @@ import torch.nn.functional as F
 from tokenspeed_kernel import (
     gated_residual_combine,
     gated_residual_mix,
-    gated_residual_mix_epilogue,
     grouped_gemma_rmsnorm,
 )
 from torch import nn
@@ -79,7 +78,7 @@ def _matching_rows(base: torch.Tensor, derived: torch.Tensor):
 
 
 class GroupedGemmaRMSNorm(nn.Module):
-    """Gemma RMSNorm with optional independently-normalized feature groups."""
+    """GPU Gemma RMSNorm with optional independently-normalized feature groups."""
 
     def __init__(self, hidden_size: int, eps: float, group_size: int | None = None):
         super().__init__()
@@ -99,32 +98,13 @@ class GroupedGemmaRMSNorm(nn.Module):
         param.data.copy_(loaded_weight)
         self.gemma_weight = param.data + 1.0
 
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        x_float = x.float()
-        if self.group_size is None:
-            variance = x_float.square().mean(dim=-1, keepdim=True)
-            normalized = x_float * torch.rsqrt(variance + self.variance_epsilon)
-        else:
-            grouped = x_float.unflatten(-1, (-1, self.group_size))
-            variance = grouped.square().mean(dim=-1, keepdim=True)
-            normalized = (
-                grouped * torch.rsqrt(variance + self.variance_epsilon)
-            ).flatten(-2)
-        return (normalized * self.gemma_weight.float()).to(input_dtype)
-
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return grouped_gemma_rmsnorm(
             x,
             self.weight,
             self.group_size,
             self.variance_epsilon,
         )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.is_cuda:
-            return self.forward_cuda(x)
-        return self.forward_native(x)
 
 
 class GatedResidualSimple(nn.Module):
@@ -200,14 +180,6 @@ class GatedResidualSimple(nn.Module):
         )
         param.data[start : start + size].copy_(weight.to(param.device, param.dtype))
 
-    def _split_projection(self, projected: torch.Tensor):
-        """Split the fused projection into mix gate and inject logits."""
-        if not self.use_combine:
-            return projected, None
-        if not self.use_mix:
-            return None, projected
-        return projected[..., : self.hc_lowrank], projected[..., self.hc_lowrank :]
-
     def _inject_logits(self, normalized: torch.Tensor):
         """Inject logits alone, for residual rows ``mix`` never saw."""
         if not self.use_combine:
@@ -244,23 +216,6 @@ class GatedResidualSimple(nn.Module):
         rows = slice(start, start + value.shape[0])
         return value, normalized[rows], inject_logits[rows]
 
-    def _mix_epilogue_torch(
-        self, gate: torch.Tensor, normalized: torch.Tensor
-    ) -> torch.Tensor:
-        weights = torch.sigmoid(gate).unflatten(-1, (self.hc_count, self.hidden_size))
-        branches = normalized.unflatten(-1, (self.hc_count, self.hidden_size))
-        return (weights * branches).mean(dim=-2).to(self.config.params_dtype)
-
-    def _mix_epilogue_cuda(
-        self, gate: torch.Tensor, normalized: torch.Tensor
-    ) -> torch.Tensor:
-        return gated_residual_mix_epilogue(
-            gate,
-            normalized,
-            self.hc_count,
-            self.hidden_size,
-        )
-
     def mix(self, hyper_input: torch.Tensor):
         """Mix ``hc_count`` residual branches into one sublayer input.
 
@@ -274,34 +229,15 @@ class GatedResidualSimple(nn.Module):
                 f"hyper input width must be {expected}, got {hyper_input.shape[-1]}"
             )
         normalized = self._normalize(hyper_input)
-        if hyper_input.shape[0] == 0:
-            mixed = hyper_input.new_empty((*hyper_input.shape[:-1], self.hidden_size))
-            inject_logits = (
-                hyper_input.new_empty((*hyper_input.shape[:-1], self.hc_count))
-                if self.use_combine
-                else None
-            )
-            return mixed, (hyper_input, normalized, inject_logits)
-        if normalized.is_cuda and normalized.dim() == 2:
-            mixed, inject_logits = gated_residual_mix(
-                normalized,
-                self.mix_inject_proj.weight,
-                self.input_mix_weight_up.weight,
-                self.hc_count,
-                self.hidden_size,
-                self.hc_lowrank,
-                projection_scale=self._projection_scale,
-            )
-        else:
-            gate, inject_logits = self._split_projection(
-                self.mix_inject_proj(normalized)
-            )
-            if self._projection_scale != 1.0:
-                gate = gate * self._projection_scale
-                if inject_logits is not None:
-                    inject_logits = inject_logits * self._projection_scale
-            gate = self.input_mix_weight_up(F.silu(gate))
-            mixed = self._mix_epilogue_torch(gate, normalized)
+        mixed, inject_logits = gated_residual_mix(
+            normalized,
+            self.mix_inject_proj.weight,
+            self.input_mix_weight_up.weight,
+            self.hc_count,
+            self.hidden_size,
+            self.hc_lowrank,
+            projection_scale=self._projection_scale,
+        )
         mixed = mixed.to(self.config.params_dtype)
         return mixed, (
             hyper_input,
@@ -309,40 +245,16 @@ class GatedResidualSimple(nn.Module):
             inject_logits,
         )
 
-    def _combine_torch(
-        self,
-        block_output: torch.Tensor,
-        hyper_input: torch.Tensor,
-        inject_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        inject = 2 * torch.sigmoid(inject_logits)
-        combined = hyper_input.unflatten(
-            -1, (self.hc_count, self.hidden_size)
-        ) + block_output.unsqueeze(-2) * inject.unsqueeze(-1)
-        return combined.flatten(-2).to(self.config.params_dtype)
-
-    def _combine_cuda(
-        self,
-        block_output: torch.Tensor,
-        hyper_input: torch.Tensor,
-        inject_logits: torch.Tensor,
-    ) -> torch.Tensor:
+    def combine(self, block_output: torch.Tensor, residuals) -> torch.Tensor:
+        """Inject one sublayer output back into every residual branch."""
+        hyper_input, _, inject_logits = residuals
         return gated_residual_combine(
             block_output,
             hyper_input,
             inject_logits,
             self.hc_count,
             self.hidden_size,
-        )
-
-    def combine(self, block_output: torch.Tensor, residuals) -> torch.Tensor:
-        """Inject one sublayer output back into every residual branch."""
-        hyper_input, _, inject_logits = residuals
-        if block_output.shape[0] == 0:
-            return hyper_input.to(self.config.params_dtype)
-        if block_output.is_cuda and block_output.dim() == 2:
-            return self._combine_cuda(block_output, hyper_input, inject_logits)
-        return self._combine_torch(block_output, hyper_input, inject_logits)
+        ).to(self.config.params_dtype)
 
 
 __all__ = [

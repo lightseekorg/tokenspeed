@@ -114,7 +114,7 @@ def grouped_gemma_rmsnorm(
     """Apply Gemma RMSNorm independently to last-dimension groups.
 
     Args:
-        x: Input shaped ``[..., width]``.
+        x: GPU input shaped ``[..., width]``.
         weight: Gemma checkpoint weight offset shaped ``[width]``; the
             effective multiplier is ``1 + weight``.
         group_size: Elements sharing one variance statistic. ``None`` means
@@ -125,27 +125,11 @@ def grouped_gemma_rmsnorm(
     Returns:
         Normalized tensor matching ``x`` shape and dtype.
     """
+    if not x.is_cuda:
+        raise ValueError("grouped_gemma_rmsnorm requires GPU tensors")
     width = int(x.shape[-1])
     effective_group_size = width if group_size is None else int(group_size)
-    if x.is_cuda:
-        return _grouped_gemma_rmsnorm(x, weight, effective_group_size, eps, out=out)
-    if effective_group_size <= 0 or width % effective_group_size:
-        raise ValueError(
-            f"group_size must divide the last dimension ({width}), got "
-            f"{effective_group_size}"
-        )
-    if weight.shape != (width,):
-        raise ValueError(
-            f"weight must have shape {(width,)}, got {tuple(weight.shape)}"
-        )
-    grouped = x.float().unflatten(-1, (-1, effective_group_size))
-    variance = grouped.square().mean(dim=-1, keepdim=True)
-    normalized = (grouped * torch.rsqrt(variance + eps)).flatten(-2)
-    result = (normalized * (1.0 + weight.float())).to(x.dtype)
-    if out is not None:
-        out.copy_(result)
-        return out
-    return result
+    return _grouped_gemma_rmsnorm(x, weight, effective_group_size, eps, out=out)
 
 
 __all__ = ["grouped_gemma_rmsnorm", "qk_rmsnorm", "rmsnorm"]

@@ -46,7 +46,6 @@ _PERSISTENT_MIX_SIGNATURES = format_signatures(
     "dense",
     _LOW_PRECISION_DTYPES,
 )
-_EPILOGUE_SIGNATURES = format_signatures(("gate", "normalized"), "dense", _DTYPES)
 _COMBINE_SIGNATURES = format_signatures(
     ("block_output", "residual", "inject_logits"), "dense", _DTYPES
 )
@@ -560,25 +559,6 @@ def triton_persistent_hyperconnection_mix(
 
 @register_kernel(
     "hyperconnection",
-    "mix_epilogue",
-    name="triton_hyperconnection_mix_epilogue",
-    solution="triton",
-    signatures=_EPILOGUE_SIGNATURES,
-    priority=Priority.PERFORMANT,
-    tags={"determinism", "portability"},
-)
-def triton_hyperconnection_mix_epilogue(
-    gate: torch.Tensor,
-    normalized: torch.Tensor,
-    hc_count: int,
-    hidden_size: int,
-) -> torch.Tensor:
-    """Triton sigmoid-weighted residual-branch mean."""
-    return _launch_mix_epilogue(gate, normalized, hc_count, hidden_size)
-
-
-@register_kernel(
-    "hyperconnection",
     "combine",
     name="triton_hyperconnection_combine",
     solution="triton",
@@ -626,6 +606,5 @@ def triton_hyperconnection_combine(
 __all__ = [
     "triton_hyperconnection_combine",
     "triton_hyperconnection_mix",
-    "triton_hyperconnection_mix_epilogue",
     "triton_persistent_hyperconnection_mix",
 ]
