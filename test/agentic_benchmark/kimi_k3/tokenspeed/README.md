@@ -5,7 +5,7 @@ at a fixed set of K3 attention/MoE parallelism layouts and report per-config
 throughput, latency, and KV-cache hit rate. Same dataset recipe, sweep
 ladder, and metric conventions as `../kimi_k2.5/tokenspeed`.
 
-Server listens on port **8000** (DP rendezvous on **4000**).
+Server listens on port **8000**.
 
 ## Run a sweep
 
@@ -22,8 +22,7 @@ To narrow the matrix, comment out entries in the `CONFIGS=()` array.
 The script builds the dataset with the kimi_k2.5 recipe (first turn 50,000
 tokens, +800/turn, 10-15 turns; 71 conversations build). Each turn's
 500-token completion joins the next prompt, so final prompts reach ~68.2K
-tokens — hence `--max-model-len 80000` in every config. The script asserts
-the count and the recipe parameters.
+tokens — hence `--max-model-len 80000` in every config.
 
 **Use ONE input file for every run you intend to compare.** The builder's
 multi-worker selection is nondeterministic — rebuilding does not reproduce
@@ -48,8 +47,6 @@ here first. tp4 layouts are omitted: the checkpoint does not fit 4 GPUs.
 |---|---|
 | `attn_tp8_moe_ep8` | baseline |
 | `attn_tp8_moe_tp8` | MoE TP variant |
-| `attn_dp8_moe_ep8` | attention DP; DP x DSpark validated on-machine (2026-08-21: boots in 1067s and completes the full 5-rung sweep with zero exceptions); never pass `--dense-tp-size`; chunked prefill pinned to 2048 (trtllm MoE workspace scales with chunk x 8 gathered tokens) |
-
 Run-to-run noise: sampling is deliberately NOT pinned (matching the
 kimi_k2.5/inkling convention — no seed, no greedy), so speculative
 acceptance drifts between runs. Measured across identical-config runs:

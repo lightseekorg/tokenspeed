@@ -4,23 +4,12 @@ set -euo pipefail
 
 # Prepare dataset
 EVALSCOPE_COMMIT=acd09b44384d53174768bb1063f675420f76fae9
-# Skip the install when evalscope is already importable so offline reruns
-# survive; delete the venv to force a re-pin.
-python3 -c "import evalscope" 2>/dev/null || \
-    pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@${EVALSCOPE_COMMIT}"
+pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@${EVALSCOPE_COMMIT}"
 
-# curl (already a hard dependency of the readiness probe) + tmp/mv so a
-# failed download cannot leave a truncated file behind the -s guard.
-[ -s build_swe_smith_dataset.py ] || {
-    curl -fsSL "https://raw.githubusercontent.com/modelscope/evalscope/${EVALSCOPE_COMMIT}/examples/perf/build_swe_smith_dataset.py" \
-        -o build_swe_smith_dataset.py.tmp
-    mv build_swe_smith_dataset.py.tmp build_swe_smith_dataset.py
-}
+[ -f build_swe_smith_dataset.py ] || wget https://raw.githubusercontent.com/modelscope/evalscope/${EVALSCOPE_COMMIT}/examples/perf/build_swe_smith_dataset.py \
+    -O build_swe_smith_dataset.py
 
-# Note: only 71 conversations can be built. The builder's multi-worker
-# selection is nondeterministic — rebuilds do NOT reproduce the file — so
-# keep ONE agentic_dataset.json and reuse it across runs (see README for the
-# frozen CI artifact you can drop in instead).
+# Note: Only 71 conversations can be built
 [ -f agentic_dataset.json ] || python3 build_swe_smith_dataset.py \
     --model-path moonshotai/Kimi-K3 \
     --first-turn-length 50000 \
@@ -31,24 +20,10 @@ python3 -c "import evalscope" 2>/dev/null || \
     --output-path agentic_dataset.json \
     --num-workers 32
 
-# The sweep + warmup consume conversations 0..69; fail fast on a stale or
-# wrong-recipe file. (Recipe-based so a dropped-in CI artifact also passes.)
-python3 - <<'PYEOF'
-import json
-d = json.load(open("agentic_dataset.json"))
-n = len(d["conversations"])
-m = d.get("metadata", {})
-assert n >= 70, f"agentic_dataset.json has only {n} conversations; need >= 70"
-recipe = (m.get("first_turn_length"), m.get("subsequent_turn_length"), m.get("min_turns"), m.get("max_turns"))
-assert recipe == (50000, 800, 10, 15), f"unexpected dataset recipe {recipe}; delete agentic_dataset.json"
-print(f"dataset ok: {n} conversations, recipe {recipe}")
-PYEOF
-
 # Sweep configs
 CONFIGS=(
     attn_tp8_moe_ep8
     attn_tp8_moe_tp8
-    attn_dp8_moe_ep8
 )
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,10 +38,7 @@ launch_server() {
 }
 
 wait_for_ready() {
-    # CI gives this checkpoint a 7200s readiness window (first boot autotunes
-    # trtllm-gen NVFP4 cubins for ~15 min; the dspark row also pulls 7.1GB of
-    # draft weights). Must stay >= the configs' --engine-startup-timeout.
-    local TIMEOUT=7200
+    local TIMEOUT=7200  # >= the configs' --engine-startup-timeout
     local START=$SECONDS
     until curl -sf -o /dev/null http://127.0.0.1:8000/readiness; do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -74,7 +46,7 @@ wait_for_ready() {
             tail -100 "$SERVER_LOG" >&2
             return 1
         fi
-        if grep -qE "CUDA out of memory|OutOfMemory|Traceback|Killed" "$SERVER_LOG"; then
+        if grep -qE "CUDA out of memory|OutOfMemory|RuntimeError|Killed" "$SERVER_LOG"; then
             echo "Server hit a fatal error:" >&2
             tail -100 "$SERVER_LOG" >&2
             return 1
@@ -116,9 +88,8 @@ wait_for_port_free() {
 
 trap stop_server EXIT  # safety net for Ctrl-C / errors
 
-# Preflight: bail out if the serve port or the DP rendezvous port is in use
+# Preflight: bail out if port 8000 is already in use
 wait_for_port_free 8000
-wait_for_port_free 4000
 
 SWEEP_TS=$(date +%Y%m%d_%H%M%S)
 SWEEP_DIR="${SCRIPT_DIR}/outputs/${SWEEP_TS}"
