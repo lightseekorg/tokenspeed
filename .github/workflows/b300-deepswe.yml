@@ -15,6 +15,7 @@ on:
         type: choice
         options:
           - "1"
+          - "4"
           - "10"
           - "113"
       concurrency:
