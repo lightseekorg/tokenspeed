@@ -116,6 +116,15 @@ class KimiCodeAgent(BaseInstalledAgent):
                 "KIMI_MODEL_BASE_URL": base_url,
                 "KIMI_MODEL_MAX_CONTEXT_SIZE": "80000",
                 "KIMI_MODEL_CAPABILITIES": "thinking,always_thinking,tool_use",
+                "KIMI_MODEL_TEMPERATURE": self._get_env("KIMI_MODEL_TEMPERATURE")
+                or "1.0",
+                "KIMI_MODEL_TOP_P": self._get_env("KIMI_MODEL_TOP_P") or "0.95",
+                "KIMI_MODEL_THINKING_EFFORT": self._get_env(
+                    "KIMI_MODEL_THINKING_EFFORT"
+                )
+                or "max",
+                "KIMI_MODEL_THINKING_KEEP": self._get_env("KIMI_MODEL_THINKING_KEEP")
+                or "all",
             }
         )
         await self.exec_as_agent(

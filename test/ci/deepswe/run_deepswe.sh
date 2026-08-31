@@ -51,6 +51,10 @@ pier run \
   --agent-env KIMI_MODEL_PROVIDER_TYPE=kimi \
   --agent-env KIMI_MODEL_MAX_CONTEXT_SIZE=80000 \
   --agent-env KIMI_MODEL_CAPABILITIES=thinking,always_thinking,tool_use \
+  --agent-env KIMI_MODEL_TEMPERATURE=1.0 \
+  --agent-env KIMI_MODEL_TOP_P=0.95 \
+  --agent-env KIMI_MODEL_THINKING_EFFORT=max \
+  --agent-env KIMI_MODEL_THINKING_KEEP=all \
   --env docker \
   --delete \
   --n-concurrent "$concurrency" \
