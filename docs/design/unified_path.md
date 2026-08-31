@@ -86,6 +86,33 @@ on it exist:
 Do not branch on this flag for anything a shared in-place refresh can
 express.
 
+### Capture is inherited
+
+`init_forward_metadata_capture_cuda_graph` has a base default — bind the
+per-bs views (`bind_decode_views`), then run the idle-refresh arm
+(`actual_bs=0`, `for_graph_replay=True`) — and that default IS the capture
+for every backend except a closed list of sanctioned overrides, each tied to
+something the idle refresh cannot express:
+
+* **FlashMLA** (slim, calls super): installs the keepalive tile-schedule
+  object whose schedule-build the graph records;
+* **DeepseekV4**: capture-phase placeholder-table validation
+  (`cache_active_pages_must_be_real`) and the packed `tokens_per_req` row
+  machinery;
+* **Mamba** (`MambaAttnBackend`): the warmup kernels need the arange
+  query-start-loc, which the idle refresh deliberately zeroes;
+* **HybridLinearAttnBackend**: a two-line fan-out so Mamba's real capture is
+  reached;
+* **Inkling**: conv-state seeding; its refresh hard-requires conv tables.
+
+Bind-only overrides (`MLAAttnBackend`, `CuteDSLMLABackend`) exist solely to
+latch `_cache_groups_bound` before the views are built. A new backend
+implements `refresh_decode_metadata` + `init_cuda_graph_state` and inherits
+capture; a new override must name its kernel-imposed asymmetry here. Every
+capture signature must accept the runner kwarg set (`cache_group_ids`,
+`page_table`, `**kwargs`) — pinned by
+`test_unified_decode_path.py::CaptureSignatureConformanceTest`.
+
 ### Refresh ordering: target before draft
 
 The wrapper's `_prepare_decode_metadata` refreshes the target backend before

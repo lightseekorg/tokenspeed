@@ -792,11 +792,12 @@ class MSAHybridAttnBackend(AttentionBackend):
         init_backend_cuda_graph_state(self.full_attn_backend, max_bs, **kwargs)
         init_backend_cuda_graph_state(self.sparse_attn_backend, max_bs, **kwargs)
 
-    def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
-        self.full_attn_backend.init_forward_metadata_capture_cuda_graph(*args, **kwargs)
-        self.sparse_attn_backend.init_forward_metadata_capture_cuda_graph(
-            *args, **kwargs
-        )
+    # Capture is inherited: the base default binds and refreshes through the
+    # two fan-outs below, and both children are default-capture themselves.
+
+    def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
+        self.full_attn_backend.bind_decode_views(bs, cache_group_ids)
+        self.sparse_attn_backend.bind_decode_views(bs, cache_group_ids)
 
     def refresh_decode_metadata(self, *args, **kwargs) -> None:
         self.full_attn_backend.refresh_decode_metadata(*args, **kwargs)

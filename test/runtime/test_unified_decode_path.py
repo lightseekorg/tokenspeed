@@ -223,6 +223,78 @@ class DefaultCaptureTest(_MhaCase):
         self.assertIs(self._refresh(LADDER_BS, 2, padded_seq, replay=True), md)
 
 
+class CaptureSignatureConformanceTest(_TorchCase):
+    """Every backend's capture accepts the full runner kwarg set.
+
+    The runner passes cache_group_ids / page_table (and V4's placeholder
+    kwargs) whenever the pool publishes them; a bespoke override with a
+    narrower signature TypeErrors at boot on exactly the configs that need
+    it (the DSA wrapper shipped that bug once)."""
+
+    _BACKEND_CLASSES = (
+        ("tokenspeed.runtime.layers.attention.backends.mha", "MHAAttnBackend"),
+        ("tokenspeed.runtime.layers.attention.backends.msa", "MSAAttnBackend"),
+        ("tokenspeed.runtime.layers.attention.backends.msa", "MSAHybridAttnBackend"),
+        ("tokenspeed.runtime.layers.attention.backends.trtllm", "TRTLLMMHAAttnBackend"),
+        ("tokenspeed.runtime.layers.attention.backends.mla", "MLAAttnBackend"),
+        ("tokenspeed.runtime.layers.attention.backends.trtllm_mla", "TRTLLMMLABackend"),
+        (
+            "tokenspeed.runtime.layers.attention.backends.tokenspeed_mla",
+            "CuteDSLMLABackend",
+        ),
+        ("tokenspeed.runtime.layers.attention.backends.flashmla", "FlashMLABackend"),
+        ("tokenspeed.runtime.layers.attention.backends.dsa", "DSABackend"),
+        (
+            "tokenspeed.runtime.layers.attention.backends.deepseek_v4",
+            "DeepseekV4AttentionBackend",
+        ),
+        (
+            "tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn",
+            "MambaAttnBackend",
+        ),
+        (
+            "tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn",
+            "HybridLinearAttnBackend",
+        ),
+        ("tokenspeed.runtime.layers.attention.backends.hybrid_kda", "KdaAttnBackend"),
+        ("tokenspeed.runtime.layers.attention.backends.inkling", "InklingAttnBackend"),
+        (
+            "tokenspeed.runtime.layers.attention.backends.qwen4_exp",
+            "Qwen4ExpMambaAttnBackend",
+        ),
+    )
+
+    def test_capture_signatures_bind_the_runner_kwarg_set(self):
+        import importlib
+        import inspect
+
+        for module_name, cls_name in self._BACKEND_CLASSES:
+            try:
+                cls = getattr(importlib.import_module(module_name), cls_name)
+            except (ImportError, ModuleNotFoundError) as exc:
+                self.skipTest(f"needs optional deps for {cls_name}: {exc}")
+            sig = inspect.signature(cls.init_forward_metadata_capture_cuda_graph)
+            with self.subTest(backend=cls_name):
+                try:
+                    # (self, bs, req_pool_indices, seq_lens, forward_mode, ...)
+                    sig.bind(
+                        None,
+                        8,
+                        None,
+                        None,
+                        None,
+                        cache_group_ids=("full_attention",),
+                        page_table=None,
+                        block_tables=None,
+                        num_tokens=8,
+                    )
+                except TypeError as exc:
+                    self.fail(
+                        f"{cls_name}.init_forward_metadata_capture_cuda_graph "
+                        f"rejects a runner kwarg: {exc}"
+                    )
+
+
 class GraphPtrGuardWalkTest(_TorchCase):
     """Walk semantics of graph_ptr_guard on a stub backend (no kernels)."""
 

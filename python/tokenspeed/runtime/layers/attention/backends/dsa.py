@@ -159,33 +159,14 @@ class DSABackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int):
         self._dense_backend.init_cuda_graph_state(max_bs)
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-    ):
-        self._dense_backend.init_forward_metadata_capture_cuda_graph(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            forward_mode=forward_mode,
-        )
-        metadata = self.forward_decode_metadata
-        # Per-token context lengths: the paged-MQA-logits kernel only supports
-        # next_n == 1, so each verify token is its own row (bs * spec_num_tokens
-        # rows, each holding its request's full KV length). The per-token causal
-        # bound is applied downstream in the top-k. See deep_gemm_dsa_decode_topk.
-        metadata._dsa_seq_lens_2d = (
-            seq_lens.unsqueeze(1)
-            .expand(-1, self.spec_num_tokens)
-            .reshape(-1, 1)
-            .contiguous()
-        )
-        metadata._dsa_plan = dsa_plan(
-            seq_lens_2d=metadata._dsa_seq_lens_2d, page_size=self.kernel_page_size
-        )
+    # Capture is inherited: the base default routes through this wrapper's
+    # refresh, whose lazy arm builds the piggybacked _dsa_seq_lens_2d /
+    # _dsa_plan once per bs on the dense backend's cached metadata and
+    # refreshes them in place afterwards. (The old bespoke capture also had
+    # a narrow signature that rejected the runner's cache_group_ids.)
+
+    def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
+        self._dense_backend.bind_decode_views(bs, cache_group_ids)
 
     def refresh_decode_metadata(
         self,
