@@ -225,6 +225,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
 
     cache_active_pages_must_be_real = True
     cache_consumer_families = frozenset({"history", "state"})
+    # The refresh replaces metadata.cache wholesale each step (the bespoke
+    # multi-group slot mapping travels on the live cache_metadata object);
+    # the captured kernels read only the persistent buffers the refresh
+    # fills FROM it, never this object through Python. Exempt it from the
+    # capture-time pointer snapshot (graph_ptr_guard).
+    graph_unstable_metadata_fields = frozenset({"cache"})
 
     def __init__(self, config) -> None:
         super().__init__(config)
