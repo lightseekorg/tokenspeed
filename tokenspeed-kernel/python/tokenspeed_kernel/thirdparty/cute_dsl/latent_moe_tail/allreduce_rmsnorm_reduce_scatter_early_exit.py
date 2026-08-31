@@ -94,7 +94,14 @@ def _select_routed_schedule(
 
 
 class AllReduceRMSNormWithReduceScatterEarlyExit:
-    """One routed role plus one ReduceScatter role per destination group."""
+    """One routed role plus one ReduceScatter role per destination group.
+
+    Routed variants launch only the CTAs needed by runtime M.  After every CTA
+    publishes its first local routed/shared fragment, it admits the PDL
+    successor; that successor may prime input-independent data while its own
+    PDL wait continues to protect collective outputs.  Shared-only variants
+    retain the full-grid completion edge.
+    """
 
     def __init__(
         self,
@@ -280,8 +287,9 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 tidx,
             )
             token = token + self.token_ctas
-        # Trigger dependents only after every CTA stores its final token wave.
-        cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not self.include_routed):
+            # A shared-only launch keeps the original full-grid edge.
+            cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
     def _token_device(
@@ -422,6 +430,8 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 local_packed,
                 volatile=False,
             )
+            if token == token_cta:
+                cute.arch.griddepcontrol_launch_dependents()
 
             cute.arch.cluster_arrive()
             # All CTAs must complete this handshake before the st.shared::cluster exchange: a partial wait skews barrier phases and the pre-DSM wait can match a stale phase, losing the peer-entered guarantee.
@@ -620,6 +630,9 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                 local_packed,
                 volatile=False,
             )
+            if cutlass.const_expr(self.include_routed):
+                if token == token_cta:
+                    cute.arch.griddepcontrol_launch_dependents()
 
             # The wait must be unconditional: every per-token-loop barrier use must be arrive/wait-symmetric on every CTA, or the phase counters skew across iterations and the next pre-DSM wait matches a stale phase.
             cute.arch.cluster_arrive()
