@@ -2205,12 +2205,12 @@ class HybridLinearAttnBackend(AttentionBackend):
             layer, out_cache_loc, forward_mode
         )
 
-    def _backends(self):
-        return [self.full_attn_backend, self.linear_attn_backend]
+    def child_backends(self):
+        return (self.full_attn_backend, self.linear_attn_backend)
 
     def set_cache_pool(self, cache_pool) -> None:
         self.cache_pool = cache_pool
-        for backend in self._backends():
+        for backend in self.child_backends():
             backend.set_cache_pool(cache_pool)
 
     def _backend_for_layer(self, layer_id: int) -> AttentionBackend:

@@ -36,6 +36,11 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.graph_ptr_guard import (
+    graph_debug_enabled,
+    snapshot_graph_metadata,
+    verify_graph_metadata,
+)
 from tokenspeed.runtime.layers.attention.backends.base import (
     init_backend_cuda_graph_state,
 )
@@ -293,6 +298,11 @@ class ForwardStepRunner:
 
         self.graphs: dict[tuple[str, int], object] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
+        # TOKENSPEED_GRAPH_DEBUG=1: capture-time tensor-identity snapshots,
+        # re-verified before every replay (graph_ptr_guard). Off by default —
+        # replays then pay a single bool check.
+        self._graph_debug = graph_debug_enabled()
+        self._metadata_snapshots: dict[tuple[str, int], dict[str, dict]] = {}
 
         self._forward_func: Callable | None = forward_func
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -382,6 +392,20 @@ class ForwardStepRunner:
 
     def _has_cuda_graph_for_bs(self, bs: int) -> bool:
         return (CUDA_GRAPH_VARIANT_DEFAULT, bs) in self.graphs
+
+    def _verify_graph_metadata(self, graph_key: tuple[str, int]) -> None:
+        """Assert the refresh rebound the tensors the captured graph reads."""
+        snapshots = self._metadata_snapshots.get(graph_key)
+        if snapshots is None:
+            return
+        context = f"variant={graph_key[0]!r}, bs={graph_key[1]}"
+        verify_graph_metadata(
+            self.attn_backend, snapshots["target"], context=f"target, {context}"
+        )
+        if self.draft_attn_backend is not None and "draft" in snapshots:
+            verify_graph_metadata(
+                self.draft_attn_backend, snapshots["draft"], context=f"draft, {context}"
+            )
 
     def _capture_one(self, bs: int, variant: str = CUDA_GRAPH_VARIANT_DEFAULT):
         graph_cls = (
@@ -539,6 +563,15 @@ class ForwardStepRunner:
             self.capturable_grammar.reset_state()
 
         global_graph_memory_pool = graph.pool()
+
+        if self._graph_debug:
+            # The slots bound by the last _init_capture_metadata are exactly
+            # what the graph recorded; snapshot their tensor identities so
+            # every replay can assert the refresh still writes them.
+            snapshots = {"target": snapshot_graph_metadata(self.attn_backend)}
+            if self.draft_attn_backend is not None:
+                snapshots["draft"] = snapshot_graph_metadata(self.draft_attn_backend)
+            self._metadata_snapshots[(variant, bs)] = snapshots
 
         return graph, out
 
@@ -1254,6 +1287,8 @@ class ForwardStepRunner:
 
             graph_key = self._cuda_graph_key(padded_bs)
             graph = self.graphs[graph_key]
+            if self._graph_debug:
+                self._verify_graph_metadata(graph_key)
             if self.device == "npu":
                 graph.update(
                     cpu_update_input=[

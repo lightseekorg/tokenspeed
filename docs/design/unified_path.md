@@ -162,10 +162,15 @@ DFLASH sentinel req-pool rows, `_set_graph_state_write_indices`, the DeepEP
 dispatch-mode restore (`deepep_adapter.replay()`), the sampler-variant
 `graph_key` lookup, output-buffer re-slicing, and the `ctx.bs` save/restore.
 
-What unification can NOT test: address-freezing bugs (capture recorded a
-pointer the refresh no longer writes), mempool reuse, hostfunc semantics.
-The e2e regression matrix keeps graph-on and graph-off configurations for
-this reason.
+Address-freezing bugs — a refresh that binds metadata views over storage the
+captured graph never recorded — are assertable: capture snapshots the tensor
+identities reachable from the decode-metadata slots (`graph_ptr_guard`), and
+`TOKENSPEED_GRAPH_DEBUG=1` re-verifies them before every replay (production
+replays pay one bool check). Per-step-mutable objects a replay never reads
+through Python are exempted via `graph_unstable_metadata_fields` (FlashMLA's
+eager tile schedule is the one occupant). What unification still can NOT
+test: mempool reuse and hostfunc semantics — the e2e regression matrix keeps
+graph-on and graph-off configurations for this reason.
 
 ## One block-table route, one unit
 
@@ -211,7 +216,8 @@ milestone (`cache-concepts.md` Principle 5).
 
 * `test/runtime/test_unified_decode_path.py` — eager refresh and padded
   replay refresh produce identical live rows over the same buffers; lazy
-  above-ladder views are pointer-stable.
+  above-ladder views are pointer-stable; the graph_ptr_guard walk reports a
+  rebound tensor by path and honors `graph_unstable_metadata_fields`.
 * `test/runtime/test_cudagraph_per_group.py`,
   `test_group_write_locations.py` — wrapper padding wiring and per-group
   write-location math on the unified path.

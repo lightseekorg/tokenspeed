@@ -228,6 +228,9 @@ class InklingAttnBackend(AttentionBackend):
             raise AttributeError(name)
         return getattr(self.inner, name)
 
+    def child_backends(self):
+        return (self.inner,)
+
     @property
     def cache_consumer_families(self):
         return frozenset(getattr(self.inner, "cache_consumer_families", ())) | {"state"}

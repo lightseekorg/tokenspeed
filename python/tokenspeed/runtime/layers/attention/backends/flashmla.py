@@ -117,6 +117,11 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
     """
 
     draft_seq_lens_attr: str = "cuda_graph_seq_lens_k"
+    # Eager refresh swaps in a fresh tile-schedule object every step (the
+    # kernel freezes the schedule on first use); the replayed graph re-runs
+    # its recorded schedule-build instead and never reads this field through
+    # Python, so the pointer guard must not pin it.
+    graph_unstable_metadata_fields: frozenset[str] = frozenset({"flashmla_metadata"})
 
     def __init__(self, config: MLAConfig):
         super().__init__(config)

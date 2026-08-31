@@ -776,6 +776,9 @@ class MSAHybridAttnBackend(AttentionBackend):
             return self.sparse_attn_backend
         return self.full_attn_backend
 
+    def child_backends(self) -> tuple[AttentionBackend, ...]:
+        return (self.full_attn_backend, self.sparse_attn_backend)
+
     @property
     def cache_consumer_families(self) -> frozenset[str]:
         """Cache families consumed by the dense and sparse children."""

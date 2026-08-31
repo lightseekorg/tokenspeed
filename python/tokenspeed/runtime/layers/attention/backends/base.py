@@ -83,6 +83,11 @@ class AttentionBackend(ABC):
     supports_mla_projected_value_decode: bool = False
     # Backend-owned cuda-graph cache-seqlens buffer the decode metadata views.
     draft_seq_lens_attr: str = "cuda_graph_seq_lens"
+    # Metadata attribute names exempt from the capture-time pointer-identity
+    # snapshot (graph_ptr_guard): sanctioned per-step-mutable objects the
+    # replayed kernels do not read through Python (e.g. FlashMLA's eager tile
+    # schedule). Keep empty unless a kernel imposes such an asymmetry.
+    graph_unstable_metadata_fields: frozenset[str] = frozenset()
 
     def __init__(self, config: BaseAttnConfig) -> None:
         self.device = config.device
@@ -101,6 +106,17 @@ class AttentionBackend(ABC):
 
     def set_cache_pool(self, cache_pool: CachePool) -> None:
         self.cache_pool = cache_pool
+
+    def child_backends(self) -> tuple[AttentionBackend, ...]:
+        """Sub-backends this backend delegates metadata and forwards to.
+
+        Composite wrappers (hybrid linear-attention, MSA hybrid, DSA,
+        Inkling) override this; leaf backends return ``()``. Drives the
+        CUDA-graph support resolution and the debug pointer-identity walk
+        (graph_ptr_guard), so a wrapper that grows a new child must list it
+        here.
+        """
+        return ()
 
     @contextmanager
     def override_num_extends(self, num_extends: int):

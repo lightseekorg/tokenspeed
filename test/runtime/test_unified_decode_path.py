@@ -166,5 +166,106 @@ class AboveLadderDecodeTest(_MhaCase):
         self.assertIs(md2, md)
 
 
+class GraphPtrGuardWalkTest(_TorchCase):
+    """Walk semantics of graph_ptr_guard on a stub backend (no kernels)."""
+
+    def setUp(self):
+        super().setUp()
+        from tokenspeed.runtime.execution import graph_ptr_guard
+
+        self.guard = graph_ptr_guard
+        torch = self.torch
+
+        class _StubBackend:
+            graph_unstable_metadata_fields = frozenset({"volatile"})
+
+            def __init__(self):
+                self.forward_decode_metadata = SimpleNamespace(
+                    stable=torch.zeros(4),
+                    volatile=torch.zeros(2),
+                    nested={"a": torch.ones(3)},
+                    scalar=7,
+                )
+
+            def child_backends(self):
+                return ()
+
+        self.stub_cls = _StubBackend
+        self.stub = _StubBackend()
+
+    def test_snapshot_records_tensors_and_skips_unstable_fields(self):
+        snap = self.guard.snapshot_graph_metadata(self.stub)
+        paths = set(snap)
+        self.assertIn("_StubBackend.forward_decode_metadata.stable", paths)
+        self.assertIn("_StubBackend.forward_decode_metadata.nested['a']", paths)
+        self.assertNotIn("_StubBackend.forward_decode_metadata.volatile", paths)
+
+    def test_unstable_field_may_mutate_between_replays(self):
+        snap = self.guard.snapshot_graph_metadata(self.stub)
+        self.stub.forward_decode_metadata.volatile = self.torch.zeros(2)
+        self.guard.verify_graph_metadata(self.stub, snap, context="test")
+
+    def test_rebound_tensor_is_reported_with_its_path(self):
+        snap = self.guard.snapshot_graph_metadata(self.stub)
+        self.stub.forward_decode_metadata.stable = self.torch.zeros(4)
+        with self.assertRaisesRegex(RuntimeError, r"forward_decode_metadata\.stable"):
+            self.guard.verify_graph_metadata(self.stub, snap, context="test")
+
+    def test_child_backends_are_walked(self):
+        stub = self.stub
+
+        class _Wrapper:
+            def child_backends(self):
+                return (stub,)
+
+        snap = self.guard.snapshot_graph_metadata(_Wrapper())
+        self.assertIn("_Wrapper._StubBackend.forward_decode_metadata.stable", set(snap))
+
+
+class MhaPtrGuardTest(_MhaCase):
+    """The guard over a real backend's refresh: the positive arm pins the
+    per-bs view cache, the negative arm is the address-freezing bug class
+    (buffer reallocated, views lazily rebuilt over fresh storage)."""
+
+    def setUp(self):
+        super().setUp()
+        from tokenspeed.runtime.execution.graph_ptr_guard import (
+            snapshot_graph_metadata,
+            verify_graph_metadata,
+        )
+
+        self.snapshot = snapshot_graph_metadata
+        self.verify = verify_graph_metadata
+
+    def _padded_seq(self):
+        torch = self.torch
+        return torch.cat(
+            [
+                torch.tensor([5, 4], dtype=torch.int32),
+                torch.ones(LADDER_BS - 2, dtype=torch.int32),
+            ]
+        )
+
+    def test_refresh_keeps_captured_identities(self):
+        self._refresh(LADDER_BS, 2, self._padded_seq(), replay=True)
+        snap = self.snapshot(self.backend)
+        # Fresh lengths, same buffers: replay refresh must not move anything.
+        self._refresh(LADDER_BS, 2, self._padded_seq() + 1, replay=True)
+        self.verify(self.backend, snap, context="test")
+
+    def test_reallocated_buffer_breaches_the_guard(self):
+        torch = self.torch
+        self._refresh(LADDER_BS, 2, self._padded_seq(), replay=True)
+        snap = self.snapshot(self.backend)
+        # The bug class the guard exists for: a persistent buffer is
+        # reallocated and the per-bs views are lazily rebuilt over the new
+        # storage — the captured graph keeps reading the old addresses.
+        self.backend.cuda_graph_seq_lens = torch.ones(MAX_DECODE_BS, dtype=torch.int32)
+        self.backend.cuda_graph_decode_metadata.clear()
+        self._refresh(LADDER_BS, 2, self._padded_seq(), replay=True)
+        with self.assertRaisesRegex(RuntimeError, r"seq_lens"):
+            self.verify(self.backend, snap, context="test")
+
+
 if __name__ == "__main__":
     unittest.main()

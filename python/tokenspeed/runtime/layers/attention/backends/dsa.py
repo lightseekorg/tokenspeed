@@ -144,6 +144,9 @@ class DSABackend(AttentionBackend):
         super().set_cache_pool(cache_pool)
         self._dense_backend.set_cache_pool(cache_pool)
 
+    def child_backends(self):
+        return (self._dense_backend,)
+
     @property
     def tables_self_padding(self):
         return getattr(self._dense_backend, "tables_self_padding", False)
