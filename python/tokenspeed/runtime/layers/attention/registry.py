@@ -203,8 +203,11 @@ _HYBRID_GDN_ARCHITECTURES = {
 _HYBRID_MLA_KDA_ARCHITECTURES = {
     "KimiK3ForConditionalGeneration",
 }
-_HYBRID_DSA_KDA_ARCHITECTURES = {
+_HYBRID_DSA_KDA_TARGET_ARCHITECTURES = {
     "Glm53FlashForConditionalGeneration",
+}
+_HYBRID_DSA_KDA_ARCHITECTURES = {
+    *_HYBRID_DSA_KDA_TARGET_ARCHITECTURES,
     "Glm53FlashForConditionalGenerationNextN",
 }
 
@@ -295,7 +298,13 @@ _CONFIG_CLS: dict[AttentionArch, type[SoftmaxAttnConfig]] = {
 # decided by generate() (NextN drafts may carry none).
 _LINEAR_ATTN_CLS: dict[str, type[LinearAttnConfig]] = {
     arch: LinearAttnConfig
-    for arch in (*_HYBRID_GDN_ARCHITECTURES, *_HYBRID_MLA_KDA_ARCHITECTURES)
+    for arch in (
+        *_HYBRID_GDN_ARCHITECTURES,
+        *_HYBRID_MLA_KDA_ARCHITECTURES,
+        # GLM NextN is one DSA layer. It reuses the target's mixed-layer
+        # metadata but must not acquire a linear-attention component.
+        *_HYBRID_DSA_KDA_TARGET_ARCHITECTURES,
+    )
 }
 
 

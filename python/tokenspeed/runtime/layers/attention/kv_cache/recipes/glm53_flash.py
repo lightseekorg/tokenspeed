@@ -30,6 +30,9 @@ from functools import cached_property
 import torch
 from typing_extensions import override
 
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheGroupDeclaration,
     CacheRecipe,
@@ -328,31 +331,31 @@ class Glm53FlashRecipe(CacheRecipe):
             int(getattr(self.server_args, "speculative_num_draft_tokens", 0) or 0),
         )
 
+    @staticmethod
+    def _require_dsa_component(config: AttnConfig) -> DSAConfig:
+        component = config.component(DSAConfig)
+        if component is None:
+            raise ValueError("GLM-5.3-Flash cache requires a DSA component")
+        return component
+
+    @cached_property
+    def _target_dsa(self) -> DSAConfig:
+        return self._require_dsa_component(self.attn_config)
+
+    @cached_property
+    def _linear_attn(self) -> LinearAttnConfig:
+        component = self.attn_config.component(LinearAttnConfig)
+        if component is None:
+            raise ValueError(
+                "GLM-5.3-Flash cache requires a linear-attention component"
+            )
+        return component
+
     @cached_property
     def _kda_shapes(self):
-        tp_size = self.attn_config.attn_tp_size
-        if tp_size <= 0:
-            raise ValueError(f"tp_size must be positive, got {tp_size}")
-        linear = self._text_config.linear_attn_config
-        if not isinstance(linear, Mapping):
-            raise TypeError("linear_attn_config must be a mapping")
-        num_heads = require_positive_int(
-            "linear_attn_config.num_heads", linear["num_heads"]
-        )
-        head_dim = require_positive_int(
-            "linear_attn_config.head_dim", linear["head_dim"]
-        )
-        kernel_size = require_positive_int(
-            "linear_attn_config.short_conv_kernel_size",
-            linear["short_conv_kernel_size"],
-        )
-        if num_heads % tp_size:
-            raise ValueError(
-                f"KDA num_heads={num_heads} must be divisible by tp_size={tp_size}"
-            )
         return (
-            (3 * num_heads * head_dim // tp_size, kernel_size - 1),
-            (num_heads // tp_size, head_dim, head_dim),
+            self._linear_attn.conv_state_shape,
+            self._linear_attn.temporal_state_shape,
         )
 
     @override
@@ -366,7 +369,8 @@ class Glm53FlashRecipe(CacheRecipe):
                 if layer_id < self.num_target_layers
                 else self.draft_attn_config
             )
-            latent_width = config.kv_lora_rank + config.qk_rope_head_dim
+            dsa = self._require_dsa_component(config)
+            latent_width = dsa.kv_lora_rank + dsa.qk_rope_head_dim
             return (
                 CacheFieldSpec(
                     f"layer.{layer_id}.latent_kv",
@@ -397,14 +401,12 @@ class Glm53FlashRecipe(CacheRecipe):
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
         return declare_glm53_flash_groups(
             self._text_config,
-            tp_size=self.attn_config.attn_tp_size,
+            tp_size=self._target_dsa.attn_tp_size,
             mla_cache_dtype=self.attn_config.kv_cache_dtype,
             draft_layers=self.num_draft_layers,
             pd_disaggregation_enabled=self.pd_disaggregation_enabled,
             fields_for_layer=self.fields_for_layer,
-            sliding_window_tokens=getattr(
-                self.attn_config, "sliding_window_tokens", None
-            ),
+            sliding_window_tokens=self._target_dsa.sliding_window_tokens,
         )
 
     @override
@@ -415,7 +417,7 @@ class Glm53FlashRecipe(CacheRecipe):
             if spec.group_id.startswith(LINEAR_ATTENTION)
         ]
         return glm53_flash_packing_counts(
-            tp_size=self.attn_config.attn_tp_size,
+            tp_size=self._target_dsa.attn_tp_size,
             mla_element_size=self.attn_config.kv_cache_dtype.itemsize,
             state_group_ids=state_group_ids,
         )
