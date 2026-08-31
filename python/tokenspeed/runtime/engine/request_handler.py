@@ -93,6 +93,11 @@ def _profile_rank_tag(attn_mapping) -> str:
     return "-".join(parts)
 
 
+def _rendezvous_on_cpu(group) -> None:
+    """Rendezvous every rank in ``group`` without touching the device."""
+    torch.distributed.all_reduce(torch.zeros(1, dtype=torch.int32), group=group)
+
+
 class RequestHandler:
     """
     1. Recv Reqs from ZMQ
@@ -553,7 +558,11 @@ class RequestHandler:
                     f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.trace.json.gz",
                 )
             )
-            torch.distributed.barrier(self.attn_tp_cpu_group)
+            # A CPU tensor, not barrier(): torch takes a collective's device
+            # from the process group, and in a CUDA process that is CUDA even
+            # for a gloo group -- the allocation would land on the control-plane
+            # thread, where DeviceHandle's guard rejects it.
+            _rendezvous_on_cpu(self.attn_tp_cpu_group)
 
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
@@ -577,7 +586,7 @@ class RequestHandler:
                 proton_error = exc
             finally:
                 # Do not reply until every TP peer has finished writing.
-                torch.distributed.barrier(self.attn_tp_cpu_group)
+                _rendezvous_on_cpu(self.attn_tp_cpu_group)
 
         if "VIZTRACER" in self.profiler_activities and self.viztracer is not None:
             self.viztracer.stop()
