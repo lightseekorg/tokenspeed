@@ -630,9 +630,7 @@ class _BackendCase(_TorchCase):
         # seq_lens 1 (never 0): flat replay recomputes write locs from these
         # (M11), and seq_len 0 would gather at position -1.
         backend.cuda_graph_seq_lens = torch.ones(MAX_BS, dtype=torch.int32)
-        backend.cuda_graph_page_tables = {}
-        backend.cuda_graph_out_cache_locs = {}
-        backend._cuda_graph_max_bs = MAX_BS
+        backend._init_group_graph_buffers(MAX_BS)
         self.backend = backend
 
     def _capture(self, bs, cache_group_ids=()):

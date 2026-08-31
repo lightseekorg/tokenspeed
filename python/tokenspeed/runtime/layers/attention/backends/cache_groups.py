@@ -18,16 +18,25 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Shared cache-group machinery for attention backends.
+"""Per-group table routing for the MHA-family backends.
 
-Every backend receives the
-scheduler's per-group block tables (``block_tables: dict[group_id,
-[bs, max_pages]]``), expands them to kernel page tables, and must route
-every cache read and write through the layer's own group. This
-mixin holds the group-selection,
-write-location, and CUDA-graph per-group buffer machinery shared by the MHA
-and TRT-LLM backends; model/kernel-specific constraints (spec decode, DFLASH)
-stay in the backends.
+Every backend receives the scheduler's per-group block tables
+(``block_tables: dict[group_id, [bs, max_pages]]``), expands them to kernel
+page tables, and must route every cache read and write through the layer's
+own group. This mixin is the ROUTING layer only — which table/locations a
+layer sees, state-group shedding, and the metadata-slot selection hooks the
+hosts override. Its collaborators each own one concern:
+
+* ``cache_group_geometry.CacheGroupGeometry`` — the pool-learned group
+  shapes (granularities, state ids, full-history grain), learned once at
+  ``set_cache_pool``;
+* ``group_write_locations`` — the slot math, as pure functions;
+* ``group_graph_buffers.GroupGraphBuffers`` — the stacked persistent
+  CUDA-graph buffers and their capture/fill ops, composed at
+  ``_init_group_graph_buffers``.
+
+Model/kernel-specific constraints (spec decode, DFLASH) stay in the
+backends.
 
 Table contract (canonical): rows are requests (padded rows carry the
 zero-init dummy page 0), column tails pad with -1 and are never read past
@@ -41,14 +50,14 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.kvcache.triton import (
-    compute_group_decode_locs,
-    unpack_group_tables,
-)
 
 from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
+    CacheGroupGeometry,
     expand_history_table,
     learn_cache_group_geometry,
+)
+from tokenspeed.runtime.layers.attention.backends.group_graph_buffers import (
+    GroupGraphBuffers,
 )
 from tokenspeed.runtime.layers.attention.backends.group_write_locations import (
     check_group_write_locs,
@@ -59,13 +68,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
 from tokenspeed.runtime.layers.attention.page_table import expand_page_table
-from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-
-logger = get_colorful_logger(__name__)
 
 
 class CacheGroupsMixin:
@@ -337,293 +342,76 @@ class CacheGroupsMixin:
     # CUDA-graph per-group buffers
     # ------------------------------------------------------------------
 
-    def _init_group_graph_buffers(self, max_bs: int) -> None:
-        """Reset the persistent per-group buffers; call from
-        init_cuda_graph_state BEFORE any backend early return — replay reads
-        the dict unconditionally for the stale-table guard.
+    # The composed buffer object (see GroupGraphBuffers); None until
+    # _init_group_graph_buffers runs.
+    group_graph: GroupGraphBuffers | None = None
 
-        Attention-consumed groups get views into ONE stacked table/loc pair
-        ([G, max_bs, Wmax] / [G, max_bs * spec_num_tokens]) so the
-        replay-time write-loc math ALWAYS runs as a single fused triton
-        launch over all groups — the per-group python chains (~4 tiny
-        elementwise launches per group per step, the nsys inter-step band)
-        are gone, on the spec-verify path too."""
-        self.cuda_graph_page_tables: dict[str, torch.Tensor] = {}
-        self.cuda_graph_out_cache_locs: dict[str, torch.Tensor] = {}
-        self._cuda_graph_max_bs = max_bs
-        self._group_locs_stack = None
-        self._group_tables_stack = None
-        self._group_source_widths = {}
-        self._group_grain_ratios = ()
-        self._graph_group_ids = []
-        self._attention_group_count = 0
-        att_gids = sorted(
-            gid
-            for gid in self.group_block_granularities
-            if gid not in self.state_group_ids
-            and gid not in self.engine_owned_group_ids
-        )
-        owned_gids = sorted(
-            gid
-            for gid in self.group_block_granularities
-            if gid in self.engine_owned_group_ids
-        )
-        gids = att_gids + owned_gids  # attention prefix, wrapper-owned tail
-        if not gids:
-            return
-        source_widths = {
-            gid: ceil_div(
-                self.max_num_pages * self.kernel_page_size,
-                self._group_block_granularity(gid),
-            )
-            for gid in gids
-        }
-        consumer_page_sizes = {gid: self._consumer_page_size(gid) for gid in att_gids}
-        ratios = {
-            gid: (
-                self._group_block_granularity(gid) // consumer_page_sizes[gid]
-                if gid in att_gids
-                else 1
-            )
-            for gid in gids
-        }
-        if any(
-            ratio <= 0 or self._group_block_granularity(gid) % consumer_page_sizes[gid]
-            for gid, ratio in ratios.items()
-            if gid in att_gids
+    @property
+    def cuda_graph_page_tables(self) -> dict[str, torch.Tensor]:
+        """Per-group graph table views ({} before graph-state init).
+
+        A property so external adopters (Inkling's conv-table adoption,
+        host backends, tests) keep reading the historical name while the
+        buffers live on the composed object.
+        """
+        return self.group_graph.page_tables if self.group_graph is not None else {}
+
+    @property
+    def cuda_graph_out_cache_locs(self) -> dict[str, torch.Tensor]:
+        """Per-group graph write-location views ({} before init)."""
+        return self.group_graph.out_cache_locs if self.group_graph is not None else {}
+
+    def _init_group_graph_buffers(self, max_bs: int) -> None:
+        """Build the composed GroupGraphBuffers; call from
+        init_cuda_graph_state BEFORE any backend early return — refresh reads
+        the table dict unconditionally for the published-groups contract
+        check. Geometry is frozen by now (set_cache_pool runs first; bare
+        test fixtures that stuff the mirror attributes directly are folded
+        back into a geometry here)."""
+        geometry = getattr(self, "_geometry", None)
+        if geometry is None or geometry.granularities != dict(
+            self.group_block_granularities
         ):
-            raise ValueError(
-                "cache group page sizes must be positive multiples of their "
-                "consumer page sizes"
+            geometry = CacheGroupGeometry(
+                granularities=dict(self.group_block_granularities),
+                state_group_ids=frozenset(self.state_group_ids),
+                history_block_granularity=getattr(
+                    self, "_history_block_granularity", self.kernel_page_size
+                ),
             )
-        widths = {gid: source_widths[gid] * ratios[gid] for gid in gids}
-        logger.debug(
-            "cache graph buffers: max_num_pages=%d page_size=%d max_bs=%d "
-            "source_widths=%s widths=%s",
-            self.max_num_pages,
-            self.kernel_page_size,
-            max_bs,
-            source_widths,
-            widths,
-        )
-        wmax = max(widths.values())
-        g = len(gids)
-        self._graph_group_ids = gids
-        self._attention_group_count = len(att_gids)
-        self._group_tables_stack = torch.zeros(
-            (g, max_bs, wmax), dtype=torch.int32, device=self.device
-        )
-        # Spec verify: graphs read [max_bs*N] loc views of the stack, so size it up front
-        spec_n = max(int(getattr(self, "spec_num_tokens", 1) or 1), 1)
-        self._group_locs_stack = torch.zeros(
-            (len(att_gids), max_bs * spec_n), dtype=torch.int32, device=self.device
-        )
-        self._group_source_widths = source_widths
-        self._group_grain_ratios = tuple(ratios[gid] for gid in gids)
-        self._group_block_granularities_tensor = torch.tensor(
-            [consumer_page_sizes[gid] for gid in att_gids],
-            dtype=torch.int32,
+        self.group_graph = GroupGraphBuffers(
+            geometry,
+            engine_owned_group_ids=frozenset(self.engine_owned_group_ids),
+            consumer_page_size_of=self._consumer_page_size,
+            max_bs=max_bs,
+            max_num_pages=self.max_num_pages,
+            kernel_page_size=self.kernel_page_size,
+            spec_num_tokens=getattr(self, "spec_num_tokens", 1),
             device=self.device,
         )
-        self._unpack_metadata_device = torch.zeros(
-            (g, 3), dtype=torch.int32, device=self.device
-        )
-        for i, gid in enumerate(gids):
-            self.cuda_graph_page_tables[gid] = self._group_tables_stack[
-                i, :, : widths[gid]
-            ]
-            if i < len(att_gids):
-                self.cuda_graph_out_cache_locs[gid] = self._group_locs_stack[i]
 
     def _capture_group_views(self, bs: int, cache_group_ids, tokens_per_req: int = 1):
-        """Capture-time (page_tables, out_cache_locs) per-group views into the
-        persistent buffers initialized by :meth:`_init_group_graph_buffers`.
-        Real tables only arrive at replay, which copies fresh data to these
-        graph-recorded addresses.
-        Verify (tokens_per_req = spec_num_tokens) keeps [bs]-row tables but
-        records [bs*N] write-loc views (token-major, single-table verify layout).
-        Returns (None, None) when only state groups (or none) are delivered.
-        """
-        if not cache_group_ids:
-            return None, None
-        page_tables = {}
-        out_cache_locs = {}
-        for gid in cache_group_ids:
-            if gid in self.state_group_ids:
-                # State pages ride to the mamba backend; no buffers here.
-                continue
-            if gid in self.engine_owned_group_ids:
-                # Engine-owned (conv) group: the wrapper keeps its own capture buffers
-                continue
-            buf = self.cuda_graph_page_tables.get(gid)
-            if buf is None:
-                # Replay write locs are ALWAYS the fused triton launch over
-                # the stacked buffers; a group outside the stack could never
-                # get its locs filled. Every capture-visible group must be
-                # known (set_cache_pool) before init_cuda_graph_state.
-                raise RuntimeError(
-                    f"cache group {gid!r} is not in the stacked CUDA-graph "
-                    f"buffers (stack: {self._graph_group_ids}); declare every "
-                    "capture-visible group's page size before graph init."
-                )
-            loc_buf = self.cuda_graph_out_cache_locs.get(gid)
-            need = self._cuda_graph_max_bs * tokens_per_req
-            if loc_buf is None or loc_buf.shape[0] < need:
-                raise RuntimeError(
-                    f"location stack too small for group {gid!r}: capture "
-                    f"needs {need} rows, have "
-                    f"{0 if loc_buf is None else loc_buf.shape[0]}; the "
-                    "stack is sized max_bs * spec_num_tokens at init, so "
-                    f"tokens_per_req={tokens_per_req} must not exceed "
-                    f"spec_num_tokens={getattr(self, 'spec_num_tokens', 1)}."
-                )
-            page_tables[gid] = buf[:bs, :]
-            out_cache_locs[gid] = loc_buf[: bs * tokens_per_req]
-        if not page_tables:
-            # Only state groups delivered: nothing for this backend.
-            return None, None
-        return page_tables, out_cache_locs
-
-    def _try_packed_group_unpack(self, bs: int, block_tables) -> bool:
-        """One-launch fill of the stacked graph tables from the bridge's
-        packed upload. Requires the stack to cover every delivered
-        non-state group and all sources to share one storage (the packed
-        bridge guarantees both); returns False to take the per-group
-        fallback otherwise."""
-        stack = self._group_tables_stack
-        if stack is None or stack.device.type != "cuda":
-            # CPU unit tests take the per-group torch fallback.
-            return False
-        gids = self._graph_group_ids
-        # Fresh pinned alloc each step: a persistent pinned buffer would race with overlap scheduling
-        meta = torch.empty((len(gids), 3), dtype=torch.int32, pin_memory=True)
-        base_ptr = None
-        actual = None
-        for i, gid in enumerate(gids):
-            src = block_tables.get(gid)
-            if src is None or src.shape[1] == 0:
-                return False
-            ptr = src.untyped_storage().data_ptr()
-            if base_ptr is None:
-                base_ptr = ptr
-                actual = src.shape[0]
-            elif ptr != base_ptr or src.shape[0] != actual:
-                return False
-            meta[i, 0] = src.storage_offset()
-            meta[i, 1] = src.shape[1]
-            meta[i, 2] = self._group_grain_ratios[i]
-        if base_ptr is None:
-            return False
-        self._unpack_metadata_device.copy_(meta, non_blocking=True)
-        src0 = block_tables[gids[0]]
-        packed = torch.as_strided(
-            src0,
-            (src0.untyped_storage().nbytes() // 4,),
-            (1,),
-            storage_offset=0,
-        )
-        unpack_group_tables(
-            packed,
-            self._unpack_metadata_device,
-            stack,
+        """Capture-time per-group views (see GroupGraphBuffers.capture_views);
+        the mixin's LIVE state/owned sets decide the shed (a wrapper may
+        register owned groups after buffer construction)."""
+        return self.group_graph.capture_views(
             bs,
-            actual_bs=min(actual, bs),
-            tail_pad=self.table_tail_pad,
+            cache_group_ids,
+            tokens_per_req,
+            skip_group_ids=frozenset(self.state_group_ids)
+            | frozenset(self.engine_owned_group_ids),
         )
-        return True
 
     def _fill_group_graph_buffers(
         self, bs: int, block_tables, seq_lens, tokens_per_req: int = 1
     ) -> None:
-        """Copy this replay's tables into the captured buffers and recompute
-        the per-group write locs from the live seq_lens (tokens_per_req locs
-        per request on the spec-verify path).
-
-        Padding contract (canonical; bs is the padded bs): dummy ROWS pad
-        with 0 — replayed at seq_lens=1 they dereference exactly col 0,
-        the zero-init dummy page. Column tails pad with -1, never read
-        past cache_seqlens.
-        """
-        if (
-            self._group_locs_stack is None
-            or self._group_locs_stack.shape[1] < bs * tokens_per_req
-        ):
-            raise RuntimeError(
-                "replay write locations need the stacked location buffer "
-                f"(bs={bs}, tokens_per_req={tokens_per_req}, stack="
-                f"{None if self._group_locs_stack is None else tuple(self._group_locs_stack.shape)}); "
-                "the stack is sized max_bs * spec_num_tokens at graph init "
-                "and there is no python fallback."
-            )
-        self._packed_group_unpack_ran = self._try_packed_group_unpack(bs, block_tables)
-        if not self._packed_group_unpack_ran:
-            for i, gid in enumerate(self._graph_group_ids):
-                src = block_tables.get(gid)
-                if src is None:
-                    continue
-                if gid in self.engine_owned_group_ids:
-                    # The wrapper fills its own scheduler-page buffer.
-                    continue
-                buf = self.cuda_graph_page_tables[gid]
-                # Clamp: scheduler may send extra reservation columns; kernels never read past cache_seqlens
-                source_cols = min(src.shape[1], self._group_source_widths[gid])
-                # cols >= 1: a zero-width table would leave dummy rows' col 0 unwritten
-                assert source_cols >= 1, f"table for group {gid!r}: zero-width table"
-                rows = min(src.shape[0], bs)
-                ratio = self._group_grain_ratios[i]
-                if ratio != 1:
-                    expand_page_table(
-                        src[:rows, :source_cols],
-                        block_granularity=self._group_block_granularity(gid),
-                        kernel_page_size=self._consumer_page_size(gid),
-                        max_kernel_pages=buf.shape[1],
-                        out=buf[:rows],
-                    )
-                    if rows < bs:
-                        buf[rows:bs].zero_()
-                    continue
-                cols = min(source_cols, buf.shape[1])
-                buf[:rows, :cols].copy_(src[:rows, :cols])
-                if cols < buf.shape[1]:
-                    buf[:rows, cols:].fill_(self.table_tail_pad)
-                if rows < bs:
-                    # Dummy rows pad with 0 (the zero-init dummy page).
-                    buf[rows:bs].fill_(0)
-
-        # One fused launch writes every group's locs into the stacked buffer the graphs read
-        if self._group_locs_stack.device.type != "cuda":
-            # CPU unit tests: same math in torch (triton needs a GPU).
-            self._compute_group_decode_locs_torch(bs, seq_lens, tokens_per_req)
-        else:
-            compute_group_decode_locs(
-                self._group_tables_stack[: self._attention_group_count],
-                self._group_block_granularities_tensor,
-                seq_lens[:bs],
-                self._group_locs_stack,
-                bs,
-                tokens_per_req,
-            )
-
-    def _compute_group_decode_locs_torch(
-        self, bs: int, seq_lens, tokens_per_req: int
-    ) -> None:
-        n = tokens_per_req
-        if n == 1:
-            pos = (seq_lens[:bs].to(torch.int64) - 1).clamp_min(0)
-        else:
-            steps = torch.arange(n, device=seq_lens.device, dtype=torch.int64)
-            pos = (
-                (seq_lens[:bs].to(torch.int64).unsqueeze(1) - n + steps)
-                .clamp_min(0)
-                .reshape(-1)
-            )
-        for i in range(self._attention_group_count):
-            ps = int(self._group_block_granularities_tensor[i])
-            table = self._group_tables_stack[i, :bs]
-            page_idx = pos // ps
-            off = (pos % ps).to(torch.int32)
-            if n == 1:
-                pages = table.gather(1, page_idx.unsqueeze(1)).squeeze(1)
-            else:
-                pages = table.gather(1, page_idx.view(bs, n)).reshape(-1)
-            self._group_locs_stack[i, : bs * n].copy_(pages.clamp_min(0) * ps + off)
+        """Replay/eager fill of the captured buffers (see
+        GroupGraphBuffers.fill); the host's ``table_tail_pad`` rides along."""
+        self._packed_group_unpack_ran = self.group_graph.fill(
+            bs,
+            block_tables,
+            seq_lens,
+            tokens_per_req=tokens_per_req,
+            tail_pad=self.table_tail_pad,
+            engine_owned_group_ids=frozenset(self.engine_owned_group_ids),
+        )

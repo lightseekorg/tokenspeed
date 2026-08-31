@@ -243,9 +243,13 @@ flag saying so (`uses_cache_groups` was deleted once it was universally
 True). The invariant replacing it: **any table a backend receives — the
 per-group `block_tables`, the staged draft `page_table`, a warmup
 placeholder — carries raw scheduler pages; kernel-page expansion happens
-inside the backend, through one helper per mixin** (`_expand_history_table`
-on `CacheGroupsMixin` and `MlaCacheGroupMixin`, both learning the
-full-history grain from the pool's specs at `set_cache_pool`).
+inside the backend, through the one shared `expand_history_table`
+(`cache_group_geometry.py`; both mixins learn the full-history grain from
+the pool's specs at `set_cache_pool` into one `CacheGroupGeometry` value
+object)**. The mixins themselves are routing layers: the write-location
+slot math lives in `group_write_locations.py` as pure functions, and the
+stacked per-group CUDA-graph buffers live in
+`group_graph_buffers.GroupGraphBuffers`, composed at graph-state init.
 `CacheBatchMetadata` no longer carries a `kernel_table` expansion;
 `cache_metadata` still travels to V4 (bespoke multi-group slot mapping) and
 KDA state paging only. `cache_active_pages_must_be_real` remains a separate
