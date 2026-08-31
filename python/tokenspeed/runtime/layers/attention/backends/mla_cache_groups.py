@@ -38,13 +38,15 @@ contract flag).
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.triton.mla_write_locations import (
-    mla_write_locations,
-)
 
 from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
     expand_history_table,
     learn_cache_group_geometry,
+)
+from tokenspeed.runtime.layers.attention.backends.group_write_locations import (
+    mla_decode_out_cache_loc,
+    mla_extend_out_cache_loc,
+    mla_per_token_slot_table,
 )
 
 
@@ -135,23 +137,13 @@ class MlaCacheGroupMixin:
         page_size: int,
         max_context_len: int,
     ) -> torch.Tensor:
-        """Per-token absolute latent slots from a kernel-page table.
-
-        flashinfer's paged prefill (``plan(page_size=1)``) reads a
-        ``[bs, max_context]`` table indexed per token: slot(req, t) =
-        ``table[req, t // p] * p + t % p``. Columns past a request's live range
-        resolve through the table's null pages and are never read (the kernel
-        walks only ``seq_len`` tokens per request).
-        """
-        table = table[:batch_size]
-        num_columns = table.shape[1]
-        columns = torch.arange(max_context_len, device=table.device)
-        page_index = torch.div(columns, page_size, rounding_mode="floor").clamp_max(
-            num_columns - 1
+        """Thin binding of :func:`mla_per_token_slot_table`."""
+        return mla_per_token_slot_table(
+            table,
+            batch_size=batch_size,
+            page_size=page_size,
+            max_context_len=max_context_len,
         )
-        offset = columns % page_size
-        pages = table[:, page_index].clamp_min(0).to(torch.int64)
-        return pages * page_size + offset
 
     def _cache_decode_out_cache_loc(
         self,
@@ -163,31 +155,17 @@ class MlaCacheGroupMixin:
         out: torch.Tensor | None = None,
         q_len_per_req: int = 1,
     ) -> torch.Tensor:
-        """Absolute latent write locations for decoded tokens in the full-attention group.
-
-        Plain decode writes one location per request (position ``seq-1``).
-        Speculative target verify decodes ``q_len_per_req`` tokens per request
-        and must write every one of them, at the trailing positions
-        ``seq-q_len .. seq-1``, flattened request-major to match the query
-        layout the verify read path builds.
-        """
-        page_size = self.kernel_page_size
-        locations = mla_write_locations(
-            seq_lens,
+        """Thin binding of :func:`mla_decode_out_cache_loc` to this backend's
+        kernel page size."""
+        return mla_decode_out_cache_loc(
             table,
-            page_size=page_size,
-            q_len_per_req=q_len_per_req,
+            seq_lens,
+            page_size=self.kernel_page_size,
             batch_size=batch_size,
+            validate_pages=validate_pages,
             out=out,
+            q_len_per_req=q_len_per_req,
         )
-        if validate_pages and locations.numel():
-            # Page 0 is the null page, so a write there lands below one page.
-            if not bool((locations >= page_size).all().item()):
-                raise RuntimeError(
-                    "MLA write location resolves to the null page 0 or a "
-                    "-1 table hole"
-                )
-        return locations
 
     def _verify_q_len(self, forward_mode) -> int:
         """KV write locations each request needs this decode step.
@@ -224,39 +202,11 @@ class MlaCacheGroupMixin:
         *,
         validate_pages: bool = False,
     ) -> torch.Tensor:
-        """Return packed cache-group extend-write locations in query order."""
-        page_size = self.kernel_page_size
-        chunks: list[torch.Tensor] = []
-        pages_for_validation: list[torch.Tensor] = []
-        for row, (start, num_new) in enumerate(
-            zip(
-                extend_prefix_lens_cpu.tolist(),
-                extend_seq_lens_cpu.tolist(),
-                strict=True,
-            )
-        ):
-            start, num_new = int(start), int(num_new)
-            if num_new <= 0:
-                continue
-            max_column = (start + num_new - 1) // page_size
-            if max_column >= table.shape[1]:
-                raise RuntimeError(
-                    "extend write locations exceed the full-attention "
-                    f"table: row={row}, prefix={start}, new={num_new}, "
-                    f"page_size={page_size}, columns={table.shape[1]}"
-                )
-            positions = torch.arange(
-                start, start + num_new, dtype=torch.int64, device=table.device
-            )
-            pages = table[row].gather(0, positions // page_size)
-            pages_for_validation.append(pages)
-            chunks.append(pages.to(torch.int64) * page_size + positions % page_size)
-        if not chunks:
-            return torch.empty(0, dtype=torch.int64, device=table.device)
-        if validate_pages and not bool(
-            (torch.cat(pages_for_validation) > 0).all().item()
-        ):
-            raise RuntimeError(
-                "MLA write location resolves to the null page 0 or a " "-1 table hole"
-            )
-        return torch.cat(chunks)
+        """Thin binding of :func:`mla_extend_out_cache_loc`."""
+        return mla_extend_out_cache_loc(
+            table,
+            extend_prefix_lens_cpu,
+            extend_seq_lens_cpu,
+            page_size=self.kernel_page_size,
+            validate_pages=validate_pages,
+        )

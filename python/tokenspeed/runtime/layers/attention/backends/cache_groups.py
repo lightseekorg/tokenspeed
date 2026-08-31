@@ -50,6 +50,11 @@ from tokenspeed.runtime.layers.attention.backends.cache_group_geometry import (
     expand_history_table,
     learn_cache_group_geometry,
 )
+from tokenspeed.runtime.layers.attention.backends.group_write_locations import (
+    check_group_write_locs,
+    decode_group_out_cache_locs,
+    extend_group_out_cache_locs,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
 )
@@ -278,70 +283,27 @@ class CacheGroupsMixin:
     def _compute_decode_group_out_cache_locs(
         self, page_tables, seq_lens, page_size, num_tokens_per_req=1
     ):
-        """Per-group decode write locs, gathered from the group's own read
-        table (M-W1). Plain decode writes one token per request at seq_len-1;
-        spec verify writes num_tokens_per_req at seq_len-N..seq_len-1,
-        flattened token-major per request ([bs*N], single-table verify layout).
-        Positions clamp at 0 for graph-padded rows (seq_len 1 < N), which
-        dereference the dummy page harmlessly. The tail page is never a hole
-        (SWA holes sit only at the window front). ``page_size`` is the base
-        size; groups with a heterogeneous page size divide by their own
-        granularity.
-        """
-        n = num_tokens_per_req
-        if n == 1:
-            pos = (seq_lens - 1).to(torch.int64)
-        else:
-            steps = torch.arange(n, device=seq_lens.device, dtype=torch.int64)
-            pos = (seq_lens.to(torch.int64).unsqueeze(1) - n + steps).clamp_min(0)
-            pos = pos.reshape(-1)
-        out = {}
-        for gid, table in page_tables.items():
-            ps = self._group_block_granularity(gid) if gid else page_size
-            page_idx = pos // ps
-            off = (pos % ps).to(torch.int32)
-            if n == 1:
-                pages = table.gather(1, page_idx.unsqueeze(1)).squeeze(1)
-            else:
-                pages = table.gather(1, page_idx.view(-1, n)).reshape(-1)
-            # Mirror the graph-path kernel's clamp: -1 pads/holes route to dummy page 0.
-            out[gid] = pages.clamp_min(0) * ps + off
-        return out
+        """Thin binding of :func:`decode_group_out_cache_locs` to this
+        backend's learned granularities (``page_size`` is the base size for
+        group-less keys)."""
+        return decode_group_out_cache_locs(
+            page_tables,
+            seq_lens,
+            lambda gid: self._group_block_granularity(gid) if gid else page_size,
+            num_tokens_per_req,
+        )
 
     def _compute_extend_group_out_cache_locs(
         self, page_tables, extend_prefix_lens_cpu, extend_seq_lens_cpu, page_size
     ):
-        """Per-group extend write locs: positions [prefix_len, seq_len) per
-        request, flattened in q/k/v token order (cu_extend_seq_lens). Bounds
-        come from the CPU mirrors — no per-request GPU sync.
-        TODO(cache-perf): batch the per-request loop via repeat_interleave.
-        """
-        device = next(iter(page_tables.values())).device
-        prefix_lens = [int(x) for x in extend_prefix_lens_cpu.tolist()]
-        extend_lens = [int(x) for x in extend_seq_lens_cpu.tolist()]
-        out = {gid: [] for gid in page_tables}
-        for i, (start, num_new) in enumerate(zip(prefix_lens, extend_lens)):
-            pos = torch.arange(start, start + num_new, dtype=torch.int64, device=device)
-            for gid, table in page_tables.items():
-                ps = self._group_block_granularity(gid)
-                max_col = (start + num_new - 1) // ps
-                if max_col >= table.shape[1]:
-                    raise RuntimeError(
-                        f"extend write locations out of table bounds: group "
-                        f"{gid!r} table {tuple(table.shape)} req={i} "
-                        f"prefix={start} new={num_new} page_size={ps} needs "
-                        f"col {max_col}"
-                    )
-                pages = table[i].gather(0, pos // ps)
-                out[gid].append(pages * ps + (pos % ps).to(torch.int32))
-        return {
-            gid: (
-                torch.cat(chunks)
-                if chunks
-                else torch.empty(0, dtype=torch.int32, device=device)
-            )
-            for gid, chunks in out.items()
-        }
+        """Thin binding of :func:`extend_group_out_cache_locs`."""
+        del page_size
+        return extend_group_out_cache_locs(
+            page_tables,
+            extend_prefix_lens_cpu,
+            extend_seq_lens_cpu,
+            self._group_block_granularity,
+        )
 
     def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
         """Re-anchor the k-row decode metadata to the committed frontier:
@@ -361,23 +323,15 @@ class CacheGroupsMixin:
         self.forward_decode_metadata = replace(md, **fields)
 
     def _maybe_check_group_write_locs(self, page_tables, out_cache_locs, page_size):
-        """TOKENSPEED_CACHE_DEBUG=1 (eager only, GPU sync): write pages must
-        be real and inside the group's table. Not for graph-padded batches —
-        dummy rows would trip the non-hole assert (see the padding contract
-        in _fill_group_graph_buffers).
-        """
+        """TOKENSPEED_CACHE_DEBUG=1 gate over
+        :func:`check_group_write_locs` (eager only — graph-padded batches
+        would trip the non-hole assert on dummy rows)."""
+        del page_size
         if not cache_debug_enabled():
             return
-        for gid, locs in out_cache_locs.items():
-            pages = (locs // self._group_block_granularity(gid)).to(torch.int32)
-            table = page_tables[gid]
-            assert (
-                pages != 0
-            ).all(), f"cache write location in null page 0 for group {gid!r}"
-            real = table[table > 0]
-            assert torch.isin(
-                pages, real
-            ).all(), f"cache write pages escape group {gid!r}'s table"
+        check_group_write_locs(
+            page_tables, out_cache_locs, self._group_block_granularity
+        )
 
     # ------------------------------------------------------------------
     # CUDA-graph per-group buffers
