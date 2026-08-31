@@ -26,9 +26,12 @@ path nothing exercised routinely.
 seq_lens, *, forward_mode, page_table, num_extends, for_graph_replay,
 **cache_kwargs)` is the ONLY way decode metadata is prepared:
 
-* **capture** (`init_forward_metadata_capture_cuda_graph`) allocates/binds
-  per-bs views over the persistent buffers and seeds safe values — never live
-  tables;
+* **capture** (`init_forward_metadata_capture_cuda_graph`) is INHERITED: the
+  base default binds the per-bs views (`bind_decode_views`, implemented by
+  the cache-group mixins) and runs the idle-refresh arm (`actual_bs=0`,
+  `for_graph_replay=True`) against the runner-seeded seq_lens and the
+  address-stable staged page_table — never live tables. Only a genuine
+  capture-only asymmetry overrides it (see "Capture is inherited");
 * **replay** = refresh (`for_graph_replay=True`) + `graph.replay()`;
 * **eager decode** = refresh (`for_graph_replay=False`) + the same forward
   Python the graph recorded.
@@ -65,13 +68,23 @@ builder shared by capture and refresh, cached per bs. A bs never captured
 — no new storage, one-time cost. Views must be pointer-stable: a captured
 graph holds their addresses forever.
 
-### `for_graph_replay` is for kernel-imposed asymmetries only
+### `for_graph_replay` is for graph-mechanics asymmetries only
 
-The only sanctioned use is FlashMLA: flash_mla freezes its tile schedule on
-the first kernel call against a `FlashMLASchedMeta`, so eager refresh must
-swap in a fresh sched-meta each step, while the captured graph re-runs the
-recorded schedule-build against the live seq_lens buffer. Do not branch on
-this flag for anything a shared in-place refresh can express.
+`for_graph_replay=True` means a graph is in play — live replay AND the base
+default capture (which runs the idle-refresh arm). Two sanctioned branches
+on it exist:
+
+* FlashMLA's tile schedule: flash_mla freezes its schedule on the first
+  kernel call against a `FlashMLASchedMeta`, so eager refresh must swap in a
+  fresh sched-meta each step, while the captured graph re-runs the recorded
+  schedule-build against the live seq_lens buffer.
+* DFLASH block-arm seeding (`not for_graph_replay or actual_bs == 0`): the
+  drafter's recorded `fill_block_decode_seq_lens` rewrites the block-end
+  lengths inside every replay, so only eager steps and the capture-time
+  seeding fill them from Python.
+
+Do not branch on this flag for anything a shared in-place refresh can
+express.
 
 ### Refresh ordering: target before draft
 
@@ -223,5 +236,6 @@ milestone (`cache-concepts.md` Principle 5).
   write-location math on the unified path.
 * `grep -rn "init_forward_metadata_replay_cuda_graph\|is_all_greedy" python/`
   must stay empty.
-* New backends implement `refresh_decode_metadata` + a seed-only capture; the
-  base class raises otherwise.
+* New backends implement `refresh_decode_metadata` + `init_cuda_graph_state`;
+  capture is inherited from the base default (bind views + idle refresh).
+  Only a kernel-imposed capture asymmetry justifies an override.

@@ -647,42 +647,10 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             max_bs, dtype=torch.int32, device=self.device
         )
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-        cache_group_ids: tuple[str, ...] = (),
-        **kwargs,
-    ):
-        if forward_mode.is_extend_or_mixed():
-            raise NotImplementedError(
-                f"trtllm CUDA graph capture not supported for {forward_mode}"
-            )
-
-        # Real tables only arrive at replay; capture records metadata views
-        # into the persistent per-group buffers.
-        if cache_group_ids:
-            # Verify keeps [bs]-row tables plus [bs*N] location views.
-            assert not (
-                self.draft_block_decode and self.spec_num_tokens > 1
-            ), "cache_group_ids is unsupported with DFLASH block decode"
-
-        if self.draft_block_decode and self.spec_num_tokens > 1:
-            self._decode_views(bs, cache_group_ids=cache_group_ids)
-            self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
-            return
-
-        # Seed the owned buffer first: the capture run reads it (and the
-        # spec>1 clamp sources it) before any refresh.
-        self.cuda_graph_cache_seqlens[:bs].copy_(seq_lens[:bs])
-        self._decode_views(bs, cache_group_ids=cache_group_ids)
-        if self.spec_num_tokens > 1:
-            self._clamped_spec_seqlens(seq_lens, bs, self.spec_num_tokens)
-            self.forward_prefill_metadata = self.cuda_graph_prefill_metadata[bs]
-        if bs in self.cuda_graph_decode_metadata:
-            self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
+    # Capture is inherited: the base default (bind_decode_views + the idle
+    # refresh arm) reproduces the old bespoke capture — the refresh below
+    # copies the runner-seeded seq_lens, redoes the spec>1 clamp and binds
+    # both metadata slots.
 
     def _init_block_decode_metadata_capture(self, bs: int):
         """DFLASH draft block (cuda-graph capture): spec_num_tokens single-query

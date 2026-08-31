@@ -500,6 +500,12 @@ class _DecodeMode:
     def is_mixed(self):
         return False
 
+    def is_decode_or_idle(self):
+        return True
+
+    def is_idle(self):
+        return False
+
 
 if __name__ == "__main__":
     unittest.main()

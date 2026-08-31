@@ -357,37 +357,10 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
         self.cuda_graph_decode_metadata[bs] = metadata
         return metadata
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_mode: ForwardMode,
-        cache_group_ids: tuple[str, ...] = (),
-        **kwargs,
-    ):
-        assert not forward_mode.is_extend_or_mixed()
-
-        # Real tables only arrive on refresh: capture records metadata views
-        # into the persistent per-group buffers.
-        if cache_group_ids:
-            # Verify keeps [bs]-row tables plus [bs*N] location views.
-            assert not (
-                self.draft_block_decode and self.spec_num_tokens > 1
-            ), "cache_group_ids is unsupported with DFLASH block decode"
-        metadata = self._decode_views(bs, cache_group_ids=cache_group_ids)
-        if self.draft_block_decode and self.spec_num_tokens > 1:
-            # Uniform non-causal seq_lens are written by the drafter inside the
-            # captured graph (see fill_block_decode_seq_lens); seed a safe
-            # baseline for the capture run before that op records.
-            metadata.seq_lens.fill_(self.spec_num_tokens)
-        else:
-            metadata.score_out.fill_(-float("inf"))
-            # Seed the owned buffer (the capture run reads it before replay),
-            # clamped to the verify floor (identity for drafts/plain decode).
-            floor = self.spec_num_tokens if not self.is_draft else 1
-            metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(floor))
-        self.forward_decode_metadata = metadata
+    # Capture is inherited: the base default (bind_decode_views + the idle
+    # refresh arm) reproduces the old bespoke capture — the refresh below
+    # re-fills score_out and the runner-seeded seq_lens satisfy the verify
+    # floor the old capture clamped to.
 
     def refresh_decode_metadata(
         self,
@@ -428,8 +401,10 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
 
         # Every pool publishes at least one history group now, so the
         # per-group capture buffers always exist; the pre-LCM single-table
-        # gather has no remaining producer.
-        if not self.cuda_graph_page_tables:
+        # gather has no remaining producer. The actual_bs == 0 arm (capture
+        # seeding / idle) computes nothing over live rows, so group-less unit
+        # fixtures may pass through it.
+        if not self.cuda_graph_page_tables and actual_bs > 0:
             raise RuntimeError(
                 "MSA decode without per-group capture buffers: the pool "
                 "published no cache groups, which the LCM contract forbids"

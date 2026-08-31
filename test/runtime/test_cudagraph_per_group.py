@@ -24,7 +24,12 @@ MAX_NUM_PAGES = 6
 
 
 def _decode_forward_mode():
-    return SimpleNamespace(is_extend_or_mixed=lambda: False)
+    return SimpleNamespace(
+        is_extend_or_mixed=lambda: False,
+        is_decode_or_idle=lambda: True,
+        is_idle=lambda: False,
+        is_mixed=lambda: False,
+    )
 
 
 class _TorchCase(unittest.TestCase):

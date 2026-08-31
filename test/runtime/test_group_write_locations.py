@@ -29,6 +29,8 @@ def _decode_forward_mode():
     return SimpleNamespace(
         is_mixed=lambda: False,
         is_extend_or_mixed=lambda: False,
+        is_decode_or_idle=lambda: True,
+        is_idle=lambda: False,
     )
 
 
