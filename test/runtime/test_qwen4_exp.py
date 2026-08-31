@@ -302,7 +302,7 @@ def test_hyperconnection_fused_projection_matches_split_checkpoint_weights() -> 
     loader(param, down_weight, "mix")
     loader(param, inject_weight, "inject")
 
-    # The shared 1 / hc_count scale is folded into the fused rows.
+    # The shared 1 / hc_count scale is exactly folded for power-of-two HC.
     torch.testing.assert_close(param[:lowrank], down_weight / hc_count)
     torch.testing.assert_close(param[lowrank:], inject_weight / hc_count)
 

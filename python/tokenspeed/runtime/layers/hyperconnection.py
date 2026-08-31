@@ -26,9 +26,12 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel import (
+    gated_residual_combine,
+    gated_residual_mix,
+    gated_residual_mix_epilogue,
+    grouped_gemma_rmsnorm,
+)
 from torch import nn
 
 
@@ -42,6 +45,12 @@ class HyperConnectionConfig:
     rms_norm_eps: float = 1e-6
     params_dtype: torch.dtype = torch.bfloat16
     hc_per_branch_norm: bool = True
+
+    def __post_init__(self) -> None:
+        if self.hc_count <= 1:
+            raise ValueError("hc_count must be greater than one")
+        if self.hidden_size <= 0 or self.hc_lowrank <= 0:
+            raise ValueError("hidden_size and hc_lowrank must be positive")
 
 
 def _matching_rows(base: torch.Tensor, derived: torch.Tensor):
@@ -105,108 +114,17 @@ class GroupedGemmaRMSNorm(nn.Module):
         return (normalized * self.gemma_weight.float()).to(input_dtype)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        from tokenspeed.runtime.layers.attention.linear.layernorm_gated import (
-            rmsnorm_fn,
-        )
-
-        return rmsnorm_fn(
+        return grouped_gemma_rmsnorm(
             x,
-            self.gemma_weight,
-            None,
-            z=None,
-            eps=self.variance_epsilon,
-            group_size=self.group_size,
+            self.weight,
+            self.group_size,
+            self.variance_epsilon,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.is_cuda:
             return self.forward_cuda(x)
         return self.forward_native(x)
-
-
-@triton.jit
-def _hc_mix_epilogue_kernel(
-    gate_ptr,
-    normalized_ptr,
-    out_ptr,
-    gate_row_stride,
-    normalized_row_stride,
-    out_row_stride,
-    hidden_size,
-    HC_COUNT: tl.constexpr,
-    BLOCK: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
-):
-    """Sigmoid gate, per-branch weighting and branch mean in one pass.
-
-    Each program owns one token and one slice of ``hidden_size``, so the widened
-    ``[..., hc_count * hidden_size]`` sigmoid and product tensors the eager path
-    materializes stay in registers and only the mixed row reaches memory.
-    """
-
-    row = tl.program_id(0)
-    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < hidden_size
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
-    mixed = tl.zeros([BLOCK], dtype=tl.float32)
-    for branch in tl.static_range(HC_COUNT):
-        column = branch * hidden_size + offsets
-        gate = tl.load(
-            gate_ptr + row * gate_row_stride + column, mask=mask, other=0.0
-        ).to(tl.float32)
-        value = tl.load(
-            normalized_ptr + row * normalized_row_stride + column, mask=mask, other=0.0
-        ).to(tl.float32)
-        mixed += tl.sigmoid(gate) * value
-    tl.store(out_ptr + row * out_row_stride + offsets, mixed / HC_COUNT, mask=mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
-
-@triton.jit
-def _hc_combine_kernel(
-    hyper_ptr,
-    block_ptr,
-    inject_ptr,
-    out_ptr,
-    hyper_row_stride,
-    block_row_stride,
-    inject_row_stride,
-    out_row_stride,
-    hidden_size,
-    HC_COUNT: tl.constexpr,
-    BLOCK: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
-):
-    """Gate one sublayer output and add it into every residual branch.
-
-    The sublayer row is loaded once and reused for all ``hc_count`` branches, so
-    the broadcast product the eager path materializes at the full residual width
-    never reaches memory.
-    """
-
-    row = tl.program_id(0)
-    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < hidden_size
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
-    value = tl.load(
-        block_ptr + row * block_row_stride + offsets, mask=mask, other=0.0
-    ).to(tl.float32)
-    for branch in tl.static_range(HC_COUNT):
-        logit = tl.load(inject_ptr + row * inject_row_stride + branch).to(tl.float32)
-        column = branch * hidden_size + offsets
-        residual = tl.load(
-            hyper_ptr + row * hyper_row_stride + column, mask=mask, other=0.0
-        ).to(tl.float32)
-        tl.store(
-            out_ptr + row * out_row_stride + column,
-            residual + value * 2.0 * tl.sigmoid(logit),
-            mask=mask,
-        )
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 class GatedResidualSimple(nn.Module):
@@ -237,8 +155,13 @@ class GatedResidualSimple(nn.Module):
         # once: rows [0, hc_lowrank) hold the mix-down weight and the next
         # hc_count rows the inject weight. Checkpoint shards are routed there by
         # the stacked mapping in load_qwen4_exp_weights. Both projections are
-        # scaled by 1 / hc_count, folded into the weight at load time, which is
-        # exact for a power-of-two hc_count.
+        # scaled by 1 / hc_count. Fold that scale only when it is an exact
+        # binary exponent change; non-power-of-two counts scale projection
+        # results at runtime instead of quantizing the checkpoint weights.
+        self._fold_projection_scale = not (self.hc_count & (self.hc_count - 1))
+        self._projection_scale = (
+            1.0 if self._fold_projection_scale else 1.0 / self.hc_count
+        )
         projection_rows = (config.hc_lowrank if use_mix else 0) + (
             self.hc_count if use_combine else 0
         )
@@ -270,9 +193,12 @@ class GatedResidualSimple(nn.Module):
                 f"hyper-connection {shard_id} shard shape mismatch: param "
                 f"{tuple(param.shape)}, loaded {tuple(loaded_weight.shape)}"
             )
-        param.data[start : start + size].copy_(
-            (loaded_weight / self.hc_count).to(param.device, param.dtype)
+        weight = (
+            loaded_weight / self.hc_count
+            if self._fold_projection_scale
+            else loaded_weight
         )
+        param.data[start : start + size].copy_(weight.to(param.device, param.dtype))
 
     def _split_projection(self, projected: torch.Tensor):
         """Split the fused projection into mix gate and inject logits."""
@@ -289,7 +215,10 @@ class GatedResidualSimple(nn.Module):
         weight = self.mix_inject_proj.weight
         if self.use_mix:
             weight = weight[self.hc_lowrank :]
-        return F.linear(normalized, weight)
+        logits = F.linear(normalized, weight)
+        if self._projection_scale != 1.0:
+            logits = logits * self._projection_scale
+        return logits
 
     def _normalize(self, hyper_input: torch.Tensor) -> torch.Tensor:
         if self.config.hc_per_branch_norm:
@@ -325,34 +254,12 @@ class GatedResidualSimple(nn.Module):
     def _mix_epilogue_cuda(
         self, gate: torch.Tensor, normalized: torch.Tensor
     ) -> torch.Tensor:
-        rows = gate.shape[0]
-        mixed = torch.empty(
-            (rows, self.hidden_size),
-            dtype=self.config.params_dtype,
-            device=gate.device,
-        )
-        # Row strides let the fused projection's split views feed the kernel
-        # without a contiguity copy; only the last dim must be dense.
-        if gate.stride(-1) != 1:
-            gate = gate.contiguous()
-        if normalized.stride(-1) != 1:
-            normalized = normalized.contiguous()
-        block = min(triton.next_power_of_2(self.hidden_size), 1024)
-        use_pdl = pdl_enabled()
-        _hc_mix_epilogue_kernel[(rows, triton.cdiv(self.hidden_size, block))](
+        return gated_residual_mix_epilogue(
             gate,
             normalized,
-            mixed,
-            gate.stride(0),
-            normalized.stride(0),
-            mixed.stride(0),
+            self.hc_count,
             self.hidden_size,
-            HC_COUNT=self.hc_count,
-            BLOCK=block,
-            ENABLE_PDL=use_pdl,
-            **({"launch_pdl": True} if use_pdl else {}),
         )
-        return mixed
 
     def mix(self, hyper_input: torch.Tensor):
         """Mix ``hc_count`` residual branches into one sublayer input.
@@ -369,16 +276,33 @@ class GatedResidualSimple(nn.Module):
         normalized = self._normalize(hyper_input)
         if hyper_input.shape[0] == 0:
             mixed = hyper_input.new_empty((*hyper_input.shape[:-1], self.hidden_size))
-            inject_logits = hyper_input.new_empty(
-                (*hyper_input.shape[:-1], self.hc_count)
+            inject_logits = (
+                hyper_input.new_empty((*hyper_input.shape[:-1], self.hc_count))
+                if self.use_combine
+                else None
             )
             return mixed, (hyper_input, normalized, inject_logits)
-        gate, inject_logits = self._split_projection(self.mix_inject_proj(normalized))
-        gate = self.input_mix_weight_up(F.silu(gate))
-        if gate.is_cuda and gate.dim() == 2:
-            mixed = self._mix_epilogue_cuda(gate, normalized)
+        if normalized.is_cuda and normalized.dim() == 2:
+            mixed, inject_logits = gated_residual_mix(
+                normalized,
+                self.mix_inject_proj.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+                self.hidden_size,
+                self.hc_lowrank,
+                projection_scale=self._projection_scale,
+            )
         else:
+            gate, inject_logits = self._split_projection(
+                self.mix_inject_proj(normalized)
+            )
+            if self._projection_scale != 1.0:
+                gate = gate * self._projection_scale
+                if inject_logits is not None:
+                    inject_logits = inject_logits * self._projection_scale
+            gate = self.input_mix_weight_up(F.silu(gate))
             mixed = self._mix_epilogue_torch(gate, normalized)
+        mixed = mixed.to(self.config.params_dtype)
         return mixed, (
             hyper_input,
             normalized,
@@ -403,39 +327,13 @@ class GatedResidualSimple(nn.Module):
         hyper_input: torch.Tensor,
         inject_logits: torch.Tensor,
     ) -> torch.Tensor:
-        rows = block_output.shape[0]
-        combined = torch.empty(
-            (rows, self.hc_count * self.hidden_size),
-            dtype=self.config.params_dtype,
-            device=block_output.device,
-        )
-        # Row strides let sliced residuals and the fused projection's inject view
-        # feed the kernel without a contiguity copy; only the last dim must be
-        # dense.
-        if hyper_input.stride(-1) != 1:
-            hyper_input = hyper_input.contiguous()
-        if block_output.stride(-1) != 1:
-            block_output = block_output.contiguous()
-        if inject_logits.stride(-1) != 1:
-            inject_logits = inject_logits.contiguous()
-        block = min(triton.next_power_of_2(self.hidden_size), 1024)
-        use_pdl = pdl_enabled()
-        _hc_combine_kernel[(rows, triton.cdiv(self.hidden_size, block))](
-            hyper_input,
+        return gated_residual_combine(
             block_output,
+            hyper_input,
             inject_logits,
-            combined,
-            hyper_input.stride(0),
-            block_output.stride(0),
-            inject_logits.stride(0),
-            combined.stride(0),
+            self.hc_count,
             self.hidden_size,
-            HC_COUNT=self.hc_count,
-            BLOCK=block,
-            ENABLE_PDL=use_pdl,
-            **({"launch_pdl": True} if use_pdl else {}),
         )
-        return combined
 
     def combine(self, block_output: torch.Tensor, residuals) -> torch.Tensor:
         """Inject one sublayer output back into every residual branch."""

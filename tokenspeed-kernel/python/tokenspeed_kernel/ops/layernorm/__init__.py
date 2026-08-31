@@ -23,6 +23,9 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.layernorm.triton import (
+    grouped_gemma_rmsnorm as _grouped_gemma_rmsnorm,
+)
 from tokenspeed_kernel.platform import current_platform
 
 _platform = current_platform()
@@ -101,4 +104,48 @@ def qk_rmsnorm(
     )
 
 
-__all__ = ["qk_rmsnorm", "rmsnorm"]
+def grouped_gemma_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    group_size: int | None,
+    eps: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply Gemma RMSNorm independently to last-dimension groups.
+
+    Args:
+        x: Input shaped ``[..., width]``.
+        weight: Gemma checkpoint weight offset shaped ``[width]``; the
+            effective multiplier is ``1 + weight``.
+        group_size: Elements sharing one variance statistic. ``None`` means
+            the full last dimension.
+        eps: Epsilon added before reciprocal square root.
+        out: Optional contiguous output matching ``x``.
+
+    Returns:
+        Normalized tensor matching ``x`` shape and dtype.
+    """
+    width = int(x.shape[-1])
+    effective_group_size = width if group_size is None else int(group_size)
+    if x.is_cuda:
+        return _grouped_gemma_rmsnorm(x, weight, effective_group_size, eps, out=out)
+    if effective_group_size <= 0 or width % effective_group_size:
+        raise ValueError(
+            f"group_size must divide the last dimension ({width}), got "
+            f"{effective_group_size}"
+        )
+    if weight.shape != (width,):
+        raise ValueError(
+            f"weight must have shape {(width,)}, got {tuple(weight.shape)}"
+        )
+    grouped = x.float().unflatten(-1, (-1, effective_group_size))
+    variance = grouped.square().mean(dim=-1, keepdim=True)
+    normalized = (grouped * torch.rsqrt(variance + eps)).flatten(-2)
+    result = (normalized * (1.0 + weight.float())).to(x.dtype)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+__all__ = ["grouped_gemma_rmsnorm", "qk_rmsnorm", "rmsnorm"]

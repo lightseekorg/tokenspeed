@@ -39,7 +39,11 @@ from tokenspeed_kernel.ops.gemm.ll_bf16 import (
     ll_bf16_mm_supported,
     ll_bf16_router_supported,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import (
+    current_platform,
+    pdl_enabled,
+    set_pdl_enabled,
+)
 from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_router
 
 if not torch.cuda.is_available():
@@ -100,6 +104,22 @@ def test_declines_non_contiguous_and_odd_k() -> None:
         KIMI3_ROUTER_SIZE, KIMI3_HIDDEN_SIZE + 1, device="cuda", dtype=torch.bfloat16
     )
     assert not ll_bf16_router_supported(odd, odd_w, 1)
+
+
+def test_compiled_cache_separates_server_pdl_policy() -> None:
+    a, b = _inputs(1, seed=23)
+    previous = pdl_enabled()
+    try:
+        set_pdl_enabled(False)
+        without_pdl = ll_bf16_router(a, b, out_dtype=torch.bfloat16)
+        assert any(key[-1] is False for key in ll_bf16_router._dotprod)
+
+        assert set_pdl_enabled(True)
+        with_pdl = ll_bf16_router(a, b, out_dtype=torch.bfloat16)
+        assert any(key[-1] is True for key in ll_bf16_router._dotprod)
+        torch.testing.assert_close(with_pdl, without_pdl)
+    finally:
+        set_pdl_enabled(previous)
 
 
 # Covers both backends: the dot product at M <= 4, split-K above it.

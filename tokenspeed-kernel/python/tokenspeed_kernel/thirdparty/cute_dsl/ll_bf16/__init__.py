@@ -41,6 +41,8 @@ _SPLITK_TILE_N = 16
 _SPLITK_TILE_K = 256
 _SPLITK_DMA_WARPS = 4
 OUT_DTYPES: tuple[torch.dtype, ...] = (torch.float32, torch.bfloat16)
+_DotprodCacheKey = tuple[int, int, int, int, torch.dtype, bool, bool]
+_SplitKCacheKey = tuple[int, int, int, torch.dtype, bool, bool]
 
 
 def block_size_for(m: int) -> int:
@@ -77,8 +79,10 @@ class LLBf16Router:
 
     def __init__(self) -> None:
         # Device-keyed: a callable compiled on one GPU must not run on another.
-        self._dotprod: dict[tuple[int, int, int, int, torch.dtype, bool], Any] = {}
-        self._splitk: dict[tuple[int, int, int, torch.dtype, bool], Any] = {}
+        # PDL is part of the compiled kernel, so the server switch belongs in
+        # the cache key as well.
+        self._dotprod: dict[_DotprodCacheKey, Any] = {}
+        self._splitk: dict[_SplitKCacheKey, Any] = {}
         self._compile_lock = threading.Lock()
         self._available: bool | None = None
 
@@ -130,6 +134,7 @@ class LLBf16Router:
         device: torch.device,
         out_dtype: torch.dtype,
         has_bias: bool,
+        enable_pdl: bool,
     ) -> None:
         import cutlass.cute as cute
         from cutlass import BFloat16
@@ -148,13 +153,21 @@ class LLBf16Router:
         gemm = _Kernel(
             k=k,
             bs=block_size,
-            use_pdl=torch.cuda.get_device_capability(device)[0] >= 9 and pdl_enabled(),
+            use_pdl=enable_pdl,
             out_dtype=cut_out_dtype,
             has_bias=has_bias,
         )
         # cute.compile targets the current device, not the operands'.
         with torch.cuda.device(device):
-            key = (device.index or 0, m, k, block_size, out_dtype, has_bias)
+            key = (
+                device.index or 0,
+                m,
+                k,
+                block_size,
+                out_dtype,
+                has_bias,
+                enable_pdl,
+            )
             self._dotprod[key] = cute.compile(
                 gemm,
                 a,
@@ -174,6 +187,7 @@ class LLBf16Router:
         device: torch.device,
         out_dtype: torch.dtype,
         has_bias: bool,
+        enable_pdl: bool,
     ) -> None:
         import cutlass.cute as cute
         from cutlass import BFloat16
@@ -195,12 +209,19 @@ class LLBf16Router:
             num_stages=num_stages,
             num_dma_warps=_SPLITK_DMA_WARPS,
             split_k=split_k,
-            use_pdl=torch.cuda.get_device_capability(device)[0] >= 9 and pdl_enabled(),
+            use_pdl=enable_pdl,
             out_dtype=cut_out_dtype,
             has_bias=has_bias,
         )
         with torch.cuda.device(device):
-            key = (device.index or 0, split_k, num_stages, out_dtype, has_bias)
+            key = (
+                device.index or 0,
+                split_k,
+                num_stages,
+                out_dtype,
+                has_bias,
+                enable_pdl,
+            )
             self._splitk[key] = cute.compile(
                 gemm, a, b, c, bias, self._stream(device), options="--enable-tvm-ffi"
             )
@@ -262,26 +283,50 @@ class LLBf16Router:
 
         device = a.device
         stream = self._stream(device)
-        if m <= MAX_M_DOTPROD:
+        enable_pdl = pdl_enabled() and torch.cuda.get_device_capability(device)[0] >= 9
+        # Every split-K cluster rank must own at least one K tile. Router
+        # projections are normally wide enough, but low-rank consumers (for
+        # example a padded rank-320 hyperconnection up projection) are not.
+        # Route those shapes through the CTA-local dot-product kernel instead
+        # of launching a cluster whose idle ranks can never complete.
+        config = splitk_config_for(m)
+        split_k, _ = config
+        use_dotprod = m <= MAX_M_DOTPROD or k < split_k * _SPLITK_TILE_K
+        if use_dotprod:
             if block_size is None:
                 block_size = block_size_for(m)
-            key = (device.index or 0, m, k, block_size, out_dtype, has_bias)
+            key = (
+                device.index or 0,
+                m,
+                k,
+                block_size,
+                out_dtype,
+                has_bias,
+                enable_pdl,
+            )
             if key not in self._dotprod:
                 # Double-checked: cute.compile is expensive and not thread-safe.
                 with self._compile_lock:
                     if key not in self._dotprod:
                         self._compile_dotprod(
-                            m, k, block_size, device, out_dtype, has_bias
+                            m,
+                            k,
+                            block_size,
+                            device,
+                            out_dtype,
+                            has_bias,
+                            enable_pdl,
                         )
             self._dotprod[key](a, b, out, bias_arg, n, stream)
             return out
 
-        config = splitk_config_for(m)
-        key = (device.index or 0, *config, out_dtype, has_bias)
+        key = (device.index or 0, *config, out_dtype, has_bias, enable_pdl)
         if key not in self._splitk:
             with self._compile_lock:
                 if key not in self._splitk:
-                    self._compile_splitk(config, device, out_dtype, has_bias)
+                    self._compile_splitk(
+                        config, device, out_dtype, has_bias, enable_pdl
+                    )
         self._splitk[key](a, b, out, bias_arg, stream, 1.0)
         return out
 
