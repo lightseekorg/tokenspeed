@@ -249,6 +249,14 @@ KDA state paging only. `cache_active_pages_must_be_real` remains a separate
 axis — it marks backends that validate live-page geometry and so need real
 capture placeholder tables (V4), not who supplies tables.
 
+Table delivery is guarded at the one dispatch point, not per backend:
+`ForwardStepRunner._decode_stale_table_guard` fails a live decode
+(`actual_bs > 0`, eager and replay alike, every backend family) whose
+`block_tables` omit any published group — the persistent decode buffers
+would otherwise serve stale pages. Extend/mixed keep the wrapper's
+`>1 groups` guard (a single group's table IS the single table, so the
+fallback is legal there). The per-backend `_replay_stale_guard` is gone.
+
 `DraftPageStaging` survives but is no longer a mapping owner: its publish is
 a pure copy + padded-row scrub into the one address-stable buffer the
 drafters' in-graph write-location kernels record at capture

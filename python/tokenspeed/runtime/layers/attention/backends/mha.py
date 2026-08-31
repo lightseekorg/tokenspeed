@@ -275,10 +275,9 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         self._learn_cache_groups(cache_group_specs)
 
         self.cuda_graph_decode_metadata = {}
-        # Per-group persistent buffers. parallels
-        # cuda_graph_page_table.
-        # Initialized before the DFLASH early return: replay reads the dict
-        # unconditionally for the stale-table guard.
+        # Per-group persistent buffers, parallels cuda_graph_page_table.
+        # Initialized before the DFLASH early return: the mixin's view
+        # builder and the LCM published-groups contract check read the dict.
         self._init_group_graph_buffers(max_bs)
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: expand to spec_num_tokens decode rows per
@@ -402,9 +401,6 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 self.fill_block_decode_seq_lens(bs, seq_lens)
             self.forward_decode_metadata = self._decode_views(bs)
             return
-
-        # Fail loudly instead of computing over stale/zero page tables.
-        self._replay_stale_guard(actual_bs, block_tables)
 
         # Every pool publishes at least one history group now, so the
         # per-group capture buffers always exist; the pre-LCM single-table

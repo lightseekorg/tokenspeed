@@ -518,6 +518,55 @@ class WrapperEagerGroupGuardTest(_TorchCase):
         self.assertIsNone(calls["init_kwargs"]["block_tables"])
 
 
+class DecodeStaleTableGuardTest(_TorchCase):
+    """Decode table-delivery guard: one wrapper-level check covering eager
+    and replay for every backend family (replaces the per-backend
+    _replay_stale_guard)."""
+
+    def _guard(self, group_ids, actual_bs, block_tables):
+        from types import MethodType
+
+        from tokenspeed.runtime.execution.forward_step import (
+            ForwardStepRunner,
+        )
+
+        mock = SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(
+                arena=SimpleNamespace(
+                    cache_group_specs=tuple(
+                        SimpleNamespace(group_id=gid) for gid in group_ids
+                    )
+                )
+            ),
+        )
+        mock._cache_group_ids = MethodType(ForwardStepRunner._cache_group_ids, mock)
+        ForwardStepRunner._decode_stale_table_guard(mock, actual_bs, block_tables)
+
+    def test_missing_tables_raise(self):
+        with self.assertRaisesRegex(RuntimeError, "missing/empty"):
+            self._guard(["full_attention"], 2, None)
+
+    def test_missing_group_raises(self):
+        tables = {"full_attention": self.torch.ones((2, 2), dtype=self.torch.int32)}
+        with self.assertRaisesRegex(RuntimeError, "missing published groups"):
+            self._guard(["full_attention", "sliding_attention"], 2, tables)
+
+    def test_full_delivery_passes(self):
+        tables = {
+            "full_attention": self.torch.ones((2, 2), dtype=self.torch.int32),
+            "sliding_attention": self.torch.ones((2, 2), dtype=self.torch.int32),
+        }
+        self._guard(["full_attention", "sliding_attention"], 2, tables)
+
+    def test_idle_and_capture_rows_skip(self):
+        # actual_bs == 0: idle replay / capture seeding synthesize their own
+        # placeholder tables downstream.
+        self._guard(["full_attention"], 0, None)
+
+    def test_group_less_pool_skips(self):
+        self._guard([], 2, None)
+
+
 class IdleBlockTablesTest(_TorchCase):
     """bs==0 idle replay tables: one col-0 page-0 entry per dummy row."""
 

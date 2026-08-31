@@ -323,12 +323,6 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         self.assertEqual(set(page_tables), set(gids))
         self.assertEqual(page_tables["full_attention"].shape, (bs, b.max_num_pages))
 
-        # Replay without tables must fail loudly (stale-table guard).
-        with self.assertRaisesRegex(RuntimeError, "stale page tables"):
-            b._replay_stale_guard(bs, None)
-        with self.assertRaisesRegex(RuntimeError, "missing captured groups"):
-            b._replay_stale_guard(bs, {"full_attention": self.torch.zeros((bs, 1))})
-
         # Replay fill copies rows, pads column tails with the trtllm dummy
         # page 0 (table_tail_pad), recomputes locs (fused triton).
         seq_lens = self.torch.tensor([65, 1, 1, 1], dtype=self.torch.int32).cuda()

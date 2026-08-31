@@ -594,30 +594,6 @@ class CacheGroupsMixin:
         )
         return True
 
-    def _replay_stale_guard(self, bs: int, block_tables) -> None:
-        """Fail loudly instead of replaying over stale/zero page tables.
-        bs == 0 may skip: col-0 buffer entries stay valid (never -1),
-        outputs are discarded, and only unit tests reach it."""
-        if not self.cuda_graph_page_tables or bs <= 0:
-            return
-        name = type(self).__name__
-        if not block_tables:
-            raise RuntimeError(
-                f"{name} replay: per-group CUDA-graph buffers "
-                f"exist for groups "
-                f"{sorted(self.cuda_graph_page_tables)} "
-                f"but block_tables is missing/empty at bs={bs}; the "
-                "captured graph would read stale page tables."
-            )
-        missing = set(self.cuda_graph_page_tables) - set(block_tables)
-        if missing:
-            raise RuntimeError(
-                f"{name} replay: block_tables at bs="
-                f"{bs} is missing captured groups {sorted(missing)} "
-                f"(delivered: {sorted(block_tables)}); the captured "
-                "graph would read stale page tables for those groups."
-            )
-
     def _fill_group_graph_buffers(
         self, bs: int, block_tables, seq_lens, tokens_per_req: int = 1
     ) -> None:

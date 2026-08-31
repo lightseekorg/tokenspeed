@@ -796,9 +796,6 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
             return
 
-        # Fail loudly instead of computing over stale/zero page tables.
-        self._replay_stale_guard(actual_bs, block_tables)
-
         # Copy the live cache lengths into our own buffer (the plain-decode and
         # draft-decode metadata view cuda_graph_cache_seqlens); the spec>1 verify
         # path instead reads spec_cache_seqlens_buf via _clamped_spec_seqlens.

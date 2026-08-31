@@ -865,6 +865,37 @@ class ForwardStepRunner:
             )
         return out
 
+    def _decode_stale_table_guard(self, actual_bs: int, block_tables) -> None:
+        """Fail loudly instead of preparing decode metadata over stale/zero
+        page tables — eager and replay alike, every backend family.
+
+        The pool's published groups are the tables the unified refresh copies
+        into the persistent decode buffers; a missing or incomplete delivery
+        means the kernels would read whatever those buffers held last.
+        ``actual_bs == 0`` (idle replay, capture seeding) carries no live
+        rows and synthesizes its own placeholders downstream.
+        """
+        if actual_bs <= 0:
+            return
+        published = self._cache_group_ids(self.token_to_kv_pool)
+        if not published:
+            return
+        if not block_tables:
+            raise RuntimeError(
+                "ForwardStepRunner decode: pool publishes cache groups "
+                f"{sorted(published)} but block_tables is missing/empty at "
+                f"bs={actual_bs}; the persistent decode buffers would serve "
+                "stale page tables."
+            )
+        missing = set(published) - set(block_tables)
+        if missing:
+            raise RuntimeError(
+                f"ForwardStepRunner decode: block_tables at bs={actual_bs} "
+                f"is missing published groups {sorted(missing)} (delivered: "
+                f"{sorted(block_tables)}); those groups' persistent decode "
+                "buffers would go stale."
+            )
+
     def _prepare_decode_metadata(
         self,
         padded_bs: int,
@@ -1234,14 +1265,14 @@ class ForwardStepRunner:
             else {}
         )
 
-        # Eager stale-table guard, all modes: with >1 published group the
-        # single-table fallback would serve first-group pages to every layer.
-        # Replay relies on the backends' own _replay_stale_guard instead.
-        # Idle/bs==0 forwards carry no requests.
+        # Extend/mixed stale-table guard: with >1 published group the
+        # single-table fallback would serve first-group pages to every layer
+        # (a single group's table IS the single table, so one group may
+        # legitimately omit it). Decode delivery is checked below by
+        # _decode_stale_table_guard, eager and replay alike.
         if (
-            not use_graph
+            ctx.forward_mode.is_extend_or_mixed()
             and bs > 0
-            and not ctx.forward_mode.is_idle()
             and not block_tables
             and len(self.token_to_kv_pool.arena.cache_group_specs) > 1
         ):
@@ -1257,6 +1288,7 @@ class ForwardStepRunner:
         # _can_use_graph already requires a decode mode, so this branches on
         # the mode alone: decode → unified refresh; extend/mixed → construct.
         if ctx.forward_mode.is_decode():
+            self._decode_stale_table_guard(bs, block_tables)
             self._prepare_decode_metadata(
                 padded_bs,
                 bs,

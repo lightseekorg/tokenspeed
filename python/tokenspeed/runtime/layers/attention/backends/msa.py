@@ -395,9 +395,6 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
             self.forward_decode_metadata = self._decode_views(bs)
             return
 
-        # Fail loudly instead of computing over stale/zero page tables.
-        self._replay_stale_guard(actual_bs, block_tables)
-
         # Every pool publishes at least one history group now, so the
         # per-group capture buffers always exist; the pre-LCM single-table
         # gather has no remaining producer. The actual_bs == 0 arm (capture
