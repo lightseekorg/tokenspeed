@@ -22,6 +22,7 @@ from .primitives import (
     VEC_BF16,
     bf16x8_to_packed_u32x4,
     block_sum_specialized,
+    finalize_top16_bf16,
     fragment_is_dirty,
     load_global_bf16_as_f32,
     load_global_s32,
@@ -135,6 +136,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         # BF16); bitwise identity is not guaranteed across compilers.
         self.finalize_input = finalize_top_k is not None
         self.finalize_top_k = finalize_top_k if finalize_top_k is not None else 0
+        self.fast_finalize_top16 = finalize_top_k == 16 and latent_dim == 3584
         self.rank = rank
         self.tp_size = tp_size
         self.latent_dim = latent_dim
@@ -327,7 +329,37 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             )
             dirty_elements = Int64(dirty_index) * (Int64(bytes_per_buffer) // Int64(2))
 
-            if cutlass.const_expr(self.finalize_input):
+            if cutlass.const_expr(self.fast_finalize_top16):
+                gemm2_vector = cute.make_ptr(
+                    BFloat16,
+                    (latent_source.iterator + Int64(packed_idx) * VEC_BF16).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                route_indices = cute.make_ptr(
+                    Int32,
+                    (
+                        finalize_idx.iterator + Int64(token) * self.finalize_top_k
+                    ).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                route_weights = cute.make_ptr(
+                    BFloat16,
+                    (
+                        finalize_weights.iterator + Int64(token) * self.finalize_top_k
+                    ).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                local_packed = sanitize_negative_zero(
+                    finalize_top16_bf16(
+                        gemm2_vector,
+                        route_indices,
+                        route_weights,
+                    )
+                )
+            elif cutlass.const_expr(self.finalize_input):
                 # Inline MoE finalize: gather this fragment from every routed
                 # expert's gemm2 row and combine with the expert scales.
                 # Semantically equivalent to the standalone finalize kernel
@@ -974,6 +1006,7 @@ class CollectiveKernel:
         # deferred-finalize triple; the standard materialized-input mode
         # stays available on the same instance.
         self.finalize_top_k = finalize_top_k
+        self.fast_finalize_top16 = finalize_top_k == 16 and latent_dim == 3584
         device = torch.device("cuda", torch.accelerator.current_device_index())
         # Placeholders for the finalize operand slots of the standard-mode
         # kernel signature (never dereferenced when finalize is compiled out).
@@ -1198,6 +1231,15 @@ class CollectiveKernel:
                 or not tensor.is_contiguous()
             ):
                 raise ValueError(f"{name} must be contiguous CUDA {dtype} [{slots}]")
+        if self.fast_finalize_top16 and any(
+            tensor.data_ptr() % 16
+            for tensor in (
+                gemm2_output,
+                expert_weights,
+                expanded_idx_to_permuted_idx,
+            )
+        ):
+            raise ValueError("fast top-16 finalize inputs must be 16-byte aligned")
         if (
             shared_source.shape != (m, self.hidden_dim)
             or shared_source.dtype != torch.bfloat16
