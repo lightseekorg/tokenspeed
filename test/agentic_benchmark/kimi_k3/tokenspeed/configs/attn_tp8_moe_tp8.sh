@@ -8,7 +8,8 @@ exec ts serve \
     --moe-tp-size 8 \
     --max-model-len 80000 \
     --max-num-seqs 16 \
-    --gpu-memory-utilization 0.92 \
+    --gpu-memory-utilization 0.95 \
+    --disable-cuda-graph-padding \
     --trust-remote-code \
     --attention-backend tokenspeed_mla \
     --kda-backend cutedsl_kda \
@@ -19,7 +20,8 @@ exec ts serve \
     --speculative-num-draft-tokens 8 \
     --drafter-attention-backend tokenspeed_mla \
     --mm-encoder-tp-mode data \
+    --disable-kvstore \
     --enable-cache-report \
-    --host 127.0.0.1 \
+    --host 0.0.0.0 \
     --port 8000 \
     --engine-startup-timeout 7200
