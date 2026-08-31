@@ -194,6 +194,11 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
         # rows [total_padded_rows, latent_dim]; ``finalize_weights`` /
         # ``finalize_idx`` are the flat [m * top_k] expert scales and
         # expanded->permuted map. Otherwise the last two are unused dummies.
+        launch_token_ctas = (
+            min(self.token_ctas, m)
+            if cutlass.const_expr(self.include_routed)
+            else self.token_ctas
+        )
         self.kernel(
             latent_source,
             gamma,
@@ -211,7 +216,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
             m,
             epsilon,
         ).launch(
-            grid=(self.token_ctas, self.cluster_ctas, self.roles),
+            grid=(launch_token_ctas, self.cluster_ctas, self.roles),
             block=(self.threads, 1, 1),
             cluster=(1, self.cluster_ctas, 1),
             smem=(self.warps + self.cluster_ctas) * 4,

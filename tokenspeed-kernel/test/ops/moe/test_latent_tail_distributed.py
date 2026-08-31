@@ -113,7 +113,8 @@ def test_latent_tail_matches_reference(m):
     assert err < 0.05 * max(scale, 1.0), f"m={m}: err {err} vs scale {scale}"
 
 
-def test_latent_tail_graph_replay():
+@pytest.mark.parametrize("m", [1, 4, 6, 16])
+def test_latent_tail_graph_replay(m):
     from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
 
     rank, dev = _setup()
@@ -127,7 +128,7 @@ def test_latent_tail_graph_replay():
         layer_index=0,
         model_scope="test",
     )
-    routed, shared, rms_w, up_w = _inputs(rank, dev, 1, seed=200)
+    routed, shared, rms_w, up_w = _inputs(rank, dev, m, seed=200 + m)
     for _ in range(3):
         op(routed, shared, rms_w, up_w)
     torch.cuda.synchronize()
@@ -139,7 +140,8 @@ def test_latent_tail_graph_replay():
     scale = None
     for seed in (300, 301):
         torch.manual_seed(seed + rank)
-        routed.copy_(torch.randn(1, L, dtype=torch.bfloat16, device=dev) * 0.1)
+        routed.copy_(torch.randn(m, L, dtype=torch.bfloat16, device=dev) * 0.1)
+        shared.copy_(torch.randn(m, H, dtype=torch.bfloat16, device=dev) * 0.1)
         graph.replay()
         torch.cuda.synchronize()
         ref = _reference(routed, shared, rms_w, up_w)
