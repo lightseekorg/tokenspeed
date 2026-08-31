@@ -34,7 +34,7 @@ from tokenspeed_kernel.ops.tuning import (
 )
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.configs.model_config import AttentionArch, ModelConfig
+from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -63,6 +63,9 @@ from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.grammar.capturable_grammar import (
     create_grammar_runtime,
     setup_grammar_step,
+)
+from tokenspeed.runtime.layers.attention.backends.base import (
+    resolve_cuda_graph_support,
 )
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
@@ -249,26 +252,10 @@ class ModelExecutorConfig:
                 physical_context_len - derived_context_len,
             )
 
-        # DSA's sparse indexer reads the attention backend's
-        # ``chunked_prefill_metadata`` from inside the captured prefill segment,
-        # but the prefill graph rebinds only the live ForwardContext at replay --
-        # the backend metadata object stays frozen at capture-time (dummy) values.
-        # Qwen4-Exp's PLE/QSA modules likewise own token-indexed side-state writes;
-        # replay pads token rows to a bucket while their cache metadata remains
-        # real-token shaped. Keep those prefills eager so padding can never
-        # advance n-gram, short-conv, or compressed-key state.
-        text_config = model_config.hf_text_config
-        qwen4_exp_has_side_state = getattr(text_config, "model_type", None) == (
-            "qwen4_exp_text"
-        ) and bool(
-            getattr(text_config, "ple_layer_ids", None)
-            or getattr(text_config, "indexer_n_heads", None) is not None
-        )
-        disable_prefill_graph = (
-            bool(server_args.disable_prefill_graph)
-            or (model_config.attention_arch == AttentionArch.DSA)
-            or qwen4_exp_has_side_state
-        )
+        # User intent only; backend-imposed graph restrictions are declared on
+        # the backend classes (cuda_graph_support) and resolved in
+        # ModelExecutor.__init__ once the backend instances exist.
+        disable_prefill_graph = bool(server_args.disable_prefill_graph)
 
         return ModelExecutorConfig(
             max_req_pool_size=max_req_pool_size,
@@ -481,6 +468,12 @@ class ModelExecutor:
                 draft_token_to_kv_pool.arena.cache_group_specs,
             )
 
+        # Backend-declared CUDA-graph support, AND-composed over the target
+        # and draft trees (the decode graph records the whole step, drafter
+        # loop included). Startup-time and class-attribute-driven, so every
+        # DP rank resolves the same answer.
+        graph_support = resolve_cuda_graph_support(attn_backend, draft_attn_backend)
+
         self.dp_sampling_runtime_config = setup_dp_sampling(
             model=self.model_runner.model,
             sampling_backend=self.sampling_backend,
@@ -516,6 +509,7 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
             page_table=self.draft_page_table,
+            decode_graph_supported=graph_support.decode_graph,
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
         if config.enforce_eager:
@@ -534,6 +528,7 @@ class ModelExecutor:
             config=config,
             page_table=self.draft_page_table,
             drafter=self.drafter,
+            graph_supported=graph_support.prefill_graph,
         )
 
         self._autotune()

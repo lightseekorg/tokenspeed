@@ -113,6 +113,25 @@ capture signature must accept the runner kwarg set (`cache_group_ids`,
 `page_table`, `**kwargs`) — pinned by
 `test_unified_decode_path.py::CaptureSignatureConformanceTest`.
 
+### Graded CUDA-graph support
+
+A backend's static graph capability is a class attribute,
+`cuda_graph_support: CudaGraphSupport(decode_graph, prefill_graph)`, never a
+scattered executor-side arch check. `ModelExecutor.__init__` AND-composes it
+over the target and draft `child_backends()` trees once
+(`resolve_cuda_graph_support`), logs every culprit class, and downgrades the
+two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
+Current declarations: `DSABackend` and `Qwen4ExpMambaAttnBackend` disable the
+prefill graph (rationale comments live on those classes).
+
+Rules: declarations are static "never works" facts — a runtime capture
+failure keeps its own degrade path (`PrefillGraph._capture_unanimous`'s
+world-agreed eager fallback). Resolution is device-side at startup and
+class-attribute-driven, so every DP rank derives the same answer
+(event-loop.md). `disable_prefill_graph` in the config carries user intent
+only. `decode_graph=False` still requires `refresh_decode_metadata` and
+`init_cuda_graph_state` — eager decode runs the same unified path.
+
 ### Refresh ordering: target before draft
 
 The wrapper's `_prepare_decode_metadata` refreshes the target backend before
@@ -263,6 +282,13 @@ milestone (`cache-concepts.md` Principle 5).
   write-location math on the unified path.
 * `grep -rn "init_forward_metadata_replay_cuda_graph\|is_all_greedy" python/`
   must stay empty.
+* `grep -rn "AttentionArch.DSA\|qwen4_exp_has_side_state"
+  python/tokenspeed/runtime/execution/` must stay empty — backend-imposed
+  graph restrictions are `cuda_graph_support` declarations
+  (`test/runtime/test_cudagraph_support_resolution.py`).
+* `grep -rn "def init_forward_metadata_capture_cuda_graph" python/` matches
+  only the base default and the sanctioned overrides listed in "Capture is
+  inherited".
 * New backends implement `refresh_decode_metadata` + `init_cuda_graph_state`;
   capture is inherited from the base default (bind views + idle refresh).
   Only a kernel-imposed capture asymmetry justifies an override.

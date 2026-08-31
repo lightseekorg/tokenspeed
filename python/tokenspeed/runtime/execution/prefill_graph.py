@@ -216,6 +216,7 @@ class PrefillGraph:
         page_table: torch.Tensor | None,
         drafter=None,
         num_warmup: int = 3,
+        graph_supported: bool = True,
     ) -> None:
         model = model_runner.model if model_runner is not None else None
         # Multimodal seam: models whose multimodal path is embeds-only expose
@@ -242,6 +243,9 @@ class PrefillGraph:
         self.disable = (
             config.enforce_eager
             or config.disable_prefill_graph
+            # Backend-declared restriction (cuda_graph_support), resolved by
+            # ModelExecutor over the backend tree at startup.
+            or not graph_supported
             or not self.capture_buckets
             or self.inner_model is None
             or self._embed_tokens is None

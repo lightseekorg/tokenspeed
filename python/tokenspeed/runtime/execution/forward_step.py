@@ -207,6 +207,7 @@ class ForwardStepRunner:
         sampling_backend: SamplingBackend | None = None,
         runtime_states: RuntimeStates | None = None,
         page_table: torch.Tensor | None = None,
+        decode_graph_supported: bool = True,
     ):
         self.config = config
         # The executor's address-stable staged full-history table — the same
@@ -252,7 +253,10 @@ class ForwardStepRunner:
         self.overlap_schedule_depth = config.overlap_schedule_depth
         self.dp_size = config.data_parallel_size
         self.world_size = config.world_size
-        self.disable = config.enforce_eager
+        # User intent (enforce_eager) OR a backend-declared restriction
+        # (resolve_cuda_graph_support in ModelExecutor); the unified refresh
+        # still serves eager decode either way.
+        self.disable = config.enforce_eager or not decode_graph_supported
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
         init_backend_cuda_graph_state(

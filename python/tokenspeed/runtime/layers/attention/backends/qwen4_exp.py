@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tokenspeed.runtime.layers.attention.backends.base import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
     MambaAttnBackend,
 )
@@ -56,6 +57,12 @@ def qwen4_exp_linear_backend(
 
 class Qwen4ExpMambaAttnBackend(MambaAttnBackend):
     """GDN backend with Qwen4-Exp PLE verification state."""
+
+    # Qwen4-Exp's PLE/QSA modules own token-indexed side-state writes; prefill
+    # graph replay pads token rows to a bucket while their cache metadata
+    # remains real-token shaped. Keep prefills eager so padding can never
+    # advance n-gram, short-conv, or compressed-key state.
+    cuda_graph_support = CudaGraphSupport(prefill_graph=False)
 
     def __init__(self, config: BaseAttnConfig) -> None:
         super().__init__(config)

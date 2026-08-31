@@ -33,7 +33,10 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.base import (
+    AttentionBackend,
+    CudaGraphSupport,
+)
 from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.trtllm_mla import TRTLLMMLABackend
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
@@ -62,6 +65,12 @@ class DSABackend(AttentionBackend):
     # block_kv_indices. Declared here because the scheduler validates the
     # outermost backend, not the delegate.
     cache_consumer_families = frozenset({"history"})
+
+    # DSA's sparse indexer reads this backend's chunked_prefill_metadata from
+    # inside the captured prefill segment, but the prefill graph rebinds only
+    # the live ForwardContext at replay — the backend metadata object stays
+    # frozen at capture-time (dummy) values. Keep prefills eager.
+    cuda_graph_support = CudaGraphSupport(prefill_graph=False)
 
     def __init__(self, config: DSAConfig):
         super().__init__(config)

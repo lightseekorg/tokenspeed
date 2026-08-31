@@ -23,11 +23,13 @@ from __future__ import annotations
 import inspect
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, TypeVar
 
 import torch
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+from tokenspeed.runtime.utils import get_colorful_logger
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -35,6 +37,61 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
+
+logger = get_colorful_logger(__name__)
+
+
+@dataclass(frozen=True)
+class CudaGraphSupport:
+    """Per-backend-class CUDA-graph capability declaration.
+
+    Rank-uniform by construction: declarations are class attributes, resolved
+    identically on every rank at startup (event-loop.md requires graph
+    decisions to derive from replicated state). ``decode_graph=False``
+    disables capture/replay of the whole-step decode graph — the unified
+    refresh still serves eager decode, so ``init_cuda_graph_state`` and
+    ``refresh_decode_metadata`` stay mandatory. ``prefill_graph=False``
+    disables the breakable prefill (extend) graph. Static "never works"
+    declarations only; runtime capture failures keep their own degrade paths
+    (``PrefillGraph._capture_unanimous``).
+    """
+
+    decode_graph: bool = True
+    prefill_graph: bool = True
+
+    def __and__(self, other: CudaGraphSupport) -> CudaGraphSupport:
+        return CudaGraphSupport(
+            decode_graph=self.decode_graph and other.decode_graph,
+            prefill_graph=self.prefill_graph and other.prefill_graph,
+        )
+
+
+def resolve_cuda_graph_support(*backends) -> CudaGraphSupport:
+    """AND-compose ``cuda_graph_support`` over ``backends`` and their
+    ``child_backends()`` trees, logging every backend class that lowers an
+    axis.
+
+    Args:
+        backends: Root attention backends; ``None`` entries are skipped. Pass
+            the target AND the draft — the decode graph records the whole
+            step, drafter loop included.
+
+    Returns:
+        The composed support: an axis is False iff any backend in any tree
+        declares it False.
+    """
+    resolved = CudaGraphSupport()
+    stack = [backend for backend in backends if backend is not None]
+    while stack:
+        backend = stack.pop()
+        declared = backend.cuda_graph_support
+        if not declared.decode_graph:
+            logger.info("Decode CUDA graphs disabled by %s", type(backend).__name__)
+        if not declared.prefill_graph:
+            logger.info("Prefill CUDA graphs disabled by %s", type(backend).__name__)
+        resolved = resolved & declared
+        stack.extend(backend.child_backends())
+    return resolved
 
 
 class SpeculativeStateBackend(Protocol):
@@ -88,6 +145,10 @@ class AttentionBackend(ABC):
     # replayed kernels do not read through Python (e.g. FlashMLA's eager tile
     # schedule). Keep empty unless a kernel imposes such an asymmetry.
     graph_unstable_metadata_fields: frozenset[str] = frozenset()
+    # Static CUDA-graph capability of this backend class; the executor
+    # AND-composes it over the target+draft trees at startup
+    # (resolve_cuda_graph_support) and downgrades the graph subsystems once.
+    cuda_graph_support: CudaGraphSupport = CudaGraphSupport()
 
     def __init__(self, config: BaseAttnConfig) -> None:
         self.device = config.device
