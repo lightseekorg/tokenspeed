@@ -258,9 +258,10 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
 
         self.assertIs(got, caller_loc)
 
-    def test_decode_metadata_grouped_drops_single_table(self):
+    def test_decode_group_write_locations(self):
+        # Per-group decode write locations (the update_draft_forward_metadata
+        # re-anchor and the capture builders share this math).
         b = self._bare_backend()
-        bs = 2
         seq_lens = self.torch.tensor([65, 3], dtype=self.torch.int32)
         tables = {
             "full_attention": self.torch.tensor(
@@ -273,24 +274,13 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         locs = b._compute_decode_group_out_cache_locs(
             tables, seq_lens, b.kernel_page_size
         )
-        b._init_decode_metadata(
-            bs,
-            req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
-            seq_lens=seq_lens,
-            page_table=None,
-            group_page_tables=tables,
-            group_out_cache_locs=locs,
-        )
-        meta = b.forward_decode_metadata
-        self.assertIsNone(meta.page_table)
-        self.assertIs(meta.page_tables, tables)
         # seq_len 65 -> page index 1, offset 0; seq_len 3 -> page 0, offset 2.
         self.assertEqual(
-            meta.out_cache_locs["full_attention"].tolist(),
+            locs["full_attention"].tolist(),
             [12 * 64 + 0, 13 * 64 + 2],
         )
         self.assertEqual(
-            meta.out_cache_locs["sliding_attention"].tolist(),
+            locs["sliding_attention"].tolist(),
             [22 * 64 + 0, 23 * 64 + 2],
         )
 

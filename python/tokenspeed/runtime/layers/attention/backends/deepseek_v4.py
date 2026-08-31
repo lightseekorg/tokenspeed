@@ -223,12 +223,8 @@ def _refresh_decode_indexer_schedule_metadata(
 class DeepseekV4AttentionBackend(AttentionBackend):
     """Metadata owner for the model-local DeepSeek V4 attention path."""
 
-    needs_group_block_tables = True
-    uses_cache_groups = True
-    cache_group_tables_replace_draft_page_table = True
     cache_active_pages_must_be_real = True
     cache_consumer_families = frozenset({"history", "state"})
-    uses_padded_decode_token_mask = True
 
     def __init__(self, config) -> None:
         super().__init__(config)
@@ -918,9 +914,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             extend_prefix_lens_cpu,
             extend_prefix_lens,
         )
-        is_packed_decode = (
-            forward_mode is not None and forward_mode.is_decode() and num_tokens != bs
-        )
         metadata_forward_mode = forward_mode
         if forward_mode is not None and forward_mode.is_mixed():
             num_prefill_reqs = max(0, min(num_extends, bs))
@@ -1114,27 +1107,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             num_prefill_tokens=num_prefill_tokens,
             forward_mode=metadata_forward_mode,
         )
-        if is_packed_decode:
+        if metadata_forward_mode is not None and metadata_forward_mode.is_idle():
+            # A pure DECODE init raises at the top, so idle is the only
+            # decode-shaped mode left here.
             self.forward_decode_metadata = self.forward_metadata
-            if getattr(self, "is_draft", False):
-                self._prepare_draft_decode_metadata(
-                    self.forward_metadata,
-                    seq_lens.clone(),
-                )
-        elif (
-            metadata_forward_mode is not None
-            and metadata_forward_mode.is_decode_or_idle()
-        ):
-            self.forward_decode_metadata = self.forward_metadata
-            if (
-                self.forward_prefill_metadata is not None
-                and self.forward_prefill_metadata.req_pool_indices.numel()
-                == seq_lens.numel()
-            ):
-                self._prepare_draft_decode_metadata(
-                    self.forward_prefill_metadata,
-                    seq_lens.clone(),
-                )
         elif forward_mode is not None and forward_mode.is_extend_or_mixed():
             self.forward_prefill_metadata = self.forward_metadata
 
@@ -2587,9 +2563,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             and self.forward_prefill_metadata is not None
             and self.forward_prefill_metadata.req_pool_indices.numel() == bs
         ):
-            # Plain draft decode after an extend round: rebuild the draft's
-            # step-1+ decode metadata from the prefill state, exactly as the
-            # legacy eager decode arm did.
+            # The extend round's plain-row draft refresh (unified draft
+            # contract step two): rebuild the draft's step-1+ decode metadata
+            # from the prefill state the init just published.
             self._prepare_draft_decode_metadata(
                 self.forward_prefill_metadata,
                 seq_lens[:bs].clone(),

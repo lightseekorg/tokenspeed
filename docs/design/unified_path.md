@@ -80,6 +80,37 @@ the draft. A draft whose kv-indices buffer is aliased to the target's
 (`_page_table_aliased`) reads what the target's refresh populated; reordering
 silently reads stale pages.
 
+### One draft metadata contract
+
+The draft backend's decode metadata comes from `refresh_decode_metadata` and
+NOWHERE else — the same two steps in every round:
+
+* **decode round**: target refresh, then draft refresh over the drafter-owned
+  `draft_seq_lens_buf` (freshly seeded from the batch seq_lens);
+* **extend/mixed round**: draft prefill init reading the accepted-prefix
+  seq_lens view (never the mutable draft buffer), then the same draft refresh
+  with plain 1-token rows — deliberately NOT the packed verify width, which
+  would take V4's packed-decode arm and clobber `forward_prefill_metadata`.
+
+Backends' `init_forward_metadata` must NOT double-fill draft decode metadata
+as a side effect (the deleted `is_extend() and self.is_draft` arms); the
+mixed/idle decode arms that remain serve the target's decode rows only.
+Drafters republish their in-loop seq_lens edits explicitly each step via
+`advance_draft_forward_metadata` (Eagle) / `update_draft_forward_metadata`
+(vanilla MTP frontier re-anchor) — metadata never aliases a buffer the
+drafter mutates behind the backend's back.
+
+Both steps run unconditionally — there is no per-drafter opt-out. What makes
+that safe is the slot discipline: init writes prefill-slot metadata, refresh
+writes decode-slot metadata, and forwards read the slot matching their mode
+(`forward_prefill_metadata` / `forward_decode_metadata`; Inkling's conv
+wrapper mirrors this with `conv_prefill_metadata` / `conv_decode_metadata`).
+A round that runs no decode steps (vanilla MTP re-runs prompt rows as EXTEND
+depths) leaves the refreshed decode slot unread; a block drafter (DFLASH)
+re-runs the same refresh inside each block-decode step, overwriting it. A
+backend that lets one call clobber the other slot's metadata is in breach —
+that, not drafter special-casing, is the invariant to fix.
+
 ### PD decode nodes
 
 A PD decode-only node never runs an extend forward, so latches set on the
@@ -136,13 +167,45 @@ pointer the refresh no longer writes), mempool reuse, hostfunc semantics.
 The e2e regression matrix keeps graph-on and graph-off configurations for
 this reason.
 
+## One block-table route, one unit
+
+Every backend consumes the wrapper's per-group `block_tables` kwarg — raw
+scheduler tables in block-granularity page ids — and there is no capability
+flag saying so (`uses_cache_groups` was deleted once it was universally
+True). The invariant replacing it: **any table a backend receives — the
+per-group `block_tables`, the staged draft `page_table`, a warmup
+placeholder — carries raw scheduler pages; kernel-page expansion happens
+inside the backend, through one helper per mixin** (`_expand_history_table`
+on `CacheGroupsMixin` and `MlaCacheGroupMixin`, both learning the
+full-history grain from the pool's specs at `set_cache_pool`).
+`CacheBatchMetadata` no longer carries a `kernel_table` expansion;
+`cache_metadata` still travels to V4 (bespoke multi-group slot mapping) and
+KDA state paging only. `cache_active_pages_must_be_real` remains a separate
+axis — it marks backends that validate live-page geometry and so need real
+capture placeholder tables (V4), not who supplies tables.
+
+`DraftPageStaging` survives but is no longer a mapping owner: its publish is
+a pure copy + padded-row scrub into the one address-stable buffer the
+drafters' in-graph write-location kernels record at capture
+(`CacheView.out_cache_loc_uniform`; per-forward group tables are fresh
+tensors, so an address-stable shadow is physically required). The
+write-location math is page-size invariant — `table[i, pos // P] * P +
+pos % P` addresses the same token at any page size — so `CacheView` resolves
+absolute slots directly over the raw table, exactly like
+`fill_input_buffers`' out_cache_loc path.
+
+Deleted flags, for the record: `needs_group_block_tables`,
+`cache_group_tables_replace_draft_page_table`,
+`reads_staged_draft_page_table`, and finally `uses_cache_groups` itself.
+None carried information not already implied by the pool's published specs.
+
 ## Non-goals
 
 Extend/mixed metadata keeps its dynamic-shape construction path
 (`init_forward_metadata`), with `PrefillGraph` as its own capture story.
-The four block-table mapping owners named in `cache-concepts.md` Principle 5
-remain four; unifying them is a separate milestone this refactor makes
-smaller (the MLA-family refresh bodies are now structurally identical).
+The two group mixins (`CacheGroupsMixin`, `MlaCacheGroupMixin`) remain two;
+merging them with V4's bespoke slot mapping is the final block-table-owner
+milestone (`cache-concepts.md` Principle 5).
 
 ## Regression gates
 

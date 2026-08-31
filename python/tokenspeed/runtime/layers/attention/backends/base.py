@@ -77,24 +77,9 @@ def init_backend_cuda_graph_state(
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
-    # The graph capture/replay helpers must hand this backend per-group
-    # ``block_tables`` as a metadata kwarg; a backend that builds its own
-    # tables from the pool leaves this False.
-    needs_group_block_tables: bool = False
-    # This backend reads per-group cache block tables (absolute index, null
-    # hole = 0). A separate flag from needs_group_block_tables because that
-    # one is about who supplies the tables and this one about the index
-    # semantics the backend reads them with; a group-aware backend sets this
-    # True. Default False keeps every existing backend on today's path.
-    uses_cache_groups: bool = False
-    # True when authoritative per-group tables also replace the shared
-    # full-history draft table for this backend. Keep this separate from
-    # uses_cache_groups: generic speculative backends still consume that table.
-    cache_group_tables_replace_draft_page_table: bool = False
     # Capture helpers use a real writable page for every active group when
     # the backend rejects the reserved null page for live sequence metadata.
     cache_active_pages_must_be_real: bool = False
-    uses_padded_decode_token_mask: bool = False
     supports_mla_projected_value_decode: bool = False
     # Backend-owned cuda-graph cache-seqlens buffer the decode metadata views.
     draft_seq_lens_attr: str = "cuda_graph_seq_lens"
@@ -136,7 +121,7 @@ class AttentionBackend(ABC):
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
         """Per-group write-location hook for out-of-backend KV writers
         (fused RoPE prewrite); identity for backends without cache
-        groups (see uses_cache_groups). ``forward_mode`` picks the
+        groups. ``forward_mode`` picks the
         metadata slot for backends that prewrite on extend as well."""
         return out_cache_loc
 
@@ -182,7 +167,7 @@ class AttentionBackend(ABC):
         """Init the metadata for a forward pass for capturing a cuda graph.
 
         ``cache_group_ids`` names the cache groups whose page tables arrive at
-        replay; a group-aware backend (``uses_cache_groups``)
+        replay; a backend
         allocates its persistent per-group buffers from these ids — no table
         data exists at capture time. Empty for single-table backends.
         """

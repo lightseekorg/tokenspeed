@@ -19,15 +19,12 @@ from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.types import DpForwardMetadata
 
 
-def _staging(rows: int = 8, columns: int = 4, page_ratio: int = 1):
-    page_size = 128 // page_ratio
+def _staging(rows: int = 8, columns: int = 4):
     return DraftPageStaging(
         max_bs=rows,
         max_pages_per_req=columns,
         block_granularity=128,
-        draft_kernel_page_size=page_size,
         full_history_group_id="full_attention",
-        enabled=True,
         device="cpu",
     )
 
@@ -64,12 +61,6 @@ class DraftPageTableScrubTest(unittest.TestCase):
         expected = torch.tensor([3, 4, 0, 0], dtype=torch.int32)
         self.assertTrue(torch.equal(st.table[0], expected))
 
-    def test_expanded_path_also_scrubs(self):
-        st = _staging(page_ratio=2)
-        _publish(st, 2, torch.tensor([[7], [9]], dtype=torch.int32))
-        _publish(st, 1, torch.tensor([[3]], dtype=torch.int32))
-        self.assertTrue(torch.equal(st.table[1:], torch.zeros_like(st.table[1:])))
-
     def test_scrub_only_publish_clears_padded_rows(self):
         # The idle path publishes with no tables: scrub must still run.
         st = _staging()
@@ -79,16 +70,14 @@ class DraftPageTableScrubTest(unittest.TestCase):
         # Rows past padded_bs are untouched (not read by this replay).
         self.assertTrue(bool((st.table[4:6] == 7).all()))
 
-    def test_disabled_staging_still_scrubs(self):
-        # cache_group_tables_replace_draft_page_table backends skip the copy
-        # but the placeholder must stay inert for its other consumers.
+    def test_groupless_contract_still_scrubs(self):
+        # A contract without a full-history group skips the copy, but the
+        # placeholder must stay inert for its other consumers.
         st = DraftPageStaging(
             max_bs=8,
             max_pages_per_req=4,
             block_granularity=128,
-            draft_kernel_page_size=128,
-            full_history_group_id="full_attention",
-            enabled=False,
+            full_history_group_id=None,
             device="cpu",
         )
         st.table[:] = 7

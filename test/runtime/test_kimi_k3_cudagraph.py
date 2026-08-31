@@ -44,7 +44,6 @@ from tokenspeed.runtime.layers.attention.backends.tokenspeed_mla import (
     CuteDSLMLABackend,
     CuteDSLMLADecodeMetadata,
 )
-from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
@@ -81,6 +80,8 @@ def _bare_mla_backend(
     backend._cache_contract_bound = False
     backend.decode_cuda_graph_metadata = {}
     backend.decode_cuda_graph_kv_indices = None
+    backend._full_history_group_id = "full_attention"
+    backend._history_block_granularity = _LOGICAL_P
     backend.decode_cuda_graph_group_out_cache_loc = None
     backend.forward_decode_metadata = None
     if cache_contract:
@@ -143,51 +144,11 @@ def _bare_amd_mla_backend(
     backend.decode_cuda_graph_group_out_cache_loc = None
     backend.forward_decode_metadata = None
     backend._should_use_absorbed_cached_extend = lambda **_: False
+    backend._full_history_group_id = "full_attention"
+    backend._history_block_granularity = _LOGICAL_P
     if cache_contract:
         backend.mark_cache_contract()
     return backend
-
-
-class _StubFullAttnMeta:
-    """Minimal stand-in for CacheBatchMetadata's MLA surface: the logical
-    full-attention table served through ``kernel_table`` (kernel-page
-    expansion, memoized), freshness-checked by op."""
-
-    full_attention_group_id = "full_attention"
-
-    def __init__(
-        self, table: torch.Tensor, prefix_granularity: int, forward_op: object
-    ):
-        self._table = table
-        self.prefix_granularity = prefix_granularity
-        self._forward_op = forward_op
-        self._kernel_tables = {}
-
-    def require_full_attention_table(self, *, active_forward_op):
-        if active_forward_op is not self._forward_op:
-            raise RuntimeError("stale forward op")
-        return self._table
-
-    def kernel_table(
-        self, group_id=None, *, kernel_page_size, max_pages=None, active_forward_op
-    ):
-        if active_forward_op is not self._forward_op:
-            raise RuntimeError("stale forward op")
-        key = (group_id, kernel_page_size, max_pages)
-        cached = self._kernel_tables.get(key)
-        if cached is None:
-            cached = expand_page_table(
-                self._table,
-                block_granularity=self.prefix_granularity,
-                kernel_page_size=kernel_page_size,
-                max_kernel_pages=max_pages,
-            )
-            self._kernel_tables[key] = cached
-        return cached
-
-    def validate_live_pages(self, seq_lens, *, active_forward_op):
-        if active_forward_op is not self._forward_op:
-            raise RuntimeError("stale forward op")
 
 
 def test_replay_refreshes_buffers_in_place_and_pads_page_zero() -> None:
@@ -206,10 +167,8 @@ def test_replay_refreshes_buffers_in_place_and_pads_page_zero() -> None:
 
     # One REAL request (row 0), one padded dummy row (row 1). The op-bound
     # table carries only the real row; padded rows must land on page 0.
-    forward_op = object()
     # Grouped table: real row 0 has two logical pages [3, 5]; page ids > 0.
     table = torch.tensor([[3, 5]], dtype=torch.int32)
-    meta = _StubFullAttnMeta(table, _LOGICAL_P, forward_op)
 
     backend.refresh_decode_metadata(
         2,  # padded bs
@@ -219,8 +178,7 @@ def test_replay_refreshes_buffers_in_place_and_pads_page_zero() -> None:
         forward_mode=ForwardMode.DECODE,
         page_table=None,
         for_graph_replay=True,
-        cache_metadata=meta,
-        forward_batch=forward_op,
+        block_tables={"full_attention": table},
     )
     md2 = backend.forward_decode_metadata
     # SAME buffers refreshed in place (no realloc): pointer-stable replay.
@@ -254,12 +212,7 @@ def test_amd_mla_grouped_graph_replay_is_pointer_stable_and_null_padded() -> Non
     page_ptr = captured.page_table.data_ptr()
     loc_ptr = captured.group_out_cache_loc.data_ptr()
 
-    forward_op = object()
-    metadata = _StubFullAttnMeta(
-        torch.tensor([[3, 5]], dtype=torch.int32),
-        _LOGICAL_P,
-        forward_op,
-    )
+    table = torch.tensor([[3, 5]], dtype=torch.int32)
     backend.refresh_decode_metadata(
         2,
         1,
@@ -268,8 +221,7 @@ def test_amd_mla_grouped_graph_replay_is_pointer_stable_and_null_padded() -> Non
         forward_mode=ForwardMode.DECODE,
         page_table=None,
         for_graph_replay=True,
-        cache_metadata=metadata,
-        forward_batch=forward_op,
+        block_tables={"full_attention": table},
     )
     replayed = backend.forward_decode_metadata
     assert replayed.page_table.data_ptr() == page_ptr
@@ -296,12 +248,7 @@ def test_amd_mla_target_verify_graph_refreshes_all_write_locations() -> None:
     assert captured.group_q_len_per_req == 2
     assert captured.group_out_cache_loc.shape == (4,)
 
-    forward_op = object()
-    metadata = _StubFullAttnMeta(
-        torch.tensor([[3, 5]], dtype=torch.int32),
-        _LOGICAL_P,
-        forward_op,
-    )
+    table = torch.tensor([[3, 5]], dtype=torch.int32)
     backend.refresh_decode_metadata(
         2,
         1,
@@ -310,8 +257,7 @@ def test_amd_mla_target_verify_graph_refreshes_all_write_locations() -> None:
         forward_mode=ForwardMode.DECODE,
         page_table=None,
         for_graph_replay=True,
-        cache_metadata=metadata,
-        forward_batch=forward_op,
+        block_tables={"full_attention": table},
     )
     replayed = backend.forward_decode_metadata
     assert replayed.page_table.data_ptr() == page_ptr
@@ -326,12 +272,7 @@ def test_amd_mla_target_verify_graph_refreshes_all_write_locations() -> None:
 
 def test_amd_mla_eager_decode_uses_group_table_and_refuses_fallback() -> None:
     backend = _bare_amd_mla_backend(cache_contract=True)
-    forward_op = object()
-    metadata = _StubFullAttnMeta(
-        torch.tensor([[3, 5], [4, -1]], dtype=torch.int32),
-        _LOGICAL_P,
-        forward_op,
-    )
+    table = torch.tensor([[3, 5], [4, -1]], dtype=torch.int32)
     seq_lens = torch.tensor([70, 40], dtype=torch.int32)
     poisoned = torch.full((8, 8), -99, dtype=torch.int32)
     backend.init_cuda_graph_state(max_bs=2)
@@ -342,8 +283,7 @@ def test_amd_mla_eager_decode_uses_group_table_and_refuses_fallback() -> None:
         seq_lens,
         forward_mode=ForwardMode.DECODE,
         page_table=poisoned,
-        cache_metadata=metadata,
-        forward_batch=forward_op,
+        block_tables={"full_attention": table},
     )
     decode = backend.forward_decode_metadata
     assert decode.page_table[0].tolist() == [6, 7, 10, 11]
@@ -362,12 +302,7 @@ def test_amd_mla_eager_decode_uses_group_table_and_refuses_fallback() -> None:
 
 def test_amd_mla_eager_target_verify_writes_the_full_window() -> None:
     backend = _bare_amd_mla_backend(cache_contract=True, spec_num_tokens=2)
-    forward_op = object()
-    metadata = _StubFullAttnMeta(
-        torch.tensor([[3, 5], [4, 6]], dtype=torch.int32),
-        _LOGICAL_P,
-        forward_op,
-    )
+    table = torch.tensor([[3, 5], [4, 6]], dtype=torch.int32)
     backend.init_cuda_graph_state(max_bs=2)
     backend.refresh_decode_metadata(
         2,
@@ -376,8 +311,7 @@ def test_amd_mla_eager_target_verify_writes_the_full_window() -> None:
         torch.tensor([70, 130], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
         page_table=torch.zeros((2, 4), dtype=torch.int32),
-        cache_metadata=metadata,
-        forward_batch=forward_op,
+        block_tables={"full_attention": table},
     )
 
     decode = backend.forward_decode_metadata
@@ -411,12 +345,7 @@ def test_amd_mla_eager_prefill_derives_group_write_locations(monkeypatch) -> Non
         ),
     )
     backend = _bare_amd_mla_backend(cache_contract=True)
-    forward_op = object()
-    metadata = _StubFullAttnMeta(
-        torch.tensor([[3, 5]], dtype=torch.int32),
-        _LOGICAL_P,
-        forward_op,
-    )
+    table = torch.tensor([[3, 5]], dtype=torch.int32)
     backend.init_forward_metadata(
         bs=1,
         num_extends=1,
@@ -428,8 +357,7 @@ def test_amd_mla_eager_prefill_derives_group_write_locations(monkeypatch) -> Non
         extend_prefix_lens_cpu=torch.tensor([100], dtype=torch.int32),
         extend_seq_lens=torch.tensor([50], dtype=torch.int32),
         extend_seq_lens_cpu=torch.tensor([50], dtype=torch.int32),
-        cache_metadata=metadata,
-        forward_batch=forward_op,
+        block_tables={"full_attention": table},
     )
     expected = torch.cat(
         (
@@ -517,15 +445,17 @@ def test_block_decode_replay_broadcasts_pages_and_scrubs_padding() -> None:
     )
     backend.init_cuda_graph_state(max_bs)
     backend.decode_cuda_graph_kv_indices.fill_(-9)
+    # Raw scheduler pages (logical P); the backend expands to kernel pages
+    # (ratio 2: page L -> [2L, 2L+1]).
     page_table = torch.tensor([[5, 6], [7, 8]], dtype=torch.int32)
 
     backend._replay_block_decode_page_table(bs, page_table)
 
     rows = backend.decode_cuda_graph_kv_indices[: bs * spec]
-    assert rows[:spec, :2].tolist() == [[5, 6]] * spec
-    assert rows[spec : 2 * spec, :2].tolist() == [[7, 8]] * spec
+    assert rows[:spec, :4].tolist() == [[10, 11, 12, 13]] * spec
+    assert rows[spec : 2 * spec, :4].tolist() == [[14, 15, 16, 17]] * spec
     assert rows[2 * spec :].eq(0).all(), "padded request kept live pages"
-    assert rows[: 2 * spec, 2:].eq(0).all(), "columns past the table were not scrubbed"
+    assert rows[: 2 * spec, 4:].eq(0).all(), "columns past the table were not scrubbed"
 
 
 def test_block_decode_lengths_are_rewritten_per_replay() -> None:

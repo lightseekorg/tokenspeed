@@ -193,7 +193,6 @@ class ModelExecutorConfig:
     overlap_schedule_depth: int = 0
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
-    use_v4_mtp_paged_metadata: bool = False
 
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
@@ -310,7 +309,6 @@ class ModelExecutorConfig:
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
             enable_nan_detection=server_args.enable_nan_detection,
-            use_v4_mtp_paged_metadata=model_config.use_v4_mtp_paged_metadata,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
         )
@@ -365,30 +363,14 @@ class ModelExecutor:
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._draft_final_step_counter = None
 
-        # fill_input_buffers indexes the scheduler table in its own table pages; the drafter indexes draft_page_table in its backend's kernel pages.
-        # The grain comes off the draft view's arena (the plan's P), never from
-        # the view itself -- a recipe may pin a P the config never saw.
+        # Everything indexes tables in raw scheduler pages of block_granularity
+        # tokens; kernel-page expansion happens inside each backend. The grain
+        # comes off the draft view's arena (the plan's P), never from the view
+        # itself -- a recipe may pin a P the config never saw.
         self._block_granularity = int(
             _cache_arena_attr(draft_token_to_kv_pool, "prefix_granularity", 0)
             or config.prefix_granularity
         )
-        draft_kernel_page_size = getattr(draft_attn_backend, "kernel_page_size", None)
-        if draft_attn_backend is not None and draft_kernel_page_size is None:
-            raise RuntimeError("draft attention backend must expose kernel_page_size")
-        # Without a draft backend the staging path degenerates to the
-        # scheduler table grain (identity expansion).
-        self._draft_kernel_page_size = int(
-            draft_kernel_page_size or self._block_granularity
-        )
-        if self._block_granularity % self._draft_kernel_page_size:
-            raise ValueError(
-                f"prefix granularity {self._block_granularity} is not a multiple "
-                f"of the draft kernel page size {self._draft_kernel_page_size}"
-            )
-        # DraftPageStaging.publish expands the target full-history table into the
-        # draft backend's kernel pages once, and every draft backend reads that
-        # staged table as-is (identity). No backend re-expands with a logical
-        # size, so there is no double-expansion to guard against here.
 
         # physical_context_len already covers the spec-verify overshoot of a
         # finished request lingering one overlap step, including the lingering
@@ -396,24 +378,20 @@ class ModelExecutor:
         # A write past this width would go out of bounds and hang the attention
         # kernel; the output processor's physical-extent tripwire raises first.
         max_num_pages_per_req = (
-            config.physical_context_len + self._draft_kernel_page_size - 1
-        ) // self._draft_kernel_page_size
+            config.physical_context_len + self._block_granularity - 1
+        ) // self._block_granularity
 
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
         # Address-stable staging of the full-history table for in-graph draft
         # consumers; also the zero/dummy placeholder for idle/warmup forwards
-        # before the cache contract binds. Single writer; unit is the draft
-        # kernel page; publish scrubs [bs, padded_bs).
+        # before the cache contract binds. Single writer; unit is the raw
+        # scheduler page; publish scrubs [bs, padded_bs).
         self._draft_staging = DraftPageStaging(
             max_bs=max_bs,
             max_pages_per_req=max_num_pages_per_req,
             block_granularity=self._block_granularity,
-            draft_kernel_page_size=self._draft_kernel_page_size,
             full_history_group_id=self._full_history_group_id,
-            enabled=not getattr(
-                attn_backend, "cache_group_tables_replace_draft_page_table", False
-            ),
             device=self.device,
         )
         self.draft_page_table = self._draft_staging.table

@@ -42,7 +42,6 @@ from test.runtime.conftest import MLA_KV_LORA_RANK as _KV_LORA_RANK
 from test.runtime.conftest import MLA_LATENT_DIM as _LATENT_DIM
 from test.runtime.conftest import MLA_QK_ROPE_DIM as _QK_ROPE_DIM
 from test.runtime.conftest import _poison
-from test.runtime.conftest import full_attention_metadata_for as _metadata_for
 from test.runtime.conftest import make_kimi_pool as _make_pool
 from test.runtime.conftest import mla_layer_id as _mla_layer_id
 from test.runtime.conftest import requires_cuda
@@ -81,7 +80,11 @@ def _make_flashmla_backend(pool, speculative_num_draft_tokens: int = 1):
         kv_cache_dim=_LATENT_DIM,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
     )
-    return FlashMLABackend(config)
+    backend = FlashMLABackend(config)
+    # Learn the pool's history-group geometry (the wrapper does this at
+    # startup through the registry).
+    backend.set_cache_pool(pool)
+    return backend
 
 
 def _init_cache_decode(backend, pool, logical_rows, seq_lens_cpu, spec=1):
@@ -91,8 +94,7 @@ def _init_cache_decode(backend, pool, logical_rows, seq_lens_cpu, spec=1):
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
     bs = len(logical_rows)
-    table_np = np.array(logical_rows, dtype=np.int32)
-    metadata, forward_op = _metadata_for(pool, table_np, "cuda")
+    table = torch.tensor(logical_rows, dtype=torch.int32, device="cuda")
     seq_lens = torch.tensor(seq_lens_cpu, device="cuda", dtype=torch.int32)
     # Unified decode path: refresh writes the persistent buffers the wrapper
     # allocates at startup (init_backend_cuda_graph_state is unconditional).
@@ -107,10 +109,9 @@ def _init_cache_decode(backend, pool, logical_rows, seq_lens_cpu, spec=1):
         seq_lens,
         forward_mode=ForwardMode.DECODE,
         page_table=_poison((16, 256)),
-        cache_metadata=metadata,
-        forward_batch=forward_op,
+        block_tables={"full_attention": table},
     )
-    return metadata
+    return table
 
 
 @requires_cuda
@@ -287,16 +288,6 @@ def _make_draft_flashmla_backend(pool):
     backend = FlashMLABackend(config)
     backend.mark_cache_contract()
     return backend
-
-
-@requires_cuda
-def test_flashmla_draft_declares_cache_groups() -> None:
-    """The wrapper's group-table distribution keys on uses_cache_groups: a
-    draft must declare it (it consumes block_tables), the target must not
-    (it reads the richer cache_metadata)."""
-    pool = _make_pool("cuda", usable_pages=6)
-    assert _make_draft_flashmla_backend(pool).uses_cache_groups is True
-    assert _make_flashmla_backend(pool).uses_cache_groups is False
 
 
 @requires_cuda

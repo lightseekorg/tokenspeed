@@ -126,11 +126,11 @@ def test_cache_view_dispatches_by_retention() -> None:
     cache_start = torch.tensor([64], device="cuda", dtype=torch.int32)
     out = torch.zeros(1, dtype=torch.int64, device="cuda")
 
-    sliding_view = CacheView(table, kernel_page_size=_P, retention="sliding_window")
+    sliding_view = CacheView(table, page_size=_P, retention="sliding_window")
     sliding_view.out_cache_loc_uniform(out, cache_start, num_tokens=1)
     assert int(out[0]) == 91 * _P  # ring-wrapped onto column 0
 
-    full_view = CacheView(table, kernel_page_size=_P, retention="full_history")
+    full_view = CacheView(table, page_size=_P, retention="full_history")
     full_view.out_cache_loc_uniform(out, cache_start, num_tokens=1)
     # Full-history clamps the out-of-table page index and routes overflow
     # to slot 0 — a different, non-ring behavior.
@@ -141,7 +141,7 @@ def test_cache_view_rejects_unknown_retention() -> None:
     with pytest.raises(ValueError, match="retention"):
         CacheView(
             torch.zeros(1, 1, dtype=torch.int32),
-            kernel_page_size=16,
+            page_size=16,
             retention="state",
         )
 

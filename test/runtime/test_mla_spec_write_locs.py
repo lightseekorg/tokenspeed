@@ -326,21 +326,6 @@ def test_capture_clamps_seq_lens_to_the_window() -> None:
     assert backend.decode_cuda_graph_metadata[2].seq_lens.tolist() == [8, 200]
 
 
-def test_an_unmarked_draft_is_refused_on_the_group_graph_path() -> None:
-    """A draft on a classic pool has no business reading the group tables."""
-    backend = _backend(spec_num_tokens=8, is_draft=True)
-    backend._cache_contract_bound = False
-    backend.init_cuda_graph_state(max_bs=2)
-    with pytest.raises(NotImplementedError, match="draft worker"):
-        backend.init_forward_metadata_capture_cuda_graph(
-            bs=2,
-            req_pool_indices=torch.tensor([0, 1]),
-            seq_lens=torch.tensor([100, 200], dtype=torch.int32),
-            forward_mode=ForwardMode.DECODE,
-            cache_group_ids=("full_attention",),
-        )
-
-
 def test_contract_bound_draft_captures_staged_page_table_path() -> None:
     """An Eagle MLA draft reads its staged table, not target group tables."""
     backend = _backend(spec_num_tokens=4, is_draft=True)

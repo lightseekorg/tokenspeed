@@ -1110,7 +1110,7 @@ class DFlash(BaseDrafter):
                 out_cache_loc=draft_cache_locs,
                 verify_width=self.spec_num_tokens,
                 draft_query_width=self.draft_query_width,
-                page_size=self.cache_view.kernel_page_size,
+                page_size=self.cache_view.page_size,
                 max_draft_prefix=max_draft_prefix,
             )
             return self._draft_native(current_tokens, prepared=True)
@@ -1157,7 +1157,7 @@ class DFlash(BaseDrafter):
             out_cache_loc=draft_cache_locs,
             verify_width=self.spec_num_tokens,
             draft_query_width=self.draft_query_width,
-            page_size=self.cache_view.kernel_page_size,
+            page_size=self.cache_view.page_size,
             max_draft_prefix=max_draft_prefix,
         )
 

@@ -2144,7 +2144,6 @@ class HybridLinearAttnBackend(AttentionBackend):
     # Both sub-backends consume per-group tables (MHA: KV pages; Mamba:
     # dual-index state pages). Target verify publishes only the accepted
     # position.
-    uses_cache_groups: bool = True
 
     def __init__(
         self,

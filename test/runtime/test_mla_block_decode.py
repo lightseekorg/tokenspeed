@@ -45,6 +45,7 @@ def _backend(
     backend.is_draft = True
     backend.max_num_pages = max_num_pages
     backend.max_context_len = max_context_len
+    backend.kernel_page_size = 64
     backend.device = torch.device("cpu")
     backend.decode_cuda_graph_metadata = {}
     backend._cache_groups_bound = False

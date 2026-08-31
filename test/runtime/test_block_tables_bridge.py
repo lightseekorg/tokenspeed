@@ -141,24 +141,5 @@ class BlockTablesBridgeTest(unittest.TestCase):
             )
 
 
-class CacheGroupGatingTest(unittest.TestCase):
-    """Backends opt into cache-group metadata explicitly."""
-
-    def setUp(self):
-        try:
-            from tokenspeed.runtime.layers.attention.backends.base import (
-                AttentionBackend,
-            )
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + backend base: {exc}")
-        self.AttentionBackend = AttentionBackend
-
-    def test_default_backend_does_not_use_cache_groups(self):
-        self.assertFalse(self.AttentionBackend.uses_cache_groups)
-        self.assertFalse(
-            self.AttentionBackend.cache_group_tables_replace_draft_page_table
-        )
-
-
 if __name__ == "__main__":
     unittest.main()

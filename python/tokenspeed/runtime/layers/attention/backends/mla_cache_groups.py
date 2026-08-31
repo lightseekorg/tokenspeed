@@ -20,15 +20,13 @@
 
 """Shared cache-group (LCM full-history) helpers for MLA backends.
 
-Every MLA backend that consumes the cache-group full-attention table needs the
-same primitives: resolve the scheduler's full-history table in this backend's
-KERNEL pages, and turn per-request sequence lengths into absolute latent write
-locations. The logical->kernel page expansion happens once upstream
-(``CacheBatchMetadata.kernel_table``); backends only ever see physical kernel
-pages of ``self.kernel_page_size`` tokens, so all the location math here uses that
-one page size. This mixin holds that logic so ``MLAAttnBackend``,
-``FlashMLABackend`` and ``TRTLLMMLABackend`` share one implementation rather
-than three copies.
+Every MLA backend consumes the cache-group full-attention table through the
+same block-table route every other backend uses: the wrapper distributes the
+scheduler's per-group ``block_tables`` (block-granularity page ids), and the
+backend expands its history group's table into its own KERNEL pages. All the
+location math here then uses ``self.kernel_page_size``. This mixin holds that
+logic so ``MLAAttnBackend``, ``FlashMLABackend``, ``TRTLLMMLABackend`` and
+``CuteDSLMLABackend`` share one implementation rather than four copies.
 
 Host-class requirements: ``self.kernel_page_size`` (kernel page size in tokens),
 ``self.max_num_pages`` (kernel page-table width), and ``self.device``. The host
@@ -43,65 +41,84 @@ from tokenspeed_kernel.ops.attention.triton.mla_write_locations import (
     mla_write_locations,
 )
 
+from tokenspeed.runtime.layers.attention.page_table import expand_page_table
+
 
 class MlaCacheGroupMixin:
     """Full-history table resolution + latent write-location math for MLA."""
 
     # MLA backends consume only the history (full-attention) cache family.
     cache_consumer_families = frozenset({"history"})
+    # The wrapper hands raw scheduler tables and this mixin expands them
+    # (self-padding: the refresh nulls its own dummy rows, so the wrapper
+    # must not F.pad).
+    tables_self_padding = True
 
-    # A draft MLA backend always reads the batch-ordered draft page table that
-    # DraftPageStaging publishes (single history group, already in kernel
-    # pages), never the wrapper's per-group table dispatch. This flag tells the
-    # CUDA-graph wrapper to skip that dispatch for MLA drafts.
-    reads_staged_draft_page_table = True
+    # Learned from the pool's published specs at set_cache_pool; None until a
+    # pool binds (unit fixtures may run without one).
+    _full_history_group_id: str | None = None
+    _history_block_granularity: int | None = None
+
+    def set_cache_pool(self, cache_pool) -> None:
+        """Bind the pool and learn the full-history group's geometry.
+
+        The same selection rule as ``ModelExecutor``: the first published
+        group with ``family="history"`` and ``retention="full_history"``.
+        """
+        super().set_cache_pool(cache_pool)
+        for spec in getattr(cache_pool.arena, "cache_group_specs", ()):
+            if spec.family == "history" and spec.retention == "full_history":
+                self._full_history_group_id = str(spec.group_id)
+                self._history_block_granularity = int(spec.block_granularity)
+                break
 
     def mark_cache_contract(self) -> None:
         """Flag this backend as an LCM cache-group contract sub-backend.
 
         Called by the registry before graph-state allocation. Eager forwards
-        bind the group tables automatically once cache metadata arrives; this
-        flag lets CUDA-graph capture size its per-group write-location buffer up
-        front.
+        bind the group tables automatically once they arrive; this flag lets
+        CUDA-graph capture size its per-group write-location buffer up front.
         """
         self._cache_contract_bound = True
 
-    def _draft_reads_batch_pages(self, bs: int, forward_mode) -> bool:
-        """True when this draft reads the published draft page table directly.
-
-        A contract-bound MLA draft is always driven this way: the drafter runs
-        without cache_metadata, and ``ModelExecutor`` publishes the target's
-        full-history table into the batch-ordered draft page table (row i ==
-        batch position i), expanding scheduler pages into draft kernel pages
-        exactly once at publish time. The backend then reads those ids as-is.
-        """
-        return (
-            self.is_draft
-            and self._cache_contract_bound
-            and bs > 0
-            and not forward_mode.is_idle()
-        )
-
     def _resolve_full_history_table(
-        self, cache_metadata, forward_batch, bs: int
-    ) -> torch.Tensor:
+        self, block_tables, bs: int, out: torch.Tensor | None = None
+    ) -> torch.Tensor | None:
         """This forward's full-attention table in this backend's kernel pages.
 
-        Host-side structural validation only (no GPU sync): operation
-        freshness, row coverage, and kernel-page divisibility all check inside
-        ``kernel_table``. The returned width is ``self.max_num_pages``.
+        Expands the wrapper-delivered raw group table (block-granularity page
+        ids, batch-ordered rows) into kernel pages of width
+        ``self.max_num_pages``; -1 holes clamp into the null page 0's kernel
+        range. Returns None when no table was delivered (warmup placeholders,
+        idle before binding) — the caller falls back to ``page_table``.
+        ``out`` writes the expansion into a persistent buffer (its rows past
+        the raw table's are the caller's to null).
         """
-        table = cache_metadata.kernel_table(
-            kernel_page_size=self.kernel_page_size,
-            max_pages=self.max_num_pages,
-            active_forward_op=forward_batch,
-        )
-        if table.shape[0] < bs:
+        if not block_tables or self._full_history_group_id is None:
+            return None
+        raw = block_tables.get(self._full_history_group_id)
+        if raw is None:
+            return None
+        if raw.shape[0] < bs:
             raise RuntimeError(
-                f"full-attention table has {table.shape[0]} rows but the "
+                f"full-attention table has {raw.shape[0]} rows but the "
                 f"batch has {bs} requests"
             )
-        return table
+        return self._expand_history_table(raw, out=out)
+
+    def _expand_history_table(
+        self, raw: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Expand a batch-ordered raw table (scheduler pages) into this
+        backend's kernel pages, ``self.max_num_pages`` wide. The staged draft
+        page table and the wrapper's group tables share this one mapping."""
+        return expand_page_table(
+            raw,
+            block_granularity=self._history_block_granularity or self.kernel_page_size,
+            kernel_page_size=self.kernel_page_size,
+            max_kernel_pages=self.max_num_pages,
+            out=out,
+        )
 
     @staticmethod
     def _group_per_token_slot_table(

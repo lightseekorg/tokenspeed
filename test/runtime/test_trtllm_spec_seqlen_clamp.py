@@ -118,16 +118,25 @@ def test_clamp_does_not_mutate_shared_seq_lens():
 def test_plain_decode_seqlen_not_clamped():
     """Plain single-token decode (q_len=1) must NOT be clamped: a seq_len of 1
     is valid there (1 query attends to 1 key)."""
-    be = _make_backend()
+    be = _make_backend(is_draft=True)
+    be.init_cuda_graph_state(8)
     bs = 3
     seq_lens = torch.tensor([1, 5, 9], dtype=torch.int32)
     req_pool_indices = torch.tensor([1, 2, 3], dtype=torch.int32)
-    page_table = _page_table(req_pool_size=8, max_pages=be.max_num_pages)
 
-    be._init_decode_metadata(bs, req_pool_indices, seq_lens, page_table)
+    # page_table=None skips the (GPU-only) page-table gather; this test pins
+    # the seq_lens handling only.
+    be.refresh_decode_metadata(
+        bs,
+        bs,
+        req_pool_indices,
+        seq_lens,
+        forward_mode=ForwardMode.DECODE,
+        page_table=None,
+    )
     cache_seqlens = be.forward_decode_metadata.cache_seqlens_int32
 
-    # Decode path aliases seq_lens verbatim (no clamp): seq_len=1 stays 1.
+    # Draft decode copies seq_lens verbatim (no clamp): seq_len=1 stays 1.
     assert int(cache_seqlens[0]) == 1
     assert torch.equal(cache_seqlens, seq_lens[:bs])
 

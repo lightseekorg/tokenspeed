@@ -12,17 +12,15 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
-from tokenspeed.runtime.execution.draft_page_staging import DraftPageStaging
+from tokenspeed.runtime.execution.draft_page_staging import CacheView, DraftPageStaging
 
 
-def _staging(page_ratio: int, page_size: int, columns: int, rows: int = 8):
+def _staging(page_size: int = 128, columns: int = 4, rows: int = 8):
     return DraftPageStaging(
         max_bs=rows,
         max_pages_per_req=columns,
-        block_granularity=page_size * page_ratio,
-        draft_kernel_page_size=page_size,
+        block_granularity=page_size,
         full_history_group_id="full_attention",
-        enabled=True,
         device="cpu",
     )
 
@@ -32,52 +30,60 @@ def _publish(staging, bs, table):
 
 
 class DraftPageTableUnitsTest(unittest.TestCase):
-    """The staged table holds draft-page ids; publishing expands logical ones.
+    """The staged table holds RAW scheduler page ids; publish is a pure copy.
 
-    The allocator hands out logical pages (Kimi-K3 LCM: 128 tokens) while the
-    draft's MLA decode kernel indexes the pool in its own smaller pages. An
-    unexpanded id makes the kernel read rows the draft's KV writes never
-    touched, which reads back as zeros and collapses EAGLE3 draft logits.
+    Kernel-page expansion happens inside each backend (the same
+    ``_expand_history_table`` a wrapper-delivered group table goes through).
+    The write-location math is page-size invariant — ``table[i, pos // P] * P
+    + pos % P`` addresses the same token for any page size — so the drafter's
+    ``CacheView`` resolves absolute slots directly over the raw table.
     """
 
-    def test_expands_logical_ids_into_draft_pages(self):
-        st = _staging(page_ratio=2, page_size=64, columns=8)
+    def test_publish_copies_raw_ids(self):
+        st = _staging()
         _publish(st, 1, torch.tensor([[3, 5, -1]], dtype=torch.int32))
-        expected = torch.tensor([6, 7, 10, 11, 0, 1, 0, 0], dtype=torch.int32)
+        # -1 holes clamp into the null page 0; the tail zero-fills.
+        expected = torch.tensor([3, 5, 0, 0], dtype=torch.int32)
         self.assertTrue(torch.equal(st.table[0], expected))
 
-    def test_expanded_ids_address_the_same_tokens(self):
-        # Draft page d covers tokens [d*64, d*64+64); logical page L covers
-        # [L*128, L*128+128). The expansion must preserve the token span.
-        st = _staging(page_ratio=2, page_size=64, columns=4)
-        _publish(st, 1, torch.tensor([[3]], dtype=torch.int32))
-        first = int(st.table[0, 0])
-        self.assertEqual(first * 64, 3 * 128)
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
+    def test_view_slots_match_the_logical_span(self):
+        # Absolute slot of position p in logical page L is L*P + p%P; the
+        # view's uniform resolver must produce exactly that.
+        st = DraftPageStaging(
+            max_bs=8,
+            max_pages_per_req=4,
+            block_granularity=128,
+            full_history_group_id="full_attention",
+            device="cuda",
+        )
+        _publish(st, 1, torch.tensor([[3]], dtype=torch.int32, device="cuda"))
+        out = torch.zeros(1, dtype=torch.int64, device="cuda")
+        st.view.out_cache_loc_uniform(
+            out=out,
+            cache_start=torch.tensor([5], dtype=torch.int32, device="cuda"),
+            num_tokens=1,
+        )
+        self.assertEqual(int(out[0]), 3 * 128 + 5)
 
-    def test_identity_when_units_match(self):
-        st = _staging(page_ratio=1, page_size=128, columns=4)
-        _publish(st, 1, torch.tensor([[7, 9, -1]], dtype=torch.int32))
-        expected = torch.tensor([7, 9, 0, 0], dtype=torch.int32)
-        self.assertTrue(torch.equal(st.table[0], expected))
-
-    def test_expansion_truncates_to_table_width(self):
-        st = _staging(page_ratio=2, page_size=64, columns=3)
-        _publish(st, 1, torch.tensor([[3, 5]], dtype=torch.int32))
-        expected = torch.tensor([6, 7, 10], dtype=torch.int32)
+    def test_copy_truncates_to_table_width(self):
+        st = _staging(columns=3)
+        _publish(st, 1, torch.tensor([[3, 5, 7, 9]], dtype=torch.int32))
+        expected = torch.tensor([3, 5, 7], dtype=torch.int32)
         self.assertTrue(torch.equal(st.table[0], expected))
 
     def test_multi_row_batch_ordered(self):
-        st = _staging(page_ratio=2, page_size=64, columns=4)
+        st = _staging()
         _publish(st, 2, torch.tensor([[3, -1], [7, -1]], dtype=torch.int32))
         self.assertTrue(
             torch.equal(
                 st.table[:2],
-                torch.tensor([[6, 7, 0, 1], [14, 15, 0, 1]], dtype=torch.int32),
+                torch.tensor([[3, 0, 0, 0], [7, 0, 0, 0]], dtype=torch.int32),
             )
         )
 
     def test_publish_clears_rows_past_the_live_batch(self):
-        st = _staging(page_ratio=2, page_size=64, columns=4, rows=4)
+        st = _staging(columns=4, rows=4)
         st.table.fill_(99)
 
         _publish(st, 1, torch.tensor([[3, -1]], dtype=torch.int32))
@@ -86,17 +92,14 @@ class DraftPageTableUnitsTest(unittest.TestCase):
             torch.equal(st.table[1:], torch.zeros((3, 4), dtype=torch.int32))
         )
 
-    def test_rejects_misaligned_page_sizes(self):
+    def test_view_reports_raw_page_capacity(self):
+        st = _staging(page_size=128, columns=4)
+        self.assertEqual(st.view.max_tokens, 4 * 128)
+        self.assertEqual(st.view.page_size, 128)
+
+    def test_view_rejects_unknown_retention(self):
         with self.assertRaises(ValueError):
-            DraftPageStaging(
-                max_bs=4,
-                max_pages_per_req=4,
-                block_granularity=100,
-                draft_kernel_page_size=64,
-                full_history_group_id="full_attention",
-                enabled=True,
-                device="cpu",
-            )
+            CacheView(torch.zeros((1, 1), dtype=torch.int32), 128, retention="ring")
 
 
 if __name__ == "__main__":

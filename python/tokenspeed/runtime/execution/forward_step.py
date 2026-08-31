@@ -239,7 +239,6 @@ class ForwardStepRunner:
             config.spec_num_tokens if config.spec_algo is not None else 1
         )
         self.overlap_schedule_depth = config.overlap_schedule_depth
-        self.use_v4_mtp_paged_metadata = config.use_v4_mtp_paged_metadata
         self.dp_size = config.data_parallel_size
         self.world_size = config.world_size
         self.disable = config.enforce_eager
@@ -639,42 +638,28 @@ class ForwardStepRunner:
             )
         return out
 
-    def _any_backend_uses_cache_groups(self) -> bool:
-        return getattr(self.attn_backend, "uses_cache_groups", False) or (
-            self.draft_attn_backend is not None
-            and getattr(self.draft_attn_backend, "uses_cache_groups", False)
-        )
-
     def _cache_group_ids(self, pool) -> tuple[str, ...]:
         """Group ids for per-group CUDA-graph capture: real tables only
         arrive at replay, so capture needs just the ids to allocate its
         persistent per-group buffers."""
-        if not getattr(self.attn_backend, "uses_cache_groups", False):
-            return ()
         return tuple(str(spec.group_id) for spec in pool.arena.cache_group_specs)
 
     def _draft_cache_group_ids(self) -> tuple[str, ...]:
         """Per-group page tables consumed by the drafter.
 
         DFLASH block decode owns an independent draft page table and must stay
-        on that single-table path. MLA drafts likewise read only the staged
-        batch-ordered draft page table (single history group), so they opt out
-        via ``reads_staged_draft_page_table``. Other draft heads share the
-        target's page-id space (EAGLE writes its own pool tensors at the same
-        indices), so each draft group consumes the target tables for the cache
-        families declared by its backend.
+        on that single-table path. Other draft heads share the target's
+        page-id space (EAGLE writes its own pool tensors at the same indices),
+        so each draft group consumes the target tables for the cache families
+        declared by its backend.
 
         A draft pool that publishes its own specs (Inkling MTP: mixed full/SWA
         depths) names exactly the groups its layers carry. Older draft paths
         without a separate pool select the same families from the target pool.
         """
-        if self.draft_attn_backend is None or not getattr(
-            self.draft_attn_backend, "uses_cache_groups", False
-        ):
+        if self.draft_attn_backend is None:
             return ()
         if getattr(self.draft_attn_backend, "draft_block_decode", False):
-            return ()
-        if getattr(self.draft_attn_backend, "reads_staged_draft_page_table", False):
             return ()
         families = frozenset(
             getattr(
@@ -705,7 +690,10 @@ class ForwardStepRunner:
 
     def _init_capture_metadata(self, bs: int):
         capture_kwargs = {}
-        if self.attn_backend.needs_group_block_tables:
+        if getattr(self.attn_backend, "cache_active_pages_must_be_real", False):
+            # Capture-time placeholder tables, only for backends that
+            # validate live-page geometry at capture (V4); the others bind
+            # persistent buffers from cache_group_ids alone.
             group_block_tables = self._capture_group_block_tables(
                 bs,
                 self.token_to_kv_pool,
@@ -726,9 +714,8 @@ class ForwardStepRunner:
         )
         if self.draft_attn_backend is not None:
             draft_kwargs = {}
-            if (
-                self.draft_token_to_kv_pool is not None
-                and self.draft_attn_backend.needs_group_block_tables
+            if self.draft_token_to_kv_pool is not None and getattr(
+                self.draft_attn_backend, "cache_active_pages_must_be_real", False
             ):
                 draft_group_block_tables = self._capture_group_block_tables(
                     bs,
@@ -858,37 +845,19 @@ class ForwardStepRunner:
         # valid ones so the backends' stale-table guards hold. Eager idle
         # bypasses the wrapper entirely (see execute_idle_forward).
         if actual_bs == 0 and use_graph:
-            if (
-                group_placeholder_tables is None
-                and self.attn_backend.needs_group_block_tables
+            if group_placeholder_tables is None and getattr(
+                self.attn_backend, "cache_active_pages_must_be_real", False
             ):
+                # A backend that validates live-page geometry (V4) needs
+                # full-width capture placeholders on idle rather than the
+                # 1-column zero tables below.
                 group_placeholder_tables = self._capture_group_block_tables(
                     padded_bs,
                     self.token_to_kv_pool,
                 )
-            if not block_tables and self._any_backend_uses_cache_groups():
+            if not block_tables:
                 block_tables = self._idle_block_tables(padded_bs)
-        target_needs_group_tables = getattr(
-            self.attn_backend,
-            "needs_group_block_tables",
-            False,
-        )
-        draft_needs_group_tables = self.draft_attn_backend is not None and getattr(
-            self.draft_attn_backend, "needs_group_block_tables", False
-        )
-        target_uses_cache_groups = getattr(
-            self.attn_backend,
-            "uses_cache_groups",
-            False,
-        )
-        draft_uses_cache_groups = self.draft_attn_backend is not None and getattr(
-            self.draft_attn_backend,
-            "uses_cache_groups",
-            False,
-        )
-        if group_placeholder_tables is not None and (
-            target_needs_group_tables or draft_needs_group_tables
-        ):
+        if group_placeholder_tables is not None:
             table_bs = next(
                 (
                     int(table.shape[0])
@@ -908,18 +877,14 @@ class ForwardStepRunner:
                     actual_bs=actual_bs,
                     padded_bs=padded_bs,
                 )
-            if target_needs_group_tables:
-                kwargs["block_tables"] = group_placeholder_tables
-                if block_table_base_offsets is not None:
-                    kwargs["block_table_base_offsets"] = block_table_base_offsets
+            kwargs["block_tables"] = group_placeholder_tables
+            if block_table_base_offsets is not None:
+                kwargs["block_table_base_offsets"] = block_table_base_offsets
         padded_block_tables = None
         if block_tables is not None and (
-            (
-                target_uses_cache_groups
-                and not getattr(self.attn_backend, "tables_self_padding", False)
-            )
+            not getattr(self.attn_backend, "tables_self_padding", False)
             or (
-                draft_uses_cache_groups
+                self.draft_attn_backend is not None
                 and not getattr(
                     self.draft_attn_backend,
                     "tables_self_padding",
@@ -936,24 +901,20 @@ class ForwardStepRunner:
                 padded_bs=padded_bs,
                 pad_value=0,
             )
-        if block_tables is not None and target_uses_cache_groups:
+        if block_tables is not None:
             if getattr(self.attn_backend, "tables_self_padding", False):
                 # Backend pads dummy rows itself; F.pad would reallocate tables and break storage sharing.
                 kwargs["block_tables"] = block_tables
             else:
                 kwargs["block_tables"] = padded_block_tables
-        if (
-            not use_graph
-            and target_needs_group_tables
-            and block_table_base_offsets is not None
-        ):
+        if not use_graph and block_table_base_offsets is not None:
             # Live replay reads offsets through cache_metadata; only the eager
             # path and the padded placeholder branch above feed them directly.
             kwargs["block_table_base_offsets"] = block_table_base_offsets
-        if target_needs_group_tables:
-            # Pure decode: ctx.input_num_tokens == bs * max_tokens_per_req, so
-            # this is the same value both paths passed before unification.
-            kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
+        # Pure decode: ctx.input_num_tokens == bs * max_tokens_per_req, so
+        # this is the same value both paths passed before unification
+        # (backends that key off their own buffers ignore it).
+        kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
         self.attn_backend.refresh_decode_metadata(
             padded_bs,
             actual_bs,
@@ -965,36 +926,26 @@ class ForwardStepRunner:
             **kwargs,
         )
         if self.draft_attn_backend is not None:
-            # The drafter mutates draft_seq_lens_buf between MTP draft steps;
-            # decode metadata must alias that buffer. Copy before any early
-            # return: DFLASH reads these lengths even when it owns its own
-            # per-step metadata init.
+            # Seed the drafter-owned buffer for the round: models and the
+            # DFLASH drafter read it directly, and the refresh below snapshots
+            # it into the backend's own seq_lens buffer. Drafters republish
+            # their in-loop edits each step through the same refresh (block
+            # drafters) or advance_draft_forward_metadata.
             draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
             draft_seq_lens.copy_(seq_lens[:padded_bs])
-            if not use_graph:
-                from tokenspeed.runtime.execution.drafter.dflash import DFlash
-
-                # Eager DFLASH inits its own draft metadata inside each
-                # block-decode step (the drafter python runs); under replay no
-                # drafter python runs, so the refresh below covers it.
-                if isinstance(self.drafter, DFlash):
-                    return
             draft_attn_kwargs = {}
-            if draft_needs_group_tables:
-                if group_placeholder_tables is not None:
-                    # Idle replay: the padded placeholder pair travels together.
-                    draft_attn_kwargs["block_tables"] = group_placeholder_tables
-                    if block_table_base_offsets is not None:
-                        draft_attn_kwargs["block_table_base_offsets"] = (
-                            block_table_base_offsets
-                        )
-                elif not use_graph and block_table_base_offsets is not None:
-                    # Live replay reads offsets through cache_metadata; only
-                    # eager feeds them directly.
+            if group_placeholder_tables is not None:
+                # Idle replay: the padded placeholder pair travels together.
+                draft_attn_kwargs["block_tables"] = group_placeholder_tables
+                if block_table_base_offsets is not None:
                     draft_attn_kwargs["block_table_base_offsets"] = (
                         block_table_base_offsets
                     )
-                draft_attn_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
+            elif not use_graph and block_table_base_offsets is not None:
+                # Live replay reads offsets through cache_metadata; only
+                # eager feeds them directly.
+                draft_attn_kwargs["block_table_base_offsets"] = block_table_base_offsets
+            draft_attn_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
             draft_table_source = (
                 block_tables
                 if getattr(
@@ -1007,17 +958,11 @@ class ForwardStepRunner:
             draft_group_tables = self._draft_group_tables(draft_table_source)
             if draft_group_tables is not None:
                 draft_attn_kwargs["block_tables"] = draft_group_tables
-            # V4's eager paged path reads the accepted-prefix view for its
-            # decode metadata rather than the drafter-owned mutable buffer.
-            if not use_graph and self.use_v4_mtp_paged_metadata:
-                draft_metadata_seq_lens = seq_lens
-            else:
-                draft_metadata_seq_lens = draft_seq_lens
             self.draft_attn_backend.refresh_decode_metadata(
                 padded_bs,
                 actual_bs,
                 req_pool_indices,
-                draft_metadata_seq_lens,
+                draft_seq_lens,
                 forward_mode=ForwardMode.DECODE,
                 page_table=self.drafter.cache_view.table,
                 for_graph_replay=use_graph,
@@ -1050,69 +995,62 @@ class ForwardStepRunner:
             **kwargs,
         )
         if self.draft_attn_backend is not None:
-            draft_kwargs = {}
-            if getattr(self.draft_attn_backend, "needs_group_block_tables", False):
-                value = kwargs.get("block_table_base_offsets")
-                if value is not None:
-                    draft_kwargs["block_table_base_offsets"] = value
-            draft_group_tables = self._draft_group_tables(kwargs.get("block_tables"))
-            if draft_group_tables is not None:
-                draft_kwargs["block_tables"] = draft_group_tables
-
-            # The drafter mutates draft_seq_lens_buf between MTP draft steps;
-            # decode metadata must alias that buffer.
+            # One draft metadata contract for every backend family, the same
+            # two steps as the pure-decode path: the prefill init reads the
+            # accepted-prefix seq_lens view, then the unified refresh prepares
+            # the draft's step-1+ decode metadata. Drafters republish their
+            # in-loop seq_lens edits through advance_draft_forward_metadata /
+            # update_draft_forward_metadata. The copy below seeds the
+            # drafter-owned buffer for the round (models and the DFLASH
+            # drafter read ctx.draft_seq_lens_buf directly).
             draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
             draft_seq_lens.copy_(seq_lens[:padded_bs])
-            # Non-V4 draft backends follow the legacy contract: a single
-            # EXTEND/MIXED metadata init fills both first-step prefill
-            # metadata and step 1+ decode metadata, with seq_lens aliased
-            # to the drafter-owned mutable buffer. V4 additionally needs
-            # the accepted-prefix view for first-step grouped-cache
-            # metadata, then a separate decode init to prepare the draft
-            # decode metadata from that first-step state.
-            draft_prefill_seq_lens = (
-                seq_lens if self.use_v4_mtp_paged_metadata else draft_seq_lens
-            )
+            draft_extend_kwargs = dict(kwargs)
             # Drafter consumes its own groups' tables (see _draft_group_tables).
-            draft_extend_kwargs = (
-                {**kwargs, "block_tables": draft_group_tables}
-                if kwargs.get("block_tables") is not None
-                else kwargs
-            )
-            if self.use_v4_mtp_paged_metadata:
-                # cache_metadata describes the target pool and exposes all
-                # target cache groups. The V4 drafter has a narrower cache
-                # contract, so it must consume only the identity-selected
-                # subset above instead of rebuilding tables from the target
-                # metadata.
-                draft_extend_kwargs = dict(draft_extend_kwargs)
-                draft_extend_kwargs.pop("cache_metadata", None)
-                draft_extend_kwargs.pop("forward_batch", None)
+            draft_group_tables = self._draft_group_tables(kwargs.get("block_tables"))
+            if draft_extend_kwargs.get("block_tables") is not None:
+                draft_extend_kwargs["block_tables"] = draft_group_tables
+            # cache_metadata describes the target pool and exposes all target
+            # cache groups. A draft consumes the wrapper-selected group subset
+            # above plus its staged batch-ordered page table (the same page
+            # ids a contract draft would resolve from the metadata), never
+            # the target metadata itself — exactly like the decode path.
+            draft_extend_kwargs.pop("cache_metadata", None)
+            draft_extend_kwargs.pop("forward_batch", None)
             self.draft_attn_backend.init_forward_metadata(
                 bs=padded_bs,
                 num_extends=num_extends,
                 req_pool_indices=req_pool_indices,
-                seq_lens=draft_prefill_seq_lens,
+                seq_lens=seq_lens,
                 page_table=self.drafter.cache_view.table,
                 forward_mode=forward_mode,
                 **draft_extend_kwargs,
             )
-            if self.use_v4_mtp_paged_metadata:
-                # The draft's step-1+ decode metadata for this extend round:
-                # the same unified refresh the pure-decode path uses. Plain
-                # 1-token rows — deliberately NOT the packed verify width:
-                # V4's packed-decode arm would clobber forward_prefill_metadata
-                # with a DECODE-mode object and break the draft's first-step
-                # prefill.
-                self.draft_attn_backend.refresh_decode_metadata(
-                    padded_bs,
-                    padded_bs,
-                    req_pool_indices,
-                    draft_seq_lens,
-                    forward_mode=ForwardMode.DECODE,
-                    page_table=self.drafter.cache_view.table,
-                    **draft_kwargs,
-                )
+            # Step two: the draft's step-1+ decode metadata for this round,
+            # via the same refresh the pure-decode path uses. Plain 1-token
+            # rows — deliberately NOT the packed verify width: V4's
+            # packed-decode arm would clobber forward_prefill_metadata with a
+            # DECODE-mode object and break the draft's first-step prefill.
+            # Refresh writes decode-slot metadata only, so rounds that run no
+            # decode steps (vanilla MTP extend depths, DFLASH block decode)
+            # simply leave it unread or overwrite it per step.
+            draft_refresh_kwargs = {}
+            if draft_group_tables is not None:
+                draft_refresh_kwargs["block_tables"] = draft_group_tables
+            if kwargs.get("block_table_base_offsets") is not None:
+                draft_refresh_kwargs["block_table_base_offsets"] = kwargs[
+                    "block_table_base_offsets"
+                ]
+            self.draft_attn_backend.refresh_decode_metadata(
+                padded_bs,
+                padded_bs,
+                req_pool_indices,
+                draft_seq_lens,
+                forward_mode=ForwardMode.DECODE,
+                num_extends=num_extends,
+                page_table=self.drafter.cache_view.table,
+                **draft_refresh_kwargs,
+            )
 
     def _global_graph_bs(self, ctx: ForwardContext) -> int | None:
         if self.dp_size <= 1 or ctx.global_num_tokens is None:
@@ -1234,8 +1172,9 @@ class ForwardStepRunner:
         if use_graph:
             self._set_graph_state_write_indices(active_req_pool_indices, padded_bs)
 
-        # MLA/KDA backends build their eager metadata from the cache contract
-        # and refresh their captured decode buffers from it during replay.
+        # V4 (bespoke multi-group slot mapping) and KDA state paging still
+        # build metadata from the cache contract object; the MLA family now
+        # consumes only the per-group block_tables like every other backend.
         # Thread it only when present so non-contract paths remain unchanged.
         cache_kwargs = (
             {
@@ -1248,15 +1187,13 @@ class ForwardStepRunner:
 
         # Eager stale-table guard, all modes: with >1 published group the
         # single-table fallback would serve first-group pages to every layer.
-        # Replay relies on the backends' own _replay_stale_guard instead (a
-        # live replay may resolve its tables through cache_metadata with no
-        # block_tables argument). Idle/bs==0 forwards carry no requests.
+        # Replay relies on the backends' own _replay_stale_guard instead.
+        # Idle/bs==0 forwards carry no requests.
         if (
             not use_graph
             and bs > 0
             and not ctx.forward_mode.is_idle()
             and not block_tables
-            and getattr(self.attn_backend, "uses_cache_groups", False)
             and len(self.token_to_kv_pool.arena.cache_group_specs) > 1
         ):
             raise RuntimeError(
@@ -1280,11 +1217,7 @@ class ForwardStepRunner:
                 forward_mode=ctx.forward_mode,
                 use_graph=use_graph,
                 block_table_base_offsets=block_table_base_offsets,
-                block_tables=(
-                    block_tables
-                    if use_graph or self._any_backend_uses_cache_groups()
-                    else None
-                ),
+                block_tables=block_tables,
                 **cache_kwargs,
             )
         else:
@@ -1307,19 +1240,9 @@ class ForwardStepRunner:
                 global_num_tokens=ctx.global_num_tokens,
                 all_decode_or_idle=ctx.all_decode_or_idle,
                 capture_hidden_mode=ctx.capture_hidden_mode,
-                **(
-                    {"num_tokens": ctx.input_num_tokens}
-                    if self.attn_backend.needs_group_block_tables
-                    else {}
-                ),
-                block_tables=(
-                    block_tables if self._any_backend_uses_cache_groups() else None
-                ),
-                block_table_base_offsets=(
-                    block_table_base_offsets
-                    if self.attn_backend.needs_group_block_tables
-                    else None
-                ),
+                num_tokens=ctx.input_num_tokens,
+                block_tables=block_tables,
+                block_table_base_offsets=block_table_base_offsets,
                 **cache_kwargs,
             )
 

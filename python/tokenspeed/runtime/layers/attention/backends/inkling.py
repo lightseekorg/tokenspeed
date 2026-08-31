@@ -166,9 +166,6 @@ class InklingAttnBackend(AttentionBackend):
     are unaware anything beyond dense attention exists.
     """
 
-    # Ask the graph wrapper for actual_bs at replay so padded rows can be marked PAD_SLOT_ID.
-    uses_padded_decode_token_mask = True
-
     def __init__(
         self,
         inner: AttentionBackend,
@@ -188,7 +185,14 @@ class InklingAttnBackend(AttentionBackend):
         # The conv groups are wrapper-owned: the inner mixin must skip their
         # write-loc math and capture buffers (see cache_groups.py).
         inner.engine_owned_group_ids = frozenset(conv_columns["group_block_tokens"])
-        self.conv_metadata: InklingConvMetadata | None = None
+        # Two slots, like forward_prefill_metadata / forward_decode_metadata
+        # on the inner backend: extend init writes the prefill slot, decode
+        # capture/refresh write the decode slot, readers route by the live
+        # forward mode. A single shared slot would let the wrapper's
+        # unconditional draft decode refresh clobber the extend metadata the
+        # same round's prefill forwards still read.
+        self.conv_prefill_metadata: InklingConvMetadata | None = None
+        self.conv_decode_metadata: InklingConvMetadata | None = None
         # Spec decoding: >1 means decode rounds carry this many tokens/request (verify / catch-up).
         self.conv_spec_num_tokens = max(1, int(spec_num_tokens))
         self.conv_is_draft = is_draft
@@ -223,15 +227,6 @@ class InklingAttnBackend(AttentionBackend):
         if name == "inner":
             raise AttributeError(name)
         return getattr(self.inner, name)
-
-    # Class-level flags on AttentionBackend would shadow __getattr__; mirror inner's explicitly.
-    @property
-    def needs_group_block_tables(self):
-        return self.inner.needs_group_block_tables
-
-    @property
-    def uses_cache_groups(self):
-        return self.inner.uses_cache_groups
 
     @property
     def cache_consumer_families(self):
@@ -483,7 +478,7 @@ class InklingAttnBackend(AttentionBackend):
             cache_indices = self._pfg_cache_indices
             has_initial_state = self._pfg_has_initial_state
         remote_restore_mask = None
-        self.conv_metadata = InklingConvMetadata(
+        self.conv_prefill_metadata = InklingConvMetadata(
             query_start_loc=query_start_loc,
             cache_indices=cache_indices,
             has_initial_state=has_initial_state,
@@ -545,7 +540,9 @@ class InklingAttnBackend(AttentionBackend):
         # Paged bridges ride through: the in-kernel publish resolves pages
         # by position, so boundaries rewritten by the re-anchored rows are
         # re-published with committed content.
-        self.conv_metadata = replace(self.conv_metadata, seq_lens=frontier)
+        self.conv_decode_metadata = replace(
+            self.conv_decode_metadata, seq_lens=frontier
+        )
 
     def register_shortconv_checkpoint_stream(
         self,
@@ -945,11 +942,11 @@ class InklingAttnBackend(AttentionBackend):
         self._graph_seq_lens[:bs].copy_(seq_lens[:bs])
         if self.conv_spec_num_tokens > 1:
             # k-token spec chunk (target verify / draft window).
-            self.conv_metadata = self._spec_conv_metadata(bs)
+            self.conv_decode_metadata = self._spec_conv_metadata(bs)
             return
         if self.conv_columns.get("pd_endpoint_snapshots", False):
             self._graph_remote_restore_mask[:bs].zero_()
-        self.conv_metadata = self._graph_decode_conv_metadata(bs)
+        self.conv_decode_metadata = self._graph_decode_conv_metadata(bs)
 
     def refresh_decode_metadata(
         self,
@@ -1005,11 +1002,11 @@ class InklingAttnBackend(AttentionBackend):
                 buf[actual_bs:bs].fill_(-1)
         if self.conv_spec_num_tokens > 1:
             # Rebuild so the eager post-verify hook (outside the graph) sees this round's bs and mode.
-            self.conv_metadata = self._spec_conv_metadata(bs)
+            self.conv_decode_metadata = self._spec_conv_metadata(bs)
             return
         if self.conv_columns.get("pd_endpoint_snapshots", False):
             self._consume_remote_restore_mask(
                 self._graph_cache_indices[:bs],
                 out=self._graph_remote_restore_mask[:bs],
             )
-        self.conv_metadata = self._graph_decode_conv_metadata(bs)
+        self.conv_decode_metadata = self._graph_decode_conv_metadata(bs)

@@ -110,7 +110,6 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
 
     # Per-group tables route reads and writes by layer.group_id, so fields
     # sharing a physical plan location (for example GPT-OSS SWA/full) are safe.
-    uses_cache_groups: bool = True
     # Graph-buffer column tails pad with the zero-init dummy page, matching
     # the single-table replay contract (gather_page_table_with_padding dummy_slot=0).
     table_tail_pad: int = 0
@@ -463,48 +462,6 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             group_page_tables=group_page_tables,
             group_out_cache_locs=group_out_cache_locs,
         )
-        # Drafter: also fill decode_metadata so step 1+ multi-step has
-        # metadata under EXTEND/MIXED target. seq_lens is the drafter's
-        # live alias buffer (wrapper pre-writes before this call).
-        if self.is_draft:
-            self._init_decode_metadata(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                page_table,
-                group_page_tables=group_page_tables,
-                group_out_cache_locs=group_out_cache_locs,
-            )
-
-    def _init_decode_metadata(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        page_table: torch.Tensor,
-        group_page_tables: dict[str, torch.Tensor] | None = None,
-        group_out_cache_locs: dict[str, torch.Tensor] | None = None,
-    ):
-        assert (
-            seq_lens.dtype == torch.int32
-        ), f"seq_lens must be int32, got {seq_lens.dtype}"
-        device = seq_lens.device
-        # Alias seq_lens (no copy, no mutation). cu_seqlens_k omitted:
-        # the decode kernel doesn't read it. On the cache path the per-group
-        # tables route every read; a shared single page_table would be dead work.
-        self.forward_decode_metadata = TRTLLMMHAMetadata(
-            cache_seqlens_int32=seq_lens[:bs],
-            max_seq_len_q=1,
-            max_seq_len_k=self.max_context_len,
-            cu_seqlens_q=torch.arange(0, bs + 1, dtype=torch.int32, device=device),
-            page_table=(
-                None
-                if group_page_tables
-                else self._build_page_table(bs, page_table, self.page_table_buf)
-            ),
-            page_tables=group_page_tables,
-            out_cache_locs=group_out_cache_locs,
-        )
 
     def _replicate_block_page_table(
         self,
@@ -605,7 +562,8 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
         )
-        # Cache path: per-group tables route every read (see _init_decode_metadata).
+        # Cache path: per-group tables route every read; a shared single
+        # page_table would be dead work.
         page_table = (
             None
             if group_page_tables
@@ -860,11 +818,15 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         self._decode_views(bs)
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: replicate the page table to each request's
-            # block rows. Under replay the seq_lens are re-derived in-graph;
+            # block rows (raw scheduler pages — expand into kernel pages
+            # first). Under replay the seq_lens are re-derived in-graph;
             # eager has no in-graph writer, so fill them here.
             if page_table is not None:
                 self._replicate_block_page_table(
-                    self.cuda_graph_page_table, req_pool_indices, bs, page_table
+                    self.cuda_graph_page_table,
+                    req_pool_indices,
+                    bs,
+                    self._expand_history_table(page_table[:bs]),
                 )
             if not for_graph_replay:
                 self.fill_block_decode_seq_lens(bs, seq_lens)
@@ -885,7 +847,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         # a cache-group scheduler).
         if not self.cuda_graph_page_tables and page_table is not None:
             gather_page_table_with_padding(
-                page_table=page_table,
+                page_table,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out=self.cuda_graph_page_table,

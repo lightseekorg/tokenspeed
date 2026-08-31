@@ -574,14 +574,16 @@ view, mirrored by the host tier. Specifically:
   family-gated (`CacheGroupSpec.__post_init__`).
 
 Remaining known item (deliberate, separate project): the mapping *primitive*
-is single but the *owners* are four — MLA `CacheBatchMetadata.kernel_table`,
-the MHA `CacheGroupsMixin` (one unified decode refresh plus the extend path;
-see `unified_path.md`), `DraftPageStaging.publish`, and DeepSeek-V4's bespoke
-slot mapping — each with its own caching and validation, and the
-write-location math triplicated alongside. Consolidating them means touching
-every backend family at once; do it as its own milestone. The decode-path
-unification (`unified_path.md`) shrank the surface: each owner now has ONE
-decode-side implementation instead of an eager arm plus a replay arm.
+is single and the *owners* are down to three — the MHA `CacheGroupsMixin`
+and the MLA `MlaCacheGroupMixin` (both consuming the wrapper's per-group
+`block_tables` in raw scheduler pages and expanding in place through one
+`_expand_history_table` helper each; `CacheBatchMetadata.kernel_table` was
+deleted when the MLA family moved onto that route, see `unified_path.md`),
+and DeepSeek-V4's bespoke slot mapping. `DraftPageStaging` is no longer an
+owner: its publish is a pure copy + scrub in raw pages (the address-stable
+shadow the drafters' in-graph write-location kernels need), with no page
+mapping of its own. Consolidating the two mixins and V4 means touching every
+backend family at once; do it as its own milestone.
 
 ### Principle 6 — provenance discipline: fixed
 

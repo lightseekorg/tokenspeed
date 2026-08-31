@@ -123,7 +123,6 @@ class DummyGroupTablesTest(unittest.TestCase):
 
     def test_backend_gets_writable_state_tables(self):
         backend = SimpleNamespace(
-            uses_cache_groups=True,
             kernel_page_size=32,
             max_num_pages=0,  # fall back to bucket-derived width
             state_group_ids=frozenset({"linear_attention"}),
@@ -153,7 +152,6 @@ class DummyGroupTablesTest(unittest.TestCase):
         # trtllm-style: row stride comes from max_kv_len, so dummy tables
         # must span the full table width, not just the bucket.
         backend = SimpleNamespace(
-            uses_cache_groups=True,
             kernel_page_size=32,
             max_num_pages=2500,
             state_group_ids=frozenset(),
@@ -164,7 +162,6 @@ class DummyGroupTablesTest(unittest.TestCase):
 
     def test_real_active_page_contract_uses_per_group_geometry(self):
         backend = SimpleNamespace(
-            uses_cache_groups=True,
             cache_active_pages_must_be_real=True,
             prefix_granularity=256,
             max_num_pages=257,
@@ -191,7 +188,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         child = SimpleNamespace(
             kernel_page_size=32, max_num_pages=0, state_group_ids=frozenset()
         )
-        wrapper = SimpleNamespace(uses_cache_groups=True, full_attn_backend=child)
+        wrapper = SimpleNamespace(full_attn_backend=child)
         pool = _fake_pool(
             specs=(
                 _spec("full_attention"),
@@ -202,8 +199,8 @@ class DummyGroupTablesTest(unittest.TestCase):
         self.assertEqual(set(tables), {"full_attention", "linear_attention"})
         self.assertEqual(tables["full_attention"].shape, (1, 2))
 
-    def test_backend_without_cache_groups_is_empty(self):
-        backend = SimpleNamespace(uses_cache_groups=False)
+    def test_pool_without_groups_is_empty(self):
+        backend = SimpleNamespace(kernel_page_size=64)
         pool = _fake_pool(specs=())
         self.assertEqual(self._bare(backend, pool)._dummy_group_tables(64, 1), {})
 

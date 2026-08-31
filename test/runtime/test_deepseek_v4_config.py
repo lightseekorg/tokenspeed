@@ -863,9 +863,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         captured = {}
 
         class FakeBackend:
-            needs_group_block_tables = True
-            uses_padded_decode_token_mask = True
-            uses_cache_groups = False
 
             def refresh_decode_metadata(self, *args, **kwargs):
                 captured["args"] = args
@@ -875,6 +872,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.attn_backend = FakeBackend()
         wrapper.draft_attn_backend = None
         wrapper.max_tokens_per_req = 1
+        wrapper.token_to_kv_pool = _fake_pool()
 
         wrapper._prepare_decode_metadata(
             4,
@@ -901,8 +899,6 @@ class TestDeepseekV4Config(unittest.TestCase):
         captured = {"target": {}, "draft": {}}
 
         class FakeBackend:
-            needs_group_block_tables = True
-            uses_padded_decode_token_mask = False
 
             def __init__(self, key):
                 self.key = key
@@ -919,7 +915,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             draft_seq_lens_buf=torch.zeros(4, dtype=torch.int32),
         )
         wrapper.max_tokens_per_req = 4
-        wrapper.use_v4_mtp_paged_metadata = True
+        wrapper.token_to_kv_pool = _fake_pool()
+        wrapper.draft_token_to_kv_pool = _fake_pool()
 
         table = torch.tensor([[7], [8]], dtype=torch.int32)
         offsets = {"v4.swa": torch.tensor([1, 2], dtype=torch.int64)}
@@ -981,17 +978,19 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
 
-    def test_cuda_graph_eager_draft_prefill_uses_single_non_v4_metadata_init(self):
+    def test_cuda_graph_eager_draft_extend_round_runs_init_then_refresh(self):
         captured = {"target": [], "draft": []}
 
         class FakeBackend:
-            needs_group_block_tables = False
 
             def __init__(self, key):
                 self.key = key
 
             def init_forward_metadata(self, *args, **kwargs):
-                captured[self.key].append((args, kwargs))
+                captured[self.key].append(("init", args, kwargs))
+
+            def refresh_decode_metadata(self, *args, **kwargs):
+                captured[self.key].append(("refresh", args, kwargs))
 
         wrapper = object.__new__(ForwardStepRunner)
         wrapper.attn_backend = FakeBackend("target")
@@ -1001,7 +1000,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             cache_view=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
             draft_seq_lens_buf=torch.tensor([0, 0], dtype=torch.int32),
         )
-        wrapper.use_v4_mtp_paged_metadata = False
+        wrapper.token_to_kv_pool = _fake_pool()
+        wrapper.draft_token_to_kv_pool = _fake_pool()
 
         seq_lens = torch.tensor([21, 22], dtype=torch.int32)
         wrapper._init_forward_metadata(
@@ -1014,21 +1014,30 @@ class TestDeepseekV4Config(unittest.TestCase):
             extend_seq_lens_cpu=torch.tensor([1, 1], dtype=torch.int32),
         )
 
-        self.assertEqual(len(captured["draft"]), 1)
-        _, draft_kwargs = captured["draft"][0]
-        self.assertEqual(draft_kwargs["forward_mode"], ForwardMode.EXTEND)
+        # The unified draft contract is two steps: prefill init, then the
+        # same decode refresh the pure-decode path uses.
         self.assertEqual(
-            draft_kwargs["seq_lens"].data_ptr(),
+            [kind for kind, _, _ in captured["draft"]], ["init", "refresh"]
+        )
+        _, _, init_kwargs = captured["draft"][0]
+        self.assertEqual(init_kwargs["forward_mode"], ForwardMode.EXTEND)
+        # The init reads the accepted-prefix view, never the drafter's mutable
+        # buffer; the buffer is only seeded for the round.
+        self.assertEqual(init_kwargs["seq_lens"].data_ptr(), seq_lens.data_ptr())
+        self.assertEqual(wrapper.drafter.draft_seq_lens_buf.tolist(), [21, 22])
+        # The refresh prepares plain 1-token rows over the drafter buffer.
+        _, refresh_args, refresh_kwargs = captured["draft"][1]
+        self.assertEqual(refresh_kwargs["forward_mode"], ForwardMode.DECODE)
+        self.assertNotIn("num_tokens", refresh_kwargs)
+        self.assertEqual(
+            refresh_args[3].data_ptr(),
             wrapper.drafter.draft_seq_lens_buf.data_ptr(),
         )
-        self.assertEqual(wrapper.drafter.draft_seq_lens_buf.tolist(), [21, 22])
 
     def test_cuda_graph_eager_v4_draft_uses_only_its_cache_group_subset(self):
         captured = {"target": [], "draft": []}
 
         class FakeBackend:
-            needs_group_block_tables = True
-            uses_cache_groups = True
 
             def __init__(self, key):
                 self.key = key
@@ -1052,7 +1061,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             cache_view=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
             draft_seq_lens_buf=torch.zeros(1, dtype=torch.int32),
         )
-        wrapper.use_v4_mtp_paged_metadata = True
         wrapper.token_to_kv_pool = _fake_pool(
             SimpleNamespace(group_id="v4.swa_kv", family="history"),
             SimpleNamespace(group_id="v4.state", family="state"),
@@ -1075,20 +1083,19 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertIs(captured["target"][0][1]["cache_metadata"], target_cache_metadata)
         self.assertIs(captured["target"][0][1]["forward_batch"], forward_batch)
+        # Two steps per round (init + decode refresh); both consume only the
+        # identity-selected group subset, never the target cache metadata.
         self.assertEqual(len(captured["draft"]), 2)
-        draft_prefill_kwargs = captured["draft"][0][1]
-        self.assertNotIn("cache_metadata", draft_prefill_kwargs)
-        self.assertNotIn("forward_batch", draft_prefill_kwargs)
-        self.assertEqual(tuple(draft_prefill_kwargs["block_tables"]), ("v4.swa_kv",))
-        self.assertIs(draft_prefill_kwargs["block_tables"]["v4.swa_kv"], swa_table)
+        for _, draft_kwargs in captured["draft"]:
+            self.assertNotIn("cache_metadata", draft_kwargs)
+            self.assertNotIn("forward_batch", draft_kwargs)
+            self.assertEqual(tuple(draft_kwargs["block_tables"]), ("v4.swa_kv",))
+            self.assertIs(draft_kwargs["block_tables"]["v4.swa_kv"], swa_table)
 
-    def test_cuda_graph_eager_draft_decode_preserves_non_v4_seq_lens_alias(self):
+    def test_cuda_graph_eager_draft_decode_aliases_drafter_seq_lens_buffer(self):
         captured = {"target": [], "draft": []}
 
         class FakeBackend:
-            needs_group_block_tables = False
-            uses_padded_decode_token_mask = False
-            uses_cache_groups = False
 
             def __init__(self, key):
                 self.key = key
@@ -1103,10 +1110,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.drafter = SimpleNamespace(
             cache_view=SimpleNamespace(table=torch.zeros((1, 1), dtype=torch.int32)),
             draft_seq_lens_buf=torch.tensor([11, 12], dtype=torch.int32),
+            owns_eager_decode_metadata=False,
         )
+        wrapper.token_to_kv_pool = _fake_pool()
+        wrapper.draft_token_to_kv_pool = _fake_pool()
 
         seq_lens = torch.tensor([21, 22], dtype=torch.int32)
-        wrapper.use_v4_mtp_paged_metadata = False
         wrapper._prepare_decode_metadata(
             2,
             2,
@@ -1117,27 +1126,15 @@ class TestDeepseekV4Config(unittest.TestCase):
             use_graph=False,
         )
 
-        non_v4_args, non_v4_kwargs = captured["draft"][-1]
+        draft_args, draft_kwargs = captured["draft"][-1]
+        # Draft decode metadata aliases the drafter-owned mutable buffer,
+        # freshly seeded from the batch seq_lens.
         self.assertEqual(
-            non_v4_args[3].data_ptr(),
+            draft_args[3].data_ptr(),
             wrapper.drafter.draft_seq_lens_buf.data_ptr(),
         )
-        self.assertEqual(non_v4_kwargs["forward_mode"], ForwardMode.DECODE)
-
-        wrapper.use_v4_mtp_paged_metadata = True
-        wrapper._prepare_decode_metadata(
-            2,
-            2,
-            req_pool_indices=torch.zeros(2, dtype=torch.int32),
-            seq_lens=seq_lens,
-            page_table=torch.zeros((1, 1), dtype=torch.int32),
-            forward_mode=ForwardMode.DECODE,
-            use_graph=False,
-        )
-
-        v4_args, v4_kwargs = captured["draft"][-1]
-        self.assertEqual(v4_args[3].data_ptr(), seq_lens.data_ptr())
-        self.assertEqual(v4_kwargs["forward_mode"], ForwardMode.DECODE)
+        self.assertEqual(wrapper.drafter.draft_seq_lens_buf.tolist(), [21, 22])
+        self.assertEqual(draft_kwargs["forward_mode"], ForwardMode.DECODE)
 
     def test_deepseek_v4_tokenizer_wrapper_uses_model_encoder(self):
         calls = []

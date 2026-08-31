@@ -144,10 +144,6 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # padded to the fused-kernel block constraint (see _calc_padded_blocks).
         self._cache_groups_bound = False
         self._cache_contract_bound = False
-        # A draft consumes its history group table from the wrapper's
-        # per-group distribution (_draft_group_tables); the target reads the
-        # richer cache_metadata instead (see FlashMLABackend for rationale).
-        self.uses_cache_groups = bool(config.is_draft)
         self.max_num_pages = self._calc_padded_blocks(config.context_len)
 
         # MLA dimensions
@@ -196,10 +192,10 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
     ) -> torch.Tensor:
         """Copy a batch-ordered kernel page table into TRTLLM metadata.
 
-        ``page_table`` is batch-ordered (row i == batch position i) and already
-        uses this backend's kernel-page units. For an LCM-backed draft,
-        ``ModelExecutor`` performs the logical-to-kernel expansion when it
-        publishes ``draft_page_table``.
+        ``page_table`` is batch-ordered (row i == batch position i) and must
+        already be in this backend's kernel-page units — callers expand raw
+        scheduler tables through ``_expand_history_table`` first (warmup
+        placeholders are empty/dummy and copy as-is).
         """
         if block_kv_indices is None:
             block_kv_indices = torch.zeros(
@@ -228,19 +224,18 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         page_table: torch.Tensor,
         **kwargs,
     ):
-        cache_metadata = kwargs.pop("cache_metadata", None)
-        forward_batch = kwargs.pop("forward_batch", None)
-        kwargs.pop("block_tables", None)
-        group_table = None
-        if cache_metadata is not None:
+        kwargs.pop("cache_metadata", None)
+        kwargs.pop("forward_batch", None)
+        group_table = self._resolve_full_history_table(
+            kwargs.pop("block_tables", None), bs
+        )
+        if group_table is not None:
             self._cache_groups_bound = True
-            group_table = self._resolve_full_history_table(
-                cache_metadata, forward_batch, bs
-            )
-        elif self._draft_reads_batch_pages(bs, forward_mode):
-            # The drafter drives this backend directly and passes no cache
-            # metadata; the batch-ordered draft page table (row i is batch
-            # position i) carries kernel pages published by DraftPageStaging.
+        elif self.is_draft and self._cache_contract_bound and bs > 0:
+            # The drafter drives this backend directly with no group tables;
+            # the batch-ordered draft page table (row i is batch position i)
+            # carries raw scheduler pages, expanded by the decode refresh
+            # like any group table.
             self._cache_groups_bound = True
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
@@ -257,15 +252,11 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 extend_seq_lens=kwargs.pop("extend_seq_lens"),
                 extend_seq_lens_cpu=kwargs.pop("extend_seq_lens_cpu"),
             )
-        # Under is_draft, also fill decode_metadata under any forward_mode so
-        # the drafter's multi-step loop has metadata. Wrapper pre-writes
-        # draft_seq_lens before calling here, so `seq_lens` aliases the
-        # drafter's live buffer for step-1+ advances.
-        if (
-            forward_mode.is_idle()
-            or forward_mode.is_mixed()
-            or (forward_mode.is_extend() and self.is_draft)
-        ):
+        # Target mixed/idle batches carry decode rows whose metadata this
+        # init must cover. A draft's decode metadata instead comes from the
+        # wrapper's refresh_decode_metadata after this init (the unified
+        # draft contract).
+        if forward_mode.is_idle() or (forward_mode.is_mixed() and not self.is_draft):
             self._init_decode_metadata(
                 bs,
                 num_extends,
@@ -488,8 +479,6 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         forward_mode: ForwardMode,
         **kwargs,
     ):
-        # cache_group_ids arrives for the draft (uses_cache_groups); the
-        # persistent kv-indices buffer already exists, nothing to allocate.
         if forward_mode.is_extend_or_mixed():
             raise NotImplementedError(
                 f"trtllm_mla CUDA graph capture not supported for {forward_mode}"
@@ -527,6 +516,9 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             )
 
         metadata = self._decode_views(bs)
+        # The cached view bakes num_extends=0; a mixed round's decode rows
+        # start after the extend rows, so publish this round's split.
+        metadata.num_extends = num_extends
 
         # Copy the live cache lengths into our own buffer (metadata.seq_lens_k
         # views it). Block indices are refreshed separately; when the block
@@ -536,28 +528,26 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
         self.cuda_graph_seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
 
-        cache_metadata = kwargs.get("cache_metadata")
-        group_table = None
-        # See FlashMLABackend.refresh_decode_metadata: a PD decode-only node
-        # never runs extend init, so _cache_groups_bound stays False and this
-        # refresh must also fire on the registry-set _cache_contract_bound, or
-        # the kernel reads a stale/zero block table (null page 0) instead of
-        # the transferred KV.
-        if (
-            self._cache_groups_bound or self._cache_contract_bound
-        ) and cache_metadata is not None:
-            self._cache_groups_bound = True
-            group_table = self._resolve_full_history_table(
-                cache_metadata, kwargs.get("forward_batch"), 0
-            )
-        elif self._draft_reads_batch_pages(bs, forward_mode) and (
-            page_table is not None
-        ):
-            # DraftPageStaging.publish already expanded into kernel pages, so
-            # the staged table is read as-is.
-            group_table = page_table[:bs]
+        # The wrapper's per-group tables refresh the block table whenever
+        # delivered — decode-only PD nodes included (they never run an extend
+        # forward, so an extend-latched gate would leave the kernel on a
+        # stale/zero block table instead of the transferred KV).
+        group_table = self._resolve_full_history_table(kwargs.get("block_tables"), 0)
         if group_table is not None:
-            real_bs = min(int(group_table.shape[0]), bs)
+            self._cache_groups_bound = True
+        elif (
+            self.is_draft
+            and self._cache_contract_bound
+            and bs > 0
+            and page_table is not None
+        ):
+            # Draft: the staged batch-ordered table carries raw scheduler
+            # pages; expand into this backend's kernel pages.
+            group_table = self._expand_history_table(page_table[:bs])
+        if group_table is not None:
+            # Live tables carry one row per REAL request; the idle replay's
+            # synthesized placeholder rows are all dummies (actual_bs caps).
+            real_bs = min(int(group_table.shape[0]), bs, actual_bs)
             if real_bs > 0 and not self._page_table_aliased:
                 self._create_block_kv_indices(
                     real_bs,

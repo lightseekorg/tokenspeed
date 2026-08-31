@@ -49,6 +49,9 @@ from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.mla_cache_groups import (
+    MlaCacheGroupMixin,
+)
 from tokenspeed.runtime.layers.attention.backends.trtllm_mla import (
     TRTLLM_BLOCK_CONSTRAINT,
     TRTLLMMLAChunkedPrefillMetadata,
@@ -100,7 +103,7 @@ class CuteDSLMLADecodeMetadata:
     group_q_len_per_req: int = 1
 
 
-class CuteDSLMLABackend(AttentionBackend):
+class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
     """CuteDSL MLA attention backend for Blackwell SM100 GPUs.
 
     Decode uses CuTe DSL JIT-compiled kernels via tokenspeed_mla_decode().
@@ -110,9 +113,6 @@ class CuteDSLMLABackend(AttentionBackend):
     _logged_decode = False
     _logged_prefill = False
 
-    # Cache contract capability: this backend consumes only history-family
-    # (full-attention) tables; state groups belong to the linear sub-backend.
-    cache_consumer_families = frozenset({"history"})
     draft_seq_lens_attr: str = "cuda_graph_seq_lens_buf"
 
     def __init__(self, config: MLAConfig):
@@ -223,9 +223,14 @@ class CuteDSLMLABackend(AttentionBackend):
         """
         if self.is_draft:
             # The CuteDSL draft keeps its batch-ordered page table. Only target
-            # forwards consume scheduler cache-group metadata.
+            # forwards consume scheduler cache-group tables.
             return
-        self._cache_contract_bound = True
+        super().mark_cache_contract()
+
+    @property
+    def max_num_pages(self) -> int:
+        # Kernel page-table width, padded to the fused-kernel block constraint.
+        return self._calc_padded_blocks(self.max_context_len)
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """Calculate block count padded to satisfy the fused-kernel constraint."""
@@ -260,27 +265,6 @@ class CuteDSLMLABackend(AttentionBackend):
         return block_kv_indices
 
     # ---- Cache-group full-attention-table metadata ----
-
-    def _resolve_full_history_table(
-        self, cache_metadata, forward_batch, bs: int
-    ) -> torch.Tensor:
-        """This forward's full-attention table in this backend's kernel pages.
-
-        Host-side structural validation only (no GPU sync): operation
-        freshness, row coverage, and kernel-page divisibility all check inside
-        ``kernel_table``.
-        """
-        table = cache_metadata.kernel_table(
-            kernel_page_size=self.kernel_page_size,
-            max_pages=self._calc_padded_blocks(self.max_context_len),
-            active_forward_op=forward_batch,
-        )
-        if table.shape[0] < bs:
-            raise RuntimeError(
-                f"full-attention table has {table.shape[0]} rows but the "
-                f"batch has {bs} requests"
-            )
-        return table
 
     def _maybe_debug_check_write_pages(self, pages: torch.Tensor) -> None:
         """TOKENSPEED_CACHE_DEBUG=1 (GPU sync): latent writes must never land
@@ -385,29 +369,23 @@ class CuteDSLMLABackend(AttentionBackend):
         seq_lens_cpu: torch.Tensor | None = None,
         **kwargs,
     ):
-        cache_metadata = kwargs.pop("cache_metadata", None)
-        forward_batch = kwargs.pop("forward_batch", None)
+        kwargs.pop("cache_metadata", None)
+        kwargs.pop("forward_batch", None)
         group_table = None
-        if cache_metadata is not None and self.is_draft:
-            # The MTP draft runs on its own classic paged pool; the target's
-            # Cache metadata rides the shared forward kwargs; ignore it here.
-            cache_metadata = None
-            forward_batch = None
-        if cache_metadata is not None:
-            self._cache_groups_bound = True
+        if not self.is_draft:
+            # The MTP draft runs on its own classic paged pool and reads the
+            # staged batch-ordered draft page table, never group tables.
             group_table = self._resolve_full_history_table(
-                cache_metadata, forward_batch, bs
+                kwargs.pop("block_tables", None), bs
             )
-            if cache_debug_enabled():
-                cache_metadata.validate_live_pages(
-                    seq_lens[:bs], active_forward_op=forward_batch
-                )
+        if group_table is not None:
+            self._cache_groups_bound = True
         elif self._cache_groups_bound and bs > 0 and not forward_mode.is_idle():
-            # Missing cache metadata must never select the legacy page_table
+            # Missing group tables must never select the legacy page_table
             # path after the backend is bound to the contract.
             raise RuntimeError(
                 "tokenspeed_mla is bound to the Cache contract but received "
-                "no cache metadata; refusing the legacy page_table path"
+                "no group tables; refusing the legacy page_table path"
             )
 
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
@@ -427,25 +405,15 @@ class CuteDSLMLABackend(AttentionBackend):
                 extend_seq_lens_cpu=kwargs.pop("extend_seq_lens_cpu"),
                 group_table=group_table,
             )
-        # Drafter steps 1..N are pure DECODE on full bs regardless of target
-        # mode, so under is_draft we also fill decode_metadata under EXTEND
-        # so the multi-step loop has metadata. The wrapper pre-writes
-        # draft_seq_lens before calling here so `seq_lens` aliases the
-        # drafter's live buffer.
-        if (
-            forward_mode.is_idle()
-            or forward_mode.is_mixed()
-            or (forward_mode.is_extend() and self.is_draft)
-        ):
-            # Target-verify decodes q_len tokens per request; the cache write
-            # locations must cover every one of them.
+        # Target mixed/idle batches carry decode rows whose metadata this
+        # init must cover (verify decodes q_len tokens per request; the cache
+        # write locations span every one of them). A draft's decode metadata
+        # instead comes from the wrapper's refresh_decode_metadata after this
+        # init (the unified draft contract).
+        if forward_mode.is_idle() or (forward_mode.is_mixed() and not self.is_draft):
             verify_q_len = (
                 self.spec_num_tokens
-                if (
-                    self.spec_num_tokens > 1
-                    and not self.is_draft
-                    and forward_mode.is_mixed()
-                )
+                if self.spec_num_tokens > 1 and forward_mode.is_mixed()
                 else 1
             )
             self._init_decode_metadata(
@@ -598,10 +566,13 @@ class CuteDSLMLABackend(AttentionBackend):
         if page_table is None:
             rows.zero_()
             return
-        real_bs = min(int(page_table.shape[0]), bs)
-        cols = min(int(page_table.shape[1]), width)
+        # The staged table carries raw scheduler pages; expand into this
+        # backend's kernel pages before broadcasting to the block rows.
+        expanded = self._expand_history_table(page_table[:bs])
+        real_bs = min(int(expanded.shape[0]), bs)
+        cols = min(int(expanded.shape[1]), width)
         if real_bs > 0:
-            rows[:real_bs, :, :cols].copy_(page_table[:real_bs, None, :cols])
+            rows[:real_bs, :, :cols].copy_(expanded[:real_bs, None, :cols])
             if cols < width:
                 rows[:real_bs, :, cols:].zero_()
         if real_bs < bs:
@@ -747,12 +718,8 @@ class CuteDSLMLABackend(AttentionBackend):
         # Structural gate: the target (contract always marked by the registry)
         # takes the cache-group capture path; the MTP draft, whose
         # mark_cache_contract deliberately early-returns, keeps the
-        # batch-ordered non-cache path.
-        uses_cache_groups = bool(cache_group_ids) or self._cache_contract_bound
-        if uses_cache_groups and self.is_draft:
-            raise NotImplementedError(
-                "tokenspeed_mla draft worker does not take the cache-group path"
-            )
+        # batch-ordered draft page table for its in-graph write-loc math.
+        bind_groups = bool(cache_group_ids) or self._cache_contract_bound
         if forward_mode.is_extend_or_mixed():
             raise NotImplementedError(
                 f"tokenspeed_mla CUDA graph capture not supported for {forward_mode}"
@@ -768,7 +735,7 @@ class CuteDSLMLABackend(AttentionBackend):
             self.forward_decode_metadata = metadata
             return
 
-        if uses_cache_groups:
+        if bind_groups:
             # Latch _cache_groups_bound so the recorded forward_decode takes
             # the cache write-location branch (select_out_cache_loc).
             self._cache_groups_bound = True
@@ -846,13 +813,15 @@ class CuteDSLMLABackend(AttentionBackend):
         for_graph_replay: bool = False,
         **kwargs,
     ) -> None:
-        cache_metadata = kwargs.get("cache_metadata")
         if forward_mode is not None and forward_mode.is_extend_or_mixed():
             raise NotImplementedError(
                 f"tokenspeed_mla decode refresh not supported for {forward_mode}"
             )
 
         metadata = self._decode_views(bs)
+        # The cached view bakes num_extends=0; a mixed round's decode rows
+        # start after the extend rows, so publish this round's split.
+        metadata.num_extends = num_extends
         if self._block_decode_active:
             # Under replay the lengths come from fill_block_decode_seq_lens,
             # inside the graph; eager has no in-graph writer, so fill here.
@@ -861,38 +830,38 @@ class CuteDSLMLABackend(AttentionBackend):
                 self.fill_block_decode_seq_lens(bs, seq_lens)
             self.forward_decode_metadata = metadata
             return
-        # A cache write-location buffer exists iff this backend runs the
-        # cache-group decode path.
-        uses_cache_groups = metadata.group_out_cache_loc is not None
-        if uses_cache_groups and self.is_draft:
-            raise NotImplementedError(
-                "tokenspeed_mla draft worker does not take the cache-group path"
-            )
+        # A cache write-location buffer exists iff this backend routes decode
+        # writes through the group-derived locations (target only; a draft
+        # owns its per-step write locations).
+        has_group_locs = metadata.group_out_cache_loc is not None
 
         # Copy the live cache lengths into our own buffer (metadata.seq_lens_k
         # views it) on both paths; the grouped helper only refreshes tables.
         self.cuda_graph_seq_lens_buf[:bs].copy_(seq_lens[:bs])
 
-        if uses_cache_groups and cache_metadata is not None:
-            self._cache_groups_bound = True
-            self._replay_refresh_decode(
-                bs,
-                seq_lens,
-                metadata,
-                cache_metadata,
-                kwargs.get("forward_batch"),
-            )
+        # The idle replay (actual_bs == 0) carries synthesized placeholder
+        # tables; every row is a dummy row, so zero the buffers instead of
+        # resolving write locations against the placeholders.
+        group_table = (
+            self._resolve_full_history_table(kwargs.get("block_tables"), 0)
+            if has_group_locs and actual_bs > 0
+            else None
+        )
+        if has_group_locs and (group_table is not None or for_graph_replay):
+            if group_table is not None:
+                self._cache_groups_bound = True
+            self._replay_refresh_decode(bs, seq_lens, metadata, group_table)
             self.forward_decode_metadata = metadata
             return
 
         # Block indices are refreshed separately; when the block table is
         # aliased to a peer backend, that peer's refresh already populated it.
+        # page_table is batch-ordered raw scheduler pages (the staged draft
+        # table, or a warmup placeholder); expand into kernel pages.
         if page_table is not None and not self._page_table_aliased:
-            self._create_block_kv_indices(
-                bs,
-                metadata.block_kv_indices.shape[1],
-                page_table,
-                metadata.block_kv_indices,
+            self._expand_history_table(
+                page_table[:bs],
+                out=metadata.block_kv_indices[:bs],
             )
 
         self.forward_decode_metadata = metadata
@@ -902,8 +871,7 @@ class CuteDSLMLABackend(AttentionBackend):
         bs: int,
         seq_lens: torch.Tensor,
         metadata: "CuteDSLMLADecodeMetadata",
-        cache_metadata,
-        forward_batch,
+        table: torch.Tensor | None,
     ) -> None:
         """Refresh captured decode buffers from this replay's
         full-attention table.
@@ -926,10 +894,7 @@ class CuteDSLMLABackend(AttentionBackend):
         replay_q_len = metadata.group_q_len_per_req
         max_blocks = metadata.block_kv_indices.shape[1]
         real_bs = 0
-        if cache_metadata is not None:
-            # Row coverage is not required here (bs is the padded batch size
-            # and the table carries one row per REAL request), so pass 0.
-            table = self._resolve_full_history_table(cache_metadata, forward_batch, 0)
+        if table is not None:
             real_bs = min(int(table.shape[0]), bs)
             if real_bs > 0:
                 self._create_block_kv_indices(

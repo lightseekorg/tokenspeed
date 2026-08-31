@@ -138,6 +138,16 @@ class DSABackend(AttentionBackend):
         group tables and the graph write-location buffer."""
         self._dense_backend.mark_cache_contract()
 
+    def set_cache_pool(self, cache_pool) -> None:
+        # The dense sub-backend owns the group-table consumption and must
+        # learn the pool's history-group geometry.
+        super().set_cache_pool(cache_pool)
+        self._dense_backend.set_cache_pool(cache_pool)
+
+    @property
+    def tables_self_padding(self):
+        return getattr(self._dense_backend, "tables_self_padding", False)
+
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
         return self._dense_backend.select_out_cache_loc(
             layer, out_cache_loc, forward_mode
@@ -262,7 +272,10 @@ class DSABackend(AttentionBackend):
             page_table=page_table,
             **kwargs,
         )
-        if forward_mode.is_mixed() or (forward_mode.is_extend() and self.is_draft):
+        # Target mixed batches carry decode rows needing the per-token plan.
+        # A draft's plan is rebuilt by the wrapper's refresh_decode_metadata
+        # after this init (the unified draft contract).
+        if forward_mode.is_mixed() and not self.is_draft:
             metadata = self.forward_decode_metadata
             # Per-token context lengths: the paged-MQA-logits kernel only supports
             # next_n == 1, so each verify token is its own row (bs * spec_num_tokens
@@ -288,18 +301,17 @@ class DSABackend(AttentionBackend):
 
         self._prefill_page_table = None
         if num_extends > 0 and forward_mode.is_extend_or_mixed():
-            cache_metadata = kwargs.get("cache_metadata")
             cmeta = getattr(self._dense_backend, "chunked_prefill_metadata", None)
             if cmeta is not None:
                 # Extend requests are the first num_extends batch rows. The
-                # target carries the full-history table in cache_metadata; a
-                # draft is handed the batch-ordered draft page table directly.
-                table = None
-                if cache_metadata is not None:
-                    table = cache_metadata.require_full_attention_table(
-                        active_forward_op=kwargs.get("forward_batch")
-                    )
-                elif page_table is not None:
+                # target carries the raw full-history group table (DSA's
+                # sparse page size equals the block granularity, so no
+                # expansion applies); a draft is handed the batch-ordered
+                # draft page table directly.
+                block_tables = kwargs.get("block_tables") or {}
+                gid = self._dense_backend._full_history_group_id
+                table = block_tables.get(gid) if gid is not None else None
+                if table is None and page_table is not None:
                     table = page_table
                 if table is not None:
                     self._prefill_page_table = table[:num_extends]

@@ -366,7 +366,13 @@ def _sconv_apply(
     every covered boundary in-kernel.
     """
     backend = ctx.attn_backend
-    md = backend.conv_metadata
+    # Same routing as the dense metadata: prefill-family forwards read the
+    # extend-init slot, decode-family forwards the capture/refresh slot.
+    md = (
+        backend.conv_prefill_metadata
+        if ctx.forward_mode.is_extend_or_mixed()
+        else backend.conv_decode_metadata
+    )
 
     # Channel slice of the layer's [slots, R, conv_dim] ring.
     state = backend.conv_pool.layer_state_wd(layer_id)[

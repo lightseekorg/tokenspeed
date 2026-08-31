@@ -103,9 +103,9 @@ class CacheGroupIdsTest(_TorchCase):
 
         self.group_ids = ForwardStepRunner._cache_group_ids
 
-    def _wrapper(self, uses_cache_groups=True):
+    def _wrapper(self):
         return SimpleNamespace(
-            attn_backend=SimpleNamespace(uses_cache_groups=uses_cache_groups),
+            attn_backend=SimpleNamespace(),
         )
 
     def _pool(self, group_ids):
@@ -128,12 +128,6 @@ class CacheGroupIdsTest(_TorchCase):
     def test_empty_without_specs(self):
         self.assertEqual(self.group_ids(self._wrapper(), self._pool([])), ())
 
-    def test_empty_when_backend_does_not_use_cache_groups(self):
-        out = self.group_ids(
-            self._wrapper(uses_cache_groups=False), self._pool(["full_attention"])
-        )
-        self.assertEqual(out, ())
-
 
 class DraftCacheGroupIdsTest(_TorchCase):
     """DFLASH owns an independent draft page table; EAGLE-style drafts use
@@ -152,13 +146,10 @@ class DraftCacheGroupIdsTest(_TorchCase):
         *,
         draft_block_decode,
         families=("history",),
-        reads_staged_draft_page_table=False,
     ):
         return SimpleNamespace(
             draft_attn_backend=SimpleNamespace(
-                uses_cache_groups=True,
                 draft_block_decode=draft_block_decode,
-                reads_staged_draft_page_table=reads_staged_draft_page_table,
                 cache_consumer_families=frozenset(families),
             ),
             draft_token_to_kv_pool=SimpleNamespace(
@@ -174,19 +165,6 @@ class DraftCacheGroupIdsTest(_TorchCase):
     def test_dflash_does_not_capture_target_group_tables(self):
         self.assertEqual(
             self.group_ids(self._wrapper(draft_block_decode=True)),
-            (),
-        )
-
-    def test_mla_draft_reads_staged_page_table(self):
-        # MLA drafts consume only the batch-ordered staged draft page table, so
-        # the wrapper must not dispatch per-group tables to them.
-        self.assertEqual(
-            self.group_ids(
-                self._wrapper(
-                    draft_block_decode=False,
-                    reads_staged_draft_page_table=True,
-                )
-            ),
             (),
         )
 
@@ -227,10 +205,8 @@ class WrapperReplayGroupedTest(_TorchCase):
             recorded.update(kwargs)
 
         mock = SimpleNamespace(
+            max_tokens_per_req=1,
             attn_backend=SimpleNamespace(
-                uses_cache_groups=True,
-                needs_group_block_tables=False,
-                uses_padded_decode_token_mask=False,
                 refresh_decode_metadata=record,
             ),
             draft_attn_backend=None,
@@ -290,16 +266,11 @@ class WrapperReplayGroupedTest(_TorchCase):
             draft_call.update(kwargs)
 
         mock = SimpleNamespace(
+            max_tokens_per_req=1,
             attn_backend=SimpleNamespace(
-                uses_cache_groups=False,
-                needs_group_block_tables=False,
-                uses_padded_decode_token_mask=False,
                 refresh_decode_metadata=lambda *args, **kwargs: None,
             ),
             draft_attn_backend=SimpleNamespace(
-                uses_cache_groups=True,
-                needs_group_block_tables=False,
-                uses_padded_decode_token_mask=False,
                 refresh_decode_metadata=record_draft,
             ),
             drafter=SimpleNamespace(
@@ -308,7 +279,6 @@ class WrapperReplayGroupedTest(_TorchCase):
                     table=torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32)
                 ),
             ),
-            use_v4_mtp_paged_metadata=False,
             _draft_group_tables=lambda tables: tables,
             _pad_block_tables_to_padded_bs=(
                 ForwardStepRunner._pad_block_tables_to_padded_bs
@@ -351,12 +321,9 @@ class WrapperReplayGroupedTest(_TorchCase):
         def record_draft(bs, actual_bs, req_pool_indices, seq_lens, **kwargs):
             calls["draft"] = kwargs["block_tables"]
 
-        backend_contract = {
-            "uses_cache_groups": True,
-            "needs_group_block_tables": False,
-            "uses_padded_decode_token_mask": True,
-        }
+        backend_contract = {}
         mock = SimpleNamespace(
+            max_tokens_per_req=1,
             attn_backend=SimpleNamespace(
                 **backend_contract,
                 refresh_decode_metadata=record_target,
@@ -371,7 +338,6 @@ class WrapperReplayGroupedTest(_TorchCase):
                     table=torch.zeros((4, MAX_NUM_PAGES), dtype=torch.int32)
                 ),
             ),
-            use_v4_mtp_paged_metadata=False,
             _draft_group_tables=lambda tables: {
                 "full_attention": tables["full_attention"]
             },
@@ -412,7 +378,7 @@ class WrapperCaptureGroupIdsTest(_TorchCase):
     cache_group_ids from the pool's published specs and pass them to
     the backend capture hook."""
 
-    def _run_capture(self, bs, group_ids, uses_cache_groups=True):
+    def _run_capture(self, bs, group_ids):
         torch = self.torch
         from types import MethodType
 
@@ -427,14 +393,13 @@ class WrapperCaptureGroupIdsTest(_TorchCase):
             recorded["kwargs"] = kwargs
 
         mock = SimpleNamespace(
+            max_tokens_per_req=1,
             input_buffers=SimpleNamespace(
                 has_mamba=False,
                 req_pool_indices_buf=torch.arange(MAX_BS, dtype=torch.int64),
                 seq_lens_buf=torch.ones(MAX_BS, dtype=torch.int32),
             ),
             attn_backend=SimpleNamespace(
-                needs_group_block_tables=False,
-                uses_cache_groups=uses_cache_groups,
                 init_forward_metadata_capture_cuda_graph=record,
             ),
             token_to_kv_pool=SimpleNamespace(
@@ -460,12 +425,6 @@ class WrapperCaptureGroupIdsTest(_TorchCase):
             ("sliding_attention", "full_attention"),
         )
 
-    def test_capture_omits_group_ids_when_backend_does_not_use_cache_groups(self):
-        recorded = self._run_capture(
-            2, ["sliding_attention", "full_attention"], uses_cache_groups=False
-        )
-        self.assertNotIn("cache_group_ids", recorded["kwargs"])
-
     def test_capture_omits_group_ids_without_specs(self):
         recorded = self._run_capture(2, [])
         self.assertNotIn("cache_group_ids", recorded["kwargs"])
@@ -488,15 +447,13 @@ class WrapperEagerGroupGuardTest(_TorchCase):
             calls["init_kwargs"] = kwargs
 
         mock = SimpleNamespace(
+            max_tokens_per_req=1,
             input_buffers=SimpleNamespace(
                 seq_lens_buf=torch.ones(MAX_BS, dtype=torch.int32),
                 req_pool_indices_buf=torch.arange(MAX_BS, dtype=torch.int64),
             ),
             config=SimpleNamespace(),
-            attn_backend=SimpleNamespace(
-                uses_cache_groups=True,
-                needs_group_block_tables=False,
-            ),
+            attn_backend=SimpleNamespace(),
             token_to_kv_pool=SimpleNamespace(
                 arena=SimpleNamespace(
                     cache_group_specs=tuple(
@@ -510,12 +467,10 @@ class WrapperEagerGroupGuardTest(_TorchCase):
             _init_forward_metadata=init_forward_metadata,
             _forward_func=lambda **kwargs: (None, None, None),
         )
-        mock._any_backend_uses_cache_groups = (
-            lambda: ForwardStepRunner._any_backend_uses_cache_groups(mock)
-        )
         ctx = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             num_extends=2,
+            input_num_tokens=2,
             global_num_tokens=None,
             all_decode_or_idle=False,
             capture_hidden_mode=None,

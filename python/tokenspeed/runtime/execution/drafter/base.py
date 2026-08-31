@@ -66,7 +66,7 @@ class BaseDrafter:
         self.runtime_states = runtime_states
         self.input_buffers = input_buffers
         # Window onto the staged batch-ordered page table (row i == batch
-        # position i, draft-kernel page units, refreshed each forward by
+        # position i, raw scheduler pages, refreshed each forward by
         # DraftPageStaging.publish). Write-location math goes through the
         # view so page ids and page-size arithmetic stay out of drafters.
         self.cache_view = cache_view

@@ -120,7 +120,6 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     # Unconditional: safety comes from the publication rule
     # (kv_cache.recipes.publish) plus the replay
     # stale-table guard. drop the flag.
-    uses_cache_groups: bool = True
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
@@ -185,9 +184,8 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         seq_lens: torch.Tensor,
         page_table: torch.Tensor,
         forward_mode: ForwardMode,
-        # Only consumed on the extend/mixed path; decode callers (e.g. the
-        # DFLASH draft and the cuda-graph wrapper's draft decode init) omit
-        # them, so they must be optional.
+        # Warmup/placeholder callers omit the extend arrays, so they must be
+        # optional.
         extend_seq_lens: torch.Tensor | None = None,
         extend_seq_lens_cpu: torch.Tensor | None = None,
         extend_prefix_lens: torch.Tensor | None = None,
@@ -264,16 +262,6 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             page_tables=group_page_tables,
             out_cache_locs=group_out_cache_locs,
         )
-
-        # Drafter step 1+ decodes under an EXTEND/MIXED target; seq_lens
-        # aliases the drafter's live buffer (pre-written by the wrapper).
-        if self.is_draft:
-            self.forward_decode_metadata = MHADecodeMetadata(
-                page_table=page_table,
-                seq_lens=seq_lens,
-                page_tables=group_page_tables,
-                out_cache_locs=group_out_cache_locs,
-            )
 
     def init_cuda_graph_state(
         self,
@@ -429,11 +417,12 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft: replicate each request's page table to its
             # spec_num_tokens block rows. The drafter's page table is
-            # batch-ordered (row i == batch position i). Under replay the
-            # block-end seq_lens are re-derived inside the captured graph
-            # from the live draft length (fill_block_decode_seq_lens); eager
-            # has no in-graph writer, so fill them here the same way.
-            base_page_table = page_table[:bs, : self.max_num_pages]
+            # batch-ordered (row i == batch position i, raw scheduler pages —
+            # expand into kernel pages first). Under replay the block-end
+            # seq_lens are re-derived inside the captured graph from the live
+            # draft length (fill_block_decode_seq_lens); eager has no
+            # in-graph writer, so fill them here the same way.
+            base_page_table = self._expand_history_table(page_table[:bs])
             self.cuda_graph_page_table[: bs * self.spec_num_tokens, :].view(
                 bs, self.spec_num_tokens, self.max_num_pages
             ).copy_(base_page_table[:, None, :])

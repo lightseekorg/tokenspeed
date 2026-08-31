@@ -423,8 +423,6 @@ class PrefillGraph:
     ) -> dict[str, "torch.Tensor"]:
         """Build capture tables that honor each backend's active-page contract."""
         backend = self.attn_backend
-        if not getattr(backend, "uses_cache_groups", False):
-            return {}
         # The arena's specs are the source; the backend's state_group_ids is
         # learned from these same specs, so consulting it as a second opinion
         # could only ever return the same set.
@@ -533,9 +531,12 @@ class PrefillGraph:
             ctx.global_bs = [bs] * self.config.world_size
         extra_metadata_kwargs: dict = {}
         if (
-            getattr(self.attn_backend, "needs_group_block_tables", False)
+            getattr(self.attn_backend, "cache_active_pages_must_be_real", False)
             and decode_wrapper is not None
         ):
+            # Placeholder tables for backends that validate live-page
+            # geometry at metadata init (V4); see _dummy_group_tables for
+            # the honoring of that contract below.
             tables = decode_wrapper._capture_group_block_tables(
                 bs, self.token_to_kv_pool
             )

@@ -29,8 +29,11 @@ they are staged into, and the single publish path that fills it.
 Invariants:
 
 * The staged table is batch-ordered — row ``i`` IS batch position ``i``.
-* Ids are draft-kernel pages; the logical→kernel expansion happens here and
-  nowhere else.
+* Ids are RAW scheduler pages of ``block_granularity`` tokens; publish is a
+  pure copy, no page mapping. Absolute slot math is page-size invariant
+  (``table[i, pos // P] * P + pos % P`` equals the same expression over any
+  kernel-page expansion), so location consumers use ``block_granularity``
+  directly and backends expand into their own kernel pages themselves.
 * Rows ``[bs, padded_bs)`` are scrubbed as part of every publish: graph
   replay reads ``padded_bs`` rows, and a stale id past ``bs`` aliases
   another request's pages (#955).
@@ -44,7 +47,6 @@ from tokenspeed.runtime.execution.cache_loc_kernel import (
     compute_out_cache_loc_sliding,
     compute_out_cache_loc_uniform,
 )
-from tokenspeed.runtime.layers.attention.page_table import expand_page_table
 
 
 class CacheView:
@@ -55,29 +57,29 @@ class CacheView:
     without touching page ids or page-size arithmetic. The kernel is picked
     by the group's retention: ``full_history`` walks columns monotonically,
     ``sliding_window`` maps positions onto the table's ring; ``state``
-    groups have no page table and
-    no view.
+    groups have no page table and no view.
 
-    ``table`` and ``kernel_page_size`` remain readable for consumers that hand the
-    staged placeholder to attention-metadata inits.
+    ``table`` and ``page_size`` remain readable for consumers that hand the
+    staged table to attention-metadata inits (the table's unit is the raw
+    scheduler page, ``page_size == block_granularity``).
     """
 
     def __init__(
         self,
         table: torch.Tensor,
-        kernel_page_size: int,
+        page_size: int,
         retention: str = "full_history",
     ) -> None:
         if retention not in ("full_history", "sliding_window"):
             raise ValueError(f"unsupported cache view retention {retention!r}")
         self.table = table
-        self.kernel_page_size = int(kernel_page_size)
+        self.page_size = int(page_size)
         self.retention = retention
 
     @property
     def max_tokens(self) -> int:
-        """Token capacity of one table row (width × kernel page size)."""
-        return self.table.shape[1] * self.kernel_page_size
+        """Token capacity of one table row (width × page size)."""
+        return self.table.shape[1] * self.page_size
 
     def out_cache_loc_uniform(
         self,
@@ -105,7 +107,7 @@ class CacheView:
                 uniform_input_length=num_tokens,
                 cache_start=cache_start,
                 page_table=self.table,
-                page_size=self.kernel_page_size,
+                page_size=self.page_size,
             )
             return out
         compute_out_cache_loc_uniform(
@@ -113,7 +115,7 @@ class CacheView:
             uniform_input_length=num_tokens,
             cache_start=cache_start,
             page_table=self.table,
-            page_size=self.kernel_page_size,
+            page_size=self.page_size,
         )
         return out
 
@@ -127,41 +129,26 @@ class DraftPageStaging:
         max_bs: int,
         max_pages_per_req: int,
         block_granularity: int,
-        draft_kernel_page_size: int,
         full_history_group_id: str | None,
-        enabled: bool,
         device,
     ) -> None:
         """Allocate the address-stable staged table.
 
         Args:
             max_bs: Widest replayable batch; the table's row count.
-            max_pages_per_req: Table width in draft-kernel pages.
-            block_granularity: Grain of the incoming scheduler tables in tokens.
-            draft_kernel_page_size: Draft backend's kernel page size (the staged
-                unit). ``block_granularity`` must be a positive multiple.
+            max_pages_per_req: Table width in raw scheduler pages.
+            block_granularity: Page size of the staged ids in tokens.
             full_history_group_id: Group whose table is staged; None when the
                 contract has no full-history group (the table then stays a
                 zeros placeholder for idle/warmup consumers).
-            enabled: False when the draft path does not read this table at
-                all (e.g. DeepSeek-V4 consumes group tables directly);
-                publish is then scrub-only.
             device: CUDA device for the persistent buffer.
         """
-        if block_granularity % draft_kernel_page_size:
-            raise ValueError(
-                f"block granularity {block_granularity} is not a multiple "
-                f"of the draft kernel page size {draft_kernel_page_size}"
-            )
         self.block_granularity = int(block_granularity)
-        self.draft_kernel_page_size = int(draft_kernel_page_size)
-        self.page_ratio = self.block_granularity // self.draft_kernel_page_size
         self.full_history_group_id = full_history_group_id
-        self.enabled = enabled
         self.table = torch.zeros(
             (max_bs, max_pages_per_req), dtype=torch.int32, device=device
         )
-        self.view = CacheView(self.table, self.draft_kernel_page_size)
+        self.view = CacheView(self.table, self.block_granularity)
 
     def publish(self, block_tables, bs: int, padded_bs: int) -> None:
         """Stage this forward's full-history table for the draft's kernels.
@@ -178,31 +165,16 @@ class DraftPageStaging:
         # (idle, no table) still leaves the padded rows inert.
         if padded_bs > bs:
             self.table[bs:padded_bs].zero_()
-        if (
-            not self.enabled
-            or bs <= 0
-            or not block_tables
-            or self.full_history_group_id is None
-        ):
+        if bs <= 0 or not block_tables or self.full_history_group_id is None:
             return
         table = block_tables.get(self.full_history_group_id)
         if table is None:
             return
         rows = self.table[:bs]
         max_width = self.table.shape[1]
-        if self.page_ratio > 1:
-            # -1 pads clamp into table page 0, itself reserved as the null page.
-            expand_page_table(
-                table,
-                block_granularity=self.block_granularity,
-                kernel_page_size=self.draft_kernel_page_size,
-                max_kernel_pages=max_width,
-                out=rows,
-            )
-            return
+        width = min(table.shape[1], max_width)
         # -1 column pads -> dummy page 0 (negative locs otherwise).
-        width = table.shape[1]
-        rows[:, :width].copy_(table)
+        rows[:, :width].copy_(table[:, :width])
         rows[:, :width].clamp_min_(0)
         if width < max_width:
             rows[:, width:].zero_()

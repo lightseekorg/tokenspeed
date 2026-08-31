@@ -75,7 +75,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             spec_num_steps=3,
             draft_model_runner=model_runner,
             cache_view=CacheView(
-                torch.zeros((max_bs, 4), dtype=torch.int32), kernel_page_size=128
+                torch.zeros((max_bs, 4), dtype=torch.int32), page_size=128
             ),
             attn_backend=backend,
             runtime_states=runtime_states,

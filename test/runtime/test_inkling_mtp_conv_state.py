@@ -715,7 +715,7 @@ class TestCheckpointMetadata(unittest.TestCase):
         )
         table = torch.tensor([[11, 12, 13]], dtype=torch.int32, device="cuda")
         qsl = torch.arange(0, bs * k + 1, k, dtype=torch.int32, device="cuda")
-        backend.conv_metadata = InklingConvMetadata(
+        backend.conv_decode_metadata = InklingConvMetadata(
             query_start_loc=qsl,
             cache_indices=torch.tensor([2], dtype=torch.int32, device="cuda"),
             has_initial_state=torch.ones(bs, dtype=torch.bool, device="cuda"),
@@ -727,7 +727,7 @@ class TestCheckpointMetadata(unittest.TestCase):
 
         backend.update_draft_forward_metadata(frontier)
 
-        md = backend.conv_metadata
+        md = backend.conv_decode_metadata
         self.assertEqual(md.query_start_loc.tolist(), [0, k], "same k-row chunk")
         self.assertEqual(md.seq_lens.tolist(), [130], "chunk end at the frontier")
         self.assertIsNotNone(md.col_block_table)

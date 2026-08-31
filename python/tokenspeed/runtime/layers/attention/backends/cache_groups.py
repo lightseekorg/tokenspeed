@@ -20,7 +20,7 @@
 
 """Shared cache-group machinery for attention backends.
 
-A group-aware backend (``uses_cache_groups = True``) receives the
+Every backend receives the
 scheduler's per-group block tables (``block_tables: dict[group_id,
 [bs, max_pages]]``), expands them to kernel page tables, and must route
 every cache read and write through the layer's own group. This
@@ -211,6 +211,34 @@ class CacheGroupsMixin:
             for spec in cache_group_specs
             if spec.family != "state"
         }
+        # The full-history grain: the unit of the batch-ordered draft page
+        # table a DFLASH block decode reads (same selection rule as the
+        # executor's staging).
+        self._history_block_granularity = next(
+            (
+                int(spec.block_granularity)
+                for spec in cache_group_specs
+                if spec.family == "history"
+                and getattr(spec, "retention", "full_history") == "full_history"
+            ),
+            self.kernel_page_size,
+        )
+
+    def _expand_history_table(
+        self, raw: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Expand a batch-ordered raw table (scheduler pages of the
+        full-history grain) into this backend's kernel pages,
+        ``self.max_num_pages`` wide."""
+        return expand_page_table(
+            raw,
+            block_granularity=getattr(
+                self, "_history_block_granularity", self.kernel_page_size
+            ),
+            kernel_page_size=self.kernel_page_size,
+            max_kernel_pages=self.max_num_pages,
+            out=out,
+        )
 
     def _group_block_granularity(self, gid: str) -> int:
         return self.group_block_granularities.get(gid, self.kernel_page_size)
