@@ -365,8 +365,7 @@ class MHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         self.cuda_graph_decode_metadata[bs] = metadata
         return metadata
 
-    # Capture is inherited: the base default (bind_decode_views + the idle
-    # refresh arm) reproduces the old bespoke capture exactly.
+    # Capture is inherited (base default: bind_decode_views + idle refresh).
 
     def refresh_decode_metadata(
         self,

@@ -300,10 +300,11 @@ class AttentionBackend(ABC):
 
         Refreshes the backend's persistent decode buffers in place (``copy_``)
         and points ``forward_decode_metadata`` at views over them. There is
-        deliberately no fresh-allocation decode path: capture allocates and
-        seeds the buffers, replay refreshes them before ``graph.replay()``,
-        and eager decode refreshes them before running the same forward code
-        the graph recorded.
+        deliberately no fresh-allocation decode path: capture runs this
+        refresh's idle arm over the same buffers (see
+        ``init_forward_metadata_capture_cuda_graph``), replay refreshes them
+        before ``graph.replay()``, and eager decode refreshes them before
+        running the same forward code the graph recorded.
 
         Args:
             bs: Rows to prepare. On graph replay this is the padded capture
@@ -311,7 +312,7 @@ class AttentionBackend(ABC):
             actual_bs: Live-request rows. Rows in ``[actual_bs, bs)`` are
                 padding: the backend must route them to the null page / dummy
                 slot so they never touch a live request's cache.
-                ``actual_bs == 0`` is the idle replay.
+                ``actual_bs == 0`` is the idle replay and the capture seeding.
             req_pool_indices: ``[>=bs]`` request-pool slots (padding rows hold
                 a sentinel or slot 0 per the wrapper's padding contract).
             seq_lens: ``[>=bs]`` live cache lengths (padding rows hold 1).
@@ -321,11 +322,10 @@ class AttentionBackend(ABC):
                 cache-group contract (and the draft's staged table).
             num_extends: Leading extend rows of a MIXED batch whose decode
                 half this refresh describes; 0 for pure decode.
-            for_graph_replay: True only under graph replay. The only
-                sanctioned use is a kernel-imposed asymmetry (e.g. FlashMLA
-                must swap in a fresh tile-schedule object per eager step
-                because the kernel freezes the schedule on first use, while
-                the captured schedule-build re-runs inside the graph).
+            for_graph_replay: True whenever a graph is in play — live replay
+                AND the capture default's idle refresh. Sanctioned branches
+                on it are graph-mechanics asymmetries only (FlashMLA's tile
+                schedule, DFLASH block-arm seeding); see unified_path.md.
             **kwargs: Cache-contract extras — ``block_tables``,
                 ``block_table_base_offsets``, ``cache_metadata``,
                 ``forward_batch``, ``num_tokens``.

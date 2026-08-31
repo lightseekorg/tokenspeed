@@ -516,10 +516,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         else:
             self.decode_cuda_graph_group_out_cache_loc = None
 
-    # Capture is inherited: the base default (bind_decode_views + the idle
-    # refresh arm) reproduces the old bespoke capture — the refresh zeroes
-    # the page table and write locations at actual_bs == 0 and applies the
-    # same verify-floor clamp to the runner-seeded seq_lens.
+    # Capture is inherited (base default: bind_decode_views + idle refresh).
 
     def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
         # An explicit group dispatch or the contract marker puts this backend
@@ -565,7 +562,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
         """Per-bs decode metadata views over the persistent buffers.
 
         One builder for capture and refresh; cached per bs — pointer-stable,
-        no storage allocated. Capture seeds the buffers separately.
+        no storage allocated.
         """
         metadata = self.decode_cuda_graph_metadata.get(bs)
         if metadata is not None:

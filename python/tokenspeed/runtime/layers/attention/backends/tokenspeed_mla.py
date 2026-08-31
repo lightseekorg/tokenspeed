@@ -706,10 +706,7 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
         else:
             self.decode_cuda_graph_group_out_cache_loc = None
 
-    # Capture is inherited: the base default (bind_decode_views + the idle
-    # refresh arm) reproduces the old bespoke capture — the refresh zeroes
-    # the kv indices and write locations at actual_bs == 0 and copies the
-    # runner-seeded seq_lens.
+    # Capture is inherited (base default: bind_decode_views + idle refresh).
 
     def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
         # Structural gate: the target (contract always marked by the registry)

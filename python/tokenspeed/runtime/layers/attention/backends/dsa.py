@@ -170,9 +170,7 @@ class DSABackend(AttentionBackend):
 
     # Capture is inherited: the base default routes through this wrapper's
     # refresh, whose lazy arm builds the piggybacked _dsa_seq_lens_2d /
-    # _dsa_plan once per bs on the dense backend's cached metadata and
-    # refreshes them in place afterwards. (The old bespoke capture also had
-    # a narrow signature that rejected the runner's cache_group_ids.)
+    # _dsa_plan once per bs on the dense backend's cached metadata.
 
     def bind_decode_views(self, bs: int, cache_group_ids: tuple[str, ...] = ()) -> None:
         self._dense_backend.bind_decode_views(bs, cache_group_ids)

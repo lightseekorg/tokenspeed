@@ -219,7 +219,8 @@ Enumerated residue in `ForwardStepRunner.__call__`, all tied to the mechanics
 of replaying a recorded graph: input-buffer padding to the ladder bs plus the
 DFLASH sentinel req-pool rows, `_set_graph_state_write_indices`, the DeepEP
 dispatch-mode restore (`deepep_adapter.replay()`), the sampler-variant
-`graph_key` lookup, output-buffer re-slicing, and the `ctx.bs` save/restore.
+`graph_key` lookup, the `TOKENSPEED_GRAPH_DEBUG` metadata verify,
+output-buffer re-slicing, and the `ctx.bs` save/restore.
 
 Address-freezing bugs — a refresh that binds metadata views over storage the
 captured graph never recorded — are assertable: capture snapshots the tensor

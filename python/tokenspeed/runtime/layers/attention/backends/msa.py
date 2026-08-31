@@ -357,10 +357,9 @@ class MSAAttnBackend(CacheGroupsMixin, AttentionBackend):
         self.cuda_graph_decode_metadata[bs] = metadata
         return metadata
 
-    # Capture is inherited: the base default (bind_decode_views + the idle
-    # refresh arm) reproduces the old bespoke capture — the refresh below
-    # re-fills score_out and the runner-seeded seq_lens satisfy the verify
-    # floor the old capture clamped to.
+    # Capture is inherited (base default: bind_decode_views + idle refresh).
+    # It relies on the runner seeding capture seq_lens >= the verify floor:
+    # the refresh below copies them without a clamp.
 
     def refresh_decode_metadata(
         self,

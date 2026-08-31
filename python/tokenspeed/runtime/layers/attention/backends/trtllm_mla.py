@@ -471,11 +471,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         self.decode_cuda_graph_metadata[bs] = metadata
         return metadata
 
-    # Capture is inherited: the base default (bind_decode_views + the idle
-    # refresh arm) reproduces the old bespoke capture — the mixin bind builds
-    # the same cached views, the refresh applies the same verify-floor clamp,
-    # and the write-location buffer is zero-init (the old capture-time
-    # zeroing was redundant before any live refresh).
+    # Capture is inherited (base default: bind_decode_views + idle refresh).
 
     def refresh_decode_metadata(
         self,

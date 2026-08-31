@@ -647,10 +647,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             max_bs, dtype=torch.int32, device=self.device
         )
 
-    # Capture is inherited: the base default (bind_decode_views + the idle
-    # refresh arm) reproduces the old bespoke capture — the refresh below
-    # copies the runner-seeded seq_lens, redoes the spec>1 clamp and binds
-    # both metadata slots.
+    # Capture is inherited (base default: bind_decode_views + idle refresh).
 
     def _init_block_decode_metadata_capture(self, bs: int):
         """DFLASH draft block (cuda-graph capture): spec_num_tokens single-query
@@ -674,7 +671,6 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     def _init_decode_metadata_capture(
         self,
         bs: int,
-        seq_lens: torch.Tensor,
         page_tables: dict[str, torch.Tensor] | None = None,
         out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
@@ -694,8 +690,6 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             page_tables=page_tables,
             out_cache_locs=out_cache_locs,
         )
-        # Seed the owned buffer: the capture run reads it before replay.
-        metadata.cache_seqlens_int32.copy_(seq_lens[:bs])
         self.cuda_graph_decode_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -760,9 +754,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 bs, self.spec_num_tokens, page_tables, out_cache_locs
             )
         if need_decode and bs not in self.cuda_graph_decode_metadata:
-            self._init_decode_metadata_capture(
-                bs, self.cuda_graph_cache_seqlens, page_tables, out_cache_locs
-            )
+            self._init_decode_metadata_capture(bs, page_tables, out_cache_locs)
 
     def refresh_decode_metadata(
         self,
