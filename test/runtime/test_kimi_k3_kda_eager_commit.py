@@ -33,18 +33,23 @@ class _Harness:
         torch.manual_seed(seed)
         self.pool = _make_kimi_pool(DEV, usable_pages=24)
         self.contract = self.pool.arena.runtime_contract
-        config = SimpleNamespace(
-            device=DEV,
+        spec = SimpleNamespace(
             num_attention_heads=H,
             num_kv_heads=H,
             attn_tp_size=1,
-            dtype=torch.bfloat16,
             head_dim=D,
+        )
+        config = SimpleNamespace(
+            device=DEV,
+            dtype=torch.bfloat16,
             is_draft=False,
             speculative_num_draft_tokens=T,
             max_bs=8,
+            components=(spec,),
+            # Stub component(): this backend construction never queries components.
+            component=lambda cls: None,
         )
-        self.backend = KdaAttnBackend(config)
+        self.backend = KdaAttnBackend(config, spec)
         self.backend.set_kv_pool(self.pool)
         if eager_replay and not self.backend._replay_active:
             pytest.skip("KDA replay commit kernel unavailable")

@@ -48,6 +48,7 @@ from tokenspeed.cli.serve_smg import (
     KIMI_K3_REASONING_PARSER,
     KIMI_K3_TOOL_CALL_PARSER,
     _args_with_default_model_parsers,
+    _free_port_avoiding_ephemeral_range,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_policy,
     _gateway_args_with_default_port,
@@ -210,6 +211,60 @@ def test_gateway_args_preserve_user_prometheus_port():
     )
 
     assert gateway_args == ["--prometheus-port", "29000"]
+
+
+def test_free_port_returns_first_sample_outside_ephemeral_range(monkeypatch):
+    """No retry needed when the first sample already clears the range."""
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._ephemeral_port_range", lambda: (32768, 60999)
+    )
+    calls = iter([8413])
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.get_free_port", lambda: next(calls))
+
+    assert _free_port_avoiding_ephemeral_range() == 8413
+
+
+def test_free_port_retries_out_of_ephemeral_range(monkeypatch):
+    """A sample landing inside the ephemeral range is resampled."""
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._ephemeral_port_range", lambda: (32768, 60999)
+    )
+    # First two samples land inside the ephemeral range; the third clears it.
+    calls = iter([40000, 41000, 9000])
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.get_free_port", lambda: next(calls))
+
+    assert _free_port_avoiding_ephemeral_range() == 9000
+
+
+def test_free_port_gives_up_after_max_attempts(monkeypatch):
+    """Never loops forever: after a bounded number of attempts, return
+    whatever the last sample was rather than retrying indefinitely."""
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._ephemeral_port_range", lambda: (32768, 60999)
+    )
+    always_ephemeral = iter([40000, 41000, 42000, 43000, 44000, 45000, 46000])
+    call_count = {"n": 0}
+
+    def fake_get_free_port():
+        call_count["n"] += 1
+        return next(always_ephemeral)
+
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.get_free_port", fake_get_free_port)
+
+    port = _free_port_avoiding_ephemeral_range()
+
+    assert port == 44000  # 5th and last attempt
+    assert call_count["n"] == 5
+
+
+def test_free_port_skips_ephemeral_check_when_range_unknown(monkeypatch):
+    """Non-Linux hosts (no /proc/sys/net/ipv4/ip_local_port_range) degrade
+    to a plain get_free_port() call -- no retries, no crash."""
+    monkeypatch.setattr("tokenspeed.cli.serve_smg._ephemeral_port_range", lambda: None)
+    calls = iter([40000])
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.get_free_port", lambda: next(calls))
+
+    assert _free_port_avoiding_ephemeral_range() == 40000
 
 
 def test_smg_disable_flags_appended_when_absent():

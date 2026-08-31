@@ -22,7 +22,7 @@ on:
           - gb200
           - gb300
       yaml:
-        description: "Single B200/GB200 or multi-node Slurm CI YAML; required for cluster=gb300"
+        description: "Optional single CI YAML; off runs the bulk task selection"
         required: true
         default: "off"
         type: choice
@@ -64,7 +64,7 @@ on:
           - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
           - test/ci/ut/ut-tokenspeed-kernel.yaml
       runners:
-        description: "GB200 bulk runners, or one declared [slurm-]gb300-* runner with a selected YAML"
+        description: "Logical bulk runners; GB300 maps B200/GB200 labels to matching GB300 runners"
         required: true
         default: "b200-4gpu,gb200-4gpu"
         type: string
@@ -148,10 +148,6 @@ jobs:
               coordinator_user=${USER:-$(id -un)}
               export TS_CI_ARTIFACT_ROOT="/data/home/$coordinator_user/tokenspeed-slurm"
               export TS_CI_CACHE_DIR="/data/home/$coordinator_user/tokenspeed-cache"
-              [ "$YAML_SELECTION" != off ] || {
-                echo "GB300 requires an explicit YAML selection" >&2
-                exit 2
-              }
               ;;
             *)
               echo "Unsupported Slurm cluster: $CLUSTER" >&2
@@ -165,6 +161,18 @@ jobs:
               [[ "$runner" == "$prefix"* ]] && return 0
             done
             return 1
+          }
+
+          gb300_runner_for() {
+            local runner=$1
+            case "$runner" in
+              b200-*) echo "gb300-${runner#b200-}" ;;
+              gb200-*) echo "gb300-${runner#gb200-}" ;;
+              slurm-b200-*) echo "slurm-gb300-${runner#slurm-b200-}" ;;
+              slurm-gb200-*) echo "slurm-gb300-${runner#slurm-gb200-}" ;;
+              gb300-*|slurm-gb300-*) echo "$runner" ;;
+              *) return 1 ;;
+            esac
           }
 
           if [ "$YAML_SELECTION" != off ]; then
@@ -188,7 +196,14 @@ jobs:
               task = normalize_task(repo / selection, repo)
           prefixes = {
               "gb200": ("b200-", "gb200-", "slurm-gb200-"),
-              "gb300": ("gb300-", "slurm-gb300-"),
+              "gb300": (
+                  "b200-",
+                  "gb200-",
+                  "slurm-b200-",
+                  "slurm-gb200-",
+                  "gb300-",
+                  "slurm-gb300-",
+              ),
           }[sys.argv[2]]
           print(f"type:{task['type']}")
           for label in task["runner"]["labels"]:
@@ -209,39 +224,41 @@ jobs:
             }
             args+=(--type "$yaml_task_type")
             if [ "$CLUSTER" = gb300 ]; then
-              [ "$yaml_task_type" != perf ] || {
-                echo "GB300 perf tasks require calibrated references" >&2
-                exit 2
-              }
-              ((${#yaml_runners[@]} == 1)) || {
-                echo "GB300 requires exactly one declared [slurm-]gb300-* runner" >&2
-                exit 2
-              }
-              yaml_runner=${yaml_runners[0]}
+              selected_runners=()
               if [ "${RUNNERS//[[:space:]]/}" = "b200-4gpu,gb200-4gpu" ]; then
-                selected_runner=$yaml_runner
+                selected_runners=("${yaml_runners[@]}")
               else
                 IFS=',' read -ra values <<< "$RUNNERS"
-                selected_runners=()
                 for value in "${values[@]}"; do
                   value="${value//[[:space:]]/}"
-                  [ -z "$value" ] || selected_runners+=("$value")
+                  [ -z "$value" ] && continue
+                  matches=0
+                  for yaml_runner in "${yaml_runners[@]}"; do
+                    effective_runner=$(gb300_runner_for "$yaml_runner") || continue
+                    if [ "$value" = "$yaml_runner" ] || [ "$value" = "$effective_runner" ]; then
+                      for selected_runner in "${selected_runners[@]}"; do
+                        [ "$selected_runner" != "$yaml_runner" ] || {
+                          echo "Runner $value selects $yaml_runner more than once" >&2
+                          exit 2
+                        }
+                      done
+                      selected_runners+=("$yaml_runner")
+                      ((matches += 1))
+                    fi
+                  done
+                  ((matches == 1)) || {
+                    echo "Runner $value does not identify exactly one runner declared by $YAML_SELECTION" >&2
+                    exit 2
+                  }
                 done
-                ((${#selected_runners[@]} == 1)) || {
-                  echo "GB300 accepts exactly one explicit runner" >&2
+              fi
+              for yaml_runner in "${selected_runners[@]}"; do
+                effective_runner=$(gb300_runner_for "$yaml_runner") || {
+                  echo "Runner $yaml_runner cannot run on the GB300 cluster" >&2
                   exit 2
                 }
-                selected_runner=${selected_runners[0]}
-              fi
-              runner_is_supported "$selected_runner" || {
-                echo "Runner $selected_runner is not supported by the GB300 cluster" >&2
-                exit 2
-              }
-              [ "$selected_runner" = "$yaml_runner" ] || {
-                echo "Runner $selected_runner is not declared by $YAML_SELECTION" >&2
-                exit 2
-              }
-              args+=(--runner "$yaml_runner")
+                args+=(--runner-alias "$yaml_runner=$effective_runner")
+              done
             else
               for value in "${yaml_runners[@]}"; do
                 args+=(--runner "$value")
@@ -253,11 +270,19 @@ jobs:
             for value in "${values[@]}"; do
               value="${value//[[:space:]]/}"
               [ -z "$value" ] && continue
-              runner_is_supported "$value" || {
-                echo "Runner $value is not supported by the $CLUSTER cluster" >&2
-                exit 2
-              }
-              args+=(--runner "$value")
+              if [ "$CLUSTER" = gb300 ]; then
+                effective_runner=$(gb300_runner_for "$value") || {
+                  echo "Runner $value cannot run on the GB300 cluster" >&2
+                  exit 2
+                }
+                args+=(--runner-alias "$value=$effective_runner")
+              else
+                runner_is_supported "$value" || {
+                  echo "Runner $value is not supported by the $CLUSTER cluster" >&2
+                  exit 2
+                }
+                args+=(--runner "$value")
+              fi
             done
 
             IFS=',' read -ra values <<< "$TASK_TYPES"

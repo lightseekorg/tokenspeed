@@ -33,6 +33,9 @@ from functools import cached_property
 import torch
 from typing_extensions import override
 
+from tokenspeed.runtime.layers.attention.configs.base import (
+    SoftmaxAttnConfig,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheGroupDeclaration,
     CacheRecipe,
@@ -67,7 +70,7 @@ class InklingRecipe(CacheRecipe):
     @property
     @override
     def num_target_layers(self) -> int:
-        return len(self.attn_config.layer_types)
+        return len(self.attn_config.component(SoftmaxAttnConfig).layer_types)
 
     @property
     @override
@@ -85,10 +88,12 @@ class InklingRecipe(CacheRecipe):
 
     @cached_property
     def layer_types(self) -> tuple[str, ...]:
-        target = tuple(self.attn_config.layer_types)
+        target = tuple(self.attn_config.component(SoftmaxAttnConfig).layer_types)
         if self.draft_attn_config is None:
             return target
-        return target + tuple(self.draft_attn_config.layer_types)
+        return target + tuple(
+            self.draft_attn_config.component(SoftmaxAttnConfig).layer_types
+        )
 
     @property
     def group_ids(self) -> tuple[str, ...]:
@@ -149,11 +154,12 @@ class InklingRecipe(CacheRecipe):
     ) -> tuple[CacheFieldSpec, ...]:
         """This layer's attention pages. Its conv checkpoints are columns."""
         config = self._layer_config(layer_id)
+        spec = self._layer_spec(layer_id)
         # mxfp8_kv_scale_fields owns the page-span and head-dim constraints the
         # interleaved scale layout imposes.
         mxfp8 = bool(config.kv_cache_mxfp8)
         kv_heads = self._layer_kv_heads(layer_id)
-        kv_shape = (self.prefix_granularity, kv_heads, config.head_dim)
+        kv_shape = (self.prefix_granularity, kv_heads, spec.head_dim)
         kv_dtype = (
             cache_dtype_name(torch.float8_e4m3fn)
             if mxfp8
@@ -179,7 +185,7 @@ class InklingRecipe(CacheRecipe):
             layer_id=layer_id,
             occurrence=occurrence,
             kv_heads=kv_heads,
-            head_dim=config.head_dim,
+            head_dim=spec.head_dim,
             prefix_granularity=self.prefix_granularity,
         )
 
@@ -203,7 +209,7 @@ class InklingRecipe(CacheRecipe):
             text_config = self._layer_model_config(layer_id).hf_config.get_text_config()
             checkpoint_rows = text_config.sconv_kernel_size - 1
             kv_row = (
-                self._layer_kv_heads(layer_id) * self._layer_config(layer_id).head_dim
+                self._layer_kv_heads(layer_id) * self._layer_spec(layer_id).head_dim
             )
             k_plane = f"unit.{occurrence}.k"
             v_plane = f"unit.{occurrence}.v"
@@ -248,6 +254,10 @@ class InklingRecipe(CacheRecipe):
             else self.draft_attn_config
         )
 
+    def _layer_spec(self, layer_id: int):
+        """The owning attn config's softmax (MHA) component spec."""
+        return self._layer_config(layer_id).component(SoftmaxAttnConfig)
+
     def _layer_model_config(self, layer_id: int):
         return (
             self.model_config
@@ -256,8 +266,8 @@ class InklingRecipe(CacheRecipe):
         )
 
     def _layer_kv_heads(self, layer_id: int) -> int:
-        config = self._layer_config(layer_id)
-        return max(1, self.layer_kv_head_counts[layer_id] // config.attn_tp_size)
+        spec = self._layer_spec(layer_id)
+        return max(1, self.layer_kv_head_counts[layer_id] // spec.attn_tp_size)
 
     # ---- extras ----
 
@@ -316,7 +326,9 @@ def _conv_ring_bytes(*, text_config, attn_config, num_layers: int, spec_tokens: 
     # Must match _wrap_inkling_backend's ring sizing: (W-1) taps + K chunk rows.
     spec_tokens = max(1, int(spec_tokens))
     ring_rows = int(text_config.sconv_kernel_size) - 1 + spec_tokens
-    conv_dim = inkling_conv_total_dim(text_config, attn_config.attn_tp_size)
+    conv_dim = inkling_conv_total_dim(
+        text_config, attn_config.component(SoftmaxAttnConfig).attn_tp_size
+    )
     pending_bytes = rows * torch.bool.itemsize
     return (
         num_layers * rows * ring_rows * conv_dim * torch.bfloat16.itemsize

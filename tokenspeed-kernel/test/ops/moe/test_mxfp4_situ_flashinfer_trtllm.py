@@ -22,7 +22,7 @@
 
 Exercises the full in-repo chain -- the weight preprocessor (concatenated
 [gate|up] loader layout -> shuffled TRTLLM [up|gate]) and the registered
-apply -- against ``a16w4_mxfp4_moe_reference`` on the same MXFP4 weights.
+apply -- against ``mxfp4_moe_reference`` on the same MXFP4 weights.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from importlib.util import find_spec
 
 import pytest
 import torch
-from kimi3_reference import a16w4_mxfp4_moe_reference
+from kimi3_reference import mxfp4_moe_reference
 from utils import make_mxfp4_moe_weights
 
 NUM_EXPERTS = 8
@@ -131,7 +131,7 @@ def test_flashinfer_situ_kernel_routing_matches_portable_reference() -> None:
     raw, hidden_states, router_logits, bias, topk_ids, topk_weights = (
         _kernel_routing_case(20260825, num_tokens)
     )
-    expected = a16w4_mxfp4_moe_reference(
+    expected = mxfp4_moe_reference(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -139,6 +139,7 @@ def test_flashinfer_situ_kernel_routing_matches_portable_reference() -> None:
         raw["w2_scale"],
         topk_ids,
         topk_weights,
+        activation_dtype=torch.bfloat16,
         situ_beta=SITU_BETA,
         situ_linear_beta=SITU_LINEAR_BETA,
     )
@@ -162,7 +163,7 @@ def test_flashinfer_situ_precomputed_routing_matches_portable_reference() -> Non
     raw, hidden_states, router_logits, bias, topk_ids, topk_weights = (
         _kernel_routing_case(20260827, 16)
     )
-    expected = a16w4_mxfp4_moe_reference(
+    expected = mxfp4_moe_reference(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -170,6 +171,7 @@ def test_flashinfer_situ_precomputed_routing_matches_portable_reference() -> Non
         raw["w2_scale"],
         topk_ids,
         topk_weights,
+        activation_dtype=torch.bfloat16,
         situ_beta=SITU_BETA,
         situ_linear_beta=SITU_LINEAR_BETA,
     )

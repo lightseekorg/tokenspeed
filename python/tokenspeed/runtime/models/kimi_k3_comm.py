@@ -114,6 +114,7 @@ def select_k3_moe_tail_tier(
     tail_fusion_max_tokens: int,
     fused_moe_ar: bool,
     multimem_ok: bool,
+    is_decode: bool = False,
 ) -> K3MoETailTier:
     """Pick the tail tier; every input must be rank-uniform.
 
@@ -124,6 +125,8 @@ def select_k3_moe_tail_tier(
             able and worth running at, 0 when absent.
         fused_moe_ar: Whether the fused-AR execution plan is armed.
         multimem_ok: Collectively-agreed multimem availability.
+        is_decode: Whether this forward is a decode (spec-verify included);
+            rank-uniform and stable between graph capture and replay.
 
     Returns:
         The best applicable ``K3MoETailTier``.
@@ -134,7 +137,12 @@ def select_k3_moe_tail_tier(
         return K3MoETailTier.TAIL_FUSION
     if not fused_moe_ar:
         return K3MoETailTier.SEPARATE_REDUCE
-    if multimem_ok and MULTIMEM_AR_MIN_TOKENS <= num_tokens <= MULTIMEM_AR_MAX_TOKENS:
+    if (
+        multimem_ok
+        # Decode buckets skip multimem: same bytes, but it leaves the GPU idle there.
+        and not is_decode
+        and MULTIMEM_AR_MIN_TOKENS <= num_tokens <= MULTIMEM_AR_MAX_TOKENS
+    ):
         return K3MoETailTier.MULTIMEM_AR
     return K3MoETailTier.FUSED_LANE_AR
 
@@ -587,7 +595,13 @@ class K3MoeTailComm:
     # ------------------------------------------------------------------
     # Routing
     # ------------------------------------------------------------------
-    def plan(self, num_tokens: int, hidden_states: torch.Tensor) -> TailPlan:
+    def plan(
+        self,
+        num_tokens: int,
+        hidden_states: torch.Tensor,
+        *,
+        is_decode: bool = False,
+    ) -> TailPlan:
         """Pick the tail tier and its forward-side obligations.
 
         Every input must be rank-uniform (token count, graph phase and the
@@ -604,6 +618,7 @@ class K3MoeTailComm:
             ),
             fused_moe_ar=self.execution_plan.fused_moe_ar,
             multimem_ok=self.state.multimem_ar_ok,
+            is_decode=is_decode,
         )
         if tier is K3MoETailTier.TAIL_FUSION:
             # Full fusion: with the trtllm fused-AR plan armed and a

@@ -47,6 +47,7 @@ from tokenspeed.runtime.layers.attention.backends.mla_cache_groups import (
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     TRTLLM_MLA_DEFAULT_PAGE_SIZE,
@@ -131,8 +132,8 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
 
     draft_seq_lens_attr: str = "cuda_graph_seq_lens_buf"
 
-    def __init__(self, config: MLAConfig):
-        super().__init__(config)
+    def __init__(self, config: AttnConfig, spec: MLAConfig):
+        super().__init__(config, spec)
 
         self.max_context_len = config.context_len
         self.kernel_page_size = (
@@ -151,12 +152,12 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         self.max_num_pages = self._calc_padded_blocks(config.context_len)
 
         # MLA dimensions
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
-        self.kv_cache_dim = config.kv_cache_dim
-        self.scaling = config.scaling
+        self.kv_lora_rank = spec.kv_lora_rank
+        self.qk_nope_head_dim = spec.qk_nope_head_dim
+        self.qk_rope_head_dim = spec.qk_rope_head_dim
+        self.v_head_dim = spec.v_head_dim
+        self.kv_cache_dim = spec.kv_cache_dim
+        self.scaling = spec.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
         self.draft_block_decode = config.draft_block_decode
@@ -170,7 +171,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 f"trtllm_mla backend requires page_size 32 or 64, got {self.kernel_page_size}"
             )
 
-        self.num_local_heads = config.num_attention_heads // config.attn_tp_size
+        self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
 
         # Metadata
         self.forward_decode_metadata: TRTLLMMLADecodeMetadata | None = None

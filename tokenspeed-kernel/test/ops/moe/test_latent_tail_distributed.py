@@ -113,7 +113,8 @@ def test_latent_tail_matches_reference(m):
     assert err < 0.05 * max(scale, 1.0), f"m={m}: err {err} vs scale {scale}"
 
 
-def test_latent_tail_graph_replay():
+@pytest.mark.parametrize("m", [1, 4, 6, 16])
+def test_latent_tail_graph_replay(m):
     from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
 
     rank, dev = _setup()
@@ -127,7 +128,7 @@ def test_latent_tail_graph_replay():
         layer_index=0,
         model_scope="test",
     )
-    routed, shared, rms_w, up_w = _inputs(rank, dev, 1, seed=200)
+    routed, shared, rms_w, up_w = _inputs(rank, dev, m, seed=200 + m)
     for _ in range(3):
         op(routed, shared, rms_w, up_w)
     torch.cuda.synchronize()
@@ -139,13 +140,66 @@ def test_latent_tail_graph_replay():
     scale = None
     for seed in (300, 301):
         torch.manual_seed(seed + rank)
-        routed.copy_(torch.randn(1, L, dtype=torch.bfloat16, device=dev) * 0.1)
+        routed.copy_(torch.randn(m, L, dtype=torch.bfloat16, device=dev) * 0.1)
+        shared.copy_(torch.randn(m, H, dtype=torch.bfloat16, device=dev) * 0.1)
         graph.replay()
         torch.cuda.synchronize()
         ref = _reference(routed, shared, rms_w, up_w)
         scale = ref.float().abs().max().item()
         err = (out.float() - ref.float()).abs().max().item()
         assert err < 0.05 * max(scale, 1.0), f"seed={seed}: err {err}"
+
+
+@pytest.mark.parametrize("m", [1, 4, 16])
+def test_latent_tail_deferred_top16_matches_materialized(m):
+    from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
+
+    rank, dev = _setup()
+    _require_latent_tail()
+    op = KimiK3LatentTailOp.initialize(
+        group=dist.group.WORLD,
+        hidden_size=H,
+        latent_size=L,
+        rms_eps=EPS,
+        device=dev,
+        layer_index=0,
+        model_scope=f"test-deferred-{m}",
+        finalize_top_k=16,
+    )
+    _, shared, rms_w, up_w = _inputs(rank, dev, m, seed=600 + m)
+    torch.manual_seed(700 + rank)
+    rows = (
+        torch.randn(m * 16, L, dtype=torch.bfloat16, device=dev) * 0.02
+    ).contiguous()
+    weights = torch.randn(m, 16, dtype=torch.bfloat16, device=dev).contiguous()
+    indices = torch.arange(m * 16, dtype=torch.int32, device=dev).reshape(m, 16)
+    indices[:, ::5] = -1
+
+    routed = torch.zeros(m, L, dtype=torch.float32, device=dev)
+    for slot in range(16):
+        valid = indices[:, slot] >= 0
+        routed[valid] += (
+            weights[valid, slot, None].float()
+            * rows[indices[valid, slot].long()].float()
+        )
+    routed = routed.to(torch.bfloat16)
+
+    expected = op(routed, shared, rms_w, up_w).clone()
+    torch.cuda.synchronize()
+    dist.barrier()
+    actual = op.call_deferred(
+        rows,
+        weights,
+        indices,
+        shared,
+        rms_w,
+        up_w,
+        num_tokens=m,
+    )
+    torch.cuda.synchronize()
+    scale = expected.float().abs().max().item()
+    err = (actual.float() - expected.float()).abs().max().item()
+    assert err < 0.02 * max(scale, 1.0), f"m={m}: err {err} vs scale {scale}"
 
 
 @pytest.mark.parametrize("m", [9, 64])

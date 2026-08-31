@@ -1067,7 +1067,7 @@ def test_mla_normalize_project_query_cuda_fallback(
     ).to(torch.bfloat16)
     expected_output = expected_query @ projection_weight.t()
 
-    returned = attention_ops.mla_normalize_project_query(
+    returned_query, absorbed_query = attention_ops.mla_normalize_project_query(
         query,
         kv,
         query_weight,
@@ -1079,9 +1079,9 @@ def test_mla_normalize_project_query_cuda_fallback(
         qk_rope_head_dim=4,
     )
 
-    assert returned.absorbed_query is None
+    assert absorbed_query is None
     torch.testing.assert_close(kv, expected_kv, atol=0, rtol=0)
-    torch.testing.assert_close(returned.query, expected_output, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(returned_query, expected_output, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("heads", [12, 16])
@@ -1109,7 +1109,7 @@ def test_mla_normalize_project_query_split_output(
     expected_kv = kv.clone()
     eps = 1e-6
 
-    returned = attention_ops.mla_normalize_project_query(
+    returned_query, absorbed_query = attention_ops.mla_normalize_project_query(
         query,
         kv,
         query_weight,
@@ -1139,12 +1139,12 @@ def test_mla_normalize_project_query_split_output(
         * kv_weight.float()
     ).to(torch.bfloat16)
 
-    assert returned.absorbed_query is not None
+    assert absorbed_query is not None
     torch.testing.assert_close(
-        returned.query, projected[..., :128], atol=2e-2, rtol=2e-2
+        returned_query, projected[..., :128], atol=2e-2, rtol=2e-2
     )
     torch.testing.assert_close(
-        returned.absorbed_query[..., 512:],
+        absorbed_query[..., 512:],
         projected[..., 128:],
         atol=2e-2,
         rtol=2e-2,

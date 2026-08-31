@@ -175,6 +175,7 @@ class _Harness:
             InklingConvStatePool,
         )
         from tokenspeed.runtime.layers.attention.backends.mha import MHAAttnBackend
+        from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
         from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
         from tokenspeed.runtime.layers.attention.kv_cache.mha import (
             MHATokenToKVPool,
@@ -183,13 +184,15 @@ class _Harness:
         self.model = model
         self.text = text
         self.device = device
-        config = MHAConfig(
-            device=device,
+        spec = MHAConfig(
             backend_name="fa4",
             num_attention_heads=text.num_attention_heads,
             num_kv_heads=text.num_key_value_heads,
             head_dim=text.head_dim,
             attn_tp_size=1,
+        )
+        config = AttnConfig(
+            device=device,
             dtype=torch.bfloat16,
             kv_cache_dtype=torch.bfloat16,
             prefix_granularity=PAGE_SIZE,
@@ -198,8 +201,9 @@ class _Harness:
             max_bs=4,
             max_graph_bs=4,
             kv_cache_quant_method="none",
+            components=(spec,),
         )
-        inner = MHAAttnBackend(config)
+        inner = MHAAttnBackend(config, spec)
         from cache_pool_test_utils import make_mha_memory_plan, make_pool
 
         # One arena, one view over it: the pool owns no memory or geometry.

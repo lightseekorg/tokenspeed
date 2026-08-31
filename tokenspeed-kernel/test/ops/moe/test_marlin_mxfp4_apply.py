@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from kimi3_reference import a16w4_mxfp4_moe_reference
+from kimi3_reference import mxfp4_moe_reference
 from tokenspeed_kernel.ops.moe.marlin.mxfp4 import (
     marlin_mxfp4_moe_weights,
     marlin_mxfp4_precomputed_moe_apply,
@@ -90,7 +90,7 @@ def test_marlin_mxfp4_situ_matches_reference(num_tokens: int) -> None:
     )
     topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
 
-    expected = a16w4_mxfp4_moe_reference(
+    expected = mxfp4_moe_reference(
         x,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -98,6 +98,7 @@ def test_marlin_mxfp4_situ_matches_reference(num_tokens: int) -> None:
         raw["w2_scale"],
         topk_ids,
         topk_weights,
+        activation_dtype=torch.bfloat16,
         situ_beta=beta,
         situ_linear_beta=linear_beta,
     )
@@ -146,7 +147,7 @@ def test_marlin_mxfp4_ep_masks_nonlocal_experts() -> None:
     )
     topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
 
-    expected = a16w4_mxfp4_moe_reference(
+    expected = mxfp4_moe_reference(
         x,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -154,6 +155,7 @@ def test_marlin_mxfp4_ep_masks_nonlocal_experts() -> None:
         raw["w2_scale"],
         topk_ids,
         topk_weights,
+        activation_dtype=torch.bfloat16,
         situ_beta=beta,
         situ_linear_beta=linear_beta,
     )

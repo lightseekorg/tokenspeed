@@ -191,6 +191,22 @@ def _swiglu_gfx1250(acc, alpha: gl.constexpr, limit: gl.constexpr, beta: gl.cons
     return s * (linear + beta)
 
 
+@gluon.jit
+def _situ_gfx1250(
+    acc,
+    beta: gl.constexpr,
+    linear_beta: gl.constexpr,
+):
+    BLOCK_M: gl.constexpr = acc.shape[0]
+    OUT_BLOCK_N: gl.constexpr = acc.shape[1] // 2
+    # Match Kimi-K3's BF16 gate/up boundary before applying SiTU.
+    acc = acc.to(gl.bfloat16).to(gl.float32)
+    gate, linear = gl.split(acc.reshape((BLOCK_M, OUT_BLOCK_N, 2)))
+    gate = beta * gl.extra.libdevice.tanh(gate / beta) / (1.0 + gl.exp(-gate))
+    linear = linear_beta * gl.extra.libdevice.tanh(linear / linear_beta)
+    return gate * linear
+
+
 @gluon.constexpr_function
 def get_bitwidth(dtype):
     if isinstance(dtype, gl.pointer_type):

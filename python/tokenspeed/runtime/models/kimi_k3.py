@@ -533,7 +533,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 )
             q = self.q_b_proj(q_norm)[0]
             return q, latent_cache, gate, None
-        projection = mla_normalize_project_query(
+        q, absorbed_query = mla_normalize_project_query(
             q_a,
             kv_a,
             self.fused_qk_layernorm.weight_q_a,
@@ -544,7 +544,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             qk_nope_head_dim=self.qk_nope_head_dim,
             qk_rope_head_dim=self.qk_rope_head_dim,
         )
-        return projection.query, latent_cache, gate, projection.absorbed_query
+        return q, latent_cache, gate, absorbed_query
 
     def can_fuse_attnres_partials(
         self,
@@ -1038,9 +1038,12 @@ class KimiLinearKDA(nn.Module):
         proj = self.num_heads * self.head_dim
         hidden = config.hidden_size
 
-        tp_rank = mapping.attn.tp_rank
-        tp_size = mapping.attn.tp_size
-        tp_group = mapping.attn.tp_group
+        # KDA parallelism reads the linear-attention mapping: it defaults to
+        # the attention TP width and diverges only under the
+        # MLA-DP + linear-attn-TP hybrid.
+        tp_rank = mapping.linear_attn.tp_rank
+        tp_size = mapping.linear_attn.tp_size
+        tp_group = mapping.linear_attn.tp_group
         self.local_num_heads = self.num_heads // tp_size
         proj_local = proj // tp_size
 
@@ -1235,7 +1238,7 @@ class KimiLinearKDA(nn.Module):
             activation="silu",
             key_dim=proj,
             value_dim=proj,
-            attention_tp_size=self.mapping.attn.tp_size,
+            attention_tp_size=self.mapping.linear_attn.tp_size,
             head_k_dim=hd,
             head_v_dim=hd,
             f_a_out=f_a_out,
@@ -1871,12 +1874,23 @@ class KimiLinearMoE(nn.Module):
 
         # Router runs uncontended on main (3us; on aux it starves to 14us
         # under concurrent GEMMs). When the selected experts need precomputed
-        # TopK, its single small CTA overlaps down_proj from the aux stream,
-        # followed by the shared chain. Kernel routing bypasses that CTA.
+        # TopK runs on the fork branch beside down_proj; routing bypasses it.
         router_logits = self.gate(hidden_states)
         routing_output_format = self._routing_output_format(ctx)
         precompute_topk = routing_output_format.is_standard()
-        plan = self.comm.plan(num_tokens, hidden_states)
+        plan = self.comm.plan(
+            num_tokens,
+            hidden_states,
+            # Rank-uniform by construction: DP-EP gather replicates the phase.
+            is_decode=(
+                ctx is not None
+                and (
+                    ctx.all_decode_or_idle
+                    if self._gather_dp_tokens_for_moe
+                    else ctx.forward_mode.is_decode()
+                )
+            ),
+        )
         if plan.lane is not None:
             self.experts._situ_output_buffer = plan.lane[:, : self.routed_hidden]
         else:

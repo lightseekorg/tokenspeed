@@ -344,7 +344,16 @@ Its responsibilities:
 * **Two tiers (Device/Host).** Device prefix publication can optionally
   stream to the Host tier (`stream_device_cache_to_host_`); a
   `pending_stores_` queue drives D2H transfers, alongside Host-side
-  acquire/contains/pin queries.
+  acquire/contains/pin queries. During prefill, each completed scheduling
+  boundary queues all newly published full-attention pages and one checkpoint
+  per snapshot-state group; the pending candidates are merged into a batched
+  writeback. The first decode admission from `PrefillDone` applies the same
+  policy to the final prompt boundary. Ordinary decode still publishes Device
+  entries but does not stream full-attention or snapshot-state entries to
+  Host. At finish or retraction, all eligible Device-resident non-state pages
+  and only the newest Device-resident checkpoint per state group are queued
+  before request ownership is released. Ordinary sliding-window entries
+  always stream when published.
 * **Reclamation and lifecycle.** `ReclaimExpired`, `Free`,
   `ClearDeviceCache`/`ClearCache`, and `NumNewlyReleasableLcmBlocks` for
   ranking retraction (preemption) victims.

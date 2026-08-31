@@ -98,7 +98,11 @@ def test_routed_backend_matches_torch(shape, backend):
     reason="route is registered for sm100 and up",
 )
 def test_non_bf16_inputs_fall_back_to_torch():
-    from tokenspeed_kernel.ops.gemm.routed_gemv import skinny_gemv, tgv_gemv
+    from tokenspeed_kernel.ops.gemm.routed_gemv import (
+        ll_bf16_gemv,
+        skinny_gemv,
+        tgv_gemv,
+    )
 
     x = torch.randn(1, 7168, device="cuda", dtype=torch.float16)
     w = torch.randn(768, 7168, device="cuda", dtype=torch.float16)
@@ -108,6 +112,11 @@ def test_non_bf16_inputs_fall_back_to_torch():
     x = torch.randn(1, 1536, device="cuda", dtype=torch.float16)
     w = torch.randn(7168, 1536, device="cuda", dtype=torch.float16)
     got = tgv_gemv(x, w)
+    assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
+
+    x = torch.randn(1, 1536, device="cuda", dtype=torch.float16)
+    w = torch.randn(2560, 1536, device="cuda", dtype=torch.float16)
+    got = ll_bf16_gemv(x, w)
     assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
 
 
@@ -252,7 +261,8 @@ def test_unlisted_shapes_keep_the_generic_selection():
     assert "rowcta" in getattr(impl, "__name__", "")
     impl = _select(4, 3216, 7168, True)
     assert "torch" in getattr(impl, "__name__", "")
-    impl = _select(3, 6288, 7168, True)
+    # A width no call site produces.
+    impl = _select(3, 6289, 7168, True)
     assert "torch" in getattr(impl, "__name__", "")
     impl = _select(1, 2304, 1536, True)
     assert "rowcta" in getattr(impl, "__name__", "")
@@ -325,3 +335,23 @@ def test_route_predicate_admits_the_registered_arch_floor():
             assert routed_gemv.decode_gemv_routed(x, w) is expected
     routed_gemv._is_routed_arch.cache_clear()
     torch.cuda.synchronize()
+
+
+def test_measured_route_source_has_no_duplicate_keys():
+    """A dict literal silently resolves duplicate keys last-wins, so a re-added
+    entry would shadow an existing one with no error anywhere. Count key
+    occurrences in the SOURCE text, where duplicates are still visible."""
+    import collections
+    import inspect
+    import re
+
+    from tokenspeed_kernel.ops.gemm import routed_gemv
+
+    src = inspect.getsource(routed_gemv)
+    keys = re.findall(r'\((\d+), (\d+), (\d+)\): "\w+"', src)
+    dupes = [k for k, n in collections.Counter(keys).items() if n > 1]
+    assert not dupes, f"duplicate MEASURED_ROUTE keys in source: {dupes}"
+    # Parsed size must match source count, else a duplicate collapsed.
+    assert len(routed_gemv.MEASURED_ROUTE) == len(keys)
+    # Exact-M keying: entries may only exist in the gap-free swept range.
+    assert all(m <= 32 for m, _, _ in routed_gemv.MEASURED_ROUTE)

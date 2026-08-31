@@ -101,6 +101,10 @@ struct GroupDemand {
     // Snapshot-state local prefill uses an absolute endpoint here; Decode-side
     // PD also uses it for latest snapshots and retained sliding tails.
     std::int32_t materialized_suffix_start{-1};
+    // Prefill publication streams newly completed history and snapshot-state
+    // blocks to Host. Decode publication leaves this false so only sliding
+    // windows keep streaming; finish/retract persist the remaining groups.
+    bool stream_completed_to_host{false};
 };
 
 struct PrefixMatch {

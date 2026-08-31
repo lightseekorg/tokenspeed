@@ -30,6 +30,7 @@ The fused dispatch policy (`fused/moe.py`) is the top of the funnel: it calls
 | `moe_sorting.py` | Block-aligned expert sort feeding the package prefill stages. |
 | `situ_decode.py` / `situ_grouped.py` | A16W4 in-situ expert-parallel paths that read the unshuffled MXFP4 weights directly: route-direct warp decode and a contiguous-EP grouped GEMM. |
 | `latent_shared_decode.py` | Latent shared-expert decode entry. |
+| `quantize_gluon.py` | Leaf Gluon helpers for MXFP4 tile quantization and CDNA4 scale stores shared by staged and fused kernels. |
 | `scale_layout.py` | Single source of truth for the CDNA4 MXFP4 scale swizzle (constants, swizzle/predicate/allocator helpers). Leaf module: torch only. |
 | `scale.py` | Activation-scale gather into sorted-route order for the package stages. |
 | `preprocess.py` / `weight_preprocess.py` | Offline weight interleave, scale swizzle, gdot128 preshuffle, package-prefill aliases. |
