@@ -94,9 +94,6 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
             )
         return workspace
 
-    def has_index_k_buffer(self) -> bool:
-        return any(buffer is not None for buffer in getattr(self, "_index_k", ()))
-
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         try:
             buffer = self._index_k[layer_id]
@@ -118,9 +115,6 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
             raise ValueError(f"layer {layer_id} has no KPool tail cache") from exc
         storage = self._kpool_tail_workspace.storage
         return index_k, storage[row, 0], storage[row, 1]
-
-    def kpool_tail_workspace_bytes(self) -> int:
-        return self._kpool_tail_workspace.storage.nbytes
 
     @torch.no_grad()
     @override

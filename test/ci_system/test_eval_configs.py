@@ -178,6 +178,7 @@ def test_glm53_flash_nvidia_sharegpt_uses_fixed_mtp_configuration():
         == GLM53_FLASH_FP8_MODEL_ID
     )
     assert tokenizer_path == "/tmp/glm-5.3-flash-tokenizer"
+    assert flag_value(perf_tokens, "--url").endswith("/v1/chat/completions")
     tokenizer_install = task["perf"]["install"][1]
     assert GLM53_FLASH_FP8_MODEL_ID in tokenizer_install
     assert f"--local-dir {tokenizer_path}" in tokenizer_install
@@ -206,7 +207,7 @@ def test_glm53_flash_nvidia_sharegpt_uses_fixed_mtp_configuration():
             "--extra-args",
         )
     ] == ["share_gpt_en", "16", "512", "512", "16", "16", "45", '{"ignore_eos":true}']
-    assert "--tokenize-prompt" in perf_tokens
+    assert "--tokenize-prompt" not in perf_tokens
     assert "'evalscope[perf]==1.10.0'" in task["perf"]["install"][0]
     assert "for run_id in 1 2 3" in task["perf"]["command"]
     assert "statistics.median" in task["perf"]["command"]

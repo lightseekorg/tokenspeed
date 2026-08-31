@@ -23,8 +23,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import replace
-from typing import Any
 
 import torch
 from torch import nn
@@ -35,7 +33,9 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
-from tokenspeed.runtime.layers.attention.dsa.utils import workspace_indices_to_kv_slots
+from tokenspeed.runtime.layers.attention.dsa.utils import (
+    _prepare_dsa_topk_for_mtp_decode,
+)
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -216,60 +216,7 @@ class Glm53FlashForConditionalGenerationNextN(nn.Module):
             ctx.draft_seq_lens_buf[: ctx.bs]
         )
 
-    @staticmethod
-    def prepare_dsa_topk_for_mtp_decode(
-        dsa_topk: tuple[Any | None, Any | None],
-        gather_ids: torch.Tensor,
-        *,
-        num_prefill_rows: int = 0,
-    ) -> tuple[Any | None, Any | None]:
-        prefill_topk, decode_topk = dsa_topk
-        if decode_topk is None or decode_topk.topk_indices.shape[0] == 0:
-            return dsa_topk
-        topk_indices = decode_topk.topk_indices
-        topk_lens = decode_topk.topk_lens
-        if num_prefill_rows <= 0 and topk_indices.shape[0] <= gather_ids.numel():
-            return dsa_topk
-        if num_prefill_rows <= 0:
-            selected_indices = topk_indices.index_select(0, gather_ids)
-            selected_lens = topk_lens.index_select(0, gather_ids)
-        else:
-            if prefill_topk is None:
-                return dsa_topk
-            num_prefill_rows = min(num_prefill_rows, gather_ids.numel())
-            prefill_rows = gather_ids[:num_prefill_rows]
-            decode_rows = gather_ids[num_prefill_rows:]
-            selected_indices = workspace_indices_to_kv_slots(
-                prefill_topk.workspace_indices.index_select(0, prefill_rows),
-                prefill_topk.kv_workspace_slots,
-            ).to(
-                device=topk_indices.device,
-                dtype=topk_indices.dtype,
-            )
-            selected_lens = prefill_topk.topk_lens.index_select(
-                0,
-                prefill_rows,
-            ).to(device=topk_lens.device, dtype=topk_lens.dtype)
-            if decode_rows.numel() > 0:
-                selected_indices = torch.cat(
-                    (
-                        selected_indices,
-                        topk_indices.index_select(0, decode_rows),
-                    ),
-                    dim=0,
-                )
-                selected_lens = torch.cat(
-                    (
-                        selected_lens,
-                        topk_lens.index_select(0, decode_rows),
-                    ),
-                    dim=0,
-                )
-        return prefill_topk, replace(
-            decode_topk,
-            topk_indices=selected_indices,
-            topk_lens=selected_lens,
-        )
+    prepare_dsa_topk_for_mtp_decode = staticmethod(_prepare_dsa_topk_for_mtp_decode)
 
     @torch.no_grad()
     def forward(

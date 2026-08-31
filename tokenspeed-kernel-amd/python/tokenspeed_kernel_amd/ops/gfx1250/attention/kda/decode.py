@@ -754,6 +754,7 @@ def _kda_fused_verify_kernel(
 @gluon.jit
 def _kda_fused_replay_kernel(
     descriptors,
+    group_indices,
     read_indices,
     write_indices,
     accepted_length,
@@ -771,7 +772,6 @@ def _kda_fused_replay_kernel(
     STATE_POOL_PAGE_STRIDE: gl.constexpr,
     HAS_LOWER_BOUND: gl.constexpr,
     LOWER_BOUND: gl.constexpr,
-    LAYERS_PER_GROUP: gl.constexpr,
     BATCH_SIZE: gl.constexpr,
 ):
     """Replay accepted raw-g prefixes for every descriptor layer.
@@ -815,7 +815,8 @@ def _kda_fused_replay_kernel(
         gl.load(descriptors + descriptor_base + 9),
         gl.pointer_type(gl.bfloat16),
     )
-    group_offset = (layer_idx // LAYERS_PER_GROUP) * BATCH_SIZE
+    group_idx = gl.load(group_indices + layer_idx).to(gl.int64)
+    group_offset = group_idx * BATCH_SIZE
     read_indices += group_offset
     write_indices += group_offset
 
@@ -1447,6 +1448,7 @@ def gluon_kda_fused_verify_gfx1250(
 
 def gluon_kda_fused_replay_gfx1250(
     descriptors: torch.Tensor,
+    group_indices: torch.Tensor,
     read_indices: torch.Tensor,
     write_indices: torch.Tensor,
     accepted_length: torch.Tensor,
@@ -1462,7 +1464,6 @@ def gluon_kda_fused_replay_gfx1250(
     state_stride: int,
     gate_stride: int,
     conv_width: int,
-    layers_per_group: int,
     lower_bound: float,
 ) -> None:
     """Replay every raw-g layer through the established Gluon recurrence.
@@ -1476,6 +1477,7 @@ def gluon_kda_fused_replay_gfx1250(
             columns are QKV payload, convolution weights, convolution pool,
             unused ``f_a``, unused ``f_b``, beta payload, ``A_log``,
             ``dt_bias``, recurrent state pool, and raw-g payload.
+        group_indices: Cache-group row for each descriptor layer.
         read_indices: ``[groups, batch]`` committed source pages.
         write_indices: ``[groups, batch]`` destination pages. A negative entry
             marks a padded row and leaves both pools alone.
@@ -1494,7 +1496,6 @@ def gluon_kda_fused_replay_gfx1250(
         state_stride: Page stride of the recurrent state pool.
         gate_stride: Row stride of the raw-g payload.
         conv_width: Convolution taps; this specialization requires 4.
-        layers_per_group: Descriptor rows sharing one cache group's pages.
         lower_bound: Safe lower bound for the log-decay gate.
 
     Returns:
@@ -1507,6 +1508,17 @@ def gluon_kda_fused_replay_gfx1250(
         raise ValueError("descriptors must have shape [layers, 10]")
     if descriptors.dtype != torch.uint64 or not descriptors.is_contiguous():
         raise ValueError("descriptors must be contiguous uint64")
+    layers = descriptors.shape[0]
+    if group_indices.shape != (layers,):
+        raise ValueError(
+            f"group_indices must have shape ({layers},), got {group_indices.shape}"
+        )
+    if group_indices.dtype != torch.int32:
+        raise TypeError("group_indices must use torch.int32")
+    if group_indices.device != descriptors.device:
+        raise ValueError("group_indices and descriptors must be on the same device")
+    if not group_indices.is_contiguous():
+        raise ValueError("group_indices must be contiguous")
     if read_indices.ndim != 2 or write_indices.shape != read_indices.shape:
         raise ValueError(
             "replay page indices must have matching [groups, batch] shapes"
@@ -1516,6 +1528,7 @@ def gluon_kda_fused_replay_gfx1250(
         raise ValueError("accepted_length must match the replay batch")
     _kda_fused_replay_kernel[(num_heads, batch, descriptors.shape[0])](
         descriptors,
+        group_indices,
         read_indices,
         write_indices,
         accepted_length,
@@ -1533,7 +1546,6 @@ def gluon_kda_fused_replay_gfx1250(
         STATE_POOL_PAGE_STRIDE=state_stride,
         HAS_LOWER_BOUND=True,
         LOWER_BOUND=lower_bound,
-        LAYERS_PER_GROUP=layers_per_group,
         BATCH_SIZE=batch,
         num_warps=8,
         num_stages=2,

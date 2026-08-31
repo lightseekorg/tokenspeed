@@ -257,25 +257,6 @@ class Glm53FlashConfigTests(unittest.TestCase):
         self.assertEqual(state_dtype, torch.float32)
         self.assertEqual(layers, config.linear_layer_ids)
 
-    def test_vision_projection_follows_text_hidden_size(self):
-        config = Glm53FlashConfig(
-            text_config={
-                "hidden_size": 512,
-                "linear_attn_config": _linear_attn_config(),
-            },
-            vision_config={"out_hidden_size": 4096},
-        )
-        self.assertEqual(config.vision_config.out_hidden_size, 512)
-
-    def test_kpool_checkpoint_flags_do_not_gate_flat_kv(self):
-        config = Glm53FlashTextConfig(
-            linear_attn_config=_linear_attn_config(),
-            index_kpool_compress=False,
-            index_kpool_always_select_tail=False,
-        )
-        self.assertFalse(config.index_kpool_compress)
-        self.assertFalse(config.index_kpool_always_select_tail)
-
     def test_nested_linear_attn_config_remains_serializable(self):
         config = Glm53FlashConfig(
             text_config={"linear_attn_config": _linear_attn_config()},

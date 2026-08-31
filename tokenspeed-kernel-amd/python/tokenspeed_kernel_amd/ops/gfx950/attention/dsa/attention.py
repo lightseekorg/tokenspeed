@@ -1023,7 +1023,7 @@ def _select_num_kv_splits(
     if work_tiles <= 8:
         return 1
     if not is_fp8:
-        # This tuning comes from GLM-5-Next. Split sufficiently large selected-KV
+        # This tuning comes from GLM-5.3-Flash. Split sufficiently large selected-KV
         # rows across CTAs so the launch provides enough parallel work to fill the GPU.
         if (
             int(qk_rope_head_dim) == 0

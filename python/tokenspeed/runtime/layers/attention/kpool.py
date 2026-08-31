@@ -98,11 +98,6 @@ def dsa_prefill_host_lengths(metadata: Any, num_extends: int) -> tuple[int, int]
     )
 
 
-def kv_page_size(ctx: ForwardContext) -> int:
-    """Return the shared cache identity grain from the recipe-planned arena."""
-    return ctx.token_to_kv_pool.arena.kv_page_size
-
-
 def build_kpool_write_plan(
     *,
     req_start_positions: torch.Tensor,
@@ -509,7 +504,7 @@ class KPoolRuntime:
             history_table,
             pool_size=self.pool_size,
             page_size=index_cache.shape[1],
-            kv_page_size=kv_page_size(ctx),
+            kv_page_size=ctx.token_to_kv_pool.arena.kv_page_size,
             topk_pools=self.index_topk // self.pool_size,
             softmax_scale=softmax_scale,
             q_len_per_req=q_len_per_req,
@@ -571,7 +566,7 @@ class KPoolRuntime:
             history_table,
             pool_size=self.pool_size,
             page_size=index_cache.shape[1],
-            kv_page_size=kv_page_size(ctx),
+            kv_page_size=ctx.token_to_kv_pool.arena.kv_page_size,
             topk_pools=self.index_topk // self.pool_size,
             softmax_scale=softmax_scale,
             req_ids=shared_plan.req_ids,

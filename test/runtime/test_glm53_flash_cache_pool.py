@@ -169,7 +169,6 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
     tail_ptr = tail_k.untyped_storage().data_ptr()
     assert tail_ptr == tail_gate.untyped_storage().data_ptr()
     assert tail_ptr != backing_ptr
-    assert pool.kpool_tail_workspace_bytes() == 2 * 2 * 10 * 4 * 128 * 2
     _, draft_tail_k, draft_tail_gate = draft_pool.get_kpool_buffers(0)
     assert draft_tail_k.untyped_storage().data_ptr() == tail_ptr
     assert draft_tail_gate.untyped_storage().data_ptr() == tail_ptr

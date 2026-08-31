@@ -64,8 +64,8 @@ import tokenspeed_kernel.ops.moe.deep_gemm as _moe_deep_gemm
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
 import tokenspeed_kernel.ops.moe.gluon.dsv4 as _moe_gluon_dsv4
-import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as _moe_gluon_sigmoid_topk
 import tokenspeed_kernel.ops.moe.gluon.fp8 as _moe_gluon_fp8
+import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as _moe_gluon_sigmoid_topk
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer

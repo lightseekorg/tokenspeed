@@ -62,11 +62,10 @@ perf:
     run_sharegpt() {
       /tmp/evalscope-perf/bin/evalscope perf \
         --model glm-5.3-flash \
-        --url http://127.0.0.1:8000/v1/completions \
+        --url http://127.0.0.1:8000/v1/chat/completions \
         --api openai \
         --dataset share_gpt_en \
         --tokenizer-path /tmp/glm-5.3-flash-tokenizer \
-        --tokenize-prompt \
         --max-prompt-length 32256 \
         --min-tokens 512 \
         --max-tokens 512 \
