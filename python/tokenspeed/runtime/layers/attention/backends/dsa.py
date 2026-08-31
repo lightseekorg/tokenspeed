@@ -165,8 +165,8 @@ class DSABackend(AttentionBackend):
             layer, out_cache_loc, forward_mode
         )
 
-    def init_cuda_graph_state(self, max_bs: int):
-        self._dense_backend.init_cuda_graph_state(max_bs)
+    def init_cuda_graph_state(self, max_bs: int, **kwargs):
+        self._dense_backend.init_cuda_graph_state(max_bs, **kwargs)
 
     # Capture is inherited: the base default routes through this wrapper's
     # refresh, whose lazy arm builds the piggybacked _dsa_seq_lens_2d /

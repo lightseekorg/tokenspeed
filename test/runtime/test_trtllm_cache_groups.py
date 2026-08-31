@@ -25,8 +25,8 @@ def _import_backend():
 class TRTLLMCacheGroupsTest(unittest.TestCase):
     """The trtllm backend consumes per-group tables through the shared
     CacheGroupsMixin: table/write-loc selection routes by layer.group_id,
-    metadata drops the single-table single table on the grouped-cache path, and the CUDA-graph
-    buffers follow the capture/replay discipline."""
+    metadata drops the single table on the grouped-cache path, and the
+    CUDA-graph buffers follow the capture/replay discipline."""
 
     def setUp(self):
         try:
@@ -201,7 +201,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         b.engine_owned_group_ids = frozenset()
         b.state_group_ids = frozenset()
         b.cuda_graph_page_table = self.torch.zeros((2, 4), dtype=self.torch.int32)
-        b.cuda_graph_cache_seqlens = self.torch.ones(2, dtype=self.torch.int32)
+        b.cuda_graph_seq_lens = self.torch.ones(2, dtype=self.torch.int32)
         b._init_group_graph_buffers(2)
 
         b.refresh_decode_metadata(
@@ -377,7 +377,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         b.engine_owned_group_ids = frozenset()
         b.state_group_ids = frozenset()
         b.cuda_graph_page_table = self.torch.zeros((2, 8), dtype=self.torch.int32)
-        b.cuda_graph_cache_seqlens = self.torch.ones(2, dtype=self.torch.int32)
+        b.cuda_graph_seq_lens = self.torch.ones(2, dtype=self.torch.int32)
         b._init_group_graph_buffers(2)
         seq_lens = self.torch.tensor([65, 3], dtype=self.torch.int32)
         tables = {
@@ -423,7 +423,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         )
         max_bs, bs = 4, 2
         b._init_group_graph_buffers(max_bs)
-        b.cuda_graph_cache_seqlens = self.torch.ones(
+        b.cuda_graph_seq_lens = self.torch.ones(
             max_bs, dtype=self.torch.int32, device="cuda"
         )
         b.init_forward_metadata_capture_cuda_graph(
@@ -431,7 +431,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             req_pool_indices=self.torch.tensor(
                 [0, 1], dtype=self.torch.int32, device="cuda"
             ),
-            seq_lens=b.cuda_graph_cache_seqlens[:bs],
+            seq_lens=b.cuda_graph_seq_lens[:bs],
             forward_mode=_DecodeMode(),
             cache_group_ids=("full_attention",),
         )
@@ -439,9 +439,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         self.assertIsNone(meta.page_table)
         self.assertEqual(meta.out_cache_locs["full_attention"].shape[0], bs * 4)
         # Replay refreshes tables and recomputes [bs*N] locs from live lens.
-        b.cuda_graph_cache_seqlens[:bs] = self.torch.tensor(
-            [65, 1], dtype=self.torch.int32
-        )
+        b.cuda_graph_seq_lens[:bs] = self.torch.tensor([65, 1], dtype=self.torch.int32)
         src = {
             "full_attention": self.torch.tensor(
                 [[11, 12], [0, -1]], dtype=self.torch.int32, device="cuda"
@@ -451,7 +449,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
             bs,
             bs,
             self.torch.tensor([0, 1], dtype=self.torch.int32),
-            b.cuda_graph_cache_seqlens,
+            b.cuda_graph_seq_lens,
             forward_mode=_DecodeMode(),
             for_graph_replay=True,
             block_tables=src,

@@ -154,7 +154,7 @@ def test_cuda_graph_capture_builder_clamps():
     assert int(cache_seqlens.min()) >= SPEC_NUM_TOKENS
     # Must be the dedicated clamped buffer, not the plain cache-seqlens buffer.
     assert cache_seqlens.data_ptr() == be.spec_cache_seqlens_buf.data_ptr()
-    assert cache_seqlens.data_ptr() != be.cuda_graph_cache_seqlens.data_ptr()
+    assert cache_seqlens.data_ptr() != be.cuda_graph_seq_lens.data_ptr()
 
 
 def test_draft_replay_refreshes_spec_cache_seqlens_buf():

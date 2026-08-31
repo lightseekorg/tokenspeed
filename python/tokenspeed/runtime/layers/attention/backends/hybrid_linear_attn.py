@@ -52,7 +52,6 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
-    init_backend_cuda_graph_state,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     cache_debug_enabled,
@@ -1045,8 +1044,8 @@ class MambaAttnBackend(AttentionBackend):
 
     # ---- CUDA graph state ----
 
-    def init_cuda_graph_state(self, max_num_tokens: int):
-        for i in range(max_num_tokens):
+    def init_cuda_graph_state(self, max_bs: int, **kwargs):
+        for i in range(max_bs):
             self.query_start_loc_list.append(
                 torch.empty((i + 2,), dtype=torch.int32, device=self.device)
             )
@@ -1069,20 +1068,20 @@ class MambaAttnBackend(AttentionBackend):
                     )
                 )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
-            0, max_num_tokens + 1, dtype=torch.int32, device=self.device
+            0, max_bs + 1, dtype=torch.int32, device=self.device
         )
         if self.speculative_num_draft_tokens > 0:
-            # Need max_num_tokens+1 entries (one per request + sentinel).
+            # Need max_bs+1 entries (one per request + sentinel).
             # Each entry is request_index * spec_num_draft_tokens.
             self.cached_cuda_graph_verify_query_start_loc = torch.arange(
                 0,
-                (max_num_tokens + 1) * self.speculative_num_draft_tokens,
+                (max_bs + 1) * self.speculative_num_draft_tokens,
                 step=self.speculative_num_draft_tokens,
                 dtype=torch.int32,
                 device=self.device,
             )
-        self._qsl_dirty = [False] * max_num_tokens
-        self._qsl_last_mode = [None] * max_num_tokens
+        self._qsl_dirty = [False] * max_bs
+        self._qsl_last_mode = [None] * max_bs
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -2230,8 +2229,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         # filter: the full backend is user-selectable and may have a narrow
         # signature (e.g. TRTLLM MHA takes only (max_bs,)), and the mamba
         # backend keeps its narrow signature today.
-        init_backend_cuda_graph_state(self.full_attn_backend, max_bs, **kwargs)
-        init_backend_cuda_graph_state(self.linear_attn_backend, max_bs, **kwargs)
+        self.full_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
+        self.linear_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
 
     def register_step_counter(self, step_counter):
         # Hybrid layerwise transfer needs one global step per model layer,

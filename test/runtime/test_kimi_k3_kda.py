@@ -328,7 +328,7 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
     # op, per group, and pads dummy rows to the pad slot id.
     pool = _make_kimi_pool("cpu", usable_pages=24)
     backend = _backend("cpu", contract_pool=pool)
-    backend.init_cuda_graph_state(max_num_tokens=2)
+    backend.init_cuda_graph_state(max_bs=2)
     backend.init_forward_metadata_capture_cuda_graph(
         bs=2,
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),

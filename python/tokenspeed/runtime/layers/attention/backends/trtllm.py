@@ -113,7 +113,6 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
     # Graph-buffer column tails pad with the zero-init dummy page, matching
     # the single-table replay contract (gather_page_table_with_padding dummy_slot=0).
     table_tail_pad: int = 0
-    draft_seq_lens_attr: str = "cuda_graph_cache_seqlens"
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
@@ -135,10 +134,6 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         if self.spec_num_tokens > 1 and not self.is_draft:
             return self.forward_prefill_metadata
         return self.forward_decode_metadata
-
-    @property
-    def sinks_dtype(self) -> torch.dtype:
-        return torch.float32
 
     def __init__(self, config: MHAConfig):
         super().__init__(config)
@@ -630,7 +625,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            self.cuda_graph_cache_seqlens = torch.full(
+            self.cuda_graph_seq_lens = torch.full(
                 (max_bs * self.spec_num_tokens,),
                 self.spec_num_tokens,
                 dtype=torch.int32,
@@ -643,7 +638,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         self.cuda_graph_page_table = torch.zeros(
             (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
         )
-        self.cuda_graph_cache_seqlens = torch.zeros(
+        self.cuda_graph_seq_lens = torch.zeros(
             max_bs, dtype=torch.int32, device=self.device
         )
 
@@ -655,9 +650,9 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         filled in-graph by fill_block_decode_seq_lens; seed a safe baseline here
         so the capture run stays in range before that op records."""
         expanded_bs = bs * self.spec_num_tokens
-        self.cuda_graph_cache_seqlens[:expanded_bs].fill_(self.spec_num_tokens)
+        self.cuda_graph_seq_lens[:expanded_bs].fill_(self.spec_num_tokens)
         metadata = TRTLLMMHAMetadata(
-            cache_seqlens_int32=self.cuda_graph_cache_seqlens[:expanded_bs],
+            cache_seqlens_int32=self.cuda_graph_seq_lens[:expanded_bs],
             max_seq_len_q=1,
             max_seq_len_k=self.max_context_len,
             cu_seqlens_q=torch.arange(
@@ -674,13 +669,13 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         page_tables: dict[str, torch.Tensor] | None = None,
         out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
-        # cache_seqlens views the backend-owned cuda_graph_cache_seqlens (set in
+        # cache_seqlens views the backend-owned cuda_graph_seq_lens (set in
         # init_cuda_graph_state).
         # Cache-group captures route reads through the per-group buffer views and
         # replay never fills a shared single page_table, so record page_table=None
         # instead of a slice of the never-filled zero buffer.
         metadata = TRTLLMMHAMetadata(
-            cache_seqlens_int32=self.cuda_graph_cache_seqlens[:bs],
+            cache_seqlens_int32=self.cuda_graph_seq_lens[:bs],
             max_seq_len_q=1,
             max_seq_len_k=self.max_context_len,
             cu_seqlens_q=torch.arange(0, bs + 1, dtype=torch.int32, device=self.device),
@@ -704,7 +699,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
         # spec_num_tokens) at capture so padded rows (seq_len=1) avoid NaN.
         # The replay path refreshes it each step.
         cache_seqlens = self._clamped_spec_seqlens(
-            self.cuda_graph_cache_seqlens, bs, spec_num_tokens
+            self.cuda_graph_seq_lens, bs, spec_num_tokens
         )
         metadata = TRTLLMMHAMetadata(
             cache_seqlens_int32=cache_seqlens,
@@ -797,9 +792,9 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             return
 
         # Copy the live cache lengths into our own buffer (the plain-decode and
-        # draft-decode metadata view cuda_graph_cache_seqlens); the spec>1 verify
+        # draft-decode metadata view cuda_graph_seq_lens); the spec>1 verify
         # path instead reads spec_cache_seqlens_buf via _clamped_spec_seqlens.
-        self.cuda_graph_cache_seqlens[:bs].copy_(seq_lens[:bs])
+        self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
 
         # Only page tables need refresh beyond that.
         # Cache-group captures read only the per-group buffers; the single
@@ -817,11 +812,11 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
                 dummy_slot=0,
             )
         if block_tables:
-            # cuda_graph_cache_seqlens was refreshed from live seq_lens above.
+            # cuda_graph_seq_lens was refreshed from live seq_lens above.
             self._fill_group_graph_buffers(
                 bs,
                 block_tables,
-                self.cuda_graph_cache_seqlens,
+                self.cuda_graph_seq_lens,
                 tokens_per_req=self._verify_tokens(),
             )
 
@@ -848,7 +843,7 @@ class TRTLLMMHAAttnBackend(CacheGroupsMixin, AttentionBackend):
             block_seq_lens: ``[bs]`` per-request block-end lengths.
         """
         spec = self.spec_num_tokens
-        self.cuda_graph_cache_seqlens[: bs * spec].view(bs, spec).copy_(
+        self.cuda_graph_seq_lens[: bs * spec].view(bs, spec).copy_(
             block_seq_lens[:bs].clamp(spec, self.max_context_len).unsqueeze(1)
         )
 

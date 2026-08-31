@@ -63,7 +63,6 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
-    init_backend_cuda_graph_state,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -884,7 +883,7 @@ class InklingAttnBackend(AttentionBackend):
         return tables
 
     def init_cuda_graph_state(self, max_bs: int, **kwargs):
-        init_backend_cuda_graph_state(self.inner, max_bs, **kwargs)
+        self.inner.init_cuda_graph_state(max_bs, **kwargs)
         device = self.conv_pool.conv_state.device
         self._decode_qsl = torch.arange(max_bs + 1, dtype=torch.int32, device=device)
         # Own the cache-seqlens buffer instead of aliasing the controller's

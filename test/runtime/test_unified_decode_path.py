@@ -294,6 +294,35 @@ class CaptureSignatureConformanceTest(_TorchCase):
                         f"rejects a runner kwarg: {exc}"
                     )
 
+    def test_init_cuda_graph_state_signatures_bind_the_runner_kwarg_set(self):
+        # The runner passes the same extras to every backend, unfiltered
+        # (the old signature-probing helper is gone); a narrower signature
+        # TypeErrors at boot.
+        import importlib
+        import inspect
+
+        for module_name, cls_name in self._BACKEND_CLASSES:
+            try:
+                cls = getattr(importlib.import_module(module_name), cls_name)
+            except (ImportError, ModuleNotFoundError) as exc:
+                self.skipTest(f"needs optional deps for {cls_name}: {exc}")
+            sig = inspect.signature(cls.init_cuda_graph_state)
+            with self.subTest(backend=cls_name):
+                try:
+                    sig.bind(
+                        None,
+                        8,
+                        cache_group_specs=(),
+                        cache_group_page_counts=None,
+                        max_tokens_per_req=2,
+                        overlap_schedule_depth=1,
+                    )
+                except TypeError as exc:
+                    self.fail(
+                        f"{cls_name}.init_cuda_graph_state rejects a runner "
+                        f"kwarg: {exc}"
+                    )
+
 
 class GraphPtrGuardWalkTest(_TorchCase):
     """Walk semantics of graph_ptr_guard on a stub backend (no kernels)."""

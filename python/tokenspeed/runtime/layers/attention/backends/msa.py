@@ -44,7 +44,6 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
-    init_backend_cuda_graph_state,
 )
 from tokenspeed.runtime.layers.attention.backends.cache_groups import (
     CacheGroupsMixin,
@@ -765,10 +764,6 @@ class MSAHybridAttnBackend(AttentionBackend):
         self.full_attn_backend.set_cache_pool(cache_pool)
         self.sparse_attn_backend.set_cache_pool(cache_pool)
 
-    @property
-    def sinks_dtype(self) -> torch.dtype:
-        return self.full_attn_backend.sinks_dtype
-
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
     ) -> bool:
@@ -785,8 +780,8 @@ class MSAHybridAttnBackend(AttentionBackend):
         max_bs: int,
         **kwargs,
     ) -> None:
-        init_backend_cuda_graph_state(self.full_attn_backend, max_bs, **kwargs)
-        init_backend_cuda_graph_state(self.sparse_attn_backend, max_bs, **kwargs)
+        self.full_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
+        self.sparse_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
 
     # Capture is inherited: the base default binds and refreshes through the
     # two fan-outs below, and both children are default-capture themselves.

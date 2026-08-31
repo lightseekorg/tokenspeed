@@ -45,7 +45,7 @@ anywhere. `init_forward_metadata_replay_cuda_graph` no longer exists.
 `ForwardStepRunner` distinguishes `max_capture_bs` (top of the capture ladder,
 bounded by `max_cudagraph_capture_size`) from `max_decode_bs`
 (`max_num_seqs // dp_size`, floored at `max_capture_bs`). Persistent decode
-buffers are sized by `max_decode_bs` — `init_backend_cuda_graph_state` runs
+buffers are sized by `max_decode_bs` — `init_cuda_graph_state` runs
 unconditionally at wrapper construction, `enforce_eager` included. A decode
 above the ladder runs the same refresh with no graph; it is a first-class
 path, not a fallback.

@@ -116,7 +116,6 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
     ``PAGE_SIZE`` stride, so that is the backend's kernel page size.
     """
 
-    draft_seq_lens_attr: str = "cuda_graph_seq_lens_k"
     # Eager refresh swaps in a fresh tile-schedule object every step (the
     # kernel freezes the schedule on first use); the replayed graph re-runs
     # its recorded schedule-build instead and never reads this field through
@@ -516,7 +515,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
     # CUDA graph (decode only, any q_len)
     # ------------------------------------------------------------------
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, **kwargs):
         max_context_len = self.max_context_len + PAGE_SIZE - 1
         # 4 PAGES are reserved for speculation
         self.cuda_graph_kv_indices = torch.full(
@@ -526,9 +525,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             device="cuda",
         )
         # Own the persistent cache_seqlens buffer the captured decode kernel reads from
-        self.cuda_graph_seq_lens_k = torch.zeros(
-            max_bs, dtype=torch.int32, device="cuda"
-        )
+        self.cuda_graph_seq_lens = torch.zeros(max_bs, dtype=torch.int32, device="cuda")
         # Cache contract: persistent write-location buffer whose address
         # the captured graph records; replay refreshes it in place from the
         # live full-history table. Only allocated when the backend is a cache
@@ -570,7 +567,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
             num_extends=0,
             flashmla_metadata=None,
             page_table=self.cuda_graph_kv_indices[:bs],
-            seq_lens_k=self.cuda_graph_seq_lens_k[:bs],
+            seq_lens_k=self.cuda_graph_seq_lens[:bs],
             group_out_cache_loc=group_out_cache_loc,
             group_q_len_per_req=q_len,
         )
@@ -632,7 +629,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         else:
             q_len = self._verify_q_len(forward_mode)
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
-        self.cuda_graph_seq_lens_k[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
+        self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
 
         # The wrapper's per-group tables refresh the block table whenever
         # delivered — decode-only PD nodes included (they never run an extend
@@ -655,7 +652,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 )
                 self._cache_decode_out_cache_loc(
                     table,
-                    self.cuda_graph_seq_lens_k,
+                    self.cuda_graph_seq_lens,
                     batch_size=real_bs,
                     validate_pages=cache_debug_enabled(),
                     out=self.cuda_graph_group_out_cache_loc,
@@ -720,7 +717,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         """
         if not self.draft_block_decode:
             raise RuntimeError("Block decode sequence lengths require DFLASH mode.")
-        self.cuda_graph_seq_lens_k[:bs].copy_(
+        self.cuda_graph_seq_lens[:bs].copy_(
             block_seq_lens[:bs].clamp(self.spec_num_tokens, self.max_context_len)
         )
 

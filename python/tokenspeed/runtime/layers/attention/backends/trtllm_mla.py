@@ -129,8 +129,6 @@ class TRTLLMMLADecodeMetadata:
 class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
     """trtllm_mla attention backend using fused kernels."""
 
-    draft_seq_lens_attr: str = "cuda_graph_seq_lens_buf"
-
     def __init__(self, config: MLAConfig):
         super().__init__(config)
 
@@ -417,10 +415,10 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
 
     # ---- CUDA Graph ----
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, **kwargs):
         # Own the cache-seqlens buffer; replay copies the live lengths in, so
         # graph state does not depend on the controller mutating a shared tensor.
-        self.cuda_graph_seq_lens_buf = torch.zeros(
+        self.cuda_graph_seq_lens = torch.zeros(
             max_bs, dtype=torch.int32, device=self.device
         )
         max_blocks = self._calc_padded_blocks(self.max_context_len)
@@ -464,7 +462,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             num_extends=0,
             block_kv_indices=self.decode_cuda_graph_kv_indices[:bs, :max_blocks],
             max_seq_len_k=self.max_context_len,
-            seq_lens_k=self.cuda_graph_seq_lens_buf[:bs],
+            seq_lens_k=self.cuda_graph_seq_lens[:bs],
             group_out_cache_loc=group_out_cache_loc,
             group_q_len_per_req=capture_q_len,
         )
@@ -502,7 +500,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # populated it with identical content.
         q_len = metadata.group_q_len_per_req
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
-        self.cuda_graph_seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
+        self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
 
         # The wrapper's per-group tables refresh the block table whenever
         # delivered — decode-only PD nodes included (they never run an extend
@@ -534,7 +532,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             if metadata.group_out_cache_loc is not None and real_bs > 0:
                 self._cache_decode_out_cache_loc(
                     group_table,
-                    self.cuda_graph_seq_lens_buf,
+                    self.cuda_graph_seq_lens,
                     batch_size=real_bs,
                     validate_pages=cache_debug_enabled(),
                     out=metadata.group_out_cache_loc,
@@ -563,7 +561,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         """
         if not self.draft_block_decode:
             raise RuntimeError("Block decode sequence lengths require DFLASH mode.")
-        self.cuda_graph_seq_lens_buf[:bs].copy_(
+        self.cuda_graph_seq_lens[:bs].copy_(
             block_seq_lens[:bs].clamp(self.spec_num_tokens, self.max_context_len)
         )
 

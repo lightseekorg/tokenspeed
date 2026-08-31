@@ -97,7 +97,7 @@ def _init_cache_decode(backend, pool, logical_rows, seq_lens_cpu, spec=1):
     table = torch.tensor(logical_rows, dtype=torch.int32, device="cuda")
     seq_lens = torch.tensor(seq_lens_cpu, device="cuda", dtype=torch.int32)
     # Unified decode path: refresh writes the persistent buffers the wrapper
-    # allocates at startup (init_backend_cuda_graph_state is unconditional).
+    # allocates at startup (init_cuda_graph_state runs unconditionally).
     if not hasattr(backend, "cuda_graph_kv_indices"):
         backend.mark_cache_contract()
         backend.init_cuda_graph_state(max_bs=max(bs, 4))

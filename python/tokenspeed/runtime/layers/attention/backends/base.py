@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import inspect
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -110,27 +109,6 @@ _SpeculativeStateBackendT = TypeVar(
 )
 
 
-def init_backend_cuda_graph_state(
-    backend: "AttentionBackend",
-    max_bs: int,
-    **extras,
-) -> None:
-    """Call ``backend.init_cuda_graph_state`` with only the kwargs its
-    signature accepts (VAR_KEYWORD accepts all of them).
-
-    Signature-probe instead of try/except TypeError: cache_group_specs
-    is load-bearing for the state shed, so a TypeError raised from inside the
-    backend's body must propagate rather than silently retry without specs.
-
-    Shared by the cuda-graph wrapper and by composite backends (hybrid) that
-    forward to user-selectable sub-backends with possibly narrow signatures.
-    """
-    params = inspect.signature(backend.init_cuda_graph_state).parameters
-    if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        extras = {k: v for k, v in extras.items() if k in params}
-    backend.init_cuda_graph_state(max_bs, **extras)
-
-
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
@@ -138,8 +116,6 @@ class AttentionBackend(ABC):
     # the backend rejects the reserved null page for live sequence metadata.
     cache_active_pages_must_be_real: bool = False
     supports_mla_projected_value_decode: bool = False
-    # Backend-owned cuda-graph cache-seqlens buffer the decode metadata views.
-    draft_seq_lens_attr: str = "cuda_graph_seq_lens"
     # Metadata attribute names exempt from the capture-time pointer-identity
     # snapshot (graph_ptr_guard): sanctioned per-step-mutable objects the
     # replayed kernels do not read through Python (e.g. FlashMLA's eager tile
@@ -202,10 +178,6 @@ class AttentionBackend(ABC):
         metadata slot for backends that prewrite on extend as well."""
         return out_cache_loc
 
-    @property
-    def sinks_dtype(self) -> torch.dtype:
-        return torch.bfloat16
-
     @abstractmethod
     def init_forward_metadata(self, *args, **kwargs):
         """Construct metadata for an extend/mixed (or idle warmup) forward.
@@ -215,18 +187,27 @@ class AttentionBackend(ABC):
         """
         raise NotImplementedError()
 
-    def init_cuda_graph_state(self, max_bs: int):
-        """Init the global shared states for cuda graph. Backends own their
-        cache-seqlens buffer and copy the live lengths in at replay time."""
+    def init_cuda_graph_state(self, max_bs: int, **kwargs):
+        """Allocate the persistent decode buffers, sized by ``max_bs``
+        (= max decode bs, never the capture ladder). Backends own their
+        cache-seqlens buffer and copy the live lengths in at replay time.
+
+        Every implementation accepts ``**kwargs`` — the runner passes the
+        same extras to every backend (``cache_group_specs``,
+        ``cache_group_page_counts``, ``max_tokens_per_req``,
+        ``overlap_schedule_depth``) and a narrower signature TypeErrors at
+        boot (pinned by the signature-conformance test).
+        """
         raise NotImplementedError()
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         """Publish the drafter's in-graph seq_lens edits into our own buffer.
 
-        Copies into ``draft_seq_lens_attr``; backends with distinct draft
-        metadata or an inner backend override this.
+        Copies into the backend-owned ``cuda_graph_seq_lens`` (one name for
+        every backend); backends with distinct draft metadata or an inner
+        backend override this.
         """
-        buf = getattr(self, self.draft_seq_lens_attr, None)
+        buf = getattr(self, "cuda_graph_seq_lens", None)
         if buf is None:
             return
         bs = seq_lens.shape[0]

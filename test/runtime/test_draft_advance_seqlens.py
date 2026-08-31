@@ -14,9 +14,6 @@ import pytest
 import torch
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.base import (
-    init_backend_cuda_graph_state,
-)
 from tokenspeed.runtime.layers.attention.backends.mha import MHAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.msa import (
     MSAAttnBackend,
@@ -72,13 +69,9 @@ def test_advance_updates_draft_decode_metadata(backend_cls):
     )
     field = _seqlens_field(be, be.forward_decode_metadata)
 
-    # The metadata field must be a view of the owned buffer.
-    owned = (
-        be.cuda_graph_cache_seqlens
-        if isinstance(be, TRTLLMMHAAttnBackend)
-        else be.cuda_graph_seq_lens
-    )
-    assert field.data_ptr() == owned[:bs].data_ptr()
+    # The metadata field must be a view of the owned buffer (one name for
+    # every backend: cuda_graph_seq_lens).
+    assert field.data_ptr() == be.cuda_graph_seq_lens[:bs].data_ptr()
 
     # Simulate the drafter advancing lengths in-graph across draft steps.
     for step_len in (11, 12, 13):
@@ -126,24 +119,18 @@ def _msa_backend() -> MSAAttnBackend:
     )
 
 
-def test_msa_init_cuda_graph_state_matches_helper_signature():
-    """msa must take the post-ownership signature (no seq_lens_buf).
-
-    It was left on the old signature while the shared parameter was dropped
-    from init_backend_cuda_graph_state, so every MiniMax cuda-graph startup
-    raised TypeError: missing 1 required positional argument: 'seq_lens_buf'.
-    """
+def test_msa_owns_its_graph_seqlens_buffer():
     be = _msa_backend()
-    init_backend_cuda_graph_state(be, 8, cache_group_specs=())
-    # And it must own the buffer rather than alias a controller tensor.
+    be.init_cuda_graph_state(8, cache_group_specs=())
+    # It must own the buffer rather than alias a controller tensor.
     assert be.cuda_graph_seq_lens.shape[0] == 8
     assert be.cuda_graph_seq_lens.dtype == torch.int32
 
 
 def test_msa_inherits_default_advance():
-    """msa's buffer uses the default name, so the base implementation applies."""
+    """One buffer name for every backend, so the base implementation applies."""
     be = _msa_backend()
-    init_backend_cuda_graph_state(be, 8, cache_group_specs=())
+    be.init_cuda_graph_state(8, cache_group_specs=())
     seq_lens = torch.tensor([11, 12, 13, 14], dtype=torch.int32)
     be.advance_draft_forward_metadata(seq_lens)
     assert torch.equal(be.cuda_graph_seq_lens[:4], seq_lens)

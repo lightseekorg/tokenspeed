@@ -2024,6 +2024,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         cache_group_page_counts=None,
         max_tokens_per_req: int = 1,
         overlap_schedule_depth: int = 0,
+        **kwargs,
     ):
         dsv4_reset_attention_state()
         self._cuda_graph_max_tokens_per_req = max(

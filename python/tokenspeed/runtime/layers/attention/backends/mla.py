@@ -494,7 +494,7 @@ class MLAAttnBackend(MlaCacheGroupMixin, AttentionBackend):
             )
         return locs
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, **kwargs):
         # Block decode records spec_num_tokens rows per request.
         graph_rows = max_bs * (self.spec_num_tokens if self._block_decode_active else 1)
         self.cuda_graph_page_table = torch.zeros(

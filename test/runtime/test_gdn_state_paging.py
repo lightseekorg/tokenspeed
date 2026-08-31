@@ -292,7 +292,7 @@ class CacheContractMetadataTest(unittest.TestCase):
     def test_capture_replay_metadata(self):
         torch = self.torch
         backend = self.backend
-        backend.init_cuda_graph_state(max_num_tokens=2)
+        backend.init_cuda_graph_state(max_bs=2)
         backend.init_forward_metadata_capture_cuda_graph(
             bs=1,
             req_pool_indices=torch.tensor([0], dtype=torch.int32),
@@ -369,7 +369,7 @@ class VerifyMetadataTest(unittest.TestCase):
             },
         )
         self.backend.set_kv_pool(stub_pool)
-        self.backend.init_cuda_graph_state(max_num_tokens=2)
+        self.backend.init_cuda_graph_state(max_bs=2)
 
     def test_target_verify_uses_per_layer_scratch(self):
         torch = self.torch

@@ -430,7 +430,7 @@ def test_block_decode_graph_buffers_hold_every_block_row() -> None:
         draft_block_decode=True,
     )
     backend.init_cuda_graph_state(max_bs)
-    assert backend.cuda_graph_seq_lens_buf.shape[0] == max_bs * spec
+    assert backend.cuda_graph_seq_lens.shape[0] == max_bs * spec
     assert backend.decode_cuda_graph_kv_indices.shape[0] == max_bs * spec
 
 
@@ -469,7 +469,7 @@ def test_block_decode_lengths_are_rewritten_per_replay() -> None:
         draft_block_decode=True,
     )
     backend.init_cuda_graph_state(max_bs)
-    buf = backend.cuda_graph_seq_lens_buf
+    buf = backend.cuda_graph_seq_lens
 
     backend.fill_block_decode_seq_lens(2, torch.tensor([40, 50], dtype=torch.int32))
     assert buf[: 2 * spec].tolist() == [40] * spec + [50] * spec

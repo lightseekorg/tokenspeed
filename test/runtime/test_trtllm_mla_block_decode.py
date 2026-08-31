@@ -103,11 +103,11 @@ def _layer() -> SimpleNamespace:
 
 def test_fill_block_decode_seq_lens_publishes_clamped_lengths() -> None:
     backend = _backend(draft_block_decode=True)
-    backend.cuda_graph_seq_lens_buf = torch.zeros(2, dtype=torch.int32)
+    backend.cuda_graph_seq_lens = torch.zeros(2, dtype=torch.int32)
 
     backend.fill_block_decode_seq_lens(2, torch.tensor([3, 99], dtype=torch.int32))
 
-    assert backend.cuda_graph_seq_lens_buf.tolist() == [4, 64]
+    assert backend.cuda_graph_seq_lens.tolist() == [4, 64]
 
 
 def test_block_decode_keeps_every_metadata_row_and_uses_uniform_lengths() -> None:

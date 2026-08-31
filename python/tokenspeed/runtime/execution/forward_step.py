@@ -41,9 +41,6 @@ from tokenspeed.runtime.execution.graph_ptr_guard import (
     snapshot_graph_metadata,
     verify_graph_metadata,
 )
-from tokenspeed.runtime.layers.attention.backends.base import (
-    init_backend_cuda_graph_state,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     compute_max_logical_pages_for_capture,
 )
@@ -259,8 +256,7 @@ class ForwardStepRunner:
         self.disable = config.enforce_eager or not decode_graph_supported
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
-        init_backend_cuda_graph_state(
-            attn_backend,
+        attn_backend.init_cuda_graph_state(
             self.max_decode_bs,
             cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
             cache_group_page_counts=(token_to_kv_pool.arena.cache_group_page_counts),
@@ -268,8 +264,7 @@ class ForwardStepRunner:
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
         if draft_attn_backend is not None:
-            init_backend_cuda_graph_state(
-                draft_attn_backend,
+            draft_attn_backend.init_cuda_graph_state(
                 self.max_decode_bs,
                 cache_group_specs=tuple(draft_token_to_kv_pool.arena.cache_group_specs),
                 cache_group_page_counts=(

@@ -113,8 +113,6 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
     _logged_decode = False
     _logged_prefill = False
 
-    draft_seq_lens_attr: str = "cuda_graph_seq_lens_buf"
-
     def __init__(self, config: MLAConfig):
         super().__init__(config)
 
@@ -586,7 +584,7 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
         itself recomputed in-graph from the target's accept lengths.
         """
         spec = self.spec_num_tokens
-        self.cuda_graph_seq_lens_buf[: bs * spec].view(bs, spec).copy_(
+        self.cuda_graph_seq_lens[: bs * spec].view(bs, spec).copy_(
             block_seq_lens[:bs].clamp(spec, self.max_context_len).unsqueeze(1)
         )
 
@@ -681,12 +679,12 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
 
     # ---- CUDA Graph ----
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, **kwargs):
         # Own the cache-seqlens buffer; replay copies the live lengths in, so
         # graph state does not depend on the controller mutating a shared tensor.
         # Block decode records spec_num_tokens rows per request.
         graph_rows = max_bs * (self.spec_num_tokens if self._block_decode_active else 1)
-        self.cuda_graph_seq_lens_buf = torch.zeros(
+        self.cuda_graph_seq_lens = torch.zeros(
             graph_rows, dtype=torch.int32, device=self.device
         )
         max_blocks = self._calc_padded_blocks(self.max_context_len)
@@ -733,7 +731,7 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
             metadata = CuteDSLMLADecodeMetadata(
                 block_kv_indices=self.decode_cuda_graph_kv_indices[:rows, :max_blocks],
                 max_seq_len_k=self.max_context_len,
-                seq_lens_k=self.cuda_graph_seq_lens_buf[:rows],
+                seq_lens_k=self.cuda_graph_seq_lens[:rows],
                 num_extends=0,
                 group_out_cache_loc=None,
                 group_q_len_per_req=1,
@@ -753,7 +751,7 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
             metadata = CuteDSLMLADecodeMetadata(
                 block_kv_indices=self.decode_cuda_graph_kv_indices[:bs, :max_blocks],
                 max_seq_len_k=self.max_context_len,
-                seq_lens_k=self.cuda_graph_seq_lens_buf[:bs],
+                seq_lens_k=self.cuda_graph_seq_lens[:bs],
                 num_extends=0,
                 group_out_cache_loc=self.decode_cuda_graph_group_out_cache_loc[
                     : bs * q_len
@@ -764,7 +762,7 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
             metadata = CuteDSLMLADecodeMetadata(
                 block_kv_indices=self.decode_cuda_graph_kv_indices[:bs, :max_blocks],
                 max_seq_len_k=self.max_context_len,
-                seq_lens_k=self.cuda_graph_seq_lens_buf[:bs],
+                seq_lens_k=self.cuda_graph_seq_lens[:bs],
                 num_extends=0,
             )
         self.decode_cuda_graph_metadata[bs] = metadata
@@ -810,7 +808,7 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
 
         # Copy the live cache lengths into our own buffer (metadata.seq_lens_k
         # views it) on both paths; the grouped helper only refreshes tables.
-        self.cuda_graph_seq_lens_buf[:bs].copy_(seq_lens[:bs])
+        self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
 
         # The idle replay (actual_bs == 0) carries synthesized placeholder
         # tables; every row is a dummy row, so zero the buffers instead of
