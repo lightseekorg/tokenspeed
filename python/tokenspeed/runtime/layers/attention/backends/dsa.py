@@ -112,7 +112,7 @@ class DSABackend(AttentionBackend):
 
     @property
     def decode_cuda_graph_kv_indices(self):
-        return getattr(self._dense_backend, "decode_cuda_graph_kv_indices", None)
+        return self._dense_backend.decode_cuda_graph_kv_indices
 
     @decode_cuda_graph_kv_indices.setter
     def decode_cuda_graph_kv_indices(self, value):
@@ -128,7 +128,7 @@ class DSABackend(AttentionBackend):
 
     @property
     def _page_table_aliased(self):
-        return getattr(self._dense_backend, "_page_table_aliased", False)
+        return self._dense_backend._page_table_aliased
 
     @_page_table_aliased.setter
     def _page_table_aliased(self, value):
@@ -153,7 +153,7 @@ class DSABackend(AttentionBackend):
 
     @property
     def tables_self_padding(self):
-        return getattr(self._dense_backend, "tables_self_padding", False)
+        return self._dense_backend.tables_self_padding
 
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
         return self._dense_backend.select_out_cache_loc(
@@ -287,7 +287,7 @@ class DSABackend(AttentionBackend):
 
         self._prefill_page_table = None
         if num_extends > 0 and forward_mode.is_extend_or_mixed():
-            cmeta = getattr(self._dense_backend, "chunked_prefill_metadata", None)
+            cmeta = self._dense_backend.chunked_prefill_metadata
             if cmeta is not None:
                 # Extend requests are the first num_extends batch rows. The
                 # target carries the raw full-history group table (DSA's
@@ -395,7 +395,7 @@ class DSABackend(AttentionBackend):
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
             )
-        metadata = getattr(self, "forward_decode_metadata", None)
+        metadata = self.forward_decode_metadata
         seq_lens = self._metadata_seq_lens(metadata) if metadata is not None else None
         if seq_lens is not None:
             num_extends = int(metadata.num_extends or 0)
@@ -494,7 +494,7 @@ class DSABackend(AttentionBackend):
         # normal PD readiness hook. Publish the layer only after the dependent
         # sparse-attention launch has been enqueued, so layerwise transfer cannot
         # observe either cache field before it is ready.
-        if getattr(self, "step_counter", None) is not None:
+        if self.step_counter is not None:
             self.step_counter.record_cache()
         return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -524,8 +524,7 @@ class DSABackend(AttentionBackend):
                 "kv_cache_quant_method='per_token_head' yet."
             )
         allow_fp8_query = (
-            getattr(self, "data_type", torch.bfloat16) == torch.float8_e4m3fn
-            and q.dtype == torch.float8_e4m3fn
+            self.data_type == torch.float8_e4m3fn and q.dtype == torch.float8_e4m3fn
         )
         if q.dtype != torch.bfloat16 and not allow_fp8_query:
             raise RuntimeError(
@@ -559,7 +558,7 @@ class DSABackend(AttentionBackend):
         else:
             q_len_per_req = 1
         num_reqs = num_tokens // q_len_per_req
-        metadata = getattr(self, "forward_decode_metadata", None)
+        metadata = self.forward_decode_metadata
         if metadata is None or metadata.seq_lens_k is None:
             raise RuntimeError("DSA sparse decode requires decode metadata.")
         num_extends = int(metadata.num_extends or 0)

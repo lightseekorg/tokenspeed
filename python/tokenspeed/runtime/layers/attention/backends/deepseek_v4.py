@@ -296,7 +296,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Publish readiness after V4's model-local cache writers complete."""
         if (
-            getattr(self, "step_counter", None) is not None
+            self.step_counter is not None
             and not forward_mode.is_decode()
             and not forward_mode.is_idle()
         ):
@@ -2355,7 +2355,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata.query_lens_cpu = None
             metadata.forward_mode = metadata_forward_mode
         self._cuda_graph_metadata[bs] = metadata
-        if is_packed_decode and getattr(self, "is_draft", False):
+        if is_packed_decode and self.is_draft:
             self._prepare_draft_decode_metadata(
                 metadata,
                 self._cuda_graph_seq_lens[:bs],
@@ -2553,7 +2553,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         metadata.num_prefill_reqs = 0
         metadata.num_prefill_tokens = 0
-        if is_packed_decode and getattr(self, "is_draft", False):
+        if is_packed_decode and self.is_draft:
             self._prepare_draft_decode_metadata(
                 metadata,
                 self._cuda_graph_seq_lens[:bs],

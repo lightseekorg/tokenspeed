@@ -962,7 +962,7 @@ class CuteDSLMLABackend(MlaCacheGroupMixin, AttentionBackend):
         out: torch.Tensor | None = None,
     ):
         if causal:
-            step_counter = getattr(self, "step_counter", None)
+            step_counter = self.step_counter
             if step_counter is not None:
                 step_counter.record_cache()
 

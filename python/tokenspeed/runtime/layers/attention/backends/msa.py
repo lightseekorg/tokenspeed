@@ -735,9 +735,9 @@ class MSAHybridAttnBackend(AttentionBackend):
     @property
     def cache_consumer_families(self) -> frozenset[str]:
         """Cache families consumed by the dense and sparse children."""
-        return frozenset(
-            getattr(self.full_attn_backend, "cache_consumer_families", ())
-        ) | frozenset(getattr(self.sparse_attn_backend, "cache_consumer_families", ()))
+        return frozenset(self.full_attn_backend.cache_consumer_families) | frozenset(
+            self.sparse_attn_backend.cache_consumer_families
+        )
 
     def set_cache_pool(self, cache_pool) -> None:
         self.cache_pool = cache_pool

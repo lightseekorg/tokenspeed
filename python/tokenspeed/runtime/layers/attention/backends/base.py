@@ -116,6 +116,22 @@ class AttentionBackend(ABC):
     # the backend rejects the reserved null page for live sequence metadata.
     cache_active_pages_must_be_real: bool = False
     supports_mla_projected_value_decode: bool = False
+    # Cache families this backend consumes from the pool contract; wrappers
+    # union their children's.
+    cache_consumer_families: frozenset[str] = frozenset({"history"})
+    # Replay fill pads dummy table rows itself, so the wrapper may pass
+    # UNPADDED tables (no per-step F.pad). The cache-group mixins set True;
+    # V4 and the state backends take the wrapper-padded path.
+    tables_self_padding: bool = False
+    # DFLASH/DSpark block drafts expand decode metadata to spec_num_tokens
+    # rows per request; set from config by the backends that support it.
+    draft_block_decode: bool = False
+    # Bound by register_step_counter (PD layerwise transfer); None otherwise.
+    step_counter: StepCounter | None = None
+    # The shared kv-indices graph buffer some MLA-family backends allocate;
+    # the runner aliases a draft's to the target's when shapes match, so the
+    # name is a cross-backend protocol. None = no such buffer.
+    decode_cuda_graph_kv_indices: torch.Tensor | None = None
     # Metadata attribute names exempt from the capture-time pointer-identity
     # snapshot (graph_ptr_guard): sanctioned per-step-mutable objects the
     # replayed kernels do not read through Python (e.g. FlashMLA's eager tile
@@ -456,7 +472,7 @@ class AttentionBackend(ABC):
             record_cache = not forward_mode.is_decode() and not forward_mode.is_idle()
         else:
             record_cache = record_kv_cache
-        record_cache = record_cache and getattr(self, "step_counter", None) is not None
+        record_cache = record_cache and self.step_counter is not None
 
         if record_cache and not save_kv_cache:
             self.step_counter.record_cache()

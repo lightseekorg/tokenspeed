@@ -232,7 +232,7 @@ class InklingAttnBackend(AttentionBackend):
 
     @property
     def cache_consumer_families(self):
-        return frozenset(getattr(self.inner, "cache_consumer_families", ())) | {"state"}
+        return frozenset(self.inner.cache_consumer_families) | {"state"}
 
     def prepare_remote_cache_slots(self, slot_indices: list[int]) -> None:
         """Clear stale hydration state before publishing RDMA destinations."""
@@ -449,7 +449,7 @@ class InklingAttnBackend(AttentionBackend):
         cache_indices = req_pool_indices[:bs].to(torch.int32)
         assert extend_seq_lens is not None and extend_prefix_lens is not None
         # Reuse the cumsum the inner backend just computed for this batch.
-        inner_md = getattr(self.inner, "forward_extend_metadata", None)
+        inner_md = self.inner.forward_extend_metadata
         if inner_md is not None:
             query_start_loc = inner_md.cu_extend_seq_lens
         else:

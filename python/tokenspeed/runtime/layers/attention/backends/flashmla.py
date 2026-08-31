@@ -766,7 +766,7 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
         out: torch.Tensor | None = None,
     ):
         if causal:
-            step_counter = getattr(self, "step_counter", None)
+            step_counter = self.step_counter
             if step_counter is not None:
                 step_counter.record_cache()
         head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim

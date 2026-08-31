@@ -126,6 +126,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             kernel_page_size=32,
             max_num_pages=0,  # fall back to bucket-derived width
             state_group_ids=frozenset({"linear_attention"}),
+            cache_active_pages_must_be_real=False,
         )
         pool = _fake_pool(
             specs=(
@@ -155,6 +156,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             kernel_page_size=32,
             max_num_pages=2500,
             state_group_ids=frozenset(),
+            cache_active_pages_must_be_real=False,
         )
         pool = _fake_pool(specs=(_spec("full_attention"),))
         tables = self._bare(backend, pool)._dummy_group_tables(100, 1)
@@ -186,7 +188,10 @@ class DummyGroupTablesTest(unittest.TestCase):
         # full_attn_backend; the helper must not AttributeError (which would
         # silently disable the prefill graph via the capture fallback).
         child = SimpleNamespace(
-            kernel_page_size=32, max_num_pages=0, state_group_ids=frozenset()
+            kernel_page_size=32,
+            max_num_pages=0,
+            state_group_ids=frozenset(),
+            cache_active_pages_must_be_real=False,
         )
         wrapper = SimpleNamespace(full_attn_backend=child)
         pool = _fake_pool(
@@ -200,7 +205,9 @@ class DummyGroupTablesTest(unittest.TestCase):
         self.assertEqual(tables["full_attention"].shape, (1, 2))
 
     def test_pool_without_groups_is_empty(self):
-        backend = SimpleNamespace(kernel_page_size=64)
+        backend = SimpleNamespace(
+            kernel_page_size=64, cache_active_pages_must_be_real=False
+        )
         pool = _fake_pool(specs=())
         self.assertEqual(self._bare(backend, pool)._dummy_group_tables(64, 1), {})
 

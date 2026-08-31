@@ -862,6 +862,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         captured = {}
 
         class FakeBackend:
+            tables_self_padding = False
+            cache_active_pages_must_be_real = False
+            draft_block_decode = False
+            cache_consumer_families = frozenset({"history"})
 
             def refresh_decode_metadata(self, *args, **kwargs):
                 captured["args"] = args
@@ -898,6 +902,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         captured = {"target": {}, "draft": {}}
 
         class FakeBackend:
+            tables_self_padding = False
+            cache_active_pages_must_be_real = False
+            draft_block_decode = False
+            cache_consumer_families = frozenset({"history"})
 
             def __init__(self, key):
                 self.key = key
@@ -952,6 +960,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         captured = {"target": [], "draft": []}
 
         class FakeBackend:
+            tables_self_padding = False
+            cache_active_pages_must_be_real = False
+            draft_block_decode = False
+            cache_consumer_families = frozenset({"history"})
 
             def __init__(self, key):
                 self.key = key
@@ -1008,6 +1020,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         captured = {"target": [], "draft": []}
 
         class FakeBackend:
+            tables_self_padding = False
+            cache_active_pages_must_be_real = False
+            draft_block_decode = False
+            cache_consumer_families = frozenset({"history"})
 
             def __init__(self, key):
                 self.key = key
@@ -1066,6 +1082,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         captured = {"target": [], "draft": []}
 
         class FakeBackend:
+            tables_self_padding = False
+            cache_active_pages_must_be_real = False
+            draft_block_decode = False
+            cache_consumer_families = frozenset({"history"})
 
             def __init__(self, key):
                 self.key = key

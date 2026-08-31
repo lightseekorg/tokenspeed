@@ -213,6 +213,7 @@ class WrapperReplayGroupedTest(_TorchCase):
             max_tokens_per_req=1,
             attn_backend=SimpleNamespace(
                 refresh_decode_metadata=record,
+                tables_self_padding=False,
             ),
             draft_attn_backend=None,
             # Production helper, so the pinned pad_value is the real one.
@@ -274,9 +275,11 @@ class WrapperReplayGroupedTest(_TorchCase):
             max_tokens_per_req=1,
             attn_backend=SimpleNamespace(
                 refresh_decode_metadata=lambda *args, **kwargs: None,
+                tables_self_padding=False,
             ),
             draft_attn_backend=SimpleNamespace(
                 refresh_decode_metadata=record_draft,
+                tables_self_padding=False,
             ),
             drafter=SimpleNamespace(
                 draft_seq_lens_buf=torch.zeros(2, dtype=torch.int32),
@@ -326,16 +329,15 @@ class WrapperReplayGroupedTest(_TorchCase):
         def record_draft(bs, actual_bs, req_pool_indices, seq_lens, **kwargs):
             calls["draft"] = kwargs["block_tables"]
 
-        backend_contract = {}
         mock = SimpleNamespace(
             max_tokens_per_req=1,
             attn_backend=SimpleNamespace(
-                **backend_contract,
                 refresh_decode_metadata=record_target,
+                tables_self_padding=False,
             ),
             draft_attn_backend=SimpleNamespace(
-                **backend_contract,
                 refresh_decode_metadata=record_draft,
+                tables_self_padding=False,
             ),
             drafter=SimpleNamespace(
                 draft_seq_lens_buf=torch.zeros(4, dtype=torch.int32),
@@ -406,6 +408,7 @@ class WrapperCaptureGroupIdsTest(_TorchCase):
             ),
             attn_backend=SimpleNamespace(
                 init_forward_metadata_capture_cuda_graph=record,
+                cache_active_pages_must_be_real=False,
             ),
             token_to_kv_pool=SimpleNamespace(
                 arena=SimpleNamespace(

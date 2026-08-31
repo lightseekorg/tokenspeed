@@ -280,8 +280,8 @@ class ForwardStepRunner:
             # skip its gather+copy in the replay path: the target's metadata
             # prep runs first and populates the shared buffer (see
             # refresh_decode_metadata).
-            target_kv = getattr(attn_backend, "decode_cuda_graph_kv_indices", None)
-            draft_kv = getattr(draft_attn_backend, "decode_cuda_graph_kv_indices", None)
+            target_kv = attn_backend.decode_cuda_graph_kv_indices
+            draft_kv = draft_attn_backend.decode_cuda_graph_kv_indices
             if (
                 target_kv is not None
                 and draft_kv is not None
@@ -687,7 +687,7 @@ class ForwardStepRunner:
         """
         if self.draft_attn_backend is None:
             return ()
-        if getattr(self.draft_attn_backend, "draft_block_decode", False):
+        if self.draft_attn_backend.draft_block_decode:
             return ()
         families = frozenset(
             getattr(
@@ -718,7 +718,7 @@ class ForwardStepRunner:
 
     def _init_capture_metadata(self, bs: int):
         capture_kwargs = {}
-        if getattr(self.attn_backend, "cache_active_pages_must_be_real", False):
+        if self.attn_backend.cache_active_pages_must_be_real:
             # Capture-time placeholder tables, only for backends that
             # validate live-page geometry at capture (V4); the others bind
             # persistent buffers from cache_group_ids alone.
@@ -744,8 +744,9 @@ class ForwardStepRunner:
         )
         if self.draft_attn_backend is not None:
             draft_kwargs = {}
-            if self.draft_token_to_kv_pool is not None and getattr(
-                self.draft_attn_backend, "cache_active_pages_must_be_real", False
+            if (
+                self.draft_token_to_kv_pool is not None
+                and self.draft_attn_backend.cache_active_pages_must_be_real
             ):
                 draft_group_block_tables = self._capture_group_block_tables(
                     bs,
@@ -910,8 +911,9 @@ class ForwardStepRunner:
         # valid ones so the backends' stale-table guards hold. Eager idle
         # bypasses the wrapper entirely (see execute_idle_forward).
         if actual_bs == 0 and use_graph:
-            if group_placeholder_tables is None and getattr(
-                self.attn_backend, "cache_active_pages_must_be_real", False
+            if (
+                group_placeholder_tables is None
+                and self.attn_backend.cache_active_pages_must_be_real
             ):
                 # A backend that validates live-page geometry (V4) needs
                 # full-width capture placeholders on idle rather than the
@@ -947,14 +949,10 @@ class ForwardStepRunner:
                 kwargs["block_table_base_offsets"] = block_table_base_offsets
         padded_block_tables = None
         if block_tables is not None and (
-            not getattr(self.attn_backend, "tables_self_padding", False)
+            not self.attn_backend.tables_self_padding
             or (
                 self.draft_attn_backend is not None
-                and not getattr(
-                    self.draft_attn_backend,
-                    "tables_self_padding",
-                    False,
-                )
+                and not self.draft_attn_backend.tables_self_padding
             )
         ):
             # Normalize once so target and draft consume the same authoritative
@@ -967,7 +965,7 @@ class ForwardStepRunner:
                 pad_value=0,
             )
         if block_tables is not None:
-            if getattr(self.attn_backend, "tables_self_padding", False):
+            if self.attn_backend.tables_self_padding:
                 # Backend pads dummy rows itself; F.pad would reallocate tables and break storage sharing.
                 kwargs["block_tables"] = block_tables
             else:
@@ -1013,11 +1011,7 @@ class ForwardStepRunner:
             draft_attn_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
             draft_table_source = (
                 block_tables
-                if getattr(
-                    self.draft_attn_backend,
-                    "tables_self_padding",
-                    False,
-                )
+                if self.draft_attn_backend.tables_self_padding
                 else padded_block_tables
             )
             draft_group_tables = self._draft_group_tables(draft_table_source)

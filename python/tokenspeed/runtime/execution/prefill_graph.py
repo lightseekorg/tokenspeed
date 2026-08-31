@@ -436,9 +436,7 @@ class PrefillGraph:
             backend, "full_attn_backend"
         ):
             backend = backend.full_attn_backend
-        require_real_active_pages = bool(
-            getattr(backend, "cache_active_pages_must_be_real", False)
-        )
+        require_real_active_pages = backend.cache_active_pages_must_be_real
         # Full width: backends that derive the row stride from max_kv_len
         # (trtllm) index the whole row even when the bucket is small.
         width = getattr(backend, "max_num_pages", 0) or -(
@@ -532,7 +530,7 @@ class PrefillGraph:
             ctx.global_bs = [bs] * self.config.world_size
         extra_metadata_kwargs: dict = {}
         if (
-            getattr(self.attn_backend, "cache_active_pages_must_be_real", False)
+            self.attn_backend.cache_active_pages_must_be_real
             and decode_wrapper is not None
         ):
             # Placeholder tables for backends that validate live-page
