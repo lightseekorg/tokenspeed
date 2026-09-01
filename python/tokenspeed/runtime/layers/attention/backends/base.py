@@ -412,13 +412,21 @@ class AttentionBackend(ABC):
 
     @property
     def cuda_graph_page_tables(self) -> dict[str, torch.Tensor]:
-        """Per-group graph table views ({} before graph-state init).
+        """Attention-consumed groups' graph table views ({} before init).
 
-        A property so external adopters (Inkling's conv-table adoption,
-        host backends, tests) keep reading the historical name while the
-        buffers live on the composed object.
+        Consumer-page-grain paged-KV tables only — page vocabulary stays
+        with kv-cache consumers; wrapper-owned groups ride the stack tail
+        under ``cuda_graph_owned_block_tables``.
         """
         return self.group_graph.page_tables if self.group_graph is not None else {}
+
+    @property
+    def cuda_graph_owned_block_tables(self) -> dict[str, torch.Tensor]:
+        """Wrapper-owned groups' block-granularity stack-tail table views
+        ({} before init); Inkling's conv-table adoption reads these."""
+        if self.group_graph is None:
+            return {}
+        return self.group_graph.owned_block_tables
 
     @property
     def cuda_graph_out_cache_locs(self) -> dict[str, torch.Tensor]:
@@ -432,6 +440,7 @@ class AttentionBackend(ABC):
         check. Geometry is frozen by now (set_cache_pool runs first)."""
         self.group_graph = GroupGraphBuffers(
             self._geometry,
+            consumed_group_ids=self._consumed_group_ids(),
             engine_owned_group_ids=frozenset(self.engine_owned_group_ids),
             consumer_page_size_of=self._consumer_page_size,
             max_bs=max_bs,
@@ -443,14 +452,13 @@ class AttentionBackend(ABC):
 
     def _capture_group_views(self, bs: int, cache_group_ids, tokens_per_req: int = 1):
         """Capture-time per-group views (see GroupGraphBuffers.capture_views);
-        the LIVE state/owned sets decide the shed (a wrapper may register
-        owned groups after buffer construction)."""
+        the LIVE consumed set decides which delivered groups get views (a
+        wrapper may register owned groups after buffer construction)."""
         return self.group_graph.capture_views(
             bs,
             cache_group_ids,
             tokens_per_req,
-            skip_group_ids=frozenset(self._geometry.state_group_ids)
-            | frozenset(self.engine_owned_group_ids),
+            consumed_group_ids=self._consumed_group_ids(),
         )
 
     def _fill_group_graph_buffers(

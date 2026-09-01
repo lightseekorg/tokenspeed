@@ -893,7 +893,7 @@ class InklingAttnBackend(AttentionBackend):
         self._graph_seq_lens = torch.zeros(max_bs, dtype=torch.int32, device=device)
         # Adopted stacked views are filled by the inner backend's packed
         # unpack (GroupGraphBuffers.fill); pad rows hit dummy slot 0.
-        inner_tabs = getattr(self.inner, "cuda_graph_page_tables", {})
+        inner_tabs = getattr(self.inner, "cuda_graph_owned_block_tables", {})
         groups = self.conv_columns["group_block_tokens"]
         self._graph_col_tables_adopted = all(g in inner_tabs for g in groups)
         if self._graph_col_tables_adopted:

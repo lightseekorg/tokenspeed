@@ -21,11 +21,12 @@
 """Cache-group geometry learned from the pool's published specs.
 
 One immutable value object answers every "what shape is this group?"
-question a backend asks — group block granularities, which groups are
-state-family (shed from attention tables), and the full-history grain that
-batch-ordered draft tables carry. Learned exactly once, at
-``set_cache_pool`` (the arena's published specs are the only source, so the
-eager and CUDA-graph arms can never answer differently).
+question a backend asks — group block granularities, every group's family
+(the positive-claim vocabulary ``cache_consumer_families`` filters against),
+and the full-history grain that batch-ordered draft tables carry. Learned
+exactly once, at ``set_cache_pool`` (the arena's published specs are the
+only source, so the eager and CUDA-graph arms can never answer
+differently).
 """
 
 from __future__ import annotations
@@ -48,11 +49,9 @@ class CacheGroupGeometry:
         families: ``group_id -> family`` for every published group. The
             positive-claim vocabulary: a backend keeps exactly the delivered
             groups whose family it declared in ``cache_consumer_families``;
-            the rest ride the same dict to their own consumers. Empty when
+            the rest (state blocks for the mamba backend, wrapper-owned conv
+            groups) ride the same dict to their own consumers. Empty when
             no pool is bound (unit fixtures, pre-contract draft pools).
-        state_group_ids: ``family="state"`` group ids (GDN/mamba state
-            blocks, consumed by the mamba backend and shed from every
-            attention table).
         full_history_group_id: The first ``family="history"`` group with
             ``retention="full_history"``, or None when no pool bound (unit
             fixtures). Same selection rule as the executor's staging.
@@ -63,7 +62,6 @@ class CacheGroupGeometry:
 
     granularities: dict[str, int] = field(default_factory=dict)
     families: dict[str, str] = field(default_factory=dict)
-    state_group_ids: frozenset[str] = frozenset()
     full_history_group_id: str | None = None
     history_block_granularity: int = 0
 
@@ -114,9 +112,6 @@ def learn_cache_group_geometry(
             if spec.family != "state"
         },
         families={str(spec.group_id): str(spec.family) for spec in cache_group_specs},
-        state_group_ids=frozenset(
-            str(spec.group_id) for spec in cache_group_specs if spec.family == "state"
-        ),
         full_history_group_id=(
             str(full_history.group_id) if full_history is not None else None
         ),

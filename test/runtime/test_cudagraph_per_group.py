@@ -699,6 +699,41 @@ class BackendCaptureGroupTest(_BackendCase):
             self._capture(2, _GROUP_IDS)
 
 
+class BackendOwnedGroupStackTest(_BackendCase):
+    """Wrapper-owned groups ride the stack tail as block-granularity views,
+    outside the page-table namespace (page vocabulary is paged-KV-only)."""
+
+    def setUp(self):
+        super().setUp()
+        self.backend.engine_owned_group_ids = frozenset({"inkling_conv"})
+        self.backend._geometry = CacheGroupGeometry(
+            granularities={"full_attention": 2, "inkling_conv": 4},
+        )
+        self.backend._init_group_graph_buffers(MAX_BS)
+
+    def test_owned_tail_is_split_from_page_tables(self):
+        self.assertEqual(set(self.backend.cuda_graph_page_tables), {"full_attention"})
+        self.assertEqual(
+            set(self.backend.cuda_graph_owned_block_tables), {"inkling_conv"}
+        )
+        self.assertEqual(
+            set(self.backend.cuda_graph_out_cache_locs), {"full_attention"}
+        )
+        # Both are views of the one stacked table buffer.
+        page = self.backend.cuda_graph_page_tables["full_attention"]
+        owned = self.backend.cuda_graph_owned_block_tables["inkling_conv"]
+        self.assertEqual(
+            page.untyped_storage().data_ptr(), owned.untyped_storage().data_ptr()
+        )
+
+    def test_capture_views_shed_owned_groups(self):
+        tables, locs = self.backend.group_graph.capture_views(
+            2, ("full_attention", "inkling_conv")
+        )
+        self.assertEqual(set(tables), {"full_attention"})
+        self.assertEqual(set(locs), {"full_attention"})
+
+
 class BackendConsumedGroupTablesTest(_BackendCase):
     """Positive claim: a backend keeps exactly the delivered groups whose
     family it declared in ``cache_consumer_families``. family="state" groups
@@ -714,7 +749,6 @@ class BackendConsumedGroupTablesTest(_BackendCase):
         self.backend._geometry = CacheGroupGeometry(
             granularities=dict(self.backend._geometry.granularities),
             families=dict(self._FAMILIES),
-            state_group_ids=frozenset({"linear_attention"}),
         )
 
     def test_filter_keeps_declared_families_only(self):
@@ -781,7 +815,6 @@ class BackendConsumedGroupTablesTest(_BackendCase):
         self.backend._geometry = CacheGroupGeometry(
             granularities={"full_attention": 2},
             families=dict(self._FAMILIES),
-            state_group_ids=frozenset({"linear_attention"}),
         )
         self.backend._init_group_graph_buffers(MAX_BS)
         self.backend.refresh_decode_metadata(

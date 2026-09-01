@@ -252,6 +252,11 @@ value object)**. The routing surface lives on `AttentionBackend` itself:
 the write-location slot math lives in `group_write_locations.py` as pure
 functions, and the stacked per-group CUDA-graph buffers live in
 `group_graph_buffers.GroupGraphBuffers`, composed at graph-state init.
+Inside the stack, page vocabulary stays with paged-KV consumers
+(`cache-concepts.md`): attention-consumed groups get consumer-page-grain
+`page_tables` plus write-location views, while wrapper-owned (Inkling conv)
+groups ride the stack tail as block-granularity `owned_block_tables` with
+no location views (the wrapper keeps its own write-loc machinery).
 `CacheBatchMetadata` no longer carries a `kernel_table` expansion;
 `cache_metadata` still travels to V4 (bespoke multi-group slot mapping) and
 KDA state paging only. `cache_active_pages_must_be_real` remains a separate

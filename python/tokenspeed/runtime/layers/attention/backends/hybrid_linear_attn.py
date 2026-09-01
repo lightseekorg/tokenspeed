@@ -1278,7 +1278,7 @@ class MambaAttnBackend(AttentionBackend):
             # bs==0 idle replay carries no operation-bound metadata; every row
             # is a dummy padded row, so skip the dual-index gather entirely.
             state_in_blocks_by_group, state_out_blocks_by_group = (
-                self._replay_contract_state_pages(
+                self._replay_contract_state_blocks(
                     bs, real_bs, seq_lens, forward_mode, kwargs
                 )
             )
@@ -1290,7 +1290,7 @@ class MambaAttnBackend(AttentionBackend):
             state_out_blocks_by_group=state_out_blocks_by_group,
         )
 
-    def _replay_contract_state_pages(
+    def _replay_contract_state_blocks(
         self,
         bs: int,
         real_bs: int,
@@ -1298,10 +1298,10 @@ class MambaAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         kwargs: dict,
     ) -> tuple[dict, dict]:
-        """Fill the per-bs persistent state-page buffers for a decode replay.
+        """Fill the per-bs persistent state-block buffers for a decode replay.
 
         Fast path: one prep-tape launch computes every group's dual-index
-        pages straight into the persistent buffers and pads the tail (the
+        blocks straight into the persistent buffers and pads the tail (the
         eager chain is ~10 launches per group plus copies/fills). Falls back
         to the eager chain when the tape preconditions do not hold (seq_lens
         dtype, group count, debug validation).

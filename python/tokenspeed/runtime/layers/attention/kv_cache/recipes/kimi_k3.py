@@ -122,8 +122,9 @@ class KimiK3Recipe(CacheRecipe):
             or len(full_layer_ids) != _KIMI_K3_MLA_LAYERS
         ):
             raise ValueError(
-                "93-layer Kimi-K3 requires 69 KDA and 24 MLA layers, got "
-                f"{len(kda_layer_ids)} and {len(full_layer_ids)}"
+                f"{_KIMI_K3_LAYERS}-layer Kimi-K3 requires "
+                f"{_KIMI_K3_KDA_LAYERS} KDA and {_KIMI_K3_MLA_LAYERS} MLA "
+                f"layers, got {len(kda_layer_ids)} and {len(full_layer_ids)}"
             )
         if len(kda_layer_ids) % _KIMI_K3_STATE_GROUPS:
             raise ValueError(

@@ -126,7 +126,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
     def test_binding_the_pool_learns_group_geometry_for_eager_metadata(self):
         # One learner, one source: set_cache_pool runs on every path, so eager
         # metadata sees the same geometry a captured graph would, and state
-        # groups land in state_group_ids rather than the span map.
+        # groups land in the family map but never the span map.
         from tokenspeed.runtime.execution import workspace
         from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
         from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -159,7 +159,7 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
 
         # Nothing is known before the pool arrives.
         self.assertEqual(backend._geometry.granularities, {})
-        self.assertEqual(backend._geometry.state_group_ids, frozenset())
+        self.assertEqual(backend._geometry.families, {})
 
         pool = SimpleNamespace(
             arena=SimpleNamespace(
@@ -182,8 +182,10 @@ class TRTLLMCacheGroupsTest(unittest.TestCase):
         self.assertIs(backend.cache_pool, pool)
         self.assertEqual(backend._geometry.granularities, {"full_attention": 128})
         self.assertEqual(
-            backend._geometry.state_group_ids, frozenset({"linear_attention_0"})
+            backend._geometry.families,
+            {"full_attention": "history", "linear_attention_0": "state"},
         )
+        self.assertEqual(backend._consumed_group_ids(), frozenset({"full_attention"}))
 
     def test_build_page_table_keeps_single_table_direct_copy_path(self):
         b = self._bare_backend(page_size=64, max_num_pages=4)

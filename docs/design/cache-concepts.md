@@ -581,6 +581,16 @@ view, mirrored by the host tier. Specifically:
 * Spec geometry is shape-checked at construction: row geometry and
   `checkpoint_granularity` are mutually exclusive, both positive, and
   family-gated (`CacheGroupSpec.__post_init__`).
+* Group consumption is claimed positively, from one declaration: a backend
+  keeps exactly the delivered `block_tables` entries whose family it
+  declared in `cache_consumer_families`, minus wrapper-owned group ids
+  (`AttentionBackend._consumed_group_ids` / `_consumed_group_tables`, fed
+  by `CacheGroupGeometry.families`; the CUDA-graph table stacks and capture
+  views select from the same set). The declaration that already drives the
+  boot-time family check (`validate_scheduler_config`) and the draft table
+  selection thus also drives the runtime filter — there is no separate
+  known-foreign subtract list to keep in sync when a new family appears. A
+  table delivered for a group the bound pool never published fails loudly.
 
 Remaining known item (deliberate, separate project): the mapping *primitive*
 is single and the *owners* are down to three — the MHA-family slot math and

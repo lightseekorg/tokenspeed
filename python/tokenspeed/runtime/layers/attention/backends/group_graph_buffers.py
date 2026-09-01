@@ -56,8 +56,12 @@ class GroupGraphBuffers:
     """The stacked per-group graph buffers and their capture/replay ops.
 
     Attributes:
-        page_tables: ``group_id -> [max_bs, width]`` views into the stacked
-            table buffer (attention groups first, then wrapper-owned tails).
+        page_tables: ``group_id -> [max_bs, width]`` consumer-page-grain
+            views into the stacked table buffer — attention-consumed (paged
+            KV) groups only, the one place page vocabulary applies here.
+        owned_block_tables: ``group_id -> [max_bs, width]`` block-granularity
+            views for the wrapper-owned (Inkling conv) groups riding the
+            stack tail; the packed unpack fills them, no location views.
         out_cache_locs: ``group_id -> [max_bs * spec_n]`` views into the
             stacked location buffer (attention groups only).
     """
@@ -66,6 +70,7 @@ class GroupGraphBuffers:
         self,
         geometry: CacheGroupGeometry,
         *,
+        consumed_group_ids: frozenset[str] | None = None,
         engine_owned_group_ids: frozenset[str],
         consumer_page_size_of,
         max_bs: int,
@@ -78,6 +83,10 @@ class GroupGraphBuffers:
 
         Args:
             geometry: The pool's learned group geometry.
+            consumed_group_ids: The groups this backend consumes — its
+                positive claim (``AttentionBackend._consumed_group_ids``);
+                they form the stack's attention prefix. ``None`` claims
+                every row-geometry group that is not wrapper-owned.
             engine_owned_group_ids: Wrapper-owned (Inkling conv) groups —
                 their tables ride in the stack tail but get no location
                 views (the wrapper keeps its own write-loc machinery).
@@ -92,6 +101,7 @@ class GroupGraphBuffers:
             device: Buffer device.
         """
         self.page_tables: dict[str, torch.Tensor] = {}
+        self.owned_block_tables: dict[str, torch.Tensor] = {}
         self.out_cache_locs: dict[str, torch.Tensor] = {}
         self._max_bs = max_bs
         self._locs_stack = None
@@ -104,10 +114,12 @@ class GroupGraphBuffers:
         self._kernel_page_size = kernel_page_size
         self._engine_owned_group_ids = engine_owned_group_ids
 
+        if consumed_group_ids is None:
+            consumed_group_ids = (
+                frozenset(geometry.granularities) - engine_owned_group_ids
+            )
         att_gids = sorted(
-            gid
-            for gid in geometry.granularities
-            if gid not in geometry.state_group_ids and gid not in engine_owned_group_ids
+            gid for gid in geometry.granularities if gid in consumed_group_ids
         )
         owned_gids = sorted(
             gid for gid in geometry.granularities if gid in engine_owned_group_ids
@@ -169,9 +181,12 @@ class GroupGraphBuffers:
             (g, 3), dtype=torch.int32, device=device
         )
         for i, gid in enumerate(gids):
-            self.page_tables[gid] = self._tables_stack[i, :, : widths[gid]]
+            view = self._tables_stack[i, :, : widths[gid]]
             if i < len(att_gids):
+                self.page_tables[gid] = view
                 self.out_cache_locs[gid] = self._locs_stack[i]
+            else:
+                self.owned_block_tables[gid] = view
 
     def capture_views(
         self,
@@ -179,40 +194,43 @@ class GroupGraphBuffers:
         cache_group_ids,
         tokens_per_req: int = 1,
         *,
-        skip_group_ids: frozenset[str] | None = None,
+        consumed_group_ids: frozenset[str] | None = None,
     ):
         """Capture-time (page_tables, out_cache_locs) per-group views.
 
         Real tables only arrive at replay, which copies fresh data to these
         graph-recorded addresses. Verify (tokens_per_req = spec_num_tokens)
         keeps [bs]-row tables but records [bs*N] write-loc views (token-major,
-        single-table verify layout). ``skip_group_ids`` names groups other
-        owners consume (state pages ride to the mamba backend, engine-owned
-        conv groups keep the wrapper's own capture buffers); defaults to the
-        construction-time state+owned set. Returns (None, None) when only
-        skipped groups (or none) are delivered.
+        single-table verify layout). ``consumed_group_ids`` is the backend's
+        positive claim; delivered groups outside it ride to their own
+        consumers (state tables ride to the mamba backend, engine-owned
+        conv groups keep the wrapper's own capture buffers). Defaults to
+        the construction-time attention prefix. Returns (None, None) when
+        no consumed group (or none at all) is delivered.
         """
         if not cache_group_ids:
             return None, None
-        if skip_group_ids is None:
-            skip_group_ids = (
-                self._geometry.state_group_ids | self._engine_owned_group_ids
+        if consumed_group_ids is None:
+            consumed_group_ids = frozenset(
+                self._group_ids[: self._attention_group_count]
             )
         page_tables = {}
         out_cache_locs = {}
         for gid in cache_group_ids:
-            if gid in skip_group_ids:
+            if gid not in consumed_group_ids:
                 continue
             buf = self.page_tables.get(gid)
             if buf is None:
                 # Replay write locs are ALWAYS the fused triton launch over
-                # the stacked buffers; a group outside the stack could never
-                # get its locs filled. Every capture-visible group must be
-                # known (set_cache_pool) before init_cuda_graph_state.
+                # the stacked buffers; a group without an attention view could
+                # never get its locs filled. Every capture-visible group must
+                # be known (set_cache_pool) before init_cuda_graph_state.
                 raise RuntimeError(
-                    f"cache group {gid!r} is not in the stacked CUDA-graph "
-                    f"buffers (stack: {self._group_ids}); declare every "
-                    "capture-visible group's page size before graph init."
+                    f"cache group {gid!r} has no attention view in the "
+                    "stacked CUDA-graph buffers (attention stack: "
+                    f"{self._group_ids[: self._attention_group_count]}); "
+                    "declare every capture-visible group's page size before "
+                    "graph init."
                 )
             loc_buf = self.out_cache_locs.get(gid)
             need = self._max_bs * tokens_per_req
@@ -228,7 +246,7 @@ class GroupGraphBuffers:
             page_tables[gid] = buf[:bs, :]
             out_cache_locs[gid] = loc_buf[: bs * tokens_per_req]
         if not page_tables:
-            # Only state groups delivered: nothing for this backend.
+            # Only foreign groups delivered: nothing for this backend.
             return None, None
         return page_tables, out_cache_locs
 
@@ -324,9 +342,13 @@ class GroupGraphBuffers:
                 if src is None:
                     continue
                 if gid in owned:
-                    # The wrapper fills its own scheduler-page buffer.
+                    # The wrapper fills its own block-granularity tables.
                     continue
-                buf = self.page_tables[gid]
+                buf = self.page_tables.get(gid)
+                if buf is None:
+                    # Construction-owned but live-unowned: still a stack
+                    # resident, copied plainly at block granularity (ratio 1).
+                    buf = self.owned_block_tables[gid]
                 # Clamp: scheduler may send extra reservation columns; kernels never read past cache_seqlens
                 source_cols = min(src.shape[1], self._source_widths[gid])
                 # cols >= 1: a zero-width table would leave dummy rows' col 0 unwritten
