@@ -1034,11 +1034,20 @@ class Qwen4ExpPLELayer(nn.Module):
 
         if verify:
             # Row 0 of every (width + 1)-strided block holds the carried state;
-            # the conv already filled the token rows that follow it.
-            init_rows = torch.arange(bs, device=input_ids.device) * scratch_stride
-            context_scratch[init_rows] = initial_context
-            conv_scratch[init_rows] = initial_conv
-            if total:
+            # the conv already filled the token rows that follow it. The scratch
+            # is exactly bs blocks long, so those rows are a plain stride and the
+            # slice copies them instead of materializing an index to scatter
+            # through. A bs mismatch would raise here rather than write the
+            # wrong rows, which the index form could do silently.
+            context_scratch[::scratch_stride] = initial_context
+            conv_scratch[::scratch_stride] = initial_conv
+            if total and total == bs * width:
+                # Uniform widths keep each request's token rows contiguous, so
+                # the tail reshapes onto the block view as one strided copy.
+                context_scratch.view(bs, scratch_stride, -1)[:, 1:] = context_tail.view(
+                    bs, width, -1
+                )
+            elif total:
                 context_scratch[req * scratch_stride + 1 + col] = context_tail
         else:
             self._write_pages(context_field, output_pages, final_context)
