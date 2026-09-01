@@ -79,7 +79,7 @@ def test_flashinfer_decode_bulk_cow_runs_once_and_respects_l2_fences() -> None:
             calls.append((reads, writes, batch_size))
 
     backend = object.__new__(KdaAttnBackend)
-    backend._decode_cow_descriptors = (Descriptor(), Descriptor())
+    backend._decode_cow_descriptor = Descriptor()
     backend._decode_cow_first_layer = 2
     backend._state_groups = lambda: ("g0", "g1", "g2")
     backend.kv_pool = SimpleNamespace(layerwise_load_tracker=None)
@@ -91,10 +91,10 @@ def test_flashinfer_decode_bulk_cow_runs_once_and_respects_l2_fences() -> None:
     )
 
     assert backend._stage_flashinfer_decode_cow(2, 2)
-    assert len(calls) == 2
-    assert all(call[2] == 2 for call in calls)
+    assert len(calls) == 1
+    assert calls[0][2] == 2
     assert backend._stage_flashinfer_decode_cow(3, 2)
-    assert len(calls) == 2
+    assert len(calls) == 1
 
     waits = []
     backend.kv_pool.layerwise_load_tracker = SimpleNamespace(
@@ -102,7 +102,7 @@ def test_flashinfer_decode_bulk_cow_runs_once_and_respects_l2_fences() -> None:
     )
     assert backend._stage_flashinfer_decode_cow(2, 2)
     assert waits == [True]
-    assert len(calls) == 4
+    assert len(calls) == 2
 
     backend.kv_pool.layerwise_load_tracker = None
     backend.forward_metadata = SimpleNamespace(
@@ -110,7 +110,7 @@ def test_flashinfer_decode_bulk_cow_runs_once_and_respects_l2_fences() -> None:
         state_out_blocks_by_group=None,
     )
     assert not backend._stage_flashinfer_decode_cow(3, 2)
-    assert len(calls) == 4
+    assert len(calls) == 2
 
 
 def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None:

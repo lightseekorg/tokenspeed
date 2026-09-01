@@ -124,7 +124,7 @@ class KdaAttnBackend(MambaAttnBackend):
         self._batched_replay_launch = None
         self._batched_replay_ready = False
         self._replay_descriptor_bound: set[int] = set()
-        self._decode_cow_descriptors: tuple[KdaGroupedStateCopyDescriptor, ...] = ()
+        self._decode_cow_descriptor: KdaGroupedStateCopyDescriptor | None = None
         self._decode_cow_first_layer: int | None = None
         self._sequence_major_conv = kda_conv_state_layout() == "sequence_major"
         self.kda_backend = (kda_backend or "auto").strip().lower()
@@ -142,7 +142,7 @@ class KdaAttnBackend(MambaAttnBackend):
     @override
     def set_kv_pool(self, kv_pool) -> None:
         super().set_kv_pool(kv_pool)
-        self._decode_cow_descriptors = ()
+        self._decode_cow_descriptor = None
         self._decode_cow_first_layer = None
         if self._sequence_major_conv:
             layer_ids = tuple(self._state_layer_ids())
@@ -160,13 +160,10 @@ class KdaAttnBackend(MambaAttnBackend):
                     self._state_components(layer_id) for layer_id in layer_ids
                 )
                 if components and components[0][0].is_cuda:
-                    self._decode_cow_descriptors = (
-                        KdaGroupedStateCopyDescriptor.build(
-                            tuple(component[0] for component in components), group_sel
-                        ),
-                        KdaGroupedStateCopyDescriptor.build(
-                            tuple(component[1] for component in components), group_sel
-                        ),
+                    self._decode_cow_descriptor = KdaGroupedStateCopyDescriptor.build(
+                        tuple(component[0] for component in components),
+                        tuple(component[1] for component in components),
+                        group_sel,
                     )
                     self._decode_cow_first_layer = layer_ids[0]
         if self._replay_active and self.speculative_num_draft_tokens > 1:
@@ -430,8 +427,8 @@ class KdaAttnBackend(MambaAttnBackend):
         A cross-layer copy cannot jump an active layerwise L2 restore. Fence its
         final event once before staging; ordinary decode still uses FlashInfer.
         """
-        descriptors = self._decode_cow_descriptors
-        if not descriptors or self._decode_cow_first_layer is None:
+        descriptor = self._decode_cow_descriptor
+        if descriptor is None or self._decode_cow_first_layer is None:
             return False
         metadata = self.forward_metadata
         if (
@@ -450,8 +447,7 @@ class KdaAttnBackend(MambaAttnBackend):
             write_groups = tuple(
                 metadata.state_out_blocks_by_group[group_id] for group_id in group_ids
             )
-            for descriptor in descriptors:
-                descriptor.copy(read_groups, write_groups, batch_size=batch_size)
+            descriptor.copy(read_groups, write_groups, batch_size=batch_size)
         return True
 
     @override
