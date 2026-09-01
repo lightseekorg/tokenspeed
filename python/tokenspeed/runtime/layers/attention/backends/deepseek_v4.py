@@ -40,6 +40,9 @@ from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4ForwardMetadata,
 )
+from tokenspeed.runtime.layers.attention.deepseek_v4.gluon_sparse_attn.dispatch import (
+    native_gluon_sparse_selected_attention,
+)
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
     V4_KERNEL_BLOCK_ROWS,
@@ -1913,7 +1916,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 topk_indices=topk_indices,
             )
         with nvtx_range(f"attn_{kind}_prefill_selected_attention"):
-            out = dsv4_prefill(
+            out = native_gluon_sparse_selected_attention(
                 q=q_padded,
                 kv=kv_workspace,
                 indices=indices,
@@ -1921,6 +1924,15 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 attn_sink=attn_sink,
                 softmax_scale=softmax_scale,
             )
+            if out is None:
+                out = dsv4_prefill(
+                    q=q_padded,
+                    kv=kv_workspace,
+                    indices=indices,
+                    lens=lens,
+                    attn_sink=attn_sink,
+                    softmax_scale=softmax_scale,
+                )
         return out[:, :num_local_heads]
 
     def forward_deepseek_v4_prefill(
