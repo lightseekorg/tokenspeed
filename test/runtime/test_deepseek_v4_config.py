@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
+from dataclasses import replace
 from io import StringIO
 from types import MethodType, SimpleNamespace
 from typing import ClassVar
@@ -2975,8 +2976,11 @@ class TestDeepseekV4Config(unittest.TestCase):
             target.forward_metadata.is_valid_token.tolist(),
             [True, True, True, True, False, False, False, False],
         )
+        # The draft's packed round ends with forward_metadata on the bs-row
+        # step object; the packed bs*N views live in the prefill slot.
+        draft_packed = draft.forward_prefill_metadata
         self.assertEqual(
-            draft.forward_metadata.is_valid_token.tolist(),
+            draft_packed.is_valid_token.tolist(),
             [True, True, True, True, False, False, False, False],
         )
         base_group_id = v4_compressed_kv_group_id(4)
@@ -2994,7 +2998,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             bool((target.forward_metadata.cache.page_table[0, base_width:] == 0).all())
         )
         self.assertTrue(bool((target.forward_metadata.cache.page_table[1] == 0).all()))
-        self.assertTrue(bool((draft.forward_metadata.cache.page_table == 0).all()))
+        self.assertTrue(bool((draft_packed.cache.page_table == 0).all()))
 
         torch.cuda.synchronize()
         reserved_before = torch.cuda.memory_reserved()
@@ -4314,12 +4318,26 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(
             draft_backend.forward_metadata.forward_mode, ForwardMode.DECODE
         )
+        # Packed-draft round end state: the prefill slot carries the bs*N
+        # verify views (step-0 shape carrier), the decode slot and
+        # forward_metadata the bs-row draft step object — the same state
+        # capture ends in (advance is the graph's last slot write), so replay
+        # and eager rounds agree.
         self.assertIs(
+            draft_backend.forward_decode_metadata, draft_backend.forward_metadata
+        )
+        self.assertIsNot(
             draft_backend.forward_prefill_metadata,
             draft_backend.forward_metadata,
         )
+        self.assertEqual(
+            draft_backend.forward_prefill_metadata.token_to_req_indices.numel(), 8
+        )
+        self.assertEqual(draft_backend.forward_metadata.token_to_req_indices.numel(), 2)
+        # Step 0's bs*N query resolves through the prefill-slot fallback.
         self.assertIs(
-            draft_backend.forward_decode_metadata, draft_backend.forward_metadata
+            draft_backend._select_decode_metadata(8),
+            draft_backend.forward_prefill_metadata,
         )
 
         with self.assertRaisesRegex(RuntimeError, "uniformly packed"):
@@ -4370,7 +4388,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(backend.forward_metadata.forward_mode, ForwardMode.DECODE)
         self.assertEqual(backend.forward_metadata.decode_token_count(), 2)
 
-    def test_deepseek_v4_select_decode_metadata_ignores_prefill_fallback(self):
+    def test_deepseek_v4_select_decode_metadata_prefill_slot_is_last_resort(self):
         backend = _v4_backend(
             SimpleNamespace(
                 prefix_granularity=64,
@@ -4407,14 +4425,24 @@ class TestDeepseekV4Config(unittest.TestCase):
             forward_mode=ForwardMode.DECODE,
         )
 
+        # The prefill slot is a legitimate LAST-resort carrier for DECODE-mode
+        # packed views (the packed-draft round publishes bs*N there), but the
+        # decode-mode slots always win over it.
         backend.forward_prefill_metadata = stale_prefill
-        self.assertIsNone(backend._select_decode_metadata(8))
+        self.assertIs(backend._select_decode_metadata(8), stale_prefill)
         backend.forward_decode_metadata = stale_prefill
         backend.forward_metadata = decode_metadata
         self.assertIs(backend._select_decode_metadata(8), decode_metadata)
         backend.forward_metadata = None
         backend.forward_decode_metadata = decode_metadata
+        backend.forward_prefill_metadata = stale_prefill
         self.assertIs(backend._select_decode_metadata(8), decode_metadata)
+        # An extend-round leftover never passes the mode gate.
+        extend_prefill = replace(stale_prefill, forward_mode=ForwardMode.EXTEND)
+        backend.forward_metadata = None
+        backend.forward_decode_metadata = None
+        backend.forward_prefill_metadata = extend_prefill
+        self.assertIsNone(backend._select_decode_metadata(8))
 
     def test_deepseek_v4_cuda_graph_replay_without_num_tokens_uses_plain_decode(self):
         backend = _v4_backend(
@@ -5159,7 +5187,13 @@ class TestDeepseekV4Config(unittest.TestCase):
             for_graph_replay=True,
         )
 
-        self.assertIs(backend.forward_prefill_metadata, backend.forward_metadata)
+        # Replay refresh ends in the capture end state: decode slot (and
+        # forward_metadata) on the bs-row draft object, prefill slot on the
+        # packed bs*N views.
+        self.assertIs(backend.forward_decode_metadata, backend.forward_metadata)
+        self.assertEqual(
+            backend.forward_prefill_metadata.token_to_req_indices.numel(), 16
+        )
         backend.advance_draft_forward_metadata()
 
         metadata = backend.forward_metadata
@@ -5191,6 +5225,125 @@ class TestDeepseekV4Config(unittest.TestCase):
         backend.advance_draft_forward_metadata()
         self.assertIs(backend.forward_metadata, first_decode_metadata)
         self.assertIs(backend.forward_metadata.attention.decode_swa_indices, cached_swa)
+
+    def test_deepseek_v4_packed_draft_replay_reproduces_capture_end_state(self):
+        """The bug-2 parity: replay's refresh must leave the slots exactly as
+        capture (whose last recorded slot write is advance) left them — a
+        captured draft graph reads the capture-end object graph forever, so a
+        refresh that ends on a different object feeds the replayed kernels
+        stale addresses (Kimi-style IMA)."""
+        backend = _v4_backend(
+            SimpleNamespace(
+                prefix_granularity=64,
+                kernel_page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=True,
+                head_dim=512,
+                context_len=128,
+                speculative_num_draft_tokens=4,
+            )
+        )
+        backend.init_cuda_graph_state(max_bs=4)
+        backend.init_forward_metadata_capture_cuda_graph(
+            bs=4,
+            num_tokens=16,
+            req_pool_indices=torch.arange(4, dtype=torch.int32),
+            seq_lens=torch.ones(4, dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+        )
+        backend.advance_draft_forward_metadata()
+        capture_end = (
+            backend.forward_prefill_metadata,
+            backend.forward_decode_metadata,
+            backend.forward_metadata,
+        )
+
+        backend.refresh_decode_metadata(
+            4,
+            2,
+            torch.arange(4, dtype=torch.int32),
+            torch.tensor([70, 3, 1, 1], dtype=torch.int32),
+            num_tokens=16,
+            forward_mode=ForwardMode.DECODE,
+            page_table=torch.tensor(
+                [[10, 11], [20, 21], [30, 31], [40, 41]],
+                dtype=torch.int32,
+            ),
+            for_graph_replay=True,
+        )
+        replay_end = (
+            backend.forward_prefill_metadata,
+            backend.forward_decode_metadata,
+            backend.forward_metadata,
+        )
+        for slot, cap, rep in zip(
+            ("prefill", "decode", "forward"), capture_end, replay_end
+        ):
+            self.assertIs(rep, cap, f"{slot} slot diverged from capture end state")
+
+    def test_deepseek_v4_eager_prep_never_mutates_graph_cached_draft_metadata(self):
+        """The bug-1 parity: an eager/extend-round prepare must not rebind
+        fields on the object a captured graph recorded. Capture stores its
+        draft-decode object in both the per-bs cache and _draft_decode_metadata,
+        so the eager prep's reuse lookup can find it — it must allocate its
+        own instead."""
+        backend = _v4_backend(
+            SimpleNamespace(
+                prefix_granularity=64,
+                kernel_page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=True,
+                head_dim=512,
+                context_len=128,
+                speculative_num_draft_tokens=4,
+            )
+        )
+        backend.init_cuda_graph_state(max_bs=4)
+        backend.init_forward_metadata_capture_cuda_graph(
+            bs=4,
+            num_tokens=16,
+            req_pool_indices=torch.arange(4, dtype=torch.int32),
+            seq_lens=torch.ones(4, dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+        )
+        graph_draft = backend._draft_decode_metadata
+        self.assertIn(
+            graph_draft,
+            list(backend._cuda_graph_draft_decode_metadata.values()),
+        )
+        recorded = (
+            graph_draft.req_pool_indices,
+            graph_draft.seq_lens,
+            graph_draft.cache,
+        )
+
+        # A NON-graph prefill metadata (dynamic extend round) drives prepare.
+        eager_prefill = _make_deepseek_v4_forward_metadata(
+            page_size=64,
+            req_pool_indices=torch.arange(4, dtype=torch.int32),
+            page_table=torch.zeros((4, 2), dtype=torch.int32),
+            seq_lens=torch.tensor([70, 3, 1, 1], dtype=torch.int32),
+            query_lens=torch.ones(4, dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            token_to_req_indices=torch.arange(4, dtype=torch.int32),
+            forward_mode=ForwardMode.EXTEND,
+        )
+        backend._prepare_draft_decode_metadata(
+            eager_prefill, torch.tensor([70, 3, 1, 1], dtype=torch.int32)
+        )
+
+        self.assertIsNot(backend._draft_decode_metadata, graph_draft)
+        self.assertIs(graph_draft.req_pool_indices, recorded[0])
+        self.assertIs(graph_draft.seq_lens, recorded[1])
+        self.assertIs(graph_draft.cache, recorded[2])
 
     def test_deepseek_v4_draft_metadata_fallback_prefers_current_shape(self):
         prefill_metadata = SimpleNamespace(

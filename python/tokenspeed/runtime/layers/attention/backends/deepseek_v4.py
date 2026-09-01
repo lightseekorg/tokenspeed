@@ -750,6 +750,24 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             if is_cuda_graph_metadata
             else self._draft_decode_metadata
         )
+        if (
+            not is_cuda_graph_metadata
+            and metadata is not None
+            # Identity scan, not `in`: dataclass __eq__ would compare tensors.
+            and any(
+                metadata is cached
+                for cached in self._cuda_graph_draft_decode_metadata.values()
+            )
+        ):
+            # The eager/extend-round prep must NEVER mutate a graph-cached
+            # object: the recorded draft kernels hold its capture-time tensor
+            # addresses, and the reuse arm below rebinds req_pool_indices and
+            # cache to this round's dynamic tensors. A capture stores its
+            # object in BOTH _cuda_graph_draft_decode_metadata and
+            # _draft_decode_metadata, so the eager path may find the graph
+            # object here — allocate its own instead (first mixed round after
+            # capture broke the replayed gather on exactly this).
+            metadata = None
         is_valid_token = self._draft_decode_is_valid_token(prefill_metadata)
         if (
             metadata is None
@@ -825,7 +843,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self,
         num_tokens: int,
     ) -> DeepseekV4ForwardMetadata | None:
-        for metadata in (self.forward_metadata, self.forward_decode_metadata):
+        # The prefill slot is scanned LAST and only for DECODE-mode objects:
+        # a packed draft round publishes its bs*N verify views there (the
+        # step-0 shape carrier) while the decode slot holds the bs-row step
+        # views — mirroring the model-side resolver's token-count fallback.
+        # A stale extend-mode prefill object never passes the mode gate.
+        for metadata in (
+            self.forward_metadata,
+            self.forward_decode_metadata,
+            self.forward_prefill_metadata,
+        ):
             if (
                 metadata is not None
                 and metadata.forward_mode is not None
@@ -2573,12 +2600,15 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         elif (
             not is_packed_decode
             and is_decode
+            and self.is_draft
             and self.forward_prefill_metadata is not None
             and self.forward_prefill_metadata.req_pool_indices.numel() == bs
         ):
             # The extend round's plain-row draft refresh (unified draft
             # contract step two): rebuild the draft's step-1+ decode metadata
-            # from the prefill state the init just published.
+            # from the prefill state the init just published. Draft only — a
+            # non-spec target's post-extend decode would otherwise build a
+            # draft-decode object nothing ever reads.
             self._prepare_draft_decode_metadata(
                 self.forward_prefill_metadata,
                 seq_lens[:bs].clone(),
@@ -2605,6 +2635,21 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 max_context_len=self.context_len,
             )
             _refresh_decode_indexer_schedule_metadata(metadata)
+        if is_packed_decode and self.is_draft:
+            # A draft's packed round ends with the decode slot (and
+            # forward_metadata) on the bs-row draft-decode object: the
+            # captured graph recorded advance_draft_forward_metadata as its
+            # LAST slot write, so the replay refresh must leave the same
+            # object reachable — graph_ptr_guard verifies the slots' object
+            # graph against the capture-end snapshot. The packed bs*N views
+            # go to the PREFILL slot as the step-0 shape carrier: eager
+            # step 0 resolves its bs*N query through _select_decode_metadata's
+            # prefill-slot fallback (DECODE-mode gated), exactly like the
+            # model-side resolver.
+            self.forward_prefill_metadata = metadata
+            self.forward_decode_metadata = self._draft_decode_metadata
+            self.forward_metadata = self._draft_decode_metadata
+            return
         if is_decode:
             self.forward_decode_metadata = metadata
         self.forward_metadata = metadata
