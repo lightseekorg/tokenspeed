@@ -130,6 +130,108 @@ def rmsnorm(
 
 
 @triton.jit
+def _grouped_gemma_rmsnorm_kernel(
+    x_ptr,
+    weight_ptr,
+    out_ptr,
+    row_stride,
+    out_row_stride,
+    eps: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    row = tl.program_id(0)
+    group = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < GROUP_SIZE
+    group_offset = group * GROUP_SIZE
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    x = tl.load(
+        x_ptr + row * row_stride + group_offset + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    variance = tl.sum(x * x, axis=0) / GROUP_SIZE
+    weight = tl.load(weight_ptr + group_offset + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    normalized = x * tl.rsqrt(variance + eps) * (1.0 + weight)
+    tl.store(
+        out_ptr + row * out_row_stride + group_offset + offsets,
+        normalized,
+        mask=mask,
+    )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def grouped_gemma_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    group_size: int,
+    eps: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Grouped Gemma RMSNorm without the unused inverse-RMS output.
+
+    ``weight`` is the checkpoint offset, so the kernel multiplies by
+    ``1 + weight``. Variance is independent for each last-dimension group.
+    """
+    if x.ndim < 1:
+        raise ValueError("x must have at least one dimension")
+    width = int(x.shape[-1])
+    if group_size <= 0 or width % group_size:
+        raise ValueError(
+            f"group_size must divide the last dimension ({width}), got {group_size}"
+        )
+    if weight.shape != (width,):
+        raise ValueError(
+            f"weight must have shape {(width,)}, got {tuple(weight.shape)}"
+        )
+    if weight.dtype != x.dtype or weight.device != x.device:
+        raise ValueError("weight must match x dtype and device")
+    if out is None:
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    elif out.shape != x.shape or out.dtype != x.dtype or out.device != x.device:
+        raise ValueError("out must match x shape, dtype, and device")
+    elif not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    if x.numel() == 0:
+        return out
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+
+    rows = x.numel() // width
+    groups = width // group_size
+    x_2d = x.view(rows, width)
+    out_2d = out.view(rows, width)
+    block = triton.next_power_of_2(group_size)
+    if block > 65536:
+        raise ValueError("group_size is too large for the Triton reduction")
+    enable_pdl = pdl_enabled()
+    launch_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
+    _grouped_gemma_rmsnorm_kernel[(rows, groups)](
+        x_2d,
+        weight,
+        out_2d,
+        x_2d.stride(0),
+        out_2d.stride(0),
+        eps=eps,
+        GROUP_SIZE=group_size,
+        BLOCK=block,
+        ENABLE_PDL=enable_pdl,
+        **launch_kwargs,
+    )
+    return out
+
+
+@triton.jit
 def _fused_qk_rmsnorm_kernel(
     q_in_ptr,
     k_in_ptr,
@@ -676,6 +778,7 @@ def fused_qk_rmsnorm_rope(
 
 
 __all__ = [
+    "grouped_gemma_rmsnorm",
     "rmsnorm",
     "qk_rmsnorm",
     "fused_qk_rmsnorm_rope_gate",

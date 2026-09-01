@@ -23,6 +23,9 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.layernorm.triton import (
+    grouped_gemma_rmsnorm as _grouped_gemma_rmsnorm,
+)
 from tokenspeed_kernel.platform import current_platform
 
 _platform = current_platform()
@@ -101,4 +104,32 @@ def qk_rmsnorm(
     )
 
 
-__all__ = ["qk_rmsnorm", "rmsnorm"]
+def grouped_gemma_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    group_size: int | None,
+    eps: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Apply Gemma RMSNorm independently to last-dimension groups.
+
+    Args:
+        x: GPU input shaped ``[..., width]``.
+        weight: Gemma checkpoint weight offset shaped ``[width]``; the
+            effective multiplier is ``1 + weight``.
+        group_size: Elements sharing one variance statistic. ``None`` means
+            the full last dimension.
+        eps: Epsilon added before reciprocal square root.
+        out: Optional contiguous output matching ``x``.
+
+    Returns:
+        Normalized tensor matching ``x`` shape and dtype.
+    """
+    if not x.is_cuda:
+        raise ValueError("grouped_gemma_rmsnorm requires GPU tensors")
+    width = int(x.shape[-1])
+    effective_group_size = width if group_size is None else int(group_size)
+    return _grouped_gemma_rmsnorm(x, weight, effective_group_size, eps, out=out)
+
+
+__all__ = ["grouped_gemma_rmsnorm", "qk_rmsnorm", "rmsnorm"]

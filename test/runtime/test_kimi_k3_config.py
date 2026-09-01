@@ -238,6 +238,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             moe=SimpleNamespace(
                 tp_ep_rank=0,
                 tp_ep_size=8,
+                has_tp_ep=True,
                 tp_ep_group=tuple(range(8)),
             )
         )
@@ -476,6 +477,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 ep_size=8,
                 ep_group=ep_group,
                 tp_ep_size=8,
+                has_tp_ep=True,
                 tp_ep_rank=0,
                 tp_ep_group=ep_group,
             ),
@@ -544,6 +546,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 ep_size=1,
                 ep_group=(0,),
                 tp_ep_size=8,
+                has_tp_ep=True,
                 tp_ep_rank=0,
                 tp_ep_group=ep_group,
             ),

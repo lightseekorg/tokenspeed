@@ -457,11 +457,10 @@ class FlashMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 validate_pages=cache_debug_enabled(),
             )
         else:
-            # No group table: the autotune/warmup dummy prefill (uses_cache_groups
-            # is False for FlashMLA, so the prefill_graph dummy builds no cache
-            # metadata). It never reads real KV, so page_table is an empty/dummy
-            # batch-ordered placeholder here (row i == batch position i). A live
-            # LCM batch always resolves a group table.
+            # No group table: a dummy prefill built while the prefill graph is
+            # off, or an unbound backend. It never reads real KV, so page_table
+            # is an empty/dummy batch-ordered placeholder here (row i == batch
+            # position i). A live LCM batch always resolves a group table.
             prefill_table = page_table
             prefill_req_pool_indices = torch.arange(
                 seq_lens.shape[0], dtype=torch.int64, device=page_table.device

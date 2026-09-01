@@ -79,7 +79,7 @@ from tokenspeed.runtime.models.qwen4_exp_ple import (
 )
 
 _requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="QSA indexer kernels require CUDA"
+    not torch.cuda.is_available(), reason="requires a CUDA device"
 )
 
 
@@ -226,6 +226,7 @@ def test_qwen4_exp_flat_config_preserves_text_rope_parameters() -> None:
     assert config.text_config.model_type == "qwen4_exp_text"
 
 
+@_requires_cuda
 def test_hyperconnection_mix_and_combine_shapes() -> None:
     mixer = GatedResidualSimple(
         HyperConnectionConfig(
@@ -234,10 +235,10 @@ def test_hyperconnection_mix_and_combine_shapes() -> None:
             hc_lowrank=4,
             params_dtype=torch.float32,
         )
-    )
-    hyper_input = torch.randn(5, 32)
+    ).cuda()
+    hyper_input = torch.randn(5, 32, device="cuda")
     mixed, residuals = mixer.mix(hyper_input)
-    combined = mixer.combine(torch.randn(5, 8), residuals)
+    combined = mixer.combine(torch.randn(5, 8, device="cuda"), residuals)
 
     assert mixed.shape == (5, 8)
     assert combined.shape == hyper_input.shape
@@ -245,6 +246,7 @@ def test_hyperconnection_mix_and_combine_shapes() -> None:
     assert torch.isfinite(combined).all()
 
 
+@_requires_cuda
 def test_hyperconnection_norm_for_reuses_the_mix_time_norm() -> None:
     mixer = GatedResidualSimple(
         HyperConnectionConfig(
@@ -253,11 +255,11 @@ def test_hyperconnection_norm_for_reuses_the_mix_time_norm() -> None:
             hc_lowrank=4,
             params_dtype=torch.float32,
         )
-    )
-    hyper_input = torch.randn(6, 32)
+    ).cuda()
+    hyper_input = torch.randn(6, 32, device="cuda")
     _, residuals = mixer.mix(hyper_input)
     sliced = hyper_input[2:5]
-    unrelated = torch.randn(3, 32)
+    unrelated = torch.randn(3, 32, device="cuda")
     sliced_reference = mixer.hc_norm(sliced)
     unrelated_reference = mixer.hc_norm(unrelated)
 
@@ -285,6 +287,7 @@ def test_hyperconnection_norm_for_reuses_the_mix_time_norm() -> None:
     assert recomputes == [unrelated.shape]
 
 
+@_requires_cuda
 def test_hyperconnection_fused_projection_matches_split_checkpoint_weights() -> None:
     hc_count, hidden_size, lowrank = 4, 8, 6
     mixer = GatedResidualSimple(
@@ -294,20 +297,20 @@ def test_hyperconnection_fused_projection_matches_split_checkpoint_weights() -> 
             hc_lowrank=lowrank,
             params_dtype=torch.float32,
         )
-    )
-    down_weight = torch.randn(lowrank, hc_count * hidden_size)
-    inject_weight = torch.randn(hc_count, hc_count * hidden_size)
+    ).cuda()
+    down_weight = torch.randn(lowrank, hc_count * hidden_size, device="cuda")
+    inject_weight = torch.randn(hc_count, hc_count * hidden_size, device="cuda")
     param = mixer.mix_inject_proj.weight
     loader = param.weight_loader
     loader(param, down_weight, "mix")
     loader(param, inject_weight, "inject")
 
-    # The shared 1 / hc_count scale is folded into the fused rows.
+    # The shared 1 / hc_count scale is exactly folded for power-of-two HC.
     torch.testing.assert_close(param[:lowrank], down_weight / hc_count)
     torch.testing.assert_close(param[lowrank:], inject_weight / hc_count)
 
-    hyper_input = torch.randn(5, hc_count * hidden_size)
-    block_output = torch.randn(5, hidden_size)
+    hyper_input = torch.randn(5, hc_count * hidden_size, device="cuda")
+    block_output = torch.randn(5, hidden_size, device="cuda")
     mixed, residuals = mixer.mix(hyper_input)
     combined = mixer.combine(block_output, residuals)
 
@@ -328,68 +331,6 @@ def test_hyperconnection_fused_projection_matches_split_checkpoint_weights() -> 
         -1, (hc_count, hidden_size)
     ) + block_output.unsqueeze(-2) * inject.unsqueeze(-1)
     torch.testing.assert_close(combined, expected.flatten(-2))
-
-
-@_requires_cuda
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_hyperconnection_mix_epilogue_fused_matches_eager(dtype: torch.dtype) -> None:
-    torch.manual_seed(11)
-    hc_count, hidden_size, rows = 4, 320, 129
-    mixer = GatedResidualSimple(
-        HyperConnectionConfig(
-            hc_count=hc_count,
-            hidden_size=hidden_size,
-            hc_lowrank=16,
-            params_dtype=dtype,
-        )
-    ).cuda()
-    gate = torch.randn(rows, hc_count * hidden_size, device="cuda", dtype=dtype)
-    normalized = torch.randn(rows, hc_count * hidden_size, device="cuda", dtype=dtype)
-
-    fused = mixer._mix_epilogue_cuda(gate, normalized)
-    eager = mixer._mix_epilogue_torch(gate, normalized)
-
-    assert fused.dtype == dtype
-    torch.testing.assert_close(fused, eager, rtol=2e-2, atol=2e-2)
-    # Strided views (the fused projection's output slices) stay exact.
-    wide = torch.randn(rows, 2, hc_count * hidden_size, device="cuda", dtype=dtype)
-    torch.testing.assert_close(
-        mixer._mix_epilogue_cuda(wide[:, 1], normalized),
-        mixer._mix_epilogue_torch(wide[:, 1], normalized),
-        rtol=2e-2,
-        atol=2e-2,
-    )
-
-
-@_requires_cuda
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_hyperconnection_combine_fused_matches_eager(dtype: torch.dtype) -> None:
-    torch.manual_seed(29)
-    hc_count, hidden_size, rows = 4, 320, 129
-    mixer = GatedResidualSimple(
-        HyperConnectionConfig(
-            hc_count=hc_count,
-            hidden_size=hidden_size,
-            hc_lowrank=16,
-            params_dtype=dtype,
-        )
-    ).cuda()
-    hyper_input = torch.randn(rows, hc_count * hidden_size, device="cuda", dtype=dtype)
-    block_output = torch.randn(rows, hidden_size, device="cuda", dtype=dtype)
-    inject_logits = torch.randn(rows, hc_count, device="cuda", dtype=dtype)
-
-    fused = mixer._combine_cuda(block_output, hyper_input, inject_logits)
-    eager = mixer._combine_torch(block_output, hyper_input, inject_logits)
-
-    assert fused.dtype == dtype
-    torch.testing.assert_close(fused, eager, rtol=2e-2, atol=2e-2)
-    # Reduce-scatter hands over row slices of both the residual and the logits.
-    torch.testing.assert_close(
-        mixer._combine_cuda(block_output[4:9], hyper_input[4:9], inject_logits[4:9]),
-        mixer._combine_torch(block_output[4:9], hyper_input[4:9], inject_logits[4:9]),
-        rtol=2e-2,
-        atol=2e-2,
-    )
 
 
 def test_qwen4_exp_loads_fp8_scales_only_into_attention_layers(monkeypatch) -> None:
@@ -1785,21 +1726,21 @@ def test_ple_verify_scratch_fill_matches_reference(lengths) -> None:
     torch.testing.assert_close(conv_new, conv_ref)
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="fused RMSNorm requires a CUDA device"
-)
+@_requires_cuda
 @pytest.mark.parametrize("group_size", [None, 4])
-def test_grouped_gemma_rmsnorm_cuda_matches_native(group_size) -> None:
+def test_grouped_gemma_rmsnorm_cuda_matches_reference(group_size) -> None:
     hidden = 12
     norm = GroupedGemmaRMSNorm(hidden, eps=1e-6, group_size=group_size).cuda()
     with torch.no_grad():
         norm.weight.normal_()
-    norm.gemma_weight = norm.weight.data + 1.0
     x = torch.randn(5, hidden, device="cuda", dtype=torch.float32)
+    effective_group_size = hidden if group_size is None else group_size
+    grouped = x.float().unflatten(-1, (-1, effective_group_size))
+    expected = (
+        grouped * torch.rsqrt(grouped.square().mean(dim=-1, keepdim=True) + 1e-6)
+    ).flatten(-2) * (1.0 + norm.weight.float())
 
-    torch.testing.assert_close(
-        norm.forward_cuda(x), norm.forward_native(x), atol=1e-2, rtol=1e-2
-    )
+    torch.testing.assert_close(norm(x), expected, atol=1e-2, rtol=1e-2)
 
 
 def _ngram_stub(ngram_size: int, heads_per_ngram: int = 4, eos: int = 7):

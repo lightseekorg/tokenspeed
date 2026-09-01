@@ -141,6 +141,11 @@ class DSABackend(AttentionBackend):
         group tables and the graph write-location buffer."""
         self._dense_backend.mark_cache_contract()
 
+    @property
+    def consumes_cache_metadata(self) -> bool:
+        # mark_cache_contract binds the child, so the wrapper must answer for it.
+        return self._dense_backend.consumes_cache_metadata
+
     def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
         return self._dense_backend.select_out_cache_loc(
             layer, out_cache_loc, forward_mode

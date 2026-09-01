@@ -93,11 +93,6 @@ def _profile_rank_tag(attn_mapping) -> str:
     return "-".join(parts)
 
 
-def _rendezvous_on_cpu(group) -> None:
-    """Rendezvous every rank in ``group`` without touching the device."""
-    torch.distributed.all_reduce(torch.zeros(1, dtype=torch.int32), group=group)
-
-
 class RequestHandler:
     """
     1. Recv Reqs from ZMQ
@@ -161,6 +156,10 @@ class RequestHandler:
             else None
         )
         self.profile_rank_tag = _profile_rank_tag(mapping.attn)
+        # Rendezvous buffer for _profile_sync. Preallocated because the stage
+        # transitions run on the control-plane thread, where allocating is what
+        # Principle 1 forbids -- see _profile_sync.
+        self._profile_sync_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
 
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
@@ -538,6 +537,29 @@ class RequestHandler:
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
+    def _profile_sync(self) -> None:
+        """Rendezvous the attention TP peers without touching the device.
+
+        ``torch.distributed.barrier`` cannot be used here. It prefers
+        ``group.bound_device_id`` over its CPU branch, and
+        ``DistributedInitializer`` binds ``cuda:N`` to every group -- including
+        the gloo ones -- to force eager NCCL init. A gloo barrier therefore
+        allocates ``aten.empty`` on CUDA, and these calls run on the
+        control-plane thread (stage transitions arrive through
+        ``_profile_batch_predicate``), where ``_NoDeviceWork`` rejects exactly
+        that. The result was every rank dying mid-profile with "control-plane
+        thread ran CUDA factory".
+
+        An all-reduce over a preallocated CPU tensor rendezvouses identically
+        and allocates nothing, matching how the loop's other in-round
+        collectives are written.
+        """
+        if self.attn_tp_size == 1:
+            return
+        torch.distributed.all_reduce(
+            self._profile_sync_buf, group=self.attn_tp_cpu_group
+        )
+
     def stop_profile(self, stage: ForwardMode | None = None) -> ProfileReqOutput | None:
         if not self.profile_in_progress:
             return ProfileReqOutput(
@@ -558,11 +580,7 @@ class RequestHandler:
                     f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.trace.json.gz",
                 )
             )
-            # A CPU tensor, not barrier(): torch takes a collective's device
-            # from the process group, and in a CUDA process that is CUDA even
-            # for a gloo group -- the allocation would land on the control-plane
-            # thread, where DeviceHandle's guard rejects it.
-            _rendezvous_on_cpu(self.attn_tp_cpu_group)
+            self._profile_sync()
 
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
@@ -586,7 +604,7 @@ class RequestHandler:
                 proton_error = exc
             finally:
                 # Do not reply until every TP peer has finished writing.
-                _rendezvous_on_cpu(self.attn_tp_cpu_group)
+                self._profile_sync()
 
         if "VIZTRACER" in self.profiler_activities and self.viztracer is not None:
             self.viztracer.stop()

@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
 from tokenspeed_kernel import profiling
 
 from tokenspeed.runtime.engine import request_handler as request_handler_mod
@@ -29,6 +30,10 @@ def _make_handler(attn_mapping: SimpleNamespace | None = None) -> RequestHandler
     attn_mapping = attn_mapping or _attn_mapping()
     handler.attn_tp_rank = attn_mapping.tp_rank
     handler.attn_tp_cpu_group = None
+    # __init__ is bypassed here, so mirror the state _profile_sync needs: the
+    # peer count it short-circuits on and the preallocated rendezvous buffer.
+    handler.attn_tp_size = getattr(attn_mapping, "tp_size", 2)
+    handler._profile_sync_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
     handler.profile_rank_tag = request_handler_mod._profile_rank_tag(attn_mapping)
     handler.init_profiler()
     return handler
@@ -50,13 +55,16 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         self.output_dir = tempfile.mkdtemp()
         profiling.ProfilingState.reset()
         self.addCleanup(profiling.ProfilingState.reset)
-        # stop_profile rendezvouses the attn-TP CPU group; there is no real
-        # process group in unit tests.
-        rendezvous_patcher = mock.patch.object(
-            request_handler_mod, "_rendezvous_on_cpu"
+        # stop_profile rendezvouses the attn-TP CPU group through
+        # _profile_sync, which all-reduces a preallocated CPU tensor rather
+        # than calling barrier (barrier would allocate on the bound CUDA
+        # device and trip the control-plane guard). No real process group
+        # exists in unit tests.
+        sync_patcher = mock.patch.object(
+            request_handler_mod.torch.distributed, "all_reduce"
         )
-        self.rendezvous = rendezvous_patcher.start()
-        self.addCleanup(rendezvous_patcher.stop)
+        self.profile_sync = sync_patcher.start()
+        self.addCleanup(sync_patcher.stop)
 
     def test_init_fails_when_proton_unavailable(self):
         with mock.patch.object(
@@ -215,7 +223,7 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         self.assertTrue(outputs[0].endswith("test-profile-DP0-TP0.proton"))
         self.assertTrue(outputs[1].endswith("test-profile-DP1-TP0.proton"))
 
-    def test_stop_profile_rendezvouses_tp_peers_after_proton_finalize(self):
+    def test_stop_profile_syncs_tp_peers_after_proton_finalize(self):
         # Only attn-TP rank 0 replies to /stop_profile; the reply must wait
         # until every TP peer has finalized its Proton file.
         self.handler.attn_tp_cpu_group = object()
@@ -225,14 +233,43 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         ), mock.patch.object(request_handler_mod, "start_profiling"), mock.patch.object(
             request_handler_mod, "stop_profiling"
         ) as stop_profiling:
-            self.rendezvous.side_effect = lambda group: self.assertTrue(
+            self.profile_sync.side_effect = lambda tensor, group: self.assertTrue(
                 stop_profiling.called
             )
             self.handler.profile(_start_req(self.output_dir))
             result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
 
         self.assertTrue(result.success)
-        self.rendezvous.assert_called_once_with(self.handler.attn_tp_cpu_group)
+        self.profile_sync.assert_called_once_with(
+            self.handler._profile_sync_buf, group=self.handler.attn_tp_cpu_group
+        )
+
+    def test_profile_sync_never_touches_the_device(self):
+        """The rendezvous must not allocate, and must not be a barrier.
+
+        stop_profile runs on the control-plane thread, where _NoDeviceWork
+        rejects CUDA factories. torch.distributed.barrier prefers
+        group.bound_device_id over its CPU branch, and every group is bound to
+        cuda:N for eager NCCL init, so a barrier here allocated on CUDA and
+        killed all ranks mid-profile. Pin both halves: no barrier, and a CPU
+        rendezvous tensor.
+        """
+        self.handler.attn_tp_cpu_group = object()
+
+        with mock.patch.object(
+            request_handler_mod.torch.distributed, "barrier"
+        ) as barrier:
+            self.handler._profile_sync()
+
+        barrier.assert_not_called()
+        self.profile_sync.assert_called_once()
+        tensor = self.profile_sync.call_args.args[0]
+        self.assertEqual(tensor.device.type, "cpu")
+
+    def test_profile_sync_is_a_noop_without_peers(self):
+        self.handler.attn_tp_size = 1
+        self.handler._profile_sync()
+        self.profile_sync.assert_not_called()
 
     def test_stop_profile_reports_proton_finalize_failure(self):
         self.handler.attn_tp_cpu_group = object()
@@ -250,7 +287,9 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("Failed to finalize Proton profiling", result.message)
         self.assertFalse(self.handler.profile_in_progress)
-        self.rendezvous.assert_called_once_with(self.handler.attn_tp_cpu_group)
+        self.profile_sync.assert_called_once_with(
+            self.handler._profile_sync_buf, group=self.handler.attn_tp_cpu_group
+        )
 
     def test_num_steps_window_finalizes_proton(self):
         with mock.patch.object(
@@ -270,28 +309,6 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             self.handler._profile_batch_predicate()
             stop_profiling.assert_called_once()
             self.assertFalse(self.handler.profile_in_progress)
-
-
-class TestRendezvousStaysOffTheDevice(unittest.TestCase):
-    """stop_profile runs on the control-plane thread, which may not touch CUDA.
-
-    ``torch.distributed.barrier`` takes the collective's device from the process
-    group, and in a CUDA process that is CUDA even for a gloo group, so it
-    allocated on the control plane and DeviceHandle's guard killed the
-    scheduler. The rendezvous must stay on the host.
-    """
-
-    def test_rendezvous_all_reduces_a_cpu_tensor(self):
-        group = object()
-        with mock.patch.object(
-            request_handler_mod.torch.distributed, "all_reduce"
-        ) as all_reduce:
-            request_handler_mod._rendezvous_on_cpu(group)
-
-        all_reduce.assert_called_once()
-        tensor = all_reduce.call_args.args[0]
-        self.assertEqual(tensor.device.type, "cpu")
-        self.assertIs(all_reduce.call_args.kwargs["group"], group)
 
 
 if __name__ == "__main__":

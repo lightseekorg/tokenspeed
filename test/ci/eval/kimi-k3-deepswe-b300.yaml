@@ -9,14 +9,21 @@ runner:
     - b300deepswe-8gpu
 env:
   CI: "true"
+  HF_HUB_CACHE: /raid/cache/huggingface/hub
+  HF_HUB_OFFLINE: "1"
+  HF_MODULES_CACHE: /tmp/huggingface/modules
   KIMI_K3_MODEL_ROOT: /raid/cache/huggingface/hub/models--moonshotai--Kimi-K3
   KIMI_K3_MODEL_REVISION: a590ce090cb049c93a33dfe8c208ec652aa20503
+  PIER_KIMI_CODE_BINARY: /cache/kimi-code/0.29.0/bin/kimi
 install:
   - bash test/ci_system/install_deps.sh
+  - bash test/ci/deepswe/install_kimi_code.sh
 server:
   command: >-
     ts serve ${KIMI_K3_MODEL_ROOT}/snapshots/${KIMI_K3_MODEL_REVISION}
     --served-model-name kimi-k3
+    --tokenizer moonshotai/Kimi-K3
+    --revision ${KIMI_K3_MODEL_REVISION}
     --trust-remote-code
     --attn-tp-size 8
     --ep-size 8
@@ -25,10 +32,10 @@ server:
     --moe-backend flashinfer_trtllm
     --kv-cache-dtype fp8
     --mm-encoder-tp-mode data
-    --max-model-len 80000
-    --max-num-seqs 64
-    --max-cudagraph-capture-size 64
-    --cudagraph-capture-sizes 1 2 4 8 16 32 64
+    --max-model-len 1048576
+    --max-num-seqs 4
+    --max-cudagraph-capture-size 4
+    --cudagraph-capture-sizes 1 2 4
     --max-prefill-tokens 32768
     --chunked-prefill-size 32768
     --gpu-memory-utilization 0.90

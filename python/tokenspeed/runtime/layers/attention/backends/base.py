@@ -94,9 +94,8 @@ class AttentionBackend(ABC):
     # full-history draft table for this backend. Keep this separate from
     # uses_cache_groups: generic speculative backends still consume that table.
     cache_group_tables_replace_draft_page_table: bool = False
-    # Capture helpers use a real writable page for every active group when
-    # the backend rejects the reserved null page for live sequence metadata.
-    cache_active_pages_must_be_real: bool = False
+    # Latched by mark_cache_contract on the backends the registry binds.
+    _cache_contract_bound: bool = False
     uses_padded_decode_token_mask: bool = False
     supports_mla_projected_value_decode: bool = False
     # Backend-owned cuda-graph cache-seqlens buffer the decode metadata views.
@@ -121,6 +120,18 @@ class AttentionBackend(ABC):
 
     def set_cache_pool(self, cache_pool: CachePool) -> None:
         self.cache_pool = cache_pool
+
+    @property
+    def consumes_cache_metadata(self) -> bool:
+        """Whether this backend takes paged cache metadata when it is offered.
+
+        Distinct from uses_cache_groups, which MLA answers oppositely: that flag
+        marks a backend that reads the wrapper's per-group block_tables, and an
+        MLA target deliberately does not -- it reads the richer cache_metadata,
+        so its flag stays False while it is exactly the backend that must be
+        handed metadata by anything synthesizing a batch.
+        """
+        return self.uses_cache_groups or self._cache_contract_bound
 
     @contextmanager
     def override_num_extends(self, num_extends: int):
