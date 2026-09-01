@@ -77,8 +77,7 @@ pier run \
   --memory ignore \
   --n-tasks "$task_count" \
   --sample-seed "$sample_seed" \
-  --yes \
-  --debug
+  --yes
 
 result=${jobs_dir}/${job_name}/result.json
 summary=${artifact_dir}/summary.md
